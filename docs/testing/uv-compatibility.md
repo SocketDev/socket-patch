@@ -17,7 +17,7 @@ managers.
 |-------|--------|----------|
 | `requirements.txt`, including uv-generated hash continuations | Exact version pins become direct artifact URLs with the patched SHA-256. Extras and markers are retained; hashes for the replaced artifact are removed. | Requirements refer to a committed wheel under `.socket/vendor/pypi/` with its hash. |
 | `uv.lock`, native `version = 1`, `[[package]]` | The package source and artifact entry agree on the hosted URL and hash. A paired `pyproject.toml` receives the corresponding uv source configuration. | The package source refers to the committed wheel. The paired `pyproject.toml` records that source. |
-| `uv.lock`, experimental uv 0.1 `[[distribution]]` | Uses the legacy direct-source and artifact grammar, including source-qualified dependency references. | Refused: this grammar needs absolute file URLs, which cannot provide portable vendoring. Use uv 0.2 or newer. |
+| `uv.lock`, experimental `[[distribution]]` (uv 0.1.45–0.2.34) | Follows the entry's own shape: `direct+` string or `{ url = … }` table source, `[[distribution.wheel]]` sub-table or inline `wheels` entry, and source-qualified dependency references where the lock carries them. | Refused (`pypi_uv_legacy_lock_unsupported`): the experimental grammar cannot carry a portable local wheel — through 0.2.6 a relative path source does not parse, and on 0.2.17–0.2.34 `--locked` rejects it while `uv lock` and plain `uv sync` absolutize it. Use uv 0.2.35 or newer. |
 | `*.py.lock` with its PEP 723 `*.py` script | Rewrites the lock and the script's uv source metadata together. | Rewrites the lock and script metadata together and commits the patched wheel. |
 | `pylock.toml` and `pylock.<name>.toml`, PEP 751 `lock-version = "1.0"` | Uses one `archive` URL with the patched SHA-256. | Uses one `archive` path with the committed wheel's SHA-256. |
 
@@ -33,12 +33,93 @@ frozen, locked, and ordinary installation outcomes separately where supported.
 ## Limits
 
 - uv 0.0 has no native `uv.lock`; its compatibility lane is compiled requirements.
-  uv 0.0.5 rejects the bare local wheel paths emitted by vendored requirements;
-  use hosted mode or upgrade uv. Vendored requirements passed from uv 0.1.45
-  onward in this matrix.
+  `uv pip sync` rejects the bare local wheel paths emitted by vendored
+  requirements through uv 0.1.23 (`Unexpected '.', expected '-c', '-e', '-r'
+  or the start of a requirement`) and accepts them from 0.1.24; use hosted mode
+  or upgrade uv for older binaries.
+- `uv lock` itself has a boundary: the subcommand appears in 0.1.42 but panics
+  (`not yet implemented`) through 0.1.44 and first writes a lock at 0.1.45,
+  the last 0.1 release. Below that, hosted mode covers uv through compiled
+  requirements (from 0.0.5).
+- uv 0.1.45–0.2.34 write the experimental `[[distribution]]` lock
+  grammar; `[[package]]` starts at 0.2.35. The grammar went through three
+  shapes, and the hosted rewriter follows the entry's own shape on each axis:
+  string sources with sub-table artifacts (`source = "registry+…"`,
+  `[distribution.sdist]`, `[[distribution.wheel]]`, source-qualified
+  `[[distribution.dependencies]]`) through 0.2.5; string sources with inline
+  artifacts (`sdist = { … }`, `wheels = [ … ]`) from 0.2.6 through 0.2.17; and
+  inline-table sources (`source = { registry = … }`) from 0.2.18. Emitting the
+  wrong shape is not a parse error the user sees: 0.2.18–0.2.34 reject the
+  string source and silently ignore the lock (`--frozen` / `--locked` fail,
+  an ordinary `uv sync` still installs the patch via the pyproject source),
+  and 0.2.6–0.2.17 ignore an unexpected `[[distribution.wheel]]` and try to
+  build the direct wheel URL as a source archive. The `[[distribution]]`
+  grammar is hosted-only: vendored native wiring is refused with
+  `pypi_uv_legacy_lock_unsupported`. The refusal is kept because no spelling of
+  a committed wheel is stable across that era: through 0.2.6 a relative path
+  source cannot be parsed at all (`path+<rel>` is an invalid URL, `path+file:`
+  forms resolve against the filesystem root or panic); 0.2.17–0.2.34 install a
+  relative `{ path = … }` source under `--frozen` and plain `uv sync`, but
+  `--locked` rejects the non-canonical spelling, `uv lock` and plain `uv sync`
+  rewrite the path to an absolute one, resolution is relative to the current
+  directory rather than the project, and hashes are not verified before
+  0.2.34. Use uv 0.2.35 or newer for native vendoring; vendored requirements
+  work on the same binaries.
+- Vendored native wiring covers every `[[package]]`-grammar release, uv 0.2.35
+  onward. uv 0.2.35 and 0.2.36 wrote no root `[package.metadata]` yet (it
+  arrived in 0.2.37); on those locks the requires-dist repoint is skipped
+  rather than refused, and the package source plus the pyproject
+  `[tool.uv.sources]` entry carry the redirect (verified with `--frozen`,
+  `--locked`, and ordinary installs). A lock that has metadata but no entry
+  for the package is stale and is still refused with
+  `pypi_uv_lock_package_missing`.
 - Native lock versions other than `version = 1`, and PEP 751 versions other than
-  `lock-version = "1.0"`, are refused. Native lock revisions and command
-  availability are measured separately by the matrix below.
+  `lock-version = "1.0"`, are refused. Lock `revision` values 1 (0.6.0–0.6.14),
+  2 (0.6.15–0.8.3) and 3 (0.8.4 onward) are all covered by the matrix below.
+- Command availability boundaries observed with real binaries: `uv lock`
+  writes a lock from 0.1.45 (see above); `uv export` from 0.4.1, its
+  `--output-file` flag from 0.4.7 (the harness reads the export from stdout
+  below that); `uv lock --script` from 0.5.17; PEP 751 `uv pip compile
+  --output-file pylock.toml` from 0.6.15. Earlier binaries record those lanes
+  as unavailable, not as failures.
+- `[tool.uv] dev-dependencies` (the pre-PEP 735 dev group) is classified as a
+  direct dependency, and every duplicate `requires-dist` / `requires-dev`
+  entry for the package (extras, markers) is repointed, so `uv sync --locked`
+  accepts the lock. `[tool.uv] constraint-dependencies` /
+  `build-constraint-dependencies` naming the package are repointed in the
+  lock's `[manifest]` `constraints` / `build-constraints` entries, which uv
+  ≥ 0.5.6 serializes with the package's source. uv 0.2.37–0.5.3 serialize
+  constraints as `{ name, specifier }` regardless of sources, so on those
+  releases the repointed entry makes `uv sync --locked` fail (`--frozen` and
+  a plain `uv sync` still install the patch; the plain sync rewrites the
+  entry back). The CLI cannot tell those binaries apart from the lock, so the
+  repoint emits the advisory `pypi_uv_constraints_require_uv_0_5_6`. The
+  project-variant lane below exercises both shapes.
+- Transitive targets are wired through `[tool.uv] override-dependencies` plus
+  a `[tool.uv.sources]` entry. uv applies sources to overrides only from
+  0.5.6: on 0.2.35–0.5.3 `--frozen` installs the patched wheel from the lock,
+  but a plain `uv sync` re-resolves the override against the registry and
+  reinstalls the pristine wheel (and rewrites the lock). The CLI cannot tell
+  those binaries apart from the lock, so the override branch emits the
+  advisory warning `pypi_uv_override_requires_uv_0_5_6` instead of refusing.
+- Symlinked `uv.lock`, `pyproject.toml`, `pylock*.toml`, `*.py.lock` and
+  script files are discovered for inventory and `repair`, but every writer
+  refuses before touching anything — hosted
+  `redirect_symlinked_file_unsupported`, vendored `pypi_uv_symlink_unsupported`
+  / `pypi_lock_symlink_unsupported` — because uv writes through the link
+  while socket-patch's atomic stage-and-rename would replace the link with a
+  regular file, leaving the target unpatched and the checkout with a type
+  change. A symlink that is not one of the files to be written does not block
+  vendoring its regular siblings.
+- Vendored requirements install on uv ≥ 0.1.24 (the bare `./wheel` path
+  grammar). The `--hash` on that line is enforced only by `uv pip sync
+  --require-hashes`, which exists from 0.1.32, and by default from 0.5.x;
+  through 0.1.29 uv silently ignores hashes. uv ≤ 0.1.23 has no local path
+  grammar at all — hosted requirements work there.
+- Both uv backends preserve CRLF line endings: the hosted rewriter and the
+  vendored `uv.lock` / `pyproject.toml` writer (including the appended
+  `[manifest]` and `[package.metadata]` fragments and their revert) keep the
+  file's convention.
 - A script lock requires its paired script and a valid PEP 723 metadata block.
   Missing metadata or an incompatible existing source is reported before either
   file is rewritten.
@@ -53,13 +134,28 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   pins, opaque URLs, and ambiguous unpinned rows are reported as
   `redirect_requirements_version_ambiguous` and preserved.
 - A script lock does not replace the main project's lockfile selection merely
-  by sharing its directory. An unrelated script lock does not block vendoring
-  a package from the project's requirements or Poetry lock. When multiple
+  by sharing its directory: its packages supplement the `poetry.lock` or
+  `requirements.txt` inventory rather than hiding it, and an unrelated script
+  lock does not block vendoring a package from the project's requirements or
+  Poetry lock. `uv.lock` keeps its exclusive precedence. When multiple
   applicable package-manager locks coexist, the CLI reports its precedence
   choice and the locks it leaves unchanged.
-- Vendored installation needs the committed artifact tree. Older uv versions
-  can also require build dependencies for the root project; an unavailable
-  offline build dependency is distinct from failure to install the patched wheel.
+- Vendored installation needs the committed artifact tree. uv 0.2.35–0.3.5
+  cannot build the ROOT fixture from an empty cache under `--offline`
+  (`setuptools>=40.8.0` is a build dependency of the fixture, not of the
+  patched wheel). `uv sync --no-install-project` exists from 0.3.3 and the
+  harness passes it whenever `sync --help` lists it, which is why the 0.3.5
+  row passes cold; from 0.4.0 uv no longer builds a root without a
+  `[build-system]`, so ≥ 0.4.0 passes regardless; ≤ 0.2.34 vendoring is
+  refused, so the case is never exercised there. On 0.2.35–0.3.0 the harness
+  retries the install with network access and records it as
+  `project-vendored-frozen-sync-root-build-networked`, distinct from any
+  failure to install the patched wheel.
+- `vendor --revert` refuses to delete a vendored Python wheel while `uv.lock`,
+  a PEP 751 lock, a script, or `requirements.txt` still references it and the
+  ledger entry has no wiring to replay (the shape `socket-patch repair`
+  rebuilds when `state.json` is lost); `vendor_wiring_unknown_revert_blocked`
+  names the file. Restore the pre-vendor files (or re-lock) first.
 
 Revert state retains the original wiring. Script and lock edits are treated as a
 pair: conflicting changes preserve both files and their recovery state rather
@@ -68,28 +164,47 @@ preserving another package's vendored entries.
 
 ## Reproduce the release-family matrix
 
-The matrix pins these 14 binaries: `0.0.5`, `0.1.45`, `0.2.37`, `0.3.5`,
-`0.4.30`, `0.5.31`, `0.6.0`, `0.6.17`, `0.7.22`, `0.8.24`, `0.9.30`,
-`0.10.12`, `0.11.33`, and `0.12.13`. They cover uv 0.0 through 0.12 and the
-additional 0.6 lock-revision boundary. This is release-family coverage, not a
-claim that every patch release was tested.
+The matrix pins 42 binaries: the first and the latest release of every uv 0.x
+family (0.0 through 0.12), plus the releases on either side of every behaviour
+boundary the probes found — `0.1.23`/`0.1.24` (local wheel paths in
+requirements), `0.1.44`/`0.1.45` (`uv lock` writes a lock; the subcommand
+exists from 0.1.42 and panics `not yet implemented` through 0.1.44),
+`0.2.5`/`0.2.6` (sub-table → inline lock artifacts),
+`0.2.17`/`0.2.18` (string → inline-table lock sources),
+`0.2.34`/`0.2.35` (`[[distribution]]` → `[[package]]`), `0.2.36`/`0.2.37`
+(root `[package.metadata]` appears),
+`0.4.0`/`0.4.1` (`uv export`), `0.5.16`/`0.5.17` (`uv lock --script`),
+`0.6.14`/`0.6.15` (PEP 751 export; lock revision 2) and `0.8.3`/`0.8.4` (lock
+revision 3). The full list is `VERSIONS` in `scripts/backtest-uv.py`; the
+boundaries were bisected with `scripts/probe-uv-boundaries.py`, which records
+the lock grammar, lock revision, command availability (including whether the
+`uv lock` subcommand exists and actually writes a lock, and whether `uv export`
+accepts `--output-file`), and local-wheel requirement support of any set of uv
+releases. The one probe-pinned boundary the matrix does not bracket is the
+`uv export --output-file` flag (0.4.6/0.4.7): the harness reads the export
+from stdout, so it is a harness detail rather than a compatibility boundary.
+This is release-family plus boundary coverage, not a claim that every patch
+release was tested.
 
 From the repository root on macOS or Linux:
 
 ```sh
 cargo build -p socket-patch-cli
+cp target/debug/socket-patch /tmp/socket-patch-backtest-bin
 python3 scripts/backtest-uv.py \
-  --socket-patch target/debug/socket-patch \
+  --socket-patch /tmp/socket-patch-backtest-bin \
   --socket-patch-revision "$(git rev-parse HEAD)" \
   --python /path/to/python3 \
   --output /tmp/socket-patch-uv-backtest
 ```
 
 Use Python 3.9 to match the recorded probes; the fixtures declare it as their
-minimum.
-`--versions` can select a smaller diagnostic run. The script downloads pinned uv
-binaries and the pristine urllib3 wheel from PyPI and verifies their registry
-hashes. It runs against the public patch proxy without an API token.
+minimum. Copy the CLI out of `target/` first so a rebuild cannot swap the binary
+under a running matrix. The default list takes roughly half an hour with the
+harness's four workers; `--versions` selects a smaller diagnostic run. The
+script downloads pinned uv binaries and the pristine urllib3 wheel from PyPI and
+verifies their registry hashes. It runs against the public patch proxy without
+an API token.
 
 For each binary, the run records command lines, exit codes, output, artifact
 hashes, and installed `urllib3/response.py` hashes. It exercises native locks,
@@ -99,6 +214,41 @@ Unsupported commands remain visible in the results; they are not counted as
 successful installation tests. A successful CLI exit with a refusal warning is
 also not counted as a successful rewrite.
 
+On every `[[package]]`-grammar binary (uv ≥ 0.2.35) the run adds a
+project-variant lane (`variant_matrix` in the script, `variant-<name>-<mode>-*`
+cases in `results.json`). Five pyproject shapes are locked fresh, scanned in
+hosted and vendored mode, and installed from the patched lock into a fresh
+environment with `uv sync --frozen`, `uv sync --locked` (where the binary has
+it) and a plain `uv sync`, recording the exit code, whether the lock survived
+untouched, and the installed bytes:
+
+- `tool-uv-dev` — `dependencies = []` plus `[tool.uv] dev-dependencies`;
+- `dependency-groups` — `dependencies = []` plus PEP 735 `[dependency-groups]`
+  `dev` (honoured from uv 0.4.27; older binaries lock an empty project and the
+  row records `formatSupported: false`);
+- `extras-duplicate` — the package both in `dependencies` and in
+  `[project.optional-dependencies]`, so the lock carries two `requires-dist`
+  entries for it;
+- `constraints` — the package in `dependencies` plus `[tool.uv]
+  constraint-dependencies`, giving the lock a `[manifest]` constraints entry
+  (skipped as unsupported when the binary records none);
+- `transitive` — `requests==2.28.2` with `[tool.uv] exclude-newer =
+  "2024-01-01T00:00:00Z"` so urllib3 resolves to 1.26.18 as a transitive
+  dependency; the CLI takes the override-dependencies branch, and on uv
+  < 0.5.6 the plain `uv sync` row is expected to reinstall the pristine wheel
+  (recorded as `installedPatch: false`, see Limits).
+
+A plain `uv sync` that rewrites the lock is recorded (`lockUnchanged: false`),
+not raised: it is a real observation, not a harness error. No export or PEP 751
+lanes run for the variants. Each version row in `results.json` carries a
+`variants` summary; the tables below are printed from that file with
+`--render-doc-table` (see the markers in the results section), so the doc can be
+regenerated after a full run without hand-editing:
+
+```sh
+python3 scripts/backtest-uv.py --render-doc-table /tmp/socket-patch-uv-backtest/results.json
+```
+
 Keep live download grants out of committed evidence. Published patch UUIDs,
 archive filenames, hashes, uv versions, and redacted command results are enough
 to identify a run. Compare the fresh installed bytes with the patched artifact,
@@ -106,21 +256,29 @@ not just with a URL or a success message.
 
 ## Full matrix results
 
-The complete run finished on **2026-09-14**, using macOS **26.6.2 arm64** and
-Python **3.9.6**. It tested socket-patch source commit
-`e11bd419ea9c01b3ecd1aa894b55874718a3ff0a` (`socket-patch 4.0.0`), with binary
-SHA-256:
+<!-- GENERATED:BEGIN — everything down to GENERATED:END is printed by
+     `python3 scripts/backtest-uv.py --render-doc-table <output>/results.json`;
+     regenerate it after a matrix run instead of editing by hand. -->
+The complete run finished on **2026-09-15**, using
+**macOS-26.6.2-arm64-arm-64bit-Mach-O** and Python **3.9.6**. It tested
+socket-patch source commit `17d0dcb84bab1bec030117e0f111c7bfd893c2eb`
+(`socket-patch 4.0.0`), with binary SHA-256:
 
 ```text
-eb5f6695a06c2124ac5c09f2117bf42e8777d767aec09c1de6ee16cd9dc4adee
+be7a0e3dd86d540b0dc038437410bec6042bcaad5ae8beba92fae23015b56548
 ```
 
-All **230 installed-byte comparisons passed**, with zero mismatches. All **99
-recorded lock-preservation checks passed**. This includes frozen and locked
-installs where supported; ordinary installs also delivered the patched bytes.
-The [machine-readable results](uv-compatibility/results.json) contain all 495
-observations and their command definitions. The [binary catalog](uv-compatibility/binaries.json)
-records each uv wheel's public PyPI source and verified hash.
+**1403 installed-byte comparisons** ran, with **18 mismatches**. **1086
+lock-preservation checks** were recorded — every install attempt against a
+patched lock (`--frozen` and `--locked` where the binary provides them, plain
+`uv sync` where it does not, `uv run --frozen --script`, `uv pip sync
+pylock.toml`, and the project-variant installs), including failed installs whose
+lock was left untouched — and **32 changed the lock**. `--frozen` never writes
+the lock, so the 383 `--locked` rows are the ones that measure preservation; 351
+of them exited 0. The [machine-readable results](uv-compatibility/results.json)
+contain all 2769 observations and their command definitions. The [binary
+catalog](uv-compatibility/binaries.json) records each uv wheel's public PyPI
+source and verified hash.
 
 Each paired result below is **hosted / vendored**. “Pass” means the installed
 `urllib3/response.py` matched the published patch; “—” means that uv binary did
@@ -130,35 +288,137 @@ compilation. PEP 751 covers both standalone locks and exported locks.
 | uv | Native grammar | Native H/V | Requirements H/V | Requirements export H/V | Scripts H/V | PEP 751 H/V | Verified installs |
 |----|----------------|------------|------------------|-------------------------|-------------|-------------|-------------------|
 | 0.0.5 | No native lock | — / — | Pass / rejected path | — / — | — / — | — / — | 2 |
+| 0.1.0 | No native lock | — / — | Pass / rejected path | — / — | — / — | — / — | 2 |
+| 0.1.23 | No native lock | — / — | Pass / rejected path | — / — | — / — | — / — | 2 |
+| 0.1.24 | No native lock | — / — | Pass / Pass | — / — | — / — | — / — | 4 |
+| 0.1.44 | No native lock | — / — | Pass / Pass | — / — | — / — | — / — | 4 |
 | 0.1.45 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 6 |
-| 0.2.37 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 10 |
-| 0.3.5 | `package`, v1 | Pass / Pass | Pass / Pass | — / — | — / — | — / — | 10 |
-| 0.4.30 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | — / — | — / — | 12 |
-| 0.5.31 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 18 |
-| 0.6.0 | `package`, v1 r1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 18 |
-| 0.6.17 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.7.22 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.8.24 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.9.30 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.10.12 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.11.33 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
-| 0.12.13 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 22 |
+| 0.2.0 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 6 |
+| 0.2.5 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 6 |
+| 0.2.6 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 6 |
+| 0.2.17 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 6 |
+| 0.2.18 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 6 |
+| 0.2.34 | `distribution`, v1 | Pass / refused | Pass / Pass | — / — | — / — | — / — | 7 |
+| 0.2.35 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 24 |
+| 0.2.36 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 24 |
+| 0.2.37 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 28 |
+| 0.3.0 | `package`, v1 | Pass / Pass¹ | Pass / Pass | — / — | — / — | — / — | 28 |
+| 0.3.5 | `package`, v1 | Pass / Pass | Pass / Pass | — / — | — / — | — / — | 28 |
+| 0.4.0 | `package`, v1 | Pass / Pass | Pass / Pass | — / — | — / — | — / — | 28 |
+| 0.4.1 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | — / — | — / — | 30 |
+| 0.4.30 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | — / — | — / — | 36 |
+| 0.5.0 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | — / — | — / — | 36 |
+| 0.5.16 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | — / — | — / — | 42 |
+| 0.5.17 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 48 |
+| 0.5.31 | `package`, v1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 48 |
+| 0.6.0 | `package`, v1 r1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 48 |
+| 0.6.14 | `package`, v1 r1 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | — / — | 48 |
+| 0.6.15 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.6.17 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.7.0 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.7.22 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.8.0 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.8.3 | `package`, v1 r2 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.8.4 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.8.24 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.9.0 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.9.30 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.10.0 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.10.12 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.11.0 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.11.33 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.12.0 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
+| 0.12.15 | `package`, v1 r3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | 52 |
 
-The nonzero outcomes were the documented boundaries:
+### Project variants (uv ≥ 0.2.35)
 
-- uv 0.0.5 rejected vendored requirements' local wheel path syntax, although
-  both hosted requirements variants installed the patch.
-- Native vendoring on uv 0.1.45 was refused with
-  `pypi_uv_legacy_lock_unsupported`; hosted native installs and both requirements
-  modes installed the patch.
-- ¹ uv 0.2.37's cold offline native install could not build the root fixture
-  because `setuptools>=40.8.0` was absent from its empty cache. The network-enabled
-  retry installed the patched wheel. Its subsequent locked and ordinary
-  installation checks also passed.
+Each `[[package]]`-grammar binary also locks five further project shapes
+(`variant-*` cases in the results), scans them in both modes, and installs from
+the patched lock with `--frozen`, `--locked` (where available) and a plain `uv
+sync`, each into a fresh environment. “Pass” requires the patched bytes from
+every executed install and an untouched lock after `--locked`; “Fail: …” names
+the installs that missed; “refused” means the CLI reported the shape unsupported
+and left the lock unpatched; “—” means the binary cannot lock that shape (no
+`[dependency-groups]`, no `[manifest]` constraints, or no `exclude-newer`
+setting).
+
+| uv | tool-uv-dev H/V | dependency-groups H/V | extras-duplicate H/V | constraints H/V | transitive H/V |
+|----|-----------------|-----------------------|----------------------|-----------------|----------------|
+| 0.2.35 | Pass / Pass | — / — | Pass / Pass | — / — | Fail: locked, plain / Fail: locked, plain |
+| 0.2.36 | Pass / Pass | — / — | Pass / Pass | — / — | Fail: locked, plain / Fail: locked, plain |
+| 0.2.37 | Pass / Pass | — / — | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.3.0 | Pass / Pass | — / — | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.3.5 | Pass / Pass | — / — | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.4.0 | Pass / Pass | — / — | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.4.1 | Pass / Pass | — / — | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.4.30 | Pass / Pass | Pass / Pass | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.5.0 | Pass / Pass | Pass / Pass | Pass / Pass | Fail: locked / Fail: locked | Fail: locked, plain / Fail: locked, plain |
+| 0.5.16 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.5.17 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.5.31 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.6.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.6.14 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.6.15 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.6.17 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.7.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.7.22 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.8.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.8.3 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.8.4 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.8.24 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.9.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.9.30 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.10.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.10.12 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.11.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.11.33 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.12.0 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+| 0.12.15 | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass | Pass / Pass |
+<!-- GENERATED:END -->
+
+Nonzero outcomes and mismatches in this run, and what each one is:
+
+- uv 0.0.5 through 0.1.23 rejected vendored requirements' local wheel path
+  syntax (`Unexpected '.', expected '-c', '-e', '-r' or the start of a
+  requirement`); 0.1.24 onward accepted it. Both hosted requirements variants
+  installed the patch on every binary. uv 0.0.5–0.1.44 have no working
+  `uv lock` (the `lock` rows exit 2), so their native lanes are `—`.
+- Native vendoring on every `[[distribution]]`-grammar binary (0.1.45 through
+  0.2.34) was refused with `pypi_uv_legacy_lock_unsupported`; hosted native
+  installs — in all three shapes: sub-table artifacts (through 0.2.5), inline
+  artifacts with string sources (0.2.6–0.2.17), and inline-table sources
+  (0.2.18–0.2.34) — and both requirements modes installed the patch.
+- ¹ uv 0.2.35, 0.2.36, 0.2.37 and 0.3.0 cannot build the root fixture from an
+  empty cache under `--offline` (`setuptools>=40.8.0` was absent). The
+  network-enabled retry (`project-vendored-frozen-sync-root-build-networked`)
+  installed the patched wheel; the subsequent locked and ordinary installation
+  checks also passed.
 - Export, script-lock, and PEP 751 commands unavailable in older binaries were
-  recorded as unavailable, not installation successes. Some older uv binaries
-  accepted an output filename ending in `pylock.toml` but emitted requirements
-  text; those results have `formatSupported: false`.
+  recorded as unavailable, not installation successes (`uv export` from 0.4.1,
+  `uv lock --script` from 0.5.17, PEP 751 compilation from 0.6.15 — 0.6.14
+  exits 2 on the `pylock.toml` output). Some older uv binaries accepted an
+  output filename ending in `pylock.toml` but emitted requirements text; those
+  results have `formatSupported: false`.
+- The **18 installed-byte mismatches** are all the `transitive` variant's plain
+  `uv sync` rows on 0.2.35–0.5.0 (nine binaries, both modes): those releases
+  do not apply `[tool.uv.sources]` to `override-dependencies`, so the plain
+  sync re-resolves the override against the registry and installs the pristine
+  wheel; `--frozen` installed the patch on every one of them. This is the
+  boundary the `pypi_uv_override_requires_uv_0_5_6` advisory names; from
+  0.5.16 (the first ≥ 0.5.6 binary in the matrix) every install passes.
+- The **32 lock changes** and the 32 non-zero `--locked` rows are those same
+  18 transitive rows plus the `constraints` variant's plain-sync / `--locked`
+  rows on 0.2.37–0.5.0 (seven binaries, both modes): those releases serialize
+  `[manifest] constraints` as `{ name, specifier }` regardless of sources, so
+  they reject the repointed entry under `--locked` and rewrite it back on a
+  plain sync — which still installed the patch (no mismatch). 0.2.35 and
+  0.2.36 do not record constraints in the lock (`—`). This is the boundary the
+  `pypi_uv_constraints_require_uv_0_5_6` advisory names; from 0.5.16 every
+  constraints install passes with the lock untouched.
+- Every other `--locked`, `--frozen`, plain, script and PEP 751 install
+  delivered the patched bytes with the lock byte-unchanged, including the
+  `[tool.uv] dev-dependencies`, `[dependency-groups]` and extras-duplicate
+  shapes on every binary that can lock them.
 
 ## Completed conditional-requirements and refusal checks
 

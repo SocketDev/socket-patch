@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import textwrap
 import zipfile
 
 import argparse
@@ -15,33 +16,97 @@ import platform
 import sys
 import urllib.request
 
+# Every 0.x release family, first and latest release of each, plus the
+# releases on either side of each behaviour boundary observed with real
+# binaries (the lower one is the last release WITHOUT the feature):
+#   0.1.23 / 0.1.24  `uv pip sync` accepts bare `./wheel` requirement paths
+#   0.1.44 / 0.1.45  `uv lock` writes a lock (the subcommand exists from 0.1.42
+#                    but panics "not yet implemented" through 0.1.44)
+#   0.2.5  / 0.2.6   `[[distribution]]` artifacts: `[distribution.sdist]` /
+#                    `[[distribution.wheel]]` tables -> inline `sdist = {…}` /
+#                    `wheels = [...]` values
+#   0.2.17 / 0.2.18  `[[distribution]]` sources: `"registry+…"` strings ->
+#                    inline tables (`{ registry = … }`)
+#   0.2.34 / 0.2.35  uv.lock `[[distribution]]` -> `[[package]]` grammar
+#   0.2.36 / 0.2.37  root `[package.metadata]` (requires-dist) appears
+#   0.4.0  / 0.4.1   `uv export`
+#   0.5.16 / 0.5.17  `uv lock --script`
+#   0.6.14 / 0.6.15  PEP 751 `pip compile -o pylock.toml`; lock revision 1 -> 2
+#   0.8.3  / 0.8.4   lock revision 2 -> 3
 VERSIONS = [
     '0.0.5',
+    '0.1.0',
+    '0.1.23',
+    '0.1.24',
+    '0.1.44',
     '0.1.45',
+    '0.2.0',
+    '0.2.5',
+    '0.2.6',
+    '0.2.17',
+    '0.2.18',
+    '0.2.34',
+    '0.2.35',
+    '0.2.36',
     '0.2.37',
+    '0.3.0',
     '0.3.5',
+    '0.4.0',
+    '0.4.1',
     '0.4.30',
+    '0.5.0',
+    '0.5.16',
+    '0.5.17',
     '0.5.31',
     '0.6.0',
+    '0.6.14',
+    '0.6.15',
     '0.6.17',
+    '0.7.0',
     '0.7.22',
+    '0.8.0',
+    '0.8.3',
+    '0.8.4',
     '0.8.24',
+    '0.9.0',
     '0.9.30',
+    '0.10.0',
     '0.10.12',
+    '0.11.0',
     '0.11.33',
-    '0.12.13',
+    '0.12.0',
+    '0.12.15',
 ]
 parser = argparse.ArgumentParser()
-parser.add_argument('--socket-patch', type=Path, required=True)
-parser.add_argument('--socket-patch-revision', required=True)
-parser.add_argument('--output', type=Path, required=True)
+parser.add_argument('--socket-patch', type=Path)
+parser.add_argument('--socket-patch-revision')
+parser.add_argument('--output', type=Path)
 parser.add_argument('--python', default=sys.executable)
 parser.add_argument('--versions', nargs='+', default=VERSIONS)
+parser.add_argument(
+    '--render-doc-table',
+    type=Path,
+    metavar='RESULTS_JSON',
+    help='print the generated section of docs/testing/uv-compatibility.md '
+    'from an existing results.json instead of running the matrix',
+)
 args = parser.parse_args()
-ROOT = args.output.resolve()
-CLI = args.socket_patch.resolve()
-BOOTSTRAP = ROOT / 'bin/0.12.13/uv'
-WHEEL = ROOT / 'urllib3-1.26.18-py2.py3-none-any.whl'
+if args.render_doc_table is None:
+    missing = [
+        flag
+        for flag, value in [
+            ('--socket-patch', args.socket_patch),
+            ('--socket-patch-revision', args.socket_patch_revision),
+            ('--output', args.output),
+        ]
+        if value is None
+    ]
+    if missing:
+        parser.error('the following arguments are required: ' + ', '.join(missing))
+ROOT = args.output.resolve() if args.output else None
+CLI = args.socket_patch.resolve() if args.socket_patch else None
+BOOTSTRAP = ROOT / 'bin/0.12.15/uv' if ROOT else None
+WHEEL = ROOT / 'urllib3-1.26.18-py2.py3-none-any.whl' if ROOT else None
 ENV = {
     key: value
     for key, value in os.environ.items()
@@ -49,7 +114,10 @@ ENV = {
 }
 ENV['SOCKET_NO_CONFIG'] = '1'
 ENV['SOCKET_TELEMETRY_DISABLED'] = '1'
-ROOT.mkdir(parents=True, exist_ok=True)
+if ROOT:
+    ROOT.mkdir(parents=True, exist_ok=True)
+PATCHED_RESPONSE = '21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4'
+PATCH_UUID = 'e828efa5-5c6d-43f3-9909-03f5ac232b98'
 
 
 def fetch_json(url):
@@ -78,7 +146,7 @@ def install_binaries():
         raise ValueError('This backtest requires macOS or Linux')
     registry = fetch_json('https://pypi.org/pypi/uv/json')
     records = []
-    for version in dict.fromkeys([*args.versions, '0.12.13']):
+    for version in dict.fromkeys([*args.versions, '0.12.15']):
         file = next(
             file
             for file in registry['releases'][version]
@@ -214,24 +282,25 @@ def project_matrix(version):
             if scan['exitCode'] != 0:
                 continue
             if kind == 'project':
+                # `uv export` exists from 0.4.1 but `--output-file` only from
+                # 0.4.7, so capture stdout instead of passing the flag: the
+                # export-boundary release 0.4.1 otherwise records exit 2 for a
+                # lane whose stdout export installs fine. Write the file only on
+                # success; an empty file would masquerade as a lock for
+                # format_matrix.
                 for fmt, filename in [
                     ('requirements-txt', 'export-requirements.txt'),
                     ('pylock.toml', 'pylock.toml'),
                 ]:
-                    run(
+                    export = run(
                         exe,
-                        [
-                            'export',
-                            '--frozen',
-                            '--format',
-                            fmt,
-                            '--output-file',
-                            filename,
-                        ],
+                        ['export', '--frozen', '--format', fmt],
                         case,
                         kind + '-' + mode + '-export-' + fmt,
                         rows,
                     )
+                    if export['exitCode'] == 0 and export['stdout']:
+                        (case / filename).write_text(export['stdout'])
                 help_out = subprocess.run(
                     [str(exe), 'sync', '--help'], capture_output=True, text=True
                 )
@@ -362,7 +431,19 @@ def requirements_matrix(version):
             sync['installedResponseSha256'] = hashlib.sha256(
                 target.read_bytes()
             ).hexdigest()
-    if version == '0.2.37':
+    # Older uv binaries (0.2.x, 0.3.0) cannot build the ROOT fixture from an
+    # empty cache under --offline: `setuptools>=40.8.0` is a build dependency
+    # of the fixture itself, not of the patched wheel. Distinguish that from a
+    # failure to install the patched wheel by retrying the frozen install with
+    # network access and recording it as its own row.
+    backtest = json.loads((base / 'backtest.json').read_text())['commands']
+    offline_root_build_failure = any(
+        row['key'] == 'project-vendored-lock-sync'
+        and row['exitCode'] != 0
+        and 'setuptools' in row['stderr']
+        for row in backtest
+    )
+    if offline_root_build_failure:
         case = base / 'project-vendored'
         sync = run(
             exe,
@@ -573,11 +654,7 @@ def unfrozen_matrix(version):
                 else ['example.py', 'example.py.lock']
             )
             lockfile = source / names[1]
-            if (
-                not lockfile.is_file()
-                or 'e828efa5-5c6d-43f3-9909-03f5ac232b98'
-                not in lockfile.read_text()
-            ):
+            if not lockfile.is_file() or PATCH_UUID not in lockfile.read_text():
                 continue
             case = base / (kind + '-unfrozen-' + mode)
             case.mkdir(exist_ok=True)
@@ -647,10 +724,203 @@ def unfrozen_matrix(version):
     }
 
 
-def write_summary():
-    patched_response = (
-        '21d9a7810de52973c88d9170f437e98921456bce445ab0618576987478a6a6e4'
+VARIANT_HEAD = (
+    '[project]\nname = "socket-uv-patch-fixture"\n'
+    'version = "0.1.0"\nrequires-python = ">=3.9"\n'
+)
+# Project shapes the plain `dependencies = ["urllib3==1.26.18"]` fixture never
+# reaches: the `[tool.uv] dev-dependencies` and PEP 735 `[dependency-groups]`
+# requires-dev paths, a duplicate requires-dist entry (extras), a `[manifest]`
+# constraints entry, and the transitive (override-dependencies) branch.
+# Each is locked fresh, scanned in both modes, then installed with `--frozen`,
+# `--locked` (where the binary has it) and a plain `uv sync`, recording the
+# installed bytes and whether the patched lock survived untouched.
+# `requires` is the lock predicate that must hold for the fixture to be
+# meaningful on that binary; failing it records `formatSupported: false`.
+VARIANTS = [
+    (
+        'tool-uv-dev',
+        VARIANT_HEAD
+        + 'dependencies = []\n\n[tool.uv]\ndev-dependencies = ["urllib3==1.26.18"]\n',
+        lambda lock: 'name = "urllib3"' in lock,
+    ),
+    (
+        'dependency-groups',
+        VARIANT_HEAD
+        + 'dependencies = []\n\n[dependency-groups]\ndev = ["urllib3==1.26.18"]\n',
+        # PEP 735 groups are honoured from uv 0.4.27; older binaries lock an
+        # empty project.
+        lambda lock: 'name = "urllib3"' in lock,
+    ),
+    (
+        'extras-duplicate',
+        VARIANT_HEAD
+        + 'dependencies = ["urllib3==1.26.18"]\n\n'
+        '[project.optional-dependencies]\nhttp = ["urllib3==1.26.18"]\n',
+        lambda lock: 'name = "urllib3"' in lock,
+    ),
+    (
+        'constraints',
+        VARIANT_HEAD
+        + 'dependencies = ["urllib3==1.26.18"]\n\n'
+        '[tool.uv]\nconstraint-dependencies = ["urllib3==1.26.18"]\n',
+        # Older uv locks the project without recording the constraint.
+        lambda lock: re.search(r'^constraints = \[', lock, re.MULTILINE) is not None,
+    ),
+    (
+        'transitive',
+        # requests 2.28.2 pins urllib3 <1.27; the cut-off keeps it at 1.26.18.
+        # It lives in pyproject rather than on the `uv lock` command line so
+        # every later `uv sync` sees the same setting: a command-line
+        # `--exclude-newer` is recorded under `[options]` and its absence on
+        # sync makes uv re-resolve ("removal of global exclude newer"), which
+        # would fail `--locked` for a reason unrelated to the patch.
+        VARIANT_HEAD
+        + 'dependencies = ["requests==2.28.2"]\n\n'
+        '[tool.uv]\nexclude-newer = "2024-01-01T00:00:00Z"\n',
+        lambda lock: 'name = "urllib3"\nversion = "1.26.18"' in lock,
+    ),
+]
+VARIANT_INSTALLS = ['frozen', 'locked', 'plain']
+
+
+def variant_matrix(version):
+    exe = ROOT / 'bin' / version / 'uv'
+    base = ROOT / 'matrix' / version
+    original_lock = base / 'original' / 'uv.lock'
+    if (
+        not original_lock.is_file()
+        or '[[package]]' not in original_lock.read_text()
+    ):
+        # `[[distribution]]`-grammar binaries cannot vendor natively and the
+        # hosted path is covered by project_matrix; nothing to add here.
+        return {'version': version, 'commands': []}
+    sync_help = subprocess.run(
+        [str(exe), 'sync', '--help'], capture_output=True, text=True
+    ).stdout
+    rows = []
+    for name, pyproject, requires in VARIANTS:
+        for mode in ['hosted', 'vendored']:
+            prefix = 'variant-' + name + '-' + mode
+            case = base / prefix
+            if case.exists():
+                shutil.rmtree(case)
+            case.mkdir(parents=True)
+            (case / 'pyproject.toml').write_text(pyproject)
+            lock = run(
+                exe, ['lock', '--python', args.python], case, prefix + '-lock', rows
+            )
+            lock_text = (
+                (case / 'uv.lock').read_text() if (case / 'uv.lock').is_file() else ''
+            )
+            lock['formatSupported'] = lock['exitCode'] == 0 and bool(requires(lock_text))
+            if not lock['formatSupported']:
+                continue
+            bootstrap(case, rows)
+            scan = run(
+                CLI,
+                [
+                    'scan',
+                    '--cwd',
+                    str(case),
+                    '--mode',
+                    mode,
+                    '--json',
+                    '--yes',
+                    '--no-telemetry',
+                ],
+                case,
+                prefix + '-socket-patch',
+                rows,
+            )
+            scan['patchInLock'] = PATCH_UUID in (case / 'uv.lock').read_text()
+            if scan['exitCode'] != 0 or not scan['patchInLock']:
+                continue
+            sync_args = ['sync', '--python', args.python]
+            if '--no-install-project' in sync_help:
+                sync_args.append('--no-install-project')
+            else:
+                package = case / 'socket_uv_patch_fixture'
+                package.mkdir(exist_ok=True)
+                (package / '__init__.py').write_text('')
+            locked = (case / 'uv.lock').read_bytes()
+            for label in VARIANT_INSTALLS:
+                flag = {'frozen': '--frozen', 'locked': '--locked', 'plain': None}[label]
+                if flag and flag not in sync_help:
+                    continue
+                shutil.rmtree(case / '.venv', ignore_errors=True)
+                if label == 'frozen':
+                    shutil.rmtree(case / '.uv-cache', ignore_errors=True)
+                command = [sync_args[0], *([flag] if flag else []), *sync_args[1:]]
+                sync = run(exe, command, case, prefix + '-' + label + '-sync', rows)
+                # Recorded, never raised: a plain `uv sync` that re-resolves
+                # the lock (uv < 0.5.6 on the transitive fixture) is a real
+                # observation the doc explains, not a harness error.
+                sync['lockUnchanged'] = (case / 'uv.lock').read_bytes() == locked
+                if sync['exitCode'] == 0:
+                    targets = list(
+                        (case / '.venv/lib').glob(
+                            'python*/site-packages/urllib3/response.py'
+                        )
+                    )
+                    sync['installedResponseSha256'] = (
+                        hashlib.sha256(targets[0].read_bytes()).hexdigest()
+                        if targets
+                        else None
+                    )
+    (base / 'variant-backtest.json').write_text(
+        json.dumps({'version': version, 'commands': rows}, indent=2) + '\n'
     )
+    return {
+        'version': version,
+        'commands': [
+            (row['key'], row['exitCode'])
+            for row in rows
+            if row['key'] not in ['venv', 'install-original']
+        ],
+    }
+
+
+def variant_status(observations, name, mode):
+    """Collapse one fixture/mode's observations into the doc-table verdict.
+
+    Returns None when the lane did not run (uv < 0.2.35), 'unsupported' when
+    the binary cannot lock the fixture shape, 'refused' when the CLI left the
+    lock unpatched, 'pass' when every executed install delivered the patched
+    bytes and the `--locked` install left the lock untouched, otherwise
+    ('fail', [failing install labels]).
+    """
+    prefix = 'variant-' + name + '-' + mode + '-'
+    rows = {
+        re.sub(r'-variant-\d+$', '', item['command'])[len(prefix):]: item
+        for item in observations
+        if item['command'].startswith(prefix)
+    }
+    if not rows:
+        return None
+    lock = rows.get('lock')
+    if lock is None or lock.get('formatSupported') is False or lock['exitCode']:
+        return 'unsupported'
+    scan = rows.get('socket-patch')
+    if scan is None or scan['exitCode']:
+        return ('fail', ['scan'])
+    if scan.get('patchInLock') is False:
+        return 'refused'
+    failed = []
+    for label in VARIANT_INSTALLS:
+        item = rows.get(label + '-sync')
+        if item is None:
+            continue
+        ok = item['exitCode'] == 0 and item.get('installedPatch') is True
+        if label == 'locked' and item.get('lockUnchanged') is not True:
+            ok = False
+        if not ok:
+            failed.append(label)
+    return 'pass' if not failed else ('fail', failed)
+
+
+def write_summary():
+    patched_response = PATCHED_RESPONSE
     versions = []
     command_catalog = {}
     for version in args.versions:
@@ -665,6 +935,7 @@ def write_summary():
             'backtest-extensions.json',
             'format-backtest.json',
             'unfrozen-backtest.json',
+            'variant-backtest.json',
         ]:
             path = base / filename
             if not path.exists():
@@ -708,6 +979,8 @@ def write_summary():
                     item['formatSupported'] = row['formatSupported']
                 if 'lockUnchanged' in row:
                     item['lockUnchanged'] = row['lockUnchanged']
+                if 'patchInLock' in row:
+                    item['patchInLock'] = row['patchInLock']
                 if row.get('installedResponseSha256'):
                     item['installedResponseSha256'] = row['installedResponseSha256']
                     item['installedPatch'] = (
@@ -748,18 +1021,30 @@ def write_summary():
                 else None,
                 'lockVersion': 1 if lock else None,
                 'lockRevision': int(revision.group(1)) if revision else None,
+                'variants': {
+                    name: {
+                        mode: variant_status(observations, name, mode)
+                        for mode in ['hosted', 'vendored']
+                    }
+                    for name, _, _ in VARIANTS
+                },
                 'observations': observations,
             }
         )
     result = {
         'date': datetime.date.today().isoformat(),
         'scope': f'{len(args.versions)} pinned uv releases on {platform.platform()}; interpreter {args.python}',
+        'pythonVersion': subprocess.check_output(
+            [args.python, '--version'], text=True, stderr=subprocess.STDOUT
+        )
+        .strip()
+        .split()[-1],
         'socketPatchRevision': args.socket_patch_revision,
         'socketPatchVersion': subprocess.check_output(
             [str(CLI), '--version'], text=True
         ).strip(),
         'socketPatchBinarySha256': hashlib.sha256(CLI.read_bytes()).hexdigest(),
-        'patchUuid': 'e828efa5-5c6d-43f3-9909-03f5ac232b98',
+        'patchUuid': PATCH_UUID,
         'originalWheelSha256': hashlib.sha256(WHEEL.read_bytes()).hexdigest(),
         'patchedWheelSha256': 'ccc9a9e0b18a5efc7038c504cfc580e47d2e02e5390f2e29cad833cbccb956b6',
         'patchedResponseSha256': patched_response,
@@ -775,16 +1060,273 @@ def write_summary():
     (ROOT / 'results.json').write_text(text)
 
 
+def render_doc_table(results):
+    """Render the generated section of docs/testing/uv-compatibility.md.
+
+    Everything between the GENERATED markers in that document comes from
+    here, so the merger can paste a fresh run's tables without hand-editing:
+    the run header, the per-release results table and the project-variant
+    table. The prose that explains the nonzero outcomes stays hand-written
+    outside the markers.
+    """
+    hosted_vendored = ['hosted', 'vendored']
+
+    def installs(obs):
+        return [
+            item
+            for item in obs
+            if item['exitCode'] == 0 and item.get('installedResponseSha256')
+        ]
+
+    def verdict(obs, unavailable_when_empty=True):
+        # Pass: every completed install delivered the patched bytes and every
+        # recorded lock check held; a failed install is a Fail unless it is
+        # the cold-offline root build the harness retried with network (the
+        # retry row is one of `obs` and counts like any other install).
+        if not obs:
+            return '—' if unavailable_when_empty else 'Fail'
+        done = installs(obs)
+        failed = [
+            item
+            for item in obs
+            if item['exitCode'] != 0 and 'root-build-networked' not in item['command']
+        ]
+        retried = any('root-build-networked' in item['command'] for item in obs)
+        if failed and not (retried and all('lock-sync' in item['command'] for item in failed)):
+            return 'Fail'
+        if not done:
+            return '—' if unavailable_when_empty else 'Fail'
+        if all(item.get('installedPatch') for item in done) and all(
+            item.get('lockUnchanged', True) for item in obs
+        ):
+            return 'Pass¹' if retried else 'Pass'
+        return 'Fail'
+
+    def rows_matching(obs, patterns):
+        return [
+            item
+            for item in obs
+            if any(
+                re.fullmatch(pattern + r'(-variant-\d+)?', item['command'])
+                for pattern in patterns
+            )
+        ]
+
+    def refusal(obs, pattern):
+        scans = rows_matching(obs, [pattern])
+        if not scans:
+            return None
+        scan = scans[0]
+        if scan['exitCode'] == 0 and not scan.get('vendorErrors'):
+            return False
+        if scan.get('vendorErrors') or scan.get('warnings'):
+            return 'refused'
+        return 'Fail'
+
+    def paragraph(text):
+        lines.extend(textwrap.wrap(text, width=80, break_long_words=False, break_on_hyphens=False))
+        lines.append('')
+
+    lines = []
+    platform_name = results['scope'].split(' on ', 1)[1].split(';')[0]
+    python_version = results.get('pythonVersion') or results['scope'].split(
+        'interpreter ', 1
+    )[-1]
+    paragraph(
+        f"The complete run finished on **{results['date']}**, using "
+        f"**{platform_name}** and Python **{python_version}**. It tested "
+        f"socket-patch source commit `{results['socketPatchRevision']}` "
+        f"(`{results['socketPatchVersion']}`), with binary SHA-256:"
+    )
+    lines.extend(['```text', results['socketPatchBinarySha256'], '```', ''])
+    all_obs = [item for version in results['versions'] for item in version['observations']]
+    compared = [item for item in all_obs if 'installedPatch' in item]
+    mismatches = [item for item in compared if not item['installedPatch']]
+    lock_checks = [item for item in all_obs if 'lockUnchanged' in item]
+    lock_changed = [item for item in lock_checks if not item['lockUnchanged']]
+    locked_rows = [item for item in lock_checks if 'locked' in item['command']]
+    locked_ok = sum(1 for item in locked_rows if item['exitCode'] == 0)
+    paragraph(
+        f"**{len(compared)} installed-byte comparisons** ran, with "
+        f"**{len(mismatches)} mismatch{'es' if len(mismatches) != 1 else ''}**. "
+        f"**{len(lock_checks)} lock-preservation checks** were recorded — every "
+        "install attempt against a patched lock (`--frozen` and `--locked` where "
+        "the binary provides them, plain `uv sync` where it does not, "
+        "`uv run --frozen --script`, `uv pip sync pylock.toml`, and the "
+        "project-variant installs), including failed installs whose lock was left "
+        f"untouched — and **{len(lock_changed)} changed the lock**. `--frozen` "
+        f"never writes the lock, so the {len(locked_rows)} `--locked` rows are the "
+        f"ones that measure preservation; {locked_ok} of them exited 0. The "
+        "[machine-readable results](uv-compatibility/results.json) contain all "
+        f"{len(all_obs)} observations and their command definitions. The "
+        "[binary catalog](uv-compatibility/binaries.json) records each uv wheel's "
+        "public PyPI source and verified hash."
+    )
+    paragraph(
+        'Each paired result below is **hosted / vendored**. “Pass” means the '
+        'installed `urllib3/response.py` matched the published patch; “—” means '
+        'that uv binary did not provide the format or command. Requirements '
+        'include plain and hashed compilation. PEP 751 covers both standalone '
+        'locks and exported locks.'
+    )
+    lines.append(
+        '| uv | Native grammar | Native H/V | Requirements H/V | Requirements export H/V | Scripts H/V | PEP 751 H/V | Verified installs |'
+    )
+    lines.append(
+        '|----|----------------|------------|------------------|-------------------------|-------------|-------------|-------------------|'
+    )
+    for version in results['versions']:
+        obs = version['observations']
+        schema = version.get('lockSchema')
+        if not schema:
+            grammar = 'No native lock'
+        else:
+            grammar = f"`{schema}`, v{version.get('lockVersion') or 1}"
+            if version.get('lockRevision'):
+                grammar += f" r{version['lockRevision']}"
+        cells = []
+        native = []
+        for mode in hosted_vendored:
+            refused = refusal(obs, f'project-{mode}-socket-patch')
+            if refused is None:
+                native.append('—')
+            elif refused:
+                native.append(refused)
+            else:
+                native.append(
+                    verdict(
+                        rows_matching(
+                            obs,
+                            [
+                                f'project-{mode}-lock-sync',
+                                f'project-{mode}-locked-install',
+                                f'project-{mode}-unfrozen-install',
+                                f'project-{mode}-frozen-sync-root-build-networked',
+                            ],
+                        ),
+                        unavailable_when_empty=False,
+                    )
+                )
+        cells.append(' / '.join(native))
+        requirements = []
+        for mode in hosted_vendored:
+            syncs = rows_matching(
+                obs, [f'requirements-{mode}-pip-sync', f'requirements-plain-{mode}-pip-sync']
+            )
+            if any(
+                "Unexpected '.'" in item.get('diagnostic', '')
+                for item in syncs
+                if item['exitCode']
+            ):
+                requirements.append('rejected path')
+            else:
+                requirements.append(verdict(syncs))
+        cells.append(' / '.join(requirements))
+        cells.append(
+            ' / '.join(
+                verdict(rows_matching(obs, [f'requirements-{mode}-export-sync']))
+                for mode in hosted_vendored
+            )
+        )
+        cells.append(
+            ' / '.join(
+                verdict(
+                    rows_matching(
+                        obs,
+                        [
+                            f'script-direct-{mode}-install',
+                            f'script-{mode}-locked-install',
+                            f'script-{mode}-unfrozen-install',
+                        ],
+                    )
+                )
+                for mode in hosted_vendored
+            )
+        )
+        cells.append(
+            ' / '.join(
+                verdict(
+                    rows_matching(
+                        obs,
+                        [f'pylock-{mode}-export-sync', f'pylock-direct-{mode}-install'],
+                    )
+                )
+                for mode in hosted_vendored
+            )
+        )
+        verified = sum(1 for item in obs if item.get('installedPatch'))
+        lines.append(
+            f"| {version['version']} | {grammar} | {' | '.join(cells)} | {verified} |"
+        )
+    lines.append('')
+    lines.extend(['### Project variants (uv ≥ 0.2.35)', ''])
+    paragraph(
+        'Each `[[package]]`-grammar binary also locks five further project shapes '
+        '(`variant-*` cases in the results), scans them in both modes, and '
+        'installs from the patched lock with `--frozen`, `--locked` (where '
+        'available) and a plain `uv sync`, each into a fresh environment. “Pass” '
+        'requires the patched bytes from every executed install and an untouched '
+        'lock after `--locked`; “Fail: …” names the installs that missed; '
+        '“refused” means the CLI reported the shape unsupported and left the lock '
+        'unpatched; “—” means the binary cannot lock that shape (no '
+        '`[dependency-groups]`, no `[manifest]` constraints, or no '
+        '`exclude-newer` setting).'
+    )
+    names = [name for name, _, _ in VARIANTS]
+    variant_rows = []
+    for version in results['versions']:
+        statuses = version.get('variants') or {
+            name: {
+                mode: variant_status(version['observations'], name, mode)
+                for mode in hosted_vendored
+            }
+            for name in names
+        }
+        if all(statuses[name][mode] is None for name in names for mode in hosted_vendored):
+            continue
+        cells = []
+        for name in names:
+            pair = []
+            for mode in hosted_vendored:
+                status = statuses[name][mode]
+                if status is None or status == 'unsupported':
+                    pair.append('—')
+                elif status == 'pass':
+                    pair.append('Pass')
+                elif status == 'refused':
+                    pair.append('refused')
+                else:
+                    pair.append('Fail: ' + ', '.join(status[1]))
+            cells.append(' / '.join(pair))
+        variant_rows.append(f"| {version['version']} | {' | '.join(cells)} |")
+    if variant_rows:
+        lines.append('| uv | ' + ' | '.join(name + ' H/V' for name in names) + ' |')
+        lines.append('|----|' + '|'.join('-' * (len(name) + 6) for name in names) + '|')
+        lines.extend(variant_rows)
+    else:
+        lines.append(
+            '_This results.json predates the project-variant lane; rerun the '
+            'matrix to populate this table._'
+        )
+    return '\n'.join(lines) + '\n'
+
+
 def backtest(version):
     return [
         project_matrix(version),
         requirements_matrix(version),
         format_matrix(version),
         unfrozen_matrix(version),
+        variant_matrix(version),
     ]
 
 
 if __name__ == '__main__':
+    if args.render_doc_table is not None:
+        sys.stdout.write(
+            render_doc_table(json.loads(args.render_doc_table.read_text()))
+        )
+        sys.exit(0)
     install_binaries()
     provenance = {
         'socketPatchRevision': args.socket_patch_revision,

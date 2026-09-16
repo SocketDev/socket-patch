@@ -7,11 +7,95 @@
     "filename": "uv-0.0.5-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl"
   },
   {
+    "version": "0.1.0",
+    "url": "https://files.pythonhosted.org/packages/0c/e3/415f40a86918316951b69b42661731bf6c5e5007f4063bc564773aec4815/uv-0.1.0-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl",
+    "sha256": "71291b3b3222da25a6af5ab9dfaec3bdd97fd4f0d21cf38a04cbd63000fa9da5",
+    "uploaded": "2024-02-15T19:44:47.783250Z",
+    "filename": "uv-0.1.0-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl"
+  },
+  {
+    "version": "0.1.23",
+    "url": "https://files.pythonhosted.org/packages/e4/02/824e40366ecd913483d67723aa10079b5d127b43d7f8c3f164dcf19fb9c4/uv-0.1.23-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl",
+    "sha256": "d9d1d6d2bca50b9ea2ed764a6931b53995f6b5dbf3def9eafbcec57a88b4a6e2",
+    "uploaded": "2024-03-21T03:09:59.075241Z",
+    "filename": "uv-0.1.23-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl"
+  },
+  {
+    "version": "0.1.24",
+    "url": "https://files.pythonhosted.org/packages/1e/ef/90fc17103183c23e8e5142c455b1ca8c1c38142c89c8aaa27f7ab37c34f5/uv-0.1.24-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl",
+    "sha256": "33d74c4c67df34de18c4318a6c568efef9dfab6d05332b1d1eddc8e516fc8806",
+    "uploaded": "2024-03-22T20:15:08.127518Z",
+    "filename": "uv-0.1.24-py3-none-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl"
+  },
+  {
+    "version": "0.1.44",
+    "url": "https://files.pythonhosted.org/packages/85/6a/4e98521c359f593cdd8cebc6381c09be1d133bd93031e76accc6b8aa7788/uv-0.1.44-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "e247dca0d8d42d71032ac99ef3d72a4fcbad4ae3114ef5979878a81a40fed274",
+    "uploaded": "2024-05-14T14:28:43.548037Z",
+    "filename": "uv-0.1.44-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
     "version": "0.1.45",
     "url": "https://files.pythonhosted.org/packages/7f/15/46efcaa86ebef51b8663d8beb95c8376fbdaaf45aeffbc269bf0a3527092/uv-0.1.45-py3-none-macosx_11_0_arm64.whl",
     "sha256": "4e5d55f0f8b6ae416c72d78106e224c8e8338356da21ddebecc7b1723de80924",
     "uploaded": "2024-05-20T21:05:54.623510Z",
     "filename": "uv-0.1.45-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.2.0",
+    "url": "https://files.pythonhosted.org/packages/cc/4a/7c3d702c5920487d481bd03a3ca821f8886ad2d6937e49f4efc0a16c6e61/uv-0.2.0-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "ba5e339a0fb32a02142346eea4d46f6ad618a390df5d70515ba0e1d3c6f7ce41",
+    "uploaded": "2024-05-22T19:11:42.407716Z",
+    "filename": "uv-0.2.0-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.2.5",
+    "url": "https://files.pythonhosted.org/packages/06/d2/ef1c65a0715731da623b430757a9b851167309fc7e326140d27d246e6541/uv-0.2.5-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "650f81439c4f65e86fdba84f2cbb6700a074b95d70c5cc3d38e8ce2b87e43a45",
+    "uploaded": "2024-05-28T18:33:49.720762Z",
+    "filename": "uv-0.2.5-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.2.6",
+    "url": "https://files.pythonhosted.org/packages/a0/53/4c9a7370ec5bf75b89b82117fae68d7bb268d229deb82c51264ca27a1368/uv-0.2.6-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "1ac3b96c6284ef2e5367e62f31472cc3f27ba4c7e14f579e7c6dbd081943e38b",
+    "uploaded": "2024-06-03T18:22:26.325121Z",
+    "filename": "uv-0.2.6-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.2.17",
+    "url": "https://files.pythonhosted.org/packages/90/c0/27b6fc7cc85984b0c86ffd0e42abf4c97aeff2cc3425b09ce86e679bedae/uv-0.2.17-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "d6628bcb0d21f2f8489ed33818fa6c2da3a472adead076864701ae7a3bafb4de",
+    "uploaded": "2024-06-26T23:39:17.070293Z",
+    "filename": "uv-0.2.17-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.2.18",
+    "url": "https://files.pythonhosted.org/packages/60/0d/d462d188343464876ca196f064ba1682982446012c4893da0d7dbba01a8c/uv-0.2.18-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "eee9773a0a9f02d084a584279891df1fdf4de32d067f273b9480f86c9f91dcdb",
+    "uploaded": "2024-06-29T18:49:23.499620Z",
+    "filename": "uv-0.2.18-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.2.34",
+    "url": "https://files.pythonhosted.org/packages/f2/a0/840b0fa6b9f884384b558b8690cad603bdc0da2b7a67cec2755b612839c9/uv-0.2.34-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "4ce15beeba44e4ea052d83c89eb4ea3586dfd68bab039c5cdf44b90fbfc5698d",
+    "uploaded": "2024-08-07T20:59:42.011904Z",
+    "filename": "uv-0.2.34-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.2.35",
+    "url": "https://files.pythonhosted.org/packages/00/eb/c578ebb0f606be6a3a1c37e36a8b6068008ceab54db95a2ab70452c792fd/uv-0.2.35-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "3ff91eb85e0804d5f609f18a911b33d81b06e11c1bced1bf1396a2d738e97bc0",
+    "uploaded": "2024-08-10T00:42:30.944714Z",
+    "filename": "uv-0.2.35-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.2.36",
+    "url": "https://files.pythonhosted.org/packages/80/40/e951bc5598dbd7d58a6daf33a93977ecbaad60fdaa584610349f00acf521/uv-0.2.36-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "8820dd5b77ffcda07dde09712a43d969d39b0aace112d8074c540f19a4911cc2",
+    "uploaded": "2024-08-13T17:28:27.711187Z",
+    "filename": "uv-0.2.36-py3-none-macosx_11_0_arm64.whl"
   },
   {
     "version": "0.2.37",
@@ -21,6 +105,13 @@
     "filename": "uv-0.2.37-py3-none-macosx_11_0_arm64.whl"
   },
   {
+    "version": "0.3.0",
+    "url": "https://files.pythonhosted.org/packages/61/95/b6603342b9a0a180776e7aec845079cdc66fb521157ed9bf62b4e4174983/uv-0.3.0-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "39a4276afe0808ca6c033e0cd6cb73249f934b4a0c9d7b18a944f3f8ea635e27",
+    "uploaded": "2024-08-20T17:52:38.258401Z",
+    "filename": "uv-0.3.0-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
     "version": "0.3.5",
     "url": "https://files.pythonhosted.org/packages/83/8e/956ad3788cfa863cc8de148907e371b025acd97f7a0bb2a9e78ce63c2b1e/uv-0.3.5-py3-none-macosx_11_0_arm64.whl",
     "sha256": "89c1515200a838014b1fa6c9cfb2b9a055bcad3178ccf7d31768bf38b43cac65",
@@ -28,11 +119,46 @@
     "filename": "uv-0.3.5-py3-none-macosx_11_0_arm64.whl"
   },
   {
+    "version": "0.4.0",
+    "url": "https://files.pythonhosted.org/packages/2e/86/9844e8ab08e25cbf2094e2fa1a7ad66563036bfed77b46986b6a2489c10c/uv-0.4.0-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "02e0295566454289348de502677e2240ad86f2cb5fa058504e1b2ca2a2ebf7e1",
+    "uploaded": "2024-08-28T18:00:42.051786Z",
+    "filename": "uv-0.4.0-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.4.1",
+    "url": "https://files.pythonhosted.org/packages/46/ad/90e0d7a448b4c92846589c8bb92813ac45d2b123a2b9d4cab4167e805f9f/uv-0.4.1-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "fcdc6503100e86fecf6a727d3149e54581e8e9ad6c10e814fc5d22c1e80fab8d",
+    "uploaded": "2024-08-30T14:42:40.152858Z",
+    "filename": "uv-0.4.1-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
     "version": "0.4.30",
     "url": "https://files.pythonhosted.org/packages/67/37/8994c3d0be99851a21a6ee01bbf3cb35ddc4b202a2f6f4014098d5893660/uv-0.4.30-py3-none-macosx_11_0_arm64.whl",
     "sha256": "353617bfcf72e1eabade426d83fb86a69d11273d1612aabc3f4566d41c596c97",
     "uploaded": "2024-11-05T01:13:59.667063Z",
     "filename": "uv-0.4.30-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.5.0",
+    "url": "https://files.pythonhosted.org/packages/69/fb/e778bce57b12eac37c1e9e8e1efc8b190a2c72dee02b532d13706be447f4/uv-0.5.0-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "a3bc6911be7d86f3750bce1580e664877a3a88c126eb68afbb132cd0896fd109",
+    "uploaded": "2024-11-07T23:05:15.972013Z",
+    "filename": "uv-0.5.0-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.5.16",
+    "url": "https://files.pythonhosted.org/packages/0f/c4/74f4507f48ce5e38cef46cecd7716af0348dffcb3d40245189422226c7b7/uv-0.5.16-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "3419888b178b82511faebd8d1ca9cb9f5920a7142406898d76878adaffe8dfb1",
+    "uploaded": "2025-01-08T16:40:50.904248Z",
+    "filename": "uv-0.5.16-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.5.17",
+    "url": "https://files.pythonhosted.org/packages/f1/7e/4c8b7ca07945fe6ffd1a7e5d1f992b72534be69e97e20a2536d192734adc/uv-0.5.17-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "12789bf19457e3c5fc20767960203ab60222124afe2cbdfde92a657318651a64",
+    "uploaded": "2025-01-10T21:13:54.034599Z",
+    "filename": "uv-0.5.17-py3-none-macosx_11_0_arm64.whl"
   },
   {
     "version": "0.5.31",
@@ -49,11 +175,32 @@
     "filename": "uv-0.6.0-py3-none-macosx_11_0_arm64.whl"
   },
   {
+    "version": "0.6.14",
+    "url": "https://files.pythonhosted.org/packages/72/89/e7fc8a047f08234cc26d1e37e5f573887744205d087f8e8e6f3d0feb04ce/uv-0.6.14-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "9fc8fe58871b4fe02a863b05b8b1b25ef1b6c60d4d224e85338f5c2be0ab4f0e",
+    "uploaded": "2025-04-09T21:56:12.061201Z",
+    "filename": "uv-0.6.14-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.6.15",
+    "url": "https://files.pythonhosted.org/packages/f6/88/ad35ecc3b986274ff560267cb6e3b9119ca0f8cc82c61e2acae28c8b9ffe/uv-0.6.15-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "f113d1746ce7fdffada6f9e12b2f667d2b9069a3c3d5b05b680836102f2586c1",
+    "uploaded": "2025-04-22T00:50:26.375142Z",
+    "filename": "uv-0.6.15-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
     "version": "0.6.17",
     "url": "https://files.pythonhosted.org/packages/a5/4f/66c7153120c155446f319647c1bafec2d9288f2b48d769cd9f9da39aa1f2/uv-0.6.17-py3-none-macosx_11_0_arm64.whl",
     "sha256": "ce243bec19c47cc274e7e9eedbaeeb3dacbe94430b0f085dd506ba15a41676ee",
     "uploaded": "2025-04-25T18:51:15.410083Z",
     "filename": "uv-0.6.17-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.7.0",
+    "url": "https://files.pythonhosted.org/packages/ed/1d/cad304d6107208fdd90adf5ca519e86a2e35786cb7229d6cd39cf29bec3d/uv-0.7.0-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "1f48eeaeb46a5f81be873c1662c999e78ff267798ecea9dd48c7082e022048ec",
+    "uploaded": "2025-04-29T22:03:35.477030Z",
+    "filename": "uv-0.7.0-py3-none-macosx_11_0_arm64.whl"
   },
   {
     "version": "0.7.22",
@@ -63,11 +210,39 @@
     "filename": "uv-0.7.22-py3-none-macosx_11_0_arm64.whl"
   },
   {
+    "version": "0.8.0",
+    "url": "https://files.pythonhosted.org/packages/9d/98/9a89983caa05cf998eea3dac1e6cff2e0ab8099be0695fd8b9dc6a5038a0/uv-0.8.0-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "2d0ebf05eaee75921b3f23e7401a56bc0732bcdabb7469081ab00769340a93b4",
+    "uploaded": "2025-07-17T22:51:04.941749Z",
+    "filename": "uv-0.8.0-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.8.3",
+    "url": "https://files.pythonhosted.org/packages/9c/ba/8ceec5d6a1adf6b827db557077d8059e573a84c3708a70433d22a0470fab/uv-0.8.3-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "3f904f574dc2d7aa1d96ddf2483480ecd121dc9d060108cadd8bff100b754b64",
+    "uploaded": "2025-07-24T21:13:57.570096Z",
+    "filename": "uv-0.8.3-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.8.4",
+    "url": "https://files.pythonhosted.org/packages/16/39/7d4b68132868c550ae97c3b2c348c55db47a987dff05ab0e5f577bf0e197/uv-0.8.4-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "edc813645348665a3b4716a7d5e961cf7c8d1d3bfb9d907a4f18cf87c712a430",
+    "uploaded": "2025-07-30T17:10:20.417141Z",
+    "filename": "uv-0.8.4-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
     "version": "0.8.24",
     "url": "https://files.pythonhosted.org/packages/ea/00/08f4e93989129bb3378f20315dddcac6f8cf26a12bdd90443a340e7ecdb4/uv-0.8.24-py3-none-macosx_11_0_arm64.whl",
     "sha256": "a2bd708a545c1c21d7be8575f4cff00d0cff26be13fc81e3f7e54b8751fb90c0",
     "uploaded": "2025-10-07T03:33:24.533046Z",
     "filename": "uv-0.8.24-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.9.0",
+    "url": "https://files.pythonhosted.org/packages/8e/06/f5e38314e318bfaa20ccce966f6d0a69b093854648d31085b2d8b2097aab/uv-0.9.0-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "b900e84d992a657e16371426dbb030ab031c0322a604b632dada34401ebe7145",
+    "uploaded": "2025-10-07T23:44:30.076333Z",
+    "filename": "uv-0.9.0-py3-none-macosx_11_0_arm64.whl"
   },
   {
     "version": "0.9.30",
@@ -77,11 +252,25 @@
     "filename": "uv-0.9.30-py3-none-macosx_11_0_arm64.whl"
   },
   {
+    "version": "0.10.0",
+    "url": "https://files.pythonhosted.org/packages/ee/77/ec8f24f8d0f19c4fda0718d917bb78b9e6f02a4e1963b401f1c4f4614a54/uv-0.10.0-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "aefea608971f4f23ac3dac2006afb8eb2b2c1a2514f5fee1fac18e6c45fd70c4",
+    "uploaded": "2026-02-05T20:57:10.581974Z",
+    "filename": "uv-0.10.0-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
     "version": "0.10.12",
     "url": "https://files.pythonhosted.org/packages/ce/db/c41ace81b8ef5d5952433df38e321c0b6e5f88ce210c508b14f84817963f/uv-0.10.12-py3-none-macosx_11_0_arm64.whl",
     "sha256": "551f799d53e397843b6cde7e3c61de716fb487da512a21a954b7d0cbc06967e0",
     "uploaded": "2026-03-19T21:50:53.693778Z",
     "filename": "uv-0.10.12-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.11.0",
+    "url": "https://files.pythonhosted.org/packages/d9/1c/6ddd0febcea06cf23e59d9bff90d07025ecfd600238807f41ed2bdafd159/uv-0.11.0-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "4b0ebbd7ae019ea9fc4bff6a07d0c1e1d6784d1842bbdcb941982d30e2391972",
+    "uploaded": "2026-03-23T22:05:48.771767Z",
+    "filename": "uv-0.11.0-py3-none-macosx_11_0_arm64.whl"
   },
   {
     "version": "0.11.33",
@@ -91,10 +280,17 @@
     "filename": "uv-0.11.33-py3-none-macosx_11_0_arm64.whl"
   },
   {
-    "version": "0.12.13",
-    "url": "https://files.pythonhosted.org/packages/2a/33/ef14dc7c9c4cfaf0c3a4aed5a298b76b5dea94c75b233f7620c49c9b2e09/uv-0.12.13-py3-none-macosx_11_0_arm64.whl",
-    "sha256": "f86e5f02883c2e7a21bf522f4aa520c20d4f779d9a3368fbd6cdfe4a8f9549b5",
-    "uploaded": "2026-09-10T19:25:08.355776Z",
-    "filename": "uv-0.12.13-py3-none-macosx_11_0_arm64.whl"
+    "version": "0.12.0",
+    "url": "https://files.pythonhosted.org/packages/a5/7b/15d6865264120bd30c738b4bf63ddff66d087087cadeb2a6b88c6284a446/uv-0.12.0-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "009758d8fde2da2b90900f5fe863c71d0e1b8b28bbdba59863ceb967973a3735",
+    "uploaded": "2026-07-28T18:56:32.904863Z",
+    "filename": "uv-0.12.0-py3-none-macosx_11_0_arm64.whl"
+  },
+  {
+    "version": "0.12.15",
+    "url": "https://files.pythonhosted.org/packages/84/62/82e86e03e111463ab224c132c0f0e6b649d98d22710b177fbc000d379103/uv-0.12.15-py3-none-macosx_11_0_arm64.whl",
+    "sha256": "03b2c763f8b3c5595fa103221bc667e3af0146f8cb327aa06630ebcf5cfe16e9",
+    "uploaded": "2026-09-15T12:07:07.611580Z",
+    "filename": "uv-0.12.15-py3-none-macosx_11_0_arm64.whl"
   }
 ]

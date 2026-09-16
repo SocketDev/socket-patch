@@ -504,9 +504,11 @@ mod tests {
     #[test]
     fn removal_helpers_preserve_foreign_line_endings() {
         // pyproject.toml is user-authored: git autocrlf on Windows makes it
-        // CRLF, and the wire's toml_edit inserts append LF lines, so revert
-        // sees mixed endings. Every byte outside the removed segment must
-        // survive verbatim (the go_mod/go_sum CRLF-churn class).
+        // CRLF. The uv wire now renders its inserts in the file's own
+        // convention, but an older wire (or a hand edit) can still leave a
+        // mixed-ending file, so the removal helpers must never normalize:
+        // every byte outside the removed segment survives verbatim (the
+        // go_mod/go_sum CRLF-churn class).
         let wired = "[project]\r\nname = \"x\"\r\n\n[tool.uv.sources]\nfoo = { path = \"w.whl\" }\n";
         let after = remove_exact_line(wired, "foo = { path = \"w.whl\" }").unwrap();
         assert_eq!(after, "[project]\r\nname = \"x\"\r\n\n[tool.uv.sources]\n");
