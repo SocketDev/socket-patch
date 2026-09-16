@@ -672,18 +672,12 @@ fn run_hosted_json(cwd: &Path, api_url: &str) -> (Option<i32>, serde_json::Value
     (out.status.code(), doc)
 }
 
-/// (c) pnpm 1/2 legacy project (the 2026-08-18 legacy-matrix layout:
-/// `shrinkwrap.yaml` + `node_modules/.modules.yaml`, no pnpm-lock.yaml and
-/// no package-lock.json): the no-lockfile diagnostic must be PNPM-flavored
-/// — `redirect_pnpm_legacy_lockfile` naming shrinkwrap.yaml and the pnpm
-/// upgrade path — never the npm `redirect_npm_no_lockfile` wording that
-/// dead-ends on a pnpm project. The legacy lock also feeds the
-/// lockfile-only supplement (shrinkwrap.yaml IS the v5 grammar under the
-/// pre-rename filename), and the run stays fail-closed: shrinkwrap.yaml is
-/// byte-untouched with zero redirects.
+/// Legacy shrinkwrap projects support both installed discovery and the
+/// lock-only supplement. Hosted mode edits their block resolutions without
+/// changing unrelated packages or introducing npm-specific diagnostics.
 #[tokio::test]
 #[serial]
-async fn hosted_legacy_shrinkwrap_project_diagnoses_pnpm_not_npm() {
+async fn hosted_legacy_shrinkwrap_project_redirects_and_discovers_uninstalled_packages() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
@@ -737,26 +731,12 @@ specifiers:
     let (code, doc) = run_hosted_json(root, &server.uri());
     assert_eq!(code, Some(0), "fail-closed diagnostics still exit 0: {doc}");
 
-    let warnings = doc["redirect"]["warnings"].as_array().unwrap();
     assert_eq!(
-        warnings.len(),
-        1,
-        "exactly the pnpm-legacy diagnostic, no npm noise: {doc}"
+        doc["redirect"]["redirected"], 1,
+        "legacy package must redirect: {doc}"
     );
-    assert_eq!(
-        warnings[0]["code"], "redirect_pnpm_legacy_lockfile",
-        "the family selection must be marker-aware: {doc}"
-    );
-    let detail = warnings[0]["detail"].as_str().unwrap();
-    assert!(
-        detail.contains("shrinkwrap.yaml") && detail.contains("pnpm"),
-        "detail must name the legacy lock and pnpm: {detail}"
-    );
-    assert!(
-        !doc.to_string().contains("redirect_npm_no_lockfile"),
-        "the npm wording must be gone: {doc}"
-    );
-    assert_eq!(doc["redirect"]["redirected"], 0, "nothing redirects: {doc}");
+    assert!(!doc.to_string().contains("redirect_npm_no_lockfile"));
+    assert!(!doc.to_string().contains("redirect_pnpm_legacy_lockfile"));
 
     // The lockfile-only supplement reads shrinkwrap.yaml: the uninstalled
     // `/legacy-only-dep/2.0.0` entry surfaces (it was 0 before the fix).
@@ -765,11 +745,12 @@ specifiers:
         "shrinkwrap.yaml must feed the lockfile-only supplement: {doc}"
     );
 
-    assert_eq!(
-        std::fs::read_to_string(root.join("shrinkwrap.yaml")).unwrap(),
-        shrinkwrap,
-        "shrinkwrap.yaml must be byte-untouched (fail-closed)"
+    let rewritten = std::fs::read_to_string(root.join("shrinkwrap.yaml")).unwrap();
+    assert!(
+        rewritten.contains(&format!("tarball: {HOSTED_URL}")),
+        "{rewritten}"
     );
+    assert!(rewritten.contains("integrity: sha512-LEGACYONLYlegacyonly=="));
 }
 
 /// (d) hosted over a VENDORED pnpm lock (the mode-conversion matrix's projB
@@ -871,4 +852,38 @@ snapshots:
         !root.join(".socket/vendor/redirect-state.json").exists(),
         "a zero-redirect run must not write a redirect ledger"
     );
+}
+
+/// A URL in one instance must not confirm the whole package while another
+/// peer instance remains upstream. This also prevents an unverified --vex
+/// attestation from being created for an incomplete rewrite.
+#[tokio::test]
+#[serial]
+async fn hosted_partial_pnpm_redirect_is_not_confirmed_by_url_presence() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let lock = format!("lockfileVersion: '6.0'\npackages:\n  /{NAME}@{VERSION}:\n    resolution: {{integrity: {PATCHED_SHA512}, tarball: {HOSTED_URL}}}\n  /{NAME}@{VERSION}(unbalanced:\n    resolution: {{integrity: {UPSTREAM_SHA512}}}\n");
+    std::fs::write(tmp.path().join("pnpm-lock.yaml"), &lock).unwrap();
+    let (code, doc) = run_hosted_json(tmp.path(), &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    assert_eq!(
+        doc["redirect"]["redirected"], 0,
+        "incomplete package must not be confirmed: {doc}"
+    );
+    assert!(doc["redirect"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w["code"] == "redirect_pnpm_unsupported_lock_key"));
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        lock
+    );
+    assert!(!tmp
+        .path()
+        .join(".socket/vendor/redirect-state.json")
+        .exists());
 }

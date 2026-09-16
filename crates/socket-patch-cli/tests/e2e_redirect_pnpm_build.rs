@@ -26,21 +26,19 @@
 //! fresh install must FAIL on the integrity check — the lockfile pin is
 //! enforcement, not decoration.
 //!
-//! Version ladder (the `e2e_vendor_pnpm_build.rs` convention): pnpm@10 is the
-//! PRIMARY leg (skips only when corepack/pnpm is unfetchable or the fixture
-//! install cannot reach the registry); pnpm@7, pnpm@8, pnpm@9 and pnpm@11 are
-//! opportunistic. The pnpm@7/@8 legs prove the LEGACY lock grammars end to
-//! end: their pnpm-emitted v5.4 / v6 locks are spliced by the same rewrite
-//! and both majors frozen-install the hosted tarball from an empty store
-//! (verified live 2026-08-18, corepack pnpm@7.33.5 / pnpm@8.15.9).
+//! The required CI matrix provisions exact pnpm versions across majors 1–12
+//! and runs `pnpm_pinned_matrix_*` with setup failures treated as failures.
+//! It covers warm-cache verification, clean reinstall, fresh frozen install,
+//! ordinary install, lock-only discovery, rollback and tamper rejection. A
+//! second fixture covers scoped aliases and peer variants in workspaces on
+//! pnpm >=6. The older named corepack capstones remain opt-in conveniences.
 //!
 //! TRUST AUTO-CONFIG: a scan that rewrites a ROOT v9 lock also ensures
 //! `trustLockfile: true` in pnpm-workspace.yaml (ledger edit kind
 //! `redirect_pnpm_workspace_trust`; the workspace file joins
 //! `rewrittenFiles`), because pnpm >=11's lockfile supply-chain policy
-//! rejects the rewritten lock otherwise. Legacy 5.x/6.0 locks mean pnpm 7/8
-//! — no policy, no setting — so they rewrite ONLY the lock and keep the
-//! manual `--trust-lockfile` guidance (the gate is lock-major >= 9). Two
+//! rejects the rewritten lock otherwise. Legacy locks need no trust setting
+//! or flag. The auto-config gate is lock-major >=9. Two
 //! pnpm@11 legs pin both sides empirically: the ZERO-TOUCH leg commits the
 //! scan-written workspace file and the plain dead-registry frozen install
 //! succeeds with NO flags; the `--no-trust-lockfile-config` control pins the
@@ -57,7 +55,7 @@
 //! byte-preserved.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use sha2::{Digest, Sha512};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
@@ -98,28 +96,43 @@ const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 // ── self-contained helpers ────────────────────────────────────────────
 
 fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
+    std::env::var_os("SOCKET_PATCH_PNPM_E2E_SOCKET_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_socket-patch")))
 }
 
 /// Probe corepack from a NEUTRAL temp dir (a `packageManager` field in an
 /// ancestor package.json — e.g. this monorepo root — otherwise makes corepack
 /// refuse a different manager).
+fn pnpm_command(pm: &str) -> Command {
+    if let Some(bin) = std::env::var_os("SOCKET_PATCH_PNPM_E2E_BIN") {
+        Command::new(bin)
+    } else {
+        let mut cmd = Command::new("corepack");
+        cmd.arg(pm);
+        cmd
+    }
+}
+
 fn has_corepack_pm(pm: &str) -> bool {
-    let Ok(probe) = tempfile::tempdir() else {
-        return false;
-    };
-    // Isolated too: this probe is what actually downloads the package manager
-    // the first time, and corepack stores it under `COREPACK_HOME`.
-    let mut cmd = Command::new("corepack");
-    cmd.args([pm, "--version"])
-        .current_dir(probe.path())
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    let probe = tempfile::tempdir().unwrap();
+    let mut cmd = pnpm_command(pm);
+    cmd.arg("--version").current_dir(probe.path());
     cache_env::isolate(&mut cmd);
-    cmd.stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
+    let output = cmd.output();
+    let ok = output.as_ref().is_ok_and(|o| o.status.success());
+    if std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some() {
+        assert!(ok, "required pnpm toolchain unavailable: {output:?}");
+        if let Ok(output) = output {
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                pm.strip_prefix("pnpm@").unwrap(),
+                "matrix must run the pinned version"
+            );
+        }
+    }
+    ok
 }
 
 /// Remove ambient `SOCKET_*` / `PNPM_*` / `npm_config_*` vars.
@@ -148,8 +161,38 @@ fn scrub_socket_env(cmd: &mut Command) {
 }
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
-    let mut cmd = Command::new("corepack");
-    cmd.arg(pm).args(args).current_dir(cwd);
+    let mut cmd = pnpm_command(pm);
+    let legacy = pm
+        .strip_prefix("pnpm@")
+        .and_then(|v| v.split('.').next())
+        .and_then(|v| v.parse::<u32>().ok())
+        .is_some_and(|major| major <= 4);
+    // pnpm <=4 accepts `store`; 1–3 silently ignore `store-dir` and early 4
+    // rejects it. Ignoring the option lets a warm store fake cold coverage.
+    let args: Vec<String> = args
+        .iter()
+        .map(|arg| {
+            if legacy {
+                arg.replacen("--store-dir=", "--store=", 1)
+            } else {
+                arg.to_string()
+            }
+        })
+        .collect();
+    cmd.args(&args).current_dir(cwd);
+    if args.first().is_some_and(|arg| arg == "install")
+        && pm
+            .strip_prefix("pnpm@")
+            .and_then(|v| v.split('.').next())
+            .and_then(|v| v.parse::<u32>().ok())
+            .is_some_and(|major| (6..=11).contains(&major))
+    {
+        cmd.args([
+            "--fetch-retries=0",
+            "--fetch-retry-mintimeout=100",
+            "--fetch-retry-maxtimeout=500",
+        ]);
+    }
     scrub_socket_env(&mut cmd);
     // After the scrub: it strips ambient `PNPM_*` / `npm_config_*`, which
     // would otherwise take the sandbox values back out again.
@@ -318,13 +361,24 @@ async fn mount_api_mocks(
     before_hash: &str,
     after_hash: &str,
 ) {
+    mount_target_api_mocks(server, hosted_url, sri, before_hash, after_hash, PURL).await;
+}
+
+async fn mount_target_api_mocks(
+    server: &MockServer,
+    hosted_url: &str,
+    sri: &str,
+    before_hash: &str,
+    after_hash: &str,
+    purl: &str,
+) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "packages": [{
-                "purl": PURL,
+                "purl": purl,
                 "patches": [{
-                    "uuid": UUID, "purl": PURL, "tier": "free",
+                    "uuid": UUID, "purl": purl, "tier": "free",
                     "cveIds": [], "ghsaIds": [], "severity": "high",
                     "title": "pnpm redirect capstone fixture"
                 }]
@@ -339,7 +393,7 @@ async fn mount_api_mocks(
         )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
-                "uuid": UUID, "purl": PURL,
+                "uuid": UUID, "purl": purl,
                 "publishedAt": "2026-01-01T00:00:00Z",
                 "description": "x", "license": "MIT", "tier": "free",
                 "vulnerabilities": {}
@@ -355,7 +409,7 @@ async fn mount_api_mocks(
                 UUID: {
                     "status": "granted",
                     "url": hosted_url,
-                    "purl": PURL,
+                    "purl": purl,
                     "artifacts": [{
                         "kind": "tarball",
                         "url": hosted_url,
@@ -371,7 +425,7 @@ async fn mount_api_mocks(
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "uuid": UUID,
-            "purl": PURL,
+            "purl": purl,
             "publishedAt": "2026-01-01T00:00:00Z",
             "files": {
                 "package/index.js": {
@@ -412,6 +466,8 @@ struct PnpmRedirectFixture {
     proj: PathBuf,
     patched: Vec<u8>,
     _server: MockServer,
+    lock_name: String,
+    lock_before: String,
 }
 
 /// Steps 1–3 of the module doc against the REAL `corepack <pm>`: fixture
@@ -451,9 +507,14 @@ async fn redirect_scanned_pnpm_project(
     let install = corepack(
         &proj,
         pm,
-        &["install", "--store-dir", store.to_str().unwrap()],
+        &["install", &format!("--store-dir={}", store.display())],
     );
     if !install.status.success() {
+        assert!(
+            std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_none(),
+            "required {pm} fixture install failed: {:?}",
+            install
+        );
         println!(
             "SKIP e2e_redirect_pnpm_build ({tag}): fixture `{pm} install` failed \
              (registry unreachable?):\n{}",
@@ -495,7 +556,12 @@ async fn redirect_scanned_pnpm_project(
     .await;
     mount_tarball_route(&server, served).await;
 
-    let lock_path = proj.join("pnpm-lock.yaml");
+    let lock_name = if proj.join("pnpm-lock.yaml").exists() {
+        "pnpm-lock.yaml"
+    } else {
+        "shrinkwrap.yaml"
+    };
+    let lock_path = proj.join(lock_name);
     let lock_before = std::fs::read_to_string(&lock_path).expect("pnpm-lock.yaml after install");
     let pkg_before = std::fs::read(proj.join("package.json")).unwrap();
     // Whether the fixture install left a workspace file behind decides the
@@ -506,7 +572,7 @@ async fn redirect_scanned_pnpm_project(
     // integrity is gone" can be asserted against whatever the registry served.
     let upstream_resolution = lock_before
         .lines()
-        .find(|l| l.trim_start().starts_with("resolution: {integrity:"))
+        .find(|l| l.contains("integrity:"))
         .expect("pristine lock must carry an inline resolution")
         .to_string();
 
@@ -521,6 +587,22 @@ async fn redirect_scanned_pnpm_project(
         "{driver:?} --mode hosted failed ({tag}).\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let env = parse_envelope(&stdout);
+    if pm == "pnpm@1.0.0" {
+        assert_eq!(
+            env["redirect"]["redirected"], 0,
+            "unsafe legacy lock must be refused: {env}"
+        );
+        assert!(
+            warning_codes(&env).contains(&"redirect_pnpm_legacy_lockfile_unsupported".to_string())
+        );
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock_before);
+        assert!(!proj.join(".socket/vendor/redirect-state.json").exists());
+        println!(
+            "EXPECTED REFUSAL: pnpm 1.0.0 discards hosted URLs; lock unchanged, no patch confirmed"
+        );
+        return None;
+    }
+
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert_eq!(
         env["redirect"]["redirected"], 1,
@@ -535,7 +617,7 @@ async fn redirect_scanned_pnpm_project(
     let expected_rewrites = if auto_trust {
         serde_json::json!(["pnpm-lock.yaml", "pnpm-workspace.yaml"])
     } else {
-        serde_json::json!(["pnpm-lock.yaml"])
+        serde_json::json!([lock_name])
     };
     assert_eq!(
         env["redirect"]["rewrittenFiles"], expected_rewrites,
@@ -577,7 +659,7 @@ async fn redirect_scanned_pnpm_project(
              reject the flag); got: {trust_detail}"
         );
         assert!(
-            trust_detail.contains("pnpm 7/8") && trust_detail.contains("installs work unchanged"),
+            trust_detail.contains("pnpm") && trust_detail.contains("no trust step"),
             "the legacy-lock warning must say installs work unchanged on pnpm 7/8; \
              got: {trust_detail}"
         );
@@ -609,9 +691,8 @@ async fn redirect_scanned_pnpm_project(
     // (hosted mode edits only the lock).
     let lock_after = std::fs::read_to_string(&lock_path).unwrap();
     assert!(
-        lock_after.contains(&format!(
-            "resolution: {{integrity: {sri}, tarball: {hosted_url}}}"
-        )),
+        lock_after.contains(&format!("integrity: {sri}"))
+            && lock_after.contains(&format!("tarball: {hosted_url}")),
         "resolution must be spliced to the patched sri + hosted tarball; got:\n{lock_after}"
     );
     assert!(
@@ -633,7 +714,7 @@ async fn redirect_scanned_pnpm_project(
     assert!(
         edits.iter().any(|e| e["kind"] == "redirect_pnpm_resolution"
             && e["key"] == format!("{DEP}@{DEP_VERSION}")
-            && e["path"] == "pnpm-lock.yaml"),
+            && e["path"] == lock_name),
         "the ledger must record the redirect_pnpm_resolution edit: {ledger}"
     );
     let trust_edits: Vec<&serde_json::Value> = edits
@@ -714,6 +795,8 @@ async fn redirect_scanned_pnpm_project(
         proj,
         patched,
         _server: server,
+        lock_name: lock_name.to_string(),
+        lock_before,
     })
 }
 
@@ -735,7 +818,7 @@ fn fresh_checkout_install(
     let fresh = fx.tmp.path().join(format!("fresh-{label}"));
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(fx.proj.join("package.json"), fresh.join("package.json")).unwrap();
-    std::fs::copy(fx.proj.join("pnpm-lock.yaml"), fresh.join("pnpm-lock.yaml")).unwrap();
+    std::fs::copy(fx.proj.join(&fx.lock_name), fresh.join(&fx.lock_name)).unwrap();
     if with_workspace_yaml {
         std::fs::copy(
             fx.proj.join("pnpm-workspace.yaml"),
@@ -758,12 +841,8 @@ fn fresh_checkout_install(
     )
     .unwrap();
     let fresh_store = fx.tmp.path().join(format!("fresh-store-{label}"));
-    let mut args = vec![
-        "install",
-        "--frozen-lockfile",
-        "--store-dir",
-        fresh_store.to_str().unwrap(),
-    ];
+    let store_flag = format!("--store-dir={}", fresh_store.display());
+    let mut args = vec!["install", "--frozen-lockfile", &store_flag];
     args.extend_from_slice(extra_args);
     let out = corepack(&fresh, pm, &args);
     (fresh, out)
@@ -1030,6 +1109,131 @@ async fn pnpm8_v6_lock_redirect_fresh_checkout_frozen_install_lands_patched_byte
 
 // ── synthetic legs (hermetic — no pnpm binary, never ignored) ─────────
 
+/// Required CI matrix: unlike the opportunistic capstones above, a missing
+/// toolchain or failed fixture is a failure. The job provisions each pnpm
+/// major with a compatible Node version and passes its absolute executable.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "requires the pinned pnpm matrix toolchain"]
+async fn pnpm_pinned_matrix_install_verify_revert_and_tamper() {
+    let version = std::env::var("SOCKET_PATCH_PNPM_E2E_VERSION")
+        .expect("set SOCKET_PATCH_PNPM_E2E_VERSION to the exact pnpm version");
+    let pm = format!("pnpm@{version}");
+    let fx = redirect_scanned_pnpm_project(&pm, &version, false, false, HostedDriver::Scan).await;
+    if version == "1.0.0" {
+        assert!(fx.is_none(), "the unsafe legacy format must be refused");
+        return;
+    }
+    let fx = fx.expect("required matrix fixture must not skip");
+    let warm_store = format!("--store-dir={}", fx.tmp.path().join("pnpm-store").display());
+    let warm = corepack(
+        &fx.proj,
+        &pm,
+        &["install", "--frozen-lockfile", &warm_store],
+    );
+    assert!(warm.status.success(), "warm install failed: {warm:?}");
+    let installed = std::fs::read(fx.proj.join("node_modules").join(DEP).join("index.js")).unwrap();
+    let (vex_code, _, _) = run_socket(
+        &fx.proj,
+        &["vex", "--offline", "--product", "pkg:npm/consumer@0.0.0"],
+    );
+    assert_eq!(
+        vex_code == 0,
+        installed == fx.patched,
+        "a successful pnpm install must not cause VEX to attest stale files"
+    );
+    // A lock-only edit does not invalidate every pnpm major's warm cache.
+    // The cross-version recovery is a clean tree AND a new empty store;
+    // --force alone is not sufficient (and pnpm 12 re-resolves upstream).
+    std::fs::remove_dir_all(fx.proj.join("node_modules")).unwrap();
+    let clean_store = format!(
+        "--store-dir={}",
+        fx.tmp.path().join("clean-store").display()
+    );
+    let clean = corepack(
+        &fx.proj,
+        &pm,
+        &["install", "--frozen-lockfile", &clean_store],
+    );
+    assert_marker_landed(
+        &fx.proj,
+        &fx.patched,
+        &clean,
+        &format!("{version} clean reinstall"),
+    );
+    let with_workspace = fx.proj.join("pnpm-workspace.yaml").exists();
+    let (fresh, install) = fresh_checkout_install(&fx, &pm, "matrix", &[], with_workspace);
+    assert_marker_landed(&fresh, &fx.patched, &install, &version);
+
+    // Local evidence of remediation: the default VEX path verifies installed
+    // hashes. This deliberately makes no assertion about dashboard alerts.
+    let (code, stdout, stderr) = run_socket(
+        &fresh,
+        &["vex", "--offline", "--product", "pkg:npm/consumer@0.0.0"],
+    );
+    assert_eq!(code, 0, "verified VEX failed: {stdout}\n{stderr}");
+    let vex: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(vex["statements"][0]["status"], "not_affected", "{vex}");
+    assert_eq!(vex["statements"][0]["vulnerability"]["name"], GHSA, "{vex}");
+
+    // An ordinary install must also preserve the patch. Use a new store so
+    // a warm cache cannot disguise an upstream re-resolution.
+    let store_flag = format!(
+        "--store-dir={}",
+        fx.tmp.path().join("ordinary-store").display()
+    );
+    std::fs::remove_dir_all(fresh.join("node_modules")).unwrap();
+    let ordinary = corepack(&fresh, &pm, &["install", &store_flag]);
+    assert_marker_landed(&fresh, &fx.patched, &ordinary, &version);
+
+    // Revert committed wiring without an installed tree: no in-place patch
+    // reversal or blob fetching can hide a lock/trust-setting rollback bug.
+    std::fs::remove_dir_all(fx.proj.join("node_modules")).unwrap();
+    let (code, stdout, stderr) =
+        run_socket(&fx.proj, &["rollback", "--offline", "--yes", "--json"]);
+    assert_eq!(code, 0, "rollback failed: {stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(fx.proj.join(&fx.lock_name)).unwrap(),
+        fx.lock_before
+    );
+    // The same project must be discoverable from just its lockfile in a
+    // fresh checkout, including the legacy shrinkwrap filename.
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &fx.proj, &fx._server.uri(), &[]);
+    assert_eq!(code, 0, "lock-only scan failed: {stdout}\n{stderr}");
+    assert_eq!(parse_envelope(&stdout)["redirect"]["redirected"], 1);
+
+    // Every major must reject a hosted tarball whose bytes disagree with its
+    // lockfile pin, even when pnpm >=11 uses trustLockfile.
+    let tampered = redirect_scanned_pnpm_project(&pm, &version, true, false, HostedDriver::GetUuid)
+        .await
+        .expect("required tamper fixture must not skip");
+    let with_workspace = tampered.proj.join("pnpm-workspace.yaml").exists();
+    let (fresh, install) = fresh_checkout_install(&tampered, &pm, "tampered", &[], with_workspace);
+    assert!(
+        !install.status.success(),
+        "{version} accepted a tampered tarball"
+    );
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert!(
+        ["integrity", "checksum"]
+            .iter()
+            .any(|word| output.to_ascii_lowercase().contains(word)),
+        "unexpected failure: {output}"
+    );
+    assert!(
+        !fresh
+            .join("node_modules")
+            .join(DEP)
+            .join("index.js")
+            .exists(),
+        "tampered bytes were linked"
+    );
+}
+
 /// A project whose only lockfile is the synthesized `lock`, with an installed
 /// node_modules stub so the crawler discovers the dep (a real pnpm project
 /// always has one).
@@ -1243,7 +1447,7 @@ async fn pnpm_v6_plain_lock_key_rewrite_stays_supported() {
          reject the flag as unknown); got: {v6_detail}"
     );
     assert!(
-        v6_detail.contains("pnpm 7/8") && v6_detail.contains("installs work unchanged"),
+        v6_detail.contains("pnpm 1–8") && v6_detail.contains("no trust step"),
         "the legacy-lock warning must say installs work unchanged on pnpm 7/8; \
          got: {v6_detail}"
     );
@@ -1290,5 +1494,189 @@ async fn pnpm_v6_plain_lock_key_rewrite_stays_supported() {
             .iter()
             .any(|e| e["kind"] == "redirect_pnpm_workspace_trust"),
         "a v6-lock scan must record no workspace trust edit: {ledger}"
+    );
+}
+
+/// Real pnpm workspace graph with a scoped target, an npm alias, two peer
+/// contexts and peers-of-peers. Registry/API/tarballs are local so this test
+/// validates graph handling without depending on upstream package metadata.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+#[ignore = "requires the pinned pnpm matrix toolchain"]
+async fn pnpm_pinned_matrix_workspace_peer_instances() {
+    let version = std::env::var("SOCKET_PATCH_PNPM_E2E_VERSION").unwrap();
+    let major: u32 = version.split('.').next().unwrap().parse().unwrap();
+    if major < 6 {
+        // The required single-package test above covers these older majors;
+        // this fixture exercises the three modern workspace lock grammars.
+        return;
+    }
+    let pm = format!("pnpm@{version}");
+    assert!(has_corepack_pm(&pm));
+    const TARGET: &str = "@fixture/left-pad";
+    const TARGET_PURL: &str = "pkg:npm/@fixture/left-pad@1.3.0";
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("workspace");
+    std::fs::create_dir_all(&proj).unwrap();
+    let original = b"module.exports = 'original';\n";
+    let patched = [MARKER.as_bytes(), original.as_slice()].concat();
+    let mut patched_tarball = Vec::new();
+    for (name, versions, peers) in [
+        (
+            TARGET,
+            vec!["1.3.0"],
+            serde_json::json!({"e2e-middle": "*", "e2e-leaf": "*"}),
+        ),
+        (
+            "e2e-middle",
+            vec!["1.0.0"],
+            serde_json::json!({"e2e-leaf": "*"}),
+        ),
+        ("e2e-leaf", vec!["1.0.0", "2.0.0"], serde_json::json!({})),
+    ] {
+        let mut metadata = serde_json::json!({"name":name,"dist-tags":{"latest": versions.last().unwrap()},"versions":{}});
+        for version in versions {
+            let package = tmp.path().join("pack");
+            std::fs::create_dir_all(&package).unwrap();
+            let manifest = serde_json::json!({"name":name,"version":version,"main":"index.js","peerDependencies":peers});
+            std::fs::write(package.join("package.json"), manifest.to_string()).unwrap();
+            std::fs::write(package.join("index.js"), original).unwrap();
+            let tgz = make_tgz_from_installed(&package, original);
+            if name == TARGET {
+                patched_tarball = make_tgz_from_installed(&package, &patched);
+            }
+            let route = format!(
+                "/{name}/-/{}-{version}.tgz",
+                name.rsplit('/').next().unwrap()
+            );
+            let mut record = manifest;
+            record["dist"] = serde_json::json!({"tarball":format!("{}{route}",server.uri()),"integrity":format!("sha512-{}",sha512_sri_b64(&tgz))});
+            metadata["versions"][version] = record;
+            Mock::given(method("GET"))
+                .and(path(&route))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(tgz))
+                .mount(&server)
+                .await;
+        }
+        let route = if name == TARGET {
+            "(?i)^/(?:@|%40)fixture(?:/|%2f)left-pad$".to_string()
+        } else {
+            format!("^/{name}$")
+        };
+        Mock::given(method("GET"))
+            .and(path_regex(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+            .mount(&server)
+            .await;
+    }
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"workspace-fixture","version":"1.0.0","private":true}"#,
+    )
+    .unwrap();
+    let registry = format!("{}/", server.uri());
+    std::fs::write(
+        proj.join(".npmrc"),
+        format!("registry={registry}\nfetch-retries=0\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join("pnpm-workspace.yaml"),
+        format!("packages:\n  - 'packages/*'\nregistry: '{registry}'\nminimumReleaseAge: 0\n"),
+    )
+    .unwrap();
+    for (app, leaf, alias) in [("a", "1.0.0", false), ("b", "2.0.0", true)] {
+        let dir = proj.join("packages").join(app);
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = if alias { "alias" } else { TARGET };
+        let spec = if alias {
+            "npm:@fixture/left-pad@1.3.0"
+        } else {
+            "1.3.0"
+        };
+        std::fs::write(dir.join("package.json"), serde_json::json!({"name":app,"version":"1.0.0","private":true,"dependencies":{name:spec,"e2e-middle":"1.0.0","e2e-leaf":leaf}}).to_string()).unwrap();
+    }
+    let store = format!("--store-dir={}", tmp.path().join("initial-store").display());
+    let install = corepack(&proj, &pm, &["install", &store]);
+    assert!(install.status.success(), "workspace fixture: {install:?}");
+    let lock_before = std::fs::read_to_string(proj.join("pnpm-lock.yaml")).unwrap();
+    let url = hosted_url_for(&server.uri());
+    let sri = format!("sha512-{}", sha512_sri_b64(&patched_tarball));
+    mount_target_api_mocks(
+        &server,
+        &url,
+        &sri,
+        &compute_git_sha256_from_bytes(original),
+        &compute_git_sha256_from_bytes(&patched),
+        TARGET_PURL,
+    )
+    .await;
+    mount_tarball_route(&server, patched_tarball).await;
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &proj, &server.uri(), &[]);
+    assert_eq!(code, 0, "workspace redirect: {stdout}\n{stderr}");
+    assert_eq!(
+        parse_envelope(&stdout)["redirect"]["redirected"],
+        1,
+        "{stdout}"
+    );
+    let lock_after = std::fs::read_to_string(proj.join("pnpm-lock.yaml")).unwrap();
+    // Both peer contexts must be represented before the rewrite; v9 factors
+    // their common resolution into packages and keeps contexts in snapshots.
+    assert!(lock_before.contains("e2e-leaf@1.0.0") || lock_before.contains("e2e-leaf/1.0.0"));
+    assert!(lock_before.contains("e2e-leaf@2.0.0") || lock_before.contains("e2e-leaf/2.0.0"));
+    if major < 9 {
+        assert_eq!(
+            lock_after.matches(&url).count(),
+            2,
+            "both legacy peer resolutions: {lock_after}"
+        );
+    }
+    let fresh = tmp.path().join("fresh-workspace");
+    std::fs::create_dir_all(&fresh).unwrap();
+    for file in [
+        "package.json",
+        "pnpm-workspace.yaml",
+        "pnpm-lock.yaml",
+        ".npmrc",
+    ] {
+        std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
+    }
+    // Copy only manifests, never node_modules or a warm store.
+    for app in ["a", "b"] {
+        let dir = fresh.join("packages").join(app);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(
+            proj.join("packages").join(app).join("package.json"),
+            dir.join("package.json"),
+        )
+        .unwrap();
+    }
+    let store = format!("--store-dir={}", tmp.path().join("fresh-store").display());
+    let install = corepack(&fresh, &pm, &["install", "--frozen-lockfile", &store]);
+    assert!(
+        install.status.success(),
+        "workspace frozen install: {install:?}"
+    );
+    for (app, target) in [("a", TARGET), ("b", "alias")] {
+        let bytes = std::fs::read(
+            fresh
+                .join("packages")
+                .join(app)
+                .join("node_modules")
+                .join(target)
+                .join("index.js"),
+        )
+        .unwrap();
+        assert_eq!(
+            bytes, patched,
+            "{version}: {app}/{target} must install the patched peer instance"
+        );
+    }
+    let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &proj, &server.uri(), &[]);
+    assert_eq!(code, 0, "workspace rerun: {stdout}\n{stderr}");
+    assert_eq!(
+        parse_envelope(&stdout)["redirect"]["rewrittenFiles"],
+        serde_json::json!([])
     );
 }
