@@ -396,6 +396,35 @@ pub(crate) async fn revert_lock_fragment_splice(
     kind: &str,
     flavor: &str,
 ) -> RevertOutcome {
+    revert_lock_fragment_splice_inner(
+        entry, root, dry_run, lock_file, kind, flavor, false,
+    )
+    .await
+}
+
+pub(crate) async fn revert_lock_fragment_splice_atomic(
+    entry: &VendorEntry,
+    root: &Path,
+    dry_run: bool,
+    lock_file: &str,
+    kind: &str,
+    flavor: &str,
+) -> RevertOutcome {
+    revert_lock_fragment_splice_inner(
+        entry, root, dry_run, lock_file, kind, flavor, true,
+    )
+    .await
+}
+
+async fn revert_lock_fragment_splice_inner(
+    entry: &VendorEntry,
+    root: &Path,
+    dry_run: bool,
+    lock_file: &str,
+    kind: &str,
+    flavor: &str,
+    atomic: bool,
+) -> RevertOutcome {
     use tokio::io::AsyncReadExt as _;
 
     let lock_path = root.join(lock_file);
@@ -465,7 +494,7 @@ pub(crate) async fn revert_lock_fragment_splice(
         }
     }
 
-    if !dry_run {
+    if !dry_run && (!atomic || warnings.is_empty()) {
         // Mode-preserving: the lock is a user-owned file we merely edit, so
         // the swapped-in inode must keep its permission bits rather than
         // reset them to umask defaults.

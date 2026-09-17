@@ -8,7 +8,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 use super::common::{
-    item_get, lock_units_named, pep621_declared_names, record, revert_lock_fragment_splice,
+    item_get, lock_units_named, pep621_declared_names, record, revert_lock_fragment_splice_atomic,
     unit_has_canon_name,
 };
 use super::path::parse_vendor_path;
@@ -370,7 +370,8 @@ pub(super) async fn revert_poetry(
     root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
-    revert_lock_fragment_splice(entry, root, dry_run, LOCK_FILE, KIND_LOCK_PACKAGE, "poetry").await
+    revert_lock_fragment_splice_atomic(entry, root, dry_run, LOCK_FILE, KIND_LOCK_PACKAGE, "poetry")
+        .await
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -846,6 +847,44 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn legacy_revert_keeps_source_and_hash_together_on_drift() {
+        let native = include_str!("../../tests/fixtures/poetry/1.1.15/poetry.lock");
+        let lock = native.replace("urllib3 = []", &format!("urllib3 = [{{file = \"urllib3-1.26.18-py2.py3-none-any.whl\", hash = \"sha256:{}\"}}]", "b".repeat(64)));
+        for crlf in [false, true] {
+            let pristine = if crlf {
+                lock.replace('\n', "\r\n")
+            } else {
+                lock.clone()
+            };
+            let tmp = write_project(&pristine, PYPROJECT_DIRECT).await;
+            let project = load_poetry_project(tmp.path()).await.unwrap();
+            let wheel = "urllib3-1.26.18-py2.py3-none-any.whl";
+            let path = format!(".socket/vendor/pypi/{UUID}/{wheel}");
+            let (wiring, meta) = wire_poetry(
+                &project,
+                tmp.path(),
+                "urllib3",
+                "1.26.18",
+                &path,
+                wheel,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap();
+            let drifted = read_lock(tmp.path())
+                .await
+                .replace("HTTP library", "Edited description");
+            tokio::fs::write(tmp.path().join("poetry.lock"), &drifted)
+                .await
+                .unwrap();
+            let outcome = revert_poetry(&entry_for(wiring, meta), tmp.path(), false).await;
+            assert!(!outcome.warnings.is_empty());
+            assert_eq!(read_lock(tmp.path()).await, drifted);
+        }
     }
 
     #[tokio::test]
