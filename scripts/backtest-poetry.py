@@ -593,7 +593,17 @@ def main():
             marker = b"patch.socket.dev" if mode == "hosted" else b".socket/vendor/pypi"
             rl.update(lockBytesUnchanged=relocked == lock_after, patchSourceKept=marker in relocked, pyprojectUnchanged=(project / "pyproject.toml").read_bytes() == pristine_pyproject)
             info["relock"] = rl
-            (project / "poetry.lock").write_bytes(lock_after)
+            if rl["patchSourceKept"] and not rl["lockBytesUnchanged"]:
+                # Poetry re-laid the unit around the kept source (1.1/1.2 drop
+                # the inserted `files` line). The documented recovery is a
+                # re-scan; it must restore the entry and leave a ledger that
+                # the final rollback below can still invert to pristine bytes.
+                rs = Run(cli_cmd(project, "scan", "--mode", mode), project, env, case / "rescan-after-relock.log")
+                ers = rs.json_or_empty()
+                check("rescanAfterRelockApplies", rs.ok() and applied_count(mode, ers) >= 0 and marker in (project / "poetry.lock").read_bytes(), {"exit": rs.rc, "applied": applied_count(mode, ers)})
+                info["rescanAfterRelock"] = {"exit": rs.rc, "applied": applied_count(mode, ers), "lockChanged": (project / "poetry.lock").read_bytes() != relocked}
+            else:
+                (project / "poetry.lock").write_bytes(lock_after)
 
         # Rollback restores every byte and clears the ledgers.
         rb = Run(cli_cmd(project, "rollback"), project, env, case / "rollback.log")
