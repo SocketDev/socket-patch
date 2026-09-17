@@ -1249,12 +1249,65 @@ fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
     Some(out)
 }
 
-/// poetry.lock: `[[package]]` blocks with `name`/`version` — discovery
-/// only (file hashes exist but carry no URLs and no platform choice).
+/// The sha256 of each package's pure-Python (`-none-any.whl`) wheel as the
+/// lock records it — `files = [...]` inside `[[package]]` (lock 2.x) or the
+/// `[metadata.files]` entry (lock 1.0/1.1). Poetry 0.12's `[metadata.hashes]`
+/// lists bare digests without filenames, so no wheel can be chosen there.
+/// Keyed by canonical name. An unparseable lock contributes nothing (the
+/// line-based name/version walk below still runs).
+fn poetry_pure_wheel_hashes(text: &str) -> HashMap<String, String> {
+    fn pure_wheel_sha(files: &Item) -> Option<String> {
+        let files = files.as_array()?;
+        files
+            .iter()
+            .filter_map(TomlValue::as_inline_table)
+            .find_map(|entry| {
+                let file = entry.get("file")?.as_str()?;
+                if !file.ends_with("-none-any.whl") {
+                    return None;
+                }
+                let sha = entry.get("hash")?.as_str()?.strip_prefix("sha256:")?;
+                is_hex_of_len(sha, 64).then(|| sha.to_ascii_lowercase())
+            })
+    }
+    let mut out = HashMap::new();
+    let Ok(document) = text.parse::<DocumentMut>() else {
+        return out;
+    };
+    if let Some(packages) = document.get("package").and_then(Item::as_array_of_tables) {
+        for package in packages.iter() {
+            let Some(name) = package.get("name").and_then(Item::as_str) else {
+                continue;
+            };
+            if let Some(sha) = package.get("files").and_then(pure_wheel_sha) {
+                out.entry(canonicalize_pypi_name(name)).or_insert(sha);
+            }
+        }
+    }
+    if let Some(files) = document
+        .get("metadata")
+        .and_then(|m| m.get("files"))
+        .and_then(Item::as_table_like)
+    {
+        for (name, entry) in files.iter() {
+            if let Some(sha) = pure_wheel_sha(entry) {
+                out.entry(canonicalize_pypi_name(name)).or_insert(sha);
+            }
+        }
+    }
+    out
+}
+
+/// poetry.lock: `[[package]]` blocks with `name`/`version`. The lock records
+/// file hashes but no URLs and no platform choice, so an entry carries the
+/// pure-Python wheel's sha256 when the lock lists one (the pypi fetcher then
+/// resolves the matching file through PyPI's JSON API) and stays
+/// discovery-only otherwise.
 async fn inventory_poetry_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = read_regular_to_string(&project_root.join("poetry.lock"))
         .await
         .ok()?;
+    let hashes = poetry_pure_wheel_hashes(&text);
     let mut out = Vec::new();
     let mut in_package = false;
     let mut name: Option<String> = None;
@@ -1280,13 +1333,17 @@ async fn inventory_poetry_lock(project_root: &Path) -> Option<Vec<LockfileEntry>
                 if path_safety::is_safe_single_segment(&n)
                     && path_safety::is_safe_single_segment(&v)
                 {
+                    let integrity = hashes
+                        .get(&n)
+                        .map(|sha| LockIntegrity::Sha256Hex(sha.clone()))
+                        .unwrap_or(LockIntegrity::None);
                     out.push(LockfileEntry {
                         ecosystem: "pypi",
                         purl: format!("pkg:pypi/{n}@{v}"),
                         name: n,
                         version: v,
                         resolved: None,
-                        integrity: LockIntegrity::None,
+                        integrity,
                     });
                 }
             }
@@ -3223,6 +3280,43 @@ source = { editable = "." }
         let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0].purl, "pkg:pypi/requests@2.28.0");
+    }
+
+    /// A lock that lists a pure-Python wheel carries its sha256 (lock 2.x
+    /// `files`, lock 1.x `[metadata.files]`), so a lock-only checkout can
+    /// vendor like uv does; platform wheels only, or 0.12's bare
+    /// `[metadata.hashes]`, stay discovery-only.
+    #[tokio::test]
+    async fn poetry_lock_carries_the_pure_wheel_sha256_when_listed() {
+        let sha = "34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07";
+        let lock2 = format!(
+            "[[package]]\nname = \"urllib3\"\nversion = \"1.26.18\"\nfiles = [\n    {{file = \"urllib3-1.26.18.tar.gz\", hash = \"sha256:{}\"}},\n    {{file = \"urllib3-1.26.18-py2.py3-none-any.whl\", hash = \"sha256:{sha}\"}},\n]\n\n[[package]]\nname = \"numpy\"\nversion = \"2.0.0\"\nfiles = [\n    {{file = \"numpy-2.0.0-cp312-cp312-macosx_11_0_arm64.whl\", hash = \"sha256:{}\"}},\n]\n\n[metadata]\nlock-version = \"2.1\"\n",
+            "f".repeat(64),
+            "e".repeat(64)
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "poetry.lock", &lock2).await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(entry(&entries, "urllib3").integrity, LockIntegrity::Sha256Hex(sha.into()));
+        assert_eq!(entry(&entries, "urllib3").resolved, None);
+        assert_eq!(entry(&entries, "numpy").integrity, LockIntegrity::None);
+
+        let lock1 = format!(
+            "[[package]]\nname = \"urllib3\"\nversion = \"1.26.18\"\n\n[metadata]\nlock-version = \"1.1\"\n\n[metadata.files]\nurllib3 = [\n    {{file = \"urllib3-1.26.18-py2.py3-none-any.whl\", hash = \"sha256:{}\"}},\n]\n",
+            sha.to_uppercase()
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "poetry.lock", &lock1).await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(entry(&entries, "urllib3").integrity, LockIntegrity::Sha256Hex(sha.into()), "lowercased");
+
+        let lock0 = format!(
+            "[[package]]\nname = \"urllib3\"\nversion = \"1.26.18\"\n\n[metadata]\ncontent-hash = \"x\"\n\n[metadata.hashes]\nurllib3 = [\"{sha}\"]\n"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "poetry.lock", &lock0).await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(entry(&entries, "urllib3").integrity, LockIntegrity::None, "bare digests name no wheel");
     }
 
     #[tokio::test]
