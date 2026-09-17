@@ -83,7 +83,10 @@ fn properties(text: &str, offset: usize) -> Result<Vec<Property>, String> {
 }
 
 fn entries(text: &str) -> Result<Vec<(String, Property)>, String> {
-    let value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    // A UTF-8 BOM (Windows editors) is not JSON; parse past it. Offsets
+    // below come from `text.find('{')`, so they stay byte-accurate.
+    let value: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|e| e.to_string())?;
     if !value.is_object() {
         return Err("Pipfile.lock is not an object".into());
     }
@@ -177,10 +180,26 @@ pub(super) fn rewrite(
                 text = rewritten;
                 result.edits.extend(edits);
             }
-            Err(detail) => {
+            // A CONFLICT (another version pinned, a foreign source, a VCS /
+            // path dependency) means the project's Pipenv install would not
+            // pick the patch up even if a sibling requirements.txt / uv.lock
+            // were repointed — so the sibling rewriters are vetoed too and
+            // nothing is half-redirected. Anything else (no entry for the
+            // package, an old pipfile-spec, an unparseable or BOM-prefixed
+            // lock, a patch without a digest) says nothing about the files
+            // the project installs from: warn and leave the siblings alone,
+            // or a stale Pipfile.lock left behind in a uv / Poetry /
+            // requirements project blocks every hosted redirect.
+            Err(PlanError::Conflict(detail)) => {
                 result.refused_pipenv_uuids.insert(dep.patch_uuid.clone());
                 result.warnings.push(RewriteWarning {
                     code: "redirect_pipenv_refused".into(),
+                    detail,
+                });
+            }
+            Err(PlanError::Skip(detail)) => {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_pipenv_skipped".into(),
                     detail,
                 });
             }
@@ -217,11 +236,35 @@ fn owned_url(value: &str, dep: &DepOverride) -> bool {
         && parts[7].split('-').nth(1) == Some(dep.version.as_str())
 }
 
+/// Why a Pipfile.lock plan did not happen. Only a [`PlanError::Conflict`]
+/// vetoes the sibling Python rewriters (see [`rewrite`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PlanError {
+    /// The lock pins another version or a non-registry / foreign source for
+    /// the package: the project's install cannot pick the patch up.
+    Conflict(String),
+    /// Nothing to do here (no entry, unsupported spec, unparseable lock,
+    /// no digest): says nothing about the project's other install files.
+    Skip(String),
+}
+
+impl From<String> for PlanError {
+    fn from(detail: String) -> Self {
+        PlanError::Skip(detail)
+    }
+}
+
+impl From<&str> for PlanError {
+    fn from(detail: &str) -> Self {
+        PlanError::Skip(detail.to_owned())
+    }
+}
+
 fn plan(
     text: &str,
     dep: &DepOverride,
     pipenv_major: Option<u32>,
-) -> Result<(String, Vec<FileEdit>), String> {
+) -> Result<(String, Vec<FileEdit>), PlanError> {
     let sha = dep
         .integrity
         .sha256
@@ -242,7 +285,10 @@ fn plan(
         })
         .collect();
     if targets.is_empty() {
-        return Err(format!("Pipfile.lock has no entry for {}", dep.name));
+        return Err(PlanError::Skip(format!(
+            "Pipfile.lock has no entry for {}",
+            dep.name
+        )));
     }
     let source_key = if pipenv_major.is_some_and(|major| (7..2018).contains(&major)) {
         "path"
@@ -260,17 +306,20 @@ fn plan(
             .any(|key| object.contains_key(*key))
             || (object.contains_key("file") && object.contains_key("path"))
         {
-            return Err(format!(
+            return Err(PlanError::Conflict(format!(
                 "Pipenv source for {} is not a registry package",
                 dep.name
-            ));
+            )));
         }
         if let Some(file) = object.get("file").or_else(|| object.get("path")) {
             if !file.as_str().is_some_and(|value| owned_url(value, dep))
                 || object.contains_key("version")
                 || object.contains_key("index")
             {
-                return Err(format!("Pipenv source for {} already exists", dep.name));
+                return Err(PlanError::Conflict(format!(
+                    "Pipenv source for {} already exists",
+                    dep.name
+                )));
             }
             if object.get(source_key).and_then(Value::as_str) == Some(&url)
                 && object.get("hashes") == Some(&json!([format!("sha256:{sha}")]))
@@ -280,10 +329,10 @@ fn plan(
         } else if object.get("version").and_then(Value::as_str)
             != Some(format!("=={}", dep.version).as_str())
         {
-            return Err(format!(
+            return Err(PlanError::Conflict(format!(
                 "Pipenv version for {} does not match {}",
                 dep.name, dep.version
-            ));
+            )));
         }
         let mut new = object.clone();
         new.remove("version");
@@ -371,6 +420,7 @@ mod tests {
             json!({"version":"==1.26.18","path":"./fork"}),
         ] {
             let mut value: Value = serde_json::from_str(&lock()).unwrap();
+            let is_null = bad.is_null();
             value["tests"]["urllib3"] = bad;
             let original = serde_json::to_string(&value).unwrap();
             let files = BTreeMap::from([("Pipfile.lock".into(), original)]);
@@ -380,7 +430,82 @@ mod tests {
             assert!(result.edits.is_empty());
             assert!(result.confirmed_pipenv_uuids.is_empty());
             assert_eq!(result.warnings.len(), 1);
+            // A pin / source CONFLICT vetoes the sibling Python rewriters; a
+            // malformed (non-object) entry is merely skipped.
+            if is_null {
+                assert_eq!(result.warnings[0].code, "redirect_pipenv_skipped");
+                assert!(result.refused_pipenv_uuids.is_empty());
+            } else {
+                assert_eq!(result.warnings[0].code, "redirect_pipenv_refused");
+                assert!(result.refused_pipenv_uuids.contains("patch-one"));
+            }
         }
+    }
+
+    /// Only conflicts veto the sibling rewriters (Bugbot HIGH on #242): a
+    /// Pipfile.lock without the package, an old pipfile-spec, an unparseable
+    /// lock or a digest-less patch is SKIPPED with `redirect_pipenv_skipped`
+    /// and the requirements.txt / uv.lock rewrite still lands.
+    #[test]
+    fn non_conflict_refusals_do_not_veto_sibling_rewriters() {
+        let dep = dependency("urllib3", "1.26.18", "patch-one");
+        let stale_locks = [
+            // no entry for the package at all
+            lock().replace("\"urllib3\"", "\"other-package\""),
+            // pipfile-spec 5
+            lock().replace("\"pipfile-spec\": 6", "\"pipfile-spec\": 5"),
+            // unparseable
+            "{".to_owned(),
+            // BOM-prefixed but otherwise fine is NOT a skip: it must plan.
+        ];
+        for stale in &stale_locks {
+            let files = BTreeMap::from([
+                ("Pipfile.lock".to_string(), stale.clone()),
+                ("requirements.txt".to_string(), "urllib3==1.26.18\n".to_string()),
+            ]);
+            let result = super::super::rewrite_registry_redirect(&files, std::slice::from_ref(&dep));
+            assert!(
+                !result.refused_pipenv_uuids.contains("patch-one"),
+                "a non-conflict must not veto: {stale}"
+            );
+            assert!(
+                result.warnings.iter().any(|w| w.code == "redirect_pipenv_skipped"),
+                "{:?}",
+                result.warnings
+            );
+            assert!(
+                result.files.get("requirements.txt").is_some_and(|t| t.contains("patch.socket.dev")),
+                "requirements.txt must still be redirected past a stale Pipfile.lock: {result:?}"
+            );
+            assert!(!result.files.contains_key("Pipfile.lock"));
+        }
+        // A digest-less patch is a skip too (the other rewriters decide for
+        // themselves whether they need one).
+        let mut no_digest = dep.clone();
+        no_digest.integrity.sha256 = None;
+        let mut result = RewriteResult::default();
+        rewrite(
+            &BTreeMap::from([("Pipfile.lock".to_string(), lock())]),
+            std::slice::from_ref(&no_digest),
+            None,
+            &mut result,
+        );
+        assert!(result.refused_pipenv_uuids.is_empty());
+        assert_eq!(result.warnings[0].code, "redirect_pipenv_skipped");
+    }
+
+    #[test]
+    fn bom_prefixed_lock_is_rewritten_and_restored_with_the_bom_intact() {
+        let dep = dependency("urllib3", "1.26.18", "patch-one");
+        let original = format!("\u{feff}{}", lock());
+        let (text, edits) = plan(&original, &dep, None).unwrap();
+        assert!(text.starts_with('\u{feff}'), "the BOM is preserved");
+        assert!(text.contains("patch.socket.dev"));
+        let mut restored = text;
+        for edit in edits.iter().rev() {
+            restored = restore(&restored, edit).unwrap();
+        }
+        assert_eq!(restored, original);
     }
 
     #[test]
