@@ -1,28 +1,171 @@
-# Poetry patches
+# Poetry compatibility and production backtests
 
-Hosted mode rewrites `poetry.lock` to a URL source. Vendored mode writes a local wheel source. Both retain the package version, dependencies, groups, markers, extras, and the pyproject content hash. No pyproject edits are required. Repeated scans leave the lock unchanged; rollback restores the recorded originals. A forked target, an existing unrelated source, an unsupported format, or a wheel/package mismatch is refused before writing.
+`socket-patch` supports hosted and vendored Python patches in every
+`poetry.lock` generation Poetry has written, and agent mode (in-place
+patching of the project's virtualenv) on every Poetry release. The tests use
+real Poetry releases bootstrapped with uv, real PyPI artifacts, and the public
+Socket patch service. Successful rewriting alone is not an installation result:
+the backtest reinstalls from the rewritten lock and compares the installed bytes
+with the published patch.
 
-The committed native locks cover Poetry 0.12.17, 1.0.10, 1.1.15, 1.2.2, 1.3.2, 1.4.2, 1.5.1, 1.6.1, 1.7.1, 1.8.5, 2.0.1, 2.1.4, 2.2.1, 2.3.4, and 2.4.3. They cover legacy `metadata.hashes`, `metadata.files` in lock 1.0/1.1, and package `files` in lock 2.0/2.1.
+This supplements the [hosted](hosted-production-e2e.md) and
+[vendored](vendored-production-e2e.md) production suites and mirrors the
+[uv matrix](uv-compatibility.md). See the
+[ecosystem matrix](../ecosystems.md#mode--ecosystem-matrix) for other package
+managers.
 
-| Poetry | Vendored | Hosted | Installer integrity |
-| --- | --- | --- | --- |
-| 0.12 | Supported | Refused: the installer ignores URL sources | Local wheel hashes are not checked by Poetry |
-| 1.0 | Supported | Supported with a SHA-256 URL fragment | Hosted hashes are checked by pip; local wheel hashes are not checked |
-| 1.1–1.3 | Supported | Supported | Hosted hashes are checked; local wheel hashes are not checked |
-| 1.4–1.8 | Supported | Supported | Both modes reject mismatched lock hashes |
-| 2.0–2.4 | Supported | Supported | Both modes reject mismatched lock hashes |
+## Formats and rewrite behavior
 
-Poetry 1.0 requires a `source.reference` even for archive sources and appends `#egg` unconditionally. Its hosted URL fragment therefore ends with a separator to preserve the SHA-256 parameter. Poetry 1.2 drops URL hashes from `metadata.files`; lock 1.1 hosted rewrites also write `package.files`, while retaining `metadata.files` for Poetry 1.1.
+| Lock generation (writer) | Hosted (`scan --mode hosted`) | Vendored (`scan --mode vendored`) |
+| --- | --- | --- |
+| `[metadata.hashes]`, no `lock-version` (Poetry 0.12) | **Refused** (`redirect_poetry_lock_unsupported`): the installer ignores `[package.source] type = "url"` and installs the registry artifact, so a rewrite would attest a patch that never lands. | `[package.source] type = "file"` + `reference = ""` (read unconditionally by 0.12) and the wheel's SHA-256 in `[metadata.hashes]`. |
+| `lock-version = "1.0"` (Poetry 1.0) | `type = "url"` + `reference = ""`; the URL carries `#sha256=<hex>&` because Poetry 1.0 appends `#egg=<name>` unconditionally and pip ≥ 22 would otherwise read `<hex>#egg=…` as the digest. pip verifies the fragment; the `[metadata.files]` entry is written for consistency but is not consulted for URL sources. | `type = "file"` + `reference = ""`; `[metadata.files]` entry replaced. |
+| `lock-version = "1.1"` (Poetry 1.1, 1.2) | `type = "url"`; the patched hash is written to BOTH `[metadata.files]` (what Poetry 1.1 verifies) and the package's own `files` (what Poetry 1.2 verifies — it drops URL hashes from `[metadata.files]`). | `type = "file"`; `[metadata.files]` entry replaced. |
+| `lock-version = "2.0"` / `"2.1"` / any `"2.<n>"` (Poetry 1.3+) | `type = "url"`; `files = [{file, hash}]` replaced with the single patched wheel. | `type = "file"`; `files` replaced. LF 2.x locks keep Poetry's own multi-line `files` formatting; CRLF locks and legacy formats go through the shared toml_edit rewriter, which writes a single-line inline array. Both are valid TOML and byte-stable under `poetry check --lock`. |
 
-The vendor warning `pypi_poetry_integrity_unverified` is emitted for lock formats readable by Poetry before 1.4. Upgrade the installer to at least 1.4 for local wheel hash enforcement. These older installers still install the patched bytes; the live backtest verifies the installed files against the patch record's SHA-256 Git blob hashes and separately records their inability to reject a changed lock hash.
+Both modes retain the package version, dependencies, groups, markers, extras
+and the pyproject `content-hash`; no pyproject edit is required. A repeated
+scan leaves the lock unchanged. Rollback restores the recorded original
+fragments — one per patch (plus the integrity-table entry on legacy formats),
+so either of two patches can be rolled back first and unrelated edits survive.
+Refused before any write: a `[[package]]` listed at several versions (marker
+fork), a user-authored `[package.source]` on another origin (an earlier Socket
+URL for the same wheel is superseded in place, e.g. after a grant-token
+rotation), an unsupported `lock-version`, a malformed `[metadata.files]` /
+`[metadata.hashes]` value, and a wheel whose filename does not match the
+locked package.
 
-Run the local Rust coverage:
+## Installer boundaries (measured)
+
+| Poetry | Hosted | Vendored | Verifies the lock hash on install | Replaces an already-installed same-version package |
+| --- | --- | --- | --- | --- |
+| 0.12 | refused (URL sources ignored) | supported | no | no |
+| 1.0 | supported (`#sha256=…&` fragment) | supported | hosted: yes (pip fragment); vendored: no | no |
+| 1.1 – 1.3 | supported | supported | hosted: yes; vendored: no | **no** |
+| 1.4 – 1.8 | supported | supported | yes / yes | yes |
+| 2.0 – 2.4 | supported | supported | yes / yes | yes |
+
+Two consequences for Poetry releases before 1.4:
+
+- A **warm virtualenv keeps the upstream package** after the lock is rewritten:
+  `poetry install` compares installed packages by name and version only and
+  prints "No dependencies to install or update". Recreate the virtualenv (or
+  `pip uninstall` the package) before installing, or upgrade Poetry. Fresh
+  installs pick up the patched wheel on every release. The CLI flags this as
+  `redirect_poetry_stale_install_risk` (hosted) and
+  `pypi_poetry_integrity_unverified` (vendored), keyed on the lock's writer:
+  formats 0 / 1.0 / 1.1 are only written by pre-1.4 releases, and a lock 2.0
+  whose header lacks a `@generated by Poetry X.Y.Z` version was written by 1.3
+  (1.4+ stamp their version). A 2.0 lock stamped 1.4–1.8 is not flagged.
+- Local (vendored) wheel hashes are **not verified**; the committed wheel bytes
+  are the protection — review them. Hosted URL hashes are verified on every
+  release from 1.0 on by the default installer (Poetry's deprecated pip backend,
+  `experimental.new-installer = false`, verifies nothing).
+
+Other measured details:
+
+- `poetry lock --no-update` (1.1–1.8) and bare `poetry lock` (2.x) keep the
+  patch source. Bare `poetry lock` on 0.12 / 1.0 (no `--no-update`),
+  `poetry lock --regenerate` (2.x), `poetry update` (with or without `--lock`)
+  and `poetry update <patched-package>` — even when the version does not
+  change — drop the source and restore the registry hashes on every release.
+  `metadata.content-hash` is unchanged by that, so `poetry check --lock` /
+  `poetry lock --check` cannot detect the loss: re-run
+  `socket-patch scan --mode …` after any of them, or gate CI on `socket-patch vex`.
+- Poetry 0.12 and 1.0 resolve a relative `type = "file"` path against the
+  shell's working directory, not the project root; run `poetry install` from
+  the project root on those releases.
+- Poetry ≤ 1.1 stores its HTTP cache under the user cache directory regardless
+  of `POETRY_CACHE_DIR`, behind one lockfile that wedges parallel runs and stays
+  wedged after a SIGKILL; the harness gives each legacy case its own `HOME`.
+
+## Mode notes
+
+- **Agent mode** patches the interpreter the crawler finds: `VIRTUAL_ENV`,
+  `./.venv`, `./venv`, else — for a project directory — the global interpreter's
+  site-packages. Poetry's default virtualenv lives outside the project
+  (`virtualenvs.in-project` unset), so run the CLI as `poetry run socket-patch
+  scan` (Poetry exports `VIRTUAL_ENV`), export `VIRTUAL_ENV=$(poetry env info -p)`,
+  or pass `--global-prefix <venv site-packages>`; the matrix's out-of-tree leg
+  uses `poetry run`. A bare `socket-patch rollback` outside that context does not
+  see the venv either. Patched bytes survive `poetry install`, `poetry sync` and
+  `poetry install --sync` on every release (same version → no reinstall).
+- **Vendored mode needs the package installed** (in the discovered virtualenv)
+  when it runs: the `poetry.lock` inventory is discovery-only, so a
+  lock-only checkout is skipped with `vendor_fetch_unverifiable` +
+  `package_not_installed` (uv's lock inventory carries integrity and vendors
+  lock-only). Commit the `.socket/vendor/` tree and rewired lock from the
+  machine that ran the scan; fresh clones then install from the committed wheel
+  with no CLI at all (verified by the matrix's fresh-clone leg).
+- **Hosted mode works lock-only** (`redirected: 1` with no virtualenv).
+
+## Running the matrix
 
 ```sh
-cargo test -p socket-patch-core --lib vendor::pypi_poetry
-cargo test -p socket-patch-core --test poetry_hosted
+cargo build -p socket-patch-cli
+cp target/debug/socket-patch /tmp/socket-patch-under-test   # rebuilds must not swap it mid-run
+python3 scripts/backtest-poetry.py \
+  --cli /tmp/socket-patch-under-test \
+  --cli-revision "$(git rev-parse --short HEAD)" \
+  --output /tmp/socket-patch-poetry-backtest \
+  --modes hosted vendored agent agent-oot setup \
+  --shapes direct populated crlf pep621
+python3 scripts/backtest-poetry.py --render-doc-table /tmp/socket-patch-poetry-backtest/summary.json
 ```
 
-The live installer harness is `tools/pipeline/poetry-patch-backtest.py` in SocketDev/depscan. It uses public PyPI and the real patch API, bootstraps the actual Poetry versions with uv, captures both CLI modes, checks repeat scans and unchanged lockfiles, verifies installed patch bytes, and tests tampered hashes. Its additional shapes cover dev dependencies, selected and excluded optional extras, Python markers, groups, PEP 621, transitive requests dependencies, and CRLF files. The edge inputs are derived from native locks; their content hashes are computed by the matching Poetry library before running the real installer.
+The harness bootstraps every release in `VERSIONS` with uv (Python 3.8.20 for
+0.12–1.1, 3.12.13 for 1.2+; Poetry 1.2.2 needs `cleo==1.0.0a5`), generates a
+native lock for a one-dependency project (`urllib3 = "1.26.18"`, whose public
+free-tier patch needs no token), and for each mode checks: exactly one patch
+applied, pyproject untouched, idempotent re-scan, `poetry install` into an
+emptied virtualenv installs bytes matching the patch record's `afterHash`,
+`poetry check --lock`, a fresh clone of the committed state installs the patch,
+`socket-patch vex` attests it, a corrupted hash is rejected where the installer
+verifies, Poetry's own relock keeps the source, and `rollback` restores every
+byte and clears the ledgers. Shapes: `direct` (the committed native fixture),
+`populated` (legacy locks with real upstream hashes filled in — today's PyPI
+JSON API leaves old Poetry's `[metadata.files]` empty), `crlf`, and `pep621`
+(2.x `[project]` tables with `package-mode = false`). Modes `agent-oot`
+(Poetry's default out-of-tree virtualenv via `poetry run`) and `setup`
+(`socket-patch setup` on a Poetry project, then `poetry lock`) are
+informational.
 
-`poetry update` and lock regeneration can replace a patch source with an upstream source. Re-run Socket Patch after changing the dependency resolution.
+Rust coverage of the rewriters: `cargo test -p socket-patch-core --lib
+utils::poetry_lock vendor::pypi_poetry` and `cargo test -p socket-patch-core
+--test poetry_hosted`. The committed native locks under
+`crates/socket-patch-core/tests/fixtures/poetry/<version>/` are the harness's
+`original/` inputs (same pyproject, same `content-hash`).
+
+## Results
+
+<!-- GENERATED:BEGIN — everything down to GENERATED:END is printed by
+     `python3 scripts/backtest-poetry.py --render-doc-table docs/testing/poetry-compatibility/results.json`;
+     regenerate rather than hand-edit. -->
+| Poetry | hosted | vendored | agent (in-project venv) | agent (`poetry run`, out-of-tree venv) | tamper rejected (hosted / vendored) | warm venv re-installed (hosted / vendored) | relock keeps patch (hosted / vendored) | lock-only vendored |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.12.17 | refused (0.x ignores URL sources) | pass (crlf,direct,populated) | pass (direct) | n/a | n/a / no | n/a / false | n/a / false | refused |
+| 1.0.10 | pass (crlf,direct,populated) | pass (crlf,direct,populated) | pass (direct) | pass (direct) | yes / no | false / false | false / false | refused |
+| 1.1.15 | pass (crlf,direct,populated) | pass (crlf,direct,populated) | pass (direct) | pass (direct) | yes / no | false / false | true / true | refused |
+| 1.2.2 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / no | false / false | true / true | refused |
+| 1.3.2 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / no | false / false | true / true | refused |
+| 1.4.2 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
+| 1.5.1 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
+| 1.6.1 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
+| 1.7.1 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
+| 1.8.5 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
+| 2.0.1 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
+| 2.1.4 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
+| 2.2.1 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
+| 2.3.4 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
+| 2.4.3 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
+<!-- GENERATED:END -->
+
+Captured 2026-09-17 on macOS arm64 against the CLI at the PR head; 108 cases,
+all passing (the `pass`/`refused` cells are the asserted outcomes, the
+`tamper` / `warm venv` / `relock` / `lock-only vendored` columns are the
+measured installer facts the sections above describe). The
+[machine-readable results](poetry-compatibility/results.json) carry every
+check, the CLI envelopes' relevant fields and the per-step exit codes.
+`poetry lock` on 0.12 / 1.0 is bare (no `--no-update`), hence
+`relock keeps patch = false` there. The companion SBOM annotation work and its
+own capture set live in SocketDev/depscan (`tools/pipeline/poetry-patch-backtest.py`).
