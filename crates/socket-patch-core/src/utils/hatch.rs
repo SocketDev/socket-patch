@@ -230,12 +230,90 @@ fn rewrite_environments(
     Ok(matched)
 }
 
+pub struct HatchPermission {
+    pub file: String,
+    pub original: String,
+    pub new: String,
+}
+
+pub struct HatchPlan {
+    pub files: BTreeMap<String, String>,
+    pub permission: Option<HatchPermission>,
+}
+
 pub fn rewrite(
     files: &BTreeMap<String, String>,
     name: &str,
     version: &str,
     url: &str,
 ) -> Result<BTreeMap<String, String>, String> {
+    plan(files, name, version, url).map(|plan| plan.files)
+}
+
+fn enable_permission(document: &mut DocumentMut, external: bool) -> Result<(), String> {
+    let keys: &[&str] = if external {
+        &["metadata"]
+    } else {
+        &["tool", "hatch", "metadata"]
+    };
+    let mut table: &mut dyn toml_edit::TableLike = document.as_table_mut();
+    for key in keys {
+        if !table.contains_key(key) {
+            table.insert(key, Item::Table(toml_edit::Table::new()));
+        }
+        table = table
+            .get_mut(key)
+            .and_then(Item::as_table_like_mut)
+            .ok_or_else(|| format!("{key} must be a TOML table"))?;
+    }
+    if table
+        .get("allow-direct-references")
+        .is_some_and(|item| !item.is_bool())
+    {
+        return Err("allow-direct-references must be a boolean".into());
+    }
+    table.insert("allow-direct-references", toml_edit::value(true));
+    Ok(())
+}
+
+pub fn has_project_direct_references(files: &BTreeMap<String, String>) -> bool {
+    let Some(document) = files
+        .get("pyproject.toml")
+        .and_then(|text| text.parse::<DocumentMut>().ok())
+    else {
+        return false;
+    };
+    let project = document.get("project");
+    let mut arrays = Vec::new();
+    if let Some(dependencies) = project
+        .and_then(|project| project.get("dependencies"))
+        .and_then(Item::as_array)
+    {
+        arrays.push(dependencies);
+    }
+    for groups in [
+        project.and_then(|project| project.get("optional-dependencies")),
+        document.get("dependency-groups"),
+    ] {
+        if let Some(groups) = groups.and_then(Item::as_table_like) {
+            arrays.extend(groups.iter().filter_map(|(_, value)| value.as_array()));
+        }
+    }
+    arrays.iter().any(|array| {
+        array.iter().filter_map(Value::as_str).any(|spec| {
+            spec.split(';')
+                .next()
+                .is_some_and(|requirement| requirement.contains('@'))
+        })
+    })
+}
+
+pub fn plan(
+    files: &BTreeMap<String, String>,
+    name: &str,
+    version: &str,
+    url: &str,
+) -> Result<HatchPlan, String> {
     let name = canonicalize_pypi_name(name);
     let mut documents = BTreeMap::new();
     for file in ["pyproject.toml", "hatch.toml"] {
@@ -245,6 +323,24 @@ pub fn rewrite(
                 text.parse::<DocumentMut>()
                     .map_err(|error| format!("{file}: {error}"))?,
             );
+        }
+    }
+    if url.starts_with("{root:uri}") {
+        for document in documents.values() {
+            let hatch = document
+                .get("tool")
+                .and_then(|tool| tool.get("hatch"))
+                .unwrap_or(document.as_item());
+            if hatch
+                .get("envs")
+                .and_then(Item::as_table_like)
+                .is_some_and(|envs| {
+                    envs.iter()
+                        .any(|(_, env)| env.get("installer").and_then(Item::as_str) == Some("uv"))
+                })
+            {
+                return Err("vendored Hatch wheels require the pip installer: uv does not enforce local wheel fragment hashes".into());
+            }
         }
     }
     let mut matched = 0;
@@ -288,27 +384,39 @@ pub fn rewrite(
     if matched == 0 {
         return Err(format!("{name}=={version} has no explicit Hatch declaration; transitive-only dependencies require the install hook"));
     }
-    if project_matched > 0 {
-        if external_keys.iter().any(|key| key == "metadata") {
-            documents
-                .get_mut("hatch.toml")
-                .ok_or("missing Hatch configuration")?["metadata"]["allow-direct-references"] =
-                toml_edit::value(true);
+    let permission = if project_matched > 0 {
+        let external = external_keys.iter().any(|key| key == "metadata");
+        let file = if external {
+            "hatch.toml"
         } else {
-            documents
-                .get_mut("pyproject.toml")
-                .ok_or("missing project")?["tool"]["hatch"]["metadata"]
-                ["allow-direct-references"] = toml_edit::value(true);
-        }
-    }
-    Ok(documents
+            "pyproject.toml"
+        };
+        let document = documents
+            .get_mut(file)
+            .ok_or("missing Hatch configuration")?;
+        enable_permission(document, external)?;
+        let original = files[file].clone();
+        let mut permission_only = original
+            .parse::<DocumentMut>()
+            .map_err(|error| error.to_string())?;
+        enable_permission(&mut permission_only, external)?;
+        Some(HatchPermission {
+            file: file.into(),
+            new: preserve_line_endings(&original, permission_only.to_string()),
+            original,
+        })
+    } else {
+        None
+    };
+    let files = documents
         .into_iter()
         .filter_map(|(name, document)| {
             let original = &files[name];
             let new = preserve_line_endings(original, document.to_string());
             (new != *original).then_some((name.to_owned(), new))
         })
-        .collect())
+        .collect();
+    Ok(HatchPlan { files, permission })
 }
 
 #[cfg(test)]
@@ -371,7 +479,11 @@ mod tests {
         let result = rewrite(&inputs, "urllib3", "1.26.18", "https://patch.test/a.whl").unwrap();
         assert!(result["pyproject.toml"].contains("urllib3>=0"));
         assert!(!result["pyproject.toml"].contains("allow-direct-references"));
-        assert!(result["hatch.toml"].contains("allow-direct-references= true"));
+        let document = result["hatch.toml"].parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            document["metadata"]["allow-direct-references"].as_bool(),
+            Some(true)
+        );
     }
 
     #[test]
@@ -384,6 +496,8 @@ mod tests {
             "[tool.hatch.envs.default]\ndependencies=[\"urllib3==1.26.18\"]\n[tool.hatch.envs.default.overrides]\nplatform.windows.dependencies=[\"urllib3==1.26.18\"]",
             "[tool.hatch.envs.default]\ndependencies=[\"requests==2.31.0\"]",
             "[project]\ndependencies=[false]",
+            "[project]\ndependencies=[\"urllib3==1.26.18\"]\n[tool.hatch]\nmetadata=false",
+            "[project]\ndependencies=[\"urllib3==1.26.18\"]\n[tool]\nhatch=false",
             "[project]\ndependencies=[\"urllib3==1.26.18\\nidna==3.6\"]",
         ] {
             assert!(rewrite(&files(text), "urllib3", "1.26.18", "https://patch.test/a.whl").is_err(), "{text}");

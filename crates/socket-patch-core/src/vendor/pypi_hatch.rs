@@ -40,6 +40,9 @@ pub(super) async fn load(
     uuid: &str,
 ) -> Result<HatchProject, Failure> {
     let files = read_files(root).await?;
+    if std::env::var("HATCH_ENV_TYPE_VIRTUAL_UV_PATH").is_ok_and(|path| !path.is_empty()) {
+        return Err(("pypi_hatch_unsupported", "vendored Hatch wheels require the pip installer: uv does not enforce local wheel fragment hashes".into()));
+    }
     let prefix = format!("{{root:uri}}/.socket/vendor/pypi/{uuid}/");
     let state = super::state::load_state(root)
         .await
@@ -175,24 +178,54 @@ pub(super) async fn wire(
     hash: &str,
 ) -> Result<Vec<WiringRecord>, Failure> {
     let url = format!("{{root:uri}}/{wheel}#sha256={hash}");
-    let edits = hatch::rewrite(&project.files, name, version, &url)
+    let plan = hatch::plan(&project.files, name, version, &url)
         .map_err(|error| ("pypi_hatch_unsupported", error))?;
-    write_files(root, &project.files, &edits)
+    let mut originals = project.files.clone();
+    let mut permission_record = None;
+    if let Some(permission) = plan.permission {
+        originals.insert(permission.file.clone(), permission.new.clone());
+        let state = super::state::load_state(root)
+            .await
+            .map_err(|error| ("pypi_hatch_ledger_invalid", error.to_string()))?;
+        permission_record = Some(
+            state
+                .entries
+                .values()
+                .flat_map(|entry| &entry.wiring)
+                .find(|record| record.kind == "hatch_permission" && record.file == permission.file)
+                .cloned()
+                .unwrap_or_else(|| {
+                    record(
+                        &permission.file,
+                        "hatch_permission",
+                        WiringAction::Rewritten,
+                        "allow-direct-references",
+                        Some(permission.original),
+                        permission.new,
+                    )
+                }),
+        );
+    }
+    write_files(root, &project.files, &plan.files)
         .await
         .map_err(|error| ("pypi_hatch_write_failed", error))?;
-    Ok(edits
+    let mut records: Vec<WiringRecord> = plan
+        .files
         .into_iter()
+        .filter(|(file, new)| originals.get(file) != Some(new))
         .map(|(file, new)| {
             record(
                 &file,
                 KIND,
                 WiringAction::Rewritten,
                 name,
-                project.files.get(&file).cloned(),
+                originals.get(&file).cloned(),
                 new,
             )
         })
-        .collect())
+        .collect();
+    records.extend(permission_record);
+    Ok(records)
 }
 
 pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> RevertOutcome {
@@ -201,7 +234,12 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
         Err((_, error)) => return RevertOutcome::failed(error),
     };
     let mut edits = BTreeMap::new();
-    for record in entry.wiring.iter().rev() {
+    for record in entry
+        .wiring
+        .iter()
+        .rev()
+        .filter(|record| record.kind != "hatch_permission")
+    {
         if !matches!(record.file.as_str(), "pyproject.toml" | "hatch.toml") || record.kind != KIND {
             return RevertOutcome::failed("invalid Hatch wiring record");
         }
@@ -222,25 +260,38 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
             Err(error) => return RevertOutcome::failed(error),
         }
     }
-    let state = match super::state::load_state(root).await {
-        Ok(state) => state,
-        Err(error) => return RevertOutcome::failed(error.to_string()),
-    };
-    let other_hatch_patch = state
-        .entries
-        .values()
-        .any(|other| other.uuid != entry.uuid && other.flavor.as_deref() == Some("hatch"));
-    if other_hatch_patch
-        && edits.iter().any(|(file, restored)| {
-            files
-                .get(file)
-                .is_some_and(|live| permission_enabled(live, file))
-                && !permission_enabled(restored, file)
-        })
-    {
-        return RevertOutcome::failed(
-            "revert later Hatch patches first: they share the direct-reference permission",
-        );
+    let mut restored_files = files.clone();
+    restored_files.extend(edits.clone());
+    if !hatch::has_project_direct_references(&restored_files) {
+        for permission in entry
+            .wiring
+            .iter()
+            .filter(|record| record.kind == "hatch_permission")
+        {
+            if !matches!(permission.file.as_str(), "pyproject.toml" | "hatch.toml") {
+                return RevertOutcome::failed("invalid Hatch permission record");
+            }
+            let (Some(original), Some(new), Some(live)) = (
+                permission
+                    .original
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str),
+                permission.new.as_ref().and_then(serde_json::Value::as_str),
+                restored_files.get(&permission.file),
+            ) else {
+                return RevertOutcome::failed("missing Hatch permission document");
+            };
+            match super::pypi_lock::restore_document(live, original, new) {
+                Ok((restored, false)) => {
+                    edits.insert(permission.file.clone(), restored);
+                }
+                _ => {
+                    return RevertOutcome::failed(
+                        "Hatch direct-reference permission changed since patching",
+                    )
+                }
+            }
+        }
     }
     if !dry_run {
         if let Err(error) = write_files(root, &files, &edits).await {
@@ -248,22 +299,6 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
         }
     }
     RevertOutcome::ok()
-}
-
-fn permission_enabled(text: &str, file: &str) -> bool {
-    text.parse::<toml_edit::DocumentMut>()
-        .is_ok_and(|document| {
-            let hatch = if file == "hatch.toml" {
-                Some(document.as_item())
-            } else {
-                document.get("tool").and_then(|tool| tool.get("hatch"))
-            };
-            hatch
-                .and_then(|hatch| hatch.get("metadata"))
-                .and_then(|metadata| metadata.get("allow-direct-references"))
-                .and_then(toml_edit::Item::as_bool)
-                == Some(true)
-        })
 }
 
 #[cfg(test)]
@@ -387,7 +422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_permission_refuses_out_of_order_and_lifo_restores() {
+    async fn shared_permission_survives_selective_and_preserved_rollback() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         tokio::fs::write(root.join("pyproject.toml"), ORIGINAL)
@@ -412,16 +447,15 @@ mod tests {
         let both = tokio::fs::read_to_string(root.join("pyproject.toml"))
             .await
             .unwrap();
-        assert!(!revert(&entries[0], root, false).await.success);
-        assert_eq!(
-            tokio::fs::read_to_string(root.join("pyproject.toml"))
-                .await
-                .unwrap(),
-            both
-        );
+        assert!(revert(&entries[0], root, false).await.success);
+        let remaining = tokio::fs::read_to_string(root.join("pyproject.toml"))
+            .await
+            .unwrap();
+        assert_ne!(remaining, both);
+        assert!(remaining.contains("allow-direct-references = true"));
+        assert!(remaining.contains("two-2-py3-none-any.whl"));
         assert!(revert(&entries[1], root, false).await.success);
-        state.entries.remove("two");
-        save_state(root, &state).await.unwrap();
+
         assert!(revert(&entries[0], root, false).await.success);
         assert_eq!(
             tokio::fs::read_to_string(root.join("pyproject.toml"))

@@ -176,6 +176,7 @@ pub struct RewriteResult {
     pub refused_pnpm_uuids: std::collections::BTreeSet<String>,
     pub hatch_uuids: std::collections::BTreeSet<String>,
     pub confirmed_hatch_uuids: std::collections::BTreeSet<String>,
+    pub confirmed_requirements_uuids: std::collections::BTreeSet<String>,
 }
 
 /// Combined name as it appears in registry coordinates / lock keys.
@@ -233,7 +234,6 @@ fn rewrite_hatch(
     result: &mut RewriteResult,
 ) {
     if !crate::utils::hatch::is_hatch(files)
-        || files.keys().any(|file| file.starts_with("requirements") && file.ends_with(".txt"))
         || files.keys().any(|file| {
             matches!(
                 file.as_str(),
@@ -241,6 +241,11 @@ fn rewrite_hatch(
             ) || crate::utils::python_lock::is_python_lock_name(file)
         })
     {
+        return;
+    }
+    if files.contains_key("requirements.txt") {
+        result.hatch_uuids.extend(overrides.iter().filter(|dep| dep.ecosystem == "pypi").map(|dep| dep.patch_uuid.clone()));
+        result.confirmed_hatch_uuids.extend(result.confirmed_requirements_uuids.iter().cloned());
         return;
     }
     let mut current = files.clone();
@@ -13214,6 +13219,14 @@ mod hatch_tests {
         assert!(result.confirmed_hatch_uuids.is_empty());
         assert!(result.files.is_empty());
         assert!(result.warnings.iter().any(|warning| warning.code == "redirect_hatch_unsupported"));
+        let mut files = files;
+        files.insert("requirements.txt".into(), String::new());
+        let result = rewrite_registry_redirect(&files, &[patch()]);
+        assert!(result.hatch_uuids.contains("test-uuid"));
+        assert!(result.confirmed_hatch_uuids.is_empty());
+        files.insert("requirements.txt".into(), "urllib3==1.26.18\n".into());
+        let result = rewrite_registry_redirect(&files, &[patch()]);
+        assert!(result.confirmed_hatch_uuids.contains("test-uuid"));
     }
 
     #[test]

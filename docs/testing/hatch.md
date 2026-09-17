@@ -8,6 +8,8 @@ Project references enable Hatchling's `allow-direct-references` setting.
 Vendored references use `{root:uri}` so checkouts remain relocatable.
 Environment references require Hatch >=1.2 on PATH; preflight verifies the
 installed version because Hatch 1.0 and 1.1 do not expand that context.
+Vendored Hatch requires the pip installer; uv currently ignores hash
+fragments for local wheels. Hosted Hatch supports both pip and uv.
 Both modes pin the wheel SHA-256, preserve extras, markers, comments and
 line endings, and record reversible document edits.
 
@@ -26,9 +28,10 @@ Repeated vendored scans compare the declared source with the committed
 artifact path and digest, and verify an existing wheel's bytes. Missing
 wheels may be rebuilt only against that recorded pin. Ledgerless direct
 references and drifted sources are refused. Concurrent manifest edits and
-symlinks are also refused. Revert later Hatch patches first when an older
-patch owns a direct-reference permission that they still need; attempting
-that selective rollback out of order leaves every file unchanged.
+symlinks are also refused. Each project patch records shared ownership of the direct-reference
+permission. Selective and preserved rollback retain the setting while any
+project direct reference remains, and restore its original value after the
+last reference is unwired.
 
 Focused Rust checks:
 
