@@ -81,6 +81,11 @@ Other measured details:
   `metadata.content-hash` is unchanged by that, so `poetry check --lock` /
   `poetry lock --check` cannot detect the loss: re-run
   `socket-patch scan --mode …` after any of them, or gate CI on `socket-patch vex`.
+- `poetry lock --no-update` on Poetry 1.1 / 1.2 keeps the hosted source but
+  rewrites the entry in its own lock-1.1 shape, dropping the package-level
+  `files` the rewrite added for Poetry ≥ 1.2's hash check; a lock relocked by
+  1.1 and then installed by 1.2+ installs the hosted wheel unverified. Re-run
+  `socket-patch scan --mode hosted` after relocking on those releases.
 - Poetry 0.12 and 1.0 resolve a relative `type = "file"` path against the
   shell's working directory, not the project root; run `poetry install` from
   the project root on those releases.

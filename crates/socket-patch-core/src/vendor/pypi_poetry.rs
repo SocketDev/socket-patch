@@ -900,6 +900,80 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
         }
     }
 
+    /// A newer ledger's record this build cannot replay (unknown kind /
+    /// foreign file) is skipped with a warning; it must NOT hold the atomic
+    /// write hostage — the fragments this build does understand are restored.
+    #[tokio::test]
+    async fn atomic_revert_ignores_unknown_records_but_holds_on_drift() {
+        let native =
+            include_str!("../../tests/fixtures/poetry/1.2.2/poetry.lock").replace("\r\n", "\n");
+        let tmp = write_project(&native, PYPROJECT_DIRECT).await;
+        let project = load_poetry_project(tmp.path()).await.unwrap();
+        let wheel = "urllib3-1.26.18-py2.py3-none-any.whl";
+        let path = format!(".socket/vendor/pypi/{UUID}/{wheel}");
+        let (mut wiring, meta) = wire_poetry(
+            &project,
+            tmp.path(),
+            "urllib3",
+            "1.26.18",
+            &path,
+            wheel,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        assert_eq!(wiring.len(), 2, "source table + metadata.files entry");
+        wiring.push(record(
+            "poetry.lock",
+            "poetry_future_kind",
+            WiringAction::Rewritten,
+            "urllib3",
+            Some("x".into()),
+            "y".into(),
+        ));
+        wiring.push(record(
+            "pyproject.toml",
+            KIND_LOCK_PACKAGE,
+            WiringAction::Rewritten,
+            "urllib3",
+            Some("x".into()),
+            "y".into(),
+        ));
+        let outcome = revert_poetry(&entry_for(wiring.clone(), meta.clone()), tmp.path(), false).await;
+        assert!(outcome.success);
+        assert_eq!(outcome.warnings.len(), 2, "{:?}", outcome.warnings);
+        assert!(outcome
+            .warnings
+            .iter()
+            .all(|w| w.code == "vendor_lock_entry_drifted"));
+        assert_eq!(read_lock(tmp.path()).await, native, "known fragments restored");
+
+        // Re-wire, then drift one fragment: now the atomic write must hold.
+        let project = load_poetry_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_poetry(
+            &project,
+            tmp.path(),
+            "urllib3",
+            "1.26.18",
+            &path,
+            wheel,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap();
+        let drifted = read_lock(tmp.path())
+            .await
+            .replace("HTTP library", "Edited description");
+        tokio::fs::write(tmp.path().join("poetry.lock"), &drifted)
+            .await
+            .unwrap();
+        let outcome = revert_poetry(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(!outcome.warnings.is_empty());
+        assert_eq!(read_lock(tmp.path()).await, drifted, "half-restore refused");
+    }
+
     #[tokio::test]
     async fn legacy_revert_keeps_source_and_hash_together_on_drift() {
         let native =
