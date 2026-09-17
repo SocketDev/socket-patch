@@ -597,6 +597,12 @@ def main():
         if case.exists():
             shutil.rmtree(case)
         case.mkdir(parents=True)
+        if major < 3 and shape == "transitive":
+            # Pipenv 0.x has no `pipfile` module to stamp the Pipfile content
+            # hash with, so the transitive Pipfile cannot be paired with the
+            # generated lock (`pipenv install` would re-lock on the mismatch).
+            return {"pipenv": version, "shape": shape, "mode": mode, "invocation": invocation, "pipfileSpec": None, "supported": False,
+                    "expected": "skipped: Pipenv 0.x cannot stamp the transitive Pipfile's content hash", "checks": {}, "info": {}, "passed": True}
         original = native_lock(version, tool, shape)
         project = (case / "nested" / "app") if invocation == "subdir" else (case / "project")
         project.mkdir(parents=True)
@@ -627,9 +633,14 @@ def main():
         # Pipenv 0.x installs plain string pins only: inline-table entries with
         # markers / extras are not understood, so nothing gets installed for
         # agent mode to patch — nothing to measure there.
-        if mode in ("agent", "agent-oot") and major < 3 and shape in ("marker", "marker-excluded", "extras"):
+        if mode in ("agent", "agent-oot") and major < 7 and shape in ("marker", "marker-excluded", "extras"):
+            # Pipenv 0.x–6.x install plain string pins only: inline-table
+            # entries are mis-handled (markers ignored, extras fail to
+            # install), so there is nothing meaningful for agent mode to
+            # measure; hosted/vendored rows for these releases are refusals
+            # judged before any install.
             row["supported"] = False
-            row["expected"] = "skipped: Pipenv 0.x does not understand inline-table (markers/extras) Pipfile entries"
+            row["expected"] = "skipped: Pipenv 0.x–6.x mishandle inline-table (markers/extras) Pipfile entries"
             row["passed"] = True
             return row
 
