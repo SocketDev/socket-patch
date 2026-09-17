@@ -157,6 +157,7 @@ impl VexEmbedArgs {
             doc_id: self.vex_doc_id.clone(),
             compact: self.vex_compact,
             assume_applied: Vec::new(),
+            known_stale: Vec::new(),
         }
     }
 }
@@ -180,6 +181,9 @@ pub(crate) struct VexBuildParams {
     /// standalone `vex` passes an empty list so redirected patches are then
     /// hash-verified against the installed tree like any applied patch.
     pub assume_applied: Vec<String>,
+    /// Hosted probes positively identified unpatched installed bytes. These
+    /// PURLs cannot be attested by another interpreter or --no-verify.
+    pub known_stale: Vec<String>,
 }
 
 /// Successful result of [`generate_vex`].
@@ -233,6 +237,7 @@ pub async fn run(args: VexArgs) -> i32 {
         doc_id: args.doc_id.clone(),
         compact: args.compact,
         assume_applied: Vec::new(),
+        known_stale: Vec::new(),
     };
 
     let manifest_path = args.common.resolved_manifest_path();
@@ -397,14 +402,45 @@ async fn generate_vex(
     // record the run did not re-confirm (a reverted lockfile or a withdrawn
     // patch must not keep attesting).
     if !params.assume_applied.is_empty() {
-        let exempt: std::collections::HashSet<&str> =
-            params.assume_applied.iter().map(|s| s.as_str()).collect();
-        outcome.failed.retain(|f| !exempt.contains(f.purl.as_str()));
-        for purl in &params.assume_applied {
-            if manifest.patches.contains_key(purl) && !outcome.applied.iter().any(|p| p == purl) {
-                outcome.applied.push(purl.clone());
+        use socket_patch_core::utils::purl::strip_purl_qualifiers;
+        // The confirmed purls come from the grant reference (unqualified —
+        // `pkg:pypi/urllib3@1.26.18`) while the ledger records the API's
+        // artifact-qualified purl (`…?artifact_id=py2-py3-none-any-whl`), so
+        // match on the qualifier-stripped form: a lock-only pypi redirect used
+        // to attest nothing and fail the same-run `--vex` with
+        // `no_applicable_patches`.
+        let exempt: std::collections::HashSet<&str> = params
+            .assume_applied
+            .iter()
+            .map(|s| strip_purl_qualifiers(s))
+            .collect();
+        let is_exempt = |purl: &str| exempt.contains(strip_purl_qualifiers(purl));
+        outcome.failed.retain(|f| !is_exempt(&f.purl));
+        for key in manifest.patches.keys() {
+            if is_exempt(key) && !outcome.applied.iter().any(|p| p == key) {
+                outcome.applied.push(key.clone());
             }
         }
+    }
+
+    // Positive evidence from a hosted probe takes precedence over an
+    // assumed redirect or a healthy copy found in a different interpreter.
+    if !params.known_stale.is_empty() {
+        use socket_patch_core::utils::purl::strip_purl_qualifiers;
+        let stale: std::collections::HashSet<&str> = params
+            .known_stale
+            .iter()
+            .map(|purl| strip_purl_qualifiers(purl))
+            .collect();
+        let is_stale = |purl: &str| stale.contains(strip_purl_qualifiers(purl));
+        outcome.applied.retain(|purl| !is_stale(purl));
+        outcome.failed.retain(|failure| !is_stale(&failure.purl));
+        outcome.failed.extend(manifest.patches.keys().filter(|purl| is_stale(purl)).map(
+            |purl| FailedPatch {
+                purl: purl.clone(),
+                reason: "stale_install".to_string(),
+            },
+        ));
     }
 
     // Vendored disclosure: the committed artifact verified (the attestation

@@ -11,8 +11,15 @@ use crate::commands::vex::generate_vex_from_manifest_path;
 
 use super::{discover_selected, ScanArgs};
 
+mod python;
+
 /// Candidate lockfiles / registry configs the redirect rewriters may touch —
 /// read from the project when present and handed to `rewrite_registry_redirect`.
+/// Fragment-edit kinds whose lockfile the package manager re-lays in place
+/// (keeping the Socket source) — a re-scan REBASES their ledger edits instead
+/// of appending; see the ledger merge below.
+const REBASE_KINDS: &[&str] = &["redirect_poetry_lock_package"];
+
 const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "package-lock.json",
     "npm-shrinkwrap.json",
@@ -27,6 +34,9 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "bun.lock",
     "requirements.txt",
     "uv.lock",
+    "poetry.lock",
+    "pdm.lock",
+    "Pipfile.lock",
     "pyproject.toml",
     "hatch.toml",
     "Cargo.toml",
@@ -387,14 +397,13 @@ fn build_redirect_json_envelope(
     result
 }
 
-/// The gem stale-install probe's outcome: warnings for both output channels,
+/// The installed-tree probes' outcome: warnings for both output channels,
 /// plus the stale purls STRUCTURALLY, so the same-run `--vex` can exclude
 /// them from `assume_applied` — an envelope must never attest a CVE its own
-/// warnings say is live. Excluded purls fall back to `vex`'s normal
-/// installed-tree verification: a patched install still attests (with hash
-/// evidence), a stale one is omitted.
+/// warnings say is live. Python also carries positive evidence through VEX
+/// so a different, healthy interpreter cannot mask a stale installation.
 #[derive(Default)]
-struct GemStaleOutcome {
+struct StaleInstallOutcome {
     warnings: Vec<serde_json::Value>,
     stale_purls: std::collections::BTreeSet<String>,
 }
@@ -488,13 +497,13 @@ fn gem_stale_cache_warning(purl: &str, cache_path: &Path) -> serde_json::Value {
 /// already-patched install must not produce a delete prescription.
 /// (`current_hash` is `Some` only when the bytes were really hashed, which
 /// also excludes the absent-new-file `Ready`.)
-async fn gem_stale_positive_evidence(
-    gem_dir: &Path,
+async fn installed_stale_positive_evidence(
+    package_dir: &Path,
     record: &socket_patch_core::manifest::schema::PatchRecord,
 ) -> bool {
     use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
     for (file_name, info) in &record.files {
-        let result = verify_file_patch(gem_dir, file_name, info).await;
+        let result = verify_file_patch(package_dir, file_name, info).await;
         if matches!(
             result.status,
             VerifyStatus::Ready | VerifyStatus::HashMismatch
@@ -528,7 +537,7 @@ async fn gem_stale_positive_evidence(
 ///   Judgments are grouped BY INSTALLED DIR: platform-variant purls of one
 ///   gem resolve to the same dir, and if ANY variant's record proves the
 ///   dir patched, the dir is patched — never warned.
-/// * STALE requires [`gem_stale_positive_evidence`] — never inferred from
+/// * STALE requires [`installed_stale_positive_evidence`] — never inferred from
 ///   missing/unreadable files.
 /// * A committed `vendor/cache/<leaf>.gem` whose sha256 differs from the
 ///   patched artifact's is stale too (bundler installs from it first, fresh
@@ -548,14 +557,14 @@ async fn gem_stale_install_warnings(
         socket_patch_core::manifest::schema::PatchRecord,
     >,
     gem_artifact_shas: &std::collections::BTreeMap<(String, String), String>,
-) -> GemStaleOutcome {
+) -> StaleInstallOutcome {
     use socket_patch_core::crawlers::types::CrawlerOptions;
     use socket_patch_core::crawlers::RubyCrawler;
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::vendor::file_sha256_hex;
     use socket_patch_core::vex::verify::verify_patch_record;
 
-    let mut out = GemStaleOutcome::default();
+    let mut out = StaleInstallOutcome::default();
     let find_record = |uuid: &str| -> Option<&PatchRecord> {
         records
             .values()
@@ -619,7 +628,7 @@ async fn gem_stale_install_warnings(
                 });
             if verify_patch_record(&pkg.path, record).await.is_ok() {
                 entry.patched = true;
-            } else if !entry.positive && gem_stale_positive_evidence(&pkg.path, record).await {
+            } else if !entry.positive && installed_stale_positive_evidence(&pkg.path, record).await {
                 entry.positive = true;
                 entry.purl = (*purl).to_string();
             }
@@ -1676,8 +1685,15 @@ pub(crate) async fn run_redirect_selected(
         .iter()
         .filter(
             |(purl, uuid, artifact_url, index_url, suffixed_version, go_module_path)| {
+                if rewrite.python_lock_uuids.contains(uuid) {
+                    return rewrite.confirmed_python_lock_uuids.contains(uuid)
+                        && !rewrite.refused_python_lock_uuids.contains(uuid);
+                }
                 if rewrite.hatch_uuids.contains(uuid) {
                     return rewrite.confirmed_hatch_uuids.contains(uuid);
+                }
+                if purl.starts_with("pkg:pypi/") {
+                    return rewrite.confirmed_requirements_uuids.contains(uuid);
                 }
                 if rewrite.refused_pnpm_uuids.contains(uuid) {
                     return false;
@@ -1820,8 +1836,66 @@ pub(crate) async fn run_redirect_selected(
             ledger.mode = "hosted".to_string();
             // The bun.lockb→bun.lock migration removal precedes the rewrite
             // edits so `--revert` unwinds it last (after restoring bun.lock).
+            //
+            // REBASE instead of append for fragment kinds whose file the
+            // package manager itself rewrites in place: when the ledger already
+            // holds edits for the same (path, kind, key) and the file no longer
+            // carried their `new` fragments before this run (Poetry 1.1/1.2
+            // `poetry lock --no-update` keeps the Socket source but re-lays the
+            // unit and drops the inserted `files` line), appending this run's
+            // edits — recorded against the RELOCKED text — would build a chain
+            // whose older links match nothing: rollback and remove then refuse
+            // forever, and the refusal's own remedy ("re-run scan") is what
+            // lengthened the chain. Keeping the oldest `original` (the pristine
+            // fragment) and adopting the fresh `new` keeps the chain a single
+            // invertible link: replay swaps the fragment this run wrote back to
+            // the fragment the very first run found.
+            let mut rebased: Vec<usize> = Vec::new();
+            for edit in rewrite.edits.iter().filter(|e| REBASE_KINDS.contains(&e.kind.as_str())) {
+                let siblings: Vec<usize> = ledger
+                    .edits
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, old)| {
+                        old.path == edit.path && old.kind == edit.kind && old.key == edit.key
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                let before = files.get(&edit.path).map(String::as_str).unwrap_or("");
+                let drifted = !siblings.is_empty()
+                    && siblings.iter().all(|&i| {
+                        ledger.edits[i]
+                            .new
+                            .as_ref()
+                            .and_then(serde_json::Value::as_str)
+                            .is_none_or(|new| !before.contains(new))
+                    });
+                if !drifted {
+                    continue;
+                }
+                // Positional pairing: the rewriter emits a key's fragments in a
+                // fixed order (package unit, then the legacy integrity entry).
+                let nth = rewrite
+                    .edits
+                    .iter()
+                    .filter(|e| e.path == edit.path && e.kind == edit.kind && e.key == edit.key)
+                    .position(|e| std::ptr::eq(e, edit))
+                    .unwrap_or(0);
+                if let Some(&target) = siblings.get(nth) {
+                    if !rebased.contains(&target) {
+                        ledger.edits[target].new = edit.new.clone();
+                        ledger.edits[target].action = edit.action.clone();
+                        rebased.push(target);
+                    }
+                }
+            }
             for edit in migration_edits.iter().chain(rewrite.edits.iter()) {
-                if !ledger.edits.contains(edit) {
+                let is_rebased = REBASE_KINDS.contains(&edit.kind.as_str())
+                    && rebased.iter().any(|&t| {
+                        let old = &ledger.edits[t];
+                        old.path == edit.path && old.kind == edit.kind && old.key == edit.key && old.new == edit.new
+                    });
+                if !is_rebased && !ledger.edits.contains(edit) {
                     ledger.edits.push(edit.clone());
                 }
             }
@@ -1873,8 +1947,8 @@ pub(crate) async fn run_redirect_selected(
     // the probe's ledger-record fallback could still judge an
     // already-redirected project, so without this gate a dry-run would warn
     // about state the run did not (re)create.
-    let gem_stale: GemStaleOutcome = if common.dry_run {
-        GemStaleOutcome::default()
+    let gem_stale: StaleInstallOutcome = if common.dry_run {
+        StaleInstallOutcome::default()
     } else {
         // purl-coordinate → the PATCHED .gem artifact's sha256 (registry
         // override identifier, tarball integrity fallback) — judges a
@@ -1901,6 +1975,12 @@ pub(crate) async fn run_redirect_selected(
             &gem_artifact_shas,
         )
         .await
+    };
+
+    let python_stale = if common.dry_run {
+        StaleInstallOutcome::default()
+    } else {
+        python::stale_install_warnings(common, &confirmed, &records, &ledger_records).await
     };
 
     // Cross-mode takeover: a committed vendored ledger (`.socket/vendor/state.json`)
@@ -1962,8 +2042,13 @@ pub(crate) async fn run_redirect_selected(
         params.assume_applied = confirmed
             .iter()
             .map(|(purl, _)| purl.clone())
-            .filter(|purl| !gem_stale.stale_purls.contains(purl))
+            .filter(|purl| {
+                !gem_stale.stale_purls.contains(purl) && !python_stale.stale_purls.contains(purl)
+            })
             .collect();
+        // A healthy copy in another interpreter must not override a stale
+        // Python tree found by the probe, including with --vex-no-verify.
+        params.known_stale = python_stale.stale_purls.iter().cloned().collect();
         let manifest_path = common.resolved_manifest_path();
         match generate_vex_from_manifest_path(common, &params, &manifest_path).await {
             Ok(summary) => vex_statements = Some(summary.statements),
@@ -1989,6 +2074,7 @@ pub(crate) async fn run_redirect_selected(
         warnings.extend(rush_warnings.iter().cloned());
         warnings.extend(pnpm_warnings.iter().cloned());
         warnings.extend(gem_stale.warnings.iter().cloned());
+        warnings.extend(python_stale.warnings.iter().cloned());
         warnings.extend(takeover_pre_warnings.iter().cloned());
         warnings.extend(takeover_warnings.iter().cloned());
         warnings.extend(prune_warnings.iter().cloned());
@@ -2066,7 +2152,7 @@ pub(crate) async fn run_redirect_selected(
             for w in &pnpm_warnings {
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
-            for w in &gem_stale.warnings {
+            for w in gem_stale.warnings.iter().chain(&python_stale.warnings) {
                 // Code included: the stale-install hazard is a silent-CVE
                 // state, so the stderr line must be greppable by its stable
                 // code in CI logs, same as the JSON envelope.
@@ -2136,7 +2222,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
 mod tests {
     use super::{
         build_redirect_json_envelope, gem_stale_cache_warning, gem_stale_install_warning,
-        gem_stale_install_warnings, gem_stale_positive_evidence, parse_purl_simple,
+        gem_stale_install_warnings, installed_stale_positive_evidence, parse_purl_simple,
         plan_workspace_trust, pnpm_heal_root, pnpm_lock_carries_hosted_redirect,
         pnpm_lock_version_major, pnpm_trust_configured_detail, pnpm_trust_legacy_detail,
         pnpm_trust_manual_guidance, pnpm_trust_workspace_unreadable_detail,
@@ -2688,7 +2774,7 @@ mod tests {
         cwd: &std::path::Path,
         confirmed: &[(String, String)],
         records: &std::collections::BTreeMap<String, PatchRecord>,
-    ) -> super::GemStaleOutcome {
+    ) -> super::StaleInstallOutcome {
         gem_stale_install_warnings(
             cwd,
             false,
@@ -2796,7 +2882,7 @@ mod tests {
     /// transiently unreadable file in a patched install must not produce
     /// a delete prescription.
     #[tokio::test]
-    async fn gem_stale_positive_evidence_requires_readable_mismatched_bytes() {
+    async fn installed_stale_positive_evidence_requires_readable_mismatched_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let record = gem_record();
 
@@ -2804,30 +2890,30 @@ mod tests {
         let upstream = tmp.path().join("upstream");
         std::fs::create_dir_all(upstream.join("lib")).unwrap();
         std::fs::write(upstream.join("lib").join("stale_unit.rb"), GEM_UPSTREAM).unwrap();
-        assert!(gem_stale_positive_evidence(&upstream, &record).await);
+        assert!(installed_stale_positive_evidence(&upstream, &record).await);
 
         // Tampered bytes (neither hash) → evidence.
         let tampered = tmp.path().join("tampered");
         std::fs::create_dir_all(tampered.join("lib")).unwrap();
         std::fs::write(tampered.join("lib").join("stale_unit.rb"), b"other").unwrap();
-        assert!(gem_stale_positive_evidence(&tampered, &record).await);
+        assert!(installed_stale_positive_evidence(&tampered, &record).await);
 
         // Patched bytes → no evidence.
         let patched = tmp.path().join("patched");
         std::fs::create_dir_all(patched.join("lib")).unwrap();
         std::fs::write(patched.join("lib").join("stale_unit.rb"), GEM_PATCHED).unwrap();
-        assert!(!gem_stale_positive_evidence(&patched, &record).await);
+        assert!(!installed_stale_positive_evidence(&patched, &record).await);
 
         // Missing file → no evidence (never a guess).
         let hollow = tmp.path().join("hollow");
         std::fs::create_dir_all(hollow.join("lib")).unwrap();
-        assert!(!gem_stale_positive_evidence(&hollow, &record).await);
+        assert!(!installed_stale_positive_evidence(&hollow, &record).await);
 
         // A DIRECTORY at the file path (the unreadable-NotFound class) →
         // no evidence.
         let blocked = tmp.path().join("blocked");
         std::fs::create_dir_all(blocked.join("lib").join("stale_unit.rb")).unwrap();
-        assert!(!gem_stale_positive_evidence(&blocked, &record).await);
+        assert!(!installed_stale_positive_evidence(&blocked, &record).await);
 
         // Absent new-file (empty beforeHash routes to Ready with NO
         // current_hash) → no evidence.
@@ -2837,7 +2923,7 @@ mod tests {
             .get_mut("lib/stale_unit.rb")
             .expect("fixture file entry")
             .before_hash = String::new();
-        assert!(!gem_stale_positive_evidence(&hollow, &new_file).await);
+        assert!(!installed_stale_positive_evidence(&hollow, &new_file).await);
     }
 
     /// The probe end to end over a real deployment layout: a STALE

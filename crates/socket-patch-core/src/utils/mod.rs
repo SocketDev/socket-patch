@@ -1,6 +1,7 @@
 pub mod env_compat;
 pub mod fs;
 pub(crate) mod http;
+pub mod poetry_lock;
 pub mod process;
 pub mod purl;
 pub mod python_lock;

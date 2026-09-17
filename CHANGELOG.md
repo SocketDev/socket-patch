@@ -51,6 +51,38 @@ into the new version's section — see docs/releasing.md.
 
 ### Added
 
+- **Poetry projects take hosted patches, and vendored patches now cover every
+  `poetry.lock` generation.** `scan --mode hosted` rewrites `poetry.lock` to a
+  `[package.source] type = "url"` pointing at the Socket-hosted, SHA-256-pinned
+  wheel (Poetry 1.0 through 2.x; Poetry 0.12 ignores URL sources and is refused
+  with `redirect_poetry_lock_unsupported`), and `scan --mode vendored` accepts
+  the legacy `[metadata.hashes]` (0.12) and `[metadata.files]` (lock 1.0/1.1)
+  layouts next to the 2.x `files` arrays, CRLF locks included. The rewrite keeps
+  every other byte of the lock — dependency metadata, groups, markers, extras
+  and the pyproject `content-hash` — and records independent rollback fragments
+  per patch, so `rollback` restores the recorded originals in any order.
+  Verified end-to-end against real Poetry 0.12.17, 1.0.10, 1.1.15, 1.2.2,
+  1.3.2, 1.4.2, 1.5.1, 1.6.1, 1.7.1, 1.8.5, 2.0.1, 2.1.4, 2.2.1, 2.3.4 and
+  2.4.3 in hosted, vendored and agent mode — see
+  `docs/testing/poetry-compatibility.md` and `scripts/backtest-poetry.py`.
+  Poetry releases before 1.4 neither verify local wheel hashes nor replace an
+  already-installed package at the same version; both modes surface that as an
+  advisory (`pypi_poetry_integrity_unverified`, `redirect_poetry_stale_install_risk`)
+  keyed on the lock's writer, and the hosted rewriter warns
+  `redirect_poetry_entry_not_found` when a lock has no entry for a granted
+  patch (uv parity). A rotated grant token or republished patch supersedes the
+  earlier hosted URL in place instead of being refused as a foreign source,
+  a future `lock-version = "2.<n>"` is rewritten like 2.1 on every path
+  (the vendored loader already accepted it), and a malformed
+  `[metadata.files]` / `[metadata.hashes]` value is refused instead of
+  panicking the scan. Rollback stays invertible across Poetry's own relocks:
+  the recorded package fragment carries its boundary header, so a unit that
+  Poetry 1.1/1.2 re-laid (source kept, inserted `files` line dropped) is
+  refused rather than mistaken for an already-reverted lock, a lock-1.0
+  redirect restored by hand converges instead of refusing, and a re-scan
+  after such a relock REBASES the ledger's edits (pristine → current)
+  instead of appending a chain whose older links match nothing — which made
+  `rollback` and `remove` refuse forever. (#241)
 - **Python patches survive uv lockfiles in both hosted and vendored modes.**
   `scan --mode hosted|vendored` now rewrites native `uv.lock` together with
   the paired `pyproject.toml` source and metadata, PEP 723 script locks
@@ -168,6 +200,32 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- Hosted Python redirects now warn when installed files still contain upstream
+  or modified bytes and omit those packages from same-run VEX. The read-only
+  probe covers Poetry virtualenvs, repeats on re-scans, and uses persisted patch
+  records if fetching fresh records fails.
+
+- **Agent mode finds Poetry's out-of-tree virtualenv.** Poetry keeps a
+  project's virtualenv under `{cache-dir}/virtualenvs/<name>-<hash>-py<X.Y>`
+  by default, so after a plain `poetry install` the crawler saw no
+  `VIRTUAL_ENV` / `.venv` / `venv` and fell through to the global interpreter:
+  `scan --mode agent` patched nothing for the project's dependencies (or the
+  wrong interpreter) while reporting success, and a bare `rollback` pruned the
+  manifest while the venv stayed patched. The crawler now reproduces Poetry's
+  own placement — `virtualenvs.create` / `in-project` / `path` and `cache-dir`
+  from `POETRY_*`, the project's `poetry.toml` and the user `config.toml`, the
+  platform default cache dir, and Poetry's env-name hash — without running
+  Poetry, and scans every `-py<X.Y>` sibling. `poetry run socket-patch …` and
+  `VIRTUAL_ENV` keep working as before.
+- **`scan --mode vendored` works from a lock-only Poetry checkout.** The
+  `poetry.lock` inventory was discovery-only, so a fresh clone with nothing
+  installed was skipped with `vendor_fetch_unverifiable` even though the lock
+  records the wheel's sha256 (uv's lock vendored fine in the same scenario).
+  The inventory now carries the pure-Python wheel's sha256 from `files` (lock
+  2.x) or `[metadata.files]` (lock 1.0/1.1), and the pypi fetcher resolves a
+  hash-only entry through PyPI's JSON API by that digest (verified again after
+  download; `SOCKET_PYPI_JSON_API` overrides the endpoint). Poetry 0.12's bare
+  `[metadata.hashes]` names no wheel and still needs an installed copy.
 - **`remove` no longer drops the manifest entry of a drift-kept vendored
   purl.** When the vendored revert keeps the artifact (`kept_artifact` —
   the lockfile drifted), the manifest entry is now kept too

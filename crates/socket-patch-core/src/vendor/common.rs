@@ -396,6 +396,42 @@ pub(crate) async fn revert_lock_fragment_splice(
     kind: &str,
     flavor: &str,
 ) -> RevertOutcome {
+    revert_lock_fragment_splice_inner(
+        entry, root, dry_run, lock_file, kind, flavor, false,
+    )
+    .await
+}
+
+/// [`revert_lock_fragment_splice`] for backends whose records are COUPLED
+/// (poetry's legacy formats write the `[package.source]` table and the
+/// `[metadata.files]` entry as two fragments): when any recorded fragment has
+/// drifted, nothing is written — a half-restored lock (registry hashes with a
+/// vendored source, or the reverse) is worse than the wired one. Records this
+/// build does not recognize are skipped with a warning as usual and do not
+/// hold the write.
+pub(crate) async fn revert_lock_fragment_splice_atomic(
+    entry: &VendorEntry,
+    root: &Path,
+    dry_run: bool,
+    lock_file: &str,
+    kind: &str,
+    flavor: &str,
+) -> RevertOutcome {
+    revert_lock_fragment_splice_inner(
+        entry, root, dry_run, lock_file, kind, flavor, true,
+    )
+    .await
+}
+
+async fn revert_lock_fragment_splice_inner(
+    entry: &VendorEntry,
+    root: &Path,
+    dry_run: bool,
+    lock_file: &str,
+    kind: &str,
+    flavor: &str,
+    atomic: bool,
+) -> RevertOutcome {
     use tokio::io::AsyncReadExt as _;
 
     let lock_path = root.join(lock_file);
@@ -413,6 +449,13 @@ pub(crate) async fn revert_lock_fragment_splice(
         Err(e) => return RevertOutcome::failed(format!("cannot read {lock_file}: {e}")),
     };
     let mut warnings: Vec<VendorWarning> = Vec::new();
+    // Set when a recorded fragment is neither present nor already restored:
+    // the only condition under which the atomic flavor must hold the write
+    // (restoring the source table while its integrity entry stays patched, or
+    // vice versa, would leave a lock Poetry cannot install). A record this
+    // build does not understand (foreign file, unknown kind) is skipped with a
+    // warning but must not veto restoring the fragments it does understand.
+    let mut drifted = false;
 
     for rec in entry.wiring.iter().rev() {
         // SECURITY: `rec.file` comes verbatim from the committed, tamper-able
@@ -454,6 +497,7 @@ pub(crate) async fn revert_lock_fragment_splice(
                 if original_text.is_some_and(|orig| lock_text.contains(orig)) {
                     continue;
                 }
+                drifted = true;
                 warnings.push(VendorWarning::new(
                     "vendor_lock_entry_drifted",
                     format!(
@@ -465,7 +509,7 @@ pub(crate) async fn revert_lock_fragment_splice(
         }
     }
 
-    if !dry_run {
+    if !dry_run && (!atomic || !drifted) {
         // Mode-preserving: the lock is a user-owned file we merely edit, so
         // the swapped-in inode must keep its permission bits rather than
         // reset them to umask defaults.
