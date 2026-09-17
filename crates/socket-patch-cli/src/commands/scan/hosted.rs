@@ -394,7 +394,7 @@ fn build_redirect_json_envelope(
 /// installed-tree verification: a patched install still attests (with hash
 /// evidence), a stale one is omitted.
 #[derive(Default)]
-struct GemStaleOutcome {
+struct StaleInstallOutcome {
     warnings: Vec<serde_json::Value>,
     stale_purls: std::collections::BTreeSet<String>,
 }
@@ -492,9 +492,19 @@ async fn gem_stale_positive_evidence(
     gem_dir: &Path,
     record: &socket_patch_core::manifest::schema::PatchRecord,
 ) -> bool {
+    stale_positive_evidence(gem_dir, record).await
+}
+
+/// The ecosystem-neutral body of [`gem_stale_positive_evidence`]: `dir` is
+/// the root the record's file paths are relative to (a gem's install dir, a
+/// Python `site-packages`).
+async fn stale_positive_evidence(
+    dir: &Path,
+    record: &socket_patch_core::manifest::schema::PatchRecord,
+) -> bool {
     use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
     for (file_name, info) in &record.files {
-        let result = verify_file_patch(gem_dir, file_name, info).await;
+        let result = verify_file_patch(dir, file_name, info).await;
         if matches!(
             result.status,
             VerifyStatus::Ready | VerifyStatus::HashMismatch
@@ -504,6 +514,124 @@ async fn gem_stale_positive_evidence(
         }
     }
     false
+}
+
+/// Post-rewrite stale-install probe for Pipfile.lock redirects — the Python
+/// twin of [`gem_stale_install_warnings`], for the same class of defect
+/// measured on real Pipenv 11.10.4, 2018.11.26 and 2026.8.0: with the same
+/// release already installed, `pipenv install`, `pipenv install --deploy`
+/// and `pipenv sync` all exit 0 and leave the upstream bytes in place (pip:
+/// "Requirement already satisfied"), so the rewritten lock protects fresh
+/// installs only.
+///
+/// * Candidates are this run's confirmed pypi purls whose patch the Pipenv
+///   rewriter actually wired (`confirmed_pipenv_uuids`) and whose record is
+///   known (this run's fetched records, then the ledger's).
+/// * Discovery is [`PythonCrawler::get_site_packages_paths`] — the same
+///   venv discovery `apply` uses (VIRTUAL_ENV, ./.venv, ./venv, Pipenv's
+///   out-of-tree venv; `--global`/`--global-prefix` honoured).
+/// * PATCHED means `verify_patch_record` Ok (an agent-mode install stays
+///   silent); STALE requires [`stale_positive_evidence`] — never inferred
+///   from missing or unreadable files. Every venv is judged on its own: one
+///   patched venv does not excuse another stale one.
+///
+/// Read-only: the remedy is prescribed, never executed.
+async fn pipenv_stale_install_warnings(
+    cwd: &Path,
+    global: bool,
+    global_prefix: Option<std::path::PathBuf>,
+    confirmed: &[(String, String)],
+    pipenv_uuids: &std::collections::BTreeSet<String>,
+    records: &std::collections::BTreeMap<String, socket_patch_core::manifest::schema::PatchRecord>,
+    ledger_records: &std::collections::BTreeMap<
+        String,
+        socket_patch_core::manifest::schema::PatchRecord,
+    >,
+) -> StaleInstallOutcome {
+    use socket_patch_core::crawlers::python_crawler::PythonCrawler;
+    use socket_patch_core::crawlers::types::CrawlerOptions;
+    use socket_patch_core::manifest::schema::PatchRecord;
+    use socket_patch_core::utils::purl::strip_purl_qualifiers;
+    use socket_patch_core::vex::verify::verify_patch_record;
+
+    let mut out = StaleInstallOutcome::default();
+    let find_record = |uuid: &str| -> Option<&PatchRecord> {
+        records
+            .values()
+            .chain(ledger_records.values())
+            .find(|r| r.uuid == uuid)
+    };
+    let candidates: Vec<(&str, &PatchRecord)> = confirmed
+        .iter()
+        .filter(|(purl, uuid)| purl.starts_with("pkg:pypi/") && pipenv_uuids.contains(uuid))
+        .filter_map(|(purl, uuid)| find_record(uuid).map(|r| (purl.as_str(), r)))
+        .filter(|(_, r)| !r.files.is_empty())
+        .collect();
+    if candidates.is_empty() {
+        return out;
+    }
+    let crawler = PythonCrawler::new();
+    let options = CrawlerOptions {
+        cwd: cwd.to_path_buf(),
+        global,
+        global_prefix,
+    };
+    let site_packages = crawler
+        .get_site_packages_paths(&options)
+        .await
+        .unwrap_or_default();
+    for (purl, record) in &candidates {
+        let stripped = strip_purl_qualifiers(purl).to_string();
+        let mut stale_dirs: Vec<std::path::PathBuf> = Vec::new();
+        for site in &site_packages {
+            let found = crawler
+                .find_by_purls(site, std::slice::from_ref(&stripped))
+                .await
+                .unwrap_or_default();
+            if !found.contains_key(&stripped) {
+                continue;
+            }
+            if verify_patch_record(site, record).await.is_ok() {
+                continue;
+            }
+            if stale_positive_evidence(site, record).await {
+                stale_dirs.push(site.clone());
+            }
+        }
+        if stale_dirs.is_empty() {
+            continue;
+        }
+        out.warnings
+            .push(pipenv_stale_install_warning(purl, &stale_dirs));
+        out.stale_purls.insert((*purl).to_string());
+    }
+    out
+}
+
+/// The `redirect_pipenv_stale_install` warning for one purl whose upstream
+/// release is still installed in `dirs` (verified remedies: a venv-level
+/// `pip uninstall` + `pipenv sync`, or a clean virtualenv — both measured to
+/// install the rewritten reference on Pipenv 2018 and 2026; `pipenv
+/// uninstall` is NOT one: it edits the Pipfile and re-locks, dropping the
+/// package, and `PIP_FORCE_REINSTALL` is ignored by Pipenv 2026).
+fn pipenv_stale_install_warning(purl: &str, dirs: &[std::path::PathBuf]) -> serde_json::Value {
+    use socket_patch_core::utils::purl::strip_purl_qualifiers;
+    let base = strip_purl_qualifiers(purl);
+    let name = base
+        .strip_prefix("pkg:pypi/")
+        .and_then(|rest| rest.split('@').next())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(base)
+        .to_string();
+    let listed = dirs
+        .iter()
+        .map(|d| d.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let detail = format!(
+        "{purl}: the UNPATCHED upstream release is still installed in {listed}. Pipenv does not reinstall a release that is already present — `pipenv install`, `pipenv install --deploy` and `pipenv sync` all exit 0 and keep those bytes — so the rewritten Pipfile.lock only protects fresh installs. Reinstall it from the lock without touching the Pipfile: `pipenv run pip uninstall -y {name} && pipenv sync` (`pipenv install --deploy` before Pipenv 2018), or `pipenv --rm && pipenv sync` for a clean virtualenv — NOT `pipenv uninstall`, which rewrites the Pipfile and re-locks the patch away; then `socket-patch vex` re-verifies the installed files."
+    );
+    serde_json::json!({ "code": "redirect_pipenv_stale_install", "detail": detail })
 }
 
 /// Post-rewrite stale-materialization probe for gem redirects — the guard
@@ -548,14 +676,14 @@ async fn gem_stale_install_warnings(
         socket_patch_core::manifest::schema::PatchRecord,
     >,
     gem_artifact_shas: &std::collections::BTreeMap<(String, String), String>,
-) -> GemStaleOutcome {
+) -> StaleInstallOutcome {
     use socket_patch_core::crawlers::types::CrawlerOptions;
     use socket_patch_core::crawlers::RubyCrawler;
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::vendor::file_sha256_hex;
     use socket_patch_core::vex::verify::verify_patch_record;
 
-    let mut out = GemStaleOutcome::default();
+    let mut out = StaleInstallOutcome::default();
     let find_record = |uuid: &str| -> Option<&PatchRecord> {
         records
             .values()
@@ -1889,8 +2017,8 @@ pub(crate) async fn run_redirect_selected(
     // the probe's ledger-record fallback could still judge an
     // already-redirected project, so without this gate a dry-run would warn
     // about state the run did not (re)create.
-    let gem_stale: GemStaleOutcome = if common.dry_run {
-        GemStaleOutcome::default()
+    let gem_stale: StaleInstallOutcome = if common.dry_run {
+        StaleInstallOutcome::default()
     } else {
         // purl-coordinate → the PATCHED .gem artifact's sha256 (registry
         // override identifier, tarball integrity fallback) — judges a
@@ -1915,6 +2043,22 @@ pub(crate) async fn run_redirect_selected(
             &records,
             &ledger_records,
             &gem_artifact_shas,
+        )
+        .await
+    };
+    // The Python twin (Pipfile.lock redirects only — see
+    // `pipenv_stale_install_warnings`), same explicit --dry-run gate.
+    let pipenv_stale: StaleInstallOutcome = if common.dry_run {
+        StaleInstallOutcome::default()
+    } else {
+        pipenv_stale_install_warnings(
+            &common.cwd,
+            common.global,
+            common.global_prefix.clone(),
+            &confirmed,
+            &rewrite.confirmed_pipenv_uuids,
+            &records,
+            &ledger_records,
         )
         .await
     };
@@ -1978,7 +2122,9 @@ pub(crate) async fn run_redirect_selected(
         params.assume_applied = confirmed
             .iter()
             .map(|(purl, _)| purl.clone())
-            .filter(|purl| !gem_stale.stale_purls.contains(purl))
+            .filter(|purl| {
+                !gem_stale.stale_purls.contains(purl) && !pipenv_stale.stale_purls.contains(purl)
+            })
             .collect();
         let manifest_path = common.resolved_manifest_path();
         match generate_vex_from_manifest_path(common, &params, &manifest_path).await {
@@ -2005,6 +2151,7 @@ pub(crate) async fn run_redirect_selected(
         warnings.extend(rush_warnings.iter().cloned());
         warnings.extend(pnpm_warnings.iter().cloned());
         warnings.extend(gem_stale.warnings.iter().cloned());
+        warnings.extend(pipenv_stale.warnings.iter().cloned());
         warnings.extend(takeover_pre_warnings.iter().cloned());
         warnings.extend(takeover_warnings.iter().cloned());
         warnings.extend(prune_warnings.iter().cloned());
@@ -2082,7 +2229,7 @@ pub(crate) async fn run_redirect_selected(
             for w in &pnpm_warnings {
                 eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
             }
-            for w in &gem_stale.warnings {
+            for w in gem_stale.warnings.iter().chain(pipenv_stale.warnings.iter()) {
                 // Code included: the stale-install hazard is a silent-CVE
                 // state, so the stderr line must be greppable by its stable
                 // code in CI logs, same as the JSON envelope.
@@ -2152,7 +2299,7 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
 mod tests {
     use super::{
         build_redirect_json_envelope, gem_stale_cache_warning, gem_stale_install_warning,
-        gem_stale_install_warnings, gem_stale_positive_evidence, parse_purl_simple,
+        gem_stale_install_warnings, pipenv_stale_install_warnings, gem_stale_positive_evidence, parse_purl_simple,
         plan_workspace_trust, pnpm_heal_root, pnpm_lock_carries_hosted_redirect,
         pnpm_lock_version_major, pnpm_trust_configured_detail, pnpm_trust_legacy_detail,
         pnpm_trust_manual_guidance, pnpm_trust_workspace_unreadable_detail,
@@ -2631,6 +2778,185 @@ mod tests {
     const GEM_UPSTREAM: &[u8] = b"module StaleUnit; STATUS = :vulnerable; end\n";
     const GEM_PATCHED: &[u8] = b"module StaleUnit; STATUS = :patched; end\n";
 
+    /// Lay `urllib3 1.26.18` into a project-local venv with the given bytes
+    /// for the record's one file and return its site-packages dir.
+    fn materialize_pipenv_venv(root: &std::path::Path, response_py: &[u8]) -> PathBuf {
+        let site = if cfg!(windows) {
+            root.join(".venv").join("Lib").join("site-packages")
+        } else {
+            root.join(".venv")
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages")
+        };
+        let dist_info = site.join("urllib3-1.26.18.dist-info");
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\nName: urllib3\nVersion: 1.26.18\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(site.join("urllib3")).unwrap();
+        std::fs::write(site.join("urllib3").join("response.py"), response_py).unwrap();
+        site
+    }
+
+    fn pipenv_record(uuid: &str, before: &[u8], after: &[u8]) -> PatchRecord {
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "urllib3/response.py".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(before),
+                after_hash: compute_git_sha256_from_bytes(after),
+            },
+        );
+        PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: "2026-01-01T00:00:00Z".to_string(),
+            files,
+            vulnerabilities: std::collections::HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: "free".to_string(),
+        }
+    }
+
+    /// The Pipenv twin of the gem probe over a real venv layout: a confirmed
+    /// Pipfile.lock redirect whose upstream release is still installed
+    /// produces one `redirect_pipenv_stale_install` warning naming the
+    /// site-packages dir and the uninstall + sync remedy, and lands the purl
+    /// in `stale_purls`; an already-patched install, a purl the Pipenv
+    /// rewriter did not wire (a requirements.txt redirect), a missing record
+    /// and an absent install all stay silent; nothing is modified.
+    #[tokio::test]
+    async fn pipenv_stale_install_probe_end_to_end() {
+        const PURL: &str = "pkg:pypi/urllib3@1.26.18?artifact_id=py2-py3-none-any-whl";
+        const UUID: &str = "e828efa5-5c6d-43f3-9909-03f5ac232b98";
+        let upstream = b"def upstream():\n    pass\n";
+        let patched = b"def patched():\n    pass\n";
+        let record = pipenv_record(UUID, upstream, patched);
+        let mut records = std::collections::BTreeMap::new();
+        records.insert(PURL.to_string(), record.clone());
+        let confirmed = vec![(PURL.to_string(), UUID.to_string())];
+        let wired: std::collections::BTreeSet<String> = [UUID.to_string()].into_iter().collect();
+        let empty_ledger = std::collections::BTreeMap::new();
+
+        // STALE: upstream bytes installed → one warning, dir + remedy named.
+        let stale = tempfile::tempdir().unwrap();
+        std::fs::write(stale.path().join("Pipfile"), "[packages]\n").unwrap();
+        let site = materialize_pipenv_venv(stale.path(), upstream);
+        let out = pipenv_stale_install_warnings(
+            stale.path(),
+            false,
+            None,
+            &confirmed,
+            &wired,
+            &records,
+            &empty_ledger,
+        )
+        .await;
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert_eq!(out.warnings[0]["code"], "redirect_pipenv_stale_install");
+        let detail = out.warnings[0]["detail"].as_str().expect("detail is a string");
+        assert!(detail.contains(&site.display().to_string()), "{detail}");
+        assert!(detail.contains("pipenv run pip uninstall -y urllib3 && pipenv sync"), "{detail}");
+        assert!(!detail.contains("`pipenv uninstall urllib3"), "the Pipfile-rewriting command must not be prescribed: {detail}");
+        assert!(detail.contains("UNPATCHED"), "{detail}");
+        assert_eq!(
+            out.stale_purls,
+            std::collections::BTreeSet::from([PURL.to_string()])
+        );
+        assert_eq!(
+            std::fs::read(site.join("urllib3").join("response.py")).unwrap(),
+            upstream,
+            "read-only"
+        );
+
+        // The ledger's record serves when this run's fetch failed.
+        let mut ledger = std::collections::BTreeMap::new();
+        ledger.insert(PURL.to_string(), record.clone());
+        let out = pipenv_stale_install_warnings(
+            stale.path(),
+            false,
+            None,
+            &confirmed,
+            &wired,
+            &std::collections::BTreeMap::new(),
+            &ledger,
+        )
+        .await;
+        assert_eq!(out.warnings.len(), 1);
+
+        // PATCHED (agent-mode bytes) → silent.
+        let done = tempfile::tempdir().unwrap();
+        std::fs::write(done.path().join("Pipfile"), "[packages]\n").unwrap();
+        materialize_pipenv_venv(done.path(), patched);
+        let out = pipenv_stale_install_warnings(
+            done.path(),
+            false,
+            None,
+            &confirmed,
+            &wired,
+            &records,
+            &empty_ledger,
+        )
+        .await;
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.stale_purls.is_empty());
+
+        // Not wired by the Pipenv rewriter (a requirements.txt redirect) →
+        // silent even with the stale install.
+        let out = pipenv_stale_install_warnings(
+            stale.path(),
+            false,
+            None,
+            &confirmed,
+            &std::collections::BTreeSet::new(),
+            &records,
+            &empty_ledger,
+        )
+        .await;
+        assert!(out.warnings.is_empty());
+
+        // No record anywhere → no judgment.
+        let out = pipenv_stale_install_warnings(
+            stale.path(),
+            false,
+            None,
+            &confirmed,
+            &wired,
+            &std::collections::BTreeMap::new(),
+            &empty_ledger,
+        )
+        .await;
+        assert!(out.warnings.is_empty());
+
+        // Lock-only checkout (nothing installed) → no positive evidence.
+        let bare = tempfile::tempdir().unwrap();
+        std::fs::write(bare.path().join("Pipfile"), "[packages]\n").unwrap();
+        let site = if cfg!(windows) {
+            bare.path().join(".venv").join("Lib").join("site-packages")
+        } else {
+            bare.path()
+                .join(".venv")
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages")
+        };
+        std::fs::create_dir_all(site).unwrap();
+        let out = pipenv_stale_install_warnings(
+            bare.path(),
+            false,
+            None,
+            &confirmed,
+            &wired,
+            &records,
+            &empty_ledger,
+        )
+        .await;
+        assert!(out.warnings.is_empty());
+    }
+
     fn gem_record() -> PatchRecord {
         gem_record_with(GEM_UUID, GEM_UPSTREAM, GEM_PATCHED)
     }
@@ -2704,7 +3030,7 @@ mod tests {
         cwd: &std::path::Path,
         confirmed: &[(String, String)],
         records: &std::collections::BTreeMap<String, PatchRecord>,
-    ) -> super::GemStaleOutcome {
+    ) -> super::StaleInstallOutcome {
         gem_stale_install_warnings(
             cwd,
             false,

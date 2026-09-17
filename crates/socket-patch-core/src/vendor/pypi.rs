@@ -455,6 +455,53 @@ pub async fn vendor_pypi(
     .await
 }
 
+/// Pipenv never reinstalls a release that is already present — measured on
+/// 11.10.4, 2018.11.26 and 2026.8.0: `pipenv install`, `install --deploy`
+/// and `sync` all exit 0 and keep the installed bytes — so wiring the lock
+/// while the upstream release sits in the virtualenv leaves that venv
+/// vulnerable until it is reinstalled. Positive evidence only (readable
+/// bytes hashing to something other than the record's afterHash); an
+/// already-patched (agent-mode) install and a lock-only checkout stay silent.
+async fn pipenv_stale_install_warning(
+    site_packages: &Path,
+    purl: &str,
+    record: &PatchRecord,
+) -> Option<VendorWarning> {
+    use crate::patch::apply::{verify_file_patch, VerifyStatus};
+    if record.files.is_empty()
+        || crate::vex::verify::verify_patch_record(site_packages, record)
+            .await
+            .is_ok()
+    {
+        return None;
+    }
+    let mut stale = false;
+    for (file, info) in &record.files {
+        let result = verify_file_patch(site_packages, file, info).await;
+        if matches!(
+            result.status,
+            VerifyStatus::Ready | VerifyStatus::HashMismatch
+        ) && result.current_hash.is_some()
+        {
+            stale = true;
+            break;
+        }
+    }
+    if !stale {
+        return None;
+    }
+    let name = parse_pypi_purl(strip_purl_qualifiers(purl))
+        .map(|(name, _)| name.to_string())
+        .unwrap_or_else(|| purl.to_string());
+    Some(VendorWarning::new(
+        "pypi_pipenv_stale_install",
+        format!(
+            "{purl}: the UNPATCHED upstream release is still installed in {}. Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. Reinstall it from the lock without touching the Pipfile: `pipenv run pip uninstall -y {name} && pipenv sync` (`pipenv install --deploy` before Pipenv 2018), or `pipenv --rm && pipenv sync` for a clean virtualenv — NOT `pipenv uninstall`, which rewrites the Pipfile and re-locks the patch away; then `socket-patch vex` re-verifies the installed files.",
+            site_packages.display()
+        ),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn vendor_pypi_with_pipenv_version(
     purl: &str,
@@ -623,6 +670,11 @@ pub async fn vendor_pypi_with_pipenv_version(
                 }
                 Ok(PipenvTarget::Fresh) => {
                     warnings.extend(project.warnings.iter().cloned());
+                    if let Some(stale) =
+                        pipenv_stale_install_warning(site_packages, purl, record).await
+                    {
+                        warnings.push(stale);
+                    }
                     WiringPlan::Pipenv(Box::new(project))
                 }
                 Err((code, detail)) => return refused(code, detail),
