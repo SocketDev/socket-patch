@@ -397,12 +397,23 @@ async fn generate_vex(
     // record the run did not re-confirm (a reverted lockfile or a withdrawn
     // patch must not keep attesting).
     if !params.assume_applied.is_empty() {
-        let exempt: std::collections::HashSet<&str> =
-            params.assume_applied.iter().map(|s| s.as_str()).collect();
-        outcome.failed.retain(|f| !exempt.contains(f.purl.as_str()));
-        for purl in &params.assume_applied {
-            if manifest.patches.contains_key(purl) && !outcome.applied.iter().any(|p| p == purl) {
-                outcome.applied.push(purl.clone());
+        use socket_patch_core::utils::purl::strip_purl_qualifiers;
+        // The confirmed purls come from the grant reference (unqualified —
+        // `pkg:pypi/urllib3@1.26.18`) while the ledger records the API's
+        // artifact-qualified purl (`…?artifact_id=py2-py3-none-any-whl`), so
+        // match on the qualifier-stripped form: a lock-only pypi redirect used
+        // to attest nothing and fail the same-run `--vex` with
+        // `no_applicable_patches`.
+        let exempt: std::collections::HashSet<&str> = params
+            .assume_applied
+            .iter()
+            .map(|s| strip_purl_qualifiers(s))
+            .collect();
+        let is_exempt = |purl: &str| exempt.contains(strip_purl_qualifiers(purl));
+        outcome.failed.retain(|f| !is_exempt(&f.purl));
+        for key in manifest.patches.keys() {
+            if is_exempt(key) && !outcome.applied.iter().any(|p| p == key) {
+                outcome.applied.push(key.clone());
             }
         }
     }
