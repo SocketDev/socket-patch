@@ -71,6 +71,15 @@ Two consequences for Poetry releases before 1.4:
   release from 1.0 on by the default installer (Poetry's deprecated pip backend,
   `experimental.new-installer = false`, verifies nothing).
 
+Hosted mode also checks the installed package's bytes, independently of the lock's
+writer version. `redirect_pypi_stale_install` means readable files in a discovered
+interpreter still differ from the patched hashes. This read-only check repeats on
+re-scans and excludes the package from same-run VEX, even with
+`--vex-no-verify` or a healthy copy in another interpreter. If no patches remain
+to attest, `--vex` fails with `no_applicable_patches`. Reinstall in the affected
+interpreter, then verify with `socket-patch vex`. A lock-only checkout has no
+installed bytes to judge and keeps the existing lock-based attestation behavior.
+
 Other measured details:
 
 - `poetry lock --no-update` (1.1–1.8) and bare `poetry lock` (2.x) keep the

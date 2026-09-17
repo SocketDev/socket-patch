@@ -14,6 +14,7 @@ use socket_patch_cli::args::GlobalArgs;
 use socket_patch_cli::commands::rollback::{self, RollbackArgs};
 use socket_patch_cli::commands::scan::{run, ScanArgs};
 use socket_patch_cli::commands::vex::VexEmbedArgs;
+use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -26,6 +27,8 @@ const RECORD_PURL: &str = "pkg:pypi/urllib3@1.26.18?artifact_id=py2-py3-none-any
 const UUID: &str = "e828efa5-5c6d-43f3-9909-03f5ac232b98";
 const HOSTED_URL: &str = "http://patch.test/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
 const GHSA: &str = "GHSA-gm62-xv2j-4w53";
+const UPSTREAM: &[u8] = b"upstream response implementation\n";
+const PATCHED: &[u8] = b"patched response implementation\n";
 
 const LOCK: &str = include_str!("../../socket-patch-core/tests/fixtures/poetry/2.4.3/poetry.lock");
 /// Poetry 1.2.2's native lock (lock-version 1.1, populated `[metadata.files]`).
@@ -87,7 +90,9 @@ async fn mock_api(server: &MockServer) {
         .mount(server)
         .await;
     Mock::given(method("GET"))
-        .and(path_regex(format!("^/v0/orgs/{ORG}/patches/by-package/.+$")))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
                 "uuid": UUID, "purl": RECORD_PURL,
@@ -126,8 +131,8 @@ async fn mock_api(server: &MockServer) {
             "publishedAt": "2026-07-29T20:20:47Z",
             "files": {
                 "urllib3/response.py": {
-                    "beforeHash": "a".repeat(64),
-                    "afterHash": "b".repeat(64),
+                    "beforeHash": compute_git_sha256_from_bytes(UPSTREAM),
+                    "afterHash": compute_git_sha256_from_bytes(PATCHED),
                 }
             },
             "vulnerabilities": {
@@ -154,7 +159,10 @@ fn write_project(root: &Path) {
     let site = if cfg!(windows) {
         root.join(".venv").join("Lib").join("site-packages")
     } else {
-        root.join(".venv").join("lib").join("python3.12").join("site-packages")
+        root.join(".venv")
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages")
     };
     std::fs::create_dir_all(site).unwrap();
 }
@@ -183,10 +191,15 @@ async fn lock_only_poetry_project_redirects_attests_rescans_and_rolls_back() {
         "{redirected}"
     );
     assert!(redirected.contains("type = \"url\""), "{redirected}");
-    assert_eq!(read(&tmp.path().join("pyproject.toml")), PYPROJECT, "pyproject untouched");
-    let ledger: serde_json::Value =
-        serde_json::from_str(&read(&tmp.path().join(".socket/vendor/redirect-state.json")))
-            .unwrap();
+    assert_eq!(
+        read(&tmp.path().join("pyproject.toml")),
+        PYPROJECT,
+        "pyproject untouched"
+    );
+    let ledger: serde_json::Value = serde_json::from_str(&read(
+        &tmp.path().join(".socket/vendor/redirect-state.json"),
+    ))
+    .unwrap();
     assert!(
         ledger["records"][RECORD_PURL].is_object(),
         "ledger keyed by the artifact-qualified purl: {ledger}"
@@ -211,7 +224,11 @@ async fn lock_only_poetry_project_redirects_attests_rescans_and_rolls_back() {
     // 2. Idempotent re-scan: no further edits, lock byte-identical.
     let code = run(hosted_args(tmp.path(), server.uri(), None)).await;
     assert_eq!(code, 0);
-    assert_eq!(read(&lock_path), redirected, "re-scan must not touch the lock");
+    assert_eq!(
+        read(&lock_path),
+        redirected,
+        "re-scan must not touch the lock"
+    );
 
     // 3. rollback unwinds the redirect and drops the record.
     let code = rollback::run(RollbackArgs {
@@ -222,7 +239,11 @@ async fn lock_only_poetry_project_redirects_attests_rescans_and_rolls_back() {
     })
     .await;
     assert_eq!(code, 0, "rollback must succeed");
-    assert_eq!(read(&lock_path), LOCK, "rollback must restore the pristine lock byte for byte");
+    assert_eq!(
+        read(&lock_path),
+        LOCK,
+        "rollback must restore the pristine lock byte for byte"
+    );
     let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
     if ledger_path.exists() {
         let ledger: serde_json::Value = serde_json::from_str(&read(&ledger_path)).unwrap();
@@ -240,6 +261,7 @@ async fn lock_only_poetry_project_redirects_attests_rescans_and_rolls_back() {
 /// `files` line, and re-lays the `[metadata.files]` entry from the CLI's
 /// inline table into Poetry's multi-line array.
 fn simulate_poetry_1x_relock(lock: &str) -> String {
+    let newline = if lock.contains("\r\n") { "\r\n" } else { "\n" };
     let mut out = String::new();
     for line in lock.lines() {
         if line.starts_with("files = [{ file = ") {
@@ -255,7 +277,7 @@ fn simulate_poetry_1x_relock(lock: &str) -> String {
         out.push_str(line);
         out.push('\n');
     }
-    out
+    out.replace("\n", newline)
 }
 
 /// Relock → re-scan → rollback must still land on the pristine lock. The
@@ -265,18 +287,30 @@ fn simulate_poetry_1x_relock(lock: &str) -> String {
 #[tokio::test]
 #[serial]
 async fn relock_then_rescan_keeps_rollback_invertible() {
+    // Checkout settings must not decide which newline shape this test covers.
+    for newline in ["\n", "\r\n"] {
+        let lock = LOCK_1_1.replace("\r\n", "\n").replace("\n", newline);
+        assert_relock_roundtrip(&lock).await;
+    }
+}
+
+async fn assert_relock_roundtrip(lock: &str) {
     let server = MockServer::start().await;
     mock_api(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
     let lock_path = tmp.path().join("poetry.lock");
-    std::fs::write(&lock_path, LOCK_1_1).unwrap();
+    std::fs::write(&lock_path, lock).unwrap();
 
     assert_eq!(run(hosted_args(tmp.path(), server.uri(), None)).await, 0);
     let redirected = read(&lock_path);
     let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
     let ledger: serde_json::Value = serde_json::from_str(&read(&ledger_path)).unwrap();
-    assert_eq!(ledger["edits"].as_array().unwrap().len(), 2, "package + metadata fragments");
+    assert_eq!(
+        ledger["edits"].as_array().unwrap().len(),
+        2,
+        "package + metadata fragments"
+    );
 
     let relocked = simulate_poetry_1x_relock(&redirected);
     assert_ne!(relocked, redirected);
@@ -286,15 +320,24 @@ async fn relock_then_rescan_keeps_rollback_invertible() {
     // Re-scan: the unit lost its `files` line, so the rewriter writes again.
     assert_eq!(run(hosted_args(tmp.path(), server.uri(), None)).await, 0);
     let rescanned = read(&lock_path);
-    assert_ne!(rescanned, relocked, "the re-scan must restore the package files entry");
+    assert_ne!(
+        rescanned, relocked,
+        "the re-scan must restore the package files entry"
+    );
     let ledger: serde_json::Value = serde_json::from_str(&read(&ledger_path)).unwrap();
     let edits = ledger["edits"].as_array().unwrap();
     assert_eq!(edits.len(), 2, "rebased, not appended: {ledger}");
     for edit in edits {
         let original = edit["original"].as_str().unwrap();
-        assert!(!original.contains(HOSTED_URL), "originals stay pristine: {original}");
+        assert!(
+            !original.contains(HOSTED_URL),
+            "originals stay pristine: {original}"
+        );
         let new = edit["new"].as_str().unwrap();
-        assert!(rescanned.contains(new), "new fragments describe the current lock");
+        assert!(
+            rescanned.contains(new),
+            "new fragments describe the current lock"
+        );
     }
 
     let code = rollback::run(RollbackArgs {
@@ -305,5 +348,187 @@ async fn relock_then_rescan_keeps_rollback_invertible() {
     })
     .await;
     assert_eq!(code, 0, "rollback after relock + re-scan must succeed");
-    assert_eq!(read(&lock_path), LOCK_1_1, "pristine lock restored byte for byte");
+    assert_eq!(
+        read(&lock_path),
+        lock,
+        "pristine lock restored byte for byte"
+    );
+}
+
+fn install_package(root: &Path, venv: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let site = if cfg!(windows) {
+        root.join(venv).join("Lib").join("site-packages")
+    } else {
+        root.join(venv)
+            .join("lib")
+            .join("python3.12")
+            .join("site-packages")
+    };
+    std::fs::create_dir_all(site.join("urllib3-1.26.18.dist-info")).unwrap();
+    std::fs::create_dir_all(site.join("urllib3")).unwrap();
+    let file = site.join("urllib3").join("response.py");
+    std::fs::write(&file, bytes).unwrap();
+    file
+}
+
+async fn scan_output(root: &Path, server: &MockServer, extra: &[&str]) -> std::process::Output {
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("SOCKET_") || name.starts_with("POETRY_") || name == "VIRTUAL_ENV" {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1")
+        .args(["scan", "--mode", "hosted", "--yes", "--cwd"])
+        .arg(root)
+        .args([
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .args(extra);
+    cmd.output().await.unwrap()
+}
+
+fn envelope(out: &std::process::Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{error}: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+fn stale_warning(value: &serde_json::Value) -> bool {
+    value["redirect"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning["code"] == "redirect_pypi_stale_install")
+}
+
+/// Both upstream and locally modified warm installs must be diagnosed on
+/// every scan. Merely rewriting the lock must never attest their live bytes.
+#[tokio::test]
+async fn stale_python_install_warns_and_cannot_attest_even_on_rescan() {
+    for bytes in [UPSTREAM, b"local modification\n".as_slice()] {
+        let server = MockServer::start().await;
+        mock_api(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(tmp.path());
+        let installed = install_package(tmp.path(), ".venv", bytes);
+        let out = scan_output(tmp.path(), &server, &["--json"]).await;
+        let json = envelope(&out);
+        assert!(out.status.success(), "{json}");
+        assert_eq!(json["redirect"]["redirected"], 1, "{json}");
+        assert!(stale_warning(&json), "{json}");
+        let redirected = read(&tmp.path().join("poetry.lock"));
+        let vex = tmp.path().join("out.vex.json");
+        for extra in [
+            vec!["--json", "--vex", vex.to_str().unwrap()],
+            vec!["--json", "--vex", vex.to_str().unwrap(), "--vex-no-verify"],
+        ] {
+            let out = scan_output(tmp.path(), &server, &extra).await;
+            let json = envelope(&out);
+            assert_eq!(out.status.code(), Some(1), "{json}");
+            assert!(stale_warning(&json), "{json}");
+            assert_eq!(json["error"]["code"], "no_applicable_patches", "{json}");
+            assert!(!vex.exists(), "stale bytes cannot produce a VEX file");
+        }
+        // A failed fresh record fetch must not bypass the persisted evidence.
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+            .respond_with(ResponseTemplate::new(404))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let out = scan_output(tmp.path(), &server, &[]).await;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("redirect_pypi_stale_install"));
+        assert_eq!(
+            std::fs::read(installed).unwrap(),
+            bytes,
+            "probe is read-only"
+        );
+        assert_eq!(read(&tmp.path().join("poetry.lock")), redirected);
+    }
+}
+
+#[tokio::test]
+async fn patched_python_install_attests_without_a_stale_warning() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let installed = install_package(tmp.path(), ".venv", PATCHED);
+    let vex = tmp.path().join("out.vex.json");
+    let out = scan_output(
+        tmp.path(),
+        &server,
+        &["--json", "--vex", vex.to_str().unwrap()],
+    )
+    .await;
+    let json = envelope(&out);
+    assert!(out.status.success(), "{json}");
+    assert!(!stale_warning(&json), "{json}");
+    assert_eq!(json["vex"]["statements"], 1, "{json}");
+    assert_eq!(std::fs::read(installed).unwrap(), PATCHED);
+}
+
+#[tokio::test]
+async fn healthy_interpreter_cannot_mask_a_stale_python_install() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    install_package(tmp.path(), ".venv", PATCHED);
+    install_package(tmp.path(), "venv", UPSTREAM);
+    let vex = tmp.path().join("out.vex.json");
+    let out = scan_output(
+        tmp.path(),
+        &server,
+        &["--json", "--vex", vex.to_str().unwrap()],
+    )
+    .await;
+    let json = envelope(&out);
+    assert_eq!(out.status.code(), Some(1), "{json}");
+    assert!(stale_warning(&json), "{json}");
+    assert!(!vex.exists());
+}
+
+#[tokio::test]
+async fn python_probe_does_not_guess_staleness_or_run_on_dry_run() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let installed = install_package(tmp.path(), ".venv", UPSTREAM);
+    let out = scan_output(tmp.path(), &server, &["--json", "--dry-run"]).await;
+    let json = envelope(&out);
+    assert!(out.status.success(), "{json}");
+    assert!(!stale_warning(&json), "{json}");
+    assert_eq!(read(&tmp.path().join("poetry.lock")), LOCK);
+    assert!(!tmp
+        .path()
+        .join(".socket/vendor/redirect-state.json")
+        .exists());
+    std::fs::remove_file(&installed).unwrap();
+    for unreadable in [false, true] {
+        if unreadable {
+            std::fs::create_dir(&installed).unwrap();
+        }
+        let out = scan_output(tmp.path(), &server, &["--json"]).await;
+        let json = envelope(&out);
+        assert!(out.status.success(), "{json}");
+        assert!(!stale_warning(&json), "{json}");
+    }
 }

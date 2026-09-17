@@ -200,6 +200,11 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- Hosted Python redirects now warn when installed files still contain upstream
+  or modified bytes and omit those packages from same-run VEX. The read-only
+  probe covers Poetry virtualenvs, repeats on re-scans, and uses persisted patch
+  records if fetching fresh records fails.
+
 - **Agent mode finds Poetry's out-of-tree virtualenv.** Poetry keeps a
   project's virtualenv under `{cache-dir}/virtualenvs/<name>-<hash>-py<X.Y>`
   by default, so after a plain `poetry install` the crawler saw no
