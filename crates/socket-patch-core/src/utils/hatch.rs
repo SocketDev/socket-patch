@@ -23,6 +23,42 @@ pub fn is_hatch(files: &BTreeMap<String, String>) -> bool {
         })
 }
 
+pub fn has_environment_dependency(files: &BTreeMap<String, String>, name: &str) -> bool {
+    let external = files
+        .get("hatch.toml")
+        .and_then(|text| text.parse::<DocumentMut>().ok());
+    let project = files
+        .get("pyproject.toml")
+        .and_then(|text| text.parse::<DocumentMut>().ok());
+    let environments = external
+        .as_ref()
+        .and_then(|document| document.get("envs"))
+        .or_else(|| {
+            project
+                .as_ref()
+                .and_then(|document| document.get("tool"))
+                .and_then(|tool| tool.get("hatch"))
+                .and_then(|hatch| hatch.get("envs"))
+        });
+    environments
+        .and_then(Item::as_table_like)
+        .is_some_and(|environments| {
+            environments.iter().any(|(_, environment)| {
+                ["dependencies", "extra-dependencies"].iter().any(|key| {
+                    environment
+                        .get(key)
+                        .and_then(Item::as_array)
+                        .is_some_and(|dependencies| {
+                            dependencies.iter().filter_map(Value::as_str).any(|spec| {
+                                canonicalize_pypi_name(pep508_name(spec))
+                                    == canonicalize_pypi_name(name)
+                            })
+                        })
+                })
+            })
+        })
+}
+
 fn replacement(spec: &str, name: &str, version: &str, url: &str) -> Result<Option<String>, String> {
     let declared = pep508_name(spec);
     if canonicalize_pypi_name(declared) != name {

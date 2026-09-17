@@ -6,6 +6,8 @@ Hatch environment `dependencies` / `extra-dependencies`. External
 `hatch.toml` tables override the corresponding top-level `tool.hatch` keys.
 Project references enable Hatchling's `allow-direct-references` setting.
 Vendored references use `{root:uri}` so checkouts remain relocatable.
+Environment references require Hatch >=1.2 on PATH; preflight verifies the
+installed version because Hatch 1.0 and 1.1 do not expand that context.
 Both modes pin the wheel SHA-256, preserve extras, markers, comments and
 line endings, and record reversible document edits.
 

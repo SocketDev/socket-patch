@@ -748,6 +748,28 @@ mod tests {
         tokio::fs::read_to_string(root.join(rel)).await.unwrap()
     }
 
+    #[tokio::test]
+    async fn hatch_documents_revert_after_checkout_newline_conversion() {
+        let original = "[project]\ndependencies=[\"one==1\"]\n[tool.hatch.envs.default]\n";
+        let files = [("pyproject.toml".to_owned(), original.to_owned())].into_iter().collect();
+        let patched = crate::utils::hatch::rewrite(&files, "one", "1", "https://patch.test/one.whl").unwrap().remove("pyproject.toml").unwrap();
+        for drift in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let live = if drift {patched.replace("one.whl", "changed.whl")} else {patched.replace('\n', "\r\n")};
+            write(dir.path(), "pyproject.toml", &live).await;
+            let mut state = state_with(vec![edit("pyproject.toml", "redirect_hatch_document", "rewritten", Some(original), Some(&patched))], &["pkg:pypi/one@1"]);
+            let outcome = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+            assert_eq!(outcome.fully_reverted(), !drift);
+            if drift {
+                assert_eq!(read(dir.path(), "pyproject.toml").await, live);
+                assert_eq!(state.edits.len(), 1);
+            } else {
+                assert_eq!(read(dir.path(), "pyproject.toml").await, original.replace('\n', "\r\n"));
+                assert!(state.edits.is_empty());
+            }
+        }
+    }
+
     // ---------- ReplaceFragment ----------
 
     #[tokio::test]

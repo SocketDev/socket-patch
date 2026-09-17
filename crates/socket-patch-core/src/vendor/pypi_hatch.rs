@@ -98,12 +98,39 @@ pub(super) async fn load(
         });
     let changes = hatch::rewrite(&files, name, version, &url)
         .map_err(|error| ("pypi_hatch_unsupported", error))?;
+    if hatch::has_environment_dependency(&files, name) {
+        require_environment_context_support(root).await?;
+    }
     let in_sync = pin.is_some() && changes.is_empty();
     Ok(HatchProject {
         files,
         in_sync,
         pin,
     })
+}
+
+async fn require_environment_context_support(root: &Path) -> Result<(), Failure> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("hatch")
+            .arg("--version")
+            .current_dir(root)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    if let Ok(Ok(output)) = output {
+        if output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .filter_map(|word| semver::Version::parse(word).ok())
+                .any(|version| version >= semver::Version::new(1, 2, 0))
+        {
+            return Ok(());
+        }
+    }
+    Err(("pypi_hatch_unsupported", "vendored environment dependencies require Hatch >=1.2 on PATH for root URI expansion; upgrade Hatch or use the install hook".into()))
 }
 
 async fn write_files(
@@ -315,6 +342,18 @@ mod tests {
         assert!(load(root, "one", "1", UUID).await.is_err());
         tokio::fs::remove_file(root.join(&wheel)).await.unwrap();
         assert!(load(root, "one", "1", UUID).await.unwrap().in_sync);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_configuration_is_refused_without_touching_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let target = external.path().join("pyproject.toml");
+        tokio::fs::write(&target, ORIGINAL).await.unwrap();
+        std::os::unix::fs::symlink(&target, temp.path().join("pyproject.toml")).unwrap();
+        assert!(load(temp.path(), "one", "1", UUID).await.is_err());
+        assert_eq!(tokio::fs::read_to_string(target).await.unwrap(), ORIGINAL);
     }
 
     #[tokio::test]
