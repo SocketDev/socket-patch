@@ -624,6 +624,15 @@ def main():
         python = venv / "bin/python"
         penv = pipenv_env(version, tool)
 
+        # Pipenv 0.x installs plain string pins only: inline-table entries with
+        # markers / extras are not understood, so nothing gets installed for
+        # agent mode to patch — nothing to measure there.
+        if mode in ("agent", "agent-oot") and major < 3 and shape in ("marker", "marker-excluded", "extras"):
+            row["supported"] = False
+            row["expected"] = "skipped: Pipenv 0.x does not understand inline-table (markers/extras) Pipfile entries"
+            row["passed"] = True
+            return row
+
         # --------------------------------------------------------- agent-oot
         if mode == "agent-oot":
             if major < 3:
@@ -820,7 +829,9 @@ def main():
         # ---- expected refusals (pre-2018 majors)
         refusal = None
         if spec != 6:
-            refusal = ("unsupported-lock-spec", "redirect_pipenv_refused" if mode == "hosted" else "pypi_pipenv_spec_unsupported")
+            # Hosted: an old lock says nothing about the project's other install
+            # files, so it is a SKIP (not a veto) — `redirect_pipenv_skipped`.
+            refusal = ("unsupported-lock-spec", "redirect_pipenv_skipped" if mode == "hosted" else "pypi_pipenv_spec_unsupported")
         elif legacy and mode == "vendored":
             refusal = ("unsupported-vendored-installer", "pypi_pipenv_installer_unsupported")
         if refusal:

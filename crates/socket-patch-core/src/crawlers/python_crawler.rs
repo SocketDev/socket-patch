@@ -323,7 +323,53 @@ async fn find_pipenv_virtualenv_site_packages_with(
     }
     let mut results = Vec::new();
     for venv in venvs {
-        results.extend(find_site_packages_under(&venv, "site-packages").await);
+        let direct = find_site_packages_under(&venv, "site-packages").await;
+        if !direct.is_empty() {
+            results.extend(direct);
+            continue;
+        }
+        // Pipenv 2018–2021 append the FULL `PIPENV_PYTHON` string to the
+        // name (`<name>-<hash>-/usr/bin/python3`), so the virtualenv lives at
+        // the bottom of a directory chain under WORKON_HOME; 2022+ append the
+        // basename. Walk the chain down to the first directory that holds a
+        // site-packages (bounded, never following symlinks).
+        results.extend(find_nested_venv_site_packages(&venv, 12).await);
+    }
+    results
+}
+
+/// The site-packages of the virtualenv(s) at the bottom of a directory
+/// chain rooted at `dir` (see the caller): every directory that itself holds
+/// a `site-packages` stops the descent there, and the depth is bounded.
+async fn find_nested_venv_site_packages(dir: &Path, depth: usize) -> Vec<PathBuf> {
+    if depth == 0 {
+        return Vec::new();
+    }
+    let mut results = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return results;
+    };
+    let mut children = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(kind) = entry.file_type().await else {
+            continue;
+        };
+        if !kind.is_dir() {
+            continue;
+        }
+        // No name-based pruning: the chain literally contains `bin/python`
+        // when PIPENV_PYTHON pointed at an interpreter, and the descent stops
+        // at the first directory that holds a site-packages anyway.
+        children.push(entry.path());
+    }
+    children.sort();
+    for child in children {
+        let here = find_site_packages_under(&child, "site-packages").await;
+        if !here.is_empty() {
+            results.extend(here);
+        } else {
+            results.extend(Box::pin(find_nested_venv_site_packages(&child, depth - 1)).await);
+        }
     }
     results
 }
@@ -1204,6 +1250,35 @@ mod tests {
     /// and no in-project venv, `find_local_venv_site_packages` returns the
     /// out-of-tree Pipenv venv instead of nothing (which used to trigger the
     /// global fallback).
+    /// Pipenv 2018–2021 with an absolute PIPENV_PYTHON append the whole
+    /// interpreter path to the venv name, so the virtualenv sits at the
+    /// bottom of `<workon>/<name>-<hash>-/<abs>/<python>/`; the crawler must
+    /// walk down to it.
+    #[tokio::test]
+    async fn pipenv_nested_interpreter_suffix_venv_is_discovered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("Pipfile"), "[packages]\n").unwrap();
+        let workon = tmp.path().join("wh");
+        std::fs::create_dir_all(&workon).unwrap();
+        let real = std::fs::canonicalize(&project).unwrap();
+        let hash = pipenv_venv_hash(&pipenv_path_string(&real.join("Pipfile")));
+        let nested = fake_venv(
+            &workon,
+            &format!("project-{hash}-/opt/tools/2018.11.26/bin/python"),
+        );
+        let workon_str = workon.to_string_lossy().into_owned();
+        let var = move |name: &str| match name {
+            "WORKON_HOME" => Some(workon_str.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            find_pipenv_virtualenv_site_packages_with(&project, &var).await,
+            vec![nested]
+        );
+    }
+
     #[tokio::test]
     async fn pipenv_custom_name_and_dot_venv_file_pointer_are_honoured() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1255,16 +1330,27 @@ mod tests {
         // where the hash was computed over the location with the recased
         // name spliced in (`_get_virtualenv_hash`'s fallback loop).
         let tmp = tempfile::tempdir().unwrap();
-        let project = tmp.path().join("proj");
-        std::fs::create_dir_all(&project).unwrap();
+        // Pipenv's fallback (mirrored here) splits the directory name at its
+        // LAST dash, so a hash that contains a dash is invisible to Pipenv
+        // itself; pick a project name whose recased hash has none.
+        let (project, recased_hash) = (0..64)
+            .map(|i| {
+                let project = tmp.path().join(format!("proj{i}"));
+                std::fs::create_dir_all(&project).unwrap();
+                let real = std::fs::canonicalize(&project).unwrap();
+                let location = pipenv_path_string(&real.join("Pipfile"));
+                let recased = location.replace(&format!("proj{i}"), &format!("Proj{i}"));
+                (project, pipenv_venv_hash(&recased))
+            })
+            .find(|(_, hash)| !hash.contains('-'))
+            .expect("some project name yields a dash-free hash");
+        let name = project.file_name().unwrap().to_string_lossy().into_owned();
         std::fs::write(project.join("Pipfile"), "[packages]\n").unwrap();
         let workon = tmp.path().join("wh");
         std::fs::create_dir_all(&workon).unwrap();
-        let real = std::fs::canonicalize(&project).unwrap();
-        let location = pipenv_path_string(&real.join("Pipfile"));
-        let recased_hash = pipenv_venv_hash(&location.replace("proj", "Proj"));
-        let recased = fake_venv(&workon, &format!("Proj-{recased_hash}"));
-        let _wrong = fake_venv(&workon, "Proj-CCCCCCCC");
+        let recased_name = name.replacen("proj", "Proj", 1);
+        let recased = fake_venv(&workon, &format!("{recased_name}-{recased_hash}"));
+        let _wrong = fake_venv(&workon, &format!("{recased_name}-CCCCCCCC"));
         let workon_str = workon.to_string_lossy().into_owned();
         let var = move |name: &str| match name {
             "WORKON_HOME" => Some(workon_str.clone()),
