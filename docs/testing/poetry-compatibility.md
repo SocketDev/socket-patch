@@ -167,28 +167,30 @@ utils::poetry_lock vendor::pypi_poetry` and `cargo test -p socket-patch-core
 | Poetry | hosted | vendored | agent (in-project venv) | agent (`poetry run`, out-of-tree venv) | tamper rejected (hosted / vendored) | warm venv re-installed (hosted / vendored) | relock keeps patch (hosted / vendored) | lock-only vendored |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 0.12.17 | refused (0.x ignores URL sources) | pass (crlf,direct,populated) | pass (direct) | n/a | n/a / no | n/a / false | n/a / false | refused |
-| 1.0.10 | pass (crlf,direct,populated) | pass (crlf,direct,populated) | pass (direct) | pass (direct) | yes / no | false / false | false / false | refused |
-| 1.1.15 | pass (crlf,direct,populated) | pass (crlf,direct,populated) | pass (direct) | pass (direct) | yes / no | false / false | true / true | refused |
-| 1.2.2 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / no | false / false | true / true | refused |
-| 1.3.2 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / no | false / false | true / true | refused |
-| 1.4.2 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
-| 1.5.1 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
-| 1.6.1 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
-| 1.7.1 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
-| 1.8.5 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
-| 2.0.1 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
-| 2.1.4 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
-| 2.2.1 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
-| 2.3.4 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
-| 2.4.3 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | refused |
+| 1.0.10 | pass (crlf,direct,populated) | pass (crlf,direct,populated) | pass (direct) | pass (direct) | yes / no | false / false | false / false | refused (crlf), refused (direct), yes (populated) |
+| 1.1.15 | pass (crlf,direct,populated) | pass (crlf,direct,populated) | pass (direct) | pass (direct) | yes / no | false / false | true / true | refused (crlf), refused (direct), yes (populated) |
+| 1.2.2 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / no | false / false | true / true | yes |
+| 1.3.2 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / no | false / false | true / true | yes |
+| 1.4.2 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
+| 1.5.1 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
+| 1.6.1 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
+| 1.7.1 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
+| 1.8.5 | pass (crlf,direct) | pass (crlf,direct) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
+| 2.0.1 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
+| 2.1.4 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
+| 2.2.1 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
+| 2.3.4 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
+| 2.4.3 | pass (crlf,direct,pep621) | pass (crlf,direct,pep621) | pass (direct) | pass (direct) | yes / yes | true / true | true / true | yes |
 <!-- GENERATED:END -->
 
-Captured 2026-09-17 on macOS arm64 against the CLI at the PR head; 108 cases,
-all passing (the `pass`/`refused` cells are the asserted outcomes, the
+Captured 2026-09-17 on macOS arm64 against the fix-branch head; 108 cases,
+all passing (the `pass`/`refused` cells are the asserted outcomes; the
 `tamper` / `warm venv` / `relock` / `lock-only vendored` columns are the
 measured installer facts the sections above describe). The
 [machine-readable results](poetry-compatibility/results.json) carry every
 check, the CLI envelopes' relevant fields and the per-step exit codes.
 `poetry lock` on 0.12 / 1.0 is bare (no `--no-update`), hence
-`relock keeps patch = false` there. The companion SBOM annotation work and its
-own capture set live in SocketDev/depscan (`tools/pipeline/poetry-patch-backtest.py`).
+`relock keeps patch = false` there; `lock-only vendored = refused` on 0.12 and
+on the unpopulated 1.0/1.1 fixtures (`urllib3 = []`) because those locks name
+no wheel hash. The companion SBOM annotation work and its own capture set live
+in SocketDev/depscan (`tools/pipeline/poetry-patch-backtest.py`).

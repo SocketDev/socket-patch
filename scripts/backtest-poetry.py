@@ -714,8 +714,19 @@ def render_doc_table(summary):
         tamper = f"{'yes' if any(c['info']['tamper']['installExit'] != 0 for c in direct_h) else ('n/a' if not direct_h else 'no')} / {'yes' if any(c['info']['tamper']['installExit'] != 0 for c in direct_v) else ('n/a' if not direct_v else 'no')}"
         relock = f"{flag([c for c in hosted if c['shape']=='direct'], 'relock', 'patchSourceKept')} / {flag([c for c in vendored if c['shape']=='direct'], 'relock', 'patchSourceKept')}"
         warm = f"{flag([c for c in hosted if c['shape']=='direct'], 'warmInstall', 'patched')} / {flag([c for c in vendored if c['shape']=='direct'], 'warmInstall', 'patched')}"
-        lockonly = flag(vendored, "lockOnlyVendor", "applied")
-        lockonly = {"0": "refused", "1": "yes"}.get(lockonly, lockonly)
+        # Per shape: the unpopulated legacy fixtures (`urllib3 = []`) name no
+        # wheel hash, so they stay refused while the populated ones vendor.
+        per_shape = {}
+        for c in vendored:
+            lo = c.get("info", {}).get("lockOnlyVendor")
+            if lo is not None:
+                per_shape[c["shape"]] = "yes" if lo.get("applied") == 1 else "refused"
+        if not per_shape:
+            lockonly = "n/a"
+        elif len(set(per_shape.values())) == 1:
+            lockonly = next(iter(per_shape.values()))
+        else:
+            lockonly = ", ".join(f"{v} ({k})" for k, v in sorted(per_shape.items()))
         lines.append(
             f"| {version} | {hosted_cell} | {cell(vendored)} | {cell(m('agent'))} | {cell(m('agent-oot'))} | {tamper} | {warm} | {relock} | {lockonly} |"
         )
