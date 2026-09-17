@@ -335,8 +335,13 @@ pub fn plan(
                 .get("envs")
                 .and_then(Item::as_table_like)
                 .is_some_and(|envs| {
-                    envs.iter()
-                        .any(|(_, env)| env.get("installer").and_then(Item::as_str) == Some("uv"))
+                    envs.iter().any(|(_, env)| {
+                        env.get("installer").and_then(Item::as_str) == Some("uv")
+                            || env
+                                .get("uv-path")
+                                .and_then(Item::as_str)
+                                .is_some_and(|path| !path.is_empty())
+                    })
                 })
             {
                 return Err("vendored Hatch wheels require the pip installer: uv does not enforce local wheel fragment hashes".into());
@@ -501,6 +506,22 @@ mod tests {
             "[project]\ndependencies=[\"urllib3==1.26.18\\nidna==3.6\"]",
         ] {
             assert!(rewrite(&files(text), "urllib3", "1.26.18", "https://patch.test/a.whl").is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn uv_installer_and_explicit_path_refuse_local_wheels() {
+        for setting in ["installer='uv'", "uv-path='uv'"] {
+            let inputs = files(&format!("[project]\ndependencies=[\"urllib3==1.26.18\"]\n[tool.hatch.envs.default]\n{setting}\n"));
+            assert!(rewrite(&inputs, "urllib3", "1.26.18", "https://patch.test/a.whl").is_ok());
+            assert!(rewrite(
+                &inputs,
+                "urllib3",
+                "1.26.18",
+                "{root:uri}/.socket/vendor/a.whl"
+            )
+            .unwrap_err()
+            .contains("pip installer"));
         }
     }
 
