@@ -6,7 +6,7 @@ Hatch environment `dependencies` / `extra-dependencies`. External
 `hatch.toml` tables override the corresponding top-level `tool.hatch` keys.
 Project references enable Hatchling's `allow-direct-references` setting.
 Vendored references use `{root:uri}` so checkouts remain relocatable.
-Environment references require Hatch >=1.2 on PATH; preflight verifies the
+Vendored environment references require Hatch >=1.2 on PATH; preflight verifies the
 installed version because Hatch 1.0 and 1.1 do not expand that context.
 Vendored Hatch requires the pip installer; uv currently ignores hash
 fragments for local wheels. Hosted Hatch supports both pip and uv.
@@ -28,8 +28,8 @@ Repeated vendored scans compare the declared source with the committed
 artifact path and digest, and verify an existing wheel's bytes. Missing
 wheels may be rebuilt only against that recorded pin. Ledgerless direct
 references and drifted sources are refused. Concurrent manifest edits and
-symlinks are also refused. Each project patch records shared ownership of the direct-reference
-permission. Selective and preserved rollback retain the setting while any
+symlinks are also refused. Each project patch records shared ownership of
+the direct-reference permission. Selective and preserved rollback retain the setting while any
 project direct reference remains, and restore its original value after the
 last reference is unwired.
 
