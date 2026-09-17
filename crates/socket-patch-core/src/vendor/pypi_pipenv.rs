@@ -452,6 +452,30 @@ pub(super) async fn revert_pipenv(
             continue;
         };
         if live != new_value {
+            // RELOCKED (not drift): `pipenv lock` / `update` regenerated the
+            // entry to registry shape with a different hash list or key set
+            // than the recorded original (Pipenv 2022 does; 2026 reproduces
+            // the original byte for byte and converges above). The vendored
+            // reference is already gone and the user's fresh resolution
+            // stands, so the record retires — keeping the artifact dir and
+            // ledger entry forever would be the drift-keep for a reference
+            // nothing points at any more. A live entry that still carries a
+            // `file`/`path` reference we did not write IS drift.
+            let registry_shaped = live
+                .as_object()
+                .is_some_and(|object| !object.contains_key("file") && !object.contains_key("path"));
+            let rewritten_with_original =
+                rec.action == WiringAction::Rewritten && rec.original.is_some();
+            if registry_shaped && rewritten_with_original {
+                warnings.push(VendorWarning::new(
+                    "vendor_lock_entry_relocked",
+                    format!(
+                        "{LOCK_FILE} entry for {:?} was regenerated to a registry reference by a relock; the vendored reference is already gone, so the record is retired",
+                        rec.key
+                    ),
+                ));
+                continue;
+            }
             warnings.push(drifted());
             continue;
         }

@@ -3615,6 +3615,89 @@ wheels = [
 }
 "#;
 
+    /// A relock regenerated the wired entry to a registry reference whose
+    /// hash list differs from the recorded original (Pipenv 2022.12.19 does
+    /// exactly this; 2026 reproduces the original and converges silently):
+    /// the vendored reference is gone, so the revert must RETIRE the record
+    /// — success, no drift-keep, artifact removed — instead of keeping the
+    /// uuid dir and ledger entry forever for a reference nothing points at.
+    /// A live entry that still carries a foreign `file` reference is drift.
+    #[tokio::test]
+    async fn pipenv_relocked_registry_entry_retires_instead_of_keeping() {
+        use crate::vendor::pypi_pipenv::{load_pipenv_project, wire_pipenv};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(root.join("Pipfile.lock"), PIPENV_REGISTRY_LOCK)
+            .await
+            .unwrap();
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let p = load_pipenv_project(root).await.unwrap();
+        let (wiring, _meta) = wire_pipenv(&p, root, "six", &rel_wheel, &"0".repeat(64), UUID)
+            .await
+            .unwrap();
+        let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
+        tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+
+        // Simulate the relock: registry shape again, but a DIFFERENT hash
+        // list than the recorded original.
+        let text = tokio::fs::read_to_string(root.join("Pipfile.lock"))
+            .await
+            .unwrap();
+        let mut live: serde_json::Value = serde_json::from_str(&text).unwrap();
+        live["default"]["six"] = serde_json::json!({
+            "hashes": ["sha256:relocked-a", "sha256:relocked-b"],
+            "index": "pypi",
+            "version": "==1.16.0"
+        });
+        let relocked = serde_json::to_string_pretty(&live).unwrap();
+        tokio::fs::write(root.join("Pipfile.lock"), &relocked)
+            .await
+            .unwrap();
+
+        let entry = revert_entry("pipenv", &rel_wheel, wiring.clone());
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_relocked"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(
+            !outcome.drift_skipped() && !outcome.kept_artifact,
+            "a relocked entry is not drift: {:?}",
+            outcome.warnings
+        );
+        assert!(!wheel.exists(), "the orphaned vendored wheel is removed");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Pipfile.lock"))
+                .await
+                .unwrap(),
+            relocked,
+            "the user's relocked entry stands"
+        );
+
+        // Foreign file reference → still drift, still kept.
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+        live["default"]["six"] = serde_json::json!({"file": "./forks/six.whl"});
+        tokio::fs::write(
+            root.join("Pipfile.lock"),
+            serde_json::to_string_pretty(&live).unwrap(),
+        )
+        .await
+        .unwrap();
+        let entry = revert_entry("pipenv", &rel_wheel, wiring);
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped() && outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(wheel.is_file());
+    }
+
     /// BUG GUARD (missing drift-keep gate — the npm-family RevertOutcome
     /// contract, residual #131): a drift-skipped pipenv revert leaves the
     /// vendor-pointing entry in Pipfile.lock, so deleting the uuid dir
