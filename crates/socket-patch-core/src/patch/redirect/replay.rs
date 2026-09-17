@@ -52,6 +52,7 @@ enum Inverse {
     /// writers record an `original` that is a substring of `new` (the
     /// Cargo.toml insert variant, the maven version suffix).
     ReplaceFragment,
+    PipenvEntry,
     /// action `added` with only `new` recorded: the redirect inserted the
     /// fragment into a pre-existing file, so the inverse removes it once
     /// (an absent fragment is the desired end state — no-op).
@@ -86,9 +87,14 @@ enum Inverse {
 /// Gemfile.lock) revert together or not at all.
 fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
     match kind {
-        "redirect_requirements_line" | "redirect_uv_lock_wheel" => ("pypi", Inverse::ReplaceFragment),
+        "redirect_pipenv_entry" => ("pypi", Inverse::PipenvEntry),
+        "redirect_requirements_line" | "redirect_uv_lock_wheel" => {
+            ("pypi", Inverse::ReplaceFragment)
+        }
         "redirect_composer_dist" => ("composer", Inverse::ReplaceFragment),
-        "redirect_cargo_toml_dep" | "redirect_cargo_lock_entry" => ("cargo", Inverse::ReplaceFragment),
+        "redirect_cargo_toml_dep" | "redirect_cargo_lock_entry" => {
+            ("cargo", Inverse::ReplaceFragment)
+        }
         "redirect_cargo_registry" => (
             "cargo",
             if action == "added" {
@@ -406,6 +412,24 @@ pub async fn revert_remaining_redirect_edits(
                     refused_groups.insert(group);
                     continue 'group;
                 }
+                Inverse::PipenvEntry => {
+                    let restored = match staged_read(&staged, project_root, &edit.path).await {
+                        Ok(Some(content)) => super::pipenv::restore(&content, &edit),
+                        Ok(None) => Err(format!("{} no longer exists", edit.path)),
+                        Err(error) => Err(error),
+                    };
+                    match restored {
+                        Ok(content) => {
+                            staged.insert(edit.path.clone(), Some(content));
+                            group_drops.insert(idx);
+                        }
+                        Err(error) => {
+                            refuse(error, &mut outcome);
+                            refused_groups.insert(group);
+                            continue 'group;
+                        }
+                    }
+                }
                 Inverse::ReplaceFragment => {
                     let (Some(original), Some(new)) =
                         (str_payload(&edit.original), str_payload(&edit.new))
@@ -420,10 +444,7 @@ pub async fn revert_remaining_redirect_edits(
                     let content = match staged_read(&staged, project_root, &edit.path).await {
                         Ok(Some(c)) => c,
                         Ok(None) => {
-                            refuse(
-                                format!("{} no longer exists", edit.path),
-                                &mut outcome,
-                            );
+                            refuse(format!("{} no longer exists", edit.path), &mut outcome);
                             refused_groups.insert(group);
                             continue 'group;
                         }
@@ -448,10 +469,7 @@ pub async fn revert_remaining_redirect_edits(
                             refused_groups.insert(group);
                             continue 'group;
                         }
-                        staged.insert(
-                            edit.path.clone(),
-                            Some(content.replacen(new, original, 1)),
-                        );
+                        staged.insert(edit.path.clone(), Some(content.replacen(new, original, 1)));
                         group_drops.insert(idx);
                     } else if content.contains(original) && !new.contains(original) {
                         // Already at the pre-edit state (an interrupted
@@ -686,7 +704,13 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    fn edit(path: &str, kind: &str, action: &str, original: Option<&str>, new: Option<&str>) -> FileEdit {
+    fn edit(
+        path: &str,
+        kind: &str,
+        action: &str,
+        original: Option<&str>,
+        new: Option<&str>,
+    ) -> FileEdit {
         FileEdit {
             path: path.into(),
             kind: kind.into(),
@@ -711,7 +735,8 @@ mod tests {
                     description: String::new(),
                     license: String::new(),
                     tier: "free".into(),
-                });
+                },
+            );
         }
         state
     }
@@ -733,7 +758,12 @@ mod tests {
     #[tokio::test]
     async fn rewritten_fragment_replays_to_original() {
         let dir = TempDir::new().unwrap();
-        write(dir.path(), "requirements.txt", "left-pad @ https://patch.example/x.whl\n").await;
+        write(
+            dir.path(),
+            "requirements.txt",
+            "left-pad @ https://patch.example/x.whl\n",
+        )
+        .await;
         let mut state = state_with(
             vec![edit(
                 "requirements.txt",
@@ -756,7 +786,12 @@ mod tests {
     async fn substring_original_checks_new_first() {
         // The maven version-suffix shape: original is a substring of new.
         let dir = TempDir::new().unwrap();
-        write(dir.path(), "pom.xml", "<version>2.17.1-socket-abc</version>\n").await;
+        write(
+            dir.path(),
+            "pom.xml",
+            "<version>2.17.1-socket-abc</version>\n",
+        )
+        .await;
         let mut state = state_with(
             vec![edit(
                 "pom.xml",
@@ -868,7 +903,12 @@ mod tests {
     #[tokio::test]
     async fn chained_reredirect_unwinds_newest_first_to_pristine() {
         let dir = TempDir::new().unwrap();
-        write(dir.path(), "go.mod", "module m\n\nreplace x => gopatch.socket.dev/x v2\n").await;
+        write(
+            dir.path(),
+            "go.mod",
+            "module m\n\nreplace x => gopatch.socket.dev/x v2\n",
+        )
+        .await;
         let mut state = state_with(
             vec![
                 edit(
@@ -1159,7 +1199,13 @@ mod tests {
     async fn unknown_kind_fails_closed() {
         let dir = TempDir::new().unwrap();
         let mut state = state_with(
-            vec![edit("f", "redirect_future_thing", "rewritten", Some("a"), Some("b"))],
+            vec![edit(
+                "f",
+                "redirect_future_thing",
+                "rewritten",
+                Some("a"),
+                Some("b"),
+            )],
             &[],
         );
         let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
@@ -1172,7 +1218,12 @@ mod tests {
     async fn leftover_npm_json_edit_refuses_and_holds_every_npm_family_record() {
         let dir = TempDir::new().unwrap();
         write(dir.path(), "package-lock.json", "{}\n").await;
-        write(dir.path(), "bun.lock", "\"pkg\": [\"https://patch.example/t.tgz\"]\n").await;
+        write(
+            dir.path(),
+            "bun.lock",
+            "\"pkg\": [\"https://patch.example/t.tgz\"]\n",
+        )
+        .await;
         let mut state = state_with(
             vec![
                 FileEdit {
@@ -1355,7 +1406,12 @@ mod tests {
     #[tokio::test]
     async fn dry_run_reports_without_touching_disk_or_ledger() {
         let dir = TempDir::new().unwrap();
-        write(dir.path(), "requirements.txt", "left-pad @ https://patch.example/x.whl\n").await;
+        write(
+            dir.path(),
+            "requirements.txt",
+            "left-pad @ https://patch.example/x.whl\n",
+        )
+        .await;
         let mut state = state_with(
             vec![edit(
                 "requirements.txt",
@@ -1384,7 +1440,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         for bad in ["/etc/passwd", "../outside", "a/../../b", "c:\\windows\\x"] {
             let mut state = state_with(
-                vec![edit(bad, "redirect_requirements_line", "rewritten", Some("a"), Some("b"))],
+                vec![edit(
+                    bad,
+                    "redirect_requirements_line",
+                    "rewritten",
+                    Some("a"),
+                    Some("b"),
+                )],
                 &[],
             );
             let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
@@ -1836,7 +1898,12 @@ mod tests {
     #[tokio::test]
     async fn trust_line_already_absent_leaves_the_file_untouched() {
         let dir = TempDir::new().unwrap();
-        write(dir.path(), "pnpm-workspace.yaml", "packages:\n  - 'apps/*'\n").await;
+        write(
+            dir.path(),
+            "pnpm-workspace.yaml",
+            "packages:\n  - 'apps/*'\n",
+        )
+        .await;
         let mut state = state_with(
             vec![FileEdit {
                 path: "pnpm-workspace.yaml".into(),
@@ -1993,7 +2060,13 @@ mod tests {
                     Some("a"),
                     Some("b"),
                 ),
-                edit("f", "redirect_future_thing", "rewritten", Some("a"), Some("b")),
+                edit(
+                    "f",
+                    "redirect_future_thing",
+                    "rewritten",
+                    Some("a"),
+                    Some("b"),
+                ),
             ],
             &["pkg:nuget/A@1", "pkg:hex/x@1"],
         );
@@ -2026,5 +2099,38 @@ mod tests {
         // must yield an empty file, not a lone newline.
         assert_eq!(remove_fragment_once("F\n", "F"), "");
         assert_eq!(remove_fragment_once("\nF\n", "F"), "");
+    }
+    #[tokio::test]
+    async fn pipenv_replay_restores_categories_and_refuses_drift_atomically() {
+        use crate::patch::redirect::{rewrite_registry_redirect, DepOverride};
+        let dep: DepOverride=serde_json::from_value(serde_json::json!({"ecosystem":"pypi","name":"urllib3","version":"1.26.18","patchUuid":"one","token":"token","artifactUrl":"https://patch.socket.dev/patch/pypi/urllib3/1.26.18/token/one/urllib3-1.26.18-py3-none-any.whl","integrity":{"sha256":"a".repeat(64)}})).unwrap();
+        let original="{\"_meta\":{\"pipfile-spec\":6},\"default\":{\"urllib3\":{\"version\":\"==1.26.18\"}},\"tests\":{\"urllib3\":{\"version\":\"==1.26.18\"}}}";
+        let result = rewrite_registry_redirect(
+            &BTreeMap::from([("Pipfile.lock".into(), original.into())]),
+            &[dep],
+        );
+        for drift in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let text = result.files["Pipfile.lock"].clone();
+            let live = if drift {
+                text.replacen("sha256:", "sha256:0", 1)
+            } else {
+                text
+            };
+            write(dir.path(), "Pipfile.lock", &live).await;
+            let mut state = state_with(result.edits.clone(), &["pkg:pypi/urllib3@1.26.18"]);
+            let before = state.edits.len();
+            let preview = revert_remaining_redirect_edits(dir.path(), &mut state, true).await;
+            assert_eq!(preview.fully_reverted(), !drift);
+            assert_eq!(read(dir.path(), "Pipfile.lock").await, live);
+            assert_eq!(state.edits.len(), before);
+            let outcome = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+            assert_eq!(outcome.fully_reverted(), !drift);
+            assert_eq!(
+                read(dir.path(), "Pipfile.lock").await,
+                if drift { live.as_str() } else { original }
+            );
+            assert_eq!(state.edits.is_empty(), !drift);
+        }
     }
 }

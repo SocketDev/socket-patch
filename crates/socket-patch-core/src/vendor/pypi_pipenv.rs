@@ -1,27 +1,6 @@
-//! pipenv wiring: a lock-ONLY `default`/`develop` entry rewrite of
-//! `Pipfile.lock` (pipfile-spec 6).
-//!
-//! `pipenv verify` / `install --deploy` compare only `_meta.hash` (derived
-//! from the Pipfile), so replacing a section entry with the V1/V2-captured
-//! file-ref shape — `{"file": "./<rel wheel>", "hashes":
-//! ["sha256:<patched>"], "markers": <preserved>}`, `index`/`version` dropped,
-//! `_meta` untouched — survives `pipenv sync`, `install --deploy`, `verify`
-//! and bare `pipenv install` byte-stably from a fresh checkout (spike
-//! V2/V3). The serializer is pinned to pipenv's own
-//! `json.dumps(obj, indent=4, sort_keys=True) + "\n"` (spike V7) so the lock
-//! never churns. See `spikes/pipenv/` and the pipenv section of
-//! `spikes/PHASE0-V2-FINDINGS.txt`.
-//!
-//! INTEGRITY caveat (spike V4, REFUTED claim): pipenv installs file-ref
-//! entries through a separate pip phase with no `--hash`/`--require-hashes`,
-//! so the recorded hash is NEVER enforced by pipenv itself — every vendor
-//! run pushes a `vendor_integrity_unverified` warning and the committed
-//! wheel bytes are the only tamper evidence (the hash we write becomes
-//! enforced for free if pipenv ever fixes that phase).
-//!
-//! Drift caveat (spike V6): `pipenv lock` regenerates the entry to registry
-//! shape and `pipenv update <pkg>` additionally rewrites the user's Pipfile
-//! pin to `*` — both silent unpatch events; bare `pipenv install` is safe.
+//! Pipenv lock-only wheel references preserve manifest hashes and categories.
+//! Vendoring requires Pipenv 2018 or later; earlier installers cannot consume
+//! portable relative wheel paths with integrity hashes.
 
 use std::path::Path;
 
@@ -42,7 +21,14 @@ const LOCK_FILE: &str = "Pipfile.lock";
 const KIND_LOCK_ENTRY: &str = "pipenv_lock_entry";
 
 /// The Pipfile.lock sections searched/wired, in application order.
-const SECTIONS: [&str; 2] = ["default", "develop"];
+fn category_names(lock: &Value) -> Vec<String> {
+    lock.as_object()
+        .into_iter()
+        .flat_map(|map| map.keys())
+        .filter(|key| key.as_str() != "_meta")
+        .cloned()
+        .collect()
+}
 
 /// Guarded read shared in shape with the sibling backend twins:
 /// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
@@ -133,11 +119,20 @@ pub(super) async fn load_pipenv_project(
         ));
     }
 
+    for section in category_names(&lock) {
+        if section.contains(':') || !lock[&section].is_object() {
+            return Err((
+                "pypi_pipenv_lock_parse_failed",
+                format!("invalid Pipenv category {section}"),
+            ));
+        }
+    }
+
     // ALWAYS pushed (spike V4 refuted hash enforcement): the recorded hash is
     // self-documentation, not a pipenv-enforced check.
     let warnings = vec![VendorWarning::new(
         "vendor_integrity_unverified",
-        "pipenv never enforces the hashes recorded on file-ref lock entries (its file-ref \
+        "Pipenv 2018 or later is required. Pipenv does not consistently enforce the hashes recorded on file-ref lock entries (its file-ref \
          install phase invokes pip without --hash/--require-hashes), so the vendored wheel is \
          protected only by the committed wheel itself; `socket-patch verify` re-checks its \
          sha256 against the lock entry",
@@ -147,13 +142,13 @@ pub(super) async fn load_pipenv_project(
 
 /// Target-specific guards (also re-run by [`wire_pipenv`] right before
 /// writing). Entries match by PEP 503 canonical NAME in `default` and
-/// `develop`; there is no version guard — the file-ref entry carries no
-/// version key and the spike proved pipenv accepts a version pin-down
-/// (V3's 1.17.0 → 1.16.0 splice installed cleanly).
+/// custom categories. Registry pins and existing vendored wheel identities
+/// must both match the selected patch version.
 pub(super) fn check_target_guards(
     p: &PipenvProject,
     canon_name: &str,
     record_uuid: &str,
+    version: &str,
 ) -> Result<PipenvTarget, (&'static str, String)> {
     let entries = find_entries(&p.lock, canon_name);
     if entries.is_empty() {
@@ -173,10 +168,29 @@ pub(super) fn check_target_guards(
                 format!("{LOCK_FILE} {section}.{key} is not a JSON object"),
             ));
         };
-        if let Some(file_ref) = obj.get("file").and_then(Value::as_str) {
+        if let Some(file_ref) = obj
+            .get("file")
+            .or_else(|| obj.get("path"))
+            .and_then(Value::as_str)
+        {
             match parse_vendor_path(file_ref) {
                 // Ours, same patch generation.
-                Some(parts) if parts.eco == "pypi" && parts.uuid == record_uuid => continue,
+                Some(parts) if parts.eco == "pypi" && parts.uuid == record_uuid => {
+                    let filename = file_ref.rsplit('/').next().unwrap_or("");
+                    let mut fields = filename.split('-');
+                    let matches_identity = fields.next().is_some_and(|name| canonicalize_pypi_name(name) == canon_name) && fields.next() == Some(version);
+                    let conflicting_source = NON_REGISTRY_KEYS.iter().filter(|key| **key != "path").any(|key| obj.contains_key(*key))
+                        || (obj.contains_key("file") && obj.contains_key("path"))
+                        || obj.contains_key("version") || obj.contains_key("index");
+                    if matches_identity && !conflicting_source
+                    {
+                        continue;
+                    }
+                    return Err((
+                        "pypi_pipenv_source_already_exists",
+                        "vendored wheel identity or source changed".into(),
+                    ));
+                }
                 // Ours, but a STALE patch generation: wiring over it would
                 // lose the only recorded registry original — refuse with the
                 // repair path (mirrors gem's stale-checksum refusal).
@@ -212,6 +226,12 @@ pub(super) fn check_target_guards(
                 ),
             ));
         }
+        if obj.get("version").and_then(Value::as_str) != Some(format!("=={version}").as_str()) {
+            return Err((
+                "pypi_pipenv_version_mismatch",
+                format!("{LOCK_FILE} {section}.{key} does not pin {version}"),
+            ));
+        }
         all_in_sync = false;
     }
     Ok(if all_in_sync {
@@ -235,7 +255,15 @@ pub(super) async fn wire_pipenv(
     wheel_sha256_hex: &str,
     record_uuid: &str,
 ) -> Result<(Vec<WiringRecord>, PipenvMeta), (&'static str, String)> {
-    match check_target_guards(p, canon_name, record_uuid)? {
+    let version = rel_wheel
+        .rsplit('/')
+        .next()
+        .and_then(|filename| filename.split('-').nth(1))
+        .ok_or((
+            "pypi_pipenv_invalid_wheel",
+            "missing wheel version".to_owned(),
+        ))?;
+    match check_target_guards(p, canon_name, record_uuid, version)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
         // "original").
@@ -254,8 +282,8 @@ pub(super) async fn wire_pipenv(
     let mut lock = p.lock.clone();
     let mut wiring: Vec<WiringRecord> = Vec::new();
     let mut sections: Vec<String> = Vec::new();
-    for section in SECTIONS {
-        let Some(map) = lock.get_mut(section).and_then(Value::as_object_mut) else {
+    for section in category_names(&lock) {
+        let Some(map) = lock.get_mut(&section).and_then(Value::as_object_mut) else {
             continue;
         };
         let keys: Vec<String> = map
@@ -269,13 +297,28 @@ pub(super) async fn wire_pipenv(
             // verbatim; index/version dropped (transitive entries never had
             // an index key — V3).
             let mut new_entry = Map::new();
-            new_entry.insert("file".to_string(), Value::String(format!("./{rel_wheel}")));
+            // Pipenv 2022 misparses local file URLs carrying extras.
+            let source_key = if old
+                .get("extras")
+                .and_then(Value::as_array)
+                .is_some_and(|extras| !extras.is_empty())
+            {
+                "path"
+            } else {
+                "file"
+            };
+            new_entry.insert(
+                source_key.to_string(),
+                Value::String(format!("./{rel_wheel}")),
+            );
             new_entry.insert(
                 "hashes".to_string(),
                 Value::Array(vec![Value::String(format!("sha256:{wheel_sha256_hex}"))]),
             );
-            if let Some(markers) = old.get("markers") {
-                new_entry.insert("markers".to_string(), markers.clone());
+            for field in ["markers", "extras"] {
+                if let Some(value) = old.get(field) {
+                    new_entry.insert(field.to_string(), value.clone());
+                }
             }
             let new_value = Value::Object(new_entry);
             if old == new_value {
@@ -289,6 +332,7 @@ pub(super) async fn wire_pipenv(
             // stale uuids refuse in the guards).
             let was_vendored = old
                 .get("file")
+                .or_else(|| old.get("path"))
                 .and_then(Value::as_str)
                 .and_then(parse_vendor_path)
                 .is_some();
@@ -301,7 +345,7 @@ pub(super) async fn wire_pipenv(
                 original: if was_vendored { None } else { Some(old) },
                 new: Some(new_value),
             });
-            if !sections.iter().any(|s| s == section) {
+            if !sections.iter().any(|s| s == &section) {
                 sections.push(section.to_string());
             }
         }
@@ -386,7 +430,7 @@ pub(super) async fn revert_pipenv(
             warnings.push(drifted());
             continue;
         };
-        if !SECTIONS.contains(&section) {
+        if section == "_meta" || section.is_empty() {
             warnings.push(drifted());
             continue;
         }
@@ -451,15 +495,18 @@ pub(super) async fn revert_pipenv(
 // ── helpers ──────────────────────────────────────────────────────────────
 
 /// Every `(section, key, entry)` whose key canonicalizes to `canon_name`.
-fn find_entries<'a>(lock: &'a Value, canon_name: &str) -> Vec<(&'static str, String, &'a Value)> {
+fn find_entries<'a>(lock: &'a Value, canon_name: &str) -> Vec<(&'a str, String, &'a Value)> {
     let mut out = Vec::new();
-    for section in SECTIONS {
-        let Some(map) = lock.get(section).and_then(Value::as_object) else {
+    for (section, value) in lock.as_object().into_iter().flat_map(|map| map.iter()) {
+        if section == "_meta" {
+            continue;
+        }
+        let Some(map) = value.as_object() else {
             continue;
         };
         for (key, value) in map {
             if canonicalize_pypi_name(key) == canon_name {
-                out.push((section, key.clone(), value));
+                out.push((section.as_str(), key.clone(), value));
             }
         }
     }
@@ -611,7 +658,7 @@ mod tests {
                 "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81"
             ],
             "markers": "python_version >= '2.7' and python_version not in '3.0, 3.1, 3.2'",
-            "version": "==1.17.0"
+            "version": "==1.16.0"
         }
     },
     "develop": {}
@@ -723,7 +770,7 @@ mod tests {
             let tmp = write_lock(before).await;
             let p = load_pipenv_project(tmp.path()).await.unwrap();
             assert_eq!(
-                check_target_guards(&p, "six", UUID).unwrap(),
+                check_target_guards(&p, "six", UUID, "1.16.0").unwrap(),
                 PipenvTarget::Fresh
             );
 
@@ -858,7 +905,7 @@ mod tests {
         // package missing from both sections
         let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
-        let err = check_target_guards(&p, "absent-pkg", UUID).unwrap_err();
+        let err = check_target_guards(&p, "absent-pkg", UUID, "1.16.0").unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_lock_package_missing");
 
         // user-declared file reference
@@ -868,7 +915,7 @@ mod tests {
         );
         let tmp = write_lock(&user).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
-        let err = check_target_guards(&p, "six", UUID).unwrap_err();
+        let err = check_target_guards(&p, "six", UUID, "1.16.0").unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_source_already_exists");
         assert!(err.1.contains("user-declared"), "{}", err.1);
 
@@ -879,7 +926,7 @@ mod tests {
         );
         let tmp = write_lock(&git).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
-        let err = check_target_guards(&p, "six", UUID).unwrap_err();
+        let err = check_target_guards(&p, "six", UUID, "1.16.0").unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_source_already_exists");
         assert!(err.1.contains("git"), "{}", err.1);
 
@@ -904,12 +951,12 @@ mod tests {
         let tmp = write_lock(LOCK_DIRECT_VENDORED).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
         assert_eq!(
-            check_target_guards(&p, "six", UUID).unwrap(),
+            check_target_guards(&p, "six", UUID, "1.16.0").unwrap(),
             PipenvTarget::InSync
         );
 
         let stale_uuid = "00000000-0000-4000-8000-000000000000";
-        let err = check_target_guards(&p, "six", stale_uuid).unwrap_err();
+        let err = check_target_guards(&p, "six", stale_uuid, "1.16.0").unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_source_already_exists");
         assert!(err.1.contains("--revert"), "{}", err.1);
         assert!(err.1.contains(UUID), "names the wired uuid: {}", err.1);
@@ -921,7 +968,7 @@ mod tests {
     async fn load_and_guards_write_nothing() {
         let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
-        let _ = check_target_guards(&p, "six", UUID).unwrap();
+        let _ = check_target_guards(&p, "six", UUID, "1.16.0").unwrap();
         assert_eq!(read_lock(tmp.path()).await, LOCK_DIRECT_REGISTRY);
     }
 
@@ -1207,7 +1254,7 @@ mod tests {
         let tmp = write_lock(&to_canonical_json(&lock)).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
 
-        let err = check_target_guards(&p, "six", UUID).unwrap_err();
+        let err = check_target_guards(&p, "six", UUID, "1.16.0").unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_lock_parse_failed");
         assert!(
             err.1.contains("default.six is not a JSON object"),
@@ -1248,7 +1295,7 @@ mod tests {
         let tmp = write_lock(&before_text).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
         assert_eq!(
-            check_target_guards(&p, "six", UUID).unwrap(),
+            check_target_guards(&p, "six", UUID, "1.16.0").unwrap(),
             PipenvTarget::Fresh,
             "the absent develop section is skipped, not an error"
         );
@@ -1281,7 +1328,7 @@ mod tests {
         let tmp = write_lock(&before_text).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
         assert_eq!(
-            check_target_guards(&p, "six", UUID).unwrap(),
+            check_target_guards(&p, "six", UUID, "1.16.0").unwrap(),
             PipenvTarget::Fresh,
             "the registry-shaped develop entry keeps the target Fresh"
         );
@@ -1558,5 +1605,28 @@ mod tests {
             wired,
             "failed write leaves the wired lock intact"
         );
+    }
+    #[tokio::test]
+    async fn custom_categories_preserve_extras_and_refuse_version_conflicts() {
+        let mut lock: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
+        let mut dependency = lock["default"]["six"].take();
+        dependency["extras"] = serde_json::json!(["test"]);
+        lock["default"] = serde_json::json!({});
+        lock["tests"] = serde_json::json!({"Six":dependency});
+        let before = to_canonical_json(&lock);
+        let tmp = write_lock(&before).await;
+        let project = load_pipenv_project(tmp.path()).await.unwrap();
+        assert!(check_target_guards(&project, "six", UUID, "1.17.0").is_err());
+        let (wiring, meta) = wire_default(&project, tmp.path()).await;
+        let rewritten: Value = serde_json::from_str(&read_lock(tmp.path()).await).unwrap();
+        assert_eq!(
+            rewritten["tests"]["Six"]["extras"],
+            serde_json::json!(["test"])
+        );
+        assert_eq!(meta.sections, vec!["tests"]);
+        let entry = entry_for(wiring, meta);
+        let reverted = revert_pipenv(&entry, tmp.path(), false).await;
+        assert!(reverted.success);
+        assert_eq!(read_lock(tmp.path()).await, before);
     }
 }

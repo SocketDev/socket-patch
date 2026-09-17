@@ -24,6 +24,7 @@ use crate::crawlers::composer_crawler::normalize_version;
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 pub mod golang_local;
+mod pipenv;
 mod pnpm;
 mod replay;
 mod requirements;
@@ -171,6 +172,8 @@ pub struct RewriteResult {
     /// presence in rewritten files (a `[registries.…]` config block alone
     /// pins nothing).
     pub confirmed_cargo_uuids: std::collections::BTreeSet<String>,
+    pub confirmed_pipenv_uuids: std::collections::BTreeSet<String>,
+    pub refused_pipenv_uuids: std::collections::BTreeSet<String>,
     /// An incomplete pnpm rewrite must not be confirmed by finding its URL
     /// in another instance, a comment, or another lockfile.
     pub refused_pnpm_uuids: std::collections::BTreeSet<String>,
@@ -207,7 +210,23 @@ pub fn rewrite_registry_redirect_with_python_metadata(
     overrides: &[DepOverride],
     python_metadata: &BTreeMap<String, String>,
 ) -> RewriteResult {
+    rewrite_registry_redirect_with_pipenv_version(files, overrides, python_metadata, None)
+}
+
+pub fn rewrite_registry_redirect_with_pipenv_version(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    python_metadata: &BTreeMap<String, String>,
+    pipenv_major: Option<u32>,
+) -> RewriteResult {
     let mut result = RewriteResult::default();
+    pipenv::rewrite(files, overrides, pipenv_major, &mut result);
+    let overrides: Vec<_> = overrides
+        .iter()
+        .filter(|dep| !result.refused_pipenv_uuids.contains(&dep.patch_uuid))
+        .cloned()
+        .collect();
+    let overrides = overrides.as_slice();
     rewrite_npm_lock(files, overrides, &mut result);
     rewrite_pnpm_lock(files, overrides, &mut result);
     rewrite_yarn_classic(files, overrides, &mut result);

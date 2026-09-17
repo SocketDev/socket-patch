@@ -105,6 +105,7 @@ pub(crate) async fn dispatch_vendor_one(
     // --vendor` / repair. Per-ecosystem backends consume it as they gain a
     // service path.
     service: Option<&VendorServiceConfig>,
+    pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
 ) -> Option<VendorOutcome> {
     let eco = ecosystem_dir_for_purl(purl)?;
 
@@ -155,7 +156,21 @@ pub(crate) async fn dispatch_vendor_one(
         // The flavor router probes the project's lockfile (package-lock /
         // yarn / pnpm / bun) and dispatches or refuses per flavor.
         "npm" => vend!(vendor::npm_flavor::vendor_npm_any),
-        "pypi" => vend!(vendor::pypi::vendor_pypi),
+        "pypi" => {
+            vendor::pypi::vendor_pypi_with_pipenv_version(
+                purl,
+                pkg_path,
+                project_root,
+                record,
+                sources,
+                vendored_at,
+                dry_run,
+                force,
+                service,
+                pipenv_version,
+            )
+            .await
+        }
         "gem" => vend!(vendor::gem::vendor_gem),
         "cargo" => vend!(vendor::cargo::vendor_cargo_crate),
         "golang" => vend!(vendor::golang::vendor_go_module),
@@ -958,6 +973,7 @@ pub(crate) async fn vendor_records(
             Err(corrupt) => (None, Some(corrupt)),
         };
 
+    let pipenv_version = tokio::sync::OnceCell::new();
     for (purl, pkg_path) in &all_packages {
         let is_variant_eco =
             Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
@@ -1151,6 +1167,7 @@ pub(crate) async fn vendor_records(
                 common.dry_run,
                 force,
                 service,
+                &pipenv_version,
             )
             .await;
 
@@ -1809,6 +1826,7 @@ mod dispatch_tests {
             false,
             false,
             Some(&service),
+            &tokio::sync::OnceCell::new(),
         )
         .await;
         // The backend itself may refuse (nothing is installed in the

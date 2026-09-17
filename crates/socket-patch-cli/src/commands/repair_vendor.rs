@@ -1119,6 +1119,7 @@ pub(crate) async fn repair_vendored_artifacts(
 
     // ── Rebuild via the normal backends ──────────────────────────────────
     let vendored_at = now_rfc3339();
+    let pipenv_version = tokio::sync::OnceCell::new();
     for c in candidates {
         if unrebuildable.contains(&c.purl) {
             continue;
@@ -1181,6 +1182,7 @@ pub(crate) async fn repair_vendored_artifacts(
             false,
             // Repair rebuilds locally from the recorded patch — no service.
             None,
+            &pipenv_version,
         )
         .await;
         match outcome {

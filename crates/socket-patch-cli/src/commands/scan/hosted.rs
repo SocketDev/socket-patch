@@ -27,6 +27,7 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "bun.lock",
     "requirements.txt",
     "uv.lock",
+    "Pipfile.lock",
     "pyproject.toml",
     "Cargo.toml",
     "Cargo.lock",
@@ -798,7 +799,7 @@ pub(crate) async fn run_redirect_selected(
 ) -> i32 {
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::patch::redirect::{
-        rewrite_registry_redirect_with_python_metadata, DepOverride, RedirectState,
+        rewrite_registry_redirect_with_pipenv_version, DepOverride, RedirectState,
     };
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
@@ -1391,8 +1392,17 @@ pub(crate) async fn run_redirect_selected(
         }
     }
     overrides.retain(|dep| !unavailable_python_artifacts.contains(&dep.artifact_url));
-    let mut rewrite =
-        rewrite_registry_redirect_with_python_metadata(&files, &overrides, &python_metadata);
+    let pipenv_major = if files.contains_key("Pipfile.lock") {
+        socket_patch_core::utils::pipenv::installed_major(&common.cwd).await
+    } else {
+        None
+    };
+    let mut rewrite = rewrite_registry_redirect_with_pipenv_version(
+        &files,
+        &overrides,
+        &python_metadata,
+        pipenv_major,
+    );
 
     // The lockb→text migration is only KEPT when the rewrite actually landed
     // in the migrated bun.lock. Otherwise nothing was redirected there and the
@@ -1675,6 +1685,9 @@ pub(crate) async fn run_redirect_selected(
         .iter()
         .filter(
             |(purl, uuid, artifact_url, index_url, suffixed_version, go_module_path)| {
+                if rewrite.refused_pipenv_uuids.contains(uuid) {
+                    return false;
+                }
                 if rewrite.refused_pnpm_uuids.contains(uuid) {
                     return false;
                 }

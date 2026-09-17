@@ -254,6 +254,27 @@ Mode support varies by ecosystem — e.g. Go can't do hosted, Rush monorepos can
 vendored. See the full **[mode × ecosystem matrix](docs/ecosystems.md#mode--ecosystem-matrix)**
 for details and per-ecosystem caveats.
 
+### Pipenv compatibility
+
+Hosted mode rewrites every matching `Pipfile.lock` category and preserves the
+Pipfile, its content hash, markers, extras, and unrelated lock entries. Socket
+Patch checks the installed Pipenv version: releases 7–11 need hosted `path`
+references, while releases from 2018 onward use `file` references. Hosted
+references include the SHA-256 URL fragment so pip verifies downloaded bytes.
+Old lock formats before `pipfile-spec: 6` are refused without changing the lock.
+
+Vendored mode requires Pipenv 2018 or later. Wheels with extras use `path`
+references to avoid Pipenv 2022's local-file URL parsing bug. Native Pipenv does
+not consistently enforce hashes on local wheels; commit the wheel and run
+`socket-patch verify`. Re-run Socket Patch after re-locking dependencies.
+
+The compatibility backtest covers the last stable release of every published
+Pipenv major, including unsupported versions to verify explicit refusal. It
+checks actual installed patch bytes, repeat scans, hash corruption, normal
+installs, lock-only installs, and `sync` where available. Parser/rewriter tests
+also cover categories, source/version conflicts, malformed locks, CRLF,
+rotating grants, and rollback with unrelated edits or drift.
+
 ## Common tasks
 
 ### Patch everything that can be patched

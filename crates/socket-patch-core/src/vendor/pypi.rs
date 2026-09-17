@@ -399,7 +399,11 @@ fn pipenv_wired_pin(lock: &serde_json::Value, uuid_dir_rel: &str) -> Option<(Str
             continue;
         };
         for entry in map.values() {
-            let Some(file) = entry.get("file").and_then(serde_json::Value::as_str) else {
+            let Some(file) = entry
+                .get("file")
+                .or_else(|| entry.get("path"))
+                .and_then(serde_json::Value::as_str)
+            else {
                 continue;
             };
             let bare = file.strip_prefix("./").unwrap_or(file);
@@ -435,6 +439,34 @@ pub async fn vendor_pypi(
     dry_run: bool,
     force: bool,
     service: Option<&VendorServiceConfig>,
+) -> VendorOutcome {
+    vendor_pypi_with_pipenv_version(
+        purl,
+        site_packages,
+        project_root,
+        record,
+        sources,
+        vendored_at,
+        dry_run,
+        force,
+        service,
+        &tokio::sync::OnceCell::new(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn vendor_pypi_with_pipenv_version(
+    purl: &str,
+    site_packages: &Path,
+    project_root: &Path,
+    record: &PatchRecord,
+    sources: &PatchSources<'_>,
+    vendored_at: &str,
+    dry_run: bool,
+    force: bool,
+    service: Option<&VendorServiceConfig>,
+    pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
 ) -> VendorOutcome {
     // The purl may carry `?artifact_id=` variant qualifiers; everything here
     // keys off the qualifier-free base.
@@ -572,7 +604,19 @@ pub async fn vendor_pypi(
                 Ok(p) => p,
                 Err((code, detail)) => return refused(code, detail),
             };
-            match super::pypi_pipenv::check_target_guards(&project, &canon_name, &record.uuid) {
+            if pipenv_version
+                .get_or_init(|| crate::utils::pipenv::installed_major(project_root))
+                .await
+                .is_some_and(|major| major < 2018)
+            {
+                return refused("pypi_pipenv_installer_unsupported", "vendored wheel references require Pipenv 2018 or later; upgrade Pipenv or use hosted mode");
+            }
+            match super::pypi_pipenv::check_target_guards(
+                &project,
+                &canon_name,
+                &record.uuid,
+                version,
+            ) {
                 Ok(PipenvTarget::InSync) => {
                     wired_pin = pipenv_wired_pin(&project.lock, &uuid_dir_rel);
                     WiringPlan::InSync
@@ -1082,13 +1126,9 @@ pub async fn revert_pypi_opts(
                 super::pypi_lock::revert_python_locks(entry, project_root, dry_run).await
             }
             Some("requirements") => revert_requirements(entry, project_root, dry_run).await,
-            Some("poetry") => {
-                super::pypi_poetry::revert_poetry(entry, project_root, dry_run).await
-            }
+            Some("poetry") => super::pypi_poetry::revert_poetry(entry, project_root, dry_run).await,
             Some("pdm") => super::pypi_pdm::revert_pdm(entry, project_root, dry_run).await,
-            Some("pipenv") => {
-                super::pypi_pipenv::revert_pipenv(entry, project_root, dry_run).await
-            }
+            Some("pipenv") => super::pypi_pipenv::revert_pipenv(entry, project_root, dry_run).await,
             other => {
                 return RevertOutcome::failed(format!(
                     "unknown pypi vendor flavor {other:?}; cannot revert"
