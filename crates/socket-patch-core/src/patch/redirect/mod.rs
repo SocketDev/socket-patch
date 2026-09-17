@@ -24,6 +24,7 @@ use crate::crawlers::composer_crawler::normalize_version;
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 pub mod golang_local;
+mod pdm;
 mod pipenv;
 mod pnpm;
 mod poetry;
@@ -175,6 +176,17 @@ pub struct RewriteResult {
     pub confirmed_cargo_uuids: std::collections::BTreeSet<String>,
     pub confirmed_pipenv_uuids: std::collections::BTreeSet<String>,
     pub refused_pipenv_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids whose `pdm.lock` redirect fully landed (written by this run
+    /// or already present). Like cargo, pdm confirmation keys off this set,
+    /// never off substring presence: a lock can carry the URL in one extras
+    /// variant while another variant still resolves the registry wheel.
+    pub confirmed_pdm_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids the pdm rewriter REFUSED (unsupported lock format, forked
+    /// package, conflicting source, malformed hashes). When pdm.lock is the
+    /// project's PyPI install driver they are withheld from every later pypi
+    /// rewriter, so no sibling file can attest a patch the installing lock will
+    /// never honor.
+    pub refused_pdm_uuids: std::collections::BTreeSet<String>,
     /// An incomplete pnpm rewrite must not be confirmed by finding its URL
     /// in another instance, a comment, or another lockfile.
     pub refused_pnpm_uuids: std::collections::BTreeSet<String>,
@@ -241,6 +253,31 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
     pipenv_major: Option<u32>,
 ) -> RewriteResult {
     let mut result = RewriteResult::default();
+    // pdm runs FIRST, but only when `pdm.lock` is the project's PyPI install
+    // driver: a `uv.lock` or `poetry.lock` beside it takes precedence (mirroring
+    // the vendored flavor precedence uv > poetry > pdm > pipenv), so a leftover
+    // `pdm.lock` neither blocks nor is attested through them. When pdm does
+    // drive, a patch it refuses is withheld from every other pypi rewriter so a
+    // sibling `Pipfile.lock` / `requirements.txt` cannot attest a patch the
+    // installing lock will never honor.
+    let pdm_drives = files.contains_key("pdm.lock")
+        && !files.contains_key("uv.lock")
+        && !files.contains_key("poetry.lock");
+    if pdm_drives {
+        pdm::rewrite(files, overrides, &mut result);
+    }
+    let usable: Vec<_> = overrides
+        .iter()
+        .filter(|dep| !result.refused_pdm_uuids.contains(&dep.patch_uuid))
+        .cloned()
+        .collect();
+    let overrides = if pdm_drives {
+        usable.as_slice()
+    } else {
+        overrides
+    };
+    // Pipenv next: a CONFLICT in a live Pipfile.lock vetoes the sibling pypi
+    // rewriters too (see `pipenv::rewrite`).
     pipenv::rewrite(files, overrides, pipenv_major, &mut result);
     let overrides: Vec<_> = overrides
         .iter()
@@ -13300,7 +13337,14 @@ mod hatch_tests {
         for (filename, text) in [
             ("uv.lock", "version = 2"),
             ("pylock.toml", "lock-version = '2.0'"),
-            ("pdm.lock", "[metadata]\nlock_version = '4.5.1'"),
+            // A real PDM lock that CONTAINS the package: the pdm writer runs
+            // ahead of hatch and confirms through its own transactional set
+            // (asserted below); a package-less stub would instead be refused
+            // and withheld from every later pypi rewriter, hatch included.
+            (
+                "pdm.lock",
+                include_str!("../../../tests/fixtures/pdm-native/2.29.2.lock"),
+            ),
             ("Pipfile.lock", "{}"),
             (
                 "poetry.lock",
@@ -13314,6 +13358,16 @@ mod hatch_tests {
             assert!(result.confirmed_hatch_uuids.is_empty(), "{filename}");
             assert!(result.confirmed_python_lock_uuids.is_empty(), "{filename}");
         }
+        let mut files = base.clone();
+        files.insert(
+            "pdm.lock".into(),
+            include_str!("../../../tests/fixtures/pdm-native/2.29.2.lock").into(),
+        );
+        let result = rewrite_registry_redirect(&files, &[patch()]);
+        assert!(result.confirmed_pdm_uuids.contains("test-uuid"));
+        assert!(result.refused_pdm_uuids.is_empty());
+        assert!(result.files.contains_key("pdm.lock"));
+        assert!(!result.files.contains_key("pyproject.toml"));
         let mut files = base;
         files.insert(
             "poetry.lock".into(),

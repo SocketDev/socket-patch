@@ -1,25 +1,4 @@
-//! pdm-project wiring: a lock-ONLY `[[package]]` splice (pdm.lock
-//! lock_version 4.5.x).
-//!
-//! pdm's `content_hash` covers the pyproject requirements only — identical
-//! between strategy variants of the same pyproject — so a per-package lock
-//! splice can never trip `pdm install --check` / `pdm lock --check`
-//! freshness. The spike-captured D1 shape is a RELATIVE `path = "./…"` key
-//! (inserted between `requires_python` and `summary`, exactly where pdm's own
-//! serializer puts it) plus `files = []` reduced to the single patched-wheel
-//! hash; `pdm sync` / `--check` / `--frozen-lockfile` all pass byte-stably
-//! and unearth hash-verifies the local wheel fail-closed (D4). See
-//! `spikes/pdm/` and the pdm section of `spikes/PHASE0-V2-FINDINGS.txt`.
-//!
-//! Drift caveat (spike D5): `pdm lock` and `pdm update <pkg>` silently revert
-//! the splice with exit 0 (only plain `pdm install` preserves it); the lock's
-//! files[] hash is the drift oracle. `pyproject.toml` and `content_hash` are
-//! NEVER written by this backend.
-//!
-//! Spike caveat (D6, partial): only the `inherit_metadata` and `static_urls`
-//! strategy shapes were captured, so any other `[metadata] strategy` flag
-//! refuses; pdm 2.27 can no longer produce hash-less locks, so a files entry
-//! without a sha256 refuses too (both fail-closed, not warnings).
+//! PDM lock-only wheel redirects. The manifest and unrelated lock entries stay byte-identical.
 
 use std::path::Path;
 
@@ -30,11 +9,10 @@ use crate::utils::fs::atomic_write_bytes_preserving_mode;
 
 use super::common::{
     item_get, lock_units_named, pep508_name, pep621_declared_names, record,
-    revert_lock_fragment_splice, unit_has_canon_name,
+    revert_lock_fragment_splice,
 };
 use super::path::parse_vendor_path;
 use super::state::{PdmMeta, VendorEntry, WiringAction, WiringRecord};
-use super::toml_surgery::{find_unit_span, package_unit_lines, replace_files_array};
 use super::{RevertOutcome, VendorWarning};
 
 /// The only file this backend ever writes (and the revert allowlist).
@@ -42,10 +20,6 @@ const LOCK_FILE: &str = "pdm.lock";
 
 /// The `WiringRecord.kind` discriminator this backend owns.
 const KIND_LOCK_PACKAGE: &str = "pdm_lock_package";
-
-/// The `[metadata] strategy` flags whose lock shapes the spike captured
-/// (D1 default + D6 static_urls). Any other flag refuses fail-closed.
-const SUPPORTED_STRATEGIES: [&str; 2] = ["inherit_metadata", "static_urls"];
 
 /// Guarded read shared in shape with the sibling backend twins:
 /// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
@@ -119,58 +93,18 @@ pub async fn load_pdm_project(root: &Path) -> Result<PdmProject, (&'static str, 
         .ok_or_else(|| {
             (
                 "pypi_pdm_lock_version_unsupported",
-                format!("{LOCK_FILE} has no [metadata] lock_version; re-lock with pdm >= 2.17"),
+                format!("{LOCK_FILE} has no [metadata] lock_version; re-lock with a supported PDM release"),
             )
         })?;
     let mut warnings = Vec::new();
-    match lock_version_series(&lock_version) {
-        // The fixture series (pdm 2.27 writes 4.5.0).
-        LockVersionSeries::Supported => {}
-        // A newer 4.x minor keeps the shapes we rewrite (additive schema);
-        // warn instead of refusing — `pdm lock --check` is the backstop.
-        LockVersionSeries::NewerMinor => warnings.push(VendorWarning::new(
-            "pypi_pdm_lock_version_untested",
-            format!(
-                "pdm.lock lock_version {lock_version} is newer than the fixture-tested 4.5.x; \
-                 verify with `pdm install --check` after vendoring"
-            ),
-        )),
-        LockVersionSeries::Unsupported => {
-            return Err((
-                "pypi_pdm_lock_version_unsupported",
-                format!(
-                    "pdm.lock lock_version {lock_version:?} is outside the supported 4.5+ \
-                     series; re-lock with a current pdm"
-                ),
-            ))
-        }
+    if lock_version == "2" {
+        warnings.push(VendorWarning::new("pypi_pdm_legacy_sync_required", "PDM 0.x may regenerate freshly generated locks during install; use `pdm sync` to preserve this patch, or upgrade PDM"));
     }
+    crate::utils::pdm_lock::lock_version(&lock)
+        .map_err(|detail| ("pypi_pdm_lock_version_unsupported", detail))?;
 
-    // SECURITY/correctness: strategies change the files[]/unit shapes; only
-    // the fixture-captured set is splice-proven (spike D6 was partial) —
-    // anything else refuses fail-closed rather than guessing an emitter shape.
-    let strategy: Vec<String> = metadata
-        .and_then(|m| item_get(m, "strategy"))
-        .and_then(Item::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(unknown) = strategy
-        .iter()
-        .find(|s| !SUPPORTED_STRATEGIES.contains(&s.as_str()))
-    {
-        return Err((
-            "pypi_pdm_lock_strategy_unsupported",
-            format!(
-                "pdm.lock [metadata] strategy contains {unknown:?}; only \
-                 inherit_metadata/static_urls locks are fixture-tested"
-            ),
-        ));
-    }
+    let strategy = crate::utils::pdm_lock::validate_strategy(&lock)
+        .map_err(|detail| ("pypi_pdm_lock_strategy_unsupported", detail))?;
 
     let pyproject_text = read_regular_to_string(&root.join("pyproject.toml"))
         .await
@@ -200,6 +134,25 @@ fn classify_dependency(p: &PdmProject, canon_name: &str) -> &'static str {
     };
     let mut declared: Vec<String> = Vec::new();
     pep621_declared_names(&doc, &mut declared);
+    if let Some(pdm) = doc
+        .get("tool")
+        .and_then(|tool| item_get(tool, "pdm"))
+        .and_then(Item::as_table_like)
+    {
+        for (section, dependencies) in pdm.iter() {
+            if section == "dependencies" || section.ends_with("-dependencies") {
+                if let Some(table) = dependencies.as_table_like() {
+                    declared.extend(
+                        table
+                            .iter()
+                            .filter(|(_, spec)| spec.as_array().is_none())
+                            .map(|(name, _)| name.to_string()),
+                    );
+                }
+            }
+        }
+    }
+
     for groups in [
         doc.get("tool")
             .and_then(|t| item_get(t, "pdm"))
@@ -248,23 +201,72 @@ pub(super) fn check_target_guards(
             format!("{LOCK_FILE} has no [[package]] entry for {canon_name}; run `pdm lock` first"),
         ));
     }
-    // Cross-platform/marker forks list the same name at multiple versions;
-    // one surgical rewrite would mispin the other forks — refuse (mirrors uv).
-    if units.len() > 1 {
+    let mut variants = std::collections::BTreeSet::new();
+    let mut fresh = false;
+    let mut in_sync = false;
+    for unit in units {
+        let extras = unit
+            .get("extras")
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        if !variants.insert(extras) {
+            return Err((
+                "pypi_pdm_lock_forked_package",
+                "duplicate or forked PDM package".into(),
+            ));
+        }
+        match check_target_unit(p, unit, canon_name, version, record_uuid)? {
+            PdmTarget::Fresh => fresh = true,
+            PdmTarget::InSync => in_sync = true,
+        }
+    }
+    if fresh && in_sync {
         return Err((
-            "pypi_pdm_lock_forked_package",
+            "pypi_pdm_source_already_exists",
+            "PDM extras have inconsistent sources".into(),
+        ));
+    }
+    Ok(if in_sync {
+        PdmTarget::InSync
+    } else {
+        PdmTarget::Fresh
+    })
+}
+
+fn check_target_unit(
+    p: &PdmProject,
+    unit: &toml_edit::Table,
+    canon_name: &str,
+    version: &str,
+    record_uuid: &str,
+) -> Result<PdmTarget, (&'static str, String)> {
+    if unit.get("version").and_then(Item::as_str) != Some(version) {
+        return Err((
+            "pypi_pdm_lock_package_missing",
             format!(
-                "{LOCK_FILE} resolves {canon_name} at multiple versions/markers (a forked \
-                 resolution); vendoring would mispin the other forks"
+                "PDM locked version {:?} differs from installed {version}",
+                unit.get("version").and_then(Item::as_str)
             ),
         ));
     }
-    let unit = units[0];
-
+    if ["url", "git", "hg", "svn", "bzr", "editable", "source"]
+        .iter()
+        .any(|key| unit.contains_key(key))
+        || unit.get("path").is_some_and(|item| item.as_str().is_none())
+    {
+        return Err((
+            "pypi_pdm_source_already_exists",
+            "PDM package has an existing source".into(),
+        ));
+    }
     if let Some(path) = unit.get("path").and_then(Item::as_str) {
         return match parse_vendor_path(path) {
             // Ours, same patch generation: the in-sync hot path.
-            Some(parts) if parts.eco == "pypi" && parts.uuid == record_uuid => {
+            Some(parts)
+                if parts.eco == "pypi"
+                    && parts.uuid == record_uuid
+                    && crate::utils::pdm_lock::wheel_matches(&parts.leaf, canon_name, version) =>
+            {
                 Ok(PdmTarget::InSync)
             }
             // Ours, but a STALE patch generation: wiring over it would lose
@@ -289,23 +291,10 @@ pub(super) fn check_target_guards(
             )),
         };
     }
-    // Direct URL / VCS units carry unit-level url/git keys — also user-owned.
-    if unit.get("url").is_some() || unit.get("git").is_some() {
-        return Err((
-            "pypi_pdm_source_already_exists",
-            format!(
-                "{LOCK_FILE} resolves {canon_name} from a user-declared url/vcs source; \
-                 refusing to overwrite it"
-            ),
-        ));
-    }
-
     // Splicing a hashed entry into a hash-less lock is untested (spike D6:
     // `--no-hashes` no longer exists in pdm 2.27, so this only arises from
     // older tools) — refuse rather than mix verification regimes.
-    let hashed_entries = unit
-        .get("files")
-        .and_then(Item::as_array)
+    let hashed_entries = crate::utils::pdm_lock::files_for(&p.lock, unit)
         .map(|arr| {
             !arr.is_empty()
                 && arr
@@ -323,18 +312,6 @@ pub(super) fn check_target_guards(
         ));
     }
 
-    // The splice keeps the unit's version line verbatim, so the lock must
-    // already resolve the version being patched (lock/venv drift otherwise).
-    let locked_version = unit.get("version").and_then(Item::as_str).unwrap_or("");
-    if locked_version != version {
-        return Err((
-            "pypi_pdm_lock_package_missing",
-            format!(
-                "{LOCK_FILE} resolves {canon_name} at {locked_version:?}, not the patched \
-                 {version}; re-lock so the lock matches the installed version"
-            ),
-        ));
-    }
     Ok(PdmTarget::Fresh)
 }
 
@@ -370,14 +347,17 @@ pub async fn wire_pdm(
         PdmTarget::Fresh => {}
     }
 
-    let (old_unit, new_unit) = rewrite_target_package_unit(
+    let new_lock = crate::utils::pdm_lock::rewrite_pdm_lock(
         &p.lock_text,
         canon_name,
-        rel_wheel,
+        version,
+        ("path", &format!("./{rel_wheel}")),
         wheel_file_name,
         wheel_sha256_hex,
-    )?;
-    let new_lock = p.lock_text.replacen(&old_unit, &new_unit, 1);
+    )
+    .map_err(|detail| ("pypi_pdm_lock_parse_failed", detail))?;
+    let fragments = crate::utils::pdm_lock::pdm_lock_edits(&p.lock_text, &new_lock, canon_name)
+        .map_err(|detail| ("pypi_pdm_lock_parse_failed", detail))?;
     // Mode-preserving: the lock is a user-owned file we merely edit, so the
     // swapped-in inode must keep its permission bits rather than reset them
     // to umask defaults (same class as the revert leg in common.rs).
@@ -390,14 +370,19 @@ pub async fn wire_pdm(
             )
         })?;
 
-    let wiring = vec![record(
-        LOCK_FILE,
-        KIND_LOCK_PACKAGE,
-        WiringAction::Rewritten,
-        canon_name,
-        Some(old_unit),
-        new_unit,
-    )];
+    let wiring = fragments
+        .into_iter()
+        .map(|(old_unit, new_unit)| {
+            record(
+                LOCK_FILE,
+                KIND_LOCK_PACKAGE,
+                WiringAction::Rewritten,
+                canon_name,
+                Some(old_unit),
+                new_unit,
+            )
+        })
+        .collect();
     let meta = PdmMeta {
         dep_class: classify_dependency(p, canon_name).to_string(),
         lock_version: p.lock_version.clone(),
@@ -414,84 +399,6 @@ pub async fn revert_pdm(entry: &VendorEntry, root: &Path, dry_run: bool) -> Reve
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
-
-enum LockVersionSeries {
-    Supported,
-    NewerMinor,
-    Unsupported,
-}
-
-/// `4.5.x` is the fixture series; a newer `4.<minor>` warns; everything else
-/// (older minors, other majors, unparseable) refuses.
-fn lock_version_series(v: &str) -> LockVersionSeries {
-    let mut it = v.split('.');
-    let major = it.next().and_then(|s| s.parse::<u64>().ok());
-    let minor = it.next().and_then(|s| s.parse::<u64>().ok());
-    match (major, minor) {
-        (Some(4), Some(5)) => LockVersionSeries::Supported,
-        (Some(4), Some(m)) if m > 5 => LockVersionSeries::NewerMinor,
-        _ => LockVersionSeries::Unsupported,
-    }
-}
-
-/// Rewrite the target `[[package]]` unit to the D1-captured local-file
-/// shape: insert `path = "./<rel_wheel>"` right after `requires_python`
-/// (falling back to `version`/`name` — pdm's own key order) and reduce
-/// `files = [...]` to the single `{file = "<wheel>", hash = "sha256:<ours>"}`
-/// element. Every other line is preserved verbatim. Returns
-/// `(old_unit, new_unit)` for the wiring record.
-fn rewrite_target_package_unit(
-    lock_text: &str,
-    canon: &str,
-    rel_wheel: &str,
-    wheel_file_name: &str,
-    wheel_sha256_hex: &str,
-) -> Result<(String, String), (&'static str, String)> {
-    let span =
-        find_unit_span(lock_text, |lines| unit_has_canon_name(lines, canon)).ok_or_else(|| {
-            (
-                "pypi_pdm_lock_package_missing",
-                format!("{LOCK_FILE} has no [[package]] entry for {canon}"),
-            )
-        })?;
-    let unit = package_unit_lines(&lock_text[span]);
-    let old_unit = unit.join("\n");
-    // The splice is a literal-text replace of this LF-joined fragment; a lock
-    // whose physical lines differ from the logical ones (CRLF endings) would
-    // silently no-op the replace while still recording the wiring — refuse.
-    if !lock_text.contains(&old_unit) {
-        return Err((
-            "pypi_pdm_lock_parse_failed",
-            format!(
-                "the {canon} [[package]] entry does not match {LOCK_FILE} byte-for-byte \
-                 (CRLF line endings?); re-lock with pdm so the lock is LF-normalized"
-            ),
-        ));
-    }
-    let mut out =
-        replace_files_array(&unit, wheel_file_name, wheel_sha256_hex).ok_or_else(|| {
-            // The hash guard already requires hashed files entries; reaching here
-            // means the parsed and textual views disagree — fail closed.
-            (
-                "pypi_pdm_lock_parse_failed",
-                format!("the {canon} [[package]] entry has no files array to rewrite"),
-            )
-        })?;
-
-    let anchor = out
-        .iter()
-        .position(|l| l.starts_with("requires_python = "))
-        .or_else(|| out.iter().position(|l| l.starts_with("version = ")))
-        .or_else(|| out.iter().position(|l| l.starts_with("name = ")))
-        .ok_or_else(|| {
-            (
-                "pypi_pdm_lock_parse_failed",
-                format!("the {canon} [[package]] entry has no key to anchor the path after"),
-            )
-        })?;
-    out.insert(anchor + 1, format!("path = \"./{rel_wheel}\""));
-    Ok((old_unit, out.join("\n")))
-}
 
 #[cfg(test)]
 mod tests {
@@ -559,12 +466,10 @@ requires_python = "==3.14.*"
 name = "six"
 version = "1.16.0"
 requires_python = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*"
-path = "./.socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl"
 summary = "Python 2 and 3 compatibility utilities"
 groups = ["default"]
-files = [
-    {file = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:7015f5a42a0f83fd1b7d3ca0ba10d8777a207c19b6ffebb39e2e1c03af6a281b"},
-]
+files = [{ file = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:7015f5a42a0f83fd1b7d3ca0ba10d8777a207c19b6ffebb39e2e1c03af6a281b" }]
+path = "./.socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl"
 "#;
 
     /// The transitive "before": [metadata] + python-dateutil unit verbatim
@@ -643,12 +548,10 @@ files = [
 name = "six"
 version = "1.16.0"
 requires_python = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*"
-path = "./.socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl"
 summary = "Python 2 and 3 compatibility utilities"
 groups = ["default"]
-files = [
-    {file = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:7015f5a42a0f83fd1b7d3ca0ba10d8777a207c19b6ffebb39e2e1c03af6a281b"},
-]
+files = [{ file = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:7015f5a42a0f83fd1b7d3ca0ba10d8777a207c19b6ffebb39e2e1c03af6a281b" }]
+path = "./.socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.16.0-py2.py3-none-any.whl"
 "#;
 
     /// The D6-captured static_urls shape: strategy gains "static_urls" and
@@ -831,8 +734,29 @@ distribution = false
     /// D6 (partial leg): strategy sets outside the fixtures refuse — their
     /// unit shapes were never captured.
     #[tokio::test]
+    async fn legacy_declarations_are_direct_and_bad_strategy_types_refuse() {
+        for section in ["dependencies", "dev-dependencies", "feature-dependencies"] {
+            let manifest = format!(
+                "[tool.pdm.{section}]\nsix = {{version = '==1.16.0', extras = ['feature']}}\n"
+            );
+            let tmp = write_project(LOCK_DIRECT_REGISTRY, &manifest).await;
+            let project = load_pdm_project(tmp.path()).await.unwrap();
+            assert_eq!(classify_dependency(&project, "six"), "direct");
+        }
+        for strategy in ["42", "['inherit_metadata', 42]"] {
+            let lock = LOCK_DIRECT_REGISTRY.replace("[\"inherit_metadata\"]", strategy);
+            let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
+            assert_eq!(
+                load_pdm_project(tmp.path()).await.unwrap_err().0,
+                "pypi_pdm_lock_strategy_unsupported"
+            );
+            assert_eq!(read_lock(tmp.path()).await, lock);
+        }
+    }
+
+    #[tokio::test]
     async fn unsupported_strategy_refuses() {
-        for flag in ["cross_platform", "direct_minimal_versions", "no_hashes"] {
+        for flag in ["unknown_strategy", "no_hashes"] {
             let lock = LOCK_DIRECT_REGISTRY.replace(
                 "strategy = [\"inherit_metadata\"]",
                 &format!("strategy = [\"inherit_metadata\", \"{flag}\"]"),
@@ -883,7 +807,7 @@ distribution = false
         let tmp = write_project("[[package]]\nname = \"six\"\n", PYPROJECT_DIRECT).await;
         let err = load_pdm_project(tmp.path()).await.unwrap_err();
         assert_eq!(err.0, "pypi_pdm_lock_version_unsupported");
-        for bad in ["4.4.1", "3.0", "5.0.0", "garbage"] {
+        for bad in ["3.1", "4.0", "4.1", "4.2", "4.6.0", "5.0.0", "garbage"] {
             let lock = LOCK_DIRECT_REGISTRY.replace(
                 "lock_version = \"4.5.0\"",
                 &format!("lock_version = \"{bad}\""),
@@ -959,18 +883,14 @@ distribution = false
     }
 
     #[tokio::test]
-    async fn newer_minor_lock_version_warns_not_refuses() {
-        let lock =
-            LOCK_DIRECT_REGISTRY.replace("lock_version = \"4.5.0\"", "lock_version = \"4.6.0\"");
+    async fn unknown_lock_version_refuses_before_writing() {
+        let lock = LOCK_DIRECT_REGISTRY.replace("4.5.0", "4.6.0");
         let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
-        let p = load_pdm_project(tmp.path()).await.unwrap();
-        assert_eq!(p.warnings.len(), 1);
-        assert_eq!(p.warnings[0].code, "pypi_pdm_lock_version_untested");
-        assert_eq!(p.lock_version, "4.6.0");
-        // The wiring itself still works on the warned lock.
-        let (wiring, meta) = wire_default(&p, tmp.path()).await;
-        assert_eq!(wiring.len(), 1);
-        assert_eq!(meta.lock_version, "4.6.0");
+        assert_eq!(
+            load_pdm_project(tmp.path()).await.unwrap_err().0,
+            "pypi_pdm_lock_version_unsupported"
+        );
+        assert_eq!(read_lock(tmp.path()).await, lock);
     }
 
     /// Re-running vendor on an already-wired lock with the SAME uuid is the
@@ -1217,106 +1137,28 @@ distribution = false
         );
     }
 
-    /// A CRLF lock (e.g. a `core.autocrlf` checkout) parses fine but its
-    /// physical lines differ from the LF-joined splice fragment, so the
-    /// literal-text replace would match nothing — wiring must refuse
-    /// fail-closed rather than report success with the lock never rewired.
     #[tokio::test]
-    async fn crlf_lock_refuses_instead_of_silently_not_wiring() {
-        let crlf = LOCK_DIRECT_REGISTRY.replace('\n', "\r\n");
-        let tmp = write_project(&crlf, PYPROJECT_DIRECT).await;
-        let p = load_pdm_project(tmp.path()).await.unwrap();
-        assert_eq!(
-            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
-            PdmTarget::Fresh,
-            "the parsed view accepts CRLF; only the splice must refuse"
-        );
-
-        let err = wire_pdm(
-            &p,
-            tmp.path(),
-            "six",
-            "1.16.0",
-            REL_WHEEL,
-            WHEEL_NAME,
-            WHEEL_SHA,
-            UUID,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.0, "pypi_pdm_lock_parse_failed");
-        assert_eq!(read_lock(tmp.path()).await, crlf, "refusal writes nothing");
-    }
-
-    /// The parsed and textual lock views can diverge on hand-edited spelling:
-    /// TOML accepts `name="six"` / `files=[` without spaces, but the textual
-    /// scanner pins pdm's own `key = ` serialization. The parsed-view guards
-    /// pass, so the splice-time rescan must refuse fail-closed — never report
-    /// success while the literal-text replace matched nothing (the CRLF twin
-    /// above is the same class).
-    #[tokio::test]
-    async fn textual_parsed_view_divergence_refuses_fail_closed() {
-        // Direct probe: an absent package misses find_unit_span.
-        let err = rewrite_target_package_unit(
-            LOCK_DIRECT_REGISTRY,
-            "absent-pkg",
-            REL_WHEEL,
-            WHEEL_NAME,
-            WHEEL_SHA,
-        )
-        .unwrap_err();
-        assert_eq!(err.0, "pypi_pdm_lock_package_missing");
-        assert!(err.1.contains("absent-pkg"), "{}", err.1);
-
-        // `name="six"`: the parsed guards pass, the unit-span scan misses.
-        let lock = LOCK_DIRECT_REGISTRY.replace("name = \"six\"", "name=\"six\"");
-        let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
-        let p = load_pdm_project(tmp.path()).await.unwrap();
-        assert_eq!(
-            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
-            PdmTarget::Fresh,
-            "the parsed view accepts the no-space spelling; only the splice must refuse"
-        );
-        let err = wire_pdm(
-            &p,
-            tmp.path(),
-            "six",
-            "1.16.0",
-            REL_WHEEL,
-            WHEEL_NAME,
-            WHEEL_SHA,
-            UUID,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.0, "pypi_pdm_lock_package_missing");
-        assert_eq!(read_lock(tmp.path()).await, lock, "refusal writes nothing");
-
-        // `files=[`: the parsed guards see the hashed array, the textual
-        // files rewrite finds no `files = [` line.
-        let lock = LOCK_DIRECT_REGISTRY.replace("files = [", "files=[");
-        let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
-        let p = load_pdm_project(tmp.path()).await.unwrap();
-        assert_eq!(
-            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
-            PdmTarget::Fresh,
-            "the parsed view sees the hashed files entries; only the splice must refuse"
-        );
-        let err = wire_pdm(
-            &p,
-            tmp.path(),
-            "six",
-            "1.16.0",
-            REL_WHEEL,
-            WHEEL_NAME,
-            WHEEL_SHA,
-            UUID,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.0, "pypi_pdm_lock_parse_failed");
-        assert!(err.1.contains("no files array to rewrite"), "{}", err.1);
-        assert_eq!(read_lock(tmp.path()).await, lock, "refusal writes nothing");
+    async fn crlf_and_noncanonical_spacing_round_trip() {
+        for lock in [
+            LOCK_DIRECT_REGISTRY.replace('\n', "\r\n"),
+            LOCK_DIRECT_REGISTRY.replace("name = ", "name="),
+            LOCK_DIRECT_REGISTRY.replace("files = [", "files=["),
+        ] {
+            let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
+            let project = load_pdm_project(tmp.path()).await.unwrap();
+            let (wiring, meta) = wire_default(&project, tmp.path()).await;
+            let rewritten = read_lock(tmp.path()).await;
+            assert!(rewritten.contains(REL_WHEEL));
+            if lock.contains("\r\n") {
+                assert!(!rewritten.replace("\r\n", "").contains('\n'));
+            }
+            assert!(
+                revert_pdm(&entry_for(wiring, meta), tmp.path(), false)
+                    .await
+                    .success
+            );
+            assert_eq!(read_lock(tmp.path()).await, lock);
+        }
     }
 
     /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —
@@ -1496,37 +1338,5 @@ distribution = false
             drifted,
             "drifted lock left alone"
         );
-    }
-
-    #[test]
-    fn lock_version_series_classifier() {
-        assert!(matches!(
-            lock_version_series("4.5.0"),
-            LockVersionSeries::Supported
-        ));
-        assert!(matches!(
-            lock_version_series("4.5.1"),
-            LockVersionSeries::Supported
-        ));
-        assert!(matches!(
-            lock_version_series("4.6.0"),
-            LockVersionSeries::NewerMinor
-        ));
-        assert!(matches!(
-            lock_version_series("4.10.2"),
-            LockVersionSeries::NewerMinor
-        ));
-        assert!(matches!(
-            lock_version_series("4.4.1"),
-            LockVersionSeries::Unsupported
-        ));
-        assert!(matches!(
-            lock_version_series("5.0.0"),
-            LockVersionSeries::Unsupported
-        ));
-        assert!(matches!(
-            lock_version_series("garbage"),
-            LockVersionSeries::Unsupported
-        ));
     }
 }
