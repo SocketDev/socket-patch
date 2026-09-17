@@ -96,6 +96,56 @@ async fn native_lock_generations_redirect_idempotently_and_restore_every_byte() 
     }
 }
 
+/// The per-generation hosted shapes real Poetry releases were measured to
+/// need: lock 1.0 gets `reference = ""` and the `#sha256=<hex>&` fragment
+/// (Poetry 1.0 reads `reference` unconditionally and appends `#egg=`); lock
+/// 1.1 gets the patched hash in BOTH the package `files` (what Poetry 1.2
+/// verifies) and `[metadata.files]` (what Poetry 1.1 verifies); 2.x gets the
+/// package `files` only, with `[metadata]` untouched.
+#[test]
+fn hosted_shapes_match_each_lock_generations_installer() {
+    let sha = "a".repeat(64);
+    let lock10 = rewrite_registry_redirect(
+        &BTreeMap::from([("poetry.lock".to_string(), original("1.0.10"))]),
+        &[patch()],
+    )
+    .files["poetry.lock"]
+        .clone();
+    assert!(lock10.contains(&format!("url = \"{URL}#sha256={sha}&\"")), "{lock10}");
+    assert!(lock10.contains("reference = \"\""), "{lock10}");
+    assert!(lock10.contains(&format!("urllib3 = [{{ file = \"{WHEEL}\", hash = \"sha256:{sha}\" }}]")), "{lock10}");
+    // Poetry >= 1.2 consuming this 1.0 lock verifies the package `files`
+    // entry, so it is written too (1.0 ignores the extra key).
+    assert_eq!(lock10.matches(&format!("sha256:{sha}")).count(), 2, "{lock10}");
+    let doc: toml_edit::DocumentMut = lock10.parse().unwrap();
+    assert!(doc["package"][0]["files"].is_array(), "{lock10}");
+
+    let lock11 = rewrite_registry_redirect(
+        &BTreeMap::from([("poetry.lock".to_string(), original("1.2.2"))]),
+        &[patch()],
+    )
+    .files["poetry.lock"]
+        .clone();
+    assert_eq!(lock11.matches(&format!("sha256:{sha}")).count(), 2, "package files + metadata.files:\n{lock11}");
+    assert!(lock11.contains(&format!("url = \"{URL}\"")), "no fragment on 1.1");
+    assert!(!lock11.contains("reference"), "{lock11}");
+    let doc: toml_edit::DocumentMut = lock11.parse().unwrap();
+    assert!(doc["package"][0]["files"].is_array());
+    assert!(doc["metadata"]["files"]["urllib3"].is_array());
+
+    let lock21 = rewrite_registry_redirect(
+        &BTreeMap::from([("poetry.lock".to_string(), original("2.4.3"))]),
+        &[patch()],
+    )
+    .files["poetry.lock"]
+        .clone();
+    assert_eq!(lock21.matches(&format!("sha256:{sha}")).count(), 1, "{lock21}");
+    assert!(!lock21.contains("reference"));
+    let pristine: toml_edit::DocumentMut = original("2.4.3").parse().unwrap();
+    let doc: toml_edit::DocumentMut = lock21.parse().unwrap();
+    assert_eq!(doc["metadata"].to_string(), pristine["metadata"].to_string(), "[metadata] untouched on 2.x");
+}
+
 #[test]
 fn every_native_lock_generation_supports_file_sources() {
     for version in VERSIONS {

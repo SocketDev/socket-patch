@@ -202,10 +202,14 @@ pub fn rewrite_poetry_lock(
         source.insert("reference", value(""));
     }
     package.insert("source", Item::Table(source));
-    if format == "1.1" && source_type == "url" {
-        // Poetry 1.2 (a lock-1.1 writer) verifies url sources against the
-        // package's own `files`, Poetry 1.1 against `metadata.files` — write
-        // both so either installer enforces the patched hash.
+    if matches!(format.as_str(), "1.0" | "1.1") && source_type == "url" {
+        // Poetry >= 1.2 verifies url sources against the package's own
+        // `files` (it never reads `metadata.files` hashes for them), Poetry
+        // 1.0/1.1 against `metadata.files` — write both so whichever installer
+        // consumes this legacy lock enforces the patched hash. Poetry 1.0/1.1
+        // ignore the extra package key (measured on 1.0.10; 1.2.2 rejects a
+        // tampered package `files` hash on a lock-1.0 file only when it is
+        // present).
         package.insert("files", value(files.clone()));
     }
     if format.starts_with('2') {

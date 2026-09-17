@@ -956,8 +956,6 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
                     second["version"] = toml_edit::value("1.16.0");
                     second.set_position(None);
                     second.remove("extras");
-                    second.set_position(None);
-                    second.remove("extras");
                     packages.push(second);
                     for field in ["files", "hashes"] {
                         if let Some(entries) = lock["metadata"].get_mut(field) {
