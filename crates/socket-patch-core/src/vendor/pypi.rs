@@ -651,12 +651,23 @@ pub async fn vendor_pypi_with_pipenv_version(
                 Ok(p) => p,
                 Err((code, detail)) => return refused(code, detail),
             };
-            if pipenv_version
+            let installer = *pipenv_version
                 .get_or_init(|| crate::utils::pipenv::installed_major(project_root))
-                .await
-                .is_some_and(|major| major < 2018)
-            {
+                .await;
+            if installer.is_some_and(|major| major < 2018) {
                 return refused("pypi_pipenv_installer_unsupported", "vendored wheel references require Pipenv 2018 or later; upgrade Pipenv or use hosted mode");
+            }
+            if installer.is_none() {
+                // Fail-open like hosted, but say so: the wiring assumes a
+                // 2018+ installer, and a Pipenv 7–11 project would not be
+                // able to consume it.
+                warnings.push(VendorWarning::new(
+                    "pypi_pipenv_installer_unknown",
+                    format!(
+                        "Pipenv was not found on PATH; the vendored references assume Pipenv 2018 or later (Pipenv 7–11 cannot consume them — use hosted mode there). Set {}=<major> to pin the installer release.",
+                        crate::utils::pipenv::MAJOR_OVERRIDE_ENV
+                    ),
+                ));
             }
             match super::pypi_pipenv::check_target_guards(
                 &project,

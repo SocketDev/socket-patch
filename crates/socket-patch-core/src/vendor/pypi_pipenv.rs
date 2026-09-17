@@ -132,10 +132,10 @@ pub(super) async fn load_pipenv_project(
     // self-documentation, not a pipenv-enforced check.
     let warnings = vec![VendorWarning::new(
         "vendor_integrity_unverified",
-        "Pipenv 2018 or later is required. Pipenv does not consistently enforce the hashes recorded on file-ref lock entries (its file-ref \
-         install phase invokes pip without --hash/--require-hashes), so the vendored wheel is \
-         protected only by the committed wheel itself; `socket-patch vex` verifies the committed wheel \
-         against its recorded artifact hash",
+        "Pipenv does not consistently enforce the hashes recorded on file-ref lock entries \
+         (2018–2022 verify them, 2023+ install a local wheel without checking), so the vendored \
+         wheel is protected only by the committed wheel itself; `socket-patch vex --product <purl>` \
+         verifies the installed files against the patch record",
     )];
     Ok(PipenvProject { lock, warnings })
 }

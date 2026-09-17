@@ -993,7 +993,10 @@ def main():
         # preview runs no backend guard.
         informational = {"warmInstallReplacesUpstream"}
         if mode == "vendored":
-            informational.add("dryRunParity")
+            # The vendored backend re-serializes the whole lock with Pipenv's
+            # own `json.dumps` (LF), so a git-autocrlf CRLF lock comes back
+            # LF — exactly what `pipenv lock` would do; recorded, not required.
+            informational.update({"dryRunParity", "crlfPreserved"})
         row["passed"] = all(val for k, val in checks.items() if k not in informational)
         return row
 

@@ -141,6 +141,12 @@ pub(super) fn restore(text: &str, edit: &FileEdit) -> Result<String, String> {
         .as_ref()
         .and_then(Value::as_str)
         .ok_or("missing Pipenv original")?;
+    // The ledger is committed and tamper-able: only a JSON object may be
+    // spliced back into the lock (never arbitrary text that would corrupt
+    // it or smuggle in extra entries).
+    if !serde_json::from_str::<Value>(original).is_ok_and(|value| value.is_object()) {
+        return Err("Pipenv original is not a JSON object".into());
+    }
     let new = edit
         .new
         .as_ref()
@@ -245,16 +251,25 @@ pub(super) fn rewrite(
     }
 }
 
+/// Whether `value` is a Socket-issued hosted reference for `dep` — served
+/// from the same origin as the grant's own artifact URL (patch.socket.dev,
+/// or a `--patch-server-url` host), with the `/patch/pypi/<name>/<version>/
+/// <grant>/<uuid>/<wheel>` shape for this package and version. Such an entry
+/// is ours to rotate; anything else is a user's or a fork's source.
 fn owned_url(value: &str, dep: &DepOverride) -> bool {
     let Ok(url) = reqwest::Url::parse(value) else {
         return false;
     };
+    let Ok(ours) = reqwest::Url::parse(&dep.artifact_url) else {
+        return false;
+    };
+    let same_origin = url.scheme() == ours.scheme()
+        && url.host_str() == ours.host_str()
+        && url.port_or_known_default() == ours.port_or_known_default();
     let parts: Vec<_> = url.path().split('/').collect();
-    url.scheme() == "https"
-        && url.host_str() == Some("patch.socket.dev")
+    (same_origin || (url.scheme() == "https" && url.host_str() == Some("patch.socket.dev")))
         && url.username().is_empty()
         && url.password().is_none()
-        && url.port().is_none()
         && url.query().is_none()
         && parts.len() == 8
         && parts[1] == "patch"
@@ -347,17 +362,29 @@ fn plan(
             )));
         }
         if let Some(file) = object.get("file").or_else(|| object.get("path")) {
-            if !file.as_str().is_some_and(|value| owned_url(value, dep))
-                || object.contains_key("version")
-                || object.contains_key("index")
-            {
+            if !file.as_str().is_some_and(|value| owned_url(value, dep)) {
                 return Err(PlanError::Conflict(format!(
                     "Pipenv source for {} already exists",
                     dep.name
                 )));
             }
+            // Ours. A `version` Pipenv re-added next to it (`pipenv lock
+            // --keep-outdated`, `install --keep-outdated <pkg>` on 2022
+            // write a file+version+index hybrid that still installs) must
+            // still name the patched release; then the entry is simply
+            // re-planned to the canonical shape.
+            if let Some(pinned) = object.get("version").and_then(Value::as_str) {
+                if pinned != format!("=={}", dep.version) {
+                    return Err(PlanError::Conflict(format!(
+                        "Pipenv version for {} does not match {}",
+                        dep.name, dep.version
+                    )));
+                }
+            }
             if object.get(source_key).and_then(Value::as_str) == Some(&url)
                 && object.get("hashes") == Some(&json!([format!("sha256:{sha}")]))
+                && !object.contains_key("version")
+                && !object.contains_key("index")
             {
                 continue;
             }
@@ -620,6 +647,71 @@ mod tests {
         let mut npm = dep.clone();
         npm.ecosystem = "npm".into();
         assert!(!lock_targets(&files(&lock()), std::slice::from_ref(&npm)));
+    }
+
+    /// `pipenv lock --keep-outdated` (2022) rewrites our entry into a
+    /// file+version+index hybrid that Pipenv still installs from: it is
+    /// ours, so it is re-planned to the canonical shape instead of being
+    /// refused as a foreign source (which also vetoed the sibling rewriters);
+    /// a hybrid naming ANOTHER version is a real conflict.
+    #[test]
+    fn owned_hybrid_entries_are_replanned_not_refused() {
+        let dep = dependency("urllib3", "1.26.18", "patch-one");
+        let (redirected, _) = plan(&lock(), &dep, None).unwrap();
+        let mut value: Value = serde_json::from_str(&redirected).unwrap();
+        value["default"]["urllib3"]["version"] = json!("==1.26.18");
+        value["default"]["urllib3"]["index"] = json!("pypi");
+        let hybrid = serde_json::to_string_pretty(&value).unwrap();
+        let (fixed, edits) = plan(&hybrid, &dep, None).unwrap();
+        assert!(!edits.is_empty(), "the hybrid is re-planned");
+        let entry: Value = serde_json::from_str(&fixed).unwrap();
+        assert!(entry["default"]["urllib3"].get("version").is_none());
+        assert!(entry["default"]["urllib3"].get("index").is_none());
+        assert!(entry["default"]["urllib3"]["file"].as_str().unwrap().contains("patch-one"));
+
+        value["default"]["urllib3"]["version"] = json!("==2.0.0");
+        let conflicting = serde_json::to_string(&value).unwrap();
+        assert!(matches!(
+            plan(&conflicting, &dep, None),
+            Err(PlanError::Conflict(detail)) if detail.contains("does not match")
+        ));
+    }
+
+    /// The Socket origin comes from the grant's own artifact URL, so a
+    /// `--patch-server-url` deployment recognizes its previous references
+    /// (rotation, idempotency) exactly like patch.socket.dev; a fork on
+    /// another host is never ours.
+    #[test]
+    fn owned_url_follows_the_grant_origin() {
+        let mut dep = dependency("urllib3", "1.26.18", "patch-one");
+        let public = "https://patch.socket.dev/patch/pypi/urllib3/1.26.18/tok/patch-one/urllib3-1.26.18-py3-none-any.whl";
+        assert!(owned_url(public, &dep));
+        assert!(!owned_url("https://example.org/patch/pypi/urllib3/1.26.18/tok/patch-one/urllib3-1.26.18-py3-none-any.whl", &dep));
+        dep.artifact_url = "https://patches.internal.example:8443/patch/pypi/urllib3/1.26.18/tok/patch-one/urllib3-1.26.18-py3-none-any.whl".into();
+        assert!(owned_url(&dep.artifact_url, &dep), "the grant's own origin is ours");
+        assert!(owned_url(public, &dep), "and so is the public service");
+        assert!(!owned_url("https://patches.internal.example:8443/patch/pypi/urllib3/1.26.19/tok/patch-one/urllib3-1.26.19-py3-none-any.whl", &dep), "another version is not");
+        // Rotation on the custom origin restores through the chain.
+        let original = lock();
+        let (first, edits) = plan(&original, &dep, None).unwrap();
+        dep.artifact_url = dep.artifact_url.replace("/tok/", "/rotated/");
+        let (second, rotation) = plan(&first, &dep, None).unwrap();
+        let mut restored = second;
+        for edit in rotation.iter().chain(edits.iter()) {
+            restored = restore(&restored, edit).unwrap();
+        }
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn restore_refuses_a_non_object_ledger_original() {
+        let dep = dependency("urllib3", "1.26.18", "patch-one");
+        let (text, edits) = plan(&lock(), &dep, None).unwrap();
+        for bad in ["\"just a string\"", "[1, 2]", "not json at all", "{\"a\": 1}, \"injected\": {}"] {
+            let mut edit = edits[0].clone();
+            edit.original = Some(Value::String(bad.to_string()));
+            assert!(restore(&text, &edit).is_err(), "{bad}");
+        }
     }
 
     #[test]
