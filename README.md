@@ -266,7 +266,7 @@ Old lock formats before `pipfile-spec: 6` are refused without changing the lock.
 Vendored mode requires Pipenv 2018 or later. Wheels with extras use `path`
 references to avoid Pipenv 2022's local-file URL parsing bug. Native Pipenv does
 not consistently enforce hashes on local wheels; commit the wheel and run
-`socket-patch verify`. Re-run Socket Patch after re-locking dependencies.
+`socket-patch vex`. Re-run Socket Patch after re-locking dependencies.
 
 The compatibility backtest covers the last stable release of every published
 Pipenv major, including unsupported versions to verify explicit refusal. It

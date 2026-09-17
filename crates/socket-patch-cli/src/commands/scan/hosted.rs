@@ -1404,6 +1404,13 @@ pub(crate) async fn run_redirect_selected(
         pipenv_major,
     );
 
+    if files.contains_key("Pipfile.lock") && pipenv_major.is_none() {
+        rewrite.warnings.push(socket_patch_core::patch::redirect::RewriteWarning {
+            code: "redirect_pipenv_installer_unknown".into(),
+            detail: "Pipenv was not detected; these hosted references require Pipenv 2018 or later. Make legacy Pipenv available on PATH to select its native lockfile format.".into(),
+        });
+    }
+
     // The lockb→text migration is only KEPT when the rewrite actually landed
     // in the migrated bun.lock. Otherwise nothing was redirected there and the
     // migration was pure side effect: restore the saved bun.lockb bytes,

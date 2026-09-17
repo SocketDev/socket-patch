@@ -134,8 +134,8 @@ pub(super) async fn load_pipenv_project(
         "vendor_integrity_unverified",
         "Pipenv 2018 or later is required. Pipenv does not consistently enforce the hashes recorded on file-ref lock entries (its file-ref \
          install phase invokes pip without --hash/--require-hashes), so the vendored wheel is \
-         protected only by the committed wheel itself; `socket-patch verify` re-checks its \
-         sha256 against the lock entry",
+         protected only by the committed wheel itself; `socket-patch vex` verifies the committed wheel \
+         against its recorded artifact hash",
     )];
     Ok(PipenvProject { lock, warnings })
 }
