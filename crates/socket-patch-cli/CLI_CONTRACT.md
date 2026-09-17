@@ -296,7 +296,7 @@ the model is **not uniform** today:
   One repo-root invocation discovers and configures every member. *Single level only* — see property
   9's nested-workspace gap.
 - **cwd-only (single project):** gem, pypi, composer. The crawler inspects only the project
-  rooted at `--cwd` (pypi looks at `<cwd>/.venv`; composer at the vendor tree); it does **not**
+  rooted at `--cwd` (pypi looks at `$VIRTUAL_ENV`, `<cwd>/.venv` / `venv`, then a Poetry project's out-of-tree virtualenv(s) under Poetry's `virtualenvs.path`; composer at the vendor tree); it does **not**
   descend into sibling subprojects. A monorepo with several independent lockfiles in subdirectories
   (`backend/Gemfile.lock` + `frontend/Gemfile.lock`, multiple `.venv`, multiple `go.mod` /
   `composer.json`) is handled by invoking the tool **once per subproject** (`--cwd` each), as a
@@ -1058,7 +1058,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `vendor_override_conflict` | `failed`        | vendor (pnpm/yarn-berry): a user-authored override/resolution for the package already exists. |
 | `vendor_integrity_unverified` | `skipped` (warning) | vendor (pipenv): the lockfile format does not hash-check file entries; the committed wheel bytes are the protection. |
 | `vendor_content_mismatch_overwritten` | `skipped` (warning) | vendor: a staged file matched NEITHER beforeHash nor afterHash (patch built against different bytes, or local edits); the stage was overwritten with the verified patched content and the vendor succeeded. |
-| `vendor_fetched_missing` | `skipped` (warning) | vendor: the package was not installed; its pristine artifact was fetched per the lockfile resolution (or staged from the committed vendor artifact), integrity-verified, and vendored — the project tree was not touched. |
+| `vendor_fetched_missing` | `skipped` (warning) | vendor: the package was not installed; its pristine artifact was fetched per the lockfile resolution (or staged from the committed vendor artifact), integrity-verified, and vendored — the project tree was not touched. For `poetry.lock` (which records hashes but no URLs) the pure-Python wheel's sha256 selects the file through PyPI's JSON API (`SOCKET_PYPI_JSON_API` overrides the endpoint); Poetry 0.12's bare `[metadata.hashes]` names no wheel, so those locks still need an installed copy (`vendor_fetch_unverifiable`). |
 | `vendor_fetch_failed` | `failed` | vendor: the lockfile-resolved fetch was attempted and failed (HTTP error, size cap, integrity mismatch, or a PRESENT-but-corrupt committed artifact — pointed at `socket-patch repair`). A MISSING committed artifact no longer lands here: it falls through to the ledger-recovered registry fetch. Suppresses the duplicate `package_not_installed` skip. |
 | `vendor_fetch_unverifiable` | `skipped` (warning) | vendor: the lockfile records no usable integrity for the missing package; nothing was fetched (fail-closed) and the `package_not_installed` skip follows. |
 | `vendor_artifact_missing` | `skipped` (warning) / `failed` | vendor: the committed artifact is gone — the registry resolution is recovered from the ledger and the artifact rebuilt (warning); repair `--offline` with no local source surfaces it as the per-entry failure instead. |

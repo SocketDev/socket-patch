@@ -193,6 +193,27 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Agent mode finds Poetry's out-of-tree virtualenv.** Poetry keeps a
+  project's virtualenv under `{cache-dir}/virtualenvs/<name>-<hash>-py<X.Y>`
+  by default, so after a plain `poetry install` the crawler saw no
+  `VIRTUAL_ENV` / `.venv` / `venv` and fell through to the global interpreter:
+  `scan --mode agent` patched nothing for the project's dependencies (or the
+  wrong interpreter) while reporting success, and a bare `rollback` pruned the
+  manifest while the venv stayed patched. The crawler now reproduces Poetry's
+  own placement — `virtualenvs.create` / `in-project` / `path` and `cache-dir`
+  from `POETRY_*`, the project's `poetry.toml` and the user `config.toml`, the
+  platform default cache dir, and Poetry's env-name hash — without running
+  Poetry, and scans every `-py<X.Y>` sibling. `poetry run socket-patch …` and
+  `VIRTUAL_ENV` keep working as before.
+- **`scan --mode vendored` works from a lock-only Poetry checkout.** The
+  `poetry.lock` inventory was discovery-only, so a fresh clone with nothing
+  installed was skipped with `vendor_fetch_unverifiable` even though the lock
+  records the wheel's sha256 (uv's lock vendored fine in the same scenario).
+  The inventory now carries the pure-Python wheel's sha256 from `files` (lock
+  2.x) or `[metadata.files]` (lock 1.0/1.1), and the pypi fetcher resolves a
+  hash-only entry through PyPI's JSON API by that digest (verified again after
+  download; `SOCKET_PYPI_JSON_API` overrides the endpoint). Poetry 0.12's bare
+  `[metadata.hashes]` names no wheel and still needs an installed copy.
 - **`remove` no longer drops the manifest entry of a drift-kept vendored
   purl.** When the vendored revert keeps the artifact (`kept_artifact` —
   the lockfile drifted), the manifest entry is now kept too

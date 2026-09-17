@@ -82,21 +82,30 @@ Other measured details:
 ## Mode notes
 
 - **Agent mode** patches the interpreter the crawler finds: `VIRTUAL_ENV`,
-  `./.venv`, `./venv`, else — for a project directory — the global interpreter's
-  site-packages. Poetry's default virtualenv lives outside the project
-  (`virtualenvs.in-project` unset), so run the CLI as `poetry run socket-patch
-  scan` (Poetry exports `VIRTUAL_ENV`), export `VIRTUAL_ENV=$(poetry env info -p)`,
-  or pass `--global-prefix <venv site-packages>`; the matrix's out-of-tree leg
-  uses `poetry run`. A bare `socket-patch rollback` outside that context does not
-  see the venv either. Patched bytes survive `poetry install`, `poetry sync` and
-  `poetry install --sync` on every release (same version → no reinstall).
-- **Vendored mode needs the package installed** (in the discovered virtualenv)
-  when it runs: the `poetry.lock` inventory is discovery-only, so a
-  lock-only checkout is skipped with `vendor_fetch_unverifiable` +
-  `package_not_installed` (uv's lock inventory carries integrity and vendors
-  lock-only). Commit the `.socket/vendor/` tree and rewired lock from the
-  machine that ran the scan; fresh clones then install from the committed wheel
-  with no CLI at all (verified by the matrix's fresh-clone leg).
+  `./.venv`, `./venv`, then — for a Poetry project — the virtualenv(s) Poetry
+  placed under its `virtualenvs.path` (`<name>-<hash>-py<X.Y>`; every
+  interpreter minor), reproducing Poetry's own placement from `POETRY_*`, the
+  project's `poetry.toml`, the user `config.toml` and the platform default
+  cache dir without running Poetry; else — for a project directory — the global
+  interpreter's site-packages. So a bare `socket-patch scan --mode agent` /
+  `rollback` in a default-configured Poetry checkout works; `poetry run
+  socket-patch …`, `VIRTUAL_ENV=$(poetry env info -p)` and
+  `--global-prefix <site-packages>` keep working. `virtualenvs.create = false`
+  (containers) means Poetry installed into the system interpreter, which the
+  project-marker global fallback covers. Patched bytes survive
+  `poetry install`, `poetry sync` and `poetry install --sync` on every release
+  (same version → no reinstall).
+- **Vendored mode works lock-only** for locks that list a pure-Python
+  (`-none-any.whl`) wheel for the package — lock 2.x `files`, lock 1.0/1.1
+  `[metadata.files]`: the inventory carries that sha256 and the fetcher
+  resolves the file through PyPI's JSON API by digest, verifying the bytes
+  again, exactly like uv's lock-only path. Poetry 0.12's bare
+  `[metadata.hashes]` names no wheel, and a package that ships only platform
+  wheels has no platform-independent choice: those still need the package
+  installed in the discovered virtualenv (`vendor_fetch_unverifiable` +
+  `package_not_installed`). Fresh clones of the committed `.socket/vendor/`
+  tree and rewired lock install from the committed wheel with no CLI at all
+  (the matrix's fresh-clone leg).
 - **Hosted mode works lock-only** (`redirected: 1` with no virtualenv).
 
 ## Running the matrix
