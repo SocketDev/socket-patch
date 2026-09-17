@@ -1130,12 +1130,21 @@ async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>>
         if let Some(entries) = inventory_poetry_lock(project_root).await {
             found = true;
             out.extend(entries);
-        } else if let Some(entries) = inventory_pipfile_lock(project_root).await {
-            found = true;
-            out.extend(entries);
-        } else if let Some(entries) = inventory_requirements_txt(project_root).await {
-            found = true;
-            out.extend(entries);
+        } else {
+            // Pipfile.lock and requirements.txt are read TOGETHER: Pipenv
+            // projects routinely ship both (`pipenv requirements` exports the
+            // same pins — deduplicated below), and a stale Pipfile.lock left in
+            // a requirements project must not hide the pins the project
+            // actually installs from (the hosted rewriter judges each file on
+            // its own).
+            if let Some(entries) = inventory_pipfile_lock(project_root).await {
+                found = true;
+                out.extend(entries);
+            }
+            if let Some(entries) = inventory_requirements_txt(project_root).await {
+                found = true;
+                out.extend(entries);
+            }
         }
     }
     found.then(|| dedup_prefer_integrity(out))
@@ -3373,8 +3382,8 @@ source = { editable = "." }
     /// Pipfile.lock: every category is read, registry pins carry the lock's
     /// digest SET (lowercased), non-registry sources / range pins / our own
     /// file references are skipped, the same package in two categories
-    /// yields one entry, and the lock outranks requirements.txt while a
-    /// parseable uv.lock outranks it.
+    /// yields one entry, requirements.txt is read alongside it, and a
+    /// parseable uv.lock outranks both.
     #[tokio::test]
     async fn pipfile_lock_inventory_reads_every_category_with_its_digest_set() {
         let wheel = "a".repeat(64);
@@ -3403,7 +3412,8 @@ source = { editable = "." }
         let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
         let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         names.sort_unstable();
-        assert_eq!(names, vec!["six", "urllib3"], "{entries:?}");
+        // requirements.txt is read alongside the Pipfile.lock, not hidden by it.
+        assert_eq!(names, vec!["flask", "six", "urllib3"], "{entries:?}");
         let urllib3 = entry(&entries, "urllib3");
         assert_eq!(urllib3.purl, "pkg:pypi/urllib3@1.26.18");
         assert_eq!(urllib3.resolved, None);
