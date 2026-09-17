@@ -360,8 +360,8 @@ mod tests {
     /// lock exists to prevent. Re-opening the path on every retry keeps
     /// the waiter honest about whatever file `apply.lock` names now.
     ///
-    /// The choreography below can lose two *benign* races on a loaded
-    /// runner (both observed on CI's macos-latest), so it retries: the
+    /// The choreography below can lose benign races on a loaded runner
+    /// (observed on macOS and Windows CI), so it retries: the
     /// regressed bug double-holds on essentially every iteration, while
     /// the benign losses need an unlucky deschedule and almost never
     /// repeat. One clean iteration proves the re-open behavior; a full
@@ -429,6 +429,28 @@ mod tests {
                 // iteration, so repeats fail below.
                 (Ok(_fresh_guard), Ok(_waiter_guard)) => {
                     benign.push("double hold via the open->flock window");
+                }
+                // Windows can keep an unlinked file delete-pending until
+                // its last handle closes. CreateFile then returns
+                // ERROR_ACCESS_DENIED (5), including when the waiter is
+                // reopening while the fresh acquire races that cleanup.
+                // Neither an I/O refusal nor Held grants a second lock.
+                // Retry this choreography; still require a clean Held
+                // iteration above, and never relax acquire's I/O errors.
+                // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
+                #[cfg(windows)]
+                (Ok(_) | Err(LockError::Held), Err(LockError::Io { source, .. }))
+                | (Err(LockError::Io { source, .. }), Ok(_) | Err(LockError::Held))
+                    if source.raw_os_error() == Some(5) =>
+                {
+                    benign.push("open raced Windows delete-pending handle");
+                }
+                #[cfg(windows)]
+                (
+                    Err(LockError::Io { source: first, .. }),
+                    Err(LockError::Io { source: second, .. }),
+                ) if first.raw_os_error() == Some(5) && second.raw_os_error() == Some(5) => {
+                    benign.push("both opens raced Windows delete-pending handle");
                 }
                 (fresh, waiter_result) => panic!(
                     "unexpected lock outcome: fresh={:?} waiter={:?}",
