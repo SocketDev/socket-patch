@@ -25,6 +25,7 @@ use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 pub mod golang_local;
 mod pnpm;
+mod poetry;
 mod replay;
 mod requirements;
 mod state;
@@ -215,6 +216,7 @@ pub fn rewrite_registry_redirect_with_python_metadata(
     rewrite_bun_lock(files, overrides, &mut result);
     rewrite_pypi_requirements(files, overrides, &mut result);
     rewrite_uv_lock(files, overrides, python_metadata, &mut result);
+    poetry::rewrite_poetry(files, overrides, &mut result);
     rewrite_cargo(files, overrides, &mut result);
     rewrite_composer_lock(files, overrides, &mut result);
     rewrite_nuget(files, overrides, &mut result);

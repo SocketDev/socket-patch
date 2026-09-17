@@ -86,7 +86,9 @@ enum Inverse {
 /// Gemfile.lock) revert together or not at all.
 fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
     match kind {
-        "redirect_requirements_line" | "redirect_uv_lock_wheel" => ("pypi", Inverse::ReplaceFragment),
+        "redirect_requirements_line" | "redirect_uv_lock_wheel" | "redirect_poetry_lock_package" => {
+            ("pypi", Inverse::ReplaceFragment)
+        }
         "redirect_composer_dist" => ("composer", Inverse::ReplaceFragment),
         "redirect_cargo_toml_dep" | "redirect_cargo_lock_entry" => ("cargo", Inverse::ReplaceFragment),
         "redirect_cargo_registry" => (
