@@ -264,7 +264,323 @@ pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
         results.extend(matches);
     }
 
+    // 3. Pipenv keeps its virtualenv OUTSIDE the project by default
+    // (`$WORKON_HOME/<dir>-<hash>`), so a plain `pipenv install` leaves
+    // nothing above to find and the crawl used to fall through to the global
+    // interpreter's site-packages — patching the wrong Python (or nothing)
+    // and reporting success. Measured on real Pipenv 11.10.4, 2018.11.26 and
+    // 2026.8.0.
+    if results.is_empty() {
+        results.extend(find_pipenv_virtualenv_site_packages(cwd).await);
+    }
+
     results
+}
+
+/// `site-packages` of the virtualenv Pipenv would use for the project at
+/// `cwd` when it is not in-project: the `.venv` FILE pointer (a path relative
+/// to the project or a name under `WORKON_HOME`), `PIPENV_CUSTOM_VENV_NAME`,
+/// or Pipenv's derived name `<sanitized dir name>-<8-char hash>` with any
+/// `-<PIPENV_PYTHON>` suffix. Empty for non-Pipenv projects and whenever the
+/// placement cannot be resolved. Read-only: nothing is executed, no `pipenv`
+/// binary is needed.
+pub async fn find_pipenv_virtualenv_site_packages(cwd: &Path) -> Vec<PathBuf> {
+    let var = |name: &str| std::env::var(name).ok();
+    find_pipenv_virtualenv_site_packages_with(cwd, &var).await
+}
+
+/// [`find_pipenv_virtualenv_site_packages`] over an explicit environment
+/// (tests pass a closure instead of mutating the process environment).
+async fn find_pipenv_virtualenv_site_packages_with(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    let is_file = |leaf: &str| cwd.join(leaf).is_file();
+    if !is_file("Pipfile") && !is_file("Pipfile.lock") {
+        return Vec::new();
+    }
+    let mut venvs: Vec<PathBuf> = Vec::new();
+    // A `.venv` FILE names the virtualenv (Pipenv 2018+): a path (contains a
+    // separator) is relative to the project, anything else is a directory
+    // name under WORKON_HOME; an empty file means the default placement.
+    let dot_venv = cwd.join(".venv");
+    if dot_venv.is_file() {
+        if let Ok(text) = std::fs::read_to_string(&dot_venv) {
+            let name = text.trim();
+            if !name.is_empty() {
+                if name.contains('/') || name.contains('\\') {
+                    venvs.push(cwd.join(name));
+                } else if let Some(home) = pipenv_workon_home(var) {
+                    venvs.push(home.join(name));
+                }
+            }
+        }
+    }
+    if venvs.is_empty() {
+        if let Some(home) = pipenv_workon_home(var) {
+            venvs.extend(pipenv_workon_home_venvs(cwd, &home, var));
+        }
+    }
+    let mut results = Vec::new();
+    for venv in venvs {
+        results.extend(find_site_packages_under(&venv, "site-packages").await);
+    }
+    results
+}
+
+/// Pipenv's `WORKON_HOME`: the environment variable (with `~`, `$VAR`,
+/// `${VAR}` and, on Windows, `%VAR%` expanded the way Pipenv's
+/// `expandvars`/`expanduser` do), else `$XDG_DATA_HOME/virtualenvs` or
+/// `~/.local/share/virtualenvs` (POSIX) / `~/.virtualenvs` (Windows) —
+/// unchanged from the pew era (Pipenv 7) through 2026.
+fn pipenv_workon_home(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if let Some(raw) = var("WORKON_HOME").filter(|v| !v.trim().is_empty()) {
+        return Some(pipenv_expand_path(raw.trim(), var));
+    }
+    let home = pipenv_home_dir(var)?;
+    if cfg!(windows) {
+        return Some(home.join(".virtualenvs"));
+    }
+    let data_home = var("XDG_DATA_HOME")
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| pipenv_expand_path(v.trim(), var))
+        .unwrap_or_else(|| home.join(".local").join("share"));
+    Some(data_home.join("virtualenvs"))
+}
+
+fn pipenv_home_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    var("HOME")
+        .or_else(|| var("USERPROFILE"))
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// `os.path.expanduser(os.path.expandvars(raw))`: `$NAME` / `${NAME}` (and
+/// `%NAME%` on Windows) from the environment — unknown names stay as written,
+/// like Python — then a leading `~` from the home directory.
+fn pipenv_expand_path(raw: &str, var: &impl Fn(&str) -> Option<String>) -> PathBuf {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '$' {
+            if chars.get(i + 1) == Some(&'{') {
+                if let Some(end) = chars[i + 2..].iter().position(|&ch| ch == '}') {
+                    let name: String = chars[i + 2..i + 2 + end].iter().collect();
+                    match var(&name) {
+                        Some(v) => out.push_str(&v),
+                        None => out.push_str(&format!("${{{name}}}")),
+                    }
+                    i += end + 3;
+                    continue;
+                }
+            }
+            let start = i + 1;
+            let mut end = start;
+            while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+                end += 1;
+            }
+            if end > start {
+                let name: String = chars[start..end].iter().collect();
+                match var(&name) {
+                    Some(v) => out.push_str(&v),
+                    None => {
+                        out.push('$');
+                        out.push_str(&name);
+                    }
+                }
+                i = end;
+                continue;
+            }
+        } else if c == '%' && cfg!(windows) {
+            if let Some(end) = chars[i + 1..].iter().position(|&ch| ch == '%') {
+                let name: String = chars[i + 1..i + 1 + end].iter().collect();
+                if !name.is_empty() {
+                    match var(&name) {
+                        Some(v) => out.push_str(&v),
+                        None => out.push_str(&format!("%{name}%")),
+                    }
+                    i += end + 2;
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    if out == "~" {
+        if let Some(home) = pipenv_home_dir(var) {
+            return home;
+        }
+    }
+    if let Some(rest) = out.strip_prefix("~/").or_else(|| out.strip_prefix("~\\")) {
+        if let Some(home) = pipenv_home_dir(var) {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(out)
+}
+
+/// `Project._sanitize`: shell-hostile characters become `_` and the name is
+/// cut to 42 characters. Pipenv 2022+ also replaces `& ( ) [ ]` (`wide`);
+/// both spellings are tried so a virtualenv created by either generation is
+/// found.
+fn pipenv_sanitize(name: &str, wide: bool) -> String {
+    name.chars()
+        .map(|c| {
+            let narrow = matches!(
+                c,
+                ' ' | '$' | '`' | '!' | '*' | '@' | '"' | '\\' | '\r' | '\n' | '\t'
+            );
+            let extra = wide && matches!(c, '&' | '(' | ')' | '[' | ']');
+            if narrow || extra {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(42)
+        .collect()
+}
+
+/// The 8-character virtualenv suffix — `Project._get_virtualenv_hash`: the
+/// first 6 bytes of `sha256(pipfile_location)`, URL-safe base64. Stable from
+/// Pipenv 7 through 2026 and pinned by known-answer vectors in the tests.
+fn pipenv_venv_hash(pipfile_location: &str) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(pipfile_location.as_bytes());
+    base64::engine::general_purpose::URL_SAFE.encode(&digest[..6])
+}
+
+/// The path string Pipenv hashes: on Windows the verbatim `\\?\` prefix is
+/// dropped and the drive letter upper-cased (`normalize_drive`); elsewhere
+/// the path as displayed.
+fn pipenv_path_string(path: &Path) -> String {
+    let mut text = path.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            text = format!(r"\\{rest}");
+        } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+            text = rest.to_string();
+        }
+        let mut chars: Vec<char> = text.chars().collect();
+        if chars.len() >= 2 && chars[1] == ':' && chars[0].is_ascii_lowercase() {
+            chars[0] = chars[0].to_ascii_uppercase();
+            text = chars.into_iter().collect();
+        }
+    }
+    text
+}
+
+/// `(project name, Pipfile location)` pairs Pipenv may have derived the
+/// virtualenv name from, most likely first: `PIPENV_PIPFILE` as given (made
+/// absolute), the Pipfile under the symlink-resolved project directory
+/// (`find_pipfile` walks `Path.cwd().resolve()` — the physical path), then
+/// the lexical absolute path.
+fn pipenv_project_identities(
+    cwd: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |pipfile: PathBuf| {
+        let name = pipfile
+            .parent()
+            .and_then(Path::file_name)
+            .map(|n| n.to_string_lossy().into_owned());
+        let Some(name) = name else {
+            return;
+        };
+        let location = pipenv_path_string(&pipfile);
+        if !out.iter().any(|(_, l)| l == &location) {
+            out.push((name, location));
+        }
+    };
+    if let Some(explicit) = var("PIPENV_PIPFILE").filter(|v| !v.trim().is_empty()) {
+        let p = PathBuf::from(explicit.trim());
+        push(if p.is_absolute() { p } else { cwd.join(p) });
+    }
+    if let Ok(real) = std::fs::canonicalize(cwd) {
+        push(real.join("Pipfile"));
+    }
+    let lexical = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf())
+    };
+    push(lexical.join("Pipfile"));
+    out
+}
+
+/// Every directory under `workon_home` that Pipenv could have created for the
+/// project at `cwd`: `PIPENV_CUSTOM_VENV_NAME` verbatim, else
+/// `<sanitized name>-<hash>` optionally followed by `-<PIPENV_PYTHON>`
+/// (matched as a `-` suffix rather than reproduced — the suffix's spelling
+/// changed across releases), plus Pipenv's case-insensitive-filesystem
+/// fallback (a same-name-different-case directory whose hash was computed
+/// over the recased location). Sorted; never follows the entries.
+fn pipenv_workon_home_venvs(
+    cwd: &Path,
+    workon_home: &Path,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Vec<PathBuf> {
+    if let Some(custom) = var("PIPENV_CUSTOM_VENV_NAME").filter(|v| !v.trim().is_empty()) {
+        return vec![workon_home.join(custom.trim())];
+    }
+    let identities = pipenv_project_identities(cwd, var);
+    if identities.is_empty() {
+        return Vec::new();
+    }
+    let mut exact: Vec<String> = Vec::new();
+    for (name, location) in &identities {
+        let hash = pipenv_venv_hash(location);
+        for wide in [true, false] {
+            let candidate = format!("{}-{hash}", pipenv_sanitize(name, wide));
+            if !exact.contains(&candidate) {
+                exact.push(candidate);
+            }
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(workon_home) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(leaf) = file_name.to_str() else {
+            continue;
+        };
+        let direct = exact
+            .iter()
+            .any(|c| leaf == c || leaf.strip_prefix(c.as_str()).is_some_and(|rest| rest.starts_with('-')));
+        if direct {
+            found.push(entry.path());
+            continue;
+        }
+        // Case-insensitive fallback: `<Recased>-<hash>` where the hash was
+        // computed over the location with the recased name spliced in.
+        let Some((env_name, hash)) = leaf.rsplit_once('-') else {
+            continue;
+        };
+        if hash.len() != 8 {
+            continue;
+        }
+        for (name, location) in &identities {
+            let sanitized = pipenv_sanitize(name, true);
+            if env_name.eq_ignore_ascii_case(&sanitized)
+                && env_name != sanitized
+                && pipenv_venv_hash(&location.replace(name.as_str(), env_name)) == hash
+            {
+                found.push(entry.path());
+                break;
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// Get global/system Python `site-packages` directories.
@@ -738,6 +1054,227 @@ pub fn parse_python_site_packages_output(stdout: &str) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::utils::purl::parse_pypi_purl;
+
+    // ── Pipenv out-of-tree virtualenv discovery ─────────────────────────────
+
+    /// Known-answer vectors computed with Pipenv's own algorithm
+    /// (`base64.urlsafe_b64encode(hashlib.sha256(location.encode()).digest()[:6])`).
+    #[test]
+    fn pipenv_venv_hash_matches_pipenv_get_virtualenv_hash() {
+        assert_eq!(pipenv_venv_hash("/tmp/proj/Pipfile"), "9zRXrcHj");
+        assert_eq!(pipenv_venv_hash("/Users/dev/My App/Pipfile"), "OhBEiq15");
+        assert_eq!(pipenv_venv_hash(r"C:\Users\dev\app\Pipfile"), "6E88tlV3");
+    }
+
+    #[test]
+    fn pipenv_sanitize_replaces_shell_hostile_characters_and_caps_at_42() {
+        assert_eq!(pipenv_sanitize("My App", true), "My_App");
+        assert_eq!(pipenv_sanitize("a(b)[c]&d", true), "a_b__c__d");
+        assert_eq!(pipenv_sanitize("a(b)[c]&d", false), "a(b)[c]&d");
+        assert_eq!(pipenv_sanitize("we$ird`na!me*@\"x\\", false), "we_ird_na_me___x_");
+        let long = "p".repeat(60);
+        assert_eq!(pipenv_sanitize(&long, true).chars().count(), 42);
+        // Case is preserved (Pipenv does not lowercase the project name).
+        assert_eq!(pipenv_sanitize("MixedCase", true), "MixedCase");
+    }
+
+    #[test]
+    fn pipenv_expand_path_expands_variables_and_home_like_python() {
+        let var = |name: &str| match name {
+            "HOME" => Some("/home/u".to_string()),
+            "X" => Some("/x".to_string()),
+            _ => None,
+        };
+        assert_eq!(pipenv_expand_path("$X/venvs", &var), PathBuf::from("/x/venvs"));
+        assert_eq!(pipenv_expand_path("${X}/v", &var), PathBuf::from("/x/v"));
+        assert_eq!(pipenv_expand_path("~/w", &var), PathBuf::from("/home/u/w"));
+        assert_eq!(pipenv_expand_path("~", &var), PathBuf::from("/home/u"));
+        assert_eq!(
+            pipenv_expand_path("$UNSET/v", &var),
+            PathBuf::from("$UNSET/v"),
+            "unknown names stay as written"
+        );
+        assert_eq!(pipenv_expand_path("/plain", &var), PathBuf::from("/plain"));
+    }
+
+    #[test]
+    fn pipenv_workon_home_honours_env_then_xdg_then_default() {
+        let with = |workon: Option<&str>, xdg: Option<&str>| {
+            let workon = workon.map(str::to_string);
+            let xdg = xdg.map(str::to_string);
+            let var = move |name: &str| match name {
+                "HOME" | "USERPROFILE" => Some("/home/u".to_string()),
+                "WORKON_HOME" => workon.clone(),
+                "XDG_DATA_HOME" => xdg.clone(),
+                _ => None,
+            };
+            pipenv_workon_home(&var)
+        };
+        assert_eq!(with(Some("~/envs"), None), Some(PathBuf::from("/home/u/envs")));
+        if cfg!(windows) {
+            assert_eq!(with(None, None), Some(PathBuf::from("/home/u").join(".virtualenvs")));
+        } else {
+            assert_eq!(
+                with(None, None),
+                Some(PathBuf::from("/home/u/.local/share/virtualenvs"))
+            );
+            assert_eq!(with(None, Some("/data")), Some(PathBuf::from("/data/virtualenvs")));
+        }
+        assert_eq!(with(Some("  "), None).is_some(), true, "blank WORKON_HOME falls through");
+        let no_home = |_: &str| None::<String>;
+        assert_eq!(pipenv_workon_home(&no_home), None);
+    }
+
+    /// Lay a fake virtualenv at `workon_home/<leaf>` and return its
+    /// site-packages (platform layout).
+    fn fake_venv(workon_home: &Path, leaf: &str) -> PathBuf {
+        let site = if cfg!(windows) {
+            workon_home.join(leaf).join("Lib").join("site-packages")
+        } else {
+            workon_home
+                .join(leaf)
+                .join("lib")
+                .join("python3.12")
+                .join("site-packages")
+        };
+        std::fs::create_dir_all(&site).unwrap();
+        site
+    }
+
+    /// The end-to-end shape: a Pipenv project with NO in-project venv and
+    /// Pipenv's default out-of-tree placement under WORKON_HOME is found by
+    /// name+hash (with and without the `-<PIPENV_PYTHON>` suffix), while a
+    /// sibling with another hash, a non-Pipenv project, and a project whose
+    /// WORKON_HOME is empty all stay invisible.
+    #[tokio::test]
+    async fn pipenv_out_of_tree_virtualenv_is_discovered_by_name_and_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("My App");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("Pipfile"), "[packages]\n").unwrap();
+        let workon = tmp.path().join("wh");
+        std::fs::create_dir_all(&workon).unwrap();
+        let workon_str = workon.to_string_lossy().into_owned();
+        let var = move |name: &str| match name {
+            "WORKON_HOME" => Some(workon_str.clone()),
+            "HOME" | "USERPROFILE" => Some("/nonexistent-home".to_string()),
+            _ => None,
+        };
+
+        // Pipenv hashes the Pipfile under the RESOLVED project directory.
+        let real = std::fs::canonicalize(&project).unwrap();
+        let hash = pipenv_venv_hash(&pipenv_path_string(&real.join("Pipfile")));
+        let plain = fake_venv(&workon, &format!("My_App-{hash}"));
+        let suffixed = fake_venv(&workon, &format!("My_App-{hash}-python3.12"));
+        let _other = fake_venv(&workon, "My_App-AAAAAAAA");
+        let _unrelated = fake_venv(&workon, "other-BBBBBBBB");
+
+        let mut found = find_pipenv_virtualenv_site_packages_with(&project, &var).await;
+        found.sort();
+        let mut want = vec![plain.clone(), suffixed.clone()];
+        want.sort();
+        assert_eq!(found, want, "name+hash (and the PIPENV_PYTHON-suffixed twin) only");
+
+        // Not a Pipenv project → nothing, even with a matching directory.
+        let plain_dir = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain_dir).unwrap();
+        assert!(find_pipenv_virtualenv_site_packages_with(&plain_dir, &var)
+            .await
+            .is_empty());
+
+        // The lock alone marks a Pipenv project (fresh checkouts often
+        // commit both, but a lock-only clone must still resolve).
+        std::fs::remove_file(project.join("Pipfile")).unwrap();
+        std::fs::write(project.join("Pipfile.lock"), "{}").unwrap();
+        assert_eq!(
+            find_pipenv_virtualenv_site_packages_with(&project, &var)
+                .await
+                .len(),
+            2
+        );
+
+        // Unresolvable WORKON_HOME (no env, no home) → nothing.
+        let no_env = |_: &str| None::<String>;
+        assert!(find_pipenv_virtualenv_site_packages_with(&project, &no_env)
+            .await
+            .is_empty());
+    }
+
+    /// The crawler's public entry point wires step 3 in: with no VIRTUAL_ENV
+    /// and no in-project venv, `find_local_venv_site_packages` returns the
+    /// out-of-tree Pipenv venv instead of nothing (which used to trigger the
+    /// global fallback).
+    #[tokio::test]
+    async fn pipenv_custom_name_and_dot_venv_file_pointer_are_honoured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("svc");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("Pipfile"), "[packages]\n").unwrap();
+        let workon = tmp.path().join("wh");
+        std::fs::create_dir_all(&workon).unwrap();
+        let workon_str = workon.to_string_lossy().into_owned();
+
+        // PIPENV_CUSTOM_VENV_NAME wins over the derived name.
+        let custom = fake_venv(&workon, "my-custom-env");
+        let w = workon_str.clone();
+        let var = move |name: &str| match name {
+            "WORKON_HOME" => Some(w.clone()),
+            "PIPENV_CUSTOM_VENV_NAME" => Some("my-custom-env".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            find_pipenv_virtualenv_site_packages_with(&project, &var).await,
+            vec![custom]
+        );
+
+        // A `.venv` FILE naming a WORKON_HOME directory.
+        let named = fake_venv(&workon, "named-env");
+        std::fs::write(project.join(".venv"), "named-env\n").unwrap();
+        let w = workon_str.clone();
+        let var = move |name: &str| match name {
+            "WORKON_HOME" => Some(w.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            find_pipenv_virtualenv_site_packages_with(&project, &var).await,
+            vec![named]
+        );
+
+        // A `.venv` FILE holding a project-relative path.
+        let rel = fake_venv(&project, "envs/here");
+        std::fs::write(project.join(".venv"), "envs/here").unwrap();
+        assert_eq!(
+            find_pipenv_virtualenv_site_packages_with(&project, &var).await,
+            vec![rel]
+        );
+    }
+
+    #[tokio::test]
+    async fn pipenv_case_insensitive_fallback_matches_recased_directory() {
+        // Pipenv on a case-insensitive filesystem reuses `<Recased>-<hash>`
+        // where the hash was computed over the location with the recased
+        // name spliced in (`_get_virtualenv_hash`'s fallback loop).
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("Pipfile"), "[packages]\n").unwrap();
+        let workon = tmp.path().join("wh");
+        std::fs::create_dir_all(&workon).unwrap();
+        let real = std::fs::canonicalize(&project).unwrap();
+        let location = pipenv_path_string(&real.join("Pipfile"));
+        let recased_hash = pipenv_venv_hash(&location.replace("proj", "Proj"));
+        let recased = fake_venv(&workon, &format!("Proj-{recased_hash}"));
+        let _wrong = fake_venv(&workon, "Proj-CCCCCCCC");
+        let workon_str = workon.to_string_lossy().into_owned();
+        let var = move |name: &str| match name {
+            "WORKON_HOME" => Some(workon_str.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            find_pipenv_virtualenv_site_packages_with(&project, &var).await,
+            vec![recased]
+        );
+    }
 
     #[test]
     fn test_canonicalize_pypi_name_basic() {
