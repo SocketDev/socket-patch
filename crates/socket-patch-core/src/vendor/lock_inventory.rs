@@ -51,6 +51,11 @@ pub enum LockIntegrity {
     /// Hex sha256 of the artifact (Cargo.lock `checksum`, pypi file hashes,
     /// Gemfile.lock `CHECKSUMS`).
     Sha256Hex(String),
+    /// One of several hex sha256 digests: the lock records every release
+    /// file's digest without saying which file is which (Pipfile.lock
+    /// `hashes`), so the fetcher picks the pure-Python wheel whose PyPI
+    /// digest is in the set and verifies the download against that digest.
+    Sha256AnyOf(Vec<String>),
     /// go.sum module-zip dirhash (`h1:<b64>`).
     GoH1(String),
     /// The lock records no content verifier.
@@ -1089,7 +1094,9 @@ fn parse_gem_spec_line(line: &str) -> Option<(String, String)> {
 /// (URL + sha256 of a pure `py3-none-any` wheel) comes from `uv.lock`;
 /// `poetry.lock` and `--hash`-pinned `requirements.txt` contribute
 /// DISCOVERY-only entries (no recorded URL; platform-independent wheel
-/// choice is not derivable offline). Pipenv/pdm locks: not yet read.
+/// choice is not derivable offline). Pipfile.lock contributes
+/// entries whose integrity is its digest SET (see `inventory_pipfile_lock`);
+/// pdm.lock: not yet read.
 async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let mut out = Vec::new();
     let mut found = false;
@@ -1121,6 +1128,9 @@ async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>>
     // lockfile supplement and vendor's lookup.
     if !uv_lock {
         if let Some(entries) = inventory_poetry_lock(project_root).await {
+            found = true;
+            out.extend(entries);
+        } else if let Some(entries) = inventory_pipfile_lock(project_root).await {
             found = true;
             out.extend(entries);
         } else if let Some(entries) = inventory_requirements_txt(project_root).await {
@@ -1354,6 +1364,84 @@ async fn inventory_poetry_lock(project_root: &Path) -> Option<Vec<LockfileEntry>
     }
     Some(dedup_prefer_integrity(out))
 }
+
+/// Pipfile.lock (pipfile-spec 6): every category other than `_meta` holds
+/// `name: {"version": "==X", "hashes": ["sha256:<hex>", …], …}` entries.
+/// Registry pins (`==` version) become entries whose integrity is the SET of
+/// recorded digests — Pipenv lists every release file's hash without
+/// filenames, so the pure-Python wheel is selected by digest at fetch time
+/// ([`LockIntegrity::Sha256AnyOf`]). VCS / path / file / editable sources and
+/// range pins are skipped (nothing registry-shaped to vendor over), as are
+/// our own already-wired file references. An unparseable lock contributes
+/// nothing, so the caller falls through to requirements.txt like an absent
+/// lock would.
+async fn inventory_pipfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+    let text = read_regular_to_string(&project_root.join("Pipfile.lock"))
+        .await
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let root = value.as_object()?;
+    let mut out = Vec::new();
+    for (section, entries) in root {
+        if section == "_meta" {
+            continue;
+        }
+        let Some(entries) = entries.as_object() else {
+            continue;
+        };
+        for (name, entry) in entries {
+            let Some(entry) = entry.as_object() else {
+                continue;
+            };
+            if ["git", "hg", "svn", "bzr", "file", "path", "editable"]
+                .iter()
+                .any(|key| entry.contains_key(*key))
+            {
+                continue;
+            }
+            let Some(version) = entry
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|v| v.strip_prefix("=="))
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            else {
+                continue;
+            };
+            let n = canonicalize_pypi_name(name);
+            if !path_safety::is_safe_single_segment(&n)
+                || !path_safety::is_safe_single_segment(version)
+            {
+                continue;
+            }
+            let hashes: Vec<String> = entry
+                .get("hashes")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|h| h.strip_prefix("sha256:"))
+                .filter(|h| is_hex_of_len(h, 64))
+                .map(|h| h.to_ascii_lowercase())
+                .collect();
+            let integrity = if hashes.is_empty() {
+                LockIntegrity::None
+            } else {
+                LockIntegrity::Sha256AnyOf(hashes)
+            };
+            out.push(LockfileEntry {
+                ecosystem: "pypi",
+                purl: format!("pkg:pypi/{n}@{version}"),
+                name: n,
+                version: version.to_string(),
+                resolved: None,
+                integrity,
+            });
+        }
+    }
+    Some(out)
+}
+
 
 /// requirements.txt with exact `==` pins — discovery only.
 async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileEntry>> {
@@ -3280,6 +3368,83 @@ source = { editable = "." }
         let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0].purl, "pkg:pypi/requests@2.28.0");
+    }
+
+    /// Pipfile.lock: every category is read, registry pins carry the lock's
+    /// digest SET (lowercased), non-registry sources / range pins / our own
+    /// file references are skipped, the same package in two categories
+    /// yields one entry, and the lock outranks requirements.txt while a
+    /// parseable uv.lock outranks it.
+    #[tokio::test]
+    async fn pipfile_lock_inventory_reads_every_category_with_its_digest_set() {
+        let wheel = "a".repeat(64);
+        let sdist = "B".repeat(64);
+        let lock = format!(
+            r#"{{
+    "_meta": {{"hash": {{"sha256": "x"}}, "pipfile-spec": 6, "requires": {{}}, "sources": []}},
+    "default": {{
+        "URLlib3": {{"hashes": ["sha256:{wheel}", "sha256:{sdist}"], "index": "pypi", "version": "==1.26.18", "markers": "python_version < '4'"}},
+        "requests": {{"git": "https://example.org/requests", "ref": "abc", "version": "==2.31.0"}},
+        "loose": {{"version": "*"}},
+        "wired": {{"file": "./.socket/vendor/pypi/00000000-0000-4000-8000-000000000000/wired-1.0-py3-none-any.whl", "hashes": ["sha256:{wheel}"]}}
+    }},
+    "develop": {{
+        "Six": {{"hashes": ["sha256:{sdist}"], "version": "==1.16.0"}}
+    }},
+    "tests": {{
+        "urllib3": {{"hashes": ["sha256:{wheel}"], "version": "==1.26.18"}}
+    }}
+}}
+"#
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "Pipfile.lock", &lock).await;
+        write(tmp.path(), "requirements.txt", "flask==3.0.0\n").await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["six", "urllib3"], "{entries:?}");
+        let urllib3 = entry(&entries, "urllib3");
+        assert_eq!(urllib3.purl, "pkg:pypi/urllib3@1.26.18");
+        assert_eq!(urllib3.resolved, None);
+        assert_eq!(
+            urllib3.integrity,
+            LockIntegrity::Sha256AnyOf(vec![wheel.clone(), sdist.to_ascii_lowercase()]),
+            "every recorded digest, lowercased, first category wins"
+        );
+        assert_eq!(
+            entry(&entries, "six").integrity,
+            LockIntegrity::Sha256AnyOf(vec![sdist.to_ascii_lowercase()])
+        );
+
+        // A parseable uv.lock stays the exclusive inventory.
+        write(
+            tmp.path(),
+            "uv.lock",
+            "version = 1\n\n[[package]]\nname = \"other\"\nversion = \"1.0.0\"\nsource = { registry = \"https://pypi.org/simple\" }\n",
+        )
+        .await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert!(entries.iter().all(|e| e.name == "other"), "{entries:?}");
+
+        // Unparseable lock → nothing from it, requirements.txt read instead.
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "Pipfile.lock", "{ not json").await;
+        write(tmp.path(), "requirements.txt", "flask==3.0.0\n").await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "flask");
+
+        // No hashes at all → discovery-only entry.
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "Pipfile.lock",
+            r#"{"_meta": {"pipfile-spec": 6}, "default": {"urllib3": {"version": "==1.26.18"}}}"#,
+        )
+        .await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(entry(&entries, "urllib3").integrity, LockIntegrity::None);
     }
 
     /// A lock that lists a pure-Python wheel carries its sha256 (lock 2.x
