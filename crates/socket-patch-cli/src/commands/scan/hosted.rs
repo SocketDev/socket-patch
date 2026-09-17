@@ -28,6 +28,7 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "requirements.txt",
     "uv.lock",
     "pyproject.toml",
+    "hatch.toml",
     "Cargo.toml",
     "Cargo.lock",
     ".cargo/config.toml",
@@ -1675,6 +1676,9 @@ pub(crate) async fn run_redirect_selected(
         .iter()
         .filter(
             |(purl, uuid, artifact_url, index_url, suffixed_version, go_module_path)| {
+                if rewrite.hatch_uuids.contains(uuid) {
+                    return rewrite.confirmed_hatch_uuids.contains(uuid);
+                }
                 if rewrite.refused_pnpm_uuids.contains(uuid) {
                     return false;
                 }

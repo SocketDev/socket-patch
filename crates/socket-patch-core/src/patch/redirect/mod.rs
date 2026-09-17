@@ -174,6 +174,8 @@ pub struct RewriteResult {
     /// An incomplete pnpm rewrite must not be confirmed by finding its URL
     /// in another instance, a comment, or another lockfile.
     pub refused_pnpm_uuids: std::collections::BTreeSet<String>,
+    pub hatch_uuids: std::collections::BTreeSet<String>,
+    pub confirmed_hatch_uuids: std::collections::BTreeSet<String>,
 }
 
 /// Combined name as it appears in registry coordinates / lock keys.
@@ -214,6 +216,7 @@ pub fn rewrite_registry_redirect_with_python_metadata(
     rewrite_yarn_berry(files, overrides, &mut result);
     rewrite_bun_lock(files, overrides, &mut result);
     rewrite_pypi_requirements(files, overrides, &mut result);
+    rewrite_hatch(files, overrides, &mut result);
     rewrite_uv_lock(files, overrides, python_metadata, &mut result);
     rewrite_cargo(files, overrides, &mut result);
     rewrite_composer_lock(files, overrides, &mut result);
@@ -222,6 +225,61 @@ pub fn rewrite_registry_redirect_with_python_metadata(
     rewrite_maven_pom(files, overrides, &mut result);
     rewrite_golang(files, overrides, &mut result);
     result
+}
+
+fn rewrite_hatch(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    if !crate::utils::hatch::is_hatch(files)
+        || files.keys().any(|file| file.starts_with("requirements") && file.ends_with(".txt"))
+        || files.keys().any(|file| {
+            matches!(
+                file.as_str(),
+                "uv.lock" | "poetry.lock" | "pdm.lock" | "Pipfile.lock"
+            ) || crate::utils::python_lock::is_python_lock_name(file)
+        })
+    {
+        return;
+    }
+    let mut current = files.clone();
+    for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
+        result.hatch_uuids.insert(dep.patch_uuid.clone());
+        let Some(hash) =
+            dep.integrity.sha256.as_ref().filter(|hash| {
+                hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        else {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_hatch_missing_sha256".into(),
+                detail: format!("{} has no valid wheel digest", dep.name),
+            });
+            continue;
+        };
+        let url = format!("{}#sha256={hash}", dep.artifact_url);
+        match crate::utils::hatch::rewrite(&current, &dep.name, &dep.version, &url) {
+            Ok(edits) => {
+                result.confirmed_hatch_uuids.insert(dep.patch_uuid.clone());
+                for (path, new) in edits {
+                    result.edits.push(FileEdit {
+                        path: path.clone(),
+                        kind: "redirect_hatch_document".into(),
+                        action: "rewritten".into(),
+                        key: Some(format!("{}@{}", dep.name, dep.version)),
+                        original: current.get(&path).cloned().map(Value::String),
+                        new: Some(Value::String(new.clone())),
+                    });
+                    current.insert(path.clone(), new.clone());
+                    result.files.insert(path, new);
+                }
+            }
+            Err(detail) => result.warnings.push(RewriteWarning {
+                code: "redirect_hatch_unsupported".into(),
+                detail,
+            }),
+        }
+    }
 }
 
 // ── npm package-lock.json / npm-shrinkwrap.json ─────────────────────────────
@@ -13128,5 +13186,43 @@ mod python_lock_warning_tests {
             1,
             "{codes:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod hatch_tests {
+    use super::*;
+
+    fn patch() -> DepOverride {
+        DepOverride {
+            ecosystem: "pypi".into(), name: "urllib3".into(), namespace: None,
+            version: "1.26.18".into(), token: String::new(), patch_uuid: "test-uuid".into(),
+            artifact_url: "https://patch.test/urllib3.whl".into(), berry_zip_url: None,
+            registry_override: None, integrity: Integrity {sha256: Some("a".repeat(64)), ..Default::default()},
+        }
+    }
+
+    #[test]
+    fn hatch_confirmation_ignores_inactive_sources_and_comments() {
+        let dep = patch();
+        let files = [
+            ("pyproject.toml".into(), format!("[project]\ndependencies=[]\n[tool.hatch.envs.default]\ndependencies=[\"urllib3 @ {}#sha256={}\"]\n", dep.artifact_url, "a".repeat(64))),
+            ("hatch.toml".into(), format!("[envs.default]\ndependencies=[\"urllib3>=1\"]\n# {}\n", dep.artifact_url)),
+        ].into_iter().collect();
+        let result = rewrite_registry_redirect(&files, &[dep]);
+        assert!(result.hatch_uuids.contains("test-uuid"));
+        assert!(result.confirmed_hatch_uuids.is_empty());
+        assert!(result.files.is_empty());
+        assert!(result.warnings.iter().any(|warning| warning.code == "redirect_hatch_unsupported"));
+    }
+
+    #[test]
+    fn hatch_confirmation_requires_success_and_reruns_stay_confirmed() {
+        let files = [("pyproject.toml".into(), "[project]\ndependencies=[\"urllib3==1.26.18\"]\n[tool.hatch.envs.default]\n".into())].into_iter().collect();
+        let result = rewrite_registry_redirect(&files, &[patch()]);
+        assert!(result.confirmed_hatch_uuids.contains("test-uuid"));
+        let second = rewrite_registry_redirect(&result.files, &[patch()]);
+        assert!(second.confirmed_hatch_uuids.contains("test-uuid"));
+        assert!(second.files.is_empty());
     }
 }

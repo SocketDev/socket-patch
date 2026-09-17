@@ -52,6 +52,7 @@ enum Inverse {
     /// writers record an `original` that is a substring of `new` (the
     /// Cargo.toml insert variant, the maven version suffix).
     ReplaceFragment,
+    HatchDocument,
     /// action `added` with only `new` recorded: the redirect inserted the
     /// fragment into a pre-existing file, so the inverse removes it once
     /// (an absent fragment is the desired end state — no-op).
@@ -86,9 +87,14 @@ enum Inverse {
 /// Gemfile.lock) revert together or not at all.
 fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
     match kind {
-        "redirect_requirements_line" | "redirect_uv_lock_wheel" => ("pypi", Inverse::ReplaceFragment),
+        "redirect_requirements_line" | "redirect_uv_lock_wheel" => {
+            ("pypi", Inverse::ReplaceFragment)
+        }
+        "redirect_hatch_document" => ("pypi", Inverse::HatchDocument),
         "redirect_composer_dist" => ("composer", Inverse::ReplaceFragment),
-        "redirect_cargo_toml_dep" | "redirect_cargo_lock_entry" => ("cargo", Inverse::ReplaceFragment),
+        "redirect_cargo_toml_dep" | "redirect_cargo_lock_entry" => {
+            ("cargo", Inverse::ReplaceFragment)
+        }
         "redirect_cargo_registry" => (
             "cargo",
             if action == "added" {
@@ -406,7 +412,7 @@ pub async fn revert_remaining_redirect_edits(
                     refused_groups.insert(group);
                     continue 'group;
                 }
-                Inverse::ReplaceFragment => {
+                Inverse::ReplaceFragment | Inverse::HatchDocument => {
                     let (Some(original), Some(new)) =
                         (str_payload(&edit.original), str_payload(&edit.new))
                     else {
@@ -433,6 +439,20 @@ pub async fn revert_remaining_redirect_edits(
                             continue 'group;
                         }
                     };
+                    if inverse == Inverse::HatchDocument {
+                        match crate::vendor::restore_python_document(&content, original, new) {
+                            Ok((restored, false)) => {
+                                staged.insert(edit.path.clone(), Some(restored));
+                                group_drops.insert(idx);
+                            }
+                            _ => {
+                                refuse(format!("{}: Hatch configuration drifted", edit.path), &mut outcome);
+                                refused_groups.insert(group);
+                                continue 'group;
+                            }
+                        }
+                        continue;
+                    }
                     // `new` before `original`: original may be a substring
                     // of new (Cargo.toml insert, maven version suffix).
                     if content.contains(new) {
