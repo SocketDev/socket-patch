@@ -256,24 +256,48 @@ for details and per-ecosystem caveats.
 
 ### Pipenv compatibility
 
-Hosted mode rewrites every matching `Pipfile.lock` category and preserves the
-Pipfile, its content hash, markers, extras, and unrelated lock entries. Socket
-Patch checks the installed Pipenv version: releases 7–11 need hosted `path`
-references, while releases from 2018 onward use `file` references. Hosted
-references include the SHA-256 URL fragment so pip verifies downloaded bytes.
-Old lock formats before `pipfile-spec: 6` are refused without changing the lock.
+Hosted mode rewrites every `Pipfile.lock` category that pins the patched
+release (`default`, `develop`, and Pipenv 2022+ named categories) and
+preserves the Pipfile, its content hash, markers, extras, and unrelated lock
+entries, so `pipenv install --deploy`, `pipenv sync` and `pipenv verify` keep
+passing. The reference shape follows the installing Pipenv: releases 7–11
+need `path` references, 2018 and later use `file` references, and lock
+formats before `pipfile-spec: 6` (Pipenv 0–6) are refused without changing
+the lock. Socket Patch probes `pipenv --version` once per run (only when a
+patch targets the lock); `SOCKET_PIPENV_MAJOR=<major>` pins the answer for
+machines without pipenv on PATH. Hosted references carry both the `#sha256=`
+URL fragment (verified by Pipenv 2023+) and a `hashes` entry (verified by
+2018–2022; Pipenv 11 verifies either), so a tampered lock fails to install
+on every supported release.
 
 Vendored mode requires Pipenv 2018 or later. Wheels with extras use `path`
-references to avoid Pipenv 2022's local-file URL parsing bug. Native Pipenv does
-not consistently enforce hashes on local wheels; commit the wheel and run
-`socket-patch vex`. Re-run Socket Patch after re-locking dependencies.
+references to avoid Pipenv 2022's local-file URL parsing bug. Pipenv 2023+
+does not enforce hashes on local wheels; commit the wheel and run
+`socket-patch vex --product <purl>` (a Pipfile names no project, so pass the
+product purl explicitly).
 
-The compatibility backtest covers the last stable release of every published
-Pipenv major, including unsupported versions to verify explicit refusal. It
-checks actual installed patch bytes, repeat scans, hash corruption, normal
-installs, lock-only installs, and `sync` where available. Parser/rewriter tests
-also cover categories, source/version conflicts, malformed locks, CRLF,
-rotating grants, and rollback with unrelated edits or drift.
+Fresh checkouts work in every mode: a clone with only `Pipfile` +
+`Pipfile.lock` is discovered from the lock (hosted redirects it, vendored
+fetches the pristine wheel by one of the lock's recorded digests), and agent
+mode finds Pipenv's default out-of-tree virtualenv under `WORKON_HOME`
+without `pipenv run`.
+
+Pipenv never reinstalls a release that is already present: `pipenv install`,
+`pipenv install --deploy` and `pipenv sync` all exit 0 and keep the installed
+bytes, on every Pipenv major. A hosted or vendored rewrite therefore
+protects fresh installs, and Socket Patch warns
+(`redirect_pipenv_stale_install` / `pypi_pipenv_stale_install`) when a venv
+still holds the upstream release, with the verified remedy:
+`pipenv run pip uninstall -y <pkg> && pipenv sync` (or `pipenv --rm &&
+pipenv sync`). Do not use `pipenv uninstall <pkg>` for this — it rewrites the
+Pipfile and re-locks the patch away. `pipenv lock` / `pipenv update`
+regenerate the entry to its registry reference (a silent unpatch): re-run
+Socket Patch afterwards; `rollback` retires the stale record cleanly.
+
+`scripts/backtest-pipenv.py` drives the real CLI and the last stable release
+of every published Pipenv major through hosted, vendored, agent and
+out-of-tree agent mode, and `docs/testing/pipenv-compatibility.md` holds the
+measured boundaries and results.
 
 ## Common tasks
 
