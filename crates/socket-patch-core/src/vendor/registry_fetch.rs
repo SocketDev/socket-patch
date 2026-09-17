@@ -290,16 +290,85 @@ async fn fetch_gem(
 /// wheel IS a site-packages layout (package dirs + `.dist-info/RECORD` at
 /// the root), which is exactly the shape the pypi vendor backend stages
 /// from.
+/// PyPI's JSON API base; override with `SOCKET_PYPI_JSON_API` (tests point it
+/// at a mock). Used only to turn a lock's file hash into a download URL for
+/// locks that record hashes without URLs (poetry.lock).
+pub const DEFAULT_PYPI_JSON_API: &str = "https://pypi.org/pypi";
+
+fn pypi_json_api_base() -> String {
+    std::env::var("SOCKET_PYPI_JSON_API")
+        .ok()
+        .map(|v| v.trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_PYPI_JSON_API.to_string())
+}
+
+/// Resolve the download URL of the release file whose sha256 the lock
+/// records, via `GET <api>/<name>/<version>/json` → `urls[].digests.sha256`.
+/// The hash, not the filename, selects the file, so a lock that names a wheel
+/// PyPI has since re-uploaded under the same name cannot be satisfied by
+/// different bytes — the download is still verified against the same hash.
+async fn resolve_pypi_url_by_hash(
+    entry: &LockfileEntry,
+    sha256: &str,
+    client: &reqwest::Client,
+) -> Result<String, FetchError> {
+    let api = format!(
+        "{}/{}/{}/json",
+        pypi_json_api_base(),
+        entry.name,
+        entry.version
+    );
+    let resp = client.get(&api).send().await.map_err(|e| {
+        FetchError::Failed(format!("PyPI JSON API request for {} failed: {e}", entry.purl))
+    })?;
+    if !resp.status().is_success() {
+        return Err(FetchError::Failed(format!(
+            "PyPI JSON API returned HTTP {} for {}",
+            resp.status(),
+            entry.purl
+        )));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|e| {
+        FetchError::Failed(format!("PyPI JSON API response for {} is not JSON: {e}", entry.purl))
+    })?;
+    body.get("urls")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|file| {
+            file.get("digests")
+                .and_then(|d| d.get("sha256"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|d| d.eq_ignore_ascii_case(sha256))
+        })
+        .and_then(|file| file.get("url").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            FetchError::Unverifiable(format!(
+                "no PyPI release file for {}@{} matches the lockfile's sha256 {sha256}",
+                entry.name, entry.version
+            ))
+        })
+}
+
 async fn fetch_pypi(
     entry: &LockfileEntry,
     client: &reqwest::Client,
 ) -> Result<FetchedPackage, FetchError> {
-    let Some(url) = entry.resolved.clone() else {
-        return Err(FetchError::Unverifiable(format!(
-            "the lockfile records no platform-independent wheel URL for {}@{} (only uv.lock \
-             carries fetchable wheel resolutions today)",
-            entry.name, entry.version
-        )));
+    let url = match (&entry.resolved, &entry.integrity) {
+        (Some(url), _) => url.clone(),
+        // poetry.lock records the wheel's hash but no URL: look the file up
+        // by that hash (verified again after download).
+        (None, LockIntegrity::Sha256Hex(sha256)) => {
+            resolve_pypi_url_by_hash(entry, sha256, client).await?
+        }
+        (None, _) => {
+            return Err(FetchError::Unverifiable(format!(
+                "the lockfile records no platform-independent wheel URL or sha256 for {}@{}",
+                entry.name, entry.version
+            )));
+        }
     };
     let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
     verify_integrity(&bytes, &entry.integrity)?;
@@ -1747,14 +1816,71 @@ mod tests {
             .join("requests-2.28.0.dist-info/RECORD")
             .is_file());
 
-        // No recorded wheel URL (poetry/requirements) → Unverifiable.
+    }
+
+    /// poetry.lock records wheel hashes but no URLs: the fetcher resolves the
+    /// file through PyPI's JSON API by sha256 and still verifies the bytes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pypi_hash_only_entry_is_resolved_through_the_json_api() {
+        let wheel = make_zip(&[
+            ("requests/__init__.py", b"__version__ = '2.28.0'\n"),
+            ("requests-2.28.0.dist-info/RECORD", b"requests/__init__.py,sha256=abc,24\n"),
+        ]);
+        let sha = hex::encode(Sha256::digest(&wheel));
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/packages/requests-2.28.0-py3-none-any.whl"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(url_path("/pypi/requests/2.28.0/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "urls": [
+                    {"filename": "requests-2.28.0.tar.gz", "url": format!("{}/packages/requests-2.28.0.tar.gz", mock.uri()), "digests": {"sha256": "0".repeat(64)}},
+                    {"filename": "requests-2.28.0-py3-none-any.whl", "url": format!("{}/packages/requests-2.28.0-py3-none-any.whl", mock.uri()), "digests": {"sha256": sha.to_uppercase()}},
+                ]
+            })))
+            .mount(&mock)
+            .await;
+        let saved = std::env::var("SOCKET_PYPI_JSON_API").ok();
+        std::env::set_var("SOCKET_PYPI_JSON_API", format!("{}/pypi/", mock.uri()));
+        let restore = || match &saved {
+            Some(v) => std::env::set_var("SOCKET_PYPI_JSON_API", v),
+            None => std::env::remove_var("SOCKET_PYPI_JSON_API"),
+        };
         let entry = LockfileEntry {
+            ecosystem: "pypi",
+            name: "requests".into(),
+            version: "2.28.0".into(),
+            purl: "pkg:pypi/requests@2.28.0".into(),
             resolved: None,
-            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
+            integrity: LockIntegrity::Sha256Hex(sha.clone()),
+        };
+        let fetched = fetch_and_stage(&entry, &build_registry_client()).await;
+        // A hash no release file carries is refused before any download.
+        let unknown = LockfileEntry {
+            integrity: LockIntegrity::Sha256Hex("1".repeat(64)),
+            ..entry.clone()
+        };
+        let missing = fetch_and_stage(&unknown, &build_registry_client()).await;
+        // No hash at all: nothing to resolve by.
+        let bare = LockfileEntry {
+            integrity: LockIntegrity::Sri("sha512-x".into()),
             ..entry
         };
-        match fetch_and_stage(&entry, &build_registry_client()).await {
-            Err(FetchError::Unverifiable(msg)) => assert!(msg.contains("wheel"), "{msg}"),
+        let bare_result = fetch_and_stage(&bare, &build_registry_client()).await;
+        restore();
+        let fetched = fetched.unwrap();
+        assert!(fetched.dir().join("requests/__init__.py").is_file());
+        assert!(fetched.url.ends_with("requests-2.28.0-py3-none-any.whl"));
+        match missing {
+            Err(FetchError::Unverifiable(msg)) => assert!(msg.contains("matches"), "{msg}"),
+            other => panic!("expected Unverifiable, got {other:?}"),
+        }
+        match bare_result {
+            Err(FetchError::Unverifiable(msg)) => assert!(msg.contains("sha256"), "{msg}"),
             other => panic!("expected Unverifiable, got {other:?}"),
         }
     }
@@ -1928,13 +2054,15 @@ mod tests {
 
     #[tokio::test]
     async fn pypi_no_wheel_url_message_is_single_spaced() {
+        // No URL and no sha256 to resolve one by (a sha256 would consult the
+        // PyPI JSON API — `pypi_hash_only_entry_is_resolved_through_the_json_api`).
         let entry = LockfileEntry {
             ecosystem: "pypi",
             name: "requests".into(),
             version: "2.28.0".into(),
             purl: "pkg:pypi/requests@2.28.0".into(),
             resolved: None,
-            integrity: LockIntegrity::Sha256Hex("0".repeat(64)),
+            integrity: LockIntegrity::Sri("sha512-x".into()),
         };
         match fetch_and_stage(&entry, &build_registry_client()).await {
             Err(FetchError::Unverifiable(msg)) => assert!(
