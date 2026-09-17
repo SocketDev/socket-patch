@@ -400,7 +400,13 @@ def main():
             if not oot_venv or not (oot_venv / "bin/python").exists():
                 raise RuntimeError("could not locate Poetry's out-of-tree venv: " + ep.out + ep.err)
             # 1. bare scan from the project dir, no VIRTUAL_ENV: does the CLI see the venv?
-            r1 = Run(cli_cmd(project, "scan", "--mode", "agent", "--dry-run"), project, env, case / "scan-bare-dryrun.log")
+            # The CLI inherits the user's Poetry configuration (the custom
+            # virtualenvs path below is configuration, not an activation) but
+            # not VIRTUAL_ENV — that is exactly what `poetry run` would add.
+            bare_env = dict(env)
+            for key in ("POETRY_VIRTUALENVS_PATH", "POETRY_CACHE_DIR", "POETRY_VIRTUALENVS_IN_PROJECT"):
+                bare_env[key] = penv[key]
+            r1 = Run(cli_cmd(project, "scan", "--mode", "agent", "--dry-run"), project, bare_env, case / "scan-bare-dryrun.log")
             e1 = r1.json_or_empty()
             paths = [p for p in (e1.get("paths") or [])]
             pkgs = e1.get("packages") or []
@@ -412,11 +418,25 @@ def main():
                 "urllib3Found": any("urllib3" in (p.get("purl") or "") for p in pkgs),
                 "packageDirs": [pth for p in pkgs for pth in (p.get("paths") or [])][:10],
             }
-            check("bareScanSeesPoetryVenv", any(str(oot_venv) in str(x) for x in json.dumps(e1).split('"')), "the CLI found the out-of-tree venv without help")
-            # 2. via `poetry run` (VIRTUAL_ENV set by Poetry) -> should patch the venv
-            r2 = Run([poetry, "run", *cli_cmd(project, "scan", "--mode", "agent")], project, penv, case / "scan-poetry-run.log")
+            # Did the bare dry-run see the package inside Poetry's venv (not
+            # merely list it lockfile-only)? A crawler that finds the venv reports
+            # urllib3 as installed with a patch to add; one that does not falls
+            # through to the global interpreter and reports it not installed.
+            sees = any(
+                "urllib3" in (p.get("purl") or "") and not p.get("notInstalled")
+                for p in pkgs
+            ) and e1.get("apply", {}).get("found", 0) >= 1 and not any(
+                ev.get("errorCode") == "package_not_installed" for ev in e1.get("apply", {}).get("patches", [])
+            )
+            check("bareScanSeesPoetryVenv", sees, {"scannedPackages": e1.get("scannedPackages"), "found": e1.get("apply", {}).get("found")})
+            # 2. apply for real: BARE when the crawler found the venv (the fixed
+            # CLI), else via `poetry run` (Poetry exports VIRTUAL_ENV).
+            bare = bool(sees)
+            info["applyPath"] = "bare" if bare else "poetry run"
+            cmd = cli_cmd(project, "scan", "--mode", "agent") if bare else [poetry, "run", *cli_cmd(project, "scan", "--mode", "agent")]
+            r2 = Run(cmd, project, bare_env if bare else penv, case / "scan-apply.log")
             e2 = r2.json_or_empty()
-            check("poetryRunScanApplied", applied_count("agent", e2) == 1, {"exit": r2.rc, "applied": applied_count("agent", e2)})
+            check("poetryRunScanApplied", applied_count("agent", e2) == 1, {"exit": r2.rc, "applied": applied_count("agent", e2), "path": info["applyPath"]})
             after, before, _ = record_hashes(project, "agent") if (project / ".socket/manifest.json").exists() else ({}, {}, None)
             res = oracle(oot_venv / "bin/python", list(after), project, case / "oracle-1.log")
             check("patchedViaPoetryRun", bool(after) and all(res.get(n) == h for n, h in after.items()), res)
@@ -429,8 +449,10 @@ def main():
                 rs = Run(sc, project, penv, case / "sync.log")
                 res = oracle(oot_venv / "bin/python", list(after), project, case / "oracle-3.log")
                 check("survivesSync", rs.ok() and bool(after) and all(res.get(n) == h for n, h in after.items()), {"exit": rs.rc, "oracle": res})
-            # 4. rollback through poetry run
-            rb = Run([poetry, "run", *cli_cmd(project, "rollback")], project, penv, case / "rollback.log")
+            # 4. rollback the same way the patch was applied (bare when the
+            # crawler sees the venv; a bare rollback that cannot see it would
+            # prune the manifest while the venv stays patched)
+            rb = Run(cli_cmd(project, "rollback") if bare else [poetry, "run", *cli_cmd(project, "rollback")], project, bare_env if bare else penv, case / "rollback.log")
             res = oracle(oot_venv / "bin/python", list(after), project, case / "oracle-4.log")
             check("rollbackRestoresUpstream", rb.ok() and bool(before) and all(res.get(n) == h for n, h in before.items()), {"exit": rb.rc, "oracle": res})
             check("rollbackClearsManifest", not (project / ".socket/manifest.json").exists() or json.loads((project / ".socket/manifest.json").read_text()).get("patches") == {})

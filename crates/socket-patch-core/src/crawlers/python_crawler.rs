@@ -244,6 +244,8 @@ async fn find_site_packages_under(
 /// 1. `VIRTUAL_ENV` environment variable
 /// 2. `.venv` directory in `cwd`
 /// 3. `venv` directory in `cwd`
+/// 4. Poetry's out-of-tree virtualenv(s) for a Poetry project (see
+///    [`find_poetry_virtualenv_site_packages`])
 pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let mut results = Vec::new();
 
@@ -264,6 +266,320 @@ pub async fn find_local_venv_site_packages(cwd: &Path) -> Vec<PathBuf> {
         results.extend(matches);
     }
 
+    // 3. Poetry keeps its virtualenv OUTSIDE the project by default, so a plain
+    // `poetry install` leaves nothing above to find and the crawl used to fall
+    // through to the global interpreter (patching the wrong site-packages, or
+    // nothing, and reporting success).
+    if results.is_empty() {
+        results.extend(find_poetry_virtualenv_site_packages(cwd).await);
+    }
+
+    results
+}
+
+/// Poetry's `virtualenvs.*` settings that decide where a project's virtualenv
+/// lives. Precedence mirrors Poetry's: `POETRY_VIRTUALENVS_*` environment
+/// variables, then the project-local `poetry.toml`, then the user
+/// `config.toml`, then the defaults.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PoetryVirtualenvConfig {
+    /// `virtualenvs.create` — `false` means Poetry installs into the
+    /// interpreter it runs under (a container's system Python), which the
+    /// project-marker global fallback already covers.
+    create: Option<bool>,
+    /// `virtualenvs.in-project` — `true` means `./.venv`, already probed.
+    in_project: Option<bool>,
+    /// `virtualenvs.path` — may carry Poetry's `{cache-dir}` /
+    /// `{project-dir}` placeholders and a leading `~`.
+    path: Option<String>,
+    /// `cache-dir` — the parent of the default `virtualenvs` root.
+    cache_dir: Option<String>,
+}
+
+impl PoetryVirtualenvConfig {
+    /// Layer `other` (lower precedence) under `self`: only unset keys take
+    /// the lower layer's value.
+    fn or(mut self, other: PoetryVirtualenvConfig) -> Self {
+        self.create = self.create.or(other.create);
+        self.in_project = self.in_project.or(other.in_project);
+        self.path = self.path.or(other.path);
+        self.cache_dir = self.cache_dir.or(other.cache_dir);
+        self
+    }
+
+    fn from_env(var: impl Fn(&str) -> Option<String>) -> Self {
+        let flag = |name: &str| {
+            var(name).map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            })
+        };
+        Self {
+            create: flag("POETRY_VIRTUALENVS_CREATE"),
+            in_project: flag("POETRY_VIRTUALENVS_IN_PROJECT"),
+            path: var("POETRY_VIRTUALENVS_PATH").filter(|v| !v.trim().is_empty()),
+            cache_dir: var("POETRY_CACHE_DIR").filter(|v| !v.trim().is_empty()),
+        }
+    }
+
+    /// `[virtualenvs]` (poetry.toml / config.toml) and the top-level
+    /// `cache-dir` key. A file that does not parse contributes nothing.
+    fn from_toml(text: &str) -> Self {
+        let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+            return Self::default();
+        };
+        let venvs = doc.get("virtualenvs").and_then(toml_edit::Item::as_table_like);
+        let get_bool = |key: &str| {
+            venvs.and_then(|t| t.get(key)).and_then(|item| {
+                item.as_bool().or_else(|| {
+                    item.as_str().map(|s| {
+                        matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+                    })
+                })
+            })
+        };
+        Self {
+            create: get_bool("create"),
+            in_project: get_bool("in-project"),
+            path: venvs
+                .and_then(|t| t.get("path"))
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_string),
+            cache_dir: doc
+                .get("cache-dir")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_string),
+        }
+    }
+}
+
+/// The user-level Poetry config file, per Poetry's own lookup:
+/// `$POETRY_CONFIG_DIR/config.toml`, else the platform config dir
+/// (`~/Library/Application Support/pypoetry` on macOS, `$XDG_CONFIG_HOME` or
+/// `~/.config` + `/pypoetry` elsewhere on unix, `%APPDATA%\pypoetry` on
+/// Windows).
+fn poetry_user_config_path(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    if let Some(dir) = var("POETRY_CONFIG_DIR").filter(|v| !v.trim().is_empty()) {
+        return Some(PathBuf::from(dir).join("config.toml"));
+    }
+    let home = var("HOME").or_else(|| var("USERPROFILE")).map(PathBuf::from);
+    let dir = if cfg!(windows) {
+        var("APPDATA")
+            .map(PathBuf::from)
+            .or_else(|| home.map(|h| h.join("AppData").join("Roaming")))?
+            .join("pypoetry")
+    } else if cfg!(target_os = "macos") {
+        home?.join("Library").join("Application Support").join("pypoetry")
+    } else {
+        var("XDG_CONFIG_HOME")
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home.map(|h| h.join(".config")))?
+            .join("pypoetry")
+    };
+    Some(dir.join("config.toml"))
+}
+
+/// Poetry's default `cache-dir`: `~/Library/Caches/pypoetry` (macOS),
+/// `$XDG_CACHE_HOME`/`~/.cache` + `/pypoetry` (other unix),
+/// `%LOCALAPPDATA%\pypoetry\Cache` (Windows).
+fn poetry_default_cache_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let home = var("HOME").or_else(|| var("USERPROFILE")).map(PathBuf::from);
+    if cfg!(windows) {
+        Some(
+            var("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .or_else(|| home.map(|h| h.join("AppData").join("Local")))?
+                .join("pypoetry")
+                .join("Cache"),
+        )
+    } else if cfg!(target_os = "macos") {
+        Some(home?.join("Library").join("Caches").join("pypoetry"))
+    } else {
+        Some(
+            var("XDG_CACHE_HOME")
+                .filter(|v| !v.trim().is_empty())
+                .map(PathBuf::from)
+                .or_else(|| home.map(|h| h.join(".cache")))?
+                .join("pypoetry"),
+        )
+    }
+}
+
+/// Poetry's virtualenv directory name for a project, minus the `-py<X.Y>`
+/// suffix — `EnvManager.generate_env_name(name, cwd)`, unchanged from Poetry
+/// 1.0 through 2.x: the lowercased project name with shell-hostile characters
+/// replaced by `_` and truncated to 42 chars, a dash, then the first 8 chars
+/// of the URL-safe base64 sha256 of `os.path.normcase(os.path.realpath(cwd))`.
+/// `realpath` is resolved by the caller (`normalized_cwd` is the already
+/// canonical path) so the pure function stays testable with fixed vectors.
+fn poetry_env_name_prefix(project_name: &str, normalized_cwd: &str) -> String {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    let lowered = project_name.to_lowercase();
+    let sanitized: String = lowered
+        .chars()
+        .map(|c| {
+            if matches!(c, ' ' | '$' | '`' | '!' | '*' | '@' | '"' | '\\' | '\r' | '\n' | '\t') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(42)
+        .collect();
+    let digest = Sha256::digest(normalized_cwd.as_bytes());
+    let hash = base64::engine::general_purpose::URL_SAFE.encode(digest);
+    format!("{sanitized}-{}", &hash[..8])
+}
+
+/// `os.path.normcase(os.path.realpath(cwd))` as Poetry hashes it: symlinks
+/// resolved; on Windows lowercased with forward slashes turned into
+/// backslashes, elsewhere unchanged.
+fn poetry_normalized_cwd(cwd: &Path) -> String {
+    let real = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let text = real.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        text.replace('/', "\\").to_lowercase()
+    } else {
+        text
+    }
+}
+
+/// The project name Poetry derives its virtualenv name from: `[tool.poetry]
+/// name`, else PEP 621 `[project] name`. Poetry canonicalizes it (PEP 503) —
+/// both spellings are returned so a lock written before that normalization
+/// still matches.
+fn poetry_project_names(pyproject: &str) -> Vec<String> {
+    let Ok(doc) = pyproject.parse::<toml_edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let raw = doc
+        .get("tool")
+        .and_then(|t| t.get("poetry"))
+        .and_then(|p| p.get("name"))
+        .and_then(toml_edit::Item::as_str)
+        .or_else(|| {
+            doc.get("project")
+                .and_then(|p| p.get("name"))
+                .and_then(toml_edit::Item::as_str)
+        });
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let mut names = vec![canonicalize_pypi_name(raw)];
+    if !names.contains(&raw.to_string()) {
+        names.push(raw.to_string());
+    }
+    names
+}
+
+/// The root directory Poetry would place this project's virtualenvs under,
+/// or `None` when Poetry would not create one (`virtualenvs.create = false`,
+/// `virtualenvs.in-project = true`, or no home to resolve the default against).
+fn poetry_virtualenvs_root(
+    cwd: &Path,
+    config: &PoetryVirtualenvConfig,
+    var: &impl Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    if config.create == Some(false) || config.in_project == Some(true) {
+        return None;
+    }
+    let cache_dir = config
+        .cache_dir
+        .as_deref()
+        .map(|c| expand_home(c, var))
+        .or_else(|| poetry_default_cache_dir(var))?;
+    match config.path.as_deref() {
+        Some(template) => {
+            let expanded = template
+                .replace("{cache-dir}", &cache_dir.to_string_lossy())
+                .replace("{project-dir}", &cwd.to_string_lossy());
+            let path = expand_home(&expanded, var);
+            Some(if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            })
+        }
+        None => Some(cache_dir.join("virtualenvs")),
+    }
+}
+
+fn expand_home(raw: &str, var: &impl Fn(&str) -> Option<String>) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        if let Some(home) = var("HOME").or_else(|| var("USERPROFILE")) {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    if raw == "~" {
+        if let Some(home) = var("HOME").or_else(|| var("USERPROFILE")) {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(raw)
+}
+
+/// `site-packages` of every virtualenv Poetry created for the project at
+/// `cwd` under its `virtualenvs.path` (`<name>-<hash>-py<X.Y>`; one per
+/// interpreter minor the user ran `poetry env use` with). Empty for
+/// non-Poetry projects and whenever Poetry's configuration says the
+/// virtualenv is in-project, disabled, or unresolvable. Read-only: nothing is
+/// executed, no `poetry` binary is needed.
+pub async fn find_poetry_virtualenv_site_packages(cwd: &Path) -> Vec<PathBuf> {
+    let var = |name: &str| std::env::var(name).ok();
+    let has = |leaf: &str| cwd.join(leaf).is_file();
+    let pyproject = match tokio::fs::read_to_string(cwd.join("pyproject.toml")).await {
+        Ok(text) => text,
+        Err(_) => return Vec::new(),
+    };
+    let poetry_project = has("poetry.lock") || has("poetry.toml") || pyproject.contains("[tool.poetry");
+    if !poetry_project {
+        return Vec::new();
+    }
+    let names = poetry_project_names(&pyproject);
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let local = match tokio::fs::read_to_string(cwd.join("poetry.toml")).await {
+        Ok(text) => PoetryVirtualenvConfig::from_toml(&text),
+        Err(_) => PoetryVirtualenvConfig::default(),
+    };
+    let user = match poetry_user_config_path(&var) {
+        Some(path) => match tokio::fs::read_to_string(&path).await {
+            Ok(text) => PoetryVirtualenvConfig::from_toml(&text),
+            Err(_) => PoetryVirtualenvConfig::default(),
+        },
+        None => PoetryVirtualenvConfig::default(),
+    };
+    let config = PoetryVirtualenvConfig::from_env(var).or(local).or(user);
+    let Some(root) = poetry_virtualenvs_root(cwd, &config, &var) else {
+        return Vec::new();
+    };
+    let normalized = poetry_normalized_cwd(cwd);
+    let prefixes: Vec<String> = names
+        .iter()
+        .map(|name| format!("{}-py", poetry_env_name_prefix(name, &normalized)))
+        .collect();
+    let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
+        return Vec::new();
+    };
+    let mut venvs = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+            venvs.push(entry.path());
+        }
+    }
+    venvs.sort();
+    let mut results = Vec::new();
+    for venv in venvs {
+        results.extend(find_site_packages_under(&venv, "site-packages").await);
+    }
     results
 }
 
@@ -738,6 +1054,181 @@ pub fn parse_python_site_packages_output(stdout: &str) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::utils::purl::parse_pypi_purl;
+
+    // ── Poetry out-of-tree virtualenv discovery ─────────────────────────────
+
+    /// Known-answer vectors computed with Poetry's own algorithm
+    /// (`EnvManager.generate_env_name`): lowercase, shell-hostile characters
+    /// to `_`, 42-char cap, `-`, first 8 chars of url-safe-b64(sha256(cwd)).
+    #[test]
+    fn poetry_env_name_prefix_matches_poetry_generate_env_name() {
+        assert_eq!(
+            poetry_env_name_prefix("poetry-patch-fixture", "/tmp/socket-patch-poetry-fixture"),
+            "poetry-patch-fixture-SmzYEVFn"
+        );
+        assert_eq!(
+            poetry_env_name_prefix("My.Project", "/Users/dev/My Project"),
+            "my.project-0aTnNZ0w"
+        );
+        let long = "a".repeat(60);
+        let prefix = poetry_env_name_prefix(&format!("we ird$name`{long}"), "/x");
+        assert!(prefix.starts_with("we_ird_name_"));
+        assert_eq!(prefix.rsplit_once('-').unwrap().0.chars().count(), 42);
+        assert_eq!(prefix.rsplit_once('-').unwrap().1.len(), 8);
+    }
+
+    #[test]
+    fn poetry_project_names_prefer_tool_poetry_and_return_both_spellings() {
+        assert_eq!(
+            poetry_project_names("[tool.poetry]\nname = \"Flask_Login\"\n[project]\nname = \"other\"\n"),
+            vec!["flask-login".to_string(), "Flask_Login".to_string()]
+        );
+        assert_eq!(
+            poetry_project_names("[project]\nname = \"my-app\"\n[tool.poetry]\npackage-mode = false\n"),
+            vec!["my-app".to_string()]
+        );
+        assert!(poetry_project_names("[tool.poetry]\nversion = \"1\"\n").is_empty());
+        assert!(poetry_project_names("not toml [").is_empty());
+    }
+
+    #[test]
+    fn poetry_virtualenv_config_layers_and_templates() {
+        let local = PoetryVirtualenvConfig::from_toml(
+            "[virtualenvs]\nin-project = false\npath = \"{cache-dir}/venvs\"\n",
+        );
+        let user = PoetryVirtualenvConfig::from_toml("cache-dir = \"/srv/poetry-cache\"\n[virtualenvs]\ncreate = false\n");
+        let env = PoetryVirtualenvConfig::from_env(|k| match k {
+            "POETRY_VIRTUALENVS_CREATE" => Some("true".into()),
+            _ => None,
+        });
+        let merged = env.or(local).or(user);
+        assert_eq!(merged.create, Some(true), "env beats config.toml");
+        assert_eq!(merged.in_project, Some(false));
+        assert_eq!(merged.path.as_deref(), Some("{cache-dir}/venvs"));
+        assert_eq!(merged.cache_dir.as_deref(), Some("/srv/poetry-cache"));
+        let var = |k: &str| match k {
+            "HOME" => Some("/home/dev".to_string()),
+            _ => None,
+        };
+        let cwd = Path::new("/home/dev/proj");
+        assert_eq!(
+            poetry_virtualenvs_root(cwd, &merged, &var),
+            Some(PathBuf::from("/srv/poetry-cache/venvs"))
+        );
+        let project_local = PoetryVirtualenvConfig {
+            path: Some("{project-dir}/.envs".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            poetry_virtualenvs_root(cwd, &project_local, &var),
+            Some(PathBuf::from("/home/dev/proj/.envs"))
+        );
+        let tilde = PoetryVirtualenvConfig {
+            path: Some("~/venvs".into()),
+            ..Default::default()
+        };
+        assert_eq!(poetry_virtualenvs_root(cwd, &tilde, &var), Some(PathBuf::from("/home/dev/venvs")));
+        for disabled in [
+            PoetryVirtualenvConfig { create: Some(false), ..Default::default() },
+            PoetryVirtualenvConfig { in_project: Some(true), ..Default::default() },
+        ] {
+            assert_eq!(poetry_virtualenvs_root(cwd, &disabled, &var), None);
+        }
+        // Defaults resolve against the platform cache dir; with no home at all
+        // there is nothing to resolve against.
+        let default = PoetryVirtualenvConfig::default();
+        assert!(poetry_virtualenvs_root(cwd, &default, &var).is_some());
+        assert_eq!(poetry_virtualenvs_root(cwd, &default, &|_: &str| None), None);
+    }
+
+    /// End to end against the filesystem: a Poetry project with no `.venv`
+    /// finds the virtualenv(s) Poetry placed under `virtualenvs.path`, every
+    /// interpreter minor, and stops looking once the project opts into
+    /// `in-project` venvs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn poetry_out_of_tree_virtualenvs_are_discovered_without_a_dot_venv() {
+        struct Guard(Vec<(&'static str, Option<String>)>);
+        impl Guard {
+            fn new(overrides: &[(&'static str, Option<&str>)]) -> Self {
+                let prev = overrides
+                    .iter()
+                    .map(|(k, v)| {
+                        let old = std::env::var(k).ok();
+                        match v {
+                            Some(v) => std::env::set_var(k, v),
+                            None => std::env::remove_var(k),
+                        }
+                        (*k, old)
+                    })
+                    .collect();
+                Guard(prev)
+            }
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                for (k, old) in &self.0 {
+                    match old {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[tool.poetry]\nname = \"Poetry_Patch.Fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("poetry.lock"), "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\n[metadata]\nlock-version = \"2.1\"\n").unwrap();
+        let venvs = tmp.path().join("venvs");
+        let prefix = poetry_env_name_prefix("poetry-patch-fixture", &poetry_normalized_cwd(&project));
+        let site = |venv: &Path, minor: &str| {
+            if cfg!(windows) {
+                venv.join("Lib").join("site-packages")
+            } else {
+                venv.join("lib").join(format!("python{minor}")).join("site-packages")
+            }
+        };
+        let venv312 = venvs.join(format!("{prefix}-py3.12"));
+        let venv311 = venvs.join(format!("{prefix}-py3.11"));
+        let other = venvs.join("someone-else-AAAAAAAA-py3.12");
+        for (venv, minor) in [(&venv312, "3.12"), (&venv311, "3.11"), (&other, "3.12")] {
+            std::fs::create_dir_all(site(venv, minor)).unwrap();
+        }
+        let _guard = Guard::new(&[
+            ("VIRTUAL_ENV", None),
+            ("POETRY_VIRTUALENVS_PATH", Some(venvs.to_str().unwrap())),
+            ("POETRY_VIRTUALENVS_IN_PROJECT", None),
+            ("POETRY_VIRTUALENVS_CREATE", None),
+            ("POETRY_CACHE_DIR", None),
+            ("POETRY_CONFIG_DIR", Some(tmp.path().join("no-config").to_str().unwrap())),
+        ]);
+
+        let found = find_local_venv_site_packages(&project).await;
+        assert_eq!(found, vec![site(&venv311, "3.11"), site(&venv312, "3.12")], "{found:?}");
+
+        // A project-local `.venv` wins and the out-of-tree probe is skipped.
+        std::fs::create_dir_all(site(&project.join(".venv"), "3.12")).unwrap();
+        assert_eq!(find_local_venv_site_packages(&project).await, vec![site(&project.join(".venv"), "3.12")]);
+        std::fs::remove_dir_all(project.join(".venv")).unwrap();
+
+        // `poetry.toml` opting into in-project venvs (or disabling creation)
+        // means Poetry never used the shared root: nothing is probed.
+        std::fs::write(project.join("poetry.toml"), "[virtualenvs]\nin-project = true\n").unwrap();
+        assert!(find_local_venv_site_packages(&project).await.is_empty());
+        std::fs::write(project.join("poetry.toml"), "[virtualenvs]\ncreate = false\n").unwrap();
+        assert!(find_local_venv_site_packages(&project).await.is_empty());
+        std::fs::remove_file(project.join("poetry.toml")).unwrap();
+
+        // Not a Poetry project (no lock, no [tool.poetry]): untouched.
+        std::fs::write(project.join("pyproject.toml"), "[project]\nname = \"poetry-patch-fixture\"\n").unwrap();
+        std::fs::remove_file(project.join("poetry.lock")).unwrap();
+        assert!(find_local_venv_site_packages(&project).await.is_empty());
+    }
 
     #[test]
     fn test_canonicalize_pypi_name_basic() {
