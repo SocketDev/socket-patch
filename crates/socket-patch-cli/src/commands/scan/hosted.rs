@@ -27,6 +27,7 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "bun.lock",
     "requirements.txt",
     "uv.lock",
+    "poetry.lock",
     "pyproject.toml",
     "Cargo.toml",
     "Cargo.lock",

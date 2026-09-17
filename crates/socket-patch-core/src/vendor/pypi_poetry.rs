@@ -1,21 +1,4 @@
-//! poetry-project wiring: a lock-ONLY `[[package]]` splice (poetry.lock
-//! lock-versions 2.0 and 2.1).
-//!
-//! Unlike uv (whose sources entry must be paired into pyproject.toml), poetry
-//! installs are 100% lock-driven and `metadata.content-hash` covers ONLY the
-//! pyproject — so the vendored wheel is wired by rewriting just the target
-//! `[[package]]` unit (files[] → the single patched-wheel hash, plus a
-//! `[package.source] type = "file"` table) and touching nothing else. The
-//! spike proved this splice passes `poetry install`/`sync`/`check --lock`
-//! byte-stably on BOTH supported majors (Poetry 2.4.1 = lock 2.1, Poetry
-//! 1.8.5 = lock 2.0), is hash-fail-closed against a tampered wheel, and works
-//! for direct AND transitive deps — see `spikes/poetry/` and the poetry
-//! section of `spikes/PHASE0-V2-FINDINGS.txt`.
-//!
-//! Drift caveat (spike P5): `poetry update <pkg>`, 2.x `poetry lock
-//! --regenerate` and 1.x plain `poetry lock` silently revert the splice with
-//! exit 0; the lock's files[] hash is the drift oracle. `pyproject.toml` and
-//! `metadata.content-hash` are NEVER written by this backend.
+//! Poetry lock wiring preserves the pyproject content hash and records reversible edits.
 
 use std::path::Path;
 
@@ -108,16 +91,21 @@ pub(super) async fn load_poetry_project(
         .and_then(|m| item_get(m, "lock-version"))
         .and_then(Item::as_str)
         .map(str::to_string)
+        .or_else(|| {
+            crate::utils::poetry_lock::lock_version(&lock)
+                .ok()
+                .map(str::to_string)
+        })
         .ok_or_else(|| {
             (
                 "pypi_poetry_lock_version_unsupported",
-                format!("{LOCK_FILE} has no [metadata] lock-version; only 2.x locks are supported"),
+                format!("{LOCK_FILE} has no [metadata] lock-version; supported locks are legacy hashes, 1.0, 1.1, and 2.x"),
             )
         })?;
     let mut warnings = Vec::new();
     match lock_version.as_str() {
         // The fixture-tested versions (Poetry 1.8.x writes 2.0, 2.x writes 2.1).
-        "2.0" | "2.1" => {}
+        "0" | "1.0" | "1.1" | "2.0" | "2.1" => {}
         // A newer 2.x minor keeps the shapes we rewrite (additive schema), so
         // it warns instead of refusing; `poetry check --lock` is the backstop.
         v if is_newer_2x(v) => warnings.push(VendorWarning::new(
@@ -131,11 +119,17 @@ pub(super) async fn load_poetry_project(
             return Err((
                 "pypi_poetry_lock_version_unsupported",
                 format!(
-                    "poetry.lock lock-version {v:?} is not a supported 2.x lock; re-lock with \
+                    "poetry.lock lock-version {v:?} is not a supported lock; re-lock with \
                      Poetry >= 1.3"
                 ),
             ))
         }
+    }
+    if matches!(lock_version.as_str(), "0" | "1.0" | "1.1" | "2.0") {
+        warnings.push(VendorWarning::new(
+            "pypi_poetry_integrity_unverified",
+            "Poetry < 1.4 does not verify local file hashes; use Poetry >= 1.4 or commit and review the vendored wheel bytes".to_string(),
+        ));
     }
 
     let pyproject_text = read_regular_to_string(&root.join("pyproject.toml"))
@@ -303,14 +297,39 @@ pub(super) async fn wire_poetry(
         PoetryTarget::Fresh => {}
     }
 
-    let (old_unit, new_unit) = rewrite_target_package_unit(
-        &p.lock_text,
-        canon_name,
-        rel_wheel,
-        wheel_file_name,
-        wheel_sha256_hex,
-    )?;
-    let new_lock = p.lock_text.replacen(&old_unit, &new_unit, 1);
+    let edits =
+        if matches!(p.lock_version.as_str(), "0" | "1.0" | "1.1") || p.lock_text.contains("\r\n") {
+            let rewritten = crate::utils::poetry_lock::rewrite_poetry_lock(
+                &p.lock_text,
+                canon_name,
+                version,
+                "file",
+                rel_wheel,
+                wheel_file_name,
+                wheel_sha256_hex,
+            )
+            .map_err(|detail| ("pypi_poetry_lock_parse_failed", detail))?
+            .ok_or_else(|| {
+                (
+                    "pypi_poetry_lock_package_missing",
+                    format!("no {canon_name}@{version} in {LOCK_FILE}"),
+                )
+            })?;
+            crate::utils::poetry_lock::poetry_lock_edits(&p.lock_text, &rewritten, canon_name)
+                .map_err(|detail| ("pypi_poetry_lock_parse_failed", detail))?
+        } else {
+            vec![rewrite_target_package_unit(
+                &p.lock_text,
+                canon_name,
+                rel_wheel,
+                wheel_file_name,
+                wheel_sha256_hex,
+            )?]
+        };
+    let mut new_lock = p.lock_text.clone();
+    for (old_unit, new_unit) in &edits {
+        new_lock = new_lock.replacen(old_unit, new_unit, 1);
+    }
     // Mode-preserving: the lock is a user-owned file we merely edit, so the
     // swapped-in inode must keep its permission bits rather than reset them
     // to umask defaults (same class as the revert leg in common.rs).
@@ -323,14 +342,19 @@ pub(super) async fn wire_poetry(
             )
         })?;
 
-    let wiring = vec![record(
-        LOCK_FILE,
-        KIND_LOCK_PACKAGE,
-        WiringAction::Rewritten,
-        canon_name,
-        Some(old_unit),
-        new_unit,
-    )];
+    let wiring = edits
+        .into_iter()
+        .map(|(old_unit, new_unit)| {
+            record(
+                LOCK_FILE,
+                KIND_LOCK_PACKAGE,
+                WiringAction::Rewritten,
+                canon_name,
+                Some(old_unit),
+                new_unit,
+            )
+        })
+        .collect();
     let meta = PoetryMeta {
         dep_class: classify_dependency(p, canon_name).to_string(),
         lock_version: p.lock_version.clone(),
@@ -824,6 +848,89 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn legacy_and_crlf_patches_revert_independently() {
+        for version in ["0.12.17", "1.0.10", "1.1.15", "1.2.2", "1.8.5", "2.4.3"] {
+            for crlf in [false, true] {
+                for reverse in [false, true] {
+                    let native = std::fs::read_to_string(format!(
+                        "{}/tests/fixtures/poetry/{version}/poetry.lock",
+                        env!("CARGO_MANIFEST_DIR")
+                    ))
+                    .unwrap();
+                    let mut lock: DocumentMut = native.parse().unwrap();
+                    let packages = lock["package"].as_array_of_tables_mut().unwrap();
+                    let mut second = packages.get(0).unwrap().clone();
+                    second["name"] = toml_edit::value("six");
+                    second["version"] = toml_edit::value("1.16.0");
+                    second.set_position(None);
+                    second.remove("extras");
+                    second.set_position(None);
+                    second.remove("extras");
+                    packages.push(second);
+                    for field in ["files", "hashes"] {
+                        if let Some(entries) = lock["metadata"].get_mut(field) {
+                            if let Some(value) = entries.get("urllib3").cloned() {
+                                entries["six"] = value;
+                            }
+                        }
+                    }
+                    let pristine = lock.to_string();
+                    let pristine = if crlf {
+                        pristine.replace('\n', "\r\n")
+                    } else {
+                        pristine
+                    };
+                    let tmp = write_project(&pristine, PYPROJECT_DIRECT).await;
+                    let mut entries = Vec::new();
+                    for (name, version, wheel) in [
+                        ("urllib3", "1.26.18", "urllib3-1.26.18-py2.py3-none-any.whl"),
+                        ("six", "1.16.0", WHEEL_NAME),
+                    ] {
+                        let project = load_poetry_project(tmp.path()).await.unwrap();
+                        let path = format!(".socket/vendor/pypi/{UUID}/{wheel}");
+                        let (wiring, meta) = wire_poetry(
+                            &project,
+                            tmp.path(),
+                            name,
+                            version,
+                            &path,
+                            wheel,
+                            WHEEL_SHA,
+                            UUID,
+                        )
+                        .await
+                        .unwrap();
+                        entries.push(entry_for(wiring, meta));
+                    }
+                    if reverse {
+                        entries.reverse();
+                    }
+                    let comment = if crlf {
+                        "# retained edit\r\n"
+                    } else {
+                        "# retained edit\n"
+                    };
+                    tokio::fs::write(
+                        tmp.path().join("poetry.lock"),
+                        format!("{comment}{}", read_lock(tmp.path()).await),
+                    )
+                    .await
+                    .unwrap();
+                    for entry in entries {
+                        let outcome = revert_poetry(&entry, tmp.path(), false).await;
+                        assert!(
+                            outcome.success && outcome.warnings.is_empty(),
+                            "{version}: {:?}",
+                            outcome.warnings
+                        );
+                    }
+                    assert_eq!(read_lock(tmp.path()).await, format!("{comment}{pristine}"));
+                }
+            }
+        }
+    }
+
     /// The load-bearing oracle: wiring the registry lock must produce the
     /// spliced evidence-lockonly lock BYTE-IDENTICALLY (per lock version,
     /// direct and transitive), leaving pyproject and content-hash untouched.
@@ -862,7 +969,7 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
         for (lock_version, before, after, pyproject, dep_class) in cases {
             let tmp = write_project(before, pyproject).await;
             let p = load_poetry_project(tmp.path()).await.unwrap();
-            assert!(p.warnings.is_empty(), "{lock_version}: {:?}", p.warnings);
+            assert_eq!(p.warnings.len(), usize::from(lock_version == "2.0"));
             assert_eq!(p.lock_version, lock_version);
             assert_eq!(classify_dependency(&p, "six"), dep_class);
             assert_eq!(
@@ -982,35 +1089,18 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
         );
     }
 
-    /// A CRLF lock (git autocrlf checkout) parses fine, but the splice
-    /// fragment is re-derived via `str::lines()` (which strips `\r`) and can
-    /// never byte-match the file — the replacen would silently no-op while
-    /// still reporting success and recording a rewrite that never landed.
-    /// Wiring must refuse instead.
     #[tokio::test]
-    async fn crlf_lock_refuses_instead_of_silently_wiring_nothing() {
+    async fn crlf_lock_wires_and_reverts_without_changing_line_endings() {
         let crlf = LOCK21_DIRECT_REGISTRY.replace('\n', "\r\n");
         let tmp = write_project(&crlf, PYPROJECT_DIRECT).await;
-        let p = load_poetry_project(tmp.path()).await.unwrap();
-        assert_eq!(
-            check_target_guards(&p, "six", "1.16.0", UUID).unwrap(),
-            PoetryTarget::Fresh
-        );
-
-        let err = wire_poetry(
-            &p,
-            tmp.path(),
-            "six",
-            "1.16.0",
-            REL_WHEEL,
-            WHEEL_NAME,
-            WHEEL_SHA,
-            UUID,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.0, "pypi_poetry_lock_parse_failed");
-        assert_eq!(read_lock(tmp.path()).await, crlf, "refusal writes nothing");
+        let project = load_poetry_project(tmp.path()).await.unwrap();
+        let (wiring, meta) = wire_default(&project, tmp.path()).await;
+        let rewritten = read_lock(tmp.path()).await;
+        assert!(rewritten.contains(REL_WHEEL));
+        assert!(!rewritten.replace("\r\n", "").contains('\n'));
+        let outcome = revert_poetry(&entry_for(wiring, meta), tmp.path(), false).await;
+        assert!(outcome.success);
+        assert_eq!(read_lock(tmp.path()).await, crlf);
     }
 
     /// Valid TOML poetry itself never emits — `name="six"` with no spaces
@@ -1093,7 +1183,7 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
         let tmp = write_project("[[package]]\nname = \"six\"\n", PYPROJECT_DIRECT).await;
         let err = load_poetry_project(tmp.path()).await.unwrap_err();
         assert_eq!(err.0, "pypi_poetry_lock_version_unsupported");
-        for bad in ["1.1", "3.0"] {
+        for bad in ["1.2", "3.0"] {
             let lock = LOCK21_DIRECT_REGISTRY.replace(
                 "lock-version = \"2.1\"",
                 &format!("lock-version = \"{bad}\""),
