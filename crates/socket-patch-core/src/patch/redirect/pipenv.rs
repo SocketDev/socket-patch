@@ -155,11 +155,46 @@ pub(super) fn restore(text: &str, edit: &FileEdit) -> Result<String, String> {
         return Ok(text.into());
     }
     if live != new {
+        // A relock (`pipenv lock`, `pipenv update`, `pipenv install <other>`
+        // on <= 2023) regenerates the entry to registry shape: the redirect
+        // is already gone and the user's fresh resolution is the desired end
+        // state, so the edit is retired instead of holding every pypi revert
+        // hostage forever. A DIFFERENT `file`/`path` reference (a user's own
+        // source, a hand edit) is real drift and still refuses.
+        let registry_shaped = entry
+            .value
+            .as_object()
+            .is_some_and(|object| !object.contains_key("file") && !object.contains_key("path"));
+        if registry_shaped {
+            return Ok(text.into());
+        }
         return Err(format!("Pipenv entry {section}.{name} drifted"));
     }
     let mut result = text.to_owned();
     result.replace_range(entry.range, original);
     Ok(result)
+}
+
+/// Whether any pypi override names a package this `Pipfile.lock` pins — the
+/// cheap pre-check that decides whether the installer probe
+/// (`pipenv --version`, up to 10 s) is worth running and whether its
+/// absence is worth a warning. An absent or unparseable lock targets nothing.
+pub(super) fn lock_targets(files: &BTreeMap<String, String>, overrides: &[DepOverride]) -> bool {
+    let Some(text) = files.get("Pipfile.lock") else {
+        return false;
+    };
+    let Ok(entries) = entries(text) else {
+        return false;
+    };
+    overrides
+        .iter()
+        .filter(|dep| dep.ecosystem == "pypi")
+        .any(|dep| {
+            let wanted = canonicalize_pypi_name(&dep.name);
+            entries
+                .iter()
+                .any(|(_, entry)| canonicalize_pypi_name(&entry.name) == wanted)
+        })
 }
 
 pub(super) fn rewrite(
@@ -527,6 +562,64 @@ mod tests {
         let mut missing_hash = dep.clone();
         missing_hash.integrity.sha256 = None;
         assert!(plan(&lock(), &missing_hash, None).is_err());
+    }
+
+    /// `pipenv lock` (and `update`, and `install <other>` before 2024)
+    /// regenerates the redirected entry to registry shape. That is the
+    /// desired end state of a rollback, so the edit retires cleanly instead
+    /// of refusing forever; a foreign `file`/`path` reference is still drift.
+    /// A re-scan after the relock (second edit on the same key) unwinds
+    /// newest-first to the relocked text.
+    #[test]
+    fn relocked_registry_entry_retires_the_edit_instead_of_refusing() {
+        let dep = dependency("urllib3", "1.26.18", "patch-one");
+        // One category, so the relock below regenerates the ONLY redirect.
+        let mut value: Value = serde_json::from_str(&lock()).unwrap();
+        value.as_object_mut().unwrap().remove("tests");
+        let original = format_entry(&value, "{", 0).unwrap() + "\n";
+        let (redirected, edits) = plan(&original, &dep, None).unwrap();
+        assert_eq!(edits.len(), 1);
+        let redirected_entry = edits[0].new.as_ref().unwrap().as_str().unwrap();
+        let relocked_entry = format_entry(
+            &json!({"hashes": ["sha256:relocked"], "index": "pypi", "version": "==1.26.18"}),
+            &redirected,
+            redirected.find(redirected_entry).unwrap(),
+        )
+        .unwrap();
+        let relocked = redirected.replacen(redirected_entry, &relocked_entry, 1);
+        assert_eq!(
+            restore(&relocked, &edits[0]).unwrap(),
+            relocked,
+            "a registry-shaped entry is already unwound"
+        );
+        let foreign = redirected.replacen(
+            redirected_entry,
+            &format_entry(&json!({"file": "https://example.org/fork.whl"}), &redirected, 0).unwrap(),
+            1,
+        );
+        assert!(restore(&foreign, &edits[0]).is_err(), "a foreign reference is drift");
+
+        // Re-scan after the relock, then roll back newest-first.
+        let (again, second) = plan(&relocked, &dep, None).unwrap();
+        let mut current = again;
+        for edit in second.iter().chain(edits.iter()) {
+            current = restore(&current, edit).unwrap();
+        }
+        assert_eq!(current, relocked);
+    }
+
+    #[test]
+    fn lock_targets_requires_a_matching_pin_in_a_parseable_lock() {
+        let dep = dependency("URLlib3", "1.26.18", "patch-one");
+        let other = dependency("six", "1.16.0", "patch-two");
+        let files = |text: &str| BTreeMap::from([("Pipfile.lock".to_string(), text.to_string())]);
+        assert!(lock_targets(&files(&lock()), std::slice::from_ref(&dep)));
+        assert!(!lock_targets(&files(&lock()), std::slice::from_ref(&other)));
+        assert!(!lock_targets(&files("{ not json"), std::slice::from_ref(&dep)));
+        assert!(!lock_targets(&BTreeMap::new(), std::slice::from_ref(&dep)));
+        let mut npm = dep.clone();
+        npm.ecosystem = "npm".into();
+        assert!(!lock_targets(&files(&lock()), std::slice::from_ref(&npm)));
     }
 
     #[test]

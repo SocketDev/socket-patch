@@ -213,6 +213,13 @@ pub fn rewrite_registry_redirect_with_python_metadata(
     rewrite_registry_redirect_with_pipenv_version(files, overrides, python_metadata, None)
 }
 
+/// Whether any pypi override targets an entry of `files["Pipfile.lock"]` —
+/// callers use it to decide whether probing the installed Pipenv release is
+/// worth a subprocess and whether its absence deserves a warning.
+pub fn pipenv_lock_targets(files: &BTreeMap<String, String>, overrides: &[DepOverride]) -> bool {
+    pipenv::lock_targets(files, overrides)
+}
+
 pub fn rewrite_registry_redirect_with_pipenv_version(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],

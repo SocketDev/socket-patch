@@ -1520,7 +1520,15 @@ pub(crate) async fn run_redirect_selected(
         }
     }
     overrides.retain(|dep| !unavailable_python_artifacts.contains(&dep.artifact_url));
-    let pipenv_major = if files.contains_key("Pipfile.lock") {
+    // The Pipfile.lock reference shape depends on the installing Pipenv
+    // (`path` for 7–11, `file` from 2018 on), so the installed release is
+    // probed (`pipenv --version`, up to 10 s) — but only when a pypi patch
+    // actually targets an entry of THIS lock: a stray Pipfile.lock in a uv /
+    // Poetry project, a re-scan with nothing left to do and any non-Python
+    // run must neither spawn Pipenv nor warn about its absence.
+    let targets_pipenv_lock =
+        socket_patch_core::patch::redirect::pipenv_lock_targets(&files, &overrides);
+    let pipenv_major = if targets_pipenv_lock {
         socket_patch_core::utils::pipenv::installed_major(&common.cwd).await
     } else {
         None
@@ -1532,10 +1540,15 @@ pub(crate) async fn run_redirect_selected(
         pipenv_major,
     );
 
-    if files.contains_key("Pipfile.lock") && pipenv_major.is_none() {
+    // Unknown installer → the modern `file` shape was chosen; say so only
+    // when the lock was (or, on --dry-run, would be) rewritten.
+    if targets_pipenv_lock && pipenv_major.is_none() && rewrite.files.contains_key("Pipfile.lock") {
         rewrite.warnings.push(socket_patch_core::patch::redirect::RewriteWarning {
             code: "redirect_pipenv_installer_unknown".into(),
-            detail: "Pipenv was not detected; these hosted references require Pipenv 2018 or later. Make legacy Pipenv available on PATH to select its native lockfile format.".into(),
+            detail: format!(
+                "Pipenv was not found on PATH, so the Pipfile.lock references use the modern                  `file` form (Pipenv 2018 and later). A project installed with Pipenv 7–11                  needs `path` references instead: put that pipenv on PATH or set {}=<major>                  and re-run `scan --mode hosted`.",
+                socket_patch_core::utils::pipenv::MAJOR_OVERRIDE_ENV
+            ),
         });
     }
 
