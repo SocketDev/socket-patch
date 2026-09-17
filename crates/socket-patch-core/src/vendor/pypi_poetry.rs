@@ -851,7 +851,8 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
 
     #[tokio::test]
     async fn legacy_revert_keeps_source_and_hash_together_on_drift() {
-        let native = include_str!("../../tests/fixtures/poetry/1.1.15/poetry.lock");
+        let native =
+            include_str!("../../tests/fixtures/poetry/1.1.15/poetry.lock").replace("\r\n", "\n");
         let lock = native.replace("urllib3 = []", &format!("urllib3 = [{{file = \"urllib3-1.26.18-py2.py3-none-any.whl\", hash = \"sha256:{}\"}}]", "b".repeat(64)));
         for crlf in [false, true] {
             let pristine = if crlf {

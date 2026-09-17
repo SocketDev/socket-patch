@@ -18,6 +18,7 @@ fn original(version: &str) -> String {
         env!("CARGO_MANIFEST_DIR")
     ))
     .unwrap()
+    .replace("\r\n", "\n")
 }
 
 fn patch() -> DepOverride {
