@@ -369,6 +369,9 @@ def main():
         if mode == "setup":
             senv = dict(env)
             senv["PATH"] = str(tool / "bin") + os.pathsep + senv.get("PATH", "")
+            # `setup` shells out to that Poetry; give it the case's isolated
+            # HOME too (Poetry <= 1.1's shared HTTP-cache lock, see poetry_env).
+            senv["HOME"] = poetry_env(project)["HOME"]
             r = Run(cli_cmd(project, "setup"), project, senv, case / "setup.log")
             info["setupExit"] = r.rc
             try:
