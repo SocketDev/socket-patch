@@ -59,8 +59,13 @@ async fn native_lock_generations_redirect_idempotently_and_restore_every_byte() 
                     .any(|warning| warning.detail.contains("ignores URL sources")));
                 continue;
             }
-            assert!(
-                result.warnings.is_empty(),
+            // Poetry < 1.4 writers (0/1.0/1.1 locks, and 1.3's unstamped 2.0 lock)
+            // get the warm-virtualenv advisory; nothing else may warn.
+            let pre_1_4 = matches!(*version, "1.0.10" | "1.1.15" | "1.2.2" | "1.3.2");
+            let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+            assert_eq!(
+                codes,
+                if pre_1_4 { vec!["redirect_poetry_stale_install_risk"] } else { vec![] },
                 "{version}: {:?}",
                 result.warnings
             );
@@ -240,7 +245,14 @@ async fn either_patch_reverts_independently_with_unrelated_edits() {
                     second.warnings,
                     first.files["poetry.lock"]
                 );
-                assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+                assert!(
+                    second
+                        .warnings
+                        .iter()
+                        .all(|w| w.code == "redirect_poetry_stale_install_risk"),
+                    "{:?}",
+                    second.warnings
+                );
                 let directory = tempfile::tempdir().unwrap();
                 let unrelated = if crlf {
                     "# retained user edit\r\n"
@@ -281,4 +293,73 @@ async fn either_patch_reverts_independently_with_unrelated_edits() {
             }
         }
     }
+}
+
+#[test]
+fn absent_entries_warn_once_and_missing_sha256_is_gated_once_per_dep() {
+    let files = BTreeMap::from([
+        ("poetry.lock".to_string(), original("2.4.3")),
+        ("packages/app/poetry.lock".to_string(), original("1.8.5")),
+    ]);
+    let mut six = patch();
+    six.name = "six".into();
+    six.version = "1.16.0".into();
+    six.artifact_url = URL.replace("urllib3", "six").replace("1.26.18", "1.16.0");
+    let result = rewrite_registry_redirect(&files, &[six]);
+    assert!(result.files.is_empty());
+    let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+    assert_eq!(
+        codes,
+        vec!["redirect_poetry_entry_not_found", "redirect_poetry_entry_not_found"]
+    );
+    let mut missing_hash = patch();
+    missing_hash.integrity.sha256 = None;
+    let result = rewrite_registry_redirect(&files, &[missing_hash]);
+    assert!(result.files.is_empty());
+    let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+    assert_eq!(codes, vec!["redirect_poetry_missing_sha256"], "gated once, not once per lock");
+}
+
+/// A future Poetry that bumps the lock minor (2.2) is rewritten like 2.1 in
+/// hosted mode — the vendored loader already accepts it with an advisory, and
+/// the same lock must not be a silent no-op on one path and applied on another.
+#[tokio::test]
+async fn newer_2x_minor_redirects_and_reverts() {
+    let lock = original("2.4.3").replace("lock-version = \"2.1\"", "lock-version = \"2.2\"");
+    let files = BTreeMap::from([("poetry.lock".to_string(), lock.clone())]);
+    let result = rewrite_registry_redirect(&files, &[patch()]);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert!(result.files["poetry.lock"].contains(URL));
+    let directory = tempfile::tempdir().unwrap();
+    tokio::fs::write(directory.path().join("poetry.lock"), &result.files["poetry.lock"])
+        .await
+        .unwrap();
+    let mut state = RedirectState {
+        edits: result.edits,
+        ..RedirectState::default()
+    };
+    let outcome = revert_remaining_redirect_edits(directory.path(), &mut state, false).await;
+    assert!(outcome.fully_reverted(), "{:?}", outcome.refusals);
+    assert_eq!(
+        tokio::fs::read_to_string(directory.path().join("poetry.lock")).await.unwrap(),
+        lock
+    );
+}
+
+/// A rotated grant token (or republished patch) supersedes the earlier hosted
+/// URL in place; rollback of the SECOND run restores the FIRST run's fragment,
+/// exactly as the ledger records it.
+#[test]
+fn rotated_grant_token_supersedes_the_prior_hosted_url() {
+    let files = BTreeMap::from([("poetry.lock".to_string(), original("1.8.5"))]);
+    let first = rewrite_registry_redirect(&files, &[patch()]);
+    let mut rotated = patch();
+    rotated.token = "00000000-0000-4000-8000-000000000000".into();
+    rotated.artifact_url = URL.replace("7e52b8b6-53f2-4dc8-860a-1ae7ebd8be0e", "00000000-0000-4000-8000-000000000000");
+    let second = rewrite_registry_redirect(&first.files, &[rotated.clone()]);
+    assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+    let lock = &second.files["poetry.lock"];
+    assert!(lock.contains(&rotated.artifact_url) && !lock.contains(URL));
+    assert_eq!(second.edits.len(), 1);
+    assert!(second.edits[0].original.as_ref().unwrap().as_str().unwrap().contains(URL));
 }
