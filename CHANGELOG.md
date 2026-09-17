@@ -75,7 +75,14 @@ into the new version's section — see docs/releasing.md.
   a future `lock-version = "2.<n>"` is rewritten like 2.1 on every path
   (the vendored loader already accepted it), and a malformed
   `[metadata.files]` / `[metadata.hashes]` value is refused instead of
-  panicking the scan. (#241)
+  panicking the scan. Rollback stays invertible across Poetry's own relocks:
+  the recorded package fragment carries its boundary header, so a unit that
+  Poetry 1.1/1.2 re-laid (source kept, inserted `files` line dropped) is
+  refused rather than mistaken for an already-reverted lock, a lock-1.0
+  redirect restored by hand converges instead of refusing, and a re-scan
+  after such a relock REBASES the ledger's edits (pristine → current)
+  instead of appending a chain whose older links match nothing — which made
+  `rollback` and `remove` refuse forever. (#241)
 - **Python patches survive uv lockfiles in both hosted and vendored modes.**
   `scan --mode hosted|vendored` now rewrites native `uv.lock` together with
   the paired `pyproject.toml` source and metadata, PEP 723 script locks

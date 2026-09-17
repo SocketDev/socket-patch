@@ -244,6 +244,28 @@ pub fn rewrite_poetry_lock(
     Ok(Some(result))
 }
 
+/// End (exclusive, before its line break) of the first top-level TOML header
+/// line at or after `from`, skipping blank lines; `text.len()` at EOF; `from`
+/// itself when the next non-blank line is not a header (a shape Poetry never
+/// writes — the fragment then ends where it used to).
+fn next_header_end(text: &str, from: usize) -> usize {
+    let mut pos = from;
+    for line in text[from..].split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        // Blank lines and comments sit between units (toml_edit clones carry
+        // the file's leading comment as decor); they belong to the boundary.
+        if content.trim().is_empty() || content.trim_start().starts_with('#') {
+            pos += line.len();
+            continue;
+        }
+        if content.starts_with('[') {
+            return pos + content.len();
+        }
+        return from;
+    }
+    text.len()
+}
+
 /// The verbatim `(original, replacement)` fragments that turn `original` into
 /// `rewritten` for `name`: the package's `[[package]]` unit (with its
 /// sub-tables) and, for legacy formats, its `[metadata.files]` /
@@ -291,6 +313,17 @@ pub fn poetry_lock_edits(
         span.end += text[span.end..]
             .find(['\r', '\n'])
             .unwrap_or(text.len() - span.end);
+        // Carry the unit's BOUNDARY: the blank line(s) after it plus the next
+        // top-level header (`[[package]]`, `[metadata]`, `[extras]`, …) or
+        // EOF. The rewrite APPENDS `[package.source]` to the unit, so without
+        // the boundary the pristine fragment would be a strict prefix of every
+        // rewritten (or later relocked) unit: rollback's "already converged"
+        // check could never fire for lock 1.0, and a relock that dropped the
+        // inserted `files` line but kept the source block would match the
+        // pristine prefix and report a successful rollback while the lock
+        // still redirected. With the header included, the pristine fragment
+        // matches only a unit that really ends where it ended.
+        span.end = next_header_end(text, span.end);
         let mut result = vec![text[span].to_string()];
         let metadata = lock
             .get("metadata")
@@ -479,6 +512,48 @@ mod tests {
         let edits = poetry_lock_edits(&lock, &rewritten, "urllib3").unwrap();
         assert_eq!(edits.len(), 2);
         assert!(edits[1].0.starts_with('\n'));
+    }
+
+    /// The package fragment ends with the NEXT top-level header, so the
+    /// pristine fragment is never a prefix of the rewritten one (the source
+    /// block sits between the unit and that header).
+    #[test]
+    fn package_fragment_carries_its_boundary_header() {
+        for version in ["1.0.10", "1.2.2", "2.4.3"] {
+            let lock = fixture(version);
+            let rewritten = hosted(&lock).unwrap().unwrap();
+            let edits = poetry_lock_edits(&lock, &rewritten, "urllib3").unwrap();
+            let (original, new) = &edits[0];
+            assert!(
+                original.ends_with("[metadata]") || original.ends_with("[extras]"),
+                "{version}: {original:?}"
+            );
+            assert!(new.ends_with("[metadata]") || new.ends_with("[extras]"));
+            assert!(!new.contains(original.as_str()), "{version}: pristine must not be a prefix of new");
+            // A relock that keeps `[package.source]` but drops the inserted
+            // `files` line must NOT contain the pristine fragment either.
+            let drifted: String = rewritten
+                .lines()
+                .filter(|l| !l.starts_with("files = [{ file"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!drifted.contains(original.as_str()), "{version}");
+        }
+        // Two adjacent packages: the first fragment ends with the second's
+        // header, the second starts with it; both splice independently.
+        let lock = fixture("2.4.3");
+        let mut doc: DocumentMut = lock.parse().unwrap();
+        let mut second = doc["package"].as_array_of_tables().unwrap().get(0).unwrap().clone();
+        second["name"] = value("six");
+        second["version"] = value("1.16.0");
+        second.set_position(None);
+        second.remove("extras");
+        doc["package"].as_array_of_tables_mut().unwrap().push(second);
+        let two = doc.to_string();
+        let first = hosted(&two).unwrap().unwrap();
+        let edits = poetry_lock_edits(&two, &first, "urllib3").unwrap();
+        assert!(edits[0].0.ends_with("[[package]]"), "{:?}", edits[0].0);
+        assert_eq!(two.matches(edits[0].0.as_str()).count(), 1);
     }
 
     #[test]

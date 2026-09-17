@@ -28,6 +28,9 @@ const HOSTED_URL: &str = "http://patch.test/patch/pypi/urllib3/1.26.18/22222222-
 const GHSA: &str = "GHSA-gm62-xv2j-4w53";
 
 const LOCK: &str = include_str!("../../socket-patch-core/tests/fixtures/poetry/2.4.3/poetry.lock");
+/// Poetry 1.2.2's native lock (lock-version 1.1, populated `[metadata.files]`).
+const LOCK_1_1: &str =
+    include_str!("../../socket-patch-core/tests/fixtures/poetry/1.2.2/poetry.lock");
 const PYPROJECT: &str =
     include_str!("../../socket-patch-core/tests/fixtures/poetry/2.4.3/pyproject.toml");
 
@@ -230,4 +233,77 @@ async fn lock_only_poetry_project_redirects_attests_rescans_and_rolls_back() {
             "no redirect record may survive rollback: {ledger}"
         );
     }
+}
+
+/// What `poetry lock --no-update` on Poetry 1.1 / 1.2 does to a redirected
+/// lock-1.1 unit: keeps `[package.source]`, drops the inserted package-level
+/// `files` line, and re-lays the `[metadata.files]` entry from the CLI's
+/// inline table into Poetry's multi-line array.
+fn simulate_poetry_1x_relock(lock: &str) -> String {
+    let mut out = String::new();
+    for line in lock.lines() {
+        if line.starts_with("files = [{ file = ") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("urllib3 = [{ ") {
+            let inner = rest.trim_end_matches(" }]");
+            out.push_str("urllib3 = [\n    {");
+            out.push_str(inner);
+            out.push_str("},\n]\n");
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Relock → re-scan → rollback must still land on the pristine lock. The
+/// re-scan REBASES the ledger's edits (pristine → freshly written) instead of
+/// appending edits recorded against the relocked text, whose older links
+/// would match nothing and make rollback (and remove) refuse forever.
+#[tokio::test]
+#[serial]
+async fn relock_then_rescan_keeps_rollback_invertible() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let lock_path = tmp.path().join("poetry.lock");
+    std::fs::write(&lock_path, LOCK_1_1).unwrap();
+
+    assert_eq!(run(hosted_args(tmp.path(), server.uri(), None)).await, 0);
+    let redirected = read(&lock_path);
+    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
+    let ledger: serde_json::Value = serde_json::from_str(&read(&ledger_path)).unwrap();
+    assert_eq!(ledger["edits"].as_array().unwrap().len(), 2, "package + metadata fragments");
+
+    let relocked = simulate_poetry_1x_relock(&redirected);
+    assert_ne!(relocked, redirected);
+    assert!(relocked.contains(HOSTED_URL), "relock keeps the source");
+    std::fs::write(&lock_path, &relocked).unwrap();
+
+    // Re-scan: the unit lost its `files` line, so the rewriter writes again.
+    assert_eq!(run(hosted_args(tmp.path(), server.uri(), None)).await, 0);
+    let rescanned = read(&lock_path);
+    assert_ne!(rescanned, relocked, "the re-scan must restore the package files entry");
+    let ledger: serde_json::Value = serde_json::from_str(&read(&ledger_path)).unwrap();
+    let edits = ledger["edits"].as_array().unwrap();
+    assert_eq!(edits.len(), 2, "rebased, not appended: {ledger}");
+    for edit in edits {
+        let original = edit["original"].as_str().unwrap();
+        assert!(!original.contains(HOSTED_URL), "originals stay pristine: {original}");
+        let new = edit["new"].as_str().unwrap();
+        assert!(rescanned.contains(new), "new fragments describe the current lock");
+    }
+
+    let code = rollback::run(RollbackArgs {
+        targets: Vec::new(),
+        common: global(tmp.path(), server.uri()),
+        one_off: false,
+        preserve_state: false,
+    })
+    .await;
+    assert_eq!(code, 0, "rollback after relock + re-scan must succeed");
+    assert_eq!(read(&lock_path), LOCK_1_1, "pristine lock restored byte for byte");
 }

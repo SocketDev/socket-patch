@@ -13,6 +13,11 @@ use super::{discover_selected, ScanArgs};
 
 /// Candidate lockfiles / registry configs the redirect rewriters may touch —
 /// read from the project when present and handed to `rewrite_registry_redirect`.
+/// Fragment-edit kinds whose lockfile the package manager re-lays in place
+/// (keeping the Socket source) — a re-scan REBASES their ledger edits instead
+/// of appending; see the ledger merge below.
+const REBASE_KINDS: &[&str] = &["redirect_poetry_lock_package"];
+
 const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "package-lock.json",
     "npm-shrinkwrap.json",
@@ -1817,8 +1822,66 @@ pub(crate) async fn run_redirect_selected(
             ledger.mode = "hosted".to_string();
             // The bun.lockb→bun.lock migration removal precedes the rewrite
             // edits so `--revert` unwinds it last (after restoring bun.lock).
+            //
+            // REBASE instead of append for fragment kinds whose file the
+            // package manager itself rewrites in place: when the ledger already
+            // holds edits for the same (path, kind, key) and the file no longer
+            // carried their `new` fragments before this run (Poetry 1.1/1.2
+            // `poetry lock --no-update` keeps the Socket source but re-lays the
+            // unit and drops the inserted `files` line), appending this run's
+            // edits — recorded against the RELOCKED text — would build a chain
+            // whose older links match nothing: rollback and remove then refuse
+            // forever, and the refusal's own remedy ("re-run scan") is what
+            // lengthened the chain. Keeping the oldest `original` (the pristine
+            // fragment) and adopting the fresh `new` keeps the chain a single
+            // invertible link: replay swaps the fragment this run wrote back to
+            // the fragment the very first run found.
+            let mut rebased: Vec<usize> = Vec::new();
+            for edit in rewrite.edits.iter().filter(|e| REBASE_KINDS.contains(&e.kind.as_str())) {
+                let siblings: Vec<usize> = ledger
+                    .edits
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, old)| {
+                        old.path == edit.path && old.kind == edit.kind && old.key == edit.key
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                let before = files.get(&edit.path).map(String::as_str).unwrap_or("");
+                let drifted = !siblings.is_empty()
+                    && siblings.iter().all(|&i| {
+                        ledger.edits[i]
+                            .new
+                            .as_ref()
+                            .and_then(serde_json::Value::as_str)
+                            .is_none_or(|new| !before.contains(new))
+                    });
+                if !drifted {
+                    continue;
+                }
+                // Positional pairing: the rewriter emits a key's fragments in a
+                // fixed order (package unit, then the legacy integrity entry).
+                let nth = rewrite
+                    .edits
+                    .iter()
+                    .filter(|e| e.path == edit.path && e.kind == edit.kind && e.key == edit.key)
+                    .position(|e| std::ptr::eq(e, edit))
+                    .unwrap_or(0);
+                if let Some(&target) = siblings.get(nth) {
+                    if !rebased.contains(&target) {
+                        ledger.edits[target].new = edit.new.clone();
+                        ledger.edits[target].action = edit.action.clone();
+                        rebased.push(target);
+                    }
+                }
+            }
             for edit in migration_edits.iter().chain(rewrite.edits.iter()) {
-                if !ledger.edits.contains(edit) {
+                let is_rebased = REBASE_KINDS.contains(&edit.kind.as_str())
+                    && rebased.iter().any(|&t| {
+                        let old = &ledger.edits[t];
+                        old.path == edit.path && old.kind == edit.kind && old.key == edit.key && old.new == edit.new
+                    });
+                if !is_rebased && !ledger.edits.contains(edit) {
                     ledger.edits.push(edit.clone());
                 }
             }

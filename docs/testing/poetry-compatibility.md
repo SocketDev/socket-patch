@@ -85,7 +85,12 @@ Other measured details:
   rewrites the entry in its own lock-1.1 shape, dropping the package-level
   `files` the rewrite added for Poetry ≥ 1.2's hash check; a lock relocked by
   1.1 and then installed by 1.2+ installs the hosted wheel unverified. Re-run
-  `socket-patch scan --mode hosted` after relocking on those releases.
+  `socket-patch scan --mode hosted` after relocking on those releases: the
+  re-scan restores the entry and rebases the ledger's recorded edits onto the
+  relocked text (pristine → current, never an appended chain), so `rollback`
+  still lands on the pristine lock afterwards. A relocked-but-not-rescanned
+  lock is refused by `rollback` (its recorded fragments match nothing) rather
+  than reported as already reverted.
 - Poetry 0.12 and 1.0 resolve a relative `type = "file"` path against the
   shell's working directory, not the project root; run `poetry install` from
   the project root on those releases.

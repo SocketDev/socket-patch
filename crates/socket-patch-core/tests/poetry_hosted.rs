@@ -413,3 +413,66 @@ fn rotated_grant_token_supersedes_the_prior_hosted_url() {
     assert_eq!(second.edits.len(), 1);
     assert!(second.edits[0].original.as_ref().unwrap().as_str().unwrap().contains(URL));
 }
+
+/// A relock (or hand edit) that drops the inserted `files` line but keeps
+/// `[package.source]` must be REFUSED by rollback, never mistaken for an
+/// already-reverted lock: before the fragment carried its boundary header the
+/// pristine unit matched as a prefix, replay reported success, deleted the
+/// ledger, and left the lock redirecting with upstream hashes in
+/// `[metadata.files]`.
+#[tokio::test]
+async fn dropped_files_line_with_source_kept_is_refused_not_converged() {
+    for version in ["1.2.2", "2.4.3"] {
+        let pristine = original(version);
+        let files = BTreeMap::from([("poetry.lock".to_string(), pristine.clone())]);
+        let result = rewrite_registry_redirect(&files, &[patch()]);
+        let redirected = &result.files["poetry.lock"];
+        let drifted: String = redirected
+            .lines()
+            .filter(|line| !line.starts_with("files = [{ file = "))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_ne!(drifted, *redirected, "{version}: the files line must have been removed");
+        assert!(drifted.contains("[package.source]"));
+        let directory = tempfile::tempdir().unwrap();
+        tokio::fs::write(directory.path().join("poetry.lock"), &drifted).await.unwrap();
+        let mut state = RedirectState {
+            edits: result.edits.clone(),
+            ..RedirectState::default()
+        };
+        let outcome = revert_remaining_redirect_edits(directory.path(), &mut state, false).await;
+        assert!(!outcome.fully_reverted(), "{version}: must refuse, not report success");
+        assert_eq!(
+            tokio::fs::read_to_string(directory.path().join("poetry.lock")).await.unwrap(),
+            drifted,
+            "{version}: a refused revert writes nothing"
+        );
+        assert!(!state.edits.is_empty(), "{version}: the ledger keeps its edits for a re-scan");
+    }
+}
+
+/// Lock 1.0 only APPENDS `[package.source]` to the unit. A lock restored to
+/// pristine by hand (or by Poetry 1.0's own bare `poetry lock`, which drops
+/// the source) must let rollback converge and clear the ledger instead of
+/// refusing with a spurious drift.
+#[tokio::test]
+async fn lock_1_0_rollback_converges_on_a_hand_restored_lock() {
+    let pristine = original("1.0.10");
+    let files = BTreeMap::from([("poetry.lock".to_string(), pristine.clone())]);
+    let result = rewrite_registry_redirect(&files, &[patch()]);
+    assert!(!result.edits.is_empty());
+    let directory = tempfile::tempdir().unwrap();
+    tokio::fs::write(directory.path().join("poetry.lock"), &pristine).await.unwrap();
+    let mut state = RedirectState {
+        edits: result.edits,
+        ..RedirectState::default()
+    };
+    let outcome = revert_remaining_redirect_edits(directory.path(), &mut state, false).await;
+    assert!(outcome.fully_reverted(), "{:?}", outcome.refusals);
+    assert!(state.edits.is_empty());
+    assert_eq!(
+        tokio::fs::read_to_string(directory.path().join("poetry.lock")).await.unwrap(),
+        pristine
+    );
+}
