@@ -71,7 +71,7 @@ failure instead of N confusing ones that look like CLI regressions.
 | Ecosystem | Hosted mode | Free patches in production | Suite coverage |
 |-----------|-------------|----------------------------|----------------|
 | npm | ✅ | ✅ many | ✅ npm, npm-shrinkwrap, pnpm, yarn classic, yarn berry, bun |
-| PyPI | ✅ (requirements.txt + uv.lock only) | ✅ many | ✅ requirements.txt, uv.lock |
+| PyPI | ✅ (requirements.txt, uv.lock, Pipfile.lock) | ✅ many | ✅ requirements.txt, uv.lock, Pipfile.lock |
 | RubyGems | ✅ | ✅ (this suite pins one purl/UUID: `activestorage@6.0.3`; the 2026-08-18 republish covers more versions) | ✅ full bundler install proof |
 | Cargo | ✅ | ❌ **none** (tier emptied 2026-08-28) | canary only |
 | Maven | ✅ | ❌ **none** | canary only |
@@ -101,13 +101,15 @@ history of this demotion shows every piece to restore (catalog constants,
 preflight registration, the install-proof leg, and these tables) in both
 production suites.
 
-PyPI's pdm / pipenv locks are **not** rewritten by hosted mode (see the
-[matrix](../ecosystems.md#mode--ecosystem-matrix)); those flavors are vendored-mode
-only, so there is no hosted leg to write for them. `poetry.lock` IS rewritten
+PyPI's pdm lock is **not** rewritten by hosted mode (see the
+[matrix](../ecosystems.md#mode--ecosystem-matrix)); that flavor is vendored-mode
+only, so there is no hosted leg to write for it. `poetry.lock` IS rewritten
 (Poetry 1.0+); its live coverage is the per-release matrix in
 [poetry-compatibility.md](poetry-compatibility.md) (`scripts/backtest-poetry.py`),
-which installs the redirected lock with every Poetry release rather than one
-pinned installer, so it is not duplicated as a leg here.
+and `Pipfile.lock` IS rewritten (Pipenv 7+); its live coverage is the per-release
+matrix in [pipenv-compatibility.md](pipenv-compatibility.md)
+(`scripts/backtest-pipenv.py`). Both install the redirected lock with every
+release rather than one pinned installer, so they are not duplicated as legs here.
 
 Two supported hosted shapes are deliberately **not** covered here:
 

@@ -1,0 +1,100 @@
+name: Pipenv compatibility
+
+# Drives the real CLI and real Pipenv releases through hosted, vendored,
+# agent and out-of-tree agent mode on Linux and macOS (the `test` job already
+# runs the in-process hosted Pipenv CLI tests on all three platforms,
+# Windows included). The pre-2018 releases need Docker and stay in the local
+# matrix (`docs/testing/pipenv-compatibility.md`). Needs network (PyPI + the
+# public patch service); no Socket token.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/socket-patch-core/src/patch/redirect/pipenv.rs'
+      - 'crates/socket-patch-core/src/vendor/pypi_pipenv.rs'
+      - 'crates/socket-patch-core/src/vendor/pypi.rs'
+      - 'crates/socket-patch-core/src/vendor/lock_inventory.rs'
+      - 'crates/socket-patch-core/src/crawlers/python_crawler.rs'
+      - 'crates/socket-patch-core/src/utils/pipenv.rs'
+      - 'crates/socket-patch-cli/src/commands/scan/hosted.rs'
+      - 'crates/socket-patch-cli/src/commands/vendor.rs'
+      - 'crates/socket-patch-cli/src/commands/rollback.rs'
+      - 'crates/socket-patch-cli/src/commands/vex.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/replay.rs'
+      - 'scripts/backtest-pipenv.py'
+      - '.github/workflows/pipenv-compatibility.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every 2018+ major, plus the shapes that exercise the relock and
+          # line-ending paths on the newest and the last Python-3.8 release.
+          - os: ubuntu-latest
+            versions: 2018.11.26 2020.11.15 2021.11.23 2022.12.19 2023.12.1 2024.4.1 2025.1.3 2026.8.0
+            shapes: direct
+          - os: ubuntu-latest
+            versions: 2022.12.19 2026.8.0
+            shapes: crlf marker-excluded extras category
+          - os: macos-latest
+            versions: 2018.11.26 2022.12.19 2023.12.1 2026.8.0
+            shapes: direct
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: pipenv-compat
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - name: Install the Pythons the Pipenv releases run on
+        run: uv python install 3.8 3.12
+      - name: Build the CLI
+        run: |
+          cargo build --locked -p socket-patch-cli
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/debug/socket-patch "$RUNNER_TEMP/bin/socket-patch"
+      - name: Run the Pipenv matrix
+        env:
+          SOCKET_NO_CONFIG: '1'
+          SOCKET_NO_UPDATE_CHECK: '1'
+          # The runners carry whatever patch release uv ships; the harness
+          # only needs one 3.8 and one 3.12.
+          BACKTEST_PY38: '3.8'
+          BACKTEST_PY312: '3.12'
+          PIPENV_VERSIONS: ${{ matrix.versions }}
+          PIPENV_SHAPES: ${{ matrix.shapes }}
+        run: |
+          # shellcheck disable=SC2086
+          python3 scripts/backtest-pipenv.py \
+            --socket-patch "$RUNNER_TEMP/bin/socket-patch" \
+            --socket-patch-revision "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/pipenv-compat" \
+            --versions $PIPENV_VERSIONS \
+            --shapes $PIPENV_SHAPES \
+            --modes hosted vendored agent agent-oot \
+            --jobs 4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: pipenv-compat-${{ matrix.os }}-${{ strategy.job-index }}
+          path: |
+            ${{ runner.temp }}/pipenv-compat/summary.json
+            ${{ runner.temp }}/pipenv-compat/summary.md
+          if-no-files-found: warn
+          retention-days: 7

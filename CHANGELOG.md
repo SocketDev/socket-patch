@@ -51,6 +51,43 @@ into the new version's section — see docs/releasing.md.
 
 ### Added
 
+- **Pipenv projects can use hosted patches, and vendored patches keep every
+  category.** `scan --mode hosted` rewrites every `Pipfile.lock` category
+  (`default`, `develop`, Pipenv 2022+ named categories) that pins the patched
+  release to the hosted wheel — `file` references for Pipenv 2018 and later,
+  `path` for 7–11 (probed once with `pipenv --version`; `SOCKET_PIPENV_MAJOR`
+  pins it), pipfile-spec < 6 refused — preserving markers, extras, unrelated
+  entries, the Pipfile and its content hash, with per-entry rollback
+  (`redirect_pipenv_entry`). Vendored mode keeps custom categories and extras,
+  uses `path` for wheels with extras (Pipenv 2022's file-URL bug) and refuses
+  installers older than 2018 (`pypi_pipenv_installer_unsupported`). A stale
+  Pipfile.lock only vetoes the sibling Python rewriters on a real pin/source
+  conflict (`redirect_pipenv_refused`); anything else is
+  `redirect_pipenv_skipped`. Measured across the last stable release of all
+  18 published Pipenv majors — see `docs/testing/pipenv-compatibility.md` and
+  `scripts/backtest-pipenv.py`.
+- **`Pipfile.lock` is inventoried.** Lock-only Pipenv checkouts (a fresh
+  clone with nothing installed) now discover their pins in every mode —
+  hosted redirects them, vendored fetches the pristine wheel by one of the
+  lock's recorded digests (`LockIntegrity::Sha256AnyOf`, resolved through
+  PyPI's JSON API and verified against the same digest) and agent/scan list
+  them as lockfile-only packages. Previously they discovered nothing and
+  exited 0. Socket's own references stay discoverable, so a re-scan of an
+  already-redirected or already-vendored lock-only checkout re-confirms it;
+  a lock that resolves only from private indexes is never looked up on
+  pypi.org.
+- **Pipenv's out-of-tree virtualenv is discovered.** Agent mode (bare `scan`,
+  `rollback`, `vex`) now finds `$WORKON_HOME/<dir>-<hash>[-<python>]` (the
+  `.venv` file pointer, `PIPENV_CUSTOM_VENV_NAME` and `PIPENV_PIPFILE`
+  included) exactly as Pipenv 7 through 2026 place it, instead of falling
+  through to the global interpreter's site-packages.
+- **Pipenv stale-install guard.** Pipenv never reinstalls a release that is
+  already present, so a hosted or vendored rewrite over a warm venv leaves the
+  upstream bytes installed; `redirect_pypi_stale_install` /
+  `pypi_pipenv_stale_install` now say so, naming the site-packages dir and
+  the verified remedy (`pipenv run pip uninstall -y <pkg> && pipenv sync`, or
+  a clean `pipenv --rm && pipenv sync`), and the stale purl is excluded from
+  the same-run `--vex`.
 - **Poetry projects take hosted patches, and vendored patches now cover every
   `poetry.lock` generation.** `scan --mode hosted` rewrites `poetry.lock` to a
   `[package.source] type = "url"` pointing at the Socket-hosted, SHA-256-pinned
@@ -200,6 +237,23 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Rollback after a Pipenv relock no longer refuses forever.** `pipenv lock`
+  (and `update`, and `install <other>` before 2024) regenerates a redirected
+  or vendored entry to registry shape on every Pipenv major; that is now the
+  desired end state — the hosted edit retires and the vendored record is
+  dropped (`vendor_lock_entry_relocked`) — instead of a permanent drift
+  refusal that held every pypi revert and kept the orphaned wheel dir. A
+  foreign `file`/`path` reference is still drift.
+- **Same-run `--vex` attests lock-only pypi redirects.** The confirmed purl is
+  unqualified while the ledger records the API's artifact-qualified purl;
+  both sides now match on the qualifier-stripped purl, so a lock-only Pipenv
+  (or uv) checkout no longer exits 1 `no_applicable_patches` after
+  redirecting its lock.
+- **The Pipenv installer probe runs only when a patch targets the lock**, warns
+  only when the lock was actually rewritten, resolves `pipenv` on absolute
+  `PATH` entries only (a relative entry would have executed a `pipenv` planted
+  in the scanned repository), finds `.bat`/`.cmd` shims on Windows, and takes
+  only the token after `version` (never a stray `Python 3.12` banner).
 - Hosted Python redirects now warn when installed files still contain upstream
   or modified bytes and omit those packages from same-run VEX. The read-only
   probe covers Poetry virtualenvs, repeats on re-scans, and uses persisted patch

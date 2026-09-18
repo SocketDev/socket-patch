@@ -808,7 +808,7 @@ pub(crate) async fn run_redirect_selected(
 ) -> i32 {
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::patch::redirect::{
-        rewrite_registry_redirect_with_python_metadata, DepOverride, RedirectState,
+        rewrite_registry_redirect_with_pipenv_version, DepOverride, RedirectState,
     };
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
@@ -1401,8 +1401,37 @@ pub(crate) async fn run_redirect_selected(
         }
     }
     overrides.retain(|dep| !unavailable_python_artifacts.contains(&dep.artifact_url));
-    let mut rewrite =
-        rewrite_registry_redirect_with_python_metadata(&files, &overrides, &python_metadata);
+    // The Pipfile.lock reference shape depends on the installing Pipenv
+    // (`path` for 7–11, `file` from 2018 on), so the installed release is
+    // probed (`pipenv --version`, up to 10 s) — but only when a pypi patch
+    // actually targets an entry of THIS lock: a stray Pipfile.lock in a uv /
+    // Poetry project, a re-scan with nothing left to do and any non-Python
+    // run must neither spawn Pipenv nor warn about its absence.
+    let targets_pipenv_lock =
+        socket_patch_core::patch::redirect::pipenv_lock_targets(&files, &overrides);
+    let pipenv_major = if targets_pipenv_lock {
+        socket_patch_core::utils::pipenv::installed_major(&common.cwd).await
+    } else {
+        None
+    };
+    let mut rewrite = rewrite_registry_redirect_with_pipenv_version(
+        &files,
+        &overrides,
+        &python_metadata,
+        pipenv_major,
+    );
+
+    // Unknown installer → the modern `file` shape was chosen; say so only
+    // when the lock was (or, on --dry-run, would be) rewritten.
+    if targets_pipenv_lock && pipenv_major.is_none() && rewrite.files.contains_key("Pipfile.lock") {
+        rewrite.warnings.push(socket_patch_core::patch::redirect::RewriteWarning {
+            code: "redirect_pipenv_installer_unknown".into(),
+            detail: format!(
+                "Pipenv was not found on PATH, so the Pipfile.lock references use the modern `file` form (Pipenv 2018 and later). A project installed with Pipenv 7–11 needs `path` references instead: put that pipenv on PATH or set {}=<major> and re-run `scan --mode hosted`.",
+                socket_patch_core::utils::pipenv::MAJOR_OVERRIDE_ENV
+            ),
+        });
+    }
 
     // The lockb→text migration is only KEPT when the rewrite actually landed
     // in the migrated bun.lock. Otherwise nothing was redirected there and the
@@ -1685,6 +1714,9 @@ pub(crate) async fn run_redirect_selected(
         .iter()
         .filter(
             |(purl, uuid, artifact_url, index_url, suffixed_version, go_module_path)| {
+                if rewrite.refused_pipenv_uuids.contains(uuid) {
+                    return false;
+                }
                 if rewrite.python_lock_uuids.contains(uuid) {
                     return rewrite.confirmed_python_lock_uuids.contains(uuid)
                         && !rewrite.refused_python_lock_uuids.contains(uuid);
@@ -1692,8 +1724,11 @@ pub(crate) async fn run_redirect_selected(
                 if rewrite.hatch_uuids.contains(uuid) {
                     return rewrite.confirmed_hatch_uuids.contains(uuid);
                 }
+                // A Pipfile.lock rewrite confirms its own uuids (the sibling
+                // requirements.txt rewriter may have had nothing to do).
                 if purl.starts_with("pkg:pypi/") {
-                    return rewrite.confirmed_requirements_uuids.contains(uuid);
+                    return rewrite.confirmed_pipenv_uuids.contains(uuid)
+                        || rewrite.confirmed_requirements_uuids.contains(uuid);
                 }
                 if rewrite.refused_pnpm_uuids.contains(uuid) {
                     return false;
@@ -1976,11 +2011,17 @@ pub(crate) async fn run_redirect_selected(
         )
         .await
     };
-
     let python_stale = if common.dry_run {
         StaleInstallOutcome::default()
     } else {
-        python::stale_install_warnings(common, &confirmed, &records, &ledger_records).await
+        python::stale_install_warnings(
+            common,
+            &confirmed,
+            &rewrite.confirmed_pipenv_uuids,
+            &records,
+            &ledger_records,
+        )
+        .await
     };
 
     // Cross-mode takeover: a committed vendored ledger (`.socket/vendor/state.json`)

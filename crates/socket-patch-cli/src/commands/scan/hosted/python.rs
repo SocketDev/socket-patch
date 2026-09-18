@@ -16,6 +16,7 @@ use super::{installed_stale_positive_evidence, StaleInstallOutcome};
 pub(super) async fn stale_install_warnings(
     common: &crate::args::GlobalArgs,
     confirmed: &[(String, String)],
+    pipenv_uuids: &BTreeSet<String>,
     records: &BTreeMap<String, PatchRecord>,
     ledger_records: &BTreeMap<String, PatchRecord>,
 ) -> StaleInstallOutcome {
@@ -37,14 +38,24 @@ pub(super) async fn stale_install_warnings(
     }
 
     let crawler = PythonCrawler::new();
-    let paths = crawler
-        .get_site_packages_paths(&CrawlerOptions {
-            cwd: common.cwd.clone(),
-            global: common.global,
-            global_prefix: common.global_prefix.clone(),
-        })
-        .await
-        .unwrap_or_default();
+    // Only venvs that belong to THIS project (VIRTUAL_ENV, ./.venv, ./venv,
+    // Poetry's and Pipenv's out-of-tree venvs): the crawler's project-marker
+    // fallback to the global interpreters would judge some unrelated Python's
+    // copy of the release (a tool venv on PATH) and warn about a venv the
+    // project's installer never touches — a false positive that also fails
+    // the same-run --vex. --global / --global-prefix keep their meaning.
+    let paths = if common.global || common.global_prefix.is_some() {
+        crawler
+            .get_site_packages_paths(&CrawlerOptions {
+                cwd: common.cwd.clone(),
+                global: common.global,
+                global_prefix: common.global_prefix.clone(),
+            })
+            .await
+            .unwrap_or_default()
+    } else {
+        socket_patch_core::crawlers::python_crawler::find_local_venv_site_packages(&common.cwd).await
+    };
 
     #[derive(Default)]
     struct Judgment {
@@ -56,7 +67,11 @@ pub(super) async fn stale_install_warnings(
     // the package identity. Any matching artifact variant can prove this
     // package patched; a healthy *different* package cannot.
     let mut judgments = BTreeMap::new();
+    let mut pipenv_purls: BTreeSet<String> = BTreeSet::new();
     for (purl, record) in candidates {
+        if pipenv_uuids.contains(&record.uuid) {
+            pipenv_purls.insert(purl.clone());
+        }
         let base = strip_purl_qualifiers(purl).to_string();
         for site in &paths {
             let found = crawler
@@ -82,15 +97,40 @@ pub(super) async fn stale_install_warnings(
             continue;
         }
         for purl in judgment.purls {
+            // Pipenv never reinstalls a release that is already present
+            // (`install`, `install --deploy`, `sync` all keep the installed
+            // bytes on every major), and `pipenv uninstall` rewrites the
+            // Pipfile and re-locks the patch away — name the verified remedy.
+            let remedy = if pipenv_purls.contains(&purl) {
+                let name = strip_purl_qualifiers(&purl)
+                    .strip_prefix("pkg:pypi/")
+                    .and_then(|rest| rest.split('@').next())
+                    .unwrap_or("<package>")
+                    .to_string();
+                format!(
+                    "Pipenv does not reinstall a release that is already present (`pipenv \
+                     install`, `pipenv install --deploy` and `pipenv sync` all keep those \
+                     bytes), so the rewritten Pipfile.lock only protects fresh installs. \
+                     Reinstall it from the lock without touching the Pipfile: `pipenv run pip \
+                     uninstall -y {name} && pipenv sync` (`pipenv install --deploy` before \
+                     Pipenv 2018), or `pipenv --rm && pipenv sync` for a clean virtualenv — \
+                     NOT `pipenv uninstall`, which rewrites the Pipfile and re-locks the \
+                     patch away; then `socket-patch vex --product <purl>` re-verifies the \
+                     installed files."
+                )
+            } else {
+                "Reinstall from the rewritten lock in this interpreter and verify with \
+                 `socket-patch vex`. Poetry before 1.4 may keep same-version packages: \
+                 recreate the project virtualenv or uninstall this package before \
+                 installing."
+                    .to_string()
+            };
             out.warnings.push(serde_json::json!({
                 "code": "redirect_pypi_stale_install",
                 "detail": format!(
                     "{purl} was redirected to a hosted patch, but installed files in {} \
-                     still differ from the patched hashes. Reinstall from the rewritten \
-                     lock in this interpreter and verify with `socket-patch vex`. \
-                     Poetry before 1.4 may keep same-version packages: recreate the \
-                     project virtualenv or uninstall this package before installing. \
-                     The installed files were left unchanged.",
+                     still differ from the patched hashes. {remedy} The installed files \
+                     were left unchanged.",
                     site.display()
                 ),
             }));
@@ -150,7 +190,7 @@ mod tests {
             ("one".into(), record("first-uuid", "first.py", b"patched")),
             ("two".into(), record("second-uuid", "second.py", b"patched")),
         ]);
-        let out = stale_install_warnings(&common, &confirmed, &BTreeMap::new(), &ledger).await;
+        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &BTreeMap::new(), &ledger).await;
         assert_eq!(out.stale_purls, BTreeSet::from([first.to_string()]));
         assert_eq!(out.warnings.len(), 1);
         assert!(out.warnings[0]["detail"]
@@ -165,7 +205,7 @@ mod tests {
             "variant".into(),
         ));
         ledger.insert("three".into(), record("variant", "first.py", b"upstream"));
-        let out = stale_install_warnings(&common, &confirmed, &BTreeMap::new(), &ledger).await;
+        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &BTreeMap::new(), &ledger).await;
         assert!(out.stale_purls.is_empty());
         assert!(out.warnings.is_empty());
     }

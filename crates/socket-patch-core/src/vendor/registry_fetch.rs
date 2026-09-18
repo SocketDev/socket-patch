@@ -308,9 +308,15 @@ fn pypi_json_api_base() -> String {
 /// The hash, not the filename, selects the file, so a lock that names a wheel
 /// PyPI has since re-uploaded under the same name cannot be satisfied by
 /// different bytes — the download is still verified against the same hash.
+///
+/// `candidates` is the lock's digest set: a single digest (poetry.lock names
+/// the wheel) takes the first release file carrying it; several digests
+/// (Pipfile.lock lists every release file's hash) take the pure-Python
+/// `-none-any.whl` whose digest is in the set — a platform wheel or sdist is
+/// never chosen, because the vendored wheel must install everywhere.
 async fn resolve_pypi_url_by_hash(
     entry: &LockfileEntry,
-    sha256: &str,
+    candidates: &[String],
     client: &reqwest::Client,
 ) -> Result<String, FetchError> {
     let api = format!(
@@ -332,23 +338,52 @@ async fn resolve_pypi_url_by_hash(
     let body: serde_json::Value = resp.json().await.map_err(|e| {
         FetchError::Failed(format!("PyPI JSON API response for {} is not JSON: {e}", entry.purl))
     })?;
-    body.get("urls")
+    let digest_matches = |file: &serde_json::Value| {
+        file.get("digests")
+            .and_then(|d| d.get("sha256"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|d| candidates.iter().any(|c| d.eq_ignore_ascii_case(c)))
+    };
+    let is_pure_wheel = |file: &serde_json::Value| {
+        file.get("filename")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| file.get("url").and_then(serde_json::Value::as_str))
+            .is_some_and(|name| {
+                name.split(['?', '#'])
+                    .next()
+                    .is_some_and(|n| n.ends_with("-none-any.whl"))
+            })
+    };
+    let files: Vec<&serde_json::Value> = body
+        .get("urls")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .find(|file| {
-            file.get("digests")
-                .and_then(|d| d.get("sha256"))
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|d| d.eq_ignore_ascii_case(sha256))
-        })
+        .filter(|file| digest_matches(file))
+        .collect();
+    let chosen = if candidates.len() == 1 {
+        files.first().copied()
+    } else {
+        files.iter().copied().find(|file| is_pure_wheel(file))
+    };
+    chosen
         .and_then(|file| file.get("url").and_then(serde_json::Value::as_str))
         .map(str::to_string)
         .ok_or_else(|| {
-            FetchError::Unverifiable(format!(
-                "no PyPI release file for {}@{} matches the lockfile's sha256 {sha256}",
-                entry.name, entry.version
-            ))
+            FetchError::Unverifiable(if candidates.len() == 1 {
+                format!(
+                    "no PyPI release file for {}@{} matches the lockfile's sha256 {}",
+                    entry.name, entry.version, candidates[0]
+                )
+            } else {
+                format!(
+                    "no platform-independent (`-none-any.whl`) PyPI release file for {}@{} \
+                     matches any of the {} sha256 digests the lockfile records",
+                    entry.name,
+                    entry.version,
+                    candidates.len()
+                )
+            })
         })
 }
 
@@ -361,7 +396,13 @@ async fn fetch_pypi(
         // poetry.lock records the wheel's hash but no URL: look the file up
         // by that hash (verified again after download).
         (None, LockIntegrity::Sha256Hex(sha256)) => {
-            resolve_pypi_url_by_hash(entry, sha256, client).await?
+            resolve_pypi_url_by_hash(entry, std::slice::from_ref(sha256), client).await?
+        }
+        // Pipfile.lock records every release file's hash without filenames:
+        // pick the pure wheel whose digest is in the set (verified again
+        // after download against that set).
+        (None, LockIntegrity::Sha256AnyOf(digests)) => {
+            resolve_pypi_url_by_hash(entry, digests, client).await?
         }
         (None, _) => {
             return Err(FetchError::Unverifiable(format!(
@@ -918,6 +959,17 @@ fn verify_integrity(bytes: &[u8], integrity: &LockIntegrity) -> Result<(), Fetch
             } else {
                 Err(FetchError::Failed(format!(
                     "sha256 mismatch: lockfile records {expect}, downloaded bytes hash to {actual}"
+                )))
+            }
+        }
+        LockIntegrity::Sha256AnyOf(expected) => {
+            let actual = hex::encode(Sha256::digest(bytes));
+            if expected.iter().any(|e| actual.eq_ignore_ascii_case(e)) {
+                Ok(())
+            } else {
+                Err(FetchError::Failed(format!(
+                    "sha256 mismatch: downloaded bytes hash to {actual}, which is none of the {} digests the lockfile records",
+                    expected.len()
                 )))
             }
         }
@@ -1882,6 +1934,103 @@ mod tests {
         match bare_result {
             Err(FetchError::Unverifiable(msg)) => assert!(msg.contains("sha256"), "{msg}"),
             other => panic!("expected Unverifiable, got {other:?}"),
+        }
+    }
+
+    /// Pipfile.lock records EVERY release file's digest without filenames:
+    /// the fetcher must pick the pure-Python wheel by digest (never the sdist
+    /// or a platform wheel that also matches), verify the download against
+    /// the set, and refuse when no pure wheel's digest is recorded.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pypi_digest_set_entry_picks_the_pure_wheel_by_hash() {
+        let wheel = make_zip(&[
+            ("requests/__init__.py", b"__version__ = '2.28.0'\n"),
+            ("requests-2.28.0.dist-info/RECORD", b"requests/__init__.py,sha256=abc,24\n"),
+        ]);
+        let wheel_sha = hex::encode(Sha256::digest(&wheel));
+        let sdist_sha = "0".repeat(64);
+        let platform_sha = "9".repeat(64);
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(url_path("/packages/requests-2.28.0-py3-none-any.whl"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(wheel))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(url_path("/packages/requests-2.28.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sdist bytes".to_vec()))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(url_path("/pypi/requests/2.28.0/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "urls": [
+                    {"filename": "requests-2.28.0.tar.gz", "url": format!("{}/packages/requests-2.28.0.tar.gz", mock.uri()), "digests": {"sha256": sdist_sha}},
+                    {"filename": "requests-2.28.0-cp312-cp312-manylinux_2_17_x86_64.whl", "url": format!("{}/packages/requests-2.28.0-cp312-cp312-manylinux_2_17_x86_64.whl", mock.uri()), "digests": {"sha256": platform_sha}},
+                    {"filename": "requests-2.28.0-py3-none-any.whl", "url": format!("{}/packages/requests-2.28.0-py3-none-any.whl", mock.uri()), "digests": {"sha256": wheel_sha.to_uppercase()}},
+                ]
+            })))
+            .mount(&mock)
+            .await;
+        let saved = std::env::var("SOCKET_PYPI_JSON_API").ok();
+        std::env::set_var("SOCKET_PYPI_JSON_API", format!("{}/pypi/", mock.uri()));
+        let restore = || match &saved {
+            Some(v) => std::env::set_var("SOCKET_PYPI_JSON_API", v),
+            None => std::env::remove_var("SOCKET_PYPI_JSON_API"),
+        };
+        let entry = LockfileEntry {
+            ecosystem: "pypi",
+            name: "requests".into(),
+            version: "2.28.0".into(),
+            purl: "pkg:pypi/requests@2.28.0".into(),
+            resolved: None,
+            // sdist first, like Pipenv writes them: the ORDER must not pick
+            // the sdist.
+            integrity: LockIntegrity::Sha256AnyOf(vec![
+                sdist_sha.clone(),
+                platform_sha.clone(),
+                wheel_sha.clone(),
+            ]),
+        };
+        let fetched = fetch_and_stage(&entry, &build_registry_client()).await;
+        // Only the sdist's and a platform wheel's digests recorded: no pure
+        // wheel to choose → refused before any download.
+        let no_pure = LockfileEntry {
+            integrity: LockIntegrity::Sha256AnyOf(vec![sdist_sha.clone(), platform_sha.clone()]),
+            ..entry.clone()
+        };
+        let no_pure_result = fetch_and_stage(&no_pure, &build_registry_client()).await;
+        // Digests no release file carries → refused.
+        let unknown = LockfileEntry {
+            integrity: LockIntegrity::Sha256AnyOf(vec!["1".repeat(64), "2".repeat(64)]),
+            ..entry.clone()
+        };
+        let unknown_result = fetch_and_stage(&unknown, &build_registry_client()).await;
+        restore();
+        let fetched = fetched.unwrap();
+        assert!(fetched.dir().join("requests/__init__.py").is_file());
+        assert!(fetched.url.ends_with("requests-2.28.0-py3-none-any.whl"), "{}", fetched.url);
+        for (label, result) in [("no pure wheel", no_pure_result), ("unknown", unknown_result)] {
+            match result {
+                Err(FetchError::Unverifiable(msg)) => {
+                    assert!(msg.contains("none-any.whl") && msg.contains("digests"), "{label}: {msg}")
+                }
+                other => panic!("{label}: expected Unverifiable, got {other:?}"),
+            }
+        }
+        // The verifier itself: bytes matching ANY recorded digest pass, others fail.
+        let set = LockIntegrity::Sha256AnyOf(vec![sdist_sha.clone(), wheel_sha.clone()]);
+        // "sdist bytes" is not the recorded sdist digest ("000…"), so it must fail.
+        assert!(verify_integrity(b"sdist bytes", &set).is_err());
+        let real_sdist = LockIntegrity::Sha256AnyOf(vec![
+            hex::encode(Sha256::digest(b"sdist bytes")),
+            wheel_sha,
+        ]);
+        assert!(verify_integrity(b"sdist bytes", &real_sdist).is_ok());
+        match verify_integrity(b"other", &real_sdist) {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("none of the 2 digests"), "{msg}"),
+            other => panic!("expected Failed, got {other:?}"),
         }
     }
 
