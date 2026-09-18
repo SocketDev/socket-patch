@@ -46,6 +46,7 @@ pub(super) fn rewrite_poetry(
     // Intake gate ONCE per dep, not once per lock file (uv parity).
     let mut usable: Vec<(&DepOverride, &str)> = Vec::new();
     for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
+        result.python_lock_uuids.insert(dep.patch_uuid.clone());
         match dep.integrity.sha256.as_deref() {
             Some(sha256) => usable.push((dep, sha256)),
             None => result.warnings.push(RewriteWarning {
@@ -83,6 +84,7 @@ pub(super) fn rewrite_poetry(
                             }
                         }
                         Err(detail) => {
+                            result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
                             result.warnings.push(RewriteWarning {
                                 code: "redirect_poetry_lock_unsupported".into(),
                                 detail: format!("{path}: {detail}"),
@@ -90,6 +92,7 @@ pub(super) fn rewrite_poetry(
                             continue;
                         }
                     }
+                    result.confirmed_python_lock_uuids.insert(dep.patch_uuid.clone());
                     content = rewritten;
                     if !stale_warned {
                         if let Some(format) = pre_1_4_writer(&content) {
@@ -122,15 +125,20 @@ pub(super) fn rewrite_poetry(
                     }
                 }
                 // Already redirected to this artifact (idempotent re-scan).
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => {
+                    result.confirmed_python_lock_uuids.insert(dep.patch_uuid.clone());
+                }
                 Ok(None) => result.warnings.push(RewriteWarning {
                     code: "redirect_poetry_entry_not_found".into(),
                     detail: format!("no {path} entry for {}@{}", dep.name, dep.version),
                 }),
-                Err(detail) => result.warnings.push(RewriteWarning {
-                    code: "redirect_poetry_lock_unsupported".into(),
-                    detail: format!("{path}: {detail}"),
-                }),
+                Err(detail) => {
+                    result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_poetry_lock_unsupported".into(),
+                        detail: format!("{path}: {detail}"),
+                    });
+                }
             }
         }
         if content != *original {

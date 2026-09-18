@@ -19,3 +19,5 @@ pub use crate::api::date;
 pub use crate::crawlers::fuzzy_match;
 pub use crate::manifest::cleanup_blobs;
 pub use crate::telemetry;
+
+pub mod hatch;

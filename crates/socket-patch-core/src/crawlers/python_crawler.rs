@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use crate::utils::fs::read_regular_to_string;
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
 // ---------------------------------------------------------------------------
@@ -530,7 +531,7 @@ fn expand_home(raw: &str, var: &impl Fn(&str) -> Option<String>) -> PathBuf {
 pub async fn find_poetry_virtualenv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     let var = |name: &str| std::env::var(name).ok();
     let has = |leaf: &str| cwd.join(leaf).is_file();
-    let pyproject = match tokio::fs::read_to_string(cwd.join("pyproject.toml")).await {
+    let pyproject = match read_regular_to_string(&cwd.join("pyproject.toml")).await {
         Ok(text) => text,
         Err(_) => return Vec::new(),
     };
@@ -542,12 +543,12 @@ pub async fn find_poetry_virtualenv_site_packages(cwd: &Path) -> Vec<PathBuf> {
     if names.is_empty() {
         return Vec::new();
     }
-    let local = match tokio::fs::read_to_string(cwd.join("poetry.toml")).await {
+    let local = match read_regular_to_string(&cwd.join("poetry.toml")).await {
         Ok(text) => PoetryVirtualenvConfig::from_toml(&text),
         Err(_) => PoetryVirtualenvConfig::default(),
     };
     let user = match poetry_user_config_path(&var) {
-        Some(path) => match tokio::fs::read_to_string(&path).await {
+        Some(path) => match read_regular_to_string(&path).await {
             Ok(text) => PoetryVirtualenvConfig::from_toml(&text),
             Err(_) => PoetryVirtualenvConfig::default(),
         },
@@ -1054,6 +1055,42 @@ pub fn parse_python_site_packages_output(stdout: &str) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use crate::utils::purl::parse_pypi_purl;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hatch_discovery_does_not_block_on_fifo_configuration() {
+        for filename in ["pyproject.toml", "poetry.toml"] {
+            let directory = tempfile::tempdir().unwrap();
+            let fifo = directory.path().join(filename);
+            if filename == "poetry.toml" {
+                std::fs::write(
+                    directory.path().join("pyproject.toml"),
+                    "[tool.poetry]\nname='hatch-project'\n",
+                )
+                .unwrap();
+            }
+            assert!(tokio::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .await
+                .unwrap()
+                .success());
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                find_poetry_virtualenv_site_packages(directory.path()),
+            )
+            .await;
+            if result.is_err() {
+                let release = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&fifo)
+                    .unwrap();
+                drop(release);
+            }
+            assert!(result.unwrap().is_empty(), "{filename}");
+        }
+    }
 
     // ── Poetry out-of-tree virtualenv discovery ─────────────────────────────
 
