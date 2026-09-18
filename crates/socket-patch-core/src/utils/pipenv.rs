@@ -6,6 +6,10 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+// Only the Windows PATHEXT test below asserts shim detection.
+#[cfg(all(test, windows))]
+use crate::utils::process::is_batch_shim;
+
 /// Pins the answer without spawning anything: CI images without pipenv on
 /// PATH, or a project installed with a different release than the machine's
 /// default pipenv.
@@ -44,60 +48,11 @@ fn parse_major(output: &str) -> Option<u32> {
 /// (`.`, an empty component) would execute a `pipenv` planted in the
 /// repository being scanned. On Windows every `PATHEXT` extension is tried,
 /// so `pipenv.exe` and the `pipenv.bat` / `pipenv.cmd` shims (pyenv-win,
-/// hand-written wrappers) are both found.
+/// hand-written wrappers) are both found. The rule lives in
+/// [`crate::utils::process::resolve_tool_with`], shared with every other
+/// tool the CLI spawns inside a project (`bun`).
 fn resolve_on_path(var: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let path = var("PATH")?;
-    let extensions: Vec<String> = if cfg!(windows) {
-        var("PATHEXT")
-            .map(|value| {
-                value
-                    .to_string_lossy()
-                    .split(';')
-                    .filter(|ext| !ext.is_empty())
-                    .map(|ext| ext.to_ascii_lowercase())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|list| !list.is_empty())
-            .unwrap_or_else(|| vec![".exe".into(), ".bat".into(), ".cmd".into()])
-    } else {
-        vec![String::new()]
-    };
-    for dir in std::env::split_paths(&path) {
-        if !dir.is_absolute() {
-            continue;
-        }
-        for ext in &extensions {
-            let candidate = dir.join(format!("pipenv{ext}"));
-            if candidate.is_file() && is_executable(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-/// A plain file that cannot be executed (a stray `pipenv` data file on PATH)
-/// is skipped in favour of the next entry, like execvp does; Windows has no
-/// mode bits, PATHEXT is the executability rule there.
-fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        true
-    }
-}
-
-fn is_batch_shim(program: &Path) -> bool {
-    cfg!(windows)
-        && program.extension().is_some_and(|ext| {
-            let ext = ext.to_string_lossy().to_ascii_lowercase();
-            ext == "bat" || ext == "cmd"
-        })
+    crate::utils::process::resolve_tool_with("pipenv", var)
 }
 
 /// The major of the `pipenv` on PATH (`11`, `2018`, `2026`, …), or `None`
@@ -112,13 +67,9 @@ pub async fn installed_major(root: &Path) -> Option<u32> {
         return Some(forced);
     }
     let program = resolve_on_path(&|name| std::env::var_os(name))?;
-    let mut command = if is_batch_shim(&program) {
-        let mut command = tokio::process::Command::new("cmd.exe");
-        command.arg("/C").arg(&program);
-        command
-    } else {
-        tokio::process::Command::new(&program)
-    };
+    // `.bat` / `.cmd` shims launch through `cmd.exe /C`, real executables
+    // directly — the shared launcher decides.
+    let mut command = tokio::process::Command::from(crate::utils::process::command_for(&program));
     // The version banner does not depend on a project, so the probe runs in a
     // NEUTRAL directory: with the scanned repository as cwd, Pipenv would read
     // its `.env`, `Pipfile` and `.venv` pointer — committed, attacker-shaped

@@ -16,7 +16,112 @@
 //! production callers either build the helper with the default
 //! runner or thread a singleton.
 
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// The executable `name` on ABSOLUTE `PATH` entries only, or `None` when
+/// no entry holds one.
+///
+/// Shared by every tool the CLI spawns with the scanned project as its
+/// working directory (`bun`, `pipenv`): a relative `PATH` component (`.`,
+/// an empty string) resolves against the child's cwd, so a bare
+/// `Command::new("bun")` would execute a `bun` planted in the repository
+/// being scanned — and on macOS `posix_spawnp` can run BOTH the planted
+/// file and the next absolute entry's binary for one spawn. Skipping
+/// non-absolute entries closes that; callers must then spawn the RESOLVED
+/// path, never the bare name.
+///
+/// On Windows every `PATHEXT` extension is tried (falling back to
+/// `.exe`/`.bat`/`.cmd` when the variable is unset or empty), so an npm-global
+/// `bun.cmd` / pyenv-win `pipenv.bat` shim is found where Rust's own
+/// `Command` resolution — which appends only `.exe` — would report NotFound.
+/// A plain file without execute permission is skipped like execvp does.
+pub fn resolve_tool(name: &str) -> Option<PathBuf> {
+    resolve_tool_with(name, &|var| std::env::var_os(var))
+}
+
+/// [`resolve_tool`] over an injected environment reader (tests).
+pub(crate) fn resolve_tool_with(
+    name: &str,
+    var: &impl Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    let path = var("PATH")?;
+    let extensions: Vec<String> = if cfg!(windows) {
+        var("PATHEXT")
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .filter(|ext| !ext.is_empty())
+                    .map(|ext| ext.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|list| !list.is_empty())
+            .unwrap_or_else(|| vec![".exe".into(), ".bat".into(), ".cmd".into()])
+    } else {
+        vec![String::new()]
+    };
+    for dir in std::env::split_paths(&path) {
+        if !dir.is_absolute() {
+            continue;
+        }
+        for ext in &extensions {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() && is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// A plain file that cannot be executed (a stray `bun` data file on PATH)
+/// is skipped in favour of the next entry, like execvp does; Windows has no
+/// mode bits, PATHEXT is the executability rule there.
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+/// `.bat` / `.cmd` files are not executables: `CreateProcess` refuses them,
+/// so they must be launched through `cmd.exe /C`. Always false off Windows.
+pub(crate) fn is_batch_shim(program: &Path) -> bool {
+    cfg!(windows)
+        && program.extension().is_some_and(|ext| {
+            let ext = ext.to_string_lossy().to_ascii_lowercase();
+            ext == "bat" || ext == "cmd"
+        })
+}
+
+/// A [`Command`] that launches the RESOLVED `program`: directly for a real
+/// executable, through `cmd.exe /C` for a Windows batch shim. Callers add
+/// their own args / cwd / env; `tokio::process::Command::from` lifts it into
+/// the async runtime unchanged.
+pub fn command_for(program: &Path) -> Command {
+    if is_batch_shim(program) {
+        let mut command = Command::new("cmd.exe");
+        command.arg("/C").arg(program);
+        command
+    } else {
+        Command::new(program)
+    }
+}
+
+/// [`resolve_tool`] + [`command_for`]: the command for the tool `name` found
+/// on an absolute PATH entry, or `None` when there is none — the caller
+/// decides how "not installed" degrades (a warning, a refusal).
+pub fn tool_command(name: &str) -> Option<Command> {
+    resolve_tool(name).map(|program| command_for(&program))
+}
 
 /// Run an external binary with the given args and return its
 /// stdout, trimmed, when the spawn succeeded AND the process exited
@@ -149,5 +254,177 @@ mod tests {
         let runner = SystemCommandRunner;
         let out = runner.run("sh", &["-c", "printf '%s' \"$1\"", "sh", "forwarded"]);
         assert_eq!(out.as_deref(), Some("forwarded"));
+    }
+
+    // ───────────────────────── resolve_tool / tool_command ─────────────────────────
+
+    /// Mark an existing file executable (no-op off Unix: PATHEXT rules there).
+    fn set_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = path;
+    }
+
+    /// An empty executable file — enough for the resolver, which only
+    /// stats candidates.
+    fn make_executable(path: &Path) {
+        std::fs::write(path, b"").unwrap();
+        set_executable(path);
+    }
+
+    /// The load-bearing rule: `.`, the empty component and a bare relative
+    /// dir name never resolve — only the absolute entry wins, even when it
+    /// comes LAST. A repo-planted `bun` under a relative entry is ignored.
+    #[test]
+    fn resolve_tool_skips_relative_entries_and_finds_absolute_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let leaf = if cfg!(windows) { "bun.exe" } else { "bun" };
+        make_executable(&bin.join(leaf));
+        let planted = tmp.path().join("planted");
+        std::fs::create_dir_all(&planted).unwrap();
+        make_executable(&planted.join(leaf));
+        let joined = std::env::join_paths([
+            PathBuf::from("."),
+            PathBuf::from(""),
+            PathBuf::from("planted"),
+            bin.clone(),
+        ])
+        .unwrap();
+        let var = |name: &str| (name == "PATH").then(|| joined.clone());
+        assert_eq!(resolve_tool_with("bun", &var), Some(bin.join(leaf)));
+
+        let only_relative =
+            std::env::join_paths([PathBuf::from("."), PathBuf::from("planted")]).unwrap();
+        let var = |name: &str| (name == "PATH").then(|| only_relative.clone());
+        assert_eq!(resolve_tool_with("bun", &var), None);
+        let none = |_: &str| None::<OsString>;
+        assert_eq!(resolve_tool_with("bun", &none), None);
+    }
+
+    /// The name is honoured exactly: a `bunx` beside no `bun` is not `bun`,
+    /// and a directory named `bun` is not a program.
+    #[test]
+    fn resolve_tool_matches_the_exact_leaf_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(bin.join("bun")).unwrap();
+        let leaf = if cfg!(windows) { "bunx.exe" } else { "bunx" };
+        make_executable(&bin.join(leaf));
+        let joined = std::env::join_paths([bin.clone()]).unwrap();
+        let var = |name: &str| (name == "PATH").then(|| joined.clone());
+        assert_eq!(resolve_tool_with("bun", &var), None);
+        assert_eq!(resolve_tool_with("bunx", &var), Some(bin.join(leaf)));
+    }
+
+    /// A non-executable data file squatting the name is skipped in favour of
+    /// the next entry's real program (execvp semantics).
+    #[cfg(unix)]
+    #[test]
+    fn resolve_tool_skips_non_executable_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(data.join("bun"), b"not a program").unwrap();
+        std::fs::set_permissions(data.join("bun"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        make_executable(&bin.join("bun"));
+        let joined = std::env::join_paths([data.clone(), bin.clone()]).unwrap();
+        let var = |name: &str| (name == "PATH").then(|| joined.clone());
+        assert_eq!(resolve_tool_with("bun", &var), Some(bin.join("bun")));
+    }
+
+    /// Off Windows nothing is a batch shim (a `bun.cmd` file on a Unix PATH
+    /// is just a file) and the command spawns the resolved path directly —
+    /// the program is the absolute path, not the bare name.
+    #[cfg(unix)]
+    #[test]
+    fn command_for_spawns_the_resolved_path_directly_on_unix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let shim = bin.join("bun");
+        std::fs::write(&shim, "#!/bin/sh\nprintf 'resolved:%s' \"$0\"\n").unwrap();
+        set_executable(&shim);
+        assert!(!is_batch_shim(&bin.join("bun.cmd")));
+        let joined = std::env::join_paths([bin.clone()]).unwrap();
+        let var = |name: &str| (name == "PATH").then(|| joined.clone());
+        let program = resolve_tool_with("bun", &var).expect("the shim resolves");
+        let command = command_for(&program);
+        assert_eq!(command.get_program(), shim.as_os_str());
+        assert_eq!(
+            command.get_args().count(),
+            0,
+            "no cmd.exe wrapper off Windows"
+        );
+        let out = command_for(&program).output().expect("spawn the shim");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("resolved:{}", shim.display()),
+            "the child sees its own absolute path as argv[0]"
+        );
+    }
+
+    /// Windows: every PATHEXT extension is tried (case-insensitively), so a
+    /// `.cmd`/`.bat` shim is found and launched through `cmd.exe /C`; an
+    /// unset PATHEXT falls back to the exe/bat/cmd triple.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_tool_honours_pathext_and_wraps_batch_shims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("bun.cmd"), b"@echo off\r\necho 1.2.3\r\n").unwrap();
+        let joined = std::env::join_paths([bin.clone()]).unwrap();
+        let with_pathext = |name: &str| match name {
+            "PATH" => Some(joined.clone()),
+            "PATHEXT" => Some(OsString::from(".COM;.EXE;.BAT;.CMD")),
+            _ => None,
+        };
+        let found = resolve_tool_with("bun", &with_pathext).expect("bun.cmd resolves via PATHEXT");
+        assert_eq!(found, bin.join("bun.cmd"));
+        assert!(is_batch_shim(&found));
+        let command = command_for(&found);
+        assert_eq!(command.get_program(), std::ffi::OsStr::new("cmd.exe"));
+        let args: Vec<OsString> = command.get_args().map(|a| a.to_os_string()).collect();
+        assert_eq!(
+            args,
+            vec![OsString::from("/C"), found.clone().into_os_string()]
+        );
+
+        // PATHEXT unset → the default triple still finds the shim.
+        let no_pathext = |name: &str| (name == "PATH").then(|| joined.clone());
+        assert_eq!(
+            resolve_tool_with("bun", &no_pathext),
+            Some(bin.join("bun.cmd"))
+        );
+
+        // A PATHEXT that does NOT list .cmd hides the shim (Windows semantics).
+        let exe_only = |name: &str| match name {
+            "PATH" => Some(joined.clone()),
+            "PATHEXT" => Some(OsString::from(".EXE")),
+            _ => None,
+        };
+        assert_eq!(resolve_tool_with("bun", &exe_only), None);
+
+        // A real .exe is spawned directly, never through cmd.exe.
+        std::fs::write(bin.join("bun.exe"), b"").unwrap();
+        let exe = resolve_tool_with("bun", &exe_only).expect("bun.exe resolves");
+        assert!(!is_batch_shim(&exe));
+        assert_eq!(command_for(&exe).get_program(), exe.as_os_str());
+    }
+
+    /// `tool_command` reads the REAL environment: a name that cannot be on
+    /// any PATH yields None (the caller's "not installed" arm).
+    #[test]
+    fn tool_command_is_none_for_an_absent_tool() {
+        assert!(tool_command("definitely-not-a-real-binary-1234567").is_none());
     }
 }
