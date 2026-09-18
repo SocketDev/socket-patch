@@ -28,6 +28,10 @@ uuid = { workspace = true }
 regex = { workspace = true }
 glob = { workspace = true }
 tempfile = { workspace = true }
+# The hosted redirect ledger carries a migrated bun.lockb's pre-migration
+# bytes as standard base64 (`commands/scan/hosted.rs`); the core replay
+# decodes them with the same crate.
+base64 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # main.rs restores the default SIGPIPE disposition so piped invocations
