@@ -1071,20 +1071,74 @@ pub(crate) async fn vendor_records(
                     .as_ref()
                     .is_some_and(|l| l.records.keys().any(|k| canon(k) == canon(candidate)));
                 if claimed && common.dry_run {
-                    record_warning(
-                        env,
+                    // Probe the takeover exactly as the wet run would — the
+                    // per-purl revert's dry run resolves every inverse and
+                    // drift check, flushes nothing, and mutates only this
+                    // throwaway clone — so the preview never promises a
+                    // takeover the wet run then refuses (a drifted lock, a
+                    // corrupt edit): those surface here with the SAME
+                    // `redirect_revert_failed` code and detail.
+                    let mut probe = redirect_ledger.clone().expect("claimed implies Some");
+                    match socket_patch_core::patch::redirect::revert_redirect_purl(
+                        &common.cwd,
+                        &mut probe,
                         candidate,
-                        &VendorWarning::new(
-                            "vendor_would_revert_redirect",
-                            format!(
-                                "{} is hosted-redirected; a non-dry-run vendor will \
-                                 revert the hosted redirect edits first, then vendor \
-                                 (mode takeover)",
-                                normalize_purl(candidate)
-                            ),
-                        ),
-                        common,
-                    );
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(revert) => {
+                            record_warning(
+                                env,
+                                candidate,
+                                &VendorWarning::new(
+                                    "vendor_would_revert_redirect",
+                                    format!(
+                                        "{} is hosted-redirected; a non-dry-run vendor will \
+                                         revert the hosted redirect edits first, then vendor \
+                                         (mode takeover)",
+                                        normalize_purl(candidate)
+                                    ),
+                                ),
+                                common,
+                            );
+                            // The backend preview below reads the lock from
+                            // disk, where the hosted wiring is still live. A
+                            // flavor whose hosted rewrite keeps the entry's
+                            // `name@version` identity (yarn, pnpm, package-lock)
+                            // previews fine over it; bun's hosted rewrite
+                            // REPLACES that spec, so the backend would refuse a
+                            // `vendor_lock_entry_not_found` the wet run never
+                            // sees. When the revert would rewrite a lock this
+                            // backend reads, the advisory already states the
+                            // whole plan (revert, then vendor) and the preview
+                            // stops here — the hosted dry run makes the same
+                            // choice after `redirect_would_revert_vendored`.
+                            if revert.reverted_files.iter().any(|f| f == "bun.lock") {
+                                continue;
+                            }
+                        }
+                        Err(detail) => {
+                            has_errors = true;
+                            env.record(
+                                PatchEvent::new(PatchAction::Failed, candidate.clone()).with_error(
+                                    "redirect_revert_failed",
+                                    format!(
+                                        "cannot vendor over the live hosted redirect: \
+                                         {detail}"
+                                    ),
+                                ),
+                            );
+                            if !common.silent && !common.json {
+                                eprintln!(
+                                    "Cannot vendor {}: cannot revert the hosted redirect: \
+                                     {detail}",
+                                    normalize_purl(candidate)
+                                );
+                            }
+                            continue;
+                        }
+                    }
                 } else if claimed {
                     let ledger = redirect_ledger.as_mut().expect("claimed implies Some");
                     match socket_patch_core::patch::redirect::revert_redirect_purl(
