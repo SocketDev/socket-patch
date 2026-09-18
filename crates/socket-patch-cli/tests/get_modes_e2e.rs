@@ -672,7 +672,14 @@ async fn get_vendored_then_hosted_takes_over_cleanly() {
     let (code, _stdout, stderr) = run_get(
         tmp.path(),
         &server.uri(),
-        &[UUID1, "--mode", "vendored", "--json", "--vendor-source", "build"],
+        &[
+            UUID1,
+            "--mode",
+            "vendored",
+            "--json",
+            "--vendor-source",
+            "build",
+        ],
     );
     assert_eq!(code, 0, "vendored step failed: {stderr}");
     let artifact = tmp
@@ -794,8 +801,11 @@ async fn get_hosted_runs_release_variant_filter() {
     )
     .unwrap();
 
-    let (code, stdout, stderr) =
-        run_get(tmp.path(), &server.uri(), &[GHSA, "--mode", "hosted", "--json"]);
+    let (code, stdout, stderr) = run_get(
+        tmp.path(),
+        &server.uri(),
+        &[GHSA, "--mode", "hosted", "--json"],
+    );
     assert_eq!(code, 0, "stderr: {stderr}\nstdout: {stdout}");
     let envelope = parse_single_json_doc(&stdout);
     let warnings = envelope["warnings"].to_string();
@@ -837,5 +847,204 @@ async fn get_pnp_only_narrowing_message_names_the_layout() {
     assert!(
         stderr.contains("yarn_pnp_unsupported"),
         "the layout refusal warning must be on stderr; stderr:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bun vendored-mode preflight through `get`: --silent, --dry-run, --save-only
+// ---------------------------------------------------------------------------
+
+const ENCODED1: &str = "pkg%3Anpm%2Fgetmodes-pkg%401.0.0";
+const BUN_WS_CODE: &str = "vendor_bun_workspace_unsupported";
+
+/// The per-package search for the exact PURL identifier path.
+async fn mock_by_package(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG}/patches/by-package/{ENCODED1}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID1, "purl": PURL1,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "get-modes fixture", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+}
+
+/// `write_project` re-locked by bun 1.3.14 as a workspace: the real
+/// lockfileVersion-1 grammar (1-tuple `workspace:` entry, blank line
+/// between entries, trailing commas), `getmodes-pkg` declared by the
+/// member — the shape the vendored gate refuses.
+fn write_bun_workspace_project(root: &Path) {
+    write_project(root);
+    std::fs::remove_file(root.join("package-lock.json")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "consumer", "version": "0.0.0", "private": true, "workspaces": ["packages/*"], "dependencies": { "app": "workspace:*" } }"#,
+    )
+    .unwrap();
+    let app = root.join("packages/app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("package.json"),
+        format!(
+            r#"{{ "name": "app", "version": "1.0.0", "dependencies": {{ "{NAME}": "1.0.0" }} }}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("bun.lock"),
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"configVersion\": 1,\n  \"workspaces\": {{\n    \"\": {{\n      \"name\": \"consumer\",\n      \"dependencies\": {{\n        \"app\": \"workspace:*\",\n      }},\n    }},\n    \"packages/app\": {{\n      \"name\": \"app\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": {{\n        \"{NAME}\": \"1.0.0\",\n      }},\n    }},\n  }},\n  \"packages\": {{\n    \"app\": [\"app@workspace:packages/app\"],\n\n    \"{NAME}\": [\"{NAME}@1.0.0\", \"\", {{}}, \"sha512-UPSTREAMupstream==\"],\n  }}\n}}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// `--silent` is "errors only": the Bun refusal is an error, so BOTH
+/// identifier kinds keep it on stderr — code-tagged — with an empty
+/// stdout and exit 1. Regression guard: the refusal lines were gated on
+/// `!silent`, so a `--silent` run exited 1 with no text anywhere.
+#[tokio::test]
+async fn get_vendored_refusal_visible_under_silent() {
+    let server = MockServer::start().await;
+    mock_view(&server, UUID1, PURL1).await;
+    mock_by_package(&server).await;
+
+    for (label, ident) in [("purl", PURL1), ("uuid", UUID1)] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bun_workspace_project(tmp.path());
+        let lock_before = std::fs::read(tmp.path().join("bun.lock")).unwrap();
+        let (code, stdout, stderr) = run_get(
+            tmp.path(),
+            &server.uri(),
+            &[
+                ident,
+                "--mode",
+                "vendored",
+                "--vendor-source",
+                "build",
+                "--silent",
+            ],
+        );
+        assert_eq!(code, 1, "{label}: stdout={stdout}\nstderr={stderr}");
+        assert!(
+            stdout.trim().is_empty(),
+            "{label}: --silent must print nothing on stdout:\n{stdout}"
+        );
+        assert!(
+            stderr.contains(BUN_WS_CODE),
+            "{label}: --silent must keep the refusal code on stderr:\n{stderr}"
+        );
+        if label == "purl" {
+            assert!(
+                stderr.contains(&format!("[error] {PURL1} ({BUN_WS_CODE}):")),
+                "purl path prints the code-tagged per-patch line:\n{stderr}"
+            );
+        } else {
+            assert!(
+                stderr.contains(&format!("Error ({BUN_WS_CODE}):")),
+                "uuid path prints the code-tagged Error line:\n{stderr}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(tmp.path().join("bun.lock")).unwrap(),
+            lock_before,
+            "{label}: refused runs never touch the lock"
+        );
+        assert!(!tmp.path().join(".socket/vendor").exists(), "{label}");
+    }
+}
+
+/// The vendored dry-run preview names what the wet run would refuse:
+/// `would_refuse` + `errorCode` + `error` (additive) instead of
+/// `would_vendor`, on both identifier kinds — exit 0, `status:"success"`,
+/// nothing written, exactly like every other vendored preview.
+#[tokio::test]
+async fn get_vendored_dry_run_reports_bun_refusal() {
+    let server = MockServer::start().await;
+    mock_view(&server, UUID1, PURL1).await;
+    mock_by_package(&server).await;
+
+    for (label, ident) in [("purl", PURL1), ("uuid", UUID1)] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bun_workspace_project(tmp.path());
+        let lock_before = std::fs::read(tmp.path().join("bun.lock")).unwrap();
+        let (code, stdout, stderr) = run_get(
+            tmp.path(),
+            &server.uri(),
+            &[
+                ident,
+                "--mode",
+                "vendored",
+                "--vendor-source",
+                "build",
+                "--dry-run",
+                "--json",
+            ],
+        );
+        assert_eq!(code, 0, "{label}: stdout={stdout}\nstderr={stderr}");
+        let v = parse_single_json_doc(&stdout);
+        assert_eq!(v["status"], "success", "{label}: {v}");
+        assert_eq!(v["found"], 1, "{label}: {v}");
+        assert_eq!(v["vendor"]["dryRun"], true, "{label}: {v}");
+        let rec = &v["vendor"]["patches"][0];
+        assert_eq!(rec["purl"], PURL1, "{label}: {v}");
+        assert_eq!(rec["uuid"], UUID1, "{label}: {v}");
+        assert_eq!(rec["action"], "would_refuse", "{label}: {v}");
+        assert_eq!(rec["errorCode"], BUN_WS_CODE, "{label}: {v}");
+        assert!(
+            rec["error"].as_str().is_some_and(|d| !d.is_empty()),
+            "{label}: {v}"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("bun.lock")).unwrap(),
+            lock_before,
+            "{label}: dry-run must not touch the lock"
+        );
+        assert!(
+            !tmp.path().join(".socket").exists(),
+            "{label}: vendored dry-run is a preview: no manifest, no artifacts, no ledger"
+        );
+    }
+}
+
+/// The preflight is scoped to the vendored posture: an agent-mode
+/// `get --save-only` on the same refused workspace project records the
+/// patch and persists the blob like on any other project (record-only
+/// intent has no Bun precondition; the fresh-clone record→vendor flow
+/// keeps working).
+#[tokio::test]
+async fn get_save_only_agent_ignores_bun_preflight() {
+    let server = MockServer::start().await;
+    mock_view(&server, UUID1, PURL1).await;
+    mock_by_package(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_workspace_project(tmp.path());
+
+    let (code, stdout, stderr) =
+        run_get(tmp.path(), &server.uri(), &[PURL1, "--save-only", "--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["status"], "success", "{v}");
+    assert_eq!(v["patches"][0]["action"], "added", "{v}");
+    assert!(v["patches"][0].get("errorCode").is_none(), "{v}");
+    assert_eq!(requests_containing(&server, "/patches/view/").await, 1);
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["patches"][PURL1]["uuid"], UUID1, "{manifest}");
+    assert!(
+        tmp.path()
+            .join(".socket/blobs")
+            .join(common::git_sha256(AFTER_BYTES))
+            .is_file(),
+        "the agent download persists the after-blob"
     );
 }
