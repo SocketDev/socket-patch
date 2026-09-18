@@ -34,10 +34,10 @@ use serde_json::Value;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::vendor::bun_lock_text::{
-    check_lock_version, decode_json_string, packages_bounds, parse_entry_line,
-    parse_packages_section, split_name_spec, BunEntry,
+    check_lock_version, decode_json_string, has_workspace_packages, lock_version, packages_bounds,
+    parse_entry_line, parse_packages_section, split_name_spec, BunEntry,
 };
 
 use super::common::{already_patched_result, refused};
@@ -55,6 +55,47 @@ const BUN_LOCK: &str = "bun.lock";
 /// The `WiringRecord.kind` this backend owns: key = the `packages` map key,
 /// original/new = the verbatim entry LINE.
 const KIND_LOCK_PACKAGE: &str = "bun_lock_package";
+
+fn check_workspace_compatibility(
+    text: &str,
+    entries: &[BunEntry],
+) -> Result<(), (&'static str, String)> {
+    if lock_version(text) != Some(2) && has_workspace_packages(entries) {
+        return Err((
+            "vendor_bun_workspace_unsupported",
+            "Bun text locks before version 2 resolve workspace tarballs relative to the \
+             workspace rather than the lockfile; upgrade to Bun >= 1.4 and run `bun install` \
+             before vendoring workspace dependencies"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse incompatible Bun projects before downloading records into the manifest.
+/// Other package managers are left to their own backends.
+pub async fn preflight_vendor(project_root: &Path) -> Result<(), (&'static str, String)> {
+    let path = project_root.join(BUN_LOCK);
+    let text = match read_regular_to_string(&path).await {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if project_root.join("bun.lockb").exists() {
+                return Err((
+                    "vendor_bun_lockb_unsupported",
+                    "Bun binary lockfiles cannot be vendored; upgrade Bun and generate bun.lock"
+                        .to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(("vendor_lockfile_missing", error.to_string())),
+    };
+    check_lock_version(&text).map_err(|detail| ("vendor_lockfile_version_unsupported", detail))?;
+    let lines = text.split('\n').map(str::to_string).collect::<Vec<_>>();
+    let entries = parse_packages_section(&lines)
+        .map_err(|detail| ("vendor_lockfile_version_unsupported", detail))?;
+    check_workspace_compatibility(&text, &entries)
+}
 
 /// Vendor one installed npm package into a bun project (see the module doc).
 /// Same contract as `npm_lock::vendor_npm`: refuse-early / wire-last,
@@ -82,7 +123,7 @@ pub(crate) async fn vendor_bun(
     let (name, version) = (coords.name.as_str(), coords.version.as_str());
 
     // ── 2. Read + strictly parse the lock (refuse before any write) ──────
-    let lock_text = match tokio::fs::read_to_string(project_root.join(BUN_LOCK)).await {
+    let lock_text = match read_regular_to_string(&project_root.join(BUN_LOCK)).await {
         Ok(text) => text,
         Err(e) => {
             return refused(
@@ -106,6 +147,10 @@ pub(crate) async fn vendor_bun(
             );
         }
     };
+
+    if let Err((code, detail)) = check_workspace_compatibility(&lock_text, &entries) {
+        return refused(code, detail);
+    }
 
     // ── 3. Pre-flight: at least one rewritable instance ──────────────────
     let target_spec = format!("{name}@{version}");
@@ -1224,6 +1269,85 @@ mod tests {
             tgz_first,
             "tarball byte-identical across re-runs"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_workspace_tarballs_refuse_before_writes() {
+        for version in [0, 1, 2] {
+            let lock = BN3_BEFORE_LOCK
+                .replace("\"lockfileVersion\": 1", &format!("\"lockfileVersion\": {version}"))
+                .replace("  \"packages\": {", "  \"packages\": {\n    \"consumer\": [\"consumer@workspace:packages/consumer\"],");
+            let fx = fixture_with(&lock, "node_modules/left-pad").await;
+            if version < 2 {
+                assert_eq!(
+                    preflight_vendor(fx.root()).await.unwrap_err().0,
+                    "vendor_bun_workspace_unsupported"
+                );
+                expect_refused(fx.vendor(false).await, "vendor_bun_workspace_unsupported");
+                assert_eq!(fx.read_lock().await, lock);
+                assert!(!fx.root().join(".socket/vendor").exists());
+            } else {
+                assert!(preflight_vendor(fx.root()).await.is_ok());
+                let (_, entry, _) = expect_done(fx.vendor(false).await);
+                assert!(entry.is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_v0_vendor_and_revert_preserve_bytes() {
+        let lock = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1", "\"lockfileVersion\": 0");
+        let fx = fixture_with(&lock, "node_modules/left-pad").await;
+        assert!(preflight_vendor(fx.root()).await.is_ok());
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(fx.read_lock().await.contains(".socket/vendor/npm/"));
+        let entry = entry.unwrap();
+        let result = revert_bun(&entry, fx.root(), false).await;
+        assert!(result.success);
+        assert_eq!(fx.read_lock().await, lock);
+    }
+
+    #[tokio::test]
+    async fn download_preflight_refuses_binary_and_malformed_bun_locks() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(preflight_vendor(root.path()).await.is_ok());
+        tokio::fs::write(root.path().join("bun.lockb"), b"binary")
+            .await
+            .unwrap();
+        assert_eq!(
+            preflight_vendor(root.path()).await.unwrap_err().0,
+            "vendor_bun_lockb_unsupported"
+        );
+        tokio::fs::write(root.path().join(BUN_LOCK), BN3_BEFORE_LOCK)
+            .await
+            .unwrap();
+        assert!(preflight_vendor(root.path()).await.is_ok());
+        tokio::fs::write(root.path().join(BUN_LOCK), "{}")
+            .await
+            .unwrap();
+        assert_eq!(
+            preflight_vendor(root.path()).await.unwrap_err().0,
+            "vendor_lockfile_version_unsupported"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_preflight_refuses_fifo_without_blocking() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(root.path().join(BUN_LOCK))
+            .status()
+            .unwrap()
+            .success());
+        let refusal = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            preflight_vendor(root.path()),
+        )
+        .await
+        .expect("Bun preflight must not block on a FIFO")
+        .unwrap_err();
+        assert_eq!(refusal.0, "vendor_lockfile_missing");
     }
 
     /// Build a scoped-package fixture and vendor it once (not dry).

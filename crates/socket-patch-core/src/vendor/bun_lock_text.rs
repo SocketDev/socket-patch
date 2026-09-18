@@ -11,6 +11,7 @@
 
 /// The text-lockfile versions the surgery has byte-exact fixtures for.
 ///
+/// Bun 1.1.39–1.1.45 emits 0 with the same package tuple grammar.
 /// bun 1.3.x emits 1 (spike pinned 1.3.14). bun 1.4.0 bumped the default to
 /// 2 (oven-sh/bun PR #31539): the bump gates stricter PARSE checks —
 /// integrity hashes required for off-registry npm tarballs, unsafe git
@@ -19,7 +20,7 @@
 /// this integer; verified empirically). Our URL/local 3-tuples always carry
 /// a sha512, so they satisfy the v2 off-registry-integrity rule by
 /// construction.
-const SUPPORTED_LOCK_VERSIONS: [u64; 2] = [1, 2];
+const SUPPORTED_LOCK_VERSIONS: [u64; 3] = [0, 1, 2];
 
 /// One parsed single-line packages entry.
 pub(crate) struct BunEntry {
@@ -50,23 +51,37 @@ pub(crate) fn split_name_spec(s: &str) -> Option<(&str, &str)> {
 /// `"lockfileVersion": <n>` head check — only the fixture-pinned text
 /// lockfile versions are spliced (fail-closed on anything newer/older).
 pub(crate) fn check_lock_version(text: &str) -> Result<(), String> {
-    let version = text.lines().take(5).find_map(|line| {
-        line.trim()
-            .strip_prefix("\"lockfileVersion\":")
-            .map(|rest| rest.trim().trim_end_matches(',').to_string())
-    });
-    match version.as_deref().map(str::parse::<u64>) {
-        Some(Ok(v)) if SUPPORTED_LOCK_VERSIONS.contains(&v) => Ok(()),
-        Some(Ok(v)) => Err(format!(
-            "bun.lock has lockfileVersion {v}; only 1 and 2 are supported — \
-             re-lock with bun >= 1.3"
+    match lock_version(text) {
+        Some(v) if SUPPORTED_LOCK_VERSIONS.contains(&v) => Ok(()),
+        Some(v) => Err(format!(
+            "bun.lock has lockfileVersion {v}; only 0, 1 and 2 are supported — \
+             re-lock with bun >= 1.4"
         )),
-        _ => Err(
-            "bun.lock has no integer lockfileVersion in its head; only 1 and 2 \
-             are supported — re-lock with bun >= 1.3"
+        None => Err(
+            "bun.lock has no integer lockfileVersion in its head; only 0, 1 and 2 \
+             are supported — re-lock with bun >= 1.4"
                 .to_string(),
         ),
     }
+}
+
+pub(crate) fn lock_version(text: &str) -> Option<u64> {
+    text.lines()
+        .take(5)
+        .find_map(|line| line.trim().strip_prefix("\"lockfileVersion\":"))
+        .and_then(|rest| rest.trim().trim_end_matches(',').parse().ok())
+}
+
+pub(crate) fn has_workspace_packages(entries: &[BunEntry]) -> bool {
+    entries.iter().any(|entry| {
+        entry
+            .elems
+            .first()
+            .and_then(|raw| decode_json_string(raw))
+            .is_some_and(|spec| {
+                split_name_spec(&spec).is_some_and(|(_, version)| version.starts_with("workspace:"))
+            })
+    })
 }
 
 /// `(header_idx, close_idx)` of the `"packages": {` section.
@@ -445,18 +460,18 @@ mod tests {
     /// same-fixture locks are byte-identical except the integer). Both must
     /// pass; anything else — or a missing/non-integer head — fails closed.
     #[test]
-    fn lock_version_gate_accepts_1_and_2_only() {
-        for v in [1u64, 2] {
+    fn lock_version_gate_accepts_0_1_and_2_only() {
+        for v in [0u64, 1, 2] {
             assert!(
                 check_lock_version(&format!("{{\n  \"lockfileVersion\": {v},\n}}\n")).is_ok(),
                 "lockfileVersion {v} must be accepted"
             );
         }
-        for v in [0u64, 3, 99] {
+        for v in [3u64, 99] {
             let err =
                 check_lock_version(&format!("{{\n  \"lockfileVersion\": {v},\n}}\n")).unwrap_err();
             assert!(
-                err.contains(&v.to_string()) && err.contains("re-lock with bun >= 1.3"),
+                err.contains(&v.to_string()) && err.contains("re-lock with bun >= 1.4"),
                 "the refusal must name the found version and the remedy: {err}"
             );
         }

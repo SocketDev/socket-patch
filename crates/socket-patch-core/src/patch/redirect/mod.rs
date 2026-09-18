@@ -2380,7 +2380,8 @@ fn rewrite_bun_lock(
     result: &mut RewriteResult,
 ) {
     use crate::vendor::bun_lock_text::{
-        check_lock_version, decode_json_string, parse_packages_section,
+        check_lock_version, decode_json_string, has_workspace_packages, lock_version,
+        parse_packages_section,
     };
 
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
@@ -2404,7 +2405,7 @@ fn rewrite_bun_lock(
     if check_lock_version(content).is_err() {
         result.warnings.push(RewriteWarning {
             code: "redirect_bun_lock_unsupported".into(),
-            detail: "bun.lock lockfileVersion is not 1 or 2; re-lock with bun >= 1.3".into(),
+            detail: "bun.lock lockfileVersion is not 0, 1 or 2; re-lock with bun >= 1.4".into(),
         });
         return;
     }
@@ -2422,6 +2423,16 @@ fn rewrite_bun_lock(
             return;
         }
     };
+
+    if lock_version(content) == Some(0) && has_workspace_packages(&entries) {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_bun_workspace_unsupported".into(),
+            detail: "Bun version-0 workspace locks cannot preserve hosted tarballs on frozen \
+                     installs; upgrade Bun and regenerate the text lockfile"
+                .into(),
+        });
+        return;
+    }
 
     let mut changed = false;
     for dep in &npm {
@@ -6604,7 +6615,7 @@ mod tests {
         assert!(r.files.is_empty());
         assert_eq!(r.warnings[0].code, "redirect_bun_lock_unsupported");
         assert!(
-            r.warnings[0].detail.contains("not 1 or 2"),
+            r.warnings[0].detail.contains("not 0, 1 or 2"),
             "the refusal must name the supported versions: {}",
             r.warnings[0].detail
         );

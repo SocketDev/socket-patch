@@ -1512,7 +1512,33 @@ pub async fn download_and_apply_patches(
     let mut patches_downloaded = 0;
     let mut downloaded_patches: Vec<serde_json::Value> = Vec::new();
 
+    // Vendored downloads must not claim a patch in the manifest when Bun
+    // cannot consume its artifact. Agent/save-only flows retain their intent.
+    let bun_refusal = if params.save_only && !params.persist_blobs {
+        socket_patch_core::vendor::bun_lock::preflight_vendor(&params.cwd)
+            .await
+            .err()
+    } else {
+        None
+    };
     for search_result in &selected {
+        if let Some((code, detail)) = bun_refusal
+            .as_ref()
+            .filter(|_| search_result.purl.starts_with("pkg:npm/"))
+        {
+            patches_failed += 1;
+            downloaded_patches.push(serde_json::json!({
+                "purl": search_result.purl,
+                "uuid": search_result.uuid,
+                "action": "failed",
+                "errorCode": code,
+                "error": detail,
+            }));
+            if !params.json && !params.silent {
+                eprintln!("  [error] {}: {detail}", search_result.purl);
+            }
+            continue;
+        }
         // org slug is already stored in the client.
         match api_client.fetch_patch(None, &search_result.uuid).await {
             Ok(Some(patch)) => {
@@ -2922,6 +2948,31 @@ async fn run_get_vendored_uuid(
             println!("[dry-run] Would download and vendor 1 patch.");
         }
         return 0;
+    }
+
+    if patch.purl.starts_with("pkg:npm/") {
+        if let Err((code, message)) =
+            socket_patch_core::vendor::bun_lock::preflight_vendor(&args.common.cwd).await
+        {
+            if args.common.json {
+                print_json(&serde_json::json!({
+                    "status": "error",
+                    "found": 1,
+                    "downloaded": 0,
+                    "failed": 1,
+                    "error": { "code": code, "message": message },
+                    "patches": [{
+                        "purl": patch.purl,
+                        "uuid": patch.uuid,
+                        "action": "failed",
+                        "errorCode": code,
+                    }],
+                }));
+            } else if !args.common.silent {
+                eprintln!("Error ({code}): {message}");
+            }
+            return 1;
+        }
     }
 
     note_vendored_whole_manifest_scope(&manifest_path, &[patch.purl.as_str()], quiet).await;

@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 0,
+  "workspaces": {
+    "": {
+      "name": "consumer",
+      "dependencies": {
+        "left-pad": "^1.3.0"
+      }
+    }
+  },
+  "packages": {
+    "consumer": ["consumer@workspace:packages/consumer"],
+    "left-pad": ["left-pad@1.3.0", "", {}, "sha512-OLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLD=="],
+  }
+}
