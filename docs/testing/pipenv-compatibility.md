@@ -126,5 +126,64 @@ requires the bare scan to see Pipenv's venv.
 ## Results
 
 <!-- GENERATED:BEGIN pipenv-matrix -->
-_Pending: regenerated from `summary.json` after the final matrix run._
+### macOS — full matrix (18 majors × 8 shapes × 4 modes)
+
+CLI revision `e521093`: **470 cases, 470 pass** (103 expected refusals, 36 skipped installer limitations, 0 failing, 0 harness errors).
+
+| Pipenv | hosted | vendored | agent (in-project venv) | agent (out-of-tree venv) | bare CLI sees out-of-tree venv | tamper rejected (hosted / vendored) | warm venv re-installed (hosted / vendored) | relock keeps patch (hosted / vendored) | `pipenv verify` (hosted / vendored) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.2.8 | refused (redirect_pipenv_skipped) | refused (pypi_pipenv_spec_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | refused (skipped: Pipenv 0.x has no `--venv` and no WORKON_HOME placement to discover) | none | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
+| 3.6.2 | refused (redirect_pipenv_skipped) | refused (pypi_pipenv_spec_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | none/true | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
+| 4.1.4 | refused (redirect_pipenv_skipped) | refused (pypi_pipenv_spec_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | none/true | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
+| 5.4.2 | refused (redirect_pipenv_skipped) | refused (pypi_pipenv_spec_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | none/true | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
+| 6.2.9 | refused (redirect_pipenv_skipped) | refused (pypi_pipenv_spec_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | none/true | n/a / n/a | n/a / n/a | n/a / n/a | n/a / n/a |
+| 7.9.10 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | refused (pypi_pipenv_installer_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | refused (skipped: Pipenv 7 cannot create its out-of-tree virtualenv in the harness image) | none | yes / n/a | false / n/a | false / n/a | 2 / n/a |
+| 8.3.2 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | refused (pypi_pipenv_installer_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / n/a | false / n/a | false / n/a | 2 / n/a |
+| 9.1.0 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | refused (pypi_pipenv_installer_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / n/a | false / n/a | false / n/a | 2 / n/a |
+| 10.1.2 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | refused (pypi_pipenv_installer_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / n/a | false / n/a | false / n/a | 2 / n/a |
+| 11.10.4 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | refused (pypi_pipenv_installer_unsupported) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / n/a | false / n/a | false / n/a | 2 / n/a |
+| 2018.11.26 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / yes | false / false | false / false | 2 / 2 |
+| 2020.11.15 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / yes | false / false | false / false | 2 / 2 |
+| 2021.11.23 | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,marker-excluded,transitive) | pass (dev,direct,extras,marker,transitive) | true | yes / yes | false / false | false / false | 2 / 2 |
+| 2022.12.19 | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,transitive) | true | yes / yes | false / false | false / false | 0 / 0 |
+| 2023.12.1 | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,transitive) | true | yes / no | false / false | false / false | 0 / 0 |
+| 2024.4.1 | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,transitive) | true | yes / no | false / false | false / false | 0 / 0 |
+| 2025.1.3 | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,transitive) | true | yes / no | false / false | false / false | 0 / 0 |
+| 2026.8.0 | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,crlf,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,marker-excluded,transitive) | pass (category,dev,direct,extras,marker,transitive) | true | yes / no | false / false | false / false | 0 / 0 |
+
+### Linux — release binary in a container (2018+ majors, direct shape, 4 modes)
+
+CLI revision `e521093`: **32 cases, 32 pass** (0 expected refusals, 0 skipped installer limitations, 0 failing, 0 harness errors).
+
+| Pipenv | hosted | vendored | agent (in-project venv) | agent (out-of-tree venv) | bare CLI sees out-of-tree venv | tamper rejected (hosted / vendored) | warm venv re-installed (hosted / vendored) | relock keeps patch (hosted / vendored) | `pipenv verify` (hosted / vendored) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2018.11.26 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / yes | false / false | false / false | 2 / 2 |
+| 2020.11.15 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / yes | false / false | false / false | 2 / 2 |
+| 2021.11.23 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / yes | false / false | false / false | 2 / 2 |
+| 2022.12.19 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / yes | false / false | false / false | 0 / 0 |
+| 2023.12.1 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / no | false / false | false / false | 0 / 0 |
+| 2024.4.1 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / no | false / false | false / false | 0 / 0 |
+| 2025.1.3 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / no | false / false | false / false | 0 / 0 |
+| 2026.8.0 | pass (direct) | pass (direct) | pass (direct) | pass (direct) | true | yes / no | false / false | false / false | 0 / 0 |
+
+### Invocation variants (`--cwd`, nested `--cwd`, symlinked project directory; direct shape, 4 modes)
+
+CLI revision `e521093`: **48 cases, 48 pass** (3 expected refusals, 0 skipped installer limitations, 0 failing, 0 harness errors).
+
+| Pipenv | invocation | hosted | vendored | agent | agent-oot |
+| --- | --- | --- | --- | --- | --- |
+| 11.10.4 | `--cwd <project>` | pass | refused (pypi_pipenv_installer_unsupported) | pass | pass |
+| 11.10.4 | `--cwd` from a nested directory | pass | refused (pypi_pipenv_installer_unsupported) | pass | pass |
+| 11.10.4 | symlinked project directory | pass | refused (pypi_pipenv_installer_unsupported) | pass | pass |
+| 2018.11.26 | `--cwd <project>` | pass | pass | pass | pass |
+| 2018.11.26 | `--cwd` from a nested directory | pass | pass | pass | pass |
+| 2018.11.26 | symlinked project directory | pass | pass | pass | pass |
+| 2022.12.19 | `--cwd <project>` | pass | pass | pass | pass |
+| 2022.12.19 | `--cwd` from a nested directory | pass | pass | pass | pass |
+| 2022.12.19 | symlinked project directory | pass | pass | pass | pass |
+| 2026.8.0 | `--cwd <project>` | pass | pass | pass | pass |
+| 2026.8.0 | `--cwd` from a nested directory | pass | pass | pass | pass |
+| 2026.8.0 | symlinked project directory | pass | pass | pass | pass |
+
+Every `pass` cell verified the installed `urllib3/response.py` against the patch record's Git blob SHA-256 after a real Pipenv install. Columns: `warm venv re-installed` and `relock keeps patch` are measured Pipenv boundaries (see above), not requirements; `pipenv verify` exit 2 means the subcommand does not exist on that release. Per-case checks, notes and harness provenance: [`results.json`](pipenv-compatibility/results.json).
 <!-- GENERATED:END pipenv-matrix -->
