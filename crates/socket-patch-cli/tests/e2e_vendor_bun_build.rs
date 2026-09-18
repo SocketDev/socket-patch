@@ -3,36 +3,62 @@
 //!
 //! Drives the REAL `bun` (network used for fixture setup only):
 //!   1. `bun install` of left-pad@1.3.0 into a tempdir (private
-//!      `BUN_INSTALL_CACHE_DIR`). bun 1.3.x writes the text `bun.lock` by
-//!      default; `--save-text-lockfile` is passed as a belt-and-braces guard
-//!      against a future binary-lockfile default.
+//!      `BUN_INSTALL_CACHE_DIR`). The text `bun.lock` is the default from
+//!      bun 1.2.0 (lockfileVersion 1; 2 from 1.4.0); on 1.1.39–1.1.x it is
+//!      the `--save-text-lockfile` opt-in (lockfileVersion 0), which the
+//!      fixture passes for those releases. Bun before 1.1.39 has no text
+//!      lockfile at all and the suite skips (or, under the REQUIRED gate,
+//!      fails — such a leg must not be scheduled).
 //!   2. Hand-stage a `.socket/` manifest + blob from the ACTUAL installed
 //!      bytes (a marker comment prepended to `index.js`).
 //!   3. `socket-patch vendor --json --offline` — assert the deterministic
 //!      tarball lands at `.socket/vendor/npm/<uuid>/…` and the bun.lock
 //!      `packages` entry is rewritten from the registry 4-tuple to the
 //!      local-tarball 3-tuple `["<name>@<rel-path>", {deps}, "sha512-<ours>"]`
-//!      (spike BN1/BN3). package.json is left UNTOUCHED.
+//!      (spike BN1/BN3). package.json is left UNTOUCHED. The registry
+//!      4-tuple spelling is identical across lockfileVersion 0, 1 and 2, so
+//!      every assertion after the fixture guard is version-independent.
 //!   4. **Fresh-checkout proof**: copy ONLY the committable files
 //!      (package.json + bun.lock + .socket/) to a new dir, an EMPTY
 //!      `BUN_INSTALL_CACHE_DIR`, and run the spike's strictest invocation
 //!      `bun install --frozen-lockfile` — the patched bytes MUST be what bun
-//!      installs (BN7).
-//!   5. Idempotency: re-running vendor leaves bun.lock byte-identical.
-//!   6. **Revert proof**: `vendor --revert` restores bun.lock byte-for-byte
+//!      installs (BN7). Then the ORDINARY install: `node_modules` removed,
+//!      another empty cache, plain `bun install` — bun.lock must stay
+//!      byte-identical (frozen mode never writes the lock, so only a plain
+//!      install can observe re-serialization drift; the backtest's
+//!      `ordinaryStableLock` is the matrix twin) and the marker bytes must
+//!      land again.
+//!   5. **Repair proof**: delete `.socket/vendor/npm/<uuid>/` outright,
+//!      `repair --offline` must rebuild the tarball byte-identically from
+//!      the installed copy + blob without touching bun.lock, and a fresh
+//!      cold-cache frozen install must again land the marker bytes.
+//!   6. Idempotency: re-running vendor leaves bun.lock byte-identical.
+//!   7. **Revert proof**: `vendor --revert` restores bun.lock byte-for-byte
 //!      and removes `.socket/vendor/` entirely.
 //!
 //! The get-driven twin (v3.6) replaces steps 2–3 with a wiremock
 //! `view/{uuid}` (same hashes, base64 `blobContent` of the after bytes) and
 //! `get <uuid> --mode vendored --vendor-source build` — scan's vendored
 //! posture end to end: manifest + committed artifact + ledger + wired lock,
-//! NO `.socket/blobs` — then re-runs the same fresh-checkout frozen-install
-//! proof. The revert half is not repeated there: `vendor --revert` on the
+//! NO `.socket/blobs` — then re-runs the same fresh-checkout install proof.
+//! The revert half is not repeated there: `vendor --revert` on the
 //! capstone already covers it (same ledger, same engine).
 //!
-//! LOCAL capstone (not behind docker-e2e): skips with a `println` + return
-//! when `bun` is unavailable or the fixture install cannot reach the
-//! registry; every assertion after that is HARD.
+//! The tampered twin swaps the committed tarball for a DIFFERENT valid
+//! tarball while bun.lock keeps our sha512: bun verifies the digest of
+//! local-tarball tuples only from 1.3.10 (`Integrity check failed`), so the
+//! fresh frozen install MUST fail there and MUST succeed — installing the
+//! tampered bytes — on every older text-lock bun (reported as PARTIAL). The
+//! boundary is pinned as [`TARBALL_INTEGRITY_ENFORCED_FROM`]; the hosted
+//! twin lives in `e2e_redirect_bun_build.rs`.
+//!
+//! Gates: without `SOCKET_PATCH_BUN_E2E_REQUIRED` (set AND non-empty — CI
+//! passes an empty string for non-bun legs) a missing `bun`, a failed
+//! fixture install or a bun without a text lockfile is a `println` SKIP and
+//! every assertion after that is HARD. With it, those skips become hard
+//! failures, and `SOCKET_PATCH_BUN_E2E_VERSION` (when set, non-empty) must
+//! equal `bun --version`, so a CI leg cannot pass by running the wrong bun
+//! or no bun at all.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -46,9 +72,30 @@ mod cache_env;
 
 const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
+/// Content of the tampered twin's replacement tarball — distinct from the
+/// pristine AND the patched bytes so "bun installed the tampered bytes" is
+/// a real assertion, not a trailing-byte no-op.
+const TAMPER_MARKER: &str = "/* SOCKET-TAMPERED */\n";
 const DEP: &str = "left-pad";
 const DEP_VERSION: &str = "1.3.0";
 const ORG: &str = "test-org";
+
+/// `(major, minor, patch)` of the bun on PATH.
+type BunVersion = (u64, u64, u64);
+
+/// First bun that verifies the sha512 of URL / local-tarball tuples on
+/// install (1.3.9 installs a mismatched tarball with exit 0; 1.3.10 fails
+/// with `Integrity check failed`). NOT 1.3.14 — that figure came from a
+/// matrix that sampled only 1.3.0 and 1.3.14. Registry 4-tuples are
+/// verified from 1.2.0 and are not what the vendored rewrite produces.
+const TARBALL_INTEGRITY_ENFORCED_FROM: BunVersion = (1, 3, 10);
+/// First bun with a text lockfile (`--save-text-lockfile` opt-in,
+/// lockfileVersion 0). Older bun writes only the binary `bun.lockb`.
+const TEXT_LOCK_FROM: BunVersion = (1, 1, 39);
+/// Text lock becomes the default and bumps to lockfileVersion 1.
+const LOCK_V1_FROM: BunVersion = (1, 2, 0);
+/// lockfileVersion 2.
+const LOCK_V2_FROM: BunVersion = (1, 4, 0);
 
 // ── self-contained helpers ────────────────────────────────────────────
 
@@ -56,16 +103,125 @@ fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
 }
 
-fn has_command(cmd: &str) -> bool {
-    let mut probe = Command::new(cmd);
+/// The REQUIRED gate: set AND non-empty. CI's e2e matrix passes
+/// `SOCKET_PATCH_BUN_E2E_REQUIRED: ${{ matrix.bun != '' && '1' || '' }}`,
+/// so an empty value is the non-bun legs' "unset" — an `is_some()` gate
+/// would turn every non-bun leg red.
+fn bun_required() -> bool {
+    std::env::var_os("SOCKET_PATCH_BUN_E2E_REQUIRED").is_some_and(|v| !v.is_empty())
+}
+
+/// The exact bun the matrix leg pinned, when it pinned one.
+fn pinned_bun_version() -> Option<String> {
+    std::env::var("SOCKET_PATCH_BUN_E2E_VERSION")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// `1.4.2` → `(1, 4, 2)`; a canary suffix (`1.4.3-canary.12+abc`) is cut at
+/// the first `-`/`+`. `None` for anything that is not three integers.
+fn parse_bun_version(raw: &str) -> Option<BunVersion> {
+    let core = raw.trim().split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// `bun --version` through the cache sandbox: `Some(trimmed stdout)` when
+/// bun ran and exited 0, `None` when it is not on PATH (or cannot start).
+fn bun_version_output() -> Option<String> {
+    let mut probe = Command::new("bun");
     probe.arg("--version");
+    scrub_socket_env(&mut probe);
     cache_env::isolate(&mut probe);
-    probe
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let out = probe.stderr(Stdio::null()).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The lockfileVersion the era table says this bun writes for a FRESH
+/// install: 1.1.39–1.1.x opt-in text lock → 0, 1.2–1.3 → 1, ≥ 1.4 → 2.
+fn expected_lock_version(v: BunVersion) -> u64 {
+    if v >= LOCK_V2_FROM {
+        2
+    } else if v >= LOCK_V1_FROM {
+        1
+    } else {
+        0
+    }
+}
+
+/// The fixture's `bun install` argv: lifecycle scripts never run (hygiene —
+/// left-pad has none, but the fixture is a REAL registry install), and
+/// `--save-text-lockfile` is passed only where the text lock is still an
+/// opt-in (< 1.2.0), so newer bun is exercised exactly as users run it.
+fn fixture_install_args(v: BunVersion) -> Vec<&'static str> {
+    let mut args = vec!["install", "--ignore-scripts"];
+    if v < LOCK_V1_FROM {
+        args.push("--save-text-lockfile");
+    }
+    args
+}
+
+/// `"lockfileVersion": <n>` from the lock head — the same head scan as
+/// `socket_patch_core::vendor::bun_lock_text::lock_version` (pub(crate)
+/// there, so mirrored here).
+fn lock_version(text: &str) -> Option<u64> {
+    text.lines()
+        .take(5)
+        .find_map(|line| line.trim().strip_prefix("\"lockfileVersion\":"))
+        .and_then(|rest| rest.trim().trim_end_matches(',').parse().ok())
+}
+
+/// The toolchain preflight every leg runs first: bun present, pinned
+/// version honored, text lockfile available. `None` = this leg is skipped
+/// (already reported with a println) — but under the REQUIRED gate every
+/// one of those is a hard failure instead, because a CI leg that silently
+/// skips is exactly the vacuous pass this suite had for months.
+fn bun_toolchain(tag: &str) -> Option<(String, BunVersion)> {
+    let Some(raw) = bun_version_output() else {
+        assert!(
+            !bun_required(),
+            "SOCKET_PATCH_BUN_E2E_REQUIRED is set but `bun --version` did not run — \
+             the matrix leg must install bun before running this suite"
+        );
+        println!("SKIP e2e_vendor_bun_build ({tag}): `bun` not installed");
+        return None;
+    };
+    if let Some(pin) = pinned_bun_version() {
+        assert_eq!(
+            raw, pin,
+            "SOCKET_PATCH_BUN_E2E_VERSION pins bun {pin} but PATH resolves bun {raw}: the \
+             matrix must run the pinned version"
+        );
+    }
+    let Some(version) = parse_bun_version(&raw) else {
+        assert!(
+            !bun_required(),
+            "required bun toolchain reports an unparsable version {raw:?}"
+        );
+        println!("SKIP e2e_vendor_bun_build ({tag}): unparsable `bun --version` output {raw:?}");
+        return None;
+    };
+    if version < TEXT_LOCK_FROM {
+        assert!(
+            !bun_required(),
+            "bun {raw} has no text lockfile (the `--save-text-lockfile` opt-in exists from \
+             1.1.39); a REQUIRED leg must not be scheduled on it"
+        );
+        println!(
+            "SKIP e2e_vendor_bun_build ({tag}): bun {raw} predates the text bun.lock (1.1.39)"
+        );
+        return None;
+    }
+    Some((raw, version))
 }
 
 /// Run `bun <args>` in `cwd` with the given private cache dir, the shared
@@ -95,9 +251,11 @@ fn scrub_socket_env(cmd: &mut Command) {
     cmd.env_remove("BUN_INSTALL_CACHE_DIR");
 }
 
+/// The real binary with `--no-telemetry` appended: nothing in this suite
+/// should ever post a telemetry event, mocked API or not.
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
-    cmd.args(args).current_dir(cwd);
+    cmd.args(args).arg("--no-telemetry").current_dir(cwd);
     scrub_socket_env(&mut cmd);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
@@ -162,6 +320,59 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
     }
 }
 
+/// A VALID npm tarball built from the ACTUALLY-installed package with the
+/// entry point swapped — the tampered twin's replacement artifact. Built
+/// with the tar crate (no system `tar`, so Windows runners need nothing);
+/// the point is a sha512 that differs from the one bun.lock pins while the
+/// archive still extracts, so "bun installed the tampered bytes" can be
+/// asserted on the pre-1.3.10 releases that never check the digest.
+fn make_tgz_from_installed(pkg_dir: &Path, replaced_index: &[u8]) -> Vec<u8> {
+    let pkg_dir = pkg_dir
+        .canonicalize()
+        .expect("installed package dir must resolve");
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![pkg_dir.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    for p in &files {
+        let rel = p.strip_prefix(&pkg_dir).unwrap();
+        // Tar entry names always use `/` regardless of host separator.
+        let name = format!(
+            "package/{}",
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        let bytes = if rel == Path::new("index.js") {
+            replaced_index.to_vec()
+        } else {
+            std::fs::read(p).unwrap()
+        };
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, &name, bytes.as_slice())
+            .unwrap();
+    }
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
 // ── shared fixture (steps 1–2) ────────────────────────────────────────
 
 /// The real-bun project both capstones drive, plus the pre-vendor snapshots
@@ -174,18 +385,21 @@ struct BunProject {
     purl: String,
     lock_before: Vec<u8>,
     pkg_before: Vec<u8>,
+    /// `bun --version`, verbatim, for messages.
+    bun_raw: String,
+    bun_version: BunVersion,
+    /// The lockfileVersion this bun wrote — asserted against the era table.
+    lock_version: u64,
 }
 
 /// Steps 1–2 of the module doc, shared by the vendor capstone and the
 /// get-driven twin: a tempdir project depending on left-pad, a REAL
 /// `bun install` (network here, private cache) with the hermeticity guard,
 /// pristine-byte checks, and the patched-content twin of the installed
-/// `index.js`. `None` = soft-skip, already reported with a println.
+/// `index.js`. `None` = soft-skip, already reported with a println (a hard
+/// failure instead under the REQUIRED gate).
 fn bun_project(tag: &str) -> Option<BunProject> {
-    if !has_command("bun") {
-        println!("SKIP e2e_vendor_bun_build ({tag}): `bun` not installed");
-        return None;
-    }
+    let (bun_raw, bun_version) = bun_toolchain(tag)?;
 
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
@@ -199,11 +413,15 @@ fn bun_project(tag: &str) -> Option<BunProject> {
     .unwrap();
 
     // 1. REAL fixture: bun install (network allowed here, private cache).
-    //    `--save-text-lockfile` guarantees the text bun.lock vendor wires
-    //    (bun 1.3.x already defaults to it; the flag future-proofs the test).
     let cache = tmp.path().join("bun-cache");
-    let install = bun(&proj, &["install", "--save-text-lockfile"], &cache);
+    let install = bun(&proj, &fixture_install_args(bun_version), &cache);
     if !install.status.success() {
+        assert!(
+            !bun_required(),
+            "required bun {bun_raw} fixture `bun install` failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&install.stdout),
+            String::from_utf8_lossy(&install.stderr)
+        );
         println!(
             "SKIP e2e_vendor_bun_build ({tag}): fixture `bun install` failed (registry \
              unreachable?):\n{}",
@@ -213,6 +431,11 @@ fn bun_project(tag: &str) -> Option<BunProject> {
     }
     let lock_path = proj.join("bun.lock");
     if !lock_path.is_file() {
+        assert!(
+            !bun_required(),
+            "required bun {bun_raw} produced no text bun.lock after {:?}",
+            fixture_install_args(bun_version)
+        );
         println!(
             "SKIP e2e_vendor_bun_build ({tag}): bun produced no text bun.lock (binary \
              lockfile?) — this bun version's default lockfile is not the wirable text form"
@@ -240,14 +463,22 @@ fn bun_project(tag: &str) -> Option<BunProject> {
     let lock_before = std::fs::read(&lock_path).expect("bun.lock after bun install");
     let pkg_before = std::fs::read(proj.join("package.json")).expect("package.json");
     let lock_before_str = String::from_utf8(lock_before.clone()).unwrap();
-    // bun 1.3 writes lockfileVersion 1, bun 1.4 writes 2 — one emitted
-    // grammar; both are wirable.
-    assert!(
-        lock_before_str.contains("\"lockfileVersion\": 1")
-            || lock_before_str.contains("\"lockfileVersion\": 2"),
-        "fixture must be a bun text lockfileVersion 1 or 2:\n{lock_before_str}"
+    // The era table, asserted rather than assumed: 1.1.39–1.1.x opt-in
+    // text lock → 0, 1.2–1.3 → 1, ≥ 1.4 → 2. All three are one emitted
+    // grammar for registry entries and all three are wirable; pinning the
+    // mapping is what makes a lock-era CI leg prove the era it claims.
+    let lock_version = lock_version(&lock_before_str).unwrap_or_else(|| {
+        panic!("fixture bun.lock has no integer lockfileVersion in its head:\n{lock_before_str}")
+    });
+    assert_eq!(
+        lock_version,
+        expected_lock_version(bun_version),
+        "bun {bun_raw} wrote lockfileVersion {lock_version}; the era table expects {} \
+         (1.1.39–1.1.x → 0, 1.2–1.3 → 1, ≥ 1.4 → 2):\n{lock_before_str}",
+        expected_lock_version(bun_version)
     );
-    // Pre-vendor: the registry 4-tuple `["left-pad@1.3.0", "", {}, "sha512-…"]`.
+    // Pre-vendor: the registry 4-tuple `["left-pad@1.3.0", "", {}, "sha512-…"]`
+    // — the same spelling in lockfileVersion 0, 1 and 2.
     assert!(
         lock_before_str.contains(&format!("\"{DEP}@{DEP_VERSION}\", \"\"")),
         "pre-vendor packages entry must be the registry 4-tuple:\n{lock_before_str}"
@@ -261,7 +492,22 @@ fn bun_project(tag: &str) -> Option<BunProject> {
         purl,
         lock_before,
         pkg_before,
+        bun_raw,
+        bun_version,
+        lock_version,
     })
+}
+
+fn vendored_tgz_rel() -> String {
+    format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz")
+}
+
+fn vendored_dir(proj: &Path) -> PathBuf {
+    proj.join(".socket").join("vendor").join("npm").join(UUID)
+}
+
+fn vendored_tgz(proj: &Path) -> PathBuf {
+    vendored_dir(proj).join(format!("{DEP}-{DEP_VERSION}.tgz"))
 }
 
 /// The on-disk vendored state BOTH drivers (`vendor --offline`, `get <uuid>
@@ -269,21 +515,24 @@ fn bun_project(tag: &str) -> Option<BunProject> {
 /// marker + ledger, the bun.lock `packages` entry rewritten from the
 /// registry 4-tuple to the local-tarball 3-tuple with OUR recomputed
 /// integrity, and package.json untouched.
-fn assert_vendored_on_disk(proj: &Path, pkg_before: &[u8]) {
-    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
+fn assert_vendored_on_disk(fx: &BunProject) {
+    let proj = &fx.proj;
+    let tgz_rel = vendored_tgz_rel();
     assert!(
-        proj.join(&tgz_rel).is_file(),
+        vendored_tgz(proj).is_file(),
         "vendored tarball missing at {tgz_rel}"
     );
     assert!(
-        proj.join(format!(
-            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
-        ))
-        .is_file(),
+        vendored_dir(proj)
+            .join("socket-patch.vendor.json")
+            .is_file(),
         "informational vendor marker missing"
     );
     assert!(
-        proj.join(".socket/vendor/state.json").is_file(),
+        proj.join(".socket")
+            .join("vendor")
+            .join("state.json")
+            .is_file(),
         "vendor ledger missing"
     );
 
@@ -305,28 +554,54 @@ fn assert_vendored_on_disk(proj: &Path, pkg_before: &[u8]) {
         ),
         "the inherited registry integrity must NOT survive the rewrite:\n{lock_after}"
     );
+    // The rewrite must keep the lock's own version line — a v0 lock stays
+    // v0, a v2 lock stays v2 (no silent format bump by the CLI).
+    assert_eq!(
+        lock_version(&lock_after),
+        Some(fx.lock_version),
+        "the vendored rewrite must preserve the lockfileVersion line verbatim:\n{lock_after}"
+    );
     // package.json is left untouched by the lock-only bun wiring.
     assert_eq!(
         std::fs::read(proj.join("package.json")).unwrap(),
-        pkg_before,
+        fx.pkg_before,
         "bun vendoring is lock-only; package.json must stay byte-identical"
     );
 }
 
-/// Step 4, shared: fresh dir with ONLY the committable files (package.json,
-/// bun.lock, and .socket/), an EMPTY `BUN_INSTALL_CACHE_DIR`, and the
-/// spike-proven strictest invocation `bun install --frozen-lockfile` — the
-/// patched bytes MUST be what bun installs (BN7), and the committed lock
-/// must stay byte-identical.
-fn fresh_checkout_frozen_install(tmp: &Path, proj: &Path, patched: &[u8]) {
-    let fresh = tmp.join("fresh");
+/// Fresh dir `<tmp>/<name>` holding ONLY the committable files
+/// (package.json, bun.lock, and .socket/).
+fn fresh_checkout(tmp: &Path, proj: &Path, name: &str) -> PathBuf {
+    let fresh = tmp.join(name);
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
     std::fs::copy(proj.join("bun.lock"), fresh.join("bun.lock")).unwrap();
     copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    fresh
+}
 
-    let fresh_cache = tmp.join("fresh-bun-cache");
-    let ci = bun(&fresh, &["install", "--frozen-lockfile"], &fresh_cache);
+/// `bun install --frozen-lockfile` in a fresh checkout named `name` against
+/// an EMPTY cache — the spike-proven strictest invocation.
+fn fresh_frozen_install(tmp: &Path, proj: &Path, name: &str) -> (PathBuf, Output) {
+    let fresh = fresh_checkout(tmp, proj, name);
+    let fresh_cache = tmp.join(format!("{name}-bun-cache"));
+    let ci = bun(
+        &fresh,
+        &["install", "--frozen-lockfile", "--ignore-scripts"],
+        &fresh_cache,
+    );
+    (fresh, ci)
+}
+
+/// Step 4, shared: the fresh-checkout frozen install MUST land the patched
+/// bytes (BN7); then the ORDINARY install (node_modules removed, another
+/// empty cache, plain `bun install`) MUST leave the committed lock
+/// byte-identical and land the patched bytes again. Frozen mode never
+/// writes the lock, so only the plain install can observe a
+/// re-serialization of the local-tarball tuple — the property the module
+/// doc calls BN3 and the backtest checks as `ordinaryStableLock`.
+fn fresh_checkout_install_proof(tmp: &Path, proj: &Path, patched: &[u8], name: &str) {
+    let (fresh, ci) = fresh_frozen_install(tmp, proj, name);
     assert!(
         ci.status.success(),
         "fresh-checkout `bun install --frozen-lockfile` must succeed from the vendored \
@@ -334,8 +609,8 @@ fn fresh_checkout_frozen_install(tmp: &Path, proj: &Path, patched: &[u8]) {
         String::from_utf8_lossy(&ci.stdout),
         String::from_utf8_lossy(&ci.stderr),
     );
-    let fresh_installed =
-        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    let installed_index = fresh.join("node_modules").join(DEP).join("index.js");
+    let fresh_installed = std::fs::read(&installed_index).unwrap();
     assert!(
         fresh_installed.starts_with(MARKER.as_bytes()),
         "bun must install the PATCHED bytes from the vendored tarball; got:\n{}",
@@ -345,19 +620,92 @@ fn fresh_checkout_frozen_install(tmp: &Path, proj: &Path, patched: &[u8]) {
         fresh_installed, patched,
         "fresh install must be byte-identical to the patched content"
     );
-    // --frozen-lockfile would have errored if the lock drifted; prove it
-    // left the committed lock byte-stable.
+    eprintln!("FRESH INSTALL OK ({name})");
+
+    // Ordinary install: the lock must survive bun's own re-serialization.
+    let wired_lock = std::fs::read(proj.join("bun.lock")).unwrap();
+    std::fs::remove_dir_all(fresh.join("node_modules")).unwrap();
+    let plain_cache = tmp.join(format!("{name}-plain-bun-cache"));
+    let plain = bun(&fresh, &["install", "--ignore-scripts"], &plain_cache);
+    assert!(
+        plain.status.success(),
+        "plain `bun install` on the vendored lock must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&plain.stdout),
+        String::from_utf8_lossy(&plain.stderr),
+    );
     assert_eq!(
         std::fs::read(fresh.join("bun.lock")).unwrap(),
-        std::fs::read(proj.join("bun.lock")).unwrap(),
-        "--frozen-lockfile install must leave bun.lock byte-identical"
+        wired_lock,
+        "an ORDINARY `bun install` must leave the vendored bun.lock byte-identical \
+         (re-serialization drift would churn every commit)"
     );
-    eprintln!("FRESH INSTALL OK");
+    assert_eq!(
+        std::fs::read(&installed_index).unwrap(),
+        patched,
+        "the ordinary install must land the patched bytes too"
+    );
+    eprintln!("PLAIN INSTALL LOCK-STABLE ({name})");
+}
+
+/// The tampered twin's shared tail: bun.lock pins OUR sha512 while the
+/// committed tarball now holds different bytes. Which outcome is correct
+/// depends on the bun: from 1.3.10 the fresh frozen install MUST fail on
+/// the integrity check; before it bun never verifies local-tarball digests
+/// and MUST install the tampered bytes with exit 0 (reported PARTIAL — the
+/// rejection proof is not available on that release, by bun's design).
+fn assert_tamper_outcome(fx: &BunProject, tampered: &[u8]) {
+    let (fresh, ci) = fresh_frozen_install(fx.tmp.path(), &fx.proj, "fresh-tampered");
+    let chatter = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr)
+    );
+    if fx.bun_version >= TARBALL_INTEGRITY_ENFORCED_FROM {
+        assert!(
+            !ci.status.success(),
+            "bun {} install MUST fail when the vendored tarball does not match the pinned \
+             sha512 (digests are enforced from 1.3.10).\n{chatter}",
+            fx.bun_raw
+        );
+        let lower = chatter.to_lowercase();
+        assert!(
+            lower.contains("integrity")
+                || lower.contains("checksum")
+                || lower.contains("hash")
+                || chatter.contains("IntegrityCheckFailed"),
+            "the failure must be the integrity check, not something incidental:\n{chatter}"
+        );
+        eprintln!("TAMPER REJECTED OK (bun {})", fx.bun_raw);
+    } else {
+        assert!(
+            ci.status.success(),
+            "bun {} (< 1.3.10) does not verify local-tarball digests, so the tampered \
+             install must still exit 0 — a failure here means the boundary moved.\n{chatter}",
+            fx.bun_raw
+        );
+        let installed =
+            std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+        assert_eq!(
+            installed, tampered,
+            "bun {} installed neither the tampered bytes nor failed: the boundary model is wrong",
+            fx.bun_raw
+        );
+        println!(
+            "PARTIAL e2e_vendor_bun_build (tampered): bun {} does not verify local tarball \
+             digests (enforced from 1.3.10) — rejection proof unavailable, acceptance pinned",
+            fx.bun_raw
+        );
+    }
 }
 
 // ── the capstone ──────────────────────────────────────────────────────
 
+// #[serial]: each fresh install gets its own empty cache dir, but bun also
+// keeps state under the sandboxed `~/.bun`; serializing keeps the tampered
+// twin (same local tarball spec, different bytes) from ever racing a
+// sibling's honest install.
 #[test]
+#[serial_test::serial]
 fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
     let Some(fx) = bun_project("vendor-offline") else {
         return;
@@ -400,15 +748,70 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
         "clean apply event: {applied}"
     );
 
-    assert_vendored_on_disk(proj, &fx.pkg_before);
-    eprintln!("VENDOR OK");
+    assert_vendored_on_disk(&fx);
+    eprintln!(
+        "VENDOR OK (bun {}, lockfileVersion {})",
+        fx.bun_raw, fx.lock_version
+    );
 
     // 4. FRESH-CHECKOUT PROOF: committable files only, EMPTY cache,
-    //    spike-proven `--frozen-lockfile`.
-    fresh_checkout_frozen_install(fx.tmp.path(), proj, &fx.patched);
+    //    spike-proven `--frozen-lockfile`, then the ordinary-install
+    //    lock-stability twin.
+    fresh_checkout_install_proof(fx.tmp.path(), proj, &fx.patched, "fresh");
 
-    // 5. Idempotency: a re-run exits 0 and leaves bun.lock byte-stable.
+    // 5. REPAIR PROOF: the committed artifact dir vanishes (a botched merge,
+    //    an over-eager clean); `repair --offline` must rebuild the tarball
+    //    byte-identically from the installed copy + blob, leave bun.lock
+    //    alone, and a cold fresh checkout must install the marker bytes
+    //    from the rebuilt artifact.
+    let tgz_path = vendored_tgz(proj);
+    let tgz_bytes = std::fs::read(&tgz_path).unwrap();
     let lock_wired = std::fs::read(&lock_path).unwrap();
+    std::fs::remove_dir_all(vendored_dir(proj)).unwrap();
+    assert!(!tgz_path.exists(), "precondition: the vendored dir is gone");
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "repair",
+            "--json",
+            "--offline",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "repair failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let renv = parse_envelope(&stdout);
+    assert_eq!(renv["status"], "success", "repair envelope: {renv}");
+    assert_eq!(
+        renv["summary"]["rebuilt"], 1,
+        "repair must rebuild the one deleted artifact: {renv}"
+    );
+    assert!(
+        renv["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "rebuilt" && e["purl"] == purl.as_str()),
+        "repair must report a rebuilt event for {purl}: {renv}"
+    );
+    assert_eq!(
+        std::fs::read(&tgz_path).unwrap(),
+        tgz_bytes,
+        "the deterministic rebuild must reproduce the vendored tarball byte-for-byte"
+    );
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        lock_wired,
+        "repair must not touch bun.lock"
+    );
+    eprintln!("REPAIR OK");
+    fresh_checkout_install_proof(fx.tmp.path(), proj, &fx.patched, "fresh-repaired");
+
+    // 6. Idempotency: a re-run exits 0 and leaves bun.lock byte-stable.
     let (code, stdout, stderr) = run_socket(
         proj,
         &[
@@ -431,7 +834,7 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
         "re-vendor must leave bun.lock byte-identical"
     );
 
-    // 6. REVERT PROOF: bun.lock restored byte-for-byte, artifacts gone.
+    // 7. REVERT PROOF: bun.lock restored byte-for-byte, artifacts gone.
     let (code, stdout, stderr) = run_socket(
         proj,
         &[
@@ -461,10 +864,57 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
         "revert must leave package.json byte-identical"
     );
     assert!(
-        !proj.join(".socket/vendor").exists(),
+        !proj.join(".socket").join("vendor").exists(),
         ".socket/vendor must be fully removed after revert"
     );
     eprintln!("REVERT OK");
+}
+
+// ── the tampered twin ─────────────────────────────────────────────────
+
+/// Negative twin: the committed tarball is swapped for a DIFFERENT valid
+/// tarball while bun.lock keeps our sha512. From bun 1.3.10 the fresh frozen
+/// install must refuse on the integrity check; earlier bun installs the
+/// tampered bytes with exit 0 and the leg pins THAT (PARTIAL), so the
+/// digest boundary is asserted from both sides across the lock-era legs.
+#[test]
+#[serial_test::serial]
+fn bun_vendor_tampered_tarball_digest_boundary() {
+    let Some(fx) = bun_project("tampered") else {
+        return;
+    };
+    let proj = &fx.proj;
+
+    stage_patch(proj, &fx.purl, "package/index.js", &fx.orig, &fx.patched);
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_vendored_on_disk(&fx);
+
+    // Tamper: a valid tarball with different content under the same path.
+    // The lock still pins the sha512 of OUR tarball.
+    let tampered: Vec<u8> = [TAMPER_MARKER.as_bytes(), fx.orig.as_slice()].concat();
+    let tampered_tgz = make_tgz_from_installed(&proj.join("node_modules").join(DEP), &tampered);
+    let tgz_path = vendored_tgz(proj);
+    assert_ne!(
+        std::fs::read(&tgz_path).unwrap(),
+        tampered_tgz,
+        "the replacement tarball must differ from the vendored one"
+    );
+    std::fs::write(&tgz_path, &tampered_tgz).unwrap();
+
+    assert_tamper_outcome(&fx, &tampered);
 }
 
 // ── the get-driven twin (v3.6) ────────────────────────────────────────
@@ -498,11 +948,12 @@ async fn mock_view(server: &MockServer, purl: &str, before: &[u8], after: &[u8])
 
 /// get-driven twin: `get <uuid> --mode vendored` must land scan's vendored
 /// result — manifest record + committed artifact + ledger + wired lock, NO
-/// blobs — and the fresh-checkout frozen install must materialize the
+/// blobs — and the fresh-checkout install proof must materialize the
 /// patched bytes. The revert half is deliberately not repeated here:
 /// `vendor --revert` on the capstone above already proves it (same ledger,
 /// same engine).
 #[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
 async fn bun_get_uuid_vendored_fresh_checkout_frozen_install() {
     let Some(fx) = bun_project("get-uuid-vendored") else {
         return;
@@ -574,23 +1025,24 @@ async fn bun_get_uuid_vendored_fresh_checkout_frozen_install() {
     );
 
     // Manifest yes, blobs no (scan-vendored parity: content stays in memory).
-    let manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(proj.join(".socket/manifest.json")).unwrap())
-            .unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".socket").join("manifest.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         manifest["patches"][fx.purl.as_str()]["uuid"],
         UUID,
         "the manifest must record the vendored patch: {manifest}"
     );
     assert!(
-        !proj.join(".socket/blobs").exists(),
+        !proj.join(".socket").join("blobs").exists(),
         "get --mode vendored must NOT persist blobs"
     );
 
-    assert_vendored_on_disk(proj, &fx.pkg_before);
+    assert_vendored_on_disk(&fx);
     eprintln!("GET VENDOR OK");
 
     // FRESH-CHECKOUT PROOF: committable files only, EMPTY cache,
-    // spike-proven `--frozen-lockfile`.
-    fresh_checkout_frozen_install(fx.tmp.path(), proj, &fx.patched);
+    // spike-proven `--frozen-lockfile`, then the ordinary-install twin.
+    fresh_checkout_install_proof(fx.tmp.path(), proj, &fx.patched, "fresh");
 }
