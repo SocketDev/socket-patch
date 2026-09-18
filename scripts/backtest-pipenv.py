@@ -47,6 +47,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import uuid as uuid_mod
 from datetime import datetime, timezone
@@ -420,8 +421,21 @@ def main():
             require(run_python(version, python, ["-c", ABSENT], cwd, penv, str(log) + ".absent"), "urllib3 uninstall")
 
     def oracle(version, python, names, cwd, penv, log):
-        r = run_python(version, python, ["-c", ORACLE, json.dumps(list(names))], cwd, penv, log)
-        return json.loads(r.out.strip().splitlines()[-1]) if r.ok() and r.out.strip() else {}
+        # For the pre-2018 releases the oracle runs in a fresh container over a
+        # bind mount the host CLI just wrote through (stage + rename): Docker
+        # Desktop's shared file cache occasionally shows the directory without
+        # the renamed entry for a moment, so a missing file is re-read a few
+        # times before it counts (a real absence stays absent).
+        attempts = 4 if is_legacy(version) else 1
+        result = {}
+        for attempt in range(attempts):
+            r = run_python(version, python, ["-c", ORACLE, json.dumps(list(names))], cwd, penv, log)
+            result = json.loads(r.out.strip().splitlines()[-1]) if r.ok() and r.out.strip() else {}
+            if result and all(v is not None for v in result.values()):
+                return result
+            if attempt + 1 < attempts:
+                time.sleep(1.5)
+        return result
 
     def urllib3_absent(version, python, cwd, penv, log):
         return run_python(version, python, ["-c", ABSENT], cwd, penv, log).ok()
