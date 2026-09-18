@@ -25,6 +25,8 @@ Every supported case verifies:
 
 The runner captures the exact project manifests, lockfiles, optional `.socket/manifest.json`, CLI JSON, file hashes and assertion results. Socket SBOM tests import these captures through their existing fixture validation framework. Vendored artifact contents are verified by the native runner; they are not needed for SBOM lockfile annotation.
 
+The `get-uuid` and `get-search` cases also exercise explicit patch retrieval by UUID and PURL, including refusal before manifest writes on unsupported Bun projects.
+
 ## Boundaries verified by the matrix
 
 | Configuration | Behavior |

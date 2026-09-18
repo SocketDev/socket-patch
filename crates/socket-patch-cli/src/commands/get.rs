@@ -2950,6 +2950,31 @@ async fn run_get_vendored_uuid(
         return 0;
     }
 
+    if patch.purl.starts_with("pkg:npm/") {
+        if let Err((code, message)) =
+            socket_patch_core::vendor::bun_lock::preflight_vendor(&args.common.cwd).await
+        {
+            if args.common.json {
+                print_json(&serde_json::json!({
+                    "status": "error",
+                    "found": 1,
+                    "downloaded": 0,
+                    "failed": 1,
+                    "error": { "code": code, "message": message },
+                    "patches": [{
+                        "purl": patch.purl,
+                        "uuid": patch.uuid,
+                        "action": "failed",
+                        "errorCode": code,
+                    }],
+                }));
+            } else if !args.common.silent {
+                eprintln!("Error ({code}): {message}");
+            }
+            return 1;
+        }
+    }
+
     note_vendored_whole_manifest_scope(&manifest_path, &[patch.purl.as_str()], quiet).await;
 
     let action = match save_patch_record(args, patch, false, false).await {

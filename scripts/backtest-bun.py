@@ -19,7 +19,8 @@ VERSIONS = ['0.8.1', '1.0.0', '1.0.36', '1.1.0', '1.1.38', '1.1.39', '1.1.45',
             '1.2.0', '1.2.23', '1.3.0', '1.3.14', '1.4.0', '1.4.2']
 SHAPES = ['direct', 'dev', 'optional', 'alias', 'transitive', 'two-versions',
           'workspace', 'workspace-nested', 'peer', 'crlf', 'space-unicode',
-          'custom-registry', 'text', 'isolated', 'hoisted', 'lockfile-only', 'production']
+          'custom-registry', 'text', 'isolated', 'hoisted', 'lockfile-only', 'production',
+          'get-uuid', 'get-search']
 PURL = 'pkg:npm/minimist@1.2.2'
 UUID = '80630680-4da6-45f9-bba8-b888e0ffd58c'
 
@@ -183,7 +184,8 @@ def main():
             checks['installedBefore'] = bool(installed_targets(project))
             if shape == 'lockfile-only':
                 shutil.rmtree(project / 'node_modules')
-            command = [cli, 'scan', '--mode', 'vendored' if mode == 'vendored-detached' else mode, '--cwd', project,
+            verb = ['get', UUID if shape == 'get-uuid' else PURL] if shape.startswith('get-') else ['scan']
+            command = [cli, *verb, '--mode', 'vendored' if mode == 'vendored-detached' else mode, '--cwd', project,
                        '--json', '--yes', '--no-telemetry']
             if mode == 'vendored-detached':
                 command.append('--detached')
@@ -197,6 +199,7 @@ def main():
             row['refusals'] = [w.get('code', w.get('errorCode')) for w in warnings]
             row['refusals'] += [p['errorCode'] for p in envelope.get('download', {}).get('patches', [])
                                if p.get('errorCode')]
+            row['refusals'] += [p['errorCode'] for p in envelope.get('patches', []) if p.get('errorCode')]
             row['applied'] = applied
             if not checks['installedBefore'] and version in ['0.8.1', '1.0.0'] and shape in ['peer', 'transitive']:
                 row['supported'] = False
@@ -301,7 +304,8 @@ def main():
 
     jobs = [(v, s, m) for v in args.versions for s in args.shapes for m in args.modes
             if (s not in ('isolated', 'hoisted') or tuple(map(int, v.split('.'))) >= (1, 3, 0))
-            and (s != 'text' or tuple(map(int, v.split('.'))) >= (1, 1, 38))]
+            and (s != 'text' or tuple(map(int, v.split('.'))) >= (1, 1, 38))
+            and (not s.startswith('get-') or m != 'vendored-detached')]
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         rows = list(pool.map(backtest, jobs))
     save(root / 'summary.json', rows)
