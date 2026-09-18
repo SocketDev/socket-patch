@@ -49,20 +49,125 @@ fn git_sha256(content: &[u8]) -> String {
 
 /// The three npm flavors this file parameterizes over. Each knows how to lay
 /// down its pre-vendor lockfile and how to prove the vendor lock rewrite
-/// survived a repair.
+/// survived a repair. The bun arm is further parameterized over the text
+/// lock's `lockfileVersion` and the presence of a workspace member.
 #[derive(Clone, Copy)]
 enum Flavor {
     Pnpm,
     YarnBerry,
-    Bun,
+    Bun(BunLock),
+}
+
+/// One bun.lock shape: `lockfileVersion` 0 (bun 1.1.39–1.1.45 text opt-in),
+/// 1 (bun 1.2/1.3) or 2 (bun 1.4), with or without a `workspace:` packages
+/// entry. Workspace shapes matter because the vendor engine's workspace
+/// gate refuses a FRESH vendor into a pre-v2 workspace lock, while `repair`
+/// (and in-sync re-runs) on a lock that ALREADY carries the vendored tuple
+/// must keep working — a project vendored before it grew a workspace member
+/// used to be refused every maintenance verb, with `repair` leaving the lock
+/// pointing at a tarball it declined to rebuild.
+#[derive(Clone, Copy)]
+struct BunLock {
+    version: u64,
+    workspace: bool,
+}
+
+impl BunLock {
+    /// The plain v1 shape the flavor-generic arms use.
+    const V1: BunLock = BunLock {
+        version: 1,
+        workspace: false,
+    };
+
+    /// lockfileVersion {0, 1, 2} × {plain, workspace}.
+    const MATRIX: [BunLock; 6] = [
+        BunLock {
+            version: 0,
+            workspace: false,
+        },
+        BunLock {
+            version: 0,
+            workspace: true,
+        },
+        BunLock {
+            version: 1,
+            workspace: false,
+        },
+        BunLock {
+            version: 1,
+            workspace: true,
+        },
+        BunLock {
+            version: 2,
+            workspace: false,
+        },
+        BunLock {
+            version: 2,
+            workspace: true,
+        },
+    ];
+
+    /// The `packages` entry bun writes for the `consumer` workspace member —
+    /// the REAL per-version grammar (bun 1.1.45 vs 1.3.14/1.4.2 output): v0
+    /// emits a 2-tuple carrying the member's deps object, v1/v2 the
+    /// 1-tuple. Followed by bun's blank-line entry separator.
+    fn workspace_entry(self) -> &'static str {
+        if self.version == 0 {
+            "    \"consumer\": [\"consumer@workspace:packages/consumer\", { \"dependencies\": { \"left-pad\": \"1.3.0\" } }],\n\n"
+        } else {
+            "    \"consumer\": [\"consumer@workspace:packages/consumer\"],\n\n"
+        }
+    }
+
+    /// Only a v2 lock accepts a FRESH vendor with the workspace entry
+    /// present; the v0/v1 workspace shapes are reached the way real projects
+    /// reach them — vendored first, workspace member added afterwards (bun
+    /// keeps both the version and the vendored tuple on an in-place
+    /// `bun install`; see [`BunLock::add_workspace_member`]).
+    fn workspace_present_before_vendor(self) -> bool {
+        self.workspace && self.version == 2
+    }
+
+    /// The pre-vendor lock text (real bun shape: no `configVersion` line on
+    /// v0; the registry 4-tuple is grammar-identical across 0/1/2).
+    fn lock_text(self, with_workspace: bool) -> String {
+        format!(
+            "{{\n  \"lockfileVersion\": {},\n  \"packages\": {{\n{}    \"{DEP}\": \
+             [\"{DEP}@{DEP_VERSION}\", \"\", {{}}, \"sha512-orig==\"],\n  }}\n}}\n",
+            self.version,
+            if with_workspace {
+                self.workspace_entry()
+            } else {
+                ""
+            },
+        )
+    }
+
+    /// Splice the workspace member into an already-vendored lock — what the
+    /// post-vendor `bun install` leaves behind (vendored tuple byte-identical,
+    /// version unchanged).
+    fn add_workspace_member(self, root: &Path) {
+        let path = root.join("bun.lock");
+        let lock = std::fs::read_to_string(&path).unwrap();
+        let spliced = lock.replacen(
+            "  \"packages\": {\n",
+            &format!("  \"packages\": {{\n{}", self.workspace_entry()),
+            1,
+        );
+        assert_ne!(spliced, lock, "the workspace splice must hit");
+        std::fs::write(&path, spliced).unwrap();
+    }
 }
 
 impl Flavor {
-    fn tag(self) -> &'static str {
+    fn tag(self) -> String {
         match self {
-            Flavor::Pnpm => "pnpm",
-            Flavor::YarnBerry => "yarn-berry",
-            Flavor::Bun => "bun",
+            Flavor::Pnpm => "pnpm".to_string(),
+            Flavor::YarnBerry => "yarn-berry".to_string(),
+            Flavor::Bun(BunLock { version, workspace }) => format!(
+                "bun(lockfileVersion {version}{})",
+                if workspace { ", workspace" } else { "" }
+            ),
         }
     }
 
@@ -71,8 +176,21 @@ impl Flavor {
         match self {
             Flavor::Pnpm => "pnpm-lock.yaml",
             Flavor::YarnBerry => "yarn.lock",
-            Flavor::Bun => "bun.lock",
+            Flavor::Bun(_) => "bun.lock",
         }
+    }
+
+    /// The `consumer` workspace member's manifest (bun refuses to install a
+    /// lock that names a missing member; the engine is lock-only, this keeps
+    /// the fixture honest).
+    fn workspace_member(self) -> bool {
+        matches!(
+            self,
+            Flavor::Bun(BunLock {
+                workspace: true,
+                ..
+            })
+        )
     }
 
     /// Write the pre-vendor lockfile (the shape each backend's capstone
@@ -127,14 +245,10 @@ snapshots:
                 )
                 .unwrap();
             }
-            Flavor::Bun => {
+            Flavor::Bun(shape) => {
                 std::fs::write(
                     root.join("bun.lock"),
-                    format!(
-                        "{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n    \
-                         \"{DEP}\": [\"{DEP}@{DEP_VERSION}\", \"\", {{}}, \"sha512-orig==\"],\n  \
-                         }}\n}}\n"
-                    ),
+                    shape.lock_text(shape.workspace_present_before_vendor()),
                 )
                 .unwrap();
             }
@@ -161,7 +275,7 @@ snapshots:
             // berry: the `file:./<rel>` locator entry.
             Flavor::YarnBerry => format!("{DEP}@file:./{tgz_rel}"),
             // bun: the local-tarball 3-tuple element 0 `<name>@<bare-rel>`.
-            Flavor::Bun => format!("\"{DEP}@{tgz_rel}\""),
+            Flavor::Bun(_) => format!("\"{DEP}@{tgz_rel}\""),
         }
     }
 }
@@ -169,14 +283,30 @@ snapshots:
 /// Vendorable flavor project: package.json + the flavor lockfile + the
 /// installed package copy the vendor backend packs from.
 fn write_fixture(root: &Path, flavor: Flavor) {
+    let workspaces = if flavor.workspace_member() {
+        r#","workspaces":["packages/*"]"#
+    } else {
+        ""
+    };
     std::fs::write(
         root.join("package.json"),
         format!(
-            r#"{{"name":"{}","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#,
+            r#"{{"name":"{}","version":"0.0.0","private":true{workspaces},"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#,
             flavor.root_name()
         ),
     )
     .unwrap();
+    if flavor.workspace_member() {
+        let member = root.join("packages/consumer");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("package.json"),
+            format!(
+                r#"{{"name":"consumer","version":"1.0.0","dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
+            ),
+        )
+        .unwrap();
+    }
     flavor.write_lock(root);
 
     let pkg = root.join("node_modules").join(DEP);
@@ -284,12 +414,28 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str]) -> (i32, String, String) 
 }
 
 /// `scan --vendor --yes` to establish a vendored flavor project; returns the
-/// vendored tarball path (identical layout for every npm flavor).
-fn vendor_project(root: &Path, mock_uri: &str) -> PathBuf {
+/// vendored tarball path (identical layout for every npm flavor). A v0/v1
+/// bun workspace shape gains its workspace member AFTER vendoring — the only
+/// way such a lock arises (a fresh vendor into it is refused by design).
+fn vendor_project(root: &Path, mock_uri: &str, flavor: Flavor) -> PathBuf {
     let (code, stdout, stderr) = run_cli(root, mock_uri, &["scan", "--vendor", "--yes"]);
-    assert_eq!(code, 0, "vendor setup failed: {stdout} {stderr}");
+    assert_eq!(
+        code,
+        0,
+        "{}: vendor setup failed: {stdout} {stderr}",
+        flavor.tag()
+    );
     let tgz = root.join(format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz"));
-    assert!(tgz.is_file(), "setup must vendor the tarball: {stdout}");
+    assert!(
+        tgz.is_file(),
+        "{}: setup must vendor the tarball: {stdout}",
+        flavor.tag()
+    );
+    if let Flavor::Bun(shape) = flavor {
+        if shape.workspace && !shape.workspace_present_before_vendor() {
+            shape.add_workspace_member(root);
+        }
+    }
     tgz
 }
 
@@ -321,7 +467,7 @@ async fn deleted_tarball_rebuilds(flavor: Flavor) {
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path(), flavor);
-    let tgz = vendor_project(tmp.path(), &mock.uri());
+    let tgz = vendor_project(tmp.path(), &mock.uri(), flavor);
     let tgz_bytes = std::fs::read(&tgz).unwrap();
     let lock1 = std::fs::read(tmp.path().join(flavor.lock_name())).unwrap();
 
@@ -363,9 +509,16 @@ async fn repair_rebuilds_deleted_yarn_berry_tarball() {
     deleted_tarball_rebuilds(Flavor::YarnBerry).await;
 }
 
+/// Every bun.lock shape — lockfileVersion {0, 1, 2} × {plain, workspace}.
+/// `repair` rebuilds through the vendor engine, whose workspace gate must
+/// let an already-vendored (`Ours`) instance through on a pre-v2 workspace
+/// lock instead of refusing and leaving the lock pointing at a tarball
+/// nobody rebuilt (cold `bun install --frozen-lockfile` then ENOENTs).
 #[tokio::test]
 async fn repair_rebuilds_deleted_bun_tarball() {
-    deleted_tarball_rebuilds(Flavor::Bun).await;
+    for shape in BunLock::MATRIX {
+        deleted_tarball_rebuilds(Flavor::Bun(shape)).await;
+    }
 }
 
 // ── (b) corrupt tarball → detected + rebuilt ───────────────────────────────
@@ -375,7 +528,7 @@ async fn corrupt_tarball_rebuilds(flavor: Flavor) {
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path(), flavor);
-    let tgz = vendor_project(tmp.path(), &mock.uri());
+    let tgz = vendor_project(tmp.path(), &mock.uri(), flavor);
     let tgz_bytes = std::fs::read(&tgz).unwrap();
 
     std::fs::write(&tgz, b"\x1f\x8bgarbage").unwrap();
@@ -405,7 +558,9 @@ async fn repair_rebuilds_corrupt_yarn_berry_tarball() {
 
 #[tokio::test]
 async fn repair_rebuilds_corrupt_bun_tarball() {
-    corrupt_tarball_rebuilds(Flavor::Bun).await;
+    for shape in BunLock::MATRIX {
+        corrupt_tarball_rebuilds(Flavor::Bun(shape)).await;
+    }
 }
 
 // ── (c) tampered ledger sha → fail-closed ──────────────────────────────────
@@ -415,7 +570,7 @@ async fn tampered_ledger_fails_closed(flavor: Flavor) {
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path(), flavor);
-    let tgz = vendor_project(tmp.path(), &mock.uri());
+    let tgz = vendor_project(tmp.path(), &mock.uri(), flavor);
 
     let state_path = tmp.path().join(".socket/vendor/state.json");
     let state = std::fs::read_to_string(&state_path).unwrap();
@@ -452,7 +607,7 @@ async fn repair_fails_closed_on_tampered_yarn_berry_ledger_sha() {
 
 #[tokio::test]
 async fn repair_fails_closed_on_tampered_bun_ledger_sha() {
-    tampered_ledger_fails_closed(Flavor::Bun).await;
+    tampered_ledger_fails_closed(Flavor::Bun(BunLock::V1)).await;
 }
 
 // ── (d) ledger deleted wholesale → reconstruct from lockfile references ─────
@@ -462,7 +617,7 @@ async fn ledger_gone_reconstructs_from_lock(flavor: Flavor) {
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path(), flavor);
-    let tgz = vendor_project(tmp.path(), &mock.uri());
+    let tgz = vendor_project(tmp.path(), &mock.uri(), flavor);
     let lock1 = std::fs::read(tmp.path().join(flavor.lock_name())).unwrap();
 
     // The whole .socket/vendor tree (state.json included) is gone — only the
@@ -521,7 +676,7 @@ async fn ledger_gone_drifted_copy_fails_closed(flavor: Flavor) {
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path(), flavor);
-    let tgz = vendor_project(tmp.path(), &mock.uri());
+    let tgz = vendor_project(tmp.path(), &mock.uri(), flavor);
     let lock1 = std::fs::read(tmp.path().join(flavor.lock_name())).unwrap();
 
     // Drift an UNPATCHED part of the installed copy (patched-file tampering
@@ -579,7 +734,7 @@ async fn repair_fails_closed_on_drifted_copy_yarn_berry() {
 
 #[tokio::test]
 async fn repair_fails_closed_on_drifted_copy_bun() {
-    ledger_gone_drifted_copy_fails_closed(Flavor::Bun).await;
+    ledger_gone_drifted_copy_fails_closed(Flavor::Bun(BunLock::V1)).await;
 }
 
 #[tokio::test]
@@ -613,7 +768,7 @@ async fn revert_of_reconstructed_pnpm_entry_fails_closed_then_recovers() {
     write_fixture(tmp.path(), Flavor::Pnpm);
     let lock_pre = std::fs::read(tmp.path().join("pnpm-lock.yaml")).unwrap();
     let pkg_pre = std::fs::read(tmp.path().join("package.json")).unwrap();
-    let tgz = vendor_project(tmp.path(), &mock.uri());
+    let tgz = vendor_project(tmp.path(), &mock.uri(), Flavor::Pnpm);
     let lock_vendored = std::fs::read(tmp.path().join("pnpm-lock.yaml")).unwrap();
 
     // Ledger gone; artifact + rewired lock intact (the empirical shape).
@@ -724,5 +879,5 @@ async fn repair_reconstructs_yarn_berry_ledger_from_lockfile() {
 
 #[tokio::test]
 async fn repair_reconstructs_bun_ledger_from_lockfile() {
-    ledger_gone_reconstructs_from_lock(Flavor::Bun).await;
+    ledger_gone_reconstructs_from_lock(Flavor::Bun(BunLock::V1)).await;
 }
