@@ -5,8 +5,12 @@
 //! `packages` entry passes `bun install --frozen-lockfile` / `bun ci`, the
 //! lock stays byte-stable under plain `bun install`, the entry's integrity
 //! (sha512 of the raw tarball bytes) is enforced fail-closed even on plain
-//! installs (BN5), warm caches never shadow the tarball (BN6), and a fresh
-//! checkout installs fully offline (BN7). package.json is left UNTOUCHED —
+//! installs (BN5) — by Bun >= 1.3.10, the release that started verifying
+//! the sha512 of URL/local-tarball tuples (registry 4-tuples are verified
+//! from >= 1.2.0); every earlier release installs a tampered tarball with
+//! exit 0, so on those consumers the integrity we write is a pin they
+//! cannot enforce — warm caches never shadow the tarball (BN6), and a
+//! fresh checkout installs fully offline (BN7). package.json is left UNTOUCHED —
 //! and per-entry edits give exact per-instance targeting that bun's
 //! name-only `overrides` cannot (BN4: a name-keyed override collapses EVERY
 //! version; a version-scoped override key is a silent no-op).
@@ -56,24 +60,75 @@ const BUN_LOCK: &str = "bun.lock";
 /// original/new = the verbatim entry LINE.
 const KIND_LOCK_PACKAGE: &str = "bun_lock_package";
 
+/// The ONE remedy text for `vendor_bun_lockb_unsupported`, shared by the
+/// flavor router ([`super::npm_flavor::detect_npm_lock_flavor`], reached by
+/// `vendor` and detached runs) and [`preflight_vendor`] (reached by
+/// `get`/`scan --mode vendored` before any download) so the code never
+/// carries two different remedies. `bun install --save-text-lockfile` is
+/// the actual fix — plain `bun install` on ANY bun (1.2.x and 1.4.x
+/// included) keeps an in-sync bun.lockb as-is — and the flag exists only
+/// from 1.1.39 (1.1.38 accepts it silently and still writes bun.lockb), so
+/// the floor is spelled out too.
+pub(crate) const BUN_LOCKB_UNSUPPORTED_DETAIL: &str =
+    "bun.lockb is bun's legacy binary lockfile, which vendor cannot rewrite; run `bun install \
+     --save-text-lockfile` (Bun >= 1.1.39), commit the resulting bun.lock, and re-run";
+
+/// Workspace gate: a `workspace:` packages entry in a lock whose
+/// `lockfileVersion` is below 2 refuses with `vendor_bun_workspace_unsupported`.
+///
+/// WHY (measured with real binaries, cold caches): Bun 1.2.x–1.3.x resolve
+/// a workspace-scoped local-tarball path relative to the workspace MEMBER
+/// that declares it — our root-relative `.socket/vendor/npm/…` tuple then
+/// ENOENTs on `bun install` — while 1.4.x resolves it relative to the
+/// lockfile. The property belongs to the consuming bun binary, which the
+/// vendoring machine cannot see; a committed lockfileVersion-2 lock is the
+/// only proof that every consumer runs Bun >= 1.4, because 1.3.x cannot
+/// parse v2 at all, whereas a v1 lock is readable by both.
+///
+/// The gate is a DELIBERATE OVER-APPROXIMATION: a package declared only by
+/// the workspace root vendors and installs correctly on every v1 release
+/// too, but the lock cannot cheaply prove which workspace declares the
+/// entry (hoisted entries collapse root and member declarations into one
+/// key), so every pre-v2 workspace lock refuses. Hosted mode accepts these
+/// locks (a URL tuple has no path to resolve), which the remedy points at.
+///
+/// Bun never bumps an existing lock's version in place — 1.4.x `install`,
+/// `--save-text-lockfile`, `--force`, `add` and `update` all keep a v1 lock
+/// at version 1; only deleting bun.lock and re-locking writes 2 — so the
+/// remedy says exactly that instead of the non-converging "upgrade and run
+/// `bun install`".
 fn check_workspace_compatibility(
     text: &str,
     entries: &[BunEntry],
 ) -> Result<(), (&'static str, String)> {
-    if lock_version(text) != Some(2) && has_workspace_packages(entries) {
-        return Err((
-            "vendor_bun_workspace_unsupported",
-            "Bun text locks before version 2 resolve workspace tarballs relative to the \
-             workspace rather than the lockfile; upgrade to Bun >= 1.4 and run `bun install` \
-             before vendoring workspace dependencies"
-                .to_string(),
-        ));
+    // `check_lock_version` already refused a lock with no integer head, so
+    // `None` is unreachable here; 0 (the oldest text grammar) is the
+    // fail-closed reading if it ever were.
+    let version = lock_version(text).unwrap_or(0);
+    if version >= 2 || !has_workspace_packages(entries) {
+        return Ok(());
     }
-    Ok(())
+    Err((
+        "vendor_bun_workspace_unsupported",
+        format!(
+            "Bun releases before 1.4 resolve a workspace-scoped local tarball path relative to \
+             the workspace member, and a lockfileVersion-{version} lock may still be installed \
+             by such a release; delete bun.lock and re-run `bun install` with Bun >= 1.4 (which \
+             writes lockfileVersion 2) before vendoring — an in-place `bun install` keeps the \
+             existing lockfileVersion — or use `--mode hosted`, which accepts version-1 \
+             workspace locks"
+        ),
+    ))
 }
 
-/// Refuse incompatible Bun projects before downloading records into the manifest.
-/// Other package managers are left to their own backends.
+/// Refuse incompatible Bun projects before downloading records into the
+/// manifest. Other package managers are left to their own backends.
+///
+/// PROJECT-LEVEL: this cannot see per-purl state, so it refuses a pre-v2
+/// workspace lock even when the purl in question is already vendored in
+/// it (the CLI exempts already-vendored purls before calling it);
+/// [`vendor_bun`] itself gates per classified instance and lets in-sync
+/// re-runs and `repair` rebuilds through.
 pub async fn preflight_vendor(project_root: &Path) -> Result<(), (&'static str, String)> {
     let path = project_root.join(BUN_LOCK);
     let text = match read_regular_to_string(&path).await {
@@ -82,8 +137,7 @@ pub async fn preflight_vendor(project_root: &Path) -> Result<(), (&'static str, 
             if project_root.join("bun.lockb").exists() {
                 return Err((
                     "vendor_bun_lockb_unsupported",
-                    "Bun binary lockfiles cannot be vendored; upgrade Bun and generate bun.lock"
-                        .to_string(),
+                    BUN_LOCKB_UNSUPPORTED_DETAIL.to_string(),
                 ));
             }
             return Ok(());
@@ -148,10 +202,6 @@ pub(crate) async fn vendor_bun(
         }
     };
 
-    if let Err((code, detail)) = check_workspace_compatibility(&lock_text, &entries) {
-        return refused(code, detail);
-    }
-
     // ── 3. Pre-flight: at least one rewritable instance ──────────────────
     let target_spec = format!("{name}@{version}");
     let target_leaf = tgz_rel_leaf(name, version);
@@ -166,6 +216,28 @@ pub(crate) async fn vendor_bun(
                  the package is installed and locked (`bun install`) before vendoring"
             ),
         );
+    }
+    // Workspace gate, evaluated on the CLASSIFIED target instances rather
+    // than the raw lock: it refuses only a run that would WRITE a new
+    // local-tarball tuple (a `Registry` instance) into a pre-v2 workspace
+    // lock. When every matching instance is already one of ours (`Ours`),
+    // the lock carries the local tuple regardless of what this run does —
+    // an in-sync re-run must synthesize AlreadyPatched and a `repair`
+    // rebuild of a missing/corrupt artifact must proceed (both route here),
+    // otherwise a project vendored before it grew a workspace member is
+    // refused every maintenance verb and `repair` leaves the lock pointing
+    // at a tarball it declined to rebuild. Still ahead of staging, so the
+    // refusal precedes every write.
+    let writes_new_local_tuple = entries.iter().any(|e| {
+        matches!(
+            classify(e, &target_spec, name, &target_leaf),
+            Some(TupleShape::Registry)
+        )
+    });
+    if writes_new_local_tuple {
+        if let Err((code, detail)) = check_workspace_compatibility(&lock_text, &entries) {
+            return refused(code, detail);
+        }
     }
 
     // ── 4. Stage → patch → pack (shared flavor-agnostic pipeline) ────────
@@ -1271,40 +1343,262 @@ mod tests {
         );
     }
 
+    // ── lockfileVersion 0 + workspace locks: real per-version grammar ─────
+    //
+    // Provenance (real `bun install --save-text-lockfile` output, verified
+    // 2026-09-18 on a root + `packages/consumer` workspace project):
+    //   bun 1.1.45 (v0): no `configVersion` line; the root's workspace dep
+    //     is spelled as a bare path (`"consumer": "packages/consumer"`);
+    //     the member's packages entry is a 2-TUPLE carrying its deps object
+    //     (`{}` when dep-less).
+    //   bun 1.3.14 (v1) / 1.4.2 (v2): `configVersion: 1`; `workspace:*`;
+    //     the 1-tuple `["consumer@workspace:packages/consumer"]`.
+    // Entries are separated by a blank line. Registry 4-tuples are
+    // grammar-identical across 0/1/2.
+
+    /// Re-head a BN3 lock (before or after) as `lockfileVersion`: the
+    /// integer, and — on 0 — no `configVersion` line.
+    fn as_lock_version(base: &str, version: u64) -> String {
+        let lock = base.replace(
+            "\"lockfileVersion\": 1,",
+            &format!("\"lockfileVersion\": {version},"),
+        );
+        if version == 0 {
+            lock.replace("  \"configVersion\": 1,\n", "")
+        } else {
+            lock
+        }
+    }
+
+    /// The `packages` entry bun writes for the `consumer` workspace member
+    /// at `lockfileVersion`.
+    fn workspace_entry_line(version: u64) -> &'static str {
+        if version == 0 {
+            "    \"consumer\": [\"consumer@workspace:packages/consumer\", { \"dependencies\": { \"left-pad\": \"1.3.0\" } }],"
+        } else {
+            "    \"consumer\": [\"consumer@workspace:packages/consumer\"],"
+        }
+    }
+
+    /// Add the `consumer` workspace member to a BN3-shaped lock the way bun
+    /// of that `lockfileVersion` spells it (root dep + first packages entry
+    /// + blank-line separator). Works on a pre- or post-vendor lock.
+    fn with_workspace_member(base: &str, version: u64) -> String {
+        let root_dep = if version == 0 {
+            "packages/consumer"
+        } else {
+            "workspace:*"
+        };
+        let lock = base
+            .replace(
+                "        \"left-pad\": \"1.3.0\",",
+                &format!("        \"consumer\": \"{root_dep}\",\n        \"left-pad\": \"1.3.0\","),
+            )
+            .replace(
+                "  \"packages\": {\n",
+                &format!("  \"packages\": {{\n{}\n\n", workspace_entry_line(version)),
+            );
+        assert_ne!(lock, base, "the workspace splice must hit");
+        lock
+    }
+
+    /// A BN3 lock re-spelled as a `lockfileVersion` workspace lock.
+    fn as_workspace_lock(base: &str, version: u64) -> String {
+        with_workspace_member(&as_lock_version(base, version), version)
+    }
+
+    /// The converging remedy: names the lock's version, says to DELETE the
+    /// lock (an in-place `bun install` keeps the version), and offers
+    /// hosted mode.
+    fn assert_workspace_remedy(detail: &str, version: u64) {
+        assert!(detail.contains("Bun releases before 1.4"), "{detail}");
+        assert!(
+            detail.contains(&format!("lockfileVersion-{version} lock")),
+            "the detail must name the actual version integer: {detail}"
+        );
+        assert!(detail.contains("delete bun.lock"), "{detail}");
+        assert!(
+            detail.contains("in-place `bun install` keeps the existing lockfileVersion"),
+            "{detail}"
+        );
+        assert!(detail.contains("--mode hosted"), "{detail}");
+        assert!(
+            !detail.contains("upgrade to Bun"),
+            "the non-converging remedy must be gone: {detail}"
+        );
+    }
+
+    /// Fresh vendoring on a workspace lock: lockfileVersion 0 and 1 refuse
+    /// BEFORE any write (preflight and engine alike) with the converging
+    /// remedy; 2 vendors byte-exactly — the workspace line survives — and
+    /// reverts byte-exactly.
     #[tokio::test]
     async fn legacy_workspace_tarballs_refuse_before_writes() {
-        for version in [0, 1, 2] {
-            let lock = BN3_BEFORE_LOCK
-                .replace("\"lockfileVersion\": 1", &format!("\"lockfileVersion\": {version}"))
-                .replace("  \"packages\": {", "  \"packages\": {\n    \"consumer\": [\"consumer@workspace:packages/consumer\"],");
+        for version in [0u64, 1, 2] {
+            let lock = as_workspace_lock(BN3_BEFORE_LOCK, version);
             let fx = fixture_with(&lock, "node_modules/left-pad").await;
             if version < 2 {
+                let (code, detail) = preflight_vendor(fx.root()).await.unwrap_err();
+                assert_eq!(code, "vendor_bun_workspace_unsupported", "v{version}");
+                assert_workspace_remedy(&detail, version);
+                let detail =
+                    expect_refused(fx.vendor(false).await, "vendor_bun_workspace_unsupported");
+                assert_workspace_remedy(&detail, version);
                 assert_eq!(
-                    preflight_vendor(fx.root()).await.unwrap_err().0,
-                    "vendor_bun_workspace_unsupported"
+                    fx.read_lock().await,
+                    lock,
+                    "v{version}: refusal writes nothing"
                 );
-                expect_refused(fx.vendor(false).await, "vendor_bun_workspace_unsupported");
-                assert_eq!(fx.read_lock().await, lock);
-                assert!(!fx.root().join(".socket/vendor").exists());
+                assert!(!fx.root().join(".socket/vendor").exists(), "v{version}");
             } else {
                 assert!(preflight_vendor(fx.root()).await.is_ok());
-                let (_, entry, _) = expect_done(fx.vendor(false).await);
-                assert!(entry.is_some());
+                let (result, entry, _) = expect_done(fx.vendor(false).await);
+                assert!(result.success, "{:?}", result.error);
+                let entry = entry.expect("success carries a ledger entry");
+                assert_eq!(
+                    fx.read_lock().await,
+                    as_workspace_lock(BN3_AFTER_LOCK, version)
+                        .replace(SPIKE_INTEGRITY, &fx.actual_integrity().await),
+                    "the BN3 transform byte-for-byte, workspace line intact"
+                );
+                let outcome = revert_bun(&entry, fx.root(), false).await;
+                assert!(outcome.success, "{:?}", outcome.error);
+                assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+                assert_eq!(
+                    fx.read_lock().await,
+                    lock,
+                    "revert byte-restores the workspace lock"
+                );
             }
         }
     }
 
+    /// Fresh vendor on a v0/v1 workspace lock — a `Registry` target instance,
+    /// so the run WOULD write a new local-tarball tuple — still refuses,
+    /// even when a stale uuid dir already sits under `.socket/vendor/`
+    /// (classification is by lock tuple, never by artifact presence).
+    #[tokio::test]
+    async fn fresh_vendor_on_v1_workspace_lock_still_refuses() {
+        for version in [0u64, 1] {
+            let lock = as_workspace_lock(BN3_BEFORE_LOCK, version);
+            let fx = fixture_with(&lock, "node_modules/left-pad").await;
+            let stale_dir = fx.root().join(format!(".socket/vendor/npm/{UUID}"));
+            tokio::fs::create_dir_all(&stale_dir).await.unwrap();
+            let detail = expect_refused(fx.vendor(false).await, "vendor_bun_workspace_unsupported");
+            assert_workspace_remedy(&detail, version);
+            assert_eq!(
+                fx.read_lock().await,
+                lock,
+                "v{version}: refusal writes nothing"
+            );
+            assert!(
+                !fx.root().join(fx.rel_tgz()).exists(),
+                "v{version}: nothing staged or packed"
+            );
+        }
+    }
+
+    /// The upgrade shape the gate must not regress: a plain v0/v1 lock
+    /// vendored (as every earlier release did), then the user adds a
+    /// workspace member and runs `bun install` in place — bun keeps the
+    /// version and leaves the vendored tuple byte-identical (verified with
+    /// bun 1.3.14). Returns the fixture, its ledger entry and the resulting
+    /// workspace lock text.
+    async fn vendored_then_workspace_added(version: u64) -> (Fixture, VendorEntry, String) {
+        let fx = fixture_with(
+            &as_lock_version(BN3_BEFORE_LOCK, version),
+            "node_modules/left-pad",
+        )
+        .await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "v{version}: {:?}", result.error);
+        let entry = entry.expect("fresh vendor records an entry");
+        let lock = with_workspace_member(&fx.read_lock().await, version);
+        tokio::fs::write(fx.root().join(BUN_LOCK), &lock)
+            .await
+            .unwrap();
+        (fx, entry, lock)
+    }
+
+    /// Every matching instance is already ours: the in-sync re-run must
+    /// synthesize AlreadyPatched (exit-0 `already_vendored` upstream), not
+    /// refuse — the lock already carries the local tuple whatever this run
+    /// does. The project-level preflight still refuses (it cannot see
+    /// per-purl state; the CLI exempts already-vendored purls before it).
+    #[tokio::test]
+    async fn in_sync_rerun_on_v1_workspace_lock_is_already_patched_not_refused() {
+        for version in [0u64, 1] {
+            let (fx, _entry, lock) = vendored_then_workspace_added(version).await;
+            assert_eq!(
+                preflight_vendor(fx.root()).await.unwrap_err().0,
+                "vendor_bun_workspace_unsupported",
+                "v{version}: the project-level gate stays blanket"
+            );
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "v{version}: {:?}", result.error);
+            assert!(
+                entry.is_none(),
+                "v{version}: in-sync re-run records nothing"
+            );
+            assert!(
+                result
+                    .files_verified
+                    .iter()
+                    .all(|v| v.status == VerifyStatus::AlreadyPatched),
+                "v{version}: {:?}",
+                result.files_verified
+            );
+            assert_eq!(fx.read_lock().await, lock, "v{version}: lock byte-stable");
+        }
+    }
+
+    /// `repair` on a missing artifact drives this exact call: the target
+    /// instance is `Ours`, so the gate is skipped, the artifact is re-packed
+    /// byte-identically and the lock is left alone — instead of refusing and
+    /// leaving the lock pointing at a tarball nobody rebuilt.
+    #[tokio::test]
+    async fn rebuild_on_missing_tarball_on_v1_workspace_lock_succeeds() {
+        for version in [0u64, 1] {
+            let (fx, _entry, lock) = vendored_then_workspace_added(version).await;
+            let tgz_path = fx.root().join(fx.rel_tgz());
+            let tgz_bytes = tokio::fs::read(&tgz_path).await.unwrap();
+            remove_tree(&fx.root().join(format!(".socket/vendor/npm/{UUID}")))
+                .await
+                .unwrap();
+            assert!(!tgz_path.exists(), "v{version}: setup deletes the artifact");
+
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "v{version}: {:?}", result.error);
+            assert!(entry.is_none(), "v{version}: the lock needed no edit");
+            assert_eq!(
+                tokio::fs::read(&tgz_path).await.unwrap(),
+                tgz_bytes,
+                "v{version}: deterministic rebuild reproduces the recorded bytes"
+            );
+            assert_eq!(fx.read_lock().await, lock, "v{version}: lock byte-stable");
+        }
+    }
+
+    /// A version-0 head (real bun 1.1.45 shape: no `configVersion`) vendors
+    /// with the exact BN3 transform and reverts byte-exactly.
     #[tokio::test]
     async fn lock_v0_vendor_and_revert_preserve_bytes() {
-        let lock = BN3_BEFORE_LOCK.replace("\"lockfileVersion\": 1", "\"lockfileVersion\": 0");
+        let lock = as_lock_version(BN3_BEFORE_LOCK, 0);
         let fx = fixture_with(&lock, "node_modules/left-pad").await;
         assert!(preflight_vendor(fx.root()).await.is_ok());
-        let (_, entry, _) = expect_done(fx.vendor(false).await);
-        assert!(fx.read_lock().await.contains(".socket/vendor/npm/"));
-        let entry = entry.unwrap();
-        let result = revert_bun(&entry, fx.root(), false).await;
-        assert!(result.success);
-        assert_eq!(fx.read_lock().await, lock);
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            fx.read_lock().await,
+            as_lock_version(BN3_AFTER_LOCK, 0)
+                .replace(SPIKE_INTEGRITY, &fx.actual_integrity().await),
+            "the BN3 transform byte-for-byte under a version-0 head"
+        );
+        let entry = entry.expect("success carries a ledger entry");
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(fx.read_lock().await, lock, "lock byte-restored");
     }
 
     #[tokio::test]
@@ -1314,10 +1608,16 @@ mod tests {
         tokio::fs::write(root.path().join("bun.lockb"), b"binary")
             .await
             .unwrap();
-        assert_eq!(
-            preflight_vendor(root.path()).await.unwrap_err().0,
-            "vendor_bun_lockb_unsupported"
+        let (code, detail) = preflight_vendor(root.path()).await.unwrap_err();
+        assert_eq!(code, "vendor_bun_lockb_unsupported");
+        // The contract's remedy, from the ONE shared text (the router emits
+        // the same string for the same code).
+        assert_eq!(detail, BUN_LOCKB_UNSUPPORTED_DETAIL);
+        assert!(
+            detail.contains("bun install --save-text-lockfile") && detail.contains("1.1.39"),
+            "remedy + version floor: {detail}"
         );
+        assert!(!detail.contains("upgrade Bun"), "{detail}");
         tokio::fs::write(root.path().join(BUN_LOCK), BN3_BEFORE_LOCK)
             .await
             .unwrap();

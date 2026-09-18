@@ -161,12 +161,11 @@ pub(crate) async fn detect_npm_lock_flavor(
             break 'flavor NpmLockFlavor::Bun;
         }
         if exists("bun.lockb").await {
+            // One remedy text for this code, shared with the pre-download
+            // preflight (`bun_lock::preflight_vendor`).
             return Err((
                 "vendor_bun_lockb_unsupported",
-                "bun.lockb is bun's legacy binary lockfile, which vendor cannot rewrite; \
-                 run `bun install --save-text-lockfile`, commit the resulting bun.lock, \
-                 and re-run vendor"
-                    .to_string(),
+                bun_lock::BUN_LOCKB_UNSUPPORTED_DETAIL.to_string(),
             ));
         }
 
