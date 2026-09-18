@@ -1205,3 +1205,134 @@ mod pty {
         assert_eq!(view_gets(&reqs), 0, "declining must not download the patch");
     }
 }
+
+// ---------------------------------------------------------------------------
+// bun.lockb-only project: a diagnosis, never a silent success-0
+// ---------------------------------------------------------------------------
+// A bun project whose only lockfile is the legacy binary `bun.lockb` (bun
+// <= 1.1.38 always; 1.1.39–1.1.45 without `--save-text-lockfile`) with no
+// `node_modules/` (fresh clone, CI lockfile-only checkout) used to scan as
+// `status: success / scannedPackages: 0` with NO warnings in every mode —
+// indistinguishable from an empty project (54 such matrix cells passed as
+// "clean"). The lock inventory now surfaces `bun_lockb_unsupported`, which
+// rides scan's additive run-level `warnings[]` (PnP-refusal precedent);
+// exit code and `status` stay unchanged.
+
+fn write_bun_lockb_only_project(root: &Path) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "covgap-lockb-only", "version": "0.0.0", "dependencies": { "minimist": "1.2.2" } }"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("bun.lockb"), b"\0binary bun lockfile").unwrap();
+}
+
+fn bun_lockb_warning(v: &serde_json::Value) -> Option<&serde_json::Value> {
+    v["warnings"]
+        .as_array()
+        .and_then(|ws| ws.iter().find(|w| w["code"] == "bun_lockb_unsupported"))
+}
+
+/// Zero-package path, every mode (agent, vendored, hosted): exit 0, the
+/// envelope stays a `success` with `scannedPackages: 0`, and `warnings[]`
+/// carries `bun_lockb_unsupported` with the `--save-text-lockfile` remedy.
+/// Hosted mode keeps it here because the hosted driver — which owns the
+/// bun.lockb migration story on a NON-empty scan — never runs on an empty
+/// one; without the warning this is exactly the old silent no-op.
+#[test]
+fn scan_bun_lockb_only_project_warns_instead_of_silent_success() {
+    for mode in [None, Some("vendored"), Some("hosted")] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bun_lockb_only_project(tmp.path());
+        let mut args = vec!["--json"];
+        if let Some(mode) = mode {
+            args.extend(["--mode", mode]);
+        }
+        let (code, stdout, stderr) = run_scan(tmp.path(), &args);
+        assert_eq!(
+            code, 0,
+            "mode={mode:?}: refusals never flip the exit; stdout={stdout}; stderr={stderr}"
+        );
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("bad JSON ({e}): {stdout}"));
+        assert_eq!(v["status"], "success", "mode={mode:?}: {v}");
+        assert_eq!(v["scannedPackages"], 0, "mode={mode:?}: {v}");
+        assert_eq!(v["lockfileOnlyPackages"], 0, "mode={mode:?}: {v}");
+        let warning = bun_lockb_warning(&v).unwrap_or_else(|| {
+            panic!("mode={mode:?}: warnings[] must carry bun_lockb_unsupported: {v}")
+        });
+        let detail = warning["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("bun install --save-text-lockfile") && detail.contains("1.1.39"),
+            "mode={mode:?}: the remedy and its version floor: {detail}"
+        );
+        assert!(
+            !stdout.contains("Warning ("),
+            "mode={mode:?}: the human warning line must not leak into the JSON stream: {stdout}"
+        );
+    }
+
+    // Human path: the same diagnosis as a stderr `Warning (code): detail`
+    // line, exit 0, and the generic "No packages found" hint still prints.
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_lockb_only_project(tmp.path());
+    let (code, stdout, stderr) = run_scan(tmp.path(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stderr
+            .contains("Warning (bun_lockb_unsupported): bun.lockb is bun's legacy binary lockfile"),
+        "the human path must name the layout and the code; got {stderr:?}"
+    );
+    assert!(
+        stderr.contains("--save-text-lockfile"),
+        "the human path must carry the remedy; got {stderr:?}"
+    );
+    assert!(stdout.contains("No packages found"), "{stdout:?}");
+}
+
+/// NON-empty hosted scan (an installed package beside the bun.lockb): the
+/// hosted driver runs and owns the bun.lockb story (`redirect_bun_lockb_*`
+/// on `redirect.warnings`, or an actual migration), so the discovery-side
+/// `bun_lockb_unsupported` is dropped there — while the same project in
+/// agent mode keeps it on its non-empty envelope.
+#[tokio::test]
+async fn scan_hosted_nonempty_drops_the_bun_lockb_discovery_warning() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+
+    for (mode, expect_warning) in [(None, true), (Some("hosted"), false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bun_lockb_only_project(tmp.path());
+        write_npm_package(tmp.path(), "minimist", "1.2.2", b"module.exports = 1;\n");
+        let uri = mock.uri();
+        let mut args = vec![
+            "--json",
+            "--api-url",
+            uri.as_str(),
+            "--api-token",
+            "fake-token-for-test",
+            "--org",
+            ORG_SLUG,
+        ];
+        if let Some(mode) = mode {
+            args.extend(["--mode", mode]);
+        }
+        let (code, stdout, stderr) = run_scan(tmp.path(), &args);
+        assert_eq!(code, 0, "mode={mode:?}: stdout={stdout}; stderr={stderr}");
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("bad JSON ({e}): {stdout}"));
+        assert_eq!(v["scannedPackages"], 1, "mode={mode:?}: {v}");
+        assert_eq!(
+            bun_lockb_warning(&v).is_some(),
+            expect_warning,
+            "mode={mode:?}: hosted drops the discovery-side lockb warning on the non-empty path, agent keeps it: {v}"
+        );
+    }
+}

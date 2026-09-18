@@ -1487,10 +1487,13 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // are flagged "not yet installed" everywhere a user could act on them.
     let lockfile_only = lockfile_supplement(&args.common, &all_crawled).await;
     // Explicit refusals for npm layouts whose packages are structurally
-    // unreachable (yarn PnP, pnpm node-linker=pnp). Under yarn PnP the
-    // crawler leg above is ALSO empty (no `node_modules/`), so without this
-    // channel every mode used to print a clean success with
-    // `scannedPackages: 0` — a silent no-op the user read as "protected".
+    // unreachable (yarn PnP, pnpm node-linker=pnp) — and for a bun project
+    // whose only lock is the legacy binary `bun.lockb`
+    // (`bun_lockb_unsupported`: the inventory cannot read it). Under yarn
+    // PnP the crawler leg above is ALSO empty (no `node_modules/`), as it
+    // is on a fresh clone of a bun.lockb project, so without this channel
+    // every mode used to print a clean success with `scannedPackages: 0` —
+    // a silent no-op the user read as "protected".
     // Surfaced as run-level `warnings[]` in the JSON envelope (omitted when
     // empty) and a stderr line on the human path; exit code and `status`
     // stay deliberately unchanged (same posture as hosted refusals, which
@@ -1734,6 +1737,22 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             println!("No packages found. Run {install_cmds} install first.");
         }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
+    }
+
+    // bun.lockb-only discovery diagnosis on the NON-EMPTY hosted path: the
+    // hosted driver runs from here on and owns the bun.lockb story — it
+    // auto-migrates the binary lock to bun.lock when a bun candidate exists
+    // (after which "cannot be inventoried" would be stale in the same
+    // envelope) and otherwise reports its own `redirect_bun_lockb_*` outcome
+    // on `redirect.warnings` — so the discovery-side warning is dropped to
+    // keep one voice per file. The zero-package envelope above keeps it in
+    // EVERY mode: the hosted driver never runs there, and without it a
+    // lockb-only fresh clone is exactly the silent success-0 no-op this
+    // channel exists to close. Agent and vendored runs keep it on both paths.
+    if hosted {
+        layout_refusals.retain(|(code, _)| {
+            code != socket_patch_core::vendor::lock_inventory::BUN_LOCKB_UNSUPPORTED_CODE
+        });
     }
 
     // Build ecosystem summary
