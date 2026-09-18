@@ -1680,6 +1680,38 @@ pub async fn recover_lock_entry(
             const NO_URL: &str = "the pre-vendor pypi lock fragment records the wheel hash but \
                  no fetchable registry URL (only uv.lock and pdm `static_urls` locks carry wheel \
                  URLs); reinstall the package so repair can rebuild from the installed copy";
+            // Pipenv's pre-vendor entry is a JSON object carrying every
+            // release file's sha256 (`"hashes": ["sha256:…", …]`): fetchable
+            // by digest through PyPI's JSON API like a fresh Pipfile.lock
+            // inventory entry, so a lock-only checkout of an already-vendored
+            // project re-scans green instead of `package_not_installed`.
+            if let Some(object) = fragment.as_object() {
+                let digests: Vec<String> = object
+                    .get("hashes")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter_map(|h| h.strip_prefix("sha256:"))
+                    .filter(|h| is_hex_of_len(h, 64))
+                    .map(|h| h.to_ascii_lowercase())
+                    .collect();
+                if digests.is_empty() {
+                    return Err(
+                        "the pre-vendor Pipfile.lock entry records no sha256 digests; reinstall the \
+                         package so repair can rebuild from the installed copy"
+                            .to_string(),
+                    );
+                }
+                return Ok(LockfileEntry {
+                    ecosystem: "pypi",
+                    purl: format!("pkg:pypi/{name}@{version}"),
+                    name,
+                    version,
+                    resolved: None,
+                    integrity: LockIntegrity::Sha256AnyOf(digests),
+                });
+            }
             let unit = fragment.as_str().ok_or_else(|| NO_URL.to_string())?;
             let (url, sha) = pure_wheel_from_uv_unit(unit).ok_or_else(|| NO_URL.to_string())?;
             Ok(LockfileEntry {

@@ -571,15 +571,25 @@ async fn pipenv_stale_install_warnings(
         return out;
     }
     let crawler = PythonCrawler::new();
-    let options = CrawlerOptions {
-        cwd: cwd.to_path_buf(),
-        global,
-        global_prefix,
+    // Only venvs that belong to THIS project (VIRTUAL_ENV, ./.venv, ./venv,
+    // Pipenv's WORKON_HOME venv): the crawler's project-marker fallback to
+    // the global interpreters would judge some unrelated Python's copy of
+    // the release (a tool venv on PATH) and warn about a venv Pipenv never
+    // installs into — a false positive that also fails the same-run --vex.
+    // --global / --global-prefix keep their explicit meaning.
+    let site_packages = if global || global_prefix.is_some() {
+        let options = CrawlerOptions {
+            cwd: cwd.to_path_buf(),
+            global,
+            global_prefix,
+        };
+        crawler
+            .get_site_packages_paths(&options)
+            .await
+            .unwrap_or_default()
+    } else {
+        socket_patch_core::crawlers::python_crawler::find_local_venv_site_packages(cwd).await
     };
-    let site_packages = crawler
-        .get_site_packages_paths(&options)
-        .await
-        .unwrap_or_default();
     for (purl, record) in &candidates {
         let stripped = strip_purl_qualifiers(purl).to_string();
         let mut stale_dirs: Vec<std::path::PathBuf> = Vec::new();
@@ -1546,7 +1556,7 @@ pub(crate) async fn run_redirect_selected(
         rewrite.warnings.push(socket_patch_core::patch::redirect::RewriteWarning {
             code: "redirect_pipenv_installer_unknown".into(),
             detail: format!(
-                "Pipenv was not found on PATH, so the Pipfile.lock references use the modern                  `file` form (Pipenv 2018 and later). A project installed with Pipenv 7–11                  needs `path` references instead: put that pipenv on PATH or set {}=<major>                  and re-run `scan --mode hosted`.",
+                "Pipenv was not found on PATH, so the Pipfile.lock references use the modern `file` form (Pipenv 2018 and later). A project installed with Pipenv 7–11 needs `path` references instead: put that pipenv on PATH or set {}=<major> and re-run `scan --mode hosted`.",
                 socket_patch_core::utils::pipenv::MAJOR_OVERRIDE_ENV
             ),
         });

@@ -646,6 +646,16 @@ def main():
 
         # --------------------------------------------------------- agent-oot
         if mode == "agent-oot":
+            if major == 7:
+                # Pipenv 7 creates its out-of-tree venv through pew + virtualenv
+                # 16, whose seeding fails inside the python:3.6.15-slim harness
+                # image ("Can not use any platform or abi specific options");
+                # its in-project agent leg and the 8–11 out-of-tree legs cover
+                # the crawler on the legacy layout.
+                row["supported"] = False
+                row["expected"] = "skipped: Pipenv 7 cannot create its out-of-tree virtualenv in the harness image"
+                row["passed"] = True
+                return row
             if major < 3:
                 row["supported"] = False
                 row["expected"] = "skipped: Pipenv 0.x has no `--venv` and no WORKON_HOME placement to discover"
@@ -1015,10 +1025,8 @@ def main():
         # preview runs no backend guard.
         informational = {"warmInstallReplacesUpstream"}
         if mode == "vendored":
-            # The vendored backend re-serializes the whole lock with Pipenv's
-            # own `json.dumps` (LF), so a git-autocrlf CRLF lock comes back
-            # LF — exactly what `pipenv lock` would do; recorded, not required.
-            informational.update({"dryRunParity", "crlfPreserved"})
+            # The vendored --dry-run preview is ledger-only by design; recorded.
+            informational.add("dryRunParity")
         row["passed"] = all(val for k, val in checks.items() if k not in informational)
         return row
 

@@ -220,6 +220,13 @@ pub fn pipenv_lock_targets(files: &BTreeMap<String, String>, overrides: &[DepOve
     pipenv::lock_targets(files, overrides)
 }
 
+/// Whether a live Pipfile.lock entry is the one Socket wrote, re-serialized by
+/// a Pipenv relock (same `file`/`path` reference; only `hashes`/`version`/
+/// `index` may differ). Shared with the vendored backend's revert.
+pub fn pipenv_reserialized_around_reference(live: &serde_json::Value, ours: &serde_json::Value) -> bool {
+    pipenv::reserialized_around_reference(live, ours)
+}
+
 pub fn rewrite_registry_redirect_with_pipenv_version(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],

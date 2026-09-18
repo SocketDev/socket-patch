@@ -11,6 +11,14 @@ use std::path::{Path, PathBuf};
 /// default pipenv.
 pub const MAJOR_OVERRIDE_ENV: &str = "SOCKET_PIPENV_MAJOR";
 
+/// `SOCKET_PIPENV_MAJOR` accepts the bare major (`11`, `2026`) or the full
+/// release as `pipenv --version` prints it (`11.10.4`, `2026.8.0`); anything
+/// else is ignored (the probe then runs as if the variable were unset).
+fn parse_override(value: &str) -> Option<u32> {
+    let value = value.trim().trim_start_matches('v');
+    value.split('.').next()?.parse::<u32>().ok()
+}
+
 /// `pipenv, version 2026.8.0` — every release from 0.2.8 through 2026.8.0
 /// prints exactly this shape on stdout (measured). Only the token after
 /// `version` counts: a bare dotted number elsewhere (a `Python 3.12` banner
@@ -60,12 +68,28 @@ fn resolve_on_path(var: &impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
         }
         for ext in &extensions {
             let candidate = dir.join(format!("pipenv{ext}"));
-            if candidate.is_file() {
+            if candidate.is_file() && is_executable(&candidate) {
                 return Some(candidate);
             }
         }
     }
     None
+}
+
+/// A plain file that cannot be executed (a stray `pipenv` data file on PATH)
+/// is skipped in favour of the next entry, like execvp does; Windows has no
+/// mode bits, PATHEXT is the executability rule there.
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
 }
 
 fn is_batch_shim(program: &Path) -> bool {
@@ -83,7 +107,7 @@ fn is_batch_shim(program: &Path) -> bool {
 pub async fn installed_major(root: &Path) -> Option<u32> {
     if let Some(forced) = std::env::var(MAJOR_OVERRIDE_ENV)
         .ok()
-        .and_then(|value| value.trim().parse::<u32>().ok())
+        .and_then(|value| parse_override(&value))
     {
         return Some(forced);
     }
@@ -95,13 +119,17 @@ pub async fn installed_major(root: &Path) -> Option<u32> {
     } else {
         tokio::process::Command::new(&program)
     };
+    // The version banner does not depend on a project, so the probe runs in a
+    // NEUTRAL directory: with the scanned repository as cwd, Pipenv would read
+    // its `.env`, `Pipfile` and `.venv` pointer — committed, attacker-shaped
+    // inputs that must not influence (or slow down) a version check.
+    let _ = root;
     command
         .arg("--version")
-        .current_dir(root)
-        // Pipenv loads the project's `.env` before answering; a broken or
-        // hostile one must not break (or slow down) the version banner.
+        .current_dir(std::env::temp_dir())
         .env("PIPENV_DONT_LOAD_ENV", "1")
         .env("PIPENV_NOSPIN", "1")
+        .env("PIPENV_IGNORE_VIRTUALENVS", "1")
         .kill_on_drop(true);
     let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
         .await
@@ -146,6 +174,11 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let leaf = if cfg!(windows) { "pipenv.exe" } else { "pipenv" };
         std::fs::write(bin.join(leaf), b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join(leaf), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         // A repo-planted `pipenv` under a RELATIVE entry must never win.
         let planted = tmp.path().join("planted");
         std::fs::create_dir_all(&planted).unwrap();
@@ -165,6 +198,35 @@ mod tests {
         assert_eq!(resolve_on_path(&var), None);
         let none = |_: &str| None::<OsString>;
         assert_eq!(resolve_on_path(&none), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_on_path_skips_non_executable_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(data.join("pipenv"), b"not a program").unwrap();
+        std::fs::set_permissions(data.join("pipenv"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(bin.join("pipenv"), b"").unwrap();
+        std::fs::set_permissions(bin.join("pipenv"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let joined = std::env::join_paths([data.clone(), bin.clone()]).unwrap();
+        let var = |name: &str| (name == "PATH").then(|| joined.clone());
+        assert_eq!(resolve_on_path(&var), Some(bin.join("pipenv")));
+    }
+
+    #[test]
+    fn override_accepts_a_major_or_a_full_release() {
+        assert_eq!(parse_override("11"), Some(11));
+        assert_eq!(parse_override(" 2026 "), Some(2026));
+        assert_eq!(parse_override("11.10.4"), Some(11));
+        assert_eq!(parse_override("v2018.11.26"), Some(2018));
+        assert_eq!(parse_override("eleven"), None);
+        assert_eq!(parse_override(""), None);
+        assert_eq!(parse_override("-11"), None);
     }
 
     #[cfg(windows)]

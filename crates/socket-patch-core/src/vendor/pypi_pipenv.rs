@@ -53,6 +53,10 @@ const NON_REGISTRY_KEYS: [&str; 6] = ["path", "git", "hg", "svn", "bzr", "editab
 pub(super) struct PipenvProject {
     /// Parsed lock (the edit substrate — re-serialized canonically).
     pub lock: Value,
+    /// The lock's line ending (`\r\n` when the checkout carries CRLF — git
+    /// autocrlf; Pipenv itself preserves it), reapplied on every write so the
+    /// wired lock and the reverted lock stay byte-comparable to the original.
+    pub crlf: bool,
     /// Non-fatal advisories raised during load. ALWAYS contains the
     /// `vendor_integrity_unverified` warning (spike V4: pipenv never enforces
     /// hashes on file-ref entries) — the orchestrator must surface these.
@@ -137,7 +141,11 @@ pub(super) async fn load_pipenv_project(
          wheel is protected only by the committed wheel itself; `socket-patch vex --product <purl>` \
          verifies the installed files against the patch record",
     )];
-    Ok(PipenvProject { lock, warnings })
+    Ok(PipenvProject {
+        lock,
+        crlf: lock_text.contains("\r\n"),
+        warnings,
+    })
 }
 
 /// Target-specific guards (also re-run by [`wire_pipenv`] right before
@@ -202,6 +210,19 @@ pub(super) fn check_target_guards(
                              .socket/vendor/pypi/{} (an earlier socket-patch vendor); run \
                              `socket-patch vendor --revert` for it and re-vendor",
                             parts.uuid
+                        ),
+                    ))
+                }
+                // Socket's own HOSTED reference (`scan --mode hosted`): the
+                // two modes do not take each other over for Pipenv yet — name
+                // the remedy instead of calling our wiring user-declared.
+                _ if is_socket_hosted_reference(file_ref) => {
+                    return Err((
+                        "pypi_pipenv_source_already_exists",
+                        format!(
+                            "{LOCK_FILE} {section}.{key} already carries a HOSTED Socket patch \
+                             reference; run `socket-patch rollback` to unwind it before vendoring \
+                             (or keep using `scan --mode hosted`)"
                         ),
                     ))
                 }
@@ -351,7 +372,7 @@ pub(super) async fn wire_pipenv(
         }
     }
 
-    let new_text = to_canonical_json(&lock);
+    let new_text = with_line_ending(to_canonical_json(&lock), p.crlf);
     atomic_write_bytes_preserving_mode(&root.join(LOCK_FILE), new_text.as_bytes())
         .await
         .map_err(|e| {
@@ -447,11 +468,33 @@ pub(super) async fn revert_pipenv(
         if map.get(name) == rec.original.as_ref() {
             continue;
         }
-        let (Some(new_value), Some(live)) = (rec.new.as_ref(), map.get(name)) else {
+        let Some(new_value) = rec.new.as_ref() else {
             warnings.push(drifted());
             continue;
         };
-        if live != new_value {
+        let Some(live) = map.get(name) else {
+            if rec.action == WiringAction::Rewritten && rec.original.is_some() {
+                // A relock dropped the entry (`pipenv uninstall <pkg>`, a Pipfile
+                // edit + `pipenv lock`): the vendored reference is gone with
+                // it — retire the record rather than keep the orphan forever.
+                warnings.push(VendorWarning::new(
+                    "vendor_lock_entry_relocked",
+                    format!("{LOCK_FILE} entry for {:?} was removed by a relock; the vendored reference is already gone, so the record is retired", rec.key),
+                ));
+            } else {
+                warnings.push(drifted());
+            }
+            continue;
+        };
+        // Still OUR reference (`file`/`path` string identical to what we
+        // wrote) with the rest re-serialized by Pipenv — 2023+ relocks an
+        // entry excluded by its marker keeping the reference but restoring
+        // the registry `hashes`/`version`: restore the original like an
+        // untouched entry.
+        let same_reference = rec.action == WiringAction::Rewritten
+            && rec.original.is_some()
+            && crate::patch::redirect::pipenv_reserialized_around_reference(live, new_value);
+        if live != new_value && !same_reference {
             // RELOCKED (not drift): `pipenv lock` / `update` regenerated the
             // entry to registry shape with a different hash list or key set
             // than the recorded original (Pipenv 2022 does; 2026 reproduces
@@ -498,7 +541,7 @@ pub(super) async fn revert_pipenv(
     // Only re-serialize when something was restored: a no-op revert must not
     // churn a lock whose formatting we did not produce.
     if changed && !dry_run {
-        let new_text = to_canonical_json(&lock);
+        let new_text = with_line_ending(to_canonical_json(&lock), lock_text.contains("\r\n"));
         if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, new_text.as_bytes()).await {
             return RevertOutcome {
                 kept_artifact: false,
@@ -541,6 +584,27 @@ fn find_entries<'a>(lock: &'a Value, canon_name: &str) -> Vec<(&'a str, String, 
 /// at every nesting level, default separators, one trailing newline —
 /// byte-identical to `json.dumps(obj, indent=4, sort_keys=True) + "\n"` for
 /// the ASCII content pipenv locks carry.
+/// A hosted Socket patch reference as `scan --mode hosted` writes it:
+/// `https://<host>/patch/pypi/<name>/<version>/<grant>/<uuid>/<wheel>[#sha256=…]`.
+fn is_socket_hosted_reference(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("https://") else {
+        return false;
+    };
+    let path = rest.split_once('/').map(|(_, path)| path).unwrap_or("");
+    let path = path.split('#').next().unwrap_or("");
+    let parts: Vec<&str> = path.split('/').collect();
+    parts.len() == 7 && parts[0] == "patch" && parts[1] == "pypi" && parts[6].ends_with(".whl")
+}
+
+/// Pipenv preserves a lock's CRLF line endings; so do we, on both writes.
+fn with_line_ending(text: String, crlf: bool) -> String {
+    if crlf {
+        text.replace('\n', "\r\n")
+    } else {
+        text
+    }
+}
+
 fn to_canonical_json(value: &Value) -> String {
     fn sorted(value: &Value) -> Value {
         match value {
@@ -1241,10 +1305,14 @@ mod tests {
             new: Some(serde_json::json!("x")),
         });
 
-        // Drift: someone replaced our hash in the vendored entry.
-        let drifted = read_lock(tmp.path())
-            .await
-            .replace(WHEEL_SHA, &"0".repeat(64));
+        // Drift: someone hand-edited the vendored entry's marker (a hash-only
+        // change next to our intact reference is what a Pipenv relock does
+        // and is restored, not drift — see `reserialized_around_reference`).
+        let drifted = {
+            let mut live: Value = serde_json::from_str(&read_lock(tmp.path()).await).unwrap();
+            live["default"]["six"]["markers"] = serde_json::json!("python_version >= '3.99'");
+            to_canonical_json(&live)
+        };
         tokio::fs::write(tmp.path().join("Pipfile.lock"), &drifted)
             .await
             .unwrap();
@@ -1506,10 +1574,14 @@ mod tests {
             let outcome = revert_pipenv(&entry_for(vec![record], meta), tmp.path(), false).await;
             assert!(outcome.success, "{label}: {:?}", outcome.error);
             assert_eq!(outcome.warnings.len(), 1, "{label}: {:?}", outcome.warnings);
-            assert_eq!(
-                outcome.warnings[0].code, "vendor_lock_entry_drifted",
-                "{label}"
-            );
+            // An entry a relock REMOVED retires the record (the reference is
+            // gone with it); every other mismatch is drift.
+            let expected = if label.contains("entry removed") {
+                "vendor_lock_entry_relocked"
+            } else {
+                "vendor_lock_entry_drifted"
+            };
+            assert_eq!(outcome.warnings[0].code, expected, "{label}");
             assert!(
                 outcome.warnings[0].detail.contains(key),
                 "{label}: {}",

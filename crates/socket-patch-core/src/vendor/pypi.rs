@@ -463,41 +463,62 @@ pub async fn vendor_pypi(
 /// bytes hashing to something other than the record's afterHash); an
 /// already-patched (agent-mode) install and a lock-only checkout stay silent.
 async fn pipenv_stale_install_warning(
-    site_packages: &Path,
+    project_root: &Path,
     purl: &str,
     record: &PatchRecord,
 ) -> Option<VendorWarning> {
+    use crate::crawlers::python_crawler::{find_local_venv_site_packages, PythonCrawler};
     use crate::patch::apply::{verify_file_patch, VerifyStatus};
-    if record.files.is_empty()
-        || crate::vex::verify::verify_patch_record(site_packages, record)
-            .await
-            .is_ok()
-    {
+    if record.files.is_empty() {
         return None;
     }
-    let mut stale = false;
-    for (file, info) in &record.files {
-        let result = verify_file_patch(site_packages, file, info).await;
-        if matches!(
-            result.status,
-            VerifyStatus::Ready | VerifyStatus::HashMismatch
-        ) && result.current_hash.is_some()
+    // Judged over the PROJECT'S venvs (VIRTUAL_ENV, ./.venv, ./venv, Pipenv's
+    // WORKON_HOME venv) — never the staging dir a lock-only vendor fetched
+    // the pristine wheel into, and never the global interpreters.
+    let base = strip_purl_qualifiers(purl).to_string();
+    let crawler = PythonCrawler::new();
+    let mut stale_dirs: Vec<std::path::PathBuf> = Vec::new();
+    for site in find_local_venv_site_packages(project_root).await {
+        let found = crawler
+            .find_by_purls(&site, std::slice::from_ref(&base))
+            .await
+            .unwrap_or_default();
+        if !found.contains_key(&base) {
+            continue;
+        }
+        if crate::vex::verify::verify_patch_record(&site, record)
+            .await
+            .is_ok()
         {
-            stale = true;
-            break;
+            continue;
+        }
+        for (file, info) in &record.files {
+            let result = verify_file_patch(&site, file, info).await;
+            if matches!(
+                result.status,
+                VerifyStatus::Ready | VerifyStatus::HashMismatch
+            ) && result.current_hash.is_some()
+            {
+                stale_dirs.push(site.clone());
+                break;
+            }
         }
     }
-    if !stale {
+    if stale_dirs.is_empty() {
         return None;
     }
     let name = parse_pypi_purl(strip_purl_qualifiers(purl))
         .map(|(name, _)| name.to_string())
         .unwrap_or_else(|| purl.to_string());
+    let listed = stale_dirs
+        .iter()
+        .map(|d| d.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     Some(VendorWarning::new(
         "pypi_pipenv_stale_install",
         format!(
-            "{purl}: the UNPATCHED upstream release is still installed in {}. Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. Reinstall it from the lock without touching the Pipfile: `pipenv run pip uninstall -y {name} && pipenv sync` (`pipenv install --deploy` before Pipenv 2018), or `pipenv --rm && pipenv sync` for a clean virtualenv — NOT `pipenv uninstall`, which rewrites the Pipfile and re-locks the patch away; then `socket-patch vex` re-verifies the installed files.",
-            site_packages.display()
+            "{purl}: the UNPATCHED upstream release is still installed in {listed}. Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. Reinstall it from the lock without touching the Pipfile: `pipenv run pip uninstall -y {name} && pipenv sync` (`pipenv install --deploy` before Pipenv 2018), or `pipenv --rm && pipenv sync` for a clean virtualenv — NOT `pipenv uninstall`, which rewrites the Pipfile and re-locks the patch away; then `socket-patch vex` re-verifies the installed files."
         ),
     ))
 }
@@ -676,13 +697,20 @@ pub async fn vendor_pypi_with_pipenv_version(
                 version,
             ) {
                 Ok(PipenvTarget::InSync) => {
+                    // A re-run over an already-wired lock keeps warning while
+                    // the venv still holds the upstream release.
+                    if let Some(stale) =
+                        pipenv_stale_install_warning(project_root, purl, record).await
+                    {
+                        warnings.push(stale);
+                    }
                     wired_pin = pipenv_wired_pin(&project.lock, &uuid_dir_rel);
                     WiringPlan::InSync
                 }
                 Ok(PipenvTarget::Fresh) => {
                     warnings.extend(project.warnings.iter().cloned());
                     if let Some(stale) =
-                        pipenv_stale_install_warning(site_packages, purl, record).await
+                        pipenv_stale_install_warning(project_root, purl, record).await
                     {
                         warnings.push(stale);
                     }
@@ -3691,6 +3719,46 @@ wheels = [
             relocked,
             "the user's relocked entry stands"
         );
+
+        // Pipenv 2023+ relocking an excluded-by-marker entry keeps OUR
+        // reference but restores the registry hashes/version next to it:
+        // still ours → the original is restored and the record retires.
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+        let (wiring2, _meta2) = wire_pipenv(
+            &load_pipenv_project(root).await.unwrap_or_else(|e| panic!("{e:?}")),
+            root,
+            "six",
+            &rel_wheel,
+            &"0".repeat(64),
+            UUID,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("rewire"));
+        let text = tokio::fs::read_to_string(root.join("Pipfile.lock"))
+            .await
+            .unwrap();
+        let mut hybrid: serde_json::Value = serde_json::from_str(&text).unwrap();
+        hybrid["default"]["six"]["hashes"] = serde_json::json!(["sha256:upstream-a"]);
+        hybrid["default"]["six"]["version"] = serde_json::json!("==1.16.0");
+        tokio::fs::write(
+            root.join("Pipfile.lock"),
+            serde_json::to_string_pretty(&hybrid).unwrap(),
+        )
+        .await
+        .unwrap();
+        let entry = revert_entry("pipenv", &rel_wheel, wiring2);
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped() && !outcome.kept_artifact, "{:?}", outcome.warnings);
+        let restored: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(root.join("Pipfile.lock"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(restored["default"]["six"].get("file").is_none(), "{restored}");
+        assert_eq!(restored["default"]["six"]["version"], serde_json::json!("==1.16.0"));
 
         // Foreign file reference → still drift, still kept.
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();

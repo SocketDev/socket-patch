@@ -71,7 +71,7 @@ failure instead of N confusing ones that look like CLI regressions.
 | Ecosystem | Hosted mode | Free patches in production | Suite coverage |
 |-----------|-------------|----------------------------|----------------|
 | npm | ✅ | ✅ many | ✅ npm, npm-shrinkwrap, pnpm, yarn classic, yarn berry, bun |
-| PyPI | ✅ (requirements.txt + uv.lock only) | ✅ many | ✅ requirements.txt, uv.lock |
+| PyPI | ✅ (requirements.txt, uv.lock, Pipfile.lock) | ✅ many | ✅ requirements.txt, uv.lock, Pipfile.lock |
 | RubyGems | ✅ | ✅ (this suite pins one purl/UUID: `activestorage@6.0.3`; the 2026-08-18 republish covers more versions) | ✅ full bundler install proof |
 | Cargo | ✅ | ❌ **none** (tier emptied 2026-08-28) | canary only |
 | Maven | ✅ | ❌ **none** | canary only |
@@ -101,7 +101,7 @@ history of this demotion shows every piece to restore (catalog constants,
 preflight registration, the install-proof leg, and these tables) in both
 production suites.
 
-PyPI's poetry / pdm / pipenv locks are **not** rewritten by hosted mode (see the
+PyPI's poetry / pdm locks are **not** rewritten by hosted mode; Pipenv's `Pipfile.lock` is (see [Pipenv compatibility](pipenv-compatibility.md)) (see the
 [matrix](../ecosystems.md#mode--ecosystem-matrix)); those flavors are vendored-mode
 only, so there is no hosted leg to write for them.
 

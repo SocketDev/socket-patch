@@ -53,13 +53,18 @@ import on modern Pythons); 2018–2022 on Python 3.8; 2023+ on Python 3.12.
   regenerates the redirected entry to its registry reference on every major,
   hosted and vendored — a silent unpatch. Re-run Socket Patch afterwards;
   `rollback` retires the stale record cleanly (2026 reproduces the original
-  entry byte for byte, 2022 writes a different hash list — both are the
-  desired end state, not drift).
+  entry byte for byte, 2022 writes a different hash list, `pipenv uninstall`
+  removes the entry — all are the desired end state, not drift). Pipenv 2023+
+  keep a hosted reference on an entry excluded by its marker and re-serialize
+  it; that is still ours and rolls back.
 - **Reference key by release.** Pipenv 7–11 install only `path` references
   (`file` fails); 2018 and later install `file`. The CLI probes
   `pipenv --version` on absolute `PATH` entries (every release prints
   `pipenv, version X`) only when a patch targets the lock;
   `SOCKET_PIPENV_MAJOR=<major>` pins the answer for CI images without pipenv.
+- **Line endings.** Pipenv preserves a CRLF lock (git autocrlf); so do both
+  rewriters and both rollbacks, and a checkout that converted the file
+  between the redirect and the rollback still restores.
 - **Vendored refusal for 7–11.** Those releases cannot reliably consume
   vendored wheel references; hosted mode covers them.
 - **Command availability.** `--ignore-pipfile` and `--venv` arrive with
@@ -75,9 +80,11 @@ import on modern Pythons); 2018–2022 on Python 3.8; 2023+ on Python 3.12.
   case-insensitive-filesystem fallback) so a bare `scan`/`rollback` sees the
   project's venv; before, it fell through to the global interpreter and
   reported success while the venv stayed unpatched.
-- **CLI scope.** The CLI is scoped to its working directory (`--cwd`), while
-  Pipenv walks up to `PIPENV_MAX_DEPTH` (3) parents for a Pipfile: run the
-  CLI in the project directory (or pass `--cwd`).
+- **CLI scope.** The CLI reads `<cwd>/Pipfile.lock` and discovers the
+  project's venv from that directory; it does not walk up to a parent
+  Pipfile the way Pipenv does (`PIPENV_MAX_DEPTH`) and does not follow
+  `PIPENV_PIPFILE` to another project's lock. Run it in the project
+  directory (or pass `--cwd`).
 
 ## Running the matrix
 

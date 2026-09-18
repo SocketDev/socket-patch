@@ -414,13 +414,20 @@ pub async fn revert_remaining_redirect_edits(
                 }
                 Inverse::PipenvEntry => {
                     let restored = match staged_read(&staged, project_root, &edit.path).await {
-                        Ok(Some(content)) => super::pipenv::restore(&content, &edit),
+                        Ok(Some(content)) => {
+                            super::pipenv::restore(&content, &edit).map(|restored| (content, restored))
+                        }
                         Ok(None) => Err(format!("{} no longer exists", edit.path)),
                         Err(error) => Err(error),
                     };
                     match restored {
-                        Ok(content) => {
-                            staged.insert(edit.path.clone(), Some(content));
+                        Ok((content, restored)) => {
+                            // An already-unwound or retired entry returns the
+                            // text unchanged: no write, no `editedFiles` credit
+                            // (mirrors the ReplaceFragment already-original arm).
+                            if restored != content {
+                                staged.insert(edit.path.clone(), Some(restored));
+                            }
                             group_drops.insert(idx);
                         }
                         Err(error) => {
@@ -2112,8 +2119,11 @@ mod tests {
         for drift in [false, true] {
             let dir = TempDir::new().unwrap();
             let text = result.files["Pipfile.lock"].clone();
+            // Drift = the REFERENCE itself changed (its `#sha256=` pin here);
+            // a hashes-only change next to an intact reference is what a
+            // Pipenv relock does and rolls back (see pipenv::restore).
             let live = if drift {
-                text.replacen("sha256:", "sha256:0", 1)
+                text.replacen("#sha256=", "#sha256=0", 1)
             } else {
                 text
             };
