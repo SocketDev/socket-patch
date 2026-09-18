@@ -1,0 +1,16 @@
+[[package]]
+name = "urllib3"
+sections = ["default"]
+version = "1.26.18"
+summary = "HTTP library with thread-safe connection pooling, file post, and more."
+
+[metadata]
+lock_version = "2"
+content_hash = "sha256:545dba5a99e3f872c46498f788bd003980b3b767c1deea7ead60fee8526dd537"
+
+
+[metadata.files]
+"urllib3 1.26.18" = [
+    {file = "urllib3-1.26.18-py2.py3-none-any.whl", hash = "sha256:34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07"},
+    {file = "urllib3-1.26.18.tar.gz", hash = "sha256:f8ecc1bba5667413457c529ab955bf8c67b45db799d159066261719e328580a0"},
+]

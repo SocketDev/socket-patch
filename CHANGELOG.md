@@ -88,6 +88,33 @@ into the new version's section — see docs/releasing.md.
   the verified remedy (`pipenv run pip uninstall -y <pkg> && pipenv sync`, or
   a clean `pipenv --rm && pipenv sync`), and the stale purl is excluded from
   the same-run `--vex`.
+- **PDM projects take hosted patches, and hosted and vendored patches share
+  one validated `pdm.lock` rewriter.** `scan --mode hosted` rewrites `pdm.lock`
+  to point the target `[[package]]` at the hosted wheel URL with the patched
+  SHA-256 (`redirect_pdm_lock_package`), and `scan --mode vendored` wires the
+  same unit to a committed wheel through the shared rewriter
+  (`utils/pdm_lock.rs`). Both preserve line endings and non-canonical spacing,
+  support the legacy `[metadata.files]` table and separate `extras` entries,
+  are idempotent, and leave `pyproject.toml` and `content_hash` untouched.
+  Supported lock formats are `2` (PDM 0.12–1.4) and `4.3`–`4.5.1` (PDM 2.8.1+;
+  PDM 2.8.0 writes the same `4.3` lock but still loses candidate identity, so
+  upgrade to ≥ 2.8.1);
+  the identity-losing `3.1` / `4.0`–`4.2` formats (PDM 1.8–2.7) and unknown
+  future formats are refused before any write (`redirect_pdm_refused` /
+  `pypi_pdm_lock_version_unsupported`), leaving the registry lock installable.
+  A `pdm.lock` written by PDM 0.x/1.x (lock format `2`) warns
+  `redirect_pdm_legacy_sync_required`: those releases have an upstream
+  freshness bug, so `pdm install` can regenerate the lock — use `pdm sync`.
+  Verified end-to-end against real PDM 0.12–2.29 across hosted, vendored and
+  agent mode on Linux, Windows and macOS; see
+  `docs/testing/pdm-compatibility.md` and `scripts/backtest-pdm.py`. When
+  several Python lockfiles coexist, `uv.lock` and `poetry.lock` drive hosted
+  PyPI redirects ahead of `pdm.lock`, so a leftover `pdm.lock` beside them
+  neither blocks a live redirect nor is falsely attested. A hosted lock-only
+  `pdm.lock` checkout is discovered and redirected (the lock inventory now
+  reads `pdm.lock`), and a re-scan after an external `pdm lock` rebases the
+  ledger's recorded edits onto the relocked text so `rollback` stays
+  byte-invertible even when PDM reflows the lock's line endings.
 - **Poetry projects take hosted patches, and vendored patches now cover every
   `poetry.lock` generation.** `scan --mode hosted` rewrites `poetry.lock` to a
   `[package.source] type = "url"` pointing at the Socket-hosted, SHA-256-pinned

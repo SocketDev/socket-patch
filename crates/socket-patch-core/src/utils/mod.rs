@@ -1,6 +1,7 @@
 pub mod env_compat;
 pub mod fs;
 pub(crate) mod http;
+pub mod pdm_lock;
 pub mod pipenv;
 pub mod poetry_lock;
 pub mod process;

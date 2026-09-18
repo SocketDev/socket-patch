@@ -18,7 +18,7 @@ mod python;
 /// Fragment-edit kinds whose lockfile the package manager re-lays in place
 /// (keeping the Socket source) — a re-scan REBASES their ledger edits instead
 /// of appending; see the ledger merge below.
-const REBASE_KINDS: &[&str] = &["redirect_poetry_lock_package"];
+const REBASE_KINDS: &[&str] = &["redirect_poetry_lock_package", "redirect_pdm_lock_package"];
 
 const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "package-lock.json",
@@ -1699,8 +1699,20 @@ pub(crate) async fn run_redirect_selected(
     // files — either written by this run or already present from an earlier
     // one. A granted reference whose rewriter found nothing to edit (e.g. no
     // lockfile) must NOT be recorded or attested: nothing pins the patch.
+    // A `pdm.lock` that is NOT the PyPI install driver (a `uv.lock` or
+    // `poetry.lock` sits beside it) is never rewritten this run, yet it can
+    // still carry a Socket artifact URL from an earlier run when pdm drove.
+    // That stale text pins nothing now, so it must not feed the substring
+    // confirmation probe below — otherwise an untouched uv/poetry project whose
+    // real lock was never redirected would report a bogus `redirected: 1` and
+    // persist a ledger record. When pdm DOES drive, pypi confirmation keys off
+    // `confirmed_pdm_uuids` and never consults this probe, so dropping the file
+    // here is always safe; `pdm.lock` only ever carries pypi URLs.
+    let pdm_inactive = files.contains_key("pdm.lock")
+        && (files.contains_key("uv.lock") || files.contains_key("poetry.lock"));
     let final_texts: Vec<&String> = files
         .iter()
+        .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
         .map(|(name, content)| rewrite.files.get(name).unwrap_or(content))
         .chain(
             rewrite
@@ -1716,6 +1728,26 @@ pub(crate) async fn run_redirect_selected(
             |(purl, uuid, artifact_url, index_url, suffixed_version, go_module_path)| {
                 if rewrite.refused_pipenv_uuids.contains(uuid) {
                     return false;
+                }
+                // pdm is transactional like cargo: a refused uuid is never
+                // confirmed, and when `pdm.lock` is the PyPI install driver
+                // (no `uv.lock` / `poetry.lock`) a pypi dep is confirmed ONLY
+                // by the pdm rewriter's own report — the URL landing in a
+                // sibling `requirements.txt` the project does not install from
+                // pins nothing. When uv/poetry drive, their own lock proof
+                // below still confirms them. This check precedes the hatch
+                // gate: a PDM project may declare `hatchling` as its build
+                // backend, which registers every pypi uuid as hatch-owned while
+                // the lock's presence keeps hatch from confirming any of them.
+                if rewrite.refused_pdm_uuids.contains(uuid) {
+                    return false;
+                }
+                if purl.starts_with("pkg:pypi/")
+                    && files.contains_key("pdm.lock")
+                    && !files.contains_key("uv.lock")
+                    && !files.contains_key("poetry.lock")
+                {
+                    return rewrite.confirmed_pdm_uuids.contains(uuid);
                 }
                 if rewrite.python_lock_uuids.contains(uuid) {
                     return rewrite.confirmed_python_lock_uuids.contains(uuid)
@@ -1918,6 +1950,18 @@ pub(crate) async fn run_redirect_selected(
                     .unwrap_or(0);
                 if let Some(&target) = siblings.get(nth) {
                     if !rebased.contains(&target) {
+                        // `pdm lock` fully un-patches the lock (registry source
+                        // restored) and may reflow line endings (CRLF → LF), so
+                        // the fresh run's `original` IS the correct
+                        // relocked-registry rollback target and the stale
+                        // recorded one would restore a mismatched fragment.
+                        // Poetry's relock instead KEEPS the Socket source (it
+                        // only drops the inserted `files` line), so its oldest
+                        // `original` — the true pre-patch fragment — must
+                        // survive; only its `new` is refreshed.
+                        if edit.kind == "redirect_pdm_lock_package" {
+                            ledger.edits[target].original = edit.original.clone();
+                        }
                         ledger.edits[target].new = edit.new.clone();
                         ledger.edits[target].action = edit.action.clone();
                         rebased.push(target);

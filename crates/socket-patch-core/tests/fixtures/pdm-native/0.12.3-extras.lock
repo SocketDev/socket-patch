@@ -1,0 +1,42 @@
+[[package]]
+name = "PySocks"
+sections = ["default"]
+version = "1.7.1"
+summary = "A Python SOCKS client module. See https://github.com/Anorov/PySocks for more information."
+
+[[package]]
+name = "urllib3"
+sections = ["default"]
+version = "1.26.18"
+summary = "HTTP library with thread-safe connection pooling, file post, and more."
+
+[[package]]
+name = "urllib3"
+sections = ["default"]
+version = "1.26.18"
+extras = ["socks"]
+summary = "HTTP library with thread-safe connection pooling, file post, and more."
+
+[package.dependencies]
+PySocks = "!=1.5.7,<2.0,>=1.5.6"
+urllib3 = "==1.26.18"
+
+[metadata]
+lock_version = "2"
+content_hash = "sha256:eabdc6e14803b58cb0df233197afbdd3439fbc3251e0b664153014ae97a3a223"
+
+
+[metadata.files]
+"pysocks 1.7.1" = [
+    {file = "PySocks-1.7.1-py27-none-any.whl", hash = "sha256:08e69f092cc6dbe92a0fdd16eeb9b9ffbc13cadfe5ca4c7bd92ffb078b293299"},
+    {file = "PySocks-1.7.1-py3-none-any.whl", hash = "sha256:2725bd0a9925919b9b51739eea5f9e2bae91e83288108a9ad338b2e3a4435ee5"},
+    {file = "PySocks-1.7.1.tar.gz", hash = "sha256:3f8804571ebe159c380ac6de37643bb4685970655d3bba243530d6558b799aa0"},
+]
+"urllib3 1.26.18" = [
+    {file = "urllib3-1.26.18-py2.py3-none-any.whl", hash = "sha256:34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07"},
+    {file = "urllib3-1.26.18.tar.gz", hash = "sha256:f8ecc1bba5667413457c529ab955bf8c67b45db799d159066261719e328580a0"},
+]
+"urllib3[socks] 1.26.18" = [
+    {file = "urllib3-1.26.18-py2.py3-none-any.whl", hash = "sha256:34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07"},
+    {file = "urllib3-1.26.18.tar.gz", hash = "sha256:f8ecc1bba5667413457c529ab955bf8c67b45db799d159066261719e328580a0"},
+]

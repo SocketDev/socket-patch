@@ -1094,9 +1094,9 @@ fn parse_gem_spec_line(line: &str) -> Option<(String, String)> {
 /// (URL + sha256 of a pure `py3-none-any` wheel) comes from `uv.lock`;
 /// `poetry.lock` and `--hash`-pinned `requirements.txt` contribute
 /// DISCOVERY-only entries (no recorded URL; platform-independent wheel
-/// choice is not derivable offline). Pipfile.lock contributes
-/// entries whose integrity is its digest SET (see `inventory_pipfile_lock`);
-/// pdm.lock: not yet read.
+/// choice is not derivable offline). `pdm.lock` contributes discovery-only
+/// entries. Pipfile.lock contributes entries whose integrity is its digest SET
+/// (see `inventory_pipfile_lock`).
 async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let mut out = Vec::new();
     let mut found = false;
@@ -1128,6 +1128,9 @@ async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>>
     // lockfile supplement and vendor's lookup.
     if !uv_lock {
         if let Some(entries) = inventory_poetry_lock(project_root).await {
+            found = true;
+            out.extend(entries);
+        } else if let Some(entries) = inventory_pdm_lock(project_root).await {
             found = true;
             out.extend(entries);
         } else {
@@ -1540,6 +1543,61 @@ async fn inventory_pipfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
     Some(out)
 }
 
+
+/// `pdm.lock`: `[[package]]` blocks with `name`/`version`, DISCOVERY-only. This
+/// surfaces the project's PyPI coordinates so a hosted lock-only checkout (no
+/// installed package) can be redirected — the hosted rewrite pins the API
+/// grant's URL and does not need a lock-derived hash. It stays discovery-only
+/// (`LockIntegrity::None`) so vendored keeps refusing a lock-only checkout
+/// (`vendor_fetch_unverifiable`): vendoring rebuilds the wheel from the
+/// INSTALLED package, and PDM installs into a `__pypackages__` tree the crawler
+/// does not probe, so a lock-only vendored path would not survive a re-scan.
+async fn inventory_pdm_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+    let text = read_regular_to_string(&project_root.join("pdm.lock"))
+        .await
+        .ok()?;
+    let mut out = Vec::new();
+    let mut in_package = false;
+    let mut name: Option<String> = None;
+    for line in text.lines() {
+        let t = line.trim();
+        if t == "[[package]]" {
+            in_package = true;
+            name = None;
+            continue;
+        }
+        if t.starts_with('[') && t != "[[package]]" {
+            in_package = false;
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(v) = t.strip_prefix("name = ") {
+            name = Some(canonicalize_pypi_name(v.trim_matches('"')));
+        } else if let Some(v) = t.strip_prefix("version = ") {
+            if let Some(n) = name.take() {
+                let v = v.trim_matches('"').to_string();
+                if path_safety::is_safe_single_segment(&n)
+                    && path_safety::is_safe_single_segment(&v)
+                {
+                    out.push(LockfileEntry {
+                        ecosystem: "pypi",
+                        purl: format!("pkg:pypi/{n}@{v}"),
+                        name: n,
+                        version: v,
+                        resolved: None,
+                        integrity: LockIntegrity::None,
+                    });
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(dedup_prefer_integrity(out))
+}
 
 /// requirements.txt with exact `==` pins — discovery only.
 async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileEntry>> {

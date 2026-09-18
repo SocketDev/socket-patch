@@ -89,9 +89,10 @@ enum Inverse {
 fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
     match kind {
         "redirect_pipenv_entry" => ("pypi", Inverse::PipenvEntry),
-        "redirect_requirements_line" | "redirect_uv_lock_wheel" | "redirect_poetry_lock_package" => {
-            ("pypi", Inverse::ReplaceFragment)
-        }
+        "redirect_requirements_line"
+        | "redirect_uv_lock_wheel"
+        | "redirect_poetry_lock_package"
+        | "redirect_pdm_lock_package" => ("pypi", Inverse::ReplaceFragment),
         "redirect_hatch_document" => ("pypi", Inverse::HatchDocument),
         "redirect_composer_dist" => ("composer", Inverse::ReplaceFragment),
         "redirect_cargo_toml_dep" | "redirect_cargo_lock_entry" => {
