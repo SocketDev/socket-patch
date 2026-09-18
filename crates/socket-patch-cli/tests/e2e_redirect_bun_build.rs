@@ -53,6 +53,17 @@
 //! (get routes through scan's `run_redirect_selected`), so the lock/ledger
 //! assertions and the fresh-checkout proof are shared via [`HostedDriver`].
 //!
+//! The scoped leg patches a DIFFERENT target: `@scope/pkg@1.0.0`, a scoped
+//! package with `dependencies` and a `bin`, served by a wiremock npm
+//! registry through bun's `[install.scopes]` (a private scoped registry —
+//! the common real-world shape). Bun records it as
+//! `["@scope/pkg@1.0.0", "<tarball url>", { "dependencies": {…}, "bin": {…}
+//! }, "sha512-…"]`; the rewrite must carry that meta object VERBATIM into
+//! the URL 3-tuple, and the fresh install must prove bun honored it: the
+//! dependency installs and the bin is linked. A meta-dropping regression is
+//! silent under every left-pad leg (bun installs a `{}`-meta tuple with
+//! exit 0, patched bytes and a stable lock — and no deps, no bin).
+//!
 //! The lock-v1-on-newer-bun leg is the one cross-version install proof a
 //! single binary can give: on bun ≥ 1.4 (native lockfileVersion 2) the
 //! fixture lock is relabelled to `"lockfileVersion": 1` before the rewrite
@@ -93,7 +104,6 @@ mod cache_env;
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
 const DEP_VERSION: &str = "1.3.0";
-const PURL: &str = "pkg:npm/left-pad@1.3.0";
 const UUID: &str = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d";
 const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
@@ -103,6 +113,20 @@ const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const TAMPER_MARKER: &str = "/* SOCKET-TAMPERED */\n";
 const GHSA: &str = "GHSA-redirect-bun-real";
 const PRODUCT: &str = "pkg:npm/app@1.0.0";
+
+/// The scoped, dependency-bearing target of the meta-preserving leg. It
+/// exists only in the wiremock registry this suite runs; bun fetches it
+/// through `[install.scopes]` and left-pad (its one dependency) from the
+/// real registry like every other fixture.
+const SCOPED_NAME: &str = "@scope/pkg";
+const SCOPED_VERSION: &str = "1.0.0";
+const SCOPED_BIN: &str = "scope-pkg";
+const SCOPED_INDEX: &[u8] = b"module.exports = require('left-pad');\n";
+/// The meta object bun writes for it, byte-exact (bun serializes
+/// `dependencies` before `bin`; identical on lockfileVersion 0, 1 and 2).
+/// The rewrite must carry this into the 3-tuple verbatim.
+const SCOPED_META: &str =
+    r#"{ "dependencies": { "left-pad": "1.3.0" }, "bin": { "scope-pkg": "bin/cli.js" } }"#;
 
 /// `(major, minor, patch)` of the bun on PATH.
 type BunVersion = (u64, u64, u64);
@@ -286,6 +310,10 @@ fn sha512_sri_b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
 }
 
+fn sri(bytes: &[u8]) -> String {
+    format!("sha512-{}", sha512_sri_b64(bytes))
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap() {
@@ -299,11 +327,30 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
     }
 }
 
+/// A gzipped npm tarball from `(entry name under package/, bytes, mode)`
+/// triples, built with the tar crate so the suite has no system-`tar`
+/// dependency (Windows runners included).
+fn build_tgz(entries: &[(String, Vec<u8>, u32)]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    for (name, bytes, mode) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(*mode);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, format!("package/{name}"), bytes.as_slice())
+            .unwrap();
+    }
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
 /// A VALID npm tarball built from the ACTUALLY-installed package with the
-/// entry point swapped for `replaced_index`. Built with the tar crate
-/// rather than a system `tar` so the suite has no external-binary
-/// dependency (bun installs from tar-crate output fine, as pnpm does in
-/// `e2e_redirect_pnpm_build.rs`).
+/// entry point swapped for `replaced_index`. File modes travel as installed
+/// (the scoped target's `bin/cli.js` keeps its exec bit); on Windows, where
+/// there is no mode, `bin/` entries are marked executable.
 fn make_tgz_from_installed(pkg_dir: &Path, replaced_index: &[u8]) -> Vec<u8> {
     let pkg_dir = pkg_dir
         .canonicalize()
@@ -321,39 +368,161 @@ fn make_tgz_from_installed(pkg_dir: &Path, replaced_index: &[u8]) -> Vec<u8> {
         }
     }
     files.sort();
-    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
-        Vec::new(),
-        flate2::Compression::default(),
-    ));
-    for p in &files {
-        let rel = p.strip_prefix(&pkg_dir).unwrap();
-        // Tar entry names always use `/` regardless of host separator.
-        let name = format!(
-            "package/{}",
-            rel.components()
+    let entries: Vec<(String, Vec<u8>, u32)> = files
+        .iter()
+        .map(|p| {
+            let rel = p.strip_prefix(&pkg_dir).unwrap();
+            // Tar entry names always use `/` regardless of host separator.
+            let name = rel
+                .components()
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
-                .join("/")
-        );
-        let bytes = if rel == Path::new("index.js") {
-            replaced_index.to_vec()
-        } else {
-            std::fs::read(p).unwrap()
-        };
-        let mut header = tar::Header::new_gnu();
-        header.set_size(bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, &name, bytes.as_slice())
-            .unwrap();
+                .join("/");
+            let bytes = if rel == Path::new("index.js") {
+                replaced_index.to_vec()
+            } else {
+                std::fs::read(p).unwrap()
+            };
+            (name.clone(), bytes, file_mode(p, &name))
+        })
+        .collect();
+    build_tgz(&entries)
+}
+
+#[cfg(unix)]
+fn file_mode(p: &Path, _name: &str) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn file_mode(_p: &Path, name: &str) -> u32 {
+    if name.starts_with("bin/") {
+        0o755
+    } else {
+        0o644
     }
-    builder.into_inner().unwrap().finish().unwrap()
+}
+
+/// The scoped target's registry tarball: package.json with the dependency
+/// and the bin, the entry point, and the (executable) bin script.
+fn scoped_registry_tgz() -> Vec<u8> {
+    let pkg_json = serde_json::json!({
+        "name": SCOPED_NAME,
+        "version": SCOPED_VERSION,
+        "main": "index.js",
+        "dependencies": { DEP: DEP_VERSION },
+        "bin": { SCOPED_BIN: "bin/cli.js" },
+    });
+    build_tgz(&[
+        (
+            "package.json".into(),
+            serde_json::to_vec_pretty(&pkg_json).unwrap(),
+            0o644,
+        ),
+        ("index.js".into(), SCOPED_INDEX.to_vec(), 0o644),
+        (
+            "bin/cli.js".into(),
+            b"#!/usr/bin/env node\nconsole.log('scope-pkg cli');\n".to_vec(),
+            0o755,
+        ),
+    ])
+}
+
+/// A wiremock npm registry for the scoped target: the packument (bun asks
+/// for `/@scope%2fpkg`) and the tarball it points at. Integrity only — bun
+/// verifies the sha512 and needs no `shasum`.
+async fn mount_scoped_registry(server: &MockServer, tgz: Vec<u8>) {
+    let tarball_url = format!("{}/@scope/pkg/-/pkg-{SCOPED_VERSION}.tgz", server.uri());
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/@scope(%2[fF]|/)pkg$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": SCOPED_NAME,
+            "dist-tags": { "latest": SCOPED_VERSION },
+            "versions": {
+                SCOPED_VERSION: {
+                    "name": SCOPED_NAME,
+                    "version": SCOPED_VERSION,
+                    "dependencies": { DEP: DEP_VERSION },
+                    "bin": { SCOPED_BIN: "bin/cli.js" },
+                    "dist": { "tarball": tarball_url, "integrity": sri(&tgz) }
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/@scope/pkg/-/pkg-{SCOPED_VERSION}.tgz")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(tgz, "application/octet-stream"))
+        .mount(server)
+        .await;
+}
+
+/// Which package the hosted rewrite targets.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Target {
+    /// left-pad@1.3.0 from the real registry: unscoped, `{}` meta — the
+    /// original capstone target.
+    LeftPad,
+    /// `@scope/pkg@1.0.0` from the suite's wiremock registry via
+    /// `[install.scopes]`: scoped key, non-empty `{dependencies, bin}` meta.
+    ScopedWithDeps,
+}
+
+impl Target {
+    fn name(self) -> &'static str {
+        match self {
+            Target::LeftPad => DEP,
+            Target::ScopedWithDeps => SCOPED_NAME,
+        }
+    }
+    fn version(self) -> &'static str {
+        match self {
+            Target::LeftPad => DEP_VERSION,
+            Target::ScopedWithDeps => SCOPED_VERSION,
+        }
+    }
+    /// The PURL the CLI derives for it (`@` is percent-encoded in npm PURLs).
+    fn purl(self) -> &'static str {
+        match self {
+            Target::LeftPad => "pkg:npm/left-pad@1.3.0",
+            Target::ScopedWithDeps => "pkg:npm/%40scope/pkg@1.0.0",
+        }
+    }
+    /// The tarball file name on the hosted URL.
+    fn hosted_leaf(self) -> String {
+        match self {
+            Target::LeftPad => format!("{DEP}-{DEP_VERSION}.tgz"),
+            Target::ScopedWithDeps => format!("pkg-{SCOPED_VERSION}.tgz"),
+        }
+    }
+    /// The meta object bun writes for it, byte-exact.
+    fn meta(self) -> &'static str {
+        match self {
+            Target::LeftPad => "{}",
+            Target::ScopedWithDeps => SCOPED_META,
+        }
+    }
+    fn installed_dir(self, root: &Path) -> PathBuf {
+        let nm = root.join("node_modules");
+        match self {
+            Target::LeftPad => nm.join(DEP),
+            Target::ScopedWithDeps => nm.join("@scope").join("pkg"),
+        }
+    }
+    fn package_json(self) -> String {
+        format!(
+            r#"{{"name":"redirect-bun-capstone","version":"0.0.0","private":true,"dependencies":{{"{}":"{}"}}}}"#,
+            self.name(),
+            self.version()
+        )
+    }
 }
 
 struct BunRedirectFixture {
     tmp: tempfile::TempDir,
     proj: PathBuf,
+    target: Target,
     /// The pristine installed `index.js`.
     orig: Vec<u8>,
     /// `MARKER` + orig — what the honest hosted tarball carries.
@@ -401,6 +570,15 @@ enum LockShape {
     V1OnNewerBun,
 }
 
+/// The `packages` line for `name` in a bun.lock (`"name": [...]`).
+fn packages_line(lock: &str, name: &str) -> String {
+    let key = format!("\"{name}\": [");
+    lock.lines()
+        .find(|l| l.trim_start().starts_with(&key))
+        .unwrap_or_else(|| panic!("no packages entry for {name} in:\n{lock}"))
+        .to_string()
+}
+
 /// Steps 1–3: real install, patched tarball + API mocks, the `driver`'s
 /// hosted invocation, and the envelope/lockfile/ledger assertions.
 /// `tamper_served_tarball` serves DIFFERENT bytes than the sha512 pinned
@@ -410,6 +588,7 @@ async fn bun_hosted_project(
     tamper_served_tarball: bool,
     driver: HostedDriver,
     shape: LockShape,
+    target: Target,
 ) -> Option<BunRedirectFixture> {
     let (bun_raw, bun_version) = bun_toolchain(tag)?;
     if shape == LockShape::V1OnNewerBun && bun_version < LOCK_V2_FROM {
@@ -425,13 +604,29 @@ async fn bun_hosted_project(
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join("package.json"),
-        format!(
-            r#"{{"name":"redirect-bun-capstone","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
-        ),
-    )
-    .unwrap();
+    std::fs::write(proj.join("package.json"), target.package_json()).unwrap();
+
+    // One wiremock serves everything: the scoped target's npm registry (up
+    // before the fixture install), the patch API, and the hosted tarball.
+    let server = MockServer::start().await;
+    let mut registry_field = String::new();
+    if target == Target::ScopedWithDeps {
+        let registry_tgz = scoped_registry_tgz();
+        mount_scoped_registry(&server, registry_tgz).await;
+        // bun's scoped-registry config — a committable file, so it travels
+        // with every fresh checkout below.
+        std::fs::write(
+            proj.join("bunfig.toml"),
+            format!(
+                "[install.scopes]\n\"@scope\" = {{ url = \"{}/\" }}\n",
+                server.uri()
+            ),
+        )
+        .unwrap();
+        // For a non-default registry bun records the TARBALL URL as the
+        // 4-tuple's registry field.
+        registry_field = format!("{}/@scope/pkg/-/pkg-{SCOPED_VERSION}.tgz", server.uri());
+    }
 
     // 1. REAL fixture: bun install (network here, private cache). Text lockfile.
     let cache = tmp.path().join("bun-cache");
@@ -484,9 +679,18 @@ async fn bun_hosted_project(
          (1.1.39–1.1.x → 0, 1.2–1.3 → 1, ≥ 1.4 → 2):\n{native_lock}",
         expected_lock_version(bun_version)
     );
+    // Pre-redirect: the registry 4-tuple, with bun's real registry field
+    // and meta object for this target — one spelling across 0/1/2.
+    let registry_tuple_head = format!(
+        "\"{}@{}\", \"{registry_field}\", {}, \"sha512-",
+        target.name(),
+        target.version(),
+        target.meta()
+    );
     assert!(
-        native_lock.contains(&format!("\"{DEP}@{DEP_VERSION}\", \"\"")),
-        "pre-redirect packages entry must be the registry 4-tuple:\n{native_lock}"
+        native_lock.contains(&registry_tuple_head),
+        "pre-redirect packages entry must be the registry 4-tuple {registry_tuple_head}…:\n\
+         {native_lock}"
     );
     let lock_version = match shape {
         LockShape::Native => native_version,
@@ -513,13 +717,20 @@ async fn bun_hosted_project(
         }
     };
     let lock_before = std::fs::read(&lock_path).unwrap();
+    let lock_before_str = String::from_utf8(lock_before.clone()).unwrap();
 
-    let installed_dir = proj.join("node_modules").join(DEP);
+    let installed_dir = target.installed_dir(&proj);
     let orig = std::fs::read(installed_dir.join("index.js")).expect("installed index.js");
     assert!(
         !orig.starts_with(MARKER.as_bytes()),
         "pristine install must not carry the marker"
     );
+    if target == Target::ScopedWithDeps {
+        assert_eq!(
+            orig, SCOPED_INDEX,
+            "bun must have installed the mock registry's bytes"
+        );
+    }
     let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
     let tampered: Vec<u8> = [TAMPER_MARKER.as_bytes(), orig.as_slice()].concat();
 
@@ -527,7 +738,7 @@ async fn bun_hosted_project(
     //    The negative twin only tampers what the route SERVES (a different,
     //    still-valid tarball), so the pin is what catches the swap.
     let tgz = make_tgz_from_installed(&installed_dir, &patched);
-    let sri = format!("sha512-{}", sha512_sri_b64(&tgz));
+    let patched_sri = sri(&tgz);
     let served: Vec<u8> = if tamper_served_tarball {
         let tampered_tgz = make_tgz_from_installed(&installed_dir, &tampered);
         assert_ne!(tampered_tgz, tgz, "the tampered tarball must differ");
@@ -537,18 +748,21 @@ async fn bun_hosted_project(
     };
 
     // 3. API mocks + the hosted tarball route bun will hit at install time.
-    let server = MockServer::start().await;
-    let hosted_url = format!(
-        "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz",
-        server.uri()
+    let purl = target.purl();
+    let hosted_path = format!(
+        "/patch/npm/{}/{}/{TOKEN}/{UUID}/{}",
+        target.name(),
+        target.version(),
+        target.hosted_leaf()
     );
+    let hosted_url = format!("{}{hosted_path}", server.uri());
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "packages": [{
-                "purl": PURL,
+                "purl": purl,
                 "patches": [{
-                    "uuid": UUID, "purl": PURL, "tier": "free",
+                    "uuid": UUID, "purl": purl, "tier": "free",
                     "cveIds": [], "ghsaIds": [], "severity": "high",
                     "title": "redirect bun capstone fixture"
                 }]
@@ -563,7 +777,7 @@ async fn bun_hosted_project(
         )))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "patches": [{
-                "uuid": UUID, "purl": PURL,
+                "uuid": UUID, "purl": purl,
                 "publishedAt": "2026-01-01T00:00:00Z",
                 "description": "x", "license": "MIT", "tier": "free",
                 "vulnerabilities": {}
@@ -579,11 +793,11 @@ async fn bun_hosted_project(
                 UUID: {
                     "status": "granted",
                     "url": hosted_url,
-                    "purl": PURL,
+                    "purl": purl,
                     "artifacts": [{
                         "kind": "tarball",
                         "url": hosted_url,
-                        "integrity": { "sha512": sri }
+                        "integrity": { "sha512": patched_sri }
                     }],
                     "registryOverride": null
                 }
@@ -595,7 +809,7 @@ async fn bun_hosted_project(
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "uuid": UUID,
-            "purl": PURL,
+            "purl": purl,
             "publishedAt": "2026-01-01T00:00:00Z",
             "files": {
                 "package/index.js": {
@@ -614,9 +828,7 @@ async fn bun_hosted_project(
         .mount(&server)
         .await;
     Mock::given(method("GET"))
-        .and(path(format!(
-            "/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz"
-        )))
+        .and(path(hosted_path.clone()))
         .respond_with(ResponseTemplate::new(200).set_body_raw(served, "application/octet-stream"))
         .mount(&server)
         .await;
@@ -705,7 +917,7 @@ async fn bun_hosted_project(
             );
             assert_eq!(stmts[0]["status"], "not_affected", "vex doc: {vex_doc}");
             assert_eq!(
-                stmts[0]["products"][0]["subcomponents"][0]["@id"], PURL,
+                stmts[0]["products"][0]["subcomponents"][0]["@id"], purl,
                 "vex doc: {vex_doc}"
             );
             assert_eq!(
@@ -748,19 +960,21 @@ async fn bun_hosted_project(
         }
     }
 
-    // Lockfile pin: the hosted URL (as the tuple spec) + the patched sha512,
-    // the registry 4-tuple gone, and the lock's own version line kept.
+    // Lockfile pin: the URL 3-tuple — hosted URL as the tuple spec, the
+    // meta object carried VERBATIM, the patched sha512 — with the registry
+    // 4-tuple gone and the lock's own version line kept.
     let lock = std::fs::read_to_string(&lock_path).unwrap();
-    assert!(
-        lock.contains(&format!("\"{DEP}@{hosted_url}\"")),
-        "bun.lock tuple spec must be name@<hosted url>; got:\n{lock}"
+    let url_tuple = format!(
+        "\"{}@{hosted_url}\", {}, \"{patched_sri}\"]",
+        target.name(),
+        target.meta()
     );
     assert!(
-        lock.contains(&sri),
-        "bun.lock integrity must be the patched sha512 ({sri}); got:\n{lock}"
+        lock.contains(&url_tuple),
+        "bun.lock packages entry must be the URL 3-tuple {url_tuple}; got:\n{lock}"
     );
     assert!(
-        !lock.contains(&format!("\"{DEP}@{DEP_VERSION}\", \"\"")),
+        !lock.contains(&registry_tuple_head),
         "the registry 4-tuple must be gone after the rewrite:\n{lock}"
     );
     assert_eq!(
@@ -768,6 +982,14 @@ async fn bun_hosted_project(
         Some(lock_version),
         "the rewrite must preserve the lockfileVersion line verbatim; got:\n{lock}"
     );
+    if target == Target::ScopedWithDeps {
+        // The dependency's own registry entry is not the target: untouched.
+        assert_eq!(
+            packages_line(&lock, DEP),
+            packages_line(&lock_before_str, DEP),
+            "the un-patched dependency's registry 4-tuple must be byte-identical:\n{lock}"
+        );
+    }
 
     let ledger = std::fs::read_to_string(redirect_ledger(&proj)).unwrap();
     assert!(
@@ -778,6 +1000,7 @@ async fn bun_hosted_project(
     Some(BunRedirectFixture {
         tmp,
         proj,
+        target,
         orig,
         patched,
         tampered,
@@ -796,12 +1019,16 @@ fn redirect_ledger(proj: &Path) -> PathBuf {
 }
 
 /// Fresh dir `<tmp>/<name>` with only the committable files (package.json,
-/// bun.lock, and `.socket/` when it exists — rollback removes it).
+/// bun.lock, bunfig.toml when the project has one, and `.socket/` when it
+/// exists — rollback removes it).
 fn fresh_checkout(fx: &BunRedirectFixture, name: &str) -> PathBuf {
     let fresh = fx.tmp.path().join(name);
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(fx.proj.join("package.json"), fresh.join("package.json")).unwrap();
     std::fs::copy(fx.proj.join("bun.lock"), fresh.join("bun.lock")).unwrap();
+    if fx.proj.join("bunfig.toml").is_file() {
+        std::fs::copy(fx.proj.join("bunfig.toml"), fresh.join("bunfig.toml")).unwrap();
+    }
     if fx.proj.join(".socket").is_dir() {
         copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
     }
@@ -821,6 +1048,33 @@ fn fresh_frozen_install(fx: &BunRedirectFixture, name: &str) -> (PathBuf, Output
     (fresh, ci)
 }
 
+/// For the scoped target: bun must have honored the meta object it read
+/// from the URL 3-tuple — the dependency is installed and the bin linked
+/// (as `node_modules/.bin/scope-pkg`, or its `.exe`/`.cmd` shims on
+/// Windows). Neither happens when the meta is `{}`.
+fn assert_scoped_meta_honored(fresh: &Path) {
+    assert!(
+        fresh
+            .join("node_modules")
+            .join(DEP)
+            .join("package.json")
+            .is_file(),
+        "bun must install the scoped package's `dependencies` from the 3-tuple meta"
+    );
+    let bin_dir = fresh.join("node_modules").join(".bin");
+    let linked = std::fs::read_dir(&bin_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().starts_with(SCOPED_BIN))
+        })
+        .unwrap_or(false);
+    assert!(
+        linked,
+        "bun must link the scoped package's `bin` from the 3-tuple meta under {}",
+        bin_dir.display()
+    );
+}
+
 /// Shared fresh-checkout proof: `bun install --frozen-lockfile` against an
 /// empty cache must materialize the PATCHED bytes from the hosted tarball;
 /// then an ORDINARY `bun install` (node_modules removed, another empty
@@ -836,7 +1090,7 @@ fn assert_patched_fresh_install(fx: &BunRedirectFixture) {
         String::from_utf8_lossy(&ci.stdout),
         String::from_utf8_lossy(&ci.stderr),
     );
-    let installed_index = fresh.join("node_modules").join(DEP).join("index.js");
+    let installed_index = fx.target.installed_dir(&fresh).join("index.js");
     let installed = std::fs::read(&installed_index).unwrap();
     assert!(
         installed.starts_with(MARKER.as_bytes()),
@@ -847,9 +1101,12 @@ fn assert_patched_fresh_install(fx: &BunRedirectFixture) {
         installed, fx.patched,
         "fresh install must be byte-identical to the patched content"
     );
+    if fx.target == Target::ScopedWithDeps {
+        assert_scoped_meta_honored(&fresh);
+    }
     eprintln!(
-        "FRESH INSTALL OK (bun {}, lockfileVersion {})",
-        fx.bun_raw, fx.lock_version
+        "FRESH INSTALL OK (bun {}, lockfileVersion {}, {:?})",
+        fx.bun_raw, fx.lock_version, fx.target
     );
 
     // Ordinary install: the lock must survive bun's own re-serialization.
@@ -874,6 +1131,9 @@ fn assert_patched_fresh_install(fx: &BunRedirectFixture) {
         fx.patched,
         "the ordinary install must land the patched bytes too"
     );
+    if fx.target == Target::ScopedWithDeps {
+        assert_scoped_meta_honored(&fresh);
+    }
     eprintln!("PLAIN INSTALL LOCK-STABLE");
 }
 
@@ -885,8 +1145,14 @@ fn assert_patched_fresh_install(fx: &BunRedirectFixture) {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn bun_redirect_fresh_checkout_installs_patched_bytes() {
-    let Some(fx) =
-        bun_hosted_project("main", false, HostedDriver::ScanVex, LockShape::Native).await
+    let Some(fx) = bun_hosted_project(
+        "main",
+        false,
+        HostedDriver::ScanVex,
+        LockShape::Native,
+        Target::LeftPad,
+    )
+    .await
     else {
         return;
     };
@@ -901,8 +1167,36 @@ async fn bun_redirect_fresh_checkout_installs_patched_bytes() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn bun_get_uuid_hosted_fresh_checkout_installs() {
-    let Some(fx) =
-        bun_hosted_project("get-uuid", false, HostedDriver::GetUuid, LockShape::Native).await
+    let Some(fx) = bun_hosted_project(
+        "get-uuid",
+        false,
+        HostedDriver::GetUuid,
+        LockShape::Native,
+        Target::LeftPad,
+    )
+    .await
+    else {
+        return;
+    };
+    assert_patched_fresh_install(&fx);
+}
+
+/// Scoped, dependency-bearing target: the rewrite must carry bun's
+/// `{ "dependencies": …, "bin": … }` meta object verbatim into the URL
+/// 3-tuple and leave the dependency's own registry entry alone; the fresh
+/// install must prove bun honored that meta — left-pad installed, the bin
+/// linked — on top of the patched bytes and the stable lock.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn bun_redirect_scoped_package_keeps_deps_and_bin_meta() {
+    let Some(fx) = bun_hosted_project(
+        "scoped-with-deps",
+        false,
+        HostedDriver::ScanVex,
+        LockShape::Native,
+        Target::ScopedWithDeps,
+    )
+    .await
     else {
         return;
     };
@@ -923,6 +1217,7 @@ async fn bun_redirect_lock_v1_on_newer_bun_fresh_checkout_installs_patched_bytes
         false,
         HostedDriver::ScanVex,
         LockShape::V1OnNewerBun,
+        Target::LeftPad,
     )
     .await
     else {
@@ -953,8 +1248,14 @@ async fn bun_redirect_lock_v1_on_newer_bun_fresh_checkout_installs_patched_bytes
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn bun_redirect_tampered_hosted_tarball_digest_boundary() {
-    let Some(fx) =
-        bun_hosted_project("tampered", true, HostedDriver::ScanVex, LockShape::Native).await
+    let Some(fx) = bun_hosted_project(
+        "tampered",
+        true,
+        HostedDriver::ScanVex,
+        LockShape::Native,
+        Target::LeftPad,
+    )
+    .await
     else {
         return;
     };
@@ -988,8 +1289,7 @@ async fn bun_redirect_tampered_hosted_tarball_digest_boundary() {
              must still exit 0 — a failure here means the boundary moved.\n{chatter}",
             fx.bun_raw
         );
-        let installed =
-            std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+        let installed = std::fs::read(fx.target.installed_dir(&fresh).join("index.js")).unwrap();
         assert_eq!(
             installed, fx.tampered,
             "bun {} installed neither the tampered bytes nor failed: the boundary model is wrong",
@@ -1011,8 +1311,14 @@ async fn bun_redirect_tampered_hosted_tarball_digest_boundary() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn bun_redirect_rollback_restores_lock_and_original_install() {
-    let Some(fx) =
-        bun_hosted_project("rollback", false, HostedDriver::ScanVex, LockShape::Native).await
+    let Some(fx) = bun_hosted_project(
+        "rollback",
+        false,
+        HostedDriver::ScanVex,
+        LockShape::Native,
+        Target::LeftPad,
+    )
+    .await
     else {
         return;
     };
@@ -1061,7 +1367,7 @@ async fn bun_redirect_rollback_restores_lock_and_original_install() {
         String::from_utf8_lossy(&ci.stdout),
         String::from_utf8_lossy(&ci.stderr),
     );
-    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    let installed = std::fs::read(fx.target.installed_dir(&fresh).join("index.js")).unwrap();
     assert!(
         !installed.starts_with(MARKER.as_bytes()),
         "after rollback bun must install the ORIGINAL bytes, not the patch"

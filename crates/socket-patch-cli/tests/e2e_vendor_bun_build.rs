@@ -6,9 +6,10 @@
 //!      `BUN_INSTALL_CACHE_DIR`). The text `bun.lock` is the default from
 //!      bun 1.2.0 (lockfileVersion 1; 2 from 1.4.0); on 1.1.39–1.1.x it is
 //!      the `--save-text-lockfile` opt-in (lockfileVersion 0), which the
-//!      fixture passes for those releases. Bun before 1.1.39 has no text
-//!      lockfile at all and the suite skips (or, under the REQUIRED gate,
-//!      fails — such a leg must not be scheduled).
+//!      fixture passes for those releases, and the fixture ASSERTS the
+//!      version it got matches that era table. Bun before 1.1.39 has no
+//!      text lockfile at all and the suite skips (or, under the REQUIRED
+//!      gate, fails — such a leg must not be scheduled).
 //!   2. Hand-stage a `.socket/` manifest + blob from the ACTUAL installed
 //!      bytes (a marker comment prepended to `index.js`).
 //!   3. `socket-patch vendor --json --offline` — assert the deterministic
@@ -44,6 +45,19 @@
 //! The revert half is not repeated there: `vendor --revert` on the
 //! capstone already covers it (same ledger, same engine).
 //!
+//! The scoped leg vendors a DIFFERENT target: `@scope/pkg@1.0.0`, a scoped
+//! package with `dependencies` and a `bin`, served by a wiremock npm
+//! registry through bun's `[install.scopes]` (a private scoped registry —
+//! the common real-world shape). Bun records it as
+//! `["@scope/pkg@1.0.0", "<tarball url>", { "dependencies": {…}, "bin": {…}
+//! }, "sha512-…"]`; the rewrite must carry that meta object VERBATIM into
+//! the local-tarball 3-tuple (whose path keeps the scope dir:
+//! `.socket/vendor/npm/<uuid>/@scope/pkg-1.0.0.tgz`), and the fresh install
+//! must prove bun honored it: the dependency installs and the bin is
+//! linked. A meta-dropping regression is silent under every left-pad leg
+//! (bun installs a `{}`-meta tuple with exit 0, patched bytes and a stable
+//! lock — and no deps, no bin).
+//!
 //! The tampered twin swaps the committed tarball for a DIFFERENT valid
 //! tarball while bun.lock keeps our sha512: bun verifies the digest of
 //! local-tarball tuples only from 1.3.10 (`Integrity check failed`), so the
@@ -63,8 +77,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use sha2::{Digest, Sha256};
-use wiremock::matchers::{method, path};
+use sha2::{Digest, Sha256, Sha512};
+use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
@@ -79,6 +93,20 @@ const TAMPER_MARKER: &str = "/* SOCKET-TAMPERED */\n";
 const DEP: &str = "left-pad";
 const DEP_VERSION: &str = "1.3.0";
 const ORG: &str = "test-org";
+
+/// The scoped, dependency-bearing target of the meta-preserving leg. It
+/// exists only in the wiremock registry this suite runs; bun fetches it
+/// through `[install.scopes]` and left-pad (its one dependency) from the
+/// real registry like every other fixture.
+const SCOPED_NAME: &str = "@scope/pkg";
+const SCOPED_VERSION: &str = "1.0.0";
+const SCOPED_BIN: &str = "scope-pkg";
+const SCOPED_INDEX: &[u8] = b"module.exports = require('left-pad');\n";
+/// The meta object bun writes for it, byte-exact (bun serializes
+/// `dependencies` before `bin`; identical on lockfileVersion 0, 1 and 2).
+/// The rewrite must carry this into the 3-tuple verbatim.
+const SCOPED_META: &str =
+    r#"{ "dependencies": { "left-pad": "1.3.0" }, "bin": { "scope-pkg": "bin/cli.js" } }"#;
 
 /// `(major, minor, patch)` of the bun on PATH.
 type BunVersion = (u64, u64, u64);
@@ -277,29 +305,8 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[u8]) {
-    let socket = proj.join(".socket");
-    std::fs::create_dir_all(socket.join("blobs")).unwrap();
-    let manifest = serde_json::json!({
-        "patches": { purl: {
-            "uuid": UUID,
-            "exportedAt": "2026-01-01T00:00:00Z",
-            "files": { file_key: {
-                "beforeHash": git_sha256(before),
-                "afterHash": git_sha256(after),
-            }},
-            "vulnerabilities": {},
-            "description": "capstone marker patch",
-            "license": "MIT",
-            "tier": "free",
-        }}
-    });
-    std::fs::write(
-        socket.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
-    std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
+fn sri(bytes: &[u8]) -> String {
+    format!("sha512-{}", b64(&Sha512::digest(bytes)))
 }
 
 fn parse_envelope(stdout: &str) -> serde_json::Value {
@@ -320,10 +327,29 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
     }
 }
 
+/// A gzipped npm tarball from `(entry name under package/, bytes, mode)`
+/// triples, built with the tar crate so the suite has no system-`tar`
+/// dependency (Windows runners included).
+fn build_tgz(entries: &[(String, Vec<u8>, u32)]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    ));
+    for (name, bytes, mode) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(*mode);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, format!("package/{name}"), bytes.as_slice())
+            .unwrap();
+    }
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
 /// A VALID npm tarball built from the ACTUALLY-installed package with the
-/// entry point swapped — the tampered twin's replacement artifact. Built
-/// with the tar crate (no system `tar`, so Windows runners need nothing);
-/// the point is a sha512 that differs from the one bun.lock pins while the
+/// entry point swapped — the tampered twin's replacement artifact. The
+/// point is a sha512 that differs from the one bun.lock pins while the
 /// archive still extracts, so "bun installed the tampered bytes" can be
 /// asserted on the pre-1.3.10 releases that never check the digest.
 fn make_tgz_from_installed(pkg_dir: &Path, replaced_index: &[u8]) -> Vec<u8> {
@@ -343,34 +369,175 @@ fn make_tgz_from_installed(pkg_dir: &Path, replaced_index: &[u8]) -> Vec<u8> {
         }
     }
     files.sort();
-    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
-        Vec::new(),
-        flate2::Compression::default(),
-    ));
-    for p in &files {
-        let rel = p.strip_prefix(&pkg_dir).unwrap();
-        // Tar entry names always use `/` regardless of host separator.
-        let name = format!(
-            "package/{}",
-            rel.components()
+    let entries: Vec<(String, Vec<u8>, u32)> = files
+        .iter()
+        .map(|p| {
+            let rel = p.strip_prefix(&pkg_dir).unwrap();
+            // Tar entry names always use `/` regardless of host separator.
+            let name = rel
+                .components()
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
-                .join("/")
-        );
-        let bytes = if rel == Path::new("index.js") {
-            replaced_index.to_vec()
-        } else {
-            std::fs::read(p).unwrap()
-        };
-        let mut header = tar::Header::new_gnu();
-        header.set_size(bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, &name, bytes.as_slice())
-            .unwrap();
+                .join("/");
+            let bytes = if rel == Path::new("index.js") {
+                replaced_index.to_vec()
+            } else {
+                std::fs::read(p).unwrap()
+            };
+            (name.clone(), bytes, file_mode(p, &name))
+        })
+        .collect();
+    build_tgz(&entries)
+}
+
+#[cfg(unix)]
+fn file_mode(p: &Path, _name: &str) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn file_mode(_p: &Path, name: &str) -> u32 {
+    if name.starts_with("bin/") {
+        0o755
+    } else {
+        0o644
     }
-    builder.into_inner().unwrap().finish().unwrap()
+}
+
+/// The scoped target's registry tarball: package.json with the dependency
+/// and the bin, the entry point, and the (executable) bin script.
+fn scoped_registry_tgz() -> Vec<u8> {
+    let pkg_json = serde_json::json!({
+        "name": SCOPED_NAME,
+        "version": SCOPED_VERSION,
+        "main": "index.js",
+        "dependencies": { DEP: DEP_VERSION },
+        "bin": { SCOPED_BIN: "bin/cli.js" },
+    });
+    build_tgz(&[
+        (
+            "package.json".into(),
+            serde_json::to_vec_pretty(&pkg_json).unwrap(),
+            0o644,
+        ),
+        ("index.js".into(), SCOPED_INDEX.to_vec(), 0o644),
+        (
+            "bin/cli.js".into(),
+            b"#!/usr/bin/env node\nconsole.log('scope-pkg cli');\n".to_vec(),
+            0o755,
+        ),
+    ])
+}
+
+/// A wiremock npm registry for the scoped target: the packument (bun asks
+/// for `/@scope%2fpkg`) and the tarball it points at. Integrity only — bun
+/// verifies the sha512 and needs no `shasum`.
+async fn mount_scoped_registry(server: &MockServer, tgz: Vec<u8>) {
+    let tarball_url = format!("{}/@scope/pkg/-/pkg-{SCOPED_VERSION}.tgz", server.uri());
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/@scope(%2[fF]|/)pkg$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": SCOPED_NAME,
+            "dist-tags": { "latest": SCOPED_VERSION },
+            "versions": {
+                SCOPED_VERSION: {
+                    "name": SCOPED_NAME,
+                    "version": SCOPED_VERSION,
+                    "dependencies": { DEP: DEP_VERSION },
+                    "bin": { SCOPED_BIN: "bin/cli.js" },
+                    "dist": { "tarball": tarball_url, "integrity": sri(&tgz) }
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/@scope/pkg/-/pkg-{SCOPED_VERSION}.tgz")))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(tgz, "application/octet-stream"))
+        .mount(server)
+        .await;
+}
+
+/// Which package the vendored rewrite targets.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Target {
+    /// left-pad@1.3.0 from the real registry: unscoped, `{}` meta — the
+    /// original capstone target.
+    LeftPad,
+    /// `@scope/pkg@1.0.0` from the suite's wiremock registry via
+    /// `[install.scopes]`: scoped key, non-empty `{dependencies, bin}` meta.
+    ScopedWithDeps,
+}
+
+impl Target {
+    fn name(self) -> &'static str {
+        match self {
+            Target::LeftPad => DEP,
+            Target::ScopedWithDeps => SCOPED_NAME,
+        }
+    }
+    fn version(self) -> &'static str {
+        match self {
+            Target::LeftPad => DEP_VERSION,
+            Target::ScopedWithDeps => SCOPED_VERSION,
+        }
+    }
+    /// The PURL the CLI derives for it (`@` is percent-encoded in npm PURLs).
+    fn purl(self) -> &'static str {
+        match self {
+            Target::LeftPad => "pkg:npm/left-pad@1.3.0",
+            Target::ScopedWithDeps => "pkg:npm/%40scope/pkg@1.0.0",
+        }
+    }
+    /// The meta object bun writes for it, byte-exact.
+    fn meta(self) -> &'static str {
+        match self {
+            Target::LeftPad => "{}",
+            Target::ScopedWithDeps => SCOPED_META,
+        }
+    }
+    fn installed_dir(self, root: &Path) -> PathBuf {
+        let nm = root.join("node_modules");
+        match self {
+            Target::LeftPad => nm.join(DEP),
+            Target::ScopedWithDeps => nm.join("@scope").join("pkg"),
+        }
+    }
+    /// The vendored tarball's path under `.socket/vendor/npm/<uuid>/` — the
+    /// scope dir is kept as a directory level.
+    fn vendored_tgz_rel(self) -> String {
+        match self {
+            Target::LeftPad => format!("{DEP}-{DEP_VERSION}.tgz"),
+            Target::ScopedWithDeps => format!("@scope/pkg-{SCOPED_VERSION}.tgz"),
+        }
+    }
+    fn package_json(self) -> String {
+        format!(
+            r#"{{"name":"bun-capstone","version":"0.0.0","private":true,"dependencies":{{"{}":"{}"}}}}"#,
+            self.name(),
+            self.version()
+        )
+    }
+}
+
+/// The `packages` line for `name` in a bun.lock (`"name": [...]`).
+fn packages_line(lock: &str, name: &str) -> String {
+    let key = format!("\"{name}\": [");
+    lock.lines()
+        .find(|l| l.trim_start().starts_with(&key))
+        .unwrap_or_else(|| panic!("no packages entry for {name} in:\n{lock}"))
+        .to_string()
+}
+
+/// The `sha512-…` integrity token of a packages line (its last element).
+fn line_sha512(line: &str) -> String {
+    let start = line
+        .rfind("\"sha512-")
+        .unwrap_or_else(|| panic!("no sha512 in packages line: {line}"));
+    let rest = &line[start + 1..];
+    let end = rest.find('"').unwrap();
+    rest[..end].to_string()
 }
 
 // ── shared fixture (steps 1–2) ────────────────────────────────────────
@@ -380,11 +547,16 @@ fn make_tgz_from_installed(pkg_dir: &Path, replaced_index: &[u8]) -> Vec<u8> {
 struct BunProject {
     tmp: tempfile::TempDir,
     proj: PathBuf,
+    target: Target,
     orig: Vec<u8>,
     patched: Vec<u8>,
-    purl: String,
     lock_before: Vec<u8>,
     pkg_before: Vec<u8>,
+    /// bun's registry 4-tuple for the target, up to its integrity — the
+    /// spelling that must be GONE after the rewrite.
+    registry_tuple_head: String,
+    /// The registry integrity bun recorded — must NOT survive the rewrite.
+    registry_sha512: String,
     /// `bun --version`, verbatim, for messages.
     bun_raw: String,
     bun_version: BunVersion,
@@ -392,25 +564,35 @@ struct BunProject {
     lock_version: u64,
 }
 
-/// Steps 1–2 of the module doc, shared by the vendor capstone and the
-/// get-driven twin: a tempdir project depending on left-pad, a REAL
-/// `bun install` (network here, private cache) with the hermeticity guard,
-/// pristine-byte checks, and the patched-content twin of the installed
-/// `index.js`. `None` = soft-skip, already reported with a println (a hard
-/// failure instead under the REQUIRED gate).
-fn bun_project(tag: &str) -> Option<BunProject> {
+/// Steps 1–2 of the module doc, shared by every leg: a tempdir project
+/// depending on the target, a REAL `bun install` (network here, private
+/// cache) with the hermeticity guard, pristine-byte checks, and the
+/// patched-content twin of the installed `index.js`. `scoped_registry` is
+/// the wiremock registry URI for [`Target::ScopedWithDeps`] (mounted by
+/// the caller — the fixture writes the matching `bunfig.toml`). `None` =
+/// soft-skip, already reported with a println (a hard failure instead
+/// under the REQUIRED gate).
+fn bun_project(tag: &str, target: Target, scoped_registry: Option<&str>) -> Option<BunProject> {
     let (bun_raw, bun_version) = bun_toolchain(tag)?;
 
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
-    std::fs::write(
-        proj.join("package.json"),
-        format!(
-            r#"{{"name":"bun-capstone","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
-        ),
-    )
-    .unwrap();
+    std::fs::write(proj.join("package.json"), target.package_json()).unwrap();
+    let mut registry_field = String::new();
+    if target == Target::ScopedWithDeps {
+        let registry = scoped_registry.expect("the scoped target needs its wiremock registry");
+        // bun's scoped-registry config — a committable file, so it travels
+        // with every fresh checkout below.
+        std::fs::write(
+            proj.join("bunfig.toml"),
+            format!("[install.scopes]\n\"@scope\" = {{ url = \"{registry}/\" }}\n"),
+        )
+        .unwrap();
+        // For a non-default registry bun records the TARBALL URL as the
+        // 4-tuple's registry field.
+        registry_field = format!("{registry}/@scope/pkg/-/pkg-{SCOPED_VERSION}.tgz");
+    }
 
     // 1. REAL fixture: bun install (network allowed here, private cache).
     let cache = tmp.path().join("bun-cache");
@@ -451,14 +633,19 @@ fn bun_project(tag: &str) -> Option<BunProject> {
         cache.display()
     );
 
-    let installed_index = proj.join("node_modules").join(DEP).join("index.js");
+    let installed_index = target.installed_dir(&proj).join("index.js");
     let orig = std::fs::read(&installed_index).expect("installed index.js");
     assert!(
         !orig.starts_with(MARKER.as_bytes()),
         "pristine install must not carry the marker"
     );
+    if target == Target::ScopedWithDeps {
+        assert_eq!(
+            orig, SCOPED_INDEX,
+            "bun must have installed the mock registry's bytes"
+        );
+    }
     let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
-    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
 
     let lock_before = std::fs::read(&lock_path).expect("bun.lock after bun install");
     let pkg_before = std::fs::read(proj.join("package.json")).expect("package.json");
@@ -477,49 +664,100 @@ fn bun_project(tag: &str) -> Option<BunProject> {
          (1.1.39–1.1.x → 0, 1.2–1.3 → 1, ≥ 1.4 → 2):\n{lock_before_str}",
         expected_lock_version(bun_version)
     );
-    // Pre-vendor: the registry 4-tuple `["left-pad@1.3.0", "", {}, "sha512-…"]`
-    // — the same spelling in lockfileVersion 0, 1 and 2.
-    assert!(
-        lock_before_str.contains(&format!("\"{DEP}@{DEP_VERSION}\", \"\"")),
-        "pre-vendor packages entry must be the registry 4-tuple:\n{lock_before_str}"
+    // Pre-vendor: the registry 4-tuple, with bun's real registry field and
+    // meta object for this target — one spelling across 0/1/2.
+    let registry_tuple_head = format!(
+        "\"{}@{}\", \"{registry_field}\", {}, \"sha512-",
+        target.name(),
+        target.version(),
+        target.meta()
     );
+    assert!(
+        lock_before_str.contains(&registry_tuple_head),
+        "pre-vendor packages entry must be the registry 4-tuple {registry_tuple_head}…:\n\
+         {lock_before_str}"
+    );
+    let registry_sha512 = line_sha512(&packages_line(&lock_before_str, target.name()));
 
     Some(BunProject {
         tmp,
         proj,
+        target,
         orig,
         patched,
-        purl,
         lock_before,
         pkg_before,
+        registry_tuple_head,
+        registry_sha512,
         bun_raw,
         bun_version,
         lock_version,
     })
 }
 
-fn vendored_tgz_rel() -> String {
-    format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz")
-}
-
 fn vendored_dir(proj: &Path) -> PathBuf {
     proj.join(".socket").join("vendor").join("npm").join(UUID)
 }
 
-fn vendored_tgz(proj: &Path) -> PathBuf {
-    vendored_dir(proj).join(format!("{DEP}-{DEP_VERSION}.tgz"))
+fn vendored_tgz(fx: &BunProject) -> PathBuf {
+    vendored_dir(&fx.proj).join(fx.target.vendored_tgz_rel())
+}
+
+/// Hand-stage the `.socket/` manifest + blob for the fixture's target from
+/// the installed bytes (the capstone's step 2).
+fn stage_patch(fx: &BunProject) {
+    let socket = fx.proj.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    let manifest = serde_json::json!({
+        "patches": { fx.target.purl(): {
+            "uuid": UUID,
+            "exportedAt": "2026-01-01T00:00:00Z",
+            "files": { "package/index.js": {
+                "beforeHash": git_sha256(&fx.orig),
+                "afterHash": git_sha256(&fx.patched),
+            }},
+            "vulnerabilities": {},
+            "description": "capstone marker patch",
+            "license": "MIT",
+            "tier": "free",
+        }}
+    });
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        socket.join("blobs").join(git_sha256(&fx.patched)),
+        &fx.patched,
+    )
+    .unwrap();
+}
+
+/// `vendor --json --offline` over the fixture; the (code, stdout, stderr).
+fn run_vendor(fx: &BunProject, extra: &[&str]) -> (i32, String, String) {
+    let mut args = vec![
+        "vendor",
+        "--json",
+        "--offline",
+        "--cwd",
+        fx.proj.to_str().unwrap(),
+    ];
+    args.extend_from_slice(extra);
+    run_socket(&fx.proj, &args)
 }
 
 /// The on-disk vendored state BOTH drivers (`vendor --offline`, `get <uuid>
 /// --mode vendored`) must produce: the committed artifact + informational
 /// marker + ledger, the bun.lock `packages` entry rewritten from the
-/// registry 4-tuple to the local-tarball 3-tuple with OUR recomputed
-/// integrity, and package.json untouched.
+/// registry 4-tuple to the local-tarball 3-tuple with the meta object
+/// carried VERBATIM and OUR recomputed integrity, and package.json
+/// untouched.
 fn assert_vendored_on_disk(fx: &BunProject) {
     let proj = &fx.proj;
-    let tgz_rel = vendored_tgz_rel();
+    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{}", fx.target.vendored_tgz_rel());
     assert!(
-        vendored_tgz(proj).is_file(),
+        vendored_tgz(fx).is_file(),
         "vendored tarball missing at {tgz_rel}"
     );
     assert!(
@@ -537,21 +775,26 @@ fn assert_vendored_on_disk(fx: &BunProject) {
     );
 
     // bun.lock packages entry rewritten to the local-tarball 3-tuple:
-    // element 0 = `<name>@<bare-rel-path>` (no `file:`/`./`), the deps object
-    // shifts to index 1, integrity is the recomputed sha512 of OUR tarball.
+    // element 0 = `<name>@<bare-rel-path>` (no `file:`/`./`), the meta
+    // object shifts to index 1 unchanged, integrity is the recomputed
+    // sha512 of OUR tarball.
     let lock_after = std::fs::read_to_string(proj.join("bun.lock")).unwrap();
-    assert!(
-        lock_after.contains(&format!("\"{DEP}@{tgz_rel}\", {{}}, \"sha512-")),
-        "bun.lock packages entry must be the local-tarball 3-tuple; got:\n{lock_after}"
+    let local_tuple_head = format!(
+        "\"{}@{tgz_rel}\", {}, \"sha512-",
+        fx.target.name(),
+        fx.target.meta()
     );
     assert!(
-        !lock_after.contains(&format!("\"{DEP}@{DEP_VERSION}\", \"\"")),
+        lock_after.contains(&local_tuple_head),
+        "bun.lock packages entry must be the local-tarball 3-tuple {local_tuple_head}…; got:\n\
+         {lock_after}"
+    );
+    assert!(
+        !lock_after.contains(&fx.registry_tuple_head),
         "the registry 4-tuple must be gone after the rewrite:\n{lock_after}"
     );
     assert!(
-        !lock_after.contains(
-            "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="
-        ),
+        !lock_after.contains(&fx.registry_sha512),
         "the inherited registry integrity must NOT survive the rewrite:\n{lock_after}"
     );
     // The rewrite must keep the lock's own version line — a v0 lock stays
@@ -561,6 +804,15 @@ fn assert_vendored_on_disk(fx: &BunProject) {
         Some(fx.lock_version),
         "the vendored rewrite must preserve the lockfileVersion line verbatim:\n{lock_after}"
     );
+    if fx.target == Target::ScopedWithDeps {
+        // The dependency's own registry entry is not the target: untouched.
+        let before = String::from_utf8(fx.lock_before.clone()).unwrap();
+        assert_eq!(
+            packages_line(&lock_after, DEP),
+            packages_line(&before, DEP),
+            "the un-patched dependency's registry 4-tuple must be byte-identical:\n{lock_after}"
+        );
+    }
     // package.json is left untouched by the lock-only bun wiring.
     assert_eq!(
         std::fs::read(proj.join("package.json")).unwrap(),
@@ -570,27 +822,58 @@ fn assert_vendored_on_disk(fx: &BunProject) {
 }
 
 /// Fresh dir `<tmp>/<name>` holding ONLY the committable files
-/// (package.json, bun.lock, and .socket/).
-fn fresh_checkout(tmp: &Path, proj: &Path, name: &str) -> PathBuf {
-    let fresh = tmp.join(name);
+/// (package.json, bun.lock, bunfig.toml when the project has one, and
+/// .socket/).
+fn fresh_checkout(fx: &BunProject, name: &str) -> PathBuf {
+    let fresh = fx.tmp.path().join(name);
     std::fs::create_dir_all(&fresh).unwrap();
-    std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
-    std::fs::copy(proj.join("bun.lock"), fresh.join("bun.lock")).unwrap();
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    std::fs::copy(fx.proj.join("package.json"), fresh.join("package.json")).unwrap();
+    std::fs::copy(fx.proj.join("bun.lock"), fresh.join("bun.lock")).unwrap();
+    if fx.proj.join("bunfig.toml").is_file() {
+        std::fs::copy(fx.proj.join("bunfig.toml"), fresh.join("bunfig.toml")).unwrap();
+    }
+    copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
     fresh
 }
 
 /// `bun install --frozen-lockfile` in a fresh checkout named `name` against
 /// an EMPTY cache — the spike-proven strictest invocation.
-fn fresh_frozen_install(tmp: &Path, proj: &Path, name: &str) -> (PathBuf, Output) {
-    let fresh = fresh_checkout(tmp, proj, name);
-    let fresh_cache = tmp.join(format!("{name}-bun-cache"));
+fn fresh_frozen_install(fx: &BunProject, name: &str) -> (PathBuf, Output) {
+    let fresh = fresh_checkout(fx, name);
+    let fresh_cache = fx.tmp.path().join(format!("{name}-bun-cache"));
     let ci = bun(
         &fresh,
         &["install", "--frozen-lockfile", "--ignore-scripts"],
         &fresh_cache,
     );
     (fresh, ci)
+}
+
+/// For the scoped target: bun must have honored the meta object it read
+/// from the local-tarball 3-tuple — the dependency is installed and the
+/// bin linked (as `node_modules/.bin/scope-pkg`, or its `.exe`/`.cmd`
+/// shims on Windows). Neither happens when the meta is `{}`.
+fn assert_scoped_meta_honored(fresh: &Path) {
+    assert!(
+        fresh
+            .join("node_modules")
+            .join(DEP)
+            .join("package.json")
+            .is_file(),
+        "bun must install the scoped package's `dependencies` from the 3-tuple meta"
+    );
+    let bin_dir = fresh.join("node_modules").join(".bin");
+    let linked = std::fs::read_dir(&bin_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().starts_with(SCOPED_BIN))
+        })
+        .unwrap_or(false);
+    assert!(
+        linked,
+        "bun must link the scoped package's `bin` from the 3-tuple meta under {}",
+        bin_dir.display()
+    );
 }
 
 /// Step 4, shared: the fresh-checkout frozen install MUST land the patched
@@ -600,8 +883,8 @@ fn fresh_frozen_install(tmp: &Path, proj: &Path, name: &str) -> (PathBuf, Output
 /// writes the lock, so only the plain install can observe a
 /// re-serialization of the local-tarball tuple — the property the module
 /// doc calls BN3 and the backtest checks as `ordinaryStableLock`.
-fn fresh_checkout_install_proof(tmp: &Path, proj: &Path, patched: &[u8], name: &str) {
-    let (fresh, ci) = fresh_frozen_install(tmp, proj, name);
+fn fresh_checkout_install_proof(fx: &BunProject, name: &str) {
+    let (fresh, ci) = fresh_frozen_install(fx, name);
     assert!(
         ci.status.success(),
         "fresh-checkout `bun install --frozen-lockfile` must succeed from the vendored \
@@ -609,7 +892,7 @@ fn fresh_checkout_install_proof(tmp: &Path, proj: &Path, patched: &[u8], name: &
         String::from_utf8_lossy(&ci.stdout),
         String::from_utf8_lossy(&ci.stderr),
     );
-    let installed_index = fresh.join("node_modules").join(DEP).join("index.js");
+    let installed_index = fx.target.installed_dir(&fresh).join("index.js");
     let fresh_installed = std::fs::read(&installed_index).unwrap();
     assert!(
         fresh_installed.starts_with(MARKER.as_bytes()),
@@ -617,15 +900,18 @@ fn fresh_checkout_install_proof(tmp: &Path, proj: &Path, patched: &[u8], name: &
         String::from_utf8_lossy(&fresh_installed[..fresh_installed.len().min(120)])
     );
     assert_eq!(
-        fresh_installed, patched,
+        fresh_installed, fx.patched,
         "fresh install must be byte-identical to the patched content"
     );
-    eprintln!("FRESH INSTALL OK ({name})");
+    if fx.target == Target::ScopedWithDeps {
+        assert_scoped_meta_honored(&fresh);
+    }
+    eprintln!("FRESH INSTALL OK ({name}, {:?})", fx.target);
 
     // Ordinary install: the lock must survive bun's own re-serialization.
-    let wired_lock = std::fs::read(proj.join("bun.lock")).unwrap();
+    let wired_lock = std::fs::read(fx.proj.join("bun.lock")).unwrap();
     std::fs::remove_dir_all(fresh.join("node_modules")).unwrap();
-    let plain_cache = tmp.join(format!("{name}-plain-bun-cache"));
+    let plain_cache = fx.tmp.path().join(format!("{name}-plain-bun-cache"));
     let plain = bun(&fresh, &["install", "--ignore-scripts"], &plain_cache);
     assert!(
         plain.status.success(),
@@ -641,9 +927,12 @@ fn fresh_checkout_install_proof(tmp: &Path, proj: &Path, patched: &[u8], name: &
     );
     assert_eq!(
         std::fs::read(&installed_index).unwrap(),
-        patched,
+        fx.patched,
         "the ordinary install must land the patched bytes too"
     );
+    if fx.target == Target::ScopedWithDeps {
+        assert_scoped_meta_honored(&fresh);
+    }
     eprintln!("PLAIN INSTALL LOCK-STABLE ({name})");
 }
 
@@ -654,7 +943,7 @@ fn fresh_checkout_install_proof(tmp: &Path, proj: &Path, patched: &[u8], name: &
 /// and MUST install the tampered bytes with exit 0 (reported PARTIAL — the
 /// rejection proof is not available on that release, by bun's design).
 fn assert_tamper_outcome(fx: &BunProject, tampered: &[u8]) {
-    let (fresh, ci) = fresh_frozen_install(fx.tmp.path(), &fx.proj, "fresh-tampered");
+    let (fresh, ci) = fresh_frozen_install(fx, "fresh-tampered");
     let chatter = format!(
         "{}\n{}",
         String::from_utf8_lossy(&ci.stdout),
@@ -683,8 +972,7 @@ fn assert_tamper_outcome(fx: &BunProject, tampered: &[u8]) {
              install must still exit 0 — a failure here means the boundary moved.\n{chatter}",
             fx.bun_raw
         );
-        let installed =
-            std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+        let installed = std::fs::read(fx.target.installed_dir(&fresh).join("index.js")).unwrap();
         assert_eq!(
             installed, tampered,
             "bun {} installed neither the tampered bytes nor failed: the boundary model is wrong",
@@ -698,6 +986,37 @@ fn assert_tamper_outcome(fx: &BunProject, tampered: &[u8]) {
     }
 }
 
+/// Steps 2–3 for the manifest-driven legs: stage the patch, `vendor
+/// --offline`, assert the envelope and the on-disk vendored state.
+fn stage_and_vendor(fx: &BunProject) {
+    stage_patch(fx);
+    let (code, stdout, stderr) = run_vendor(fx, &[]);
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
+    assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
+    let purl = fx.target.purl();
+    let applied = env["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "applied" && e["purl"] == purl)
+        .unwrap_or_else(|| panic!("expected an applied event for {purl}: {env}"));
+    assert!(
+        applied.get("errorCode").is_none(),
+        "clean apply event: {applied}"
+    );
+    assert_vendored_on_disk(fx);
+    eprintln!(
+        "VENDOR OK (bun {}, lockfileVersion {}, {:?})",
+        fx.bun_raw, fx.lock_version, fx.target
+    );
+}
+
 // ── the capstone ──────────────────────────────────────────────────────
 
 // #[serial]: each fresh install gets its own empty cache dir, but bun also
@@ -707,64 +1026,27 @@ fn assert_tamper_outcome(fx: &BunProject, tampered: &[u8]) {
 #[test]
 #[serial_test::serial]
 fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
-    let Some(fx) = bun_project("vendor-offline") else {
+    let Some(fx) = bun_project("vendor-offline", Target::LeftPad, None) else {
         return;
     };
     let proj = &fx.proj;
     let lock_path = proj.join("bun.lock");
     let pkg_path = proj.join("package.json");
-    let purl = &fx.purl;
 
-    // 2. Hand-stage the .socket/ manifest + blob from the installed bytes.
-    stage_patch(proj, purl, "package/index.js", &fx.orig, &fx.patched);
-
-    // 3. Vendor (offline).
-    let (code, stdout, stderr) = run_socket(
-        proj,
-        &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            proj.to_str().unwrap(),
-        ],
-    );
-    assert_eq!(
-        code, 0,
-        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    let env = parse_envelope(&stdout);
-    assert_eq!(env["status"], "success", "envelope: {env}");
-    assert_eq!(env["summary"]["applied"], 1, "one package vendored: {env}");
-    assert_eq!(env["summary"]["failed"], 0, "no failures: {env}");
-    let applied = env["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["action"] == "applied" && e["purl"] == purl.as_str())
-        .unwrap_or_else(|| panic!("expected an applied event for {purl}: {env}"));
-    assert!(
-        applied.get("errorCode").is_none(),
-        "clean apply event: {applied}"
-    );
-
-    assert_vendored_on_disk(&fx);
-    eprintln!(
-        "VENDOR OK (bun {}, lockfileVersion {})",
-        fx.bun_raw, fx.lock_version
-    );
+    // 2–3. Hand-stage the .socket/ manifest + blob, vendor (offline).
+    stage_and_vendor(&fx);
 
     // 4. FRESH-CHECKOUT PROOF: committable files only, EMPTY cache,
     //    spike-proven `--frozen-lockfile`, then the ordinary-install
     //    lock-stability twin.
-    fresh_checkout_install_proof(fx.tmp.path(), proj, &fx.patched, "fresh");
+    fresh_checkout_install_proof(&fx, "fresh");
 
     // 5. REPAIR PROOF: the committed artifact dir vanishes (a botched merge,
     //    an over-eager clean); `repair --offline` must rebuild the tarball
     //    byte-identically from the installed copy + blob, leave bun.lock
     //    alone, and a cold fresh checkout must install the marker bytes
     //    from the rebuilt artifact.
-    let tgz_path = vendored_tgz(proj);
+    let tgz_path = vendored_tgz(&fx);
     let tgz_bytes = std::fs::read(&tgz_path).unwrap();
     let lock_wired = std::fs::read(&lock_path).unwrap();
     std::fs::remove_dir_all(vendored_dir(proj)).unwrap();
@@ -795,8 +1077,9 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|e| e["action"] == "rebuilt" && e["purl"] == purl.as_str()),
-        "repair must report a rebuilt event for {purl}: {renv}"
+            .any(|e| e["action"] == "rebuilt" && e["purl"] == fx.target.purl()),
+        "repair must report a rebuilt event for {}: {renv}",
+        fx.target.purl()
     );
     assert_eq!(
         std::fs::read(&tgz_path).unwrap(),
@@ -809,19 +1092,10 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
         "repair must not touch bun.lock"
     );
     eprintln!("REPAIR OK");
-    fresh_checkout_install_proof(fx.tmp.path(), proj, &fx.patched, "fresh-repaired");
+    fresh_checkout_install_proof(&fx, "fresh-repaired");
 
     // 6. Idempotency: a re-run exits 0 and leaves bun.lock byte-stable.
-    let (code, stdout, stderr) = run_socket(
-        proj,
-        &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            proj.to_str().unwrap(),
-        ],
-    );
+    let (code, stdout, stderr) = run_vendor(&fx, &[]);
     assert_eq!(
         code, 0,
         "re-vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -835,17 +1109,7 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
     );
 
     // 7. REVERT PROOF: bun.lock restored byte-for-byte, artifacts gone.
-    let (code, stdout, stderr) = run_socket(
-        proj,
-        &[
-            "vendor",
-            "--revert",
-            "--json",
-            "--offline",
-            "--cwd",
-            proj.to_str().unwrap(),
-        ],
-    );
+    let (code, stdout, stderr) = run_vendor(&fx, &["--revert"]);
     assert_eq!(
         code, 0,
         "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -870,6 +1134,30 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
     eprintln!("REVERT OK");
 }
 
+// ── the scoped, dependency-bearing leg ────────────────────────────────
+
+/// Scoped target with `dependencies` + `bin`: the vendored rewrite must
+/// carry bun's meta object verbatim into the local-tarball 3-tuple (path
+/// keeping the scope dir), leave the dependency's own registry entry
+/// alone, and the fresh install must prove bun honored that meta —
+/// left-pad installed, the bin linked — on top of the patched bytes and
+/// the stable lock.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn bun_vendor_scoped_package_keeps_deps_and_bin_meta() {
+    let server = MockServer::start().await;
+    mount_scoped_registry(&server, scoped_registry_tgz()).await;
+    let Some(fx) = bun_project(
+        "scoped-with-deps",
+        Target::ScopedWithDeps,
+        Some(&server.uri()),
+    ) else {
+        return;
+    };
+    stage_and_vendor(&fx);
+    fresh_checkout_install_proof(&fx, "fresh");
+}
+
 // ── the tampered twin ─────────────────────────────────────────────────
 
 /// Negative twin: the committed tarball is swapped for a DIFFERENT valid
@@ -880,33 +1168,16 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
 #[test]
 #[serial_test::serial]
 fn bun_vendor_tampered_tarball_digest_boundary() {
-    let Some(fx) = bun_project("tampered") else {
+    let Some(fx) = bun_project("tampered", Target::LeftPad, None) else {
         return;
     };
-    let proj = &fx.proj;
-
-    stage_patch(proj, &fx.purl, "package/index.js", &fx.orig, &fx.patched);
-    let (code, stdout, stderr) = run_socket(
-        proj,
-        &[
-            "vendor",
-            "--json",
-            "--offline",
-            "--cwd",
-            proj.to_str().unwrap(),
-        ],
-    );
-    assert_eq!(
-        code, 0,
-        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert_vendored_on_disk(&fx);
+    stage_and_vendor(&fx);
 
     // Tamper: a valid tarball with different content under the same path.
     // The lock still pins the sha512 of OUR tarball.
     let tampered: Vec<u8> = [TAMPER_MARKER.as_bytes(), fx.orig.as_slice()].concat();
-    let tampered_tgz = make_tgz_from_installed(&proj.join("node_modules").join(DEP), &tampered);
-    let tgz_path = vendored_tgz(proj);
+    let tampered_tgz = make_tgz_from_installed(&fx.target.installed_dir(&fx.proj), &tampered);
+    let tgz_path = vendored_tgz(&fx);
     assert_ne!(
         std::fs::read(&tgz_path).unwrap(),
         tampered_tgz,
@@ -955,17 +1226,18 @@ async fn mock_view(server: &MockServer, purl: &str, before: &[u8], after: &[u8])
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn bun_get_uuid_vendored_fresh_checkout_frozen_install() {
-    let Some(fx) = bun_project("get-uuid-vendored") else {
+    let Some(fx) = bun_project("get-uuid-vendored", Target::LeftPad, None) else {
         return;
     };
     let proj = &fx.proj;
+    let purl = fx.target.purl();
 
     // Steps 2–3, get-driven: the patch record comes from a mocked
     // `view/{uuid}` instead of a hand-staged `.socket/`, and the vendor step
     // builds the artifact locally (`--vendor-source build` — no vendoring
     // service, so no grant/tarball mocks are needed).
     let server = MockServer::start().await;
-    mock_view(&server, &fx.purl, &fx.orig, &fx.patched).await;
+    mock_view(&server, purl, &fx.orig, &fx.patched).await;
 
     let server_uri = server.uri();
     let (code, stdout, stderr) = run_socket(
@@ -1030,8 +1302,7 @@ async fn bun_get_uuid_vendored_fresh_checkout_frozen_install() {
     )
     .unwrap();
     assert_eq!(
-        manifest["patches"][fx.purl.as_str()]["uuid"],
-        UUID,
+        manifest["patches"][purl]["uuid"], UUID,
         "the manifest must record the vendored patch: {manifest}"
     );
     assert!(
@@ -1044,5 +1315,5 @@ async fn bun_get_uuid_vendored_fresh_checkout_frozen_install() {
 
     // FRESH-CHECKOUT PROOF: committable files only, EMPTY cache,
     // spike-proven `--frozen-lockfile`, then the ordinary-install twin.
-    fresh_checkout_install_proof(fx.tmp.path(), proj, &fx.patched, "fresh");
+    fresh_checkout_install_proof(&fx, "fresh");
 }
