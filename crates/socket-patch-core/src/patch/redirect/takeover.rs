@@ -13,16 +13,20 @@
 //! patches crates-io-sourced deps) and the project is unbuildable in both
 //! modes.
 //!
-//! npm family (package-lock/npm-shrinkwrap, yarn classic, yarn berry, pnpm):
-//! each recorded lock edit's `original` fragment is replayed over its `new`
-//! fragment. Here the follow-up vendor rewire happens to succeed either way
-//! (the vendored wiring replaces whatever resolution is present), but
-//! WITHOUT the pre-revert the vendor ledger records the grant-tokenized
-//! hosted fragment as its unrecoverable pre-vendor "original" (so `vendor
-//! --revert` restores an expiring hosted URL with no CLI path back to
-//! registry state), and the superseded redirect records/edits survive
-//! forever — a stale ledger that VEX/audits keep reading and a replay hazard
-//! for any later redirect revert.
+//! npm family (package-lock/npm-shrinkwrap, yarn classic, yarn berry, pnpm,
+//! bun): each recorded lock edit's `original` fragment is replayed over its
+//! `new` fragment. For most flavors the follow-up vendor rewire happens to
+//! succeed either way (the vendored wiring replaces whatever resolution is
+//! present), but WITHOUT the pre-revert the vendor ledger records the
+//! grant-tokenized hosted fragment as its unrecoverable pre-vendor
+//! "original" (so `vendor --revert` restores an expiring hosted URL with no
+//! CLI path back to registry state), and the superseded redirect
+//! records/edits survive forever — a stale ledger that VEX/audits keep
+//! reading and a replay hazard for any later redirect revert. bun is
+//! stricter still: its hosted rewrite REPLACES the `name@version` spec the
+//! bun vendor backend keys on (registry 4-tuple → URL 3-tuple), so without
+//! the pre-revert the package cannot be vendored at all
+//! (`vendor_lock_entry_not_found`).
 //!
 //! FAIL CLOSED: a file that matches neither the recorded redirected fragment
 //! nor the recorded original has drifted — the revert refuses (`Err`) rather
@@ -348,13 +352,129 @@ fn parse_npm_purl(canon: &str) -> Option<(&str, &str)> {
     (!name.is_empty() && !version.is_empty()).then_some((name, version))
 }
 
-/// The npm-family text-fragment edit kinds: `original`/`new` hold the whole
-/// lock fragment as a string, and the revert is a `replacen(new, original)`.
+/// The npm-family text-fragment edit kinds CLAIMED BY KEY: `original`/`new`
+/// hold the whole lock fragment as a string, the edit's `key` embeds
+/// `<name>@<version>`, and the revert is a `replacen(new, original)`.
 const NPM_TEXT_KINDS: [&str; 3] = [
     "redirect_yarn_classic_entry",
     "redirect_yarn_berry_entry",
     "redirect_pnpm_resolution",
 ];
+
+/// The bun hosted rewriter's edit kind (`rewrite_bun_lock`): `original`/`new`
+/// hold the whole `packages` entry LINE, so it replays exactly like the
+/// [`NPM_TEXT_KINDS`]. It is CLAIMED differently: bun edits key by the
+/// lock's package map key — `minimist`, a nested `other/minimist`, or the
+/// alias of an `alias@npm:minimist@1.2.2` install — never by
+/// `name@version`, so ownership is read from the recorded line's spec
+/// (`elems[0]`), the field the rewriter itself matched on.
+const BUN_TEXT_KIND: &str = "redirect_bun_lock_package";
+
+/// Does this edit kind replay as a whole text fragment
+/// (`content.replacen(new, original, 1)`, fail-closed on drift)?
+fn replays_as_text_fragment(kind: &str) -> bool {
+    NPM_TEXT_KINDS.contains(&kind) || kind == BUN_TEXT_KIND
+}
+
+/// Ownership verdict for one [`BUN_TEXT_KIND`] edit.
+#[derive(Debug, PartialEq)]
+enum BunClaim {
+    /// The edit rewrote an instance of exactly this `name@version`.
+    Ours,
+    /// Another package, or another version of this one (a nested
+    /// `other/minimist` instance at 1.2.8 while reverting 1.2.2): not ours
+    /// to touch, and no reason to refuse.
+    Foreign,
+    /// The recorded fragments mention this package but neither one parses
+    /// under bun's entry grammar (hand-edited or truncated ledger), so
+    /// ownership cannot be decided. Deciding "foreign" would drop this
+    /// purl's record while stranding an edit that may be its own — half a
+    /// takeover — so the caller refuses.
+    Undecidable,
+}
+
+/// Attribute a bun.lock edit to `name@version` the way the hosted rewriter
+/// matched it: by the spec of the recorded line.
+///
+/// A registry 4-tuple's spec is exactly `<name>@<version>`; a hosted URL
+/// 3-tuple's spec is `<name>@<artifact url>`. Either fragment may be the
+/// hosted URL (a re-redirect chain records `original` = the PRIOR hosted
+/// line, `new` = the current one), so both are consulted and one match
+/// claims. The URL half is discriminated by version through its tarball
+/// leaf — see [`hosted_url_names`] — never by the name substring alone,
+/// which would claim a sibling version's edit and silently un-host it.
+fn bun_edit_ownership(edit: &FileEdit, name: &str, version: &str) -> BunClaim {
+    use crate::vendor::bun_lock_text::{decode_json_string, parse_entry_line};
+    fn fragment(v: &Option<Value>) -> Option<&str> {
+        v.as_ref().and_then(Value::as_str)
+    }
+    let spec_of = |line: &str| -> Option<String> {
+        let entry = parse_entry_line(line).ok()?;
+        decode_json_string(entry.elems.first()?)
+    };
+    let mut parsed_any = false;
+    for line in [fragment(&edit.original), fragment(&edit.new)]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(spec) = spec_of(line) {
+            parsed_any = true;
+            if bun_spec_names(&spec, name, version) {
+                return BunClaim::Ours;
+            }
+        }
+    }
+    if parsed_any {
+        return BunClaim::Foreign;
+    }
+    // Neither fragment is a bun entry line. Only refuse when the raw text
+    // so much as mentions this package; an edit naming nothing of ours is
+    // someone else's problem and must not block this purl's takeover.
+    let probe = format!("\"{name}@");
+    let mentions = |v: &Option<Value>| fragment(v).is_some_and(|s| s.contains(&probe));
+    if mentions(&edit.original) || mentions(&edit.new) {
+        BunClaim::Undecidable
+    } else {
+        BunClaim::Foreign
+    }
+}
+
+/// Is `spec` (a bun.lock entry's decoded `elems[0]`) the registry spec
+/// `<name>@<version>` or a hosted artifact URL spec for that exact
+/// `name@version`?
+fn bun_spec_names(spec: &str, name: &str, version: &str) -> bool {
+    use crate::vendor::bun_lock_text::split_name_spec;
+    let Some((spec_name, rest)) = split_name_spec(spec) else {
+        return false;
+    };
+    spec_name == name && (rest == version || hosted_url_names(rest, name, version))
+}
+
+/// True when `url` is an http(s) artifact URL whose last path segment is
+/// `<bare>-<version>.tgz` — the leaf every hosted artifact URL for this
+/// `name@version` ends in. `<bare>` is the name without its `@scope/`: the
+/// vendor path layer (`tgz_rel_leaf`) keeps a scope as a directory level
+/// (`@scope/pkg-1.0.0.tgz`), and the hosted rewriter's prior-URL match
+/// (`is_prior_hosted_bun_spec`) compares the same last path segment, so
+/// `pkg-1.0.0.tgz` is the one spelling both agree on. Anything that fails
+/// to parse fails the match (closed). The exact-leaf comparison is the
+/// version discriminator: `pkg-1.3.0.tgz` never equals `pkg-11.3.0.tgz`
+/// or `pkg-1.3.0-rc1.tgz`.
+fn hosted_url_names(url: &str, name: &str, version: &str) -> bool {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return false;
+    }
+    let scheme_end = url
+        .find("://")
+        .expect("url starts with http(s):// — checked above")
+        + 3;
+    let Some(path_start) = url[scheme_end..].find('/').map(|i| i + scheme_end) else {
+        return false;
+    };
+    let leaf = url[path_start..].rsplit('/').next().unwrap_or_default();
+    let bare = name.rsplit('/').next().unwrap_or(name);
+    !leaf.is_empty() && leaf == format!("{bare}-{version}.tgz")
+}
 
 /// Revert every hosted-redirect edit the ledger records for `purl` (an npm
 /// package), then drop that purl's record and edits from `state`. The caller
@@ -414,10 +534,13 @@ pub async fn revert_npm_redirect_purl(
     // SIBLING purl's edits (left-pad@1.2.0 vs @1.3.0 both hosted-redirected,
     // or `npm i name@npm:other` aliasing another package onto this key path)
     // and replaying those silently un-hosts the other purl while dropping
-    // its edits. A bun.lock edit that may belong to this purl is a hard
-    // refusal: bun edits key by the lock's package key (not name@version)
-    // and their revert is not implemented, so vendoring over one would drop
-    // the record while stranding its edits — half a takeover.
+    // its edits. bun edits key by the lock's package MAP key (`minimist`,
+    // nested `other/minimist`, an install alias) — never `name@version` —
+    // so they are attributed by the spec of the recorded line, the field
+    // the rewriter matched on (`bun_edit_ownership`); a sibling version's
+    // line is foreign, and a fragment that mentions the package but cannot
+    // be parsed at all refuses rather than guess (dropping the record while
+    // stranding a possibly-own edit would be half a takeover).
     let mut mine: Vec<usize> = Vec::new();
     for (i, e) in state.edits.iter().enumerate() {
         let key = e.key.as_deref().unwrap_or_default();
@@ -481,23 +604,25 @@ pub async fn revert_npm_redirect_purl(
                     }
                 }
             }
-            "redirect_bun_lock_package" => {
-                let probe = format!("\"{name}@");
-                let holds = |v: &Option<Value>| {
-                    v.as_ref()
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| s.contains(&probe))
-                };
-                if holds(&e.new) || holds(&e.original) {
+            BUN_TEXT_KIND => match bun_edit_ownership(e, &name, &version) {
+                BunClaim::Ours => true,
+                BunClaim::Foreign => false,
+                // The WORKING remedy is the whole-ledger replay: a plain
+                // `bun install` keeps a hosted URL tuple byte-identically
+                // (it re-locks nothing), and hand-editing the ledger is
+                // exactly what the hosted flow tells users never to do.
+                BunClaim::Undecidable => {
                     return Err(format!(
-                        "the redirect ledger records a bun.lock hosted redirect \
-                         for {name}, which this revert cannot replay yet; \
-                         restore the registry wiring manually (or re-lock with \
-                         `bun install`), remove the ledger entry, then re-run"
+                        "the redirect ledger records a {} hosted redirect edit \
+                         that mentions {name} but is not a bun packages entry \
+                         line, so it cannot be attributed to {lock_key}; run an \
+                         unscoped `socket-patch rollback` (the whole-ledger \
+                         replay unwinds bun.lock hosted edits), then re-run; do \
+                         not edit .socket/vendor/redirect-state.json by hand",
+                        e.path
                     ));
                 }
-                false
-            }
+            },
             _ => false,
         };
         if claimed {
@@ -512,7 +637,11 @@ pub async fn revert_npm_redirect_purl(
     // previous step's `new`).
     for &i in mine.iter().rev() {
         let edit = state.edits[i].clone();
-        if NPM_TEXT_KINDS.contains(&edit.kind.as_str()) {
+        if replays_as_text_fragment(&edit.kind) {
+            // Whole-fragment replay. For bun the fragments are whole lines
+            // (a CRLF lock's carry their trailing `\r`), so a
+            // `contains`/`replacen` on the raw content restores the line
+            // byte-exactly whatever the line ending.
             let (Some(new), Some(orig)) = (
                 edit.new.as_ref().and_then(Value::as_str),
                 edit.original.as_ref().and_then(Value::as_str),
@@ -2217,32 +2346,517 @@ mod tests {
         assert!(err.contains("records no hosted redirect"), "{err}");
     }
 
+    // ── bun ──────────────────────────────────────────────────────────────
+
+    /// Real text-lock grammar (bun 1.4.2 matrix capture, lockfileVersion 2;
+    /// the `packages` tuple grammar is identical on 0/1/2): the root
+    /// `left-pad@1.3.0` registry 4-tuple, a nested `haspad/left-pad`
+    /// instance at the SIBLING version 1.2.0, and an unrelated `other`.
+    fn bun_pristine() -> String {
+        r#"{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "takeover-fixture",
+      "dependencies": {
+        "haspad": "1.0.0",
+        "left-pad": "1.3.0",
+        "other": "1.0.0",
+      },
+    },
+  },
+  "packages": {
+    "haspad": ["haspad@1.0.0", "", { "dependencies": { "left-pad": "^1.2.0" } }, "sha512-hh=="],
+
+    "left-pad": ["left-pad@1.3.0", "", {}, "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],
+
+    "other": ["other@1.0.0", "", {}, "sha512-oo=="],
+
+    "haspad/left-pad": ["left-pad@1.2.0", "", {}, "sha512-OQadpCyFCT/VLniZQgym8d3/ofIJtuZyw2ibsVeIUOexKgW/osn8+mMFJbwGMPeDC4GnLzD8q115WPCDx4YRWg=="],
+  }
+}
+"#
+        .to_string()
+    }
+
+    /// The packages-entry line keyed `key` (verbatim, without its line
+    /// terminator).
+    fn bun_line(lock: &str, key: &str) -> String {
+        let prefix = format!("    \"{key}\": [");
+        lock.split('\n')
+            .find(|l| l.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("no `{key}` entry in:\n{lock}"))
+            .trim_end_matches('\r')
+            .to_string()
+    }
+
+    async fn read_lock(root: &Path) -> String {
+        tokio::fs::read_to_string(root.join("bun.lock"))
+            .await
+            .unwrap()
+    }
+
+    /// The bun revert used to be a hard refusal ("cannot replay yet");
+    /// now the takeover claims the purl's `redirect_bun_lock_package` edit
+    /// by the recorded line's spec and replays the registry line back,
+    /// leaving the sibling-version and foreign entries untouched.
     #[tokio::test]
-    async fn npm_bun_lock_edit_is_a_fail_closed_refusal() {
-        // The bun revert is not implemented; a ledger claiming this purl via
-        // a bun.lock edit must refuse rather than drop the record while
-        // stranding the edit.
+    async fn npm_bun_lock_takeover_restores_the_registry_line_and_drops_the_ledger() {
+        let (tmp, mut state) = npm_redirected_fixture("bun.lock", &bun_pristine()).await;
+        let root = tmp.path();
+        let wired = read_lock(root).await;
+        assert!(wired.contains(NPM_URL), "fixture is hosted-wired:\n{wired}");
+        assert_eq!(
+            state
+                .edits
+                .iter()
+                .filter(|e| e.kind == BUN_TEXT_KIND)
+                .count(),
+            1,
+            "one bun edit for the one 1.3.0 instance: {:?}",
+            state.edits
+        );
+
+        let out = revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("bun takeover revert succeeds");
+        assert_eq!(out.reverted_files, vec!["bun.lock".to_string()]);
+        assert_eq!(
+            read_lock(root).await,
+            bun_pristine(),
+            "bun.lock restored byte-identical"
+        );
+        assert!(state.records.is_empty(), "record dropped");
+        assert!(state.edits.is_empty(), "edit consumed");
+    }
+
+    /// (a) A hosted edit for ANOTHER VERSION of the same package (the nested
+    /// `haspad/left-pad` at 1.2.0) is not this purl's to claim: reverting
+    /// 1.3.0 leaves the 1.2.0 line hosted and its record + edit in the
+    /// ledger.
+    #[tokio::test]
+    async fn npm_bun_sibling_version_edit_is_neither_claimed_nor_a_refusal() {
+        const SIBLING: &str = "pkg:npm/left-pad@1.2.0";
+        let (tmp, mut state) = npm_redirected_fixture_multi(
+            "bun.lock",
+            &bun_pristine(),
+            &[
+                (NPM_PURL, npm_dep()),
+                (SIBLING, npm_dep_for("left-pad", "1.2.0")),
+            ],
+        )
+        .await;
+        let root = tmp.path();
+        let wired = read_lock(root).await;
+        let sibling_line = bun_line(&wired, "haspad/left-pad");
+        assert!(
+            sibling_line.contains("/left-pad/1.2.0/")
+                && sibling_line.contains("left-pad-1.2.0.tgz"),
+            "sibling instance is hosted-wired too: {sibling_line}"
+        );
+        assert_eq!(state.edits.len(), 2, "{:?}", state.edits);
+
+        revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("takeover of 1.3.0 succeeds");
+        let after = read_lock(root).await;
+        assert_eq!(
+            bun_line(&after, "left-pad"),
+            bun_line(&bun_pristine(), "left-pad"),
+            "the 1.3.0 line is back to its registry tuple"
+        );
+        assert_eq!(
+            bun_line(&after, "haspad/left-pad"),
+            sibling_line,
+            "the sibling version's hosted line is untouched"
+        );
+        assert_eq!(state.edits.len(), 1, "{:?}", state.edits);
+        assert_eq!(state.edits[0].key.as_deref(), Some("haspad/left-pad"));
+        assert!(
+            state.records.contains_key(SIBLING) && !state.records.contains_key(NPM_PURL),
+            "{:?}",
+            state.records.keys()
+        );
+    }
+
+    /// (b) Scoped package + re-redirect chain: the hosted rewrite destroys
+    /// the `@scope/pkg@1.0.0` spec, so the SECOND redirect (a rotated
+    /// artifact URL) records a hosted-URL line as its `original`. That edit
+    /// is claimed through the URL's tarball leaf (`pkg-1.0.0.tgz` — the
+    /// scope is a path level, not part of the basename) plus the full
+    /// scoped name in the spec; `@other/pkg` and bare `pkg`, whose leaves
+    /// are identical, stay hosted. Both links unwind newest-first to the
+    /// registry line.
+    #[tokio::test]
+    async fn npm_bun_scoped_package_claims_the_re_redirect_chain_by_spec_and_leaf() {
+        const SCOPED: &str = "pkg:npm/%40scope/pkg@1.0.0";
+        const OTHER_SCOPE: &str = "pkg:npm/%40other/pkg@1.0.0";
+        const BARE: &str = "pkg:npm/pkg@1.0.0";
+        let pristine = r#"{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "scoped-fixture",
+      "dependencies": {
+        "@other/pkg": "1.0.0",
+        "@scope/pkg": "1.0.0",
+        "pkg": "1.0.0",
+      },
+    },
+  },
+  "packages": {
+    "@other/pkg": ["@other/pkg@1.0.0", "", {}, "sha512-o1=="],
+
+    "@scope/pkg": ["@scope/pkg@1.0.0", "", {}, "sha512-s1=="],
+
+    "pkg": ["pkg@1.0.0", "", {}, "sha512-p1=="],
+  }
+}
+"#;
+        let (tmp, mut state) = npm_redirected_fixture_multi(
+            "bun.lock",
+            pristine,
+            &[
+                (SCOPED, npm_dep_for("@scope/pkg", "1.0.0")),
+                (OTHER_SCOPE, npm_dep_for("@other/pkg", "1.0.0")),
+                (BARE, npm_dep_for("pkg", "1.0.0")),
+            ],
+        )
+        .await;
+        let root = tmp.path();
+        let first = read_lock(root).await;
+        let first_scoped_line = bun_line(&first, "@scope/pkg");
+        assert!(
+            first_scoped_line.contains("/@scope/pkg/1.0.0/"),
+            "{first_scoped_line}"
+        );
+
+        // Second redirect of ONLY @scope/pkg with a rotated artifact URL
+        // (same origin + leaf, different uuid path segment): the rewriter's
+        // prior-hosted match re-pins it and records the chain link.
+        let mut rotated = npm_dep_for("@scope/pkg", "1.0.0");
+        rotated.artifact_url = rotated.artifact_url.replace("/6b7c/", "/7c8d/");
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        files.insert("bun.lock".into(), first.clone());
+        let rewrite = crate::patch::redirect::rewrite_registry_redirect(&files, &[rotated]);
+        let second = rewrite
+            .files
+            .get("bun.lock")
+            .unwrap_or_else(|| panic!("re-redirect must rewrite: {:?}", rewrite.warnings))
+            .clone();
+        assert!(
+            bun_line(&second, "@scope/pkg").contains("/7c8d/"),
+            "{second}"
+        );
+        tokio::fs::write(root.join("bun.lock"), &second)
+            .await
+            .unwrap();
+        state.edits.extend(rewrite.edits);
+        assert_eq!(state.edits.len(), 4, "{:?}", state.edits);
+        let chain_link = state.edits.last().unwrap();
+        assert!(
+            chain_link.original.as_ref().and_then(Value::as_str)
+                == Some(first_scoped_line.as_str()),
+            "the chain link's original is the PRIOR hosted line: {chain_link:?}"
+        );
+
+        revert_redirect_purl(root, &mut state, "pkg:npm/@scope/pkg@1.0.0", false)
+            .await
+            .expect("scoped takeover succeeds");
+        let after = read_lock(root).await;
+        assert_eq!(
+            bun_line(&after, "@scope/pkg"),
+            bun_line(pristine, "@scope/pkg"),
+            "both chain links unwound to the registry tuple"
+        );
+        assert_eq!(
+            bun_line(&after, "@other/pkg"),
+            bun_line(&first, "@other/pkg"),
+            "same-leaf scoped sibling stays hosted"
+        );
+        assert_eq!(
+            bun_line(&after, "pkg"),
+            bun_line(&first, "pkg"),
+            "same-leaf bare sibling stays hosted"
+        );
+        assert_eq!(state.edits.len(), 2, "{:?}", state.edits);
+        assert!(
+            state
+                .edits
+                .iter()
+                .all(|e| matches!(e.key.as_deref(), Some("@other/pkg") | Some("pkg"))),
+            "{:?}",
+            state.edits
+        );
+        assert!(
+            !state.records.contains_key(SCOPED)
+                && state.records.contains_key(OTHER_SCOPE)
+                && state.records.contains_key(BARE),
+            "{:?}",
+            state.records.keys()
+        );
+    }
+
+    /// The claim rule in isolation: registry spec by exact version, hosted
+    /// URL spec by exact tarball leaf, full (scoped) name in every case;
+    /// anything else — sibling versions, local vendored paths, workspace
+    /// specs, URLs without a path — is not ours.
+    #[test]
+    fn bun_spec_names_discriminates_name_and_version() {
+        assert!(bun_spec_names("left-pad@1.3.0", "left-pad", "1.3.0"));
+        assert!(!bun_spec_names("left-pad@1.3.0-rc1", "left-pad", "1.3.0"));
+        assert!(!bun_spec_names("left-pad@11.3.0", "left-pad", "1.3.0"));
+        assert!(!bun_spec_names("left-pad@1.3.0", "other", "1.3.0"));
+        assert!(bun_spec_names(
+            &format!("left-pad@{NPM_URL}"),
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(!bun_spec_names(
+            "left-pad@http://127.0.0.1:5555/p/left-pad-11.3.0.tgz",
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(!bun_spec_names(
+            "left-pad@http://127.0.0.1:5555/p/left-pad-1.3.0-rc1.tgz",
+            "left-pad",
+            "1.3.0"
+        ));
+        // Vendored local path, workspace and origin-only specs are never
+        // hosted redirects.
+        assert!(!bun_spec_names(
+            "left-pad@.socket/vendor/npm/6b7c/left-pad-1.3.0.tgz",
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(!bun_spec_names(
+            "left-pad@workspace:packages/left-pad",
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(!bun_spec_names(
+            "left-pad@https://patch.socket.dev",
+            "left-pad",
+            "1.3.0"
+        ));
+        // Scoped: the leaf is the BARE basename whether the URL keeps the
+        // scope as a path level (production, test fixtures) or not; the
+        // full scoped name must match the spec's name.
+        assert!(bun_spec_names(
+            "@scope/pkg@https://patch.socket.dev/patch/npm/@scope/pkg/1.0.0/t/u/pkg-1.0.0.tgz",
+            "@scope/pkg",
+            "1.0.0"
+        ));
+        assert!(bun_spec_names(
+            "@scope/pkg@http://127.0.0.1:5555/patch/npm/@scope/pkg/1.0.0/tok/6b7c/@scope/pkg-1.0.0.tgz",
+            "@scope/pkg",
+            "1.0.0"
+        ));
+        assert!(!bun_spec_names(
+            "@other/pkg@https://h/patch/npm/@other/pkg/1.0.0/t/u/pkg-1.0.0.tgz",
+            "@scope/pkg",
+            "1.0.0"
+        ));
+        assert!(!bun_spec_names(
+            "pkg@https://h/patch/npm/pkg/1.0.0/t/u/pkg-1.0.0.tgz",
+            "@scope/pkg",
+            "1.0.0"
+        ));
+        assert!(bun_spec_names("@scope/pkg@1.0.0", "@scope/pkg", "1.0.0"));
+    }
+
+    /// (c) Drift: the line was re-resolved by a third party since the
+    /// redirect (neither the hosted nor the registry line is present) —
+    /// the same fail-closed refusal the yarn/pnpm text kinds give, with the
+    /// file and ledger left exactly as found.
+    #[tokio::test]
+    async fn npm_bun_drifted_line_refuses_fail_closed() {
+        let (tmp, mut state) = npm_redirected_fixture("bun.lock", &bun_pristine()).await;
+        let root = tmp.path();
+        let wired = read_lock(root).await;
+        let drifted = wired.replace(
+            &bun_line(&wired, "left-pad"),
+            "    \"left-pad\": [\"left-pad@https://corp.example/mirror/left-pad-1.3.0.tgz\", {}, \"sha512-corp==\"],",
+        );
+        assert_ne!(drifted, wired);
+        tokio::fs::write(root.join("bun.lock"), &drifted)
+            .await
+            .unwrap();
+        let records_before = state.records.len();
+        let edits_before = state.edits.len();
+
+        let err = revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect_err("drifted line must refuse");
+        assert!(err.contains("drifted"), "{err}");
+        assert!(err.contains("bun.lock"), "{err}");
+        assert_eq!(read_lock(root).await, drifted, "file untouched");
+        assert_eq!(state.records.len(), records_before);
+        assert_eq!(state.edits.len(), edits_before);
+    }
+
+    /// (d) CRLF lock: the recorded lines carry (or, for a rewriter that
+    /// normalized the rewritten line, lack) a trailing `\r`; the whole-line
+    /// replace restores the pristine CRLF bytes either way.
+    #[tokio::test]
+    async fn npm_bun_crlf_lock_round_trips_byte_exact() {
+        let pristine = bun_pristine().replace('\n', "\r\n");
+        let (tmp, mut state) = npm_redirected_fixture("bun.lock", &pristine).await;
+        let root = tmp.path();
+        let wired = read_lock(root).await;
+        assert!(wired.contains(NPM_URL), "{wired}");
+        assert!(
+            wired.contains("\r\n"),
+            "CRLF preserved elsewhere: {wired:?}"
+        );
+
+        revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("CRLF takeover succeeds");
+        assert_eq!(
+            read_lock(root).await,
+            pristine,
+            "CRLF bun.lock restored byte-identical"
+        );
+        assert!(state.records.is_empty() && state.edits.is_empty());
+    }
+
+    /// (e) Two hosted records (different packages): the takeover of one
+    /// restores only its line and keeps the other purl's record + edit —
+    /// the state a scoped `rollback <purl>` / `remove <purl>` needs.
+    #[tokio::test]
+    async fn npm_bun_two_hosted_records_takeover_of_one_leaves_the_other_hosted() {
+        const OTHER: &str = "pkg:npm/other@1.0.0";
+        let (tmp, mut state) = npm_redirected_fixture_multi(
+            "bun.lock",
+            &bun_pristine(),
+            &[
+                (NPM_PURL, npm_dep()),
+                (OTHER, npm_dep_for("other", "1.0.0")),
+            ],
+        )
+        .await;
+        let root = tmp.path();
+        let wired = read_lock(root).await;
+        let other_line = bun_line(&wired, "other");
+        assert!(other_line.contains("other-1.0.0.tgz"), "{other_line}");
+
+        let out = revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("takeover succeeds");
+        assert_eq!(out.reverted_files, vec!["bun.lock".to_string()]);
+        let after = read_lock(root).await;
+        assert_eq!(
+            bun_line(&after, "left-pad"),
+            bun_line(&bun_pristine(), "left-pad")
+        );
+        assert_eq!(bun_line(&after, "other"), other_line, "other stays hosted");
+        assert_eq!(state.edits.len(), 1);
+        assert_eq!(state.edits[0].key.as_deref(), Some("other"));
+        assert_eq!(state.records.len(), 1);
+        assert!(state.records.contains_key(OTHER));
+
+        // Taking over the second one finishes the job.
+        revert_redirect_purl(root, &mut state, OTHER, false)
+            .await
+            .expect("second takeover succeeds");
+        assert_eq!(read_lock(root).await, bun_pristine());
+        assert!(state.records.is_empty() && state.edits.is_empty());
+    }
+
+    /// bun's dry run mirrors the cargo/yarn contract: every inverse and
+    /// drift check resolves, nothing reaches disk, the in-memory ledger is
+    /// claimed, and the preview names the files a wet run rewrites.
+    #[tokio::test]
+    async fn npm_bun_dry_run_previews_without_touching_disk() {
+        let (tmp, mut state) = npm_redirected_fixture("bun.lock", &bun_pristine()).await;
+        let root = tmp.path();
+        let wired = read_lock(root).await;
+
+        let dry = revert_redirect_purl(root, &mut state, NPM_PURL, true)
+            .await
+            .expect("dry-run revert succeeds");
+        assert_eq!(dry.reverted_files, vec!["bun.lock".to_string()]);
+        assert_eq!(read_lock(root).await, wired, "disk untouched");
+        assert!(state.records.is_empty(), "record claimed in memory");
+        assert!(state.edits.is_empty(), "edit claimed in memory");
+    }
+
+    /// A hand-edited ledger whose bun fragments mention the package but are
+    /// not entry lines cannot be attributed: refuse with the WORKING remedy
+    /// (the whole-ledger `rollback` replay) — never `bun install`, which
+    /// keeps a hosted URL tuple byte-identically — and keep the ledger.
+    #[tokio::test]
+    async fn npm_bun_unparseable_edit_mentioning_the_package_refuses_with_the_rollback_remedy() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = RedirectState::new();
         state.records.insert(NPM_PURL.to_string(), record());
         state.edits.push(FileEdit {
             path: "bun.lock".into(),
-            kind: "redirect_bun_lock_package".into(),
+            kind: BUN_TEXT_KIND.into(),
             action: "rewritten".into(),
             key: Some("left-pad".into()),
-            original: Some(Value::String(
-                "    \"left-pad\": [\"left-pad@1.3.0\", \"reg\", {}, \"sha512-p==\"],".into(),
-            )),
-            new: Some(Value::String(format!(
-                "    \"left-pad\": [\"left-pad@{NPM_URL}\", {{}}, \"sha512-h==\"],"
-            ))),
+            original: Some(Value::String("\"left-pad@1.3.0\" (truncated".into())),
+            new: Some(Value::String(format!("\"left-pad@{NPM_URL}\" (truncated"))),
         });
         let err = revert_npm_redirect_purl(tmp.path(), &mut state, NPM_PURL, false)
             .await
-            .expect_err("bun edits must refuse");
-        assert!(err.contains("bun.lock"), "{err}");
+            .expect_err("undecidable bun edit must refuse");
+        assert!(err.contains("unscoped `socket-patch rollback`"), "{err}");
+        assert!(err.contains("do not edit"), "{err}");
+        assert!(!err.contains("bun install"), "{err}");
         assert!(!state.records.is_empty(), "ledger keeps the record");
         assert!(!state.edits.is_empty(), "ledger keeps the edit");
+    }
+
+    /// An alias install (`bun add alias@npm:left-pad@1.3.0`) keys the entry
+    /// by the alias; the rewriter matched it by spec, and so does the
+    /// claim.
+    #[tokio::test]
+    async fn npm_bun_alias_keyed_instance_is_claimed_by_spec() {
+        let pristine = r#"{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "alias-fixture",
+      "dependencies": {
+        "alias": "npm:left-pad@1.3.0",
+      },
+    },
+  },
+  "packages": {
+    "alias": ["left-pad@1.3.0", "", {}, "sha512-XI5M=="],
+  }
+}
+"#;
+        let (tmp, mut state) = npm_redirected_fixture("bun.lock", pristine).await;
+        let root = tmp.path();
+        assert_eq!(state.edits[0].key.as_deref(), Some("alias"));
+        revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("alias takeover succeeds");
+        assert_eq!(read_lock(root).await, pristine);
+        assert!(state.records.is_empty() && state.edits.is_empty());
+    }
+
+    /// A user hand-restored bun.lock (git checkout): the revert is a clean
+    /// no-op that still drops the ledger entries.
+    #[tokio::test]
+    async fn npm_bun_hand_restored_lock_is_a_noop_that_drops_the_ledger() {
+        let (tmp, mut state) = npm_redirected_fixture("bun.lock", &bun_pristine()).await;
+        let root = tmp.path();
+        tokio::fs::write(root.join("bun.lock"), bun_pristine())
+            .await
+            .unwrap();
+        let out = revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("revert succeeds");
+        assert!(out.reverted_files.is_empty(), "{:?}", out.reverted_files);
+        assert_eq!(read_lock(root).await, bun_pristine());
+        assert!(state.records.is_empty() && state.edits.is_empty());
     }
 
     // ── refusal / degenerate arms of the fail-closed contract ────────────
