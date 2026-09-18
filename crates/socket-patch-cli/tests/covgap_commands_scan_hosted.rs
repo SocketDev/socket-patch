@@ -708,6 +708,11 @@ async fn bun_lockb_dry_run_warns_would_migrate_without_spawning_bun() {
         "a dry-run must never report a migration ATTEMPT (proof no bun was \
          spawned): {doc:#}"
     );
+    assert!(
+        !warning_codes(&doc).contains(&"redirect_npm_no_lockfile".to_string()),
+        "a bun.lockb project is a Bun project: the npm no-lockfile warning is \
+         noise beside the would-migrate preview: {doc:#}"
+    );
     assert_eq!(
         std::fs::read(tmp.path().join("bun.lockb")).unwrap(),
         lockb_before,
@@ -759,8 +764,21 @@ async fn failed_bun_lockb_migration_warns_unsupported_and_keeps_the_binary_lock(
     assert_eq!(code, 0, "a failed migration is a warning, not an error: {doc:#}");
     let detail = warning_detail(&doc, "redirect_bun_lockb_unsupported");
     assert!(
-        detail.contains("cannot pin a binary lockfile"),
-        "the unsupported warning must explain the refusal: {detail}"
+        detail.contains("cannot pin a binary lockfile") && detail.contains("exit status: 1"),
+        "the unsupported warning must explain the refusal and carry bun's exit: {detail}"
+    );
+    let codes = warning_codes(&doc);
+    assert_eq!(
+        codes
+            .iter()
+            .filter(|c| *c == "redirect_bun_lockb_unsupported")
+            .count(),
+        1,
+        "exactly one unsupported warning: {codes:?}"
+    );
+    assert!(
+        !codes.contains(&"redirect_npm_no_lockfile".to_string()),
+        "a bun.lockb project never gets the npm no-lockfile noise: {codes:?}"
     );
     assert_eq!(doc["redirect"]["redirected"], 0, "envelope: {doc:#}");
     assert_eq!(
@@ -853,12 +871,21 @@ async fn unreadable_bun_lockb_backup_keeps_the_migration_and_warns_loudly() {
         "bun deleted the binary lock and no backup could restore it"
     );
     // The kept migration's removal record reaches the ledger so a future
-    // `--revert` knows the file was replaced.
-    let ledger =
-        std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap();
+    // `--revert` knows the file was replaced — WITHOUT `original`: the
+    // pre-migration read failed, so there are no bytes to restore from.
+    let ledger: Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
+    )
+    .unwrap();
+    let migration = &ledger["edits"][0];
+    assert_eq!(
+        migration["kind"], "redirect_bun_lockb_migrated",
+        "{ledger:#}"
+    );
+    assert_eq!(migration["action"], "removed", "{ledger:#}");
     assert!(
-        ledger.contains("redirect_bun_lockb_migrated") && ledger.contains("\"removed\""),
-        "the ledger must keep the migration's removal record: {ledger}"
+        migration.get("original").is_none(),
+        "an unreadable lock is recorded without bytes: {ledger:#}"
     );
 }
 
