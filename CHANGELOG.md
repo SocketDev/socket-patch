@@ -72,7 +72,10 @@ into the new version's section — see docs/releasing.md.
   lock's recorded digests (`LockIntegrity::Sha256AnyOf`, resolved through
   PyPI's JSON API and verified against the same digest) and agent/scan list
   them as lockfile-only packages. Previously they discovered nothing and
-  exited 0.
+  exited 0. Socket's own references stay discoverable, so a re-scan of an
+  already-redirected or already-vendored lock-only checkout re-confirms it;
+  a lock that resolves only from private indexes is never looked up on
+  pypi.org.
 - **Pipenv's out-of-tree virtualenv is discovered.** Agent mode (bare `scan`,
   `rollback`, `vex`) now finds `$WORKON_HOME/<dir>-<hash>[-<python>]` (the
   `.venv` file pointer, `PIPENV_CUSTOM_VENV_NAME` and `PIPENV_PIPFILE`
