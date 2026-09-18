@@ -677,23 +677,32 @@ pub(crate) async fn fetch_pristine_package(
     purl: &str,
     ledger_entry: Option<&VendorEntry>,
 ) -> PristineFetch {
-    let entry = match lock_inventory::lookup(inventory, purl) {
-        Some(e) => e.clone(),
-        None => {
-            let Some(le) = ledger_entry else {
-                return PristineFetch::NoSource;
-            };
-            match lock_inventory::recover_lock_entry(project_root, le).await {
-                Ok(rec) => rec,
-                Err(e) => {
-                    return PristineFetch::Unverifiable(format!(
-                        "the lockfile no longer records a registry resolution for {purl} \
-                         (rewired to the vendored artifact) and the ledger cannot recover \
-                         one: {e}"
-                    ))
-                }
+    // A lock entry that carries an integrity is the registry resolution to
+    // fetch. A DISCOVERY-ONLY entry (the lock is rewired to OUR reference,
+    // whose recorded hashes are the patched wheel's — nothing PyPI serves)
+    // cannot be fetched by itself: the ledger's pre-vendor fragment can, so
+    // an already-vendored lock-only checkout re-scans green.
+    let inventory_entry = lock_inventory::lookup(inventory, purl).cloned();
+    let fetchable = inventory_entry
+        .as_ref()
+        .filter(|e| e.integrity != lock_inventory::LockIntegrity::None)
+        .cloned();
+    let entry = match (fetchable, ledger_entry) {
+        (Some(e), _) => e,
+        (None, Some(le)) => match lock_inventory::recover_lock_entry(project_root, le).await {
+            Ok(rec) => rec,
+            Err(e) => {
+                return PristineFetch::Unverifiable(format!(
+                    "the lockfile no longer records a registry resolution for {purl} \
+                     (rewired to the vendored artifact) and the ledger cannot recover \
+                     one: {e}"
+                ))
             }
-        }
+        },
+        (None, None) => match inventory_entry {
+            Some(e) => e,
+            None => return PristineFetch::NoSource,
+        },
     };
     match registry_fetch::fetch_and_stage(&entry, client).await {
         Ok(fetched) => PristineFetch::Fetched(fetched),

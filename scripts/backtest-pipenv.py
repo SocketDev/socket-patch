@@ -813,6 +813,17 @@ def main():
         codes0 = sorted({(w.get("code") or w.get("errorCode")) for w in envelope_warnings(mode, e0) if (w.get("code") or w.get("errorCode"))})
         info["lockOnly"] = {"exit": r0.rc, "applied": applied_count(mode, e0), "lockfileOnlyPackages": e0.get("lockfileOnlyPackages"), "codes": codes0}
         check("lockOnlyApplies", applied_count(mode, e0) == 1, info["lockOnly"])
+        if applied_count(mode, e0) == 1:
+            # The CI re-run shape: the checkout already carries the committed
+            # reference and nothing is installed — the re-scan must stay green
+            # (hosted re-confirms; vendored reports already_vendored), not
+            # `package_not_installed`, and the lock must not change.
+            lock1 = (project / "Pipfile.lock").read_bytes()
+            r1 = cli_run(penv, "scan", "--mode", mode, log="scan-lockonly-rescan.log")
+            e1 = r1.json_or_empty()
+            codes1 = sorted({(w.get("code") or w.get("errorCode")) for w in envelope_warnings(mode, e1) if (w.get("code") or w.get("errorCode"))})
+            ok1 = r1.ok() and e1.get("status") == "success" and (project / "Pipfile.lock").read_bytes() == lock1 and "package_not_installed" not in codes1
+            check("lockOnlyRescanGreen", ok1, {"exit": r1.rc, "status": e1.get("status"), "codes": codes1})
         shutil.rmtree(project / ".socket", ignore_errors=True)
         shutil.rmtree(venv, ignore_errors=True)
         (project / "Pipfile.lock").write_bytes(pristine_lock)
