@@ -278,7 +278,7 @@ grep -qF "path = \"./.socket/vendor/pypi/__UUID__/$WHEEL_NAME\"" pdm.lock \
   || { cat pdm.lock >&2; fail "pdm.lock six entry has no relative path= to the vendored wheel"; }
 grep -qF "hash = \"sha256:$WHEEL_SHA\"" pdm.lock \
   || { cat pdm.lock >&2; fail "pdm.lock files[] hash != vendored wheel sha256"; }
-N=$(awk '/^name = "six"$/{f=1} f&&/^files = \[/{infiles=1;next} infiles&&/^\]/{infiles=0;f=0} infiles&&/file = /{c++} END{print c+0}' pdm.lock)
+N=$(awk '/^name = "six"$/{f=1} f&&/files = \[/{infiles=1} infiles{c+=gsub(/file = /,"&")} infiles&&/\]/{infiles=0;f=0} END{print c+0}' pdm.lock)
 [ "$N" = "1" ] || { cat pdm.lock >&2; fail "six files[] has $N entries, expected exactly 1"; }
 # pyproject + content_hash are NEVER touched by the pdm lock-only splice.
 cmp -s pyproject.toml /workspace/snap/pyproject.prevendor \

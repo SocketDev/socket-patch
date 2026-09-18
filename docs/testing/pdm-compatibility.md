@@ -30,7 +30,8 @@ span-based edits, and produces byte-exact fragments for replay. The
 | PDM 0.12 – 1.4 | `2` | `url` + `files = [{file, hash}]` (or the legacy `[metadata.files]` entry). PDM 0.x/1.x has an upstream freshness bug — a freshly generated lock can fail its own hash check, so ordinary `pdm install` may regenerate it and discard the redirect. The CLI warns `redirect_pdm_legacy_sync_required`; use `pdm sync`. | Local-file `path` + `files` hash; same freshness advisory (`pypi_pdm_legacy_sync_required`). |
 | PDM 1.8 – 1.15 | `3.1` | **Refused** (`unsupported PDM lock_version`): native dependency lookup loses URL/path candidate identity before install, so a rewrite would not resolve. The original registry lock still installs. | Refused for the same reason. |
 | PDM 2.0 – 2.7 | `4.0` / `4.1` / `4.2` | **Refused** (same identity loss). | Refused. |
-| PDM 2.8 – current | `4.3` / `4.4` / `4.4.1` / `4.5.0` / `4.5.1` | `url` + single `{file, hash}`; `static_urls` locks keep their `{url, hash}` file shape. | Local-file `path` + `{file, hash}`. |
+| PDM 2.8.0 | `4.3` | **Accepted but not installable.** 2.8.0 writes the `4.3` grammar yet still loses `url`/`path` candidate identity (fixed in 2.8.1), so `pdm sync` on the rewritten lock crashes with `KeyError`. A 2.8.0 lock is byte-identical to a 2.8.1 lock and records no PDM version, so the rewriter cannot refuse it by format — upgrade to ≥ 2.8.1. | Same crash. |
+| PDM 2.8.1 – current | `4.3` / `4.4` / `4.4.1` / `4.5.0` / `4.5.1` | `url` + single `{file, hash}`; `static_urls` locks keep their `{url, hash}` file shape. | Local-file `path` + `{file, hash}`. |
 | Any future `lock_version` | unknown | **Refused** until the format is tested (fail-closed). | Refused. |
 
 Both modes retain the package version, extras, groups, markers and the
@@ -51,7 +52,8 @@ whose filename does not match the locked package.
 | 1.0 – 1.4 | 2 | supported | supported | supported | yes | as 0.12; 1.0 cannot self-install a dev-group project natively. |
 | 1.8 – 1.15 | 3.1 | refused | refused | supported | — | native install of the original registry lock is unaffected. |
 | 2.0 – 2.7 | 4.0–4.2 | refused | refused | supported | — | same identity-loss boundary. |
-| 2.8 – current | 4.3–4.5.1 | supported | supported | supported | yes | `pdm sync` + `pdm install --check`; static_urls, extras, markers, multi-target and PEP 735 dependency-groups all pass. |
+| 2.8.0 | 4.3 | crashes | crashes | supported | — | rewrite accepted but `pdm sync`/`pdm install` raise `KeyError` (identity loss, fixed in 2.8.1); agent mode is unaffected. Upgrade to ≥ 2.8.1. |
+| 2.8.1 – current | 4.3–4.5.1 | supported | supported | supported | yes | `pdm sync` + `pdm install --check`; static_urls, extras, markers, multi-target and PEP 735 dependency-groups all pass. |
 
 Measured details:
 
@@ -109,7 +111,7 @@ needs no Socket API token (the `urllib3@1.26.18` patch is a free tier).
 <!-- GENERATED:BEGIN — printed by `python3 scripts/backtest-pdm.py --render-doc-table docs/testing/pdm-compatibility/results.json`;
      regenerate after a matrix run instead of editing by hand. -->
 
-Run captured 2026-09-17 on macOS-26.6.2-arm64-arm-64bit-Mach-O with socket-patch `socket-patch 4.0.0` (source `fixed`, binary sha256 `99a0977e83aad0d01371b41147104a123f7eaa8bfb3f85ac1b2dc64a5b6f093d`), 25 PDM releases, shapes: direct, transitive, dev, optional, extras, marker, marker-excluded, platform-linux, platform-windows, crlf, static-urls, space-unicode, dependency-groups, multi-target, two-versions, custom-lockfile, pep582.
+Run captured 2026-09-18 on macOS-26.6.2-arm64-arm-64bit-Mach-O with socket-patch `socket-patch 4.0.0` (source `fixed2`, binary sha256 `b7ac2064ae2a466ab2d2bd74447ba1ae1f47b94943eab9a4310012fc253cac38`), 25 PDM releases, shapes: direct, transitive, dev, optional, extras, marker, marker-excluded, platform-linux, platform-windows, crlf, static-urls, space-unicode, dependency-groups, multi-target, two-versions, custom-lockfile, pep582.
 
 | PDM | Python | lock_version | hosted | vendored | agent | tamper rejected (H/V) | `pdm install` keeps lock (H/V) | relock keeps patch (H/V) | notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -127,7 +129,7 @@ Run captured 2026-09-17 on macOS-26.6.2-arm64-arm-64bit-Mach-O with socket-patch
 | 2.6.1 | 3.11 | 4.2 | refused (12 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | n/a / n/a | n/a / n/a | n/a / n/a | lock_version 4.2 unsupported: refused before any write, native install intact; `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record; lock-only checkout (nothing installed) is not redirected |
 | 2.7.4 | 3.11 | 4.2 | refused (12 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | n/a / n/a | n/a / n/a | n/a / n/a | lock_version 4.2 unsupported: refused before any write, native install intact; `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record; lock-only checkout (nothing installed) is not redirected |
 | 2.8.2 | 3.11 | 4.3 | pass (13 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |
-| 2.9.3 | 3.11 | 4.3 | pass (13 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |
+| 2.9.3 | 3.11 | 4.3 | pass (13 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); agent mode on a `__pypackages__` project patched the PATH interpreter's site-packages; refused vendored scan still writes a `.socket/manifest.json` record |
 | 2.10.4 | 3.11 | 4.4 | pass (13 shapes) | 12/13 (13 shapes) | 8/9 (9 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |
 | 2.11.2 | 3.11 | 4.4.1 | pass (14 shapes) | 13/14 (14 shapes) | 9/10 (10 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |
 | 2.12.4 | 3.11 | 4.4.1 | pass (14 shapes) | 13/14 (14 shapes) | 9/10 (10 shapes) | yes / yes | yes / yes | false / false | `__pypackages__` layout: crawler does not see it (falls through to the PATH interpreter); refused vendored scan still writes a `.socket/manifest.json` record |

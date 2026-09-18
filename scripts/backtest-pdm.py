@@ -926,13 +926,26 @@ def main():
             # the install) cannot serve this layout — with no venv the crawler
             # falls through to the `python` on PATH, which is NOT this
             # project's install. Documented `__pypackages__` limitation.
-            row["expected"] = "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)"
-            check("lockUnchanged", lock_after == pristine_lock)
-            if applied:
-                info["patchedOutsideProject"] = {"applied": applied, "crawled": crawled}
-                rb = Run(cli_cmd(project, "rollback"), project, cenv, case / "rollback.log", timeout=900)
-                info["rollbackOutsideProject"] = {"exit": rb.rc, "rolledBack": rb.json_or_empty().get("rolledBack")}
-            return finish("UNSUPPORTED" if checks["lockUnchanged"] else "FAIL")
+            row["expected"] = "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)"
+            if not applied:
+                # Refused / no-op (the common case): nothing was written.
+                check("lockUnchanged", lock_after == pristine_lock)
+                return finish("UNSUPPORTED" if checks["lockUnchanged"] else "FAIL")
+            # The CLI still wired/patched something despite the invisible
+            # `__pypackages__` layout — vendored via a prebuilt-wheel download,
+            # or agent patching the PATH interpreter. The install itself is
+            # unverifiable here, but whatever changed MUST be cleanly reversible
+            # and must not strand the project.
+            info["patchedOutsideProject"] = {"applied": applied, "crawled": crawled}
+            rb = Run(cli_cmd(project, "rollback"), project, cenv, case / "rollback.log", timeout=900)
+            restored = (
+                rb.ok()
+                and (project / lockname).read_bytes() == pristine_lock
+                and (project / "pyproject.toml").read_bytes() == pristine_pyproject
+            )
+            info["rollbackOutsideProject"] = {"exit": rb.rc, "restored": restored}
+            check("rollbackRestoresUnverifiableWrite", restored)
+            return finish("UNSUPPORTED" if restored else "FAIL")
 
         expected_refusal = mode != "agent" and (row["lockVersion"] not in SUPPORTED_LOCK_VERSIONS or shape in EXPECTED_NOOP_SHAPES)
         if expected_refusal:

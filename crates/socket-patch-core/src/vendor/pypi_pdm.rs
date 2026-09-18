@@ -21,6 +21,27 @@ const LOCK_FILE: &str = "pdm.lock";
 /// The `WiringRecord.kind` discriminator this backend owns.
 const KIND_LOCK_PACKAGE: &str = "pdm_lock_package";
 
+/// Refuse when `pdm.lock` is itself a symlink. Every writer here stages a
+/// replacement next to the path and renames over it, which REPLACES the link
+/// with a detached regular file: the shared target the link points at stays
+/// unpatched (git shows a 120000→100644 typechange), and `revert` restores
+/// bytes but never the link. Both wire and revert check before any write —
+/// mirroring the uv/pypi_lock vendored siblings and the hosted `first_symlink`
+/// guard (pdm itself relocks THROUGH a linked pdm.lock).
+async fn refuse_symlinked_lock(root: &Path) -> Result<(), (&'static str, String)> {
+    if crate::utils::fs::is_symlink(&root.join(LOCK_FILE)).await {
+        return Err((
+            "pypi_pdm_symlink_unsupported",
+            format!(
+                "{LOCK_FILE} is a symbolic link; the atomic rewrite would replace the link with \
+                 a regular file and leave its target stale — vendor the real file's directory \
+                 instead"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Guarded read shared in shape with the sibling backend twins:
 /// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
 /// files, so a FIFO planted as `pdm.lock` (or the diagnostics-only
@@ -201,6 +222,23 @@ pub(super) fn check_target_guards(
             format!("{LOCK_FILE} has no [[package]] entry for {canon_name}; run `pdm lock` first"),
         ));
     }
+    // A marker/multi-target lock (PDM >= 2.17 `pdm lock --append`) can resolve
+    // one package to several versions, one per fork. Detect it ahead of the
+    // per-unit version check so the refusal is accurate (the target version IS
+    // present) and ordering-independent.
+    let locked_versions: std::collections::BTreeSet<&str> = units
+        .iter()
+        .filter_map(|unit| unit.get("version").and_then(Item::as_str))
+        .collect();
+    if locked_versions.len() > 1 {
+        return Err((
+            "pypi_pdm_lock_forked_package",
+            format!(
+                "{LOCK_FILE} resolves {canon_name} at multiple versions (a marker or \
+                 multi-target fork); vendoring one fork would leave the others unpatched"
+            ),
+        ));
+    }
     let mut variants = std::collections::BTreeSet::new();
     let mut fresh = false;
     let mut in_sync = false;
@@ -240,13 +278,11 @@ fn check_target_unit(
     version: &str,
     record_uuid: &str,
 ) -> Result<PdmTarget, (&'static str, String)> {
-    if unit.get("version").and_then(Item::as_str) != Some(version) {
+    let locked_version = unit.get("version").and_then(Item::as_str).unwrap_or("");
+    if locked_version != version {
         return Err((
             "pypi_pdm_lock_package_missing",
-            format!(
-                "PDM locked version {:?} differs from installed {version}",
-                unit.get("version").and_then(Item::as_str)
-            ),
+            format!("PDM locked version {locked_version} differs from installed {version}"),
         ));
     }
     if ["url", "git", "hg", "svn", "bzr", "editable", "source"]
@@ -297,9 +333,16 @@ fn check_target_unit(
     let hashed_entries = crate::utils::pdm_lock::files_for(&p.lock, unit)
         .map(|arr| {
             !arr.is_empty()
-                && arr
-                    .iter()
-                    .all(|v| v.as_inline_table().is_some_and(|t| t.contains_key("hash")))
+                && arr.iter().all(|v| {
+                    v.as_inline_table()
+                        .and_then(|t| t.get("hash"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|hash| {
+                            hash.strip_prefix("sha256:").is_some_and(|hex| {
+                                hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            })
+                        })
+                })
         })
         .unwrap_or(false);
     if !hashed_entries {
@@ -313,6 +356,40 @@ fn check_target_unit(
     }
 
     Ok(PdmTarget::Fresh)
+}
+
+/// `true` when the target `[[package]]` unit's `files` already list THIS run's
+/// patched wheel sha256.
+///
+/// A `pdm add <other>` / partial relock on an already-vendored lock reuses the
+/// stale `files` entry — which still carries our PATCHED wheel hash — while
+/// dropping the vendored `path` source (measured on PDM 2.8–2.15, lock_version
+/// 4.3/4.4/4.4.1: `pdm add` reuses pinned units verbatim, unlike a full
+/// `pdm lock` which re-resolves the registry hashes). Sourceless and hashed,
+/// that unit reads as [`PdmTarget::Fresh`], so a re-scan would rewrite it AND
+/// record it as the pre-vendor `original`, baking the patched hash into the
+/// ledger as the "registry" state — a later rollback then restores an
+/// uninstallable lock and the true registry original is lost. A pristine
+/// registry unit lists the REGISTRY hashes, never our patch's, so this cannot
+/// false-positive on a genuinely fresh target.
+fn target_carries_patched_wheel_hash(
+    lock: &DocumentMut,
+    canon_name: &str,
+    wheel_sha256_hex: &str,
+) -> bool {
+    let needle = format!("sha256:{}", wheel_sha256_hex.to_ascii_lowercase());
+    lock_units_named(lock, canon_name).into_iter().any(|unit| {
+        crate::utils::pdm_lock::files_for(lock, unit)
+            .map(|files| {
+                files.iter().any(|file| {
+                    file.as_inline_table()
+                        .and_then(|table| table.get("hash"))
+                        .and_then(Value::as_str)
+                        == Some(needle.as_str())
+                })
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Wire pdm.lock for the vendored wheel: rewrite ONLY the target
@@ -331,6 +408,8 @@ pub async fn wire_pdm(
     wheel_sha256_hex: &str,
     record_uuid: &str,
 ) -> Result<(Vec<WiringRecord>, PdmMeta), (&'static str, String)> {
+    // Before ANY write: a symlinked lock would be replaced by the rename-over.
+    refuse_symlinked_lock(root).await?;
     match check_target_guards(p, canon_name, version, record_uuid)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
@@ -345,6 +424,26 @@ pub async fn wire_pdm(
             ))
         }
         PdmTarget::Fresh => {}
+    }
+
+    // A `pdm add <other>` / partial relock drops our vendored `path` but reuses
+    // the stale `files` entry that still carries the patched wheel sha256 (PDM
+    // 2.8–2.15, lock_version 4.3/4.4/4.4.1). Sourceless + hashed, that unit
+    // reads as `Fresh`; rewriting it here would ALSO record it as the pre-vendor
+    // `original`, baking our patched hash into the ledger as the "registry"
+    // state — a later rollback would then restore an uninstallable lock and the
+    // true registry original would be lost. Refuse with the repair path (a full
+    // `pdm lock` re-resolves the registry hashes) so the ledger's real original
+    // survives untouched.
+    if target_carries_patched_wheel_hash(&p.lock, canon_name, wheel_sha256_hex) {
+        return Err((
+            "pypi_pdm_source_already_exists",
+            format!(
+                "{LOCK_FILE}'s {canon_name} entry still carries this patch's wheel hash while PDM \
+                 dropped the vendored `path` (a `pdm add`/partial relock left an uninstallable \
+                 lock); run `pdm lock` to restore the registry hashes, then re-run vendor"
+            ),
+        ));
     }
 
     let new_lock = crate::utils::pdm_lock::rewrite_pdm_lock(
@@ -395,6 +494,18 @@ pub async fn wire_pdm(
 /// the shared fragment-splice revert (drift-tolerant, pdm.lock-only
 /// allowlist).
 pub async fn revert_pdm(entry: &VendorEntry, root: &Path, dry_run: bool) -> RevertOutcome {
+    // A symlinked lock would be replaced by the atomic rewrite-over, leaving
+    // its target stale and never restoring the link. Keep the artifact (the
+    // wiring still routes through the linked file) and fail — the guard lives
+    // here, not in the poetry-shared splice helper, so poetry is untouched.
+    if let Err((code, detail)) = refuse_symlinked_lock(root).await {
+        return RevertOutcome {
+            kept_artifact: true,
+            success: false,
+            warnings: Vec::new(),
+            error: Some(format!("{code}: {detail}")),
+        };
+    }
     revert_lock_fragment_splice(entry, root, dry_run, LOCK_FILE, KIND_LOCK_PACKAGE, "pdm").await
 }
 
@@ -1338,5 +1449,72 @@ distribution = false
             drifted,
             "drifted lock left alone"
         );
+    }
+
+    /// A symlinked pdm.lock must be refused BEFORE any write: the atomic
+    /// rename-over would replace the link with a regular file and leave its
+    /// target stale, and revert would never restore the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_lock_refuses_wire_and_revert_without_writing() {
+        let outer = tempfile::tempdir().unwrap();
+        let real = outer.path().join("real.lock");
+        tokio::fs::write(&real, LOCK_DIRECT_REGISTRY).await.unwrap();
+        let root = outer.path().join("proj");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(root.join("pyproject.toml"), PYPROJECT_DIRECT)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&real, root.join("pdm.lock")).unwrap();
+
+        let p = load_pdm_project(&root).await.unwrap();
+        let err = wire_pdm(&p, &root, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "pypi_pdm_symlink_unsupported");
+        // The link is intact and its target is byte-unchanged.
+        assert!(std::fs::symlink_metadata(root.join("pdm.lock"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(read_lock(&root).await, LOCK_DIRECT_REGISTRY);
+
+        // revert refuses the same way and keeps the artifact.
+        let meta = PdmMeta {
+            dep_class: "direct".into(),
+            lock_version: "4.5.0".into(),
+            strategy: vec!["inherit_metadata".into()],
+        };
+        let wiring = vec![record(
+            LOCK_FILE,
+            KIND_LOCK_PACKAGE,
+            WiringAction::Rewritten,
+            "six",
+            Some("a".into()),
+            "b".into(),
+        )];
+        let outcome = revert_pdm(&entry_for(wiring, meta), &root, false).await;
+        assert!(!outcome.success);
+        assert!(outcome.kept_artifact);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("pypi_pdm_symlink_unsupported")),
+            "{:?}",
+            outcome.error
+        );
+    }
+
+    /// A pre-flight `files` entry whose hash is present but NOT a 64-hex
+    /// sha256 must be refused by the guard (before the wheel is built), not
+    /// only later by the rewriter.
+    #[tokio::test]
+    async fn non_sha256_hash_refused_by_preflight_guard() {
+        let lock = LOCK_DIRECT_REGISTRY.replace("sha256:", "md5:");
+        let tmp = write_project(&lock, PYPROJECT_DIRECT).await;
+        let p = load_pdm_project(tmp.path()).await.unwrap();
+        let err = check_target_guards(&p, "six", "1.16.0", UUID).unwrap_err();
+        assert_eq!(err.0, "pypi_pdm_lock_no_hashes");
     }
 }

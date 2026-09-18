@@ -1,9 +1,9 @@
 {
  "provenance": {
-  "capturedAt": "2026-09-17T23:40:37.750526+00:00",
-  "cliPath": "/private/tmp/claude-501/-Users-mikolalysenko-Projects-socket-patch/9840a7e8-5cf9-4f42-8960-54a9c23b7cd7/scratchpad/socket-patch-fixed",
-  "cliRevision": "fixed",
-  "cliSha256": "99a0977e83aad0d01371b41147104a123f7eaa8bfb3f85ac1b2dc64a5b6f093d",
+  "capturedAt": "2026-09-18T00:43:22.692909+00:00",
+  "cliPath": "/private/tmp/claude-501/-Users-mikolalysenko-Projects-socket-patch/9840a7e8-5cf9-4f42-8960-54a9c23b7cd7/scratchpad/socket-patch-fixed2",
+  "cliRevision": "fixed2",
+  "cliSha256": "b7ac2064ae2a466ab2d2bd74447ba1ae1f47b94943eab9a4310012fc253cac38",
   "cliVersion": "socket-patch 4.0.0",
   "hostPython": "3.14.3",
   "modes": [
@@ -501,7 +501,7 @@
    "mode": "agent",
    "outcome": "UNSUPPORTED",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "patchedOutsideProject": {
@@ -517,7 +517,7 @@
     ],
     "rollbackOutsideProject": {
      "exit": 0,
-     "rolledBack": 1
+     "restored": true
     }
    }
   },
@@ -543,7 +543,7 @@
    "mode": "vendored",
    "outcome": "UNSUPPORTED",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -815,7 +815,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -832,7 +833,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -846,6 +848,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -948,7 +951,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -965,7 +969,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -979,6 +984,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -1081,7 +1087,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -1098,7 +1105,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -1112,6 +1120,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -1214,7 +1223,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -1231,7 +1241,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -1245,6 +1256,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -1347,7 +1359,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -1364,7 +1377,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -1378,6 +1392,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -1458,6 +1473,7 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -1475,7 +1491,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -1489,6 +1506,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -1586,7 +1604,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -1603,7 +1622,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -1617,6 +1637,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -1679,7 +1700,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "2",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "patchedOutsideProject": {
@@ -1695,7 +1716,7 @@
     ],
     "rollbackOutsideProject": {
      "exit": 0,
-     "rolledBack": 1
+     "restored": true
     }
    }
   },
@@ -1729,7 +1750,8 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -1746,7 +1768,8 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
-     "redirect_pdm_refused"
+     "redirect_pdm_refused",
+     "redirect_pdm_stale_install_risk"
     ]
    }
   },
@@ -1757,7 +1780,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "2",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -1793,6 +1816,7 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -1810,7 +1834,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -1824,6 +1849,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -1899,6 +1925,7 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -1916,7 +1943,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -1930,6 +1958,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -2027,7 +2056,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -2044,7 +2074,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -2058,6 +2089,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -2155,7 +2187,8 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -2173,7 +2206,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -2187,6 +2221,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ],
     "rollbackAfterRelock": {
@@ -2297,7 +2332,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -2314,7 +2350,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -2328,6 +2365,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -2430,7 +2468,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -2447,7 +2486,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -2461,6 +2501,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -2563,7 +2604,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -2580,7 +2622,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -2594,6 +2637,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -2696,7 +2740,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -2713,7 +2758,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -2727,6 +2773,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -2829,7 +2876,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -2846,7 +2894,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -2860,6 +2909,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -2940,6 +2990,7 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -2957,7 +3008,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -2971,6 +3023,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -3068,7 +3121,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -3085,7 +3139,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -3099,6 +3154,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -3161,7 +3217,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "2",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "patchedOutsideProject": {
@@ -3177,7 +3233,7 @@
     ],
     "rollbackOutsideProject": {
      "exit": 0,
-     "rolledBack": 1
+     "restored": true
     }
    }
   },
@@ -3211,7 +3267,8 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -3228,7 +3285,8 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
-     "redirect_pdm_refused"
+     "redirect_pdm_refused",
+     "redirect_pdm_stale_install_risk"
     ]
    }
   },
@@ -3239,7 +3297,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "2",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -3275,6 +3333,7 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -3292,7 +3351,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -3306,6 +3366,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -3381,6 +3442,7 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -3398,7 +3460,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -3412,6 +3475,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -3509,7 +3573,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -3526,7 +3591,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -3540,6 +3606,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -3637,7 +3704,8 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -3655,7 +3723,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -3669,6 +3738,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ],
     "rollbackAfterRelock": {
@@ -3779,7 +3849,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -3796,7 +3867,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -3810,6 +3882,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -3912,7 +3985,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -3929,7 +4003,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -3943,6 +4018,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -4045,7 +4121,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -4062,7 +4139,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -4076,6 +4154,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -4178,7 +4257,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -4195,7 +4275,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -4209,6 +4290,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -4311,7 +4393,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -4328,7 +4411,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -4342,6 +4426,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -4422,6 +4507,7 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -4439,7 +4525,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -4453,6 +4540,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -4550,7 +4638,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -4567,7 +4656,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -4581,6 +4671,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -4643,7 +4734,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "2",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "patchedOutsideProject": {
@@ -4660,7 +4751,7 @@
     ],
     "rollbackOutsideProject": {
      "exit": 0,
-     "rolledBack": 2
+     "restored": true
     }
    }
   },
@@ -4694,7 +4785,8 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -4711,7 +4803,8 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
-     "redirect_pdm_refused"
+     "redirect_pdm_refused",
+     "redirect_pdm_stale_install_risk"
     ]
    }
   },
@@ -4722,7 +4815,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "2",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -4758,6 +4851,7 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -4775,7 +4869,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -4789,6 +4884,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -4864,6 +4960,7 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -4881,7 +4978,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -4895,6 +4993,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -4992,7 +5091,8 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
-      "redirect_pdm_legacy_sync_required"
+      "redirect_pdm_legacy_sync_required",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -5009,7 +5109,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -5023,6 +5124,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -5120,7 +5222,8 @@
      "applied": 1,
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "exit": 0,
      "patchInLock": true
@@ -5138,7 +5241,8 @@
     "lockOnlyHosted": {
      "codes": [
       "redirect_pdm_legacy_sync_required",
-      "redirect_pdm_refused"
+      "redirect_pdm_refused",
+      "redirect_pdm_stale_install_risk"
      ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18",
@@ -5152,6 +5256,7 @@
     "applied": 1,
     "codes": [
      "redirect_pdm_legacy_sync_required",
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ],
     "rollbackAfterRelock": {
@@ -5681,7 +5786,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "3.1",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "patchedOutsideProject": {
@@ -5697,7 +5802,7 @@
     ],
     "rollbackOutsideProject": {
      "exit": 0,
-     "rolledBack": 1
+     "restored": true
     }
    }
   },
@@ -5725,7 +5830,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "3.1",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -6442,7 +6547,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "3.1",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "patchedOutsideProject": {
@@ -6458,7 +6563,7 @@
     ],
     "rollbackOutsideProject": {
      "exit": 0,
-     "rolledBack": 1
+     "restored": true
     }
    }
   },
@@ -6486,7 +6591,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "3.1",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -7222,7 +7327,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "3.1",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -7255,7 +7360,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "3.1",
    "python": "3.8",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -7986,7 +8091,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.0",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -8019,7 +8124,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.0",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -8750,7 +8855,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.0",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -8783,7 +8888,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.0",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -9514,7 +9619,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.0",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -9547,7 +9652,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.0",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -10278,7 +10383,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.1",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -10311,7 +10416,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.1",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -11042,7 +11147,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.2",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -11075,7 +11180,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.2",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -11806,7 +11911,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.2",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -11839,7 +11944,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.2",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -12123,7 +12228,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -12137,7 +12244,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -12148,6 +12257,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -12289,7 +12399,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -12303,7 +12415,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -12314,6 +12428,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -12413,7 +12528,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -12427,7 +12544,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -12438,6 +12557,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -12537,7 +12657,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -12551,7 +12673,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -12562,6 +12686,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -12661,7 +12786,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -12675,7 +12802,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -12686,6 +12815,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -12763,6 +12893,7 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -12778,7 +12909,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -12789,6 +12922,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -12883,7 +13017,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -12897,7 +13033,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -12908,6 +13046,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -12968,7 +13107,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.3",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -13005,7 +13144,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -13019,7 +13160,9 @@
      "targetKept": true
     },
     "applied": 1,
-    "codes": []
+    "codes": [
+     "redirect_pdm_stale_install_risk"
+    ]
    }
   },
   {
@@ -13029,7 +13172,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.3",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -13063,6 +13206,7 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -13078,7 +13222,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -13089,6 +13235,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -13161,6 +13308,7 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -13176,7 +13324,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -13187,6 +13337,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -13281,7 +13432,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -13295,7 +13448,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -13306,6 +13461,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -13405,7 +13561,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -13419,7 +13577,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -13430,6 +13590,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -13529,7 +13690,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -13543,17 +13706,21 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
      "exit": 0,
-     "lockfileOnlyPackages": 1,
+     "lockfileOnlyPackages": 0,
      "redirected": 1,
-     "scannedPackages": 43
+     "scannedPackages": 45
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -13619,11 +13786,13 @@
    "info": {
     "lockOnlyHosted": {
      "codes": [],
-     "crawledUrllib3": [],
+     "crawledUrllib3": [
+      "pkg:pypi/urllib3@1.26.18"
+     ],
      "exit": 0,
      "lockfileOnlyPackages": 0,
      "redirected": 0,
-     "scannedPackages": 42
+     "scannedPackages": 45
     },
     "manifestLeftover": [],
     "applied": 0,
@@ -13695,7 +13864,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -13709,17 +13880,21 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
      "exit": 0,
-     "lockfileOnlyPackages": 1,
+     "lockfileOnlyPackages": 0,
      "redirected": 1,
-     "scannedPackages": 43
+     "scannedPackages": 45
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -13819,7 +13994,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -13833,17 +14010,21 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
      "exit": 0,
-     "lockfileOnlyPackages": 1,
+     "lockfileOnlyPackages": 0,
      "redirected": 1,
-     "scannedPackages": 43
+     "scannedPackages": 45
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -13943,7 +14124,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -13957,7 +14140,1497 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
+     "crawledUrllib3": [
+      "pkg:pypi/urllib3@1.26.18"
+     ],
+     "exit": 0,
+     "lockfileOnlyPackages": 1,
+     "redirected": 1,
+     "scannedPackages": 46
+    },
+    "applied": 1,
+    "codes": [
+     "redirect_pdm_stale_install_risk",
+     "redirect_pypi_stale_install"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "extras",
+   "mode": "vendored",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "vendor_prebuilt_downloaded"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "applied": 1,
+    "codes": [
+     "vendor_prebuilt_downloaded"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "marker",
+   "mode": "agent",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "applied": 1,
+    "codes": []
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "marker",
+   "mode": "hosted",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "lockOnlyHosted": {
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
+     "crawledUrllib3": [
+      "pkg:pypi/urllib3@1.26.18"
+     ],
+     "exit": 0,
+     "lockfileOnlyPackages": 0,
+     "redirected": 1,
+     "scannedPackages": 45
+    },
+    "applied": 1,
+    "codes": [
+     "redirect_pdm_stale_install_risk",
+     "redirect_pypi_stale_install"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "marker",
+   "mode": "vendored",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "vendor_prebuilt_downloaded"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "applied": 1,
+    "codes": [
+     "vendor_prebuilt_downloaded"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "marker-excluded",
+   "mode": "hosted",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": false,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "lockOnlyHosted": {
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
+     "crawledUrllib3": [
+      "pkg:pypi/urllib3@1.26.18"
+     ],
+     "exit": 0,
+     "lockfileOnlyPackages": 0,
+     "redirected": 1,
+     "scannedPackages": 45
+    },
+    "applied": 1,
+    "codes": [
+     "redirect_pdm_stale_install_risk",
+     "redirect_pypi_stale_install"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "marker-excluded",
+   "mode": "vendored",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": false,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "vendor_prebuilt_downloaded"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "applied": 1,
+    "codes": [
+     "vendor_prebuilt_downloaded"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "optional",
+   "mode": "agent",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "applied": 1,
+    "codes": []
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "optional",
+   "mode": "hosted",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "lockOnlyHosted": {
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
+     "crawledUrllib3": [
+      "pkg:pypi/urllib3@1.26.18"
+     ],
+     "exit": 0,
+     "lockfileOnlyPackages": 0,
+     "redirected": 1,
+     "scannedPackages": 45
+    },
+    "applied": 1,
+    "codes": [
+     "redirect_pdm_stale_install_risk",
+     "redirect_pypi_stale_install"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "optional",
+   "mode": "vendored",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "vendor_prebuilt_downloaded"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "applied": 1,
+    "codes": [
+     "vendor_prebuilt_downloaded"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "pep582",
+   "mode": "agent",
+   "outcome": "UNSUPPORTED",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
+   "baselineFresh": true,
+   "info": {
+    "patchedOutsideProject": {
+     "applied": 1,
+     "crawled": [
+      "pkg:pypi/urllib3@1.26.18"
+     ]
+    },
+    "applied": 1,
+    "codes": [],
+    "rollbackOutsideProject": {
+     "exit": 0,
+     "restored": true
+    }
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "pep582",
+   "mode": "hosted",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "applied": 1,
+    "codes": [
+     "redirect_pdm_stale_install_risk"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "pep582",
+   "mode": "vendored",
+   "outcome": "UNSUPPORTED",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
+   "baselineFresh": true,
+   "info": {
+    "patchedOutsideProject": {
+     "applied": 1,
+     "crawled": [
+      "pkg:pypi/urllib3@1.26.18"
+     ]
+    },
+    "applied": 1,
+    "codes": [
+     "vendor_prebuilt_downloaded"
+    ],
+    "rollbackOutsideProject": {
+     "exit": 0,
+     "restored": true
+    }
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "platform-linux",
+   "mode": "hosted",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": false,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "lockOnlyHosted": {
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
+     "crawledUrllib3": [
+      "pkg:pypi/urllib3@1.26.18"
+     ],
+     "exit": 0,
+     "lockfileOnlyPackages": 0,
+     "redirected": 1,
+     "scannedPackages": 45
+    },
+    "applied": 1,
+    "codes": [
+     "redirect_pdm_stale_install_risk",
+     "redirect_pypi_stale_install"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "platform-linux",
+   "mode": "vendored",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": false,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "vendor_prebuilt_downloaded"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "applied": 1,
+    "codes": [
+     "vendor_prebuilt_downloaded"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "platform-windows",
+   "mode": "hosted",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": false,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "lockOnlyHosted": {
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
+     "crawledUrllib3": [
+      "pkg:pypi/urllib3@1.26.18"
+     ],
+     "exit": 0,
+     "lockfileOnlyPackages": 0,
+     "redirected": 1,
+     "scannedPackages": 45
+    },
+    "applied": 1,
+    "codes": [
+     "redirect_pdm_stale_install_risk",
+     "redirect_pypi_stale_install"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "platform-windows",
+   "mode": "vendored",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": false,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "vendor_prebuilt_downloaded"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "applied": 1,
+    "codes": [
+     "vendor_prebuilt_downloaded"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "space-unicode",
+   "mode": "agent",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "applied": 1,
+    "codes": []
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "space-unicode",
+   "mode": "hosted",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "lockOnlyHosted": {
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
+     "crawledUrllib3": [
+      "pkg:pypi/urllib3@1.26.18"
+     ],
+     "exit": 0,
+     "lockfileOnlyPackages": 0,
+     "redirected": 1,
+     "scannedPackages": 45
+    },
+    "applied": 1,
+    "codes": [
+     "redirect_pdm_stale_install_risk",
+     "redirect_pypi_stale_install"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "space-unicode",
+   "mode": "vendored",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "vendor_prebuilt_downloaded"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "applied": 1,
+    "codes": [
+     "vendor_prebuilt_downloaded"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "transitive",
+   "mode": "agent",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "applied": 1,
+    "codes": []
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "transitive",
+   "mode": "hosted",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "lockOnlyHosted": {
+     "codes": [
+      "redirect_pdm_stale_install_risk",
+      "redirect_pypi_stale_install"
+     ],
+     "crawledUrllib3": [
+      "pkg:pypi/urllib3@1.26.18"
+     ],
+     "exit": 0,
+     "lockfileOnlyPackages": 4,
+     "redirected": 1,
+     "scannedPackages": 49
+    },
+    "applied": 1,
+    "codes": [
+     "redirect_pdm_stale_install_risk",
+     "redirect_pypi_stale_install"
+    ]
+   }
+  },
+  {
+   "pdm": "2.9.3",
+   "shape": "transitive",
+   "mode": "vendored",
+   "outcome": "PASS",
+   "lockVersion": "4.3",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "vendor_prebuilt_downloaded"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "applied": 1,
+    "codes": [
+     "vendor_prebuilt_downloaded"
+    ]
+   }
+  },
+  {
+   "pdm": "2.10.4",
+   "shape": "crlf",
+   "mode": "agent",
+   "outcome": "PASS",
+   "lockVersion": "4.4",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "applied": 1,
+    "codes": []
+   }
+  },
+  {
+   "pdm": "2.10.4",
+   "shape": "crlf",
+   "mode": "hosted",
+   "outcome": "PASS",
+   "lockVersion": "4.4",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": true,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "lockOnlyHosted": {
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
+     "crawledUrllib3": [
+      "pkg:pypi/urllib3@1.26.18"
+     ],
+     "exit": 0,
+     "lockfileOnlyPackages": 1,
+     "redirected": 1,
+     "scannedPackages": 43
+    },
+    "applied": 1,
+    "codes": [
+     "redirect_pdm_stale_install_risk",
+     "redirect_pypi_stale_install"
+    ]
+   }
+  },
+  {
+   "pdm": "2.10.4",
+   "shape": "crlf",
+   "mode": "vendored",
+   "outcome": "PASS",
+   "lockVersion": "4.4",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "vendor_prebuilt_downloaded"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": true,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "applied": 1,
+    "codes": [
+     "vendor_prebuilt_downloaded"
+    ]
+   }
+  },
+  {
+   "pdm": "2.10.4",
+   "shape": "custom-lockfile",
+   "mode": "hosted",
+   "outcome": "REFUSED-EXPECTED",
+   "lockVersion": "4.4",
+   "python": "3.11",
+   "expected": "no-op: the CLI only reads pdm.lock",
+   "baselineFresh": false,
+   "info": {
+    "lockOnlyHosted": {
      "codes": [],
+     "crawledUrllib3": [],
+     "exit": 0,
+     "lockfileOnlyPackages": 0,
+     "redirected": 0,
+     "scannedPackages": 42
+    },
+    "manifestLeftover": [],
+    "applied": 0,
+    "codes": []
+   }
+  },
+  {
+   "pdm": "2.10.4",
+   "shape": "custom-lockfile",
+   "mode": "vendored",
+   "outcome": "REFUSED-EXPECTED",
+   "lockVersion": "4.4",
+   "python": "3.11",
+   "expected": "no-op: the CLI only reads pdm.lock",
+   "baselineFresh": false,
+   "info": {
+    "manifestLeftover": [
+     "pkg:pypi/urllib3@1.26.18?artifact_id=py2-py3-none-any-whl"
+    ],
+    "applied": 0,
+    "codes": [
+     "pypi_pdm_no_lockfile"
+    ]
+   }
+  },
+  {
+   "pdm": "2.10.4",
+   "shape": "dev",
+   "mode": "agent",
+   "outcome": "PASS",
+   "lockVersion": "4.4",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "applied": 1,
+    "codes": []
+   }
+  },
+  {
+   "pdm": "2.10.4",
+   "shape": "dev",
+   "mode": "hosted",
+   "outcome": "PASS",
+   "lockVersion": "4.4",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "lockOnlyHosted": {
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
+     "crawledUrllib3": [
+      "pkg:pypi/urllib3@1.26.18"
+     ],
+     "exit": 0,
+     "lockfileOnlyPackages": 1,
+     "redirected": 1,
+     "scannedPackages": 43
+    },
+    "applied": 1,
+    "codes": [
+     "redirect_pdm_stale_install_risk",
+     "redirect_pypi_stale_install"
+    ]
+   }
+  },
+  {
+   "pdm": "2.10.4",
+   "shape": "dev",
+   "mode": "vendored",
+   "outcome": "PASS",
+   "lockVersion": "4.4",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "vendor_prebuilt_downloaded"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "applied": 1,
+    "codes": [
+     "vendor_prebuilt_downloaded"
+    ]
+   }
+  },
+  {
+   "pdm": "2.10.4",
+   "shape": "direct",
+   "mode": "agent",
+   "outcome": "PASS",
+   "lockVersion": "4.4",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "applied": 1,
+    "codes": []
+   }
+  },
+  {
+   "pdm": "2.10.4",
+   "shape": "direct",
+   "mode": "hosted",
+   "outcome": "PASS",
+   "lockVersion": "4.4",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "lockOnlyHosted": {
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
+     "crawledUrllib3": [
+      "pkg:pypi/urllib3@1.26.18"
+     ],
+     "exit": 0,
+     "lockfileOnlyPackages": 1,
+     "redirected": 1,
+     "scannedPackages": 43
+    },
+    "applied": 1,
+    "codes": [
+     "redirect_pdm_stale_install_risk",
+     "redirect_pypi_stale_install"
+    ]
+   }
+  },
+  {
+   "pdm": "2.10.4",
+   "shape": "direct",
+   "mode": "vendored",
+   "outcome": "PASS",
+   "lockVersion": "4.4",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "vendor_prebuilt_downloaded"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "applied": 1,
+    "codes": [
+     "vendor_prebuilt_downloaded"
+    ]
+   }
+  },
+  {
+   "pdm": "2.10.4",
+   "shape": "extras",
+   "mode": "agent",
+   "outcome": "PASS",
+   "lockVersion": "4.4",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "applied": 1,
+    "codes": []
+   }
+  },
+  {
+   "pdm": "2.10.4",
+   "shape": "extras",
+   "mode": "hosted",
+   "outcome": "PASS",
+   "lockVersion": "4.4",
+   "python": "3.11",
+   "baselineFresh": true,
+   "info": {
+    "tamper": {
+     "installExit": 1,
+     "installedPatchedAnyway": false,
+     "mentionsHash": true
+    },
+    "ordinaryInstall": {
+     "baselineFresh": true,
+     "exit": 0,
+     "lockStable": true
+    },
+    "ordinaryInstallPatched": true,
+    "rollbackAfterRelockPristine": {
+     "exit": 0,
+     "failed": [],
+     "lockEqualsRelocked": true,
+     "status": "success"
+    },
+    "rescanAfterRelock": {
+     "applied": 1,
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
+     "exit": 0,
+     "patchInLock": true
+    },
+    "relock": {
+     "crlfKept": null,
+     "equalsOriginal": true,
+     "exit": 0,
+     "keepsPatch": false,
+     "lockBytesUnchanged": false,
+     "pyprojectUnchanged": true,
+     "targetKept": true
+    },
+    "lockOnlyHosted": {
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -13968,1412 +15641,7 @@
     },
     "applied": 1,
     "codes": [
-     "redirect_pypi_stale_install"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "extras",
-   "mode": "vendored",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "vendor_prebuilt_downloaded"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "applied": 1,
-    "codes": [
-     "vendor_prebuilt_downloaded"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "marker",
-   "mode": "agent",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "applied": 1,
-    "codes": []
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "marker",
-   "mode": "hosted",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "lockOnlyHosted": {
-     "codes": [],
-     "crawledUrllib3": [
-      "pkg:pypi/urllib3@1.26.18"
-     ],
-     "exit": 0,
-     "lockfileOnlyPackages": 1,
-     "redirected": 1,
-     "scannedPackages": 43
-    },
-    "applied": 1,
-    "codes": [
-     "redirect_pypi_stale_install"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "marker",
-   "mode": "vendored",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "vendor_prebuilt_downloaded"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "applied": 1,
-    "codes": [
-     "vendor_prebuilt_downloaded"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "marker-excluded",
-   "mode": "hosted",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": false,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "redirect_pypi_stale_install"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "lockOnlyHosted": {
-     "codes": [],
-     "crawledUrllib3": [
-      "pkg:pypi/urllib3@1.26.18"
-     ],
-     "exit": 0,
-     "lockfileOnlyPackages": 1,
-     "redirected": 1,
-     "scannedPackages": 43
-    },
-    "applied": 1,
-    "codes": [
-     "redirect_pypi_stale_install"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "marker-excluded",
-   "mode": "vendored",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": false,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "vendor_prebuilt_downloaded"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "applied": 1,
-    "codes": [
-     "vendor_prebuilt_downloaded"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "optional",
-   "mode": "agent",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "applied": 1,
-    "codes": []
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "optional",
-   "mode": "hosted",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "lockOnlyHosted": {
-     "codes": [],
-     "crawledUrllib3": [
-      "pkg:pypi/urllib3@1.26.18"
-     ],
-     "exit": 0,
-     "lockfileOnlyPackages": 1,
-     "redirected": 1,
-     "scannedPackages": 43
-    },
-    "applied": 1,
-    "codes": [
-     "redirect_pypi_stale_install"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "optional",
-   "mode": "vendored",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "vendor_prebuilt_downloaded"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "applied": 1,
-    "codes": [
-     "vendor_prebuilt_downloaded"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "pep582",
-   "mode": "agent",
-   "outcome": "UNSUPPORTED",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
-   "baselineFresh": true,
-   "info": {
-    "applied": 0,
-    "codes": [
-     "package_not_installed"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "pep582",
-   "mode": "hosted",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "applied": 1,
-    "codes": []
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "pep582",
-   "mode": "vendored",
-   "outcome": "UNSUPPORTED",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
-   "baselineFresh": true,
-   "info": {
-    "applied": 0,
-    "codes": [
-     "package_not_installed",
-     "vendor_fetch_unverifiable"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "platform-linux",
-   "mode": "hosted",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": false,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "redirect_pypi_stale_install"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "lockOnlyHosted": {
-     "codes": [],
-     "crawledUrllib3": [
-      "pkg:pypi/urllib3@1.26.18"
-     ],
-     "exit": 0,
-     "lockfileOnlyPackages": 1,
-     "redirected": 1,
-     "scannedPackages": 43
-    },
-    "applied": 1,
-    "codes": [
-     "redirect_pypi_stale_install"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "platform-linux",
-   "mode": "vendored",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": false,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "vendor_prebuilt_downloaded"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "applied": 1,
-    "codes": [
-     "vendor_prebuilt_downloaded"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "platform-windows",
-   "mode": "hosted",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": false,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "redirect_pypi_stale_install"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "lockOnlyHosted": {
-     "codes": [],
-     "crawledUrllib3": [
-      "pkg:pypi/urllib3@1.26.18"
-     ],
-     "exit": 0,
-     "lockfileOnlyPackages": 1,
-     "redirected": 1,
-     "scannedPackages": 43
-    },
-    "applied": 1,
-    "codes": [
-     "redirect_pypi_stale_install"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "platform-windows",
-   "mode": "vendored",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": false,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "vendor_prebuilt_downloaded"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "applied": 1,
-    "codes": [
-     "vendor_prebuilt_downloaded"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "space-unicode",
-   "mode": "agent",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "applied": 1,
-    "codes": []
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "space-unicode",
-   "mode": "hosted",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "lockOnlyHosted": {
-     "codes": [],
-     "crawledUrllib3": [
-      "pkg:pypi/urllib3@1.26.18"
-     ],
-     "exit": 0,
-     "lockfileOnlyPackages": 1,
-     "redirected": 1,
-     "scannedPackages": 43
-    },
-    "applied": 1,
-    "codes": [
-     "redirect_pypi_stale_install"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "space-unicode",
-   "mode": "vendored",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "vendor_prebuilt_downloaded"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "applied": 1,
-    "codes": [
-     "vendor_prebuilt_downloaded"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "transitive",
-   "mode": "agent",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "applied": 1,
-    "codes": []
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "transitive",
-   "mode": "hosted",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "lockOnlyHosted": {
-     "codes": [],
-     "crawledUrllib3": [
-      "pkg:pypi/urllib3@1.26.18"
-     ],
-     "exit": 0,
-     "lockfileOnlyPackages": 5,
-     "redirected": 1,
-     "scannedPackages": 47
-    },
-    "applied": 1,
-    "codes": [
-     "redirect_pypi_stale_install"
-    ]
-   }
-  },
-  {
-   "pdm": "2.9.3",
-   "shape": "transitive",
-   "mode": "vendored",
-   "outcome": "PASS",
-   "lockVersion": "4.3",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "vendor_prebuilt_downloaded"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "applied": 1,
-    "codes": [
-     "vendor_prebuilt_downloaded"
-    ]
-   }
-  },
-  {
-   "pdm": "2.10.4",
-   "shape": "crlf",
-   "mode": "agent",
-   "outcome": "PASS",
-   "lockVersion": "4.4",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "applied": 1,
-    "codes": []
-   }
-  },
-  {
-   "pdm": "2.10.4",
-   "shape": "crlf",
-   "mode": "hosted",
-   "outcome": "PASS",
-   "lockVersion": "4.4",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": true,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "lockOnlyHosted": {
-     "codes": [],
-     "crawledUrllib3": [
-      "pkg:pypi/urllib3@1.26.18"
-     ],
-     "exit": 0,
-     "lockfileOnlyPackages": 1,
-     "redirected": 1,
-     "scannedPackages": 43
-    },
-    "applied": 1,
-    "codes": [
-     "redirect_pypi_stale_install"
-    ]
-   }
-  },
-  {
-   "pdm": "2.10.4",
-   "shape": "crlf",
-   "mode": "vendored",
-   "outcome": "PASS",
-   "lockVersion": "4.4",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "vendor_prebuilt_downloaded"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": true,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "applied": 1,
-    "codes": [
-     "vendor_prebuilt_downloaded"
-    ]
-   }
-  },
-  {
-   "pdm": "2.10.4",
-   "shape": "custom-lockfile",
-   "mode": "hosted",
-   "outcome": "REFUSED-EXPECTED",
-   "lockVersion": "4.4",
-   "python": "3.11",
-   "expected": "no-op: the CLI only reads pdm.lock",
-   "baselineFresh": false,
-   "info": {
-    "lockOnlyHosted": {
-     "codes": [],
-     "crawledUrllib3": [],
-     "exit": 0,
-     "lockfileOnlyPackages": 0,
-     "redirected": 0,
-     "scannedPackages": 42
-    },
-    "manifestLeftover": [],
-    "applied": 0,
-    "codes": []
-   }
-  },
-  {
-   "pdm": "2.10.4",
-   "shape": "custom-lockfile",
-   "mode": "vendored",
-   "outcome": "REFUSED-EXPECTED",
-   "lockVersion": "4.4",
-   "python": "3.11",
-   "expected": "no-op: the CLI only reads pdm.lock",
-   "baselineFresh": false,
-   "info": {
-    "manifestLeftover": [
-     "pkg:pypi/urllib3@1.26.18?artifact_id=py2-py3-none-any-whl"
-    ],
-    "applied": 0,
-    "codes": [
-     "pypi_pdm_no_lockfile"
-    ]
-   }
-  },
-  {
-   "pdm": "2.10.4",
-   "shape": "dev",
-   "mode": "agent",
-   "outcome": "PASS",
-   "lockVersion": "4.4",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "applied": 1,
-    "codes": []
-   }
-  },
-  {
-   "pdm": "2.10.4",
-   "shape": "dev",
-   "mode": "hosted",
-   "outcome": "PASS",
-   "lockVersion": "4.4",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "lockOnlyHosted": {
-     "codes": [],
-     "crawledUrllib3": [
-      "pkg:pypi/urllib3@1.26.18"
-     ],
-     "exit": 0,
-     "lockfileOnlyPackages": 1,
-     "redirected": 1,
-     "scannedPackages": 43
-    },
-    "applied": 1,
-    "codes": [
-     "redirect_pypi_stale_install"
-    ]
-   }
-  },
-  {
-   "pdm": "2.10.4",
-   "shape": "dev",
-   "mode": "vendored",
-   "outcome": "PASS",
-   "lockVersion": "4.4",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "vendor_prebuilt_downloaded"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "applied": 1,
-    "codes": [
-     "vendor_prebuilt_downloaded"
-    ]
-   }
-  },
-  {
-   "pdm": "2.10.4",
-   "shape": "direct",
-   "mode": "agent",
-   "outcome": "PASS",
-   "lockVersion": "4.4",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "applied": 1,
-    "codes": []
-   }
-  },
-  {
-   "pdm": "2.10.4",
-   "shape": "direct",
-   "mode": "hosted",
-   "outcome": "PASS",
-   "lockVersion": "4.4",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "lockOnlyHosted": {
-     "codes": [],
-     "crawledUrllib3": [
-      "pkg:pypi/urllib3@1.26.18"
-     ],
-     "exit": 0,
-     "lockfileOnlyPackages": 1,
-     "redirected": 1,
-     "scannedPackages": 43
-    },
-    "applied": 1,
-    "codes": [
-     "redirect_pypi_stale_install"
-    ]
-   }
-  },
-  {
-   "pdm": "2.10.4",
-   "shape": "direct",
-   "mode": "vendored",
-   "outcome": "PASS",
-   "lockVersion": "4.4",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [
-      "vendor_prebuilt_downloaded"
-     ],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "applied": 1,
-    "codes": [
-     "vendor_prebuilt_downloaded"
-    ]
-   }
-  },
-  {
-   "pdm": "2.10.4",
-   "shape": "extras",
-   "mode": "agent",
-   "outcome": "PASS",
-   "lockVersion": "4.4",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "applied": 1,
-    "codes": []
-   }
-  },
-  {
-   "pdm": "2.10.4",
-   "shape": "extras",
-   "mode": "hosted",
-   "outcome": "PASS",
-   "lockVersion": "4.4",
-   "python": "3.11",
-   "baselineFresh": true,
-   "info": {
-    "tamper": {
-     "installExit": 1,
-     "installedPatchedAnyway": false,
-     "mentionsHash": true
-    },
-    "ordinaryInstall": {
-     "baselineFresh": true,
-     "exit": 0,
-     "lockStable": true
-    },
-    "ordinaryInstallPatched": true,
-    "rollbackAfterRelockPristine": {
-     "exit": 0,
-     "failed": [],
-     "lockEqualsRelocked": true,
-     "status": "success"
-    },
-    "rescanAfterRelock": {
-     "applied": 1,
-     "codes": [],
-     "exit": 0,
-     "patchInLock": true
-    },
-    "relock": {
-     "crlfKept": null,
-     "equalsOriginal": true,
-     "exit": 0,
-     "keepsPatch": false,
-     "lockBytesUnchanged": false,
-     "pyprojectUnchanged": true,
-     "targetKept": true
-    },
-    "lockOnlyHosted": {
-     "codes": [],
-     "crawledUrllib3": [
-      "pkg:pypi/urllib3@1.26.18"
-     ],
-     "exit": 0,
-     "lockfileOnlyPackages": 2,
-     "redirected": 1,
-     "scannedPackages": 44
-    },
-    "applied": 1,
-    "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -15473,7 +15741,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -15487,7 +15757,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -15498,6 +15770,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -15575,6 +15848,7 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -15590,7 +15864,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -15601,6 +15877,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -15695,7 +15972,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -15709,7 +15988,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -15720,6 +16001,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -15780,7 +16062,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.4",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -15817,7 +16099,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -15831,7 +16115,9 @@
      "targetKept": true
     },
     "applied": 1,
-    "codes": []
+    "codes": [
+     "redirect_pdm_stale_install_risk"
+    ]
    }
   },
   {
@@ -15841,7 +16127,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.4",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -15875,6 +16161,7 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -15890,7 +16177,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -15901,6 +16190,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -15973,6 +16263,7 @@
     "rescanAfterRelock": {
      "applied": 1,
      "codes": [
+      "redirect_pdm_stale_install_risk",
       "redirect_pypi_stale_install"
      ],
      "exit": 0,
@@ -15988,7 +16279,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -15999,6 +16292,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -16093,7 +16387,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -16107,7 +16403,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -16118,6 +16416,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -16217,7 +16516,9 @@
     },
     "rescanAfterRelock": {
      "applied": 1,
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "exit": 0,
      "patchInLock": true
     },
@@ -16231,7 +16532,9 @@
      "targetKept": true
     },
     "lockOnlyHosted": {
-     "codes": [],
+     "codes": [
+      "redirect_pdm_stale_install_risk"
+     ],
      "crawledUrllib3": [
       "pkg:pypi/urllib3@1.26.18"
      ],
@@ -16242,6 +16545,7 @@
     },
     "applied": 1,
     "codes": [
+     "redirect_pdm_stale_install_risk",
      "redirect_pypi_stale_install"
     ]
    }
@@ -17186,7 +17490,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.4.1",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -17247,7 +17551,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.4.1",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -18716,7 +19020,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.4.1",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -18777,7 +19081,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.4.1",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -20246,7 +20550,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.4.1",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -20307,7 +20611,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.4.1",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -21900,7 +22204,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.5.0",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -21961,7 +22265,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.5.0",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -23730,7 +24034,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.5.0",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -23791,7 +24095,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.5.0",
    "python": "3.11",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -26294,7 +26598,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.5.0",
    "python": "3.13",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -26355,7 +26659,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.5.0",
    "python": "3.13",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -28124,7 +28428,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.5.1",
    "python": "3.13",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,
@@ -28185,7 +28489,7 @@
    "outcome": "UNSUPPORTED",
    "lockVersion": "4.5.1",
    "python": "3.13",
-   "expected": "PDM `__pypackages__` layout: agent/vendored need a crawlable install (use hosted, or set `python.use_venv`)",
+   "expected": "PDM `__pypackages__` layout: agent/vendored cannot verify the install (use hosted, or set `python.use_venv`)",
    "baselineFresh": true,
    "info": {
     "applied": 0,

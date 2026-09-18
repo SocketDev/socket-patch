@@ -18,10 +18,11 @@ pub fn lock_version(lock: &DocumentMut) -> Result<&str, String> {
 
 pub fn validate_strategy(lock: &DocumentMut) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
-    if let Some(strategy) = lock
-        .get("metadata")
-        .and_then(|metadata| metadata.get("strategy"))
-    {
+    let Some(metadata) = lock.get("metadata") else {
+        return Ok(result);
+    };
+    if let Some(strategy) = metadata.get("strategy") {
+        // lock_version >= 4.4: the strategy is an array of flag strings.
         for item in strategy.as_array().ok_or("invalid PDM strategy")? {
             let value = item.as_str().ok_or("invalid PDM strategy flag")?;
             if !matches!(
@@ -32,12 +33,58 @@ pub fn validate_strategy(lock: &DocumentMut) -> Result<Vec<String>, String> {
             }
             result.push(value.to_string());
         }
+    } else {
+        // lock_version 4.3 (PDM 2.8-2.9) spells the strategy as `[metadata]`
+        // booleans instead of an array. Mirror PDM's own normalization so the
+        // flag set is recorded (and gated) identically to the array spelling.
+        for flag in ["cross_platform", "static_urls"] {
+            if let Some(item) = metadata.get(flag) {
+                if item.as_bool().ok_or("invalid PDM strategy flag")? {
+                    result.push(flag.to_string());
+                }
+            }
+        }
+    }
+    // A lock_version >= 4.4.1 without `inherit_metadata` (what `pdm lock
+    // --strategy no_inherit_metadata` writes) stores no per-package group or
+    // candidate metadata, so PDM ~2.12-2.23 re-resolves the lock at sync time
+    // and cannot match a package we rewrote to a `url`/`path` source
+    // (CandidateNotFound). Refuse rather than emit a lock that installs only on
+    // the exact PDM that wrote it. lock_version "4.4"/"4.3"/"2" predate the
+    // requirement (their default locks omit it) and stay allowed.
+    if matches!(lock_version(lock), Ok("4.4.1" | "4.5.0" | "4.5.1"))
+        && !result.iter().any(|flag| flag == "inherit_metadata")
+    {
+        return Err("PDM lock strategy lacks inherit_metadata; re-lock without \
+                    `--strategy no_inherit_metadata`"
+            .into());
     }
     Ok(result)
 }
 
+/// Mirror PDM's `safe_name(name).lower()`, which derives the legacy
+/// `[metadata.files]` keys (lock_version "2", PDM 0.12-1.5). `safe_name`
+/// collapses runs of characters outside `[A-Za-z0-9.]` to a single `-` but
+/// PRESERVES dots — unlike PEP 503 canonicalization, which folds `.` into `-`.
+/// So a dotted-name package such as `zope.interface` is keyed
+/// `"zope.interface <version>"`, not `"zope-interface <version>"`.
+fn pdm_files_key_name(name: &str) -> String {
+    let mut result = String::with_capacity(name.len());
+    let mut in_separator_run = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' {
+            in_separator_run = false;
+            result.push(ch.to_ascii_lowercase());
+        } else if !in_separator_run {
+            result.push('-');
+            in_separator_run = true;
+        }
+    }
+    result
+}
+
 pub fn legacy_files_key(package: &Table) -> Option<String> {
-    let name = canonicalize_pypi_name(package.get("name")?.as_str()?);
+    let name = pdm_files_key_name(package.get("name")?.as_str()?);
     let version = package.get("version")?.as_str()?;
     let mut extras: Vec<&str> = package
         .get("extras")
@@ -69,6 +116,32 @@ pub fn wheel_matches(filename: &str, name: &str, version: &str) -> bool {
         && matches!(parts.len(), 5 | 6)
         && canonicalize_pypi_name(parts[0]) == canonicalize_pypi_name(name)
         && parts[1] == version
+}
+
+/// Whether `existing` is an earlier hosted redirect of the SAME artifact:
+/// same origin (`scheme://host[:port]`) and same trailing wheel filename as the
+/// current artifact URL, fragments ignored. Grant tokens and patch uuids live
+/// in the path between them, so a rotated token or a superseded patch (new
+/// uuid) takes over the stale pin in place instead of being refused as a
+/// foreign source (the poetry / bun rewriters make the same call).
+fn is_prior_hosted_url(existing: &str, current: &str) -> bool {
+    fn origin_and_leaf(url: &str) -> Option<(&str, &str)> {
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return None;
+        }
+        let url = url.split('#').next()?;
+        let scheme_end = url.find("://")? + 3;
+        let path_start = url[scheme_end..].find('/')? + scheme_end;
+        let leaf = url[path_start..]
+            .rsplit('/')
+            .next()
+            .filter(|leaf| !leaf.is_empty())?;
+        Some((&url[..path_start], leaf))
+    }
+    match (origin_and_leaf(existing), origin_and_leaf(current)) {
+        (Some(old), Some(new)) => old == new,
+        _ => false,
+    }
 }
 
 pub fn rewrite_pdm_lock(
@@ -112,6 +185,21 @@ pub fn rewrite_pdm_lock(
     if indices.is_empty() {
         return Err("missing PDM package".into());
     }
+    // A marker/multi-target lock (PDM >= 2.17 `pdm lock --append`) can carry the
+    // same package at several versions, one per resolution fork. A single
+    // surgical rewrite would patch one fork and leave the others pinned to the
+    // registry, so refuse the whole lock ahead of the per-unit version check —
+    // the target version IS present, so the plain "version differs" below would
+    // misdirect the user to re-lock.
+    let locked_versions: std::collections::BTreeSet<&str> = indices
+        .iter()
+        .filter_map(|&index| packages.get(index)?.get("version").and_then(Item::as_str))
+        .collect();
+    if locked_versions.len() > 1 {
+        return Err("PDM lock resolves this package at multiple versions (a marker or \
+                    multi-target fork); patching one fork would leave the others unpatched"
+            .into());
+    }
     let mut variants = std::collections::BTreeSet::new();
     let mut edits = Vec::new();
     for index in indices {
@@ -133,7 +221,16 @@ pub fn rewrite_pdm_lock(
             "url", "path", "git", "hg", "svn", "bzr", "editable", "source",
         ] {
             if let Some(existing) = package.get(field) {
-                if field != kind || existing.as_str() != Some(location) {
+                let same_target = field == kind && existing.as_str() == Some(location);
+                // A prior socket-hosted `url` (rotated grant token or a
+                // superseded patch uuid — same origin and wheel leaf) is taken
+                // over in place; foreign urls and every other source refuse.
+                let prior_hosted = field == kind
+                    && kind == "url"
+                    && existing
+                        .as_str()
+                        .is_some_and(|existing| is_prior_hosted_url(existing, location));
+                if !same_target && !prior_hosted {
                     return Err(format!("refusing existing PDM {field} source"));
                 }
             }
@@ -191,6 +288,27 @@ pub fn rewrite_pdm_lock(
     Ok(result)
 }
 
+/// End (exclusive, before its line break) of the first top-level TOML header
+/// line at or after `from`, skipping blank/comment lines; `text.len()` at EOF;
+/// `from` itself when the next non-blank line is not a header (a shape PDM never
+/// writes — the fragment then ends where it used to). Kept local, like this
+/// module's own `extend_span`.
+fn next_header_end(text: &str, from: usize) -> usize {
+    let mut pos = from;
+    for line in text[from..].split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        if content.trim().is_empty() || content.trim_start().starts_with('#') {
+            pos += line.len();
+            continue;
+        }
+        if content.starts_with('[') {
+            return pos + content.len();
+        }
+        return from;
+    }
+    text.len()
+}
+
 pub fn pdm_lock_edits(
     original: &str,
     rewritten: &str,
@@ -228,6 +346,14 @@ pub fn pdm_lock_edits(
             span.end += text[span.end..]
                 .find(['\r', '\n'])
                 .unwrap_or(text.len() - span.end);
+            // Carry the unit's BOUNDARY (blank line(s) after it plus the next
+            // top-level header, or EOF): the rewrite APPENDS `url` to the unit,
+            // so for a lock_version-2 unit — whose body carries no inline
+            // `files` to diverge — the pristine fragment would otherwise be a
+            // strict prefix of the rewritten one, and replay's "already
+            // converged" guard (`!new.contains(original)`) could never fire for
+            // a relocked lock.
+            span.end = next_header_end(text, span.end);
             result.push(text[span].to_string());
             if !package.contains_key("files") {
                 let key = legacy_files_key(package).ok_or("missing PDM files key")?;
@@ -422,5 +548,109 @@ mod tests {
             "invalid"
         )
         .is_err());
+    }
+
+    fn doc(text: &str) -> DocumentMut {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn strategy_boolean_spelling_and_inherit_metadata_gate() {
+        // lock_version 4.3 (PDM 2.8-2.9) spells strategy as [metadata] booleans.
+        assert_eq!(
+            validate_strategy(&doc(&fixture("2.8.2"))).unwrap(),
+            vec!["cross_platform".to_string()],
+            "4.3 booleans are read (static_urls=false is not recorded)"
+        );
+        // 4.4 (2.10.4) default lock has no inherit_metadata and is still allowed.
+        assert!(validate_strategy(&doc(&fixture("2.10.4"))).is_ok());
+        // A 4.5.0 lock whose strategy drops inherit_metadata (what
+        // `pdm lock --strategy no_inherit_metadata` writes) is refused — PDM
+        // re-resolves such a lock and cannot round-trip our url/path source.
+        let stripped = fixture("2.17.3").replace("[\"inherit_metadata\"]", "[\"cross_platform\"]");
+        let err = validate_strategy(&doc(&stripped)).unwrap_err();
+        assert!(err.contains("inherit_metadata"), "{err}");
+        // The default 4.4.1/4.5.x locks keep inherit_metadata → allowed.
+        for v in ["2.11.2", "2.29.2"] {
+            assert!(validate_strategy(&doc(&fixture(v))).is_ok(), "{v}");
+        }
+    }
+
+    #[test]
+    fn multiple_locked_versions_refuse_as_a_fork() {
+        // A marker/multi-target lock holding urllib3 at two versions is refused
+        // ahead of the per-unit version check, with an accurate message.
+        let forked = format!(
+            "{}\n[[package]]\nname = \"urllib3\"\nversion = \"2.2.3\"\ngroups = [\"default\"]\nfiles = [\n    {{file = \"urllib3-2.2.3-py3-none-any.whl\", hash = \"sha256:{}\"}},\n]\n",
+            fixture("2.29.2").trim_end(),
+            "b".repeat(64)
+        );
+        let err = rewrite_pdm_lock(
+            &forked,
+            "urllib3",
+            "1.26.18",
+            ("path", PATH),
+            WHEEL,
+            &"a".repeat(64),
+        )
+        .unwrap_err();
+        assert!(err.contains("multiple versions"), "{err}");
+    }
+
+    #[test]
+    fn supersedes_a_prior_socket_hosted_url_in_place() {
+        let base = "https://patch.socket.dev/patch/pypi/urllib3/1.26.18";
+        let stale = format!("{base}/OLDTOKEN/OLDUUID/{WHEEL}");
+        let fresh = format!("{base}/NEWTOKEN/NEWUUID/{WHEEL}");
+        // A lock already routing through an earlier Socket url (rotated token /
+        // new uuid, same origin + wheel leaf) is superseded, not refused.
+        let wired = rewrite_pdm_lock(
+            &fixture("2.29.2"),
+            "urllib3",
+            "1.26.18",
+            ("url", &stale),
+            WHEEL,
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let rewired = rewrite_pdm_lock(
+            &wired,
+            "urllib3",
+            "1.26.18",
+            ("url", &fresh),
+            WHEEL,
+            &"a".repeat(64),
+        )
+        .unwrap();
+        assert!(rewired.contains(&fresh) && !rewired.contains(&stale), "{rewired}");
+        // A foreign (non-Socket) existing url is still refused.
+        let foreign = fixture("2.29.2").replace(
+            "name = \"urllib3\"",
+            "name = \"urllib3\"\nurl = \"https://example.com/urllib3-1.26.18-py2.py3-none-any.whl\"",
+        );
+        assert!(rewrite_pdm_lock(
+            &foreign,
+            "urllib3",
+            "1.26.18",
+            ("url", &fresh),
+            WHEEL,
+            &"a".repeat(64)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_files_key_preserves_dotted_names() {
+        // PDM 0.12-1.5 key [metadata.files] with safe_name(name).lower(), which
+        // keeps dots — unlike PEP 503 canonicalization.
+        let table: Table = "name = \"Zope.Interface\"\nversion = \"6.0\"\n"
+            .parse::<DocumentMut>()
+            .unwrap()
+            .as_table()
+            .clone();
+        assert_eq!(
+            legacy_files_key(&table).as_deref(),
+            Some("zope.interface 6.0")
+        );
     }
 }

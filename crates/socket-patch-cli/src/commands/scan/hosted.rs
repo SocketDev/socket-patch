@@ -1699,8 +1699,20 @@ pub(crate) async fn run_redirect_selected(
     // files — either written by this run or already present from an earlier
     // one. A granted reference whose rewriter found nothing to edit (e.g. no
     // lockfile) must NOT be recorded or attested: nothing pins the patch.
+    // A `pdm.lock` that is NOT the PyPI install driver (a `uv.lock` or
+    // `poetry.lock` sits beside it) is never rewritten this run, yet it can
+    // still carry a Socket artifact URL from an earlier run when pdm drove.
+    // That stale text pins nothing now, so it must not feed the substring
+    // confirmation probe below — otherwise an untouched uv/poetry project whose
+    // real lock was never redirected would report a bogus `redirected: 1` and
+    // persist a ledger record. When pdm DOES drive, pypi confirmation keys off
+    // `confirmed_pdm_uuids` and never consults this probe, so dropping the file
+    // here is always safe; `pdm.lock` only ever carries pypi URLs.
+    let pdm_inactive = files.contains_key("pdm.lock")
+        && (files.contains_key("uv.lock") || files.contains_key("poetry.lock"));
     let final_texts: Vec<&String> = files
         .iter()
+        .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
         .map(|(name, content)| rewrite.files.get(name).unwrap_or(content))
         .chain(
             rewrite

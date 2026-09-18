@@ -96,7 +96,9 @@ into the new version's section — see docs/releasing.md.
   (`utils/pdm_lock.rs`). Both preserve line endings and non-canonical spacing,
   support the legacy `[metadata.files]` table and separate `extras` entries,
   are idempotent, and leave `pyproject.toml` and `content_hash` untouched.
-  Supported lock formats are `2` (PDM 0.12–1.4) and `4.3`–`4.5.1` (PDM 2.8+);
+  Supported lock formats are `2` (PDM 0.12–1.4) and `4.3`–`4.5.1` (PDM 2.8.1+;
+  PDM 2.8.0 writes the same `4.3` lock but still loses candidate identity, so
+  upgrade to ≥ 2.8.1);
   the identity-losing `3.1` / `4.0`–`4.2` formats (PDM 1.8–2.7) and unknown
   future formats are refused before any write (`redirect_pdm_refused` /
   `pypi_pdm_lock_version_unsupported`), leaving the registry lock installable.
