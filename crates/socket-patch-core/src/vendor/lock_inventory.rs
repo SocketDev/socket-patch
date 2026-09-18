@@ -1374,6 +1374,52 @@ async fn inventory_poetry_lock(project_root: &Path) -> Option<Vec<LockfileEntry>
     Some(dedup_prefer_integrity(out))
 }
 
+/// `https://pypi.org/simple`, `https://pypi.python.org/simple`,
+/// `https://files.pythonhosted.org/…`: the public index PyPI's JSON API
+/// describes.
+fn is_public_pypi_url(url: &str) -> bool {
+    let host = url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let host = host.rsplit('@').next().unwrap_or(&host);
+    matches!(
+        host,
+        "pypi.org" | "www.pypi.org" | "pypi.python.org" | "files.pythonhosted.org"
+    )
+}
+
+/// The `(canonical name, version)` a Socket-written Pipfile.lock reference
+/// stands for: a hosted URL
+/// `https://<host>/patch/pypi/<name>/<version>/<grant>/<uuid>/<wheel>[#…]`
+/// (coordinates from the path) or a vendored path
+/// `[./].socket/vendor/pypi/<uuid>/<name>-<version>-…whl` (coordinates from
+/// the wheel filename). `None` for a user's own file/path reference.
+fn socket_reference_coords(reference: &str) -> Option<(String, String)> {
+    let reference = reference.split('#').next().unwrap_or(reference);
+    if let Some(rest) = reference.strip_prefix("https://") {
+        let path = rest.split_once('/')?.1;
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() == 7 && parts[0] == "patch" && parts[1] == "pypi" && parts[6].ends_with(".whl") {
+            return Some((canonicalize_pypi_name(parts[2]), parts[3].to_string()));
+        }
+        return None;
+    }
+    let rel = reference.trim_start_matches("./");
+    let rest = rel.strip_prefix(".socket/vendor/pypi/")?;
+    let (_uuid, wheel) = rest.split_once('/')?;
+    let stem = wheel.strip_suffix(".whl")?;
+    let mut fields = stem.split('-');
+    let name = fields.next()?;
+    let version = fields.next()?;
+    if name.is_empty() || version.is_empty() || !version.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((canonicalize_pypi_name(name), version.to_string()))
+}
+
 /// Pipfile.lock (pipfile-spec 6): every category other than `_meta` holds
 /// `name: {"version": "==X", "hashes": ["sha256:<hex>", …], …}` entries.
 /// Registry pins (`==` version) become entries whose integrity is the SET of
@@ -1388,8 +1434,25 @@ async fn inventory_pipfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
     let text = read_regular_to_string(&project_root.join("Pipfile.lock"))
         .await
         .ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let value: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
     let root = value.as_object()?;
+    // Digests are only fetchable through PyPI's JSON API when the lock
+    // resolves from PyPI: a lock whose `_meta.sources` name only private
+    // indexes must not leak its package names to pypi.org (and would not find
+    // its files there anyway) — its entries stay discovery-only.
+    let public_index = root
+        .get("_meta")
+        .and_then(|m| m.get("sources"))
+        .and_then(serde_json::Value::as_array)
+        .map_or(true, |sources| {
+            sources.is_empty()
+                || sources.iter().any(|source| {
+                    source
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(is_public_pypi_url)
+                })
+        });
     let mut out = Vec::new();
     for (section, entries) in root {
         if section == "_meta" {
@@ -1402,7 +1465,33 @@ async fn inventory_pipfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
             let Some(entry) = entry.as_object() else {
                 continue;
             };
-            if ["git", "hg", "svn", "bzr", "file", "path", "editable"]
+            // Socket's own references (a hosted `file` URL, a vendored
+            // `./.socket/vendor/pypi/<uuid>/<wheel>` path) stay DISCOVERABLE
+            // as the package they replace, so a re-scan of an already
+            // redirected lock-only checkout still lists (and re-confirms /
+            // attests) it instead of reporting zero packages.
+            if let Some(reference) = entry
+                .get("file")
+                .or_else(|| entry.get("path"))
+                .and_then(serde_json::Value::as_str)
+            {
+                if let Some((n, v)) = socket_reference_coords(reference) {
+                    if path_safety::is_safe_single_segment(&n)
+                        && path_safety::is_safe_single_segment(&v)
+                    {
+                        out.push(LockfileEntry {
+                            ecosystem: "pypi",
+                            purl: format!("pkg:pypi/{n}@{v}"),
+                            name: n,
+                            version: v,
+                            resolved: None,
+                            integrity: LockIntegrity::None,
+                        });
+                    }
+                }
+                continue;
+            }
+            if ["git", "hg", "svn", "bzr", "editable"]
                 .iter()
                 .any(|key| entry.contains_key(*key))
             {
@@ -1433,7 +1522,7 @@ async fn inventory_pipfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
                 .filter(|h| is_hex_of_len(h, 64))
                 .map(|h| h.to_ascii_lowercase())
                 .collect();
-            let integrity = if hashes.is_empty() {
+            let integrity = if hashes.is_empty() || !public_index {
                 LockIntegrity::None
             } else {
                 LockIntegrity::Sha256AnyOf(hashes)
@@ -3412,10 +3501,11 @@ source = { editable = "." }
     }
 
     /// Pipfile.lock: every category is read, registry pins carry the lock's
-    /// digest SET (lowercased), non-registry sources / range pins / our own
-    /// file references are skipped, the same package in two categories
-    /// yields one entry, requirements.txt is read alongside it, and a
-    /// parseable uv.lock outranks both.
+    /// digest SET (lowercased), non-registry sources / range pins / a user's
+    /// file references are skipped while our own vendored reference stays
+    /// discoverable, the same package in two categories yields one entry,
+    /// requirements.txt is read alongside it, and a parseable uv.lock
+    /// outranks both.
     #[tokio::test]
     async fn pipfile_lock_inventory_reads_every_category_with_its_digest_set() {
         let wheel = "a".repeat(64);
@@ -3444,8 +3534,11 @@ source = { editable = "." }
         let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
         let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         names.sort_unstable();
-        // requirements.txt is read alongside the Pipfile.lock, not hidden by it.
-        assert_eq!(names, vec!["flask", "six", "urllib3"], "{entries:?}");
+        // requirements.txt is read alongside the Pipfile.lock, not hidden by
+        // it; our own vendored reference stays discoverable (discovery-only).
+        assert_eq!(names, vec!["flask", "six", "urllib3", "wired"], "{entries:?}");
+        assert_eq!(entry(&entries, "wired").integrity, LockIntegrity::None);
+        assert_eq!(entry(&entries, "wired").purl, "pkg:pypi/wired@1.0");
         let urllib3 = entry(&entries, "urllib3");
         assert_eq!(urllib3.purl, "pkg:pypi/urllib3@1.26.18");
         assert_eq!(urllib3.resolved, None);
@@ -3487,6 +3580,49 @@ source = { editable = "." }
         .await;
         let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
         assert_eq!(entry(&entries, "urllib3").integrity, LockIntegrity::None);
+    }
+
+    /// Socket's own references in a Pipfile.lock (a hosted URL, a vendored
+    /// path) keep the package discoverable on a lock-only re-scan; a lock
+    /// whose sources are private indexes only never carries a fetchable
+    /// digest set (no pypi.org lookups for it).
+    #[tokio::test]
+    async fn pipfile_lock_inventory_keeps_socket_references_discoverable_and_respects_private_indexes() {
+        let hosted = r#"{"_meta": {"pipfile-spec": 6, "sources": [{"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true}]},
+"default": {
+ "urllib3": {"file": "https://patch.socket.dev/patch/pypi/urllib3/1.26.18/grant/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl#sha256=cc", "hashes": ["sha256:cc"], "markers": "x"},
+ "Six": {"file": "./.socket/vendor/pypi/00000000-0000-4000-8000-000000000000/six-1.16.0-py2.py3-none-any.whl", "hashes": ["sha256:dd"]},
+ "fork": {"file": "./forks/fork-1.0-py3-none-any.whl"},
+ "requests": {"version": "==2.31.0", "hashes": ["sha256:%s"]}
+}}"#.replace("%s", &"a".repeat(64));
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "Pipfile.lock", &hosted).await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["requests", "six", "urllib3"], "{entries:?}");
+        assert_eq!(entry(&entries, "urllib3").purl, "pkg:pypi/urllib3@1.26.18");
+        assert_eq!(entry(&entries, "urllib3").integrity, LockIntegrity::None, "a hosted reference is discovery-only");
+        assert_eq!(entry(&entries, "six").purl, "pkg:pypi/six@1.16.0");
+        assert_eq!(entry(&entries, "six").integrity, LockIntegrity::None);
+        assert!(matches!(entry(&entries, "requests").integrity, LockIntegrity::Sha256AnyOf(_)));
+
+        // Private index only → the registry pin is discovery-only.
+        let private = hosted.replace("https://pypi.org/simple", "https://pypi.internal.example/simple");
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "Pipfile.lock", &private).await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert_eq!(entry(&entries, "requests").integrity, LockIntegrity::None, "no pypi.org lookup for a private-index lock");
+        // A mirror listed next to PyPI keeps the digest set.
+        let mixed = hosted.replace(r#"[{"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true}]"#, r#"[{"name": "mirror", "url": "https://mirror.example/simple", "verify_ssl": true}, {"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true}]"#);
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "Pipfile.lock", &mixed).await;
+        let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+        assert!(matches!(entry(&entries, "requests").integrity, LockIntegrity::Sha256AnyOf(_)));
+        assert!(is_public_pypi_url("https://user:tok@pypi.org/simple"));
+        assert!(!is_public_pypi_url("https://pypi.org.evil.example/simple"));
+        assert_eq!(socket_reference_coords("./forks/fork-1.0-py3-none-any.whl"), None);
+        assert_eq!(socket_reference_coords("https://example.org/patch/pypi/a/1/g/u/a-1-py3-none-any.whl"), Some(("a".into(), "1".into())));
     }
 
     /// A lock that lists a pure-Python wheel carries its sha256 (lock 2.x
@@ -4465,20 +4601,36 @@ mod recover_tests {
             assert!(!err.contains("uv.lock fragment recorded"), "{kind}: {err}");
         }
 
-        // pipenv records a JSON object (hashes + version), not a string unit.
+        // pipenv records a JSON object (hashes + version), not a string unit:
+        // its digest set IS fetchable (PyPI JSON API lookup by digest), so a
+        // lock-only checkout of an already-vendored project recovers.
         let pipenv = entry(
             "pypi",
             "pkg:pypi/six@1.16.0",
             vec![rec(
                 "pipenv_lock_entry",
                 serde_json::json!({
-                    "hashes": [format!("sha256:{}", "a".repeat(64))],
+                    "hashes": [format!("sha256:{}", "a".repeat(64)), format!("sha256:{}", "B".repeat(64))],
                     "version": "==1.16.0",
                 }),
             )],
         );
-        let err = recover_lock_entry(tmp.path(), &pipenv).await.unwrap_err();
-        assert!(err.contains("no fetchable registry URL"), "pipenv: {err}");
+        let recovered = recover_lock_entry(tmp.path(), &pipenv).await.unwrap();
+        assert_eq!(recovered.purl, "pkg:pypi/six@1.16.0");
+        assert_eq!(recovered.resolved, None);
+        assert_eq!(
+            recovered.integrity,
+            LockIntegrity::Sha256AnyOf(vec!["a".repeat(64), "b".repeat(64)]),
+            "lowercased digest set"
+        );
+        // …but a pipenv fragment without digests has nothing to fetch by.
+        let digestless = entry(
+            "pypi",
+            "pkg:pypi/six@1.16.0",
+            vec![rec("pipenv_lock_entry", serde_json::json!({"version": "==1.16.0"}))],
+        );
+        let err = recover_lock_entry(tmp.path(), &digestless).await.unwrap_err();
+        assert!(err.contains("no sha256 digests"), "pipenv: {err}");
 
         // A ledger with no pypi fragment at all is still a hard error.
         let bare = entry("pypi", "pkg:pypi/six@1.16.0", vec![]);

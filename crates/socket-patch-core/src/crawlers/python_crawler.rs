@@ -394,11 +394,24 @@ fn pipenv_workon_home(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> 
     Some(data_home.join("virtualenvs"))
 }
 
+/// `os.path.expanduser("~")` as Pipenv's Python sees it: `USERPROFILE` (then
+/// `HOMEDRIVE`+`HOMEPATH`) on Windows — Python 3.8+ ignores `HOME` there, so a
+/// Git-Bash `HOME=/c/Users/u` must not win — and `HOME` elsewhere.
 fn pipenv_home_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    var("HOME")
-        .or_else(|| var("USERPROFILE"))
-        .filter(|v| !v.trim().is_empty())
-        .map(PathBuf::from)
+    let non_empty = |v: String| (!v.trim().is_empty()).then_some(v);
+    if cfg!(windows) {
+        var("USERPROFILE")
+            .and_then(non_empty)
+            .or_else(|| {
+                let drive = var("HOMEDRIVE").and_then(non_empty)?;
+                let path = var("HOMEPATH").and_then(non_empty)?;
+                Some(format!("{drive}{path}"))
+            })
+            .or_else(|| var("HOME").and_then(non_empty))
+            .map(PathBuf::from)
+    } else {
+        var("HOME").and_then(non_empty).map(PathBuf::from)
+    }
 }
 
 /// `os.path.expanduser(os.path.expandvars(raw))`: `$NAME` / `${NAME}` (and
@@ -1159,6 +1172,13 @@ mod tests {
         assert_eq!(with(Some("~/envs"), None), Some(PathBuf::from("/home/u/envs")));
         if cfg!(windows) {
             assert_eq!(with(None, None), Some(PathBuf::from("/home/u").join(".virtualenvs")));
+            // USERPROFILE wins over a Git-Bash style HOME, like Python's expanduser.
+            let var = |name: &str| match name {
+                "HOME" => Some("/c/Users/u".to_string()),
+                "USERPROFILE" => Some(r"C:\Users\u".to_string()),
+                _ => None,
+            };
+            assert_eq!(pipenv_workon_home(&var), Some(PathBuf::from(r"C:\Users\u").join(".virtualenvs")));
         } else {
             assert_eq!(
                 with(None, None),

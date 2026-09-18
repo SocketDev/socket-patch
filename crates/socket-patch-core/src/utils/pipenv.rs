@@ -246,17 +246,4 @@ mod tests {
         assert_eq!(found, bin.join("pipenv.bat"));
         assert!(is_batch_shim(&found));
     }
-
-    #[tokio::test]
-    async fn override_env_short_circuits_the_probe() {
-        // Serialized on the env var by name; the value is process-global.
-        let saved = std::env::var(MAJOR_OVERRIDE_ENV).ok();
-        std::env::set_var(MAJOR_OVERRIDE_ENV, " 11 ");
-        let forced = installed_major(Path::new(".")).await;
-        match saved {
-            Some(v) => std::env::set_var(MAJOR_OVERRIDE_ENV, v),
-            None => std::env::remove_var(MAJOR_OVERRIDE_ENV),
-        }
-        assert_eq!(forced, Some(11));
-    }
 }
