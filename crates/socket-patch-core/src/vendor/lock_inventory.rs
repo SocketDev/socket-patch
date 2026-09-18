@@ -1444,7 +1444,7 @@ async fn inventory_pipfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
         .get("_meta")
         .and_then(|m| m.get("sources"))
         .and_then(serde_json::Value::as_array)
-        .map_or(true, |sources| {
+        .is_none_or(|sources| {
             sources.is_empty()
                 || sources.iter().any(|source| {
                     source
