@@ -886,7 +886,7 @@ def main():
             return row
         # The scan ran against a venv holding the UPSTREAM release: Pipenv will
         # not reinstall it, so the CLI must say so (positive-evidence probe).
-        stale_code = "redirect_pipenv_stale_install" if mode == "hosted" else "pypi_pipenv_stale_install"
+        stale_code = "redirect_pypi_stale_install" if mode == "hosted" else "pypi_pipenv_stale_install"
         stale = [w for w in warnings if (w.get("code") or w.get("errorCode")) == stale_code]
         stale_text = (stale[0].get("detail") or stale[0].get("reason") or "") if stale else ""
         check("staleInstallWarned", bool(stale) and "pipenv run pip uninstall" in stale_text, {"codes": sorted({(w.get("code") or w.get("errorCode")) for w in warnings if (w.get("code") or w.get("errorCode"))}), "detail": stale_text[:300] or None})

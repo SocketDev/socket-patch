@@ -1,0 +1,14 @@
+[[package]]
+category = "main"
+description = "HTTP library with thread-safe connection pooling, file post, and more."
+name = "urllib3"
+optional = false
+python-versions = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, !=3.4.*, !=3.5.*"
+version = "1.26.18"
+
+[metadata]
+content-hash = "4f9ffb08e662523420bf03909c6f496ad5f6d44d5107bda8fb5955ce0dfe3ab2"
+python-versions = ">=3.8"
+
+[metadata.hashes]
+urllib3 = []

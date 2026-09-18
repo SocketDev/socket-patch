@@ -53,6 +53,7 @@ enum PypiFlavor {
     Pipenv,
     /// Plain `requirements.txt` (pip / `uv pip`) → line rewriting.
     Requirements,
+    Hatch,
 }
 
 impl PypiFlavor {
@@ -64,6 +65,7 @@ impl PypiFlavor {
             PypiFlavor::Pdm => "pdm",
             PypiFlavor::Pipenv => "pipenv",
             PypiFlavor::Requirements => "requirements",
+            PypiFlavor::Hatch => "hatch",
         }
     }
 }
@@ -304,6 +306,17 @@ async fn detect_pypi_flavor(
     if has_requirements {
         return Ok((PypiFlavor::Requirements, warnings));
     }
+    if exists("hatch.toml").await
+        || has_pyproject_table("tool.hatch")
+        || pyproject_text.as_ref().is_some_and(|text| {
+            let files = [("pyproject.toml".to_owned(), text.clone())]
+                .into_iter()
+                .collect();
+            crate::utils::hatch::is_hatch(&files)
+        })
+    {
+        return Ok((PypiFlavor::Hatch, warnings));
+    }
     if pyproject_text.is_some() {
         return Err((
             "pypi_pyproject_only",
@@ -328,6 +341,7 @@ enum WiringPlan {
     Uv(Box<UvProject>),
     PythonLocks(super::pypi_lock::PythonLocks),
     Requirements,
+    Hatch(super::pypi_hatch::HatchProject),
     Poetry(Box<PoetryProject>),
     Pdm(Box<PdmProject>),
     Pipenv(Box<PipenvProject>),
@@ -617,6 +631,16 @@ pub async fn vendor_pypi_with_pipenv_version(
                 WiringPlan::PythonLocks(project)
             }
         }
+        PypiFlavor::Hatch => {
+            match super::pypi_hatch::load(project_root, &canon_name, version, &record.uuid).await {
+                Ok(project) if project.in_sync => {
+                    wired_pin = project.pin;
+                    WiringPlan::InSync
+                }
+                Ok(project) => WiringPlan::Hatch(project),
+                Err((code, detail)) => return refused(code, detail),
+            }
+        }
         PypiFlavor::Requirements => {
             match preflight_requirements(project_root, &canon_name, version, &record.uuid).await {
                 Ok(RequirementsTarget::InSync { pin }) => {
@@ -729,7 +753,16 @@ pub async fn vendor_pypi_with_pipenv_version(
         // not-installed re-run stays green). Missing artifact → rebuild the
         // wheel only; the wiring is correct and re-running it would re-record
         // live vendored fragments as pre-vendor originals.
-        if uuid_dir_has_wheel(&project_root.join(&uuid_dir_rel)).await || dry_run {
+        let artifact_present = if flavor == PypiFlavor::Hatch {
+            if let Some((wheel, _)) = &wired_pin {
+                project_root.join(wheel).is_file()
+            } else {
+                false
+            }
+        } else {
+            uuid_dir_has_wheel(&project_root.join(&uuid_dir_rel)).await
+        };
+        if artifact_present || dry_run {
             return done(
                 already_patched_result(base, Path::new(""), &record.files),
                 None,
@@ -819,6 +852,7 @@ pub async fn vendor_pypi_with_pipenv_version(
             PypiFlavor::Pipenv => {
                 "Pipfile.lock now resolves it from this single-platform wheel only"
             }
+            PypiFlavor::Hatch => "Hatch now installs this single-platform wheel only",
             PypiFlavor::Requirements => {
                 "the requirements.txt path line installs on this platform only"
             }
@@ -903,6 +937,16 @@ pub async fn vendor_pypi_with_pipenv_version(
             (wiring, MetaSlot::Uv(Some(meta)))
         }),
         WiringPlan::PythonLocks(project) => super::pypi_lock::wire_python_locks(
+            &project,
+            project_root,
+            &canon_name,
+            version,
+            &rel_wheel,
+            &artifact.sha256_hex,
+        )
+        .await
+        .map(|wiring| (wiring, MetaSlot::None)),
+        WiringPlan::Hatch(project) => super::pypi_hatch::wire(
             &project,
             project_root,
             &canon_name,
@@ -1064,6 +1108,7 @@ async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Optio
     let needle = format!(".socket/vendor/pypi/{uuid}/");
     let mut names: Vec<String> = [
         "pyproject.toml",
+        "hatch.toml",
         "uv.lock",
         "pylock.toml",
         "poetry.lock",
@@ -1153,10 +1198,11 @@ async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Optio
 /// `VendorEntry::flavor` values the dispatch below knows how to revert —
 /// the set an UNWIRED entry must belong to (or be `None`) before it is
 /// treated as a reclaimable orphan.
-const KNOWN_PYPI_FLAVORS: [&str; 6] = [
+const KNOWN_PYPI_FLAVORS: [&str; 7] = [
     "uv",
     "python-lock",
     "requirements",
+    "hatch",
     "poetry",
     "pdm",
     "pipenv",
@@ -1216,6 +1262,7 @@ pub async fn revert_pypi_opts(
             Some("python-lock") => {
                 super::pypi_lock::revert_python_locks(entry, project_root, dry_run).await
             }
+            Some("hatch") => super::pypi_hatch::revert(entry, project_root, dry_run).await,
             Some("requirements") => revert_requirements(entry, project_root, dry_run).await,
             Some("poetry") => super::pypi_poetry::revert_poetry(entry, project_root, dry_run).await,
             Some("pdm") => super::pypi_pdm::revert_pdm(entry, project_root, dry_run).await,
@@ -5889,5 +5936,20 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
         assert!(warnings
             .iter()
             .any(|warning| warning.code == "pypi_unmatched_lockfiles"));
+    }
+}
+
+#[cfg(test)]
+mod hatch_routing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn hatchling_with_requirements_preserves_pip_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("pyproject.toml"), "[build-system]\nbuild-backend=\"hatchling.build\"\n[project]\ndependencies=[\"urllib3==1.26.18\"]\n").await.unwrap();
+        tokio::fs::write(dir.path().join("requirements.txt"), "urllib3==1.26.18\n").await.unwrap();
+        assert_eq!(detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18"))).await.unwrap().0, PypiFlavor::Requirements);
+        tokio::fs::remove_file(dir.path().join("requirements.txt")).await.unwrap();
+        assert_eq!(detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18"))).await.unwrap().0, PypiFlavor::Hatch);
     }
 }

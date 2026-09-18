@@ -390,7 +390,7 @@ async fn warm_venv_with_the_upstream_release_is_not_attested() {
 
     // The lock is rewritten, but the installed release is the UPSTREAM one
     // Pipenv will not reinstall: the stale purl is kept out of the same-run
-    // attestation (`redirect_pipenv_stale_install`), so nothing can be
+    // attestation (`redirect_pypi_stale_install`), so nothing can be
     // attested and the embedded-VEX contract fails the command.
     let code = run(hosted_args(tmp.path(), server.uri(), Some(&vex_path))).await;
     let redirected = read(&lock_path);

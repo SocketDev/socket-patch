@@ -101,9 +101,15 @@ history of this demotion shows every piece to restore (catalog constants,
 preflight registration, the install-proof leg, and these tables) in both
 production suites.
 
-PyPI's poetry / pdm locks are **not** rewritten by hosted mode; Pipenv's `Pipfile.lock` is (see [Pipenv compatibility](pipenv-compatibility.md)) (see the
-[matrix](../ecosystems.md#mode--ecosystem-matrix)); those flavors are vendored-mode
-only, so there is no hosted leg to write for them.
+PyPI's pdm lock is **not** rewritten by hosted mode (see the
+[matrix](../ecosystems.md#mode--ecosystem-matrix)); that flavor is vendored-mode
+only, so there is no hosted leg to write for it. `poetry.lock` IS rewritten
+(Poetry 1.0+); its live coverage is the per-release matrix in
+[poetry-compatibility.md](poetry-compatibility.md) (`scripts/backtest-poetry.py`),
+and `Pipfile.lock` IS rewritten (Pipenv 7+); its live coverage is the per-release
+matrix in [pipenv-compatibility.md](pipenv-compatibility.md)
+(`scripts/backtest-pipenv.py`). Both install the redirected lock with every
+release rather than one pinned installer, so they are not duplicated as legs here.
 
 Two supported hosted shapes are deliberately **not** covered here:
 

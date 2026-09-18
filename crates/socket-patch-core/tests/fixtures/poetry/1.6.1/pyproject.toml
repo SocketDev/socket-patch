@@ -1,0 +1,9 @@
+[tool.poetry]
+name = "poetry-patch-fixture"
+version = "0.1.0"
+description = ""
+authors = ["Socket <engineering@socket.dev>"]
+
+[tool.poetry.dependencies]
+python = ">=3.8"
+urllib3 = "1.26.18"

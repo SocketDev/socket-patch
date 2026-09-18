@@ -67,6 +67,8 @@ pub mod nuget_feed;
 pub mod pnpm_lock;
 pub mod pnpm_lock_legacy;
 pub mod pypi;
+mod pypi_hatch;
+pub(crate) use pypi_lock::restore_document as restore_python_document;
 mod pypi_lock;
 pub mod pypi_pdm;
 pub mod pypi_pipenv;

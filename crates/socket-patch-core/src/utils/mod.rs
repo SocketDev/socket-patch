@@ -2,6 +2,7 @@ pub mod env_compat;
 pub mod fs;
 pub(crate) mod http;
 pub mod pipenv;
+pub mod poetry_lock;
 pub mod process;
 pub mod purl;
 pub mod python_lock;
@@ -19,3 +20,5 @@ pub use crate::api::date;
 pub use crate::crawlers::fuzzy_match;
 pub use crate::manifest::cleanup_blobs;
 pub use crate::telemetry;
+
+pub mod hatch;

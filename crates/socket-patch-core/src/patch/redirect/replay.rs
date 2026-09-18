@@ -53,6 +53,7 @@ enum Inverse {
     /// Cargo.toml insert variant, the maven version suffix).
     ReplaceFragment,
     PipenvEntry,
+    HatchDocument,
     /// action `added` with only `new` recorded: the redirect inserted the
     /// fragment into a pre-existing file, so the inverse removes it once
     /// (an absent fragment is the desired end state — no-op).
@@ -88,9 +89,10 @@ enum Inverse {
 fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
     match kind {
         "redirect_pipenv_entry" => ("pypi", Inverse::PipenvEntry),
-        "redirect_requirements_line" | "redirect_uv_lock_wheel" => {
+        "redirect_requirements_line" | "redirect_uv_lock_wheel" | "redirect_poetry_lock_package" => {
             ("pypi", Inverse::ReplaceFragment)
         }
+        "redirect_hatch_document" => ("pypi", Inverse::HatchDocument),
         "redirect_composer_dist" => ("composer", Inverse::ReplaceFragment),
         "redirect_cargo_toml_dep" | "redirect_cargo_lock_entry" => {
             ("cargo", Inverse::ReplaceFragment)
@@ -437,7 +439,7 @@ pub async fn revert_remaining_redirect_edits(
                         }
                     }
                 }
-                Inverse::ReplaceFragment => {
+                Inverse::ReplaceFragment | Inverse::HatchDocument => {
                     let (Some(original), Some(new)) =
                         (str_payload(&edit.original), str_payload(&edit.new))
                     else {
@@ -461,6 +463,20 @@ pub async fn revert_remaining_redirect_edits(
                             continue 'group;
                         }
                     };
+                    if inverse == Inverse::HatchDocument {
+                        match crate::vendor::restore_python_document(&content, original, new) {
+                            Ok((restored, false)) => {
+                                staged.insert(edit.path.clone(), Some(restored));
+                                group_drops.insert(idx);
+                            }
+                            _ => {
+                                refuse(format!("{}: Hatch configuration drifted", edit.path), &mut outcome);
+                                refused_groups.insert(group);
+                                continue 'group;
+                            }
+                        }
+                        continue;
+                    }
                     // `new` before `original`: original may be a substring
                     // of new (Cargo.toml insert, maven version suffix).
                     if content.contains(new) {
@@ -758,6 +774,28 @@ mod tests {
 
     async fn read(root: &Path, rel: &str) -> String {
         tokio::fs::read_to_string(root.join(rel)).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn hatch_documents_revert_after_checkout_newline_conversion() {
+        let original = "[project]\ndependencies=[\"one==1\"]\n[tool.hatch.envs.default]\n";
+        let files = [("pyproject.toml".to_owned(), original.to_owned())].into_iter().collect();
+        let patched = crate::utils::hatch::rewrite(&files, "one", "1", "https://patch.test/one.whl").unwrap().remove("pyproject.toml").unwrap();
+        for drift in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let live = if drift {patched.replace("one.whl", "changed.whl")} else {patched.replace('\n', "\r\n")};
+            write(dir.path(), "pyproject.toml", &live).await;
+            let mut state = state_with(vec![edit("pyproject.toml", "redirect_hatch_document", "rewritten", Some(original), Some(&patched))], &["pkg:pypi/one@1"]);
+            let outcome = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+            assert_eq!(outcome.fully_reverted(), !drift);
+            if drift {
+                assert_eq!(read(dir.path(), "pyproject.toml").await, live);
+                assert_eq!(state.edits.len(), 1);
+            } else {
+                assert_eq!(read(dir.path(), "pyproject.toml").await, original.replace('\n', "\r\n"));
+                assert!(state.edits.is_empty());
+            }
+        }
     }
 
     // ---------- ReplaceFragment ----------

@@ -505,7 +505,11 @@ fn restore_item(live: &mut Item, original: &Item, new: &Item) -> bool {
     true
 }
 
-fn restore_document(live: &str, original: &str, new: &str) -> Result<(String, bool), String> {
+pub(crate) fn restore_document(
+    live: &str,
+    original: &str,
+    new: &str,
+) -> Result<(String, bool), String> {
     if live == new || live == original {
         return Ok((original.to_string(), false));
     }

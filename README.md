@@ -233,7 +233,7 @@ The same patched bytes can reach your build three different ways. The modes diff
 |------|----------------------|--------------------------|-----------|
 | **agent** — `scan --mode agent` (or [`apply`](#apply)) | `.socket/` manifest + blobs, committed; the CLI re-applies after each install | The `socket-patch` CLI must run (install hook via [`setup`](#setup), or an `apply` step in CI) | Small repo footprint (per-file blobs, not whole packages); no lockfile edits; the only mode that needs CI / install-hook changes |
 | **vendored** — `scan --mode vendored` (or [`vendor`](#vendor)) | Patched packages committed under `.socket/vendor/`; the lockfile is rewired to consume them | **None** — the package manager installs the committed bytes | Fully airgapped and hermetic, at the cost of repo size |
-| **hosted** — `scan --mode hosted` | No patched bytes in your repo: the lockfile is rewritten so **only** the patched dependencies resolve to Socket-hosted, integrity-pinned packages on `patch.socket.dev`; the edits + patch records are ledgered in `.socket/vendor/redirect-state.json` (commit it — [`vex`](#vex) reads it, and it records the pre-redirect originals a future revert feature will need; hosted has no CLI revert yet, see [Undo things](#undo-things)) | Installs must be able to reach `patch.socket.dev` (no CLI, no install hook) | Smallest possible diff (lockfile + ledger); not for airgapped installs |
+| **hosted** — `scan --mode hosted` | No patched bytes in your repo: the lockfile is rewritten so **only** the patched dependencies resolve to Socket-hosted, integrity-pinned packages on `patch.socket.dev`; the edits + patch records are ledgered in `.socket/vendor/redirect-state.json` (commit it — [`vex`](#vex) reads it, and [`rollback`](#rollback) replays its recorded pre-redirect originals to unwind the redirect, see [Undo things](#undo-things)) | Installs must be able to reach `patch.socket.dev` (no CLI, no install hook) | Smallest possible diff (lockfile + ledger); not for airgapped installs |
 
 Every mode pins the patched bytes: in agent mode the CLI verifies every file on each
 apply; vendored and hosted modes lean on your package manager's own lockfile integrity
@@ -286,7 +286,7 @@ Pipenv never reinstalls a release that is already present: `pipenv install`,
 `pipenv install --deploy` and `pipenv sync` all exit 0 and keep the installed
 bytes, on every Pipenv major. A hosted or vendored rewrite therefore
 protects fresh installs, and Socket Patch warns
-(`redirect_pipenv_stale_install` / `pypi_pipenv_stale_install`) when a venv
+(`redirect_pypi_stale_install` / `pypi_pipenv_stale_install`) when a venv
 still holds the upstream release, with the verified remedy:
 `pipenv run pip uninstall -y <pkg> && pipenv sync` (or `pipenv --rm &&
 pipenv sync`). Do not use `pipenv uninstall <pkg>` for this — it rewrites the
@@ -401,11 +401,12 @@ and repair; pick by what you want back:
 
 And `setup --remove` reverts the install hooks that `setup` added.
 
-> Hosted mode has no CLI revert yet: `scan --mode hosted` makes plain lockfile /
-> registry-config edits, so undo them with your version control (e.g.
-> `git checkout -- <lockfile>`) and delete the `.socket/vendor/redirect-state.json`
-> ledger — once you've reverted by hand, its recorded original fragments are stale, and
-> a leftover ledger would still let [`vex`](#vex) attest the removed redirects.
+> Hosted mode is unwound by [`rollback`](#rollback), which replays the original
+> lockfile / registry-config fragments recorded in `.socket/vendor/redirect-state.json`
+> and drops the redirect records. If you revert a hosted edit by hand instead (e.g.
+> `git checkout -- <lockfile>`), also delete that ledger — its recorded originals are
+> then stale, and a leftover ledger would still let [`vex`](#vex) attest the removed
+> redirects.
 
 ## Command reference
 

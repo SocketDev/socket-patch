@@ -42,7 +42,7 @@ import on modern Pythons); 2018–2022 on Python 3.8; 2023+ on Python 3.12.
   installed, `pipenv install`, `pipenv install --deploy` and `pipenv sync`
   exit 0 and keep the upstream bytes — on every major, hosted and vendored.
   The rewritten lock protects fresh installs; the CLI warns
-  (`redirect_pipenv_stale_install` / `pypi_pipenv_stale_install`) while a
+  (`redirect_pypi_stale_install` / `pypi_pipenv_stale_install`) while a
   venv still holds the upstream release. Verified remedies (Pipfile
   byte-untouched): `pipenv run pip uninstall -y <pkg> && pipenv sync`, or
   `pipenv --rm && pipenv sync`. `pipenv uninstall <pkg>` is **not** a remedy:
