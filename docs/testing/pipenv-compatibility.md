@@ -116,7 +116,9 @@ the stale-install warning over a warm venv, whether Pipenv reinstalls a warm
 venv (recorded), the lock-driven install into an emptied venv with the
 installed bytes checked against the patch record's Git blob SHA-256 hashes, a
 fresh clone of the committed state, `pipenv verify` / `requirements`, tamper
-rejection, what `pipenv lock` does to the entry, rollback after that relock,
+rejection, what `pipenv lock` does to the entry, rollback after that relock
+(a registry-shaped entry is kept and only the ledger retires; the Pipenv 2023+
+hybrid that still carries our reference rolls back to the original entry),
 `vex`, and a byte-exact `rollback`. Agent mode additionally checks that
 repeat installs and `sync` keep the in-place patch, and the out-of-tree leg
 requires the bare scan to see Pipenv's venv.

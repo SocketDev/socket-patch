@@ -208,6 +208,13 @@ class Run:
         return (self.out + self.err)[-n:]
 
 
+def urllib3_entries(lock_bytes):
+    """Every category's urllib3 entry of a Pipfile.lock, parsed, for a
+    semantic (key-order- and whitespace-insensitive) comparison."""
+    data = json.loads(lock_bytes.decode("utf-8-sig"))
+    return {cat: entries["urllib3"] for cat, entries in data.items() if cat != "_meta" and isinstance(entries, dict) and "urllib3" in entries}
+
+
 def require(r, what):
     if not r.ok():
         raise RuntimeError(f"{what} failed (exit {r.rc}):\n{(r.out + r.err)[-4000:]}")
@@ -1012,9 +1019,14 @@ def main():
         relocked = (project / "Pipfile.lock").read_bytes()
         marker = b"patch.socket.dev" if mode == "hosted" else b".socket/vendor/pypi"
         info["relock"] = {"exit": rl.rc, "lockBytesUnchanged": relocked == lock_after, "patchSourceKept": marker in relocked, "pipfileUnchanged": (project / "Pipfile").read_bytes() == pristine_pipfile, "tail": rl.tail(300) if not rl.ok() else None}
-        # A relock regenerated the entry to registry shape: `rollback` must
-        # retire the redirect cleanly (exit 0, ledger cleared) instead of
-        # refusing forever — judged in a copy so the main flow keeps its state.
+        # A relock regenerated the entry: `rollback` must retire the redirect
+        # cleanly (exit 0, ledger cleared) instead of refusing forever — judged
+        # in a copy so the main flow keeps its state. Two relock outcomes exist:
+        # registry shape (the reference is gone; the relocked lock is the desired
+        # end state and must be kept) and the Pipenv 2023+ hybrid of a
+        # marker-excluded entry (our reference kept, upstream hashes + version
+        # restored around it); that entry is still ours and must roll back to
+        # the original registry entry, leaving no Socket reference behind.
         if rl.ok() and relocked != lock_after:
             relocked_dir = case / "relocked"
             shutil.copytree(project, relocked_dir, ignore=shutil.ignore_patterns(".venv", "__pycache__"))
@@ -1024,7 +1036,13 @@ def main():
             ledger2 = relocked_dir / ".socket/vendor/redirect-state.json"
             state2 = relocked_dir / ".socket/vendor/state.json"
             cleared = (not ledger2.exists() or not json.loads(ledger2.read_text()).get("records")) and (not state2.exists() or not json.loads(state2.read_text()).get("entries"))
-            check("rollbackAfterRelockRetires", rrb.ok() and cleared and (relocked_dir / "Pipfile.lock").read_bytes() == relocked, {"exit": rrb.rc, "cleared": cleared, "lockKeptRelocked": (relocked_dir / "Pipfile.lock").read_bytes() == relocked, "envelope": {k: erb2.get(k) for k in ("status", "hosted", "vendoredReverted", "failed") if k in erb2}, "tail": rrb.tail(400) if not rrb.ok() else None})
+            post = (relocked_dir / "Pipfile.lock").read_bytes()
+            hybrid = marker in relocked
+            if hybrid:
+                lock_ok = marker not in post and urllib3_entries(post) == urllib3_entries(pristine_lock)
+            else:
+                lock_ok = post == relocked
+            check("rollbackAfterRelockRetires", rrb.ok() and cleared and lock_ok, {"exit": rrb.rc, "cleared": cleared, "hybridRelock": hybrid, "lockKeptRelocked": post == relocked, "lockRestoredOriginal": post == pristine_lock, "referenceLeft": marker in post, "envelope": {k: erb2.get(k) for k in ("status", "hosted", "vendoredReverted", "failed") if k in erb2}, "tail": rrb.tail(400) if not rrb.ok() else None})
         (project / "Pipfile.lock").write_bytes(lock_after)
         (project / "Pipfile").write_bytes(pristine_pipfile)
 
