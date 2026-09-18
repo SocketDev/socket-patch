@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::vendor::bun_lock_text::{
     check_lock_version, decode_json_string, has_workspace_packages, lock_version, packages_bounds,
     parse_entry_line, parse_packages_section, split_name_spec, BunEntry,
@@ -76,7 +76,7 @@ fn check_workspace_compatibility(
 /// Other package managers are left to their own backends.
 pub async fn preflight_vendor(project_root: &Path) -> Result<(), (&'static str, String)> {
     let path = project_root.join(BUN_LOCK);
-    let text = match tokio::fs::read_to_string(&path).await {
+    let text = match read_regular_to_string(&path).await {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if project_root.join("bun.lockb").exists() {
@@ -123,7 +123,7 @@ pub(crate) async fn vendor_bun(
     let (name, version) = (coords.name.as_str(), coords.version.as_str());
 
     // ── 2. Read + strictly parse the lock (refuse before any write) ──────
-    let lock_text = match tokio::fs::read_to_string(project_root.join(BUN_LOCK)).await {
+    let lock_text = match read_regular_to_string(&project_root.join(BUN_LOCK)).await {
         Ok(text) => text,
         Err(e) => {
             return refused(
@@ -1329,6 +1329,25 @@ mod tests {
             preflight_vendor(root.path()).await.unwrap_err().0,
             "vendor_lockfile_version_unsupported"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_preflight_refuses_fifo_without_blocking() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(root.path().join(BUN_LOCK))
+            .status()
+            .unwrap()
+            .success());
+        let refusal = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            preflight_vendor(root.path()),
+        )
+        .await
+        .expect("Bun preflight must not block on a FIFO")
+        .unwrap_err();
+        assert_eq!(refusal.0, "vendor_lockfile_missing");
     }
 
     /// Build a scoped-package fixture and vendor it once (not dry).

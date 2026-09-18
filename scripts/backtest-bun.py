@@ -139,9 +139,10 @@ def main():
                         choices=['hosted', 'vendored', 'vendored-detached'])
     parser.add_argument('--jobs', type=int, default=4)
     args = parser.parse_args()
-    cli = args.cli.resolve()
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=True)
+    cli = root / ('socket-patch.exe' if platform.system() == 'Windows' else 'socket-patch')
+    shutil.copy2(args.cli.resolve(), cli)
     toolroot = (args.tools or root / 'tools').resolve()
     tools = {v: install_tool(toolroot, v) for v in args.versions}
     base_env = {k: v for k, v in os.environ.items()
