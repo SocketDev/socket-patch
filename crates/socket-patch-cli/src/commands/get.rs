@@ -898,8 +898,7 @@ fn purl_has_version(purl: &str) -> bool {
 /// positive costs one grant request the rewriter's per-dep confirmation
 /// then ignores.
 fn pnpm_lock_resolves(text: &str, name: &str, version: &str) -> bool {
-    let version_boundary =
-        |c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+    let version_boundary = |c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
     let name_boundary = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\'' | '"');
     for needle in [format!("{name}@{version}"), format!("/{name}/{version}")] {
         for (pos, _) in text.match_indices(needle.as_str()) {
@@ -908,7 +907,10 @@ fn pnpm_lock_resolves(text: &str, name: &str, version: &str) -> bool {
                 // v5/v6's leading key delimiter — legitimate only when the
                 // char before it is itself a boundary (otherwise this is a
                 // scoped `@scope/<name>` tail: a DIFFERENT package).
-                Some('/') => text[..pos - 1].chars().next_back().is_none_or(name_boundary),
+                Some('/') => text[..pos - 1]
+                    .chars()
+                    .next_back()
+                    .is_none_or(name_boundary),
                 Some(c) => name_boundary(c),
             };
             let after_ok = text[pos + needle.len()..]
@@ -1031,8 +1033,7 @@ async fn filter_to_installed_purls(
     // keep-branch below on version membership, so a large advisory fan-out
     // doesn't request grants for every version ever patched (raw
     // `read_to_string` matches the hosted flow's own candidate-file reads).
-    let pnpm_pnp_lock_text: Option<String> = (pnp_pnpm
-        && mode == super::scan::ScanMode::Hosted)
+    let pnpm_pnp_lock_text: Option<String> = (pnp_pnpm && mode == super::scan::ScanMode::Hosted)
         .then(|| std::fs::read_to_string(common.cwd.join("pnpm-lock.yaml")).ok())
         .flatten();
 
@@ -1167,6 +1168,116 @@ async fn api_client_for(params: &DownloadParams) -> socket_patch_core::api::clie
         .0
 }
 
+/// The Bun vendored-mode preflight outcome shared by EVERY path that feeds
+/// the vendor engine: `scan --mode vendored` (the manifest-tracked AND the
+/// `--detached` download phases), `get … --mode vendored` (search and uuid
+/// paths), and their `--dry-run` previews. One read-only
+/// [`preflight_vendor`] per run, evaluated BEFORE any `/patches/view/`
+/// fetch, so an incompatible Bun project (binary `bun.lockb` without a text
+/// lock, an unreadable lock, an unsupported `lockfileVersion`, a
+/// pre-version-2 `workspace:` lock) never has a patch downloaded on its
+/// behalf — let alone recorded in the manifest — and every entry point
+/// reports the SAME vendor code (a detached run used to fetch first and
+/// then, for alias-installed packages, degrade to `package_not_installed`).
+///
+/// `exempt` holds the selected purls the vendor ledger ALREADY wires at the
+/// SAME uuid this run selected: in-sync re-runs, and the upgrade path of a
+/// project vendored before the workspace gate existed. The refusal must not
+/// pre-empt those — they flow through to the engine's `already_vendored`
+/// skip exactly as on a non-Bun project. An unreadable ledger exempts
+/// nothing (fail closed; the vendor step reports the corrupt ledger itself).
+///
+/// [`preflight_vendor`]: socket_patch_core::vendor::bun_lock::preflight_vendor
+pub(crate) struct BunVendorRefusal {
+    /// The stable vendor error code (`vendor_bun_lockb_unsupported`,
+    /// `vendor_lockfile_missing`, `vendor_lockfile_version_unsupported`,
+    /// `vendor_bun_workspace_unsupported`) — the same string the vendor
+    /// engine would have emitted as a `failed` event.
+    pub(crate) code: &'static str,
+    /// The engine's human-readable detail, relayed verbatim.
+    pub(crate) detail: String,
+    exempt: std::collections::HashSet<String>,
+}
+
+impl BunVendorRefusal {
+    /// Whether the refusal applies to `purl`: npm-family only (no other
+    /// ecosystem's backend consults `bun.lock`), minus the already-vendored
+    /// exemption.
+    pub(crate) fn applies_to(&self, purl: &str) -> bool {
+        purl.starts_with("pkg:npm/") && !self.exempt.contains(purl)
+    }
+}
+
+/// Run the Bun preflight once for `selected` — only when it holds at least
+/// one npm purl, since nothing else can be affected — and compute the
+/// already-vendored exemption from the vendor ledger at `cwd`. `None` means
+/// nothing to refuse.
+pub(crate) async fn bun_vendor_preflight(
+    cwd: &Path,
+    selected: &[PatchSearchResult],
+) -> Option<BunVendorRefusal> {
+    if !selected.iter().any(|s| s.purl.starts_with("pkg:npm/")) {
+        return None;
+    }
+    let (code, detail) = socket_patch_core::vendor::bun_lock::preflight_vendor(cwd)
+        .await
+        .err()?;
+    let state = socket_patch_core::vendor::load_state(cwd)
+        .await
+        .unwrap_or_default();
+    Some(bun_vendor_refusal_with_ledger(
+        code,
+        detail,
+        selected,
+        &state.entries,
+    ))
+}
+
+/// [`bun_vendor_preflight`] for callers that already loaded the ledger (the
+/// detached download phase, the dry-run preview).
+pub(crate) async fn bun_vendor_preflight_with_ledger(
+    cwd: &Path,
+    selected: &[PatchSearchResult],
+    entries: &HashMap<String, socket_patch_core::vendor::state::VendorEntry>,
+) -> Option<BunVendorRefusal> {
+    if !selected.iter().any(|s| s.purl.starts_with("pkg:npm/")) {
+        return None;
+    }
+    let (code, detail) = socket_patch_core::vendor::bun_lock::preflight_vendor(cwd)
+        .await
+        .err()?;
+    Some(bun_vendor_refusal_with_ledger(
+        code, detail, selected, entries,
+    ))
+}
+
+fn bun_vendor_refusal_with_ledger(
+    code: &'static str,
+    detail: String,
+    selected: &[PatchSearchResult],
+    entries: &HashMap<String, socket_patch_core::vendor::state::VendorEntry>,
+) -> BunVendorRefusal {
+    let exempt = selected
+        .iter()
+        .filter(|s| {
+            // The ledger is keyed by the manifest purl (possibly qualified)
+            // and `lookup_entry` also resolves base purls; try the selected
+            // spelling first, then its qualifier-free base.
+            socket_patch_core::vendor::lookup_entry(entries, &s.purl)
+                .or_else(|| {
+                    socket_patch_core::vendor::lookup_entry(entries, strip_purl_qualifiers(&s.purl))
+                })
+                .is_some_and(|e| e.uuid == s.uuid)
+        })
+        .map(|s| s.purl.clone())
+        .collect();
+    BunVendorRefusal {
+        code,
+        detail,
+        exempt,
+    }
+}
+
 /// Download and apply a set of selected patches.
 ///
 /// Used by both `get` and `scan` commands. Returns (exit_code, json_result).
@@ -1209,6 +1320,21 @@ pub(crate) async fn download_patch_records(
         .await
         .unwrap_or_default();
 
+    // The same Bun preflight the manifest-tracked download runs (see
+    // `download_and_apply_patches`): a detached run feeds the same vendor
+    // engine, so it must refuse the same projects BEFORE fetching. Without
+    // it the patch view was downloaded for nothing and — for a package
+    // installed under an alias directory, resolvable only through the
+    // unreadable bun.lockb inventory — the vendor step then misreported
+    // `package_not_installed` instead of the real `vendor_bun_*` code.
+    // `persist_blobs` is never set on this (vendor-only) path; the gate
+    // mirrors the manifest-tracked download's posture defensively.
+    let bun_refusal = if params.persist_blobs {
+        None
+    } else {
+        bun_vendor_preflight_with_ledger(&params.cwd, &selected, &vendor_state.entries).await
+    };
+
     let mut records: HashMap<String, PatchRecord> = HashMap::new();
     let mut downloaded = 0usize;
     let mut skipped = 0usize;
@@ -1232,6 +1358,29 @@ pub(crate) async fn download_patch_records(
             }));
             records.insert(search_result.purl.clone(), record);
             skipped += 1;
+            continue;
+        }
+
+        if let Some(refusal) = bun_refusal
+            .as_ref()
+            .filter(|r| r.applies_to(&search_result.purl))
+        {
+            // Errors are exempt from --silent ("errors only"); JSON runs
+            // carry the code + detail in the envelope instead.
+            if !params.json {
+                eprintln!(
+                    "  [error] {} ({}): {}",
+                    search_result.purl, refusal.code, refusal.detail
+                );
+            }
+            failed += 1;
+            patch_records_json.push(serde_json::json!({
+                "purl": search_result.purl,
+                "uuid": search_result.uuid,
+                "action": "failed",
+                "errorCode": refusal.code,
+                "error": refusal.detail,
+            }));
             continue;
         }
 
@@ -1513,29 +1662,37 @@ pub async fn download_and_apply_patches(
     let mut downloaded_patches: Vec<serde_json::Value> = Vec::new();
 
     // Vendored downloads must not claim a patch in the manifest when Bun
-    // cannot consume its artifact. Agent/save-only flows retain their intent.
+    // cannot consume its artifact (see `BunVendorRefusal`). Agent/save-only
+    // flows (`persist_blobs`) retain their record-only intent: the preflight
+    // is scoped to the `save_only && !persist_blobs` posture the vendored
+    // flows use, never the agent download.
     let bun_refusal = if params.save_only && !params.persist_blobs {
-        socket_patch_core::vendor::bun_lock::preflight_vendor(&params.cwd)
-            .await
-            .err()
+        bun_vendor_preflight(&params.cwd, &selected).await
     } else {
         None
     };
     for search_result in &selected {
-        if let Some((code, detail)) = bun_refusal
+        if let Some(refusal) = bun_refusal
             .as_ref()
-            .filter(|_| search_result.purl.starts_with("pkg:npm/"))
+            .filter(|r| r.applies_to(&search_result.purl))
         {
             patches_failed += 1;
             downloaded_patches.push(serde_json::json!({
                 "purl": search_result.purl,
                 "uuid": search_result.uuid,
                 "action": "failed",
-                "errorCode": code,
-                "error": detail,
+                "errorCode": refusal.code,
+                "error": refusal.detail,
             }));
-            if !params.json && !params.silent {
-                eprintln!("  [error] {}: {detail}", search_result.purl);
+            // Errors are exempt from --silent ("errors only", like the
+            // `[fail]` lines below); JSON runs carry the code + detail in
+            // the envelope instead. Code-tagged so a `--silent` operator
+            // can grep the stable code, not just the prose.
+            if !params.json {
+                eprintln!(
+                    "  [error] {} ({}): {}",
+                    search_result.purl, refusal.code, refusal.detail
+                );
             }
             continue;
         }
@@ -2699,6 +2856,25 @@ fn boxed_download_and_apply<'a>(
     Box::pin(download_and_apply_patches(selected, params))
 }
 
+/// Human rendering of the vendored dry-run preview's `would_refuse` records
+/// (see [`super::scan::preview_vendor_json`]): the count line above it still
+/// says "would download and vendor", so name what the wet run would refuse
+/// and why. Informational (the preview exits 0), hence behind the caller's
+/// `--silent` gate.
+fn print_dry_run_refusals(preview: &serde_json::Value) {
+    let Some(patches) = preview["patches"].as_array() else {
+        return;
+    };
+    for p in patches.iter().filter(|p| p["action"] == "would_refuse") {
+        println!(
+            "  [would-refuse] {} ({}): {}",
+            p["purl"].as_str().unwrap_or_default(),
+            p["errorCode"].as_str().unwrap_or_default(),
+            p["error"].as_str().unwrap_or_default()
+        );
+    }
+}
+
 /// Print the whole-manifest blast-radius note for `--mode vendored`: the
 /// vendor step is scan's — it reconciles and (re)vendors EVERY manifest
 /// record, not just the one(s) this get selected.
@@ -2814,6 +2990,7 @@ async fn run_get_vendored_search(
                 "[dry-run] Would download and vendor {} patch(es).",
                 selected.len()
             );
+            print_dry_run_refusals(&preview);
         }
         return 0;
     }
@@ -2867,8 +3044,11 @@ async fn run_get_vendored_search(
     {
         Ok((vendor_errors, venv)) => {
             has_errors |= vendor_errors;
+            // Telemetry follows the RUN outcome, not the vendor step alone:
+            // a download-phase refusal/failure exits 1 and must not report
+            // a successful vendoring of zero patches (scan's arms agree).
             crate::commands::vendor::track_outcomes_for_vendor(
-                vendor_errors,
+                has_errors,
                 &venv,
                 args.common.dry_run,
                 telemetry_token,
@@ -2946,33 +3126,66 @@ async fn run_get_vendored_uuid(
             print_json(&result);
         } else if !args.common.silent {
             println!("[dry-run] Would download and vendor 1 patch.");
+            print_dry_run_refusals(&preview);
         }
         return 0;
     }
 
-    if patch.purl.starts_with("pkg:npm/") {
-        if let Err((code, message)) =
-            socket_patch_core::vendor::bun_lock::preflight_vendor(&args.common.cwd).await
-        {
-            if args.common.json {
-                print_json(&serde_json::json!({
-                    "status": "error",
-                    "found": 1,
-                    "downloaded": 0,
-                    "failed": 1,
-                    "error": { "code": code, "message": message },
-                    "patches": [{
-                        "purl": patch.purl,
-                        "uuid": patch.uuid,
-                        "action": "failed",
-                        "errorCode": code,
-                    }],
-                }));
-            } else if !args.common.silent {
-                eprintln!("Error ({code}): {message}");
-            }
-            return 1;
+    // Bun preflight (see `BunVendorRefusal`): refuse BEFORE the manifest
+    // record is saved and before the vendor step, so the tree stays exactly
+    // as it was (no `.socket/` is created on a fresh project). The
+    // already-fetched patch is the only network traffic of a refused run.
+    //
+    // JSON shape (contract: `get <uuid> --mode vendored` pre-record refusal;
+    // the record carries BOTH `errorCode` and `error` like the search path's
+    // failed records, and the envelope carries `skipped` like this path's
+    // success shape):
+    //
+    // {
+    //   "status": "error",
+    //   "found": 1, "downloaded": 0, "skipped": 0, "failed": 1,
+    //   "error": { "code": "<vendor code>", "message": "<detail>" },
+    //   "patches": [{ "purl": "…", "uuid": "…", "action": "failed",
+    //                 "errorCode": "<vendor code>", "error": "<detail>" }]
+    // }
+    //
+    // Human: `Error (<code>): <detail>` on stderr — an error, so it is
+    // exempt from `--silent` like every other `Error (…)` line here.
+    let selected = vec![search_result_from_response(patch)];
+    if let Some(refusal) = bun_vendor_preflight(&args.common.cwd, &selected)
+        .await
+        .filter(|r| r.applies_to(&patch.purl))
+    {
+        let BunVendorRefusal { code, detail, .. } = refusal;
+        // Same failure telemetry as the vendor-step Err arm below: this run
+        // exits 1 without vendoring anything.
+        socket_patch_core::telemetry::track_patch_vendor_failed(
+            &detail,
+            args.common.dry_run,
+            telemetry_token,
+            telemetry_org,
+        )
+        .await;
+        if args.common.json {
+            print_json(&serde_json::json!({
+                "status": "error",
+                "found": 1,
+                "downloaded": 0,
+                "skipped": 0,
+                "failed": 1,
+                "error": { "code": code, "message": detail },
+                "patches": [{
+                    "purl": patch.purl,
+                    "uuid": patch.uuid,
+                    "action": "failed",
+                    "errorCode": code,
+                    "error": detail,
+                }],
+            }));
+        } else {
+            eprintln!("Error ({code}): {detail}");
         }
+        return 1;
     }
 
     note_vendored_whole_manifest_scope(&manifest_path, &[patch.purl.as_str()], quiet).await;
@@ -4208,8 +4421,16 @@ mod tests {
         assert!(pnpm_lock_resolves("left-pad@1.3.0:\n", "left-pad", "1.3.0"));
         // pos == 0, v5/v6 `/name/version` and `/name@version` spellings: the
         // leading `/` delimiter itself has nothing before it.
-        assert!(pnpm_lock_resolves("/left-pad/1.3.0:\n", "left-pad", "1.3.0"));
-        assert!(pnpm_lock_resolves("/left-pad@1.3.0:\n", "left-pad", "1.3.0"));
+        assert!(pnpm_lock_resolves(
+            "/left-pad/1.3.0:\n",
+            "left-pad",
+            "1.3.0"
+        ));
+        assert!(pnpm_lock_resolves(
+            "/left-pad@1.3.0:\n",
+            "left-pad",
+            "1.3.0"
+        ));
         // Still boundary-checked at the start of text: a scoped tail whose
         // name begins mid-token must NOT match.
         assert!(!pnpm_lock_resolves(
@@ -4479,7 +4700,10 @@ mod tests {
         assert_eq!(code, 1, "guardrail failure must exit 1; json={json}");
         assert_eq!(json["failed"], 1, "json={json}");
         assert_eq!(json["downloaded"], 0, "json={json}");
-        assert!(records.is_empty(), "no record may be handed to the vendor step");
+        assert!(
+            records.is_empty(),
+            "no record may be handed to the vendor step"
+        );
         assert_eq!(json["patches"][0]["action"], "failed", "json={json}");
         assert_eq!(
             json["patches"][0]["error"], "patch has no applicable files",
@@ -4553,9 +4777,10 @@ mod tests {
             .as_array()
             .unwrap_or_else(|| panic!("keep-all fallback must surface warnings; json={json}"));
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.as_str().unwrap_or_default().contains("not installed locally")),
+            warnings.iter().any(|w| w
+                .as_str()
+                .unwrap_or_default()
+                .contains("not installed locally")),
             "warning must explain the keep-all fallback; json={json}"
         );
     }
@@ -4665,7 +4890,10 @@ mod tests {
             crate::commands::scan::ScanMode::Hosted,
         )
         .await;
-        assert!(out.kept.is_empty(), "nothing may be kept via a corrupt ledger");
+        assert!(
+            out.kept.is_empty(),
+            "nothing may be kept via a corrupt ledger"
+        );
         assert_eq!(out.skip_records.len(), 1);
         assert_eq!(out.skip_records[0]["errorCode"], "package_not_installed");
     }
@@ -4825,7 +5053,11 @@ mod tests {
         );
         assert!(records.is_empty());
         assert!(
-            server.received_requests().await.unwrap_or_default().is_empty(),
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
             "the failure must precede any fetch"
         );
         assert_eq!(
@@ -4877,7 +5109,10 @@ mod tests {
             json["patches"][0]["error"], "Blob decode or write failed",
             "json={json}"
         );
-        assert!(records.is_empty(), "a blob failure must not hand back a record");
+        assert!(
+            records.is_empty(),
+            "a blob failure must not hand back a record"
+        );
         let blobs = tmp.path().join(".socket/blobs");
         assert!(blobs.is_dir(), "the blobs dir itself was created");
         assert_eq!(
@@ -4907,7 +5142,9 @@ mod tests {
         let missing_purl = "pkg:npm/covgap-missing@1.0.0";
 
         Mock::given(method("GET"))
-            .and(wm_path(format!("/v0/orgs/test-org/patches/view/{good_uuid}")))
+            .and(wm_path(format!(
+                "/v0/orgs/test-org/patches/view/{good_uuid}"
+            )))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "uuid": good_uuid, "purl": good_purl,
                 "publishedAt": "2024-01-01T00:00:00Z",
@@ -4960,7 +5197,10 @@ mod tests {
             .iter()
             .filter_map(|p| p["error"].as_str())
             .collect();
-        assert!(errors.contains(&"patch has no applicable files"), "json={json}");
+        assert!(
+            errors.contains(&"patch has no applicable files"),
+            "json={json}"
+        );
         assert!(errors.contains(&"could not fetch details"), "json={json}");
     }
 
@@ -5028,8 +5268,317 @@ mod tests {
             "the ledger's embedded record must be reused"
         );
         assert!(
-            server.received_requests().await.unwrap_or_default().is_empty(),
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
             "an already-vendored entry must never touch the network"
+        );
+    }
+
+    // --- download_patch_records: Bun preflight (detached parity) -----------
+    // The detached download phase must refuse the same Bun projects the
+    // manifest-tracked one does, BEFORE any view fetch (request-log oracle),
+    // and with the vendor code (never the downstream `package_not_installed`
+    // the alias-shaped lockb project used to degrade to).
+
+    /// A real bun 1.3.14 lockfileVersion-1 workspace lock (matrix capture
+    /// grammar): 1-tuple `workspace:` entry, blank line between entries,
+    /// trailing commas.
+    const BUN_V1_WORKSPACE_LOCK: &str = r#"{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "unit-fixture",
+      "dependencies": {
+        "consumer": "workspace:*",
+      },
+    },
+    "packages/consumer": {
+      "name": "consumer",
+      "version": "1.0.0",
+      "dependencies": {
+        "covgap-bun": "1.0.0",
+      },
+    },
+  },
+  "packages": {
+    "consumer": ["consumer@workspace:packages/consumer"],
+
+    "covgap-bun": ["covgap-bun@1.0.0", "", {}, "sha512-AAAA=="],
+  }
+}
+"#;
+
+    fn seed_bun_vendor_entry(root: &Path, purl: &str, uuid: &str) {
+        let vendor = root.join(".socket/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(
+            vendor.join("state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "entries": { purl: {
+                    "ecosystem": "npm",
+                    "basePurl": purl,
+                    "uuid": uuid,
+                    "artifact": {
+                        "path": format!(".socket/vendor/npm/{uuid}/covgap-bun-1.0.0.tgz"),
+                    },
+                    "wiring": [],
+                    "flavor": "bun",
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_patch_records_bun_lockb_refuses_before_fetch() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let server = MockServer::start().await;
+        let uuid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let purl = "pkg:npm/covgap-bun@1.0.0";
+        // A view that WOULD succeed — proves the refusal is decided before
+        // the fetch, not by a failed fetch.
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v0/orgs/test-org/patches/view/{uuid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": uuid, "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": { "package/index.js": {
+                    "beforeHash": "0".repeat(64), "afterHash": "1".repeat(64),
+                    "blobContent": "cGF0Y2hlZAo=",
+                }},
+                "vulnerabilities": {}, "description": "d", "license": "MIT", "tier": "free",
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bun.lockb"), b"\x00binary").unwrap();
+        let selected = vec![mk_patch(uuid, purl, "free", "2024-01-01")];
+        let (code, json, records) =
+            download_patch_records(&selected, &detached_params(tmp.path(), server.uri())).await;
+
+        assert_eq!(code, 1, "json={json}");
+        assert_eq!(json["found"], 1, "json={json}");
+        assert_eq!(json["downloaded"], 0, "json={json}");
+        assert_eq!(json["failed"], 1, "json={json}");
+        assert_eq!(json["patches"][0]["action"], "failed", "json={json}");
+        assert_eq!(
+            json["patches"][0]["errorCode"], "vendor_bun_lockb_unsupported",
+            "json={json}"
+        );
+        assert!(
+            json["patches"][0]["error"]
+                .as_str()
+                .is_some_and(|d| !d.is_empty()),
+            "the record must carry the engine's detail; json={json}"
+        );
+        assert!(records.is_empty(), "no record may reach the vendor step");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "a refused Bun project must never fetch the patch view"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_patch_records_bun_v1_workspace_refuses_before_fetch() {
+        use wiremock::MockServer;
+
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let server = MockServer::start().await; // trap: no mounts
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bun.lock"), BUN_V1_WORKSPACE_LOCK).unwrap();
+        let uuid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        let purl = "pkg:npm/covgap-bun@1.0.0";
+        let selected = vec![mk_patch(uuid, purl, "free", "2024-01-01")];
+
+        let (code, json, records) =
+            download_patch_records(&selected, &detached_params(tmp.path(), server.uri())).await;
+
+        assert_eq!(code, 1, "json={json}");
+        assert_eq!(json["failed"], 1, "json={json}");
+        assert_eq!(
+            json["patches"][0]["errorCode"], "vendor_bun_workspace_unsupported",
+            "json={json}"
+        );
+        assert!(records.is_empty());
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "refused before any fetch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap(),
+            BUN_V1_WORKSPACE_LOCK,
+            "the preflight is read-only"
+        );
+    }
+
+    /// The preflight is npm-only: a non-npm purl on a Bun-refused tree is
+    /// fetched as usual (here: the view is unmounted, so it fails as a fetch
+    /// miss — proving it reached the network, not the refusal).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_patch_records_bun_refusal_skips_non_npm_purls() {
+        use wiremock::MockServer;
+
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bun.lockb"), b"\x00binary").unwrap();
+        let uuid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        let purl = "pkg:pypi/covgap-not-bun@1.0.0";
+        let selected = vec![mk_patch(uuid, purl, "free", "2024-01-01")];
+
+        let (code, json, _) =
+            download_patch_records(&selected, &detached_params(tmp.path(), server.uri())).await;
+
+        assert_eq!(code, 1, "json={json}");
+        assert_eq!(
+            json["patches"][0]["error"], "could not fetch details",
+            "a pypi purl must reach the fetch, not the Bun refusal; json={json}"
+        );
+        assert!(json["patches"][0].get("errorCode").is_none(), "json={json}");
+        assert_eq!(
+            server.received_requests().await.unwrap_or_default().len(),
+            1,
+            "exactly the view fetch"
+        );
+    }
+
+    /// Already-vendored exemption: a ledger entry at the SAME uuid the run
+    /// selected is not refused (it proceeds to the fetch — unmounted here,
+    /// so it surfaces as a fetch miss), while a second purl the ledger
+    /// wires at an OLDER uuid is still refused before fetching.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_patch_records_bun_refusal_exempts_ledger_entry_at_same_uuid() {
+        use wiremock::MockServer;
+
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bun.lock"), BUN_V1_WORKSPACE_LOCK).unwrap();
+        let same = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        let older = "abababab-abab-4bab-8bab-abababababab";
+        let newer = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
+        let in_sync = "pkg:npm/covgap-bun@1.0.0";
+        let stale = "pkg:npm/covgap-bun-stale@1.0.0";
+        // Two ledger entries: one in sync with the selection, one stale.
+        let vendor = tmp.path().join(".socket/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        let entry = |purl: &str, uuid: &str| {
+            serde_json::json!({
+                "ecosystem": "npm", "basePurl": purl, "uuid": uuid,
+                "artifact": { "path": format!(".socket/vendor/npm/{uuid}/x.tgz") },
+                "wiring": [], "flavor": "bun",
+            })
+        };
+        std::fs::write(
+            vendor.join("state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "entries": { in_sync: entry(in_sync, same), stale: entry(stale, older) },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let selected = vec![
+            mk_patch(same, in_sync, "free", "2024-01-01"),
+            mk_patch(newer, stale, "free", "2024-01-01"),
+        ];
+        let (code, json, _) =
+            download_patch_records(&selected, &detached_params(tmp.path(), server.uri())).await;
+
+        assert_eq!(code, 1, "json={json}");
+        let by_purl = |purl: &str| {
+            json["patches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["purl"] == purl)
+                .cloned()
+                .unwrap_or_else(|| panic!("no record for {purl}: {json}"))
+        };
+        let exempt = by_purl(in_sync);
+        assert_eq!(
+            exempt["error"], "could not fetch details",
+            "the in-sync purl must be exempt from the refusal; json={json}"
+        );
+        assert!(exempt.get("errorCode").is_none(), "json={json}");
+        let refused = by_purl(stale);
+        assert_eq!(
+            refused["errorCode"], "vendor_bun_workspace_unsupported",
+            "a stale-uuid entry is refused like a fresh vendoring; json={json}"
+        );
+        let paths: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert_eq!(paths.len(), 1, "only the exempt purl may fetch: {paths:?}");
+        assert!(paths[0].ends_with(same), "{paths:?}");
+    }
+
+    /// `bun_vendor_preflight` never reads the lock when nothing selected is
+    /// npm (no needless I/O, no spurious refusal for other ecosystems), and
+    /// an unreadable ledger exempts nothing (fail closed).
+    #[tokio::test]
+    async fn bun_vendor_preflight_scope_and_corrupt_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bun.lockb"), b"\x00binary").unwrap();
+        let pypi = vec![mk_patch(
+            "11111111-1111-4111-8111-111111111111",
+            "pkg:pypi/only@1.0.0",
+            "free",
+            "2024-01-01",
+        )];
+        assert!(
+            bun_vendor_preflight(tmp.path(), &pypi).await.is_none(),
+            "no npm purl selected => no refusal"
+        );
+
+        let uuid = "22222222-2222-4222-8222-222222222222";
+        let purl = "pkg:npm/covgap-bun@1.0.0";
+        let npm = vec![mk_patch(uuid, purl, "free", "2024-01-01")];
+        let refusal = bun_vendor_preflight(tmp.path(), &npm)
+            .await
+            .expect("lockb-only project is refused");
+        assert_eq!(refusal.code, "vendor_bun_lockb_unsupported");
+        assert!(refusal.applies_to(purl));
+        assert!(!refusal.applies_to("pkg:pypi/only@1.0.0"));
+
+        // Exempt when the ledger wires this purl at this uuid…
+        seed_bun_vendor_entry(tmp.path(), purl, uuid);
+        let refusal = bun_vendor_preflight(tmp.path(), &npm).await.unwrap();
+        assert!(!refusal.applies_to(purl), "in-sync ledger entry is exempt");
+
+        // …but a corrupt ledger exempts nothing.
+        std::fs::write(tmp.path().join(".socket/vendor/state.json"), b"{ not json").unwrap();
+        let refusal = bun_vendor_preflight(tmp.path(), &npm).await.unwrap();
+        assert!(
+            refusal.applies_to(purl),
+            "an unreadable ledger must not exempt (fail closed)"
         );
     }
 

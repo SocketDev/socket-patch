@@ -17,7 +17,10 @@ use std::time::Duration;
 
 use crate::args::GlobalArgs;
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
-use crate::commands::get::{download_and_apply_patches, download_patch_records, DownloadParams};
+use crate::commands::get::{
+    bun_vendor_preflight_with_ledger, download_and_apply_patches, download_patch_records,
+    DownloadParams,
+};
 use crate::commands::vendor::{
     note_classic_migration_risk, reconcile_dropped, track_outcomes_for_vendor, vendor_records,
 };
@@ -29,22 +32,42 @@ use super::{
     note_vendor_supersedes_redirect, ScanArgs,
 };
 
-/// Dry-run preview for `scan --vendor`: classify each selected patch
-/// against the vendor ledger without touching disk or the network beyond
-/// discovery. Action values are part of the CLI contract:
-/// `would_vendor` (no ledger entry), `already_vendored` (entry at this
-/// uuid), `would_revendor` + `oldUuid` (entry at an older uuid).
+/// Dry-run preview for `scan --vendor` (and `get … --mode vendored
+/// --dry-run`): classify each selected patch against the vendor ledger
+/// without writing anything or touching the network beyond discovery.
+/// Action values are part of the CLI contract: `would_vendor` (no ledger
+/// entry), `already_vendored` (entry at this uuid), `would_revendor` +
+/// `oldUuid` (entry at an older uuid), and — additive — `would_refuse` +
+/// `errorCode` + `error` for npm purls the wet run's Bun preflight
+/// ([`crate::commands::get::BunVendorRefusal`]) would refuse before any
+/// download. The preview stays a ledger classification otherwise (engine
+/// refusals outside the preflight are not predicted), and it never flips
+/// the run's status or exit code: `would_refuse` is best-effort advice so a
+/// preview never advertises vendoring the wet run is known to refuse.
+/// The preflight is one read of `bun.lock`/`bun.lockb` — the only disk
+/// access here — and runs only when the selection holds an npm purl.
 pub(crate) async fn preview_vendor_json(
     cwd: &Path,
     selected: &[PatchSearchResult],
 ) -> serde_json::Value {
     let state = load_state(cwd).await.unwrap_or_default();
+    let refusal = bun_vendor_preflight_with_ledger(cwd, selected, &state.entries).await;
     let mut patches: Vec<serde_json::Value> = selected
         .iter()
         .map(|p| match lookup_entry(&state.entries, &p.purl) {
             Some(e) if e.uuid == p.uuid => serde_json::json!({
                 "purl": p.purl, "uuid": p.uuid, "action": "already_vendored",
             }),
+            // An in-sync ledger entry is exactly the preflight's exemption,
+            // so this arm never shadows `already_vendored`; a stale entry
+            // (`would_revendor`) IS refused by the wet run, like a fresh one.
+            _ if refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl)) => {
+                let r = refusal.as_ref().expect("checked by the guard");
+                serde_json::json!({
+                    "purl": p.purl, "uuid": p.uuid, "action": "would_refuse",
+                    "errorCode": r.code, "error": r.detail,
+                })
+            }
             Some(e) => serde_json::json!({
                 "purl": p.purl, "uuid": p.uuid,
                 "action": "would_revendor", "oldUuid": e.uuid,
@@ -344,8 +367,11 @@ async fn run_vendor_json_path(
     {
         Ok((vendor_errors, venv)) => {
             has_errors |= vendor_errors;
+            // Telemetry follows the RUN outcome: a download-phase failure
+            // (a Bun refusal, a failed view fetch) exits 1 and must not
+            // report a successful vendoring of zero patches.
             track_outcomes_for_vendor(
-                vendor_errors,
+                has_errors,
                 &venv,
                 args.common.dry_run,
                 telemetry_token,
@@ -459,8 +485,9 @@ async fn run_vendor_interactive_path(
     {
         Ok((vendor_errors, venv)) => {
             has_errors |= vendor_errors;
+            // Run-outcome telemetry, same as the JSON arm above.
             track_outcomes_for_vendor(
-                vendor_errors,
+                has_errors,
                 &venv,
                 args.common.dry_run,
                 telemetry_token,
@@ -755,6 +782,170 @@ mod service_config_tests {
             Some("https://patch.example")
         );
         assert!(cfg.offline);
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::preview_vendor_json;
+    use socket_patch_core::api::types::PatchSearchResult;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    const UUID: &str = "11111111-1111-4111-8111-111111111111";
+    const OLD_UUID: &str = "00000000-0000-4000-8000-000000000000";
+    const NPM: &str = "pkg:npm/preview-bun@1.0.0";
+    const PYPI: &str = "pkg:pypi/preview-other@1.0.0";
+
+    /// Real bun 1.3.14 lockfileVersion-1 workspace grammar (1-tuple
+    /// `workspace:` entry) — the shape the wet run refuses.
+    const V1_WORKSPACE_LOCK: &str = r#"{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "preview-fixture",
+      "dependencies": {
+        "consumer": "workspace:*",
+      },
+    },
+    "packages/consumer": {
+      "name": "consumer",
+      "version": "1.0.0",
+      "dependencies": {
+        "preview-bun": "1.0.0",
+      },
+    },
+  },
+  "packages": {
+    "consumer": ["consumer@workspace:packages/consumer"],
+
+    "preview-bun": ["preview-bun@1.0.0", "", {}, "sha512-AAAA=="],
+  }
+}
+"#;
+
+    fn sel(uuid: &str, purl: &str) -> PatchSearchResult {
+        PatchSearchResult {
+            uuid: uuid.into(),
+            purl: purl.into(),
+            published_at: "2024-01-01T00:00:00Z".into(),
+            description: String::new(),
+            license: "MIT".into(),
+            tier: "free".into(),
+            vulnerabilities: HashMap::new(),
+        }
+    }
+
+    fn seed_entry(root: &Path, purl: &str, uuid: &str) {
+        let vendor = root.join(".socket/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(
+            vendor.join("state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "entries": { purl: {
+                    "ecosystem": "npm", "basePurl": purl, "uuid": uuid,
+                    "artifact": { "path": format!(".socket/vendor/npm/{uuid}/x.tgz") },
+                    "wiring": [], "flavor": "bun",
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn action_of<'a>(preview: &'a serde_json::Value, purl: &str) -> &'a serde_json::Value {
+        preview["patches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["purl"] == purl)
+            .unwrap_or_else(|| panic!("no preview record for {purl}: {preview}"))
+    }
+
+    /// Without a Bun lock the preview is the pre-existing ledger
+    /// classification, byte for byte: `would_vendor` and nothing else.
+    #[tokio::test]
+    async fn preview_without_bun_lock_is_plain_would_vendor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        assert_eq!(
+            preview,
+            serde_json::json!({
+                "dryRun": true,
+                "patches": [{ "purl": NPM, "uuid": UUID, "action": "would_vendor" }],
+            })
+        );
+    }
+
+    /// A refused Bun tree flips npm purls to the additive `would_refuse`
+    /// (with the vendor code + detail) and leaves other ecosystems alone.
+    #[tokio::test]
+    async fn preview_marks_would_refuse_for_refused_bun_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bun.lock"), V1_WORKSPACE_LOCK).unwrap();
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM), sel(UUID, PYPI)]).await;
+        let npm = action_of(&preview, NPM);
+        assert_eq!(npm["action"], "would_refuse", "{preview}");
+        assert_eq!(
+            npm["errorCode"], "vendor_bun_workspace_unsupported",
+            "{preview}"
+        );
+        assert!(
+            npm["error"].as_str().is_some_and(|d| !d.is_empty()),
+            "{preview}"
+        );
+        assert_eq!(
+            action_of(&preview, PYPI)["action"],
+            "would_vendor",
+            "{preview}"
+        );
+        assert_eq!(preview["dryRun"], true);
+        // The preflight is read-only.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap(),
+            V1_WORKSPACE_LOCK
+        );
+    }
+
+    /// The already-vendored exemption: an in-sync ledger entry keeps
+    /// `already_vendored` (the wet run's engine skip), while a stale entry
+    /// is `would_refuse` — the wet run refuses re-vendoring at a new uuid.
+    #[tokio::test]
+    async fn preview_already_vendored_wins_over_refusal_stale_entry_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bun.lock"), V1_WORKSPACE_LOCK).unwrap();
+
+        seed_entry(tmp.path(), NPM, UUID);
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        assert_eq!(
+            action_of(&preview, NPM)["action"],
+            "already_vendored",
+            "{preview}"
+        );
+
+        seed_entry(tmp.path(), NPM, OLD_UUID);
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        let rec = action_of(&preview, NPM);
+        assert_eq!(rec["action"], "would_refuse", "{preview}");
+        assert!(
+            rec.get("oldUuid").is_none(),
+            "a refused record is not a revendor preview: {preview}"
+        );
+    }
+
+    /// bun.lockb without a text lock: `would_refuse` with the lockb code.
+    #[tokio::test]
+    async fn preview_marks_lockb_only_tree_would_refuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bun.lockb"), b"\x00binary").unwrap();
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        assert_eq!(
+            action_of(&preview, NPM)["errorCode"],
+            "vendor_bun_lockb_unsupported",
+            "{preview}"
+        );
     }
 }
 
