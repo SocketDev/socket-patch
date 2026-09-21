@@ -92,28 +92,25 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-/// `.bat` / `.cmd` files are not executables: `CreateProcess` refuses them,
-/// so they must be launched through `cmd.exe /C`. Always false off Windows.
-pub(crate) fn is_batch_shim(program: &Path) -> bool {
-    cfg!(windows)
-        && program.extension().is_some_and(|ext| {
-            let ext = ext.to_string_lossy().to_ascii_lowercase();
-            ext == "bat" || ext == "cmd"
-        })
-}
-
-/// A [`Command`] that launches the RESOLVED `program`: directly for a real
-/// executable, through `cmd.exe /C` for a Windows batch shim. Callers add
-/// their own args / cwd / env; `tokio::process::Command::from` lifts it into
-/// the async runtime unchanged.
+/// A [`Command`] that launches the RESOLVED `program` — the absolute path
+/// [`resolve_tool`] found, never the bare name. Callers add their own args /
+/// cwd / env; `tokio::process::Command::from` lifts it into the async
+/// runtime unchanged.
+///
+/// A Windows `.bat` / `.cmd` shim (npm-global `bun.cmd`, pyenv-win
+/// `pipenv.bat`) is spawned through this same path: since Rust 1.77.2 (the
+/// BatBadBut fix) `std` detects the batch extension on the resolved program
+/// and runs `%SystemRoot%\System32\cmd.exe /e:ON /v:OFF /d /c ""<script>"
+/// <args>"` itself — an OUTER quote pair around the whole line plus per-
+/// argument escaping — so a shim path with a space AND a cmd metacharacter
+/// (`C:\Program Files (x86)\…\bun.cmd`, `C:\Users\Jane (Work)\…`) survives
+/// cmd's `/c` quote-stripping rule. A hand-rolled `cmd.exe /C <shim>`
+/// wrapper here (the shape this replaced) quoted the path as an ordinary
+/// argument, which that rule strips down to `C:\Program` → "is not
+/// recognized". Nothing to add on top of `std`; a wrapper can only be
+/// less correct.
 pub fn command_for(program: &Path) -> Command {
-    if is_batch_shim(program) {
-        let mut command = Command::new("cmd.exe");
-        command.arg("/C").arg(program);
-        command
-    } else {
-        Command::new(program)
-    }
+    Command::new(program)
 }
 
 /// [`resolve_tool`] + [`command_for`]: the command for the tool `name` found
@@ -341,9 +338,9 @@ mod tests {
         assert_eq!(resolve_tool_with("bun", &var), Some(bin.join("bun")));
     }
 
-    /// Off Windows nothing is a batch shim (a `bun.cmd` file on a Unix PATH
-    /// is just a file) and the command spawns the resolved path directly —
-    /// the program is the absolute path, not the bare name.
+    /// The command spawns the RESOLVED path directly — the program is the
+    /// absolute path, not the bare name, with no wrapper and no args of its
+    /// own (a `bun.cmd` file on a Unix PATH is just a file).
     #[cfg(unix)]
     #[test]
     fn command_for_spawns_the_resolved_path_directly_on_unix() {
@@ -353,7 +350,6 @@ mod tests {
         let shim = bin.join("bun");
         std::fs::write(&shim, "#!/bin/sh\nprintf 'resolved:%s' \"$0\"\n").unwrap();
         set_executable(&shim);
-        assert!(!is_batch_shim(&bin.join("bun.cmd")));
         let joined = std::env::join_paths([bin.clone()]).unwrap();
         let var = |name: &str| (name == "PATH").then(|| joined.clone());
         let program = resolve_tool_with("bun", &var).expect("the shim resolves");
@@ -362,7 +358,7 @@ mod tests {
         assert_eq!(
             command.get_args().count(),
             0,
-            "no cmd.exe wrapper off Windows"
+            "no wrapper, no args of its own"
         );
         let out = command_for(&program).output().expect("spawn the shim");
         assert_eq!(
@@ -373,11 +369,16 @@ mod tests {
     }
 
     /// Windows: every PATHEXT extension is tried (case-insensitively), so a
-    /// `.cmd`/`.bat` shim is found and launched through `cmd.exe /C`; an
-    /// unset PATHEXT falls back to the exe/bat/cmd triple.
+    /// `.cmd`/`.bat` shim is found; an unset PATHEXT falls back to the
+    /// exe/bat/cmd triple. The shim is spawned DIRECTLY — `std` runs it
+    /// through cmd.exe with an outer quote pair — and that spawn is proven
+    /// to work from a directory whose name carries a space AND a cmd
+    /// metacharacter (`Program Files (x86)`), the exact shape the replaced
+    /// `cmd.exe /C <shim>` wrapper misquoted ("'C:\Program' is not
+    /// recognized").
     #[cfg(windows)]
     #[test]
-    fn resolve_tool_honours_pathext_and_wraps_batch_shims() {
+    fn resolve_tool_honours_pathext_and_spawns_batch_shims_directly() {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -390,14 +391,42 @@ mod tests {
         };
         let found = resolve_tool_with("bun", &with_pathext).expect("bun.cmd resolves via PATHEXT");
         assert_eq!(found, bin.join("bun.cmd"));
-        assert!(is_batch_shim(&found));
         let command = command_for(&found);
-        assert_eq!(command.get_program(), std::ffi::OsStr::new("cmd.exe"));
-        let args: Vec<OsString> = command.get_args().map(|a| a.to_os_string()).collect();
         assert_eq!(
-            args,
-            vec![OsString::from("/C"), found.clone().into_os_string()]
+            command.get_program(),
+            found.as_os_str(),
+            "the shim itself is the program: no cmd.exe wrapper"
         );
+        assert_eq!(command.get_args().count(), 0, "no wrapper args");
+        let out = command_for(&found)
+            .arg("--version")
+            .output()
+            .expect("std spawns a .cmd through cmd.exe");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1.2.3");
+
+        // The misquoting shape: a shim under a directory with a space AND a
+        // cmd metacharacter. std's outer quote pair keeps the path whole.
+        let awkward = tmp.path().join("Program Files (x86)").join("npm");
+        std::fs::create_dir_all(&awkward).unwrap();
+        std::fs::write(awkward.join("bun.cmd"), b"@echo off\r\necho 1.2.3\r\n").unwrap();
+        let awkward_path = std::env::join_paths([awkward.clone()]).unwrap();
+        let awkward_env = |name: &str| match name {
+            "PATH" => Some(awkward_path.clone()),
+            "PATHEXT" => Some(OsString::from(".COM;.EXE;.BAT;.CMD")),
+            _ => None,
+        };
+        let found = resolve_tool_with("bun", &awkward_env).expect("the awkward shim resolves");
+        assert_eq!(found, awkward.join("bun.cmd"));
+        let out = command_for(&found)
+            .arg("--version")
+            .output()
+            .expect("std spawns a .cmd under `Program Files (x86)`");
+        assert!(
+            out.status.success(),
+            "a shim path with a space and parentheses must run: {out:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1.2.3");
 
         // PATHEXT unset → the default triple still finds the shim.
         let no_pathext = |name: &str| (name == "PATH").then(|| joined.clone());
@@ -414,10 +443,9 @@ mod tests {
         };
         assert_eq!(resolve_tool_with("bun", &exe_only), None);
 
-        // A real .exe is spawned directly, never through cmd.exe.
+        // A real .exe is the program too — the same path for both shapes.
         std::fs::write(bin.join("bun.exe"), b"").unwrap();
         let exe = resolve_tool_with("bun", &exe_only).expect("bun.exe resolves");
-        assert!(!is_batch_shim(&exe));
         assert_eq!(command_for(&exe).get_program(), exe.as_os_str());
     }
 

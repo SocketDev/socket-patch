@@ -6,10 +6,6 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-// Only the Windows PATHEXT test below asserts shim detection.
-#[cfg(all(test, windows))]
-use crate::utils::process::is_batch_shim;
-
 /// Pins the answer without spawning anything: CI images without pipenv on
 /// PATH, or a project installed with a different release than the machine's
 /// default pipenv.
@@ -67,8 +63,9 @@ pub async fn installed_major(root: &Path) -> Option<u32> {
         return Some(forced);
     }
     let program = resolve_on_path(&|name| std::env::var_os(name))?;
-    // `.bat` / `.cmd` shims launch through `cmd.exe /C`, real executables
-    // directly — the shared launcher decides.
+    // The RESOLVED path is spawned; a Windows `.bat` / `.cmd` shim is run by
+    // `std` itself through cmd.exe with correct quoting (see the shared
+    // launcher's docs).
     let mut command = tokio::process::Command::from(crate::utils::process::command_for(&program));
     // The version banner does not depend on a project, so the probe runs in a
     // NEUTRAL directory: with the scanned repository as cwd, Pipenv would read
@@ -110,12 +107,19 @@ mod tests {
             ),
             Some(2023)
         );
-        assert_eq!(parse_major("Loading .env environment variables...\npipenv, version 2022.12.19"), Some(2022));
+        assert_eq!(
+            parse_major("Loading .env environment variables...\npipenv, version 2022.12.19"),
+            Some(2022)
+        );
         // …and a dotted number that is NOT the pipenv version is never taken.
         assert_eq!(parse_major("Python 3.12.0"), None);
         assert_eq!(parse_major("version"), None);
         assert_eq!(parse_major("version x.1"), None);
-        assert_eq!(parse_major("pipenv version 2024\n"), None, "no minor: not a version banner");
+        assert_eq!(
+            parse_major("pipenv version 2024\n"),
+            None,
+            "no minor: not a version banner"
+        );
     }
 
     #[test]
@@ -123,12 +127,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let leaf = if cfg!(windows) { "pipenv.exe" } else { "pipenv" };
+        let leaf = if cfg!(windows) {
+            "pipenv.exe"
+        } else {
+            "pipenv"
+        };
         std::fs::write(bin.join(leaf), b"").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(bin.join(leaf), std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(bin.join(leaf), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         }
         // A repo-planted `pipenv` under a RELATIVE entry must never win.
         let planted = tmp.path().join("planted");
@@ -144,7 +153,11 @@ mod tests {
         let var = |name: &str| (name == "PATH").then(|| joined.clone());
         assert_eq!(resolve_on_path(&var), Some(bin.join(leaf)));
 
-        let only_relative = std::env::join_paths([std::path::PathBuf::from("."), std::path::PathBuf::from("planted")]).unwrap();
+        let only_relative = std::env::join_paths([
+            std::path::PathBuf::from("."),
+            std::path::PathBuf::from("planted"),
+        ])
+        .unwrap();
         let var = |name: &str| (name == "PATH").then(|| only_relative.clone());
         assert_eq!(resolve_on_path(&var), None);
         let none = |_: &str| None::<OsString>;
@@ -161,9 +174,11 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(data.join("pipenv"), b"not a program").unwrap();
-        std::fs::set_permissions(data.join("pipenv"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(data.join("pipenv"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
         std::fs::write(bin.join("pipenv"), b"").unwrap();
-        std::fs::set_permissions(bin.join("pipenv"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(bin.join("pipenv"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         let joined = std::env::join_paths([data.clone(), bin.clone()]).unwrap();
         let var = |name: &str| (name == "PATH").then(|| joined.clone());
         assert_eq!(resolve_on_path(&var), Some(bin.join("pipenv")));
@@ -195,6 +210,16 @@ mod tests {
         };
         let found = resolve_on_path(&var).unwrap();
         assert_eq!(found, bin.join("pipenv.bat"));
-        assert!(is_batch_shim(&found));
+        // Spawned directly: std runs the .bat through cmd.exe itself, and the
+        // banner parses like a real pipenv's.
+        let out = crate::utils::process::command_for(&found)
+            .arg("--version")
+            .output()
+            .expect("std spawns a .bat shim");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            parse_major(&String::from_utf8_lossy(&out.stdout)),
+            Some(2024)
+        );
     }
 }

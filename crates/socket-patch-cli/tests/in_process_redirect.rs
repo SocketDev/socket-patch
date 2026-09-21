@@ -1735,8 +1735,10 @@ async fn relative_path_entry_never_runs_a_repo_planted_bun() {
 //
 // `npm i -g bun` on Windows leaves `bun`, `bun.cmd` and `bun.ps1` shims on
 // PATH and NO bun.exe; Rust's `Command::new("bun")` appends only `.exe` and
-// reports NotFound. The PATHEXT-aware resolver finds `bun.cmd` and launches
-// it through `cmd.exe /C`. These twins can only run on a Windows host.
+// reports NotFound. The PATHEXT-aware resolver finds `bun.cmd` and spawns the
+// resolved path directly — `std` (≥ 1.77.2) runs a `.cmd` through cmd.exe
+// with an outer quote pair, so a shim path with spaces and parentheses works
+// too. These twins can only run on a Windows host.
 
 /// Windows twin of `migration_that_keeps_bun_lockb_is_normalized_and_rollback_restores_it`.
 /// The shim copies a canned text lock into place (no `echo` quoting games)
