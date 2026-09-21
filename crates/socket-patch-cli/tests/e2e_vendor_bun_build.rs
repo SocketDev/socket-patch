@@ -166,7 +166,7 @@ fn parse_bun_version(raw: &str) -> Option<BunVersion> {
 fn bun_version_output() -> Option<String> {
     let mut probe = Command::new("bun");
     probe.arg("--version");
-    scrub_socket_env(&mut probe);
+    cache_env::scrub_ambient_bun_env(&mut probe);
     cache_env::isolate(&mut probe);
     let out = probe.stderr(Stdio::null()).output().ok()?;
     out.status
@@ -254,29 +254,20 @@ fn bun_toolchain(tag: &str) -> Option<(String, BunVersion)> {
 
 /// Run `bun <args>` in `cwd` with the given private cache dir, the shared
 /// cache sandbox for everything bun keeps outside that dir (`~/.bun`, the
-/// npmrc it reads), and every `SOCKET_*` var scrubbed.
+/// npmrc it reads), and the ambient env scrubbed by the scrub the three bun
+/// suites share (`cache_env::scrub_ambient_bun_env`: `SOCKET_*`, every
+/// `BUN_*`, case-insensitive `npm_config_*` — an ambient registry mirror
+/// would put the mirror tarball URL in the 4-tuple's registry slot and fail
+/// the pre-vendor assertions).
 fn bun(cwd: &Path, args: &[&str], cache_dir: &Path) -> Output {
     let mut cmd = Command::new("bun");
     cmd.args(args).current_dir(cwd);
-    // Scrub BEFORE seeding: scrub_socket_env removes BUN_INSTALL_CACHE_DIR,
-    // and Command's last env call wins.
-    scrub_socket_env(&mut cmd);
+    // Scrub BEFORE seeding: the scrub removes BUN_INSTALL_CACHE_DIR, and
+    // Command's last env call wins.
+    cache_env::scrub_ambient_bun_env(&mut cmd);
     cache_env::isolate(&mut cmd);
     cmd.env("BUN_INSTALL_CACHE_DIR", cache_dir);
     cmd.output().expect("failed to run bun")
-}
-
-/// Remove ambient `SOCKET_*` vars and the bun cache env the harness controls
-/// (always passed explicitly).
-fn scrub_socket_env(cmd: &mut Command) {
-    for (k, _) in std::env::vars_os() {
-        let k = k.to_string_lossy();
-        if k.starts_with("SOCKET_") && k != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(k.as_ref());
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("BUN_INSTALL_CACHE_DIR");
 }
 
 /// The real binary with `--no-telemetry` appended: nothing in this suite
@@ -284,7 +275,7 @@ fn scrub_socket_env(cmd: &mut Command) {
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
     cmd.args(args).arg("--no-telemetry").current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    cache_env::scrub_ambient_bun_env(&mut cmd);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),

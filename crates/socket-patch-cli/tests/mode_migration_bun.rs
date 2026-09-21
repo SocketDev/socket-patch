@@ -308,20 +308,12 @@ fn bun_toolchain(tag: &str) -> Option<(String, BunVersion)> {
 
 /// Remove ambient `SOCKET_*` (except the hermetic `SOCKET_NO_CONFIG`),
 /// every `BUN_*` var (the harness passes bun's install/cache dirs
-/// explicitly per project) and `npm_config_*` (bun reads npm's registry
+/// explicitly per project), `npm_config_*` (bun reads npm's registry
 /// config; an ambient mirror or auth token would change what the fixture
-/// install resolves against).
+/// install resolves against) and `VIRTUAL_ENV` — the scrub the three bun
+/// suites share, so none can drift back to a `SOCKET_*`-only scrub.
 fn scrub_env(cmd: &mut Command) {
-    for (k, _) in std::env::vars_os() {
-        let key = k.to_string_lossy();
-        if (key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG")
-            || key.starts_with("BUN_")
-            || key.to_ascii_lowercase().starts_with("npm_config_")
-        {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
+    cache_env::scrub_ambient_bun_env(cmd);
 }
 
 /// Run `bun <args>` in `cwd` with a PRIVATE `BUN_INSTALL` + cache under

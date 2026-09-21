@@ -186,7 +186,7 @@ fn parse_bun_version(raw: &str) -> Option<BunVersion> {
 fn bun_version_output() -> Option<String> {
     let mut probe = Command::new("bun");
     probe.arg("--version");
-    scrub_socket_env(&mut probe);
+    cache_env::scrub_ambient_bun_env(&mut probe);
     cache_env::isolate(&mut probe);
     let out = probe.stderr(Stdio::null()).output().ok()?;
     out.status
@@ -272,20 +272,18 @@ fn bun_toolchain(tag: &str) -> Option<(String, BunVersion)> {
     Some((raw, version))
 }
 
-fn scrub_socket_env(cmd: &mut Command) {
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("SOCKET_") && k.to_string_lossy() != "SOCKET_NO_CONFIG" {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove("VIRTUAL_ENV");
-    cmd.env_remove("BUN_INSTALL_CACHE_DIR");
-}
-
+/// Run `bun <args>` in `cwd` with the given private cache dir, the shared
+/// cache sandbox for everything else bun keeps outside it, and the ambient
+/// env scrubbed by the scrub the three bun suites share
+/// (`cache_env::scrub_ambient_bun_env`: `SOCKET_*`, every `BUN_*`,
+/// case-insensitive `npm_config_*` — an ambient registry mirror would put
+/// the mirror tarball URL in the 4-tuple's registry slot and fail the
+/// pre-rewrite assertions). Scrub BEFORE seeding: `Command`'s last env call
+/// for a name wins, and the scrub removes `BUN_INSTALL_CACHE_DIR`.
 fn bun(cwd: &Path, args: &[&str], cache_dir: &Path) -> Output {
     let mut cmd = Command::new("bun");
     cmd.args(args).current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    cache_env::scrub_ambient_bun_env(&mut cmd);
     cache_env::isolate(&mut cmd);
     cmd.env("BUN_INSTALL_CACHE_DIR", cache_dir);
     cmd.output().expect("failed to run bun")
@@ -296,7 +294,7 @@ fn bun(cwd: &Path, args: &[&str], cache_dir: &Path) -> Output {
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     let mut cmd = Command::new(binary());
     cmd.args(args).arg("--no-telemetry").current_dir(cwd);
-    scrub_socket_env(&mut cmd);
+    cache_env::scrub_ambient_bun_env(&mut cmd);
     let out = cmd.output().expect("failed to run socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
