@@ -1093,6 +1093,188 @@ async fn already_vendored_v1_workspace_rerun_is_already_vendored_exit_zero() {
     assert_eq!(lock_bytes(tmp.path()), lock_before);
 }
 
+/// A SUPERSEDING patch uuid on the upgraded workspace project: the ledger
+/// holds the OLD uuid, so a ledger-only exemption refused the update at
+/// download (`vendor_bun_workspace_unsupported`, exit 1) with a re-lock
+/// remedy a Bun 1.2/1.3 team cannot follow — while the engine would have
+/// re-vendored the already-local tuple in place. The lock-derived
+/// exemption sees every instance is ours and lets the run through: the
+/// record is `updated`, the engine re-pins the tuple at the new uuid, the
+/// lock stays at lockfileVersion 1 with its workspace entry intact.
+#[tokio::test]
+async fn superseding_uuid_on_already_vendored_v1_workspace_is_revendored_not_refused() {
+    const SUPERSEDING_UUID: &str = "33333333-3333-4333-8333-333333333333";
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    vendor_then_add_workspace(tmp.path(), &mock.uri());
+    mount_view(&mock, SUPERSEDING_UUID, PURL).await;
+
+    let (exit, stdout, stderr) =
+        get_vendored(tmp.path(), &mock.uri(), SUPERSEDING_UUID, &["--json"]);
+    assert_eq!(exit, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["status"], "success", "{v}");
+    assert_eq!(v["patches"][0]["action"], "updated", "{v}");
+    assert_eq!(v["patches"][0]["oldUuid"], UUID, "{v}");
+    assert!(v["patches"][0].get("errorCode").is_none(), "{v}");
+    assert_eq!(v["vendor"]["summary"]["applied"], 1, "{v}");
+    assert_eq!(v["vendor"]["summary"]["failed"], 0, "{v}");
+    assert!(
+        !stdout.contains(WS_CODE),
+        "no arm may raise the workspace refusal for an already-vendored purl: {v}"
+    );
+    let lock = String::from_utf8(lock_bytes(tmp.path())).unwrap();
+    assert!(
+        lock.contains(&format!(
+            "\"left-pad@.socket/vendor/npm/{SUPERSEDING_UUID}/left-pad-1.3.0.tgz\""
+        )),
+        "the tuple must point at the superseding uuid:\n{lock}"
+    );
+    assert!(
+        !lock.contains(UUID),
+        "the old uuid path must be gone:\n{lock}"
+    );
+    assert!(
+        lock.contains("    \"consumer\": [\"consumer@workspace:packages/consumer\"],\n"),
+        "the workspace entry survives:\n{lock}"
+    );
+    assert!(lock.starts_with("{\n  \"lockfileVersion\": 1,\n"), "{lock}");
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["entries"][PURL]["uuid"], SUPERSEDING_UUID, "{state}");
+    assert!(tmp
+        .path()
+        .join(format!(
+            ".socket/vendor/npm/{SUPERSEDING_UUID}/left-pad-1.3.0.tgz"
+        ))
+        .is_file());
+    assert!(
+        !tmp.path()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists(),
+        "the stale uuid dir is swept"
+    );
+}
+
+/// The same upgraded project with its vendor ledger LOST (`state.json`
+/// deleted — the shape `repair` reconstructs from): the ledger exemption
+/// has nothing to match, but the lock still says every instance is ours,
+/// so the download phase must NOT refuse the in-sync re-run — it
+/// classifies `skipped` (already in the manifest) and hands the ledgerless
+/// wiring to the engine, whose verdict (not the preflight's) decides the
+/// run. Nothing here may raise the workspace code.
+#[tokio::test]
+async fn wiped_ledger_on_already_vendored_v1_workspace_is_not_refused_at_preflight() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let lock_before = vendor_then_add_workspace(tmp.path(), &mock.uri());
+    std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
+
+    let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
+    let v = parse_single_json_doc(&stdout);
+    let rec = &v["download"]["patches"][0];
+    assert_eq!(
+        rec["action"], "skipped",
+        "an in-sync purl must not be refused for a lost ledger (exit {exit}): {v}\n{stderr}"
+    );
+    assert!(rec.get("errorCode").is_none(), "{v}");
+    assert_eq!(v["download"]["failed"], 0, "{v}");
+    assert!(
+        !stdout.contains(WS_CODE),
+        "no arm may raise the workspace refusal: {v}"
+    );
+    assert_eq!(
+        lock_bytes(tmp.path()),
+        lock_before,
+        "the wired lock is left alone"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Corrupt vendor ledger beside a refused Bun lock: name the ledger
+// ---------------------------------------------------------------------------
+
+/// `get <uuid> --mode vendored` returns before the vendor step, so the
+/// preflight's refusal is the ONLY diagnosis the run emits; the dry-run
+/// preview and the detached download phase share the same ledger-blind
+/// spot. All three must report `vendor_state_unreadable` (the code every
+/// other vendor-adjacent command uses for this file) with the io/parse
+/// detail, not the Bun re-lock remedy — fail-closed still: nothing exempt,
+/// nothing written, the corrupt ledger left in place for the operator.
+#[tokio::test]
+async fn corrupt_vendor_ledger_on_refused_bun_lock_reports_vendor_state_unreadable() {
+    const LEDGER_CODE: &str = "vendor_state_unreadable";
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_project(tmp.path(), LockShape::V1Workspace);
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(vendor_dir.join("state.json"), b"{ not json").unwrap();
+    let lock_before = lock_bytes(tmp.path());
+
+    // uuid path, JSON: the pre-record refusal envelope carries the ledger code.
+    let (exit, stdout, stderr) = get_vendored(tmp.path(), &mock.uri(), UUID, &["--json"]);
+    assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["status"], "error", "{v}");
+    assert_eq!(v["error"]["code"], LEDGER_CODE, "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("state.json")),
+        "the detail names the ledger file: {v}"
+    );
+    assert_eq!(v["patches"][0]["errorCode"], LEDGER_CODE, "{v}");
+    assert!(
+        !stdout.contains(WS_CODE),
+        "the Bun lock remedy must not shadow the ledger corruption: {v}"
+    );
+    assert!(!tmp.path().join(".socket/manifest.json").exists());
+
+    // uuid path, human: the code-tagged Error line.
+    let (exit, stdout, stderr) = get_vendored(tmp.path(), &mock.uri(), UUID, &[]);
+    assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stderr.contains(&format!("Error ({LEDGER_CODE}):")),
+        "stderr must carry the ledger code:\n{stderr}"
+    );
+
+    // Dry-run preview: `would_refuse` with the ledger code.
+    let (exit, stdout, stderr) =
+        get_vendored(tmp.path(), &mock.uri(), UUID, &["--dry-run", "--json"]);
+    assert_eq!(exit, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    let rec = &v["vendor"]["patches"][0];
+    assert_eq!(rec["action"], "would_refuse", "{v}");
+    assert_eq!(rec["errorCode"], LEDGER_CODE, "{v}");
+
+    // Detached download phase: the same code before any fetch.
+    let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--detached", "--json"]);
+    assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    let rec = &v["download"]["patches"][0];
+    assert_eq!(rec["action"], "failed", "{v}");
+    assert_eq!(rec["errorCode"], LEDGER_CODE, "{v}");
+    assert_eq!(v["download"]["downloaded"], 0, "{v}");
+
+    assert_eq!(
+        lock_bytes(tmp.path()),
+        lock_before,
+        "refused runs never touch the lock"
+    );
+    assert_eq!(
+        std::fs::read(vendor_dir.join("state.json")).unwrap(),
+        b"{ not json",
+        "the corrupt ledger is left for the operator, never overwritten"
+    );
+    assert!(!vendor_dir.join("npm").exists());
+}
+
 // ---------------------------------------------------------------------------
 // Digest-less re-saves (Bun 1.1.39–1.3.9)
 // ---------------------------------------------------------------------------

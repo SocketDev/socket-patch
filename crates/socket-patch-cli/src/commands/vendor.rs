@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::apply::{representative_file, result_to_event, variant_matches_installed};
+use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
@@ -951,6 +952,31 @@ pub(crate) async fn vendor_records(
         }
     };
 
+    // Bun vendored preflight (see `crate::commands::bun_preflight`), run
+    // ONCE per run over the in-scope npm records and consulted per
+    // candidate in the dispatch loop BEFORE the hosted→vendored takeover.
+    // The bun engine refuses a pre-v2 `workspace:` lock (and a lockb-only /
+    // unreadable / unsupported-version project) before its own writes —
+    // but the takeover below reverts a hosted purl's lockfile edits and
+    // persists the redirect-ledger drop FIRST, so without this gate a
+    // `vendor` over a hosted-wired v1 workspace lock stripped the live
+    // hosted redirect, then failed `vendor_bun_workspace_unsupported`:
+    // unpatched in both modes, with the refusal telling the user to use
+    // the hosted mode it had just destroyed. `scan`/`get --mode vendored`
+    // already run this preflight at download time; here it is the ONLY
+    // gate the plain `vendor` command has, and its dry-run arm previews the
+    // same refusal instead of the takeover advisory. A purl the vendor
+    // ledger wires at the record's uuid, or whose lock instances are all
+    // already ours, is exempt (the engine handles in-sync re-runs and
+    // superseding-uuid re-vendors itself) — the ledger loaded above is the
+    // one it consults. Pairs are the in-scope vendorable records, so an
+    // `--ecosystems` filter that excludes npm never reads the lock.
+    let bun_pairs: Vec<(&str, &str)> = vendorable
+        .iter()
+        .filter_map(|p| records.get(p).map(|r| (p.as_str(), r.uuid.as_str())))
+        .collect();
+    let bun_refusal = bun_vendor_preflight_pairs(&common.cwd, &bun_pairs, Ok(&state.entries)).await;
+
     // Release-variant grouping (pypi `?artifact_id=`, gem `?platform=`):
     // the crawler emits base purls; match the manifest's qualified variants
     // against the installed distribution via the first-file probe.
@@ -1032,6 +1058,29 @@ pub(crate) async fn vendor_records(
             }
             matched.insert(candidate.clone());
 
+            // The Bun preflight verdict (computed once above): the engine
+            // would refuse this project for this purl, so refuse HERE — the
+            // same `failed` event, code and detail the engine would have
+            // produced, in the dry run and the wet run alike — before the
+            // takeover block below can revert a live hosted redirect on its
+            // behalf. Hosted wiring, redirect ledger and lockfile stay
+            // byte-untouched for a refused purl.
+            if let Some(refusal) = bun_refusal.as_ref().filter(|r| r.applies_to(candidate)) {
+                has_errors = true;
+                env.record(
+                    PatchEvent::new(PatchAction::Failed, candidate.clone())
+                        .with_error(refusal.code, refusal.detail.clone()),
+                );
+                if !common.silent && !common.json {
+                    eprintln!(
+                        "Cannot vendor {}: {}",
+                        normalize_purl(candidate),
+                        refusal.detail
+                    );
+                }
+                continue;
+            }
+
             // Cross-mode takeover: vendoring over a LIVE hosted redirect
             // must first revert the hosted edits from the redirect ledger.
             // Cargo: `[patch.crates-io]` only patches crates-io-sourced
@@ -1048,7 +1097,10 @@ pub(crate) async fn vendor_records(
             // lock fragment to record as the ledger's originals. A purl
             // whose hosted edits cannot be cleanly reverted is REFUSED; the
             // cargo backend's own fail-closed guard (`hosted_redirect_live`)
-            // backstops states with no usable ledger at all.
+            // backstops states with no usable ledger at all. A purl whose
+            // bun project the vendor engine would refuse outright never
+            // reaches this block (the Bun preflight `continue`d above), so
+            // a refusal can no longer land AFTER the revert was persisted.
             if socket_patch_core::patch::redirect::redirect_revert_supported(candidate) {
                 if let Some(corrupt) = &redirect_ledger_corrupt {
                     has_errors = true;
@@ -1114,6 +1166,11 @@ pub(crate) async fn vendor_records(
                             // whole plan (revert, then vendor) and the preview
                             // stops here — the hosted dry run makes the same
                             // choice after `redirect_would_revert_vendored`.
+                            // The project-level refusals the engine WOULD
+                            // raise after the revert (workspace gate, lock
+                            // version) were already previewed by the Bun
+                            // preflight above, so stopping here promises
+                            // nothing the wet run then refuses.
                             if revert.reverted_files.iter().any(|f| f == "bun.lock") {
                                 continue;
                             }

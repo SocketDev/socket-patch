@@ -1290,13 +1290,18 @@ fn scan_bun_lockb_only_project_warns_instead_of_silent_success() {
     assert!(stdout.contains("No packages found"), "{stdout:?}");
 }
 
-/// NON-empty hosted scan (an installed package beside the bun.lockb): the
-/// hosted driver runs and owns the bun.lockb story (`redirect_bun_lockb_*`
-/// on `redirect.warnings`, or an actual migration), so the discovery-side
-/// `bun_lockb_unsupported` is dropped there — while the same project in
-/// agent mode keeps it on its non-empty envelope.
+/// NON-empty scan (an installed package beside the bun.lockb), EVERY mode:
+/// the discovery-side `bun_lockb_unsupported` rides the non-empty envelope
+/// too — hosted included. An earlier version dropped it on every non-empty
+/// hosted run on the theory that the hosted driver "owns the bun.lockb
+/// story", but the driver only speaks about the file when an npm override
+/// is actually granted (`redirect_bun_lockb_*` / a migration edit); with
+/// nothing to redirect (this fixture: no patches) a hosted scan printed a
+/// clean success that never mentioned the unread bun lock — the silent
+/// no-op this channel exists to close. Nothing is deduplicated: on the run
+/// that does migrate, the envelope may carry both voices about the file.
 #[tokio::test]
-async fn scan_hosted_nonempty_drops_the_bun_lockb_discovery_warning() {
+async fn scan_nonempty_keeps_the_bun_lockb_discovery_warning_in_every_mode() {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
@@ -1307,7 +1312,7 @@ async fn scan_hosted_nonempty_drops_the_bun_lockb_discovery_warning() {
         .mount(&mock)
         .await;
 
-    for (mode, expect_warning) in [(None, true), (Some("hosted"), false)] {
+    for mode in [None, Some("vendored"), Some("hosted")] {
         let tmp = tempfile::tempdir().unwrap();
         write_bun_lockb_only_project(tmp.path());
         write_npm_package(tmp.path(), "minimist", "1.2.2", b"module.exports = 1;\n");
@@ -1329,10 +1334,102 @@ async fn scan_hosted_nonempty_drops_the_bun_lockb_discovery_warning() {
         let v: serde_json::Value = serde_json::from_str(stdout.trim())
             .unwrap_or_else(|e| panic!("bad JSON ({e}): {stdout}"));
         assert_eq!(v["scannedPackages"], 1, "mode={mode:?}: {v}");
-        assert_eq!(
-            bun_lockb_warning(&v).is_some(),
-            expect_warning,
-            "mode={mode:?}: hosted drops the discovery-side lockb warning on the non-empty path, agent keeps it: {v}"
+        assert_eq!(v["status"], "success", "mode={mode:?}: {v}");
+        let warning = bun_lockb_warning(&v).unwrap_or_else(|| {
+            panic!("mode={mode:?}: the non-empty envelope must keep bun_lockb_unsupported: {v}")
+        });
+        assert!(
+            warning["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("--save-text-lockfile")),
+            "mode={mode:?}: {v}"
         );
     }
+
+    // Human hosted path: the same warning line on stderr before the driver
+    // runs (exit 0; nothing to redirect).
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_lockb_only_project(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2", b"module.exports = 1;\n");
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--mode", "hosted"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stderr.contains("Warning (bun_lockb_unsupported):"),
+        "the human hosted path must keep the warning; got {stderr:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Human `--mode vendored --dry-run`: the `[would-refuse]` lines
+// ---------------------------------------------------------------------------
+// The contract promises the human vendored preview names what the wet run
+// would refuse. Only `get --mode vendored --dry-run` printed the lines; a
+// human `scan --mode vendored --dry-run` on a refused Bun project said
+// "Would download and vendor 1 patch(es). No changes made." for a run that
+// exits 1. Both commands now share the printer.
+
+/// A real bun 1.3.14 lockfileVersion-1 workspace lock resolving minimist
+/// from the registry: the shape the vendored preflight refuses.
+fn write_bun_v1_workspace_lock(root: &Path) {
+    std::fs::write(
+        root.join("bun.lock"),
+        "{\n  \"lockfileVersion\": 1,\n  \"configVersion\": 1,\n  \"workspaces\": {\n    \"\": {\n      \"name\": \"covgap-scan-root\",\n      \"dependencies\": {\n        \"consumer\": \"workspace:*\",\n      },\n    },\n    \"packages/consumer\": {\n      \"name\": \"consumer\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": {\n        \"minimist\": \"1.2.2\",\n      },\n    },\n  },\n  \"packages\": {\n    \"consumer\": [\"consumer@workspace:packages/consumer\"],\n\n    \"minimist\": [\"minimist@1.2.2\", \"\", {}, \"sha512-AAAA==\"],\n  }\n}\n",
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn scan_human_vendored_dry_run_names_would_refuse_records() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+    mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+    write_bun_v1_workspace_lock(tmp.path());
+
+    let (code, stdout, stderr) = run_scan_human(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "vendored", "--dry-run"],
+    );
+    assert_eq!(
+        code, 0,
+        "a preview never flips the exit; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("[dry-run] Would download and vendor 1 patch(es). No changes made."),
+        "the count line stays; got {stdout:?}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "  [would-refuse] {purl} (vendor_bun_workspace_unsupported): "
+        )),
+        "the human scan preview must name the refusal like get's does; got {stdout:?}"
+    );
+    assert!(
+        stdout.contains("lockfileVersion-1 lock") && stdout.contains("--mode hosted"),
+        "the engine's detail rides along; got {stdout:?}"
+    );
+    // Nothing written: no manifest, no blobs, no vendor ledger. (The human
+    // preview does fetch the patch view for its baseline-hash check — the
+    // same as every human dry run — so the request log is not the oracle.)
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "a dry run writes nothing"
+    );
+
+    // `--silent`: informational, so nothing at all on stdout.
+    let (code, stdout, _) = run_scan_human(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "vendored", "--dry-run", "--silent"],
+    );
+    assert_eq!(code, 0);
+    assert!(
+        stdout.trim().is_empty(),
+        "silent dry run prints nothing:\n{stdout}"
+    );
 }

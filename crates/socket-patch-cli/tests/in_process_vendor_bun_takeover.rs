@@ -25,6 +25,11 @@
 //!      whole-ledger replay is not eligible) unwinds only the targeted line
 //!      and record; the sibling stays hosted.
 //!   4. Same ledger, `remove <purl>`.
+//!   5. A hosted-wired lockfileVersion-1 WORKSPACE lock (hosted accepts it,
+//!      the vendored backend refuses it): `vendor` — dry and wet — refuses
+//!      `vendor_bun_workspace_unsupported` BEFORE the takeover reverts
+//!      anything, so the hosted wiring survives byte-for-byte; the v2 twin
+//!      still takes over.
 //!
 //! Every child process gets the ambient `SOCKET_*` vars scrubbed and
 //! telemetry hard-disabled; each test runs in its own tempdir.
@@ -900,4 +905,187 @@ fn bun_scoped_remove_of_one_of_two_hosted_records_unwinds_only_that_purl() {
         "no top-level error expected: {env:#}"
     );
     assert_only_left_pad_unwound(root, &pristine);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 5. hosted-wired pre-v2 WORKSPACE lock: `vendor` refuses BEFORE un-hosting
+// ─────────────────────────────────────────────────────────────────────
+// Hosted mode accepts a lockfileVersion-1 workspace lock (a URL tuple has
+// no path to resolve); the vendored backend refuses every pre-v2 workspace
+// lock (`vendor_bun_workspace_unsupported`). The plain `vendor` command
+// used to run the takeover FIRST — revert the hosted line, persist the
+// redirect-ledger drop — and only then hear the engine's refusal, leaving
+// the project unpatched in BOTH modes while the refusal's remedy pointed
+// at the hosted mode it had just destroyed; its dry run promised the
+// takeover (`vendor_would_revert_redirect`, status success) outright. The
+// Bun preflight now runs inside the engine loop before the takeover block.
+
+const WS_CODE: &str = "vendor_bun_workspace_unsupported";
+
+/// Pristine `lockfileVersion` workspace lock — root + a `packages/consumer`
+/// member declaring left-pad — in the real bun 1.3.14 (v1) / 1.4.2 (v2)
+/// grammar: `configVersion`, the member's 1-tuple `workspace:` entry, a
+/// blank line between entries, trailing commas.
+fn pristine_workspace_lock(version: u64) -> String {
+    format!(
+        "{{\n  \"lockfileVersion\": {version},\n  \"configVersion\": 1,\n  \"workspaces\": {{\n    \"\": {{\n      \"name\": \"bun-takeover-fixture\",\n      \"dependencies\": {{\n        \"consumer\": \"workspace:*\",\n      }},\n    }},\n    \"packages/consumer\": {{\n      \"name\": \"consumer\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": {{\n        \"left-pad\": \"1.3.0\",\n      }},\n    }},\n  }},\n  \"packages\": {{\n    \"consumer\": [\"consumer@workspace:packages/consumer\"],\n\n{LEFT_PAD_REGISTRY_LINE}\n  }}\n}}\n"
+    )
+}
+
+/// A hosted-live WORKSPACE bun project with ONE redirect record, written
+/// exactly as `scan --mode hosted` leaves it, plus the manifest record and
+/// blob a default-mode `get`/`scan` adds — the shape the plain `vendor`
+/// command acts on (a hosted-only project is a `noManifest` no-op).
+/// Returns the hosted lock text.
+fn write_hosted_workspace_project(root: &Path, version: u64) -> String {
+    let pristine = pristine_workspace_lock(version);
+    write_bun_project(root, &pristine, &[(NAME, VERSION)]);
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"bun-takeover-fixture","version":"1.0.0","private":true,"workspaces":["packages/*"],"dependencies":{"consumer":"workspace:*"}}"#,
+    )
+    .unwrap();
+    let consumer = root.join("packages/consumer");
+    std::fs::create_dir_all(&consumer).unwrap();
+    std::fs::write(
+        consumer.join("package.json"),
+        r#"{"name":"consumer","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}"#,
+    )
+    .unwrap();
+    let left_pad_hosted = hosted_line(NAME, NAME, HOSTED_URL, PATCHED_SHA512);
+    let hosted = pristine.replace(LEFT_PAD_REGISTRY_LINE, &left_pad_hosted);
+    assert_ne!(hosted, pristine, "the hosted splice must hit");
+    std::fs::write(root.join("bun.lock"), &hosted).unwrap();
+    let ledger = json!({
+        "version": 1,
+        "mode": "hosted",
+        "edits": [{
+            "path": "bun.lock",
+            "kind": "redirect_bun_lock_package",
+            "action": "rewritten",
+            "key": NAME,
+            "original": LEFT_PAD_REGISTRY_LINE,
+            "new": left_pad_hosted,
+        }],
+        "records": { PURL: patch_record(UUID) },
+    });
+    std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
+    std::fs::write(
+        root.join(".socket/vendor/redirect-state.json"),
+        serde_json::to_vec_pretty(&ledger).unwrap(),
+    )
+    .unwrap();
+    seed_manifest_and_blob(root);
+    hosted
+}
+
+/// Every byte of the hosted wiring must survive a refused run: the lock,
+/// the redirect ledger (record + edit), and no vendor ledger or artifact.
+fn assert_hosted_wiring_intact(root: &Path, hosted_lock: &str, hosted_ledger: &[u8]) {
+    assert_eq!(
+        read(root, "bun.lock"),
+        hosted_lock,
+        "bun.lock must stay byte-identical to the hosted lock"
+    );
+    let ledger_path = root.join(".socket/vendor/redirect-state.json");
+    assert_eq!(
+        std::fs::read(&ledger_path).unwrap(),
+        hosted_ledger,
+        "the redirect ledger must stay byte-identical"
+    );
+    let ledger: Value =
+        serde_json::from_str(&read(root, ".socket/vendor/redirect-state.json")).unwrap();
+    assert!(ledger["records"].get(PURL).is_some(), "{ledger:#}");
+    let edits = ledger["edits"].as_array().unwrap();
+    assert_eq!(edits.len(), 1, "{ledger:#}");
+    assert_eq!(edits[0]["key"], NAME, "{ledger:#}");
+    assert!(
+        !root.join(".socket/vendor/state.json").exists(),
+        "a refused run must not create the vendor ledger"
+    );
+    assert!(
+        !root.join(".socket/vendor/npm").exists(),
+        "a refused run must not stage or pack an artifact"
+    );
+}
+
+#[test]
+fn bun_vendor_over_hosted_v1_workspace_lock_refuses_before_unhosting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let hosted_lock = write_hosted_workspace_project(root, 1);
+    let hosted_ledger = std::fs::read(root.join(".socket/vendor/redirect-state.json")).unwrap();
+
+    // Dry run: previews the REFUSAL, not the takeover, with the wet run's
+    // exit code — and writes nothing.
+    let (code, env) = vendor_cli(root, &["--dry-run"]);
+    assert_eq!(
+        code, 1,
+        "the preview must exit like the wet run it predicts: {env:#}"
+    );
+    assert_eq!(env["status"], "partialFailure", "{env:#}");
+    assert_eq!(env["dryRun"], true, "{env:#}");
+    let failed = find_event(&env, "failed", Some(WS_CODE));
+    assert_eq!(failed["purl"], PURL, "{env:#}");
+    assert_eq!(env["summary"]["failed"], 1, "{env:#}");
+    assert_no_event_code(&env, "vendor_would_revert_redirect");
+    assert_no_event_code(&env, "vendor_takeover_reverted_redirect");
+    assert_no_event_code(&env, "redirect_revert_failed");
+    assert_hosted_wiring_intact(root, &hosted_lock, &hosted_ledger);
+
+    // Wet run: the same refusal, BEFORE any revert — hosted wiring intact.
+    // Used to: `skipped vendor_takeover_reverted_redirect` then `failed
+    // vendor_bun_workspace_unsupported`, registry tuple back in the lock,
+    // redirect-state.json deleted, `.socket/vendor/` empty.
+    let (code, env) = vendor_cli(root, &[]);
+    assert_eq!(code, 1, "the wet run refuses: {env:#}");
+    assert_eq!(env["status"], "partialFailure", "{env:#}");
+    let failed = find_event(&env, "failed", Some(WS_CODE));
+    assert_eq!(failed["purl"], PURL, "{env:#}");
+    assert!(
+        failed["error"]
+            .as_str()
+            .is_some_and(|d| d.contains("lockfileVersion-1 lock") && d.contains("--mode hosted")),
+        "the detail names the version and the hosted alternative this run left in place: {env:#}"
+    );
+    assert_eq!(env["summary"]["applied"], 0, "{env:#}");
+    assert_eq!(env["summary"]["failed"], 1, "{env:#}");
+    assert_no_event_code(&env, "vendor_takeover_reverted_redirect");
+    assert_no_event_code(&env, "vendor_would_revert_redirect");
+    assert_no_event_code(&env, "redirect_revert_failed");
+    assert_hosted_wiring_intact(root, &hosted_lock, &hosted_ledger);
+
+    // The manifest record survives too (the recovery path — a networked
+    // `scan --mode hosted` — needs nothing this run could have dropped).
+    let manifest: Value = serde_json::from_str(&read(root, ".socket/manifest.json")).unwrap();
+    assert_eq!(manifest["patches"][PURL]["uuid"], UUID, "{manifest:#}");
+}
+
+/// The lockfileVersion-2 twin: hosted mode and the vendored backend both
+/// accept it, so the takeover still completes — the preflight must not
+/// over-refuse the supported workspace shape.
+#[test]
+fn bun_vendor_over_hosted_v2_workspace_lock_still_takes_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_hosted_workspace_project(root, 2);
+
+    let (code, env) = vendor_cli(root, &["--dry-run"]);
+    assert_eq!(code, 0, "{env:#}");
+    find_event(&env, "skipped", Some("vendor_would_revert_redirect"));
+    assert_no_event_code(&env, WS_CODE);
+
+    let (code, env) = vendor_cli(root, &[]);
+    assert_eq!(code, 0, "the v2 takeover must succeed: {env:#}");
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
+    find_event(&env, "skipped", Some("vendor_takeover_reverted_redirect"));
+    find_event(&env, "applied", None);
+    assert_no_event_code(&env, WS_CODE);
+    assert_pure_vendored(root);
+    let lock = read(root, "bun.lock");
+    assert!(
+        lock.contains("    \"consumer\": [\"consumer@workspace:packages/consumer\"],\n"),
+        "the workspace entry survives the takeover:\n{lock}"
+    );
+    assert!(lock.starts_with("{\n  \"lockfileVersion\": 2,\n"), "{lock}");
 }

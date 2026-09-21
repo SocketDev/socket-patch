@@ -16,11 +16,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::args::GlobalArgs;
+use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
-use crate::commands::get::{
-    bun_vendor_preflight_with_ledger, download_and_apply_patches, download_patch_records,
-    DownloadParams,
-};
+use crate::commands::get::{download_and_apply_patches, download_patch_records, DownloadParams};
 use crate::commands::vendor::{
     note_classic_migration_risk, reconcile_dropped, track_outcomes_for_vendor, vendor_records,
 };
@@ -39,28 +37,40 @@ use super::{
 /// entry), `already_vendored` (entry at this uuid), `would_revendor` +
 /// `oldUuid` (entry at an older uuid), and — additive — `would_refuse` +
 /// `errorCode` + `error` for npm purls the wet run's Bun preflight
-/// ([`crate::commands::get::BunVendorRefusal`]) would refuse before any
-/// download. The preview stays a ledger classification otherwise (engine
-/// refusals outside the preflight are not predicted), and it never flips
-/// the run's status or exit code: `would_refuse` is best-effort advice so a
-/// preview never advertises vendoring the wet run is known to refuse.
-/// The preflight is one read of `bun.lock`/`bun.lockb` — the only disk
-/// access here — and runs only when the selection holds an npm purl.
+/// ([`crate::commands::bun_preflight::BunVendorRefusal`]) would refuse
+/// before any download. The preview stays a ledger classification otherwise
+/// (engine refusals outside the preflight are not predicted), and it never
+/// flips the run's status or exit code: `would_refuse` is best-effort
+/// advice so a preview never advertises vendoring the wet run is known to
+/// refuse. The preflight reads `bun.lock`/`bun.lockb` (plus, on a refused
+/// workspace lock, the lock once more per npm purl for the exemption) —
+/// the only disk access here — and runs only when the selection holds an
+/// npm purl.
 pub(crate) async fn preview_vendor_json(
     cwd: &Path,
     selected: &[PatchSearchResult],
 ) -> serde_json::Value {
-    let state = load_state(cwd).await.unwrap_or_default();
-    let refusal = bun_vendor_preflight_with_ledger(cwd, selected, &state.entries).await;
+    // The ledger load outcome reaches the preflight AS a result, so an
+    // unreadable ledger previews as `vendor_state_unreadable` (nothing
+    // exempt) instead of being flattened into an empty ledger that then
+    // predicts a Bun lock refusal; the classification below degrades it to
+    // empty (every npm record then reads `would_refuse` with that code).
+    let state = load_state(cwd).await;
+    let refusal =
+        bun_vendor_preflight_with_ledger(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
+    let state = state.unwrap_or_default();
     let mut patches: Vec<serde_json::Value> = selected
         .iter()
         .map(|p| match lookup_entry(&state.entries, &p.purl) {
             Some(e) if e.uuid == p.uuid => serde_json::json!({
                 "purl": p.purl, "uuid": p.uuid, "action": "already_vendored",
             }),
-            // An in-sync ledger entry is exactly the preflight's exemption,
-            // so this arm never shadows `already_vendored`; a stale entry
-            // (`would_revendor`) IS refused by the wet run, like a fresh one.
+            // An in-sync ledger entry is exactly the preflight's ledger
+            // exemption, so this arm never shadows `already_vendored`. A
+            // stale entry is refused by the wet run like a fresh one when
+            // the lock still holds a registry instance of the purl; when
+            // every instance is already ours the preflight exempts it (the
+            // engine re-vendors in place) and it previews `would_revendor`.
             _ if refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl)) => {
                 let r = refusal.as_ref().expect("checked by the guard");
                 serde_json::json!({
@@ -79,6 +89,28 @@ pub(crate) async fn preview_vendor_json(
         .collect();
     patches.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
     serde_json::json!({ "dryRun": true, "patches": patches })
+}
+
+/// Human rendering of the vendored dry-run preview's `would_refuse` records
+/// (see [`preview_vendor_json`]): the count line above it still says
+/// "would download and vendor", so name what the wet run would refuse and
+/// why. Shared by `scan --mode vendored --dry-run`'s interactive arm and
+/// both `get … --mode vendored --dry-run` arms so the two commands' human
+/// previews cannot drift (the contract promises the line for both).
+/// Informational (the preview exits 0), hence behind the caller's
+/// `--silent` gate.
+pub(crate) fn print_dry_run_refusals(preview: &serde_json::Value) {
+    let Some(patches) = preview["patches"].as_array() else {
+        return;
+    };
+    for p in patches.iter().filter(|p| p["action"] == "would_refuse") {
+        println!(
+            "  [would-refuse] {} ({}): {}",
+            p["purl"].as_str().unwrap_or_default(),
+            p["errorCode"].as_str().unwrap_or_default(),
+            p["error"].as_str().unwrap_or_default()
+        );
+    }
 }
 
 /// Build the vendoring-service config for scan's vendored flow — the SAME
