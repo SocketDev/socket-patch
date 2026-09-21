@@ -1085,7 +1085,11 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
     eprintln!("REPAIR OK");
     fresh_checkout_install_proof(&fx, "fresh-repaired");
 
-    // 6. Idempotency: a re-run exits 0 and leaves bun.lock byte-stable.
+    // 6. Idempotency: a re-run exits 0, is a SKIP (`already_vendored`, not a
+    //    re-vendor — a regression that re-classifies the in-sync local-path
+    //    tuple as needing a rewrite re-packs the deterministic tarball and
+    //    re-records the wiring while leaving bun.lock byte-identical, so the
+    //    lock bytes alone cannot see it) and leaves bun.lock byte-stable.
     let (code, stdout, stderr) = run_vendor(&fx, &[]);
     assert_eq!(
         code, 0,
@@ -1093,6 +1097,33 @@ fn bun_vendor_fresh_checkout_frozen_install_and_revert() {
     );
     let env2 = parse_envelope(&stdout);
     assert_eq!(env2["summary"]["failed"], 0, "re-run must not fail: {env2}");
+    assert_eq!(
+        env2["summary"]["applied"], 0,
+        "an in-sync re-run must not re-vendor: {env2}"
+    );
+    assert_eq!(
+        env2["summary"]["skipped"], 1,
+        "the one in-sync entry is skipped: {env2}"
+    );
+    assert!(
+        env2["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "skipped"
+                && e["errorCode"] == "already_vendored"
+                && e["purl"] == fx.target.purl()),
+        "in-sync rerun must report already_vendored for {}: {env2}",
+        fx.target.purl()
+    );
+    assert!(
+        !env2["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "applied"),
+        "no entry may be re-applied on an in-sync re-run: {env2}"
+    );
     assert_eq!(
         std::fs::read(&lock_path).unwrap(),
         lock_wired,
