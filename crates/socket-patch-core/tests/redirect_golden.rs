@@ -144,6 +144,24 @@ fn redirect_golden_fixtures_match() {
             assert_eq!(got, expected, "{rel}: edits mismatch");
         }
 
+        // Warning codes match the recorded list when a case pins one
+        // (`expected-warnings.json`: a JSON array of code strings, order-
+        // sensitive). Without it, a refusal fixture proves only "nothing
+        // changed" — which any refusal, or a silently non-matching entry,
+        // also produces — so refusal cases MUST ship this file. It is
+        // optional so that cases which legitimately rewrite AND warn (the
+        // maven advisories) keep passing unchanged; a positive case may pin
+        // `[]` to assert a warning-free rewrite. Codes only: the detail text
+        // is prose that each side may word differently.
+        let warnings_path = case.join("expected-warnings.json");
+        if warnings_path.is_file() {
+            let expected: Vec<String> =
+                serde_json::from_str(&fs::read_to_string(&warnings_path).unwrap())
+                    .unwrap_or_else(|e| panic!("{rel}: bad expected-warnings.json: {e}"));
+            let got: Vec<String> = result.warnings.iter().map(|w| w.code.clone()).collect();
+            assert_eq!(got, expected, "{rel}: warning codes mismatch");
+        }
+
         // Determinism: a second run yields identical bytes.
         let again = rewrite_registry_redirect(&files, &overrides);
         assert_eq!(again.files, result.files, "{rel}: non-deterministic");
