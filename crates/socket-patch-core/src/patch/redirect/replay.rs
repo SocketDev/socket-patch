@@ -1296,8 +1296,8 @@ mod tests {
             assert_eq!(
                 out.refusals.len(),
                 1,
-                "{kind} over {live}: {:?}",
-                out.refusals
+                "{kind}: exactly one refusal expected, got {}",
+                out.refusals.len()
             );
             assert!(
                 out.refusals[0].reason.contains(reason),
