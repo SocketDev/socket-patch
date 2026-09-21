@@ -130,13 +130,50 @@ pub struct UnsupportedNpmLayout {
 /// its own `vendor_bun_lockb_unsupported` code.
 pub const BUN_LOCKB_UNSUPPORTED_CODE: &str = "bun_lockb_unsupported";
 
-/// Inventory-phrased detail for [`BUN_LOCKB_UNSUPPORTED_CODE`]: what was
-/// NOT discovered and the one remedy (the flag exists from Bun 1.1.39;
-/// plain `bun install` on any release keeps an in-sync bun.lockb as-is).
+/// Inventory-phrased detail for [`BUN_LOCKB_UNSUPPORTED_CODE`] when
+/// bun.lockb is the project's ONLY lockfile: what was NOT discovered and
+/// the one remedy (the flag exists from Bun 1.1.39; plain `bun install` on
+/// any release keeps an in-sync bun.lockb as-is).
 pub const BUN_LOCKB_UNSUPPORTED_INVENTORY_DETAIL: &str =
     "bun.lockb is bun's legacy binary lockfile and cannot be inventoried; run `bun install \
      --save-text-lockfile` (Bun >= 1.1.39) so lockfile-only discovery and vendored mode can \
      read it";
+
+/// The sibling-aware variant of [`BUN_LOCKB_UNSUPPORTED_INVENTORY_DETAIL`]:
+/// the flavor router checks bun.lockb BEFORE pnpm/yarn/npm locks
+/// ([`detect_npm_lock_flavor`]), so a project that migrated from bun and
+/// left a stale bun.lockb committed loses lockfile-only discovery of its
+/// LIVE `sibling` lock. Telling that project to run `bun install
+/// --save-text-lockfile` would create a bun.lock for a non-bun project; the
+/// real remedy is deleting the debris, so the detail names the shadowed
+/// lock and offers both, keyed on which installer is actually in use. The
+/// `--save-text-lockfile` / `1.1.39` substrings stay so consumers grepping
+/// for the remedy keep matching.
+pub fn bun_lockb_shadows_sibling_detail(sibling: &str) -> String {
+    format!(
+        "bun.lockb is bun's legacy binary lockfile and shadows {sibling} in lockfile \
+         discovery; delete the stale bun.lockb if {sibling}'s installer is in use, or run \
+         `bun install --save-text-lockfile` (Bun >= 1.1.39) if bun is"
+    )
+}
+
+/// The first recognised non-bun lockfile beside a bun.lockb, in the flavor
+/// router's precedence (pnpm, yarn, npm — [`detect_npm_lock_flavor`] steps
+/// 3–5): the lock the router WOULD have chosen had bun.lockb not
+/// pre-empted it. `None` when bun.lockb is the only lock.
+async fn bun_lockb_shadowed_sibling(root: &Path) -> Option<&'static str> {
+    for name in [
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "npm-shrinkwrap.json",
+        "package-lock.json",
+    ] {
+        if tokio::fs::metadata(root.join(name)).await.is_ok() {
+            return Some(name);
+        }
+    }
+    None
+}
 
 /// Inventory the project's npm-family lockfile. Routes by
 /// [`detect_npm_lock_flavor`]. `Ok(None)` means there is nothing to
@@ -179,11 +216,22 @@ pub(crate) async fn inventory_npm_lock(
             // here made `scan` print a clean `scannedPackages: 0` success
             // in every mode (54 lockfile-only matrix cells at bun <=
             // 1.1.45). Own code + inventory-phrased remedy; the probe's
-            // vendor-phrased text stays with the vendor refusal.
+            // vendor-phrased text stays with the vendor refusal. When a
+            // pnpm/yarn/npm lock sits beside the bun.lockb the project has
+            // most likely migrated AWAY from bun and the binary lock is
+            // stale debris shadowing the live lock (router precedence) —
+            // the detail then names that lock and the delete remedy
+            // instead of prescribing a bun.lock for a non-bun project.
+            // Still fail-closed: the shadowed sibling is NOT inventoried
+            // (which installer is live is the user's call, not ours).
             if code == "vendor_bun_lockb_unsupported" {
+                let detail = match bun_lockb_shadowed_sibling(project_root).await {
+                    Some(sibling) => bun_lockb_shadows_sibling_detail(sibling),
+                    None => BUN_LOCKB_UNSUPPORTED_INVENTORY_DETAIL.to_string(),
+                };
                 return Err(UnsupportedNpmLayout {
                     code: BUN_LOCKB_UNSUPPORTED_CODE,
-                    detail: BUN_LOCKB_UNSUPPORTED_INVENTORY_DETAIL.to_string(),
+                    detail,
                 });
             }
             // The flavor probe passes only pnpm locks the WIRING backends
@@ -2665,6 +2713,70 @@ packages:
             diag.code, BUN_LOCKB_UNSUPPORTED_CODE,
             "a stale pnpm-lock.yaml behind bun.lockb must not be inventoried"
         );
+    }
+
+    /// The converse migration (bun → pnpm/yarn/npm, stale bun.lockb left
+    /// committed): the router still refuses on bun.lockb, so the LIVE
+    /// sibling lock is not inventoried (fail-closed, unchanged) — but the
+    /// diagnosis must name the shadowed lock and the delete remedy instead
+    /// of telling a non-bun project to write a bun.lock. The
+    /// `--save-text-lockfile` remedy stays as the bun-is-live alternative.
+    /// Sibling precedence follows the router (pnpm, yarn, npm).
+    #[tokio::test]
+    async fn bun_lockb_beside_a_live_sibling_lock_names_the_shadowed_lock() {
+        for (files, sibling) in [
+            (vec![("pnpm-lock.yaml", PNPM_LOCK)], "pnpm-lock.yaml"),
+            (vec![("yarn.lock", YARN_CLASSIC)], "yarn.lock"),
+            (
+                vec![("package-lock.json", PACKAGE_LOCK)],
+                "package-lock.json",
+            ),
+            (
+                vec![
+                    ("npm-shrinkwrap.json", PACKAGE_LOCK),
+                    ("package-lock.json", PACKAGE_LOCK),
+                ],
+                "npm-shrinkwrap.json",
+            ),
+            (
+                vec![
+                    ("yarn.lock", YARN_CLASSIC),
+                    ("package-lock.json", PACKAGE_LOCK),
+                ],
+                "yarn.lock",
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            for (name, content) in &files {
+                write(tmp.path(), name, content).await;
+            }
+            write(tmp.path(), "bun.lockb", "\0binary").await;
+            let diag = inventory_npm_lock(tmp.path()).await.unwrap_err();
+            assert_eq!(diag.code, BUN_LOCKB_UNSUPPORTED_CODE, "{sibling}");
+            assert_eq!(
+                diag.detail,
+                bun_lockb_shadows_sibling_detail(sibling),
+                "{sibling}"
+            );
+            assert!(
+                diag.detail
+                    .contains(&format!("shadows {sibling} in lockfile discovery"))
+                    && diag.detail.contains("delete the stale bun.lockb")
+                    && diag.detail.contains("bun install --save-text-lockfile")
+                    && diag.detail.contains("1.1.39"),
+                "{sibling}: {}",
+                diag.detail
+            );
+            assert!(
+                !diag.detail.contains("cannot be inventoried"),
+                "{sibling}: the lockb-only phrasing must not leak: {}",
+                diag.detail
+            );
+            // Fail-closed posture unchanged: nothing inventoried.
+            let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
+            assert!(entries.is_empty(), "{sibling}: {entries:?}");
+            assert_eq!(unsupported, vec![diag], "{sibling}");
+        }
     }
 
     /// A bun.lockb-only project (bun <= 1.1.38, or 1.1.39–1.1.45 without
