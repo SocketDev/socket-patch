@@ -337,6 +337,15 @@ def base_env():
         SOCKET_NO_UPDATE_CHECK="1",
         SOCKET_TELEMETRY_DISABLED="1",
     )
+    if platform.system() == "Linux":
+        # Python 3.8 still calls pthread_exit when a worker finishes. glibc
+        # lazily loads libgcc_s there and can abort during concurrent installs:
+        # "libgcc_s.so.1 must be installed for pthread_exit to work". Load it
+        # before threads start, including in PDM's build subprocesses. Keep
+        # Python 3.8 coverage and the install assertions instead of retrying
+        # (or skipping) interpreter crashes. CPython's documented workaround:
+        # https://github.com/python/cpython/issues/88600#issuecomment-1093919486
+        env["LD_PRELOAD"] = " ".join(filter(None, ("libgcc_s.so.1", env.get("LD_PRELOAD"))))
     return env
 
 

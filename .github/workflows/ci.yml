@@ -94,6 +94,9 @@ jobs:
           ruby -c crates/socket-patch-core/src/setup/gem/templates/plugins.rb.tmpl
           ruby -c crates/socket-patch-core/src/setup/gem/templates/gemspec.tmpl
 
+      - name: Python — test native installer harnesses
+        run: python3 -B -m unittest discover -s scripts/tests -v
+
       - name: Shell — shellcheck the curl|sh installer
         # install.sh is the other distribution artifact this job lints; it
         # had no coverage anywhere before the self-update work touched the
@@ -417,7 +420,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload host LCOV artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: ./.github/actions/upload-artifact
         with:
           name: coverage-host
           path: coverage-host.lcov
@@ -544,7 +547,7 @@ jobs:
             --output-path coverage-docker-${{ matrix.ecosystem }}.lcov
 
       - name: Upload per-ecosystem LCOV artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: ./.github/actions/upload-artifact
         with:
           name: coverage-docker-${{ matrix.ecosystem }}
           path: coverage-docker-${{ matrix.ecosystem }}.lcov
@@ -561,6 +564,11 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
       - name: Install lcov
         run: sudo apt-get update && sudo apt-get install -y lcov
 
@@ -602,7 +610,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload merged LCOV artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: ./.github/actions/upload-artifact
         with:
           name: coverage-lcov
           path: coverage.lcov
@@ -1049,7 +1057,7 @@ jobs:
 
       - name: Upload ${{ matrix.ecosystem }} setup-matrix report
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: ./.github/actions/upload-artifact
         with:
           name: setup-matrix-${{ matrix.ecosystem }}
           path: report-${{ matrix.ecosystem }}.json
