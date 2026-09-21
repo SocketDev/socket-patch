@@ -2432,22 +2432,30 @@ fn rewrite_bun_lock(
     };
 
     // Version-0 locks (bun 1.1.39–1.1.45's opt-in text lockfile) with a
-    // `workspace:` member are refused. The remedy is verified against real
-    // Bun: a plain `bun install` with ANY release ≥ 1.2.0 (1.2.0, 1.2.23,
-    // 1.3.0, 1.3.13, 1.3.14, 1.4.0–1.4.2 checked) rewrites a v0 WORKSPACE
-    // lock in place as lockfileVersion 1 — the root workspace dep spelling
-    // changes from a bare path to `workspace:*`, which forces the save —
-    // while 1.1.45 keeps it at 0. (A v0 lock WITHOUT workspaces is kept at
-    // 0 by an in-place install on 1.2.0, 1.2.23 and 1.3.0 and bumped to 1
-    // by 1.3.9 and every later release — the first bumping release lies in
-    // (1.3.0, 1.3.9]; that case is accepted here either way.)
+    // `workspace:` member are refused. The remedy that converges on every
+    // release (measured against real Bun 1.2.0, 1.2.23, 1.3.0, 1.3.9,
+    // 1.3.14, 1.4.0–1.4.2) is `rm bun.lock && bun install` with Bun ≥ 1.2:
+    // 1.2–1.3 write lockfileVersion 1, 1.4 writes 2, both accepted here. A
+    // plain IN-PLACE `bun install` bumps a v0 workspace lock to 1 only when
+    // some workspace depends on another workspace (root → member, as in the
+    // backtest's `workspace` shapes, or member → member): Bun ≥ 1.2 re-saves
+    // the bare-path spelling of that dependency as `workspace:*`, which
+    // forces the save. Without such a dependency (a root that only lists
+    // `workspaces`), 1.2.0 exits 0 and keeps 0, and 1.2.23–1.4.2 exit 1 with
+    // `<pkg>@<ver> failed to resolve` and keep 0 — so the in-place bump is
+    // stated as conditional, never as the remedy. (A v0 lock WITHOUT
+    // workspaces is kept at 0 by an in-place install on 1.2.0, 1.2.23 and
+    // 1.3.0 and bumped to 1 by 1.3.9 and every later release; that case is
+    // accepted here either way.)
     if lock_version(content) == Some(0) && has_workspace_packages(&entries) {
         result.warnings.push(RewriteWarning {
             code: "redirect_bun_workspace_unsupported".into(),
             detail: "Bun version-0 workspace locks cannot preserve hosted tarballs on frozen \
-                     installs; re-lock with Bun ≥ 1.2 (a plain `bun install` rewrites the lock \
-                     as lockfileVersion 1, which hosted mode accepts) or delete bun.lock and \
-                     re-run `bun install`"
+                     installs; delete bun.lock and re-run `bun install` with Bun >= 1.2 (which \
+                     writes lockfileVersion 1, accepted by hosted mode) — a plain in-place `bun \
+                     install` bumps the version only when a workspace depends on another \
+                     workspace (e.g. root -> member); otherwise it keeps version 0 or fails to \
+                     resolve"
                 .into(),
         });
         return;
@@ -6872,12 +6880,19 @@ mod tests {
         assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
         assert_eq!(r.warnings[0].code, "redirect_bun_workspace_unsupported");
         let detail = &r.warnings[0].detail;
+        assert_eq!(
+            detail,
+            "Bun version-0 workspace locks cannot preserve hosted tarballs on frozen installs; \
+             delete bun.lock and re-run `bun install` with Bun >= 1.2 (which writes \
+             lockfileVersion 1, accepted by hosted mode) — a plain in-place `bun install` bumps \
+             the version only when a workspace depends on another workspace (e.g. root -> \
+             member); otherwise it keeps version 0 or fails to resolve",
+            "the refusal must lead with the remedy that converges on every release \
+             (delete + re-lock) and state the in-place bump as CONDITIONAL"
+        );
         assert!(
-            detail.contains("version-0 workspace")
-                && detail.contains("re-lock with Bun ≥ 1.2")
-                && detail.contains("`bun install` rewrites the lock as lockfileVersion 1")
-                && detail.contains("delete bun.lock and re-run `bun install`"),
-            "the refusal must name the verified remedy: {detail}"
+            !detail.contains("rewrites the lock as lockfileVersion 1"),
+            "the old unconditional in-place claim must be gone: {detail}"
         );
 
         // The SAME entries at lockfileVersion 1 and 2 → rewritten; the
