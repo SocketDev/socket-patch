@@ -170,8 +170,34 @@ pub async fn is_symlink(path: &Path) -> bool {
 pub fn read_regular_to_string_sync(path: &Path) -> std::io::Result<String> {
     use std::io::Read as _;
 
+    let (mut file, metadata) = open_regular_file_sync(path)?;
+    let mut content = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+/// Raw-bytes twin of [`read_regular_to_string_sync`] for BINARY project
+/// files the CLI captures verbatim (the hosted flow's pre-migration
+/// `bun.lockb` snapshot): same non-blocking open + fstat regular-file check,
+/// so a FIFO squatting the path fails fast with `InvalidInput` instead of
+/// wedging in open(2) — and the caller can refuse BEFORE spawning a tool
+/// that would block on the same FIFO. No UTF-8 decode, so a binary lock
+/// never fails with `InvalidData`; every other error keeps its kind.
+pub fn read_regular_to_bytes_sync(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let (mut file, metadata) = open_regular_file_sync(path)?;
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut content)?;
+    Ok(content)
+}
+
+/// Blocking twin of [`open_regular_file`]: `O_NONBLOCK` open on Unix, then
+/// the handle-based regular-file check, so the two sync readers above share
+/// one guard instead of re-declaring it.
+fn open_regular_file_sync(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     #[cfg(unix)]
-    let mut file = {
+    let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::OpenOptions::new()
             .read(true)
@@ -179,7 +205,7 @@ pub fn read_regular_to_string_sync(path: &Path) -> std::io::Result<String> {
             .open(path)?
     };
     #[cfg(not(unix))]
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
 
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -188,9 +214,7 @@ pub fn read_regular_to_string_sync(path: &Path) -> std::io::Result<String> {
             format!("{} is not a regular file", path.display()),
         ));
     }
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content)?;
-    Ok(content)
+    Ok((file, metadata))
 }
 
 /// The first of `rels` (root-relative, in the caller's order) that is a
@@ -913,6 +937,64 @@ mod tests {
                 // Release the wedged opener so the suite can fail cleanly.
                 let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
                 panic!("the sync reader wedged in open(2) on a FIFO");
+            }
+        }
+    }
+
+    /// The bytes twin returns a binary file VERBATIM (no UTF-8 decode, so
+    /// bytes that would be `InvalidData` for the string reader are fine),
+    /// keeps `NotFound` for an absent path and classifies a directory like
+    /// the string reader.
+    #[test]
+    fn read_regular_to_bytes_sync_returns_binary_verbatim_and_classifies_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = read_regular_to_bytes_sync(&tmp.path().join("absent")).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        let dir = read_regular_to_bytes_sync(tmp.path()).unwrap_err();
+        #[cfg(unix)]
+        assert_eq!(dir.kind(), std::io::ErrorKind::InvalidInput, "{dir}");
+        #[cfg(not(unix))]
+        assert!(
+            matches!(
+                dir.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::PermissionDenied
+            ),
+            "{dir}"
+        );
+        let lockb = tmp.path().join("bun.lockb");
+        let bytes: Vec<u8> = vec![0x00, 0xff, 0xfe, b'b', b'u', b'n', 0x00, 0x80];
+        std::fs::write(&lockb, &bytes).unwrap();
+        assert_eq!(read_regular_to_bytes_sync(&lockb).unwrap(), bytes);
+        #[cfg(unix)]
+        {
+            let link = tmp.path().join("link.lockb");
+            std::os::unix::fs::symlink("bun.lockb", &link).unwrap();
+            assert_eq!(read_regular_to_bytes_sync(&link).unwrap(), bytes);
+        }
+    }
+
+    /// A FIFO squatting `bun.lockb` must fail fast (`InvalidInput`), never
+    /// block in open(2): the hosted driver refuses the lockb migration on
+    /// this error BEFORE spawning bun (which would block on the same FIFO).
+    #[cfg(unix)]
+    #[test]
+    fn read_regular_to_bytes_sync_rejects_a_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("bun.lockb");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_regular_to_bytes_sync(&probe).map_err(|e| e.kind()));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(result) => assert_eq!(result, Err(std::io::ErrorKind::InvalidInput)),
+            Err(_) => {
+                // Release the wedged opener so the suite can fail cleanly.
+                let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+                panic!("the sync bytes reader wedged in open(2) on a FIFO");
             }
         }
     }

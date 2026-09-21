@@ -654,10 +654,9 @@ async fn cargo_socket_owned_wiring_without_ledger_refuses_the_redirect() {
         "the refusal must name the missing ledger: {detail}"
     );
     assert!(
-        doc["redirect"]["skipped"]
-            .as_array()
-            .is_some_and(|s| s.iter().any(|e| e["purl"] == CPURL
-                && e["reason"] == "vendored_revert_failed")),
+        doc["redirect"]["skipped"].as_array().is_some_and(|s| s
+            .iter()
+            .any(|e| e["purl"] == CPURL && e["reason"] == "vendored_revert_failed")),
         "the refusal must be accounted as skipped: {doc:#}"
     );
     assert_eq!(doc["redirect"]["redirected"], 0, "envelope: {doc:#}");
@@ -761,7 +760,10 @@ async fn failed_bun_lockb_migration_warns_unsupported_and_keeps_the_binary_lock(
         &[],
         &[("PATH", path_value.as_str())],
     );
-    assert_eq!(code, 0, "a failed migration is a warning, not an error: {doc:#}");
+    assert_eq!(
+        code, 0,
+        "a failed migration is a warning, not an error: {doc:#}"
+    );
     let detail = warning_detail(&doc, "redirect_bun_lockb_unsupported");
     assert!(
         detail.contains("cannot pin a binary lockfile") && detail.contains("exit status: 1"),
@@ -855,7 +857,10 @@ async fn unreadable_bun_lockb_backup_keeps_the_migration_and_warns_loudly() {
         &[],
         &[("PATH", path_value.as_str())],
     );
-    assert_eq!(code, 0, "the kept migration is a warning, not an error: {doc:#}");
+    assert_eq!(
+        code, 0,
+        "the kept migration is a warning, not an error: {doc:#}"
+    );
     let detail = warning_detail(&doc, "redirect_bun_lockb_migrated_without_redirect");
     assert!(
         detail.contains("git history is the restore path"),
@@ -886,6 +891,368 @@ async fn unreadable_bun_lockb_backup_keeps_the_migration_and_warns_loudly() {
     assert!(
         migration.get("original").is_none(),
         "an unreadable lock is recorded without bytes: {ledger:#}"
+    );
+}
+
+/// A fake `bun` that records the spawn in `marker` (an absolute path, so the
+/// child's cwd is irrelevant) and then fails. Every test below asserts the
+/// marker is ABSENT: the gate under test must refuse before any spawn.
+#[cfg(unix)]
+fn install_marker_bun_shim(root: &Path) -> (String, std::path::PathBuf) {
+    let marker = root.join("bun-was-spawned");
+    let path_value = install_bun_shim(
+        root,
+        &format!("#!/bin/sh\ntouch \"{}\"\nexit 1\n", marker.display()),
+    );
+    (path_value, marker)
+}
+
+#[cfg(unix)]
+fn mkfifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+    assert_eq!(rc, 0, "mkfifo(2): {}", std::io::Error::last_os_error());
+}
+
+/// `scan_hosted_json` on a worker thread with a deadline: a wedged run never
+/// returns, so on timeout a writer is connected to `fifo` (releasing any
+/// reader blocked in open(2)) and the test FAILS instead of hanging the
+/// suite. The deadline is generous on purpose — a healthy run finishes in
+/// seconds, the regression under test never finishes — so a slow CI box
+/// (first-launch dyld stall, parallel test load) cannot turn into a flake.
+#[cfg(unix)]
+fn scan_hosted_json_or_release_fifo(
+    cwd: &Path,
+    api_url: &str,
+    extra: &[&str],
+    env: &[(&str, &str)],
+    fifo: &Path,
+) -> (i32, Value) {
+    let cwd = cwd.to_path_buf();
+    let api_url = api_url.to_string();
+    let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+    let env: Vec<(String, String)> = env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+        let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let _ = tx.send(scan_hosted_json(&cwd, &api_url, &extra, &env));
+    });
+    let deadline = std::time::Duration::from_secs(60);
+    match rx.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let released = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(fifo)
+                .is_ok();
+            panic!(
+                "scan --mode hosted wedged on a FIFO bun.lockb for {deadline:?} (a reader \
+                 was blocked in open(2): {released})"
+            );
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the scan thread panicked before reporting (see the output above)")
+        }
+    }
+}
+
+/// A FIFO squatting `bun.lockb` passes the `exists()` gate but is not a
+/// lock the migration can capture: the pre-migration read goes through the
+/// FIFO-safe opener and refuses `redirect_bun_lockb_unsupported` ("not a
+/// regular file") BEFORE spawning bun — bun's own open of the lock blocks on
+/// the same FIFO, so a guarded read that still spawned would only relocate
+/// the hang into the child. Pinned: the run returns (a plain `std::fs::read`
+/// wedged forever here), the shim never ran, the FIFO is left in place, no
+/// text lock appears, and `--dry-run` predicts the same refusal instead of
+/// the would-migrate preview.
+#[cfg(unix)]
+#[tokio::test]
+async fn fifo_bun_lockb_refuses_before_spawning_bun_and_never_wedges() {
+    let server = MockServer::start().await;
+    mock_discovery(&server, PURL, UUID).await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_lockb_project(tmp.path());
+    let fifo = tmp.path().join("bun.lockb");
+    std::fs::remove_file(&fifo).unwrap();
+    mkfifo(&fifo);
+    let (path_value, marker) = install_marker_bun_shim(tmp.path());
+    let env = [("PATH", path_value.as_str())];
+
+    for extra in [&["--dry-run"][..], &[][..]] {
+        let (code, doc) =
+            scan_hosted_json_or_release_fifo(tmp.path(), &server.uri(), extra, &env, &fifo);
+        assert_eq!(
+            code, 0,
+            "{extra:?}: the refusal is a warning, not an error: {doc:#}"
+        );
+        let detail = warning_detail(&doc, "redirect_bun_lockb_unsupported");
+        assert_eq!(
+            detail, "bun.lockb is not a regular file; refusing to migrate it",
+            "{extra:?}: the refusal must name the reason, not a bun failure"
+        );
+        let codes = warning_codes(&doc);
+        assert_eq!(
+            codes
+                .iter()
+                .filter(|c| *c == "redirect_bun_lockb_unsupported")
+                .count(),
+            1,
+            "{extra:?}: exactly one unsupported warning: {codes:?}"
+        );
+        for absent in [
+            "redirect_bun_lockb_would_migrate",
+            "redirect_bun_lockb_manual_migration",
+            "redirect_bun_lockb_migrated_without_redirect",
+            "redirect_npm_no_lockfile",
+        ] {
+            assert!(
+                !codes.contains(&absent.to_string()),
+                "{extra:?}: {absent} must not accompany the not-a-regular-file refusal: {codes:?}"
+            );
+        }
+        assert_eq!(doc["redirect"]["redirected"], 0, "{extra:?}: {doc:#}");
+        assert!(
+            !marker.exists(),
+            "{extra:?}: bun must never be spawned on a FIFO bun.lockb (it blocks on it too)"
+        );
+        let meta = std::fs::symlink_metadata(&fifo).unwrap();
+        assert!(
+            std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()),
+            "{extra:?}: the FIFO is left in place, never replaced or removed"
+        );
+        assert!(
+            !tmp.path().join("bun.lock").exists(),
+            "{extra:?}: no text lock may appear"
+        );
+    }
+}
+
+/// The verbatim `redirect_bun_lockb_sibling_lock` detail for one sibling —
+/// the string the contract documents.
+#[cfg(unix)]
+fn sibling_lock_detail(sibling: &str) -> String {
+    format!(
+        "bun.lockb was left alone because {sibling} is also present; the redirect follows \
+         {sibling} — delete the stale bun.lockb if it is debris, or remove {sibling} and re-run \
+         if bun is the installer"
+    )
+}
+
+/// Shared assertions for a stale `bun.lockb` beside a live sibling lock:
+/// the migration is skipped with `redirect_bun_lockb_sibling_lock` naming
+/// the sibling (dry-run: instead of the would-migrate preview), bun is never
+/// spawned, bun.lockb is byte-identical, no text lock appears, and the
+/// redirect lands in (or, dry-run, previews) the sibling lock.
+#[cfg(unix)]
+fn assert_sibling_lock_outcome(
+    doc: &Value,
+    root: &Path,
+    sibling: &str,
+    lockb_before: &[u8],
+    marker: &Path,
+    dry_run: bool,
+) {
+    assert_eq!(
+        warning_detail(doc, "redirect_bun_lockb_sibling_lock"),
+        sibling_lock_detail(sibling),
+        "dry_run={dry_run}: the warning must name the sibling and both remedies"
+    );
+    let codes = warning_codes(doc);
+    for absent in [
+        "redirect_bun_lockb_would_migrate",
+        "redirect_bun_lockb_unsupported",
+        "redirect_bun_lockb_manual_migration",
+        "redirect_bun_lockb_migration_reverted",
+        "redirect_bun_lockb_migrated_without_redirect",
+        "redirect_npm_no_lockfile",
+    ] {
+        assert!(
+            !codes.contains(&absent.to_string()),
+            "dry_run={dry_run}: {absent} must not accompany the sibling-lock skip: {codes:?}"
+        );
+    }
+    assert_eq!(doc["redirect"]["dryRun"], dry_run, "{doc:#}");
+    let rewritten: Vec<&str> = doc["redirect"]["rewrittenFiles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        rewritten.contains(&sibling),
+        "dry_run={dry_run}: the redirect must follow the sibling lock: {doc:#}"
+    );
+    assert!(
+        !rewritten.contains(&"bun.lock"),
+        "dry_run={dry_run}: no bun.lock may be rewritten (none was created): {doc:#}"
+    );
+    assert_eq!(
+        doc["redirect"]["redirected"], 1,
+        "dry_run={dry_run}: {doc:#}"
+    );
+    assert!(
+        !marker.exists(),
+        "dry_run={dry_run}: bun must never be spawned beside a live {sibling}"
+    );
+    assert_eq!(
+        std::fs::read(root.join("bun.lockb")).unwrap(),
+        lockb_before,
+        "dry_run={dry_run}: the stale bun.lockb is left byte-identical"
+    );
+    assert!(
+        !root.join("bun.lock").exists(),
+        "dry_run={dry_run}: no text lock may be created for a {sibling} project"
+    );
+}
+
+/// A project that migrated from bun to npm and left `bun.lockb` committed:
+/// the hosted driver must NOT run the lockb→text migration (it would turn the
+/// npm project into a bun.lock project — bun 1.4.2 really did, deleting
+/// bun.lockb and writing a lockfileVersion-2 bun.lock beside the redirected
+/// package-lock.json). The redirect follows package-lock.json as today, the
+/// binary lock is left alone with `redirect_bun_lockb_sibling_lock`, and the
+/// human leg prints that detail.
+#[cfg(unix)]
+#[tokio::test]
+async fn stale_bun_lockb_beside_package_lock_is_left_alone_and_the_redirect_follows_it() {
+    let server = MockServer::start().await;
+    mock_discovery(&server, PURL, UUID).await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    mock_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), NAME);
+    let lockb_before = b"\x00stale-bun-lockb-debris".to_vec();
+    std::fs::write(tmp.path().join("bun.lockb"), &lockb_before).unwrap();
+    let (path_value, marker) = install_marker_bun_shim(tmp.path());
+    let env = [("PATH", path_value.as_str())];
+
+    // Dry-run: the same code, never the would-migrate preview.
+    let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &["--dry-run"], &env);
+    assert_eq!(code, 0, "dry-run exits 0: {doc:#}");
+    assert_sibling_lock_outcome(
+        &doc,
+        tmp.path(),
+        "package-lock.json",
+        &lockb_before,
+        &marker,
+        true,
+    );
+    let lock_before = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(
+        !lock_before.contains(HOSTED_URL),
+        "dry-run must not rewrite the sibling lock"
+    );
+
+    // Live: package-lock.json is redirected, bun.lockb untouched, no spawn.
+    let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &env);
+    assert_eq!(code, 0, "live run exits 0: {doc:#}");
+    assert_sibling_lock_outcome(
+        &doc,
+        tmp.path(),
+        "package-lock.json",
+        &lockb_before,
+        &marker,
+        false,
+    );
+    let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
+    assert!(
+        lock.contains(&format!("\"resolved\": \"{HOSTED_URL}\"")),
+        "the redirect must land in package-lock.json:\n{lock}"
+    );
+    let ledger: Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/redirect-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        ledger["edits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["path"] != "bun.lockb" && e["kind"] != "redirect_bun_lockb_migrated"),
+        "no lockb migration may be recorded: {ledger:#}"
+    );
+
+    // Human leg (fresh project so the warning fires again): the
+    // migration-warning loop prints the bare detail.
+    let tmp2 = tempfile::tempdir().unwrap();
+    write_npm_project(tmp2.path(), NAME);
+    std::fs::write(tmp2.path().join("bun.lockb"), &lockb_before).unwrap();
+    let (path_value2, marker2) = install_marker_bun_shim(tmp2.path());
+    let (code, _stdout, stderr) = scan_hosted(
+        tmp2.path(),
+        &server.uri(),
+        &[],
+        &[("PATH", path_value2.as_str())],
+    );
+    assert_eq!(code, 0, "human run exits 0; stderr=\n{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "  warning: {}",
+            sibling_lock_detail("package-lock.json")
+        )),
+        "the sibling-lock detail must reach human stderr; stderr=\n{stderr}"
+    );
+    assert!(!marker2.exists(), "human leg: bun must never be spawned");
+    assert_eq!(
+        std::fs::read(tmp2.path().join("bun.lockb")).unwrap(),
+        lockb_before
+    );
+}
+
+/// The pnpm twin: a stale `bun.lockb` beside a live v9 `pnpm-lock.yaml`. The
+/// lock the redirect follows is pnpm's; the binary lock is left alone, bun
+/// is never spawned, and the npm rewriter's no-lockfile noise stays
+/// suppressed by the core's own sibling gate.
+#[cfg(unix)]
+#[tokio::test]
+async fn stale_bun_lockb_beside_pnpm_lock_is_left_alone_and_the_redirect_follows_it() {
+    let server = MockServer::start().await;
+    mock_discovery(&server, PURL, UUID).await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    mock_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let lockb_before = b"\x00stale-bun-lockb-debris".to_vec();
+    std::fs::write(tmp.path().join("bun.lockb"), &lockb_before).unwrap();
+    let (path_value, marker) = install_marker_bun_shim(tmp.path());
+    let env = [("PATH", path_value.as_str())];
+
+    let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &["--dry-run"], &env);
+    assert_eq!(code, 0, "dry-run exits 0: {doc:#}");
+    assert_sibling_lock_outcome(
+        &doc,
+        tmp.path(),
+        "pnpm-lock.yaml",
+        &lockb_before,
+        &marker,
+        true,
+    );
+
+    let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &[], &env);
+    assert_eq!(code, 0, "live run exits 0: {doc:#}");
+    assert_sibling_lock_outcome(
+        &doc,
+        tmp.path(),
+        "pnpm-lock.yaml",
+        &lockb_before,
+        &marker,
+        false,
+    );
+    let lock = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains(&format!("tarball: {HOSTED_URL}")),
+        "the redirect must land in pnpm-lock.yaml:\n{lock}"
     );
 }
 
@@ -921,7 +1288,10 @@ async fn unreadable_pnpm_workspace_gets_warning_only_guidance_in_a_live_run() {
     // be read back.
     std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-    assert_eq!(code, 0, "the fallback is warning-only, never an error: {doc:#}");
+    assert_eq!(
+        code, 0,
+        "the fallback is warning-only, never an error: {doc:#}"
+    );
     let detail = warning_detail(&doc, "redirect_pnpm_trust_lockfile");
     assert!(
         detail.contains("exists but could not be read") && detail.contains("left untouched"),
@@ -1050,7 +1420,10 @@ async fn live_hosted_overlap_fires_redirect_supersedes_vendored() {
     );
 
     let (code, doc) = scan_hosted_json(root, &server.uri(), &[], &[]);
-    assert_eq!(code, 0, "the overlap warning never flips the exit code: {doc:#}");
+    assert_eq!(
+        code, 0,
+        "the overlap warning never flips the exit code: {doc:#}"
+    );
     assert_eq!(
         doc["redirect"]["redirected"], 1,
         "anchor: Y must redirect normally: {doc:#}"
@@ -1065,8 +1438,7 @@ async fn live_hosted_overlap_fires_redirect_supersedes_vendored() {
         "the per-package remediation must be prescribed: {detail}"
     );
     // Warn-only contract: the stale vendored ledger is NOT deleted.
-    let state =
-        std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap();
+    let state = std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap();
     assert!(
         state.contains(XPURL),
         "the takeover warning must not delete the other mode's ledger: {state}"
@@ -1110,7 +1482,10 @@ async fn human_dry_run_prints_would_rewrite_pnpm_guidance_and_vex_skip() {
         ],
         &[],
     );
-    assert_eq!(code, 0, "dry-run exits 0; stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "dry-run exits 0; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
     assert!(
         stdout.contains("Redirected 1 package(s)") && stdout.contains("; would rewrite"),
         "the dry-run summary must use the preview verb; stdout=\n{stdout}"
@@ -1159,7 +1534,10 @@ async fn human_vex_success_summary_names_statements_path_and_ledger_caveat() {
         ],
         &[],
     );
-    assert_eq!(code, 0, "scan --vex exits 0; stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "scan --vex exits 0; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
     assert!(
         stdout.contains("Redirected 1 package(s); rewrote"),
         "anchor: the wet-run summary verb; stdout=\n{stdout}"
@@ -1173,10 +1551,9 @@ async fn human_vex_success_summary_names_statements_path_and_ledger_caveat() {
         stderr.contains("attested from the ledger"),
         "the no-verify caveat is load-bearing; stderr=\n{stderr}"
     );
-    let doc: Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join("out.vex.json")).unwrap(),
-    )
-    .unwrap();
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(tmp.path().join("out.vex.json")).unwrap())
+            .unwrap();
     assert_eq!(
         doc["statements"].as_array().map(Vec::len),
         Some(1),
@@ -1199,7 +1576,10 @@ async fn human_rush_run_prints_the_repo_state_stale_warning_line() {
     write_rush_project(tmp.path());
 
     let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &[], &[]);
-    assert_eq!(code, 0, "rush run exits 0; stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert_eq!(
+        code, 0,
+        "rush run exits 0; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
     assert!(
         stdout.contains("Redirected 1 package(s); rewrote"),
         "anchor: the rush lock must be rewritten; stdout=\n{stdout}"
@@ -1269,10 +1649,9 @@ async fn ledger_save_failure_after_successful_revert_fails_closed() {
         "the post-revert ledger-save failure must be named: {detail}"
     );
     assert!(
-        doc["redirect"]["skipped"]
-            .as_array()
-            .is_some_and(|s| s.iter().any(|e| e["purl"] == PURL
-                && e["reason"] == "vendored_revert_failed")),
+        doc["redirect"]["skipped"].as_array().is_some_and(|s| s
+            .iter()
+            .any(|e| e["purl"] == PURL && e["reason"] == "vendored_revert_failed")),
         "the refusal must be accounted as skipped: {doc:#}"
     );
     assert_eq!(doc["redirect"]["redirected"], 0, "envelope: {doc:#}");

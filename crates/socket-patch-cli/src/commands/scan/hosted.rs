@@ -118,6 +118,47 @@ fn lockb_original_payload(bytes: Option<&[u8]>) -> Option<serde_json::Value> {
         })
 }
 
+/// Recognised lockfiles that, beside a `bun.lockb` and no `bun.lock`, mark
+/// the binary lock as probable debris of a migration AWAY from bun — the
+/// same names the vendored router knows, in its precedence order once the
+/// lockb is gone. Migrating the lockb there would turn an npm/yarn/pnpm
+/// project into a bun.lock project as a side effect, so the driver leaves
+/// it alone and the redirect follows the sibling instead.
+const LOCKB_SIBLING_LOCKS: [&str; 4] = [
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "npm-shrinkwrap.json",
+    "package-lock.json",
+];
+
+/// The `redirect_bun_lockb_unsupported` detail for a `bun.lockb` that is not
+/// a regular file (FIFO, socket, directory): refused BEFORE any bun spawn,
+/// because bun's own open of the lock would block on the same FIFO.
+const LOCKB_NOT_REGULAR_DETAIL: &str = "bun.lockb is not a regular file; refusing to migrate it";
+
+/// The [`LOCKB_SIBLING_LOCKS`] present in `cwd` as regular files (a lock
+/// the redirect cannot read is not one it follows), in probe order.
+fn present_lockb_sibling_locks(cwd: &Path) -> Vec<&'static str> {
+    LOCKB_SIBLING_LOCKS
+        .iter()
+        .copied()
+        .filter(|name| cwd.join(name).is_file())
+        .collect()
+}
+
+/// The `redirect_bun_lockb_sibling_lock` detail: names every sibling lock
+/// present and both remedies (delete the debris, or remove the sibling and
+/// re-run when bun really is the installer).
+fn lockb_sibling_lock_detail(siblings: &[&str]) -> String {
+    let list = siblings.join(", ");
+    let verb = if siblings.len() == 1 { "is" } else { "are" };
+    format!(
+        "bun.lockb was left alone because {list} {verb} also present; the redirect follows \
+         {list} — delete the stale bun.lockb if it is debris, or remove {list} and re-run if \
+         bun is the installer"
+    )
+}
+
 const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     "package-lock.json",
     "npm-shrinkwrap.json",
@@ -726,7 +767,8 @@ async fn gem_stale_install_warnings(
                 });
             if verify_patch_record(&pkg.path, record).await.is_ok() {
                 entry.patched = true;
-            } else if !entry.positive && installed_stale_positive_evidence(&pkg.path, record).await {
+            } else if !entry.positive && installed_stale_positive_evidence(&pkg.path, record).await
+            {
                 entry.positive = true;
                 entry.purl = (*purl).to_string();
             }
@@ -1325,6 +1367,20 @@ pub(crate) async fn run_redirect_selected(
     // Gated on an npm-ecosystem override: the migration exists solely so the
     // bun rewriter has a text lock to edit — with nothing to redirect it would
     // re-lock (and delete) the user's lockfile as a side effect of a no-op run.
+    // Two more gates run BEFORE any bun spawn, both fail-closed:
+    //   • a recognised sibling lock (package-lock.json, npm-shrinkwrap.json,
+    //     yarn.lock, pnpm-lock.yaml) beside the bun.lockb: the project most
+    //     likely migrated AWAY from bun and left the binary lock as debris,
+    //     and re-locking it would convert an npm/yarn/pnpm project into a
+    //     bun.lock project as a side effect. The lockb is left alone with
+    //     `redirect_bun_lockb_sibling_lock` naming both files and both
+    //     remedies; the redirect follows the sibling lock, rewritten as
+    //     today. Dry-run reports the same code instead of the preview.
+    //   • the pre-migration bytes are read through the FIFO-safe opener: a
+    //     FIFO (socket, directory) squatting `bun.lockb` passes `exists()`
+    //     but wedges a plain open(2) forever — and bun itself blocks on the
+    //     same FIFO — so a non-regular file refuses with
+    //     `redirect_bun_lockb_unsupported` and bun is never spawned.
     let mut migration_warnings: Vec<serde_json::Value> = Vec::new();
     let mut migration_edits: Vec<socket_patch_core::patch::redirect::FileEdit> = Vec::new();
     // The pre-migration bun.lockb bytes, held so the migration can be undone
@@ -1342,69 +1398,101 @@ pub(crate) async fn run_redirect_selected(
     let has_bun_lock = common.cwd.join("bun.lock").exists();
     let has_npm_override = overrides.iter().any(|o| o.ecosystem == "npm");
     if has_lockb && !has_bun_lock && has_npm_override {
-        if common.dry_run {
+        let lockb_path = common.cwd.join("bun.lockb");
+        let siblings = present_lockb_sibling_locks(&common.cwd);
+        if !siblings.is_empty() {
             migration_warnings.push(serde_json::json!({
-                "code": "redirect_bun_lockb_would_migrate",
-                "detail": "bun.lockb would be migrated to a text bun.lock \
-                           (`bun install --save-text-lockfile`) before redirecting; \
-                           re-run without --dry-run to apply",
+                "code": "redirect_bun_lockb_sibling_lock",
+                "detail": lockb_sibling_lock_detail(&siblings),
             }));
+        } else if common.dry_run {
+            // stat, never open: a FIFO would wedge the open, and the preview
+            // must predict the refusal the wet run makes.
+            if std::fs::metadata(&lockb_path).is_ok_and(|m| m.is_file()) {
+                migration_warnings.push(serde_json::json!({
+                    "code": "redirect_bun_lockb_would_migrate",
+                    "detail": "bun.lockb would be migrated to a text bun.lock \
+                               (`bun install --save-text-lockfile`) before redirecting; \
+                               re-run without --dry-run to apply",
+                }));
+            } else {
+                migration_warnings.push(serde_json::json!({
+                    "code": "redirect_bun_lockb_unsupported",
+                    "detail": LOCKB_NOT_REGULAR_DETAIL,
+                }));
+            }
         } else {
-            let lockb_path = common.cwd.join("bun.lockb");
             // Read the binary lock BEFORE the migration replaces it: the
             // zero-rewrite unwind and the ledger's restore payload both need
-            // the original bytes.
-            let lockb_bytes = std::fs::read(&lockb_path).ok();
-            match migrate_bun_lockb(&common.cwd) {
-                LockbMigration::Migrated => {
-                    // bun 1.1.43–1.1.45 leave bun.lockb beside the new text
-                    // lock; bun ≥ 1.2 deletes it. Remove a kept one ourselves
-                    // so the project is text-only on every release and the
-                    // `removed` record below is true (a stale binary lock
-                    // beside the redirected text lock is also what bun
-                    // ≤ 1.1.38 would silently install the UNPATCHED bytes
-                    // from). NotFound is the ≥ 1.2 case — already gone.
-                    let removal = match std::fs::remove_file(&lockb_path) {
-                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-                        _ => Ok(()),
-                    };
-                    match removal {
-                        Ok(()) => {
-                            lockb_migrated = true;
-                            lockb_backup = lockb_bytes;
-                            // Record the removal so `rollback` knows the file
-                            // was replaced, carrying the pre-migration bytes
-                            // (base64, capped) it needs to put it back.
-                            let original = lockb_original_payload(lockb_backup.as_deref());
-                            migration_edits.push(socket_patch_core::patch::redirect::FileEdit {
-                                path: "bun.lockb".into(),
-                                kind: "redirect_bun_lockb_migrated".into(),
-                                action: "removed".into(),
-                                key: None,
-                                original,
-                                new: None,
-                            });
-                        }
-                        Err(e) => {
-                            // Fail closed: a bun.lockb we cannot remove would
-                            // make the `removed` record a lie and leave two
-                            // lockfiles behind. Undo the migration (drop the
-                            // text lock bun just wrote — bun.lockb is intact)
-                            // and refuse exactly like a failed spawn.
-                            let _ = std::fs::remove_file(common.cwd.join("bun.lock"));
-                            migration_warnings.push(serde_json::json!({
-                                "code": "redirect_bun_lockb_unsupported",
-                                "detail": format!(
-                                    "bun.lockb could not be migrated to a text bun.lock (bun \
-                                     wrote bun.lock but the binary lock could not be removed: \
-                                     {e}); the redirect cannot pin a binary lockfile"
-                                ),
-                            }));
+            // the original bytes. Through the FIFO-safe opener (non-blocking
+            // open + fstat regular-file check): a FIFO squatting the path
+            // wedged this read — and would wedge bun's own open — forever.
+            // Only the non-regular kind refuses; any other read error
+            // (PermissionDenied) keeps today's contract: the migration
+            // proceeds and the lock is recorded without restorable bytes.
+            let lockb_read = socket_patch_core::utils::fs::read_regular_to_bytes_sync(&lockb_path);
+            if lockb_read
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::InvalidInput)
+            {
+                migration_warnings.push(serde_json::json!({
+                    "code": "redirect_bun_lockb_unsupported",
+                    "detail": LOCKB_NOT_REGULAR_DETAIL,
+                }));
+            } else {
+                let lockb_bytes = lockb_read.ok();
+                match migrate_bun_lockb(&common.cwd) {
+                    LockbMigration::Migrated => {
+                        // bun 1.1.43–1.1.45 leave bun.lockb beside the new text
+                        // lock; bun ≥ 1.2 deletes it. Remove a kept one ourselves
+                        // so the project is text-only on every release and the
+                        // `removed` record below is true (a stale binary lock
+                        // beside the redirected text lock is also what bun
+                        // ≤ 1.1.38 would silently install the UNPATCHED bytes
+                        // from). NotFound is the ≥ 1.2 case — already gone.
+                        let removal = match std::fs::remove_file(&lockb_path) {
+                            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                            _ => Ok(()),
+                        };
+                        match removal {
+                            Ok(()) => {
+                                lockb_migrated = true;
+                                lockb_backup = lockb_bytes;
+                                // Record the removal so `rollback` knows the file
+                                // was replaced, carrying the pre-migration bytes
+                                // (base64, capped) it needs to put it back.
+                                let original = lockb_original_payload(lockb_backup.as_deref());
+                                migration_edits.push(
+                                    socket_patch_core::patch::redirect::FileEdit {
+                                        path: "bun.lockb".into(),
+                                        kind: "redirect_bun_lockb_migrated".into(),
+                                        action: "removed".into(),
+                                        key: None,
+                                        original,
+                                        new: None,
+                                    },
+                                );
+                            }
+                            Err(e) => {
+                                // Fail closed: a bun.lockb we cannot remove would
+                                // make the `removed` record a lie and leave two
+                                // lockfiles behind. Undo the migration (drop the
+                                // text lock bun just wrote — bun.lockb is intact)
+                                // and refuse exactly like a failed spawn.
+                                let _ = std::fs::remove_file(common.cwd.join("bun.lock"));
+                                migration_warnings.push(serde_json::json!({
+                                    "code": "redirect_bun_lockb_unsupported",
+                                    "detail": format!(
+                                        "bun.lockb could not be migrated to a text bun.lock (bun \
+                                         wrote bun.lock but the binary lock could not be removed: \
+                                         {e}); the redirect cannot pin a binary lockfile"
+                                    ),
+                                }));
+                            }
                         }
                     }
-                }
-                LockbMigration::NoLockWritten => {
-                    migration_warnings.push(serde_json::json!({
+                    LockbMigration::NoLockWritten => {
+                        migration_warnings.push(serde_json::json!({
                         "code": "redirect_bun_lockb_manual_migration",
                         "detail": "bun.lockb was not migrated: the installed Bun accepted \
                                    `bun install --save-text-lockfile --frozen-lockfile \
@@ -1414,16 +1502,17 @@ pub(crate) async fn run_redirect_selected(
                                    --save-text-lockfile` yourself (Bun >= 1.1.39), then re-run; \
                                    the redirect cannot pin a binary lockfile",
                     }));
-                }
-                LockbMigration::Failed(why) => {
-                    migration_warnings.push(serde_json::json!({
-                        "code": "redirect_bun_lockb_unsupported",
-                        "detail": format!(
-                            "bun.lockb could not be migrated to a text bun.lock (`bun install \
-                             --save-text-lockfile --frozen-lockfile --lockfile-only` failed: \
-                             {why}); the redirect cannot pin a binary lockfile"
-                        ),
-                    }));
+                    }
+                    LockbMigration::Failed(why) => {
+                        migration_warnings.push(serde_json::json!({
+                            "code": "redirect_bun_lockb_unsupported",
+                            "detail": format!(
+                                "bun.lockb could not be migrated to a text bun.lock (`bun install \
+                                 --save-text-lockfile --frozen-lockfile --lockfile-only` failed: \
+                                 {why}); the redirect cannot pin a binary lockfile"
+                            ),
+                        }));
+                    }
                 }
             }
         }
@@ -1450,8 +1539,7 @@ pub(crate) async fn run_redirect_selected(
                 .strip_suffix(".py.lock")
                 .map(|prefix| format!("{prefix}.py"))
             {
-                if let Ok(content) = read_regular_to_string(&common.cwd.join(&script_path)).await
-                {
+                if let Ok(content) = read_regular_to_string(&common.cwd.join(&script_path)).await {
                     files.insert(script_path, content);
                 }
             }
@@ -2087,7 +2175,11 @@ pub(crate) async fn run_redirect_selected(
             // invertible link: replay swaps the fragment this run wrote back to
             // the fragment the very first run found.
             let mut rebased: Vec<usize> = Vec::new();
-            for edit in rewrite.edits.iter().filter(|e| REBASE_KINDS.contains(&e.kind.as_str())) {
+            for edit in rewrite
+                .edits
+                .iter()
+                .filter(|e| REBASE_KINDS.contains(&e.kind.as_str()))
+            {
                 let siblings: Vec<usize> = ledger
                     .edits
                     .iter()
@@ -2141,7 +2233,10 @@ pub(crate) async fn run_redirect_selected(
                 let is_rebased = REBASE_KINDS.contains(&edit.kind.as_str())
                     && rebased.iter().any(|&t| {
                         let old = &ledger.edits[t];
-                        old.path == edit.path && old.kind == edit.kind && old.key == edit.key && old.new == edit.new
+                        old.path == edit.path
+                            && old.kind == edit.kind
+                            && old.key == edit.key
+                            && old.new == edit.new
                     });
                 if !is_rebased && !ledger.edits.contains(edit) {
                     ledger.edits.push(edit.clone());
@@ -2477,11 +2572,12 @@ mod tests {
     use super::{
         build_redirect_json_envelope, gem_stale_cache_warning, gem_stale_install_warning,
         gem_stale_install_warnings, installed_stale_positive_evidence, lockb_original_payload,
-        output_tail, parse_purl_simple, plan_workspace_trust, pnpm_heal_root,
-        pnpm_lock_carries_hosted_redirect, pnpm_lock_version_major, pnpm_trust_configured_detail,
-        pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
-        pnpm_trust_workspace_unreadable_detail, read_workspace_for_trust, TrustPlan,
-        LOCKB_ORIGINAL_CAP, REDIRECT_CANDIDATE_FILES,
+        lockb_sibling_lock_detail, output_tail, parse_purl_simple, plan_workspace_trust,
+        pnpm_heal_root, pnpm_lock_carries_hosted_redirect, pnpm_lock_version_major,
+        pnpm_trust_configured_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
+        pnpm_trust_workspace_unreadable_detail, present_lockb_sibling_locks,
+        read_workspace_for_trust, TrustPlan, LOCKB_NOT_REGULAR_DETAIL, LOCKB_ORIGINAL_CAP,
+        LOCKB_SIBLING_LOCKS, REDIRECT_CANDIDATE_FILES,
     };
     use socket_patch_core::constants::npm_family;
     use socket_patch_core::patch::redirect::DepOverride;
@@ -3645,6 +3741,68 @@ mod tests {
             lockb_original_payload(Some(&over)),
             None,
             "one byte over → None"
+        );
+    }
+
+    /// The sibling-lock probe reports every recognised lock present as a
+    /// REGULAR file, in the router's precedence order, and nothing for a
+    /// lockb-only project; `bun.lock` itself is not a sibling (the gate that
+    /// reaches the probe already requires its absence) and a directory or
+    /// FIFO squatting a sibling name is not a lock the redirect follows.
+    #[test]
+    fn present_lockb_sibling_locks_reports_regular_files_in_router_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bun.lockb"), b"\x00BUN").unwrap();
+        assert!(present_lockb_sibling_locks(tmp.path()).is_empty());
+        std::fs::write(tmp.path().join("package-lock.json"), "{}").unwrap();
+        assert_eq!(
+            present_lockb_sibling_locks(tmp.path()),
+            vec!["package-lock.json"]
+        );
+        std::fs::write(
+            tmp.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
+        std::fs::create_dir(tmp.path().join("yarn.lock")).unwrap();
+        assert_eq!(
+            present_lockb_sibling_locks(tmp.path()),
+            vec!["pnpm-lock.yaml", "package-lock.json"],
+            "pnpm first (router precedence), the yarn.lock DIRECTORY skipped"
+        );
+        assert!(
+            !LOCKB_SIBLING_LOCKS.contains(&"bun.lock")
+                && !LOCKB_SIBLING_LOCKS.contains(&"bun.lockb")
+        );
+        for name in LOCKB_SIBLING_LOCKS {
+            assert!(
+                REDIRECT_CANDIDATE_FILES.contains(&name),
+                "{name} must be a lock the hosted rewriters actually read"
+            );
+        }
+    }
+
+    /// The sibling warning names the sibling(s) twice — as the reason and as
+    /// what the redirect follows — and both remedies, agreeing in number.
+    #[test]
+    fn lockb_sibling_lock_detail_names_the_sibling_and_both_remedies() {
+        let one = lockb_sibling_lock_detail(&["package-lock.json"]);
+        assert_eq!(
+            one,
+            "bun.lockb was left alone because package-lock.json is also present; the redirect \
+             follows package-lock.json — delete the stale bun.lockb if it is debris, or remove \
+             package-lock.json and re-run if bun is the installer"
+        );
+        let two = lockb_sibling_lock_detail(&["pnpm-lock.yaml", "yarn.lock"]);
+        assert!(
+            two.starts_with(
+                "bun.lockb was left alone because pnpm-lock.yaml, yarn.lock are also present"
+            ) && two.contains("remove pnpm-lock.yaml, yarn.lock and re-run"),
+            "{two}"
+        );
+        assert_eq!(
+            LOCKB_NOT_REGULAR_DETAIL,
+            "bun.lockb is not a regular file; refusing to migrate it"
         );
     }
 
