@@ -80,6 +80,7 @@ enum Inverse {
     /// capture, or an oversize lock — the inverse warns only when bun.lockb is
     /// actually absent on disk, and drops the edit either way.
     BunLockbMigrated,
+    BunBinaryPackage,
     /// Owned by a per-purl revert (npm JSON kinds). Present here only
     /// when that revert failed — refuse the group rather than guess.
     PerPurlOnly,
@@ -117,6 +118,7 @@ fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
         "redirect_yarn_classic_entry" | "redirect_yarn_berry_entry" => {
             ("yarn", Inverse::ReplaceFragment)
         }
+        "redirect_bun_lockb_package" => ("bun", Inverse::BunBinaryPackage),
         "redirect_bun_lock_package" => ("bun", Inverse::ReplaceFragment),
         "redirect_bun_lockb_migrated" => ("bun", Inverse::BunLockbMigrated),
         "redirect_gemfile_lock_dependency_pin"
@@ -405,6 +407,29 @@ pub async fn revert_remaining_redirect_edits(
                 Inverse::NoopDrop => {
                     // Removal of prior socket wiring — already pristine-ward.
                     group_drops.insert(idx);
+                }
+                Inverse::BunBinaryPackage => {
+                    let restored = async {
+                        let content = match staged_bytes.get(&edit.path) {
+                            Some(bytes) => bytes.clone(),
+                            None => read_rel_bytes(project_root, &edit.path)
+                                .await?
+                                .ok_or("bun.lockb no longer exists")?,
+                        };
+                        super::bun_binary::restore(&content, &edit)
+                    }
+                    .await;
+                    match restored {
+                        Ok(bytes) => {
+                            staged_bytes.insert(edit.path.clone(), bytes);
+                            group_drops.insert(idx);
+                        }
+                        Err(reason) => {
+                            refuse(reason, &mut outcome);
+                            refused_groups.insert(group);
+                            continue 'group;
+                        }
+                    }
                 }
                 Inverse::BunLockbMigrated => {
                     // The pre-migration bytes, when the writer captured them

@@ -118,7 +118,8 @@ pub async fn verify_vendored_patch_record(
     })
     .await
     .map_err(|_| "vendor_artifact_unreadable".to_string())??;
-    verify_member_map(&map, record)
+    verify_member_map(&map, record)?;
+    super::bun_workspace::verify(project_root, entry).await
 }
 
 /// Dir-shaped ecosystems (cargo/golang/composer/gem): hash files in place,
@@ -346,15 +347,32 @@ pub async fn check_vendored_artifact(
     record: &PatchRecord,
 ) -> ArtifactHealth {
     match verify_vendored_patch_record(project_root, entry, record).await {
-        Err(tag) => match tag.as_str() {
-            "vendor_artifact_missing" => ArtifactHealth::Missing,
-            "vendor_uuid_mismatch" => ArtifactHealth::StaleUuid,
-            "vendor_hash_mismatch"
-            | "file_not_found"
-            | "vendor_artifact_unreadable"
-            | "vendor_inventory_mismatch" => ArtifactHealth::Corrupt { reason: tag },
-            _ => ArtifactHealth::Unverifiable { reason: tag },
-        },
+        Err(tag) => {
+            // A broken member copy must not hide a simultaneously corrupt
+            // canonical artifact: repair can copy mirrors directly only
+            // after the canonical fingerprint has been verified.
+            if tag.starts_with("vendor_workspace_artifact_") && !entry.artifact.sha256.is_empty() {
+                match file_sha256_hex(&project_root.join(&entry.artifact.path)).await {
+                    Some(hex) if hex.eq_ignore_ascii_case(&entry.artifact.sha256) => {}
+                    _ => {
+                        return ArtifactHealth::Corrupt {
+                            reason: "vendor_sha256_mismatch".into(),
+                        }
+                    }
+                }
+            }
+            match tag.as_str() {
+                "vendor_artifact_missing" => ArtifactHealth::Missing,
+                "vendor_uuid_mismatch" => ArtifactHealth::StaleUuid,
+                "vendor_hash_mismatch"
+                | "file_not_found"
+                | "vendor_artifact_unreadable"
+                | "vendor_inventory_mismatch"
+                | "vendor_workspace_artifact_missing"
+                | "vendor_workspace_artifact_corrupt" => ArtifactHealth::Corrupt { reason: tag },
+                _ => ArtifactHealth::Unverifiable { reason: tag },
+            }
+        }
         Ok(()) => {
             let norm = entry.artifact.path.replace('\\', "/");
             // `.nupkg` (NuGet) and `.jar` (Maven) are single committed files
@@ -501,6 +519,71 @@ mod tests {
         zip.start_file::<_, ()>(member, Default::default()).unwrap();
         zip.write_all(bytes).unwrap();
         zip.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn binary_workspace_health_attests_every_installable_tarball() {
+        use base64::Engine as _;
+        use sha2::Digest;
+        let root = tempfile::tempdir().unwrap();
+        let rel = format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz");
+        std::fs::create_dir_all(root.path().join(&rel).parent().unwrap()).unwrap();
+        write_tgz(&root.path().join(&rel), "package/index.js", PATCHED);
+        let bytes = std::fs::read(root.path().join(&rel)).unwrap();
+        let mut entry = entry("npm", UUID, &rel);
+        entry.base_purl = "pkg:npm/minimist@1.2.2".into();
+        entry.flavor = Some("bun".into());
+        entry.artifact.sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+        let record = record(UUID, "index.js");
+        let mut lock = super::super::bun_lockb::BunLockb::parse(include_bytes!(
+            "../../tests/fixtures/bun-lockb/1.1.45-extensions/bun.lockb"
+        ))
+        .unwrap();
+        let id = lock
+            .packages()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "minimist")
+            .unwrap()
+            .id;
+        let sri = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&bytes))
+        );
+        lock.set_package(id, &rel, &sri).unwrap();
+        std::fs::write(root.path().join("bun.lockb"), lock.bytes()).unwrap();
+        assert_eq!(
+            check_vendored_artifact(root.path(), &entry, &record).await,
+            ArtifactHealth::Corrupt {
+                reason: "vendor_workspace_artifact_missing".into()
+            }
+        );
+        entry.wiring = super::super::bun_workspace::repair(root.path(), &entry, false)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(
+            check_vendored_artifact(root.path(), &entry, &record).await,
+            ArtifactHealth::Healthy
+        );
+        std::fs::write(root.path().join(&entry.wiring[0].file), b"corrupt mirror").unwrap();
+        assert_eq!(
+            verify_vendored_patch_record(root.path(), &entry, &record)
+                .await
+                .unwrap_err(),
+            "vendor_workspace_artifact_corrupt"
+        );
+        // The archive's patched member remains readable, but the canonical
+        // fingerprint must take precedence over the damaged member copy.
+        let mut changed = bytes;
+        changed.extend_from_slice(b"trailing drift");
+        std::fs::write(root.path().join(&rel), changed).unwrap();
+        assert_eq!(
+            check_vendored_artifact(root.path(), &entry, &record).await,
+            ArtifactHealth::Corrupt {
+                reason: "vendor_sha256_mismatch".into()
+            }
+        );
     }
 
     /// The whole-tree inventory closes the dir-shaped blindspot: with only

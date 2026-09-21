@@ -12,7 +12,8 @@
 //!   lock carries no content verifier is never fetched.
 //!
 //! Parsing is fail-soft per entry (a malformed entry is skipped, never an
-//! error; a malformed file yields `None`) and fail-closed per value:
+//! error; a malformed text file yields `None`, while a malformed binary Bun
+//! lock emits `bun_lockb_invalid`) and fail-closed per value:
 //! names/versions are path-safety-guarded before an entry is emitted — the
 //! lockfile is committed, tamperable input that later feeds filesystem paths
 //! and download URLs.
@@ -102,86 +103,24 @@ impl LockfileEntry {
     }
 }
 
-/// A project layout whose npm-family packages the inventory structurally
-/// CANNOT serve — distinct from "no lockfile" (`Ok(None)`), which is a
-/// normal, silent state. Today: the Plug'n'Play loaders (yarn berry's PnP,
-/// and pnpm's own `node-linker=pnp` mode), and a bun project whose only
-/// lockfile is the legacy binary `bun.lockb`. Consumers surface this as an
-/// explicit refusal instead of a silent empty inventory: under yarn PnP the
-/// installed-tree crawl is ALSO structurally empty (no `node_modules/`), so
-/// swallowing this diagnosis used to turn `scan` into a silent
-/// success-0 no-op in every mode — and a fresh clone of a bun.lockb project
-/// (no `node_modules/`, an unreadable lock) scanned exactly the same way.
+/// A project layout or lockfile that cannot be inventoried safely.
+/// Consumers surface these diagnoses instead of treating an unreadable
+/// dependency graph as an empty project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedNpmLayout {
-    /// Stable diagnosis code: the flavor probe's
-    /// `vendor_yarn_berry_unsupported` / `vendor_pnpm_pnp_unsupported`, or
-    /// [`BUN_LOCKB_UNSUPPORTED_CODE`].
+    /// Stable diagnosis code, including `bun_lockb_invalid` for malformed
+    /// binary Bun locks and the flavor probe's Plug'n'Play refusal codes.
     pub code: &'static str,
-    /// Human-readable diagnosis with remedy.
+    /// Human-readable diagnosis with format or filesystem error details.
     pub detail: String,
-}
-
-/// Stable diagnosis code for a bun project whose only lockfile is the
-/// legacy binary `bun.lockb` (bun <= 1.1.38 always, 1.1.39–1.1.45 without
-/// `--save-text-lockfile`). Spelled for scan's `warnings[]` (the CLI
-/// forwards it verbatim), parallel to `yarn_pnp_unsupported` /
-/// `pnpm_pnp_unsupported`; the vendor-side refusal for the same file keeps
-/// its own `vendor_bun_lockb_unsupported` code.
-pub const BUN_LOCKB_UNSUPPORTED_CODE: &str = "bun_lockb_unsupported";
-
-/// Inventory-phrased detail for [`BUN_LOCKB_UNSUPPORTED_CODE`] when
-/// bun.lockb is the project's ONLY lockfile: what was NOT discovered and
-/// the one remedy (the flag exists from Bun 1.1.39; plain `bun install` on
-/// any release keeps an in-sync bun.lockb as-is).
-pub const BUN_LOCKB_UNSUPPORTED_INVENTORY_DETAIL: &str =
-    "bun.lockb is bun's legacy binary lockfile and cannot be inventoried; run `bun install \
-     --save-text-lockfile` (Bun >= 1.1.39) so lockfile-only discovery and vendored mode can \
-     read it";
-
-/// The sibling-aware variant of [`BUN_LOCKB_UNSUPPORTED_INVENTORY_DETAIL`]:
-/// the flavor router checks bun.lockb BEFORE pnpm/yarn/npm locks
-/// ([`detect_npm_lock_flavor`]), so a project that migrated from bun and
-/// left a stale bun.lockb committed loses lockfile-only discovery of its
-/// LIVE `sibling` lock. Telling that project to run `bun install
-/// --save-text-lockfile` would create a bun.lock for a non-bun project; the
-/// real remedy is deleting the debris, so the detail names the shadowed
-/// lock and offers both, keyed on which installer is actually in use. The
-/// `--save-text-lockfile` / `1.1.39` substrings stay so consumers grepping
-/// for the remedy keep matching.
-pub fn bun_lockb_shadows_sibling_detail(sibling: &str) -> String {
-    format!(
-        "bun.lockb is bun's legacy binary lockfile and shadows {sibling} in lockfile \
-         discovery; delete the stale bun.lockb if {sibling}'s installer is in use, or run \
-         `bun install --save-text-lockfile` (Bun >= 1.1.39) if bun is"
-    )
-}
-
-/// The first recognised non-bun lockfile beside a bun.lockb, in the flavor
-/// router's precedence (pnpm, yarn, npm — [`detect_npm_lock_flavor`] steps
-/// 3–5): the lock the router WOULD have chosen had bun.lockb not
-/// pre-empted it. `None` when bun.lockb is the only lock.
-async fn bun_lockb_shadowed_sibling(root: &Path) -> Option<&'static str> {
-    for name in [
-        "pnpm-lock.yaml",
-        "yarn.lock",
-        "npm-shrinkwrap.json",
-        "package-lock.json",
-    ] {
-        if tokio::fs::metadata(root.join(name)).await.is_ok() {
-            return Some(name);
-        }
-    }
-    None
 }
 
 /// Inventory the project's npm-family lockfile. Routes by
 /// [`detect_npm_lock_flavor`]. `Ok(None)` means there is nothing to
 /// inventory (missing lockfile, dep-less locks); `Err` propagates the
 /// probe's Plug'n'Play diagnosis — a layout whose packages the inventory
-/// can NEVER serve — and the bun.lockb-only diagnosis (a lock that DOES
-/// name the resolved set, in a binary encoding this reader cannot parse),
-/// which callers must not conflate with the calm no-lockfile case. Two
+/// can NEVER serve — and malformed binary Bun locks, which callers must
+/// not conflate with the calm no-lockfile case. Two
 /// pnpm-specific refusals fall back instead of
 /// yielding `None`: an unsupported `lockfileVersion` reads the root
 /// `pnpm-lock.yaml` directly — unless a live sibling lock the router would
@@ -208,31 +147,6 @@ pub(crate) async fn inventory_npm_lock(
                 "vendor_yarn_berry_unsupported" | "vendor_pnpm_pnp_unsupported"
             ) {
                 return Err(UnsupportedNpmLayout { code, detail });
-            }
-            // bun.lockb with no bun.lock is a DIAGNOSIS too, not an absence:
-            // the binary lock names the resolved set just as a text lock
-            // would, we simply cannot read it — and on a fresh clone the
-            // installed-tree crawl is empty as well, so the calm `Ok(None)`
-            // here made `scan` print a clean `scannedPackages: 0` success
-            // in every mode (54 lockfile-only matrix cells at bun <=
-            // 1.1.45). Own code + inventory-phrased remedy; the probe's
-            // vendor-phrased text stays with the vendor refusal. When a
-            // pnpm/yarn/npm lock sits beside the bun.lockb the project has
-            // most likely migrated AWAY from bun and the binary lock is
-            // stale debris shadowing the live lock (router precedence) —
-            // the detail then names that lock and the delete remedy
-            // instead of prescribing a bun.lock for a non-bun project.
-            // Still fail-closed: the shadowed sibling is NOT inventoried
-            // (which installer is live is the user's call, not ours).
-            if code == "vendor_bun_lockb_unsupported" {
-                let detail = match bun_lockb_shadowed_sibling(project_root).await {
-                    Some(sibling) => bun_lockb_shadows_sibling_detail(sibling),
-                    None => BUN_LOCKB_UNSUPPORTED_INVENTORY_DETAIL.to_string(),
-                };
-                return Err(UnsupportedNpmLayout {
-                    code: BUN_LOCKB_UNSUPPORTED_CODE,
-                    detail,
-                });
             }
             // The flavor probe passes only pnpm locks the WIRING backends
             // support (lockfileVersion 5.4/6.0/9.0), but inventory is
@@ -310,7 +224,16 @@ pub(crate) async fn inventory_npm_lock(
         NpmLockFlavor::Pnpm | NpmLockFlavor::PnpmLegacy => inventory_pnpm_lock(project_root).await,
         NpmLockFlavor::YarnClassic => inventory_yarn_classic(project_root).await,
         NpmLockFlavor::YarnBerry => inventory_yarn_berry(project_root).await,
-        NpmLockFlavor::Bun => inventory_bun(project_root).await,
+        NpmLockFlavor::Bun => {
+            if tokio::fs::symlink_metadata(project_root.join("bun.lock"))
+                .await
+                .is_ok()
+            {
+                inventory_bun(project_root).await
+            } else {
+                Some(inventory_bun_binary(project_root).await?)
+            }
+        }
     };
     Ok(raw.map(|raw| (flavor, finalize_npm(raw))))
 }
@@ -332,12 +255,17 @@ async fn inventory_live_sibling_lock(root: &Path) -> Option<(NpmLockFlavor, Vec<
     // bun.lock — router step 2. That step runs BEFORE the pnpm sniff, so
     // when the version refusal fired no bun.lock can actually be present;
     // probed anyway to keep this a literal transcription of the router's
-    // order. bun.lockb (the legacy binary lock) refuses in the router
-    // rather than routing — mirrored here by omission.
+    // order. The binary lock shares the same routing precedence.
     if exists("bun.lock").await {
         return Some((
             NpmLockFlavor::Bun,
             inventory_bun(root).await.unwrap_or_default(),
+        ));
+    }
+    if exists("bun.lockb").await {
+        return Some((
+            NpmLockFlavor::Bun,
+            inventory_bun_binary(root).await.unwrap_or_default(),
         ));
     }
     // yarn.lock — router step 4, where classic vs berry is a content
@@ -919,6 +847,39 @@ async fn inventory_yarn_berry(root: &Path) -> Option<Vec<LockfileEntry>> {
 }
 
 // ──────────────────────────────── bun.lock ────────────────────────────────
+
+async fn inventory_bun_binary(root: &Path) -> Result<Vec<LockfileEntry>, UnsupportedNpmLayout> {
+    let invalid = |detail: String| UnsupportedNpmLayout {
+        code: "bun_lockb_invalid",
+        detail: format!("cannot inventory bun.lockb: {detail}"),
+    };
+    let bytes = read_regular(&root.join("bun.lockb"))
+        .await
+        .map_err(|error| invalid(error.to_string()))?;
+    let lock = super::bun_lockb::BunLockb::parse(&bytes).map_err(invalid)?;
+    let packages = lock.packages().map_err(invalid)?;
+    Ok(packages
+        .into_iter()
+        .filter_map(|package| {
+            let version = package.version?;
+            // Only resolved registry versions participate. Workspace, file and
+            // git sources have no registry version; a local vendored tarball's
+            // pristine metadata is recovered from its wiring ledger instead.
+            if !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            Some(LockfileEntry::npm(
+                package.name,
+                version,
+                http_url(&package.resolution),
+                package
+                    .integrity
+                    .map(LockIntegrity::Sri)
+                    .unwrap_or(LockIntegrity::None),
+            ))
+        })
+        .collect())
+}
 
 async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = read_regular_to_string(&root.join("bun.lock")).await.ok()?;
@@ -1626,7 +1587,6 @@ async fn inventory_pipfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
     Some(out)
 }
 
-
 /// `pdm.lock`: `[[package]]` blocks with `name`/`version`, DISCOVERY-only. This
 /// surfaces the project's PyPI coordinates so a hosted lock-only checkout (no
 /// installed package) can be redirected — the hosted rewrite pins the API
@@ -2041,6 +2001,39 @@ pub async fn wired_vendor_integrity(
         return pinned.map(LockIntegrity::Sha256Hex);
     }
 
+    // Read active binary resolution records, never the append-only string
+    // pool: it can retain paths and digests from earlier patch generations.
+    if tokio::fs::symlink_metadata(project_root.join("bun.lock"))
+        .await
+        .is_err()
+    {
+        if let Ok(bytes) = read_regular(&project_root.join("bun.lockb")).await {
+            if let Ok(lock) = super::bun_lockb::BunLockb::parse(&bytes) {
+                if let Ok(packages) = lock.packages() {
+                    let mut pinned: Option<String> = None;
+                    for package in packages {
+                        if package
+                            .resolution
+                            .trim_start_matches("file:")
+                            .trim_start_matches("./")
+                            != rel
+                        {
+                            continue;
+                        }
+                        let sri = package.integrity.filter(|sri| looks_like_sri(sri))?;
+                        if pinned.as_ref().is_some_and(|previous| previous != &sri) {
+                            return None;
+                        }
+                        pinned = Some(sri);
+                    }
+                    if let Some(sri) = pinned {
+                        return Some(LockIntegrity::Sri(sri));
+                    }
+                }
+            }
+        }
+    }
+
     // JSON locks: resolved == "file:<rel>" (npm writes exactly this form).
     for lock in ["npm-shrinkwrap.json", "package-lock.json"] {
         let Ok(bytes) = read_regular(&project_root.join(lock)).await else {
@@ -2228,6 +2221,33 @@ fn recover_npm_fragment(
                     return Ok(mk(None, LockIntegrity::BerryChecksum(v)));
                 }
             }
+        }
+    }
+    // Binary Bun records carry semantic registry metadata alongside the
+    // opaque fields needed for lossless restoration. Recovery must verify
+    // the snapshot's coordinates before trusting its download and digest.
+    for wiring in &entry.wiring {
+        if wiring.kind != "bun_lockb_package" {
+            continue;
+        }
+        let Some(original) = wiring.original.as_ref() else {
+            continue;
+        };
+        if original.get("name").and_then(Value::as_str) != Some(name)
+            || original.get("version").and_then(Value::as_str) != Some(version)
+        {
+            continue;
+        }
+        if let Some(sri) = original
+            .get("integrity")
+            .and_then(Value::as_str)
+            .filter(|s| looks_like_sri(s))
+        {
+            let resolved = original
+                .get("resolution")
+                .and_then(Value::as_str)
+                .and_then(http_url);
+            return Ok(mk(resolved, LockIntegrity::Sri(sri.to_string())));
         }
     }
     // bun: the original is the raw tuple line; the integrity is its last
@@ -2699,115 +2719,128 @@ packages:
         );
     }
 
-    /// Same stale-lock hazard for a pnpm→bun migration: bun.lockb refuses
-    /// with a bun-specific code, so the pnpm fallback must stay out — and
-    /// the refusal now surfaces as the bun.lockb diagnosis rather than a
-    /// silent `None`.
+    /// A malformed binary lock fails closed with format context, including
+    /// beside a different package manager's lock. A text Bun lock wins.
     #[tokio::test]
-    async fn stale_pnpm_lock_behind_bun_lockb_is_not_inventoried() {
-        let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
-        write(tmp.path(), "bun.lockb", "\0binary").await;
-        let diag = inventory_npm_lock(tmp.path()).await.unwrap_err();
-        assert_eq!(
-            diag.code, BUN_LOCKB_UNSUPPORTED_CODE,
-            "a stale pnpm-lock.yaml behind bun.lockb must not be inventoried"
-        );
-    }
-
-    /// The converse migration (bun → pnpm/yarn/npm, stale bun.lockb left
-    /// committed): the router still refuses on bun.lockb, so the LIVE
-    /// sibling lock is not inventoried (fail-closed, unchanged) — but the
-    /// diagnosis must name the shadowed lock and the delete remedy instead
-    /// of telling a non-bun project to write a bun.lock. The
-    /// `--save-text-lockfile` remedy stays as the bun-is-live alternative.
-    /// Sibling precedence follows the router (pnpm, yarn, npm).
-    #[tokio::test]
-    async fn bun_lockb_beside_a_live_sibling_lock_names_the_shadowed_lock() {
-        for (files, sibling) in [
-            (vec![("pnpm-lock.yaml", PNPM_LOCK)], "pnpm-lock.yaml"),
-            (vec![("yarn.lock", YARN_CLASSIC)], "yarn.lock"),
-            (
-                vec![("package-lock.json", PACKAGE_LOCK)],
-                "package-lock.json",
-            ),
-            (
-                vec![
-                    ("npm-shrinkwrap.json", PACKAGE_LOCK),
-                    ("package-lock.json", PACKAGE_LOCK),
-                ],
-                "npm-shrinkwrap.json",
-            ),
-            (
-                vec![
-                    ("yarn.lock", YARN_CLASSIC),
-                    ("package-lock.json", PACKAGE_LOCK),
-                ],
-                "yarn.lock",
-            ),
+    async fn malformed_bun_lockb_yields_a_diagnosis_without_inventorying_siblings() {
+        for sibling in [
+            None,
+            Some(("pnpm-lock.yaml", PNPM_LOCK)),
+            Some(("yarn.lock", YARN_CLASSIC)),
+            Some(("package-lock.json", PACKAGE_LOCK)),
         ] {
             let tmp = tempfile::tempdir().unwrap();
-            for (name, content) in &files {
+            if let Some((name, content)) = sibling {
                 write(tmp.path(), name, content).await;
             }
             write(tmp.path(), "bun.lockb", "\0binary").await;
             let diag = inventory_npm_lock(tmp.path()).await.unwrap_err();
-            assert_eq!(diag.code, BUN_LOCKB_UNSUPPORTED_CODE, "{sibling}");
-            assert_eq!(
-                diag.detail,
-                bun_lockb_shadows_sibling_detail(sibling),
-                "{sibling}"
-            );
-            assert!(
-                diag.detail
-                    .contains(&format!("shadows {sibling} in lockfile discovery"))
-                    && diag.detail.contains("delete the stale bun.lockb")
-                    && diag.detail.contains("bun install --save-text-lockfile")
-                    && diag.detail.contains("1.1.39"),
-                "{sibling}: {}",
-                diag.detail
-            );
-            assert!(
-                !diag.detail.contains("cannot be inventoried"),
-                "{sibling}: the lockb-only phrasing must not leak: {}",
-                diag.detail
-            );
-            // Fail-closed posture unchanged: nothing inventoried.
+            assert_eq!(diag.code, "bun_lockb_invalid");
+            assert!(diag.detail.contains("bun.lockb"), "{}", diag.detail);
+            assert!(!diag.detail.contains("--save-text-lockfile"));
             let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
-            assert!(entries.is_empty(), "{sibling}: {entries:?}");
-            assert_eq!(unsupported, vec![diag], "{sibling}");
+            assert!(entries.is_empty(), "{entries:?}");
+            assert_eq!(unsupported, vec![diag]);
+
+            write(tmp.path(), "bun.lock", BUN_LOCK).await;
+            let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+            assert_eq!(flavor, NpmLockFlavor::Bun);
+            assert_eq!(entry(&entries, "left-pad").version, "1.3.0");
+            assert!(inventory_project_diagnosed(tmp.path()).await.1.is_empty());
         }
     }
 
-    /// A bun.lockb-only project (bun <= 1.1.38, or 1.1.39–1.1.45 without
-    /// `--save-text-lockfile`) is a diagnosis, never a silent `None`: scan
-    /// rides it onto `warnings[]` instead of reporting a clean empty
-    /// project. A text bun.lock beside it wins (bun reads bun.lock when
-    /// both exist), and the diagnosis reaches `inventory_project_diagnosed`.
     #[tokio::test]
-    async fn bun_lockb_only_project_yields_a_diagnosis_not_silence() {
-        let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), "bun.lockb", "\0binary").await;
-        let diag = inventory_npm_lock(tmp.path()).await.unwrap_err();
-        assert_eq!(diag.code, "bun_lockb_unsupported");
-        assert!(
-            diag.detail.contains("bun install --save-text-lockfile")
-                && diag.detail.contains("1.1.39")
-                && diag.detail.contains("cannot be inventoried"),
-            "inventory-phrased remedy with the version floor: {}",
-            diag.detail
-        );
-        let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
-        assert!(entries.is_empty(), "{entries:?}");
-        assert_eq!(unsupported, vec![diag]);
+    async fn bun_binary_inventory_works_without_an_install_or_runtime() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bun-lockb");
+        for version in [
+            "0.1.1", "0.6.7", "0.6.8", "0.8.1", "1.0.0", "1.0.36", "1.1.0", "1.1.38", "1.1.45",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let bytes = std::fs::read(fixtures.join(version).join("bun.lockb")).unwrap();
+            tokio::fs::write(tmp.path().join("bun.lockb"), &bytes)
+                .await
+                .unwrap();
+            let (entries, diagnoses) = inventory_project_diagnosed(tmp.path()).await;
+            assert!(diagnoses.is_empty(), "Bun {version}: {diagnoses:?}");
+            assert_eq!(
+                sorted_pairs(&entries),
+                vec![
+                    ("is-number".into(), "7.0.0".into()),
+                    ("minimist".into(), "1.2.2".into())
+                ],
+                "Bun {version}"
+            );
+            let minimist = entry(&entries, "minimist");
+            assert!(
+                minimist
+                    .resolved
+                    .as_deref()
+                    .is_some_and(|url| url.ends_with("minimist-1.2.2.tgz")),
+                "Bun {version}: {minimist:?}"
+            );
+            assert!(
+                super::super::bun_lock::preflight_vendor(tmp.path())
+                    .await
+                    .is_ok(),
+                "Bun {version}"
+            );
+            assert_eq!(
+                tokio::fs::read(tmp.path().join("bun.lockb")).await.unwrap(),
+                bytes,
+                "discovery/preflight must preserve Bun {version} bytes"
+            );
+            assert!(!tmp.path().join("bun.lock").exists());
+            assert!(!tmp.path().join("node_modules").exists());
+        }
+    }
 
-        // Migrated: bun.lock present (bun.lockb left behind, as bun 1.1.45
-        // does) → inventoried normally, no diagnosis.
+    #[tokio::test]
+    async fn bun_binary_vendor_integrity_follows_live_package_records() {
+        let bytes = include_bytes!("../../tests/fixtures/bun-lockb/1.1.45/bun.lockb");
+        let mut lock = super::super::bun_lockb::BunLockb::parse(bytes).unwrap();
+        let package = lock
+            .packages()
+            .unwrap()
+            .into_iter()
+            .find(|package| package.name == "minimist")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = ".socket/vendor/npm/11111111-1111-4111-8111-111111111111/minimist-1.2.2.tgz";
+        let first = format!("sha512-{}", "A".repeat(86) + "==");
+        lock.set_package(package.id, rel, &first).unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            wired_vendor_integrity(tmp.path(), rel).await,
+            Some(LockIntegrity::Sri(first))
+        );
+        let next = rel.replace(
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+        );
+        lock.set_package(
+            package.id,
+            &next,
+            &format!("sha512-{}", "A".repeat(86) + "=="),
+        )
+        .unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            wired_vendor_integrity(tmp.path(), rel).await,
+            None,
+            "retired strings are not active resolutions"
+        );
+        assert!(wired_vendor_integrity(tmp.path(), &next).await.is_some());
         write(tmp.path(), "bun.lock", BUN_LOCK).await;
-        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
-        assert_eq!(flavor, NpmLockFlavor::Bun);
-        assert_eq!(entry(&entries, "left-pad").version, "1.3.0");
-        assert!(inventory_project_diagnosed(tmp.path()).await.1.is_empty());
+        assert_eq!(
+            wired_vendor_integrity(tmp.path(), &next).await,
+            None,
+            "text lock takes precedence"
+        );
     }
 
     /// A pnpm-lock.yaml whose lockfileVersion the probe refuses — pnpm 6
@@ -4619,6 +4652,36 @@ mod recover_tests {
             Some("https://registry.npmjs.org/@scope/x/-/x-1.2.3.tgz")
         );
         assert_eq!(got.integrity, LockIntegrity::Sri("sha512-AAAA".into()));
+    }
+
+    #[tokio::test]
+    async fn bun_binary_snapshot_recovers_registry_metadata_and_checks_coordinates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = serde_json::json!({
+            "name": "@scope/x", "version": "1.2.3",
+            "resolution": "https://registry.example/@scope/x/-/x-1.2.3.tgz",
+            "integrity": "sha512-AAAA",
+        });
+        let good = entry(
+            "npm",
+            "pkg:npm/@scope/x@1.2.3",
+            vec![rec("bun_lockb_package", original.clone())],
+        );
+        let recovered = recover_lock_entry(tmp.path(), &good).await.unwrap();
+        assert_eq!(
+            recovered.resolved.as_deref(),
+            Some("https://registry.example/@scope/x/-/x-1.2.3.tgz")
+        );
+        assert_eq!(
+            recovered.integrity,
+            LockIntegrity::Sri("sha512-AAAA".into())
+        );
+        let mismatched = entry(
+            "npm",
+            "pkg:npm/@scope/x@2.0.0",
+            vec![rec("bun_lockb_package", original)],
+        );
+        assert!(recover_lock_entry(tmp.path(), &mismatched).await.is_err());
     }
 
     #[tokio::test]

@@ -651,10 +651,14 @@ pub(crate) async fn run_hosted_leg(
     // one of several bun records takes the per-purl revert instead, which
     // claims that purl's `redirect_bun_lock_package` edits by the recorded
     // line's spec and replays them like the yarn/pnpm text kinds.
-    let has_bun_edits = state
-        .edits
-        .iter()
-        .any(|e| e.kind == "redirect_bun_lock_package" || e.kind == "redirect_bun_lockb_migrated");
+    let has_bun_edits = state.edits.iter().any(|e| {
+        matches!(
+            e.kind.as_str(),
+            "redirect_bun_lock_package"
+                | "redirect_bun_lockb_migrated"
+                | "redirect_bun_lockb_package"
+        )
+    });
     let mut deferred_to_replay: Vec<String> = Vec::new();
     for purl in purls {
         let defer_bun = has_bun_edits && purl.starts_with("pkg:npm/") && replay_eligible;

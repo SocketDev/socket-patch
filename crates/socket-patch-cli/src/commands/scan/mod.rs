@@ -1488,18 +1488,10 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // discovery — counts, API lookup, table, the prune "scanned" set — and
     // are flagged "not yet installed" everywhere a user could act on them.
     let lockfile_only = lockfile_supplement(&args.common, &all_crawled).await;
-    // Explicit refusals for npm layouts whose packages are structurally
-    // unreachable (yarn PnP, pnpm node-linker=pnp) — and for a bun project
-    // whose only lock is the legacy binary `bun.lockb`
-    // (`bun_lockb_unsupported`: the inventory cannot read it). Under yarn
-    // PnP the crawler leg above is ALSO empty (no `node_modules/`), as it
-    // is on a fresh clone of a bun.lockb project, so without this channel
-    // every mode used to print a clean success with `scannedPackages: 0` —
-    // a silent no-op the user read as "protected".
-    // Surfaced as run-level `warnings[]` in the JSON envelope (omitted when
-    // empty) and a stderr line on the human path; exit code and `status`
-    // stay deliberately unchanged (same posture as hosted refusals, which
-    // exit 0 with `redirected: 0`).
+    // Discovery diagnoses unsupported installation layouts and malformed
+    // binary Bun locks. Preserve these on empty scans too: an unreadable
+    // graph is not evidence that a fresh checkout has no dependencies.
+    // Surface them as run-level JSON warnings and human stderr messages.
     let mut layout_refusals = unsupported_layout_warnings(&lockfile_only.unsupported);
     // Config-sourced gem bundle root refused by the crawler's containment
     // guard (a committed `.bundle/config` whose BUNDLE_PATH resolves
@@ -1741,22 +1733,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
-    // The bun.lockb discovery diagnosis (`bun_lockb_unsupported`) stays in
-    // `layout_refusals` in EVERY mode on this non-empty path too — hosted
-    // included. It reports a fact about THIS run's discovery (the binary
-    // lock was never read, so its lockfile-only packages are invisible),
-    // and nothing here can tell whether the hosted driver about to run
-    // will say anything about the file: the driver speaks only when an npm
-    // override is actually granted (`redirect_bun_lockb_*` on
-    // `redirect.warnings`, or a `redirect_bun_lockb_migrated` edit), a
-    // network-dependent outcome decided inside `run_redirect`, which owns
-    // the envelope from here on. An earlier version dropped the warning on
-    // every non-empty hosted run — so a polyglot project or an
-    // installed-but-unpatched npm tree printed a clean hosted success with
-    // no mention that the bun lock was skipped, the very silent no-op this
-    // channel exists to close. Two voices about one file on the run that
-    // does migrate beat silence on the many that never mention it; nothing
-    // is deduplicated.
+    // Keep discovery format errors on non-empty scans in every mode as
+    // well: installed packages do not make an unreadable lockfile safe.
 
     // Build ecosystem summary
     let mut eco_parts = Vec::new();

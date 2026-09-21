@@ -126,9 +126,7 @@ fn view_gets(reqs: &[wiremock::Request]) -> usize {
 
 fn batch_bodies(reqs: &[wiremock::Request]) -> Vec<String> {
     reqs.iter()
-        .filter(|r| {
-            format!("{}", r.method) == "POST" && r.url.path().ends_with("/patches/batch")
-        })
+        .filter(|r| format!("{}", r.method) == "POST" && r.url.path().ends_with("/patches/batch"))
         .map(|r| String::from_utf8_lossy(&r.body).into_owned())
         .collect()
 }
@@ -1207,18 +1205,10 @@ mod pty {
 }
 
 // ---------------------------------------------------------------------------
-// bun.lockb-only project: a diagnosis, never a silent success-0
+// Invalid binary lockfiles must report a format error in every scan mode.
 // ---------------------------------------------------------------------------
-// A bun project whose only lockfile is the legacy binary `bun.lockb` (bun
-// <= 1.1.38 always; 1.1.39–1.1.45 without `--save-text-lockfile`) with no
-// `node_modules/` (fresh clone, CI lockfile-only checkout) used to scan as
-// `status: success / scannedPackages: 0` with NO warnings in every mode —
-// indistinguishable from an empty project (54 such matrix cells passed as
-// "clean"). The lock inventory now surfaces `bun_lockb_unsupported`, which
-// rides scan's additive run-level `warnings[]` (PnP-refusal precedent);
-// exit code and `status` stay unchanged.
 
-fn write_bun_lockb_only_project(root: &Path) {
+fn write_invalid_bun_lockb_project(root: &Path) {
     std::fs::write(
         root.join("package.json"),
         r#"{ "name": "covgap-lockb-only", "version": "0.0.0", "dependencies": { "minimist": "1.2.2" } }"#,
@@ -1230,20 +1220,16 @@ fn write_bun_lockb_only_project(root: &Path) {
 fn bun_lockb_warning(v: &serde_json::Value) -> Option<&serde_json::Value> {
     v["warnings"]
         .as_array()
-        .and_then(|ws| ws.iter().find(|w| w["code"] == "bun_lockb_unsupported"))
+        .and_then(|ws| ws.iter().find(|w| w["code"] == "bun_lockb_invalid"))
 }
 
-/// Zero-package path, every mode (agent, vendored, hosted): exit 0, the
-/// envelope stays a `success` with `scannedPackages: 0`, and `warnings[]`
-/// carries `bun_lockb_unsupported` with the `--save-text-lockfile` remedy.
-/// Hosted mode keeps it here because the hosted driver — which owns the
-/// bun.lockb migration story on a NON-empty scan — never runs on an empty
-/// one; without the warning this is exactly the old silent no-op.
+/// A corrupt binary lock must remain visible as a format error on the
+/// zero-package path, including when hosted mode has nothing to redirect.
 #[test]
-fn scan_bun_lockb_only_project_warns_instead_of_silent_success() {
+fn scan_invalid_bun_lockb_warns_instead_of_silent_success() {
     for mode in [None, Some("vendored"), Some("hosted")] {
         let tmp = tempfile::tempdir().unwrap();
-        write_bun_lockb_only_project(tmp.path());
+        write_invalid_bun_lockb_project(tmp.path());
         let mut args = vec!["--json"];
         if let Some(mode) = mode {
             args.extend(["--mode", mode]);
@@ -1259,12 +1245,12 @@ fn scan_bun_lockb_only_project_warns_instead_of_silent_success() {
         assert_eq!(v["scannedPackages"], 0, "mode={mode:?}: {v}");
         assert_eq!(v["lockfileOnlyPackages"], 0, "mode={mode:?}: {v}");
         let warning = bun_lockb_warning(&v).unwrap_or_else(|| {
-            panic!("mode={mode:?}: warnings[] must carry bun_lockb_unsupported: {v}")
+            panic!("mode={mode:?}: warnings[] must carry bun_lockb_invalid: {v}")
         });
         let detail = warning["detail"].as_str().unwrap_or_default();
         assert!(
-            detail.contains("bun install --save-text-lockfile") && detail.contains("1.1.39"),
-            "mode={mode:?}: the remedy and its version floor: {detail}"
+            detail.contains("cannot inventory bun.lockb"),
+            "mode={mode:?}: the binary format error must name its file: {detail}"
         );
         assert!(
             !stdout.contains("Warning ("),
@@ -1275,31 +1261,22 @@ fn scan_bun_lockb_only_project_warns_instead_of_silent_success() {
     // Human path: the same diagnosis as a stderr `Warning (code): detail`
     // line, exit 0, and the generic "No packages found" hint still prints.
     let tmp = tempfile::tempdir().unwrap();
-    write_bun_lockb_only_project(tmp.path());
+    write_invalid_bun_lockb_project(tmp.path());
     let (code, stdout, stderr) = run_scan(tmp.path(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stderr
-            .contains("Warning (bun_lockb_unsupported): bun.lockb is bun's legacy binary lockfile"),
+        stderr.contains("Warning (bun_lockb_invalid): cannot inventory bun.lockb"),
         "the human path must name the layout and the code; got {stderr:?}"
     );
     assert!(
-        stderr.contains("--save-text-lockfile"),
+        stderr.contains("cannot inventory bun.lockb"),
         "the human path must carry the remedy; got {stderr:?}"
     );
     assert!(stdout.contains("No packages found"), "{stdout:?}");
 }
 
-/// NON-empty scan (an installed package beside the bun.lockb), EVERY mode:
-/// the discovery-side `bun_lockb_unsupported` rides the non-empty envelope
-/// too — hosted included. An earlier version dropped it on every non-empty
-/// hosted run on the theory that the hosted driver "owns the bun.lockb
-/// story", but the driver only speaks about the file when an npm override
-/// is actually granted (`redirect_bun_lockb_*` / a migration edit); with
-/// nothing to redirect (this fixture: no patches) a hosted scan printed a
-/// clean success that never mentioned the unread bun lock — the silent
-/// no-op this channel exists to close. Nothing is deduplicated: on the run
-/// that does migrate, the envelope may carry both voices about the file.
+/// Installed dependencies do not suppress binary format diagnoses in any
+/// mode, including when hosted mode finds no patches to redirect.
 #[tokio::test]
 async fn scan_nonempty_keeps_the_bun_lockb_discovery_warning_in_every_mode() {
     let mock = MockServer::start().await;
@@ -1314,7 +1291,7 @@ async fn scan_nonempty_keeps_the_bun_lockb_discovery_warning_in_every_mode() {
 
     for mode in [None, Some("vendored"), Some("hosted")] {
         let tmp = tempfile::tempdir().unwrap();
-        write_bun_lockb_only_project(tmp.path());
+        write_invalid_bun_lockb_project(tmp.path());
         write_npm_package(tmp.path(), "minimist", "1.2.2", b"module.exports = 1;\n");
         let uri = mock.uri();
         let mut args = vec![
@@ -1336,12 +1313,12 @@ async fn scan_nonempty_keeps_the_bun_lockb_discovery_warning_in_every_mode() {
         assert_eq!(v["scannedPackages"], 1, "mode={mode:?}: {v}");
         assert_eq!(v["status"], "success", "mode={mode:?}: {v}");
         let warning = bun_lockb_warning(&v).unwrap_or_else(|| {
-            panic!("mode={mode:?}: the non-empty envelope must keep bun_lockb_unsupported: {v}")
+            panic!("mode={mode:?}: the non-empty envelope must keep bun_lockb_invalid: {v}")
         });
         assert!(
             warning["detail"]
                 .as_str()
-                .is_some_and(|d| d.contains("--save-text-lockfile")),
+                .is_some_and(|d| d.contains("cannot inventory bun.lockb")),
             "mode={mode:?}: {v}"
         );
     }
@@ -1349,12 +1326,12 @@ async fn scan_nonempty_keeps_the_bun_lockb_discovery_warning_in_every_mode() {
     // Human hosted path: the same warning line on stderr before the driver
     // runs (exit 0; nothing to redirect).
     let tmp = tempfile::tempdir().unwrap();
-    write_bun_lockb_only_project(tmp.path());
+    write_invalid_bun_lockb_project(tmp.path());
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"module.exports = 1;\n");
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--mode", "hosted"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stderr.contains("Warning (bun_lockb_unsupported):"),
+        stderr.contains("Warning (bun_lockb_invalid):"),
         "the human hosted path must keep the warning; got {stderr:?}"
     );
 }

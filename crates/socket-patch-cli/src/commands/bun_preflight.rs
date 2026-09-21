@@ -7,7 +7,7 @@
 //!
 //! One read-only [`preflight_vendor`] per run, evaluated before any
 //! `/patches/view/` fetch and before any write, so an incompatible Bun
-//! project (binary `bun.lockb` without a text lock, an unreadable lock, an
+//! project (malformed binary `bun.lockb`, an unreadable lock, an
 //! unsupported `lockfileVersion`, a pre-version-2 `workspace:` lock) never
 //! has a patch downloaded on its behalf — let alone recorded in the
 //! manifest, or its live hosted redirect stripped — and every entry point
@@ -50,7 +50,7 @@ pub(crate) type LedgerLoad<'a> = Result<&'a HashMap<String, VendorEntry>, &'a st
 ///
 /// [`wired_instances_all_ours`]: socket_patch_core::vendor::bun_lock::wired_instances_all_ours
 pub(crate) struct BunVendorRefusal {
-    /// The stable vendor error code (`vendor_bun_lockb_unsupported`,
+    /// The stable vendor error code (`vendor_bun_lockb_invalid`,
     /// `vendor_lockfile_missing`, `vendor_lockfile_version_unsupported`,
     /// `vendor_bun_workspace_unsupported`) — the same string the vendor
     /// engine would have emitted as a `failed` event — or
@@ -283,15 +283,15 @@ mod tests {
         let npm = vec![sel(UUID, PURL)];
         let refusal = bun_vendor_preflight(tmp.path(), &npm)
             .await
-            .expect("lockb-only project is refused");
-        assert_eq!(refusal.code, "vendor_bun_lockb_unsupported");
+            .expect("malformed lockb project is refused");
+        assert_eq!(refusal.code, "vendor_bun_lockb_invalid");
         assert!(refusal.applies_to(PURL));
         assert!(!refusal.applies_to("pkg:pypi/only@1.0.0"));
 
-        // A ledger at this UUID cannot make a binary lock vendorable.
+        // A ledger at this UUID cannot make a malformed binary lock vendorable.
         seed_bun_vendor_entry(tmp.path(), PURL, UUID);
         let refusal = bun_vendor_preflight(tmp.path(), &npm).await.unwrap();
-        assert_eq!(refusal.code, "vendor_bun_lockb_unsupported");
+        assert_eq!(refusal.code, "vendor_bun_lockb_invalid");
         assert!(refusal.applies_to(PURL), "the live lock must be compatible");
 
         // …but a corrupt ledger exempts nothing and names itself.

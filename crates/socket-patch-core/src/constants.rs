@@ -68,8 +68,7 @@ mod tests {
 /// (`vendor::npm_flavor`), the hosted-redirect candidate list (the CLI's
 /// `scan::hosted`), the crawler layout probe (`crawlers::pkg_managers`) and
 /// setup's PM detection (`package_json::find`). Those sites accept
-/// INTENTIONALLY divergent subsets: hosted redirect deliberately omits
-/// `bun.lockb` (it auto-migrates it to `bun.lock` before rewriting), and the
+/// INTENTIONALLY divergent subsets: binary locks have a native byte reader, and the
 /// `pnpm-lock.yml` spelling is accepted only by setup detection. This table
 /// encodes each divergence once, visibly, instead of homogenizing them.
 ///
@@ -147,13 +146,11 @@ pub mod npm_family {
             redirect_candidate: true,
             detects_pnpm: false,
         },
-        // The legacy binary lock: the vendor probe knows it (to refuse with
-        // the migration hint); hosted redirect deliberately does NOT list it
-        // as a candidate — it auto-migrates to bun.lock first.
+        // Binary Bun locks are read and rewritten natively.
         FileRow {
             name: "bun.lockb",
             vendor_probe: true,
-            redirect_candidate: false,
+            redirect_candidate: true,
             detects_pnpm: false,
         },
         // deno.lock is deliberately absent: deno is its own ecosystem

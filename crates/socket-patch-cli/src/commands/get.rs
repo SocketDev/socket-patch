@@ -5198,7 +5198,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn download_patch_records_bun_lockb_refuses_before_fetch() {
+    async fn download_patch_records_malformed_bun_lockb_refuses_before_fetch() {
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -5234,7 +5234,7 @@ mod tests {
         assert_eq!(json["failed"], 1, "json={json}");
         assert_eq!(json["patches"][0]["action"], "failed", "json={json}");
         assert_eq!(
-            json["patches"][0]["errorCode"], "vendor_bun_lockb_unsupported",
+            json["patches"][0]["errorCode"], "vendor_bun_lockb_invalid",
             "json={json}"
         );
         assert!(

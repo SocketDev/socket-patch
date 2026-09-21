@@ -975,15 +975,15 @@ mod preview_tests {
         );
     }
 
-    /// bun.lockb without a text lock: `would_refuse` with the lockb code.
+    /// Malformed bun.lockb: `would_refuse` with the binary format code.
     #[tokio::test]
-    async fn preview_marks_lockb_only_tree_would_refuse() {
+    async fn preview_marks_malformed_lockb_would_refuse() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lockb"), b"\x00binary").unwrap();
         let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
         assert_eq!(
             action_of(&preview, NPM)["errorCode"],
-            "vendor_bun_lockb_unsupported",
+            "vendor_bun_lockb_invalid",
             "{preview}"
         );
     }

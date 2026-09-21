@@ -14,7 +14,7 @@
 //!   `configVersion`, the root's workspace dep spelled as a bare path, and
 //!   the 2-tuple `["consumer@workspace:packages/consumer", { "dependencies":
 //!   { … } }]`;
-//! * a `bun.lockb` with no text lock (bun ≤ 1.1.38, or an un-migrated repo);
+//! * a malformed `bun.lockb` with no text lock;
 //! * a malformed lock (`lockfileVersion` 3, non-canonical `"packages" : {`
 //!   header, unterminated entry) and — on Unix — a FIFO squatting
 //!   `bun.lock`.
@@ -57,7 +57,7 @@ const AFTER: &[u8] = b"after\n";
 const LEFT_PAD_SHA512: &str =
     "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==";
 const WS_CODE: &str = "vendor_bun_workspace_unsupported";
-const LOCKB_CODE: &str = "vendor_bun_lockb_unsupported";
+const LOCKB_CODE: &str = "vendor_bun_lockb_invalid";
 const VERSION_CODE: &str = "vendor_lockfile_version_unsupported";
 const MISSING_CODE: &str = "vendor_lockfile_missing";
 
@@ -171,7 +171,7 @@ enum LockShape {
     V2Workspace,
     V0Direct,
     V1Direct,
-    LockbOnly,
+    MalformedLockb,
     MalformedV3,
 }
 
@@ -193,7 +193,7 @@ impl LockShape {
             LockShape::V0Direct => DIRECT_V0_TEMPLATE.to_string(),
             LockShape::V1Direct => DIRECT_V1_TEMPLATE.to_string(),
             LockShape::MalformedV3 => return Some(MALFORMED_V3_LOCK.to_string()),
-            LockShape::LockbOnly => return None,
+            LockShape::MalformedLockb => return None,
         };
         Some(text.replace("{REGISTRY}", &registry))
     }
@@ -512,8 +512,8 @@ async fn scan_vendored_refuses_v0_workspace_two_tuple_lock_before_download() {
 }
 
 #[tokio::test]
-async fn scan_vendored_refuses_bun_lockb_only_before_download() {
-    assert_scan_refuses(LockShape::LockbOnly, LOCKB_CODE).await;
+async fn scan_vendored_refuses_malformed_bun_lockb_before_download() {
+    assert_scan_refuses(LockShape::MalformedLockb, LOCKB_CODE).await;
 }
 
 #[tokio::test]
@@ -602,7 +602,7 @@ async fn scan_vendored_detached_refuses_bun_lockb_before_fetch() {
     let mock = MockServer::start().await;
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
-    write_bun_project(tmp.path(), LockShape::LockbOnly);
+    write_bun_project(tmp.path(), LockShape::MalformedLockb);
 
     let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--detached", "--json"]);
     assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
@@ -689,7 +689,7 @@ async fn get_uuid_vendored_refusal_human_names_code_on_stderr() {
     let mock = MockServer::start().await;
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
-    write_bun_project(tmp.path(), LockShape::LockbOnly);
+    write_bun_project(tmp.path(), LockShape::MalformedLockb);
 
     let (exit, stdout, stderr) = get_vendored(tmp.path(), &mock.uri(), UUID, &[]);
     assert_eq!(exit, 1, "stdout={stdout}\nstderr={stderr}");
@@ -864,7 +864,7 @@ async fn dry_run_human_names_would_refuse_records() {
     let mock = MockServer::start().await;
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
-    write_bun_project(tmp.path(), LockShape::LockbOnly);
+    write_bun_project(tmp.path(), LockShape::MalformedLockb);
 
     let (exit, stdout, stderr) = get_vendored(tmp.path(), &mock.uri(), PURL, &["--dry-run"]);
     assert_eq!(exit, 0, "stdout={stdout}\nstderr={stderr}");

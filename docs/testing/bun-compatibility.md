@@ -1,7 +1,7 @@
 # Bun patch compatibility
 
 `socket-patch` supports hosted, vendored and agent-mode npm patches in Bun
-projects (text `bun.lock`). Two layers of real-Bun evidence back this page:
+projects using text `bun.lock` or native binary `bun.lockb`. Real-Bun evidence backs both formats:
 
 - **The native matrix** — `scripts/backtest-bun.py` runs real Bun releases
   against the public free Socket patch for `minimist@1.2.2`
@@ -11,10 +11,10 @@ projects (text `bun.lock`). Two layers of real-Bun evidence back this page:
   Windows ([workflow](../../.github/workflows/bun-compatibility.yml)).
 - **The hermetic real-Bun suites** —
   `crates/socket-patch-cli/tests/e2e_redirect_bun_build.rs` (hosted),
-  `e2e_vendor_bun_build.rs` (vendored) and `mode_migration_bun.rs`
+  `e2e_vendor_bun_build.rs` (vendored), `e2e_bun_lockb.rs` (native binary) and `mode_migration_bun.rs`
   (hosted ⇄ vendored takeover, scoped unwind) drive a real `bun install`
-  against a wiremock patch service on every pull request, in `ci.yml`'s
-  `e2e` matrix.
+  against a wiremock patch service. The text suites run in `ci.yml`'s `e2e`
+  matrix; the binary writer/reader suite runs in `bun-compatibility.yml`.
 
 Underneath, the hosted and vendored bun rewriters are pinned by shared golden
 fixtures (`crates/socket-patch-core/tests/fixtures/redirect/npm/bun/*`, shared
@@ -42,7 +42,8 @@ other npm lockfile flavors.
 | Version-0 lock (Bun 1.1.39–1.1.45 `--save-text-lockfile`) with `workspace:` packages — 2-tuple entries `"consumer": ["consumer@workspace:packages/consumer", { "dependencies": { … } }]` | Refused `redirect_bun_workspace_unsupported`, lock untouched, exit 0. Remedy: delete `bun.lock` and re-lock with Bun ≥ 1.2 (writes lockfileVersion 1, which hosted mode accepts; 2 on Bun ≥ 1.4). A plain in-place `bun install` bumps the version only when a workspace depends on another workspace (root → member — the matrix's `workspace` shape, the only shape it was measured on); otherwise Bun 1.2.0 keeps version 0 and 1.2.23+ fail to resolve (see [In-place re-versioning](#installer-boundaries-measured)). | Refused `vendor_bun_workspace_unsupported` (pre-version-2 policy, next row); its remedy tail for a version-0 lock says to re-lock with Bun ≥ 1.2 before trying `--mode hosted`, which refuses version 0 too. | Works. |
 | Version-1 lock (Bun 1.2–1.3 default) with `workspace:` packages — 1-tuple entries `["consumer@workspace:packages/consumer"]` | Rewritten (golden `lock-v1-workspace`; matrix 1.2.0–1.3.14 `workspace` / `workspace-nested`). | Refused `vendor_bun_workspace_unsupported` before any write. Policy, not a grammar limit: Bun 1.2.x–1.3.x resolve a workspace member's local-tarball path relative to the MEMBER (our root-relative tuple ENOENTs on `bun install`), 1.4.x relative to the lockfile, and a committed lockfileVersion-2 lock is the only proof that every consumer runs Bun ≥ 1.4 (1.3.x cannot parse v2). A deliberate over-approximation: a package declared only by the workspace ROOT vendors and installs on v1 too, but the lock cannot cheaply prove which workspace declares a hoisted entry. Remedy in the detail: delete `bun.lock`, re-run `bun install` with Bun ≥ 1.4 (an in-place `bun install` keeps the existing version), or — version 1 — use `--mode hosted`, which accepts version-1 workspace locks (a version-0 lock is told to re-lock with Bun ≥ 1.2 first). NOT refused: purls the vendor ledger wires at the selected uuid, purls whose every matching lock tuple already points into `.socket/vendor/npm/` (any uuid — a superseding patch re-pins in place; the lock-derived rule the engine uses), in-sync re-runs and `repair` rebuilds. `vendor` and the vendor step run the same preflight BEFORE a hosted → vendored takeover's revert, so a hosted-redirected purl on such a lock stays hosted-patched (`failed vendor_bun_workspace_unsupported`, lock and ledgers untouched; `vendor --dry-run` previews the same code). A `.socket/vendor/state.json` the preflight cannot read is `vendor_state_unreadable`, fail-closed. | Works. |
 | Version-2 lock (Bun 1.4+) with `workspace:` packages, nested versions included | Rewritten (golden `lock-v2-workspace-nested` — provenance: its nested same-version `consumer/left-pad` entry is a synthetic, grammar-valid extension of the 1.4.2 capture; bun hoists identical resolutions and never writes that entry itself, but bun 1.4.2 installs the fixture unchanged, and it is the only case pinning the rewrite of every matching tuple in one lock). | Vendored (matrix 1.4.0 / 1.4.2 `workspace`, `workspace-nested`, `already-vendored-workspace`). | Works. |
-| Binary `bun.lockb` only (Bun ≤ 1.1.38 always; 1.1.39–1.1.45 without `--save-text-lockfile`) | Auto-migrated to text before the read when an npm patch is granted — see [the `bun.lockb` migration](#the-bunlockb-migration); a stale `bun.lockb` beside a live `package-lock.json` / `npm-shrinkwrap.json` / `yarn.lock` / `pnpm-lock.yaml` is left alone (`redirect_bun_lockb_sibling_lock`, the redirect follows the sibling); `scan`'s run-level `bun_lockb_unsupported` warning is kept in hosted mode too — beside the driver's outcome on the run that migrates, alone when no npm patch is granted. | Refused `vendor_bun_lockb_unsupported`: "run `bun install --save-text-lockfile` (Bun >= 1.1.39), commit the resulting bun.lock, and re-run" — one detail text on the `vendor` router and on the `get` / `scan` pre-download preflight. | The installed tree is patched; the inventory cannot read the lock, so `scan` warns `bun_lockb_unsupported` (run-level `warnings[]` + stderr) instead of reporting a clean empty inventory on a fresh clone; when a sibling npm / yarn / pnpm lock is shadowed by the stale `bun.lockb`, the detail names it and says to delete the debris (the sibling stays un-inventoried: fail-closed). |
+| Binary `bun.lockb` (binary format revisions 1, 2 and 3) | Package resolution and integrity records are rewritten in place. The CLI does not spawn Bun or produce a text lock. | Native local-tarball wiring, committed artifact, detached mode, repair and hosted ⇄ vendored takeover. | Registry package records are inventoried directly, including lockfile-only projects without `node_modules`. |
+| Truncated, corrupt or unrecognized binary `bun.lockb` | Refused with `redirect_bun_lockb_invalid`, preserving the lock. | Refused with `vendor_bun_lockb_invalid` before downloads or artifact creation. | The inventory reports the malformed lock. |
 | `bun.lock` with a `lockfileVersion` ≥ 3, no integer version, or a `packages` section outside bun's single-line grammar | Refused `redirect_bun_lock_unsupported`. | Refused `vendor_lockfile_version_unsupported` (preflight and engine). | The inventory skips the lock. |
 
 One detail text serves both modes for the version gate: a newer version says
@@ -81,50 +82,120 @@ everything through the whole-ledger replay. Pinned hermetically by
 `tests/mode_migration_bun.rs` (CI: Bun 1.4.2 on three OSes, 1.3.14 on Linux)
 and by the matrix's `hosted-then-vendored` / `vendored-then-hosted` shapes.
 
-### The `bun.lockb` migration
+### Native `bun.lockb` support
 
-Hosted mode needs a text lock to edit. On a project whose only lock is
-`bun.lockb`, and only when an npm patch is granted, the CLI runs the `bun`
-resolved on absolute `PATH` entries (Windows `bun.cmd` / `.bat` shims found
-through `PATHEXT` and spawned directly — the standard library launches batch
-shims through `cmd.exe` with correct quoting, so a shim under a path with
-spaces and `(x86)`-style metacharacters works; a relative `PATH` entry never
-runs a repository-planted `bun`) as
+Binary locks are parsed and patched directly. The codec understands the original
+version-1 representation, the version-2 URL representation, the later scripts
+package field, and version 3's wider semantic-version representation. It keeps
+package IDs, dependency edges, hoisting data, package metadata and optional
+extensions intact. Historical workspace dependency flags and literals are
+normalized to the equivalent representation accepted by old and new readers;
+the original encoding is retained for rollback. Unknown versions and invalid
+offsets fail closed.
 
-```sh
-bun install --save-text-lockfile --frozen-lockfile --lockfile-only
+Hosted redirects and vendoring use per-package binary snapshots in their ledgers.
+This allows a scoped rollback or mode switch to restore one package while keeping
+other packages wired. Whole-ledger reverse replay restores the original binary
+bytes when no external re-save occurred. Scoped rollback restores package
+resolutions and may retain equivalent binary normalization; if Bun itself has
+subsequently upgraded the binary schema, rollback preserves that schema and
+restores the original package resolutions.
+Dry runs validate the same input and drift conditions without changing it. No Bun
+executable is required to inspect, rewrite or restore a binary lock.
+
+This replaces the earlier forced `bun.lockb` → `bun.lock` migration. Existing
+migration ledger records retain their rollback compatibility, but new operations
+keep the lock binary. A format-1 input is promoted directly to binary format 2
+when needed for tarball resolutions, with an exact original snapshot for rollback.
+When `bun.lock` also exists, it takes
+precedence, matching modern Bun's installer.
+
+Binary workspace vendoring records byte-identical tarball copies under each
+workspace's `.socket/vendor/npm/<uuid>/` directory as well as the canonical root
+artifact. This supports Bun releases that interpret local-tarball paths relative
+to the workspace and those that interpret them relative to the lockfile. Commit
+these copies along with the root artifact. Repair rebuilds missing or corrupt
+copies, including recovery when the local ledger is missing; rollback and mode
+switches remove the tracked copies with drift checks.
+
+Bun 1.2 and newer can still write native binary locks. Use the following project
+configuration in `bunfig.toml` when creating a new binary lock:
+
+```toml
+[install]
+saveTextLockfile = false
 ```
 
-which needs no network and fails closed on drift. Measured against real
-releases (macOS arm64, 2026-09-21; the matrix's `legacy-lockb` shape
-re-measures it per OS):
+The committed real-Bun captures live in
+`crates/socket-patch-core/tests/fixtures/bun-lockb/<version>/`, with their manifest,
+lock and SHA-256 provenance. They cover 0.1.1, 0.1.6, 0.1.7, 0.5.9, 0.6.7, 0.6.8,
+0.8.1, 1.0.0, 1.0.36, 1.1.0, 1.1.38, 1.1.45, 1.2.0, 1.2.23, 1.3.0,
+1.3.14 and 1.4.2. The fixture boundaries follow Bun's
+[binary lock implementation](https://github.com/oven-sh/bun/blob/bun-v1.4.2/src/install/lockfile.rs).
 
-| Bun on `PATH` | What the recipe does | CLI outcome |
-|---|---|---|
-| ≤ 1.1.38 | exit 0, "no changes" — no text lockfile exists | `redirect_bun_lockb_manual_migration`; the detail says Bun ≤ 1.1.38 must be upgraded |
-| 1.1.39–1.1.42 | exit 0, "no changes", **no `bun.lock` written** (`--frozen-lockfile` suppresses the save; a bare `bun install --save-text-lockfile` does write one) | `redirect_bun_lockb_manual_migration` — run `bun install --save-text-lockfile` yourself, then re-run |
-| 1.1.43–1.1.45 | writes `bun.lock` (lockfileVersion 0) and **keeps `bun.lockb`** | migrated; the CLI deletes the surviving `bun.lockb` itself |
-| ≥ 1.2.0 | writes `bun.lock` (lockfileVersion 1) and deletes `bun.lockb` | migrated |
-| `bun` missing, unspawnable, or exit ≠ 0 | — | `redirect_bun_lockb_unsupported` with bun's output tail in the detail; `bun.lockb` untouched (never parsed) |
-| `bun.lockb` is not a regular file (a FIFO, socket or directory squatting the name) | not spawned (bun would block on it too) | `redirect_bun_lockb_unsupported` "bun.lockb is not a regular file; refusing to migrate it"; nothing touched |
-| a live `package-lock.json` / `npm-shrinkwrap.json` / `yarn.lock` / `pnpm-lock.yaml` sits beside `bun.lockb` | not spawned | `redirect_bun_lockb_sibling_lock` (also under `--dry-run`): the stale binary lock is left alone and the redirect follows the sibling lock — delete the debris, or remove the sibling and re-run if bun is the installer |
-| `--dry-run` | not spawned | `redirect_bun_lockb_would_migrate` |
+Run the dedicated binary acceptance matrix:
 
-A successful migration is recorded as a `redirect_bun_lockb_migrated` /
-`removed` ledger edit whose `original` carries the pre-migration bytes
-(standard base64, locks up to 8 MiB). `rollback` writes `bun.lockb` back and
-warns `redirect_bun_lockb_restored` (the generated `bun.lock` is kept —
-Bun ≥ 1.1.39 reads `bun.lock` when both exist; delete whichever you do not
-want); `redirect_bun_lockb_unrestorable` is reserved for a marker without
-bytes while the file is absent, or a different `bun.lockb` that appeared
-since (never clobbered). A migration whose rewrite then lands nothing (the
-granted version is not in the lock) is undone — bytes restored, text lock
-removed, no ledger record — and reported
-`redirect_bun_lockb_migration_reverted`. Bun ≥ 1.2 has no flag that emits the
-binary form, so the hermetic suites cannot generate a `bun.lockb`; the branch
-is pinned by shim-driven CLI tests (`tests/in_process_redirect.rs` incl. the
-Windows `bun.cmd` twins, `tests/covgap_commands_scan_hosted.rs`) and by the
-matrix's `legacy-lockb` shape against real Bun 1.1.39–1.4.2.
+```sh
+python3 scripts/backtest-bun-lockb.py \
+  --tools /tmp/bun-tools \
+  --output /tmp/bun-lockb-compatibility
+```
+
+Bun 0.1.x predates upstream checksum manifests; its official release assets use
+the reviewed SHA-256 pins in `scripts/bun-historical-shas.json`. Later releases
+are verified against their published `SHASUMS256.txt`.
+
+Native writers from Bun 0.5.9 onward are paired with their own reader. Bun
+0.1.1, 0.1.6 and 0.1.7 have no tarball installer: they silently omit tarball
+packages even when installation exits zero. Their original binary locks are
+therefore tested with Bun 0.5.9, the first tarball-capable reader; this upstream
+limitation is recorded explicitly in each matrix row. Newer readers also consume an
+unchanged 1.1.45 binary lock. The Rust tests assert cold frozen installs from an
+empty cache, exact patched and bystander bytes, preservation of the binary file,
+hosted and vendored reruns, both takeover directions, dry-run immutability,
+artifact repair, detached mode and byte-exact rollback. Extended cells cover npm
+aliases, overridden transitives, workspace members, multiple versions, root and
+workspace scripts, and GitHub resolutions. Workspace cells also exercise missing
+and corrupt copies, with and without the local ledger.
+The public-service matrix additionally verifies ordinary installs, warmed-cache
+frozen and ordinary installs, and digest tampering.
+`SOCKET_PATCH_BUN_LOCKB_REQUIRED=1` makes missing tools a failure. A regular
+`cargo test -p socket-patch-cli --test e2e_bun_lockb` uses Bun on `PATH`; a modern
+Bun reads the committed binary fixture, so no separate old writer is needed.
+
+### Latest local validation
+
+Measured on 2026-09-21, macOS arm64, using the native binary implementation in
+the worktree based on `4b61c9620b800d26056211060ebb4a4c60288da5`:
+
+| Suite | Result | Coverage |
+|-------|--------|----------|
+| Public patch service | 370 / 370 cases passed | 11 releases: 0.8.1, 1.0.0, 1.0.36, 1.1.0, 1.1.38, 1.1.45, 1.2.0, 1.2.23, 1.3.0, 1.3.14, 1.4.2. 340 accepted flows and 30 expected text-workspace refusals. Direct, alias, transitive, two-version, workspace, nested workspace, root workspace, lockfile-only, UUID/search get, legacy binary and both takeover shapes. |
+| Explicit warm-cache installs | 90 / 90 cases passed | Six eras: 0.8.1, 1.0.36, 1.1.45, 1.2.23, 1.3.14, 1.4.2. Direct, workspace, nested workspace, legacy binary and both takeovers, with cold and warmed-cache frozen and ordinary installs. Includes eight expected text-workspace refusals. |
+| Native binary writer/reader matrix | 25 / 25 pairs passed | All 17 fixture writers listed above; own-version readers from 0.5.9 onward, 0.5.9 readers for the three 0.1.x writers, five 1.2–1.4 readers of 1.1.45, and 1.4.2 readers of 0.1.1, 0.1.6 and 0.6.7. All three Rust acceptance tests ran in each pair. |
+| Historical concurrency regression | 30 / 30 pairs passed | Six repetitions of 0.5.9 reading 0.1.1, 0.1.6 and 0.5.9, plus 1.4.2 reading 0.1.1 and 0.1.6, with isolated temporary directories. |
+
+The public-service captures record CLI SHA-256
+`a3e7683d66e6e6654644c3cd51ada1260a58a8d8f9b96c0a2ea4f585a9219910`.
+The binary matrix records both Bun executable hashes and its test executable
+hash in every result. The final local reports are under
+`/tmp/socket-patch-bun-public-final`, `/tmp/socket-patch-bun-public-warm-final`
+and `/tmp/socket-patch-bun-native-final-isolated`.
+
+Early parallel historical probes exposed Bun 0.5.9's `FileNotFound extracting
+tarball` and Bun 0.1.1's lockfile `AccessDenied` errors in a shared temporary
+directory. The harness now gives every fixture its own temporary directory and
+an empty cache directory. Historical writers use timestamp-derived temporary
+names. The failing logs remain under `/tmp/socket-patch-bun-native-verified` and
+`/tmp/socket-patch-bun-native-emptycache-*`; the six repeated runs above verify
+the corrected isolation without retrying failed assertions or changing readers.
+
+Production Clippy passed with warnings denied. The workspace library run passed
+4,123 tests after excluding the existing Ruby setup suite; an unfiltered run
+passed 4,218 tests and failed six Ruby setup tests because the local system has
+unsupported Bundler 1.17.2. Eight focused CLI suites passed 210 tests. These are
+local macOS measurements; the Linux and Windows matrix jobs are configured in
+CI and were not run locally.
 
 ## Installer boundaries (measured)
 
@@ -141,7 +212,7 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   (lockfileVersion 1) through 1.3.x; 1.4.0 writes 2 for a FRESH lock behind
   an unchanged grammar. Registry 4-tuples are byte-identical across 0/1/2,
   so the rewrite is version-independent; the workspace grammar, the
-  migration recipe and digest enforcement are not.
+  binary layout and digest enforcement are not.
 - **In-place re-versioning.** Bun never bumps an existing version-1 lock in
   place — 1.4.x `install`, `add`, `update`, `--force` and
   `--save-text-lockfile` all keep 1; only deleting `bun.lock` and re-locking
@@ -197,26 +268,17 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   `rollback` → `partial_failure`, `vendor_lock_entry_not_found` /
   `vendor_lock_entry_drifted`); the `already-vendored-workspace` matrix
   shape on 1.2.0–1.3.9 is the regression guard.
-- **Both lockfiles present.** Bun ≥ 1.1.39 reads `bun.lock` when `bun.lockb`
-  sits beside it; Bun ≤ 1.1.38 reads only `bun.lockb` — which is why the CLI
-  removes a surviving `bun.lockb` after the migration (a stale binary lock
-  beside the redirected text lock is what an old Bun would silently install
-  the UNPATCHED bytes from).
+- **Both lockfiles present.** Modern Bun prefers text `bun.lock` over
+  `bun.lockb`. The CLI follows the selected lock format; native binary writes
+  never create a sibling text lock.
 - **Bun 0.8.1 / 1.0.0 with peer or overridden-transitive shapes** do not
-  install the selected patched version at all; the CLI leaves those projects
-  unchanged (an upstream limitation, recorded by the matrix as such). The two
-  shapes leave different traces: `transitive` still installs `mkdirp`, so a
-  `bun.lockb` sits beside `node_modules` and `scan` carries the run-level
-  `bun_lockb_unsupported` layout warning in every mode, hosted included;
-  `peer` installs nothing and both releases delete the empty lockfile ("No
-  packages! Deleted empty lockfile"), so no lock exists to diagnose and every
-  mode reports no code. The oracle encodes both, and `unchangedLockPresence`
-  pins the split. The same layout warning accompanies every `scan` on a
-  `bun.lockb`-only project — on hosted runs beside the driver's
-  `redirect_bun_lockb_*` outcome (`legacy-lockb`, and every shape on
-  ≤ 1.1.45 without `--save-text-lockfile`); `get` runs no inventory pass and
-  carries only the driver's codes.
-- **Frozen installs never write the lock**, so only a plain `bun install` can
+  install the selected patched version. Those projects remain unchanged; the
+  matrix records this upstream limitation and checks lock presence explicitly.
+- **Modern frozen installs preserve the lock**. Bun 0.5.9 upgrades an untouched
+  format-1 registry lock to format 2 even with `--frozen-lockfile`; that historical
+  exception is checked explicitly. Modern ordinary installs upgrade format 2 to
+  3, which the matrix validates using Bun's complete semantic lockfile dump.
+  Outside these schema transitions, only a plain `bun install` can
   observe re-serialization drift — the matrix's `ordinaryStableLock` check and
   the plain-install legs of the hermetic suites both run it.
 
@@ -276,10 +338,9 @@ another purl must survive a refused vendored run).
 boundaries above — not the CLI's own output — and every cell asserts
 `supported` against it and the refusal codes EXACTLY, after removing an
 explicit informational allowlist (`vendor_prebuilt_downloaded`,
-`vendor_fetched_missing`, `reinstall_required`, `redirect_bun_lockb_restored`,
+`vendor_fetched_missing`, `reinstall_required`,
 …); substring matching is never used. A configuration expected to be
-supported FAILS on `redirect_bun_lockb_migration_reverted`,
-`redirect_bun_lockb_migrated_without_redirect`, `redirect_bun_entry_not_found`
+supported FAILS on unexpected warnings, `redirect_bun_entry_not_found`
 or `redirect_revert_failed`. Exit codes are recorded for every invocation and
 asserted: supported → 0; hosted refusals → 0 with `redirect.redirected == 0`
 (the documented hosted-refusal posture); vendored, detached and `get` refusals
@@ -305,10 +366,9 @@ asserted: supported → 0; hosted refusals → 0 with `redirect.redirected == 0`
   (`legacyDigestBehavior`) rather than asserted;
 - rollback restores the original manifest / lock bytes, removes the
   `.socket/vendor` state, and a clean install reproduces the record's
-  `beforeHash` bytes; text-lock projects end with `bun.lock` restored and no
-  `bun.lockb`, and `legacy-lockb` cells end with `bun.lockb` restored
-  byte-identical (sha256 == baseline) beside the generated `bun.lock`, with
-  `redirect_bun_lockb_restored` and never `redirect_bun_lockb_unrestorable`.
+  `beforeHash` bytes; text projects retain `bun.lock`, and binary projects
+  retain `bun.lockb` without creating a text lock. The original lock presence
+  and SHA-256 are both checked.
 
 The runner captures the exact project manifests, lockfiles, optional
 `.socket/manifest.json`, CLI JSON, exit codes, file hashes and assertion
@@ -364,15 +424,14 @@ table above.
 | Claim | Real-Bun matrix (`backtest-bun.py`) | Real-Bun hermetic suites (`ci.yml` `e2e`) | Bun-less unit / CLI tests |
 |---|---|---|---|
 | Text lock 0 / 1 / 2 rewritten and installed, both modes | 1.1.39–1.4.2 | `e2e_redirect_bun_build` + `e2e_vendor_bun_build` on 1.4.2 (3 OS), 1.1.45 and 1.2.23 (Linux); the fixture asserts the lock version matches the era table, the v1-on-1.4 leg proves a committed v1 lock keeps installing | goldens `lock-v0`, `basic` (v1), `lock-v2`; `bun_lock.rs`, `lock_inventory.rs` |
-| Binary lock → vendored refuses; `scan` warns `bun_lockb_unsupported` in every mode (hosted: beside the migration outcome) | 0.8.1–1.1.45, `legacy-lockb` (hosted rows expect the layout code plus the band's `redirect_bun_lockb_*` code) | — | `in_process_vendor_bun`, `covgap_commands_scan_mod` |
-| lockb migration bands (manual 1.1.39–1.1.42; migrates ≥ 1.1.43; the CLI removes `bun.lockb`; rollback restores it) | `legacy-lockb`, 1.1.39–1.4.2 | — (Bun ≥ 1.2 cannot write a `bun.lockb`) | shim-driven `in_process_redirect` (incl. Windows `bun.cmd`), `covgap_commands_scan_hosted`, `replay.rs` |
-| Version-0 workspace hosted refusal + remedy | `text-workspace` (1.1.39–1.1.45); 1.1.45 `workspace*` after migration | — | golden `lock-v0-workspace-refusal` (+ `expected-warnings.json`), `redirect/mod.rs` unit tests |
+| Native binary formats 1 / 2 / 3: inventory, hosted, vendored, detached, repair, takeovers, rollback | `direct`, `legacy-lockb`, conversion shapes; dedicated `backtest-bun-lockb.py` | `e2e_bun_lockb` across writer / reader revisions | `bun_lockb.rs` and committed real binary fixtures; native CLI tests |
+| Version-0 workspace hosted refusal + remedy | `text-workspace` (1.1.39–1.1.45) | — | golden `lock-v0-workspace-refusal` (+ `expected-warnings.json`), `redirect/mod.rs` unit tests |
 | Pre-v2 workspace vendored refusal (policy) + remedy; version 2 supported incl. nested | v1: 1.2.0–1.3.14 `workspace*`; v0: `text-workspace`; v2: 1.4.x | `e2e_vendor_bun_build` scoped leg (deps + bin meta survive) | `bun_lock.rs` (`legacy_workspace_tarballs_refuse_before_writes`, in-sync / rebuild exemptions), `in_process_vendor_bun`, `repair_vendor_flavors_e2e` over {0, 1, 2} × workspace shapes |
 | Digest boundary 1.3.10 (registry tuples 1.2.0) | 1.3.9 vs 1.3.10 cells, `registryDigestEnforced` | tampered twins in both suites, pinned from both sides | — |
 | Digest-less re-saves below 1.3.10 recognised, healed and unwound (both modes, takeovers, scoped unwinds, `repair`) | `already-vendored-workspace` on 1.2.0–1.3.9 (`digestDroppedOnResave`; `resaveKeepsDigest` from 1.3.10) | `bun_redirect_survives_a_digest_dropping_lock_resave`, `bun_vendor_survives_a_digest_dropping_lock_resave` (real `file:`-dep re-save; the era's spelling asserted from both sides) | goldens `digestless-hosted-already-wired`, `digestless-hosted-stale-url-repin`; `bun_lock_text.rs` (`same_wiring_modulo_integrity`), `redirect/mod.rs`, `replay.rs`, `takeover.rs`, `bun_lock.rs` unit tests; `in_process_redirect`, `in_process_vendor_bun`, `in_process_vendor_bun_takeover` |
 | Mode conversion both directions; scoped `rollback` / `remove` | `hosted-then-vendored`, `vendored-then-hosted` | `mode_migration_bun` (1.4.2 × 3 OS, 1.3.14) | `in_process_vendor_bun_takeover`, `takeover.rs`, `covgap_commands_rollback` |
 | CRLF lockfiles preserved (hosted line, vendored, rollback) | `crlf-lock` | — | golden `lock-v2-crlf`, `bun_lock.rs` |
-| Bun 0.8.1 / 1.0.0 peer / transitive upstream limitation | recorded per cell — `transitive` carries exactly `bun_lockb_unsupported` in all three modes (a `bun.lockb` is left), `peer` carries no code, exit 0 throughout | — | — |
+| Bun 0.8.1 / 1.0.0 peer / transitive upstream limitation | recorded per cell; no selected target is installed, exit 0 and lock unchanged | — | — |
 | Pre-download preflight envelopes, `--silent`, `--dry-run` `would_refuse`, detached parity | `get-uuid` / `get-search` / `workspace-get-uuid` / `workspace-get-search` refusals (exit codes, `downloaded == 0`) | — | `in_process_vendor_bun` (exact uuid-path envelope), `scan_vendor_e2e`, `get_modes_e2e`, `vendor_flow.rs` |
 
 Not measured: a `--cwd <workspace member>` run (the member holds no
@@ -409,6 +468,13 @@ package shapes the real registry never installs for the free patch
   remainder writes a `noCells` summary and passes), and a `shapes` / `modes`
   narrowing that applies to none of a cell's release yields the script's
   `noCells` row rather than a red cell.
+- **Native binary matrix** — `bun-compatibility.yml` also runs
+  `scripts/backtest-bun-lockb.py` on Linux, macOS and Windows. Unix exercises all
+  17 pinned binary writers and their compatible readers, plus modern readers
+  of 1.1.45 and the earliest format-1 / pre-scripts locks. Windows starts at
+  1.1.0, its first available release. Each job builds the Rust test executable,
+  rejects missing tools and skipped required cases, and uploads every pair's
+  log and SHA-256 provenance in `bun-binary-results-<os>`.
 - **Production suites (on demand).**
   `e2e_hosted_production::bun_hosted_install_proof` runs in `ci.yml`'s
   `hosted-e2e` job (`npm install -g bun@1`,

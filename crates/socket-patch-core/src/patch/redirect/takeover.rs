@@ -460,7 +460,7 @@ fn bun_spec_names(spec: &str, name: &str, version: &str) -> bool {
 /// to parse fails the match (closed). The exact-leaf comparison is the
 /// version discriminator: `pkg-1.3.0.tgz` never equals `pkg-11.3.0.tgz`
 /// or `pkg-1.3.0-rc1.tgz`.
-fn hosted_url_names(url: &str, name: &str, version: &str) -> bool {
+pub(super) fn hosted_url_names(url: &str, name: &str, version: &str) -> bool {
     if !url.starts_with("https://") && !url.starts_with("http://") {
         return false;
     }
@@ -604,6 +604,7 @@ pub async fn revert_npm_redirect_purl(
                     }
                 }
             }
+            super::bun_binary::KIND => super::bun_binary::names(e, &name, &version)?,
             BUN_TEXT_KIND => match bun_edit_ownership(e, &name, &version) {
                 BunClaim::Ours => true,
                 BunClaim::Foreign => false,
@@ -632,12 +633,34 @@ pub async fn revert_npm_redirect_purl(
 
     let mut out = RedirectRevert::default();
     let mut staged: Staged = Staged::new();
+    let mut binary: Option<Vec<u8>> = None;
     // Newest-first: the hosted flow appends edits, so reverse index order
     // unwinds re-redirect chains correctly (each step's `original` is the
     // previous step's `new`).
     for &i in mine.iter().rev() {
         let edit = state.edits[i].clone();
-        if replays_as_text_fragment(&edit.kind) {
+        if edit.kind == super::bun_binary::KIND {
+            if edit.path != "bun.lockb" {
+                return Err("unexpected binary lock edit path".into());
+            }
+            let metadata = tokio::fs::symlink_metadata(project_root.join("bun.lockb"))
+                .await
+                .map_err(|e| format!("cannot inspect bun.lockb: {e}"))?;
+            if !metadata.is_file() {
+                return Err("bun.lockb is not a regular file".into());
+            }
+            let content = match binary.take() {
+                Some(v) => v,
+                None => {
+                    crate::utils::fs::read_regular_to_bytes_sync(&project_root.join("bun.lockb"))
+                        .map_err(|e| format!("cannot read bun.lockb: {e}"))?
+                }
+            };
+            binary = Some(super::bun_binary::restore(&content, &edit)?);
+            if !out.reverted_files.iter().any(|p| p == "bun.lockb") {
+                out.reverted_files.push("bun.lockb".into());
+            }
+        } else if replays_as_text_fragment(&edit.kind) {
             // Whole-fragment replay. For bun the fragments are whole lines
             // (a CRLF lock's carry their trailing `\r`), so a
             // `contains`/`replacen` on the raw content restores the line
@@ -710,6 +733,14 @@ pub async fn revert_npm_redirect_purl(
     // persists it on a dry run, so nothing durable changes.
     if !dry_run {
         flush_staged(project_root, &staged).await?;
+        if let Some(bytes) = &binary {
+            crate::utils::fs::atomic_write_bytes_preserving_mode(
+                &project_root.join("bun.lockb"),
+                bytes,
+            )
+            .await
+            .map_err(|e| format!("cannot write bun.lockb: {e}"))?;
+        }
     }
 
     // Only after every inverse applied cleanly: drop this purl's edits and

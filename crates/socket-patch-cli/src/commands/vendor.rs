@@ -644,6 +644,21 @@ pub(crate) async fn persist_vendor_entry(
             .any(|e| e.ecosystem == prev.ecosystem && e.uuid == prev.uuid);
         let stale_rel = vendor::path::vendor_uuid_dir_rel(&prev.ecosystem, &prev.uuid);
         if let Some(rel) = stale_rel.filter(|_| !still_referenced) {
+            if let Err(detail) = vendor::bun_lock::cleanup_binary_workspace_artifacts(
+                &common.cwd,
+                &prev,
+                common.dry_run,
+            )
+            .await
+            {
+                record_warning(
+                    env,
+                    &candidate,
+                    &VendorWarning::new("vendor_stale_artifact_kept", detail),
+                    common,
+                );
+                return has_errors;
+            }
             if !common.dry_run {
                 let _ = remove_tree(&common.cwd.join(rel)).await;
             }
@@ -798,6 +813,30 @@ pub(crate) async fn vendor_records(
         common.silent || common.json,
     )
     .await;
+
+    // An npm alias is installed under its dependency key, not its actual
+    // package name. The targeted resolver probes canonical paths; before
+    // fetching a supposedly missing source, resolve aliases by the installed
+    // package.json identity. This also permits offline binary Bun vendoring.
+    let missing_npm: Vec<_> = vendorable_partition
+        .get(&Ecosystem::Npm)
+        .into_iter()
+        .flatten()
+        .filter(|p| !all_packages.contains_key(*p))
+        .cloned()
+        .collect();
+    if !missing_npm.is_empty() {
+        let crawler = socket_patch_core::crawlers::npm_crawler::NpmCrawler::new();
+        for package in crawler.crawl_all(&crawler_options).await {
+            for purl in &missing_npm {
+                if normalize_purl(strip_purl_qualifiers(purl)) == normalize_purl(&package.purl) {
+                    all_packages
+                        .entry(purl.clone())
+                        .or_insert_with(|| package.path.clone());
+                }
+            }
+        }
+    }
 
     // ── Auto-fetch: lockfile-resolved packages with no installed copy ────
     // A manifest patch whose package is not on disk but IS resolvable from
@@ -1171,7 +1210,11 @@ pub(crate) async fn vendor_records(
                             // version) were already previewed by the Bun
                             // preflight above, so stopping here promises
                             // nothing the wet run then refuses.
-                            if revert.reverted_files.iter().any(|f| f == "bun.lock") {
+                            if revert
+                                .reverted_files
+                                .iter()
+                                .any(|f| f == "bun.lock" || f == "bun.lockb")
+                            {
                                 continue;
                             }
                         }
@@ -1462,6 +1505,9 @@ pub(crate) async fn vendor_records(
                     "Commit .socket/vendor/ and the updated lockfiles to make the patches \
                      portable."
                 );
+            }
+            if wired_flavors.contains("bun") && common.cwd.join("bun.lockb").exists() {
+                println!("For binary Bun workspaces, also commit the workspace members' .socket/vendor/ tarballs recorded in the vendor ledger.");
             }
             let mut installs: Vec<&str> = wired_flavors
                 .iter()

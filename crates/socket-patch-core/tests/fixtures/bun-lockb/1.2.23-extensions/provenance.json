@@ -1,0 +1,7 @@
+{
+  "bun": "1.2.23",
+  "os": "darwin",
+  "arch": "aarch64",
+  "command": "bun install --ignore-scripts",
+  "sha256": "860cdba017c8ee5b95658f81dc17d867fd0dca602926c4cb6a38c6ed7ed59d4f"
+}

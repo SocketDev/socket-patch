@@ -45,7 +45,7 @@ pub(crate) enum NpmLockFlavor {
     /// `pnpm-lock.yaml`, the legacy grammars — lockfileVersion 5.4 (pnpm 7)
     /// or 6.0 (pnpm 8).
     PnpmLegacy,
-    /// `bun.lock` (bun's text lockfile).
+    /// `bun.lock` or native binary `bun.lockb`.
     Bun,
 }
 
@@ -84,7 +84,7 @@ const LOCKFILE_FAMILIES: [(NpmLockFlavor, &[&str]); 4] = [
     ),
     (NpmLockFlavor::YarnClassic, &["yarn.lock"]),
     (NpmLockFlavor::Pnpm, &["pnpm-lock.yaml"]),
-    // bun reads bun.lock when both exist (lockb is the migrated-away binary).
+    // Bun reads bun.lock when both text and binary lockfiles exist.
     (NpmLockFlavor::Bun, &["bun.lock", "bun.lockb"]),
 ];
 
@@ -96,7 +96,7 @@ const LOCKFILE_FAMILIES: [(NpmLockFlavor, &[&str]); 4] = [
 ///    pnpm store + no yarn.lock, see
 ///    [`crate::crawlers::pkg_managers::pnpm_pnp_layout`]) → Err
 ///    `vendor_pnpm_pnp_unsupported` with a pnpm remedy;
-/// 2. `bun.lock` → Bun; else `bun.lockb` → Err `vendor_bun_lockb_unsupported`;
+/// 2. `bun.lock` or `bun.lockb` → Bun (text takes precedence);
 /// 3. `pnpm-lock.yaml` → head-sniff `lockfileVersion`: `'9.0'` → Pnpm;
 ///    `5.4`/`'6.0'` (pnpm 7/8) → PnpmLegacy; anything else → Err
 ///    `vendor_lockfile_version_unsupported` (version-aware remedy);
@@ -156,17 +156,10 @@ pub(crate) async fn detect_npm_lock_flavor(
     }
 
     let detected = 'flavor: {
-        // 2. bun: the text lockfile is wirable; the legacy binary one is not.
-        if exists("bun.lock").await {
+        // 2. Bun's native backend accepts text and binary locks. Selection
+        // inside the backend and inventory preserves bun.lock precedence.
+        if exists("bun.lock").await || exists("bun.lockb").await {
             break 'flavor NpmLockFlavor::Bun;
-        }
-        if exists("bun.lockb").await {
-            // One remedy text for this code, shared with the pre-download
-            // preflight (`bun_lock::preflight_vendor`).
-            return Err((
-                "vendor_bun_lockb_unsupported",
-                bun_lock::BUN_LOCKB_UNSUPPORTED_DETAIL.to_string(),
-            ));
         }
 
         // 3. pnpm: lockfileVersion 9.0 routes to the v9 backend, the legacy
@@ -222,7 +215,7 @@ pub(crate) async fn detect_npm_lock_flavor(
             "vendor_lockfile_missing",
             format!(
                 "no package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml, or \
-                 bun.lock at {} — vendoring rewires the lockfile, so one must exist (run \
+                 bun.lock, or bun.lockb at {} — vendoring rewires the lockfile, so one must exist (run \
                  your package manager's install first)",
                 project_root.display()
             ),
@@ -318,7 +311,7 @@ async fn sniff_yarn_lock(project_root: &Path) -> Result<NpmLockFlavor, (&'static
 
 /// Vendor one npm package through whichever lockfile-flavor backend serves
 /// this project (package-lock / yarn classic / yarn berry node-modules /
-/// pnpm / bun). Probe refusals (PnP, bun.lockb, unsupported lock versions)
+/// pnpm / bun). Probe refusals (PnP, unsupported lock versions)
 /// surface verbatim; the detected flavor is stamped onto the ledger entry so
 /// `revert_npm_any` routes back to the same backend.
 #[allow(clippy::too_many_arguments)]
@@ -415,7 +408,27 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
         Some("yarn-classic") | Some("yarn-berry") => {
             lock_text_mentions_uuid(project_root, &["yarn.lock"], &entry.uuid).await
         }
-        Some("bun") => lock_text_mentions_uuid(project_root, &["bun.lock"], &entry.uuid).await,
+        Some("bun") => {
+            if tokio::fs::symlink_metadata(project_root.join("bun.lock"))
+                .await
+                .is_ok()
+            {
+                return lock_text_mentions_uuid(project_root, &["bun.lock"], &entry.uuid).await;
+            }
+            let bytes = crate::utils::fs::read_regular_to_bytes(&project_root.join("bun.lockb"))
+                .await
+                .ok()?;
+            let lock = super::bun_lockb::BunLockb::parse(&bytes).ok()?;
+            let needle = format!(".socket/vendor/npm/{}/", entry.uuid);
+            // The string pool can retain superseded paths. Only active
+            // package resolutions count, so stale bytes do not prevent GC.
+            Some(
+                lock.packages()
+                    .ok()?
+                    .iter()
+                    .any(|package| package.resolution.contains(&needle)),
+            )
+        }
         Some(_) => None, // unknown flavor: cannot determine
     }
 }
@@ -589,7 +602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bun_lock_routes_and_lockb_refuses() {
+    async fn bun_text_and_binary_locks_route_to_bun() {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "bun.lock", "{\n  \"lockfileVersion\": 1\n}\n").await;
         let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
@@ -602,15 +615,13 @@ mod tests {
         assert_eq!(flavor, NpmLockFlavor::Bun);
         assert!(warnings.is_empty(), "{warnings:?}");
 
-        // lockb alone: actionable migration pointer.
+        // Binary-only trees reach the native parser; malformed content is
+        // diagnosed there rather than mistaken for an unsupported format.
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "bun.lockb", "binary").await;
-        let (code, detail) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
-        assert_eq!(code, "vendor_bun_lockb_unsupported");
-        assert!(
-            detail.contains("bun install --save-text-lockfile"),
-            "{detail}"
-        );
+        let (flavor, warnings) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
+        assert_eq!(flavor, NpmLockFlavor::Bun);
+        assert!(warnings.is_empty());
     }
 
     #[tokio::test]
@@ -938,8 +949,8 @@ mod tests {
         );
     }
 
-    /// The router's documented contract: probe refusals (PnP, bun.lockb,
-    /// unsupported lock versions, missing locks) surface VERBATIM through
+    /// The router's documented contract: backend format errors and probe
+    /// refusals (unsupported versions, missing locks) surface VERBATIM through
     /// `vendor_npm_any` — same code, same detail, nothing remapped — and a
     /// refusal writes nothing. (The one other Refused-outcome test gets its
     /// refusal from a backend AFTER a successful probe; this one exercises
@@ -956,9 +967,9 @@ mod tests {
         let VendorOutcome::Refused { code, detail } = outcome else {
             panic!("expected the probe's Refused, got {outcome:?}");
         };
-        assert_eq!(code, "vendor_bun_lockb_unsupported");
+        assert_eq!(code, "vendor_bun_lockb_invalid");
         assert!(
-            detail.contains("bun install --save-text-lockfile"),
+            detail.contains("bun.lockb"),
             "the probe's remedy must surface unremapped: {detail}"
         );
         assert!(
@@ -1089,6 +1100,79 @@ mod tests {
         // Unknown flavor: undeterminable, fail-safe keep.
         let entry = probe_entry(Some("future-pm"));
         assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, None);
+    }
+
+    #[tokio::test]
+    async fn binary_bun_in_use_ignores_old_pool_strings_and_obeys_text_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes = include_bytes!("../../tests/fixtures/bun-lockb/1.1.45/bun.lockb");
+        let mut lock = super::super::bun_lockb::BunLockb::parse(bytes).unwrap();
+        let package = lock
+            .packages()
+            .unwrap()
+            .into_iter()
+            .find(|package| package.name == "minimist")
+            .unwrap();
+        let entry = probe_entry(Some("bun"));
+        let target = format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz");
+        let sri = format!("sha512-{}", "A".repeat(86) + "==");
+        lock.set_package(package.id, &target, &sri).unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
+            .await
+            .unwrap();
+        assert_eq!(vendored_entry_in_use(&entry, tmp.path()).await, Some(true));
+        assert!(
+            bun_lock::wired_instances_all_ours(tmp.path(), "pkg:npm/minimist@1.2.2")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !bun_lock::wired_instances_all_ours(tmp.path(), "pkg:npm/minimist@9.9.9")
+                .await
+                .unwrap()
+        );
+
+        lock.set_package(
+            package.id,
+            "https://registry.example/minimist-1.2.2.tgz",
+            &sri,
+        )
+        .unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            vendored_entry_in_use(&entry, tmp.path()).await,
+            Some(false),
+            "old string-pool references do not prevent garbage collection"
+        );
+        assert!(
+            !bun_lock::wired_instances_all_ours(tmp.path(), "pkg:npm/minimist@1.2.2")
+                .await
+                .unwrap()
+        );
+
+        lock.set_package(package.id, &target, &sri).unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), lock.bytes())
+            .await
+            .unwrap();
+        touch(tmp.path(), "bun.lock", "{\n  \"packages\": {}\n}\n").await;
+        assert_eq!(
+            vendored_entry_in_use(&entry, tmp.path()).await,
+            Some(false),
+            "text wins even when binary still references the artifact"
+        );
+        tokio::fs::remove_file(tmp.path().join("bun.lock"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("bun.lockb"), b"invalid")
+            .await
+            .unwrap();
+        assert_eq!(
+            vendored_entry_in_use(&entry, tmp.path()).await,
+            None,
+            "malformed means unknown, never garbage collect"
+        );
     }
 
     /// An entry stamped `flavor="pnpm-legacy"` must dispatch to the legacy

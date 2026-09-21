@@ -16,7 +16,10 @@ on:
     paths:
       - '.github/actions/upload-artifact/**'
       - '.github/workflows/bun-compatibility.yml'
-      - 'scripts/backtest-bun.py'
+      - 'scripts/backtest-bun*.py'
+      - 'scripts/bun-historical-shas.json'
+      - 'crates/socket-patch-cli/tests/e2e_bun_lockb.rs'
+      - 'crates/socket-patch-core/tests/fixtures/bun-lockb/**'
       - 'docs/testing/bun-compatibility.md'
       - 'Cargo.lock'
       - 'crates/socket-patch-core/src/vendor/**'
@@ -45,12 +48,13 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/bun-compatibility.yml'
-      - 'scripts/backtest-bun.py'
+      - 'scripts/backtest-bun*.py'
+      - 'scripts/bun-historical-shas.json'
+      - 'crates/socket-patch-cli/tests/e2e_bun_lockb.rs'
+      - 'crates/socket-patch-core/tests/fixtures/bun-lockb/**'
       - 'Cargo.lock'
       - 'crates/socket-patch-core/src/vendor/**'
-      - 'crates/socket-patch-core/src/patch/redirect/mod.rs'
-      - 'crates/socket-patch-core/src/patch/redirect/replay.rs'
-      - 'crates/socket-patch-core/src/patch/redirect/takeover.rs'
+      - 'crates/socket-patch-core/src/patch/redirect/**'
       - 'crates/socket-patch-cli/src/commands/get.rs'
       - 'crates/socket-patch-cli/src/commands/scan/**'
       - 'crates/socket-patch-cli/src/commands/rollback.rs'
@@ -130,7 +134,7 @@ jobs:
         # Every lock-format and behaviour boundary the CLI has to survive:
         #   0.8.1 / 1.0.0 / 1.0.36 / 1.1.0 / 1.1.38  binary bun.lockb only
         #   1.1.39                                   first text lock (lockfileVersion 0, opt-in)
-        #   1.1.43                                   first `--lockfile-only` (the lockb migration recipe)
+        #   1.1.43                                   first `--lockfile-only`
         #   1.1.45                                   last v0 writer
         #   1.2.0 / 1.2.23 / 1.3.0                   text default, lockfileVersion 1
         #   1.3.9 / 1.3.10                           URL/local tarball sha512 enforcement boundary
@@ -326,4 +330,51 @@ jobs:
             native-bun/captures/**/cli-output.json
             native-bun/captures/**/tree/**
             native-bun/captures/**/*.log
+          retention-days: 14
+
+
+  binary:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: bun-native-binary
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Native binary writer and reader acceptance
+        shell: bash
+        run: |
+          versions=()
+          # Windows releases begin at 1.1.0. Unix exercises all binary
+          # schema boundaries, including the earliest format-1 writer.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            versions=(--versions 1.1.0 1.1.38 1.1.45 1.2.0 1.2.23 1.3.0 1.3.14 1.4.2)
+          fi
+          python3 scripts/backtest-bun-lockb.py \
+            --tools native-binary/tools \
+            --output native-binary/results \
+            --jobs 2 "${versions[@]}"
+
+      - name: Upload binary acceptance results
+        if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: bun-binary-results-${{ matrix.os }}
+          path: native-binary/results
           retention-days: 14
