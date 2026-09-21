@@ -1067,12 +1067,11 @@ async fn already_vendored_v1_workspace_rerun_download_phase_is_skipped_not_refus
 }
 
 /// The full in-sync re-run on the upgraded workspace project: exit 0, the
-/// download phase `skipped`, the vendor step `already_vendored`. Needs the
-/// engine-side ordering fix (vendor_bun must classify the in-sync tuple
-/// before applying the workspace gate — lane B1); until that lands the
-/// vendor step still refuses with `vendor_bun_workspace_unsupported`.
+/// download phase `skipped` (the CLI exempts already-vendored purls from the
+/// Bun preflight), the vendor step a `skipped`/`already_vendored` event —
+/// `vendor_bun` classifies the in-sync tuple BEFORE applying the workspace
+/// gate, so a pre-1.4 workspace project vendored earlier keeps working.
 #[tokio::test]
-#[ignore = "needs lane B1: vendor_bun applies the workspace gate before the in-sync classification"]
 async fn already_vendored_v1_workspace_rerun_is_already_vendored_exit_zero() {
     let mock = MockServer::start().await;
     mount_patch_api(&mock).await;
@@ -1086,9 +1085,9 @@ async fn already_vendored_v1_workspace_rerun_is_already_vendored_exit_zero() {
     assert_eq!(v["download"]["patches"][0]["action"], "skipped", "{v}");
     let events = v["vendor"]["events"].as_array().unwrap();
     assert!(
-        events
-            .iter()
-            .any(|e| e["purl"] == PURL && e["action"] == "already_vendored"),
+        events.iter().any(|e| e["purl"] == PURL
+            && e["action"] == "skipped"
+            && e["errorCode"] == "already_vendored"),
         "{v}"
     );
     assert_eq!(lock_bytes(tmp.path()), lock_before);
