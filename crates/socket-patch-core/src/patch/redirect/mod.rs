@@ -2503,8 +2503,15 @@ fn rewrite_bun_lock(
             }
             matched_any = true;
             let original = lines[entry.line_idx].clone();
+            // Lines come from a bare `split('\n')`, so a CRLF lock's lines
+            // carry a trailing `\r` (the grammar trims it away when parsing).
+            // Re-emit it verbatim — mirroring `vendor/bun_lock.rs` — so the
+            // rewritten line never becomes the lone LF line of a CRLF file,
+            // and the ledger `new` fragment matches the on-disk bytes the
+            // way `original` already does (replay matches fragments exactly).
+            let cr = if original.ends_with('\r') { "\r" } else { "" };
             let rebuilt = format!(
-                "{indent}{key}: [{url}, {deps}, {integrity}]{comma}",
+                "{indent}{key}: [{url}, {deps}, {integrity}]{comma}{cr}",
                 indent = entry.indent,
                 key = entry.key_raw,
                 url = serde_json::to_string(&url_spec)
@@ -6984,6 +6991,68 @@ mod tests {
         rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.contains_key("bun.lock"));
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// A CRLF bun.lock (Windows `core.autocrlf` checkout) must keep CRLF on
+    /// the REWRITTEN line too — the vendored engine already does — so the
+    /// file never ends up mixed-EOL, and the ledger `new` fragment carries
+    /// the same on-disk `\r` as `original` (replay matches fragments
+    /// byte-exactly: an LF `new` would no longer be found after an autocrlf
+    /// commit/checkout round-trip, leaving `\r\r\n` on revert). Modelled on
+    /// `yarn_classic_crlf_lock_rewrites_only_the_target_entry`.
+    #[test]
+    fn bun_crlf_lock_keeps_crlf_on_rewritten_line() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &sha512);
+        let decoy = "    \"abbrev\": [\"abbrev@1.1.1\", \"\", {}, \"sha512-DECOYdecoy==\"],";
+        let target = "    \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"],";
+        let lf_lock = bun_workspace_lock(2, &[decoy, target]);
+
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), lf_lock.replace('\n', "\r\n"));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "clean rewrite: {:?}", r.warnings);
+        let out = r.files.get("bun.lock").expect("bun.lock must be rewritten");
+        assert!(
+            out.contains(&format!("{decoy}\r\n")),
+            "the decoy entry must stay byte-identical: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "    \"left-pad\": [\"left-pad@http://p.test/lp.tgz\", {{}}, \"{sha512}\"],\r\n"
+            )),
+            "the target entry must pin the hosted artifact AND keep its CRLF: {out}"
+        );
+        assert_eq!(
+            out.matches('\n').count(),
+            out.matches("\r\n").count(),
+            "every line must keep its CRLF ending: {out}"
+        );
+
+        // The CRLF output is exactly the LF rewrite re-expanded.
+        let mut lf_files = BTreeMap::new();
+        lf_files.insert("bun.lock".to_string(), lf_lock);
+        let mut lf_r = RewriteResult::default();
+        rewrite_bun_lock(&lf_files, std::slice::from_ref(&ovr), &mut lf_r);
+        assert_eq!(
+            out,
+            &lf_r.files["bun.lock"].replace('\n', "\r\n"),
+            "CRLF rewrite must equal the LF rewrite modulo line endings"
+        );
+
+        // Ledger fragments carry the on-disk (CR-bearing) byte form on BOTH
+        // sides, so revert finds `new` and restores `original` byte-exactly.
+        assert_eq!(r.edits.len(), 1);
+        let original = r.edits[0].original.as_ref().unwrap().as_str().unwrap();
+        let new = r.edits[0].new.as_ref().unwrap().as_str().unwrap();
+        assert_eq!(
+            original,
+            format!("{target}\r"),
+            "original must carry the \\r"
+        );
+        assert!(new.ends_with("],\r"), "new must carry the \\r too: {new:?}");
+        assert!(!new.contains('\n') && !original.contains('\n'));
     }
 
     /// A packages header spelled any way other than bun's byte-exact emitted
