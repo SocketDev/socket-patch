@@ -199,7 +199,7 @@ install), `transitive` (overridden transitive), `two-versions`, `workspace`
 (the member declares the dep), `workspace-nested` (root and member at
 different versions), `workspace-root` (the root declares the dep, the member
 something else), `text-workspace` (Bun 1.1.39–1.1.45 `--save-text-lockfile`
-on the workspace project — a REAL version-0 workspace lock), `workspace-get`
+on the workspace project — a REAL version-0 workspace lock), `workspace-get-uuid` / `workspace-get-search`
 (`get` by uuid and by PURL on the workspace project), `already-vendored-
 workspace` (vendor a plain project, add a workspace member, `bun install`,
 re-run — must be `already_vendored`; then `repair` rebuilds a deleted
@@ -274,7 +274,7 @@ needed for SBOM lockfile annotation.
 | Mode conversion both directions; scoped `rollback` / `remove` | `hosted-then-vendored`, `vendored-then-hosted` | `mode_migration_bun` (1.4.2 × 3 OS, 1.3.14) | `in_process_vendor_bun_takeover`, `takeover.rs`, `covgap_commands_rollback` |
 | CRLF lockfiles preserved (hosted line, vendored, rollback) | `crlf-lock` | — | golden `lock-v2-crlf`, `bun_lock.rs` |
 | Bun 0.8.1 / 1.0.0 peer / transitive upstream limitation | recorded per cell | — | — |
-| Pre-download preflight envelopes, `--silent`, `--dry-run` `would_refuse`, detached parity | `get-uuid` / `get-search` / `workspace-get` refusals (exit codes, `downloaded == 0`) | — | `in_process_vendor_bun` (exact uuid-path envelope), `scan_vendor_e2e`, `get_modes_e2e`, `vendor_flow.rs` |
+| Pre-download preflight envelopes, `--silent`, `--dry-run` `would_refuse`, detached parity | `get-uuid` / `get-search` / `workspace-get-uuid` / `workspace-get-search` refusals (exit codes, `downloaded == 0`) | — | `in_process_vendor_bun` (exact uuid-path envelope), `scan_vendor_e2e`, `get_modes_e2e`, `vendor_flow.rs` |
 
 Not measured: a `--cwd <workspace member>` run (the member holds no
 `bun.lock`, so the preflight passes and the engine refuses
