@@ -28,8 +28,11 @@ runs:
   steps:
     # The artifact client does not retry the service's intermittent
     # "FinalizeArtifact ... (403) Forbidden: Error from intermediary".
-    # A fresh upload recovers from this failure. Each caller owns a unique
-    # artifact name; overwrite also handles a lost finalization response.
+    # An unfinished upload reserves its name but is invisible to the list /
+    # delete APIs, so overwrite cannot recover it. Retry with a fresh name,
+    # including run_attempt so rerunning a failed job cannot reuse a poisoned
+    # retry name either. Consumers use a name pattern and merge-multiple to
+    # accept any successful attempt without duplicating identical files.
     - name: Upload (attempt 1)
       id: first
       if: ${{ !cancelled() }}
@@ -53,7 +56,7 @@ runs:
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       continue-on-error: true
       with:
-        name: ${{ inputs.name }}
+        name: ${{ inputs.name }}-retry-${{ github.run_attempt }}-2
         path: ${{ inputs.path }}
         if-no-files-found: ${{ inputs.if-no-files-found }}
         retention-days: ${{ inputs.retention-days }}
@@ -71,7 +74,7 @@ runs:
       if: ${{ !cancelled() && steps.second.outcome == 'failure' }}
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
-        name: ${{ inputs.name }}
+        name: ${{ inputs.name }}-retry-${{ github.run_attempt }}-3
         path: ${{ inputs.path }}
         if-no-files-found: ${{ inputs.if-no-files-found }}
         retention-days: ${{ inputs.retention-days }}
