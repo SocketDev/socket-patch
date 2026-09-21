@@ -52,11 +52,24 @@ Boundaries the oracle encodes (measured against real releases):
   bun.lockb, vendored       vendor_bun_lockb_unsupported before any download
   1.3.10                    URL/local tarball sha512 enforced (registry tuples are
                             enforced on every text-lock release)
-  0.8.1 / 1.0.0             peers not installed, overrides ignored (upstream)
+  bun.lockb, scan           bun_lockb_unsupported (run-level, every mode incl.
+                            hosted: the inventory never read the binary lock)
+  0.8.1 / 1.0.0             peers not installed, overrides ignored (upstream);
+                            `transitive` still installs mkdirp and leaves a
+                            bun.lockb, so the scan carries that layout warning
 
 Every cell records the CLI exit codes (main, repeat, rollback, conversion),
 the exact refusal-code set, the repeat-run envelope semantics, digest
 enforcement, and after rollback the lockfile presence rules and byte identity.
+
+Provenance: `--cli-revision` is the branch-resolvable commit the row is about
+(PR head, or the pushed commit); `--cli-build-sha` (or the CLI_BUILD_SHA
+environment variable) is the commit the binary was actually built from —
+`refs/pull/N/merge` on a pull request — recorded as `cliBuildSha` (null when
+neither is given). A `--versions/--shapes/--modes` narrowing that leaves no
+applicable cell is reported, writes a single `{"noCells": true}` summary row
+and exits 0 — the default shape list always holds `direct`, which applies to
+every release and mode, so an un-narrowed run can never go vacuous.
 """
 
 import argparse
@@ -392,32 +405,44 @@ def expected_outcome(version, shape, mode):
         return dict(supported=supported, codes=set(codes), exit=exit,
                     limitation=limitation, rerun=rerun)
 
+    # A bun.lockb-only project: `scan`'s lockfile inventory cannot read the
+    # binary lock and says so in EVERY mode with the run-level
+    # `bun_lockb_unsupported` layout warning — hosted included (the hosted
+    # driver's own `redirect_bun_lockb_*` outcome rides beside it on the run
+    # that migrates; nothing is deduplicated). `get` runs no inventory pass.
+    layout = {'bun_lockb_unsupported'} if scan else set()
     if version in NO_PEER_OR_OVERRIDE and shape in ('peer', 'transitive'):
-        return outcome(False, limitation='This Bun release does not install the requested '
-                                         'peer or honor the transitive override')
+        # `transitive` still installs mkdirp, so a bun.lockb sits beside
+        # node_modules and the scan carries the layout warning. `peer`
+        # installs nothing and bun deletes the empty lockfile, so no lock
+        # exists to diagnose — `unchangedLockPresence` pins that split.
+        return outcome(False, layout if shape == 'transitive' else set(),
+                       limitation='This Bun release does not install the requested '
+                                  'peer or honor the transitive override')
     if shape == 'already-vendored-workspace':
         return outcome(True, rerun=True)
     if not text_lock:
         if shape == 'lockfile-only':
-            return outcome(False, {'bun_lockb_unsupported'},
+            return outcome(False, layout,
                            limitation='A binary bun.lockb without node_modules supplies no '
                                       'package inventory')
         if hosted:
             if v < LOCKFILE_ONLY_FROM:
-                return outcome(False, {'redirect_bun_lockb_manual_migration'},
+                return outcome(False, layout | {'redirect_bun_lockb_manual_migration'},
                                limitation='This Bun release accepts `bun install '
                                           '--save-text-lockfile --frozen-lockfile '
                                           '--lockfile-only` but writes no bun.lock')
             if workspace and lock_version == 0:
                 # Migration lands a version-0 lock; its workspace entries are
                 # refused and the migration is unwound.
-                return outcome(False, {'redirect_bun_workspace_unsupported',
-                                       'redirect_bun_lockb_migration_reverted'},
+                return outcome(False, layout | {'redirect_bun_workspace_unsupported',
+                                                'redirect_bun_lockb_migration_reverted'},
                                limitation='The migrated version-0 workspace lock cannot '
                                           'carry hosted tarballs; bun.lockb restored')
-            return outcome(True)
-        codes = {'vendor_bun_lockb_unsupported'} | ({'bun_lockb_unsupported'} if scan else set())
-        return outcome(False, codes, 'nonzero',
+            # The migration lands: the layout warning is the only code, and
+            # it describes the discovery pass that ran before the migration.
+            return outcome(True, layout)
+        return outcome(False, layout | {'vendor_bun_lockb_unsupported'}, 'nonzero',
                        limitation='Vendored mode cannot rewrite a binary bun.lockb')
     if workspace:
         if hosted and lock_version == 0:
@@ -576,7 +601,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--cli', type=Path, required=True)
-    parser.add_argument('--cli-revision', required=True)
+    parser.add_argument('--cli-revision', required=True,
+                        help='the branch-resolvable commit the rows are about (cliRevision)')
+    parser.add_argument('--cli-build-sha', default=os.environ.get('CLI_BUILD_SHA') or None,
+                        help='the commit the CLI binary was built from (cliBuildSha; on a pull '
+                             'request the refs/pull/N/merge commit, which diverges from the head '
+                             'once main advances) — defaults to $CLI_BUILD_SHA, else null')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--tools', type=Path)
     parser.add_argument('--versions', nargs='+', default=VERSIONS)
@@ -591,11 +621,27 @@ def main():
     toolroot = (args.tools or root / 'tools').resolve()
     provenance = dict(capturedAt=datetime.now(timezone.utc).isoformat(),
                       os=platform.system().lower(), platform=platform.platform(),
-                      cliRevision=args.cli_revision, cliSha256=sha256(cli.read_bytes()))
+                      cliRevision=args.cli_revision, cliBuildSha=args.cli_build_sha,
+                      cliSha256=sha256(cli.read_bytes()))
+    jobs = [(v, s, m) for v in args.versions for s in args.shapes for m in args.modes
+            if cell_applies(v, s, m)]
+    if not jobs:
+        # Only an explicit --versions/--shapes/--modes narrowing gets here: the
+        # default shape list holds `direct`, which applies to every release and
+        # mode. Not a failure — but the summary must say that nothing ran, so a
+        # consumer can never mistake it for a green matrix.
+        reason = ('no (version, shape, mode) cell applies to the requested narrowing: '
+                  f'versions={" ".join(args.versions)} shapes={" ".join(args.shapes)} '
+                  f'modes={" ".join(args.modes)}')
+        save(root / 'summary.json', [dict(noCells=True, bun=' '.join(args.versions), shape='*',
+                                          mode='*', passed=False, error=reason, **provenance)])
+        print(f'::notice::{reason}', flush=True)
+        return 0
     # The legacy-lockb shape baselines every project with the last binary-only
-    # release, whatever the matrix version.
-    needed = list(dict.fromkeys([*args.versions,
-                                 *([LEGACY_BUN] if 'legacy-lockb' in args.shapes else [])]))
+    # release, whatever the matrix version — needed only where such a cell
+    # applies (the shape is gated to releases that can read the migrated lock).
+    legacy_needed = any(shape == 'legacy-lockb' for _, shape, _ in jobs)
+    needed = list(dict.fromkeys([*args.versions, *([LEGACY_BUN] if legacy_needed else [])]))
     try:
         tools = {v: install_tool(toolroot, v) for v in needed}
     except Exception as error:  # noqa: BLE001 — the artifact must explain the run
@@ -950,8 +996,6 @@ def main():
               [k for k, v in checks.items() if not v], row.get('error', '')[:200], flush=True)
         return row
 
-    jobs = [(v, s, m) for v in args.versions for s in args.shapes for m in args.modes
-            if cell_applies(v, s, m)]
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
         rows = list(pool.map(backtest, jobs))
     save(root / 'summary.json', rows)
