@@ -1,4 +1,5 @@
 pub mod apply;
+pub(crate) mod bun_preflight;
 pub(crate) mod fetch_stage;
 pub mod get;
 pub mod list;

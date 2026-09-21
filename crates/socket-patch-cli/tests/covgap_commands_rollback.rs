@@ -1880,8 +1880,13 @@ fn hosted_persist_failure_lands_in_hosted_failed() {
 /// for {purl}" line prints from the deferred path.
 #[test]
 fn bun_deferred_purl_unwinds_via_replay() {
-    let bun_original = r#"    "left-pad": ["left-pad@1.2.3", "", {}, "sha512-UPSTREAMupstream=="],"#;
-    let bun_redirected = format!(r#"    "left-pad": ["{LP_HOSTED_URL}", "", {{}}, "sha512-PATCHEDpatched=="],"#);
+    let bun_original =
+        r#"    "left-pad": ["left-pad@1.2.3", "", {}, "sha512-UPSTREAMupstream=="],"#;
+    // The engine's real redirected shape: registry 4-tuple → URL 3-tuple
+    // `["name@<url>", {deps}, "sha512-…"]` (the registry slot is dropped).
+    let bun_redirected = format!(
+        r#"    "left-pad": ["left-pad@{LP_HOSTED_URL}", {{}}, "sha512-PATCHEDpatched=="],"#
+    );
     let bun_lock = |block: &str| {
         format!("{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n{block}\n  }}\n}}\n")
     };
@@ -2287,8 +2292,13 @@ fn per_purl_revert_failure_prints_human_stderr_line() {
 /// ledger byte-identical afterwards.
 #[test]
 fn bun_deferred_purl_dry_run_previews_via_replay() {
-    let bun_original = r#"    "left-pad": ["left-pad@1.2.3", "", {}, "sha512-UPSTREAMupstream=="],"#;
-    let bun_redirected = format!(r#"    "left-pad": ["{LP_HOSTED_URL}", "", {{}}, "sha512-PATCHEDpatched=="],"#);
+    let bun_original =
+        r#"    "left-pad": ["left-pad@1.2.3", "", {}, "sha512-UPSTREAMupstream=="],"#;
+    // The engine's real redirected shape: registry 4-tuple → URL 3-tuple
+    // `["name@<url>", {deps}, "sha512-…"]` (the registry slot is dropped).
+    let bun_redirected = format!(
+        r#"    "left-pad": ["left-pad@{LP_HOSTED_URL}", {{}}, "sha512-PATCHEDpatched=="],"#
+    );
     let bun_lock = |block: &str| {
         format!("{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n{block}\n  }}\n}}\n")
     };

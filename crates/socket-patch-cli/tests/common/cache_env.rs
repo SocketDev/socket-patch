@@ -250,6 +250,48 @@ pub fn isolate(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+// ── Ambient-env scrub for the bun suites ──────────────────────────────
+
+/// True for an ambient variable the real-bun suites must strip from every
+/// child (`bun install` fixtures AND the CLI under test) before [`isolate`]:
+///
+/// * `SOCKET_*` except the hermetic `SOCKET_NO_CONFIG` — the CLI's own env
+///   surface (`SOCKET_DRY_RUN`, `SOCKET_API_TOKEN`, …);
+/// * every `BUN_*` — the harness re-pins `BUN_INSTALL` /
+///   `BUN_INSTALL_CACHE_DIR` per project after the scrub, and bun's other
+///   knobs (`BUN_CONFIG_REGISTRY`, `BUN_CONFIG_TOKEN`) must not reach a
+///   fixture install;
+/// * `npm_config_*` case-insensitively — bun honours `npm_config_registry`
+///   and `NPM_CONFIG_REGISTRY` alike. Measured (bun 1.2.23 / 1.4.2): an
+///   ambient URL-rewriting mirror (npmmirror, Verdaccio, Artifactory) makes
+///   bun record the mirror tarball URL in the 4-tuple's registry slot
+///   instead of `""`, and every pre-rewrite `["name@ver", "", {}, "sha512-…"]`
+///   assertion fails as a false negative;
+/// * `VIRTUAL_ENV` — leaks the caller's Python env into the CLI's probes.
+///
+/// One predicate for the three bun suites so they cannot drift: two of them
+/// once scrubbed only `SOCKET_*` and went red under `BUN_CONFIG_REGISTRY`
+/// while the third, with the full scrub, stayed green.
+pub fn is_ambient_bun_var(name: &str) -> bool {
+    (name.starts_with("SOCKET_") && name != "SOCKET_NO_CONFIG")
+        || name.starts_with("BUN_")
+        || name.to_ascii_lowercase().starts_with("npm_config_")
+        || name == "VIRTUAL_ENV"
+}
+
+/// Remove every [`is_ambient_bun_var`] variable of the PARENT environment
+/// from `cmd`. Call it BEFORE [`isolate`] and before the suite's own
+/// per-project `BUN_INSTALL` / `BUN_INSTALL_CACHE_DIR` pins (the ordering
+/// rule in the module docs: the scrub iterates the parent env and would
+/// otherwise remove what those seed).
+pub fn scrub_ambient_bun_env(cmd: &mut Command) {
+    for (k, _) in std::env::vars_os() {
+        if is_ambient_bun_var(&k.to_string_lossy()) {
+            cmd.env_remove(&k);
+        }
+    }
+}
+
 // ── Self-tests ────────────────────────────────────────────────────────
 //
 // Integration-test crates do not get `cfg(test)`, so — exactly as in
@@ -258,6 +300,75 @@ pub fn isolate(cmd: &mut Command) -> &mut Command {
 // module up.
 mod cache_env_selftests {
     use super::*;
+
+    /// The names the bun suites' hermeticity depends on — the registry
+    /// overrides that reproduced the false negative, bun's auth and cache
+    /// knobs, the CLI's own surface — are covered; the hermetic switch, the
+    /// toolchain vars and look-alike prefixes (`BUNDLE_*`) survive.
+    #[test]
+    fn ambient_bun_scrub_covers_the_registry_and_config_overrides() {
+        for name in [
+            "BUN_CONFIG_REGISTRY",
+            "BUN_CONFIG_TOKEN",
+            "BUN_INSTALL",
+            "BUN_INSTALL_CACHE_DIR",
+            "BUN_RUNTIME_TRANSPILER_CACHE_PATH",
+            "npm_config_registry",
+            "NPM_CONFIG_REGISTRY",
+            "Npm_Config_Registry",
+            "npm_config__auth",
+            "npm_config_cache",
+            "SOCKET_API_TOKEN",
+            "SOCKET_DRY_RUN",
+            "VIRTUAL_ENV",
+        ] {
+            assert!(is_ambient_bun_var(name), "{name} must be scrubbed");
+        }
+        for name in [
+            "SOCKET_NO_CONFIG",
+            "PATH",
+            "HOME",
+            "BUNDLE_PATH",
+            "BUNDLE_USER_HOME",
+            "npm_lifecycle_event",
+            "XDG_CONFIG_HOME",
+            "RUSTUP_HOME",
+        ] {
+            assert!(!is_ambient_bun_var(name), "{name} must survive the scrub");
+        }
+    }
+
+    /// The scrub removes exactly the parent variables the predicate names:
+    /// nothing else is touched, and no matching parent variable is missed.
+    #[test]
+    fn ambient_bun_scrub_removes_only_matching_parent_vars() {
+        let mut cmd = Command::new("true");
+        scrub_ambient_bun_env(&mut cmd);
+        let removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in &removed {
+            assert!(
+                is_ambient_bun_var(name),
+                "{name} was removed but is not an ambient bun var"
+            );
+        }
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy();
+            if is_ambient_bun_var(&name) {
+                assert!(
+                    removed.iter().any(|r| *r == name),
+                    "{name} is set in the parent env but was not scrubbed"
+                );
+            }
+        }
+        assert!(
+            cmd.get_envs().all(|(_, value)| value.is_none()),
+            "the scrub only removes; it seeds nothing"
+        );
+    }
 
     /// The variables whose whole point is that they outrank `HOME`. A future
     /// edit that drops one would silently restore the leak this module

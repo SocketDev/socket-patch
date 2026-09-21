@@ -47,7 +47,9 @@ pub(crate) use self::discovery::unsupported_layout_warnings;
 use self::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
 pub(crate) use self::hosted::boxed_run_redirect_selected;
 use self::hosted::run_redirect;
-pub(crate) use self::vendor_flow::{boxed_scan_vendor_step, preview_vendor_json};
+pub(crate) use self::vendor_flow::{
+    boxed_scan_vendor_step, preview_vendor_json, print_dry_run_refusals,
+};
 use self::vendor_flow::{
     boxed_vendor_interactive_path, boxed_vendor_json_path, fold_vendored_skips_into_apply,
     partition_skipped_selected,
@@ -1487,10 +1489,13 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // are flagged "not yet installed" everywhere a user could act on them.
     let lockfile_only = lockfile_supplement(&args.common, &all_crawled).await;
     // Explicit refusals for npm layouts whose packages are structurally
-    // unreachable (yarn PnP, pnpm node-linker=pnp). Under yarn PnP the
-    // crawler leg above is ALSO empty (no `node_modules/`), so without this
-    // channel every mode used to print a clean success with
-    // `scannedPackages: 0` — a silent no-op the user read as "protected".
+    // unreachable (yarn PnP, pnpm node-linker=pnp) — and for a bun project
+    // whose only lock is the legacy binary `bun.lockb`
+    // (`bun_lockb_unsupported`: the inventory cannot read it). Under yarn
+    // PnP the crawler leg above is ALSO empty (no `node_modules/`), as it
+    // is on a fresh clone of a bun.lockb project, so without this channel
+    // every mode used to print a clean success with `scannedPackages: 0` —
+    // a silent no-op the user read as "protected".
     // Surfaced as run-level `warnings[]` in the JSON envelope (omitted when
     // empty) and a stderr line on the human path; exit code and `status`
     // stay deliberately unchanged (same posture as hosted refusals, which
@@ -1735,6 +1740,23 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
+
+    // The bun.lockb discovery diagnosis (`bun_lockb_unsupported`) stays in
+    // `layout_refusals` in EVERY mode on this non-empty path too — hosted
+    // included. It reports a fact about THIS run's discovery (the binary
+    // lock was never read, so its lockfile-only packages are invisible),
+    // and nothing here can tell whether the hosted driver about to run
+    // will say anything about the file: the driver speaks only when an npm
+    // override is actually granted (`redirect_bun_lockb_*` on
+    // `redirect.warnings`, or a `redirect_bun_lockb_migrated` edit), a
+    // network-dependent outcome decided inside `run_redirect`, which owns
+    // the envelope from here on. An earlier version dropped the warning on
+    // every non-empty hosted run — so a polyglot project or an
+    // installed-but-unpatched npm tree printed a clean hosted success with
+    // no mention that the bun lock was skipped, the very silent no-op this
+    // channel exists to close. Two voices about one file on the run that
+    // does migrate beat silence on the many that never mention it; nothing
+    // is deduplicated.
 
     // Build ecosystem summary
     let mut eco_parts = Vec::new();
@@ -2703,6 +2725,15 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 "\n[dry-run] Would {action} {} patch(es). No changes made.",
                 selected.len()
             );
+            // Vendored preview: the same ledger classification the JSON arm
+            // nests under `vendor`, rendered as `[would-refuse]` lines so a
+            // human preview never advertises vendoring the wet run's Bun
+            // preflight is known to refuse (the `get --mode vendored
+            // --dry-run` arms print the identical lines).
+            if vendor {
+                let preview = preview_vendor_json(&args.common.cwd, &selected).await;
+                print_dry_run_refusals(&preview);
+            }
         }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }

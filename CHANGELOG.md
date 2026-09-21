@@ -249,7 +249,11 @@ into the new version's section — see docs/releasing.md.
   pypi, composer, bun, and the non-package rideshare edits (pnpm
   `trustLockfile` auto-config — pristine scaffold deleted, modified
   scaffold keeps the file and loses only the owned line). The bun.lockb
-  migration is unrestorable by design (warning names git history);
+  migration marker restores the binary lock from the bytes the ledger
+  captured (`redirect_bun_lockb_restored`; the generated `bun.lock` is kept)
+  and warns `redirect_bun_lockb_unrestorable` naming git history only when
+  the ledger holds no bytes and the file is absent, or a different
+  `bun.lockb` has appeared since;
   maven and nuget fail closed with `hosted_revert_unsupported` guidance
   (their structured-metadata edits keep their ledger records; re-run
   `scan --mode hosted` or restore from VCS). Refused groups keep their
@@ -264,6 +268,99 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Bun refusal safety:** hosted compatibility is checked before removing
+  an existing vendored patch, including during dry-run. Vendored preflight
+  exemptions require live local lock tuples; a ledger retained by
+  `rollback --preserve-state` cannot bypass a refusal or hide it in a preview.
+  Symlinked `bun.lockb` files are refused before migration so their links
+  survive, and `vendor --silent` keeps refusal diagnostics on stderr.
+
+- **Bun projects: every text-lock generation is accepted, vendored refusals
+  fire before any write, and every mode change unwinds.** `bun.lock`
+  `lockfileVersion` 0 — the opt-in text lock Bun 1.1.39–1.1.45 write with
+  `--save-text-lockfile` — joins 1 and 2 in the shared version gate, so hosted
+  mode redirects it (golden fixture `npm/bun/lock-v0`), vendored mode wires it
+  and the lockfile inventory discovers it; a newer version is now refused with
+  "update socket-patch" instead of a re-lock that would reproduce it. Workspace
+  locks are refused only where Bun cannot consume the rewrite: hosted mode
+  refuses a version-0 lock holding `workspace:` packages
+  (`redirect_bun_workspace_unsupported`; delete `bun.lock` and re-lock with
+  Bun ≥ 1.2, which writes version 1 — accepted; a plain in-place
+  `bun install` bumps the version only when a workspace depends on another
+  workspace, otherwise Bun 1.2.0 keeps version 0 and 1.2.23+ fail to
+  resolve) and vendored mode refuses any pre-version-2 workspace lock before
+  writing (`vendor_bun_workspace_unsupported` — Bun 1.2–1.3 resolve a
+  workspace member's local tarball path relative to the member; delete
+  `bun.lock` and re-lock with Bun ≥ 1.4, since an in-place `bun install`
+  keeps the existing version, or — for a version-1 lock — use hosted mode; a
+  version-0 lock is told to re-lock with Bun ≥ 1.2 first, since hosted
+  refuses it too), while purls already vendored (by the ledger at the
+  selected uuid, or with every matching lock tuple already pointing into
+  `.socket/vendor/`, so a superseding patch uuid re-pins in place), re-runs
+  and `repair` on such a lock keep working; a corrupt
+  `.socket/vendor/state.json` met by that preflight is reported as
+  `vendor_state_unreadable` rather than a Bun lock code. `scan --mode vendored`,
+  `get --mode vendored` (search and uuid paths) and `--detached` runs now
+  preflight the Bun lock BEFORE any download: a binary-only, unreadable,
+  unsupported-version or pre-version-2 workspace lock marks the npm patches
+  `failed` with the vendor refusal code and detail, fetches nothing and
+  records no patch — the `scan` / `get <purl>` path still writes an unchanged
+  `.socket/manifest.json` and exits `partial_failure`, `get <uuid> --mode
+  vendored` exits 1 with `status: "error"` and writes nothing — where
+  previously the record landed in the manifest and the vendor step failed
+  afterwards (and a detached run over an alias install misreported
+  `package_not_installed`). The refusals stay visible under `--silent`
+  (code-tagged stderr line), `--dry-run` previews them as the additive
+  `would_refuse` action (the human `scan` and `get` previews both print the
+  `[would-refuse]` lines), the `bun.lockb` refusal carries one remedy on every
+  path (`bun install --save-text-lockfile`, Bun ≥ 1.1.39), and a `scan` on a
+  `bun.lockb`-only project warns `bun_lockb_unsupported` instead of reporting
+  a clean empty inventory — the detail names a shadowed sibling
+  `package-lock.json` / `yarn.lock` / `pnpm-lock.yaml` and the
+  delete-the-stale-lockb remedy when one exists, and the warning is kept in
+  hosted mode too (beside the driver's own `redirect_bun_lockb_*` outcome on
+  the run that migrates) instead of being dropped on every non-empty hosted
+  run. Hosted → vendored
+  takeover now works for bun —
+  `scan`/`get --mode vendored` and `vendor` over a hosted-redirected `bun.lock`
+  claim and replay that purl's hosted edit instead of refusing
+  `redirect_revert_failed`, and `vendor --dry-run` probes the takeover instead
+  of promising it — as do `rollback <purl>` / `remove <purl>` of one of
+  several hosted bun records; on a lock the vendored backend refuses (a
+  pre-version-2 workspace lock) `vendor` and its dry run report the refusal
+  BEFORE the hosted revert, leaving the purl hosted-patched instead of
+  un-hosting it and then refusing. The hosted `bun.lockb` migration is truthful:
+  `bun` is resolved on absolute `PATH` entries (Windows `bun.cmd` shims
+  included, spawned directly — the standard library quotes batch-shim paths
+  with spaces and metacharacters correctly), a stale `bun.lockb` beside a
+  live npm / yarn / pnpm lock is left alone (`redirect_bun_lockb_sibling_lock`;
+  the redirect follows the sibling lock) instead of converting the project to
+  `bun.lock`, a `bun.lockb` that is not a regular file is refused before
+  `bun` is spawned, a `bun.lockb` that Bun 1.1.43–1.1.45 keep beside the new text
+  lock is removed by the CLI so the ledger's `removed` edit is true, the
+  pre-migration bytes ride the ledger and `rollback` restores `bun.lockb`
+  (`redirect_bun_lockb_restored`; the generated `bun.lock` is kept), Bun
+  1.1.39–1.1.42 — which accept the flags but write nothing — get
+  `redirect_bun_lockb_manual_migration` instead of a false "unavailable", and
+  a failed spawn's `redirect_bun_lockb_unsupported` carries bun's output tail.
+  The hosted rewrite keeps CRLF on the rewritten `bun.lock` line. Real-Bun
+  coverage now runs in CI: the hermetic hosted and vendored suites on Linux,
+  macOS and Windows (Bun 1.4.2, plus 1.1.45 and 1.2.23 lock-era legs), and
+  the production native matrix — 16 releases from 0.8.1 to 1.4.2 in hosted,
+  vendored and detached-vendored mode — on pull requests and `main` (rows
+  carry `cliRevision` and `cliBuildSha` provenance), with
+  the corrected digest boundary (Bun verifies URL/local tarball sha512 from
+  1.3.10, not 1.3.14). Bun 1.1.39–1.3.9 also re-save a hosted URL or
+  vendored local-tarball tuple WITHOUT its `sha512` on any later lock
+  re-save (`bun add`, `bun install` after a manifest change); that
+  digest-less 2-tuple is now recognised as the CLI's own wiring — repeat runs
+  heal the digest, `repair` rebuilds through it, and `rollback`, scoped
+  `rollback` / `remove`, `vendor --revert` and both mode takeovers unwind it
+  to the registry line — where previously every re-save on those releases
+  left `redirect_bun_entry_not_found` beside `redirected: 1`, a
+  `partial_failure` rollback and `vendor_lock_entry_not_found` /
+  `vendor_lock_entry_drifted` refusals. See
+  `docs/testing/bun-compatibility.md` and `scripts/backtest-bun.py`. (#245)
 - **Rollback after a Pipenv relock no longer refuses forever.** `pipenv lock`
   (and `update`, and `install <other>` before 2024) regenerates a redirected
   or vendored entry to registry shape on every Pipenv major; that is now the

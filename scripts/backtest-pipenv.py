@@ -241,6 +241,26 @@ def base_env():
     return env
 
 
+def pipenv_shim_dir(root, version, tool):
+    """Expose only pipenv on PATH, without the tool venv's Python.
+
+    Different shape workers share this directory. Create the link atomically
+    and accept EEXIST only when another worker created the same shim.
+    """
+    if is_legacy(version):
+        return root / "legacy-bin" / version
+    directory = root / "pipenv-bin" / version
+    directory.mkdir(parents=True, exist_ok=True)
+    link = directory / "pipenv"
+    target = tool / "bin/pipenv"
+    try:
+        link.symlink_to(target)
+    except FileExistsError:
+        if not link.is_symlink() or os.readlink(link) != str(target):
+            raise
+    return directory
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--socket-patch", type=Path, help="socket-patch CLI binary")
@@ -358,21 +378,9 @@ def main():
         return tool
 
     # ------------------------------------------------------------- pipenv env
-    def pipenv_shim_dir(version, tool):
-        """A PATH entry exposing only `pipenv` (a user's PATH has pipenv, not the
-        tool venv's python3 — the CLI's global fallback must not crawl that venv)."""
-        if is_legacy(version):
-            return wrapper_dir(version)
-        d = root / "pipenv-bin" / version
-        d.mkdir(parents=True, exist_ok=True)
-        link = d / "pipenv"
-        if not link.exists():
-            link.symlink_to(tool / "bin/pipenv")
-        return d
-
     def pipenv_env(version, tool, in_project=True, workon_home=None):
         e = dict(env)
-        e["PATH"] = str(pipenv_shim_dir(version, tool)) + os.pathsep + e.get("PATH", "")
+        e["PATH"] = str(pipenv_shim_dir(root, version, tool)) + os.pathsep + e.get("PATH", "")
         e["PIPENV_PYTHON"] = str(tool / "bin/python")
         if in_project:
             e["PIPENV_VENV_IN_PROJECT"] = "1"

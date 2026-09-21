@@ -242,7 +242,10 @@ pub fn pipenv_lock_targets(files: &BTreeMap<String, String>, overrides: &[DepOve
 /// Whether a live Pipfile.lock entry is the one Socket wrote, re-serialized by
 /// a Pipenv relock (same `file`/`path` reference; only `hashes`/`version`/
 /// `index` may differ). Shared with the vendored backend's revert.
-pub fn pipenv_reserialized_around_reference(live: &serde_json::Value, ours: &serde_json::Value) -> bool {
+pub fn pipenv_reserialized_around_reference(
+    live: &serde_json::Value,
+    ours: &serde_json::Value,
+) -> bool {
     pipenv::reserialized_around_reference(live, ours)
 }
 
@@ -2374,14 +2377,81 @@ fn rewrite_yarn_berry(
 // Binary `bun.lockb` is NEVER parsed — its presence (without a text `bun.lock`)
 // is a documented refusal. Uses the shared `bun_lock_text` grammar (fail-CLOSED
 // on any deviation). Byte-for-byte twin of the TS `rewriteBun`.
+/// Check a text Bun lock before reverting any existing vendored wiring.
+/// Uses the rewriter's own version, grammar and workspace compatibility rules.
+pub fn preflight_bun_hosted(content: &str) -> Result<(), RewriteWarning> {
+    parse_bun_hosted_lock(content).map(|_| ())
+}
+
+fn parse_bun_hosted_lock(
+    content: &str,
+) -> Result<(Vec<String>, Vec<crate::vendor::bun_lock_text::BunEntry>), RewriteWarning> {
+    use crate::vendor::bun_lock_text::{
+        check_lock_version, has_workspace_packages, lock_version, parse_packages_section,
+    };
+
+    // The shared gate's `Err` text IS the detail: hosted and vendored refuse
+    // an unsupported head with one message (and one remedy per arm — a
+    // future version means "update socket-patch", a missing integer means
+    // "re-lock"), so the two modes cannot drift apart.
+    if let Err(detail) = check_lock_version(content) {
+        return Err(RewriteWarning {
+            code: "redirect_bun_lock_unsupported".into(),
+            detail,
+        });
+    }
+    let lines: Vec<String> = content.split('\n').map(str::to_string).collect();
+    let entries = match parse_packages_section(&lines) {
+        Ok(entries) => entries,
+        Err(_) => {
+            // Fail-closed: never line-splice a lock whose packages section
+            // deviates from bun's emitted single-line grammar.
+            return Err(RewriteWarning {
+                code: "redirect_bun_lock_unsupported".into(),
+                detail: "bun.lock packages section is not in bun's emitted single-line shape"
+                    .into(),
+            });
+        }
+    };
+
+    // Version-0 locks (bun 1.1.39–1.1.45's opt-in text lockfile) with a
+    // `workspace:` member are refused. The remedy that converges on every
+    // release (measured against real Bun 1.2.0, 1.2.23, 1.3.0, 1.3.9,
+    // 1.3.14, 1.4.0–1.4.2) is `rm bun.lock && bun install` with Bun ≥ 1.2:
+    // 1.2–1.3 write lockfileVersion 1, 1.4 writes 2, both accepted here. A
+    // plain IN-PLACE `bun install` bumps a v0 workspace lock to 1 only when
+    // some workspace depends on another workspace (root → member, as in the
+    // backtest's `workspace` shapes, or member → member): Bun ≥ 1.2 re-saves
+    // the bare-path spelling of that dependency as `workspace:*`, which
+    // forces the save. Without such a dependency (a root that only lists
+    // `workspaces`), 1.2.0 exits 0 and keeps 0, and 1.2.23–1.4.2 exit 1 with
+    // `<pkg>@<ver> failed to resolve` and keep 0 — so the in-place bump is
+    // stated as conditional, never as the remedy. (A v0 lock WITHOUT
+    // workspaces is kept at 0 by an in-place install on 1.2.0, 1.2.23 and
+    // 1.3.0 and bumped to 1 by 1.3.9 and every later release; that case is
+    // accepted here either way.)
+    if lock_version(content) == Some(0) && has_workspace_packages(&entries) {
+        return Err(RewriteWarning {
+            code: "redirect_bun_workspace_unsupported".into(),
+            detail: "Bun version-0 workspace locks cannot preserve hosted tarballs on frozen \
+                     installs; delete bun.lock and re-run `bun install` with Bun >= 1.2 (which \
+                     writes lockfileVersion 1, accepted by hosted mode) — a plain in-place `bun \
+                     install` bumps the version only when a workspace depends on another \
+                     workspace (e.g. root -> member); otherwise it keeps version 0 or fails to \
+                     resolve"
+                .into(),
+        });
+    }
+
+    Ok((lines, entries))
+}
+
 fn rewrite_bun_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    use crate::vendor::bun_lock_text::{
-        check_lock_version, decode_json_string, parse_packages_section,
-    };
+    use crate::vendor::bun_lock_text::decode_json_string;
 
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() {
@@ -2401,24 +2471,10 @@ fn rewrite_bun_lock(
     let Some(content) = files.get("bun.lock") else {
         return;
     };
-    if check_lock_version(content).is_err() {
-        result.warnings.push(RewriteWarning {
-            code: "redirect_bun_lock_unsupported".into(),
-            detail: "bun.lock lockfileVersion is not 1 or 2; re-lock with bun >= 1.3".into(),
-        });
-        return;
-    }
-    let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
-    let entries = match parse_packages_section(&lines) {
-        Ok(entries) => entries,
-        Err(_) => {
-            // Fail-closed: never line-splice a lock whose packages section
-            // deviates from bun's emitted single-line grammar.
-            result.warnings.push(RewriteWarning {
-                code: "redirect_bun_lock_unsupported".into(),
-                detail: "bun.lock packages section is not in bun's emitted single-line shape"
-                    .into(),
-            });
+    let (mut lines, entries) = match parse_bun_hosted_lock(content) {
+        Ok(parsed) => parsed,
+        Err(warning) => {
+            result.warnings.push(warning);
             return;
         }
     };
@@ -2449,24 +2505,35 @@ fn rewrite_bun_lock(
             {
                 // Registry 4-tuple → URL 3-tuple. Deps object preserved verbatim.
                 deps_verbatim = entry.elems[2].clone();
-            } else if entry.elems.len() == 3 && spec == url_spec {
-                // Already one of our URL 3-tuples for this exact URL. Idempotent
-                // if the integrity already matches; otherwise refresh it.
+            } else if matches!(entry.elems.len(), 2 | 3) && spec == url_spec {
+                // Already one of our URL tuples for this exact URL. A 3-tuple
+                // is idempotent if the integrity already matches and is
+                // refreshed otherwise. A 2-tuple is our wiring with its digest
+                // DROPPED: Bun 1.1.39–1.3.9 re-save a URL tuple without its
+                // `"sha512-…"` on any lock re-save (`bun add`, `bun install`
+                // after a manifest change) — the spec bun installs from is
+                // intact, so the patch still lands, but ≥ 1.3.10 consumers of
+                // the same lock lose digest verification. HEAL it back to the
+                // canonical 3-tuple; the edit below records the 2-tuple as its
+                // `original`, and replay accepts that spelling of a recorded
+                // `new` (`bun_lock_text::same_wiring_modulo_integrity`), so
+                // the chain still unwinds to the pristine registry line.
                 matched_any = true;
-                if entry.elems[2] == format!("\"{sha512}\"") {
+                if entry.elems.len() == 3 && entry.elems[2] == format!("\"{sha512}\"") {
                     continue;
                 }
                 deps_verbatim = entry.elems[1].clone();
-            } else if entry.elems.len() == 3
+            } else if matches!(entry.elems.len(), 2 | 3)
                 && entry.elems[1].starts_with('{')
                 && is_prior_hosted_bun_spec(&spec, &fname, &dep.artifact_url)
             {
-                // A URL 3-tuple written by an EARLIER redirect whose artifact
+                // A URL tuple written by an EARLIER redirect whose artifact
                 // URL has since changed (a patch republish rotates the uuid
                 // path segment; grant-token rotation changes the token — the
                 // registry `name@version` spec was destroyed by that first
                 // rewrite, so exact-URL matching alone would strand the stale
-                // pin forever). Re-pin to the current URL. Ownership is
+                // pin forever). Re-pin to the current URL — from the 3-tuple
+                // or from its digest-less 2-tuple re-save alike. Ownership is
                 // claimed narrowly — same origin and same `<name>-<version>
                 // .tgz` leaf as the CURRENT artifact URL — so user URL deps
                 // and other-version entries never match (fail-closed).
@@ -2478,8 +2545,15 @@ fn rewrite_bun_lock(
             }
             matched_any = true;
             let original = lines[entry.line_idx].clone();
+            // Lines come from a bare `split('\n')`, so a CRLF lock's lines
+            // carry a trailing `\r` (the grammar trims it away when parsing).
+            // Re-emit it verbatim — mirroring `vendor/bun_lock.rs` — so the
+            // rewritten line never becomes the lone LF line of a CRLF file,
+            // and the ledger `new` fragment matches the on-disk bytes the
+            // way `original` already does (replay matches fragments exactly).
+            let cr = if original.ends_with('\r') { "\r" } else { "" };
             let rebuilt = format!(
-                "{indent}{key}: [{url}, {deps}, {integrity}]{comma}",
+                "{indent}{key}: [{url}, {deps}, {integrity}]{comma}{cr}",
                 indent = entry.indent,
                 key = entry.key_raw,
                 url = serde_json::to_string(&url_spec)
@@ -2758,7 +2832,9 @@ fn rewrite_uv_lock(
                     continue;
                 }
                 Err(detail) => {
-                    result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
+                    result
+                        .refused_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
                     result.warnings.push(RewriteWarning {
                         code: "redirect_uv_lock_unsupported".into(),
                         detail: format!("{path}: {detail}"),
@@ -2770,7 +2846,9 @@ fn rewrite_uv_lock(
                 match plan_python_metadata(path, &content, files, dep, result) {
                     Ok(plan) => plan,
                     Err(warning) => {
-                        result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
+                        result
+                            .refused_python_lock_uuids
+                            .insert(dep.patch_uuid.clone());
                         result.warnings.push(warning);
                         continue;
                     }
@@ -2785,7 +2863,9 @@ fn rewrite_uv_lock(
             ) {
                 Ok(rewritten) => rewritten,
                 Err(detail) => {
-                    result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
+                    result
+                        .refused_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
                     result.warnings.push(RewriteWarning {
                         code: "redirect_uv_metadata_unsupported".into(),
                         detail: format!("{path}: {detail}"),
@@ -2793,7 +2873,9 @@ fn rewrite_uv_lock(
                     continue;
                 }
             };
-            result.confirmed_python_lock_uuids.insert(dep.patch_uuid.clone());
+            result
+                .confirmed_python_lock_uuids
+                .insert(dep.patch_uuid.clone());
             if let Some(edit) = metadata_edit {
                 record_python_metadata_edit(edit, dep, result);
             }
@@ -6604,9 +6686,45 @@ mod tests {
         assert!(r.files.is_empty());
         assert_eq!(r.warnings[0].code, "redirect_bun_lock_unsupported");
         assert!(
-            r.warnings[0].detail.contains("not 1 or 2"),
-            "the refusal must name the supported versions: {}",
+            r.warnings[0]
+                .detail
+                .contains("lockfileVersion 3, newer than this socket-patch release supports")
+                && r.warnings[0].detail.contains("(0, 1 and 2)")
+                && r.warnings[0].detail.contains("update socket-patch"),
+            "the refusal must name the found version, the supported set and a remedy that \
+             can work (a v3 lock was written by a NEWER Bun): {}",
             r.warnings[0].detail
+        );
+        // One message for both modes: the hosted detail IS the shared gate's
+        // error text, so vendored and hosted refusals cannot drift apart.
+        assert_eq!(
+            r.warnings[0].detail,
+            crate::vendor::bun_lock_text::check_lock_version(&files["bun.lock"]).unwrap_err()
+        );
+
+        // No integer lockfileVersion at all → the OTHER remedy (re-lock).
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            "{\n  \"packages\": {\n    \
+             \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"],\n  }\n}\n"
+                .to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty());
+        assert_eq!(r.warnings[0].code, "redirect_bun_lock_unsupported");
+        assert!(
+            r.warnings[0].detail.contains("no integer lockfileVersion")
+                && r.warnings[0]
+                    .detail
+                    .contains("re-lock with Bun ≥ 1.2 (`bun install`)"),
+            "a head without an integer version must point at a Bun re-lock: {}",
+            r.warnings[0].detail
+        );
+        assert_eq!(
+            r.warnings[0].detail,
+            crate::vendor::bun_lock_text::check_lock_version(&files["bun.lock"]).unwrap_err()
         );
 
         // Non-single-line packages section → fail-closed refusal.
@@ -6733,6 +6851,164 @@ mod tests {
         assert_eq!(r.warnings[0].code, "redirect_bun_entry_not_found");
     }
 
+    /// bun's REAL emitted workspace-lock shape (captured from bun 1.1.45 at
+    /// lockfileVersion 0 and from 1.3.14 / 1.4.2 at 1 / 2): trailing commas
+    /// throughout and a blank line between packages entries. Only the
+    /// version integer and the packages entries vary per test; the root
+    /// workspace dep is spelled as the bare path bun 1.1.x writes (≥ 1.2
+    /// writes `workspace:*`) — the rewriter never reads that block.
+    fn bun_workspace_lock(version: u64, entries: &[&str]) -> String {
+        format!(
+            "{{\n  \"lockfileVersion\": {version},\n  \"workspaces\": {{\n    \"\": {{\n      \
+             \"name\": \"bun-patch-backtest\",\n      \"dependencies\": {{\n        \
+             \"consumer\": \"packages/consumer\",\n      }},\n    }},\n    \
+             \"packages/consumer\": {{\n      \"name\": \"consumer\",\n      \"version\": \
+             \"1.0.0\",\n      \"dependencies\": {{\n        \"left-pad\": \"1.3.0\",\n      \
+             }},\n    }},\n  }},\n  \"packages\": {{\n{}\n  }}\n}}\n",
+            entries.join("\n\n")
+        )
+    }
+
+    /// The bun 1.1.39–1.1.45 (lockfileVersion 0) workspace refusal, on the
+    /// grammar those releases actually write — the 2-tuple
+    /// `["consumer@workspace:packages/consumer", { "dependencies": {…} }]`
+    /// (v1/v2 write a 1-tuple) — and its positive twins: the SAME entries at
+    /// lockfileVersion 1 and 2 must rewrite with the workspace line kept
+    /// byte-identical, proving the gate is version-0-only and not "any
+    /// workspace lock". Mutations this pins: dropping the `Some(0)` half of
+    /// the gate, renaming the code, or regressing the remedy text.
+    #[test]
+    fn bun_lock_v0_workspace_refuses_and_v1_v2_workspace_rewrite() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &sha512);
+        let ws_v0 = "    \"consumer\": [\"consumer@workspace:packages/consumer\", \
+                     { \"dependencies\": { \"left-pad\": \"1.3.0\" } }],";
+        let registry = "    \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"],";
+
+        // Version 0 + workspace member → refused, byte-untouched, exactly one
+        // warning (no entry-not-found double-warn) with the verified remedy.
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_workspace_lock(0, &[ws_v0, registry]),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert_eq!(r.warnings[0].code, "redirect_bun_workspace_unsupported");
+        let detail = &r.warnings[0].detail;
+        assert_eq!(
+            detail,
+            "Bun version-0 workspace locks cannot preserve hosted tarballs on frozen installs; \
+             delete bun.lock and re-run `bun install` with Bun >= 1.2 (which writes \
+             lockfileVersion 1, accepted by hosted mode) — a plain in-place `bun install` bumps \
+             the version only when a workspace depends on another workspace (e.g. root -> \
+             member); otherwise it keeps version 0 or fails to resolve",
+            "the refusal must lead with the remedy that converges on every release \
+             (delete + re-lock) and state the in-place bump as CONDITIONAL"
+        );
+        assert!(
+            !detail.contains("rewrites the lock as lockfileVersion 1"),
+            "the old unconditional in-place claim must be gone: {detail}"
+        );
+
+        // The SAME entries at lockfileVersion 1 and 2 → rewritten; the
+        // workspace line survives byte-for-byte; no warning of any kind.
+        for version in [1u64, 2] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "bun.lock".to_string(),
+                bun_workspace_lock(version, &[ws_v0, registry]),
+            );
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(r.warnings.is_empty(), "v{version}: {:?}", r.warnings);
+            let out = r
+                .files
+                .get("bun.lock")
+                .unwrap_or_else(|| panic!("a v{version} workspace lock must be rewritten"));
+            assert!(
+                out.contains(&format!("\"lockfileVersion\": {version},")),
+                "{out}"
+            );
+            assert!(
+                out.contains(&format!("{ws_v0}\n")),
+                "v{version}: the workspace line must be byte-identical: {out}"
+            );
+            assert!(
+                out.contains("\"left-pad\": [\"left-pad@http://p.test/lp.tgz\", {}, \"sha512-"),
+                "v{version}: the registry tuple must become the URL 3-tuple: {out}"
+            );
+            assert_eq!(r.edits.len(), 1, "v{version}: {:?}", r.edits);
+            assert_eq!(r.edits[0].key.as_deref(), Some("left-pad"));
+            assert_eq!(
+                out,
+                &bun_workspace_lock(
+                    version,
+                    &[
+                        ws_v0,
+                        &format!(
+                            "    \"left-pad\": [\"left-pad@http://p.test/lp.tgz\", {{}}, \
+                             \"{sha512}\"],"
+                        )
+                    ]
+                ),
+                "v{version}: only the target line may change"
+            );
+        }
+
+        // The 1-tuple spelling bun ≥ 1.2 actually writes for a workspace
+        // member is rewritten the same way (the gate reads the spec only).
+        let ws_v1 = "    \"consumer\": [\"consumer@workspace:packages/consumer\"],";
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_workspace_lock(1, &[ws_v1, registry]),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = r
+            .files
+            .get("bun.lock")
+            .expect("real v1 grammar must rewrite");
+        assert!(out.contains(&format!("{ws_v1}\n")), "{out}");
+        assert!(out.contains("left-pad@http://p.test/lp.tgz"), "{out}");
+    }
+
+    /// A version-0 lock whose only `workspaces` key is the root `""` (bun
+    /// 1.1.45 `--save-text-lockfile` on a plain project — captured grammar:
+    /// no `configVersion`, trailing commas) has no `workspace:` member and
+    /// must be rewritten, not refused: the gate is "v0 AND a workspace
+    /// member", not "v0".
+    #[test]
+    fn bun_lock_v0_root_only_workspace_rewrites() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &sha512);
+        let lock = "{\n  \"lockfileVersion\": 0,\n  \"workspaces\": {\n    \"\": {\n      \
+                    \"name\": \"bun-patch-backtest\",\n      \"dependencies\": {\n        \
+                    \"left-pad\": \"1.3.0\",\n      },\n    },\n  },\n  \"packages\": {\n    \
+                    \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"],\n  }\n}\n";
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), lock.to_string());
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        let out = r
+            .files
+            .get("bun.lock")
+            .expect("a root-only v0 lock must be rewritten");
+        assert_eq!(
+            out,
+            &lock.replace(
+                "[\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"]",
+                &format!("[\"left-pad@http://p.test/lp.tgz\", {{}}, \"{sha512}\"]")
+            )
+        );
+        assert_eq!(r.edits.len(), 1);
+    }
+
     /// A granted dep that matches no rewritable tuple (lock re-resolved to a
     /// different version) must warn — mirroring pnpm/berry/uv — instead of
     /// silently dropping out of the `redirected` count.
@@ -6772,6 +7048,68 @@ mod tests {
         rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.contains_key("bun.lock"));
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// A CRLF bun.lock (Windows `core.autocrlf` checkout) must keep CRLF on
+    /// the REWRITTEN line too — the vendored engine already does — so the
+    /// file never ends up mixed-EOL, and the ledger `new` fragment carries
+    /// the same on-disk `\r` as `original` (replay matches fragments
+    /// byte-exactly: an LF `new` would no longer be found after an autocrlf
+    /// commit/checkout round-trip, leaving `\r\r\n` on revert). Modelled on
+    /// `yarn_classic_crlf_lock_rewrites_only_the_target_entry`.
+    #[test]
+    fn bun_crlf_lock_keeps_crlf_on_rewritten_line() {
+        let sha512 = format!("sha512-{}==", "A".repeat(86));
+        let ovr = npm_override("left-pad", "1.3.0", "http://p.test/lp.tgz", &sha512);
+        let decoy = "    \"abbrev\": [\"abbrev@1.1.1\", \"\", {}, \"sha512-DECOYdecoy==\"],";
+        let target = "    \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"],";
+        let lf_lock = bun_workspace_lock(2, &[decoy, target]);
+
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), lf_lock.replace('\n', "\r\n"));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.warnings.is_empty(), "clean rewrite: {:?}", r.warnings);
+        let out = r.files.get("bun.lock").expect("bun.lock must be rewritten");
+        assert!(
+            out.contains(&format!("{decoy}\r\n")),
+            "the decoy entry must stay byte-identical: {out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "    \"left-pad\": [\"left-pad@http://p.test/lp.tgz\", {{}}, \"{sha512}\"],\r\n"
+            )),
+            "the target entry must pin the hosted artifact AND keep its CRLF: {out}"
+        );
+        assert_eq!(
+            out.matches('\n').count(),
+            out.matches("\r\n").count(),
+            "every line must keep its CRLF ending: {out}"
+        );
+
+        // The CRLF output is exactly the LF rewrite re-expanded.
+        let mut lf_files = BTreeMap::new();
+        lf_files.insert("bun.lock".to_string(), lf_lock);
+        let mut lf_r = RewriteResult::default();
+        rewrite_bun_lock(&lf_files, std::slice::from_ref(&ovr), &mut lf_r);
+        assert_eq!(
+            out,
+            &lf_r.files["bun.lock"].replace('\n', "\r\n"),
+            "CRLF rewrite must equal the LF rewrite modulo line endings"
+        );
+
+        // Ledger fragments carry the on-disk (CR-bearing) byte form on BOTH
+        // sides, so revert finds `new` and restores `original` byte-exactly.
+        assert_eq!(r.edits.len(), 1);
+        let original = r.edits[0].original.as_ref().unwrap().as_str().unwrap();
+        let new = r.edits[0].new.as_ref().unwrap().as_str().unwrap();
+        assert_eq!(
+            original,
+            format!("{target}\r"),
+            "original must carry the \\r"
+        );
+        assert!(new.ends_with("],\r"), "new must carry the \\r too: {new:?}");
+        assert!(!new.contains('\n') && !original.contains('\n'));
     }
 
     /// A packages header spelled any way other than bun's byte-exact emitted
@@ -12082,6 +12420,155 @@ packages:
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
     }
 
+    /// Bun 1.1.39–1.3.9 re-save our URL 3-tuple WITHOUT its sha512 on any
+    /// later lock re-save (`bun add`, `bun install` after a manifest
+    /// change) — verified on real 1.2.23 and 1.3.9; 1.3.10+ keep it. A
+    /// 2-tuple at the CURRENT artifact URL is our wiring with its digest
+    /// dropped: heal it back to the 3-tuple (the edit records the 2-tuple
+    /// as `original`), never warn `redirect_bun_entry_not_found`, and stay
+    /// a no-op on the healed lock.
+    #[test]
+    fn bun_lock_digestless_current_url_tuple_is_healed() {
+        let sha = format!("sha512-{}==", "N".repeat(86));
+        let url = "https://patch.socket.dev/patch/npm/tok-1111/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.3.0.tgz";
+        let ovr = npm_override("left-pad", "1.3.0", url, &sha);
+        let digestless = format!("\"left-pad\": [\"left-pad@{url}\", {{}}],");
+        let healed = format!("\"left-pad\": [\"left-pad@{url}\", {{}}, \"{sha}\"],");
+
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(&digestless, 1));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        let out = r
+            .files
+            .get("bun.lock")
+            .expect("the digest-less tuple must be healed");
+        assert_eq!(
+            out,
+            &bun_lock_file(&healed, 1),
+            "healed back to the canonical 3-tuple, byte-exact"
+        );
+        assert!(
+            r.warnings.is_empty(),
+            "a digest-less instance of our own wiring is not `entry_not_found`: {:?}",
+            r.warnings
+        );
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        assert_eq!(r.edits[0].key.as_deref(), Some("left-pad"));
+        assert_eq!(
+            r.edits[0].original.as_ref().and_then(Value::as_str),
+            Some(format!("    {digestless}").as_str()),
+            "the heal records the 2-tuple it found as its original"
+        );
+        assert_eq!(
+            r.edits[0].new.as_ref().and_then(Value::as_str),
+            Some(format!("    {healed}").as_str())
+        );
+
+        // The healed lock is in sync: no files, no edits, no warnings.
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), out.clone());
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+
+        // CRLF lock: the healed line keeps its `\r`, and both ledger
+        // fragments carry it (replay matches bytes).
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            bun_lock_file(&digestless, 1).replace('\n', "\r\n"),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        let out = r.files.get("bun.lock").expect("CRLF heal");
+        assert_eq!(out, &bun_lock_file(&healed, 1).replace('\n', "\r\n"));
+        assert_eq!(
+            r.edits[0].original.as_ref().and_then(Value::as_str),
+            Some(format!("    {digestless}\r").as_str())
+        );
+        assert_eq!(
+            r.edits[0].new.as_ref().and_then(Value::as_str),
+            Some(format!("    {healed}\r").as_str())
+        );
+    }
+
+    /// The digest-less re-save of a STALE hosted URL (an earlier grant's
+    /// token/uuid) is re-pinned to the current URL exactly like its 3-tuple
+    /// form; ownership stays origin + `<name>-<version>.tgz` leaf, so a
+    /// foreign-origin or other-version 2-tuple is never claimed and a
+    /// 2-tuple carrying the bare registry spec (not a shape bun emits for a
+    /// registry package) is not rewritten either.
+    #[test]
+    fn bun_lock_digestless_stale_url_tuple_is_repinned_and_unowned_ones_are_not() {
+        let new_sha = format!("sha512-{}==", "N".repeat(86));
+        let old_url = "https://patch.socket.dev/patch/npm/oldtoken-1111/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.3.0.tgz";
+        let new_url = "https://patch.socket.dev/patch/npm/newtoken-2222/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/left-pad-1.3.0.tgz";
+        let ovr = npm_override("left-pad", "1.3.0", new_url, &new_sha);
+
+        let stale = format!("\"left-pad\": [\"left-pad@{old_url}\", {{}}],");
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_lock_file(&stale, 1));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        let out = r
+            .files
+            .get("bun.lock")
+            .expect("stale digest-less URL must be re-pinned");
+        assert_eq!(
+            out,
+            &bun_lock_file(
+                &format!("\"left-pad\": [\"left-pad@{new_url}\", {{}}, \"{new_sha}\"],"),
+                1
+            )
+        );
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert_eq!(r.edits.len(), 1);
+        assert_eq!(
+            r.edits[0].original.as_ref().and_then(Value::as_str),
+            Some(format!("    {stale}").as_str())
+        );
+
+        for unowned in [
+            // Foreign origin, same leaf: a user's own URL dep.
+            "\"left-pad\": [\"left-pad@https://example.com/mirror/left-pad-1.3.0.tgz\", {}],",
+            // Our origin, another version's leaf.
+            "\"left-pad\": [\"left-pad@https://patch.socket.dev/patch/npm/oldtoken-1111/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.2.0.tgz\", {}],",
+            // Registry spec in a 2-tuple: not bun's registry grammar.
+            "\"left-pad\": [\"left-pad@1.3.0\", {}],",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("bun.lock".to_string(), bun_lock_file(unowned, 1));
+            let mut r = RewriteResult::default();
+            rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "unowned 2-tuple must stay untouched: {unowned}"
+            );
+            assert_eq!(
+                r.warnings.iter().map(|w| w.code.as_str()).collect::<Vec<_>>(),
+                vec!["redirect_bun_entry_not_found"],
+                "{unowned}"
+            );
+        }
+
+        // A version-1 workspace lock's 2-tuple workspace entry (the v0
+        // grammar hand-carried forward) beside the target: the registry
+        // tuple is redirected, the workspace 2-tuple is never touched.
+        let ws = "    \"consumer\": [\"consumer@workspace:packages/consumer\", { \"dependencies\": { \"left-pad\": \"1.3.0\" } }],";
+        let target = "    \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"],";
+        let mut files = BTreeMap::new();
+        files.insert("bun.lock".to_string(), bun_workspace_lock(1, &[ws, target]));
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        let out = r.files.get("bun.lock").expect("target rewritten");
+        assert!(out.contains(ws), "{out}");
+        assert!(out.contains(&format!("\"left-pad@{new_url}\"")), "{out}");
+        assert_eq!(r.edits.len(), 1);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
     /// Fail-closed ownership legs of the URL-tuple takeover: an OTHER-name
     /// spec, a non-http `file:` spec, and a foreign-origin URL all survive
     /// byte-identically while the target registry tuple in the same lock is
@@ -13400,4 +13887,3 @@ mod hatch_tests {
         assert!(second.files.is_empty());
     }
 }
-

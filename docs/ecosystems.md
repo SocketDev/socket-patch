@@ -14,7 +14,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 
 | Ecosystem | agent (`--mode agent`) | vendored (`--mode vendored`) | hosted (`--mode hosted`) |
 |-----------|------------------------|------------------------------|--------------------------|
-| npm (`npm`) — pnpm / yarn / berry / bun | ✅ any install layout; `setup` postinstall hook | ✅ six lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun `bun.lock` (binary `bun.lockb` refused with a `--save-text-lockfile` pointer). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun — pnpm, berry, and bun carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) |
+| npm (`npm`) — pnpm / yarn / berry / bun | ✅ any install layout; `setup` postinstall hook | ✅ six lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun `bun.lock` lockfileVersion 0/1/2 (binary `bun.lockb` refused with a `bun install --save-text-lockfile` — Bun ≥ 1.1.39 — pointer, `vendor_bun_lockb_unsupported`; a lock holding `workspace:` packages needs lockfileVersion 2 — `vendor_bun_workspace_unsupported` otherwise, Bun < 1.4 resolves a member's local tarball path relative to the member; `scan`/`get --mode vendored` apply both refusals before downloading anything — see [Bun compatibility](testing/bun-compatibility.md)). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun — pnpm, berry, and bun carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) |
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ `.pth` startup hook via `setup` | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum) |
 | RubyGems (`gem`) | ✅ Bundler plugin via `setup` — needs bundler ≥ 2.2 (1.x cannot load `plugin ... path:` directives; `setup` refuses below the floor and `setup --check` red-flags a wired 1.x project) | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` project cannot vendor yet) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` when present (bundler prefers them over `Gemfile`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
@@ -65,13 +65,43 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   unpatched artifact. The reverse shape — an alias of the patched NAME pointing at a
   different package (`"left-pad@npm:some-fork@^1.3.0"`, the fork-substitution idiom) —
   is never rewritten: it resolves a different package.
-- **bun** — text `bun.lock` lockfileVersion 1 or 2 (bun 1.3 / 1.4 — one emitted
-  grammar; anything else is refused). A binary `bun.lockb` with no text lock beside it
-  is auto-migrated first: the CLI runs your installed `bun`
-  (`bun install --save-text-lockfile --frozen-lockfile --lockfile-only`) before reading
-  the lock — `redirect_bun_lockb_would_migrate` on `--dry-run`,
-  `redirect_bun_lockb_unsupported` when `bun` is unavailable. (Contrast vendored mode,
-  which refuses `bun.lockb` and leaves you to run the migration yourself.)
+- **bun** — text `bun.lock` lockfileVersion 0, 1 or 2: 0 is the `--save-text-lockfile`
+  opt-in lock of Bun 1.1.39–1.1.45, 1 the 1.2–1.3 default, 2 the 1.4+ default; all three
+  emit one `packages` grammar, so registry entries rewrite identically. Any other or
+  missing version, or a `packages` section outside bun's single-line grammar, is refused
+  `redirect_bun_lock_unsupported` (a newer version means "update socket-patch" — re-locking
+  would reproduce it). A version-0 lock holding `workspace:` packages is refused
+  `redirect_bun_workspace_unsupported`: frozen installs of that grammar cannot keep the
+  hosted tuple; delete `bun.lock` and re-lock with Bun ≥ 1.2 (which writes lockfileVersion
+  1, accepted) — a plain in-place `bun install` bumps the version only when a workspace
+  depends on another workspace (root → member), otherwise Bun 1.2.0 keeps version 0 and
+  1.2.23+ fail to resolve. Version-1 and version-2 workspace locks (nested versions included)
+  are rewritten. A binary `bun.lockb` with no text lock beside it is auto-migrated first,
+  when an npm patch is granted: the CLI runs the `bun` resolved on absolute `PATH` entries
+  (Windows `bun.cmd` shims included, spawned directly) as `bun install --save-text-lockfile
+  --frozen-lockfile --lockfile-only`, keeps the pre-migration bytes in the redirect ledger
+  and deletes the surviving `bun.lockb` itself, so `rollback` puts the binary lock back
+  (`redirect_bun_lockb_restored`; the generated `bun.lock` is kept — Bun ≥ 1.1.39 reads
+  `bun.lock` when both exist). The recipe works from Bun 1.1.43; Bun 1.1.39–1.1.42 accept
+  the flags but write no text lock (`redirect_bun_lockb_manual_migration` — run
+  `bun install --save-text-lockfile` yourself and re-run), Bun ≤ 1.1.38 has no text
+  lockfile at all, a missing or failing `bun` is `redirect_bun_lockb_unsupported` (with
+  bun's output tail), `--dry-run` reports `redirect_bun_lockb_would_migrate`, and a
+  migration whose rewrite lands nothing is undone (`redirect_bun_lockb_migration_reverted`).
+  A stale `bun.lockb` beside a live `package-lock.json` / `npm-shrinkwrap.json` /
+  `yarn.lock` / `pnpm-lock.yaml` is left alone (`redirect_bun_lockb_sibling_lock`; the
+  redirect follows the sibling lock), and a `bun.lockb` that is not a regular file is
+  refused before `bun` is spawned. (Contrast vendored mode, which refuses `bun.lockb` with
+  the `--save-text-lockfile` pointer and needs lockfileVersion 2 for `workspace:` locks —
+  see the matrix row above.) Hosted → vendored and vendored → hosted conversions both work
+  in place (mode takeover) — on a lock the vendored backend refuses (a pre-version-2
+  `workspace:` lock) `vendor` reports the refusal before the hosted revert and leaves the
+  purl hosted-patched — and `rollback <purl>` / `remove <purl>` unwind one of several
+  hosted bun redirects.
+  Bun verifies the sha512 of URL and local-tarball tuples only from 1.3.10 (registry
+  tuples from 1.2.0), so on 1.1.39–1.3.9 a hosted or vendored rewrite removes digest
+  enforcement for the patched package. Every boundary here is measured against real
+  Bun releases — see [Bun compatibility](testing/bun-compatibility.md).
 
 ## npm: Rush monorepos
 

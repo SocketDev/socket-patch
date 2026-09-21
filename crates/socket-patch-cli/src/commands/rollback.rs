@@ -644,9 +644,13 @@ pub(crate) async fn run_hosted_leg(
     };
 
     let mut out = HostedLegOutcome::default();
-    // bun.lock edits hard-refuse the per-purl npm revert; when the replay
-    // will run it owns them instead, so npm purls on bun projects defer
-    // rather than fail.
+    // When the whole-ledger replay will run anyway (the scope covers every
+    // record), npm purls on bun projects defer to it: the replay stages the
+    // bun group all-or-nothing together with the rideshare `bun.lockb`
+    // migration marker the per-purl revert never claims. A SCOPED unwind of
+    // one of several bun records takes the per-purl revert instead, which
+    // claims that purl's `redirect_bun_lock_package` edits by the recorded
+    // line's spec and replays them like the yarn/pnpm text kinds.
     let has_bun_edits = state
         .edits
         .iter()

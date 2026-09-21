@@ -10,6 +10,7 @@ name: Pipenv compatibility
 on:
   pull_request:
     paths:
+      - '.github/actions/upload-artifact/**'
       - 'crates/socket-patch-core/src/patch/redirect/pipenv.rs'
       - 'crates/socket-patch-core/src/vendor/pypi_pipenv.rs'
       - 'crates/socket-patch-core/src/vendor/pypi.rs'
@@ -89,7 +90,7 @@ jobs:
             --shapes $PIPENV_SHAPES \
             --modes hosted vendored agent agent-oot \
             --jobs 4
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: ./.github/actions/upload-artifact
         if: always()
         with:
           name: pipenv-compat-${{ matrix.os }}-${{ strategy.job-index }}

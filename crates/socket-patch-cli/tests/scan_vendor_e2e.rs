@@ -1679,3 +1679,180 @@ async fn scan_apply_skips_lockfile_only_without_error() {
         "no manifest entry is written for a not-installed package"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bun vendored-mode preflight through `scan`: download phase, --detached,
+// --silent
+// ---------------------------------------------------------------------------
+
+const BUN_WS_CODE: &str = "vendor_bun_workspace_unsupported";
+
+/// `write_fixture` re-locked by bun 1.3.14 as a workspace: the real
+/// lockfileVersion-1 grammar (1-tuple `workspace:` entry, blank line
+/// between entries, trailing commas; registry integrity from the BN3 spike
+/// fixture), left-pad declared by the member — the shape the vendored gate
+/// refuses (bun < 1.4 resolves member tarball paths relative to the member).
+fn write_bun_v1_workspace_fixture(root: &Path) {
+    write_fixture(root);
+    std::fs::remove_file(root.join("package-lock.json")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "scan-vendor-test", "version": "0.0.0", "private": true, "workspaces": ["packages/*"], "dependencies": { "consumer": "workspace:*" } }"#,
+    )
+    .unwrap();
+    let consumer = root.join("packages/consumer");
+    std::fs::create_dir_all(&consumer).unwrap();
+    std::fs::write(
+        consumer.join("package.json"),
+        r#"{ "name": "consumer", "version": "1.0.0", "dependencies": { "left-pad": "1.3.0" } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("bun.lock"),
+        "{\n  \"lockfileVersion\": 1,\n  \"configVersion\": 1,\n  \"workspaces\": {\n    \"\": {\n      \"name\": \"scan-vendor-test\",\n      \"dependencies\": {\n        \"consumer\": \"workspace:*\",\n      },\n    },\n    \"packages/consumer\": {\n      \"name\": \"consumer\",\n      \"version\": \"1.0.0\",\n      \"dependencies\": {\n        \"left-pad\": \"1.3.0\",\n      },\n    },\n  },\n  \"packages\": {\n    \"consumer\": [\"consumer@workspace:packages/consumer\"],\n\n    \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==\"],\n  }\n}\n",
+    )
+    .unwrap();
+}
+
+/// The manifest-tracked vendored scan refuses a v1 workspace lock IN THE
+/// DOWNLOAD PHASE: the record is `failed` with the vendor code + detail,
+/// nothing is fetched (request-log oracle), the lock is byte-identical,
+/// nothing is vendored, and the manifest — written by contract — holds no
+/// record for the refused purl.
+#[tokio::test]
+async fn scan_vendored_bun_v1_workspace_refuses_in_download_phase() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_v1_workspace_fixture(tmp.path());
+    let lock_before = std::fs::read(tmp.path().join("bun.lock")).unwrap();
+
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--mode", "vendored"]);
+    assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "partial_failure", "envelope={v}");
+    let dl = &v["download"];
+    assert_eq!(dl["found"], 1, "envelope={v}");
+    assert_eq!(dl["downloaded"], 0, "envelope={v}");
+    assert_eq!(dl["failed"], 1, "envelope={v}");
+    assert_eq!(dl["patches"][0]["purl"], PURL, "envelope={v}");
+    assert_eq!(dl["patches"][0]["action"], "failed", "envelope={v}");
+    assert_eq!(dl["patches"][0]["errorCode"], BUN_WS_CODE, "envelope={v}");
+    assert!(
+        dl["patches"][0]["error"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "the refused record carries the engine's detail: {v}"
+    );
+    assert_eq!(v["vendor"]["summary"]["applied"], 0, "envelope={v}");
+
+    let reqs = mock.received_requests().await.unwrap();
+    assert!(
+        !reqs.iter().any(|r| r.url.path().contains("/patches/view/")),
+        "a refused patch must never be fetched"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("bun.lock")).unwrap(),
+        lock_before,
+        "bun.lock must be byte-identical"
+    );
+    assert!(!tmp.path().join(".socket/vendor").exists());
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest,
+        serde_json::json!({ "patches": {} }),
+        "no record may be claimed for the refused purl"
+    );
+}
+
+/// The `--detached` twin refuses BEFORE any fetch too (it used to fetch the
+/// view and only fail in the vendor step): same record, zero downloads,
+/// and — detached — no manifest at all.
+#[tokio::test]
+async fn scan_vendored_bun_detached_refuses_before_fetch() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_v1_workspace_fixture(tmp.path());
+    let lock_before = std::fs::read(tmp.path().join("bun.lock")).unwrap();
+
+    let (code, stdout, stderr) = run_scan_vendor(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "vendored", "--detached"],
+    );
+    assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "partial_failure", "envelope={v}");
+    assert_eq!(v["download"]["detached"], true, "envelope={v}");
+    assert_eq!(v["download"]["downloaded"], 0, "envelope={v}");
+    assert_eq!(v["download"]["failed"], 1, "envelope={v}");
+    assert_eq!(
+        v["download"]["patches"][0]["action"], "failed",
+        "envelope={v}"
+    );
+    assert_eq!(
+        v["download"]["patches"][0]["errorCode"], BUN_WS_CODE,
+        "envelope={v}"
+    );
+    let reqs = mock.received_requests().await.unwrap();
+    assert!(
+        !reqs.iter().any(|r| r.url.path().contains("/patches/view/")),
+        "detached must refuse before fetching"
+    );
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "detached mode never writes a manifest"
+    );
+    assert!(!tmp.path().join(".socket/vendor").exists());
+    assert_eq!(
+        std::fs::read(tmp.path().join("bun.lock")).unwrap(),
+        lock_before
+    );
+}
+
+/// The interactive (`--silent`, non-JSON) arm: "errors only" means the
+/// refusal line — code-tagged, naming the purl — stays on stderr while
+/// stdout is empty, exit 1. Regression guard: the line was gated on
+/// `!silent`, so a `--silent` scan exited 1 with no text at all.
+#[tokio::test]
+async fn scan_vendored_bun_silent_human_names_code_on_stderr() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_v1_workspace_fixture(tmp.path());
+
+    let uri = mock.uri();
+    let (code, stdout, stderr) = run_cli_env(
+        tmp.path(),
+        &[
+            "scan",
+            "--mode",
+            "vendored",
+            "--vendor-source",
+            "build",
+            "--silent",
+            "--yes",
+            "--api-url",
+            &uri,
+            "--api-token",
+            "fake-token",
+            "--org",
+            ORG_SLUG,
+        ],
+        &[],
+    );
+    assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.trim().is_empty(),
+        "--silent must print nothing on stdout:\n{stdout}"
+    );
+    assert!(
+        stderr.contains(&format!("[error] {PURL} ({BUN_WS_CODE}):")),
+        "--silent must keep the code-tagged refusal on stderr:\n{stderr}"
+    );
+    assert!(!tmp.path().join(".socket/vendor").exists());
+}
