@@ -72,11 +72,13 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   `redirect_bun_lock_unsupported` (a newer version means "update socket-patch" — re-locking
   would reproduce it). A version-0 lock holding `workspace:` packages is refused
   `redirect_bun_workspace_unsupported`: frozen installs of that grammar cannot keep the
-  hosted tuple; a plain `bun install` with any Bun ≥ 1.2 rewrites it in place as version 1,
-  which is accepted. Version-1 and version-2 workspace locks (nested versions included)
+  hosted tuple; delete `bun.lock` and re-lock with Bun ≥ 1.2 (which writes lockfileVersion
+  1, accepted) — a plain in-place `bun install` bumps the version only when a workspace
+  depends on another workspace (root → member), otherwise Bun 1.2.0 keeps version 0 and
+  1.2.23+ fail to resolve. Version-1 and version-2 workspace locks (nested versions included)
   are rewritten. A binary `bun.lockb` with no text lock beside it is auto-migrated first,
   when an npm patch is granted: the CLI runs the `bun` resolved on absolute `PATH` entries
-  (Windows `bun.cmd` shims included) as `bun install --save-text-lockfile
+  (Windows `bun.cmd` shims included, spawned directly) as `bun install --save-text-lockfile
   --frozen-lockfile --lockfile-only`, keeps the pre-migration bytes in the redirect ledger
   and deletes the surviving `bun.lockb` itself, so `rollback` puts the binary lock back
   (`redirect_bun_lockb_restored`; the generated `bun.lock` is kept — Bun ≥ 1.1.39 reads
@@ -86,10 +88,16 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   lockfile at all, a missing or failing `bun` is `redirect_bun_lockb_unsupported` (with
   bun's output tail), `--dry-run` reports `redirect_bun_lockb_would_migrate`, and a
   migration whose rewrite lands nothing is undone (`redirect_bun_lockb_migration_reverted`).
-  (Contrast vendored mode, which refuses `bun.lockb` with the `--save-text-lockfile`
-  pointer and needs lockfileVersion 2 for `workspace:` locks — see the matrix row above.)
-  Hosted → vendored and vendored → hosted conversions both work in place (mode takeover),
-  and `rollback <purl>` / `remove <purl>` unwind one of several hosted bun redirects.
+  A stale `bun.lockb` beside a live `package-lock.json` / `npm-shrinkwrap.json` /
+  `yarn.lock` / `pnpm-lock.yaml` is left alone (`redirect_bun_lockb_sibling_lock`; the
+  redirect follows the sibling lock), and a `bun.lockb` that is not a regular file is
+  refused before `bun` is spawned. (Contrast vendored mode, which refuses `bun.lockb` with
+  the `--save-text-lockfile` pointer and needs lockfileVersion 2 for `workspace:` locks —
+  see the matrix row above.) Hosted → vendored and vendored → hosted conversions both work
+  in place (mode takeover) — on a lock the vendored backend refuses (a pre-version-2
+  `workspace:` lock) `vendor` reports the refusal before the hosted revert and leaves the
+  purl hosted-patched — and `rollback <purl>` / `remove <purl>` unwind one of several
+  hosted bun redirects.
   Bun verifies the sha512 of URL and local-tarball tuples only from 1.3.10 (registry
   tuples from 1.2.0), so on 1.1.39–1.3.9 a hosted or vendored rewrite removes digest
   enforcement for the patched package. Every boundary here is measured against real
