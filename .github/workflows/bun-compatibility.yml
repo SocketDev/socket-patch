@@ -20,7 +20,7 @@ on:
       - 'Cargo.lock'
       - 'crates/socket-patch-core/src/vendor/**'
       - 'crates/socket-patch-core/src/patch/redirect/**'
-      - 'crates/socket-patch-core/src/patch/bun_lock_text.rs'
+      - 'crates/socket-patch-core/src/vendor/bun_lock_text.rs'
       - 'crates/socket-patch-core/src/crawlers/npm_crawler.rs'
       - 'crates/socket-patch-core/src/crawlers/pkg_managers.rs'
       - 'crates/socket-patch-core/src/constants.rs'
@@ -33,30 +33,37 @@ on:
       - 'crates/socket-patch-cli/src/commands/repair_vendor.rs'
       - 'crates/socket-patch-cli/src/commands/remove.rs'
   # Main runs are the only rust-cache writers (save-if below), so a
-  # path-filtered push trigger is what seeds the cache the PR builds restore.
+  # path-filtered push trigger is what seeds the cache the PR builds restore
+  # (rust-cache keys on Cargo.lock, so Cargo.lock belongs here) and re-runs
+  # the matrix post-merge on the code paths it exercises: the vendored engine
+  # (`vendor/**` — bun_lock.rs, bun_lock_text.rs's shared version gate,
+  # npm_flavor.rs, lock_inventory.rs), the hosted rewriter + unwinds, and the
+  # CLI drivers (`scan/**` — hosted.rs, vendor_flow.rs, mod.rs — plus the
+  # vendor / repair / remove commands the matrix runs).
   push:
     branches: [main]
     paths:
       - '.github/workflows/bun-compatibility.yml'
       - 'scripts/backtest-bun.py'
-      - 'crates/socket-patch-core/src/vendor/bun_lock.rs'
-      - 'crates/socket-patch-core/src/vendor/npm_flavor.rs'
-      - 'crates/socket-patch-core/src/vendor/lock_inventory.rs'
-      - 'crates/socket-patch-core/src/patch/bun_lock_text.rs'
+      - 'Cargo.lock'
+      - 'crates/socket-patch-core/src/vendor/**'
       - 'crates/socket-patch-core/src/patch/redirect/mod.rs'
       - 'crates/socket-patch-core/src/patch/redirect/replay.rs'
       - 'crates/socket-patch-core/src/patch/redirect/takeover.rs'
       - 'crates/socket-patch-cli/src/commands/get.rs'
-      - 'crates/socket-patch-cli/src/commands/scan/hosted.rs'
+      - 'crates/socket-patch-cli/src/commands/scan/**'
       - 'crates/socket-patch-cli/src/commands/rollback.rs'
+      - 'crates/socket-patch-cli/src/commands/vendor.rs'
+      - 'crates/socket-patch-cli/src/commands/repair_vendor.rs'
+      - 'crates/socket-patch-cli/src/commands/remove.rs'
   workflow_dispatch:
     inputs:
       versions:
-        description: 'Space-separated Bun versions (empty = the pinned matrix below; every cell runs the override)'
+        description: 'Space-separated Bun versions (empty = the pinned matrix below; every cell runs the override; releases before 1.1.0 are skipped on Windows, which has no build of them)'
         required: false
         default: ''
       shapes:
-        description: 'Space-separated shapes (empty = every shape)'
+        description: 'Space-separated shapes (empty = every shape; a cell where no requested shape applies to its release reports noCells and passes)'
         required: false
         default: ''
       modes:
@@ -156,18 +163,28 @@ jobs:
           python-version: '3.12'
 
       - name: Download Bun ${{ matrix.bun }}
-        # The script's install_tool() fetches each release with one
-        # un-retried urlretrieve, before any case runs — a single transient
-        # GitHub 5xx (seen on this workflow's first run) kills the whole
-        # cell with no summary.json. Pre-populate the exact directory layout
-        # install_tool() looks up (`tools/<version>/<asset>/bun[.exe]`) with
-        # a backoff loop, and verify the archive against the release's own
-        # SHASUMS256.txt before extracting (fail closed), so the script only
-        # ever finds a verified, cached binary.
+        id: bun
+        # Pre-populate the exact directory layout the script's install_tool()
+        # looks up (`tools/<version>/<asset>/bun[.exe]`, SHASUMS256.txt beside
+        # it) for EVERY release the run needs: the matrix release (or the
+        # dispatch override) plus Bun 1.1.38, the baseline the `legacy-lockb`
+        # shape installs with on every other release (LEGACY_BUN in
+        # scripts/backtest-bun.py) — de-duplicated, and only when that shape
+        # is in play. install_tool() would fetch a missing release itself,
+        # retried and SHASUMS-verified (never fail-open), but a GitHub outage
+        # during that in-job fetch kills the whole cell before any case runs;
+        # here the backoff loop rides it out, the SHASUMS listing is checked
+        # BEFORE the zip is fetched (a release with no asset for this OS fails
+        # in one request instead of five 404 rounds — or, for the pre-1.1.0
+        # releases that never shipped a Windows build, is skipped with a
+        # notice), and the archive is verified against the release's own
+        # SHASUMS256.txt before extraction (fail closed). The releases that
+        # were actually staged are exported for the run step.
         shell: bash
         env:
           MATRIX_BUN: ${{ matrix.bun }}
           VERSIONS_OVERRIDE: ${{ github.event.inputs.versions }}
+          SHAPES_OVERRIDE: ${{ github.event.inputs.shapes }}
         run: |
           set -euo pipefail
           case "$RUNNER_OS" in
@@ -195,19 +212,42 @@ jobs:
               sleep $((10 * attempt))
             done
           }
-          versions="$MATRIX_BUN"
-          if [ -n "$VERSIONS_OVERRIDE" ]; then versions="$VERSIONS_OVERRIDE"; fi
-          for version in $versions; do
+          before_windows_builds() {
+            # True when $1 predates Bun 1.1.0, the first release with a
+            # Windows binary (the matrix `exclude` list covers the pinned
+            # releases; a dispatch override can name any release).
+            IFS=. read -r major minor _ <<<"$1"
+            [ "${major:-0}" -lt 1 ] || { [ "${major:-0}" -eq 1 ] && [ "${minor:-0}" -lt 1 ]; }
+          }
+          requested="$MATRIX_BUN"
+          if [ -n "$VERSIONS_OVERRIDE" ]; then requested="$VERSIONS_OVERRIDE"; fi
+          run_versions=""
+          for version in $requested; do
+            if [ "$system" = windows ] && before_windows_builds "$version"; then
+              echo "::notice::skipping Bun ${version} on Windows: no bun-windows-x64.zip before 1.1.0"
+            else
+              run_versions="${run_versions} ${version}"
+            fi
+          done
+          run_versions="${run_versions# }"
+          # The run step's --versions; empty only when every requested
+          # release was skipped above (the run step then reports noCells).
+          echo "versions=${run_versions}" >> "$GITHUB_OUTPUT"
+          stage="$run_versions"
+          if [ -n "$run_versions" ] && { [ -z "$SHAPES_OVERRIDE" ] || [[ " $SHAPES_OVERRIDE " == *" legacy-lockb "* ]]; }; then
+            stage="${stage} 1.1.38"
+          fi
+          for version in $(printf '%s\n' $stage | awk 'NF && !seen[$0]++'); do
             base="https://github.com/oven-sh/bun/releases/download/bun-v${version}"
             dir="native-bun/tools/${version}"
             mkdir -p "$dir"
             fetch "${base}/SHASUMS256.txt" "${dir}/SHASUMS256.txt"
-            fetch "${base}/${asset}.zip" "${dir}/${asset}.zip"
             expected="$(awk -v name="${asset}.zip" '{ sub(/\r$/, "") } $2 == name { print $1 }' "${dir}/SHASUMS256.txt")"
             if [ -z "$expected" ]; then
               echo "::error::${asset}.zip is not listed in SHASUMS256.txt for bun-v${version}"
               exit 1
             fi
+            fetch "${base}/${asset}.zip" "${dir}/${asset}.zip"
             python3 - "${dir}/${asset}.zip" "$expected" "$dir" <<'PY'
           import hashlib, pathlib, sys, zipfile
           archive, expected, dest = pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])
@@ -232,23 +272,31 @@ jobs:
       - name: Install, verify patched bytes, reject corruption, and roll back
         shell: bash
         env:
-          MATRIX_BUN: ${{ matrix.bun }}
+          # The releases the download step staged: the matrix release or the
+          # dispatch override, minus any pre-1.1.0 release skipped on Windows.
+          BUN_VERSIONS: ${{ steps.bun.outputs.versions }}
           # Provenance for the captures the depscan SBOM fixtures import:
           # `cliRevision` is the branch-resolvable head commit (PR head, or the
-          # pushed commit on main); CLI_BUILD_SHA is the commit actions/checkout
+          # pushed commit on main); `cliBuildSha` is the commit actions/checkout
           # actually built (refs/pull/N/merge on PRs) — they diverge once main
-          # advances past the PR's merge-base, so the script gets both.
+          # advances past the PR's merge-base, so the script records both.
           CLI_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
           CLI_BUILD_SHA: ${{ github.sha }}
-          VERSIONS_OVERRIDE: ${{ github.event.inputs.versions }}
           SHAPES_OVERRIDE: ${{ github.event.inputs.shapes }}
           MODES_OVERRIDE: ${{ github.event.inputs.modes }}
         run: |
+          if [ -z "$BUN_VERSIONS" ]; then
+            # Every requested release was skipped by the download step (a
+            # pre-1.1.0 override on Windows): nothing to run, not a failure —
+            # but the artifact must say so rather than go missing.
+            echo "::notice::no Bun release to run on ${RUNNER_OS}: every requested release predates the first Windows build (1.1.0)"
+            mkdir -p native-bun
+            printf '[{"noCells": true, "passed": false, "error": "every requested Bun release was skipped on %s: no Windows build before 1.1.0"}]\n' "$RUNNER_OS" > native-bun/summary.json
+            exit 0
+          fi
           chmod +x native-cli/socket-patch* || true
           cli="native-cli/socket-patch"
           if [ "$RUNNER_OS" = "Windows" ]; then cli="native-cli/socket-patch.exe"; fi
-          versions="$MATRIX_BUN"
-          if [ -n "$VERSIONS_OVERRIDE" ]; then versions="$VERSIONS_OVERRIDE"; fi
           modes="hosted vendored vendored-detached"
           if [ -n "$MODES_OVERRIDE" ]; then modes="$MODES_OVERRIDE"; fi
           shapes_arg=()
@@ -256,9 +304,10 @@ jobs:
           python3 scripts/backtest-bun.py \
             --cli "$cli" \
             --cli-revision "$CLI_REVISION" \
+            --cli-build-sha "$CLI_BUILD_SHA" \
             --output native-bun \
             --tools native-bun/tools \
-            --versions $versions \
+            --versions $BUN_VERSIONS \
             --modes $modes \
             "${shapes_arg[@]}" \
             --jobs 3
