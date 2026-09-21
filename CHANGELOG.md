@@ -264,6 +264,59 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Bun projects: every text-lock generation is accepted, vendored refusals
+  fire before any write, and every mode change unwinds.** `bun.lock`
+  `lockfileVersion` 0 — the opt-in text lock Bun 1.1.39–1.1.45 write with
+  `--save-text-lockfile` — joins 1 and 2 in the shared version gate, so hosted
+  mode redirects it (golden fixture `npm/bun/lock-v0`), vendored mode wires it
+  and the lockfile inventory discovers it; a newer version is now refused with
+  "update socket-patch" instead of a re-lock that would reproduce it. Workspace
+  locks are refused only where Bun cannot consume the rewrite: hosted mode
+  refuses a version-0 lock holding `workspace:` packages
+  (`redirect_bun_workspace_unsupported`; a plain `bun install` with Bun ≥ 1.2
+  rewrites it in place as version 1, which is accepted) and vendored mode
+  refuses any pre-version-2 workspace lock before writing
+  (`vendor_bun_workspace_unsupported` — Bun 1.2–1.3 resolve a workspace
+  member's local tarball path relative to the member; delete `bun.lock` and
+  re-lock with Bun ≥ 1.4, since an in-place `bun install` keeps the existing
+  version, or use hosted mode), while already-vendored purls, re-runs and
+  `repair` on such a lock keep working. `scan --mode vendored`,
+  `get --mode vendored` (search and uuid paths) and `--detached` runs now
+  preflight the Bun lock BEFORE any download: a binary-only, unreadable,
+  unsupported-version or pre-version-2 workspace lock marks the npm patches
+  `failed` with the vendor refusal code and detail, fetches nothing and
+  records no patch — the `scan` / `get <purl>` path still writes an unchanged
+  `.socket/manifest.json` and exits `partial_failure`, `get <uuid> --mode
+  vendored` exits 1 with `status: "error"` and writes nothing — where
+  previously the record landed in the manifest and the vendor step failed
+  afterwards (and a detached run over an alias install misreported
+  `package_not_installed`). The refusals stay visible under `--silent`
+  (code-tagged stderr line), `--dry-run` previews them as the additive
+  `would_refuse` action, the `bun.lockb` refusal carries one remedy on every
+  path (`bun install --save-text-lockfile`, Bun ≥ 1.1.39), and a `scan` on a
+  `bun.lockb`-only project warns `bun_lockb_unsupported` instead of reporting
+  a clean empty inventory. Hosted → vendored takeover now works for bun —
+  `scan`/`get --mode vendored` and `vendor` over a hosted-redirected `bun.lock`
+  claim and replay that purl's hosted edit instead of refusing
+  `redirect_revert_failed`, and `vendor --dry-run` probes the takeover instead
+  of promising it — as do `rollback <purl>` / `remove <purl>` of one of
+  several hosted bun records. The hosted `bun.lockb` migration is truthful:
+  `bun` is resolved on absolute `PATH` entries (Windows `bun.cmd` shims
+  included), a `bun.lockb` that Bun 1.1.43–1.1.45 keep beside the new text
+  lock is removed by the CLI so the ledger's `removed` edit is true, the
+  pre-migration bytes ride the ledger and `rollback` restores `bun.lockb`
+  (`redirect_bun_lockb_restored`; the generated `bun.lock` is kept), Bun
+  1.1.39–1.1.42 — which accept the flags but write nothing — get
+  `redirect_bun_lockb_manual_migration` instead of a false "unavailable", and
+  a failed spawn's `redirect_bun_lockb_unsupported` carries bun's output tail.
+  The hosted rewrite keeps CRLF on the rewritten `bun.lock` line. Real-Bun
+  coverage now runs in CI: the hermetic hosted and vendored suites on Linux,
+  macOS and Windows (Bun 1.4.2, plus 1.1.45 and 1.2.23 lock-era legs), and
+  the production native matrix — 16 releases from 0.8.1 to 1.4.2 in hosted,
+  vendored and detached-vendored mode — on pull requests and `main`, with
+  the corrected digest boundary (Bun verifies URL/local tarball sha512 from
+  1.3.10, not 1.3.14). See `docs/testing/bun-compatibility.md` and
+  `scripts/backtest-bun.py`. (#245)
 - **Rollback after a Pipenv relock no longer refuses forever.** `pipenv lock`
   (and `update`, and `install <other>` before 2024) regenerates a redirected
   or vendored entry to registry shape on every Pipenv major; that is now the
