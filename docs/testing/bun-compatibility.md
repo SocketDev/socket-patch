@@ -158,6 +158,25 @@ runners) from the GitHub releases and verifies it against `SHASUMS256.txt`. Ever
   1.3.14; the hermetic suites pin it from both sides
   (`TARBALL_INTEGRITY_ENFORCED_FROM = (1, 3, 10)` with the 1.1.45 / 1.2.23 /
   1.4.2 legs) and the matrix carries 1.3.9 and 1.3.10.
+- **Digest-less re-saves.** The same releases (every text-lock Bun below
+  1.3.10 — measured on 1.1.45 at lockfileVersion 0, 1.2.23 and 1.3.9)
+  re-save a URL or local-tarball tuple WITHOUT its `sha512` whenever the lock
+  is re-saved for another reason: `bun add <pkg>`, or `bun install` after a
+  package.json / workspace change (a root rename alone does not re-save; a
+  frozen install never writes). The 3-tuple comes back as the 2-tuple
+  `["name@<url|path>", {meta}]`, spec and meta intact; 1.3.10, 1.3.14 and
+  1.4.2 keep the digest. The CLI recognises that spelling as its own wiring:
+  the repeat hosted run heals it (`redirected: 1`, no
+  `redirect_bun_entry_not_found`, a second ledger edit whose `original` is
+  the 2-tuple), the vendored re-run stays `already_vendored` and re-pins the
+  digest on disk, `repair` rebuilds through it, and `rollback` / scoped
+  `rollback` / `remove` / `vendor --revert` / both takeovers accept the
+  digest-less spelling of a recorded line and restore the registry original
+  over it. Before the fix every one of those refused after any lock re-save
+  on those releases (`redirect_bun_entry_not_found` beside `redirected: 1`,
+  `rollback` → `partial_failure`, `vendor_lock_entry_not_found` /
+  `vendor_lock_entry_drifted`); the `already-vendored-workspace` matrix
+  shape on 1.2.0–1.3.9 is the regression guard.
 - **Both lockfiles present.** Bun ≥ 1.1.39 reads `bun.lock` when `bun.lockb`
   sits beside it; Bun ≤ 1.1.38 reads only `bun.lockb` — which is why the CLI
   removes a surviving `bun.lockb` after the migration (a stale binary lock
@@ -271,6 +290,7 @@ needed for SBOM lockfile annotation.
 | Version-0 workspace hosted refusal + remedy | `text-workspace` (1.1.39–1.1.45); 1.1.45 `workspace*` after migration | — | golden `lock-v0-workspace-refusal` (+ `expected-warnings.json`), `redirect/mod.rs` unit tests |
 | Pre-v2 workspace vendored refusal (policy) + remedy; version 2 supported incl. nested | v1: 1.2.0–1.3.14 `workspace*`; v0: `text-workspace`; v2: 1.4.x | `e2e_vendor_bun_build` scoped leg (deps + bin meta survive) | `bun_lock.rs` (`legacy_workspace_tarballs_refuse_before_writes`, in-sync / rebuild exemptions), `in_process_vendor_bun`, `repair_vendor_flavors_e2e` over {0, 1, 2} × workspace shapes |
 | Digest boundary 1.3.10 (registry tuples 1.2.0) | 1.3.9 vs 1.3.10 cells, `registryDigestEnforced` | tampered twins in both suites, pinned from both sides | — |
+| Digest-less re-saves below 1.3.10 recognised, healed and unwound (both modes, takeovers, scoped unwinds, `repair`) | `already-vendored-workspace` on 1.2.0–1.3.9 (`digestDroppedOnResave`; `resaveKeepsDigest` from 1.3.10) | `bun_redirect_survives_a_digest_dropping_lock_resave`, `bun_vendor_survives_a_digest_dropping_lock_resave` (real `file:`-dep re-save; the era's spelling asserted from both sides) | goldens `digestless-hosted-already-wired`, `digestless-hosted-stale-url-repin`; `bun_lock_text.rs` (`same_wiring_modulo_integrity`), `redirect/mod.rs`, `replay.rs`, `takeover.rs`, `bun_lock.rs` unit tests; `in_process_redirect`, `in_process_vendor_bun`, `in_process_vendor_bun_takeover` |
 | Mode conversion both directions; scoped `rollback` / `remove` | `hosted-then-vendored`, `vendored-then-hosted` | `mode_migration_bun` (1.4.2 × 3 OS, 1.3.14) | `in_process_vendor_bun_takeover`, `takeover.rs`, `covgap_commands_rollback` |
 | CRLF lockfiles preserved (hosted line, vendored, rollback) | `crlf-lock` | — | golden `lock-v2-crlf`, `bun_lock.rs` |
 | Bun 0.8.1 / 1.0.0 peer / transitive upstream limitation | recorded per cell | — | — |

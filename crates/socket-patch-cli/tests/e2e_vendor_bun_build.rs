@@ -1317,3 +1317,226 @@ async fn bun_get_uuid_vendored_fresh_checkout_frozen_install() {
     // spike-proven `--frozen-lockfile`, then the ordinary-install twin.
     fresh_checkout_install_proof(&fx, "fresh");
 }
+
+// ── digest-dropping lock re-saves (Bun 1.1.39–1.3.9) ─────────────────
+
+/// A local `file:` tarball dep (`local-dep-<n>`) added to package.json plus
+/// this bun's ordinary install: the one network-free way to make bun
+/// RE-SAVE an existing lock. Returns the tarball file name, which every
+/// fresh checkout below must carry along.
+fn grow_project_with_local_dep(fx: &BunProject, n: u32) -> String {
+    let name = format!("local-dep-{n}");
+    let tgz_name = format!("{name}-1.0.0.tgz");
+    let tgz = build_tgz(&[
+        (
+            "package.json".to_string(),
+            format!(r#"{{"name":"{name}","version":"1.0.0"}}"#).into_bytes(),
+            0o644,
+        ),
+        (
+            "index.js".to_string(),
+            b"module.exports = 'local';\n".to_vec(),
+            0o644,
+        ),
+    ]);
+    std::fs::write(fx.proj.join(&tgz_name), tgz).unwrap();
+    let pkg_path = fx.proj.join("package.json");
+    let mut pkg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&pkg_path).unwrap()).unwrap();
+    pkg["dependencies"][&name] = serde_json::json!(format!("file:./{tgz_name}"));
+    std::fs::write(&pkg_path, serde_json::to_vec_pretty(&pkg).unwrap()).unwrap();
+    let cache = fx.tmp.path().join(format!("resave-{n}-bun-cache"));
+    let out = bun(&fx.proj, &fixture_install_args(fx.bun_version), &cache);
+    assert!(
+        out.status.success(),
+        "`bun install` after adding {name} must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lock = std::fs::read_to_string(fx.proj.join("bun.lock")).unwrap();
+    assert!(
+        lock.contains(&format!("\"{name}\": [")),
+        "the re-save must have landed {name}'s entry:\n{lock}"
+    );
+    tgz_name
+}
+
+/// The re-saved line must be the recorded 3-tuple (bun ≥ 1.3.10) or its
+/// digest-less 2-tuple (below) — asserted per era, never guessed.
+fn assert_resave_shape(fx: &BunProject, wired_line: &str) -> String {
+    let live = packages_line(
+        &std::fs::read_to_string(fx.proj.join("bun.lock")).unwrap(),
+        fx.target.name(),
+    );
+    let digestless = format!(
+        "{}],",
+        &wired_line[..wired_line.rfind(", \"sha512-").unwrap()]
+    );
+    if fx.bun_version < TARBALL_INTEGRITY_ENFORCED_FROM {
+        assert_eq!(
+            live, digestless,
+            "bun {} (< 1.3.10) must re-save the local tuple WITHOUT its sha512",
+            fx.bun_raw
+        );
+    } else {
+        assert_eq!(
+            live, wired_line,
+            "bun {} (>= 1.3.10) must keep the local tuple's sha512 on re-save",
+            fx.bun_raw
+        );
+    }
+    live
+}
+
+/// `bun install --frozen-lockfile` in a fresh checkout carrying the grown
+/// project's local tarballs; returns the installed target `index.js`.
+fn fresh_frozen_install_with_local_deps(fx: &BunProject, name: &str, tgzs: &[String]) -> Vec<u8> {
+    let fresh = fresh_checkout(fx, name);
+    for tgz in tgzs {
+        std::fs::copy(fx.proj.join(tgz), fresh.join(tgz)).unwrap();
+    }
+    let cache = fx.tmp.path().join(format!("{name}-bun-cache"));
+    let ci = bun(
+        &fresh,
+        &["install", "--frozen-lockfile", "--ignore-scripts"],
+        &cache,
+    );
+    assert!(
+        ci.status.success(),
+        "fresh-checkout `bun install --frozen-lockfile` ({name}) must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr)
+    );
+    std::fs::read(fx.target.installed_dir(&fresh).join("index.js")).unwrap()
+}
+
+/// Every text-lock bun below 1.3.10 re-saves our local-tarball 3-tuple
+/// WITHOUT its sha512 whenever the lock is re-saved for another reason
+/// (measured on 1.1.45, 1.2.23 and 1.3.9; 1.3.10+ keep it). The 2-tuple is
+/// still our wiring, so after a real re-save: the `vendor` re-run must stay
+/// a clean no-op that heals the digest, `repair` must rebuild a deleted
+/// artifact through it and re-pin the digest, a fresh frozen install must
+/// land the patched bytes, and — after bun drops the digest AGAIN —
+/// `vendor --revert` must restore the registry line inside the grown lock.
+/// On ≥ 1.3.10 the same steps are the no-regression twin (digest kept).
+#[test]
+#[serial_test::serial]
+fn bun_vendor_survives_a_digest_dropping_lock_resave() {
+    let Some(fx) = bun_project("vendor-digestless-resave", Target::LeftPad, None) else {
+        return;
+    };
+    let proj = &fx.proj;
+    let lock_path = proj.join("bun.lock");
+    stage_and_vendor(&fx);
+    let wired_line = packages_line(&std::fs::read_to_string(&lock_path).unwrap(), DEP);
+    assert!(wired_line.contains("\"sha512-"), "{wired_line}");
+
+    // 1. Grow → re-save; assert the era's spelling.
+    let tgz_a = grow_project_with_local_dep(&fx, 1);
+    assert_resave_shape(&fx, &wired_line);
+    eprintln!("RESAVE OK (bun {})", fx.bun_raw);
+
+    // 2. Re-run `vendor`: exit 0, nothing failed, in sync, digest healed.
+    let (code, stdout, stderr) = run_vendor(&fx, &[]);
+    assert_eq!(
+        code, 0,
+        "re-vendor over the re-saved lock failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "{env}");
+    assert_eq!(env["summary"]["failed"], 0, "{env}");
+    assert!(
+        env["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["errorCode"] != "vendor_lock_entry_not_found" && e["action"] != "failed"),
+        "{env}"
+    );
+    let healed = std::fs::read_to_string(&lock_path).unwrap();
+    assert_eq!(
+        packages_line(&healed, DEP),
+        wired_line,
+        "the re-run must leave the canonical local 3-tuple in place:\n{healed}"
+    );
+    eprintln!("RE-VENDOR OK");
+
+    // 3. Repair through a digest-less line: drop the digest again, delete
+    //    the artifact, rebuild.
+    let tgz_b = grow_project_with_local_dep(&fx, 2);
+    assert_resave_shape(&fx, &wired_line);
+    std::fs::remove_dir_all(vendored_dir(proj)).unwrap();
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "repair",
+            "--json",
+            "--offline",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "repair failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let renv = parse_envelope(&stdout);
+    assert_eq!(renv["status"], "success", "{renv}");
+    assert_eq!(renv["summary"]["rebuilt"], 1, "{renv}");
+    assert!(vendored_tgz(&fx).is_file(), "the artifact must be rebuilt");
+    let repaired = std::fs::read_to_string(&lock_path).unwrap();
+    assert_eq!(
+        packages_line(&repaired, DEP),
+        wired_line,
+        "repair re-pins the digest into the healed 3-tuple:\n{repaired}"
+    );
+    eprintln!("REPAIR THROUGH DIGEST-LESS LOCK OK");
+
+    // 4. The repaired lock installs the patched bytes from an empty cache.
+    let installed = fresh_frozen_install_with_local_deps(
+        &fx,
+        "fresh-repaired",
+        &[tgz_a.clone(), tgz_b.clone()],
+    );
+    assert_eq!(
+        installed, fx.patched,
+        "the repaired lock must install the patched bytes"
+    );
+
+    // 5. Drop the digest once more, then revert straight over it.
+    let tgz_c = grow_project_with_local_dep(&fx, 3);
+    assert_resave_shape(&fx, &wired_line);
+    let (code, stdout, stderr) = run_vendor(&fx, &["--revert"]);
+    assert_eq!(
+        code, 0,
+        "revert over the re-saved lock failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let renv = parse_envelope(&stdout);
+    assert_eq!(renv["status"], "success", "{renv}");
+    assert_eq!(renv["summary"]["removed"], 1, "{renv}");
+    let restored = std::fs::read_to_string(&lock_path).unwrap();
+    let lock_before = String::from_utf8(fx.lock_before.clone()).unwrap();
+    assert_eq!(
+        packages_line(&restored, DEP),
+        packages_line(&lock_before, DEP),
+        "the pristine registry 4-tuple must be back:\n{restored}"
+    );
+    for n in 1..=3 {
+        assert!(
+            restored.contains(&format!("\"local-dep-{n}\": [")),
+            "revert must not disturb the grown entries:\n{restored}"
+        );
+    }
+    assert!(
+        !proj.join(".socket").join("vendor").exists(),
+        ".socket/vendor must be fully removed after revert"
+    );
+    let installed =
+        fresh_frozen_install_with_local_deps(&fx, "fresh-reverted", &[tgz_a, tgz_b, tgz_c]);
+    assert_eq!(
+        installed, fx.orig,
+        "after revert bun installs the ORIGINAL bytes"
+    );
+    eprintln!("REVERT AFTER RESAVE OK (bun {})", fx.bun_raw);
+}

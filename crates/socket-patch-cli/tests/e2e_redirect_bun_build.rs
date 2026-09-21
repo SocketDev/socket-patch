@@ -1377,3 +1377,264 @@ async fn bun_redirect_rollback_restores_lock_and_original_install() {
         "after rollback the fresh install must be byte-identical to the pristine package"
     );
 }
+
+// ── digest-dropping lock re-saves (Bun 1.1.39–1.3.9) ─────────────────
+
+/// A local `file:` tarball dep added to `proj`'s package.json plus this
+/// bun's ordinary install: the one network-free way to make bun RE-SAVE an
+/// existing lock (a root rename does not; `bun add` needs the registry).
+/// Returns the tarball's file name, which every fresh checkout below must
+/// carry along.
+fn grow_project_with_local_dep(fx: &BunRedirectFixture, cache_tag: &str) -> String {
+    let tgz_name = "local-dep-1.0.0.tgz".to_string();
+    let tgz = build_tgz(&[
+        (
+            "package.json".to_string(),
+            br#"{"name":"local-dep","version":"1.0.0"}"#.to_vec(),
+            0o644,
+        ),
+        (
+            "index.js".to_string(),
+            b"module.exports = 'local';\n".to_vec(),
+            0o644,
+        ),
+    ]);
+    std::fs::write(fx.proj.join(&tgz_name), tgz).unwrap();
+    let pkg_path = fx.proj.join("package.json");
+    let mut pkg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&pkg_path).unwrap()).unwrap();
+    pkg["dependencies"]["local-dep"] = serde_json::json!(format!("file:./{tgz_name}"));
+    std::fs::write(&pkg_path, serde_json::to_vec_pretty(&pkg).unwrap()).unwrap();
+    let cache = fx.tmp.path().join(format!("{cache_tag}-bun-cache"));
+    let out = bun(&fx.proj, &fixture_install_args(fx.bun_version), &cache);
+    assert!(
+        out.status.success(),
+        "`bun install` after adding the local dep must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lock = std::fs::read_to_string(fx.proj.join("bun.lock")).unwrap();
+    assert!(
+        lock.contains("\"local-dep\": ["),
+        "the re-save must have landed the local dep's entry:\n{lock}"
+    );
+    tgz_name
+}
+
+/// `bun install --frozen-lockfile` in a fresh checkout that also carries the
+/// grown project's local tarball; returns the installed `index.js` bytes.
+fn fresh_frozen_install_with_local_dep(
+    fx: &BunRedirectFixture,
+    name: &str,
+    tgz_name: &str,
+) -> Vec<u8> {
+    let fresh = fresh_checkout(fx, name);
+    std::fs::copy(fx.proj.join(tgz_name), fresh.join(tgz_name)).unwrap();
+    let cache = fx.tmp.path().join(format!("{name}-bun-cache"));
+    let ci = bun(
+        &fresh,
+        &["install", "--frozen-lockfile", "--ignore-scripts"],
+        &cache,
+    );
+    assert!(
+        ci.status.success(),
+        "fresh-checkout `bun install --frozen-lockfile` ({name}) must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr)
+    );
+    std::fs::read(fx.target.installed_dir(&fresh).join("index.js")).unwrap()
+}
+
+/// Every text-lock bun below 1.3.10 re-saves our URL 3-tuple WITHOUT its
+/// sha512 whenever the lock is re-saved for another reason (measured on
+/// 1.1.45, 1.2.23 and 1.3.9; 1.3.10+ keep it). The digest-less 2-tuple is
+/// still our wiring — the spec bun installs from is intact — so after a
+/// real re-save: `rollback --dry-run` must resolve, the repeat hosted run
+/// must report `redirected: 1` with no `redirect_bun_entry_not_found` and
+/// heal the line back to the 3-tuple (a second ledger edit), a fresh
+/// frozen install must land the patched bytes, and `rollback` must put the
+/// registry line back inside the GROWN lock and install the original bytes.
+/// On ≥ 1.3.10 the same steps prove the no-regression twin: digest kept,
+/// repeat run a no-op, one ledger edit.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn bun_redirect_survives_a_digest_dropping_lock_resave() {
+    let Some(fx) = bun_hosted_project(
+        "digestless-resave",
+        false,
+        HostedDriver::ScanVex,
+        LockShape::Native,
+        Target::LeftPad,
+    )
+    .await
+    else {
+        return;
+    };
+    let proj = &fx.proj;
+    let lock_path = proj.join("bun.lock");
+    let wired_line = packages_line(&std::fs::read_to_string(&lock_path).unwrap(), DEP);
+    assert!(wired_line.contains("\"sha512-"), "{wired_line}");
+    let expect_drop = fx.bun_version < TARBALL_INTEGRITY_ENFORCED_FROM;
+
+    // 1. Grow the project so bun re-saves the lock.
+    let tgz_name = grow_project_with_local_dep(&fx, "resave");
+    let resaved = std::fs::read_to_string(&lock_path).unwrap();
+    let live_line = packages_line(&resaved, DEP);
+    let digestless_spelling = format!(
+        "{}],",
+        &wired_line[..wired_line.rfind(", \"sha512-").unwrap()]
+    );
+    if expect_drop {
+        assert_eq!(
+            live_line, digestless_spelling,
+            "bun {} (< 1.3.10) must re-save the URL tuple WITHOUT its sha512:\n{resaved}",
+            fx.bun_raw
+        );
+    } else {
+        assert_eq!(
+            live_line, wired_line,
+            "bun {} (>= 1.3.10) must keep the URL tuple's sha512 on re-save:\n{resaved}",
+            fx.bun_raw
+        );
+    }
+    eprintln!(
+        "RESAVE OK (bun {}, digest {})",
+        fx.bun_raw,
+        if expect_drop { "dropped" } else { "kept" }
+    );
+
+    // 2. The unwind must already resolve over the re-saved lock (dry run).
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "rollback",
+            "--dry-run",
+            "--yes",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "rollback --dry-run over the re-saved lock must resolve.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        resaved,
+        "a dry run writes nothing"
+    );
+
+    // 3. Repeat hosted run: consistent envelope, digest healed (or a no-op).
+    let server_uri = fx._server.uri();
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &server_uri,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "repeat scan --mode hosted failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("repeat scan output is not JSON: {e}\nstdout:\n{stdout}"));
+    assert_eq!(env["status"], "success", "{env:#}");
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let codes: Vec<&str> = env["redirect"]["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert!(
+        !codes.contains(&"redirect_bun_entry_not_found"),
+        "the digest-less spelling of our own wiring is not `entry_not_found`: {env:#}"
+    );
+    let healed = std::fs::read_to_string(&lock_path).unwrap();
+    assert_eq!(
+        packages_line(&healed, DEP),
+        wired_line,
+        "the repeat run must leave the canonical URL 3-tuple in place:\n{healed}"
+    );
+    assert!(
+        healed.contains("\"local-dep\": ["),
+        "the grown entry survives"
+    );
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(redirect_ledger(proj)).unwrap()).unwrap();
+    let edits = ledger["edits"].as_array().unwrap();
+    assert_eq!(
+        edits.len(),
+        if expect_drop { 2 } else { 1 },
+        "the heal is recorded as a second edit exactly when the digest was dropped: {ledger:#}"
+    );
+    if expect_drop {
+        assert_eq!(
+            edits[1]["original"],
+            serde_json::json!(digestless_spelling),
+            "{ledger:#}"
+        );
+        assert_eq!(edits[1]["new"], serde_json::json!(wired_line), "{ledger:#}");
+    }
+    eprintln!("REPEAT HOSTED RUN OK");
+
+    // 4. The healed lock installs the patched bytes from an empty cache.
+    let installed = fresh_frozen_install_with_local_dep(&fx, "fresh-healed", &tgz_name);
+    assert_eq!(
+        installed, fx.patched,
+        "the healed lock must install the patched bytes"
+    );
+
+    // 5. Rollback: registry line back inside the grown lock, ledger gone,
+    //    original bytes on a fresh install.
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "rollback",
+            "--yes",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "rollback failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(env["status"], "success", "{env:#}");
+    let restored = std::fs::read_to_string(&lock_path).unwrap();
+    let lock_before = String::from_utf8(fx.lock_before.clone()).unwrap();
+    assert_eq!(
+        packages_line(&restored, DEP),
+        packages_line(&lock_before, DEP),
+        "the pristine registry 4-tuple must be back:\n{restored}"
+    );
+    assert!(
+        restored.contains("\"local-dep\": ["),
+        "rollback must not disturb the grown entry:\n{restored}"
+    );
+    assert!(
+        !redirect_ledger(proj).exists(),
+        "the emptied ledger is deleted"
+    );
+    let installed = fresh_frozen_install_with_local_dep(&fx, "fresh-rolled-back", &tgz_name);
+    assert_eq!(
+        installed, fx.orig,
+        "after rollback bun installs the ORIGINAL bytes"
+    );
+    eprintln!("ROLLBACK AFTER RESAVE OK (bun {})", fx.bun_raw);
+}

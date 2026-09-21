@@ -665,14 +665,35 @@ pub async fn revert_npm_redirect_purl(
             } else if content.contains(orig) {
                 // Already at (or unwound to) the pre-redirect fragment.
             } else {
-                return Err(format!(
-                    "the {} entry for {lock_key} has drifted from the recorded \
-                     hosted redirect (neither the redirected nor the original \
-                     fragment is present); refusing to touch it — re-run \
-                     `scan --mode hosted` to normalize the redirect, or \
-                     restore the registry wiring manually, then re-run",
-                    edit.path
-                ));
+                // bun only: Bun 1.1.39–1.3.9 re-save our URL 3-tuple WITHOUT
+                // its sha512 on any later lock re-save, so the recorded
+                // `new` is on disk as a digest-less 2-tuple (same key, spec
+                // and meta). That spelling IS the recorded wiring — restore
+                // `orig` over it; a stale ledger of its own making must not
+                // block the takeover, scoped rollback or remove. Anything
+                // else still refuses (fail closed).
+                let healed = if edit.kind == BUN_TEXT_KIND {
+                    crate::vendor::bun_lock_text::restore_digestless_line(&content, new, orig)
+                        .map_err(|ambiguous| format!("{}: {ambiguous}", edit.path))?
+                } else {
+                    None
+                };
+                match healed {
+                    Some(restored) => {
+                        staged.insert(edit.path.clone(), Some(restored));
+                        out.reverted_files.push(edit.path.clone());
+                    }
+                    None => {
+                        return Err(format!(
+                            "the {} entry for {lock_key} has drifted from the recorded \
+                             hosted redirect (neither the redirected nor the original \
+                             fragment is present); refusing to touch it — re-run \
+                             `scan --mode hosted` to normalize the redirect, or \
+                             restore the registry wiring manually, then re-run",
+                            edit.path
+                        ));
+                    }
+                }
             }
         } else {
             revert_npm_json_edit(project_root, &mut staged, &edit, &name, &version, &mut out)
@@ -1211,7 +1232,10 @@ mod tests {
         // previews — the whole-ledger replay running after per-purl
         // reverts — must see the post-claim state); the caller owns the
         // clone and never persists it on a dry run.
-        assert!(state.records.len() < records_before, "record claimed in memory");
+        assert!(
+            state.records.len() < records_before,
+            "record claimed in memory"
+        );
         assert!(state.edits.len() < edits_before, "edits claimed in memory");
 
         // The preview names exactly the files a wet run then reverts —
@@ -2030,7 +2054,9 @@ mod tests {
             .and_then(Value::as_object_mut)
             .unwrap();
         entry.remove("name").expect("fixture name field present");
-        entry.remove("version").expect("fixture version field present");
+        entry
+            .remove("version")
+            .expect("fixture version field present");
         tokio::fs::write(
             root.join("package-lock.json"),
             serde_json::to_string_pretty(&on_disk).unwrap(),
@@ -2167,9 +2193,7 @@ mod tests {
         .await;
         let root = tmp.path();
         assert_eq!(state.edits.len(), 2, "{:?}", state.edits);
-        let scoped_url = npm_dep_for("@scope/left-pad", "1.3.0")
-            .artifact_url
-            .clone();
+        let scoped_url = npm_dep_for("@scope/left-pad", "1.3.0").artifact_url.clone();
         // Hand edit / merge artifact: strip the alias entry's name+version.
         let mut on_disk: Value = serde_json::from_str(
             &tokio::fs::read_to_string(root.join("package-lock.json"))
@@ -2183,7 +2207,9 @@ mod tests {
             .and_then(Value::as_object_mut)
             .unwrap();
         entry.remove("name").expect("fixture name field present");
-        entry.remove("version").expect("fixture version field present");
+        entry
+            .remove("version")
+            .expect("fixture version field present");
         tokio::fs::write(
             root.join("package-lock.json"),
             serde_json::to_string_pretty(&on_disk).unwrap(),
@@ -2478,6 +2504,133 @@ mod tests {
             "{:?}",
             state.records.keys()
         );
+    }
+
+    /// The digest-less spelling Bun 1.1.39–1.3.9 re-save a URL 3-tuple as
+    /// (`bun add`, `bun install` after a manifest change): the recorded
+    /// `new` is no longer on disk byte-for-byte, but the 2-tuple with the
+    /// same key/spec/meta IS our wiring — the claim must not refuse as
+    /// drift (that blocked hosted→vendored takeover, scoped `rollback` and
+    /// `remove` for every user on those releases). The registry line comes
+    /// back and the ledger is cleared.
+    fn drop_digest(line: &str) -> String {
+        let cut = line
+            .rfind(", \"sha512-")
+            .unwrap_or_else(|| panic!("no sha512 element in {line}"));
+        let tail = if line.trim_end_matches('\r').ends_with("],") {
+            "],"
+        } else {
+            "]"
+        };
+        let cr = if line.ends_with('\r') { "\r" } else { "" };
+        format!("{}{tail}{cr}", &line[..cut])
+    }
+
+    #[tokio::test]
+    async fn npm_bun_digestless_live_line_is_claimed_and_restored() {
+        let (tmp, mut state) = npm_redirected_fixture("bun.lock", &bun_pristine()).await;
+        let root = tmp.path();
+        let wired = read_lock(root).await;
+        let wired_line = bun_line(&wired, "left-pad");
+        let digestless = drop_digest(&wired_line);
+        assert!(
+            digestless.ends_with("{}],") && !digestless.contains("sha512"),
+            "{digestless}"
+        );
+        tokio::fs::write(
+            root.join("bun.lock"),
+            wired.replace(&wired_line, &digestless),
+        )
+        .await
+        .unwrap();
+
+        let out = revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("the digest-less spelling of our own wiring must not refuse");
+        assert_eq!(out.reverted_files, vec!["bun.lock".to_string()]);
+        assert_eq!(
+            read_lock(root).await,
+            bun_pristine(),
+            "registry line restored"
+        );
+        assert!(state.records.is_empty() && state.edits.is_empty());
+    }
+
+    /// Both hosted instances re-saved digest-less; reverting 1.3.0 restores
+    /// ONLY its line — the sibling 1.2.0 keeps its digest-less hosted
+    /// 2-tuple untouched (it is that purl's wiring, not ours to heal).
+    #[tokio::test]
+    async fn npm_bun_digestless_sibling_stays_untouched() {
+        const SIBLING: &str = "pkg:npm/left-pad@1.2.0";
+        let (tmp, mut state) = npm_redirected_fixture_multi(
+            "bun.lock",
+            &bun_pristine(),
+            &[
+                (NPM_PURL, npm_dep()),
+                (SIBLING, npm_dep_for("left-pad", "1.2.0")),
+            ],
+        )
+        .await;
+        let root = tmp.path();
+        let wired = read_lock(root).await;
+        let main_line = bun_line(&wired, "left-pad");
+        let sibling_line = bun_line(&wired, "haspad/left-pad");
+        let sibling_digestless = drop_digest(&sibling_line);
+        let live = wired
+            .replace(&main_line, &drop_digest(&main_line))
+            .replace(&sibling_line, &sibling_digestless);
+        tokio::fs::write(root.join("bun.lock"), &live)
+            .await
+            .unwrap();
+
+        revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("takeover of 1.3.0 succeeds");
+        let after = read_lock(root).await;
+        assert_eq!(
+            bun_line(&after, "left-pad"),
+            bun_line(&bun_pristine(), "left-pad")
+        );
+        assert_eq!(
+            bun_line(&after, "haspad/left-pad"),
+            sibling_digestless,
+            "the sibling's digest-less hosted line is left exactly as found"
+        );
+        assert_eq!(state.edits.len(), 1);
+        assert!(state.records.contains_key(SIBLING) && !state.records.contains_key(NPM_PURL));
+    }
+
+    /// A digest-less 2-tuple at ANOTHER uuid (someone re-granted the patch
+    /// and Bun re-saved it) is not the recorded wiring: still drift, still
+    /// a refusal, file byte-identical.
+    #[tokio::test]
+    async fn npm_bun_digestless_line_at_another_uuid_still_refuses() {
+        let (tmp, mut state) = npm_redirected_fixture("bun.lock", &bun_pristine()).await;
+        let root = tmp.path();
+        let wired = read_lock(root).await;
+        let wired_line = bun_line(&wired, "left-pad");
+        let foreign = drop_digest(&wired_line).replace("/6b7c/", "/7c8d/");
+        assert_ne!(
+            foreign,
+            drop_digest(&wired_line),
+            "the uuid segment must differ"
+        );
+        let live = wired.replace(&wired_line, &foreign);
+        tokio::fs::write(root.join("bun.lock"), &live)
+            .await
+            .unwrap();
+
+        let err = revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect_err("another uuid's digest-less line is drift");
+        assert!(err.contains("drifted"), "{err}");
+        assert_eq!(
+            read_lock(root).await,
+            live,
+            "refusal leaves the lock untouched"
+        );
+        assert_eq!(state.edits.len(), 1);
+        assert!(state.records.contains_key(NPM_PURL));
     }
 
     /// (b) Scoped package + re-redirect chain: the hosted rewrite destroys
@@ -2975,7 +3128,9 @@ mod tests {
         let cfg_before = tokio::fs::read_to_string(root.join(".cargo/config.toml"))
             .await
             .unwrap();
-        tokio::fs::remove_file(root.join("Cargo.lock")).await.unwrap();
+        tokio::fs::remove_file(root.join("Cargo.lock"))
+            .await
+            .unwrap();
         let records_before = state.records.len();
         let edits_before = state.edits.len();
 
@@ -3129,9 +3284,12 @@ mod tests {
         let wired_toml = tokio::fs::read_to_string(root.join("Cargo.toml"))
             .await
             .unwrap();
-        tokio::fs::write(root.join("Cargo.toml"), format!("{wired_toml}{pinned_line}"))
-            .await
-            .unwrap();
+        tokio::fs::write(
+            root.join("Cargo.toml"),
+            format!("{wired_toml}{pinned_line}"),
+        )
+        .await
+        .unwrap();
 
         let out = revert_cargo_redirect_purl(root, &mut state, PURL, false)
             .await
@@ -3241,7 +3399,9 @@ mod tests {
     async fn npm_missing_text_lock_refuses_and_keeps_the_ledger() {
         let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &classic_pristine()).await;
         let root = tmp.path();
-        tokio::fs::remove_file(root.join("yarn.lock")).await.unwrap();
+        tokio::fs::remove_file(root.join("yarn.lock"))
+            .await
+            .unwrap();
         let records_before = state.records.len();
         let edits_before = state.edits.len();
 
@@ -3435,7 +3595,10 @@ mod tests {
         let err = revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
             .await
             .expect_err("vanished v2 tree must refuse");
-        assert!(err.contains("no longer holds a `dependencies` tree"), "{err}");
+        assert!(
+            err.contains("no longer holds a `dependencies` tree"),
+            "{err}"
+        );
         let after = tokio::fs::read_to_string(root.join("package-lock.json"))
             .await
             .unwrap();

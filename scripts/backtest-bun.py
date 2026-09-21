@@ -541,6 +541,20 @@ def wired_fragments(project, mode):
     return next(w for w in wiring if w['file'] == 'bun.lock')
 
 
+def wired_line(text, recorded_new):
+    """The live bun.lock line carrying the recorded wiring `recorded_new`:
+    byte-identical, or the digest-less 2-tuple Bun < 1.3.10 re-saves it as
+    (same `"key": ["spec", {meta}` head, no trailing `"sha512-…"`). None when
+    neither spelling is present."""
+    if recorded_new in text:
+        return recorded_new
+    head = recorded_new[:recorded_new.rfind(', "sha512-')]
+    for line in text.splitlines():
+        if line.startswith(head) and line[len(head):] in (']', '],'):
+            return line
+    return None
+
+
 def crlf_only(data):
     return all(line.endswith(b'\r\n') for line in data.splitlines(keepends=True) if line.strip())
 
@@ -723,14 +737,20 @@ def main():
                     checks['memberInstall'] = code == 0 and 'workspace:packages/consumer' in text
                     wiring = wired_fragments(project, pre_mode)
                     # Bun < 1.3.10 re-saves URL/local tarball tuples WITHOUT
-                    # their sha512 (a 2-tuple), which the CLI then no longer
-                    # recognizes as its own wiring: re-runs and rollback break.
-                    checks['wiringSurvivesInstall'] = wiring['new'] in text
+                    # their sha512 (the 2-tuple `["name@<spec>", {meta}]`);
+                    # 1.3.10+ keep the 3-tuple. Either spelling is the CLI's
+                    # own wiring (the spec bun installs from is intact): the
+                    # re-run heals the digest and rollback unwinds both.
+                    live_wired = wired_line(text, wiring['new'])
+                    checks['wiringSurvivesInstall'] = live_wired is not None
+                    row['digestDroppedOnResave'] = live_wired != wiring['new']
+                    if ver(version) >= TARBALL_INTEGRITY_ENFORCED_FROM:
+                        checks['resaveKeepsDigest'] = live_wired == wiring['new']
                     # Rollback restores the wired line only: the pristine lock
                     # is the grown lock with the registry line put back.
                     original = {name: (project / name).read_bytes() for name in files}
                     original['bun.lock'] = lock.read_bytes().replace(
-                        wiring['new'].encode(), wiring['original'].encode())
+                        (live_wired or wiring['new']).encode(), wiring['original'].encode())
 
             command = cli_command(get_verb(shape), main_mode)
             code, output = run(command, project, env, case / 'cli.log', False)

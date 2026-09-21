@@ -315,8 +315,17 @@ into the new version's section — see docs/releasing.md.
   the production native matrix — 16 releases from 0.8.1 to 1.4.2 in hosted,
   vendored and detached-vendored mode — on pull requests and `main`, with
   the corrected digest boundary (Bun verifies URL/local tarball sha512 from
-  1.3.10, not 1.3.14). See `docs/testing/bun-compatibility.md` and
-  `scripts/backtest-bun.py`. (#245)
+  1.3.10, not 1.3.14). Bun 1.1.39–1.3.9 also re-save a hosted URL or
+  vendored local-tarball tuple WITHOUT its `sha512` on any later lock
+  re-save (`bun add`, `bun install` after a manifest change); that
+  digest-less 2-tuple is now recognised as the CLI's own wiring — repeat runs
+  heal the digest, `repair` rebuilds through it, and `rollback`, scoped
+  `rollback` / `remove`, `vendor --revert` and both mode takeovers unwind it
+  to the registry line — where previously every re-save on those releases
+  left `redirect_bun_entry_not_found` beside `redirected: 1`, a
+  `partial_failure` rollback and `vendor_lock_entry_not_found` /
+  `vendor_lock_entry_drifted` refusals. See
+  `docs/testing/bun-compatibility.md` and `scripts/backtest-bun.py`. (#245)
 - **Rollback after a Pipenv relock no longer refuses forever.** `pipenv lock`
   (and `update`, and `install <other>` before 2024) regenerates a redirected
   or vendored entry to registry shape on every Pipenv major; that is now the

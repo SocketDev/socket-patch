@@ -33,7 +33,9 @@
 
 use std::path::Path;
 
+use base64::Engine as _;
 use serde_json::Value;
+use sha2::{Digest, Sha512};
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
@@ -240,6 +242,26 @@ pub(crate) async fn vendor_bun(
         }
     }
 
+    // The sha512 of the artifact already sitting at the target path, if
+    // any — the one witness a digest-less in-sync tuple (see `classify`)
+    // still has of the digest Bun dropped: the lock line was written from
+    // these bytes. Read BEFORE staging, which overwrites the file; a
+    // missing or non-regular path (a `repair` rebuild after deletion, a
+    // FIFO) yields `None`, which the in-sync check below treats as "not
+    // provably the same bytes".
+    let prior_artifact_integrity: Option<String> = {
+        let abs = project_root.join(&coords.uuid_dir_rel).join(&target_leaf);
+        match tokio::fs::metadata(&abs).await {
+            Ok(meta) if meta.is_file() => tokio::fs::read(&abs).await.ok().map(|bytes| {
+                format!(
+                    "sha512-{}",
+                    base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&bytes))
+                )
+            }),
+            _ => None,
+        }
+    };
+
     // ── 4. Stage → patch → pack (shared flavor-agnostic pipeline) ────────
     // A wiring failure past this point must unwind the uuid dir staging is
     // about to create — but never one that already existed (a same-uuid
@@ -291,20 +313,15 @@ pub(crate) async fn vendor_bun(
     // ── 5. Rewrite every matching instance (in-memory) ────────────────────
     let mut wiring: Vec<WiringRecord> = Vec::new();
     let mut changed = false;
+    // In-sync instances whose digest Bun dropped (see `classify`): re-pinned
+    // on disk WITHOUT a wiring record — the ledger already holds this
+    // instance's pristine original and `revert_one_record` recognises both
+    // spellings — so the run stays an AlreadyPatched no-op for the ledger
+    // while ≥ 1.3.10 consumers of the committed lock regain verification.
+    let mut healed = false;
     for entry in &entries {
         let Some(shape) = classify(entry, &target_spec, name, &target_leaf) else {
             continue;
-        };
-        let (deps_verbatim, was_ours) = match shape {
-            TupleShape::Registry => (entry.elems[2].clone(), false),
-            TupleShape::Ours { path } => {
-                // Idempotency: an instance already carrying this exact path
-                // and integrity needs no edit and no wiring record.
-                if path == rel_tgz && entry.elems[2] == format!("\"{}\"", packed.integrity) {
-                    continue;
-                }
-                (entry.elems[1].clone(), true)
-            }
         };
         let original_line = lines[entry.line_idx].clone();
         // Lines come from a bare `split('\n')`, so a CRLF lock's lines carry
@@ -315,14 +332,51 @@ pub(crate) async fn vendor_bun(
         } else {
             ""
         };
-        let new_line = format!(
-            "{indent}{key}: [\"{name}@{rel_tgz}\", {deps}, \"{integrity}\"]{comma}{cr}",
-            indent = entry.indent,
-            key = entry.key_raw,
-            deps = deps_verbatim,
-            integrity = packed.integrity,
-            comma = if entry.trailing_comma { "," } else { "" },
-        );
+        let local_tuple_line = |deps: &str| {
+            format!(
+                "{indent}{key}: [\"{name}@{rel_tgz}\", {deps}, \"{integrity}\"]{comma}{cr}",
+                indent = entry.indent,
+                key = entry.key_raw,
+                integrity = packed.integrity,
+                comma = if entry.trailing_comma { "," } else { "" },
+            )
+        };
+        let (deps_verbatim, was_ours) = match shape {
+            TupleShape::Registry => (entry.elems[2].clone(), false),
+            TupleShape::Ours { path } => {
+                if path == rel_tgz {
+                    match entry.elems.get(2) {
+                        // Idempotency: an instance already carrying this exact
+                        // path and integrity needs no edit and no wiring record.
+                        Some(integrity) if *integrity == format!("\"{}\"", packed.integrity) => {
+                            continue;
+                        }
+                        // Digest-less re-save of THIS wiring (Bun 1.1.39–1.3.9)
+                        // over the SAME bytes the lock was written from (the
+                        // artifact found at the path before this run re-staged
+                        // it equals the staged one): heal the line in place,
+                        // record nothing — the ledger's fingerprint still holds.
+                        None if prior_artifact_integrity.as_deref()
+                            == Some(packed.integrity.as_str()) =>
+                        {
+                            lines[entry.line_idx] = local_tuple_line(&entry.elems[1]);
+                            healed = true;
+                            continue;
+                        }
+                        // Same path, different digest — or a digest-less line
+                        // whose artifact was missing or differed before staging
+                        // (a `repair` rebuild, a service-prebuilt ↔ local-pack
+                        // flip): re-pinned below like any stale tuple of ours,
+                        // so the returned entry carries the rebuilt artifact's
+                        // fingerprint (`carry_forward_wiring` refills the
+                        // pristine original from the entry it replaces).
+                        _ => {}
+                    }
+                }
+                (entry.elems[1].clone(), true)
+            }
+        };
+        let new_line = local_tuple_line(&deps_verbatim);
         lines[entry.line_idx] = new_line.clone();
         wiring.push(WiringRecord {
             file: BUN_LOCK.to_string(),
@@ -344,8 +398,29 @@ pub(crate) async fn vendor_bun(
 
     if !changed {
         // Every instance already points at this uuid with the packed
-        // integrity: in sync. The tarball re-pack above was byte-identical
-        // by determinism; synthesize AlreadyPatched and record nothing.
+        // integrity (or with the digest Bun dropped, now re-pinned): in
+        // sync. The tarball re-pack above was byte-identical by
+        // determinism; synthesize AlreadyPatched and record nothing. The
+        // heal is the one write of an in-sync run, and a failed write
+        // leaves the still-installable digest-less lock — reported as the
+        // failure it is, like every other lock write below.
+        if healed {
+            if let Err(e) = atomic_write_bytes_preserving_mode(
+                &project_root.join(BUN_LOCK),
+                lines.join("\n").as_bytes(),
+            )
+            .await
+            {
+                return done_failure_unstage(
+                    purl,
+                    format!("cannot write {BUN_LOCK}: {e}"),
+                    project_root,
+                    &coords.uuid_dir_rel,
+                    uuid_dir_preexisted,
+                )
+                .await;
+            }
+        }
         return VendorOutcome::Done {
             result: already_patched_result(purl, &project_root.join(&rel_tgz), &record.files),
             entry: None,
@@ -580,9 +655,12 @@ fn revert_one_record(
             return;
         }
         // Ours iff the line is exactly what we wrote, or its tuple still
-        // points into OUR uuid dir (a re-serialized but unmoved entry).
+        // points into OUR uuid dir (a re-serialized but unmoved entry —
+        // including the digest-less 2-tuple Bun 1.1.39–1.3.9 re-save our
+        // 3-tuple as on any later lock re-save; the path is the claim, the
+        // dropped sha512 proves nothing either way).
         let exact = Some(lines[idx].as_str()) == rec.new.as_ref().and_then(Value::as_str);
-        let ours_uuid = parsed.elems.len() == 3
+        let ours_uuid = matches!(parsed.elems.len(), 2 | 3)
             && decode_json_string(&parsed.elems[0])
                 .and_then(|spec| split_name_spec(&spec).map(|(_, p)| p.to_string()))
                 .and_then(|path| parse_vendor_path(&path))
@@ -624,7 +702,9 @@ fn revert_one_record(
 enum TupleShape {
     /// Registry 4-tuple `["name@version", "<registry>", {deps}, "sha512-…"]`.
     Registry,
-    /// Our local 3-tuple (any uuid; the caller decides current vs stale).
+    /// Our local tuple (any uuid; the caller decides current vs stale): the
+    /// 3-tuple we write, or the digest-less 2-tuple Bun 1.1.39–1.3.9 re-save
+    /// it as (`elems.len()` tells them apart; only a 3-tuple has `elems[2]`).
     Ours { path: String },
 }
 
@@ -634,7 +714,12 @@ enum TupleShape {
 /// `None` otherwise. The Ours arm matches on the uuid-independent tarball
 /// leaf, NOT the name alone: a vendored tuple for ANOTHER version of the
 /// same package is someone else's edit (two patched versions can coexist in
-/// one lock — nested instances) and must never be cross-clobbered.
+/// one lock — nested instances) and must never be cross-clobbered. It
+/// accepts the 2-tuple spelling too: Bun 1.1.39–1.3.9 drop a local tarball
+/// tuple's `"sha512-…"` on any lock re-save (`bun add`, `bun install` after
+/// a manifest change), leaving spec and meta intact — still our wiring, so
+/// re-runs stay in sync, `repair` can rebuild and revert can unwind it
+/// instead of refusing `vendor_lock_entry_not_found` / `_drifted`.
 fn classify(
     entry: &BunEntry,
     target_spec: &str,
@@ -650,7 +735,7 @@ fn classify(
         {
             Some(TupleShape::Registry)
         }
-        3 => {
+        2 | 3 => {
             let (entry_name, path) = split_name_spec(&spec)?;
             if entry_name != name || !entry.elems[1].starts_with('{') {
                 return None;
@@ -670,8 +755,6 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::{ApplyResult, VerifyStatus};
-    use base64::Engine as _;
-    use sha2::{Digest, Sha512};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -2422,6 +2505,307 @@ mod tests {
                 .exists(),
             "cleanup completes"
         );
+    }
+
+    // ── digest-less re-saves (Bun 1.1.39–1.3.9, every text-lock release below 1.3.10) ─────────────────────────
+    // Those releases re-save our local-tarball 3-tuple WITHOUT its sha512
+    // on any later lock re-save (`bun add`, `bun install` after a manifest
+    // change) — verified on real 1.2.23 and 1.3.9; 1.3.10+ keep it. The
+    // 2-tuple `["name@.socket/vendor/npm/<uuid>/leaf", {meta}]` is still
+    // our wiring: re-runs stay in sync (and heal the digest back, recording
+    // nothing), `repair` rebuilds through it, and revert unwinds it.
+
+    /// Strip the trailing integrity element of a 3-tuple line the way Bun
+    /// < 1.3.10 re-saves it (any `\r` kept).
+    fn drop_digest(line: &str) -> String {
+        let cut = line
+            .rfind(", \"sha512-")
+            .unwrap_or_else(|| panic!("no sha512 element in {line}"));
+        let tail = if line.trim_end_matches('\r').ends_with("],") {
+            "],"
+        } else {
+            "]"
+        };
+        let cr = if line.ends_with('\r') { "\r" } else { "" };
+        format!("{}{tail}{cr}", &line[..cut])
+    }
+
+    /// The wired line of `entry` and the lock with that line's digest dropped.
+    fn digestless_lock(wired: &str, entry: &VendorEntry) -> (String, String) {
+        let new_line = entry.wiring[0]
+            .new
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let digestless = drop_digest(&new_line);
+        assert!(!digestless.contains("sha512-"), "{digestless}");
+        assert!(wired.contains(&new_line), "{wired}");
+        (new_line.clone(), wired.replacen(&new_line, &digestless, 1))
+    }
+
+    #[tokio::test]
+    async fn digestless_rerun_is_already_patched_and_heals_the_digest_without_a_record() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let wired = fx.read_lock().await;
+        let (_, digestless) = digestless_lock(&wired, &entry);
+        tokio::fs::write(fx.root().join(BUN_LOCK), &digestless)
+            .await
+            .unwrap();
+
+        // Re-run: in sync (AlreadyPatched, no entry), NOT
+        // `vendor_lock_entry_not_found`; the digest is healed on disk and the
+        // lock is byte-identical to the post-vendor lock again.
+        let (result, rerun_entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(rerun_entry.is_none(), "an in-sync re-run records nothing");
+        assert!(
+            result
+                .files_verified
+                .iter()
+                .all(|v| v.status == VerifyStatus::AlreadyPatched),
+            "{:?}",
+            result.files_verified
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            fx.read_lock().await,
+            wired,
+            "digest healed back to the 3-tuple"
+        );
+
+        // The healed lock reverts through the ORIGINAL entry byte-exactly.
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK);
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+    }
+
+    /// Revert straight over the digest-less line (no re-run in between —
+    /// `rollback` right after a `bun add`): the path claims the line, the
+    /// registry original comes back, the artifact goes, no drift warning.
+    #[tokio::test]
+    async fn digestless_tuple_revert_restores_the_registry_line() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let (_, digestless) = digestless_lock(&fx.read_lock().await, &entry);
+        tokio::fs::write(fx.root().join(BUN_LOCK), &digestless)
+            .await
+            .unwrap();
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome.warnings.is_empty(),
+            "a digest-less spelling of our own tuple is not drift: {:?}",
+            outcome.warnings
+        );
+        assert!(!outcome.kept_artifact);
+        assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK);
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+    }
+
+    /// CRLF lock: the digest-less re-save keeps `\r`; the heal keeps every
+    /// line's `\r\n` and revert lands byte-exact on the CRLF original.
+    #[tokio::test]
+    async fn digestless_crlf_lock_heals_and_reverts_byte_exact() {
+        let crlf_before = BN3_BEFORE_LOCK.replace('\n', "\r\n");
+        let fx = fixture_with(&crlf_before, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let wired = fx.read_lock().await;
+        let (new_line, digestless) = digestless_lock(&wired, &entry);
+        assert!(
+            new_line.ends_with('\r'),
+            "wired line carries its \\r: {new_line:?}"
+        );
+        tokio::fs::write(fx.root().join(BUN_LOCK), &digestless)
+            .await
+            .unwrap();
+
+        let (result, rerun_entry, _) = expect_done(fx.vendor(false).await);
+        assert!(
+            result.success && rerun_entry.is_none(),
+            "{:?}",
+            result.error
+        );
+        let healed = fx.read_lock().await;
+        assert_eq!(healed, wired, "CRLF heal is byte-exact");
+        assert_eq!(healed.matches('\n').count(), healed.matches("\r\n").count());
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(
+            outcome.success && outcome.warnings.is_empty(),
+            "{outcome:?}"
+        );
+        assert_eq!(fx.read_lock().await, crlf_before);
+    }
+
+    /// The upgraded-workspace case (the matrix's `already-vendored-workspace`
+    /// shape on Bun 1.1.39–1.3.9): vendored, then a member added and `bun
+    /// install` re-saved the lock digest-less. The in-sync re-run must stay
+    /// AlreadyPatched (the v1 workspace gate fires only on a run that would
+    /// WRITE a new local tuple) and heal the digest; revert restores the
+    /// grown lock with the registry line back.
+    #[tokio::test]
+    async fn digestless_rerun_on_v1_workspace_lock_is_already_patched_and_heals() {
+        for version in [0u64, 1] {
+            let (fx, entry, lock) = vendored_then_workspace_added(version).await;
+            let (_, digestless) = digestless_lock(&lock, &entry);
+            tokio::fs::write(fx.root().join(BUN_LOCK), &digestless)
+                .await
+                .unwrap();
+            let (result, rerun_entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "v{version}: {:?}", result.error);
+            assert!(
+                rerun_entry.is_none(),
+                "v{version}: in-sync re-run records nothing"
+            );
+            assert!(
+                result
+                    .files_verified
+                    .iter()
+                    .all(|v| v.status == VerifyStatus::AlreadyPatched),
+                "v{version}: {:?}",
+                result.files_verified
+            );
+            assert_eq!(fx.read_lock().await, lock, "v{version}: digest healed");
+
+            let outcome = revert_bun(&entry, fx.root(), false).await;
+            assert!(
+                outcome.success && outcome.warnings.is_empty(),
+                "v{version}: {outcome:?}"
+            );
+            let original_line = entry.wiring[0]
+                .original
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap();
+            let new_line = entry.wiring[0]
+                .new
+                .as_ref()
+                .and_then(Value::as_str)
+                .unwrap();
+            assert_eq!(
+                fx.read_lock().await,
+                lock.replacen(new_line, original_line, 1),
+                "v{version}: the grown lock with the registry line put back"
+            );
+        }
+    }
+
+    /// `repair` on a digest-less lock: the artifact is gone, the lock still
+    /// points at it (2-tuple). The rebuild routes through `vendor_bun`, must
+    /// pass the has-match preflight (the 2-tuple IS our instance), rebuild
+    /// the tarball and heal the digest — never refuse
+    /// `vendor_lock_entry_not_found` and leave the lock pointing at ENOENT.
+    #[tokio::test]
+    async fn rebuild_on_missing_tarball_through_a_digestless_lock_succeeds() {
+        for version in [0u64, 1, 2] {
+            let (fx, entry, lock) = vendored_then_workspace_added(version).await;
+            let (_, digestless) = digestless_lock(&lock, &entry);
+            tokio::fs::write(fx.root().join(BUN_LOCK), &digestless)
+                .await
+                .unwrap();
+            let tgz = fx.root().join(fx.rel_tgz());
+            tokio::fs::remove_file(&tgz).await.unwrap();
+
+            let (result, rebuilt_entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "v{version}: {:?}", result.error);
+            assert!(tgz.is_file(), "v{version}: the tarball must be rebuilt");
+            assert_eq!(
+                fx.read_lock().await,
+                lock,
+                "v{version}: the rebuilt digest is re-pinned into the healed 3-tuple"
+            );
+            // No artifact stood witness for the dropped digest, so this is
+            // a re-pin, not a silent heal: a fresh entry carries the rebuilt
+            // fingerprint for the ledger (its `original` is refilled from
+            // the replaced entry by `carry_forward_wiring`).
+            let rebuilt_entry =
+                rebuilt_entry.expect("a rebuild through a digest-less line returns an entry");
+            assert_eq!(rebuilt_entry.artifact.path, fx.rel_tgz());
+            assert!(rebuilt_entry.wiring[0].original.is_none(), "v{version}");
+        }
+    }
+
+    /// The digest-less line's artifact is PRESENT but no longer the bytes
+    /// the lock was written from (a service-prebuilt tarball replaced by a
+    /// local pack, or vice versa). The tuple cannot say which digest it
+    /// pinned, so this is a re-pin with a fresh entry — never a silent heal
+    /// that would leave the ledger's fingerprint pointing at other bytes
+    /// (`repair`'s post-verify then rejects the rebuild and deletes it).
+    #[tokio::test]
+    async fn digestless_tuple_over_different_artifact_bytes_is_repinned_with_a_fresh_entry() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let wired = fx.read_lock().await;
+        let (_, digestless) = digestless_lock(&wired, &entry);
+        tokio::fs::write(fx.root().join(BUN_LOCK), &digestless)
+            .await
+            .unwrap();
+        // Different artifact bytes at the same path.
+        tokio::fs::write(fx.root().join(fx.rel_tgz()), b"not the packed tarball")
+            .await
+            .unwrap();
+
+        let (result, repinned, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let repinned = repinned.expect("differing bytes force a re-pin with a fresh entry");
+        assert_eq!(
+            fx.read_lock().await,
+            wired,
+            "the line is re-pinned to the freshly packed digest"
+        );
+        assert_eq!(
+            repinned.artifact.sha256, entry.artifact.sha256,
+            "the fresh entry fingerprints the re-staged (deterministic) pack"
+        );
+        assert!(repinned.wiring[0].original.is_none());
+        assert_eq!(
+            repinned.wiring[0].new.as_ref().and_then(Value::as_str),
+            entry.wiring[0].new.as_ref().and_then(Value::as_str)
+        );
+    }
+
+    /// A digest-less 2-tuple pointing at ANOTHER uuid for the same leaf is
+    /// not this entry's wiring on revert: drift-kept with the warning, the
+    /// lock and artifact left alone (mirrors the 3-tuple stale-uuid rule).
+    #[tokio::test]
+    async fn digestless_tuple_of_another_uuid_is_drift_on_revert() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let (_, digestless) = digestless_lock(&fx.read_lock().await, &entry);
+        let foreign = digestless.replace(UUID, UUID_B);
+        assert_ne!(foreign, digestless);
+        tokio::fs::write(fx.root().join(BUN_LOCK), &foreign)
+            .await
+            .unwrap();
+
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted" && w.detail.contains("left-pad")),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(outcome.kept_artifact, "drift keeps the artifact");
+        assert_eq!(fx.read_lock().await, foreign, "lock untouched");
     }
 
     /// A re-vendor under a NEW uuid rewrites our own earlier tuple, so its

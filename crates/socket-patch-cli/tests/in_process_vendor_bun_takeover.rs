@@ -479,6 +479,216 @@ async fn bun_hosted_then_scan_vendored_takeover_round_trips_to_registry() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// 1b. Digest-less re-saves (Bun 1.1.39–1.3.9) across the conversions
+// ─────────────────────────────────────────────────────────────────────
+// Every text-lock release below 1.3.10 re-saves a URL or local-tarball
+// 3-tuple WITHOUT its sha512 on any later lock re-save (`bun add`, `bun
+// install` after a manifest change; measured on real 1.1.45, 1.2.23 and
+// 1.3.9). The 2-tuple is still the recorded wiring (same key, spec and
+// meta): the per-purl claim must not refuse it as drift, or the
+// hosted→vendored takeover, `rollback <purl>` and `remove <purl>` all fail
+// `redirect_revert_failed`; the vendored revert must claim it by path, or
+// the vendored→hosted takeover fails `redirect_vendored_revert_failed`.
+
+/// The line as Bun < 1.3.10 re-saves it: trailing `"sha512-…"` dropped.
+fn drop_bun_digest(line: &str) -> String {
+    let cut = line
+        .rfind(", \"sha512-")
+        .unwrap_or_else(|| panic!("no sha512 element in {line}"));
+    let tail = if line.ends_with("],") { "]," } else { "]" };
+    format!("{}{tail}", &line[..cut])
+}
+
+/// Re-spell the `key` packages line of the live bun.lock digest-less.
+fn drop_digest_in_lock(root: &Path, key: &str) -> String {
+    let lock = read(root, "bun.lock");
+    let line = lock_line(&lock, key);
+    let digestless = drop_bun_digest(&line);
+    assert!(
+        !digestless.contains("sha512") && digestless.ends_with("],"),
+        "{digestless}"
+    );
+    std::fs::write(root.join("bun.lock"), lock.replace(&line, &digestless)).unwrap();
+    digestless
+}
+
+fn redirect_warning_codes(env: &Value) -> Vec<String> {
+    env["redirect"]["warnings"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|w| w["code"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_digestless_hosted_line_is_taken_over_by_scan_vendored_and_reverts_to_registry() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_bun_project(root, &pristine_lock(), &[(NAME, VERSION)]);
+    let pristine = std::fs::read(root.join("bun.lock")).unwrap();
+
+    let (code, env) = scan_mode(root, &server.uri(), "hosted", &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(
+        lock_line(&read(root, "bun.lock"), NAME),
+        hosted_line(NAME, NAME, HOSTED_URL, PATCHED_SHA512)
+    );
+    let digestless = drop_digest_in_lock(root, NAME);
+    assert!(digestless.contains(HOSTED_URL), "{digestless}");
+
+    // The takeover over the digest-less hosted line: used to refuse
+    // `redirect_revert_failed` ("has drifted from the recorded hosted
+    // redirect") and vendor nothing.
+    let (code, env) = scan_mode(root, &server.uri(), "vendored", &[]);
+    assert_eq!(code, 0, "takeover over a digest-less hosted line: {env:#}");
+    assert_eq!(env["status"], "success", "{env:#}");
+    let vendor = &env["vendor"];
+    assert_eq!(vendor["summary"]["applied"], 1, "{env:#}");
+    assert_eq!(vendor["summary"]["failed"], 0, "{env:#}");
+    find_event(vendor, "skipped", Some("vendor_takeover_reverted_redirect"));
+    find_event(vendor, "applied", None);
+    assert_no_event_code(vendor, "redirect_revert_failed");
+    assert_pure_vendored(root);
+
+    // And the vendored wiring, re-saved digest-less again, still reverts
+    // to the pristine registry lock.
+    drop_digest_in_lock(root, NAME);
+    let (code, env) = vendor_cli(root, &["--revert"]);
+    assert_eq!(code, 0, "revert over a digest-less vendored line: {env:#}");
+    assert_eq!(env["status"], "success", "{env:#}");
+    assert_eq!(
+        std::fs::read(root.join("bun.lock")).unwrap(),
+        pristine,
+        "bun.lock restored byte-identical to the pristine registry lock; got:\n{}",
+        read(root, "bun.lock")
+    );
+    assert!(
+        !root.join(".socket/vendor").exists(),
+        ".socket/vendor pruned"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_digestless_vendored_line_is_taken_over_by_scan_hosted_and_rolls_back_to_registry() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_bun_project(root, &pristine_lock(), &[(NAME, VERSION)]);
+    let pristine = std::fs::read(root.join("bun.lock")).unwrap();
+
+    let (code, env) = scan_mode(root, &server.uri(), "vendored", &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(env["vendor"]["summary"]["applied"], 1, "{env:#}");
+    let digestless = drop_digest_in_lock(root, NAME);
+    assert!(
+        digestless.contains(&vendored_rel_tgz()),
+        "the vendored spec survives the re-save: {digestless}"
+    );
+
+    // vendored → hosted over the digest-less local tuple: the vendored
+    // revert claims the line by its `.socket/vendor/npm/<uuid>/` path.
+    let (code, env) = scan_mode(root, &server.uri(), "hosted", &[]);
+    assert_eq!(
+        code, 0,
+        "takeover over a digest-less vendored line: {env:#}"
+    );
+    assert_eq!(env["status"], "success", "{env:#}");
+    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+    let codes = redirect_warning_codes(&env);
+    assert!(
+        codes
+            .iter()
+            .any(|c| c == "redirect_takeover_reverted_vendored"),
+        "the takeover must be announced: {codes:?}\n{env:#}"
+    );
+    assert!(
+        !codes.iter().any(|c| c == "redirect_vendored_revert_failed"),
+        "the vendored revert must not be refused: {env:#}"
+    );
+    let lock = read(root, "bun.lock");
+    assert_eq!(
+        lock_line(&lock, NAME),
+        hosted_line(NAME, NAME, HOSTED_URL, PATCHED_SHA512),
+        "hosted URL 3-tuple written:\n{lock}"
+    );
+    assert!(
+        !lock.contains(".socket/vendor/npm/"),
+        "the local tuple must be gone:\n{lock}"
+    );
+    assert!(
+        !root.join(vendored_rel_tgz()).exists(),
+        "the vendored artifact must be removed by the takeover"
+    );
+    let ledger: Value =
+        serde_json::from_str(&read(root, ".socket/vendor/redirect-state.json")).unwrap();
+    assert_eq!(
+        ledger["edits"][0]["original"],
+        json!(LEFT_PAD_REGISTRY_LINE),
+        "the hosted ledger records the PRISTINE registry line as its original: {ledger:#}"
+    );
+
+    // Unscoped rollback of the hosted wiring lands on the pristine lock.
+    let (code, env) = run_json(
+        root,
+        &[
+            "rollback",
+            "--yes",
+            "--json",
+            "--cwd",
+            root.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(env["status"], "success", "{env:#}");
+    assert_eq!(
+        std::fs::read(root.join("bun.lock")).unwrap(),
+        pristine,
+        "pristine lock restored; got:\n{}",
+        read(root, "bun.lock")
+    );
+}
+
+#[test]
+fn bun_scoped_rollback_and_remove_of_a_digestless_hosted_record_unwind_only_that_purl() {
+    for verb in ["rollback", "remove"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let pristine = write_two_record_hosted_project(root);
+        let digestless = drop_digest_in_lock(root, NAME);
+        assert!(digestless.contains(HOSTED_URL), "{digestless}");
+
+        let (code, env) = run_json(
+            root,
+            &[
+                verb,
+                PURL,
+                "--yes",
+                "--json",
+                "--cwd",
+                root.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            code, 0,
+            "scoped {verb} over a digest-less hosted line must succeed: {env:#}"
+        );
+        if verb == "rollback" {
+            assert_eq!(env["hosted"]["reverted"], json!([PURL]), "{env:#}");
+            assert_eq!(env["hosted"]["failed"], json!([]), "{env:#}");
+        } else {
+            assert!(env["error"].is_null(), "{env:#}");
+        }
+        assert_only_left_pad_unwound(root, &pristine);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // 2. vendor --dry-run over the live hosted redirect, then the wet vendor
 // ─────────────────────────────────────────────────────────────────────
 

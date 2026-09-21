@@ -552,7 +552,10 @@ pub async fn revert_remaining_redirect_edits(
                                 group_drops.insert(idx);
                             }
                             _ => {
-                                refuse(format!("{}: Hatch configuration drifted", edit.path), &mut outcome);
+                                refuse(
+                                    format!("{}: Hatch configuration drifted", edit.path),
+                                    &mut outcome,
+                                );
                                 refused_groups.insert(group);
                                 continue 'group;
                             }
@@ -588,17 +591,43 @@ pub async fn revert_remaining_redirect_edits(
                         // the edit as reverted.
                         group_drops.insert(idx);
                     } else {
-                        refuse(
-                            format!(
-                                "{}: content matches neither the redirected nor the \
-                                 original fragment for {} — the file drifted; re-run \
-                                 `scan --mode hosted` to normalize",
-                                edit.path, edit.kind
-                            ),
-                            &mut outcome,
-                        );
-                        refused_groups.insert(group);
-                        continue 'group;
+                        // bun only: Bun 1.1.39–1.3.9 re-save our URL 3-tuple
+                        // WITHOUT its sha512 on any later lock re-save, so
+                        // the recorded `new` is on disk as a digest-less
+                        // 2-tuple — same key, spec and meta. That spelling
+                        // is the recorded wiring, not drift: put `original`
+                        // back over it. Anything else still refuses.
+                        let healed = if edit.kind == "redirect_bun_lock_package" {
+                            crate::vendor::bun_lock_text::restore_digestless_line(
+                                &content, new, original,
+                            )
+                        } else {
+                            Ok(None)
+                        };
+                        match healed {
+                            Ok(Some(restored)) => {
+                                staged.insert(edit.path.clone(), Some(restored));
+                                group_drops.insert(idx);
+                            }
+                            Ok(None) => {
+                                refuse(
+                                    format!(
+                                        "{}: content matches neither the redirected nor the \
+                                         original fragment for {} — the file drifted; re-run \
+                                         `scan --mode hosted` to normalize",
+                                        edit.path, edit.kind
+                                    ),
+                                    &mut outcome,
+                                );
+                                refused_groups.insert(group);
+                                continue 'group;
+                            }
+                            Err(ambiguous) => {
+                                refuse(format!("{}: {ambiguous}", edit.path), &mut outcome);
+                                refused_groups.insert(group);
+                                continue 'group;
+                            }
+                        }
                     }
                 }
                 Inverse::RemoveAddedFragment => {
@@ -847,9 +876,9 @@ mod tests {
         let mut state = RedirectState::new();
         state.edits = edits;
         for p in record_purls {
-            state
-                .records
-                .insert((*p).to_string(), crate::manifest::schema::PatchRecord {
+            state.records.insert(
+                (*p).to_string(),
+                crate::manifest::schema::PatchRecord {
                     uuid: "u".into(),
                     exported_at: "now".into(),
                     files: Default::default(),
@@ -878,20 +907,42 @@ mod tests {
     #[tokio::test]
     async fn hatch_documents_revert_after_checkout_newline_conversion() {
         let original = "[project]\ndependencies=[\"one==1\"]\n[tool.hatch.envs.default]\n";
-        let files = [("pyproject.toml".to_owned(), original.to_owned())].into_iter().collect();
-        let patched = crate::utils::hatch::rewrite(&files, "one", "1", "https://patch.test/one.whl").unwrap().remove("pyproject.toml").unwrap();
+        let files = [("pyproject.toml".to_owned(), original.to_owned())]
+            .into_iter()
+            .collect();
+        let patched =
+            crate::utils::hatch::rewrite(&files, "one", "1", "https://patch.test/one.whl")
+                .unwrap()
+                .remove("pyproject.toml")
+                .unwrap();
         for drift in [false, true] {
             let dir = TempDir::new().unwrap();
-            let live = if drift {patched.replace("one.whl", "changed.whl")} else {patched.replace('\n', "\r\n")};
+            let live = if drift {
+                patched.replace("one.whl", "changed.whl")
+            } else {
+                patched.replace('\n', "\r\n")
+            };
             write(dir.path(), "pyproject.toml", &live).await;
-            let mut state = state_with(vec![edit("pyproject.toml", "redirect_hatch_document", "rewritten", Some(original), Some(&patched))], &["pkg:pypi/one@1"]);
+            let mut state = state_with(
+                vec![edit(
+                    "pyproject.toml",
+                    "redirect_hatch_document",
+                    "rewritten",
+                    Some(original),
+                    Some(&patched),
+                )],
+                &["pkg:pypi/one@1"],
+            );
             let outcome = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
             assert_eq!(outcome.fully_reverted(), !drift);
             if drift {
                 assert_eq!(read(dir.path(), "pyproject.toml").await, live);
                 assert_eq!(state.edits.len(), 1);
             } else {
-                assert_eq!(read(dir.path(), "pyproject.toml").await, original.replace('\n', "\r\n"));
+                assert_eq!(
+                    read(dir.path(), "pyproject.toml").await,
+                    original.replace('\n', "\r\n")
+                );
                 assert!(state.edits.is_empty());
             }
         }
@@ -920,7 +971,10 @@ mod tests {
         );
         let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
         assert!(out.fully_reverted(), "{:?}", out.refusals);
-        assert_eq!(read(dir.path(), "requirements.txt").await, "left-pad==1.3.0\n");
+        assert_eq!(
+            read(dir.path(), "requirements.txt").await,
+            "left-pad==1.3.0\n"
+        );
         assert!(state.edits.is_empty());
         assert!(state.records.is_empty());
         assert_eq!(out.dropped_records, vec!["pkg:pypi/left-pad@1.3.0"]);
@@ -948,7 +1002,10 @@ mod tests {
         );
         let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
         assert!(out.fully_reverted(), "{:?}", out.refusals);
-        assert_eq!(read(dir.path(), "pom.xml").await, "<version>2.17.1</version>\n");
+        assert_eq!(
+            read(dir.path(), "pom.xml").await,
+            "<version>2.17.1</version>\n"
+        );
     }
 
     #[tokio::test]
@@ -1075,6 +1132,182 @@ mod tests {
         let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
         assert!(out.fully_reverted(), "{:?}", out.refusals);
         assert_eq!(read(dir.path(), "go.mod").await, "module m\n");
+    }
+
+    // ---------- bun: digest-less re-saves (Bun 1.1.39–1.3.9, every text-lock release below 1.3.10) ----------
+
+    const BUN_URL: &str =
+        "https://patch.socket.dev/patch/npm/tok-1111/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/left-pad-1.3.0.tgz";
+    const BUN_REGISTRY_LINE: &str =
+        "    \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-XI5M==\"],";
+
+    fn bun_url_line(sha: &str) -> String {
+        format!("    \"left-pad\": [\"left-pad@{BUN_URL}\", {{}}, \"{sha}\"],")
+    }
+
+    fn bun_digestless_line() -> String {
+        format!("    \"left-pad\": [\"left-pad@{BUN_URL}\", {{}}],")
+    }
+
+    fn bun_lock(entry: &str) -> String {
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n    \"abbrev\": [\"abbrev@1.1.1\", \
+             \"\", {{}}, \"sha512-D==\"],\n\n{entry}\n  }}\n}}\n"
+        )
+    }
+
+    fn bun_edit(original: &str, new: &str) -> FileEdit {
+        edit(
+            "bun.lock",
+            "redirect_bun_lock_package",
+            "rewritten",
+            Some(original),
+            Some(new),
+        )
+    }
+
+    /// The live lock carries the digest-less 2-tuple Bun < 1.3.10 re-saved
+    /// our URL 3-tuple as; the recorded `new` is the 3-tuple. That is the
+    /// recorded wiring, not drift: the registry original comes back, the
+    /// edit and record are consumed.
+    #[tokio::test]
+    async fn bun_digestless_live_line_replays_to_the_registry_original() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "bun.lock", &bun_lock(&bun_digestless_line())).await;
+        let mut state = state_with(
+            vec![bun_edit(BUN_REGISTRY_LINE, &bun_url_line("sha512-AAAA=="))],
+            &["pkg:npm/left-pad@1.3.0"],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(
+            read(dir.path(), "bun.lock").await,
+            bun_lock(BUN_REGISTRY_LINE),
+            "the pristine registry line is restored, the decoy untouched"
+        );
+        assert!(state.edits.is_empty() && state.records.is_empty());
+        assert_eq!(out.dropped_records, vec!["pkg:npm/left-pad@1.3.0"]);
+
+        // CRLF lock (ledger recorded with `\r` on both fragments, as the
+        // rewriter does): every line keeps its `\r\n`.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "bun.lock",
+            &bun_lock(&bun_digestless_line()).replace('\n', "\r\n"),
+        )
+        .await;
+        let mut state = state_with(
+            vec![bun_edit(
+                &format!("{BUN_REGISTRY_LINE}\r"),
+                &format!("{}\r", bun_url_line("sha512-AAAA==")),
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(
+            read(dir.path(), "bun.lock").await,
+            bun_lock(BUN_REGISTRY_LINE).replace('\n', "\r\n")
+        );
+    }
+
+    /// The hosted rewriter HEALS a digest-less tuple and records that heal
+    /// as a second edit for the same key (`original` = the 2-tuple). The
+    /// chain unwinds newest-first: heal → 2-tuple, then the first edit
+    /// recognises the 2-tuple as its digest-less `new` → registry line.
+    /// Same end state when Bun has since dropped the digest AGAIN (the
+    /// heal edit is then "already at its original" and simply drops).
+    #[tokio::test]
+    async fn bun_heal_chain_unwinds_to_the_registry_line() {
+        let healed = bun_url_line("sha512-AAAA==");
+        for live in [healed.clone(), bun_digestless_line()] {
+            let dir = TempDir::new().unwrap();
+            write(dir.path(), "bun.lock", &bun_lock(&live)).await;
+            let mut state = state_with(
+                vec![
+                    bun_edit(BUN_REGISTRY_LINE, &healed),
+                    bun_edit(&bun_digestless_line(), &healed),
+                ],
+                &["pkg:npm/left-pad@1.3.0"],
+            );
+            let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+            assert!(out.fully_reverted(), "live={live}: {:?}", out.refusals);
+            assert_eq!(
+                read(dir.path(), "bun.lock").await,
+                bun_lock(BUN_REGISTRY_LINE),
+                "live={live}: the chain must end at the pristine registry line"
+            );
+            assert!(state.edits.is_empty() && state.records.is_empty());
+        }
+    }
+
+    /// The relaxation is exactly "our tuple minus its digest": another
+    /// uuid/token in the URL, a re-laid meta object, a duplicate digest-less
+    /// instance, or a non-bun edit kind over the same bytes all still
+    /// refuse, leaving the file byte-identical.
+    #[tokio::test]
+    async fn bun_digestless_relaxation_is_narrow() {
+        let recorded_new = bun_url_line("sha512-AAAA==");
+        let other_uuid = bun_digestless_line().replace(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        );
+        let other_meta = bun_digestless_line().replace("{}", "{ \"bin\": \"x\" }");
+        for (live, kind, reason) in [
+            (
+                bun_lock(&other_uuid),
+                "redirect_bun_lock_package",
+                "neither the redirected nor the original",
+            ),
+            (
+                bun_lock(&other_meta),
+                "redirect_bun_lock_package",
+                "neither the redirected nor the original",
+            ),
+            (
+                bun_lock(&format!(
+                    "{}\n{}",
+                    bun_digestless_line(),
+                    bun_digestless_line()
+                )),
+                "redirect_bun_lock_package",
+                "more than once",
+            ),
+            (
+                bun_lock(&bun_digestless_line()),
+                "redirect_pnpm_resolution",
+                "neither the redirected nor the original",
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            write(dir.path(), "bun.lock", &live).await;
+            let mut state = state_with(
+                vec![edit(
+                    "bun.lock",
+                    kind,
+                    "rewritten",
+                    Some(BUN_REGISTRY_LINE),
+                    Some(&recorded_new),
+                )],
+                &["pkg:npm/left-pad@1.3.0"],
+            );
+            let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+            assert_eq!(
+                out.refusals.len(),
+                1,
+                "{kind} over {live}: {:?}",
+                out.refusals
+            );
+            assert!(
+                out.refusals[0].reason.contains(reason),
+                "{kind}: {}",
+                out.refusals[0].reason
+            );
+            assert_eq!(read(dir.path(), "bun.lock").await, live, "file untouched");
+            assert_eq!(state.edits.len(), 1, "refused edit kept");
+            assert!(state.records.contains_key("pkg:npm/left-pad@1.3.0"));
+        }
     }
 
     // ---------- RemoveAddedFragment / ReinsertRemoved ----------
@@ -1392,7 +1625,9 @@ mod tests {
         // The npm group refused; the bun group replayed.
         assert_eq!(out.refusals.len(), 1);
         assert_eq!(out.refusals[0].group, "npm");
-        assert!(read(dir.path(), "bun.lock").await.contains("upstream.example"));
+        assert!(read(dir.path(), "bun.lock")
+            .await
+            .contains("upstream.example"));
         // npm-family records are held while ANY npm-family group refused.
         assert!(state.records.contains_key("pkg:npm/a@1"));
         assert_eq!(state.edits.len(), 1, "only the refused npm edit remains");
@@ -1572,7 +1807,9 @@ mod tests {
         assert_eq!(out.dropped_records, vec!["pkg:pypi/left-pad@1.3.0"]);
         assert!(out.reverted_files.contains("requirements.txt"));
         // Disk and ledger untouched.
-        assert!(read(dir.path(), "requirements.txt").await.contains("patch.example"));
+        assert!(read(dir.path(), "requirements.txt")
+            .await
+            .contains("patch.example"));
         assert_eq!(state.edits.len(), 1);
         assert_eq!(state.records.len(), 1);
     }
@@ -2040,7 +2277,9 @@ mod tests {
         );
         let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
         assert_eq!(out.refusals.len(), 1, "{out:?}");
-        assert!(out.refusals[0].reason.contains("missing its recorded lines"));
+        assert!(out.refusals[0]
+            .reason
+            .contains("missing its recorded lines"));
         assert_eq!(state.edits.len(), 1);
         assert_eq!(read(dir.path(), "go.sum").await, "x v1 h1:a\n");
     }
@@ -2086,10 +2325,16 @@ mod tests {
         ];
         for (path, kind, action, original, new) in cases {
             let dir = TempDir::new().unwrap();
-            tokio::fs::create_dir_all(dir.path().join(path)).await.unwrap();
+            tokio::fs::create_dir_all(dir.path().join(path))
+                .await
+                .unwrap();
             let mut state = state_with(vec![edit(path, kind, action, original, new)], &[]);
             let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
-            assert_eq!(out.refusals.len(), 1, "{kind}/{action} must refuse: {out:?}");
+            assert_eq!(
+                out.refusals.len(),
+                1,
+                "{kind}/{action} must refuse: {out:?}"
+            );
             assert!(
                 out.refusals[0].reason.starts_with(&format!("read {path}:")),
                 "{kind}/{action}: {}",
@@ -2354,7 +2599,10 @@ mod tests {
         );
         let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
         assert_eq!(out.refusals.len(), 1, "{out:?}");
-        assert_eq!(out.refusals[0].reason, "composer.lock is not a regular file");
+        assert_eq!(
+            out.refusals[0].reason,
+            "composer.lock is not a regular file"
+        );
         assert_eq!(
             read(dir.path(), "real.lock").await,
             "https://patch.example/a\n",

@@ -967,6 +967,140 @@ async fn scan_redirect_refuses_bun_lock_v3() {
     );
 }
 
+/// The packages-entry line keyed `key` in a bun.lock (verbatim, no line
+/// terminator).
+fn bun_packages_line(lock: &str, key: &str) -> String {
+    let prefix = format!("    \"{key}\": [");
+    lock.split('\n')
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no `{key}` packages entry in:\n{lock}"))
+        .trim_end_matches('\r')
+        .to_string()
+}
+
+/// Re-spell a URL 3-tuple line the way Bun 1.1.39–1.3.9 re-save it on any
+/// later lock re-save (`bun add <pkg>`, `bun install` after a package.json
+/// change): the trailing `"sha512-…"` element dropped, everything else
+/// verbatim (measured on real 1.1.45, 1.2.23 and 1.3.9; 1.3.10+ keep it).
+fn drop_bun_digest(line: &str) -> String {
+    let cut = line
+        .rfind(", \"sha512-")
+        .unwrap_or_else(|| panic!("no sha512 element in {line}"));
+    let tail = if line.ends_with("],") { "]," } else { "]" };
+    format!("{}{tail}", &line[..cut])
+}
+
+/// Bun 1.1.39–1.3.9 re-save our URL 3-tuple WITHOUT its sha512 whenever the
+/// lock is re-saved for another reason. The digest-less 2-tuple is still
+/// our wiring (the spec bun installs from is intact): a repeat `scan
+/// --mode hosted` must report a CONSISTENT envelope — `redirected: 1` with
+/// no `redirect_bun_entry_not_found` — heal the line back to the 3-tuple
+/// and record the heal as a second ledger edit for the key (`original` =
+/// the 2-tuple); a third run appends nothing; and `rollback` must unwind
+/// the chain to the pristine registry line whether the lock is the healed
+/// 3-tuple or Bun has since dropped the digest again. Before the fix the
+/// repeat scan warned `entry_not_found` beside `redirected: 1` and
+/// rollback refused `partial_failure` ("matches neither the redirected nor
+/// the original fragment"), stranding every user on those releases.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_heals_digestless_bun_tuple_and_rollback_restores_the_registry_line() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    // The record fetch too, so the "no warnings at all" assertion below is
+    // exact (without it every run carries a `record_fetch_failed` advisory).
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_bun_project(tmp.path(), 1);
+    let lock_path = tmp.path().join("bun.lock");
+    let pristine = std::fs::read_to_string(&lock_path).unwrap();
+    let ledger_path = tmp.path().join(".socket/vendor/redirect-state.json");
+
+    for drop_again_before_rollback in [false, true] {
+        let env = run_redirect_subprocess(tmp.path(), &server.uri());
+        assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+        let wired = std::fs::read_to_string(&lock_path).unwrap();
+        let wired_line = bun_packages_line(&wired, NAME);
+        assert!(
+            wired_line.contains(HOSTED_URL) && wired_line.contains(PATCHED_SHA512),
+            "{wired_line}"
+        );
+        let digestless = drop_bun_digest(&wired_line);
+        assert!(
+            digestless.ends_with("{}],") && !digestless.contains("sha512"),
+            "{digestless}"
+        );
+        std::fs::write(&lock_path, wired.replace(&wired_line, &digestless)).unwrap();
+
+        // Repeat hosted run over the digest-less lock.
+        let env = run_redirect_subprocess(tmp.path(), &server.uri());
+        assert_eq!(env["status"], "success", "{env:#}");
+        assert_eq!(
+            env["redirect"]["redirected"], 1,
+            "the wired dep still counts as redirected: {env:#}"
+        );
+        let codes = warning_codes(&env);
+        assert!(
+            !codes.contains(&"redirect_bun_entry_not_found".to_string()),
+            "a digest-less instance of our own wiring is not `entry_not_found`: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            wired,
+            "the digest is healed back — lock byte-identical to the first run's"
+        );
+        let ledger = read_ledger(tmp.path());
+        let edits = ledger["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 2, "first edit + the heal: {ledger:#}");
+        assert_eq!(
+            edits[0]["original"],
+            serde_json::json!(bun_packages_line(&pristine, NAME)),
+            "{ledger:#}"
+        );
+        assert_eq!(edits[1]["key"], NAME, "{ledger:#}");
+        assert_eq!(
+            edits[1]["original"],
+            serde_json::json!(digestless),
+            "{ledger:#}"
+        );
+        assert_eq!(edits[1]["new"], serde_json::json!(wired_line), "{ledger:#}");
+
+        // A third run over the healed lock is a no-op for the ledger.
+        let env = run_redirect_subprocess(tmp.path(), &server.uri());
+        assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
+        assert!(warning_codes(&env).is_empty(), "{env:#}");
+        assert_eq!(
+            read_ledger(tmp.path())["edits"].as_array().unwrap().len(),
+            2,
+            "a re-run over the healed lock must not append edits"
+        );
+
+        if drop_again_before_rollback {
+            // Another `bun add` on Bun < 1.3.10: the digest is gone again.
+            std::fs::write(&lock_path, wired.replace(&wired_line, &digestless)).unwrap();
+        }
+        let (code, env) = rollback_json(tmp.path());
+        assert_eq!(
+            code,
+            Some(0),
+            "rollback (digest dropped again: {drop_again_before_rollback}) must succeed: {env:#}"
+        );
+        assert_eq!(env["status"], "success", "{env:#}");
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            pristine,
+            "rollback lands on the pristine registry line (digest dropped again: \
+             {drop_again_before_rollback})"
+        );
+        assert!(
+            !ledger_path.exists(),
+            "the emptied ledger is deleted after a full unwind"
+        );
+    }
+}
+
 /// The bun.lockb auto-migration leg: a fake `bun` shim prepended to PATH writes
 /// a canned text bun.lock and deletes bun.lockb (the bun ≥ 1.2 shape),
 /// exercising the migration branch of `run_redirect` without a real bun. The

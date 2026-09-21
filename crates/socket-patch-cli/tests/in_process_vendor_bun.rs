@@ -1094,6 +1094,158 @@ async fn already_vendored_v1_workspace_rerun_is_already_vendored_exit_zero() {
 }
 
 // ---------------------------------------------------------------------------
+// Digest-less re-saves (Bun 1.1.39–1.3.9)
+// ---------------------------------------------------------------------------
+// Every text-lock release below 1.3.10 re-saves our local-tarball 3-tuple
+// WITHOUT its sha512 on any later lock re-save (`bun add`, `bun install`
+// after a manifest change) — measured on real 1.1.45, 1.2.23 and 1.3.9. The
+// 2-tuple `["left-pad@.socket/vendor/npm/<uuid>/left-pad-1.3.0.tgz", {}]`
+// is still our wiring: the re-run must stay `already_vendored` (and heal
+// the digest), `repair` must rebuild through it, and `rollback` must
+// restore the registry line — not `vendor_lock_entry_not_found` /
+// `vendor_lock_entry_drifted` + `vendor_artifact_kept`.
+
+/// The packages-entry line keyed `key` (verbatim, no line terminator).
+fn bun_packages_line(lock: &str, key: &str) -> String {
+    let prefix = format!("    \"{key}\": [");
+    lock.split('\n')
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no `{key}` packages entry in:\n{lock}"))
+        .trim_end_matches('\r')
+        .to_string()
+}
+
+/// The line as Bun < 1.3.10 re-saves it: trailing `"sha512-…"` dropped.
+fn drop_bun_digest(line: &str) -> String {
+    let cut = line
+        .rfind(", \"sha512-")
+        .unwrap_or_else(|| panic!("no sha512 element in {line}"));
+    let tail = if line.ends_with("],") { "]," } else { "]" };
+    format!("{}{tail}", &line[..cut])
+}
+
+/// Vendor the V1 direct project, then re-spell its wired line digest-less.
+/// Returns (pristine lock, wired lock, wired line).
+fn vendor_then_drop_digest(root: &Path, mock_uri: &str) -> (Vec<u8>, String, String) {
+    write_bun_project(root, LockShape::V1Direct);
+    let pristine = lock_bytes(root);
+    let (exit, stdout, stderr) = scan_vendored(root, mock_uri, &["--json"]);
+    assert_eq!(exit, 0, "setup vendoring: stdout={stdout}\nstderr={stderr}");
+    let wired = String::from_utf8(lock_bytes(root)).unwrap();
+    let wired_line = bun_packages_line(&wired, "left-pad");
+    assert!(
+        wired_line.contains(&format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"))
+            && wired_line.contains("\"sha512-"),
+        "setup: {wired_line}"
+    );
+    let digestless = drop_bun_digest(&wired_line);
+    std::fs::write(
+        root.join("bun.lock"),
+        wired.replace(&wired_line, &digestless),
+    )
+    .unwrap();
+    (pristine, wired, wired_line)
+}
+
+#[tokio::test]
+async fn digestless_vendored_tuple_rerun_is_already_vendored_and_heals_the_digest() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, wired, _) = vendor_then_drop_digest(tmp.path(), &mock.uri());
+
+    let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
+    assert_eq!(exit, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["status"], "success", "{v}");
+    assert_eq!(
+        v["download"]["patches"][0]["action"], "skipped",
+        "the ledger still wires the purl: {v}"
+    );
+    assert_eq!(v["download"]["failed"], 0, "{v}");
+    let vendor = &v["vendor"];
+    assert_eq!(vendor["summary"]["applied"], 0, "{v}");
+    assert_eq!(vendor["summary"]["skipped"], 1, "{v}");
+    assert_eq!(vendor["summary"]["failed"], 0, "{v}");
+    let events = vendor["events"].as_array().unwrap();
+    assert!(
+        events.iter().any(|e| e["purl"] == PURL
+            && e["action"] == "skipped"
+            && e["errorCode"] == "already_vendored"),
+        "{v}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| e["errorCode"] != "vendor_lock_entry_not_found" && e["action"] != "failed"),
+        "{v}"
+    );
+    assert_eq!(
+        String::from_utf8(lock_bytes(tmp.path())).unwrap(),
+        wired,
+        "the in-sync re-run heals the digest back to the 3-tuple, byte-identical"
+    );
+}
+
+#[tokio::test]
+async fn digestless_vendored_tuple_rollback_restores_the_registry_line() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (pristine, _, _) = vendor_then_drop_digest(tmp.path(), &mock.uri());
+
+    let (exit, stdout, stderr) = run(tmp.path(), &with_api(&["rollback", "--json"], &mock.uri()));
+    assert_eq!(exit, 0, "rollback: stdout={stdout}\nstderr={stderr}");
+    assert!(
+        !stdout.contains("vendor_lock_entry_drifted") && !stdout.contains("vendor_artifact_kept"),
+        "the digest-less spelling of our own tuple is not drift: {stdout}"
+    );
+    assert_eq!(
+        lock_bytes(tmp.path()),
+        pristine,
+        "rollback must restore the registry lock byte-for-byte"
+    );
+    assert!(
+        !tmp.path().join(".socket/vendor/npm").exists(),
+        "rollback removes the vendored artifact tree"
+    );
+}
+
+#[tokio::test]
+async fn repair_rebuilds_a_deleted_artifact_through_a_digestless_lock() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, wired, _) = vendor_then_drop_digest(tmp.path(), &mock.uri());
+    let tgz = tmp
+        .path()
+        .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
+    std::fs::remove_file(&tgz).unwrap();
+
+    // `scan --mode vendored` keeps no local blob in this harness, so the
+    // rebuild fetches the patch content from the mock API (no `--offline`).
+    let (exit, stdout, stderr) = run(tmp.path(), &with_api(&["repair", "--json"], &mock.uri()));
+    assert_eq!(exit, 0, "repair: stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["status"], "success", "{v}");
+    assert_eq!(v["summary"]["rebuilt"], 1, "{v}");
+    assert!(
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL),
+        "{v}"
+    );
+    assert!(tgz.is_file(), "the artifact must be rebuilt");
+    assert_eq!(
+        String::from_utf8(lock_bytes(tmp.path())).unwrap(),
+        wired,
+        "the rebuild re-pins the digest into the healed 3-tuple"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Workspace-member --cwd: today's behaviour, pinned
 // ---------------------------------------------------------------------------
 
