@@ -1071,7 +1071,7 @@ pub(crate) async fn vendor_records(
                     PatchEvent::new(PatchAction::Failed, candidate.clone())
                         .with_error(refusal.code, refusal.detail.clone()),
                 );
-                if !common.silent && !common.json {
+                if !common.json {
                     eprintln!(
                         "Cannot vendor {}: {}",
                         normalize_purl(candidate),

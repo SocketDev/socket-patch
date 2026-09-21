@@ -922,6 +922,94 @@ fn bun_scoped_remove_of_one_of_two_hosted_records_unwinds_only_that_purl() {
 
 const WS_CODE: &str = "vendor_bun_workspace_unsupported";
 
+#[tokio::test]
+async fn bun_hosted_refusal_preserves_vendored_v0_workspace() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let direct = pristine_lock()
+        .replace("\"lockfileVersion\": 2", "\"lockfileVersion\": 0")
+        .replace("  \"configVersion\": 1,\n", "");
+    write_bun_project(root, &direct, &[(NAME, VERSION)]);
+    seed_manifest_and_blob(root);
+    let (code, env) = vendor_cli(root, &["--vendor-source", "build"]);
+    assert_eq!(code, 0, "{env:#}");
+
+    // Bun 1.1.45 preserves the local tuple when a direct project grows an
+    // unrelated workspace. Its old lock remains consumable and patched.
+    let lock = read(root, "bun.lock").replace(
+        "  \"packages\": {\n",
+        "  \"packages\": {\n    \"consumer\": [\"consumer@workspace:packages/consumer\", {}],\n\n",
+    );
+    std::fs::write(root.join("bun.lock"), &lock).unwrap();
+    let state = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
+    let artifact = std::fs::read(root.join(vendored_rel_tgz())).unwrap();
+    let manifest = std::fs::read(root.join(".socket/manifest.json")).unwrap();
+
+    for extra in [&["--dry-run"][..], &[][..]] {
+        let (code, env) = scan_mode(root, &server.uri(), "hosted", extra);
+        assert_eq!(code, 0, "{env:#}");
+        assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+        let warnings = env["redirect"]["warnings"].as_array().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w["code"] == "redirect_bun_workspace_unsupported"),
+            "{env:#}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|w| w["code"] != "redirect_would_revert_vendored"
+                    && w["code"] != "redirect_takeover_reverted_vendored"),
+            "{env:#}"
+        );
+        assert_eq!(read(root, "bun.lock"), lock);
+        assert_eq!(
+            std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+            state
+        );
+        assert_eq!(
+            std::fs::read(root.join(vendored_rel_tgz())).unwrap(),
+            artifact
+        );
+        assert_eq!(
+            std::fs::read(root.join(".socket/manifest.json")).unwrap(),
+            manifest
+        );
+        assert!(!root.join(".socket/vendor/redirect-state.json").exists());
+    }
+}
+
+#[test]
+fn bun_vendor_silent_refusal_keeps_error_diagnosis() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let lock = write_hosted_workspace_project(root, 1);
+    let ledger = std::fs::read(root.join(".socket/vendor/redirect-state.json")).unwrap();
+    for dry_run in [true, false] {
+        let mut args = vec![
+            "vendor",
+            "--offline",
+            "--silent",
+            "--cwd",
+            root.to_str().unwrap(),
+        ];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let (code, stdout, stderr) = run_cli(root, &args);
+        assert_eq!(code, 1);
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(
+            stderr.contains("Cannot vendor") && stderr.contains("lockfileVersion-1"),
+            "{stderr}"
+        );
+        assert_hosted_wiring_intact(root, &lock, &ledger);
+    }
+}
+
 /// Pristine `lockfileVersion` workspace lock — root + a `packages/consumer`
 /// member declaring left-pad — in the real bun 1.3.14 (v1) / 1.4.2 (v2)
 /// grammar: `configVersion`, the member's 1-tuple `workspace:` entry, a

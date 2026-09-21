@@ -144,8 +144,7 @@ fn check_workspace_compatibility(
 /// PROJECT-LEVEL: this cannot see per-purl state, so it refuses a pre-v2
 /// workspace lock even when the purl in question is already vendored in
 /// it. The CLI exempts a purl from this refusal before acting on it when
-/// EITHER its vendor ledger already wires the purl at the uuid the run
-/// selected (an in-sync re-run) OR [`wired_instances_all_ours`] reports
+/// [`wired_instances_all_ours`] reports
 /// that every lock instance of the purl is already one of our tuples — the
 /// same criterion [`vendor_bun`] applies per classified instance, so that
 /// in-sync re-runs, superseding-uuid re-vendors and `repair` rebuilds of a

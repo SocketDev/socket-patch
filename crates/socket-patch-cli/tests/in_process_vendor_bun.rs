@@ -1038,6 +1038,62 @@ fn vendor_then_add_workspace(root: &Path, mock_uri: &str) -> Vec<u8> {
     with_workspace.into_bytes()
 }
 
+#[tokio::test]
+async fn preserved_ledger_does_not_bypass_bun_refusal_after_rollback() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_bun_project(root, LockShape::V1Direct);
+    let (exit, stdout, stderr) = scan_vendored(root, &mock.uri(), &["--json", "--detached"]);
+    assert_eq!(exit, 0, "{stdout}\n{stderr}");
+    assert!(!root.join(".socket/manifest.json").exists());
+    let (exit, stdout, stderr) = run(root, &["rollback", "--preserve-state", "--yes", "--json"]);
+    assert_eq!(exit, 0, "{stdout}\n{stderr}");
+    let registry = String::from_utf8(lock_bytes(root)).unwrap();
+    assert!(!registry.contains(".socket/vendor/npm/"));
+    let lock = registry.replace(
+        "  \"packages\": {\n",
+        "  \"packages\": {\n    \"consumer\": [\"consumer@workspace:packages/consumer\"],\n\n",
+    );
+    std::fs::write(root.join("bun.lock"), &lock).unwrap();
+    let state = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
+    let artifact_path = root.join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
+    let artifact = std::fs::read(&artifact_path).unwrap();
+
+    let (exit, stdout, stderr) = scan_vendored(root, &mock.uri(), &["--json", "--dry-run"]);
+    assert_eq!(exit, 0, "{stdout}\n{stderr}");
+    let preview = parse_single_json_doc(&stdout);
+    assert_eq!(
+        preview["vendor"]["patches"][0]["action"], "would_refuse",
+        "{preview}"
+    );
+    assert_eq!(
+        preview["vendor"]["patches"][0]["errorCode"], WS_CODE,
+        "{preview}"
+    );
+
+    let views_before = view_requests_for(&mock, UUID).await;
+    let (exit, stdout, stderr) = get_vendored(root, &mock.uri(), UUID, &["--json"]);
+    assert_eq!(exit, 1, "{stdout}\n{stderr}");
+    let env = parse_single_json_doc(&stdout);
+    assert_eq!(env["status"], "error", "{env}");
+    assert_eq!(env["downloaded"], 0, "{env}");
+    assert_eq!(env["error"]["code"], WS_CODE, "{env}");
+    assert_eq!(
+        view_requests_for(&mock, UUID).await,
+        views_before + 1,
+        "only the UUID lookup may fetch"
+    );
+    assert!(!root.join(".socket/manifest.json").exists());
+    assert_eq!(String::from_utf8(lock_bytes(root)).unwrap(), lock);
+    assert_eq!(
+        std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+        state
+    );
+    assert_eq!(std::fs::read(artifact_path).unwrap(), artifact);
+}
+
 /// The download phase must NOT refuse a purl the ledger already wires at
 /// the selected uuid: the re-run classifies it `skipped` (already in the
 /// manifest) exactly as on a non-Bun project, instead of `failed`. Pinned

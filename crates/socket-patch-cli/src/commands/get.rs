@@ -5324,13 +5324,11 @@ mod tests {
         );
     }
 
-    /// Already-vendored exemption: a ledger entry at the SAME uuid the run
-    /// selected is not refused (it proceeds to the fetch — unmounted here,
-    /// so it surfaces as a fetch miss), while a second purl the ledger
-    /// wires at an OLDER uuid is still refused before fetching.
+    /// Ledger entries at either the selected or an older UUID must not
+    /// bypass the refusal when the live lock contains registry wiring.
     #[tokio::test]
     #[serial_test::serial]
-    async fn download_patch_records_bun_refusal_exempts_ledger_entry_at_same_uuid() {
+    async fn download_patch_records_bun_refusal_rejects_unwired_ledger_entries() {
         use wiremock::MockServer;
 
         let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
@@ -5379,12 +5377,11 @@ mod tests {
                 .cloned()
                 .unwrap_or_else(|| panic!("no record for {purl}: {json}"))
         };
-        let exempt = by_purl(in_sync);
+        let refused_same = by_purl(in_sync);
         assert_eq!(
-            exempt["error"], "could not fetch details",
-            "the in-sync purl must be exempt from the refusal; json={json}"
+            refused_same["errorCode"], "vendor_bun_workspace_unsupported",
+            "UUID equality alone cannot bypass the refusal; json={json}"
         );
-        assert!(exempt.get("errorCode").is_none(), "json={json}");
         let refused = by_purl(stale);
         assert_eq!(
             refused["errorCode"], "vendor_bun_workspace_unsupported",
@@ -5397,8 +5394,7 @@ mod tests {
             .iter()
             .map(|r| r.url.path().to_string())
             .collect();
-        assert_eq!(paths.len(), 1, "only the exempt purl may fetch: {paths:?}");
-        assert!(paths[0].ends_with(same), "{paths:?}");
+        assert!(paths.is_empty(), "no refused purl may fetch: {paths:?}");
     }
 
     /// An unreadable vendor ledger silences the drift warning (the main

@@ -1135,6 +1135,31 @@ pub(crate) async fn run_redirect_selected(
         .map(|l| l.records.clone())
         .unwrap_or_default();
 
+    // The migration unlinks its input, so check links before any takeover
+    // can mutate another dependency in this run as well as before Bun runs.
+    if overrides.iter().any(|o| o.ecosystem == "npm")
+        && !common.cwd.join("bun.lock").exists()
+        && present_lockb_sibling_locks(&common.cwd).is_empty()
+        && socket_patch_core::utils::fs::first_symlink(&common.cwd, ["bun.lockb"])
+            .await
+            .is_some()
+    {
+        // Neither Bun's migration nor our byte-only backup can restore
+        // a link. Refuse before spawning Bun, including during preview.
+        let message = "bun.lockb is a symbolic link; replace it with a regular file (or run \
+                       socket-patch in the directory it points to) before migrating; nothing \
+                       was written";
+        eprintln!("Error (redirect_symlinked_file_unsupported): {message}");
+        if common.json {
+            emit_json_error_with_code(
+                scan_result.take(),
+                Some("redirect_symlinked_file_unsupported"),
+                message,
+            );
+        }
+        return 1;
+    }
+
     // Cross-mode takeover: a purl this run is about to redirect may still be
     // VENDORED — for cargo a committed `[patch.crates-io]` path entry, a
     // detached Cargo.lock entry, a committed copy, and a vendored ledger
@@ -1169,6 +1194,25 @@ pub(crate) async fn run_redirect_selected(
         use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
         let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
         let vendor_state = socket_patch_core::vendor::load_state(&common.cwd).await;
+        // Compatibility must be known before the takeover removes a live
+        // patch. In particular, a v0 workspace can keep an existing local
+        // tuple even though hosted mode cannot replace it with a URL.
+        let bun_takeover_refusal = if candidates.iter().any(|(p, ..)| p.starts_with("pkg:npm/")) {
+            match socket_patch_core::utils::fs::read_regular_to_string(&common.cwd.join("bun.lock"))
+                .await
+            {
+                Ok(content) => {
+                    socket_patch_core::patch::redirect::preflight_bun_hosted(&content).err()
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => Some(socket_patch_core::patch::redirect::RewriteWarning {
+                    code: "redirect_bun_lock_unsupported".into(),
+                    detail: format!("cannot read bun.lock before mode takeover: {e}"),
+                }),
+            }
+        } else {
+            None
+        };
         let patch_entries =
             socket_patch_core::vendor::cargo_config::read_patch_entries(&common.cwd).await;
         let mut refused: Vec<String> = Vec::new();
@@ -1183,6 +1227,19 @@ pub(crate) async fn run_redirect_selected(
                 .and_then(|s| socket_patch_core::vendor::lookup_entry(&s.entries, stripped))
                 .cloned();
             if let Some(entry) = ledger_entry {
+                if let Some(warning) = bun_takeover_refusal
+                    .as_ref()
+                    .filter(|_| purl.starts_with("pkg:npm/"))
+                {
+                    refused.push(purl.clone());
+                    if !takeover_pre_warnings
+                        .iter()
+                        .any(|w| w["code"] == warning.code)
+                    {
+                        takeover_pre_warnings.push(serde_json::json!(warning));
+                    }
+                    continue;
+                }
                 if common.dry_run {
                     // Preview through the same per-purl revert machinery the
                     // wet run dispatches (write-free under dry_run): a
@@ -1314,8 +1371,12 @@ pub(crate) async fn run_redirect_selected(
         if !refused.is_empty() {
             for purl in &refused {
                 if let Some((_, uuid, ..)) = candidates.iter().find(|(p, ..)| p == purl) {
+                    let reason = bun_takeover_refusal
+                        .as_ref()
+                        .filter(|_| purl.starts_with("pkg:npm/"))
+                        .map_or("vendored_revert_failed", |w| w.code.as_str());
                     skipped.push(serde_json::json!({
-                        "purl": purl, "uuid": uuid, "reason": "vendored_revert_failed",
+                        "purl": purl, "uuid": uuid, "reason": reason,
                     }));
                 }
             }

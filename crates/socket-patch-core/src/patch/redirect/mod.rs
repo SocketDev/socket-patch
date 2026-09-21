@@ -2377,57 +2377,40 @@ fn rewrite_yarn_berry(
 // Binary `bun.lockb` is NEVER parsed — its presence (without a text `bun.lock`)
 // is a documented refusal. Uses the shared `bun_lock_text` grammar (fail-CLOSED
 // on any deviation). Byte-for-byte twin of the TS `rewriteBun`.
-fn rewrite_bun_lock(
-    files: &BTreeMap<String, String>,
-    overrides: &[DepOverride],
-    result: &mut RewriteResult,
-) {
+/// Check a text Bun lock before reverting any existing vendored wiring.
+/// Uses the rewriter's own version, grammar and workspace compatibility rules.
+pub fn preflight_bun_hosted(content: &str) -> Result<(), RewriteWarning> {
+    parse_bun_hosted_lock(content).map(|_| ())
+}
+
+fn parse_bun_hosted_lock(
+    content: &str,
+) -> Result<(Vec<String>, Vec<crate::vendor::bun_lock_text::BunEntry>), RewriteWarning> {
     use crate::vendor::bun_lock_text::{
-        check_lock_version, decode_json_string, has_workspace_packages, lock_version,
-        parse_packages_section,
+        check_lock_version, has_workspace_packages, lock_version, parse_packages_section,
     };
 
-    let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
-    if npm.is_empty() {
-        return;
-    }
-    // Binary lockfile without a text one: presence-only refusal. NEVER parse
-    // `.lockb` content. The CLI auto-migrates it to text before rewriting.
-    if files.contains_key("bun.lockb") && !files.contains_key("bun.lock") {
-        result.warnings.push(RewriteWarning {
-            code: "redirect_bun_lockb_unsupported".into(),
-            detail: "bun.lockb is a binary lockfile; re-lock with a text lockfile \
-                     (`bun install --save-text-lockfile`) so the redirect can pin the hosted patch"
-                .into(),
-        });
-        return;
-    }
-    let Some(content) = files.get("bun.lock") else {
-        return;
-    };
     // The shared gate's `Err` text IS the detail: hosted and vendored refuse
     // an unsupported head with one message (and one remedy per arm — a
     // future version means "update socket-patch", a missing integer means
     // "re-lock"), so the two modes cannot drift apart.
     if let Err(detail) = check_lock_version(content) {
-        result.warnings.push(RewriteWarning {
+        return Err(RewriteWarning {
             code: "redirect_bun_lock_unsupported".into(),
             detail,
         });
-        return;
     }
-    let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
+    let lines: Vec<String> = content.split('\n').map(str::to_string).collect();
     let entries = match parse_packages_section(&lines) {
         Ok(entries) => entries,
         Err(_) => {
             // Fail-closed: never line-splice a lock whose packages section
             // deviates from bun's emitted single-line grammar.
-            result.warnings.push(RewriteWarning {
+            return Err(RewriteWarning {
                 code: "redirect_bun_lock_unsupported".into(),
                 detail: "bun.lock packages section is not in bun's emitted single-line shape"
                     .into(),
             });
-            return;
         }
     };
 
@@ -2448,7 +2431,7 @@ fn rewrite_bun_lock(
     // 1.3.0 and bumped to 1 by 1.3.9 and every later release; that case is
     // accepted here either way.)
     if lock_version(content) == Some(0) && has_workspace_packages(&entries) {
-        result.warnings.push(RewriteWarning {
+        return Err(RewriteWarning {
             code: "redirect_bun_workspace_unsupported".into(),
             detail: "Bun version-0 workspace locks cannot preserve hosted tarballs on frozen \
                      installs; delete bun.lock and re-run `bun install` with Bun >= 1.2 (which \
@@ -2458,8 +2441,43 @@ fn rewrite_bun_lock(
                      resolve"
                 .into(),
         });
+    }
+
+    Ok((lines, entries))
+}
+
+fn rewrite_bun_lock(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    use crate::vendor::bun_lock_text::decode_json_string;
+
+    let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
+    if npm.is_empty() {
         return;
     }
+    // Binary lockfile without a text one: presence-only refusal. NEVER parse
+    // `.lockb` content. The CLI auto-migrates it to text before rewriting.
+    if files.contains_key("bun.lockb") && !files.contains_key("bun.lock") {
+        result.warnings.push(RewriteWarning {
+            code: "redirect_bun_lockb_unsupported".into(),
+            detail: "bun.lockb is a binary lockfile; re-lock with a text lockfile \
+                     (`bun install --save-text-lockfile`) so the redirect can pin the hosted patch"
+                .into(),
+        });
+        return;
+    }
+    let Some(content) = files.get("bun.lock") else {
+        return;
+    };
+    let (mut lines, entries) = match parse_bun_hosted_lock(content) {
+        Ok(parsed) => parsed,
+        Err(warning) => {
+            result.warnings.push(warning);
+            return;
+        }
+    };
 
     let mut changed = false;
     for dep in &npm {

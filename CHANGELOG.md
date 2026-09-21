@@ -268,6 +268,13 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Bun refusal safety:** hosted compatibility is checked before removing
+  an existing vendored patch, including during dry-run. Vendored preflight
+  exemptions require live local lock tuples; a ledger retained by
+  `rollback --preserve-state` cannot bypass a refusal or hide it in a preview.
+  Symlinked `bun.lockb` files are refused before migration so their links
+  survive, and `vendor --silent` keeps refusal diagnostics on stderr.
+
 - **Bun projects: every text-lock generation is accepted, vendored refusals
   fire before any write, and every mode change unwinds.** `bun.lock`
   `lockfileVersion` 0 — the opt-in text lock Bun 1.1.39–1.1.45 write with

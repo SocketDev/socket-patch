@@ -62,15 +62,8 @@ pub(crate) async fn preview_vendor_json(
     let mut patches: Vec<serde_json::Value> = selected
         .iter()
         .map(|p| match lookup_entry(&state.entries, &p.purl) {
-            Some(e) if e.uuid == p.uuid => serde_json::json!({
-                "purl": p.purl, "uuid": p.uuid, "action": "already_vendored",
-            }),
-            // An in-sync ledger entry is exactly the preflight's ledger
-            // exemption, so this arm never shadows `already_vendored`. A
-            // stale entry is refused by the wet run like a fresh one when
-            // the lock still holds a registry instance of the purl; when
-            // every instance is already ours the preflight exempts it (the
-            // engine re-vendors in place) and it previews `would_revendor`.
+            // Refusal takes priority: a preserved ledger can name this
+            // UUID even after rollback has removed its live wiring.
             _ if refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl)) => {
                 let r = refusal.as_ref().expect("checked by the guard");
                 serde_json::json!({
@@ -78,6 +71,9 @@ pub(crate) async fn preview_vendor_json(
                     "errorCode": r.code, "error": r.detail,
                 })
             }
+            Some(e) if e.uuid == p.uuid => serde_json::json!({
+                "purl": p.purl, "uuid": p.uuid, "action": "already_vendored",
+            }),
             Some(e) => serde_json::json!({
                 "purl": p.purl, "uuid": p.uuid,
                 "action": "would_revendor", "oldUuid": e.uuid,
@@ -941,11 +937,10 @@ mod preview_tests {
         );
     }
 
-    /// The already-vendored exemption: an in-sync ledger entry keeps
-    /// `already_vendored` (the wet run's engine skip), while a stale entry
-    /// is `would_refuse` — the wet run refuses re-vendoring at a new uuid.
+    /// A ledger cannot override the live-lock refusal. Already-vendored
+    /// classification remains available when the lock is actually wired.
     #[tokio::test]
-    async fn preview_already_vendored_wins_over_refusal_stale_entry_is_refused() {
+    async fn preview_bun_refusal_requires_live_wiring_even_at_the_same_uuid() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bun.lock"), V1_WORKSPACE_LOCK).unwrap();
 
@@ -953,7 +948,7 @@ mod preview_tests {
         let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
         assert_eq!(
             action_of(&preview, NPM)["action"],
-            "already_vendored",
+            "would_refuse",
             "{preview}"
         );
 
@@ -964,6 +959,19 @@ mod preview_tests {
         assert!(
             rec.get("oldUuid").is_none(),
             "a refused record is not a revendor preview: {preview}"
+        );
+
+        let wired = V1_WORKSPACE_LOCK.replace(
+            r#"["preview-bun@1.0.0", "", {}, "sha512-AAAA=="]"#,
+            &format!(r#"["preview-bun@.socket/vendor/npm/{UUID}/preview-bun-1.0.0.tgz", {{}}, "sha512-AAAA=="]"#),
+        );
+        std::fs::write(tmp.path().join("bun.lock"), wired).unwrap();
+        seed_entry(tmp.path(), NPM, UUID);
+        let preview = preview_vendor_json(tmp.path(), &[sel(UUID, NPM)]).await;
+        assert_eq!(
+            action_of(&preview, NPM)["action"],
+            "already_vendored",
+            "{preview}"
         );
     }
 

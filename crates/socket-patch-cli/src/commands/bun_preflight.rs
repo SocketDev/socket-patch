@@ -19,9 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use socket_patch_core::api::types::PatchSearchResult;
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::vendor::load_state;
 use socket_patch_core::vendor::state::VendorEntry;
-use socket_patch_core::vendor::{load_state, lookup_entry};
 
 /// The vendor ledger as the preflight consumes it: the caller's own
 /// `load_state` outcome, so an UNREADABLE ledger is a fact the refusal can
@@ -32,18 +31,14 @@ pub(crate) type LedgerLoad<'a> = Result<&'a HashMap<String, VendorEntry>, &'a st
 ///
 /// `exempt` holds the selected purls the refusal must NOT pre-empt — they
 /// flow through to the engine, which lets them in exactly as on a non-Bun
-/// project. A purl is exempt when EITHER
+/// project. A purl is exempt only when `bun.lock` wires every instance of
+/// its `name@version` to one of our `.socket/vendor/npm/` tuples, at any
+/// UUID ([`wired_instances_all_ours`]). This matches the engine's workspace
+/// gate: updating an already-local tuple introduces no new relative path,
+/// so in-sync runs, superseding patches and repairs remain supported.
 ///
-/// * the vendor ledger already wires it at the SAME uuid this run selected
-///   (an in-sync re-run: the engine's `already_vendored` skip), OR
-/// * `bun.lock` already wires EVERY instance of its `name@version` to one
-///   of our `.socket/vendor/npm/` tuples, at any uuid
-///   ([`wired_instances_all_ours`]) — the engine's own criterion for
-///   skipping the workspace gate: rewriting an already-local tuple to a
-///   superseding uuid adds no new workspace-relative path, so a patch
-///   UPDATE on a project vendored before it grew a workspace member (or
-///   the same re-run after a wiped `state.json`) re-vendors in place
-///   instead of dying here with a remedy Bun 1.2/1.3 teams cannot follow.
+/// A matching ledger UUID alone is insufficient: `rollback --preserve-state`
+/// retains the entry after removing its wiring.
 ///
 /// An unreadable ledger exempts nothing (fail closed) and the refusal
 /// itself becomes `vendor_state_unreadable` with the io/parse detail:
@@ -78,7 +73,7 @@ impl BunVendorRefusal {
 
 /// Run the Bun preflight once for `selected` — only when it holds at least
 /// one npm purl, since nothing else can be affected — loading the vendor
-/// ledger at `cwd` for the exemption. `None` means nothing to refuse.
+/// ledger at `cwd` to detect corruption. `None` means nothing to refuse.
 pub(crate) async fn bun_vendor_preflight(
     cwd: &Path,
     selected: &[PatchSearchResult],
@@ -142,7 +137,7 @@ fn selection_pairs(selected: &[PatchSearchResult]) -> Vec<(&str, &str)> {
 }
 
 /// Turn the engine's project-level refusal into the per-purl verdict: the
-/// ledger-or-lock exemption described on [`BunVendorRefusal`], or the
+/// live-lock exemption described on [`BunVendorRefusal`], or the
 /// `vendor_state_unreadable` refusal when the ledger cannot be read.
 async fn refusal_with_exemptions(
     cwd: &Path,
@@ -151,37 +146,30 @@ async fn refusal_with_exemptions(
     pairs: &[(&str, &str)],
     ledger: LedgerLoad<'_>,
 ) -> BunVendorRefusal {
-    let entries = match ledger {
-        Ok(entries) => entries,
-        Err(e) => {
-            return BunVendorRefusal {
-                code: "vendor_state_unreadable",
-                detail: e.to_string(),
-                exempt: HashSet::new(),
-            };
-        }
-    };
+    if let Err(e) = ledger {
+        return BunVendorRefusal {
+            code: "vendor_state_unreadable",
+            detail: e.to_string(),
+            exempt: HashSet::new(),
+        };
+    }
     // The lock-derived exemption exists only for the workspace gate: every
     // other preflight code means bun.lock could not be read or parsed, so
     // nothing in it can be ours and re-reading it per purl would be wasted
     // (guarded, but still) I/O.
     let lock_parsed = code == "vendor_bun_workspace_unsupported";
     let mut exempt = HashSet::new();
-    for (purl, uuid) in pairs {
+    for (purl, _) in pairs {
         if !purl.starts_with("pkg:npm/") {
             continue;
         }
-        // The ledger is keyed by the manifest purl (possibly qualified) and
-        // `lookup_entry` also resolves base purls; try the selected spelling
-        // first, then its qualifier-free base.
-        let ledger_in_sync = lookup_entry(entries, purl)
-            .or_else(|| lookup_entry(entries, strip_purl_qualifiers(purl)))
-            .is_some_and(|e| e.uuid == *uuid);
+        // A preserved ledger can outlive its wiring (rollback --preserve-state).
+        // Only live lock tuples prove the engine can skip the workspace gate.
         let lock_all_ours = lock_parsed
             && socket_patch_core::vendor::bun_lock::wired_instances_all_ours(cwd, purl)
                 .await
                 .unwrap_or(false);
-        if ledger_in_sync || lock_all_ours {
+        if lock_all_ours {
             exempt.insert((*purl).to_string());
         }
     }
@@ -275,8 +263,8 @@ mod tests {
     }
 
     /// `bun_vendor_preflight` never reads the lock when nothing selected is
-    /// npm (no needless I/O, no spurious refusal for other ecosystems); an
-    /// in-sync ledger entry exempts; an unreadable ledger exempts nothing
+    /// npm (no needless I/O, no spurious refusal for other ecosystems);
+    /// a ledger alone never exempts; an unreadable ledger exempts nothing
     /// (fail closed) AND is reported as the real problem
     /// (`vendor_state_unreadable`), never as a Bun lock remedy.
     #[tokio::test]
@@ -300,11 +288,11 @@ mod tests {
         assert!(refusal.applies_to(PURL));
         assert!(!refusal.applies_to("pkg:pypi/only@1.0.0"));
 
-        // Exempt when the ledger wires this purl at this uuid…
+        // A ledger at this UUID cannot make a binary lock vendorable.
         seed_bun_vendor_entry(tmp.path(), PURL, UUID);
         let refusal = bun_vendor_preflight(tmp.path(), &npm).await.unwrap();
         assert_eq!(refusal.code, "vendor_bun_lockb_unsupported");
-        assert!(!refusal.applies_to(PURL), "in-sync ledger entry is exempt");
+        assert!(refusal.applies_to(PURL), "the live lock must be compatible");
 
         // …but a corrupt ledger exempts nothing and names itself.
         std::fs::write(tmp.path().join(".socket/vendor/state.json"), b"{ not json").unwrap();
@@ -350,9 +338,13 @@ mod tests {
             "a fresh registry instance is refused"
         );
 
-        // Vendored at UUID, ledger in sync: exempt (both rules agree).
-        std::fs::write(tmp.path().join("bun.lock"), vendored_lock(UUID)).unwrap();
+        // A preserved ledger does not make registry wiring exempt.
         seed_bun_vendor_entry(tmp.path(), PURL, UUID);
+        let refusal = bun_vendor_preflight(tmp.path(), &fresh).await.unwrap();
+        assert!(refusal.applies_to(PURL));
+
+        // Live vendored tuples remain exempt.
+        std::fs::write(tmp.path().join("bun.lock"), vendored_lock(UUID)).unwrap();
         let refusal = bun_vendor_preflight(tmp.path(), &fresh).await.unwrap();
         assert!(!refusal.applies_to(PURL), "in-sync re-run is exempt");
 

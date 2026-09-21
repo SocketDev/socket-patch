@@ -1273,6 +1273,66 @@ fn install_bun_shim(root: &Path, body: &str) -> std::path::PathBuf {
     bin_dir
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_bun_lockb_refuses_before_migration_including_dry_run() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    for dry_run in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_bun_lockb_project(root, LOCKB_BYTES);
+        std::fs::rename(root.join("bun.lockb"), root.join("shared.lockb")).unwrap();
+        std::os::unix::fs::symlink("shared.lockb", root.join("bun.lockb")).unwrap();
+        let bin = install_bun_shim(
+            root,
+            &format!(
+                "#!/bin/sh\ntouch bun-was-spawned\ncat > bun.lock <<'LOCK'\n{}LOCK\n",
+                canned_bun_lock(),
+            ),
+        );
+        let mut cmd = scrubbed_cli();
+        cmd.args([
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            root.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .env("PATH", path_with_first(&bin));
+        if dry_run {
+            cmd.arg("--dry-run");
+        }
+        let output = cmd.output().unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{env:#}");
+        assert_eq!(
+            env["errorCode"], "redirect_symlinked_file_unsupported",
+            "{env:#}"
+        );
+        assert_eq!(
+            std::fs::read_link(root.join("bun.lockb")).unwrap(),
+            std::path::Path::new("shared.lockb")
+        );
+        assert_eq!(
+            std::fs::read(root.join("shared.lockb")).unwrap(),
+            LOCKB_BYTES
+        );
+        assert!(!root.join("bun-was-spawned").exists());
+        assert!(!root.join("bun.lock").exists());
+        assert!(!root.join(".socket/vendor/redirect-state.json").exists());
+    }
+}
+
 /// A fake `bun.cmd` batch shim in `<root>/fakebin` (the npm-global `bun`
 /// layout: no bun.exe anywhere on PATH); returns that dir. `body` is joined
 /// with CRLF as cmd.exe expects.
