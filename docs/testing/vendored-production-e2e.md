@@ -167,6 +167,13 @@ The suite is `#[ignore]`-gated, so it stays out of the `test` and `e2e` jobs and
 runs only where it is explicitly asked for. `--test-threads=1` keeps the real
 installs from contending on the shared cache sandbox.
 
+The bun leg (`bun_vendored_install_proof`) is therefore on-demand production
+coverage. The per-PR real-Bun evidence for vendored mode is the hermetic
+`e2e_vendor_bun_build` suite in `ci.yml`'s `e2e` matrix (Bun 1.4.2 on three
+OSes, 1.1.45 and 1.2.23 on Linux) plus the production native matrix in
+`bun-compatibility.yml` (16 releases × 3 OS in hosted, vendored and
+vendored-detached mode) — see [Bun compatibility](bun-compatibility.md).
+
 ### Environment knobs
 
 | Variable | Effect |
