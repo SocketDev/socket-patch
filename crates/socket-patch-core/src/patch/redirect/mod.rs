@@ -2402,10 +2402,14 @@ fn rewrite_bun_lock(
     let Some(content) = files.get("bun.lock") else {
         return;
     };
-    if check_lock_version(content).is_err() {
+    // The shared gate's `Err` text IS the detail: hosted and vendored refuse
+    // an unsupported head with one message (and one remedy per arm — a
+    // future version means "update socket-patch", a missing integer means
+    // "re-lock"), so the two modes cannot drift apart.
+    if let Err(detail) = check_lock_version(content) {
         result.warnings.push(RewriteWarning {
             code: "redirect_bun_lock_unsupported".into(),
-            detail: "bun.lock lockfileVersion is not 0, 1 or 2; re-lock with bun >= 1.4".into(),
+            detail,
         });
         return;
     }
@@ -6615,9 +6619,45 @@ mod tests {
         assert!(r.files.is_empty());
         assert_eq!(r.warnings[0].code, "redirect_bun_lock_unsupported");
         assert!(
-            r.warnings[0].detail.contains("not 0, 1 or 2"),
-            "the refusal must name the supported versions: {}",
+            r.warnings[0]
+                .detail
+                .contains("lockfileVersion 3, newer than this socket-patch release supports")
+                && r.warnings[0].detail.contains("(0, 1 and 2)")
+                && r.warnings[0].detail.contains("update socket-patch"),
+            "the refusal must name the found version, the supported set and a remedy that \
+             can work (a v3 lock was written by a NEWER Bun): {}",
             r.warnings[0].detail
+        );
+        // One message for both modes: the hosted detail IS the shared gate's
+        // error text, so vendored and hosted refusals cannot drift apart.
+        assert_eq!(
+            r.warnings[0].detail,
+            crate::vendor::bun_lock_text::check_lock_version(&files["bun.lock"]).unwrap_err()
+        );
+
+        // No integer lockfileVersion at all → the OTHER remedy (re-lock).
+        let mut files = BTreeMap::new();
+        files.insert(
+            "bun.lock".to_string(),
+            "{\n  \"packages\": {\n    \
+             \"left-pad\": [\"left-pad@1.3.0\", \"\", {}, \"sha512-OLD==\"],\n  }\n}\n"
+                .to_string(),
+        );
+        let mut r = RewriteResult::default();
+        rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
+        assert!(r.files.is_empty());
+        assert_eq!(r.warnings[0].code, "redirect_bun_lock_unsupported");
+        assert!(
+            r.warnings[0].detail.contains("no integer lockfileVersion")
+                && r.warnings[0]
+                    .detail
+                    .contains("re-lock with Bun ≥ 1.2 (`bun install`)"),
+            "a head without an integer version must point at a Bun re-lock: {}",
+            r.warnings[0].detail
+        );
+        assert_eq!(
+            r.warnings[0].detail,
+            crate::vendor::bun_lock_text::check_lock_version(&files["bun.lock"]).unwrap_err()
         );
 
         // Non-single-line packages section → fail-closed refusal.

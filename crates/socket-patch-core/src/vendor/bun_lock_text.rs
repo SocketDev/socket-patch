@@ -50,16 +50,27 @@ pub(crate) fn split_name_spec(s: &str) -> Option<(&str, &str)> {
 
 /// `"lockfileVersion": <n>` head check — only the fixture-pinned text
 /// lockfile versions are spliced (fail-closed on anything newer/older).
+///
+/// The `Err` text is the user-facing refusal detail for BOTH the vendored
+/// and the hosted (`redirect_bun_lock_unsupported`) paths, so the two modes
+/// never drift apart. Each arm's remedy is the one that can actually work:
+/// every accepted version is 0, 1 or 2 and the parser yields a `u64`, so an
+/// unsupported `Some(v)` is a lock newer than this release knows — written
+/// by a Bun newer than any we test — and "re-lock with a newer Bun" would
+/// just reproduce it; updating socket-patch (or re-locking with an older
+/// Bun) is the fix. Only a head with no integer at all is a lock that a
+/// current Bun re-lock repairs.
 pub(crate) fn check_lock_version(text: &str) -> Result<(), String> {
     match lock_version(text) {
         Some(v) if SUPPORTED_LOCK_VERSIONS.contains(&v) => Ok(()),
         Some(v) => Err(format!(
-            "bun.lock has lockfileVersion {v}; only 0, 1 and 2 are supported — \
-             re-lock with bun >= 1.4"
+            "bun.lock has lockfileVersion {v}, newer than this socket-patch release supports \
+             (0, 1 and 2) — update socket-patch, or re-lock with a Bun release that writes \
+             lockfileVersion 0–2"
         )),
         None => Err(
-            "bun.lock has no integer lockfileVersion in its head; only 0, 1 and 2 \
-             are supported — re-lock with bun >= 1.4"
+            "bun.lock has no integer lockfileVersion in its head; only 0, 1 and 2 are \
+             supported — re-lock with Bun ≥ 1.2 (`bun install`)"
                 .to_string(),
         ),
     }
@@ -467,17 +478,41 @@ mod tests {
                 "lockfileVersion {v} must be accepted"
             );
         }
+        // Every unsupported integer is ≥ 3, i.e. written by a Bun NEWER than
+        // this release tests: the remedy must be "update socket-patch" (or
+        // downgrade the writer) — never "re-lock with a newer Bun", which
+        // would reproduce the same head.
         for v in [3u64, 99] {
             let err =
                 check_lock_version(&format!("{{\n  \"lockfileVersion\": {v},\n}}\n")).unwrap_err();
             assert!(
-                err.contains(&v.to_string()) && err.contains("re-lock with bun >= 1.4"),
-                "the refusal must name the found version and the remedy: {err}"
+                err.contains(&format!(
+                    "lockfileVersion {v}, newer than this socket-patch release"
+                )) && err.contains("(0, 1 and 2)")
+                    && err.contains("update socket-patch")
+                    && err.contains("re-lock with a Bun release that writes lockfileVersion 0–2"),
+                "the refusal must name the found version and a remedy that can work: {err}"
+            );
+            assert!(
+                !err.contains(">= 1.4"),
+                "a future-version refusal must not tell the user to re-lock with the Bun that \
+                 wrote it: {err}"
             );
         }
-        // Missing / non-integer / string-typed heads fail closed too.
-        assert!(check_lock_version("{\n  \"packages\": {\n  }\n}\n").is_err());
-        assert!(check_lock_version("{\n  \"lockfileVersion\": \"1\",\n}\n").is_err());
-        assert!(check_lock_version("{\n  \"lockfileVersion\": one,\n}\n").is_err());
+        // Missing / non-integer / string-typed heads fail closed too — and
+        // THIS is the arm where a plain re-lock with a current Bun is the fix.
+        for head in [
+            "{\n  \"packages\": {\n  }\n}\n",
+            "{\n  \"lockfileVersion\": \"1\",\n}\n",
+            "{\n  \"lockfileVersion\": one,\n}\n",
+        ] {
+            let err = check_lock_version(head).unwrap_err();
+            assert!(
+                err.contains("no integer lockfileVersion")
+                    && err.contains("only 0, 1 and 2 are supported")
+                    && err.contains("re-lock with Bun ≥ 1.2 (`bun install`)"),
+                "a head without an integer version must point at a Bun re-lock: {err}"
+            );
+        }
     }
 }
