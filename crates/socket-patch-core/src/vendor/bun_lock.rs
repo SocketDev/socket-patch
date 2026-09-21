@@ -99,6 +99,16 @@ pub(crate) const BUN_LOCKB_UNSUPPORTED_DETAIL: &str =
 /// at version 1; only deleting bun.lock and re-locking writes 2 — so the
 /// remedy says exactly that instead of the non-converging "upgrade and run
 /// `bun install`".
+///
+/// The hosted alternative in the remedy is VERSION-SPECIFIC: hosted mode
+/// accepts a version-1 workspace lock (a URL tuple has no path to resolve)
+/// but refuses a version-0 one (`redirect_bun_workspace_unsupported`,
+/// `redirect/mod.rs`), so pointing a Bun 1.1.39–1.1.45 user at `--mode
+/// hosted` as-is would only earn them a second refusal with a different
+/// remedy. A v0 lock must be re-locked with Bun >= 1.2 (which writes
+/// version 1) before hosted mode can take it — and that means DELETING the
+/// lock first: measured on this lock shape, an in-place `bun install` keeps
+/// v0 on 1.2.0 and fails to resolve on 1.3.14/1.4.2.
 fn check_workspace_compatibility(
     text: &str,
     entries: &[BunEntry],
@@ -110,6 +120,12 @@ fn check_workspace_compatibility(
     if version >= 2 || !has_workspace_packages(entries) {
         return Ok(());
     }
+    let hosted_alternative = if version == 0 {
+        "or delete bun.lock, re-lock with Bun >= 1.2 (which writes lockfileVersion 1) and use \
+         `--mode hosted`"
+    } else {
+        "or use `--mode hosted`, which accepts version-1 workspace locks"
+    };
     Err((
         "vendor_bun_workspace_unsupported",
         format!(
@@ -117,8 +133,7 @@ fn check_workspace_compatibility(
              the workspace member, and a lockfileVersion-{version} lock may still be installed \
              by such a release; delete bun.lock and re-run `bun install` with Bun >= 1.4 (which \
              writes lockfileVersion 2) before vendoring — an in-place `bun install` keeps the \
-             existing lockfileVersion — or use `--mode hosted`, which accepts version-1 \
-             workspace locks"
+             existing lockfileVersion — {hosted_alternative}"
         ),
     ))
 }
@@ -128,9 +143,14 @@ fn check_workspace_compatibility(
 ///
 /// PROJECT-LEVEL: this cannot see per-purl state, so it refuses a pre-v2
 /// workspace lock even when the purl in question is already vendored in
-/// it (the CLI exempts already-vendored purls before calling it);
-/// [`vendor_bun`] itself gates per classified instance and lets in-sync
-/// re-runs and `repair` rebuilds through.
+/// it. The CLI exempts a purl from this refusal before acting on it when
+/// EITHER its vendor ledger already wires the purl at the uuid the run
+/// selected (an in-sync re-run) OR [`wired_instances_all_ours`] reports
+/// that every lock instance of the purl is already one of our tuples — the
+/// same criterion [`vendor_bun`] applies per classified instance, so that
+/// in-sync re-runs, superseding-uuid re-vendors and `repair` rebuilds of a
+/// project vendored before it grew a workspace member all reach the
+/// engine instead of dying here.
 pub async fn preflight_vendor(project_root: &Path) -> Result<(), (&'static str, String)> {
     let path = project_root.join(BUN_LOCK);
     let text = match read_regular_to_string(&path).await {
@@ -151,6 +171,54 @@ pub async fn preflight_vendor(project_root: &Path) -> Result<(), (&'static str, 
     let entries = parse_packages_section(&lines)
         .map_err(|detail| ("vendor_lockfile_version_unsupported", detail))?;
     check_workspace_compatibility(&text, &entries)
+}
+
+/// Whether `bun.lock` already wires EVERY packages entry resolving the npm
+/// `purl`'s `name@version` to one of our `.socket/vendor/npm/` tarballs —
+/// any uuid, 3-tuple or the digest-less 2-tuple Bun < 1.3.10 re-saves it
+/// as (see [`classify`]). `Ok(false)` when no entry resolves the purl at
+/// all (a fresh vendor, or a hosted URL tuple the takeover has yet to
+/// revert) or when any resolving instance is still the registry tuple.
+///
+/// This is the per-purl half of the vendored preflight: [`preflight_vendor`]
+/// is project-level and refuses every pre-v2 workspace lock, whereas
+/// [`vendor_bun`] skips that gate whenever the instances it would rewrite
+/// are already ours — rewriting an `Ours` tuple to another uuid adds no new
+/// workspace-relative path, so a superseding patch on a project vendored
+/// before it grew a workspace member re-vendors in place, and a `repair`
+/// rebuild proceeds. The CLI consults this so its pre-download refusal
+/// exempts exactly what the engine would let through, ledger or no ledger
+/// (a wiped `state.json` used to turn every such update into a false
+/// `vendor_bun_workspace_unsupported`).
+///
+/// `Err` mirrors [`preflight_vendor`]'s codes (unreadable lock, unsupported
+/// version, out-of-grammar packages section); a purl that is not an npm
+/// `name@version` yields `Ok(false)` — nothing in the lock can be ours.
+pub async fn wired_instances_all_ours(
+    project_root: &Path,
+    purl: &str,
+) -> Result<bool, (&'static str, String)> {
+    let Some((name, version)) = super::npm_common::parse_npm_purl(purl) else {
+        return Ok(false);
+    };
+    let text = read_regular_to_string(&project_root.join(BUN_LOCK))
+        .await
+        .map_err(|error| ("vendor_lockfile_missing", error.to_string()))?;
+    check_lock_version(&text).map_err(|detail| ("vendor_lockfile_version_unsupported", detail))?;
+    let lines = text.split('\n').map(str::to_string).collect::<Vec<_>>();
+    let entries = parse_packages_section(&lines)
+        .map_err(|detail| ("vendor_lockfile_version_unsupported", detail))?;
+    let target_spec = format!("{name}@{version}");
+    let target_leaf = tgz_rel_leaf(&name, &version);
+    let mut matched = 0usize;
+    for entry in &entries {
+        match classify(entry, &target_spec, &name, &target_leaf) {
+            Some(TupleShape::Ours { .. }) => matched += 1,
+            Some(TupleShape::Registry) => return Ok(false),
+            None => {}
+        }
+    }
+    Ok(matched > 0)
 }
 
 /// Vendor one installed npm package into a bun project (see the module doc).
@@ -1492,7 +1560,10 @@ mod tests {
 
     /// The converging remedy: names the lock's version, says to DELETE the
     /// lock (an in-place `bun install` keeps the version), and offers
-    /// hosted mode.
+    /// hosted mode in a VERSION-SPECIFIC tail — hosted accepts a v1
+    /// workspace lock as-is but refuses a v0 one, so the v0 tail must say
+    /// to re-lock with Bun >= 1.2 first instead of sending the user into a
+    /// second refusal.
     fn assert_workspace_remedy(detail: &str, version: u64) {
         assert!(detail.contains("Bun releases before 1.4"), "{detail}");
         assert!(
@@ -1504,7 +1575,22 @@ mod tests {
             detail.contains("in-place `bun install` keeps the existing lockfileVersion"),
             "{detail}"
         );
-        assert!(detail.contains("--mode hosted"), "{detail}");
+        let tail = if version == 0 {
+            "— or delete bun.lock, re-lock with Bun >= 1.2 (which writes lockfileVersion 1) and \
+             use `--mode hosted`"
+        } else {
+            "— or use `--mode hosted`, which accepts version-1 workspace locks"
+        };
+        assert!(
+            detail.ends_with(tail),
+            "v{version}: the hosted alternative must be version-specific:\n{detail}"
+        );
+        if version == 0 {
+            assert!(
+                !detail.contains("accepts version-1"),
+                "a v0 lock must not be told hosted accepts it as-is: {detail}"
+            );
+        }
         assert!(
             !detail.contains("upgrade to Bun"),
             "the non-converging remedy must be gone: {detail}"
@@ -1660,6 +1746,93 @@ mod tests {
             );
             assert_eq!(fx.read_lock().await, lock, "v{version}: lock byte-stable");
         }
+    }
+
+    /// The CLI's lock-derived exemption mirrors the engine's gate: on the
+    /// upgrade shape (vendored, then a workspace member added) every
+    /// instance is ours — at the recorded uuid, at a superseding uuid the
+    /// ledger has never seen, and in the digest-less 2-tuple spelling — so
+    /// the project-level refusal still fires but the purl is exempt; a
+    /// fresh registry instance and a purl the lock does not resolve are not.
+    #[tokio::test]
+    async fn wired_instances_all_ours_mirrors_the_engine_gate() {
+        const PURL: &str = "pkg:npm/left-pad@1.3.0";
+        for version in [0u64, 1] {
+            let (fx, entry, lock) = vendored_then_workspace_added(version).await;
+            assert_eq!(
+                preflight_vendor(fx.root()).await.unwrap_err().0,
+                "vendor_bun_workspace_unsupported",
+                "v{version}: the project-level gate stays blanket"
+            );
+            assert_eq!(
+                wired_instances_all_ours(fx.root(), PURL).await,
+                Ok(true),
+                "v{version}: the vendored tuple is ours"
+            );
+            // Another version of the same package is someone else's edit.
+            assert_eq!(
+                wired_instances_all_ours(fx.root(), "pkg:npm/left-pad@1.2.0").await,
+                Ok(false),
+                "v{version}: an unresolved purl is not exempt"
+            );
+            assert_eq!(
+                wired_instances_all_ours(fx.root(), "pkg:pypi/left-pad@1.3.0").await,
+                Ok(false),
+                "v{version}: a non-npm purl can never be ours"
+            );
+            // The digest-less re-save (Bun < 1.3.10) is still our wiring.
+            let (_, digestless) = digestless_lock(&lock, &entry);
+            tokio::fs::write(fx.root().join(BUN_LOCK), &digestless)
+                .await
+                .unwrap();
+            assert_eq!(
+                wired_instances_all_ours(fx.root(), PURL).await,
+                Ok(true),
+                "v{version}: the digest-less 2-tuple is ours"
+            );
+            // A superseding uuid: the ledger would not match, the lock does.
+            let other_uuid = "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
+            tokio::fs::write(fx.root().join(BUN_LOCK), lock.replace(UUID, other_uuid))
+                .await
+                .unwrap();
+            assert_eq!(
+                wired_instances_all_ours(fx.root(), PURL).await,
+                Ok(true),
+                "v{version}: any uuid of ours counts"
+            );
+
+            // A fresh registry instance is exactly what the gate refuses.
+            let fresh = fixture_with(
+                &as_workspace_lock(BN3_BEFORE_LOCK, version),
+                "node_modules/left-pad",
+            )
+            .await;
+            assert_eq!(
+                wired_instances_all_ours(fresh.root(), PURL).await,
+                Ok(false),
+                "v{version}: a registry tuple would be rewritten"
+            );
+        }
+
+        // Unreadable or unsupported locks mirror `preflight_vendor`'s codes.
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            wired_instances_all_ours(root.path(), PURL)
+                .await
+                .unwrap_err()
+                .0,
+            "vendor_lockfile_missing"
+        );
+        tokio::fs::write(root.path().join(BUN_LOCK), "{}")
+            .await
+            .unwrap();
+        assert_eq!(
+            wired_instances_all_ours(root.path(), PURL)
+                .await
+                .unwrap_err()
+                .0,
+            "vendor_lockfile_version_unsupported"
+        );
     }
 
     /// A version-0 head (real bun 1.1.45 shape: no `configVersion`) vendors
