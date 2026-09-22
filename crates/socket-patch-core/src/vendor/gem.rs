@@ -60,12 +60,13 @@ use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::patch::redirect::gem_line_trailing_options;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::purl::{build_gem_purl, parse_gem_purl, purl_qualifier};
 
 use super::common::{
-    already_patched_result, copy_matches_after_hashes, done, refused, service_offline_conflict,
-    synthesized_result,
+    already_patched_result, copy_matches_after_hashes, done, failed_result,
+    prune_empty_vendor_levels, refused, service_offline_conflict, stage_dir_for,
+    swap_stage_into_place, synthesized_result,
 };
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::extract_gem_data;
@@ -79,20 +80,6 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, Vendo
 
 const GEMFILE: &str = "Gemfile";
 const GEMFILE_LOCK: &str = "Gemfile.lock";
-
-/// Guarded read shared in shape with the composer.lock / Cargo.lock twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
-/// so a FIFO planted as the Gemfile, Gemfile.lock, or a stub gemspec fails
-/// fast instead of wedging vendor's pair read, revert's restore readers, or
-/// the ledger reconstruction forever in an `open(2)` that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// Wiring-record discriminators (`key` is the gem name for all three).
 ///
@@ -329,19 +316,22 @@ pub async fn vendor_gem(
     let remote_line = format!("  remote: {copy_rel}");
     let lock_wired =
         lock_text.split('\n').any(|l| l == remote_line) && gemfile_text.contains(&copy_rel);
-    // D4 heal: a project vendored before the invalid-stub hardening carries
-    // the defective SERVED stub on disk, so EXISTS is not enough — an on-disk
-    // stub that fails the required-attribute bar routes into the artifact
-    // rebuild below (which re-materialises a valid stub) instead of the
-    // silent `already_vendored` no-op.
-    let copy_stub_ok = match read_regular_to_string(&copy_dir.join(format!("{name}.gemspec"))).await
-    {
-        Ok(text) => gemspec_missing_required_attrs(&text).is_empty(),
-        Err(_) => false,
-    };
-    let copy_ok = copy_matches_after_hashes(&copy_dir, &record.files).await && copy_stub_ok;
     if lock_wired {
         if lock_checksum_in_sync(&lock_text, name, version) {
+            // Probe the copy only once the lock is known to be wired (the
+            // common fresh vendor has no copy to hash). D4 heal: a project
+            // vendored before the invalid-stub hardening carries the
+            // defective SERVED stub on disk, so EXISTS is not enough — an
+            // on-disk stub that fails the required-attribute bar routes into
+            // the artifact rebuild below (which re-materialises a valid
+            // stub) instead of the silent `already_vendored` no-op. The stub
+            // read runs second so a hash mismatch short-circuits it.
+            let copy_ok = copy_matches_after_hashes(&copy_dir, &record.files).await
+                && match read_regular_to_string(&copy_dir.join(format!("{name}.gemspec"))).await
+                {
+                    Ok(text) => gemspec_missing_required_attrs(&text).is_empty(),
+                    Err(_) => false,
+                };
             if copy_ok {
                 return done(
                     already_patched_result(purl, &copy_dir, &record.files),
@@ -438,6 +428,20 @@ pub async fn vendor_gem(
         Ok(p) => p,
         Err(detail) => return refused("gemfile_declaration_not_editable", detail),
     };
+    // ── Gemfile.lock edit (pure text surgery, computed before any write) ──
+    // A lock-shape failure therefore costs no download / copy / patch and no
+    // Gemfile write — the same failed `Done` outcome the unwind path used to
+    // produce, minus the unwind.
+    let lock_edit = match edit_lock(&lock_text, name, version, &copy_rel) {
+        Ok(edit) => edit,
+        Err(e) => {
+            return done(
+                failed_result(purl, &copy_dir, format!("failed to edit Gemfile.lock: {e}")),
+                None,
+                Vec::new(),
+            );
+        }
+    };
 
     // ── materialise the patched copy ──────────────────────────────────────
     // Prefer the prebuilt `.gem` + stub gemspec from the patch service
@@ -480,38 +484,30 @@ pub async fn vendor_gem(
     if let Err(e) = atomic_write_bytes_preserving_mode(&gemfile_path, new_gemfile.as_bytes()).await
     {
         let _ = remove_tree(&uuid_dir).await;
+        prune_empty_vendor_levels(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write Gemfile: {e}"));
         return done(result, None, warnings);
     }
 
-    // ── Gemfile.lock edit (a failure here unwinds the Gemfile) ───────────
-    let lock_edit = match edit_lock(&lock_text, name, version, &copy_rel) {
-        Ok(edit) => {
-            match atomic_write_bytes_preserving_mode(&lock_path, edit.text.as_bytes()).await {
-                Ok(()) => Ok(edit),
-                Err(e) => Err(format!("failed to write Gemfile.lock: {e}")),
-            }
+    // ── Gemfile.lock write (a failure here unwinds the Gemfile) ──────────
+    if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, lock_edit.text.as_bytes()).await
+    {
+        let mut detail = format!("failed to write Gemfile.lock: {e}");
+        // Unwind: a Gemfile pointing at a path the lock doesn't agree with
+        // is exactly the half-wired state the pair edit exists to prevent —
+        // restore the recorded original bytes.
+        if let Err(e) =
+            atomic_write_bytes_preserving_mode(&gemfile_path, gemfile_text.as_bytes()).await
+        {
+            detail.push_str(&format!(" (Gemfile unwind also failed: {e})"));
         }
-        Err(e) => Err(format!("failed to edit Gemfile.lock: {e}")),
-    };
-    let lock_edit = match lock_edit {
-        Ok(edit) => edit,
-        Err(mut detail) => {
-            // Unwind: a Gemfile pointing at a path the lock doesn't agree
-            // with is exactly the half-wired state the pair edit exists to
-            // prevent — restore the recorded original bytes.
-            if let Err(e) =
-                atomic_write_bytes_preserving_mode(&gemfile_path, gemfile_text.as_bytes()).await
-            {
-                detail.push_str(&format!(" (Gemfile unwind also failed: {e})"));
-            }
-            let _ = remove_tree(&uuid_dir).await;
-            result.success = false;
-            result.error = Some(detail);
-            return done(result, None, warnings);
-        }
-    };
+        let _ = remove_tree(&uuid_dir).await;
+        prune_empty_vendor_levels(&uuid_dir).await;
+        result.success = false;
+        result.error = Some(detail);
+        return done(result, None, warnings);
+    }
 
     // ── marker + ledger entry ────────────────────────────────────────────
     let base_purl = build_gem_purl(name, version);
@@ -685,96 +681,6 @@ pub async fn vendor_gem(
 
 // ── materialisation (service download / local build) ──────────────────────────
 
-/// A swap sibling for a copy dir: `<uuid>/<name>-<version><suffix>`. Same
-/// directory as the copy → every swap step is a real rename, never a
-/// cross-device copy. The suffixes can never collide with a copy dir: this
-/// backend creates exactly one `<name>-<version>` leaf per uuid dir, from
-/// validated plain gem tokens (see the mirrored cargo.rs machinery).
-fn swap_sibling_for(copy_dir: &Path, suffix: &str) -> std::path::PathBuf {
-    let name = copy_dir
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "copy".to_string());
-    match copy_dir.parent() {
-        Some(parent) => parent.join(format!("{name}{suffix}")),
-        None => copy_dir.join(suffix),
-    }
-}
-
-/// The staging sibling for a copy dir: `<uuid>/<name>-<version>.socket-stage`.
-/// (Re)builds are materialised here and swapped into place only on success, so
-/// a failure can never destroy a pre-existing (possibly live-wired) copy.
-fn stage_dir_for(copy_dir: &Path) -> std::path::PathBuf {
-    swap_sibling_for(copy_dir, ".socket-stage")
-}
-
-/// The backup sibling the old copy is parked at mid-swap:
-/// `<uuid>/<name>-<version>.socket-old`.
-fn backup_dir_for(copy_dir: &Path) -> std::path::PathBuf {
-    swap_sibling_for(copy_dir, ".socket-old")
-}
-
-/// Swap a fully-built stage into place without a destructive window: park the
-/// old copy (if any) at `<copy>.socket-old` with a same-dir rename, rename the
-/// stage over the now-vacant copy path, and only then delete the backup. Every
-/// step is a single atomic rename — unlike a remove-then-rename swap (where a
-/// partial `remove_dir_all`, realistic under Windows file locks, strands a
-/// half-deleted copy) no step can leave less recoverable state than it started
-/// with. If the stage rename fails the backup is renamed straight back; should
-/// even that restore fail (an external process racing the uuid dir), the old
-/// copy still exists intact at `<copy>.socket-old` instead of being destroyed.
-async fn swap_stage_into_place(stage: &Path, copy_dir: &Path) -> std::io::Result<()> {
-    let backup = backup_dir_for(copy_dir);
-    // A stale backup (crash mid-swap on an earlier run) would make the
-    // park rename fail; `remove_tree` is a no-op when it is absent.
-    remove_tree(&backup).await?;
-    let had_old = match tokio::fs::rename(copy_dir, &backup).await {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e),
-    };
-    match tokio::fs::rename(stage, copy_dir).await {
-        Ok(()) => {
-            if had_old {
-                let _ = remove_tree(&backup).await;
-            }
-            Ok(())
-        }
-        Err(e) => {
-            if had_old {
-                let _ = tokio::fs::rename(&backup, copy_dir).await;
-            }
-            Err(e)
-        }
-    }
-}
-
-/// Best-effort removal of an EMPTY `<uuid>/` dir plus the empty
-/// `.socket/vendor/gem/` and `.socket/vendor/` levels a failed run may have
-/// created, so a hard failure leaves no husk for the user to commit.
-/// `remove_dir` refuses non-empty dirs, so live copies, markers, and other
-/// gems' vendor dirs always survive.
-async fn prune_empty_vendor_dirs(uuid_dir: &Path) {
-    // The uuid level may already be gone (the unwind paths `remove_tree` it
-    // before pruning): NotFound must continue to the parent levels this run
-    // created, or they survive as committable husks. Any other error (i.e.
-    // non-empty: a live copy or marker) still stops the prune.
-    match tokio::fs::remove_dir(uuid_dir).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return,
-    }
-    let Some(eco_dir) = uuid_dir.parent() else {
-        return;
-    };
-    if tokio::fs::remove_dir(eco_dir).await.is_err() {
-        return;
-    }
-    if let Some(vendor_dir) = eco_dir.parent() {
-        let _ = tokio::fs::remove_dir(vendor_dir).await;
-    }
-}
-
 /// Failure cleanup for a staged (re)build: always remove the stage, then
 /// either unwind the whole `<uuid>/` dir (`unwind_uuid_dir` — a fresh vendor
 /// with no pre-existing state worth keeping) or leave existing state
@@ -786,7 +692,7 @@ async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bo
     if unwind_uuid_dir {
         let _ = remove_tree(uuid_dir).await;
     }
-    prune_empty_vendor_dirs(uuid_dir).await;
+    prune_empty_vendor_levels(uuid_dir).await;
 }
 
 /// The path-source stub gemspec served as the gem's SECOND artifact, alongside
@@ -1233,6 +1139,15 @@ pub async fn revert_gem(entry: &VendorEntry, project_root: &Path, dry_run: bool)
 /// [`revert_gem`] with full [`RevertOpts`]: `keep_artifact` skips ONLY the
 /// artifact deletion; the wiring restore — and the empty-wiring refusal,
 /// which applies under `keep_artifact` too — runs unchanged.
+///
+/// LOSSINESS GUARD (the [`RevertOutcome`] contract every backend honors): a
+/// record left alone as genuine drift keeps the artifact dir (and the caller
+/// keeps the ledger entry) — the Gemfile `path:` or the lock's PATH section
+/// may still route through it, and the entry holds the only pre-vendor
+/// originals. A record whose live state already equals its reverted state
+/// is convergence, not drift, and stays silent (LIVENESS CONTRACT), so an
+/// earlier partial revert or a `bundle update` regeneration never wedges
+/// the entry forever.
 pub async fn revert_gem_opts(
     entry: &VendorEntry,
     project_root: &Path,
@@ -1301,15 +1216,21 @@ pub async fn revert_gem_opts(
                 continue;
             }
         };
+        let key = w.key.as_deref().unwrap_or("<unknown>");
         match restored {
-            Ok(true) => {}
-            Ok(false) => warnings.push(VendorWarning::new(
+            Ok(RecordRevert::Done) => {}
+            Ok(RecordRevert::Drifted) => warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
                 format!(
-                    "{} no longer carries what vendor wrote for {}; left alone",
-                    w.file,
-                    w.key.as_deref().unwrap_or("<unknown>")
+                    "{} no longer carries what vendor wrote for {key}; left alone",
+                    w.file
                 ),
+            )),
+            // A missing wired file cannot still route through the copy dir:
+            // reported, but not drift — the artifact may still be removed.
+            Ok(RecordRevert::FileMissing) => warnings.push(VendorWarning::new(
+                "vendor_lockfile_missing",
+                format!("{} is missing; the {key} entry cannot be restored", w.file),
             )),
             Err(e) => {
                 return RevertOutcome {
@@ -1322,26 +1243,37 @@ pub async fn revert_gem_opts(
         }
     }
 
-    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
-    // (and the caller keeps the ledger entry), so only the deletion is
-    // skipped.
-    if !dry_run && !keep_artifact {
-        if let Err(e) = remove_tree(&uuid_dir).await {
-            return RevertOutcome {
-                kept_artifact: false,
-                success: false,
-                warnings,
-                error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
-            };
-        }
-    }
-
-    RevertOutcome {
+    let mut outcome = RevertOutcome {
         kept_artifact: false,
         success: true,
         warnings,
         error: None,
+    };
+    if dry_run {
+        return outcome;
     }
+    // Drift-keep (see the fn doc): never delete a copy dir a left-alone
+    // record may still reference.
+    if outcome.drift_skipped() {
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
+    // (and the caller keeps the ledger entry), so only the deletion is
+    // skipped.
+    if keep_artifact {
+        return outcome;
+    }
+    if let Err(e) = remove_tree(&uuid_dir).await {
+        outcome.success = false;
+        outcome.error = Some(format!("failed to remove {}: {e}", uuid_dir.display()));
+        return outcome;
+    }
+    // The last gem entry leaves `.socket/vendor/gem/` (and `.socket/vendor/`)
+    // empty: prune them so a reverted project carries no vendor residue
+    // (`remove_dir` keeps non-empty levels).
+    prune_empty_vendor_levels(&uuid_dir).await;
+    outcome
 }
 
 // ── ledger reconstruction ───────────────────────────────────────────────────
@@ -2308,36 +2240,61 @@ fn lock_checksum_in_sync(lock_text: &str, name: &str, version: &str) -> bool {
 
 // ── revert helpers ───────────────────────────────────────────────────────────
 
-/// Restore one `gemfile_line` record. `Ok(true)` = restored (or would be, on
-/// dry run); `Ok(false)` = the written line/block is gone (drift), left alone.
+/// What restoring one wiring record found on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordRevert {
+    /// Restored (or would be, on a dry run) — or already in its reverted
+    /// state (convergence: silent per the LIVENESS CONTRACT on
+    /// [`RevertOutcome::drift_skipped`]).
+    Done,
+    /// What vendor wrote is gone and the pre-vendor original is not back
+    /// either: genuine third-party drift, left alone in full.
+    Drifted,
+    /// The wired file itself no longer exists: nothing can still route
+    /// through the vendored copy via it.
+    FileMissing,
+}
+
+/// Restore one `gemfile_line` record.
 async fn revert_gemfile_record(
     gemfile_path: &Path,
     w: &WiringRecord,
     dry_run: bool,
-) -> Result<bool, String> {
+) -> Result<RecordRevert, String> {
     let text = match read_regular_to_string(gemfile_path).await {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RecordRevert::FileMissing)
+        }
         Err(e) => return Err(format!("unreadable Gemfile: {e}")),
     };
     let Some(written) = w.new.as_ref().and_then(Value::as_str) else {
-        return Ok(false);
+        return Ok(RecordRevert::Drifted);
     };
     let restored = match w.action {
         WiringAction::Rewritten => {
             let Some(original) = w.original.as_ref().and_then(Value::as_str) else {
-                return Ok(false);
+                return Ok(RecordRevert::Drifted);
             };
             let mut lines: Vec<&str> = text.split('\n').collect();
             let Some(i) = lines.iter().position(|l| *l == written) else {
-                return Ok(false);
+                // ALREADY CONVERGED: the pre-vendor line is back (a hand
+                // restore, a `bundle update` regeneration, an earlier partial
+                // revert) — not drift, nothing to write.
+                return Ok(if lines.contains(&original) {
+                    RecordRevert::Done
+                } else {
+                    RecordRevert::Drifted
+                });
             };
             lines[i] = original;
             lines.join("\n")
         }
         WiringAction::Added => {
             let Some(at) = text.find(written) else {
-                return Ok(false);
+                // ALREADY CONVERGED: an Added block's reverted state is its
+                // absence (the LIVENESS CONTRACT's "key is absent" case).
+                return Ok(RecordRevert::Done);
             };
             let mut out = String::with_capacity(text.len());
             out.push_str(&text[..at]);
@@ -2350,37 +2307,71 @@ async fn revert_gemfile_record(
             .await
             .map_err(|e| format!("failed to write Gemfile: {e}"))?;
     }
-    Ok(true)
+    Ok(RecordRevert::Done)
 }
 
-/// Restore one `gemfile_lock_spec` record. `Ok(true)` = restored (or would
-/// be, on dry run); `Ok(false)` = the lock no longer carries what vendor
-/// wrote (drift), left alone in full — a partial splice would corrupt it.
+/// Restore one `gemfile_lock_spec` record. Drift leaves the lock alone in
+/// full — a partial splice would corrupt it.
 async fn revert_lock_record(
     lock_path: &Path,
     w: &WiringRecord,
     dry_run: bool,
-) -> Result<bool, String> {
+) -> Result<RecordRevert, String> {
     let Some(original_lines) = wiring_string_array(w.original.as_ref()) else {
-        return Ok(false);
+        return Ok(RecordRevert::Drifted);
     };
     let Some(new_lines) = wiring_string_array(w.new.as_ref()) else {
-        return Ok(false);
+        return Ok(RecordRevert::Drifted);
     };
     let text = match read_regular_to_string(lock_path).await {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RecordRevert::FileMissing)
+        }
         Err(e) => return Err(format!("unreadable Gemfile.lock: {e}")),
     };
     let Some(restored) = revert_lock_text(&text, &original_lines, &new_lines) else {
-        return Ok(false);
+        // ALREADY CONVERGED: our PATH section is gone and every pre-vendor
+        // spec line is back in GEM/specs (a `bundle update` regeneration or
+        // an earlier partial revert) — not drift, nothing to write.
+        return Ok(if lock_record_converged(&text, &original_lines, &new_lines) {
+            RecordRevert::Done
+        } else {
+            RecordRevert::Drifted
+        });
     };
     if !dry_run {
         atomic_write_bytes_preserving_mode(lock_path, restored.as_bytes())
             .await
             .map_err(|e| format!("failed to write Gemfile.lock: {e}"))?;
     }
-    Ok(true)
+    Ok(RecordRevert::Done)
+}
+
+/// True when the lock already holds the record's reverted state: no PATH
+/// section carries vendor's `remote:` line and every spec-block line of the
+/// pre-vendor original is present.
+fn lock_record_converged(text: &str, original_lines: &[String], new_lines: &[String]) -> bool {
+    // A record whose `new` lost its `remote:` line is malformed, never
+    // converged (the tampered-ledger matrix pins it as drift).
+    let Some(remote_line) = new_lines.get(1).filter(|l| l.starts_with("  remote: ")) else {
+        return false;
+    };
+    let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    if find_path_section(&lines, remote_line).is_some() {
+        return false;
+    }
+    let Some((gs, ge)) = section_span(&lines, "GEM") else {
+        return false;
+    };
+    let gem = &lines[gs..ge];
+    let mut spec_block = original_lines.iter().filter(|l| l.starts_with("    "));
+    let mut any = false;
+    let all_present = spec_block.all(|l| {
+        any = true;
+        gem.contains(l)
+    });
+    any && all_present
 }
 
 fn wiring_string_array(v: Option<&Value>) -> Option<Vec<String>> {
@@ -2398,36 +2389,46 @@ fn wiring_string_array(v: Option<&Value>) -> Option<Vec<String>> {
 /// the token is not recomputable offline (spike `bare-checksum-registry-gem`
 /// pair). The search is confined to the CHECKSUMS section so a coincidental
 /// identical line elsewhere (e.g. a DEPENDENCIES entry) is never clobbered.
-/// `Ok(true)` = restored (or would be, on dry run); `Ok(false)` = the line is
-/// gone (drift), left alone.
+/// The line vendor wrote being gone is drift — unless the registry line it
+/// replaced is already back (convergence), left alone either way.
 async fn revert_lock_checksum_record(
     lock_path: &Path,
     w: &WiringRecord,
     dry_run: bool,
-) -> Result<bool, String> {
+) -> Result<RecordRevert, String> {
     let Some(written) = w.new.as_ref().and_then(Value::as_str) else {
-        return Ok(false);
+        return Ok(RecordRevert::Drifted);
     };
     let text = match read_regular_to_string(lock_path).await {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RecordRevert::FileMissing)
+        }
         Err(e) => return Err(format!("unreadable Gemfile.lock: {e}")),
     };
     let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
     let Some((ck_start, ck_end)) = section_span(&lines, "CHECKSUMS") else {
-        return Ok(false);
+        return Ok(RecordRevert::Drifted);
     };
+    let original = w.original.as_ref().and_then(Value::as_str);
     let Some(i) = (ck_start + 1..ck_end).find(|&i| lines[i] == written) else {
-        return Ok(false);
+        // ALREADY CONVERGED: the registry line vendor replaced is back.
+        let converged =
+            original.is_some_and(|orig| (ck_start + 1..ck_end).any(|i| lines[i] == orig));
+        return Ok(if converged {
+            RecordRevert::Done
+        } else {
+            RecordRevert::Drifted
+        });
     };
-    let Some(original) = w.original.as_ref().and_then(Value::as_str) else {
+    let Some(original) = original else {
         // A re-vendor rides the checksum record forward with `original: None`
         // for the caller's carry-forward to fill. When the chain has no
         // registry line to fill FROM — the pre-vendor entry was ALREADY the
         // bare path form (vendor then recorded no checksum wiring at all) —
         // there is nothing to restore: the bare line still standing IS the
         // pre-vendor state, not drift.
-        return Ok(true);
+        return Ok(RecordRevert::Done);
     };
     lines[i] = original.to_string();
     if !dry_run {
@@ -2435,7 +2436,7 @@ async fn revert_lock_checksum_record(
             .await
             .map_err(|e| format!("failed to write Gemfile.lock: {e}"))?;
     }
-    Ok(true)
+    Ok(RecordRevert::Done)
 }
 
 /// Pure splice reversing [`edit_lock`]: drop the PATH section vendor emitted,
@@ -2693,6 +2694,7 @@ fn gemspec_missing_required_attrs(spec_text: &str) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vendor::common::{backup_dir_for, swap_sibling_for};
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::VerifyStatus;
@@ -3518,8 +3520,13 @@ mod tests {
         assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
     }
 
+    /// A `bundle update` regenerated both files back to their pre-vendor
+    /// registry form: that is CONVERGENCE (the reverted state is already on
+    /// disk), not drift — revert stays silent (LIVENESS CONTRACT), leaves the
+    /// files alone and still removes the artifact dir, so the entry can never
+    /// wedge in the ledger forever.
     #[tokio::test]
-    async fn test_revert_drift_warnings() {
+    async fn test_revert_converged_files_are_silent_and_still_remove() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
 
         let (result, entry, _w) =
@@ -3527,9 +3534,6 @@ mod tests {
         assert!(result.success);
         let entry = entry.unwrap();
 
-        // Third-party drift: a `bundle update` regenerated both files back to
-        // registry form. Revert must leave them alone, warn per file, and
-        // still remove the artifact dir.
         tokio::fs::write(root.join(GEMFILE), GEMFILE_DIRECT)
             .await
             .unwrap();
@@ -3539,16 +3543,12 @@ mod tests {
 
         let outcome = revert_gem(&entry, &root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        let drift_count = outcome
-            .warnings
-            .iter()
-            .filter(|w| w.code == "vendor_lock_entry_drifted")
-            .count();
-        assert_eq!(
-            drift_count, 2,
-            "one drift warning per file: {:?}",
+        assert!(
+            outcome.warnings.is_empty(),
+            "regenerated pre-vendor files are convergence, not drift: {:?}",
             outcome.warnings
         );
+        assert!(!outcome.kept_artifact);
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
             GEMFILE_DIRECT
@@ -4037,6 +4037,15 @@ mod tests {
             drift_count, 1,
             "exactly the checksum record drifts: {:?}",
             outcome.warnings
+        );
+        assert!(
+            outcome.kept_artifact,
+            "genuine drift keeps the artifact (and the ledger entry): {:?}",
+            outcome.warnings
+        );
+        assert!(
+            root.join(copy_rel_318()).exists(),
+            "the copy dir survives a drift-keep"
         );
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
@@ -6846,6 +6855,9 @@ mod tests {
 
     /// An unrecognized wiring kind (a newer ledger) warns and continues —
     /// forward compatibility: the known records still restore byte-exactly.
+    /// The unknown record is a left-alone fragment, so the copy dir it may
+    /// still reference is kept (the family-wide drift-keep), never deleted
+    /// under a record this build cannot read.
     #[tokio::test]
     async fn revert_unrecognized_wiring_kind_warns_and_continues() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
@@ -6881,7 +6893,10 @@ mod tests {
                 .unwrap(),
             LOCK_DIRECT
         );
-        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+        assert!(
+            outcome.kept_artifact && root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
+            "an unreadable record keeps the copy dir it may reference"
+        );
     }
 
     /// Artifact removal failing at revert's END (read-only parent dir): the
@@ -6935,10 +6950,11 @@ mod tests {
         );
     }
 
-    /// A deleted Gemfile drifts (NotFound → left alone) while the lock
+    /// A deleted Gemfile is reported as missing (NotFound → nothing can
+    /// route through the copy via it, so NOT a drift-keep) while the lock
     /// record still restores and the artifact is still removed.
     #[tokio::test]
-    async fn revert_missing_gemfile_drifts_and_restores_lock() {
+    async fn revert_missing_gemfile_warns_and_restores_lock() {
         let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
         let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert!(r1.success, "{:?}", r1.error);
@@ -6947,12 +6963,13 @@ mod tests {
 
         let outcome = revert_gem(&entry, &root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        let drift = outcome
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        let missing = outcome
             .warnings
             .iter()
-            .filter(|w| w.code == "vendor_lock_entry_drifted")
+            .filter(|w| w.code == "vendor_lockfile_missing")
             .count();
-        assert_eq!(drift, 1, "{:?}", outcome.warnings);
+        assert_eq!(missing, 1, "{:?}", outcome.warnings);
         assert!(!root.join(GEMFILE).exists(), "the missing file stays gone");
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
@@ -6963,10 +6980,11 @@ mod tests {
         assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
     }
 
-    /// A deleted lock drifts BOTH lock-side records (spec + checksum, via
-    /// NotFound) while the Gemfile still restores.
+    /// A deleted lock reports BOTH lock-side records (spec + checksum, via
+    /// NotFound) as missing — not drift — while the Gemfile still restores
+    /// and the artifact is still removed.
     #[tokio::test]
-    async fn revert_missing_lock_drifts_and_restores_gemfile() {
+    async fn revert_missing_lock_warns_and_restores_gemfile() {
         let (_tmp, root, installed, blobs, record) =
             fixture_318(SPIKE_GEMFILE_CHECKSUMS, SPIKE_LOCK_CHECKSUMS_BEFORE).await;
         let (r1, e1, _) =
@@ -6980,14 +6998,15 @@ mod tests {
 
         let outcome = revert_gem(&entry, &root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        let drift = outcome
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        let missing = outcome
             .warnings
             .iter()
-            .filter(|w| w.code == "vendor_lock_entry_drifted")
+            .filter(|w| w.code == "vendor_lockfile_missing")
             .count();
         assert_eq!(
-            drift, 2,
-            "both lock-side records drift: {:?}",
+            missing, 2,
+            "both lock-side records report the missing lock: {:?}",
             outcome.warnings
         );
         assert!(!root.join(GEMFILE_LOCK).exists());
@@ -7108,6 +7127,10 @@ mod tests {
             .filter(|w| w.code == "vendor_lock_entry_drifted")
             .count();
         assert_eq!(drift, 1, "{:?}", outcome.warnings);
+        assert!(
+            outcome.kept_artifact && root.join(copy_rel_318()).exists(),
+            "the lock still holds the PATH section: the copy dir is kept"
+        );
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
                 .await
@@ -7167,9 +7190,12 @@ mod tests {
     }
 
     /// A hand-deleted managed block (the `Added` Gemfile record's written
-    /// text is gone) drifts instead of guessing; the lock still restores.
+    /// text is gone) is already in its reverted state — convergence, not
+    /// drift (LIVENESS CONTRACT: an Added record with no original is
+    /// reverted once absent) — so the lock restores and the artifact is
+    /// removed without a drift-keep.
     #[tokio::test]
-    async fn revert_added_block_gone_drifts() {
+    async fn revert_added_block_gone_is_converged() {
         let (_tmp, root, installed, blobs, record) =
             fixture(GEMFILE_TRANSITIVE, LOCK_TRANSITIVE).await;
         let (r1, e1, _) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
@@ -7181,12 +7207,9 @@ mod tests {
 
         let outcome = revert_gem(&entry, &root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        let drift = outcome
-            .warnings
-            .iter()
-            .filter(|w| w.code == "vendor_lock_entry_drifted")
-            .count();
-        assert_eq!(drift, 1, "{:?}", outcome.warnings);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(!outcome.kept_artifact);
+        assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
             GEMFILE_TRANSITIVE
@@ -7743,16 +7766,16 @@ mod tests {
         assert!(!backup_dir_for(&copy).exists(), "no parked backup litter");
     }
 
-    /// `prune_empty_vendor_dirs` removes exactly the three levels a failed
+    /// `prune_empty_vendor_levels` removes exactly the three levels a failed
     /// run may have created (`<uuid>` → `gem` → `vendor`) and never climbs
     /// higher; a parentless uuid path has no levels above it and returns.
     #[tokio::test]
-    async fn prune_empty_vendor_dirs_removes_three_levels_and_stops() {
+    async fn prune_empty_vendor_levels_removes_three_levels_and_stops() {
         let dir = tempfile::tempdir().unwrap();
         let keep = dir.path().join("keep");
         let uuid = keep.join("vendor/gem").join(UUID);
         tokio::fs::create_dir_all(&uuid).await.unwrap();
-        prune_empty_vendor_dirs(&uuid).await;
+        prune_empty_vendor_levels(&uuid).await;
         assert!(
             !keep.join("vendor").exists(),
             "all three empty levels pruned"
@@ -7771,7 +7794,7 @@ mod tests {
         tokio::fs::write(busy.join("vendor/gem/other-gem-marker"), b"x")
             .await
             .unwrap();
-        prune_empty_vendor_dirs(&uuid_b).await;
+        prune_empty_vendor_levels(&uuid_b).await;
         assert!(!uuid_b.exists(), "the empty uuid level is pruned");
         assert!(
             busy.join("vendor/gem/other-gem-marker").exists(),
@@ -7779,7 +7802,7 @@ mod tests {
         );
 
         // Parentless uuid path: nothing above to prune, returns cleanly.
-        prune_empty_vendor_dirs(Path::new("")).await;
+        prune_empty_vendor_levels(Path::new("")).await;
     }
 
     /// DEPENDENCIES entries are exactly 2-space-indented and specs entries
@@ -7835,7 +7858,11 @@ mod tests {
             new: Some(Value::String("not-an-array".to_string())),
         };
         let restored = revert_lock_record(dir.path(), &w, true).await.unwrap();
-        assert!(!restored, "malformed `new` wiring is drift, not an error");
+        assert_eq!(
+            restored,
+            RecordRevert::Drifted,
+            "malformed `new` wiring is drift, not an error"
+        );
     }
 
     /// The specs-splice scan steps over a line inside GEM/specs that is not

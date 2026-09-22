@@ -27,6 +27,7 @@ use toml_edit::{DocumentMut, Item, TableLike, Value as TomlValue};
 use crate::crawlers::composer_crawler::normalize_version;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::patch::path_safety;
+use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 use crate::vendor::bun_lock_text;
 
@@ -398,31 +399,6 @@ fn dedup_prefer_integrity(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
     out
 }
 
-/// Guarded read shared in shape with the vendor siblings' twins
-/// (cargo_lock.rs, gem.rs, go_mod_edit.rs): `open_regular_file` opens with
-/// `O_NONBLOCK` and rejects non-regular files, so a FIFO planted as any
-/// inventoried lockfile fails fast instead of wedging every consumer —
-/// scan's lockfile supplement, vendor's auto-fetch, repair's no-ledger
-/// reconstruction — forever in an `open(2)` that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
-
-/// Bytes twin of [`read_regular_to_string`] for the JSON locks.
-async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
 // ──────────────────────────────── Cargo.lock ────────────────────────────────
 
 /// Inventory `Cargo.lock` `[[package]]` blocks. Only crates.io-sourced
@@ -553,7 +529,7 @@ async fn inventory_package_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
     // Shrinkwrap wins, mirroring `npm_lock::select_lockfile`.
     let mut bytes = None;
     for lock in ["npm-shrinkwrap.json", "package-lock.json"] {
-        if let Ok(b) = read_regular(&root.join(lock)).await {
+        if let Ok(b) = read_regular_to_bytes(&root.join(lock)).await {
             bytes = Some(b);
             break;
         }
@@ -853,7 +829,7 @@ async fn inventory_bun_binary(root: &Path) -> Result<Vec<LockfileEntry>, Unsuppo
         code: "bun_lockb_invalid",
         detail: format!("cannot inventory bun.lockb: {detail}"),
     };
-    let bytes = read_regular(&root.join("bun.lockb"))
+    let bytes = read_regular_to_bytes(&root.join("bun.lockb"))
         .await
         .map_err(|error| invalid(error.to_string()))?;
     let lock = super::bun_lockb::BunLockb::parse(&bytes).map_err(invalid)?;
@@ -937,7 +913,7 @@ async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
 /// versions drop the pretty leading `v`/`V` through the crawler's
 /// [`normalize_version`], so installed and lockfile rows agree.
 async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let bytes = read_regular(&project_root.join("composer.lock"))
+    let bytes = read_regular_to_bytes(&project_root.join("composer.lock"))
         .await
         .ok()?;
     let doc: Value = serde_json::from_slice(&bytes).ok()?;
@@ -2007,7 +1983,7 @@ pub async fn wired_vendor_integrity(
         .await
         .is_err()
     {
-        if let Ok(bytes) = read_regular(&project_root.join("bun.lockb")).await {
+        if let Ok(bytes) = read_regular_to_bytes(&project_root.join("bun.lockb")).await {
             if let Ok(lock) = super::bun_lockb::BunLockb::parse(&bytes) {
                 if let Ok(packages) = lock.packages() {
                     let mut pinned: Option<String> = None;
@@ -2036,7 +2012,7 @@ pub async fn wired_vendor_integrity(
 
     // JSON locks: resolved == "file:<rel>" (npm writes exactly this form).
     for lock in ["npm-shrinkwrap.json", "package-lock.json"] {
-        let Ok(bytes) = read_regular(&project_root.join(lock)).await else {
+        let Ok(bytes) = read_regular_to_bytes(&project_root.join(lock)).await else {
             continue;
         };
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {

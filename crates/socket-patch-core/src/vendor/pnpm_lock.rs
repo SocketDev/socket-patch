@@ -51,9 +51,14 @@ use serde_json::Value;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{
+    atomic_write_bytes_preserving_mode, read_regular_to_bytes, read_regular_to_string,
+};
 
-use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
+use super::common::{
+    already_patched_result, detect_indent, done, prune_empty_vendor_levels, refused,
+    serialize_json,
+};
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
@@ -124,7 +129,7 @@ pub async fn vendor_pnpm(
     let override_key = format!("{name}@{version}");
 
     // ── 2. Read the pair (refuse before any write) ───────────────────────
-    let pkg_bytes = match read_regular(&project_root.join(PACKAGE_JSON)).await {
+    let pkg_bytes = match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
         Ok(bytes) => bytes,
         Err(e) => {
             return refused(
@@ -146,7 +151,7 @@ pub async fn vendor_pnpm(
             );
         }
     };
-    let lock_text = match read_regular_string(&project_root.join(PNPM_LOCK)).await {
+    let lock_text = match read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
         Ok(text) => text,
         Err(e) => {
             return refused(
@@ -183,7 +188,7 @@ pub async fn vendor_pnpm(
     // would route into the create path, which OVERWRITES the user's
     // workspace definition with the root-only scaffold.
     let ws_text: Option<String> =
-        match read_regular_string(&project_root.join(PNPM_WORKSPACE)).await {
+        match read_regular_to_string(&project_root.join(PNPM_WORKSPACE)).await {
             Ok(text) => Some(text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
@@ -241,12 +246,6 @@ pub async fn vendor_pnpm(
     }
 
     // ── 4. Stage → patch → pack (shared flavor-agnostic pipeline) ────────
-    // A wiring failure past this point must unwind the uuid dir staging is
-    // about to create — but never one that already existed (a same-uuid
-    // re-vendor's dir may still be referenced by live wiring).
-    let uuid_dir_preexisted = tokio::fs::metadata(project_root.join(&coords.uuid_dir_rel))
-        .await
-        .is_ok();
     let (staged, result) = match stage_patch_pack(
         purl,
         installed_dir,
@@ -267,6 +266,7 @@ pub async fn vendor_pnpm(
         // Failed patch or dry run: wiring never ran, project byte-untouched.
         return done(result, None, warnings);
     };
+    let uuid_dir_preexisted = staged.uuid_dir_preexisted;
     debug_assert_eq!(staged.rel_tgz, rel_tgz);
     let packed = staged.packed;
     if staged.staged_pkg_json.is_some() {
@@ -451,7 +451,7 @@ pub async fn vendor_pnpm(
 /// `None`: cannot determine (missing/unreadable/unsupported lock) —
 /// callers must keep the entry, fail-safe.
 pub async fn pnpm_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    let text = read_regular_string(&project_root.join(PNPM_LOCK))
+    let text = read_regular_to_string(&project_root.join(PNPM_LOCK))
         .await
         .ok()?;
     if check_lock_version(&text).is_err() {
@@ -573,7 +573,7 @@ pub async fn revert_pnpm_opts(
     // the wet run refuses (same precedent as the uuid guard above). Skipped
     // under `keep_artifact`: the refusal exists only to protect the
     // deletion, which a preserve-state revert never performs.
-    if entry.wiring.is_empty() {
+    if !keep_artifact && entry.wiring.is_empty() {
         let in_use = pnpm_entry_in_use(entry, project_root).await;
         if let Some(blocked) = guard_unwired_revert(project_root, in_use, &uuid_dir_rel).await {
             return blocked;
@@ -610,7 +610,7 @@ pub async fn revert_pnpm_opts(
     // file degrades to a warning and the artifact removal still proceeds).
     let mut lock_lines: Option<Vec<String>> = None;
     if touches_lock {
-        match read_regular_string(&project_root.join(PNPM_LOCK)).await {
+        match read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
             Ok(text) => lock_lines = Some(split_lines(&text)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 outcome.warnings.push(VendorWarning::new(
@@ -623,7 +623,7 @@ pub async fn revert_pnpm_opts(
     }
     let mut pkg_state: Option<(Value, String)> = None; // (doc, indent)
     if touches_pkg {
-        match read_regular(&project_root.join(PACKAGE_JSON)).await {
+        match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(doc) if doc.is_object() => {
                     let indent = detect_indent(&String::from_utf8_lossy(&bytes));
@@ -773,9 +773,14 @@ pub async fn revert_pnpm_opts(
     // ran; the artifact dir stays behind (and the caller keeps the ledger
     // entry), so only the deletion is skipped.
     if !keep_artifact {
-        if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
+        let uuid_dir = project_root.join(&uuid_dir_rel);
+        if let Err(e) = remove_tree(&uuid_dir).await {
             return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
         }
+        // The last npm-family entry leaves `.socket/vendor/npm/` (and
+        // `.socket/vendor/`) empty: prune them so a reverted project carries
+        // no vendor residue (`remove_dir` keeps non-empty levels).
+        prune_empty_vendor_levels(&uuid_dir).await;
     }
     outcome
 }
@@ -794,7 +799,7 @@ async fn revert_workspace(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(), String> {
     let path = project_root.join(PNPM_WORKSPACE);
-    let text = match read_regular_string(&path).await {
+    let text = match read_regular_to_string(&path).await {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // ALREADY CONVERGED: for an Added override (no recorded
@@ -2516,28 +2521,6 @@ async fn unwind_override_surfaces(
 }
 
 // ───────────────────────────── guarded reads ──────────────────────────────
-
-/// Guarded read shared in shape with the vendor siblings' twins
-/// (npm_lock.rs, npm_flavor.rs, lock_inventory.rs): `open_regular_file`
-/// opens with `O_NONBLOCK` and rejects non-regular files, so a FIFO planted
-/// as one of the pair files fails fast instead of wedging vendor / revert /
-/// the in-use probe forever in an `open(2)` waiting for a writer.
-pub(super) async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
-/// [`read_regular`], decoded as UTF-8 (`InvalidData` on failure, matching
-/// `read_to_string`'s error kind).
-pub(super) async fn read_regular_string(path: &Path) -> std::io::Result<String> {
-    let bytes = read_regular(path).await?;
-    String::from_utf8(bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
 
 // ─────────────────────── yaml-ish line-block helpers ──────────────────────
 // pnpm-lock.yaml is machine-emitted with a fixed 2/4/6/8-space shape; these
@@ -7257,5 +7240,40 @@ snapshots:
             "clobbered again",
             "no original bytes recorded: the unwind must not delete or guess"
         );
+    }
+
+    /// `--preserve-state` with a repair-reconstructed (empty-wiring) entry:
+    /// the deletion-protecting refusal — and the lock probe that feeds it —
+    /// must be SKIPPED (the fn doc, bun and the legacy backend all promise
+    /// it — a preserve-state revert deletes nothing), so the revert
+    /// completes as a successful no-op with lock and artifact intact.
+    /// Dry-run preview included.
+    #[tokio::test]
+    async fn empty_wiring_preserve_state_revert_skips_the_deletion_refusal() {
+        let (fx, entry) = reconstructed_fixture().await;
+        let tgz_path = fx.root().join(fx.rel_tgz());
+        let lock_before = fx.read(PNPM_LOCK).await;
+
+        for dry_run in [true, false] {
+            let outcome = revert_pnpm_opts(
+                &entry,
+                fx.root(),
+                RevertOpts {
+                    dry_run,
+                    keep_artifact: true,
+                },
+            )
+            .await;
+            assert!(
+                outcome.success,
+                "dry_run={dry_run}: preserve-state deletes nothing, so the \
+                 deletion guard must not fire: {:?}",
+                outcome.error
+            );
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert!(!outcome.kept_artifact, "preserve-state is not a drift-keep");
+            assert!(tgz_path.exists(), "artifact kept");
+            assert_eq!(fx.read(PNPM_LOCK).await, lock_before, "lock untouched");
+        }
     }
 }

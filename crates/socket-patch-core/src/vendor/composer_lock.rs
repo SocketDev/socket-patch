@@ -37,12 +37,13 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
 
 use super::common::{
-    already_patched_result, copy_matches_after_hashes, done, refused, serialize_json,
-    service_offline_conflict, synthesized_result,
+    already_patched_result, copy_matches_after_hashes, done, prune_empty_vendor_levels, refused,
+    serialize_json, service_offline_conflict, stage_dir_for, swap_stage_into_place,
+    synthesized_result,
 };
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::extract_zip;
@@ -54,20 +55,6 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, Vendo
 
 /// Project-relative lockfile this backend wires.
 const COMPOSER_LOCK: &str = "composer.lock";
-
-/// Guarded read shared in shape with the Cargo.lock / .cargo/config.toml
-/// twins: `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `composer.lock` fails fast instead of wedging
-/// every caller (vendor's presence read, revert's stranded scan and restore)
-/// forever in an `open(2)` that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// Wiring-record discriminator. The record's `key` is
 /// `"<section>:<vendor>/<name>"` where `<section>` is `packages` or
@@ -486,6 +473,10 @@ pub async fn revert_composer_opts(
                 error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
             };
         }
+        // The last composer entry leaves `.socket/vendor/composer/` (and
+        // `.socket/vendor/`) empty: prune them so a reverted project carries
+        // no vendor residue (`remove_dir` keeps non-empty levels).
+        prune_empty_vendor_levels(&uuid_dir).await;
     }
 
     warnings.push(VendorWarning::new(
@@ -511,82 +502,23 @@ pub async fn revert_composer_opts(
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn swap_sibling_for(copy_dir: &Path, suffix: &str) -> std::path::PathBuf {
-    let name = copy_dir
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "copy".to_string());
-    match copy_dir.parent() {
-        Some(parent) => parent.join(format!("{name}{suffix}")),
-        None => copy_dir.join(suffix),
-    }
-}
-
-/// The staging sibling for a copy dir:
-/// `<uuid>/<vendor>/<name>@<version>.socket-stage`. (Re)builds are
-/// materialised here and swapped into place only on success, so a failure can
-/// never destroy a pre-existing (possibly live-wired) copy.
-fn stage_dir_for(copy_dir: &Path) -> std::path::PathBuf {
-    swap_sibling_for(copy_dir, ".socket-stage")
-}
-
-/// The backup sibling the old copy is parked at mid-swap:
-/// `<uuid>/<vendor>/<name>@<version>.socket-old`.
-fn backup_dir_for(copy_dir: &Path) -> std::path::PathBuf {
-    swap_sibling_for(copy_dir, ".socket-old")
-}
-
-/// Swap a fully-built stage into place without a destructive window: park the
-/// old copy (if any) at `<copy>.socket-old` with a same-dir rename, rename the
-/// stage over the now-vacant copy path, and only then delete the backup.
-/// Every step is a single atomic rename — no step can leave less recoverable
-/// state than it started with (see the cargo twin for the full rationale).
-async fn swap_stage_into_place(stage: &Path, copy_dir: &Path) -> std::io::Result<()> {
-    let backup = backup_dir_for(copy_dir);
-    // A stale backup (crash mid-swap on an earlier run) would make the
-    // park rename fail; `remove_tree` is a no-op when it is absent.
-    remove_tree(&backup).await?;
-    let had_old = match tokio::fs::rename(copy_dir, &backup).await {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e),
-    };
-    match tokio::fs::rename(stage, copy_dir).await {
-        Ok(()) => {
-            if had_old {
-                let _ = remove_tree(&backup).await;
-            }
-            Ok(())
-        }
-        Err(e) => {
-            if had_old {
-                let _ = tokio::fs::rename(&backup, copy_dir).await;
-            }
-            Err(e)
-        }
-    }
-}
-
 /// Best-effort removal of the EMPTY dir levels a failed run may have created
-/// above the copy — `<uuid>/<vendor>/`, `<uuid>/`, `.socket/vendor/composer/`
-/// and `.socket/vendor/` — so a hard failure leaves no husk for sweep to
-/// enumerate as a vendored unit (or for the user to commit). `remove_dir`
-/// refuses non-empty dirs, so live copies, markers, and other patches' vendor
-/// dirs always survive. `copy_dir` may be the copy or its stage sibling
-/// (same parent); pruning starts at its parent.
+/// above the copy — `<uuid>/<vendor>/`, then `<uuid>/`,
+/// `.socket/vendor/composer/` and `.socket/vendor/` via the shared prune — so
+/// a hard failure leaves no husk for sweep to enumerate as a vendored unit (or
+/// for the user to commit). `remove_dir` refuses non-empty dirs, so live
+/// copies, markers, and other patches' vendor dirs always survive. `copy_dir`
+/// may be the copy or its stage sibling (same parent); pruning starts at its
+/// parent.
 async fn prune_empty_vendor_dirs(copy_dir: &Path) {
-    let mut level = copy_dir.parent();
-    for _ in 0..4 {
-        let Some(dir) = level else { return };
-        match tokio::fs::remove_dir(dir).await {
-            Ok(()) => {}
-            // Already unwound wholesale (`remove_tree(uuid_dir)`): keep
-            // pruning the parent levels this run created.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            // Non-empty (a live copy or marker) or otherwise busy: stop.
-            Err(_) => return,
-        }
-        level = dir.parent();
+    let Some(vendor_level) = copy_dir.parent() else {
+        return;
+    };
+    // Already unwound wholesale (`remove_tree(uuid_dir)`) reads as NotFound
+    // and the shared prune below still walks the levels this run created.
+    let _ = tokio::fs::remove_dir(vendor_level).await;
+    if let Some(uuid_dir) = vendor_level.parent() {
+        prune_empty_vendor_levels(uuid_dir).await;
     }
 }
 
@@ -1006,6 +938,7 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::{ApplyResult, VerifyStatus};
+    use crate::vendor::common::backup_dir_for;
     use crate::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;

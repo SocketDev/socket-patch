@@ -4,7 +4,7 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::{atomic_write_bytes_preserving_mode, is_symlink, read_regular_to_string};
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, first_symlink, read_regular_to_string};
 use crate::utils::python_lock::{
     is_python_lock_name, python_lock_paths, rewrite_python_lock, ArtifactSource,
 };
@@ -68,12 +68,9 @@ fn symlink_refusal(file: &str) -> String {
 }
 
 async fn refuse_symlinked(root: &Path, files: impl Iterator<Item = &String>) -> Option<String> {
-    for file in files {
-        if is_symlink(&root.join(file)).await {
-            return Some(symlink_refusal(file));
-        }
-    }
-    None
+    first_symlink(root, files.map(String::as_str))
+        .await
+        .map(symlink_refusal)
 }
 
 fn package<'a>(document: &'a DocumentMut, name: &str, version: &str) -> Option<&'a Table> {

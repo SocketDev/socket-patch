@@ -36,11 +36,16 @@ use sha2::{Digest, Sha512};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{normalize_file_path, PatchSources};
 use crate::patch::copy_tree::remove_tree;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{
+    atomic_write_bytes_preserving_mode, read_regular_to_bytes, read_regular_to_string,
+};
 use crate::utils::uri::encode_uri_component;
 
 use super::berry_zip::berry_cache_checksum_10c0;
-use super::common::{already_patched_result, detect_eol, detect_indent, refused, serialize_json};
+use super::common::{
+    already_patched_result, detect_eol, detect_indent, prune_empty_vendor_levels, refused,
+    serialize_json,
+};
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
@@ -49,9 +54,8 @@ use super::state::{
     write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::yarn_classic_lock::{
-    body_field_line, lines_to_json, pattern_real_name, read_regular, read_regular_to_string,
-    read_yarn_lock, replace_block, revert_recorded_block, scan_blocks, split_key_patterns,
-    split_pattern, LockBlock,
+    body_field_line, lines_to_json, pattern_real_name, read_yarn_lock, replace_block,
+    revert_recorded_block, scan_blocks, split_key_patterns, split_pattern, LockBlock,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -161,7 +165,7 @@ pub async fn vendor_yarn_berry(
 
     // ── 5. package.json + user-override conflict gate ─────────────────────
     let pkg_path = project_root.join(PACKAGE_JSON);
-    let pkg_bytes = match read_regular(&pkg_path).await {
+    let pkg_bytes = match read_regular_to_bytes(&pkg_path).await {
         Ok(b) => b,
         Err(e) => {
             return refused(
@@ -278,12 +282,6 @@ pub async fn vendor_yarn_berry(
         .any(|k| normalize_file_path(k) == "package.json");
 
     // ── 7. Stage → patch → pack (shared flavor-agnostic pipeline) ─────────
-    // A wiring failure past this point must unwind the uuid dir staging is
-    // about to create — but never one that already existed (a same-uuid
-    // re-vendor's dir may still be referenced by live wiring).
-    let uuid_dir_preexisted = tokio::fs::metadata(project_root.join(&uuid_dir_rel))
-        .await
-        .is_ok();
     let (staged, result) = match stage_patch_pack(
         purl,
         installed_dir,
@@ -308,6 +306,7 @@ pub async fn vendor_yarn_berry(
             warnings,
         };
     };
+    let uuid_dir_preexisted = staged.uuid_dir_preexisted;
     debug_assert_eq!(staged.rel_tgz, rel_tgz);
     let packed = staged.packed;
     let dest = project_root.join(&rel_tgz);
@@ -544,7 +543,7 @@ pub async fn revert_yarn_berry_opts(
     // wet run refuses. Skipped under `keep_artifact`: the refusal exists
     // only to protect the deletion, which a preserve-state revert never
     // performs.
-    if entry.wiring.is_empty() {
+    if !keep_artifact && entry.wiring.is_empty() {
         for wired in [YARN_LOCK, PACKAGE_JSON] {
             if let Some(blocked) = super::npm_lock::guard_unwired_textual_revert(
                 project_root,
@@ -621,7 +620,7 @@ pub async fn revert_yarn_berry_opts(
     // package.json resolutions entries.
     if !pkg_recs.is_empty() {
         let pkg_path = project_root.join(PACKAGE_JSON);
-        match read_regular(&pkg_path).await {
+        match read_regular_to_bytes(&pkg_path).await {
             Ok(bytes) => {
                 let mut pkg: Value = match serde_json::from_slice(&bytes) {
                     Ok(v) => v,
@@ -720,9 +719,14 @@ pub async fn revert_yarn_berry_opts(
         }
     }
 
-    if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
+    let uuid_dir = project_root.join(&uuid_dir_rel);
+    if let Err(e) = remove_tree(&uuid_dir).await {
         return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
     }
+    // The last npm-family entry leaves `.socket/vendor/npm/` (and
+    // `.socket/vendor/`) empty: prune them so a reverted project carries no
+    // vendor residue (`remove_dir` keeps non-empty levels).
+    prune_empty_vendor_levels(&uuid_dir).await;
 
     outcome
 }
@@ -3024,5 +3028,55 @@ __metadata:
         );
         assert!(detail.contains("@workspace:."), "{detail}");
         fx.assert_untouched().await;
+    }
+
+    /// `--preserve-state` with a repair-reconstructed (empty-wiring) entry:
+    /// both deletion-protecting probes (yarn.lock AND package.json) must be
+    /// SKIPPED — a preserve-state revert deletes nothing — so the revert
+    /// completes as a successful no-op with lock, package.json and artifact
+    /// intact. Dry-run preview included.
+    #[tokio::test]
+    async fn empty_wiring_preserve_state_revert_skips_the_deletion_refusal() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring.clear();
+        let lock_vendored = tokio::fs::read(fx.lock_path()).await.unwrap();
+        let pkg_vendored = tokio::fs::read(fx.root().join(PACKAGE_JSON))
+            .await
+            .unwrap();
+
+        for dry_run in [true, false] {
+            let outcome = revert_yarn_berry_opts(
+                &entry,
+                fx.root(),
+                RevertOpts {
+                    dry_run,
+                    keep_artifact: true,
+                },
+            )
+            .await;
+            assert!(
+                outcome.success,
+                "dry_run={dry_run}: preserve-state deletes nothing, so the \
+                 deletion guards must not fire: {:?}",
+                outcome.error
+            );
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert!(!outcome.kept_artifact, "preserve-state is not a drift-keep");
+            assert!(fx.tgz_path().exists(), "artifact kept");
+            assert_eq!(
+                tokio::fs::read(fx.lock_path()).await.unwrap(),
+                lock_vendored,
+                "empty wiring replays nothing"
+            );
+            assert_eq!(
+                tokio::fs::read(fx.root().join(PACKAGE_JSON))
+                    .await
+                    .unwrap(),
+                pkg_vendored,
+                "package.json untouched"
+            );
+        }
     }
 }

@@ -21,9 +21,12 @@ use serde_json::Value;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_bytes};
 
-use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
+use super::common::{
+    already_patched_result, detect_indent, done, prune_empty_vendor_levels, refused,
+    serialize_json,
+};
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
@@ -198,12 +201,6 @@ pub async fn vendor_npm(
     // ── 4–7. Stage → patch → pack (shared flavor-agnostic pipeline:
     //         tempdir stage outside the project, nested node_modules prune,
     //         bundled-deps refusal, hardened apply, deterministic pack) ────
-    // A wiring failure past this point must unwind the uuid dir staging is
-    // about to create — but never one that already existed (a same-uuid
-    // re-vendor's dir may still be referenced by live wiring).
-    let uuid_dir_preexisted = tokio::fs::metadata(project_root.join(&uuid_dir_rel))
-        .await
-        .is_ok();
     let (staged, result) = match stage_patch_pack(
         purl,
         installed_dir,
@@ -225,6 +222,7 @@ pub async fn vendor_npm(
         // byte-untouched) or a dry run (stops after the verify).
         return done(result, None, warnings);
     };
+    let uuid_dir_preexisted = staged.uuid_dir_preexisted;
     // `staged.name`/`staged.version` echo the validated coords (the wiring
     // below keeps using the borrowed `name`/`version`).
     debug_assert_eq!(
@@ -501,7 +499,7 @@ pub async fn revert_npm_opts(
     // the wet run refuses (same precedent as the uuid guard above). Skipped
     // under `keep_artifact`: the refusal exists only to protect the
     // deletion, which a preserve-state revert never performs.
-    if entry.wiring.is_empty() {
+    if !keep_artifact && entry.wiring.is_empty() {
         if let Some(blocked) = guard_unwired_textual_revert(
             project_root,
             &entry.uuid,
@@ -539,7 +537,7 @@ pub async fn revert_npm_opts(
 
     for lock_name in lock_files {
         let lock_path = project_root.join(lock_name);
-        let lock_bytes = match read_regular(&lock_path).await {
+        let lock_bytes = match read_regular_to_bytes(&lock_path).await {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // The lock is gone (user regenerated the project?); the
@@ -644,9 +642,14 @@ pub async fn revert_npm_opts(
 
     // Remove the whole validated uuid dir (tgz + marker + any @scope level)
     // in one tree delete — pruning by leaf would leave empty dirs behind.
-    if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
+    let uuid_dir = project_root.join(&uuid_dir_rel);
+    if let Err(e) = remove_tree(&uuid_dir).await {
         return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
     }
+    // The last npm-family entry leaves `.socket/vendor/npm/` (and
+    // `.socket/vendor/`) empty: prune them so a reverted project carries no
+    // vendor residue (`remove_dir` keeps non-empty levels).
+    prune_empty_vendor_levels(&uuid_dir).await;
 
     outcome
 }
@@ -964,24 +967,9 @@ fn revert_one_record(
 // ───────────────────────────── small helpers ─────────────────────────────
 // (the flavor-agnostic coordinate/staging helpers live in `npm_common`)
 
-/// Guarded read shared in shape with the vendor siblings' twins
-/// (npm_flavor.rs, lock_inventory.rs, cargo_lock.rs): `open_regular_file`
-/// opens with `O_NONBLOCK` and rejects non-regular files, so a FIFO planted
-/// as a lockfile fails fast instead of wedging vendor (flavor detection is
-/// existence-only for the npm locks, so [`select_lockfile`]'s read is the
-/// FIRST open) or revert forever in an `open(2)` waiting for a writer.
-async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
 async fn select_lockfile(project_root: &Path) -> std::io::Result<Option<(String, Vec<u8>)>> {
     for lock_name in [SHRINKWRAP, PACKAGE_LOCK] {
-        match read_regular(&project_root.join(lock_name)).await {
+        match read_regular_to_bytes(&project_root.join(lock_name)).await {
             Ok(bytes) => return Ok(Some((lock_name.to_string(), bytes))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
@@ -3532,5 +3520,44 @@ mod tests {
         }
         assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), before);
         assert!(!fx.root().join(fx.expected_rel_tgz()).exists());
+    }
+
+    /// `--preserve-state` with a repair-reconstructed (empty-wiring) entry:
+    /// the deletion-protecting refusal must be SKIPPED (the fn doc, bun and
+    /// pnpm-legacy all promise it — a preserve-state revert deletes
+    /// nothing), so the revert completes as a successful no-op with lock and
+    /// artifact intact. Dry-run preview included: it must never advertise a
+    /// refusal the wet preserve-state run does not hit.
+    #[tokio::test]
+    async fn empty_wiring_preserve_state_revert_skips_the_deletion_refusal() {
+        let (fx, entry) = reconstructed_fixture().await;
+        let tgz_path = fx.root().join(fx.expected_rel_tgz());
+        let lock_vendored = tokio::fs::read(fx.lock_path()).await.unwrap();
+
+        for dry_run in [true, false] {
+            let outcome = revert_npm_opts(
+                &entry,
+                fx.root(),
+                RevertOpts {
+                    dry_run,
+                    keep_artifact: true,
+                },
+            )
+            .await;
+            assert!(
+                outcome.success,
+                "dry_run={dry_run}: preserve-state deletes nothing, so the \
+                 deletion guard must not fire: {:?}",
+                outcome.error
+            );
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert!(!outcome.kept_artifact, "preserve-state is not a drift-keep");
+            assert!(tgz_path.exists(), "artifact kept");
+            assert_eq!(
+                tokio::fs::read(fx.lock_path()).await.unwrap(),
+                lock_vendored,
+                "empty wiring replays nothing"
+            );
+        }
     }
 }

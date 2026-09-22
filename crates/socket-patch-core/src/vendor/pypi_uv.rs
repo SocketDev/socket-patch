@@ -31,7 +31,9 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::python_lock::preserve_line_endings;
 
-use super::common::{item_get, pep508_name, pep621_declared_names, record};
+use super::common::{
+    ensure_unchanged, item_get, pep508_name, pep621_declared_names, record, refuse_symlinked,
+};
 use super::state::{UvMeta, VendorEntry, WiringAction, WiringRecord};
 use super::toml_surgery::{
     balanced_span, find_unit_span, line_index, remove_exact_line, remove_substring,
@@ -458,7 +460,7 @@ pub(super) async fn wire_uv(
     record_uuid: &str,
 ) -> Result<(Vec<WiringRecord>, UvMeta, Vec<VendorWarning>), (&'static str, String)> {
     // Before ANY write: a symlinked half would be replaced by the rename.
-    refuse_symlinked_pair(root).await?;
+    refuse_symlinked(root, &UV_PAIR, "pypi_uv_symlink_unsupported").await?;
     match check_target_guards(p, canon_name, record_uuid)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
@@ -696,6 +698,10 @@ pub(super) async fn wire_uv(
     }
 
     // ── commit: pyproject first, then the lock; unwind on lock failure ────
+    // Both edits were computed from the pre-flight snapshot; a `uv lock` /
+    // editor save that landed during the wheel build must not be clobbered.
+    ensure_unchanged(root, UV_PAIR[0], &p.pyproject_text, "pypi_uv_changed").await?;
+    ensure_unchanged(root, UV_PAIR[1], &p.lock_text, "pypi_uv_changed").await?;
     // Mode-preserving: both are user-owned files we merely edit, so the
     // swapped-in inode must keep its permission bits rather than reset them
     // to umask defaults (same class as the poetry/pdm/pipenv writers).
@@ -746,7 +752,8 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
     let lock_path = root.join("uv.lock");
     // A symlinked half would be replaced by the rename-over write: keep the
     // artifact (the wiring still routes through it) and fail the revert.
-    if let Err((code, detail)) = refuse_symlinked_pair(root).await {
+    if let Err((code, detail)) = refuse_symlinked(root, &UV_PAIR, "pypi_uv_symlink_unsupported").await
+    {
         return RevertOutcome {
             kept_artifact: true,
             success: false,
@@ -956,26 +963,10 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-/// Refuse when `pyproject.toml` or `uv.lock` is itself a symlink. The
-/// writers stage a replacement next to the path and rename over it, which
-/// would REPLACE the link with a regular file — the target left stale, git
-/// showing a typechange — so both wire and revert check before any write
-/// (uv itself writes through the link). `Err` names the offending file.
-async fn refuse_symlinked_pair(root: &Path) -> Result<(), (&'static str, String)> {
-    for name in ["pyproject.toml", "uv.lock"] {
-        if crate::utils::fs::is_symlink(&root.join(name)).await {
-            return Err((
-                "pypi_uv_symlink_unsupported",
-                format!(
-                    "{name} is a symbolic link; the atomic rewrite would replace the link with \
-                     a regular file and leave its target stale — vendor the real file's \
-                     directory instead"
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
+/// The two files this backend edits — both are checked for symlinks before
+/// any write (uv itself writes through a link; the atomic rename would
+/// replace it) and re-verified against the pre-flight snapshot.
+const UV_PAIR: [&str; 2] = ["pyproject.toml", "uv.lock"];
 
 /// The lock's line terminator. uv writes LF, but git autocrlf on Windows
 /// hands us a CRLF file; every fragment we splice, append or remove must be
@@ -5531,5 +5522,37 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             assert!(meta.file_type().is_symlink(), "{linked}: link replaced by revert");
             assert_eq!(tokio::fs::read(&target).await.unwrap(), target_before);
         }
+    }
+
+    /// A pair file changed between the pre-flight snapshot and the write (a
+    /// `uv lock` landed during the wheel build): refuse before the FIRST
+    /// write instead of clobbering it with the stale snapshot-derived text —
+    /// neither half is touched.
+    #[tokio::test]
+    async fn pair_changed_during_vendoring_is_refused_before_the_write() {
+        let tmp = write_pair(DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK).await;
+        let p = load_uv_project(tmp.path()).await.unwrap();
+        let relocked = format!("{DIRECT_REGISTRY_LOCK}# relocked\n");
+        tokio::fs::write(tmp.path().join("uv.lock"), &relocked)
+            .await
+            .unwrap();
+
+        let err = wire_uv(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_uv_changed");
+        assert!(err.1.contains("uv.lock changed during vendoring"), "{}", err.1);
+        let (pyproject, lock) = read_pair(tmp.path()).await;
+        assert_eq!(pyproject, DIRECT_REGISTRY_PYPROJECT, "pyproject never written");
+        assert_eq!(lock, relocked, "the live lock is left alone");
     }
 }

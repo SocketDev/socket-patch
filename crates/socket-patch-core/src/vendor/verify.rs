@@ -403,16 +403,18 @@ pub async fn check_vendored_artifact(
 
 /// Plain sha256 hex of a regular file, size-capped; `None` on any read
 /// failure or cap breach. Public for repair's ledger re-synthesis (the
-/// rebuilt artifact's recorded sha).
+/// rebuilt artifact's recorded sha). Opens once through the shared guarded
+/// opener (`O_NONBLOCK` + fstat on the handle), so the size gate and the
+/// bytes hashed come from the same inode and a FIFO swapped in at the path
+/// can never wedge the health check in `open(2)`.
 pub async fn file_sha256_hex(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncReadExt;
 
-    let meta = tokio::fs::metadata(path).await.ok()?;
-    if !meta.is_file() || meta.len() > MAX_HEALTH_HASH_BYTES {
+    let (mut file, meta) = crate::utils::fs::open_regular_file(path).await.ok()?;
+    if meta.len() > MAX_HEALTH_HASH_BYTES {
         return None;
     }
-    let mut file = tokio::fs::File::open(path).await.ok()?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {

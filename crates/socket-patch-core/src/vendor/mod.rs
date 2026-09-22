@@ -107,6 +107,7 @@ use crate::patch::apply::{
     apply_package_patch, is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
     VerifyStatus,
 };
+use crate::utils::fs::read_regular_to_string_sync;
 use crate::utils::purl::strip_purl_qualifiers;
 
 /// A non-fatal advisory surfaced as a warning event (`code` is a stable
@@ -124,39 +125,6 @@ impl VendorWarning {
             detail: detail.into(),
         }
     }
-}
-
-/// Read a UTF-8 file, requiring a regular file — the sync twin of
-/// [`crate::utils::fs::open_regular_file`] for the advisory probe below.
-/// The probe runs unconditionally at envelope-finalize time on every
-/// vendor / scan --vendor run, and a plain `open(2)` of a FIFO planted at
-/// `yarn.lock` or `package.json` waits for a writer that may never come —
-/// wedging the whole run after all the real work already happened.
-/// `O_NONBLOCK` makes the open return immediately; the handle-based
-/// `is_file` check then rejects FIFOs/devices/directories so the probe
-/// degrades to its unreadable-file behavior.
-fn read_regular_file_to_string(path: &Path) -> std::io::Result<String> {
-    use std::io::Read as _;
-    #[cfg(unix)]
-    let mut file = {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)?
-    };
-    #[cfg(not(unix))]
-    let mut file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
-    let mut s = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut s)?;
-    Ok(s)
 }
 
 /// Advisory probe: is this project one `yarn install` away from silently
@@ -177,11 +145,15 @@ fn read_regular_file_to_string(path: &Path) -> std::io::Result<String> {
 /// callers can invoke it unconditionally at envelope-finalize time: it stays
 /// silent on unwired projects and after a full revert.
 pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWarning> {
-    let lock = read_regular_file_to_string(&project_root.join("yarn.lock")).ok()?;
+    // The guarded sync reader (`O_NONBLOCK` open + fstat regular-file check):
+    // this probe runs at envelope-finalize time on every vendor / scan
+    // --vendor run, and a plain `open(2)` of a FIFO planted at `yarn.lock` or
+    // `package.json` would wedge the whole run after the real work is done.
+    let lock = read_regular_to_string_sync(&project_root.join("yarn.lock")).ok()?;
     if !lock.contains("# yarn lockfile v1") || !lock.contains(".socket/vendor/") {
         return None;
     }
-    if let Some(pm) = read_regular_file_to_string(&project_root.join("package.json"))
+    if let Some(pm) = read_regular_to_string_sync(&project_root.join("package.json"))
         .ok()
         .and_then(|pkg| serde_json::from_str::<serde_json::Value>(&pkg).ok())
         .and_then(|v| {
@@ -432,7 +404,14 @@ pub async fn harvest_artifact_blobs(
         // Tarball/wheel artifacts: read entries in memory.
         let lower = entry.artifact.path.to_ascii_lowercase();
         if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") {
-            if let Ok(map) = crate::patch::package::read_archive_to_map(&artifact) {
+            // The tarball reader is synchronous (gzip + tar decode): run it
+            // off the async thread like `verify` does, so a large committed
+            // artifact never stalls the runtime.
+            let tgz = artifact.clone();
+            let read =
+                tokio::task::spawn_blocking(move || crate::patch::package::read_archive_to_map(&tgz))
+                    .await;
+            if let Ok(Ok(map)) = read {
                 for bytes in map.into_values() {
                     let h = compute_git_sha256_from_bytes(&bytes);
                     if needed.contains(h.as_str()) {

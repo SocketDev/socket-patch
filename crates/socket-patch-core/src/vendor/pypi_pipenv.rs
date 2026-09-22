@@ -7,9 +7,9 @@ use std::path::Path;
 use serde_json::{Map, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
-use super::common::serialize_json;
+use super::common::{ensure_unchanged, refuse_symlinked, serialize_json};
 use super::path::parse_vendor_path;
 use super::state::{PipenvMeta, VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
@@ -30,21 +30,6 @@ fn category_names(lock: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Guarded read shared in shape with the sibling backend twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `Pipfile.lock` fails fast instead of wedging
-/// every pipenv-project vendor run (and revert) forever in an `open(2)` that
-/// waits for a writer — the flavor-routing probes ahead of the load are
-/// metadata-only, so these are the first opens.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
-
 /// Pipfile.lock entry keys that mark a user-declared non-registry source.
 const NON_REGISTRY_KEYS: [&str; 6] = ["path", "git", "hg", "svn", "bzr", "editable"];
 
@@ -53,6 +38,10 @@ const NON_REGISTRY_KEYS: [&str; 6] = ["path", "git", "hg", "svn", "bzr", "editab
 pub(super) struct PipenvProject {
     /// Parsed lock (the edit substrate — re-serialized canonically).
     pub lock: Value,
+    /// Verbatim lock text the parse came from: the wire step re-reads the
+    /// file and refuses when it no longer matches (a `pipenv lock` landed
+    /// during the wheel build).
+    pub lock_text: String,
     /// The lock's line ending (`\r\n` when the checkout carries CRLF — git
     /// autocrlf; Pipenv itself preserves it), reapplied on every write so the
     /// wired lock and the reverted lock stay byte-comparable to the original.
@@ -144,6 +133,7 @@ pub(super) async fn load_pipenv_project(
     Ok(PipenvProject {
         lock,
         crlf: lock_text.contains("\r\n"),
+        lock_text,
         warnings,
     })
 }
@@ -272,18 +262,13 @@ pub(super) async fn wire_pipenv(
     p: &PipenvProject,
     root: &Path,
     canon_name: &str,
+    version: &str,
     rel_wheel: &str,
     wheel_sha256_hex: &str,
     record_uuid: &str,
 ) -> Result<(Vec<WiringRecord>, PipenvMeta), (&'static str, String)> {
-    let version = rel_wheel
-        .rsplit('/')
-        .next()
-        .and_then(|filename| filename.split('-').nth(1))
-        .ok_or((
-            "pypi_pipenv_invalid_wheel",
-            "missing wheel version".to_owned(),
-        ))?;
+    // Before ANY write: a symlinked lock would be replaced by the rename-over.
+    refuse_symlinked(root, &[LOCK_FILE], "pypi_pipenv_symlink_unsupported").await?;
     match check_target_guards(p, canon_name, record_uuid, version)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
@@ -373,6 +358,9 @@ pub(super) async fn wire_pipenv(
     }
 
     let new_text = with_line_ending(to_canonical_json(&lock), p.crlf);
+    // The edit was computed from the pre-flight snapshot; a `pipenv lock` /
+    // editor save that landed during the wheel build must not be clobbered.
+    ensure_unchanged(root, LOCK_FILE, &p.lock_text, "pypi_pipenv_changed").await?;
     atomic_write_bytes_preserving_mode(&root.join(LOCK_FILE), new_text.as_bytes())
         .await
         .map_err(|e| {
@@ -393,6 +381,19 @@ pub(super) async fn revert_pipenv(
     root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
+    // A symlinked lock would be replaced by the atomic rewrite-over, leaving
+    // its target stale and never restoring the link. Keep the artifact (the
+    // wiring still routes through the linked file) and fail.
+    if let Err((code, detail)) =
+        refuse_symlinked(root, &[LOCK_FILE], "pypi_pipenv_symlink_unsupported").await
+    {
+        return RevertOutcome {
+            kept_artifact: true,
+            success: false,
+            warnings: Vec::new(),
+            error: Some(format!("{code}: {detail}")),
+        };
+    }
     let lock_path = root.join(LOCK_FILE);
     let lock_text = match read_regular_to_string(&lock_path).await {
         Ok(t) => t,
@@ -836,7 +837,7 @@ mod tests {
     }
 
     async fn wire_default(p: &PipenvProject, root: &Path) -> (Vec<WiringRecord>, PipenvMeta) {
-        wire_pipenv(p, root, "six", REL_WHEEL, WHEEL_SHA, UUID)
+        wire_pipenv(p, root, "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID)
             .await
             .unwrap()
     }
@@ -1020,7 +1021,7 @@ mod tests {
 
         // wire re-runs the guards itself (refusal before any write)
         let before = read_lock(tmp.path()).await;
-        let err = wire_pipenv(&p, tmp.path(), "six", REL_WHEEL, WHEEL_SHA, UUID)
+        let err = wire_pipenv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID)
             .await
             .unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_source_already_exists");
@@ -1364,7 +1365,7 @@ mod tests {
         let tmp = write_lock(LOCK_DIRECT_VENDORED).await;
         let p = load_pipenv_project(tmp.path()).await.unwrap();
 
-        let err = wire_pipenv(&p, tmp.path(), "six", REL_WHEEL, WHEEL_SHA, UUID)
+        let err = wire_pipenv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID)
             .await
             .unwrap_err();
         assert_eq!(err.0, "pypi_pipenv_source_already_exists");
@@ -1466,7 +1467,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = wire_pipenv(&p, tmp.path(), "six", REL_WHEEL, WHEEL_SHA, UUID)
+        let err = wire_pipenv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID)
             .await
             .unwrap_err();
         tokio::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))
@@ -1724,5 +1725,78 @@ mod tests {
         let reverted = revert_pipenv(&entry, tmp.path(), false).await;
         assert!(reverted.success);
         assert_eq!(read_lock(tmp.path()).await, before);
+    }
+
+    /// A symlinked Pipfile.lock is refused before any write by both wire and
+    /// revert: the rename-over would replace the link with a regular file
+    /// and leave its target stale, and revert would never restore the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_lock_refuses_wire_and_revert_without_writing() {
+        let outer = tempfile::tempdir().unwrap();
+        let real = outer.path().join("real.lock");
+        tokio::fs::write(&real, LOCK_DIRECT_REGISTRY).await.unwrap();
+        let root = outer.path().join("proj");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        std::os::unix::fs::symlink(&real, root.join(LOCK_FILE)).unwrap();
+
+        let p = load_pipenv_project(&root).await.unwrap();
+        let err = wire_pipenv(&p, &root, "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "pypi_pipenv_symlink_unsupported");
+        assert!(std::fs::symlink_metadata(root.join(LOCK_FILE))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(read_lock(&root).await, LOCK_DIRECT_REGISTRY);
+
+        // revert refuses the same way and keeps the artifact.
+        let wiring = vec![WiringRecord {
+            file: LOCK_FILE.to_string(),
+            kind: KIND_LOCK_ENTRY.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("default:six".to_string()),
+            original: Some(serde_json::json!({})),
+            new: Some(serde_json::json!({})),
+        }];
+        let meta = PipenvMeta {
+            sections: vec!["default".into()],
+        };
+        let outcome = revert_pipenv(&entry_for(wiring, meta), &root, false).await;
+        assert!(!outcome.success);
+        assert!(outcome.kept_artifact);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("pypi_pipenv_symlink_unsupported")),
+            "{:?}",
+            outcome.error
+        );
+    }
+
+    /// The lock changed between the pre-flight snapshot and the write (a
+    /// `pipenv lock` landed during the wheel build): refuse instead of
+    /// clobbering it with the stale snapshot-derived text.
+    #[tokio::test]
+    async fn lock_changed_during_vendoring_is_refused_before_the_write() {
+        let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
+        let p = load_pipenv_project(tmp.path()).await.unwrap();
+        let relocked = format!("{LOCK_DIRECT_REGISTRY}\n");
+        tokio::fs::write(tmp.path().join(LOCK_FILE), &relocked)
+            .await
+            .unwrap();
+
+        let err = wire_pipenv(&p, tmp.path(), "six", "1.16.0", REL_WHEEL, WHEEL_SHA, UUID)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "pypi_pipenv_changed");
+        assert!(err.1.contains("changed during vendoring"), "{}", err.1);
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            relocked,
+            "the live lock is left alone"
+        );
     }
 }

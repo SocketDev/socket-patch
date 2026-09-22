@@ -17,27 +17,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
-use super::common::detect_eol;
+use super::common::{detect_eol, refuse_symlinked};
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
-
-/// Guarded read shared in shape with the sibling backend twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `requirements.txt` (or an include) fails
-/// fast instead of wedging every requirements-project vendor run (and
-/// revert) forever in an `open(2)` that waits for a writer — the
-/// flavor-routing probe ahead of the walk is metadata-only, so these are
-/// the first opens.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// Classification of the target package within the requirements tree.
 #[derive(Debug, PartialEq, Eq)]
@@ -243,6 +227,10 @@ pub(super) async fn wire_requirements(
     wheel_sha256_hex: &str,
 ) -> Result<Vec<WiringRecord>, (&'static str, String)> {
     let plan = plan_requirements(root, canon_name, version, rel_wheel, wheel_sha256_hex).await?;
+    // Before ANY write: a symlinked requirements file (root or `-r` include)
+    // would be replaced by the rename-over.
+    let planned: Vec<&str> = plan.iter().map(|f| f.rel.as_str()).collect();
+    refuse_symlinked(root, &planned, "pypi_requirements_symlink_unsupported").await?;
     let mut wiring = Vec::new();
     let mut written: Vec<&PlannedFile> = Vec::new();
     for file in &plan {
@@ -315,6 +303,21 @@ pub(super) async fn revert_requirements(
         if !files.contains(&rec.file) {
             files.push(rec.file.clone());
         }
+    }
+
+    // A symlinked file would be replaced by the atomic rewrite-over, leaving
+    // its target stale and never restoring the link. Keep the artifact (the
+    // wiring still routes through the linked file) and fail.
+    let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
+    if let Err((code, detail)) =
+        refuse_symlinked(root, &file_refs, "pypi_requirements_symlink_unsupported").await
+    {
+        return RevertOutcome {
+            kept_artifact: true,
+            success: false,
+            warnings,
+            error: Some(format!("{code}: {detail}")),
+        };
     }
 
     let mut reverted: Vec<(String, String)> = Vec::new();
@@ -2120,5 +2123,59 @@ mod tests {
                 hashed: false,
             }
         );
+    }
+
+    /// A symlinked requirements file is refused before any write by both
+    /// wire and revert: the rename-over would replace the link with a
+    /// regular file and leave its target stale, and revert would never
+    /// restore the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_requirements_refuses_wire_and_revert_without_writing() {
+        // wire: the planned root file is a link.
+        let outer = tempfile::tempdir().unwrap();
+        let real = outer.path().join("real.txt");
+        tokio::fs::write(&real, "six==1.16.0\n").await.unwrap();
+        let root = outer.path().join("proj");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        std::os::unix::fs::symlink(&real, root.join("requirements.txt")).unwrap();
+        let err = wire_requirements(&root, "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "pypi_requirements_symlink_unsupported");
+        assert!(std::fs::symlink_metadata(root.join("requirements.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(read_root(&root).await, "six==1.16.0\n");
+
+        // revert: a wired regular file swapped for a link afterwards.
+        let tmp = write_root("six==1.16.0\n").await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        let wired = read_root(tmp.path()).await;
+        let target = outer.path().join("wired.txt");
+        tokio::fs::write(&target, &wired).await.unwrap();
+        tokio::fs::remove_file(tmp.path().join("requirements.txt"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join("requirements.txt")).unwrap();
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        assert!(!outcome.success);
+        assert!(outcome.kept_artifact);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("pypi_requirements_symlink_unsupported")),
+            "{:?}",
+            outcome.error
+        );
+        assert!(std::fs::symlink_metadata(tmp.path().join("requirements.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(read_root(tmp.path()).await, wired, "the link target is untouched");
     }
 }

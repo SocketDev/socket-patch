@@ -54,12 +54,15 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::utils::fs::{atomic_write_bytes, atomic_write_bytes_preserving_mode, list_dir_entries};
+use crate::utils::fs::{
+    atomic_write_bytes, atomic_write_bytes_preserving_mode, list_dir_entries, read_regular_to_bytes,
+    read_regular_to_string,
+};
 use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
 
 use super::common::{
-    already_patched_result, done, failed_result, rebuild_zip, refused, synthesized_result,
-    zip_matches_after_hashes,
+    already_patched_result, done, failed_result, prune_empty_vendor_levels, read_zip_artifact,
+    rebuild_zip, refused, synthesized_result, zip_bytes_match_after_hashes,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
@@ -145,32 +148,6 @@ fn is_plain_nuget_token(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
-}
-
-/// Guarded read shared in shape with the vendor twins (cargo.rs, gem.rs,
-/// maven_repo.rs …): `open_regular_file` opens with `O_NONBLOCK` and rejects
-/// non-regular files, so a FIFO planted at any of this backend's read paths —
-/// the committed vendored tree, the project `nuget.config` /
-/// `packages.lock.json`, the `~/.nuget` cache — fails fast instead of wedging
-/// the caller forever in an `open(2)` waiting for a writer that never comes.
-async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
-/// String twin of [`read_regular`] (invalid UTF-8 errors as `InvalidData`,
-/// matching `tokio::fs::read_to_string`).
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Vendor a NuGet package: rebuild a patched `.nupkg` under
@@ -272,22 +249,27 @@ pub async fn vendor_nuget(
         .as_deref()
         .is_some_and(|t| t.contains(&source_key));
     if config_wired {
-        let nupkg_ok = zip_matches_after_hashes(&nupkg_path, &record.files).await;
-        let lock_ok = match &lock_text {
-            None => true,
-            Some(text) => match read_regular(&nupkg_path).await {
-                Ok(bytes) => {
-                    let expected = content_hash(&bytes);
-                    // Pinned at our bytes, or no matching resolved entry at
-                    // all — the same absence `edit_lock` tolerates with a
-                    // warning on the first run. Treating absence as stale
-                    // would misreport "missing or stale; rebuilt" on every
-                    // rerun with nothing to actually pin.
-                    lock_pinned(text, name, &version_norm, &expected)
-                        || matches!(edit_lock(text, name, &version_norm, &expected), Ok(None))
-                }
-                Err(_) => false,
-            },
+        // One guarded read of the committed nupkg serves both the member-hash
+        // check and the lock's content-hash pin.
+        let nupkg_bytes = read_zip_artifact(&nupkg_path).await;
+        let nupkg_ok = nupkg_bytes
+            .as_deref()
+            .is_some_and(|bytes| zip_bytes_match_after_hashes(bytes, &record.files));
+        // Only worth computing when the artifact itself is in sync (a stale
+        // nupkg rebuilds regardless of what the lock pins).
+        let lock_ok = match (&lock_text, &nupkg_bytes) {
+            (None, _) => true,
+            (Some(text), Some(bytes)) if nupkg_ok => {
+                let expected = content_hash(bytes);
+                // Pinned at our bytes, or no matching resolved entry at
+                // all — the same absence `edit_lock` tolerates with a
+                // warning on the first run. Treating absence as stale
+                // would misreport "missing or stale; rebuilt" on every
+                // rerun with nothing to actually pin.
+                lock_pinned(text, name, &version_norm, &expected)
+                    || matches!(edit_lock(text, name, &version_norm, &expected), Ok(None))
+            }
+            _ => false,
         };
         if nupkg_ok && lock_ok {
             return done(
@@ -417,6 +399,7 @@ pub async fn vendor_nuget(
             Ok(edit) => edit,
             Err(detail) => {
                 let _ = remove_tree(&uuid_dir).await;
+                prune_empty_vendor_levels(&uuid_dir).await;
                 result.success = false;
                 result.error = Some(detail);
                 return done(result, None, warnings);
@@ -429,6 +412,7 @@ pub async fn vendor_nuget(
         atomic_write_bytes_preserving_mode(&config_target, config_edit.new_text.as_bytes()).await
     {
         let _ = remove_tree(&uuid_dir).await;
+        prune_empty_vendor_levels(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write {}: {e}", config_target.display()));
         return done(result, None, warnings);
@@ -655,6 +639,10 @@ pub async fn revert_nuget_opts(
                 error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
             };
         }
+        // The last nuget entry leaves `.socket/vendor/nuget/` (and
+        // `.socket/vendor/`) empty: prune them so a reverted project carries
+        // no vendor residue (`remove_dir` keeps non-empty levels).
+        prune_empty_vendor_levels(&uuid_dir).await;
     }
 
     RevertOutcome {
@@ -698,6 +686,7 @@ async fn materialise_patched_nupkg(
             if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &bytes).await {
                 if !config_wired {
                     let _ = remove_tree(uuid_dir).await;
+                    prune_empty_vendor_levels(uuid_dir).await;
                 }
                 return Err(Box::new(refused("vendor_prebuilt_write_failed", e)));
             }
@@ -756,7 +745,7 @@ async fn local_rebuild(
             ),
         )));
     };
-    let bytes = match read_regular(&src_nupkg).await {
+    let bytes = match read_regular_to_bytes(&src_nupkg).await {
         Ok(b) => b,
         Err(e) => {
             return Ok((
@@ -835,6 +824,7 @@ async fn local_rebuild(
         // the marker) must stay — the config still routes restores here.
         if !config_wired {
             let _ = remove_tree(uuid_dir).await;
+            prune_empty_vendor_levels(uuid_dir).await;
         }
         return Ok((Vec::new(), failed_result(purl, nupkg_path, e)));
     }
@@ -1405,6 +1395,7 @@ async fn unwind_config(config_target: &Path, original: Option<&str>, uuid_dir: &
         }
     }
     let _ = remove_tree(uuid_dir).await;
+    prune_empty_vendor_levels(uuid_dir).await;
 }
 
 #[cfg(test)]

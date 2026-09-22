@@ -67,12 +67,15 @@ use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::utils::fs::{atomic_write_bytes, atomic_write_bytes_preserving_mode};
+use crate::utils::fs::{
+    atomic_write_bytes, atomic_write_bytes_preserving_mode, read_regular_to_bytes,
+    read_regular_to_string,
+};
 use crate::utils::purl::{build_maven_purl, parse_maven_purl};
 
 use super::common::{
-    already_patched_result, done, failed_result, rebuild_zip, refused, synthesized_result,
-    zip_matches_after_hashes,
+    already_patched_result, done, failed_result, prune_empty_vendor_levels, read_zip_artifact,
+    rebuild_zip, refused, synthesized_result, zip_bytes_match_after_hashes,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
@@ -135,32 +138,6 @@ fn group_id_to_path(group_id: &str) -> String {
 /// `is_safe_maven_coordinate` group half. Fails closed on tampered coordinates.
 fn is_safe_group_id(group_id: &str) -> bool {
     group_id.split('.').all(is_safe_single_segment)
-}
-
-/// Guarded read shared in shape with the vendor twins (cargo.rs, gem.rs,
-/// composer_lock.rs …): `open_regular_file` opens with `O_NONBLOCK` and
-/// rejects non-regular files, so a FIFO planted at any of this backend's read
-/// paths — the committed vendored tree, the project `pom.xml`, the `~/.m2`
-/// cache — fails fast instead of wedging the caller forever in an `open(2)`
-/// waiting for a writer that never comes.
-async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
-/// String twin of [`read_regular`] (invalid UTF-8 errors as `InvalidData`,
-/// matching `tokio::fs::read_to_string`).
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Vendor a Maven package: rebuild a patched `.jar` under a committed maven2
@@ -385,6 +362,7 @@ pub async fn vendor_maven(
         Ok(text) => text,
         Err(detail) => {
             let _ = remove_tree(&uuid_dir).await;
+            prune_empty_vendor_levels(&uuid_dir).await;
             result.success = false;
             result.error = Some(detail);
             return done(result, None, warnings);
@@ -393,6 +371,7 @@ pub async fn vendor_maven(
     if let Err(e) = atomic_write_bytes_preserving_mode(&pom_xml_path, new_pom_xml.as_bytes()).await
     {
         let _ = remove_tree(&uuid_dir).await;
+        prune_empty_vendor_levels(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write {}: {e}", pom_xml_path.display()));
         return done(result, None, warnings);
@@ -537,6 +516,10 @@ pub async fn revert_maven_opts(
                 error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
             };
         }
+        // The last maven entry leaves `.socket/vendor/maven/` (and
+        // `.socket/vendor/`) empty: prune them so a reverted project carries
+        // no vendor residue (`remove_dir` keeps non-empty levels).
+        prune_empty_vendor_levels(&uuid_dir).await;
     }
 
     RevertOutcome {
@@ -627,6 +610,7 @@ async fn materialise_and_write(
     if let Err(e) = write_maven_artifact(leaf_dir, jar_leaf, &jar_bytes, pom_leaf, &pom_bytes).await
     {
         let _ = remove_tree(uuid_dir).await;
+        prune_empty_vendor_levels(uuid_dir).await;
         return Ok((Vec::new(), failed_result(purl, jar_path, e)));
     }
     Ok((jar_bytes, result))
@@ -722,7 +706,7 @@ async fn acquire_upstream_pom(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<Vec<u8>, String> {
     let local = installed_dir.join(format!("{artifact_id}-{version}.pom"));
-    match read_regular(&local).await {
+    match read_regular_to_bytes(&local).await {
         Ok(bytes) => return Ok(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("unreadable local pom {}: {e}", local.display())),
@@ -773,17 +757,13 @@ async fn fetch_pom_bytes(url: &str) -> Result<Vec<u8>, String> {
     if !resp.status().is_success() {
         return Err(format!("GET {url}: HTTP {}", resp.status()));
     }
-    let bytes = resp
-        .bytes()
+    // Enforce the cap on the declared Content-Length AND on the streamed
+    // bytes (the shared reader every other registry download uses): a
+    // mirror serving a huge body is refused mid-stream instead of being
+    // buffered whole before the size check.
+    crate::utils::http::read_capped(resp, MAX_POM_BYTES as u64, "pom")
         .await
-        .map_err(|e| format!("read body of {url}: {e}"))?;
-    if bytes.len() > MAX_POM_BYTES {
-        return Err(format!(
-            "pom at {url} is {} bytes (cap {MAX_POM_BYTES})",
-            bytes.len()
-        ));
-    }
-    Ok(bytes.to_vec())
+        .map_err(|e| format!("{url}: {e}"))
 }
 
 /// Dry-run verify-only: extract the local jar to a private stage and run the
@@ -841,7 +821,7 @@ async fn dry_run_verify(
 /// entry fail-closed. Returns the live [`tempfile::TempDir`] (the caller holds
 /// it for the stage's lifetime).
 async fn extract_jar_to_stage(src_jar: &Path) -> Result<tempfile::TempDir, String> {
-    let bytes = read_regular(src_jar)
+    let bytes = read_regular_to_bytes(src_jar)
         .await
         .map_err(|e| format!("cannot read {}: {e}", src_jar.display()))?;
     let stage = tempfile::tempdir().map_err(|e| format!("cannot create stage dir: {e}"))?;
@@ -884,16 +864,28 @@ async fn artifact_in_sync(
     pom_leaf: &str,
     files: &HashMap<String, PatchFileInfo>,
 ) -> bool {
-    if !zip_matches_after_hashes(&leaf_dir.join(jar_leaf), files).await {
+    // One guarded read of the jar serves both the member-hash check and its
+    // `.sha1` sidecar compare (the hot path runs on every re-run).
+    let Some(jar) = read_zip_artifact(&leaf_dir.join(jar_leaf)).await else {
+        return false;
+    };
+    if !zip_bytes_match_after_hashes(&jar, files) {
         return false;
     }
-    // The pom + both sidecars must exist and match their bytes.
-    sidecar_matches(leaf_dir, jar_leaf).await && sidecar_matches(leaf_dir, pom_leaf).await
+    let Ok(recorded) = read_regular_to_string(&leaf_dir.join(format!("{jar_leaf}.sha1"))).await
+    else {
+        return false;
+    };
+    if recorded.trim() != sha1_hex(&jar) {
+        return false;
+    }
+    // The pom + its sidecar must exist and match their bytes too.
+    sidecar_matches(leaf_dir, pom_leaf).await
 }
 
 /// True when `<leaf>.sha1` exists and equals the hex sha1 of `<leaf>`'s bytes.
 async fn sidecar_matches(leaf_dir: &Path, leaf: &str) -> bool {
-    let Ok(bytes) = read_regular(&leaf_dir.join(leaf)).await else {
+    let Ok(bytes) = read_regular_to_bytes(&leaf_dir.join(leaf)).await else {
         return false;
     };
     let Ok(recorded) = read_regular_to_string(&leaf_dir.join(format!("{leaf}.sha1"))).await else {

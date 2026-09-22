@@ -14,11 +14,13 @@ use crate::api::client::ApiClient;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::{atomic_write_bytes, read_regular_to_string};
 use crate::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
 use crate::utils::toml_edit_ext::has_table;
 
-use super::common::{already_patched_result, done, refused, service_offline_conflict};
+use super::common::{
+    already_patched_result, done, prune_empty_vendor_levels, refused, service_offline_conflict,
+};
 use super::path::vendor_uuid_dir_rel;
 use super::pypi_pdm::{PdmProject, PdmTarget};
 use super::pypi_pipenv::{PipenvProject, PipenvTarget};
@@ -132,20 +134,6 @@ pub async fn fetch_hosted_wheel_metadata(
 const SETUP_ALTERNATIVE: &str =
     "use the `socket-patch setup` .pth install hook instead, which patches installed \
      site-packages without lockfile edits";
-
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
-/// so a FIFO planted as `pyproject.toml` fails fast — read as "no pyproject",
-/// falling through to the requirements routing — instead of wedging flavor
-/// detection (and every lockless-project vendor run) forever in an `open(2)`
-/// that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// Route the project to a wiring flavor, first match wins. Lockfiles are the
 /// authoritative "this tool manages installs" signal, so locks are compared
@@ -352,7 +340,7 @@ enum WiringPlan {
 
 /// Which `VendorEntry` meta slot a flavor's wiring produced.
 enum MetaSlot {
-    Uv(Option<UvMeta>),
+    Uv(UvMeta),
     Poetry(PoetryMeta),
     Pdm(PdmMeta),
     Pipenv(PipenvMeta),
@@ -714,33 +702,30 @@ pub async fn vendor_pypi_with_pipenv_version(
                     ),
                 ));
             }
-            match super::pypi_pipenv::check_target_guards(
+            let target = match super::pypi_pipenv::check_target_guards(
                 &project,
                 &canon_name,
                 &record.uuid,
                 version,
             ) {
-                Ok(PipenvTarget::InSync) => {
-                    // A re-run over an already-wired lock keeps warning while
-                    // the venv still holds the upstream release.
-                    if let Some(stale) =
-                        pipenv_stale_install_warning(project_root, purl, record).await
-                    {
-                        warnings.push(stale);
-                    }
+                Ok(target) => target,
+                // A refusal carries no warnings: probe nothing for it.
+                Err((code, detail)) => return refused(code, detail),
+            };
+            if target == PipenvTarget::Fresh {
+                warnings.extend(project.warnings.iter().cloned());
+            }
+            // Both a fresh vendor and a re-run over an already-wired lock
+            // keep warning while the venv still holds the upstream release.
+            if let Some(stale) = pipenv_stale_install_warning(project_root, purl, record).await {
+                warnings.push(stale);
+            }
+            match target {
+                PipenvTarget::InSync => {
                     wired_pin = pipenv_wired_pin(&project.lock, &uuid_dir_rel);
                     WiringPlan::InSync
                 }
-                Ok(PipenvTarget::Fresh) => {
-                    warnings.extend(project.warnings.iter().cloned());
-                    if let Some(stale) =
-                        pipenv_stale_install_warning(project_root, purl, record).await
-                    {
-                        warnings.push(stale);
-                    }
-                    WiringPlan::Pipenv(Box::new(project))
-                }
-                Err((code, detail)) => return refused(code, detail),
+                PipenvTarget::Fresh => WiringPlan::Pipenv(Box::new(project)),
             }
         }
     };
@@ -824,9 +809,22 @@ pub async fn vendor_pypi_with_pipenv_version(
     .await
     {
         Ok(a) => a,
-        Err(outcome) => return outcome,
+        Err(outcome) => {
+            // A refused/hard-failed acquisition may have scaffolded the
+            // empty uuid dir (and the ecosystem / vendor levels on a fresh
+            // project) before failing: prune them so the failure leaves no
+            // committable husk. Dry runs create nothing.
+            if !dry_run {
+                prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
+            }
+            return outcome;
+        }
     };
-    if dry_run || !result.success {
+    if !result.success {
+        prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
+        return done(result, None, warnings);
+    }
+    if dry_run {
         return done(result, None, warnings);
     }
     let Some(artifact) = artifact else {
@@ -875,6 +873,7 @@ pub async fn vendor_pypi_with_pipenv_version(
         if let Some((pin_path, pin_sha)) = &expected_pin {
             if *pin_path != rel_wheel || *pin_sha != artifact.sha256_hex {
                 let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
+                prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
                 let mut result = result;
                 result.success = false;
                 result.error = Some(format!(
@@ -912,6 +911,7 @@ pub async fn vendor_pypi_with_pipenv_version(
     let marker = VendorMarker::new("pypi", base, record, vendored_at);
     if let Err(e) = write_marker(&project_root.join(&uuid_dir_rel), &marker).await {
         let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
+        prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
         let mut result = result;
         result.success = false;
         result.error = Some(format!("cannot write vendor marker: {e}"));
@@ -934,7 +934,7 @@ pub async fn vendor_pypi_with_pipenv_version(
         .await
         .map(|(wiring, meta, advisories)| {
             warnings.extend(advisories);
-            (wiring, MetaSlot::Uv(Some(meta)))
+            (wiring, MetaSlot::Uv(meta))
         }),
         WiringPlan::PythonLocks(project) => super::pypi_lock::wire_python_locks(
             &project,
@@ -993,6 +993,7 @@ pub async fn vendor_pypi_with_pipenv_version(
             &project,
             project_root,
             &canon_name,
+            version,
             &rel_wheel,
             &artifact.sha256_hex,
             &record.uuid,
@@ -1006,6 +1007,7 @@ pub async fn vendor_pypi_with_pipenv_version(
         Ok(pair) => pair,
         Err((code, detail)) => {
             let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
+            prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
             let mut result = result;
             result.success = false;
             result.error = Some(format!("{code}: {detail}"));
@@ -1037,7 +1039,7 @@ pub async fn vendor_pypi_with_pipenv_version(
         pipenv: None,
     };
     match meta {
-        MetaSlot::Uv(m) => entry.uv = m,
+        MetaSlot::Uv(m) => entry.uv = Some(m),
         MetaSlot::Poetry(m) => entry.poetry = Some(m),
         MetaSlot::Pdm(m) => entry.pdm = Some(m),
         MetaSlot::Pipenv(m) => entry.pipenv = Some(m),
@@ -1176,14 +1178,13 @@ async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Optio
     }
     for name in &names {
         let path = project_root.join(name);
-        if matches!(tokio::fs::try_exists(&path).await, Ok(false)) {
-            continue;
-        }
         match read_regular_to_string(&path).await {
             Ok(text) if text.contains(&needle) => {
                 return Some(format!("{name} still resolves through it"));
             }
             Ok(_) => {}
+            // A file that no longer exists cannot reference it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             // Fail-closed: a file we cannot read may still reference it.
             Err(_) => {
                 return Some(format!(
@@ -1331,6 +1332,11 @@ pub async fn revert_pypi_opts(
             format!("could not remove {uuid_dir_rel}: {e}"),
         )),
     }
+    // The last pypi entry leaves `.socket/vendor/pypi/` (and `.socket/vendor/`)
+    // empty: prune them so a reverted project carries no vendor residue
+    // (`remove_dir` keeps non-empty levels, and a dir the removal above could
+    // not delete stops the climb).
+    prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
     outcome
 }
 
@@ -3718,7 +3724,7 @@ wheels = [
             .unwrap();
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
         let p = load_pipenv_project(root).await.unwrap();
-        let (wiring, _meta) = wire_pipenv(&p, root, "six", &rel_wheel, &"0".repeat(64), UUID)
+        let (wiring, _meta) = wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
             .await
             .unwrap();
         let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
@@ -3776,6 +3782,7 @@ wheels = [
             &load_pipenv_project(root).await.unwrap_or_else(|e| panic!("{e:?}")),
             root,
             "six",
+            "1.16.0",
             &rel_wheel,
             &"0".repeat(64),
             UUID,
@@ -3840,7 +3847,7 @@ wheels = [
             .unwrap();
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
         let p = load_pipenv_project(root).await.unwrap();
-        let (wiring, _meta) = wire_pipenv(&p, root, "six", &rel_wheel, &"0".repeat(64), UUID)
+        let (wiring, _meta) = wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
             .await
             .unwrap();
         let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
@@ -3974,7 +3981,7 @@ wheels = [
             .unwrap();
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
         let p = load_pipenv_project(root).await.unwrap();
-        let (wiring, _meta) = wire_pipenv(&p, root, "six", &rel_wheel, &"0".repeat(64), UUID)
+        let (wiring, _meta) = wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
             .await
             .unwrap();
         let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
@@ -5384,10 +5391,9 @@ wheels = [
             "six==1.16.0\n",
             "the wiring is only ever written after a successful wheel"
         );
-        // Pin of CURRENT residue behavior: the refusal does not sweep the
-        // (pre-existing) uuid dir — nothing references it, since the wiring
-        // was never touched. FIXME(no-residue): candidate cleanup gap if the
-        // dir was created by this very run.
+        // The refusal prunes only EMPTY levels this run may have created:
+        // the pre-existing, non-empty uuid dir is never collateral (nothing
+        // references it, and `remove_dir` refuses a non-empty dir).
         assert!(blocker.is_dir());
     }
 

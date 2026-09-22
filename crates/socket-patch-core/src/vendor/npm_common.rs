@@ -121,6 +121,12 @@ pub(super) struct NpmStagedPack {
     /// lockfile's dependency-mirror fields are then stale and the flavor
     /// wiring must recompute them from this parsed manifest).
     pub staged_pkg_json: Option<Value>,
+    /// True iff `<project>/.socket/vendor/npm/<uuid>` existed BEFORE this
+    /// run wrote into it. A wiring failure after the pack must unwind the
+    /// uuid dir the pipeline created — but never one that already existed
+    /// (a same-uuid re-vendor's dir may still be referenced by live wiring);
+    /// backends feed this to [`done_failure_unstage`].
+    pub uuid_dir_preexisted: bool,
 }
 
 /// Stage → patch → pack one installed npm package.
@@ -308,6 +314,7 @@ pub(super) async fn stage_patch_pack(
             rel_tgz,
             packed,
             staged_pkg_json,
+            uuid_dir_preexisted,
         }),
         result,
     ))
@@ -500,6 +507,7 @@ async fn staged_pack_from_service_bytes(
         rel_tgz,
         packed,
         staged_pkg_json,
+        uuid_dir_preexisted,
     })
 }
 
@@ -633,7 +641,10 @@ pub(super) fn done_failure(purl: &str, error: String) -> VendorOutcome {
 /// ever persisted for a failed wiring, so `--revert` could never clean it up
 /// and the module contract ("a failure leaves the project byte-untouched")
 /// would be broken by an orphaned, possibly defective artifact dir. Empty
-/// parent dirs are pruned non-recursively (a sibling artifact keeps them).
+/// parent dirs are pruned non-recursively (a sibling artifact keeps them) up
+/// to and including `.socket/vendor/`; `.socket/` itself is never pruned
+/// here — the CLI holds `.socket/apply.lock` for the whole run, and its lock
+/// guard removes the emptied directory when it releases.
 pub(super) async fn done_failure_unstage(
     purl: &str,
     error: String,

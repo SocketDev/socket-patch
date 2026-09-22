@@ -5,11 +5,11 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
 use super::common::{
-    item_get, lock_units_named, pep508_name, pep621_declared_names, record,
-    revert_lock_fragment_splice,
+    ensure_unchanged, item_get, lock_units_named, pep508_name, pep621_declared_names, record,
+    refuse_symlinked, revert_lock_fragment_splice,
 };
 use super::path::parse_vendor_path;
 use super::state::{PdmMeta, VendorEntry, WiringAction, WiringRecord};
@@ -20,42 +20,6 @@ const LOCK_FILE: &str = "pdm.lock";
 
 /// The `WiringRecord.kind` discriminator this backend owns.
 const KIND_LOCK_PACKAGE: &str = "pdm_lock_package";
-
-/// Refuse when `pdm.lock` is itself a symlink. Every writer here stages a
-/// replacement next to the path and renames over it, which REPLACES the link
-/// with a detached regular file: the shared target the link points at stays
-/// unpatched (git shows a 120000→100644 typechange), and `revert` restores
-/// bytes but never the link. Both wire and revert check before any write —
-/// mirroring the uv/pypi_lock vendored siblings and the hosted `first_symlink`
-/// guard (pdm itself relocks THROUGH a linked pdm.lock).
-async fn refuse_symlinked_lock(root: &Path) -> Result<(), (&'static str, String)> {
-    if crate::utils::fs::is_symlink(&root.join(LOCK_FILE)).await {
-        return Err((
-            "pypi_pdm_symlink_unsupported",
-            format!(
-                "{LOCK_FILE} is a symbolic link; the atomic rewrite would replace the link with \
-                 a regular file and leave its target stale — vendor the real file's directory \
-                 instead"
-            ),
-        ));
-    }
-    Ok(())
-}
-
-/// Guarded read shared in shape with the sibling backend twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `pdm.lock` (or the diagnostics-only
-/// `pyproject.toml`) fails fast instead of wedging every pdm-project vendor
-/// run forever in an `open(2)` that waits for a writer — the flavor-routing
-/// probes ahead of the load are metadata-only, so these are the first opens.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// A loaded-and-guard-checked pdm project.
 #[derive(Debug)]
@@ -409,7 +373,7 @@ pub async fn wire_pdm(
     record_uuid: &str,
 ) -> Result<(Vec<WiringRecord>, PdmMeta), (&'static str, String)> {
     // Before ANY write: a symlinked lock would be replaced by the rename-over.
-    refuse_symlinked_lock(root).await?;
+    refuse_symlinked(root, &[LOCK_FILE], "pypi_pdm_symlink_unsupported").await?;
     match check_target_guards(p, canon_name, version, record_uuid)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
@@ -457,6 +421,9 @@ pub async fn wire_pdm(
     .map_err(|detail| ("pypi_pdm_lock_parse_failed", detail))?;
     let fragments = crate::utils::pdm_lock::pdm_lock_edits(&p.lock_text, &new_lock, canon_name)
         .map_err(|detail| ("pypi_pdm_lock_parse_failed", detail))?;
+    // The edit was computed from the pre-flight snapshot; a `pdm lock` /
+    // editor save that landed during the wheel build must not be clobbered.
+    ensure_unchanged(root, LOCK_FILE, &p.lock_text, "pypi_pdm_changed").await?;
     // Mode-preserving: the lock is a user-owned file we merely edit, so the
     // swapped-in inode must keep its permission bits rather than reset them
     // to umask defaults (same class as the revert leg in common.rs).
@@ -498,7 +465,9 @@ pub async fn revert_pdm(entry: &VendorEntry, root: &Path, dry_run: bool) -> Reve
     // its target stale and never restoring the link. Keep the artifact (the
     // wiring still routes through the linked file) and fail — the guard lives
     // here, not in the poetry-shared splice helper, so poetry is untouched.
-    if let Err((code, detail)) = refuse_symlinked_lock(root).await {
+    if let Err((code, detail)) =
+        refuse_symlinked(root, &[LOCK_FILE], "pypi_pdm_symlink_unsupported").await
+    {
         return RevertOutcome {
             kept_artifact: true,
             success: false,
@@ -1516,5 +1485,38 @@ distribution = false
         let p = load_pdm_project(tmp.path()).await.unwrap();
         let err = check_target_guards(&p, "six", "1.16.0", UUID).unwrap_err();
         assert_eq!(err.0, "pypi_pdm_lock_no_hashes");
+    }
+
+    /// The lock changed between the pre-flight snapshot and the write (a
+    /// `pdm lock` landed during the wheel build): refuse instead of
+    /// clobbering it with the stale snapshot-derived text.
+    #[tokio::test]
+    async fn lock_changed_during_vendoring_is_refused_before_the_write() {
+        let tmp = write_project(LOCK_DIRECT_REGISTRY, PYPROJECT_DIRECT).await;
+        let p = load_pdm_project(tmp.path()).await.unwrap();
+        let relocked = format!("{LOCK_DIRECT_REGISTRY}# relocked\n");
+        tokio::fs::write(tmp.path().join(LOCK_FILE), &relocked)
+            .await
+            .unwrap();
+
+        let err = wire_pdm(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_pdm_changed");
+        assert!(err.1.contains("changed during vendoring"), "{}", err.1);
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            relocked,
+            "the live lock is left alone"
+        );
     }
 }

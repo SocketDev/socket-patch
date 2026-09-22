@@ -61,18 +61,23 @@ use serde_json::Value;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{
+    atomic_write_bytes_preserving_mode, read_regular_to_bytes, read_regular_to_string,
+};
 
-use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
+use super::common::{
+    already_patched_result, detect_indent, done, prune_empty_vendor_levels, refused,
+    serialize_json,
+};
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
 use super::path::parse_vendor_path;
 use super::pnpm_lock::{
     apply_pkg_override, check_lock_override, classify_pkg_override, commit_surfaces, drifted,
-    guard_unwired_revert, lines_value, next_block, overrides_record, parse_key_line, read_regular,
-    read_regular_string, revert_overrides_line, revert_pkg_record, section_bounds, split_lines,
-    value_lines, vendor_value_is_for, yaml_key, yaml_key_like, KIND_LOCK_OVERRIDES,
+    guard_unwired_revert, lines_value, next_block, overrides_record, parse_key_line,
+    revert_overrides_line, revert_pkg_record, section_bounds, split_lines, value_lines,
+    vendor_value_is_for, yaml_key, yaml_key_like, KIND_LOCK_OVERRIDES,
 };
 use super::state::{
     write_marker, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
@@ -303,7 +308,7 @@ pub async fn vendor_pnpm_legacy(
     let override_key = format!("{name}@{version}");
 
     // ── 2. Read the pair (refuse before any write) ───────────────────────
-    let pkg_bytes = match read_regular(&project_root.join(PACKAGE_JSON)).await {
+    let pkg_bytes = match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
         Ok(bytes) => bytes,
         Err(e) => {
             return refused(
@@ -325,7 +330,7 @@ pub async fn vendor_pnpm_legacy(
             );
         }
     };
-    let lock_text = match read_regular_string(&project_root.join(PNPM_LOCK)).await {
+    let lock_text = match read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
         Ok(text) => text,
         Err(e) => {
             return refused(
@@ -432,12 +437,6 @@ pub async fn vendor_pnpm_legacy(
     }
 
     // ── 4. Stage → patch → pack ───────────────────────────────────────────
-    // A wiring failure past this point must unwind the uuid dir staging is
-    // about to create — but never one that already existed (a same-uuid
-    // re-vendor's dir may still be referenced by live wiring).
-    let uuid_dir_preexisted = tokio::fs::metadata(project_root.join(&coords.uuid_dir_rel))
-        .await
-        .is_ok();
     let (staged, result) = match stage_patch_pack(
         purl,
         installed_dir,
@@ -457,6 +456,7 @@ pub async fn vendor_pnpm_legacy(
     let Some(staged) = staged else {
         return done(result, None, warnings);
     };
+    let uuid_dir_preexisted = staged.uuid_dir_preexisted;
     debug_assert_eq!(staged.rel_tgz, rel_tgz);
     let packed = staged.packed;
     if staged.staged_pkg_json.is_some() {
@@ -670,7 +670,7 @@ pub async fn vendor_pnpm_legacy(
 /// (the `overrides:` declaration alone never counts); `None` when
 /// undeterminable — callers keep the entry, fail-safe.
 pub async fn pnpm_legacy_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    let text = read_regular_string(&project_root.join(PNPM_LOCK))
+    let text = read_regular_to_string(&project_root.join(PNPM_LOCK))
         .await
         .ok()?;
     match sniff_lock_grammar(&text) {
@@ -1319,7 +1319,7 @@ pub async fn revert_pnpm_legacy_opts(
 
     let mut lock_lines: Option<Vec<String>> = None;
     if touches_lock {
-        match read_regular_string(&project_root.join(PNPM_LOCK)).await {
+        match read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
             Ok(text) => lock_lines = Some(split_lines(&text)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 outcome.warnings.push(VendorWarning::new(
@@ -1332,7 +1332,7 @@ pub async fn revert_pnpm_legacy_opts(
     }
     let mut pkg_state: Option<(Value, String)> = None;
     if touches_pkg {
-        match read_regular(&project_root.join(PACKAGE_JSON)).await {
+        match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(doc) if doc.is_object() => {
                     let indent = detect_indent(&String::from_utf8_lossy(&bytes));
@@ -1451,9 +1451,14 @@ pub async fn revert_pnpm_legacy_opts(
     // ran; the artifact dir stays behind (and the caller keeps the ledger
     // entry), so only the deletion is skipped.
     if !keep_artifact {
-        if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
+        let uuid_dir = project_root.join(&uuid_dir_rel);
+        if let Err(e) = remove_tree(&uuid_dir).await {
             return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
         }
+        // The last npm-family entry leaves `.socket/vendor/npm/` (and
+        // `.socket/vendor/`) empty: prune them so a reverted project carries
+        // no vendor residue (`remove_dir` keeps non-empty levels).
+        prune_empty_vendor_levels(&uuid_dir).await;
     }
     outcome
 }

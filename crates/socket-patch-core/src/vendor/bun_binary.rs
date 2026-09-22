@@ -1,7 +1,7 @@
 //! Native binary Bun vendoring. Package records are edited without re-resolving
 //! dependencies or requiring a Bun executable.
 use super::bun_lockb::{BinaryPackage, BunLockb};
-use super::common::{already_patched_result, refused};
+use super::common::{already_patched_result, prune_empty_vendor_levels, refused};
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
@@ -436,9 +436,14 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
             }
             prune_mirror_parents(&mirror).await;
         }
-        if let Err(e) = crate::patch::copy_tree::remove_tree(&root.join(&dir)).await {
+        let uuid_dir = root.join(&dir);
+        if let Err(e) = crate::patch::copy_tree::remove_tree(&uuid_dir).await {
             return RevertOutcome::failed(format!("cannot remove {dir}: {e}"));
         }
+        // The last npm-family entry leaves `.socket/vendor/npm/` (and
+        // `.socket/vendor/`) empty: prune them so a reverted project carries
+        // no vendor residue (`remove_dir` keeps non-empty levels).
+        prune_empty_vendor_levels(&uuid_dir).await;
     }
     outcome
 }
