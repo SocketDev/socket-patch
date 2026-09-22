@@ -167,7 +167,7 @@ frozen and ordinary installs, and digest tampering.
 `cargo test -p socket-patch-cli --test e2e_bun_lockb` uses Bun on `PATH`; a modern
 Bun reads the committed binary fixture, so no separate old writer is needed.
 
-### Latest local validation
+### Measured validation
 
 Measured on 2026-09-21, macOS arm64, using the native binary implementation in
 the worktree based on `4b61c9620b800d26056211060ebb4a4c60288da5`:
@@ -194,17 +194,27 @@ names. The failing logs remain under `/tmp/socket-patch-bun-native-verified` and
 `/tmp/socket-patch-bun-native-emptycache-*`; the six repeated runs above verify
 the corrected isolation without retrying failed assertions or changing readers.
 
-Production Clippy passed with warnings denied. The workspace library run passed
-4,123 tests after excluding the existing Ruby setup suite; an unfiltered run
-passed 4,218 tests and failed six Ruby setup tests because the local system has
-unsupported Bundler 1.17.2. Eight focused CLI suites passed 210 tests. These are
-local macOS measurements; the Linux and Windows matrix jobs are configured in
-CI and were not run locally.
+On 2026-09-22, the full workspace test run passed 7,326 tests with no failures,
+and production Clippy passed with warnings denied. The production-filter
+regression passed all 33 public-service cases across the same 11 release eras,
+including cold and warmed-cache frozen and ordinary installs. A separate complex
+graph passed both scoped rollback orders on 0.8.1 and 1.0.0; that graph is now
+part of the permanent binary matrix. These local measurements use macOS arm64.
 
-On 2026-09-22, the production-filter regression passed all 33 public-service
-cases across the same 11 release eras, including cold and warmed-cache frozen
-and ordinary installs. A separate complex graph passed both scoped rollback
-orders on 0.8.1 and 1.0.0; that graph is now part of the permanent binary matrix.
+The [PR validation run for `9644add`](https://github.com/SocketDev/socket-patch/actions/runs/35729497310)
+also passed all 25 native binary writer/reader pairs on macOS and all 13 pairs
+available on Windows, including the permanent production/scoped-rollback cases.
+Windows has no official Bun binaries before 1.1.0. Each pair ran all three Rust
+acceptance tests.
+
+The Linux runner exposed a separate historical-runtime boundary: official Bun
+0.5.9, 0.6.7 and 0.6.8 crashed with `SIGSEGV` during pristine installs on
+`ubuntu-latest` (Ubuntu 24.04), before `socket-patch` ran. The workflow retains
+all 25 required historical pairs on Ubuntu 22.04, and additionally runs the 16
+pairs using Bun 0.8.1 and later on `ubuntu-latest`; every historical format and
+reader remains in the required matrix. Linux failures upload bounded pristine
+runtime probes and, when available, syscall traces under the binary result artifact's
+`linux-diagnostics/` directory.
 
 ## Installer boundaries (measured)
 
