@@ -73,7 +73,7 @@ use crate::commands::vendor::{
     dispatch_vendor_one, ecosystem_in_scope, fetch_pristine_package, persist_vendor_entry,
     record_warning, PristineFetch,
 };
-use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
+use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::json_envelope::{Envelope, PatchAction, PatchEvent, RunWarning};
 
 /// One broken vendored unit queued for rebuild.
@@ -466,20 +466,84 @@ async fn restore_aside_vendor_dir(live: &Path, kept: &Path) {
     let _ = tokio::fs::rename(kept, live).await;
 }
 
+/// Crash recovery for [`set_aside_vendor_dir`]'s transient: a run killed
+/// between the move-aside and the backend's replacement leaves
+/// `.socket/vendor/<eco>/<uuid>.pre-rebuild` as the ONLY copy of bytes the
+/// rewired lockfiles still point at, with the live path a bare ENOENT. Put
+/// every such leftover back where the wiring expects it before pass 1
+/// classifies the unit (it then re-derives corrupt/soft/healthy from the
+/// restored bytes exactly as the crashed run did). A leftover whose live
+/// sibling EXISTS is left alone: the live dir may be the completed
+/// replacement or a partial husk, and only the health pass can tell — a
+/// unit it condemns is set aside again, which clears the leftover. Wet
+/// runs only; scope-gated like every other unit; best-effort throughout.
+async fn restore_orphaned_pre_rebuild_dirs(common: &GlobalArgs) {
+    const SUFFIX: &str = ".pre-rebuild";
+    let vendor_root = common.cwd.join(".socket/vendor");
+    let Ok(mut ecos) = tokio::fs::read_dir(&vendor_root).await else {
+        return;
+    };
+    while let Ok(Some(eco_dir)) = ecos.next_entry().await {
+        let eco = eco_dir.file_name().to_string_lossy().into_owned();
+        if !ecosystem_in_scope(common, &eco) || !eco_dir.path().is_dir() {
+            continue;
+        }
+        let Ok(mut units) = tokio::fs::read_dir(eco_dir.path()).await else {
+            continue;
+        };
+        while let Ok(Some(unit)) = units.next_entry().await {
+            let name = unit.file_name().to_string_lossy().into_owned();
+            let Some(uuid) = name.strip_suffix(SUFFIX) else {
+                continue;
+            };
+            let live = eco_dir.path().join(uuid);
+            if unit.path().is_dir() && tokio::fs::symlink_metadata(&live).await.is_err() {
+                let _ = tokio::fs::rename(unit.path(), &live).await;
+            }
+        }
+    }
+}
+
 /// The vendored-artifact phase of `repair`. Runs between the download and
 /// cleanup phases (and under `--download-only` — restoring artifacts IS
 /// repair's job). `manifest` is `None` when the project has no
 /// `.socket/manifest.json` (detached/reconstruction-only repairs).
 /// Returns the number of artifacts rebuilt (for the human summary line);
 /// failures are carried by `env` (`Failed` events + partial-failure status).
+///
+/// Scans the wiring files for vendored references itself; a caller that
+/// already ran [`scan_vendor_references`] under the same lock (repair.rs
+/// does, for its `referenced_uuids`) should pass that result to
+/// [`repair_vendored_artifacts_with_references`] instead of paying for the
+/// ~20-file scan a second time.
 pub(crate) async fn repair_vendored_artifacts(
     common: &GlobalArgs,
     manifest: Option<&PatchManifest>,
     socket_dir: &Path,
     env: &mut Envelope,
 ) -> usize {
+    let references = scan_vendor_references(&common.cwd).await;
+    repair_vendored_artifacts_with_references(common, manifest, socket_dir, env, &references).await
+}
+
+/// [`repair_vendored_artifacts`] with the wiring-file reference scan
+/// supplied by the caller: `references` is [`scan_vendor_references`]'s
+/// `(ecosystem, uuid, artifact relpath)` output for `common.cwd`, taken
+/// under the apply lock this phase runs under (the lockfiles it describes
+/// are the ones the reconstruction below rewires).
+pub(crate) async fn repair_vendored_artifacts_with_references(
+    common: &GlobalArgs,
+    manifest: Option<&PatchManifest>,
+    socket_dir: &Path,
+    env: &mut Envelope,
+    references: &[(String, String, String)],
+) -> usize {
     let quiet = common.json || common.silent;
     let mut rebuilt = 0usize;
+
+    if !common.dry_run {
+        restore_orphaned_pre_rebuild_dirs(common).await;
+    }
 
     let mut state = match load_state(&common.cwd).await {
         Ok(s) => s,
@@ -729,7 +793,7 @@ pub(crate) async fn repair_vendored_artifacts(
         .values()
         .map(|e| (e.ecosystem.clone(), e.uuid.clone()))
         .collect();
-    for (eco, uuid, relpath) in scan_vendor_references(&common.cwd).await {
+    for (eco, uuid, relpath) in references.iter().cloned() {
         if covered.contains(&(eco.clone(), uuid.clone())) || !ecosystem_in_scope(common, &eco) {
             continue;
         }
@@ -1047,7 +1111,16 @@ pub(crate) async fn repair_vendored_artifacts(
         global: common.global,
         global_prefix: common.global_prefix.clone(),
     };
-    let mut all_packages = find_packages_for_purls(&partitioned, &crawler_options, quiet).await;
+    // Ledger keys are the manifest spelling — QUALIFIED for release-variant
+    // ecosystems (gem `?platform=`, pypi `?artifact_id=`, maven
+    // `?classifier=&ext=`) — while the crawler knows only base purls.
+    // `find_packages_for_purls` keys its result by the base purl, so the
+    // `contains_key(&c.purl)` checks below would miss every installed
+    // qualified-key package and fall through to a needless registry fetch
+    // (or, offline, a spurious unrepairable / fingerprint-less restore).
+    // The rollback variant fans each base path back out to every qualified
+    // caller purl — the same fix `vendor_records` carries.
+    let mut all_packages = find_packages_for_rollback(&partitioned, &crawler_options, quiet).await;
     let inventory = lock_inventory::inventory_project(&common.cwd).await;
     let client = registry_fetch::build_registry_client();
     let mut holders: Vec<registry_fetch::FetchedPackage> = Vec::new();

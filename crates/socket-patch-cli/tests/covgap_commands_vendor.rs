@@ -730,7 +730,10 @@ fn human_revert_empty_ledger_prints_nothing_to_revert() {
 }
 
 /// Human plain vendor with no manifest at all: the clean no-op message,
-/// exit 0 (same contract as apply).
+/// exit 0 (same contract as apply). The line names the MANIFEST — the
+/// fixture's `.socket/` (blobs) very much exists, so the old "No .socket
+/// folder found" text was false here and on every hosted-only or
+/// vendored-mode project.
 #[test]
 fn human_missing_manifest_prints_nothing_to_vendor() {
     let fx = npm_fixture();
@@ -739,10 +742,59 @@ fn human_missing_manifest_prints_nothing_to_vendor() {
     let (code, stdout, stderr) = human_vendor(&fx, &[]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stdout.contains("No .socket folder found, nothing to vendor."),
+        stdout.contains("No manifest found, nothing to vendor."),
         "the no-manifest no-op line: {stdout}"
     );
+    assert!(
+        !stdout.contains(".socket folder"),
+        "never claims .socket/ is missing: {stdout}"
+    );
     assert!(!fx.vendor_dir().exists(), "nothing written");
+    assert!(
+        !fx.root().join(".socket/apply.lock").exists(),
+        "the no-op path takes no lock"
+    );
+}
+
+/// Human plain vendor on a LEDGER-tracked project with no manifest — the
+/// shape every `scan`/`get --mode vendored` project has (`.socket/vendor/`
+/// exists, `.socket/manifest.json` does not): still the clean exit-0
+/// no-op (nothing locked, reverted or written), but the line says what IS
+/// vendored and points at `repair` instead of implying nothing is set up.
+#[tokio::test]
+async fn human_missing_manifest_with_ledger_names_the_tracked_entries() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "stage vendor");
+    std::fs::remove_file(fx.manifest_path()).unwrap();
+    let wired_lock = fx.lock_bytes();
+    let state_before = std::fs::read(fx.state_path()).unwrap();
+
+    let (code, stdout, stderr) = human_vendor(&fx, &[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("No manifest to vendor from; 1 vendored entry is tracked in the ledger"),
+        "the ledger-aware no-op line: {stdout}"
+    );
+    assert!(
+        stdout.contains("`socket-patch repair`"),
+        "points at repair as the verification path: {stdout}"
+    );
+    assert!(!stdout.contains(".socket folder"), "{stdout}");
+    assert!(fx.tgz_path().is_file(), "no-op: the artifact survives");
+    assert_eq!(
+        fx.lock_bytes(),
+        wired_lock,
+        "no-op: the wiring is untouched"
+    );
+    assert_eq!(
+        std::fs::read(fx.state_path()).unwrap(),
+        state_before,
+        "no-op: the ledger is untouched"
+    );
+    assert!(
+        !fx.root().join(".socket/apply.lock").exists(),
+        "the no-op path takes no lock"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -857,6 +909,42 @@ async fn revert_state_write_failure_reports_failed_after_removal() {
         fx.lock_bytes(),
         fx.original_lock,
         "the lock restore itself succeeded"
+    );
+}
+
+/// The reconcile twin of the pin above: a patch dropped from the manifest
+/// whose ledger save fails AFTER the entry's revert succeeded
+/// (`.socket/vendor` read-only, the artifact dir under `npm/` still
+/// deletable). The purl carries BOTH its `vendor_reconciled` removal and a
+/// `vendor_state_write_failed` failure, and the run exits 1 — pre-fix
+/// `reconcile_dropped` swallowed the error (`let _ = save_state`) and
+/// exited 0 with a ledger still listing the reverted purl.
+#[cfg(unix)]
+#[tokio::test]
+async fn reconcile_state_write_failure_reports_failed_after_removal() {
+    let fx = npm_fixture();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "stage vendor");
+    std::fs::write(fx.manifest_path(), b"{\"patches\": {}}\n").unwrap();
+    chmod(&fx.vendor_dir(), 0o555);
+    let _restore = RestorePerms(fx.vendor_dir());
+
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 1, "{env:#}");
+    let removed = find_event(&env, "removed", Some("vendor_reconciled"));
+    assert_eq!(
+        removed["purl"], PURL,
+        "the revert itself succeeded: {env:#}"
+    );
+    let failed = find_event(&env, "failed", Some("vendor_state_write_failed"));
+    assert_eq!(failed["purl"], PURL, "{env:#}");
+    assert_eq!(
+        fx.lock_bytes(),
+        fx.original_lock,
+        "the lock restore itself succeeded"
+    );
+    assert!(
+        fx.state_path().is_file(),
+        "the stale ledger is left in place — the write is what failed"
     );
 }
 

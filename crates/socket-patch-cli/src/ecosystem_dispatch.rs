@@ -429,6 +429,13 @@ pub async fn find_all_packages_for_rollback(
 /// For each ecosystem in the partitioned map, create the crawler, discover
 /// source paths, and look up the given PURLs. Returns a unified
 /// `purl -> path` map (one representative copy per PURL).
+///
+/// No production caller since `repair` moved onto the qualified-aware
+/// [`find_packages_for_rollback`] (ledger keys are qualified for
+/// release-variant ecosystems, and this base-keyed map never matched them);
+/// kept for the in-file tests that pin that contrast. Integration pass:
+/// delete it or make it `#[cfg(test)]`.
+#[allow(dead_code)]
 pub async fn find_packages_for_purls(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,

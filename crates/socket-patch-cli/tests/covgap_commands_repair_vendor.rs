@@ -33,6 +33,9 @@ const GEM_UUID: &str = "22222222-2222-4222-8222-222222222222";
 const GEM_NAME: &str = "padlock";
 const GEM_VERSION: &str = "1.2.0";
 const GEM_PURL: &str = "pkg:gem/padlock@1.2.0";
+/// The qualified spelling production publishes for gems (`platform=ruby`,
+/// the portable default): the ledger key when the served record carries it.
+const GEM_PURL_QUALIFIED: &str = "pkg:gem/padlock@1.2.0?platform=ruby";
 const GEM_ENCODED: &str = "pkg%3Agem%2Fpadlock%401.2.0";
 const GEMSPEC_STUB: &[u8] = b"Gem::Specification.new do |s|\n  s.name = \"padlock\"\n  s.version = \"1.2.0\"\n  s.summary = \"repair fixture\"\n  s.authors = [\"socket-patch e2e\"]\n  s.require_paths = [\"lib\"]\nend\n";
 
@@ -1347,6 +1350,136 @@ async fn repair_offline_soft_restore_without_installed_copy() {
         std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
         AFTER,
         "the artifact bytes are untouched"
+    );
+}
+
+// ─────────────── qualified ledger keys resolve the installed copy ───────────────
+
+/// Ledger keys are the manifest spelling — for release-variant ecosystems
+/// the QUALIFIED purl production publishes (`pkg:gem/…?platform=ruby`) —
+/// while the crawler knows only base purls. Repair must resolve the
+/// installed copy through the qualified-aware resolver (the one
+/// `vendor_records` uses): pre-fix the base-keyed lookup never matched a
+/// qualified ledger key, so an INSTALLED package read as absent and an
+/// offline rebuild of a missing artifact failed `vendor_artifact_missing`
+/// instead of rebuilding from the copy on disk (online, it fell through to
+/// the registry-fetch rung — a needless network round-trip that, with no
+/// rubygems route mounted here, fails the repair outright).
+#[tokio::test]
+async fn repair_rebuilds_qualified_ledger_key_from_installed_copy() {
+    let mock = MockServer::start().await;
+    mount_gem_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_gem_fixture(tmp.path(), false);
+    let copy = vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
+
+    // Re-key the ledger entry to the qualified spelling (`basePurl` stays
+    // bare — exactly what `scan --vendor` records for a served qualified
+    // purl).
+    let mut state = read_state(tmp.path());
+    let entry = state["entries"]
+        .as_object_mut()
+        .unwrap()
+        .remove(GEM_PURL)
+        .expect("the vendored ledger entry");
+    state["entries"][GEM_PURL_QUALIFIED] = entry;
+    write_state(tmp.path(), &state);
+    // The artifact is gone: the installed copy is the pristine source (the
+    // patch content itself comes from the mocked patch view, as in every
+    // online rebuild here).
+    std::fs::remove_dir_all(&copy).unwrap();
+
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["action"] == "rebuilt" && e["purl"] == GEM_PURL_QUALIFIED),
+        "the installed copy must drive the rebuild of the qualified-keyed entry: {v}"
+    );
+    assert!(
+        !events_of(&v).iter().any(|e| e["action"] == "failed"
+            || e["errorCode"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("vendor_fetch"))),
+        "an installed package is never 'not installed' — no registry rung, no failure: {v}"
+    );
+    assert_eq!(
+        std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
+        AFTER,
+        "rebuilt from the installed copy plus the recorded patch"
+    );
+    let state = read_state(tmp.path());
+    assert!(
+        state["entries"][GEM_PURL_QUALIFIED].is_object(),
+        "the qualified key survives the rebuild: {state}"
+    );
+    assert!(
+        state["entries"][GEM_PURL].is_null(),
+        "no duplicate base-keyed entry is invented: {state}"
+    );
+}
+
+// ─────────────── crashed set-aside leftovers ───────────────
+
+/// A repair killed between the move-aside and the backend's replacement
+/// leaves `<uuid>.pre-rebuild` as the ONLY copy of the bytes the rewired
+/// Gemfile/lock still point at, and a bare ENOENT at the live path. The
+/// next wet repair puts the leftover back first — the healthy bytes need no
+/// rebuild, and no `.pre-rebuild` survives — while `--dry-run` (which
+/// mutates nothing) leaves the leftover exactly where it was. Pre-fix the
+/// leftover lingered forever: the orphan sweeps skip non-uuid names, and
+/// the entry classified Missing so set-aside (the only other clearer) never
+/// ran for it.
+#[tokio::test]
+async fn repair_restores_crashed_set_aside_leftover_before_classifying() {
+    let mock = MockServer::start().await;
+    mount_gem_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_gem_fixture(tmp.path(), false);
+    let copy = vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
+    // `set_aside_vendor_dir` moves the whole UUID dir (marker + copy), so
+    // the crash leaves `<eco>/<uuid>.pre-rebuild` beside a missing
+    // `<eco>/<uuid>`.
+    let uuid_dir = tmp.path().join(format!(".socket/vendor/gem/{GEM_UUID}"));
+    let kept = tmp
+        .path()
+        .join(format!(".socket/vendor/gem/{GEM_UUID}.pre-rebuild"));
+    std::fs::rename(&uuid_dir, &kept).unwrap();
+    // The installed copy is gone too: nothing but the leftover can serve
+    // the wiring, so a run that ignores it has no source at all.
+    std::fs::remove_dir_all(tmp.path().join("vendor/bundle")).unwrap();
+
+    let (_, stdout, stderr) = run_cli(
+        tmp.path(),
+        &mock.uri(),
+        &["repair", "--offline", "--dry-run"],
+    );
+    assert!(
+        kept.is_dir(),
+        "--dry-run must not move the leftover: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !uuid_dir.exists(),
+        "--dry-run must not restore the live dir"
+    );
+
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        !events_of(&v).iter().any(|e| e["action"] == "failed"),
+        "the restored bytes are healthy — nothing to rebuild, nothing failed: {v}"
+    );
+    assert_eq!(
+        std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
+        AFTER,
+        "the leftover is back at the live path the wiring points at"
+    );
+    assert!(
+        !kept.exists(),
+        "no .pre-rebuild leftover survives the wet run"
     );
 }
 
