@@ -36,6 +36,7 @@ tar = "=0.4.46"
 flate2 = "=1.1.9"
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 fs2 = "=0.4.3"
+same-file = "=1.0.6"
 libc = "=0.2.182"
 semver = "=1.0.27"
 self-replace = "=1.5.0"

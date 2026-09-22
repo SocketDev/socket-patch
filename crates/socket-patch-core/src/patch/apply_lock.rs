@@ -1,43 +1,86 @@
 //! Advisory file lock used to serialize mutating operations against a
 //! single `.socket/` directory.
 //!
-//! Apply, rollback, repair, and remove can each rewrite manifest state
-//! and on-disk package files. Two of them running at once against the
-//! same project — common when a dev runs `socket-patch apply` while CI
-//! triggers a deploy hook, or when `apply` and a `repair` are stacked
-//! by a wrapper script — race on every file write. The lock turns
-//! that race into a clean refusal: the second invocation reports
-//! `lock_held` and exits non-zero, leaving the first to finish.
+//! Apply, rollback, repair, remove, vendor and the hosted/vendored scan
+//! flows can each rewrite manifest state and on-disk package files. Two
+//! of them running at once against the same project — common when a dev
+//! runs `socket-patch apply` while CI triggers a deploy hook, or when
+//! `apply` and a `repair` are stacked by a wrapper script — race on
+//! every file write. The lock turns that race into a clean refusal: the
+//! second invocation reports `lock_held` and exits non-zero, leaving the
+//! first to finish.
 //!
-//! The lock file lives at `<.socket>/apply.lock`. It is created on
-//! demand (the parent `.socket/` directory must exist first; callers
-//! get a clear error otherwise) and is retained by the mutating
-//! commands across runs — the file handle drop releases the OS-level
-//! advisory lock, but the inode sticks around for next time. That
-//! keeps the lock idempotent across restarts and avoids a race where
-//! two callers create the lock file at the same time. Callers must
-//! never unlink a lock they hold (or one a live process might hold):
-//! a competitor keeping or taking an advisory lock on the orphaned
-//! inode while a fresh acquire locks its replacement defeats mutual
-//! exclusion. The one sanctioned deletion is `socket-patch repair`,
-//! which removes the leftover file as its final housekeeping step —
-//! after releasing its own guard — so a finished repair leaves a
-//! clean `.socket/` tree. A leftover file from a crashed run needs no
-//! removal to unblock anything: the kernel released the dead
-//! process's advisory lock with its file handle, so the next acquire
-//! reclaims the file in place.
+//! # Lifecycle
 //!
-//! Locking is advisory (`flock(2)` on Unix, `LockFileEx` on Windows
-//! via the `fs2` crate). Non-cooperating writers (a user shelling
-//! `rm -rf .socket/`) are not stopped — but every socket-patch
-//! mutating command honors the lock, which is what matters in
-//! practice.
+//! The lock file lives at `<.socket>/apply.lock` and exists only while a
+//! command holds the lock:
+//!
+//! * [`acquire`] creates `socket_dir` itself (idempotently, inside the
+//!   retry loop), opens-or-creates `apply.lock`, takes the OS lock, and
+//!   then verifies that the handle it locked is still the file the path
+//!   names ([`same_file::Handle`] identity: device + inode on Unix,
+//!   volume serial + file index on Windows). A mismatch means a releaser
+//!   unlinked the file between our open and our lock, so the handle is
+//!   an orphan: we drop it and retry against whatever the path names now.
+//! * [`LockGuard`]'s drop unlinks `apply.lock` WHILE STILL HOLDING the
+//!   lock, then closes the handle (releasing the lock), then best-effort
+//!   removes an otherwise-empty `.socket/`. Unlinking under the lock is
+//!   what makes the unlink safe: any waiter that already opened this
+//!   inode fails the identity check once it finally locks it, instead of
+//!   becoming a second live holder alongside whoever locked the
+//!   replacement file.
+//!
+//! So no command leaves `apply.lock` behind, and a project that had no
+//! `.socket/` before a run has none after it unless the run wrote real
+//! state there. A leftover file from a crashed run needs no removal to
+//! unblock anything — the kernel released the dead process's advisory
+//! lock with its file handle — so the next acquire reclaims it in place
+//! and removes it on exit. `Held` therefore always means a live process.
+//!
+//! # Windows
+//!
+//! `DeleteFile` on an open file succeeds, but the name stays
+//! delete-pending until the last handle closes, and every open of that
+//! name in the meantime fails with `ERROR_ACCESS_DENIED` (5),
+//! `ERROR_SHARING_VIOLATION` (32) or `ERROR_DELETE_PENDING` (303). Two
+//! measures keep that window short and harmless: a waiter never holds
+//! the file open across its backoff sleep, and those three codes get a
+//! short fixed grace (5 ms × 40, independent of the caller's timeout)
+//! before they surface as `Io`. std's default share mode already
+//! includes `FILE_SHARE_DELETE`, so a holder can unlink the file while
+//! waiters have it open.
+//!
+//! Locking is advisory (`flock(2)` on Unix, `LockFileEx` on Windows via
+//! the `fs2` crate). Non-cooperating writers (a user shelling
+//! `rm -rf .socket/`) are not stopped — but every socket-patch mutating
+//! command honors the lock, which is what matters in practice.
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
+use same_file::Handle;
 use thiserror::Error;
+
+const LOCK_FILE_NAME: &str = "apply.lock";
+const SOCKET_DIR_NAME: &str = ".socket";
+
+/// Longest single backoff sleep while waiting on a live holder.
+const BACKOFF_CAP: Duration = Duration::from_millis(100);
+
+/// Consecutive "the file vanished under us" retries (open `NotFound`, or
+/// a post-lock identity mismatch) before giving up with `Io`. Each one
+/// is a releaser pruning `.socket/` between two of our steps; they cost
+/// no sleep and are not contention, so they are bounded by count rather
+/// than by `timeout`.
+const VANISHED_LIMIT: u32 = 16;
+
+/// Windows delete-pending grace: `attempts × sleep`, independent of
+/// `timeout` (a zero-timeout try-once still waits it out, because the
+/// name is free, just not reusable yet).
+const DELETE_PENDING_ATTEMPTS: u32 = 40;
+const DELETE_PENDING_SLEEP: Duration = Duration::from_millis(5);
 
 /// Errors surfaced when acquiring the apply lock.
 #[derive(Debug, Error)]
@@ -47,8 +90,11 @@ pub enum LockError {
     #[error("another socket-patch process is operating in this directory")]
     Held,
 
-    /// We could not create or open the lock file (typically a missing
-    /// `.socket/` directory or a permissions problem).
+    /// We could not create `socket_dir`, or could not open or lock the
+    /// lock file (a file squatting on `.socket/`, a directory squatting
+    /// on `apply.lock`, a permissions problem, a filesystem without
+    /// advisory locks, …). `path` is the directory for a `create_dir`
+    /// failure and the lock file otherwise.
     #[error("failed to open lock file at {path:?}: {source}")]
     Io {
         path: PathBuf,
@@ -59,30 +105,79 @@ pub enum LockError {
 
 /// RAII guard for the apply lock.
 ///
-/// Drop releases the OS-level advisory lock. There is no explicit
-/// `unlock()` API on purpose — Rust's drop guarantees are simpler to
-/// reason about than a `?`-fallible unlock path.
+/// Drop unlinks `apply.lock` while still holding the lock, releases the
+/// OS-level advisory lock by closing the handle, and then best-effort
+/// removes an otherwise-empty `.socket/` (see the module doc). There is
+/// no fallible `unlock()` API on purpose — Rust's drop guarantees are
+/// simpler to reason about than a `?`-fallible unlock path; [`release`]
+/// exists only to name an early drop.
+///
+/// [`release`]: LockGuard::release
 #[derive(Debug)]
 #[must_use = "the lock is released when this guard is dropped"]
 pub struct LockGuard {
-    // The std::fs::File holds the OS handle whose drop releases the
-    // lock; we keep it alive for the guard's lifetime. Field is unused
-    // by name but its Drop side effect is the entire point.
-    _file: std::fs::File,
+    // `Some` for the guard's whole life. `Drop` clears it so the handle
+    // closes (releasing the lock) BETWEEN unlinking the file and pruning
+    // the directory: Windows only lets go of the name once the last
+    // handle is gone, so the rmdir has to come after the close.
+    handle: Option<Handle>,
+    path: PathBuf,
+    socket_dir: PathBuf,
+}
+
+impl LockGuard {
+    /// Release the lock now — unlink, close, prune — instead of at the
+    /// end of the guard's scope.
+    pub fn release(self) {
+        drop(self);
+    }
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        // R1: unlink while still holding the lock. `NotFound` (a
+        // non-cooperating `rm`) and every other error are ignored: a
+        // leftover file is harmless and reclaimed by the next acquire.
+        let _ = std::fs::remove_file(&self.path);
+        // R2: close the handle; the OS releases the advisory lock.
+        self.handle = None;
+        // R3: prune an otherwise-empty `.socket/`. Non-recursive, so it
+        // fails harmlessly when anything else lives there — including a
+        // concurrent acquirer's freshly created `apply.lock`.
+        prune_empty_socket_dir(&self.socket_dir);
+    }
+}
+
+/// Best-effort `remove_dir` of `socket_dir`, gated to a directory
+/// literally named `.socket`: `--manifest-path` can point the lock at an
+/// arbitrary user directory, and the lock must never delete one of those
+/// just because it happened to be empty.
+fn prune_empty_socket_dir(socket_dir: &Path) {
+    if socket_dir
+        .file_name()
+        .is_some_and(|name| name == SOCKET_DIR_NAME)
+    {
+        let _ = std::fs::remove_dir(socket_dir);
+    }
 }
 
 /// Try to acquire the apply lock at `<socket_dir>/apply.lock`.
 ///
 /// `timeout = Duration::ZERO` makes this a non-blocking try-once. Any
 /// positive `timeout` re-tries with a 100 ms backoff until the lock
-/// becomes available or the budget elapses.
+/// becomes available or the budget elapses. Only genuine contention (a
+/// live holder) consumes the budget; the transient outcomes of racing a
+/// releaser's cleanup — the directory or file vanishing between two of
+/// our steps, Windows delete-pending opens — are retried on their own
+/// small fixed bounds so a zero-timeout caller still gets its one honest
+/// attempt.
 ///
-/// The lock file is created on demand. Its parent (`socket_dir`) must
-/// already exist — apply and friends create `.socket/` separately
-/// during `setup`, and we don't want lock acquisition to silently
-/// create directories on a misconfigured path.
+/// `socket_dir` is created on demand (idempotently, inside the retry
+/// loop, because a finished holder prunes an empty `.socket/` on exit).
+/// A failed acquire prunes it again if it is still empty, so a refused
+/// lock leaves no residue.
 pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockError> {
-    let path = socket_dir.join("apply.lock");
+    let path = socket_dir.join(LOCK_FILE_NAME);
 
     // Use `checked_add` so an astronomically large `timeout` (the flag
     // is a user-supplied `u64` of seconds — e.g. `--lock-timeout` /
@@ -93,37 +188,16 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
     // while still capping each sleep at 100 ms so the loop stays
     // responsive and `ZERO` keeps its non-blocking try-once semantics.
     let deadline = Instant::now().checked_add(timeout);
+    let mut vanished: u32 = 0;
+    let mut delete_pending: u32 = 0;
     loop {
-        // Open (or create) the lock file. `create(true)` is idempotent
-        // if it already exists; we never write to the file, only flock
-        // it. The open lives INSIDE the retry loop on purpose: `repair`
-        // may unlink `apply.lock` (and a fresh acquire recreate it)
-        // while we are parked waiting, and re-flocking a handle opened
-        // before the loop would lock the orphaned pre-deletion inode —
-        // handing out a second live guard alongside whoever locked the
-        // replacement file. Re-opening keeps every attempt bound to the
-        // inode the path names now.
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| LockError::Io {
-                path: path.clone(),
-                source,
-            })?;
-
-        match file.try_lock_exclusive() {
-            Ok(()) => return Ok(LockGuard { _file: file }),
-            // Only a genuine "someone else holds it" signal counts as
-            // contention and feeds the retry/`Held` path. Any other
-            // failure (ENOLCK, EBADF, a filesystem that doesn't support
-            // advisory locks, EACCES on a pre-existing read-only lock
-            // file, …) is a real I/O fault: surface it immediately as
-            // `Io` rather than busy-sleeping for the whole budget and
-            // then mislabelling it as `Held`. See `is_lock_contended`.
-            Err(ref e) if is_lock_contended(e) => {
+        // One mkdir → open → lock → identity-check attempt, in its own
+        // function so the file handle is closed before any sleep below:
+        // a waiter parked with the file open would prolong a Windows
+        // delete-pending window for everyone.
+        match attempt(&path, socket_dir) {
+            Attempt::Acquired(guard) => return Ok(guard),
+            Attempt::Contended => {
                 let now = Instant::now();
                 // A `None` deadline (timeout overflowed `Instant`) never
                 // elapses; otherwise give up once the budget is spent.
@@ -134,22 +208,173 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
                 // must not be rounded up to a full 100 ms wait. When
                 // there is a deadline the remaining slice is always > 0
                 // here (now < deadline); with no deadline, just use the
-                // full 100 ms quantum.
-                let cap = Duration::from_millis(100);
+                // full quantum.
                 let sleep_for = match deadline {
-                    Some(d) => (d - now).min(cap),
-                    None => cap,
+                    Some(d) => (d - now).min(BACKOFF_CAP),
+                    None => BACKOFF_CAP,
                 };
                 std::thread::sleep(sleep_for);
             }
-            Err(source) => {
-                return Err(LockError::Io {
-                    path: path.clone(),
-                    source,
-                });
+            Attempt::Vanished => {
+                vanished += 1;
+                if vanished > VANISHED_LIMIT {
+                    let source = std::io::Error::new(
+                        ErrorKind::NotFound,
+                        "lock file kept vanishing while acquiring it",
+                    );
+                    return Err(fail(socket_dir, path, source));
+                }
+            }
+            Attempt::DeletePending(source) => {
+                delete_pending += 1;
+                if delete_pending > DELETE_PENDING_ATTEMPTS {
+                    return Err(fail(socket_dir, path, source));
+                }
+                std::thread::sleep(DELETE_PENDING_SLEEP);
+            }
+            Attempt::Fault { path, source } => return Err(fail(socket_dir, path, source)),
+        }
+    }
+}
+
+/// Outcome of one mkdir → open → lock → identity-check attempt. Every
+/// variant but `Acquired` has already closed its file handle.
+enum Attempt {
+    Acquired(LockGuard),
+    /// A live holder has the lock (the `fs2` contention sentinel).
+    Contended,
+    /// The directory or file disappeared between two of our steps, or
+    /// the handle we locked is an orphan: a releaser ran its cleanup.
+    Vanished,
+    /// Windows: the name is still delete-pending from a releaser's
+    /// unlink; free, but not reusable until its last handle closes.
+    DeletePending(std::io::Error),
+    /// A genuine I/O fault at `path` — surface immediately, never as
+    /// `Held`.
+    Fault {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+fn attempt(path: &Path, socket_dir: &Path) -> Attempt {
+    // 1. The directory, idempotently. Inside every attempt on purpose:
+    // a releaser may have pruned it since the last one.
+    match std::fs::create_dir_all(socket_dir) {
+        Ok(()) => {}
+        // std's `create_dir_all` stats the path after `EEXIST` to decide
+        // whether the existing entry is a directory; a releaser pruning
+        // it between those two syscalls makes that stat fail and the
+        // call report `AlreadyExists` for a directory that is now gone.
+        // Re-check: a non-directory squatting on the path is a fault;
+        // anything else (still a directory, or vanished again) is left
+        // to the open below, which reports a missing parent as
+        // `Vanished`.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            if std::fs::metadata(socket_dir).is_ok_and(|md| !md.is_dir()) {
+                return Attempt::Fault {
+                    path: socket_dir.to_path_buf(),
+                    source: e,
+                };
+            }
+        }
+        Err(e) if is_delete_pending(&e) => return Attempt::DeletePending(e),
+        Err(e) => {
+            return Attempt::Fault {
+                path: socket_dir.to_path_buf(),
+                source: e,
             }
         }
     }
+
+    // 2a. Open (or create) the lock file. `create(true)` is idempotent
+    // if it already exists; we never write to the file, only lock it.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) => return open_failure(e, path, socket_dir),
+    };
+
+    // 2b. Only a genuine "someone else holds it" signal counts as
+    // contention. Any other failure (ENOLCK, EBADF, a filesystem that
+    // doesn't support advisory locks, EACCES on a read-only lock file,
+    // …) is a real I/O fault: surface it immediately rather than
+    // busy-sleeping for the whole budget and then mislabelling it as
+    // `Held`. See `is_lock_contended`.
+    match file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(ref e) if is_lock_contended(e) => return Attempt::Contended,
+        Err(source) => {
+            return Attempt::Fault {
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    }
+
+    // 2c. Identity check: is the handle we locked still the file the
+    // path names? `from_file` consumes the `File` (it needs the fstat
+    // identity), so the guard keeps the `Handle`; `as_file` would give
+    // the `File` back if anyone ever needed it. Dropping `held` on the
+    // mismatch arms releases the orphan's lock.
+    let held = match Handle::from_file(file) {
+        Ok(held) => held,
+        Err(source) => {
+            return Attempt::Fault {
+                path: path.to_path_buf(),
+                source,
+            }
+        }
+    };
+    match Handle::from_path(path) {
+        Ok(now) if now == held => Attempt::Acquired(LockGuard {
+            handle: Some(held),
+            path: path.to_path_buf(),
+            socket_dir: socket_dir.to_path_buf(),
+        }),
+        // The path names a replacement: a releaser unlinked the inode we
+        // locked between our open and our lock, and a newcomer created
+        // the next file.
+        Ok(_) => Attempt::Vanished,
+        Err(e) => open_failure(e, path, socket_dir),
+    }
+}
+
+/// Classify a failed open (or identity probe) of the lock file. A
+/// missing file or parent is a releaser's cleanup racing us (retry);
+/// so is any other failure while the parent directory is gone — macOS
+/// reports an `O_CREAT` open inside a directory that was rmdir'd a
+/// moment ago as `EINVAL` rather than `ENOENT`. Windows delete-pending
+/// codes get their grace; everything else is a genuine fault.
+fn open_failure(e: std::io::Error, path: &Path, socket_dir: &Path) -> Attempt {
+    if e.kind() == ErrorKind::NotFound {
+        return Attempt::Vanished;
+    }
+    if is_delete_pending(&e) {
+        return Attempt::DeletePending(e);
+    }
+    if matches!(std::fs::metadata(socket_dir), Err(ref m) if m.kind() == ErrorKind::NotFound) {
+        return Attempt::Vanished;
+    }
+    Attempt::Fault {
+        path: path.to_path_buf(),
+        source: e,
+    }
+}
+
+/// Build the `Io` error for a failed acquire, first pruning the empty
+/// `.socket/` this call may have created so a refused lock leaves no
+/// residue behind. (`remove_dir` is non-recursive: a lock file we
+/// created but could not lock keeps the directory, on purpose — we must
+/// never unlink a file we do not hold the lock on.)
+fn fail(socket_dir: &Path, path: PathBuf, source: std::io::Error) -> LockError {
+    prune_empty_socket_dir(socket_dir);
+    LockError::Io { path, source }
 }
 
 /// Distinguish "the lock is held by someone else" from a real I/O
@@ -166,18 +391,39 @@ fn is_lock_contended(err: &std::io::Error) -> bool {
     err.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
+/// Windows only: is this open/identity-probe error the delete-pending
+/// window of a just-released lock (`ERROR_ACCESS_DENIED` 5,
+/// `ERROR_SHARING_VIOLATION` 32, `ERROR_DELETE_PENDING` 303)? Always
+/// false elsewhere — those numbers mean unrelated errnos on Unix. Only
+/// applied to the open and identity-probe paths, never to the lock
+/// call: `LockFileEx` contention is a different code (33) and must keep
+/// feeding the `Held`/deadline logic.
+fn is_delete_pending(err: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(err.raw_os_error(), Some(5) | Some(32) | Some(303))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Lock file is created on demand and the first acquisition succeeds.
+    /// A `.socket/` under a fresh tempdir — the shape production uses,
+    /// and the name the guard's prune step is gated on.
+    fn socket_dir(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join(".socket")
+    }
+
+    /// Lock file exists while held and is gone once the guard drops.
     #[test]
     fn first_acquire_succeeds() {
         let dir = tempfile::tempdir().unwrap();
-        let guard = acquire(dir.path(), Duration::ZERO).unwrap();
-        // Lock file must exist on disk.
-        assert!(dir.path().join("apply.lock").is_file());
+        let socket = socket_dir(&dir);
+        let guard = acquire(&socket, Duration::ZERO).unwrap();
+        assert!(socket.join("apply.lock").is_file());
         drop(guard);
+        assert!(
+            !socket.join("apply.lock").exists(),
+            "drop must unlink the lock file"
+        );
     }
 
     /// Second concurrent acquire returns `LockError::Held` when the
@@ -185,35 +431,92 @@ mod tests {
     #[test]
     fn second_concurrent_acquire_is_held() {
         let dir = tempfile::tempdir().unwrap();
-        let _first = acquire(dir.path(), Duration::ZERO).unwrap();
-        let err = acquire(dir.path(), Duration::ZERO).unwrap_err();
+        let socket = socket_dir(&dir);
+        let _first = acquire(&socket, Duration::ZERO).unwrap();
+        let err = acquire(&socket, Duration::ZERO).unwrap_err();
         assert!(matches!(err, LockError::Held));
     }
 
-    /// After the first guard drops, a fresh acquire succeeds.
+    /// After the first guard drops (which also unlinks the file and
+    /// prunes the directory), a fresh acquire recreates both and
+    /// succeeds.
     #[test]
     fn drop_releases_lock() {
         let dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir(&dir);
         {
-            let _g = acquire(dir.path(), Duration::ZERO).unwrap();
+            let _g = acquire(&socket, Duration::ZERO).unwrap();
         } // guard dropped here
-        let again = acquire(dir.path(), Duration::ZERO);
+        let again = acquire(&socket, Duration::ZERO);
         assert!(again.is_ok());
     }
 
-    /// Missing socket directory surfaces as `LockError::Io` with the
-    /// original `NotFound` underneath.
+    /// `acquire` creates a missing `.socket/` itself, and the guard's
+    /// drop removes both the lock file and the now-empty directory —
+    /// a lock-only run leaves the project exactly as it found it.
     #[test]
-    fn missing_socket_dir_surfaces_io() {
+    fn acquire_creates_missing_socket_dir_and_prunes_it_on_drop() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("does-not-exist");
-        let err = acquire(&missing, Duration::ZERO).unwrap_err();
+        let socket = socket_dir(&dir);
+        assert!(!socket.exists());
+
+        let guard = acquire(&socket, Duration::ZERO).unwrap();
+        assert!(socket.join("apply.lock").is_file());
+
+        drop(guard);
+        assert!(!socket.join("apply.lock").exists());
+        assert!(
+            !socket.exists(),
+            "an otherwise-empty .socket/ must be pruned on release"
+        );
+    }
+
+    /// The prune is non-recursive: a `.socket/` holding real state keeps
+    /// everything but the lock file.
+    #[test]
+    fn drop_leaves_non_empty_socket_dir_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir(&dir);
+        std::fs::create_dir_all(&socket).unwrap();
+        std::fs::write(socket.join("manifest.json"), b"{}").unwrap();
+
+        let guard = acquire(&socket, Duration::ZERO).unwrap();
+        drop(guard);
+
+        assert!(!socket.join("apply.lock").exists());
+        assert!(socket.join("manifest.json").is_file());
+        assert!(socket.is_dir());
+    }
+
+    /// The directory prune is gated to a directory literally named
+    /// `.socket`: `--manifest-path` can aim the lock at any user
+    /// directory, which the guard must not delete even when empty.
+    #[test]
+    fn drop_prunes_only_a_dir_named_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("custom");
+        let guard = acquire(&custom, Duration::ZERO).unwrap();
+        assert!(custom.join("apply.lock").is_file());
+        drop(guard);
+        assert!(!custom.join("apply.lock").exists());
+        assert!(custom.is_dir(), "a user-named lock dir must survive");
+    }
+
+    /// A regular file squatting where `.socket/` should be is an `Io`
+    /// naming the directory — never `Held`, and the squatter is left
+    /// untouched.
+    #[test]
+    fn file_squatting_on_socket_dir_surfaces_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir(&dir);
+        std::fs::write(&socket, b"not a directory").unwrap();
+
+        let err = acquire(&socket, Duration::from_millis(250)).unwrap_err();
         match err {
-            LockError::Io { source, .. } => {
-                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
-            }
-            _ => panic!("expected Io error, got {:?}", err),
+            LockError::Io { path, .. } => assert_eq!(path, socket),
+            LockError::Held => panic!("a squatting file is an I/O fault, not contention"),
         }
+        assert_eq!(std::fs::read(&socket).unwrap(), b"not a directory");
     }
 
     /// Non-zero timeout waits then errors `Held` when the lock never
@@ -221,9 +524,10 @@ mod tests {
     #[test]
     fn timeout_held() {
         let dir = tempfile::tempdir().unwrap();
-        let _first = acquire(dir.path(), Duration::ZERO).unwrap();
+        let socket = socket_dir(&dir);
+        let _first = acquire(&socket, Duration::ZERO).unwrap();
         let start = Instant::now();
-        let err = acquire(dir.path(), Duration::from_millis(250)).unwrap_err();
+        let err = acquire(&socket, Duration::from_millis(250)).unwrap_err();
         let elapsed = start.elapsed();
         assert!(matches!(err, LockError::Held));
         // We waited at least the budget (with some slack for the
@@ -271,15 +575,35 @@ mod tests {
         }
     }
 
+    /// The delete-pending grace is Windows-only and never overlaps the
+    /// contention sentinel: on Windows codes 5/32/303 qualify and
+    /// `ERROR_LOCK_VIOLATION` (33) does not; elsewhere nothing does
+    /// (5 is EIO and 32 is EPIPE on Unix).
+    #[test]
+    fn delete_pending_classifier_is_windows_only_and_excludes_contention() {
+        use std::io::Error;
+
+        assert!(!is_delete_pending(&fs2::lock_contended_error()));
+        assert!(!is_delete_pending(&Error::from(ErrorKind::NotFound)));
+        for code in [5, 32, 303] {
+            assert_eq!(
+                is_delete_pending(&Error::from_raw_os_error(code)),
+                cfg!(windows),
+                "os error {code}"
+            );
+        }
+    }
+
     /// A non-blocking (`ZERO`) acquire on a contended lock returns
     /// `Held` essentially immediately — it must not pay the 100 ms
     /// backoff sleep before giving up.
     #[test]
     fn zero_timeout_does_not_sleep_before_held() {
         let dir = tempfile::tempdir().unwrap();
-        let _first = acquire(dir.path(), Duration::ZERO).unwrap();
+        let socket = socket_dir(&dir);
+        let _first = acquire(&socket, Duration::ZERO).unwrap();
         let start = Instant::now();
-        let err = acquire(dir.path(), Duration::ZERO).unwrap_err();
+        let err = acquire(&socket, Duration::ZERO).unwrap_err();
         let elapsed = start.elapsed();
         assert!(matches!(err, LockError::Held));
         assert!(
@@ -298,30 +622,35 @@ mod tests {
     #[test]
     fn overflowing_timeout_does_not_panic_when_free() {
         let dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir(&dir);
         // Would panic ("overflow when adding duration to instant") under
         // the old `Instant::now() + timeout`.
-        let guard = acquire(dir.path(), Duration::from_secs(u64::MAX)).unwrap();
-        assert!(dir.path().join("apply.lock").is_file());
+        let guard = acquire(&socket, Duration::from_secs(u64::MAX)).unwrap();
+        assert!(socket.join("apply.lock").is_file());
         drop(guard);
+        assert!(!socket.join("apply.lock").exists());
     }
 
     /// Regression companion: with an overflowing (effectively infinite)
     /// timeout AND a contended lock, `acquire` must *wait* — not panic
     /// and not give up — and then succeed once the holder releases.
     /// Proves both the no-overflow-panic fix and that a `None` deadline
-    /// never spuriously elapses into `Held`.
+    /// never spuriously elapses into `Held`. The holder's release also
+    /// unlinks the file and prunes `.socket/`, so the parked waiter has
+    /// to recreate both — the mkdir-inside-the-loop path.
     #[test]
     fn overflowing_timeout_waits_then_acquires_on_release() {
         use std::sync::Arc;
 
         let dir = Arc::new(tempfile::tempdir().unwrap());
-        let held = acquire(dir.path(), Duration::ZERO).unwrap();
+        let socket = socket_dir(&dir);
+        let held = acquire(&socket, Duration::ZERO).unwrap();
 
         // Release the lock a little while after the waiter starts.
         let dir2 = Arc::clone(&dir);
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
-            drop(held); // releases the OS lock
+            drop(held); // unlinks, releases the OS lock, prunes .socket/
                         // Keep the tempdir alive until the waiter has acquired.
             std::thread::sleep(Duration::from_millis(200));
             drop(dir2);
@@ -331,139 +660,199 @@ mod tests {
         // panics before ever sleeping. With the fix it waits indefinitely
         // and acquires once `held` drops above.
         let start = Instant::now();
-        let guard = acquire(dir.path(), Duration::from_secs(u64::MAX)).unwrap();
+        let guard = acquire(&socket, Duration::from_secs(u64::MAX)).unwrap();
         let waited = start.elapsed();
         assert!(
             waited >= Duration::from_millis(100),
             "should have waited for the holder to release, waited {:?}",
             waited
         );
+        assert!(socket.join("apply.lock").is_file());
         drop(guard);
+        assert!(!socket.exists(), "last guard out prunes .socket/");
         releaser.join().unwrap();
     }
 
-    /// Regression: a waiter parked in the retry loop must not keep
-    /// locking the *old* inode across `repair`'s sanctioned lock-file
-    /// deletion.
+    /// A waiter parked in the retry loop must never end up holding the
+    /// lock alongside the next command once the holder releases.
     ///
-    /// `repair` drops its guard and then unlinks `apply.lock` as its
-    /// final housekeeping step. It justifies that with a "residual
-    /// window of microseconds" between the drop and the unlink — true
-    /// for a fresh acquire (open, then immediately flock), but false
-    /// for a waiter: `acquire` used to open the lock file exactly once,
-    /// *before* the loop, then re-flock that same handle for the whole
-    /// `--lock-timeout` budget. So a waiter parked for minutes would
-    /// eventually flock the unlinked, orphaned inode and report success
-    /// while the next command created a fresh `apply.lock` and locked
-    /// that — two simultaneous holders of the "exclusive" apply lock,
-    /// i.e. exactly the concurrent manifest/package-file corruption the
-    /// lock exists to prevent. Re-opening the path on every retry keeps
-    /// the waiter honest about whatever file `apply.lock` names now.
-    ///
-    /// The choreography below can lose benign races on a loaded runner
-    /// (observed on macOS and Windows CI), so it retries: the
-    /// regressed bug double-holds on essentially every iteration, while
-    /// the benign losses need an unlucky deschedule and almost never
-    /// repeat. One clean iteration proves the re-open behavior; a full
-    /// run of iterations without one is statistically the bug.
+    /// The holder's drop unlinks `apply.lock` under the lock and then
+    /// releases; a fresh try-once acquire follows at once and takes the
+    /// lock on a brand-new inode. The waiter may have opened the OLD
+    /// inode before the unlink: if it locks that orphan, the post-lock
+    /// identity check must reject it (the path names a different file
+    /// now, or nothing) and send it back around the loop, where it either
+    /// wins the free window itself or sees the fresh holder and reports
+    /// `Held`. Both are correct; two live guards at once is the bug this
+    /// pins, and — unlike the pre-identity-check protocol, which merely
+    /// called that window "vanishingly rare" — it is now impossible, so
+    /// every iteration asserts it outright.
     #[test]
-    fn waiter_does_not_lock_orphaned_inode_after_lock_file_deleted() {
+    fn waiter_does_not_lock_orphaned_inode_after_holder_release() {
         use std::sync::mpsc;
 
         const ATTEMPTS: usize = 5;
-        let mut benign = Vec::new();
         for _ in 0..ATTEMPTS {
             let dir = tempfile::tempdir().unwrap();
-            let lock_path = dir.path().join("apply.lock");
+            let socket = socket_dir(&dir);
+            let lock_path = socket.join("apply.lock");
 
-            // A `repair` run holds the lock; this is the inode the
+            // A mutating command holds the lock; this is the inode the
             // waiter will open below.
-            let repair_guard = acquire(dir.path(), Duration::ZERO).unwrap();
+            let holder = acquire(&socket, Duration::ZERO).unwrap();
 
             // The waiter: a concurrent `apply --lock-timeout 1` that
-            // parks in the retry loop while repair finishes.
+            // parks in the retry loop while the holder finishes.
             let (started_tx, started_rx) = mpsc::channel();
-            let waiter_dir = dir.path().to_path_buf();
+            let waiter_dir = socket.clone();
             let waiter = std::thread::spawn(move || {
                 started_tx.send(()).unwrap();
                 acquire(&waiter_dir, Duration::from_millis(600))
             });
 
-            // Let the waiter open the lock file and burn its first
-            // (contended) attempt, so its handle is on the pre-deletion
-            // inode. Being late here is harmless — it just means the
-            // waiter burns another attempt on the same handle.
+            // Let the waiter burn its first (contended) attempt. Being
+            // late here is harmless — it just burns another attempt.
             started_rx.recv().unwrap();
             std::thread::sleep(Duration::from_millis(50));
 
-            // repair's tail: release the guard, then unlink the lock
-            // file. The next mutating command comes along and takes the
-            // lock on a brand-new inode.
-            drop(repair_guard);
-            std::fs::remove_file(&lock_path).unwrap();
-            let fresh = acquire(dir.path(), Duration::ZERO);
+            // The holder finishes (unlink under the lock, release,
+            // prune) and the next command takes the lock immediately.
+            drop(holder);
+            let fresh = acquire(&socket, Duration::ZERO);
 
             let waiter_result = waiter.join().unwrap();
-            match (fresh, waiter_result) {
-                // The interleaving under test: the fresh acquire won
-                // the post-unlink window, and the waiter — re-opening
-                // the path every retry — saw the new inode held and
-                // gave up. Under the bug this outcome is unreachable
-                // (the waiter flocks its orphaned pre-loop handle and
-                // returns a guard), so one clean iteration is proof.
-                (Ok(_fresh_guard), Err(LockError::Held)) => return,
-                // Benign race: the waiter's retry landed between the
-                // unlink and the fresh acquire, while the lock was
-                // genuinely free — it recreated the file and is a
-                // legitimate sole holder, and the fresh try-once
-                // correctly reported Held. Mutual exclusion held; retry
-                // for the interleaving under test.
-                (Err(LockError::Held), Ok(_waiter_guard)) => {
-                    benign.push("waiter won the free-lock window");
-                }
-                // Both hold "the" lock at once. For the fixed,
-                // re-opening waiter this needs the sanctioned
-                // microsecond window between its open() and flock()
-                // straddling repair's drop+unlink — vanishingly rare
-                // twice. The old one-handle waiter lands here on every
-                // iteration, so repeats fail below.
-                (Ok(_fresh_guard), Ok(_waiter_guard)) => {
-                    benign.push("double hold via the open->flock window");
-                }
-                // Windows can keep an unlinked file delete-pending until
-                // its last handle closes. CreateFile then returns
-                // ERROR_ACCESS_DENIED (5), including when the waiter is
-                // reopening while the fresh acquire races that cleanup.
-                // Neither an I/O refusal nor Held grants a second lock.
-                // Retry this choreography; still require a clean Held
-                // iteration above, and never relax acquire's I/O errors.
-                // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
+            match (&fresh, &waiter_result) {
+                // The fresh acquire won and the waiter, re-checking the
+                // path every retry, saw the new inode held and gave up.
+                (Ok(_), Err(LockError::Held)) => {}
+                // The waiter's retry landed in the free window between
+                // the release and the fresh acquire: it recreated the
+                // file and is the legitimate sole holder, and the fresh
+                // try-once correctly reported Held.
+                (Err(LockError::Held), Ok(_)) => {}
+                (Ok(_), Ok(_)) => panic!(
+                    "two live guards on the apply lock at once: the waiter locked \
+                     the orphaned pre-release inode and the identity check let it through"
+                ),
+                // Windows keeps an unlinked name delete-pending until its
+                // last handle closes; the grace in `acquire` should absorb
+                // that, but if a loaded runner outlasts it, an I/O refusal
+                // still grants nobody a second lock.
                 #[cfg(windows)]
                 (Ok(_) | Err(LockError::Held), Err(LockError::Io { source, .. }))
                 | (Err(LockError::Io { source, .. }), Ok(_) | Err(LockError::Held))
-                    if source.raw_os_error() == Some(5) =>
-                {
-                    benign.push("open raced Windows delete-pending handle");
-                }
-                #[cfg(windows)]
-                (
-                    Err(LockError::Io { source: first, .. }),
-                    Err(LockError::Io { source: second, .. }),
-                ) if first.raw_os_error() == Some(5) && second.raw_os_error() == Some(5) => {
-                    benign.push("both opens raced Windows delete-pending handle");
-                }
+                    if is_delete_pending(source) => {}
                 (fresh, waiter_result) => panic!(
                     "unexpected lock outcome: fresh={:?} waiter={:?}",
-                    fresh.map(|_| "Ok(guard)"),
-                    waiter_result.map(|_| "Ok(guard)")
+                    fresh.as_ref().map(|_| "Ok(guard)"),
+                    waiter_result.as_ref().map(|_| "Ok(guard)")
                 ),
             }
+
+            // Whoever held it, releasing leaves nothing behind.
+            drop(fresh);
+            drop(waiter_result);
+            assert!(
+                !lock_path.exists(),
+                "apply.lock must not outlive its holders"
+            );
+            assert!(
+                !socket.exists(),
+                "an otherwise-empty .socket/ must be pruned"
+            );
         }
-        panic!(
-            "waiter must not acquire the apply lock while another holder is live \
-             (it locked the orphaned pre-deletion inode): no clean iteration in \
-             {ATTEMPTS} attempts — {benign:?}"
+    }
+
+    /// The lock binds to the file the path names NOW: a guard left
+    /// holding an orphaned inode (a non-cooperating `rm` + `touch`
+    /// replaced the file under it) neither blocks a fresh acquire nor
+    /// gets confused on its own drop. Unix-only: Windows cannot replace
+    /// a name that another handle keeps delete-pending.
+    #[cfg(unix)]
+    #[test]
+    fn orphaned_inode_holder_does_not_block_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir(&dir);
+        let lock_path = socket.join("apply.lock");
+
+        let orphan = acquire(&socket, Duration::ZERO).unwrap();
+        // Replace the lock file behind the holder's back.
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::File::create(&lock_path).unwrap();
+
+        // The replacement is unlocked, so a fresh acquire takes it even
+        // though `orphan` still holds the old inode.
+        let fresh = acquire(&socket, Duration::ZERO).unwrap();
+        assert!(lock_path.is_file());
+
+        drop(fresh);
+        assert!(!lock_path.exists());
+        assert!(!socket.exists());
+        // The orphan's drop finds nothing to unlink or prune and must not
+        // panic.
+        drop(orphan);
+        assert!(!socket.exists());
+    }
+
+    /// Two threads hammering acquire/release on one `.socket/` — every
+    /// release unlinking the file and pruning the directory, every
+    /// acquire recreating both — must never observe two live guards and
+    /// must end with no lock file and no directory. This is the live
+    /// stress test of the unlink-under-lock + identity-check protocol
+    /// and of the mkdir-inside-the-loop / vanished-file retries.
+    #[test]
+    fn concurrent_acquire_release_never_double_holds_and_leaves_no_residue() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        const ITERATIONS: usize = 200;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir(&dir);
+        let holders = Arc::new(AtomicUsize::new(0));
+        let violated = Arc::new(AtomicBool::new(false));
+
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let socket = socket.clone();
+                let holders = Arc::clone(&holders);
+                let violated = Arc::clone(&violated);
+                std::thread::spawn(move || {
+                    let mut faults = Vec::new();
+                    for _ in 0..ITERATIONS {
+                        match acquire(&socket, Duration::ZERO) {
+                            Ok(guard) => {
+                                if holders.fetch_add(1, Ordering::SeqCst) != 0 {
+                                    violated.store(true, Ordering::SeqCst);
+                                }
+                                std::thread::yield_now();
+                                holders.fetch_sub(1, Ordering::SeqCst);
+                                drop(guard);
+                            }
+                            // Refusal (the other thread holds) is a
+                            // correct outcome; only a double hold or an
+                            // I/O fault is a failure.
+                            Err(LockError::Held) => {}
+                            Err(e @ LockError::Io { .. }) => faults.push(e.to_string()),
+                        }
+                    }
+                    faults
+                })
+            })
+            .collect();
+
+        let mut faults = Vec::new();
+        for worker in workers {
+            faults.extend(worker.join().unwrap());
+        }
+
+        assert!(
+            !violated.load(Ordering::SeqCst),
+            "two threads held the apply lock at once"
         );
+        assert!(faults.is_empty(), "acquire hit I/O faults: {faults:?}");
+        assert!(!socket.join("apply.lock").exists());
+        assert!(!socket.exists(), "the last release must prune .socket/");
     }
 
     /// mkfifo(2) directly, not the /usr/bin/mkfifo binary: spawning a child
@@ -486,7 +875,7 @@ mod tests {
     /// A non-contention `try_lock_exclusive` fault must surface as
     /// `LockError::Io` immediately — not busy-sleep the whole timeout
     /// budget and then come out mislabelled as `Held` (the documented
-    /// contract of the second `Err` arm in `acquire`).
+    /// contract of the `Fault` arm in `attempt`).
     ///
     /// Induced for real, with no fault-injection seam: a FIFO planted at
     /// `apply.lock` opens fine with `O_RDWR` (the process is both reader
@@ -518,9 +907,9 @@ mod tests {
                     fs2::lock_contended_error().raw_os_error()
                 );
             }
-            LockError::Held => panic!(
-                "a genuine flock fault must not be mislabelled as contention"
-            ),
+            LockError::Held => {
+                panic!("a genuine flock fault must not be mislabelled as contention")
+            }
         }
         // The fault arm returns without ever entering the retry/backoff
         // path: nowhere near the 5 s budget (the old funnel-everything-
@@ -530,6 +919,9 @@ mod tests {
             "Io fault must not burn the retry budget, took {:?}",
             elapsed
         );
+        // A failed acquire never unlinks a file it does not hold the
+        // lock on.
+        assert!(lock_path.exists(), "the squatting FIFO must survive");
     }
 
     /// Companion in try-once mode: `timeout = ZERO` on a faulting lock
@@ -552,9 +944,9 @@ mod tests {
                     fs2::lock_contended_error().raw_os_error()
                 );
             }
-            LockError::Held => panic!(
-                "try-once mode must not mislabel a genuine flock fault as Held"
-            ),
+            LockError::Held => {
+                panic!("try-once mode must not mislabel a genuine flock fault as Held")
+            }
         }
     }
 
@@ -565,9 +957,10 @@ mod tests {
     #[test]
     fn wait_respects_deadline_without_full_quantum_overshoot() {
         let dir = tempfile::tempdir().unwrap();
-        let _first = acquire(dir.path(), Duration::ZERO).unwrap();
+        let socket = socket_dir(&dir);
+        let _first = acquire(&socket, Duration::ZERO).unwrap();
         let start = Instant::now();
-        let err = acquire(dir.path(), Duration::from_millis(150)).unwrap_err();
+        let err = acquire(&socket, Duration::from_millis(150)).unwrap_err();
         let elapsed = start.elapsed();
         assert!(matches!(err, LockError::Held));
         assert!(

@@ -237,14 +237,33 @@ fn lock_released_after_external_drop() {
         code, 1,
         "partialFailure against an absent package exits 1.\nstderr:\n{stderr}"
     );
+    // The binary reclaimed the file the test created and removed it on
+    // exit — the lock never outlives the command that held it.
+    assert_no_lock_residue(&socket_dir);
 }
 
-/// The lock file is intentionally not deleted on guard drop —
-/// keeping the inode lets subsequent apply runs re-flock without a
-/// create race. Verify the file is still there after a successful
-/// apply, and that re-acquiring still works.
+/// Every run that takes the lock removes `apply.lock` on exit, while
+/// leaving the real `.socket/` state (here: the manifest) alone. The
+/// guard unlinks the file under the lock and prunes only an EMPTY
+/// `.socket/`, so a project with a manifest keeps its directory.
+fn assert_no_lock_residue(socket_dir: &Path) {
+    assert!(
+        !socket_dir.join("apply.lock").exists(),
+        "apply.lock must not outlive the run that held it"
+    );
+    assert!(
+        socket_dir.join("manifest.json").is_file(),
+        "the manifest is real state and must survive a lock release"
+    );
+}
+
+/// The lock file exists only while a command holds it: each run creates
+/// `apply.lock` on demand, unlinks it (under the lock) on exit, and the
+/// next run creates it afresh. Verify the file is gone after each
+/// completed apply, that the manifest survives, and that re-acquiring
+/// still works.
 #[test]
-fn lock_file_persists_across_runs() {
+fn lock_file_is_removed_after_each_run() {
     let dir = tempfile::tempdir().unwrap();
     let socket_dir = dir.path().join(".socket");
     setup_socket_dir(&socket_dir);
@@ -256,27 +275,17 @@ fn lock_file_persists_across_runs() {
         "apply.lock must not exist before the first run"
     );
 
-    // First run: must acquire (not lock_held) and create the file.
+    // First run: must acquire (not lock_held), create the file, and
+    // remove it again on exit.
     let (_code1, stdout1, _stderr1) = run(dir.path(), &["apply", "--json"]);
     assert_lock_acquired(&parse_json_envelope(&stdout1));
+    assert_no_lock_residue(&socket_dir);
 
-    // Lock file should persist after the run completes (inode kept so
-    // subsequent acquires don't race on create).
-    assert!(
-        socket_dir.join("apply.lock").is_file(),
-        "apply.lock should persist between runs"
-    );
-
-    // Second run must still be able to acquire (file exists, but no
-    // one holds the OS lock) — full envelope check, not a substring.
+    // Second run recreates the file, acquires, and removes it again —
+    // full envelope check, not a substring.
     let (_code2, stdout2, _stderr2) = run(dir.path(), &["apply", "--json"]);
     assert_lock_acquired(&parse_json_envelope(&stdout2));
-
-    // And the file is still there afterwards.
-    assert!(
-        socket_dir.join("apply.lock").is_file(),
-        "apply.lock should still persist after the second run"
-    );
+    assert_no_lock_residue(&socket_dir);
 }
 
 /// Multiple real `socket-patch apply` subprocesses contending for the
@@ -329,10 +338,13 @@ fn two_apply_subprocesses_serialize() {
         assert_eq!(json_string(&env, "status"), Some("error"));
     }
 
-    // Release and re-run — must now succeed in acquiring.
+    // Release and re-run — must now succeed in acquiring. The refused
+    // children never held a guard, so none of them unlinked the file the
+    // test created; the run that finally acquires it removes it.
     drop(external);
     let (_code2, stdout2, _) = run(dir.path(), &["apply", "--json"]);
     assert_lock_acquired(&parse_json_envelope(&stdout2));
+    assert_no_lock_residue(&socket_dir);
 }
 
 /// Sanity check that doesn't actually depend on the binary: confirm
@@ -361,18 +373,21 @@ fn helper_lock_is_actually_exclusive() {
 }
 
 /// `apply` against a pre-staged lock file (no live holder) reclaims
-/// the file in place and proceeds with the apply pass — no flag
-/// needed. Mirrors the OS-level scenario: a previous run crashed and
-/// left `apply.lock` behind, but the kernel released the dead
-/// holder's flock, so a fresh acquire sails through. This fact is
-/// what made `--break-lock` (and the `unlock` subcommand) redundant.
+/// the file in place, proceeds with the apply pass, and removes the
+/// file on exit — no flag needed. Mirrors the OS-level scenario: a
+/// previous run crashed and left `apply.lock` behind, but the kernel
+/// released the dead holder's flock, so a fresh acquire sails through.
+/// This fact is what made `--break-lock` (and the `unlock` subcommand)
+/// redundant, and the exit-time unlink means the leftover does not
+/// even survive the next run.
 #[test]
-fn stale_lock_file_does_not_block_apply() {
+fn stale_lock_file_is_reclaimed_then_removed() {
     let dir = tempfile::tempdir().unwrap();
     let socket_dir = dir.path().join(".socket");
     setup_socket_dir(&socket_dir);
-    // Pre-stage a lock file but DON'T hold an OS lock.
-    std::fs::write(socket_dir.join("apply.lock"), b"").unwrap();
+    // Pre-stage a lock file but DON'T hold an OS lock. Non-empty bytes
+    // so the reclaim is visibly "this file", not a fresh create.
+    std::fs::write(socket_dir.join("apply.lock"), b"leftover").unwrap();
 
     let (code, stdout, stderr) = run(dir.path(), &["apply", "--json"]);
     let env = parse_json_envelope(&stdout);
@@ -386,11 +401,8 @@ fn stale_lock_file_does_not_block_apply() {
         code, 1,
         "apply that ran the pipeline to partialFailure must exit 1.\nstderr:\n{stderr}"
     );
-    // The inode is kept for subsequent acquires.
-    assert!(
-        socket_dir.join("apply.lock").is_file(),
-        "apply.lock should still exist after the run"
-    );
+    // The reclaimed leftover is gone; the manifest is untouched.
+    assert_no_lock_residue(&socket_dir);
 }
 
 /// `apply --lock-timeout=1` against a held lock waits up to 1s

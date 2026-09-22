@@ -168,8 +168,10 @@ fn repair_subcommand_parses() {
 
 #[test]
 fn unlock_subcommand_is_removed() {
-    // BREAKING (4.0): the `unlock` subcommand was folded into `repair`
-    // (which now deletes the leftover `apply.lock` after finishing).
+    // BREAKING (4.0): the `unlock` subcommand was removed. A leftover
+    // lock never blocks acquisition (the OS releases a dead holder's
+    // advisory lock) and every mutating command now unlinks its own
+    // `apply.lock` on exit, so there is no stale-lock state to clear.
     // Pin the removal so the name can't quietly come back half-wired.
     let err = expect_err(parse(&["socket-patch", "unlock"]));
     assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
