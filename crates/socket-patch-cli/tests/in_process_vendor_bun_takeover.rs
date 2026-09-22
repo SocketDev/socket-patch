@@ -457,8 +457,15 @@ async fn bun_hosted_then_scan_vendored_takeover_round_trips_to_registry() {
     find_event(vendor, "applied", None);
     assert_no_event_code(vendor, "redirect_revert_failed");
     assert_pure_vendored(root);
-    let manifest: Value = serde_json::from_str(&read(root, ".socket/manifest.json")).unwrap();
-    assert_eq!(manifest["patches"][PURL]["uuid"], UUID, "{manifest:#}");
+    // Vendored mode is manifest-free: the ledger entry (with its embedded
+    // record) is the only record of the vendored patch.
+    let state: Value = serde_json::from_str(&read(root, ".socket/vendor/state.json")).unwrap();
+    assert_eq!(state["entries"][PURL]["uuid"], UUID, "{state:#}");
+    assert_eq!(state["entries"][PURL]["record"]["uuid"], UUID, "{state:#}");
+    assert!(
+        !root.join(".socket/manifest.json").exists(),
+        "a vendored scan must not write a manifest"
+    );
 
     // C: a re-run is an in-sync no-op with no second takeover.
     let (code, env) = scan_mode(root, &server.uri(), "vendored", &[]);

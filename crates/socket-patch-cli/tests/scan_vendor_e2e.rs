@@ -1,7 +1,9 @@
-//! End-to-end tests for `scan --vendor` (and `--detached`) — the bot
-//! workflow that discovers patches, downloads them, and vendors each
-//! patched package into the committable `.socket/vendor/` tree instead
-//! of applying in place. Mock API + a real npm lockfile fixture, driven
+//! End-to-end tests for `scan --vendor` — the bot workflow that discovers
+//! patches, fetches their records in memory, and vendors each patched
+//! package into the committable `.socket/vendor/` tree instead of
+//! applying in place. Vendored mode is manifest-free: the ledger's
+//! embedded records are the only state written (`--detached` is an
+//! accepted no-op). Mock API + a real npm lockfile fixture, driven
 //! through the built binary.
 
 use std::path::{Path, PathBuf};
@@ -195,26 +197,25 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, String,
     run_cli_env(root, &argv, &[])
 }
 
-/// Vendor flows hold patch content in MEMORY: `.socket/` must end up with
-/// nothing beyond the manifest and the committed vendor artifacts — no
-/// `blobs/`, `diffs/`, `packages/`, or stray temp files.
+/// Vendored mode writes ONLY `.socket/vendor/**`: no manifest, no
+/// `blobs/`, `diffs/`, `packages/`, no stray temp files — and no
+/// `apply.lock`, which every run removes on exit.
 fn assert_socket_dir_lean(root: &Path) {
     let entries: Vec<String> = std::fs::read_dir(root.join(".socket"))
         .expect(".socket exists")
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n != "apply.lock")
         .collect();
-    assert!(
-        entries
-            .iter()
-            .all(|n| n == "manifest.json" || n == "vendor"),
-        "vendoring must not write blobs or temp files into .socket; found: {entries:?}"
+    assert_eq!(
+        entries,
+        vec!["vendor".to_string()],
+        "vendored mode must write only .socket/vendor; found: {entries:?}"
     );
 }
 
 #[tokio::test]
-async fn scan_vendor_manifest_mode_end_to_end() {
-    // scan --vendor: discover → download (manifest written) → vendor.
+async fn scan_vendor_end_to_end_is_manifest_free() {
+    // scan --vendor: discover → fetch records in memory → vendor. The
+    // ledger (with embedded records) is the only state written.
     let mock = MockServer::start().await;
     mount_patch_api(&mock, UUID).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -225,17 +226,15 @@ async fn scan_vendor_manifest_mode_end_to_end() {
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "envelope={v}");
 
-    // Download phase: manifest written with the patch, blob staged.
+    // Download phase: the record fetched in memory, nothing written.
     let dl = v["download"].as_object().expect("download sub-object");
     assert_eq!(dl["downloaded"], 1, "download={dl:?}");
     assert_eq!(dl["failed"], 0, "download={dl:?}");
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        manifest["patches"][PURL]["uuid"], UUID,
-        "manifest={manifest}"
+    assert_eq!(dl["detached"], true, "download={dl:?}");
+    assert_eq!(dl["patches"][0]["action"], "downloaded", "download={dl:?}");
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "vendored mode never writes a manifest"
     );
 
     // Vendor phase: a full vendor Envelope with one applied event.
@@ -244,8 +243,9 @@ async fn scan_vendor_manifest_mode_end_to_end() {
     assert_eq!(venv["status"], "success", "vendor={venv:?}");
     assert_eq!(venv["summary"]["applied"], 1, "vendor={venv:?}");
 
-    // Disk: tarball at the contract path, ledger entry NOT detached,
-    // lock rewired to consume the vendored artifact.
+    // Disk: tarball at the contract path, ledger entry DETACHED with the
+    // embedded record (the verification source), lock rewired to consume
+    // the vendored artifact.
     let tgz = tmp
         .path()
         .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
@@ -256,11 +256,14 @@ async fn scan_vendor_manifest_mode_end_to_end() {
     .unwrap();
     let entry = &state["entries"][PURL];
     assert_eq!(entry["uuid"], UUID, "state={state}");
-    assert!(
-        entry["detached"].is_null(),
-        "manifest-mode entries are not detached: {state}"
+    assert_eq!(
+        entry["detached"], true,
+        "every vendored entry is ledger-owned: {state}"
     );
-    assert!(entry["record"].is_null(), "no embedded record: {state}");
+    assert_eq!(
+        entry["record"]["uuid"], UUID,
+        "the embedded record is the verification source: {state}"
+    );
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert!(
         lock.contains(&format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")),
@@ -274,11 +277,13 @@ async fn scan_vendor_manifest_mode_end_to_end() {
     );
     assert_socket_dir_lean(tmp.path());
 
-    // Idempotent re-run: already_vendored skip, zero new applies.
+    // Idempotent re-run: the embedded record is reused (no view fetch),
+    // already_vendored skip, zero new applies.
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v2: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(v2["status"], "success", "envelope={v2}");
+    assert_eq!(v2["download"]["skipped"], 1, "envelope={v2}");
     assert_eq!(v2["vendor"]["summary"]["applied"], 0, "envelope={v2}");
     let events = v2["vendor"]["events"].as_array().expect("events");
     assert!(
@@ -337,45 +342,27 @@ fn seed_committed_manifest(root: &Path) {
     .unwrap();
 }
 
-/// CONTRACT (CLI_CONTRACT.md, `scan --vendor`): "The whole manifest is
-/// vendored" — and `run_vendor_json_path` says so in code ("the vendor
-/// step still runs when zero patches were downloaded (re-vendor after a
-/// wipe)"). `scan/mod.rs`'s `selected.is_empty() && !vendor` guard encodes
-/// the same intent for the interactive arm.
-///
-/// But the interactive arm never reaches that guard on an empty discovery:
-/// the earlier `all_packages_with_patches.is_empty()` /
-/// `downloadable_count == 0` / `all_search_results.is_empty()` returns fire
-/// first and exit before the vendor dispatch. Same fixture, same mock, only
-/// `--json` differing must not decide whether the vendor tree gets rebuilt.
+/// Vendored mode takes its work from DISCOVERY, never from a committed
+/// manifest: with nothing discovered there is nothing to vendor, so
+/// `scan --vendor` is a clean no-op that creates nothing — no
+/// `.socket/vendor/`, no `apply.lock` — and a legacy manifest is left
+/// byte-identical. Both arms agree (the interactive arm exits before the
+/// vendor dispatch; the JSON arm's vendor step skips itself before taking
+/// the lock). Rebuilding committed vendored state is `repair`'s job;
+/// migrating a legacy manifest-mode project is a NON-empty vendored run's
+/// (see `scan_vendor_migrates_legacy_manifest_mode_project`).
 #[tokio::test]
-async fn scan_vendor_rebuilds_committed_manifest_when_discovery_is_empty() {
+async fn scan_vendor_with_empty_discovery_is_a_no_op() {
     let mock = MockServer::start().await;
     mount_empty_discovery(&mock).await;
     let uri = mock.uri();
 
-    // --- JSON arm (the documented behavior) ---
-    let json_tmp = tempfile::tempdir().unwrap();
-    write_fixture(json_tmp.path());
-    seed_committed_manifest(json_tmp.path());
-    let (json_code, json_out, json_err) = run_scan_vendor(json_tmp.path(), &uri, &[]);
-    let json_tgz = json_tmp
-        .path()
-        .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
-    assert_eq!(json_code, 0, "stdout={json_out}; stderr={json_err}");
-    assert!(
-        json_tgz.is_file(),
-        "baseline: scan --json --vendor must re-vendor the committed manifest \
-         even when discovery returns no patches; stdout={json_out}; stderr={json_err}"
-    );
-
-    // --- Interactive arm (same inputs, no --json) ---
-    let tty_tmp = tempfile::tempdir().unwrap();
-    write_fixture(tty_tmp.path());
-    seed_committed_manifest(tty_tmp.path());
-    let (tty_code, tty_out, tty_err) = run_cli_env(
-        tty_tmp.path(),
-        &[
+    for json in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path());
+        seed_committed_manifest(tmp.path());
+        let manifest_before = std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap();
+        let mut argv = vec![
             "scan",
             "--vendor",
             "--yes",
@@ -385,28 +372,125 @@ async fn scan_vendor_rebuilds_committed_manifest_when_discovery_is_empty() {
             "fake-token",
             "--org",
             ORG_SLUG,
-        ],
-        &[],
+        ];
+        if json {
+            argv.push("--json");
+        }
+        let (code, stdout, stderr) = run_cli_env(tmp.path(), &argv, &[]);
+        assert_eq!(code, 0, "json={json}; stdout={stdout}; stderr={stderr}");
+        if json {
+            let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+            assert_eq!(v["download"]["found"], 0, "{v}");
+            assert_eq!(v["download"]["detached"], true, "{v}");
+            assert_eq!(v["vendor"]["summary"]["applied"], 0, "{v}");
+        }
+        assert!(
+            !tmp.path().join(".socket/vendor").exists(),
+            "json={json}: nothing discovered ⇒ nothing vendored; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(
+            !tmp.path().join(".socket/apply.lock").exists(),
+            "json={json}: a run with nothing to vendor takes no lock"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap(),
+            manifest_before,
+            "json={json}: a committed manifest is not vendored mode's record source"
+        );
+    }
+}
+
+/// A project vendored by an older, manifest-mode CLI (manifest record +
+/// NON-detached ledger entry at the same uuid): the next vendored run
+/// migrates it — the ledger entry gains `detached: true` plus the embedded
+/// record, the manifest record moves out (an emptied manifest stays as
+/// `{"patches":{}}`), the run says so in `vendor.warnings[]` — and the run
+/// after that is a fetch-free `skipped` re-run with nothing left to
+/// migrate.
+#[tokio::test]
+async fn scan_vendor_migrates_legacy_manifest_mode_project() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+    // The legacy state, produced by the (still manifest-driven) standalone
+    // `vendor` command from a committed manifest + blob.
+    seed_committed_manifest(tmp.path());
+    let (code, venv, stderr) = run_vendor(tmp.path(), &["--vendor-source", "build"]);
+    assert_eq!(code, 0, "legacy setup: {venv:#} {stderr}");
+    let state_path = tmp.path().join(".socket/vendor/state.json");
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    assert_eq!(state["entries"][PURL]["uuid"], UUID, "{state}");
+    assert!(
+        state["entries"][PURL]["detached"].is_null(),
+        "legacy setup must be manifest-tracked: {state}"
     );
-    let tty_tgz = tty_tmp
+
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success", "{v}");
+    // A legacy entry carries no record, so the view is fetched once more…
+    assert_eq!(v["download"]["downloaded"], 1, "{v}");
+    // …and the engine finds artifact + wiring already in sync.
+    let events = v["vendor"]["events"].as_array().expect("events");
+    assert!(
+        events
+            .iter()
+            .any(|e| e["action"] == "skipped" && e["errorCode"] == "already_vendored"),
+        "{v}"
+    );
+    assert!(
+        v["vendor"]["warnings"].as_array().is_some_and(|ws| ws.iter().any(|w| {
+            w["code"] == "vendor_manifest_record_migrated"
+                && w["detail"].as_str().unwrap_or("").contains(PURL)
+        })),
+        "the migration must be announced: {v}"
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let entry = &state["entries"][PURL];
+    assert_eq!(entry["detached"], true, "upgraded in place: {state}");
+    assert_eq!(entry["record"]["uuid"], UUID, "record embedded: {state}");
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest,
+        serde_json::json!({ "patches": {} }),
+        "the record moved to the ledger; an emptied manifest is kept, not deleted"
+    );
+    assert!(tmp
         .path()
-        .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
-    assert_eq!(tty_code, 0, "stdout={tty_out}; stderr={tty_err}");
+        .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"))
+        .is_file());
+
+    // Migrated: the re-run reuses the embedded record (no view fetch) and
+    // has nothing left to warn about.
+    let before_reqs = mock.received_requests().await.unwrap().len();
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v2: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v2["download"]["skipped"], 1, "{v2}");
     assert!(
-        tty_tgz.is_file(),
-        "scan --vendor (interactive) must re-vendor the committed manifest too — \
-         --json must not decide whether the vendor step runs; stdout={tty_out}; stderr={tty_err}"
+        v2["vendor"].get("warnings").is_none(),
+        "nothing left to migrate: {v2}"
     );
+    let after_reqs = mock.received_requests().await.unwrap();
     assert!(
-        tty_tmp.path().join(".socket/vendor/state.json").is_file(),
-        "the ledger must be written by the interactive arm; stdout={tty_out}; stderr={tty_err}"
+        !after_reqs[before_reqs..]
+            .iter()
+            .any(|r| r.url.path().contains("/patches/view/")),
+        "a migrated project re-runs without re-fetching the view"
     );
 }
 
 #[tokio::test]
 async fn scan_vendor_detached_mode_writes_no_manifest() {
-    // scan --vendor --detached: the ledger (with embedded records) is the
-    // only state — .socket/manifest.json is never created.
+    // scan --vendor --detached: the flag is a compatibility no-op — the run
+    // is the same manifest-free flow, embedded-record ledger and all.
     let mock = MockServer::start().await;
     mount_patch_api(&mock, UUID).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -839,9 +923,9 @@ async fn mount_scoped_patch_api(mock: &MockServer, uuid: &str) {
 }
 
 /// The production patches API serves scoped purls percent-encoded
-/// (`pkg:npm/%40scope/...`) and scan stores them verbatim as manifest keys.
+/// (`pkg:npm/%40scope/...`) and scan stores them verbatim as ledger keys.
 /// The whole pipeline — download, vendor lookup against the literal
-/// `node_modules/@scope/...` install, lock rewiring, prune exemption — must
+/// `node_modules/@scope/...` install, lock rewiring, GC exemption — must
 /// bridge the two spellings. (Flowise regression: `%40modelcontextprotocol`
 /// failed with `package not installed`.)
 #[tokio::test]
@@ -851,26 +935,27 @@ async fn scan_vendor_resolves_percent_encoded_scoped_purl() {
     let tmp = tempfile::tempdir().unwrap();
     write_scoped_fixture(tmp.path());
 
-    // --prune in the same run: the freshly-downloaded ENCODED manifest
-    // entry must not be GC'd against the literal crawler purl.
+    // --prune in the same run: the freshly-vendored ENCODED entry must not
+    // be GC'd against the literal crawler purl (nor by the lockfile-usage
+    // probe — the lock consumes its artifact).
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &["--prune"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success", "envelope={v}");
 
-    // Manifest keyed by the verbatim encoded purl — and NOT pruned.
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        manifest["patches"][SCOPED_API_PURL]["uuid"], UUID,
-        "manifest={manifest}"
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "vendored mode never writes a manifest"
     );
     assert_eq!(
         v["gc"]["prunedManifestEntries"],
         serde_json::json!([]),
-        "the encoded entry must not look prunable: {v}"
+        "nothing looks prunable: {v}"
+    );
+    assert_eq!(
+        v["gc"]["revertedVendoredEntries"],
+        serde_json::json!([]),
+        "the just-vendored entry is lock-visible and must not be reverted: {v}"
     );
 
     // Vendored: artifact under the DECODED scope dir, lock rewired.
@@ -903,16 +988,19 @@ async fn scan_vendor_resolves_percent_encoded_scoped_purl() {
 /// 1. The wired lock entry VANISHED (an uninstall is one drift flavor —
 ///    the live lock no longer matches anything the wiring recorded), so
 ///    the backend revert keeps the artifacts (`RevertOutcome::
-///    kept_artifact`, residual #131) and the GC must keep the ledger and
-///    manifest entries too — pre-fix it pruned the ledger, dropped the
-///    manifest records, reported the purl in `revertedVendoredEntries`,
-///    and the orphan sweep then destroyed the kept artifacts (with the
-///    recorded pre-vendor originals, the state a later `git checkout` of
-///    the vendored lock still points at).
+///    kept_artifact`, residual #131) and the GC must keep the ledger entry
+///    too — pre-fix it pruned the ledger, reported the purl in
+///    `revertedVendoredEntries`, and the orphan sweep then destroyed the
+///    kept artifacts (with the recorded pre-vendor originals, the state a
+///    later `git checkout` of the vendored lock still points at).
 /// 2. Undoing the drift (restoring the pre-vendor registry lock — the
 ///    keep warning's documented remediation) converges every recorded
-///    fragment, and the same prune then reverts fully: ledger entry +
-///    manifest entry dropped, artifact dir removed, lock untouched.
+///    fragment, and the same prune then reverts fully: ledger entry
+///    dropped, artifact dir removed, lock untouched.
+///
+/// Every vendored entry is ledger-owned (`detached`), and the lockfile-
+/// usage leg of the GC judges entries by the LIVE lock, so being detached
+/// exempts nothing here.
 #[tokio::test]
 async fn scan_prune_reverts_unused_vendored_entry() {
     let mock = MockServer::start().await;
@@ -933,6 +1021,10 @@ async fn scan_prune_reverts_unused_vendored_entry() {
 
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "vendored mode never writes a manifest"
+    );
 
     // Simulate `npm uninstall left-pad` + re-lock: drop the dep from the
     // lock graph and remove the installed copy. The override-free npm
@@ -991,16 +1083,6 @@ async fn scan_prune_reverts_unused_vendored_entry() {
         state["entries"][PURL].is_object(),
         "ledger entry must be kept: {state}"
     );
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(
-        manifest["patches"]
-            .as_object()
-            .is_some_and(|m| m.contains_key(PURL)),
-        "manifest entry must be kept: {manifest}"
-    );
     assert!(
         tmp.path()
             .join(format!(".socket/vendor/npm/{UUID}"))
@@ -1024,8 +1106,8 @@ async fn scan_prune_reverts_unused_vendored_entry() {
         "gc must report the reverted entry: {v}"
     );
 
-    // Ledger empty (an emptied state file may be removed outright),
-    // manifest entry dropped, artifact gone.
+    // Ledger empty (an emptied state file is removed outright), artifact
+    // gone.
     match std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")) {
         Ok(text) => {
             let state: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -1037,16 +1119,6 @@ async fn scan_prune_reverts_unused_vendored_entry() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => panic!("unexpected state.json read error: {e}"),
     }
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
-    )
-    .unwrap();
-    assert!(
-        manifest["patches"]
-            .as_object()
-            .is_none_or(|m| !m.contains_key(PURL)),
-        "manifest entry dropped: {manifest}"
-    );
     assert!(
         !tmp.path()
             .join(format!(".socket/vendor/npm/{UUID}"))
@@ -1714,11 +1786,11 @@ fn write_bun_v1_workspace_fixture(root: &Path) {
     .unwrap();
 }
 
-/// The manifest-tracked vendored scan refuses a v1 workspace lock IN THE
-/// DOWNLOAD PHASE: the record is `failed` with the vendor code + detail,
-/// nothing is fetched (request-log oracle), the lock is byte-identical,
-/// nothing is vendored, and the manifest — written by contract — holds no
-/// record for the refused purl.
+/// The vendored scan refuses a v1 workspace lock IN THE DOWNLOAD PHASE:
+/// the record is `failed` with the vendor code + detail, nothing is
+/// fetched (request-log oracle), the lock is byte-identical, nothing is
+/// vendored — and a run with nothing left to vendor creates nothing under
+/// `.socket/` at all.
 #[tokio::test]
 async fn scan_vendored_bun_v1_workspace_refuses_in_download_phase() {
     let mock = MockServer::start().await;
@@ -1756,15 +1828,9 @@ async fn scan_vendored_bun_v1_workspace_refuses_in_download_phase() {
         lock_before,
         "bun.lock must be byte-identical"
     );
-    assert!(!tmp.path().join(".socket/vendor").exists());
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        manifest,
-        serde_json::json!({ "patches": {} }),
-        "no record may be claimed for the refused purl"
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "a fully refused run vendors nothing and creates nothing under .socket/"
     );
 }
 
