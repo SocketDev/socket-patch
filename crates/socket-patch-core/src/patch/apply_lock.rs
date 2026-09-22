@@ -69,12 +69,21 @@ const SOCKET_DIR_NAME: &str = ".socket";
 /// Longest single backoff sleep while waiting on a live holder.
 const BACKOFF_CAP: Duration = Duration::from_millis(100);
 
-/// Consecutive "the file vanished under us" retries (open `NotFound`, or
-/// a post-lock identity mismatch) before giving up with `Io`. Each one
-/// is a releaser pruning `.socket/` between two of our steps; they cost
-/// no sleep and are not contention, so they are bounded by count rather
-/// than by `timeout`.
-const VANISHED_LIMIT: u32 = 16;
+/// Consecutive "the file vanished under us" retries (open `NotFound` /
+/// `EINVAL`, or a post-lock identity mismatch) before giving up with
+/// `Io`. Each one means a releaser pruned `.socket/` between two of our
+/// steps — i.e. a competitor completed a whole acquire→release cycle —
+/// so they are not contention and are bounded by count rather than by
+/// `timeout`. The bound is generous: two processes hammering the lock
+/// back-to-back (the unit tests do exactly that) can string dozens of
+/// these together, each costing only a `yield_now`.
+const VANISHED_LIMIT: u32 = 256;
+
+/// `EINVAL`: macOS reports an `O_CREAT` open inside a directory that was
+/// rmdir'd a moment ago with this errno instead of `ENOENT`. Same value
+/// on every Unix we build for; unused on Windows.
+#[cfg(unix)]
+const EINVAL: i32 = 22;
 
 /// Windows delete-pending grace: `attempts × sleep`, independent of
 /// `timeout` (a zero-timeout try-once still waits it out, because the
@@ -224,6 +233,10 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
                     );
                     return Err(fail(socket_dir, path, source));
                 }
+                // Let the releaser finish its unlink → close → rmdir
+                // before we mkdir again; spinning straight back in just
+                // races the same cleanup a second time.
+                std::thread::yield_now();
             }
             Attempt::DeletePending(source) => {
                 delete_pending += 1;
@@ -353,6 +366,15 @@ fn attempt(path: &Path, socket_dir: &Path) -> Attempt {
 /// codes get their grace; everything else is a genuine fault.
 fn open_failure(e: std::io::Error, path: &Path, socket_dir: &Path) -> Attempt {
     if e.kind() == ErrorKind::NotFound {
+        return Attempt::Vanished;
+    }
+    // Unconditional, not gated on a "is the parent gone right now" stat:
+    // a competitor can recreate the directory between our failed open
+    // and that probe, which would misreport this benign race as a fault
+    // (seen under full-suite load). We never pass invalid flags, so
+    // `EINVAL` on this open has no other cause.
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(EINVAL) {
         return Attempt::Vanished;
     }
     if is_delete_pending(&e) {
