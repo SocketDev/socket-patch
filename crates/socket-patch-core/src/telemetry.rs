@@ -121,7 +121,6 @@ struct PatchTelemetryEvent {
 /// Telemetry is disabled when:
 /// - `SOCKET_TELEMETRY_DISABLED` is `"1"` or `"true"`
 ///   (legacy `SOCKET_PATCH_TELEMETRY_DISABLED` still honored with warning)
-/// - `VITEST` is `"true"` (test environment)
 /// - `SOCKET_OFFLINE` is `"1"` or `"true"` (airgap mode — the telemetry
 ///   endpoint is a network call, so honoring `--offline`/`SOCKET_OFFLINE`
 ///   here keeps every command compliant with the strict-airgap contract)
@@ -136,8 +135,7 @@ pub fn is_telemetry_disabled() -> bool {
     )
     .unwrap_or_default();
     let disabled_via_env = matches!(env_value.as_str(), "1" | "true");
-    let vitest = std::env::var("VITEST").unwrap_or_default() == "true";
-    disabled_via_env || vitest || is_offline_env()
+    disabled_via_env || is_offline_env()
 }
 
 /// Log debug messages when debug mode is enabled.
@@ -257,7 +255,11 @@ fn resolve_telemetry_endpoint(api_token: Option<&str>, org_slug: Option<&str>) -
 /// Send a telemetry event to the API.
 ///
 /// This is fire-and-forget: errors are logged in debug mode but never
-/// propagated. Uses `reqwest` with a 5-second timeout.
+/// propagated. Uses `reqwest` with a 5-second request timeout and a
+/// 2-second connect timeout: the send is awaited inline by every command
+/// before it prints, so a network that blackholes the endpoint (dropped
+/// SYNs, no RST) must give up on the handshake quickly rather than stall
+/// even a read-only `scan --json` for the full request budget.
 async fn send_telemetry_event(
     event: &PatchTelemetryEvent,
     api_token: Option<&str>,
@@ -268,6 +270,7 @@ async fn send_telemetry_event(
     debug_log(&format!("Sending telemetry to {url}"));
 
     let client = match reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(5))
         .build()
     {
@@ -726,13 +729,11 @@ mod tests {
         // Save originals
         let orig_new = std::env::var("SOCKET_TELEMETRY_DISABLED").ok();
         let orig_legacy = std::env::var("SOCKET_PATCH_TELEMETRY_DISABLED").ok();
-        let orig_vitest = std::env::var("VITEST").ok();
         let orig_offline = std::env::var("SOCKET_OFFLINE").ok();
 
         // Default: not disabled
         std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
         std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
-        std::env::remove_var("VITEST");
         std::env::remove_var("SOCKET_OFFLINE");
         assert!(!is_telemetry_disabled());
 
@@ -775,10 +776,6 @@ mod tests {
         match orig_legacy {
             Some(v) => std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", v),
             None => std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED"),
-        }
-        match orig_vitest {
-            Some(v) => std::env::set_var("VITEST", v),
-            None => std::env::remove_var("VITEST"),
         }
         match orig_offline {
             Some(v) => std::env::set_var("SOCKET_OFFLINE", v),

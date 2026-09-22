@@ -16,7 +16,14 @@ use std::path::Path;
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use super::detect::{deps_contain_hook, HOOK_DEP};
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+// Guarded read shared with the detect.rs/gem/composer/npm setup twins: a
+// FIFO planted at `requirements.txt` / `pyproject.toml` fails fast to `Error`
+// instead of wedging `setup` / `setup --remove` forever in an `open(2)` that
+// waits for a writer — detection never opens the manifest it hands the edit
+// path (a lockfile routes here without a read, and the Pip fallback targets
+// `requirements.txt` sight-unseen).
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::python_lock::preserve_line_endings;
 use crate::utils::toml_edit_ext::ensure_table;
 use crate::vendor::common::detect_eol;
 
@@ -57,22 +64,6 @@ impl PthEditResult {
             error: Some(msg.into()),
         }
     }
-}
-
-/// Guarded read shared with the detect.rs/gem/composer/npm setup twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
-/// so a FIFO planted at `requirements.txt` / `pyproject.toml` fails fast to
-/// `Error` instead of wedging `setup` / `setup --remove` forever in an
-/// `open(2)` that waits for a writer — detection never opens the manifest it
-/// hands the edit path (a lockfile routes here without a read, and the Pip
-/// fallback targets `requirements.txt` sight-unseen).
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Shared tail of add/remove: `None` means already in the desired state,
@@ -241,7 +232,7 @@ fn pyproject_add(content: &str) -> Result<Option<String>, String> {
                 .to_string(),
         );
     };
-    Ok(if changed { Some(doc.to_string()) } else { None })
+    Ok(changed.then(|| render_pyproject(content, &doc)))
 }
 
 fn pyproject_remove(content: &str) -> Result<Option<String>, String> {
@@ -253,7 +244,15 @@ fn pyproject_remove(content: &str) -> Result<Option<String>, String> {
     changed |= pep621_remove(&mut doc);
     changed |= poetry_remove(&mut doc);
 
-    Ok(if changed { Some(doc.to_string()) } else { None })
+    Ok(changed.then(|| render_pyproject(content, &doc)))
+}
+
+/// Render an edited pyproject document in the original's newline convention.
+/// toml_edit (0.25.x) re-emits every line terminator as `\n`, untouched
+/// lines included, so without this a CRLF checkout is rewritten wholesale
+/// and `--remove` could never hand back the pre-setup bytes.
+fn render_pyproject(original: &str, doc: &DocumentMut) -> String {
+    preserve_line_endings(original, doc.to_string())
 }
 
 fn pep621_add(doc: &mut DocumentMut) -> Result<bool, String> {
@@ -751,6 +750,29 @@ mod tests {
         assert_eq!(out, "requests\r\nsocket-patch[hook]\r\n");
         let removed = requirements_remove(&out).unwrap();
         assert_eq!(removed, "requests\r\n");
+    }
+
+    /// A Windows (`core.autocrlf`) checkout's pyproject.toml is CRLF. toml_edit
+    /// renders every newline as LF, so `setup` must re-apply CRLF (or every
+    /// line of the manifest diffs) and `--remove` must hand back the exact
+    /// pre-setup bytes (CLI_CONTRACT property 8).
+    #[test]
+    fn test_pyproject_preserves_crlf() {
+        let original =
+            "[project]\r\nname = \"demo\"\r\ndependencies = [\r\n  \"requests\",\r\n]\r\n";
+        let added = pyproject_add(original).unwrap().expect("hook dep added");
+        assert!(added.contains(HOOK_DEP), "hook added: {added:?}");
+        assert!(
+            !added.replace("\r\n", "").contains('\n'),
+            "every newline must stay CRLF: {added:?}"
+        );
+        // Idempotent on the CRLF output.
+        assert_eq!(pyproject_add(&added).unwrap(), None);
+        let removed = pyproject_remove(&added).unwrap().expect("hook dep removed");
+        assert_eq!(
+            removed, original,
+            "--remove restores the CRLF bytes exactly"
+        );
     }
 
     // ── file-level NotFound handling (the create / no-op paths) ──────

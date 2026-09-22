@@ -274,27 +274,17 @@ pub async fn remove_hook(composer_json: &Path, dry_run: bool) -> ComposerEditRes
     edit(composer_json, dry_run, composer_remove).await
 }
 
-/// Guarded read: a FIFO planted as `composer.json` would make a plain
-/// `read_to_string` open block forever waiting for a writer — discovery
-/// accepts any path whose metadata stats, so it reaches here unopened.
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, same as the package_json/update.rs and find.rs guards.
-async fn read_composer_json_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
-
 async fn edit(
     composer_json: &Path,
     dry_run: bool,
     transform: impl FnOnce(&str) -> Result<Option<String>, String>,
 ) -> ComposerEditResult {
     let result = async {
-        let content = match read_composer_json_to_string(composer_json).await {
+        // Guarded read: a FIFO planted as `composer.json` would make a plain
+        // `read_to_string` open block forever waiting for a writer —
+        // discovery accepts any path whose metadata stats, so it reaches
+        // here unopened. The shared reader rejects non-regular files.
+        let content = match crate::utils::fs::read_regular_to_string(composer_json).await {
             Ok(c) => c,
             // A missing composer.json on remove is a no-op, not an error.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),

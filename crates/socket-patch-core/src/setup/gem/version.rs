@@ -140,7 +140,7 @@ async fn probe_bundler_with(
     // to the `bundle --version` fallback, not wedge `setup`/`--check`
     // forever in `open(2)` — same guard as every other raw read in this
     // module tree.
-    if let Ok(lock) = super::read_regular_to_string(&lock_path).await {
+    if let Ok(lock) = crate::utils::fs::read_regular_to_string(&lock_path).await {
         if let Some(version) = parse_bundled_with(&lock) {
             let lock_name = lock_path
                 .file_name()

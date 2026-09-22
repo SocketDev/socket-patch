@@ -71,7 +71,18 @@ pub fn acquire_update_lock() -> Result<Option<UpdateLock>, UpdateError> {
     }
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(UpdateLock { _file: file })),
-        Err(_) => Err(UpdateError::InProgress),
+        // Only a genuine contention errno is "another update is running";
+        // every other flock(2) failure (ENOLCK on an NFS-homed state dir,
+        // ENOTSUP on a lockless filesystem, ...) must surface with its real
+        // cause instead of masquerading as `update_in_progress` — the same
+        // split `patch/apply_lock.rs` makes for apply.lock.
+        Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Err(UpdateError::InProgress)
+        }
+        Err(e) => Err(UpdateError::SwapFailed(format!(
+            "cannot lock {}: {e}",
+            path.display()
+        ))),
     }
 }
 
