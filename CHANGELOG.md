@@ -17,8 +17,9 @@ into the new version's section — see docs/releasing.md.
 
 ## [Unreleased]
 
-> **Semver note:** this entry changes `rollback`'s default behavior and
-> narrows the meaning of its existing `vendored: []` JSON key — both MAJOR
+> **Semver note:** this entry changes `rollback`'s default behavior, narrows
+> the meaning of its existing `vendored: []` JSON key, makes vendored mode
+> manifest-free, and turns a plain non-TTY `scan` report-only — all MAJOR
 > per CLI_CONTRACT.md's semver policy — so it ships as the next major
 > release (v5.0).
 
@@ -37,7 +38,7 @@ into the new version's section — see docs/releasing.md.
   GCs the now-unused blobs plus diff/package archives. No `--mode` needed:
   state is inferred from the manifest, the vendor ledger, and the redirect
   ledger, and rollback now runs manifest-less when a ledger holds work
-  (hosted-only and detached-vendored projects; the truly-empty project
+  (hosted-only and vendored projects; the truly-empty project
   keeps the "Manifest not found" exit 1, and a wired-but-ledgerless project
   errors naming `socket-patch repair`). Wet non-preserve runs confirm once
   ("Roll back N patch(es), remove them from the local manifest, and delete
@@ -52,6 +53,56 @@ into the new version's section — see docs/releasing.md.
   always-present `warnings[]` (`{code, detail}`, now populated), `hosted`
   (`{reverted, failed, unsupported, editedFiles}`), `manifest`
   (`{removedEntries, preserved}`), `gc`, and `paths` keys.
+- **Vendored mode is manifest-free.** `scan --mode vendored` and
+  `get --mode vendored` never write (or read) `.socket/manifest.json`: the
+  selected patch records are fetched into memory and every vendor-ledger entry
+  carries `detached: true` plus the embedded `record` as its verification
+  source, so a vendored project's footprint is `.socket/vendor/**` only. The
+  former `--detached` opt-in is now the only vendored posture — the flag is
+  hidden, accepted as a no-op for compatibility, and still a usage error
+  without vendored mode. JSON uses the detached download vocabulary for both
+  commands (`downloaded: N`, `detached: true`, `patches[].action` =
+  `downloaded` | `skipped` | `failed`). The vendor step vendors exactly what
+  discovery selected — the "whole manifest is vendored" re-vendor from a
+  committed manifest on an empty discovery is retired (`repair` verifies and
+  rebuilds committed vendored state) — and a legacy manifest record for a purl
+  a vendored run vendors is migrated into the ledger (dropped from the
+  manifest; an emptied manifest is left as `{"patches": {}}`). `list` now
+  reads the vendor ledger too, so a vendored-only project lists its patches
+  with a `(vendored)` marker and exits 0 instead of `manifest_not_found`;
+  `scan --prune`'s lockfile-unused reconcile applies to every ledger entry
+  (the check is about the lockfile, not the manifest); and standalone `vendor`
+  with no manifest is a clean exit-0 no-op whose message names the missing
+  manifest (and the ledger entries `repair` verifies) instead of claiming
+  "No .socket folder found".
+- **A plain `scan` without a TTY is report-only.** When stdin is not a TTY,
+  `--yes` is absent, and no intent flag (`--mode`, `--apply`, `--sync`,
+  `--vendor`, `--redirect`, `--prune`) is given, human-mode `scan` prints the
+  discovery report and the "To apply a patch, run: …" hint, downloads
+  nothing, creates no `.socket/`, and exits 0 — it no longer auto-accepts the
+  apply prompt. Any intent flag, `--yes`, or a TTY keeps the previous
+  behavior; `rollback`/`remove`/`get`'s non-TTY auto-accept is unchanged.
+  Human `scan --mode hosted` now prints the results table and update
+  detection like the other modes and confirms once ("Redirect N package(s)
+  to hosted patches?", default yes, skipped by `--yes`/`--json`).
+- **`apply.lock` never outlives a command, and hosted mode takes it.** Lock
+  acquisition creates `.socket/` when missing; the lock file is unlinked
+  (while still held) and an otherwise-empty `.socket/` removed when the
+  command exits, dry runs included, so there is nothing to `.gitignore` and
+  `repair` no longer has a lock-cleanup step (a leftover from a crashed run is
+  reclaimed and removed by the next lock-taking command; a live holder is
+  still `lock_held`, exit 1). `scan`/`get --mode hosted` now acquire the lock
+  around their first wet write — never on `--dry-run` or when nothing would
+  be written, so previews create no `.socket/` — and report `lock_held` like
+  the other lock holders; the GC legs of `scan --prune` and `vendor` honor
+  `--lock-timeout` and report a lock I/O error instead of silently skipping
+  on it.
+- **Retired:** the legacy `.socket/cargo-patches` redirect takeover in the
+  cargo vendor backend (never shipped in a tagged release — such
+  `[patch.crates-io]` entries now refuse as `user_authored_patch_entry`), the
+  `VITEST` telemetry kill-switch (set `SOCKET_TELEMETRY_DISABLED=1` in test
+  harnesses), and the `pypi_pipenv_invalid_wheel` refusal code (the Pipenv
+  backend takes the resolved version instead of parsing the wheel filename).
 
 ### Added
 
@@ -268,6 +319,55 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Reversal leaves no `.socket/` residue.** `rollback`, `remove`,
+  `vendor --revert`, the hosted unwind and the GC sweeps now prune what they
+  empty: an emptied redirect or vendor ledger is deleted together with the
+  empty `.socket/vendor/<eco>/` and `.socket/vendor/` directories (per-entry
+  vendored reverts prune their ecosystem husk; a `redirect-state.json.corrupt`
+  quarantine keeps its directory), emptied `blobs/`, `diffs/` and `packages/`
+  stores are removed, and `.socket/` itself goes with the lock when nothing is
+  left — so a fully unwound hosted or vendored project has no `.socket/` at
+  all. Deliberately kept: the zero-patch `.socket/manifest.json`
+  (`{"patches": {}}` + its `setup` block — `list`/`apply`/`vex` exit codes
+  depend on it) and the `setup`-owned `.socket/.gitignore`,
+  `gem-plugin-stamp` and `bundler-plugin/` (rollback never undoes setup).
+  `setup --remove` now also removes an emptied `.socket/`.
+- **A normal `scan` never creates `.socket/`.** Report-only, `--dry-run`,
+  zero-discovery and no-op runs (hosted or otherwise) no longer scaffold the
+  directory or a lock file; a GC pass checks for a manifest before it locks.
+- **`apply --silent` on an all-unmatched manifest prints its error line** —
+  errors are never muted by `--silent`; and the no-manifest early exits of
+  `apply` and `vendor` name the missing `.socket/manifest.json` instead of
+  "No .socket folder found" (the folder may legitimately hold setup files or
+  vendored state).
+- **Hosted redirect hygiene.** Missing project files no longer skip silently:
+  `redirect_composer_no_lockfile`, `redirect_gem_no_gemfile` (neither manifest
+  nor lock present) and `redirect_maven_no_pom` (no `pom.xml`, no Gradle
+  build) warn once per run; a present-but-corrupt `packages.lock.json` warns
+  `redirect_nuget_lock_unparseable` before any config mutation; a `Cargo.lock`
+  with several same-name+version `[[package]]` blocks and no `source`
+  disambiguation warns `redirect_cargo_lock_pkg_ambiguous` and skips
+  transactionally; a registry override of the wrong kind now warns the arm's
+  missing-override code for nuget/gem/golang (previously a silent skip); the
+  ledger's `redirect_nuget_source` edit records `action: "added"` when
+  `nuget.config` was authored from scratch; hosted-revert lockfile restores are
+  atomic and mode-preserving (including `bun.lockb`), and a FIFO or symlink
+  squatting on a lockfile is refused instead of wedging the revert.
+- **Vendor backend parity.** Gem reverts follow every other backend's
+  drift-keep rule (genuine drift keeps artifact + ledger entry; converged files
+  are silent; a missing `Gemfile`/`Gemfile.lock` warns `vendor_lockfile_missing`
+  and still removes the artifact); the golang service leg stages its download
+  and, when a re-download of a wired present copy fails, keeps the copy and
+  directive instead of tearing them down; poetry/pipenv/requirements refuse
+  symlinked targets (`pypi_{poetry,pipenv,requirements}_symlink_unsupported`)
+  and every pypi flavor refuses a project file that changed between plan and
+  write (`pypi_{poetry,pdm,pipenv,uv}_changed`) instead of clobbering it;
+  `pyproject.toml` edits made by `setup` preserve CRLF line endings; an
+  unreadable (EACCES / squatting directory or FIFO) redirect ledger is
+  reported as unreadable and left in place instead of being quarantined as
+  "malformed"; a blob-cleanup pass keeps sweeping after one unremovable file
+  and reports the first error afterwards; the ledgers skip byte-identical
+  rewrites.
 - **Bun refusal safety:** hosted compatibility is checked before removing
   an existing vendored patch, including during dry-run. Vendored preflight
   exemptions require live local lock tuples; a ledger retained by
@@ -300,12 +400,12 @@ into the new version's section — see docs/releasing.md.
   and `repair` on such a lock keep working; a corrupt
   `.socket/vendor/state.json` met by that preflight is reported as
   `vendor_state_unreadable` rather than a Bun lock code. `scan --mode vendored`,
-  `get --mode vendored` (search and uuid paths) and `--detached` runs now
+  `get --mode vendored` (search and uuid paths) now
   preflight the Bun lock BEFORE any download: a malformed binary, unreadable,
   unsupported-version or pre-version-2 workspace lock marks the npm patches
   `failed` with the vendor refusal code and detail, fetches nothing and
-  records no patch — the `scan` / `get <purl>` path still writes an unchanged
-  `.socket/manifest.json` and exits `partial_failure`, `get <uuid> --mode
+  records no patch — the `scan` / `get <purl>` path writes nothing under
+  `.socket/` and exits `partial_failure`, `get <uuid> --mode
   vendored` exits 1 with `status: "error"` and writes nothing — where
   previously the record landed in the manifest and the vendor step failed
   afterwards (and a detached run over an alias install misreported
@@ -330,8 +430,8 @@ into the new version's section — see docs/releasing.md.
   rewrite keeps CRLF on the rewritten `bun.lock` line. Real-Bun
   coverage now runs in CI: the hermetic hosted and vendored suites on Linux,
   macOS and Windows (Bun 1.4.2, plus 1.1.45 and 1.2.23 lock-era legs), and
-  the production native matrix — 16 releases from 0.8.1 to 1.4.2 in hosted,
-  vendored and detached-vendored mode — on pull requests and `main` (rows
+  the production native matrix — 16 releases from 0.8.1 to 1.4.2 in hosted
+  and vendored mode — on pull requests and `main` (rows
   carry `cliRevision` and `cliBuildSha` provenance), with
   the corrected digest boundary (Bun verifies URL/local tarball sha512 from
   1.3.10, not 1.3.14). Bun 1.1.39–1.3.9 also re-save a hosted URL or

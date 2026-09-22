@@ -3,8 +3,10 @@ name: Bun patch compatibility
 # Native Bun installer matrix: builds the CLI once per OS, downloads each
 # pinned Bun release straight from its GitHub release (retried, SHA-256
 # verified against the release's SHASUMS256.txt) and runs
-# `scripts/backtest-bun.py` — hosted, vendored and vendored-detached mode
-# against the public minimist free patch, verifying the INSTALLED bytes,
+# `scripts/backtest-bun.py` — hosted and vendored mode (vendored is
+# manifest-free: the ledger embeds the record, so the former
+# vendored-detached leg collapsed into it) against the public minimist free
+# patch, verifying the INSTALLED bytes,
 # lock stability, digest rejection and rollback on Linux, macOS and Windows.
 # No Socket API token is needed. See docs/testing/bun-compatibility.md.
 #
@@ -74,7 +76,7 @@ on:
         required: false
         default: ''
       modes:
-        description: 'Space-separated modes from hosted / vendored / vendored-detached (empty = all three)'
+        description: 'Space-separated modes from hosted / vendored (empty = both)'
         required: false
         default: ''
 
@@ -308,7 +310,7 @@ jobs:
           chmod +x native-cli/socket-patch* || true
           cli="native-cli/socket-patch"
           if [ "$RUNNER_OS" = "Windows" ]; then cli="native-cli/socket-patch.exe"; fi
-          modes="hosted vendored vendored-detached"
+          modes="hosted vendored"
           if [ -n "$MODES_OVERRIDE" ]; then modes="$MODES_OVERRIDE"; fi
           shapes_arg=()
           if [ -n "$SHAPES_OVERRIDE" ]; then shapes_arg=(--shapes $SHAPES_OVERRIDE); fi

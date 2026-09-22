@@ -3,7 +3,7 @@
 
 The Rust suite uses a local patch service and real Bun installers. Each reader
 must accept hosted and vendored binary rewrites, both takeover directions,
-dry runs, idempotence, artifact repair, detached scans and byte-exact rollback.
+dry runs, idempotence, artifact repair, manifest-free vendored scans and byte-exact rollback.
 Fresh frozen installs use empty caches and compare installed package bytes.
 
 Modern releases write native binary locks using install.saveTextLockfile=false.

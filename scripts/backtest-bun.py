@@ -44,7 +44,7 @@ Boundaries the oracle encodes (measured against real releases):
   1.1.39                    first text lock (lockfileVersion 0, --save-text-lockfile)
   1.2.0                     text default, lockfileVersion 1;  1.4.0: lockfileVersion 2
   version-0 workspace lock  hosted refuses (redirect_bun_workspace_unsupported)
-  pre-v2 workspace lock     vendored/detached refuse (vendor_bun_workspace_unsupported)
+  pre-v2 workspace lock     vendored refuses (vendor_bun_workspace_unsupported)
   bun.lockb                native binary inventory and package-record rewrites
   1.3.10                    URL/local tarball sha512 enforced (registry tuples are
                             enforced on every text-lock release)
@@ -91,7 +91,9 @@ SHAPES = ['direct', 'dev', 'optional', 'alias', 'transitive', 'two-versions',
           'lockfile-only', 'production', 'get-uuid', 'get-search',
           'hosted-then-vendored', 'vendored-then-hosted', 'already-vendored-workspace',
           'preexisting-manifest']
-MODES = ['hosted', 'vendored', 'vendored-detached']
+# Vendored mode is manifest-free (the vendor ledger embeds the record), so the
+# former `vendored-detached` leg collapsed into `vendored`: same footprint.
+MODES = ['hosted', 'vendored']
 PURL = 'pkg:npm/minimist@1.2.2'
 UUID = '80630680-4da6-45f9-bba8-b888e0ffd58c'
 # The registry slot bun writes for a non-default registry: the full tarball URL.
@@ -408,8 +410,6 @@ def cell_applies(version, shape, mode):
         return False  # the matrix release would be the legacy writer itself
     if shape in ('crlf-lock', 'custom-registry') and v < TEXT_DEFAULT_FROM:
         return False  # both need a default text bun.lock to edit
-    if shape in GET_SHAPES and mode == 'vendored-detached':
-        return False  # `get` has no --detached
     if shape == 'already-vendored-workspace' and v < TEXT_DEFAULT_FROM:
         return False  # this shape explicitly inspects text re-save syntax
     if shape in ('hosted-then-vendored', 'vendored-then-hosted') and mode == 'hosted':
@@ -424,7 +424,7 @@ def expected_outcome(version, shape, mode):
 
     supported: whether the patch must land;  codes: the EXACT refusal-code set
     (after removing INFORMATIONAL);  exit: 'zero' (supported, hosted refusals,
-    upstream limitations) or 'nonzero' (vendored / detached / get refusals);
+    upstream limitations) or 'nonzero' (vendored / get refusals);
     limitation: the row annotation for an unsupported cell;  rerun: the main
     command is a documented no-op re-run (already_vendored) rather than a
     first application."""
@@ -523,8 +523,8 @@ def downloaded_count(envelope):
 
 def rerun_clean(code, envelope, mode):
     """The documented no-op re-run: hosted re-confirms the wiring (redirected 1,
-    nothing rewritten, no warnings beyond advisories); vendored / detached
-    skips exactly one already_vendored purl with nothing failed."""
+    nothing rewritten, no warnings beyond advisories); vendored skips exactly
+    one already_vendored purl with nothing failed."""
     if code != 0 or envelope.get('status') != 'success':
         return False
     codes, _ = envelope_codes(envelope)
@@ -541,18 +541,18 @@ def rerun_clean(code, envelope, mode):
 
 
 def ledger_record(project, mode):
-    """The patch record the mode's ledger holds for PURL (None when absent)."""
+    """The patch record the mode's ledger holds for PURL (None when absent).
+
+    Both ledgers embed the record — hosted under `records`, vendored under the
+    entry's `record`; vendored mode never writes `.socket/manifest.json`."""
     path = project / ('.socket/vendor/redirect-state.json' if mode == 'hosted'
-                      else '.socket/vendor/state.json' if mode == 'vendored-detached'
-                      else '.socket/manifest.json')
+                      else '.socket/vendor/state.json')
     if not path.is_file():
         return None
     state = json.loads(path.read_text(encoding='utf-8'))
     if mode == 'hosted':
         return state.get('records', {}).get(PURL)
-    if mode == 'vendored-detached':
-        return state.get('entries', {}).get(PURL, {}).get('record')
-    return state.get('patches', {}).get(PURL)
+    return state.get('entries', {}).get(PURL, {}).get('record')
 
 
 def load_json(path):
@@ -616,7 +616,7 @@ def main():
     parser.add_argument('--tools', type=Path)
     parser.add_argument('--versions', nargs='+', default=VERSIONS)
     parser.add_argument('--shapes', nargs='+', default=SHAPES, choices=SHAPES)
-    parser.add_argument('--modes', nargs='+', default=['hosted', 'vendored'], choices=MODES)
+    parser.add_argument('--modes', nargs='+', default=MODES, choices=MODES)
     parser.add_argument('--jobs', type=int, default=4)
     args = parser.parse_args()
     root = args.output.resolve()
@@ -695,11 +695,8 @@ def main():
             env = env_for(bun, 'cache')
 
             def cli_command(verb, run_mode):
-                command = [cli, *verb, '--mode', 'vendored' if run_mode == 'vendored-detached' else run_mode,
-                           '--cwd', project, '--json', '--yes', '--no-telemetry']
-                if run_mode == 'vendored-detached':
-                    command.append('--detached')
-                return command
+                return [cli, *verb, '--mode', run_mode,
+                        '--cwd', project, '--json', '--yes', '--no-telemetry']
 
             def install(binary, label, flags=(), cache=None):
                 remove_node_modules(project)
@@ -839,7 +836,7 @@ def main():
                 checks['unchangedLockPresence'] = all((project / name).exists() == (name in original)
                                                       for name in ['bun.lock', 'bun.lockb'])
                 # Hosted refusals exit 0 with redirected 0 (documented posture);
-                # vendored / detached / get refusals exit non-zero and never fetch.
+                # vendored / get refusals exit non-zero and never fetch.
                 checks['exitCodeContract'] = code == 0 if expected['exit'] == 'zero' else code != 0
                 if expected['exit'] == 'nonzero':
                     checks['noDownloadOnRefusal'] = downloaded_count(envelope) == 0
@@ -848,6 +845,9 @@ def main():
                 if seeded is not None:
                     checks['preexistingManifestPreserved'] = (
                         after is not None and after.get('patches', {}).get(OTHER_PURL) == seeded['patches'][OTHER_PURL])
+                else:
+                    # No mode writes .socket/manifest.json (vendored is manifest-free).
+                    checks['noManifest'] = after is None
             else:
                 if expected['rerun']:
                     checks['rerunClean'] = rerun_clean(code, envelope, main_mode)
@@ -862,8 +862,9 @@ def main():
                     raise RuntimeError(f'No ledger record for {PURL} in {main_mode} mode')
                 row['patchUuid'] = record['uuid']
                 checks['publishedPatch'] = record['uuid'] == UUID
-                if main_mode == 'vendored-detached':
-                    checks['noManifest'] = not manifest.exists()
+                # Neither ledger-backed mode writes .socket/manifest.json: vendored
+                # is manifest-free and hosted persists only the redirect ledger.
+                checks['noManifest'] = not manifest.exists()
                 patched_lock = lock.read_bytes()
                 lockb_origin = lock.name == 'bun.lockb'
                 lock_text = patched_lock.decode('utf-8', errors='replace')
@@ -892,16 +893,9 @@ def main():
                     vendor_ledger = load_json(project / '.socket/vendor/state.json')
                     checks['vendorLedgerEntryGone'] = (vendor_ledger is None
                                                        or PURL not in vendor_ledger.get('entries', {}))
-                    # Observed contract: the hosted takeover unwinds the vendored
-                    # wiring, ledger entry and artifact but leaves the vendored-era
-                    # manifest record in place (rollback removes it); detached
-                    # vendoring never wrote one.
-                    after = load_json(manifest)
-                    if mode == 'vendored':
-                        checks['manifestRecordKeptAfterHostedTakeover'] = (
-                            after is not None and PURL in after.get('patches', {}))
-                    else:
-                        checks['noManifest'] = after is None
+                    # The hosted takeover unwinds the vendored wiring, ledger entry
+                    # and artifact; neither mode ever wrote a manifest record
+                    # (`noManifest` above covers the whole cell).
                 if shape == 'custom-registry':
                     checks['registrySlotDropped'] = REGISTRY_SLOT not in lock_text
                 if shape == 'crlf-lock':

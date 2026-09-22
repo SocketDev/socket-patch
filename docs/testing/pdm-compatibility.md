@@ -108,6 +108,11 @@ the lock and `pyproject.toml` byte for byte. `.github/workflows/pdm-compatibilit
 runs it on Linux, Windows and macOS across every PDM major family. The matrix
 needs no Socket API token (the `urllib3@1.26.18` patch is a free tier).
 
+> **Note (v5.0):** the "refused vendored scan still writes a `.socket/manifest.json`
+> record" observation in the notes column below describes the 4.0.0 binary the run
+> was captured with. Vendored mode is manifest-free since v5.0 — `scan --mode vendored`
+> never writes `.socket/manifest.json` — so the note disappears on the next regeneration.
+
 <!-- GENERATED:BEGIN — printed by `python3 scripts/backtest-pdm.py --render-doc-table docs/testing/pdm-compatibility/results.json`;
      regenerate after a matrix run instead of editing by hand. -->
 
