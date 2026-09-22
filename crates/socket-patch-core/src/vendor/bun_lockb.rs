@@ -1463,7 +1463,7 @@ mod tests {
     }
 
     #[test]
-    fn native_local_hosted_migration_and_exact_restore_all_layouts() {
+    fn native_local_hosted_transitions_and_exact_restore_all_layouts() {
         for version in VERSIONS {
             let original = fixture(version);
             let mut lock = BunLockb::parse(&original).unwrap();

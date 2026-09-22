@@ -80,8 +80,8 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
   hosted and vendored modes, including lockfile-only discovery. The CLI updates
   package resolutions, integrity records and Bun's metadata hash without spawning
   Bun or creating a text lock. Text `bun.lock` takes precedence when both exist;
-  malformed binary locks fail closed before patching. Existing migration ledgers
-  from older Socket Patch releases remain rollback-compatible. Hosted → vendored and vendored → hosted conversions both work
+  malformed binary locks fail closed before patching. Hosted → vendored and
+  vendored → hosted conversions both work
   in place (mode takeover) — on a lock the vendored backend refuses (a pre-version-2
   `workspace:` lock) `vendor` reports the refusal before the hosted revert and leaves the
   purl hosted-patched — and `rollback <purl>` / `remove <purl>` unwind one of several

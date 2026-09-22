@@ -1874,10 +1874,9 @@ fn hosted_persist_failure_lands_in_hosted_failed() {
     );
 }
 
-/// bun-deferred npm purls: bun.lock edits hard-refuse the per-purl npm
-/// revert, so on a replay-eligible run the purl DEFERS to the whole-ledger
-/// replay and succeeds through it — the wet human "Unwound hosted redirect
-/// for {purl}" line prints from the deferred path.
+/// An unscoped Bun rollback stages its package edits together through
+/// whole-ledger replay. Its human confirmation prints from that deferred
+/// path after the original lockfile is restored.
 #[test]
 fn bun_deferred_purl_unwinds_via_replay() {
     let bun_original =
@@ -2285,9 +2284,8 @@ fn per_purl_revert_failure_prints_human_stderr_line() {
     );
 }
 
-/// Dry-run twin of `bun_deferred_purl_unwinds_via_replay`: the bun-lock
-/// edits hard-refuse the per-purl npm revert, so the deferred purl's
-/// PREVIEW routes through the replay's dropped-records probe and prints
+/// Dry-run twin of `bun_deferred_purl_unwinds_via_replay`: the deferred
+/// preview routes through the replay's dropped-records probe and prints
 /// "Would unwind hosted redirect for {purl}" — with bun.lock and the
 /// ledger byte-identical afterwards.
 #[test]

@@ -114,12 +114,11 @@ NO_PEER_OR_OVERRIDE = ('0.8.1', '1.0.0')      # peers not installed, overrides i
 # Advisory codes a SUPPORTED run may carry; everything else is a refusal.
 INFORMATIONAL = {
     'vendor_prebuilt_downloaded', 'vendor_prebuilt_unavailable', 'vendor_prebuilt_pending',
-    'vendor_fetched_missing', 'reinstall_required', 'redirect_bun_lockb_restored',
+    'vendor_fetched_missing', 'reinstall_required',
     'vendor_takeover_reverted_redirect', 'redirect_takeover_reverted_vendored',
 }
 # Codes that mean the rewriter or the takeover broke on a supported configuration.
 REGRESSION_CODES = {
-    'redirect_bun_lockb_migration_reverted', 'redirect_bun_lockb_migrated_without_redirect',
     'redirect_bun_entry_not_found', 'redirect_revert_failed',
 }
 

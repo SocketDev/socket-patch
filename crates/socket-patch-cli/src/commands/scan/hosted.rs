@@ -959,9 +959,8 @@ pub(crate) async fn run_redirect_selected(
         }
     }
 
-    // Load the existing redirect ledger BEFORE any file is written — the
-    // cargo takeover reverts and the bun migration included. The ledger is
-    // the only store of the pre-redirect originals a future revert needs, so
+    // Load the existing redirect ledger before any file changes, including
+    // Cargo takeover reverts. It stores the originals a future revert needs, so
     // a malformed (torn/hand-mangled) ledger must abort the run while the
     // project is still untouched: the old tolerant load treated it as "no
     // ledger" and the merge below would have started fresh, silently
@@ -2252,7 +2251,7 @@ pub(crate) async fn run_redirect_selected(
             }
             // Same warning set as the JSON envelope, same order: the
             // rewriter's own warnings first (e.g. `no package-lock.json`),
-            // then the record/migration/rush extras.
+            // then the record and package-manager warnings.
             for w in &rewrite.warnings {
                 eprintln!("  warning: {}", w.detail);
             }

@@ -103,12 +103,10 @@ restores the original package resolutions.
 Dry runs validate the same input and drift conditions without changing it. No Bun
 executable is required to inspect, rewrite or restore a binary lock.
 
-This replaces the earlier forced `bun.lockb` → `bun.lock` migration. Existing
-migration ledger records retain their rollback compatibility, but new operations
-keep the lock binary. A format-1 input is promoted directly to binary format 2
-when needed for tarball resolutions, with an exact original snapshot for rollback.
-When `bun.lock` also exists, it takes
-precedence, matching modern Bun's installer.
+Binary locks stay binary through patching, mode changes and rollback. A format-1
+input is promoted directly to binary format 2 when needed for tarball resolutions,
+with an exact original snapshot for rollback. When `bun.lock` also exists, it
+takes precedence, matching modern Bun's installer.
 
 Binary workspace vendoring records byte-identical tarball copies under each
 workspace's `.socket/vendor/npm/<uuid>/` directory as well as the canonical root

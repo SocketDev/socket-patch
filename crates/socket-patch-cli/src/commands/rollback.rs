@@ -645,18 +645,13 @@ pub(crate) async fn run_hosted_leg(
 
     let mut out = HostedLegOutcome::default();
     // When the whole-ledger replay will run anyway (the scope covers every
-    // record), npm purls on bun projects defer to it: the replay stages the
-    // bun group all-or-nothing together with the rideshare `bun.lockb`
-    // migration marker the per-purl revert never claims. A SCOPED unwind of
-    // one of several bun records takes the per-purl revert instead, which
-    // claims that purl's `redirect_bun_lock_package` edits by the recorded
-    // line's spec and replays them like the yarn/pnpm text kinds.
+    // record), npm purls on Bun projects defer to it so all lockfile edits
+    // are staged together atomically. A scoped unwind of one of several
+    // Bun records uses the per-purl revert to restore only its package.
     let has_bun_edits = state.edits.iter().any(|e| {
         matches!(
             e.kind.as_str(),
-            "redirect_bun_lock_package"
-                | "redirect_bun_lockb_migrated"
-                | "redirect_bun_lockb_package"
+            "redirect_bun_lock_package" | "redirect_bun_lockb_package"
         )
     });
     let mut deferred_to_replay: Vec<String> = Vec::new();
@@ -699,9 +694,8 @@ pub(crate) async fn run_hosted_leg(
     // The whole-ledger replay runs when the scope covers every record
     // (however it was spelled), and also as the "last one out turns off
     // the lights" pass — per-purl reverts never claim the non-package
-    // rideshare edits (pnpm trustLockfile, the bun.lockb migration
-    // marker), so an emptied record map with leftover edits replays them
-    // here too.
+    // shared settings edits (such as pnpm trustLockfile), so an emptied
+    // record map with leftover edits replays them here too.
     if replay_eligible || (state.records.is_empty() && !state.edits.is_empty()) {
         let replay = revert_remaining_redirect_edits(&common.cwd, state, common.dry_run).await;
         for refusal in &replay.refusals {

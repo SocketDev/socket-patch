@@ -744,11 +744,6 @@ async fn native_bun_lockb_hosting_dry_run_rerun_and_rollback_without_bun() {
         .unwrap()
         .iter()
         .any(|edit| edit["kind"] == "redirect_bun_lockb_package"));
-    assert!(!ledger["edits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|edit| edit["kind"] == "redirect_bun_lockb_migrated"));
 
     let (code, rerun) = scan_hosted_json(tmp.path(), &server.uri(), &[], &env);
     assert_eq!(code, 0, "{rerun:#}");
@@ -942,19 +937,12 @@ async fn fifo_bun_lockb_refuses_before_spawning_bun_and_never_wedges() {
                 .filter(|c| *c == "redirect_bun_lockb_invalid")
                 .count(),
             1,
-            "{extra:?}: exactly one unsupported warning: {codes:?}"
+            "{extra:?}: exactly one binary-format warning: {codes:?}"
         );
-        for absent in [
-            "redirect_bun_lockb_would_migrate",
-            "redirect_bun_lockb_manual_migration",
-            "redirect_bun_lockb_migrated_without_redirect",
-            "redirect_npm_no_lockfile",
-        ] {
-            assert!(
-                !codes.contains(&absent.to_string()),
-                "{extra:?}: {absent} must not accompany the not-a-regular-file refusal: {codes:?}"
-            );
-        }
+        assert!(
+            !codes.contains(&"redirect_npm_no_lockfile".to_string()),
+            "{extra:?}: the existing binary lock must not be reported missing: {codes:?}"
+        );
         assert_eq!(doc["redirect"]["redirected"], 0, "{extra:?}: {doc:#}");
         assert!(
             !marker.exists(),
@@ -1019,7 +1007,7 @@ async fn malformed_bun_lockb_beside_package_lock_is_not_confirmed() {
     let (path_value, marker) = install_marker_bun_shim(tmp.path());
     let env = [("PATH", path_value.as_str())];
 
-    // Dry-run: the same code, never the would-migrate preview.
+    // Dry-run reports the same binary-format error.
     let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &["--dry-run"], &env);
     assert_eq!(code, 0, "dry-run exits 0: {doc:#}");
     assert_sibling_lock_outcome(

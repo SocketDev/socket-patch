@@ -1393,23 +1393,10 @@ async fn no_redirectable_patch_leaves_bun_lockb_alone() {
     .unwrap();
     std::fs::write(tmp.path().join("bun.lockb"), b"BUN-BINARY-PLACEHOLDER").unwrap();
 
-    // A fake `bun` on PATH that WOULD migrate if invoked — the assertion below
-    // is that it never runs (bun.lockb survives untouched).
-    let bin_dir = tmp.path().join("fakebin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim = bin_dir.join("bun");
-    std::fs::write(
-        &shim,
-        "#!/bin/sh\n\
-         echo '{ \"lockfileVersion\": 1, \"packages\": {} }' > bun.lock\n\
-         rm -f bun.lockb\n\
-         exit 0\n",
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let bin_dir = install_bun_shim(
+        tmp.path(),
+        "#!/bin/sh\n: > \"${0%/*}/bun-was-spawned\"\nexit 97\n",
+    );
     let orig_path = std::env::var("PATH").unwrap_or_default();
     // SAFETY: single-threaded #[serial] test; PATH restored below.
     unsafe {
@@ -1422,6 +1409,7 @@ async fn no_redirectable_patch_leaves_bun_lockb_alone() {
         std::env::set_var("PATH", orig_path);
     }
     assert_eq!(code, 0, "a fully-skipped redirect still exits 0");
+    assert!(!bin_dir.join("bun-was-spawned").exists());
     assert!(
         tmp.path().join("bun.lockb").exists(),
         "bun.lockb must survive a scan that redirected nothing"
@@ -1472,21 +1460,10 @@ async fn corrupt_ledger_refuses_before_the_bun_lockb_edit() {
     let corrupt_bytes = b"{\"mode\":\"hosted\",\"edits\":[{\"path\":\"bun.lo";
     std::fs::write(&ledger_path, corrupt_bytes).unwrap();
 
-    let bin_dir = tmp.path().join("fakebin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim = bin_dir.join("bun");
-    std::fs::write(
-        &shim,
-        "#!/bin/sh\n\
-         echo '{ \"lockfileVersion\": 1, \"packages\": {} }' > bun.lock\n\
-         rm -f bun.lockb\n\
-         exit 0\n",
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let bin_dir = install_bun_shim(
+        tmp.path(),
+        "#!/bin/sh\n: > \"${0%/*}/bun-was-spawned\"\nexit 97\n",
+    );
     let orig_path = std::env::var("PATH").unwrap_or_default();
     // SAFETY: single-threaded #[serial] test; PATH restored below.
     unsafe {
@@ -1499,6 +1476,7 @@ async fn corrupt_ledger_refuses_before_the_bun_lockb_edit() {
         std::env::set_var("PATH", orig_path);
     }
     assert_eq!(code, 1, "a corrupt ledger must flip the exit code");
+    assert!(!bin_dir.join("bun-was-spawned").exists());
     assert_eq!(
         std::fs::read(tmp.path().join("bun.lockb")).ok().as_deref(),
         Some(b"BUN-BINARY-PLACEHOLDER".as_slice()),
@@ -1955,8 +1933,8 @@ packages:
 /// `--json` envelope: they carry the load-bearing "why nothing happened /
 /// what you must do" guidance (`redirect_npm_no_lockfile`,
 /// `redirect_gradle_manual_snippet`, the missing-integrity family).
-/// Regression guard: the human branch printed the skipped/record/migration/
-/// rush warnings but dropped `rewrite.warnings` entirely, so a default-mode
+/// Regression guard: the human branch printed skipped/record/rush warnings
+/// but dropped `rewrite.warnings` entirely, so a default-mode
 /// `scan --redirect` in a lockfile-less project reported "Redirected 0
 /// package(s)" with no explanation at all. Subprocess (not in-process) so
 /// stderr can be read back.
@@ -2020,7 +1998,7 @@ async fn redirect_human_mode_prints_rewriter_warnings() {
     );
 }
 
-/// Human-mode `skipped` lines and the record/migration/rush warnings are built
+/// Human-mode `skipped` lines and the record/rush warnings are built
 /// as `serde_json::Value`s and were printed with `{}` — `Display` for `Value`
 /// emits JSON, so every one of them reached the terminal wrapped in literal
 /// double quotes (`skipped "pkg:npm/x@1.0.0" ("forbidden")`, `warning: "…"`),
