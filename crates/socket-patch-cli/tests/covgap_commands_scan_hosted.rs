@@ -292,6 +292,13 @@ snapshots:
 /// `vendor::load_state` parses). Empty wiring — the classifiers and reverts
 /// under test never need recorded lock fragments.
 fn write_vendor_state(root: &Path, purl: &str, uuid: &str, flavor: &str) {
+    write_vendor_state_wired(root, purl, uuid, flavor, json!([]));
+}
+
+/// [`write_vendor_state`] with explicit `wiring` records (the camelCase
+/// `WiringRecord` shape) — for the takeover tests whose revert must have a
+/// lock fragment to restore.
+fn write_vendor_state_wired(root: &Path, purl: &str, uuid: &str, flavor: &str, wiring: Value) {
     let state = json!({
         "version": 1,
         "entries": {
@@ -302,7 +309,7 @@ fn write_vendor_state(root: &Path, purl: &str, uuid: &str, flavor: &str) {
                 "artifact": {
                     "path": format!(".socket/vendor/npm/{uuid}/{NAME}-{VERSION}.tgz")
                 },
-                "wiring": [],
+                "wiring": wiring,
                 "flavor": flavor
             }
         }
@@ -558,6 +565,213 @@ async fn wet_takeover_refuses_unrevertable_vendored_flavor_fail_closed() {
     assert!(
         stderr.contains("  warning: ") && stderr.contains("could not be reverted"),
         "the takeover pre-warning must reach human stderr; stderr=\n{stderr}"
+    );
+}
+
+// ──────────── takeover symlink pre-check (before any revert dispatches) ────────────
+
+/// A vendored→hosted takeover must NOT revert a vendored purl whose recorded
+/// wiring file is a symbolic link: the npm revert stages and renames over
+/// package-lock.json exactly like the rewriters do, so it would DETACH the
+/// link (and remove the committed artifact) before the general symlink
+/// guard — which runs after the takeover — could refuse. The pre-check
+/// refuses the whole run first, with the guard's own code and "nothing was
+/// written" wording, under `--dry-run` too: the link, its target, the
+/// vendored ledger and the artifact stay byte-identical, no redirect ledger
+/// appears, and the apply lock the wet run took is gone again.
+#[cfg(unix)]
+#[tokio::test]
+async fn takeover_refuses_symlinked_wiring_file_before_reverting() {
+    const VUUID: &str = "77777777-7777-4777-8777-777777777777";
+    const CODE: &str = "redirect_symlinked_file_unsupported";
+    let server = MockServer::start().await;
+    mock_discovery(&server, PURL, UUID).await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_npm_project(root, NAME);
+    // The vendored shape the revert restores from: the live lock entry
+    // resolves through the committed artifact; the wiring records the
+    // registry original the revert would write back.
+    let registry_resolved = format!("https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz");
+    let vendored_resolved = format!("file:.socket/vendor/npm/{VUUID}/{NAME}-{VERSION}.tgz");
+    let vendored_lock = std::fs::read_to_string(root.join("package-lock.json"))
+        .unwrap()
+        .replace(&registry_resolved, &vendored_resolved)
+        .replace(UPSTREAM_SHA512, PATCHED_SHA512);
+    write_vendor_state_wired(
+        root,
+        PURL,
+        VUUID,
+        "package-lock",
+        json!([{
+            "file": "package-lock.json",
+            "kind": "npm_lock_entry",
+            "action": "rewritten",
+            "key": format!("node_modules/{NAME}"),
+            "original": {
+                "version": VERSION, "resolved": registry_resolved, "integrity": UPSTREAM_SHA512
+            },
+            "new": {
+                "version": VERSION, "resolved": vendored_resolved, "integrity": PATCHED_SHA512
+            }
+        }]),
+    );
+    let artifact = root
+        .join(".socket/vendor/npm")
+        .join(VUUID)
+        .join(format!("{NAME}-{VERSION}.tgz"));
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, b"tgz").unwrap();
+    // The lock lives in a shared dir; the project holds a relative symlink.
+    let shared = root.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::write(shared.join("package-lock.json"), &vendored_lock).unwrap();
+    std::fs::remove_file(root.join("package-lock.json")).unwrap();
+    std::os::unix::fs::symlink("shared/package-lock.json", root.join("package-lock.json")).unwrap();
+    let state_before = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
+
+    let is_symlink = |p: &Path| {
+        std::fs::symlink_metadata(p)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+    };
+    let assert_untouched = |doc: &Value| {
+        assert!(
+            is_symlink(&root.join("package-lock.json")),
+            "the link must survive — a revert's rename-over would have detached it: {doc:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(shared.join("package-lock.json")).unwrap(),
+            vendored_lock,
+            "the link target must be byte-identical: {doc:#}"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+            state_before,
+            "the vendored ledger must be byte-identical: {doc:#}"
+        );
+        assert!(artifact.is_file(), "the committed artifact must survive: {doc:#}");
+        assert!(
+            !root.join(".socket/vendor/redirect-state.json").exists(),
+            "no redirect ledger may be written: {doc:#}"
+        );
+        assert!(
+            !root.join(".socket/apply.lock").exists(),
+            "the apply lock never outlives the run: {doc:#}"
+        );
+    };
+
+    for dry_run in [false, true] {
+        let extra: &[&str] = if dry_run { &["--dry-run"] } else { &[] };
+        let (code, doc) = scan_hosted_json(root, &server.uri(), extra, &[]);
+        assert_eq!(code, 1, "dry_run={dry_run}: a symlinked revert target fails the run: {doc:#}");
+        assert_eq!(doc["status"], "error", "dry_run={dry_run}: {doc:#}");
+        assert_eq!(doc["errorCode"], CODE, "dry_run={dry_run}: {doc:#}");
+        let error = doc["error"].as_str().unwrap_or_default();
+        assert!(
+            error.starts_with("package-lock.json is a symbolic link")
+                && error.ends_with("nothing was written"),
+            "dry_run={dry_run}: the refusal names the link and promises no write: {error}"
+        );
+        assert_untouched(&doc);
+    }
+
+    // Human arm: the guard's stderr line, same code.
+    let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
+    assert_eq!(code, 1, "stderr=\n{stderr}");
+    assert!(
+        stderr.contains(&format!("Error ({CODE}): package-lock.json is a symbolic link")),
+        "the human refusal must carry the stable code; stderr=\n{stderr}"
+    );
+    assert_untouched(&json!(null));
+}
+
+// ───────────────────── apply lock (hosted holds it, lazily) ─────────────────────
+
+/// `scan --mode hosted` takes the same `.socket/apply.lock` every other
+/// mutating command holds — but only when it could write. A WET run with a
+/// granted reference refuses a held lock with `lock_held` (the hosted
+/// envelope's top-level `errorCode`, the shared contention message, exit 1)
+/// BEFORE the ledger load or any file write; the human arm prints the
+/// `Error (lock_held):` line plus the `--lock-timeout` hint. A `--dry-run`,
+/// and a wet run whose references are all skipped, never contend: nothing
+/// they do touches `.socket/`, so they succeed under the held lock. Once the
+/// holder releases, `.socket/` is gone — the hosted runs created nothing.
+#[tokio::test]
+async fn hosted_lock_held_refuses_before_any_write() {
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+    mock_discovery(&server, PURL, UUID).await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    // Same discovery, but the reference endpoint grants nothing: every
+    // selection is skipped as `not_found`, so the run has nothing to write.
+    let no_grant = MockServer::start().await;
+    mock_discovery(&no_grant, PURL, UUID).await;
+    mock_reference_results(&no_grant, json!({})).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_npm_project(root, NAME);
+    let lock_before = std::fs::read(root.join("package-lock.json")).unwrap();
+    let holder =
+        socket_patch_core::patch::apply_lock::acquire(&root.join(".socket"), Duration::ZERO)
+            .unwrap();
+    const HELD: &str = "another socket-patch process is operating in this directory";
+
+    // Wet --json: refused before anything is written.
+    let (code, doc) = scan_hosted_json(root, &server.uri(), &[], &[]);
+    assert_eq!(code, 1, "a held lock refuses the wet run: {doc:#}");
+    assert_eq!(doc["status"], "error", "{doc:#}");
+    assert_eq!(doc["errorCode"], "lock_held", "{doc:#}");
+    assert_eq!(doc["error"], HELD, "no --lock-timeout: no waited clause; {doc:#}");
+    assert_eq!(
+        doc["redirect"]["mode"], "hosted",
+        "the hosted error envelope keeps its redirect block: {doc:#}"
+    );
+
+    // Wet human: the stderr line carries the stable code and the hint.
+    let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
+    assert_eq!(code, 1, "stderr=\n{stderr}");
+    assert!(
+        stderr.contains(&format!("Error (lock_held): {HELD}")),
+        "stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--lock-timeout"),
+        "the wait hint must accompany a live holder; stderr=\n{stderr}"
+    );
+
+    // --dry-run under the held lock: a preview never locks (it writes
+    // nothing), so it previews the rewrite instead of contending.
+    let (code, doc) = scan_hosted_json(root, &server.uri(), &["--dry-run"], &[]);
+    assert_eq!(code, 0, "a dry run never contends: {doc:#}");
+    assert_eq!(doc["redirect"]["dryRun"], true, "{doc:#}");
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+
+    // Zero grants under the held lock: nothing to write, so no lock taken.
+    let (code, doc) = scan_hosted_json(root, &no_grant.uri(), &[], &[]);
+    assert_eq!(code, 0, "an all-skipped run never contends: {doc:#}");
+    assert_eq!(doc["redirect"]["redirected"], 0, "{doc:#}");
+    assert!(
+        doc["redirect"]["skipped"]
+            .as_array()
+            .is_some_and(|s| s.iter().any(|e| e["reason"] == "not_found")),
+        "{doc:#}"
+    );
+
+    assert_eq!(
+        std::fs::read(root.join("package-lock.json")).unwrap(),
+        lock_before,
+        "none of the runs may touch the lockfile"
+    );
+    assert!(!root.join(".socket/vendor/redirect-state.json").exists());
+    drop(holder);
+    assert!(
+        !root.join(".socket").exists(),
+        "the hosted runs created nothing under .socket/, so the released lock leaves no dir"
     );
 }
 

@@ -4,8 +4,11 @@
 //! discovery, then returns without touching the apply/vendor branches.
 
 use std::path::Path;
+use std::time::Duration;
 
 use socket_patch_core::api::types::BatchPackagePatches;
+use socket_patch_core::patch::apply_lock::{acquire, LockError, LockGuard};
+use socket_patch_core::patch::redirect::DepOverride;
 
 use crate::commands::vex::generate_vex_from_manifest_path;
 
@@ -398,6 +401,106 @@ fn build_redirect_json_envelope(
     result
 }
 
+/// The nested `redirect` block of every hosted `--json` envelope — the ONE
+/// spelling of its key set (`mode`, `redirected`, `rewrittenFiles`,
+/// `skipped`, `warnings`, `dryRun`), shared by the ≥1-package path here and
+/// the zero-discovery arm in `run`, so the two cannot drift by convention.
+/// `mode` is `"hosted"` (the final mode name for `--redirect`): an additive
+/// key so consumers dispatch on the mode without inferring it from which
+/// sub-object is present.
+pub(super) fn redirect_json_block(
+    redirected: usize,
+    rewritten: Vec<String>,
+    skipped: Vec<serde_json::Value>,
+    warnings: Vec<serde_json::Value>,
+    dry_run: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "mode": "hosted",
+        "redirected": redirected,
+        "rewrittenFiles": rewritten,
+        "skipped": skipped,
+        "warnings": warnings,
+        "dryRun": dry_run,
+    })
+}
+
+/// The `redirect_prune_ignored` warning object (`--prune` is a no-op in
+/// hosted mode; see the constants' doc in `run`'s module).
+pub(super) fn prune_ignored_warning() -> serde_json::Value {
+    serde_json::json!({
+        "code": super::REDIRECT_PRUNE_IGNORED,
+        "detail": super::REDIRECT_PRUNE_IGNORED_DETAIL,
+    })
+}
+
+/// The fail-closed refusal for a symlinked rewrite target (both the general
+/// SYMLINK GUARD and the takeover pre-check in [`run_redirect_selected`]):
+/// stderr line + `--json` envelope, exit 1. The writers stage next to the
+/// path and rename over it, which REPLACES a symbolic link with a detached
+/// regular copy — the link target goes stale and a revert restores bytes but
+/// never the link — so nothing may be written.
+fn refuse_symlinked_file(
+    common: &crate::args::GlobalArgs,
+    scan_result: Option<serde_json::Value>,
+    linked: &str,
+) -> i32 {
+    let message = format!(
+        "{linked} is a symbolic link; socket-patch rewrites files in place with an atomic \
+         rename, which would replace the link — replace the link with a regular file (or \
+         run socket-patch in the directory it points to) and re-run; nothing was written"
+    );
+    eprintln!("Error (redirect_symlinked_file_unsupported): {message}");
+    if common.json {
+        emit_json_error_with_code(
+            scan_result,
+            Some("redirect_symlinked_file_unsupported"),
+            &message,
+        );
+    }
+    1
+}
+
+/// The apply lock for a WET hosted run: the same `<manifest dir>/apply.lock`
+/// `apply`/`rollback`/`remove`/`vendor` hold, so the takeover pre-reverts,
+/// the ledger merge and the lockfile writes never race them. `acquire`
+/// creates a missing `.socket/` and the guard's drop unlinks the lock file
+/// and prunes an otherwise-empty `.socket/`, so a run that ends up writing
+/// nothing leaves no residue. Contention / IO failures render through the
+/// shared [`crate::commands::lock_cli::lock_failure`] mapping — the
+/// `lock_held` / `lock_io` codes and the "(waited …)" clause match every
+/// other mutating command — into the hosted error envelope (NOT
+/// `acquire_or_emit`, whose `Envelope` would replace the classic scan / get
+/// object) plus the stderr line and, for a live holder, the wait hint.
+fn acquire_hosted_lock(
+    common: &crate::args::GlobalArgs,
+    scan_result: &mut Option<serde_json::Value>,
+) -> Result<LockGuard, i32> {
+    let manifest_path = common.resolved_manifest_path();
+    let socket_dir = manifest_path
+        .parent()
+        .expect("manifest path names a file, so it has a parent");
+    let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
+    match acquire(socket_dir, timeout) {
+        Ok(guard) => Ok(guard),
+        Err(err) => {
+            let (code, message) = crate::commands::lock_cli::lock_failure(&err, timeout);
+            // Errors print even under --silent ("errors only", never
+            // "nothing"): exit 1 with no message would be undiagnosable.
+            eprintln!("Error ({code}): {message}");
+            if matches!(err, LockError::Held) {
+                eprintln!(
+                    "  Wait for it to finish, or retry with --lock-timeout <secs> to wait for the lock."
+                );
+            }
+            if common.json {
+                emit_json_error_with_code(scan_result.take(), Some(code), &message);
+            }
+            Err(1)
+        }
+    }
+}
+
 /// The installed-tree probes' outcome: warnings for both output channels,
 /// plus the stale purls STRUCTURALLY, so the same-run `--vex` can exclude
 /// them from `assume_applied` — an envelope must never attest a CVE its own
@@ -786,8 +889,9 @@ pub(super) async fn run_redirect(
 }
 
 /// The hosted-redirect engine over an ALREADY-SELECTED `(purl, uuid)` set:
-/// reference grants → DepOverride build → vendored→hosted takeover pre-revert
-/// → candidate-file read → rewrite → pnpm trust config →
+/// reference grants → DepOverride build → apply lock (wet runs with a grant)
+/// → ledger load → vendored→hosted takeover pre-revert (symlink-checked
+/// first) → candidate-file read → rewrite → pnpm trust config →
 /// confirmation probe → ledger merge-then-persist → file writes → gem stale
 /// probe → warnings → optional VEX. Shared VERBATIM by `scan --mode hosted`
 /// (whose `run_redirect` wrapper selects via `discover_selected`) and
@@ -810,28 +914,24 @@ pub(crate) async fn run_redirect_selected(
 ) -> i32 {
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::patch::redirect::{
-        rewrite_registry_redirect_with_pipenv_version, DepOverride, RedirectState,
+        rewrite_registry_redirect_with_pipenv_version, RedirectState,
     };
 
     let mut skipped: Vec<serde_json::Value> = Vec::new();
-    let mut overrides: Vec<DepOverride> = Vec::new();
-    // (purl, uuid, artifact_url, registry index_url, maven suffixed version,
-    // go module path) per granted reference — used AFTER the rewrite to decide
-    // which deps were actually redirected (their target URL / index / suffixed
-    // version / socket module path landed in a file) before persisting records
-    // or attesting anything. The fifth element is Some only for fail-closed
-    // maven overrides; the sixth only for golang (whose go.mod/go.sum edits
-    // carry the content-addressed `patch.socket.dev/gopatch/<uuid>` module
-    // path, never the artifact or index URL).
-    type RedirectCandidate = (
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    );
-    let mut candidates: Vec<RedirectCandidate> = Vec::new();
+    /// One granted reference: the purl it was granted for plus the rewriter
+    /// override built from it. The purl is what the takeover, the skip
+    /// records and the confirmation probe key on; everything the probe
+    /// needs AFTER the rewrite to decide whether the dep was actually
+    /// redirected (artifact URL, registry index URL, fail-closed maven's
+    /// suffixed version, golang's content-addressed module path) already
+    /// rides the override. The single vector is filtered in place by every
+    /// withhold/refusal step, and the rewriters' `overrides` slice is
+    /// materialized from it once, after the last filter.
+    struct Candidate {
+        purl: String,
+        dep: DepOverride,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
 
     if !selected.is_empty() {
         let uuids: Vec<String> = selected.iter().map(|(_, uuid)| uuid.clone()).collect();
@@ -906,23 +1006,6 @@ pub(crate) async fn run_redirect_selected(
                     integrity.go_mod_h1 = Some(gomod_h1);
                 }
             }
-            candidates.push((
-                purl.to_string(),
-                sel_uuid.clone(),
-                url.clone(),
-                reference
-                    .registry_override
-                    .as_ref()
-                    .map(|o| o.index_url.clone()),
-                reference
-                    .registry_override
-                    .as_ref()
-                    .and_then(|o| o.identifiers.maven_suffixed_version.clone()),
-                reference
-                    .registry_override
-                    .as_ref()
-                    .and_then(|o| o.identifiers.go_module_path.clone()),
-            ));
             // The grant token is never a top-level reference field — it only
             // rides the URLs the reference endpoint hands back, as the path
             // level before the patch uuid. Recover it so the rewriters'
@@ -944,61 +1027,31 @@ pub(crate) async fn run_redirect_selected(
                     socket_patch_core::patch::redirect::grant_token_path_segment(&url, sel_uuid)
                 })
                 .unwrap_or_default();
-            overrides.push(DepOverride {
-                ecosystem,
-                name,
-                namespace: None,
-                version,
-                token,
-                patch_uuid: sel_uuid.clone(),
-                artifact_url: url,
-                berry_zip_url: berry_zip.and_then(|a| a.url.clone()),
-                registry_override: reference.registry_override.clone(),
-                integrity,
+            candidates.push(Candidate {
+                purl: purl.to_string(),
+                dep: DepOverride {
+                    ecosystem,
+                    name,
+                    namespace: None,
+                    version,
+                    token,
+                    patch_uuid: sel_uuid.clone(),
+                    artifact_url: url,
+                    berry_zip_url: berry_zip.and_then(|a| a.url.clone()),
+                    registry_override: reference.registry_override.clone(),
+                    integrity,
+                },
             });
         }
     }
 
-    // Load the existing redirect ledger before any file changes, including
-    // Cargo takeover reverts. It stores the originals a future revert needs, so
-    // a malformed (torn/hand-mangled) ledger must abort the run while the
-    // project is still untouched: the old tolerant load treated it as "no
-    // ledger" and the merge below would have started fresh, silently
-    // overwriting that revert data. The malformed file is moved aside to
-    // redirect-state.json.corrupt (never clobbered) so recovery stays
-    // possible; a dry-run reports the same hard error but moves nothing.
-    let existing_ledger =
-        match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await {
-            Ok(state) => state,
-            Err(mut corrupt) => {
-                if !common.dry_run {
-                    corrupt.quarantine().await;
-                }
-                let message = corrupt.to_string();
-                eprintln!("{message}");
-                if common.json {
-                    emit_json_error(scan_result.take(), &message);
-                }
-                return 1;
-            }
-        };
-
-    // Snapshot the persisted patch records BEFORE the ledger value is
-    // consumed by the write below: they are the gem stale-install probe's
-    // fallback judgment source when this run's /patches/view fetch fails
-    // transiently (the warning must keep firing until the stale
-    // materialization is gone, not until the first flaky fetch).
-    let ledger_records: std::collections::BTreeMap<
-        String,
-        socket_patch_core::manifest::schema::PatchRecord,
-    > = existing_ledger
-        .as_ref()
-        .map(|l| l.records.clone())
-        .unwrap_or_default();
-
+    // Text retains Bun's precedence when both lock spellings are present;
+    // the takeover reverts rewrite locks in place (never create or remove
+    // one), so the probe holds for the binary-lock decision below too.
+    let bun_lock_present = common.cwd.join("bun.lock").exists();
     // Check binary lock symlinks before a mode takeover changes any wiring.
-    if overrides.iter().any(|o| o.ecosystem == "npm")
-        && !common.cwd.join("bun.lock").exists()
+    if candidates.iter().any(|c| c.dep.ecosystem == "npm")
+        && !bun_lock_present
         && socket_patch_core::utils::fs::first_symlink(&common.cwd, ["bun.lockb"])
             .await
             .is_some()
@@ -1017,6 +1070,56 @@ pub(crate) async fn run_redirect_selected(
         }
         return 1;
     }
+
+    // The apply lock (see `acquire_hosted_lock`), taken only by a WET run
+    // that holds at least one granted reference — the only runs that can
+    // write anything: the takeover pre-reverts (lockfiles + the vendored
+    // ledger), the redirect-ledger merge and the lockfile writes. Dry runs
+    // and zero-grant runs never touch `.socket/`, so they never lock (a
+    // preview must not create `.socket/`, flip to `lock_held` under a
+    // concurrent wet run, or fail on a read-only checkout). Acquired BEFORE
+    // the ledger load so load → merge → persist is one critical section
+    // (rollback's rule: a ledger a run will persist is loaded under the
+    // lock) and held to the end of the function.
+    let _lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() {
+        match acquire_hosted_lock(common, &mut scan_result) {
+            Ok(guard) => Some(guard),
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
+
+    // Load the existing redirect ledger before any file changes, including
+    // Cargo takeover reverts. It stores the originals a future revert needs, so
+    // a malformed (torn/hand-mangled) ledger must abort the run while the
+    // project is still untouched: the old tolerant load treated it as "no
+    // ledger" and the merge below would have started fresh, silently
+    // overwriting that revert data. The malformed file is moved aside to
+    // redirect-state.json.corrupt (never clobbered) so recovery stays
+    // possible; a dry-run reports the same hard error but moves nothing.
+    //
+    // Held as the ONE in-memory ledger for the whole run: the write below
+    // merges into it in place, and the stale-install probes read its
+    // records (persisted ones included — their fallback judgment source
+    // when this run's /patches/view fetch fails transiently: the warning
+    // must keep firing until the stale materialization is gone, not until
+    // the first flaky fetch).
+    let mut ledger =
+        match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await {
+            Ok(state) => state.unwrap_or_else(RedirectState::new),
+            Err(mut corrupt) => {
+                if !common.dry_run {
+                    corrupt.quarantine().await;
+                }
+                let message = corrupt.to_string();
+                eprintln!("{message}");
+                if common.json {
+                    emit_json_error(scan_result.take(), &message);
+                }
+                return 1;
+            }
+        };
 
     // Cross-mode takeover: a purl this run is about to redirect may still be
     // VENDORED — for cargo a committed `[patch.crates-io]` path entry, a
@@ -1046,16 +1149,45 @@ pub(crate) async fn run_redirect_selected(
     // wet run reverts FIRST) and counted as redirected below, so the
     // preview's envelope matches the wet run's outcome.
     let mut dry_run_takeover: Vec<(String, String)> = Vec::new();
-    if !candidates.iter().any(|(p, ..)| takeover_capable(p)) {
+    if !candidates.iter().any(|c| takeover_capable(&c.purl)) {
         // No takeover-capable candidates — nothing to reconcile.
     } else {
         use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
         let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-        let vendor_state = socket_patch_core::vendor::load_state(&common.cwd).await;
+        // Loaded ONCE and mutated in place per reverted purl (the wet loop
+        // saves after each revert): this run holds the apply lock, so no
+        // other writer can move the on-disk ledger under it.
+        let mut vendor_state = socket_patch_core::vendor::load_state(&common.cwd).await;
+        // Each takeover-capable candidate with its vendored ledger entry, if
+        // any (cloned out so the loop can mutate the state).
+        let takeover: Vec<(&Candidate, Option<socket_patch_core::vendor::VendorEntry>)> =
+            candidates
+                .iter()
+                .filter(|c| takeover_capable(&c.purl))
+                .map(|c| {
+                    let entry = vendor_state
+                        .as_ref()
+                        .ok()
+                        .and_then(|s| {
+                            socket_patch_core::vendor::lookup_entry(
+                                &s.entries,
+                                strip_purl_qualifiers(&c.purl),
+                            )
+                        })
+                        .cloned();
+                    (c, entry)
+                })
+                .collect();
         // Compatibility must be known before the takeover removes a live
         // patch. In particular, a v0 workspace can keep an existing local
-        // tuple even though hosted mode cannot replace it with a URL.
-        let bun_takeover_refusal = if candidates.iter().any(|(p, ..)| p.starts_with("pkg:npm/")) {
+        // tuple even though hosted mode cannot replace it with a URL. Only
+        // an npm purl WITH a vendored entry can be taken over, so the bun
+        // locks are read here only when one exists — the candidate-file
+        // read below covers every other run.
+        let bun_takeover_refusal = if takeover
+            .iter()
+            .any(|(c, entry)| entry.is_some() && c.purl.starts_with("pkg:npm/"))
+        {
             match socket_patch_core::utils::fs::read_regular_to_string(&common.cwd.join("bun.lock"))
                 .await
             {
@@ -1084,23 +1216,38 @@ pub(crate) async fn run_redirect_selected(
         } else {
             None
         };
+        // A bun-refused npm purl is never dispatched (see the loop), so its
+        // wiring is not a write target here.
+        let bun_refused = |c: &Candidate| {
+            bun_takeover_refusal.is_some() && c.purl.starts_with("pkg:npm/")
+        };
+        // SYMLINK PRE-CHECK for the takeover reverts — the same rule as the
+        // SYMLINK GUARD below, applied to the files the reverts rewrite
+        // (each ledger entry's recorded wiring): the revert backends stage
+        // and rename over the lock like the rewriters do, so a symlinked
+        // package-lock.json would be detached — or a later refusal would
+        // find the purl neither vendored nor hosted — before the general
+        // guard ever ran. Checked in one pass BEFORE any revert dispatches
+        // (and under --dry-run too) so "nothing was written" stays true.
+        let revert_targets = takeover
+            .iter()
+            .filter_map(|(c, entry)| entry.as_ref().filter(|_| !bun_refused(c)))
+            .flat_map(|entry| entry.wiring.iter().map(|w| w.file.as_str()));
+        if let Some(linked) =
+            socket_patch_core::utils::fs::first_symlink(&common.cwd, revert_targets).await
+        {
+            return refuse_symlinked_file(common, scan_result.take(), linked);
+        }
         let patch_entries =
             socket_patch_core::vendor::cargo_config::read_patch_entries(&common.cwd).await;
         let mut refused: Vec<String> = Vec::new();
-        for (purl, uuid, ..) in &candidates {
-            if !takeover_capable(purl) {
-                continue;
-            }
-            let stripped = strip_purl_qualifiers(purl);
-            let ledger_entry = vendor_state
-                .as_ref()
-                .ok()
-                .and_then(|s| socket_patch_core::vendor::lookup_entry(&s.entries, stripped))
-                .cloned();
+        for (candidate, ledger_entry) in &takeover {
+            let purl = &candidate.purl;
+            let uuid = &candidate.dep.patch_uuid;
             if let Some(entry) = ledger_entry {
                 if let Some(warning) = bun_takeover_refusal
                     .as_ref()
-                    .filter(|_| purl.starts_with("pkg:npm/"))
+                    .filter(|_| bun_refused(candidate))
                 {
                     refused.push(purl.clone());
                     if !takeover_pre_warnings
@@ -1123,7 +1270,7 @@ pub(crate) async fn run_redirect_selected(
                     // revert itself while reporting `redirected: 0` for a
                     // migration the wet run lands.
                     let outcome =
-                        crate::commands::vendor::dispatch_revert_one(&entry, &common.cwd, true)
+                        crate::commands::vendor::dispatch_revert_one(entry, &common.cwd, true)
                             .await;
                     if !outcome.success {
                         refused.push(purl.clone());
@@ -1150,7 +1297,7 @@ pub(crate) async fn run_redirect_selected(
                     continue;
                 }
                 let outcome =
-                    crate::commands::vendor::dispatch_revert_one(&entry, &common.cwd, false).await;
+                    crate::commands::vendor::dispatch_revert_one(entry, &common.cwd, false).await;
                 if !outcome.success {
                     refused.push(purl.clone());
                     takeover_pre_warnings.push(serde_json::json!({
@@ -1164,29 +1311,18 @@ pub(crate) async fn run_redirect_selected(
                     }));
                     continue;
                 }
-                // Drop the reverted entry and persist per purl so a crash
-                // mid-run leaves a ledger matching the on-disk wiring.
-                // Re-loaded fresh each iteration (each iteration saves): the
-                // saved file is the truth.
-                let mut state = match socket_patch_core::vendor::load_state(&common.cwd).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        refused.push(purl.clone());
-                        takeover_pre_warnings.push(serde_json::json!({
-                            "code": "redirect_vendored_revert_failed",
-                            "detail": format!(
-                                "{purl}: vendored wiring reverted but the vendored \
-                                 ledger could not be re-read ({e}); NOT redirected — \
-                                 fix .socket/vendor/state.json and re-run"
-                            ),
-                        }));
-                        continue;
-                    }
-                };
+                // Drop the reverted entry from the in-memory ledger and
+                // persist per purl so a crash mid-run leaves a ledger
+                // matching the on-disk wiring. The entry stays dropped even
+                // when the save fails: its wiring and artifact ARE gone, so
+                // a later successful save in this loop writes the truth.
+                let state = vendor_state
+                    .as_mut()
+                    .expect("a vendored ledger entry was looked up in this state, so it loaded");
                 state
                     .entries
                     .retain(|k, e| canon(k) != canon(purl) && canon(&e.base_purl) != canon(purl));
-                if let Err(e) = socket_patch_core::vendor::save_state(&common.cwd, &state).await {
+                if let Err(e) = socket_patch_core::vendor::save_state(&common.cwd, state).await {
                     // The wiring is reverted but the ledger still claims it;
                     // redirecting now would leave a ledger asserting wiring
                     // that is gone. Fail closed for this purl.
@@ -1239,48 +1375,32 @@ pub(crate) async fn run_redirect_selected(
                 }
             }
         }
-        if !refused.is_empty() {
-            for purl in &refused {
-                if let Some((_, uuid, ..)) = candidates.iter().find(|(p, ..)| p == purl) {
-                    let reason = bun_takeover_refusal
-                        .as_ref()
-                        .filter(|_| purl.starts_with("pkg:npm/"))
-                        .map_or("vendored_revert_failed", |w| w.code.as_str());
-                    skipped.push(serde_json::json!({
-                        "purl": purl, "uuid": uuid, "reason": reason,
-                    }));
-                }
+        for purl in &refused {
+            if let Some(c) = candidates.iter().find(|c| &c.purl == purl) {
+                let reason = bun_takeover_refusal
+                    .as_ref()
+                    .filter(|_| bun_refused(c))
+                    .map_or("vendored_revert_failed", |w| w.code.as_str());
+                skipped.push(serde_json::json!({
+                    "purl": purl, "uuid": c.dep.patch_uuid, "reason": reason,
+                }));
             }
         }
         // Purls leaving the rewrite set: refused takeovers, plus the dry-run
         // takeover previews (still vendored on disk — the wet run reverts
         // them before the rewriters ever see their files).
-        let withheld: Vec<&String> = refused
+        let withheld: std::collections::HashSet<&str> = refused
             .iter()
-            .chain(dry_run_takeover.iter().map(|(p, _)| p))
+            .map(String::as_str)
+            .chain(dry_run_takeover.iter().map(|(p, _)| p.as_str()))
             .collect();
         if !withheld.is_empty() {
-            let withheld_names: std::collections::HashSet<(String, String, String)> = candidates
-                .iter()
-                .filter(|(p, ..)| withheld.contains(&p))
-                .filter_map(|(p, ..)| parse_purl_simple(p))
-                .collect();
-            candidates.retain(|(p, ..)| !withheld.contains(&p));
-            overrides.retain(|o| {
-                // Overrides built here carry the full coordinate in `name`
-                // (namespace unset) — the same shape parse_purl_simple emits.
-                let coord = match o.namespace.as_deref() {
-                    Some(ns) if !ns.is_empty() => format!("{ns}/{}", o.name),
-                    _ => o.name.clone(),
-                };
-                !withheld_names.contains(&(o.ecosystem.clone(), coord, o.version.clone()))
-            });
+            candidates.retain(|c| !withheld.contains(c.purl.as_str()));
         }
     }
 
-    // The binary lock is read and rewritten directly. Text retains Bun's
-    // precedence when both filenames are present.
-    let binary_bun = !common.cwd.join("bun.lock").exists() && common.cwd.join("bun.lockb").exists();
+    // The binary lock is read and rewritten directly.
+    let binary_bun = !bun_lock_present && common.cwd.join("bun.lockb").exists();
     // Read the project's candidate files, run the rewriters. Every read goes
     // through the FIFO-safe reader (non-blocking open + fstat regular-file
     // check): a FIFO planted under any candidate name — pyproject.toml,
@@ -1288,33 +1408,15 @@ pub(crate) async fn run_redirect_selected(
     // hosted` forever in a plain `read_to_string` open(2) waiting for a
     // writer. A non-regular file now reads as "unreadable" and is skipped
     // exactly like a missing one.
+    //
+    // Skipped entirely when no candidate survived (every reference skipped,
+    // refused or withheld as a dry-run takeover preview): the rewriters
+    // place nothing and warn about nothing without a dep, so the ~45 reads
+    // would only feed an empty rewrite. Everything after the rewrite still
+    // runs — the previews are counted, the skips and warnings reported, a
+    // requested VEX still attempted.
     use socket_patch_core::utils::fs::read_regular_to_string;
     let mut files: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for name in REDIRECT_CANDIDATE_FILES {
-        if *name == "bun.lockb" {
-            continue;
-        }
-        if let Ok(content) = read_regular_to_string(&common.cwd.join(name)).await {
-            files.insert((*name).to_string(), content);
-        }
-    }
-
-    if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(&common.cwd) {
-        for path in paths {
-            if let Some(script_path) = path
-                .strip_suffix(".py.lock")
-                .map(|prefix| format!("{prefix}.py"))
-            {
-                if let Ok(content) = read_regular_to_string(&common.cwd.join(&script_path)).await {
-                    files.insert(script_path, content);
-                }
-            }
-            if let Ok(content) = read_regular_to_string(&common.cwd.join(&path)).await {
-                files.insert(path, content);
-            }
-        }
-    }
-
     // Rush monorepos have no root package.json/lock pair: the single pnpm
     // source-of-truth lock lives at common/config/rush/pnpm-lock.yaml, and
     // (when subspaces are enabled) one lock per subspace under
@@ -1323,29 +1425,59 @@ pub(crate) async fn run_redirect_selected(
     // rewritten in place, and the write-back below is already path-generic.
     let mut rush_warnings: Vec<serde_json::Value> = Vec::new();
     let mut rush_lock_keys: Vec<String> = Vec::new();
-    if common.cwd.join("rush.json").is_file() {
-        let common_lock = socket_patch_core::constants::npm_family::RUSH_COMMON_LOCK_REL;
-        if let Ok(content) = read_regular_to_string(&common.cwd.join(common_lock)).await {
-            files.insert(common_lock.to_string(), content);
-            rush_lock_keys.push(common_lock.to_string());
+    if !candidates.is_empty() {
+        for name in REDIRECT_CANDIDATE_FILES {
+            if *name == "bun.lockb" {
+                continue;
+            }
+            if let Ok(content) = read_regular_to_string(&common.cwd.join(name)).await {
+                files.insert((*name).to_string(), content);
+            }
         }
-        let subspaces_dir = common.cwd.join("common/config/subspaces");
-        if let Ok(read_dir) = std::fs::read_dir(&subspaces_dir) {
-            // read_dir order is unspecified — sort for deterministic output.
-            let mut subspace_dirs: Vec<std::path::PathBuf> = read_dir
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                .map(|e| e.path())
-                .collect();
-            subspace_dirs.sort();
-            for dir in subspace_dirs {
-                let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                let key = format!("common/config/subspaces/{name}/pnpm-lock.yaml");
-                if let Ok(content) = read_regular_to_string(&dir.join("pnpm-lock.yaml")).await {
-                    files.insert(key.clone(), content);
-                    rush_lock_keys.push(key);
+
+        if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(&common.cwd) {
+            for path in paths {
+                if let Some(script_path) = path
+                    .strip_suffix(".py.lock")
+                    .map(|prefix| format!("{prefix}.py"))
+                {
+                    if let Ok(content) =
+                        read_regular_to_string(&common.cwd.join(&script_path)).await
+                    {
+                        files.insert(script_path, content);
+                    }
+                }
+                if let Ok(content) = read_regular_to_string(&common.cwd.join(&path)).await {
+                    files.insert(path, content);
+                }
+            }
+        }
+
+        if common.cwd.join("rush.json").is_file() {
+            let common_lock = socket_patch_core::constants::npm_family::RUSH_COMMON_LOCK_REL;
+            if let Ok(content) = read_regular_to_string(&common.cwd.join(common_lock)).await {
+                files.insert(common_lock.to_string(), content);
+                rush_lock_keys.push(common_lock.to_string());
+            }
+            let subspaces_dir = common.cwd.join("common/config/subspaces");
+            if let Ok(read_dir) = std::fs::read_dir(&subspaces_dir) {
+                // read_dir order is unspecified — sort for deterministic output.
+                let mut subspace_dirs: Vec<std::path::PathBuf> = read_dir
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| e.path())
+                    .collect();
+                subspace_dirs.sort();
+                for dir in subspace_dirs {
+                    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    let key = format!("common/config/subspaces/{name}/pnpm-lock.yaml");
+                    if let Ok(content) = read_regular_to_string(&dir.join("pnpm-lock.yaml")).await
+                    {
+                        files.insert(key.clone(), content);
+                        rush_lock_keys.push(key);
+                    }
                 }
             }
         }
@@ -1356,7 +1488,11 @@ pub(crate) async fn run_redirect_selected(
     // it rides the same atomic-write / ledger-first machinery as the locks.
     let mut python_metadata = std::collections::BTreeMap::new();
     let mut unavailable_python_artifacts = std::collections::BTreeSet::new();
-    for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
+    for dep in candidates
+        .iter()
+        .map(|c| &c.dep)
+        .filter(|dep| dep.ecosystem == "pypi")
+    {
         let Some(sha256) = dep.integrity.sha256.as_deref() else {
             continue;
         };
@@ -1408,7 +1544,10 @@ pub(crate) async fn run_redirect_selected(
             }
         }
     }
-    overrides.retain(|dep| !unavailable_python_artifacts.contains(&dep.artifact_url));
+    candidates.retain(|c| !unavailable_python_artifacts.contains(&c.dep.artifact_url));
+    // The rewriters' override slice — materialized ONCE, after the last
+    // candidate filter, so it can never disagree with `candidates`.
+    let overrides: Vec<DepOverride> = candidates.iter().map(|c| c.dep.clone()).collect();
     // The Pipfile.lock reference shape depends on the installing Pipenv
     // (`path` for 7–11, `file` from 2018 on), so the installed release is
     // probed (`pipenv --version`, up to 10 s) — but only when a pypi patch
@@ -1726,7 +1865,7 @@ pub(crate) async fn run_redirect_selected(
     // `confirmed_pdm_uuids` and never consults this probe, so dropping the file
     // here is always safe; `pdm.lock` only ever carries pypi URLs.
     let pdm_inactive = files.contains_key("pdm.lock")
-        && (files.contains_key("uv.lock") || files.contains_key("poetry.lock"));
+        && !socket_patch_core::patch::redirect::pdm_drives(&files);
     let final_texts: Vec<&String> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
@@ -1741,89 +1880,88 @@ pub(crate) async fn run_redirect_selected(
         .collect();
     let confirmed: Vec<(String, String)> = candidates
         .iter()
-        .filter(
-            |(purl, uuid, artifact_url, index_url, suffixed_version, go_module_path)| {
-                if binary_bun && purl.starts_with("pkg:npm/") {
-                    return rewrite.confirmed_bun_binary_uuids.contains(uuid);
-                }
-                if rewrite.refused_pipenv_uuids.contains(uuid) {
-                    return false;
-                }
-                // pdm is transactional like cargo: a refused uuid is never
-                // confirmed, and when `pdm.lock` is the PyPI install driver
-                // (no `uv.lock` / `poetry.lock`) a pypi dep is confirmed ONLY
-                // by the pdm rewriter's own report — the URL landing in a
-                // sibling `requirements.txt` the project does not install from
-                // pins nothing. When uv/poetry drive, their own lock proof
-                // below still confirms them. This check precedes the hatch
-                // gate: a PDM project may declare `hatchling` as its build
-                // backend, which registers every pypi uuid as hatch-owned while
-                // the lock's presence keeps hatch from confirming any of them.
-                if rewrite.refused_pdm_uuids.contains(uuid) {
-                    return false;
-                }
-                if purl.starts_with("pkg:pypi/")
-                    && files.contains_key("pdm.lock")
-                    && !files.contains_key("uv.lock")
-                    && !files.contains_key("poetry.lock")
-                {
-                    return rewrite.confirmed_pdm_uuids.contains(uuid);
-                }
-                if rewrite.python_lock_uuids.contains(uuid) {
-                    return rewrite.confirmed_python_lock_uuids.contains(uuid)
-                        && !rewrite.refused_python_lock_uuids.contains(uuid);
-                }
-                if rewrite.hatch_uuids.contains(uuid) {
-                    return rewrite.confirmed_hatch_uuids.contains(uuid);
-                }
-                // A Pipfile.lock rewrite confirms its own uuids (the sibling
-                // requirements.txt rewriter may have had nothing to do).
-                if purl.starts_with("pkg:pypi/") {
-                    return rewrite.confirmed_pipenv_uuids.contains(uuid)
-                        || rewrite.confirmed_requirements_uuids.contains(uuid);
-                }
-                if rewrite.refused_pnpm_uuids.contains(uuid) {
-                    return false;
-                }
-                // Cargo is transactional: the rewriter reports exactly which
-                // patch uuids FULLY landed (manifest pin + lock + registry
-                // block). Substring presence must never confirm a cargo dep —
-                // the `[registries.…]` config block contains the index URL while
-                // pinning nothing, so a config-block-only rewrite would be
-                // attested with zero enforcement in any build.
-                if purl.starts_with("pkg:cargo/") {
-                    return rewrite.confirmed_cargo_uuids.contains(uuid);
-                }
-                let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
-                final_texts.iter().any(|text| {
-                    // The rewriters' own predicate — raw, or the `\/`-escaped
-                    // slashes an old composer.lock spells them with — so a
-                    // writer's spelling can never be one this probe misses. It
-                    // was: the composer rewriter emitted `\/`-escaped urls this
-                    // probe never looked for, so a fully successful composer
-                    // redirect reported `redirected: 0`, fetched no patch record
-                    // into the ledger, and left the patch unattestable by `vex`.
-                    socket_patch_core::patch::redirect::artifact_url_present(text, artifact_url)
-                        // The berry rewriter writes the URL percent-encoded into the
-                        // lock's `::__archiveUrl=` binding, so the raw form is absent.
-                        || text.contains(encoded.as_str())
-                        || index_url.as_deref().is_some_and(|iu| text.contains(iu))
-                        // Fail-closed maven pins the globally-unique
-                        // `-socket.<hex8>` suffixed version (never the `.pom` URL),
-                        // so match on that string.
-                        || suffixed_version
-                            .as_deref()
-                            .is_some_and(|sv| text.contains(sv))
-                        // golang pins the content-addressed
-                        // `patch.socket.dev/gopatch/<uuid>` module path into
-                        // go.mod + go.sum (no URL ever lands in either file).
-                        || go_module_path
-                            .as_deref()
-                            .is_some_and(|gm| text.contains(gm))
-                })
-            },
-        )
-        .map(|(purl, uuid, _, _, _, _)| (purl.clone(), uuid.clone()))
+        .filter(|c| {
+            let purl = c.purl.as_str();
+            let uuid = c.dep.patch_uuid.as_str();
+            if binary_bun && purl.starts_with("pkg:npm/") {
+                return rewrite.confirmed_bun_binary_uuids.contains(uuid);
+            }
+            if rewrite.refused_pipenv_uuids.contains(uuid) {
+                return false;
+            }
+            // pdm is transactional like cargo: a refused uuid is never
+            // confirmed, and when `pdm.lock` is the PyPI install driver
+            // (no `uv.lock` / `poetry.lock`) a pypi dep is confirmed ONLY
+            // by the pdm rewriter's own report — the URL landing in a
+            // sibling `requirements.txt` the project does not install from
+            // pins nothing. When uv/poetry drive, their own lock proof
+            // below still confirms them. This check precedes the hatch
+            // gate: a PDM project may declare `hatchling` as its build
+            // backend, which registers every pypi uuid as hatch-owned while
+            // the lock's presence keeps hatch from confirming any of them.
+            if rewrite.refused_pdm_uuids.contains(uuid) {
+                return false;
+            }
+            if purl.starts_with("pkg:pypi/")
+                && socket_patch_core::patch::redirect::pdm_drives(&files)
+            {
+                return rewrite.confirmed_pdm_uuids.contains(uuid);
+            }
+            if rewrite.python_lock_uuids.contains(uuid) {
+                return rewrite.confirmed_python_lock_uuids.contains(uuid)
+                    && !rewrite.refused_python_lock_uuids.contains(uuid);
+            }
+            if rewrite.hatch_uuids.contains(uuid) {
+                return rewrite.confirmed_hatch_uuids.contains(uuid);
+            }
+            // A Pipfile.lock rewrite confirms its own uuids (the sibling
+            // requirements.txt rewriter may have had nothing to do).
+            if purl.starts_with("pkg:pypi/") {
+                return rewrite.confirmed_pipenv_uuids.contains(uuid)
+                    || rewrite.confirmed_requirements_uuids.contains(uuid);
+            }
+            if rewrite.refused_pnpm_uuids.contains(uuid) {
+                return false;
+            }
+            // Cargo is transactional: the rewriter reports exactly which
+            // patch uuids FULLY landed (manifest pin + lock + registry
+            // block). Substring presence must never confirm a cargo dep —
+            // the `[registries.…]` config block contains the index URL while
+            // pinning nothing, so a config-block-only rewrite would be
+            // attested with zero enforcement in any build.
+            if purl.starts_with("pkg:cargo/") {
+                return rewrite.confirmed_cargo_uuids.contains(uuid);
+            }
+            // The override's own targets: artifact URL; per-dependency
+            // registry index URL; fail-closed maven's globally-unique
+            // `-socket.<hex8>` suffixed version (never the `.pom` URL);
+            // golang's content-addressed `patch.socket.dev/gopatch/<uuid>`
+            // module path (go.mod + go.sum never carry a URL).
+            let artifact_url = c.dep.artifact_url.as_str();
+            let registry = c.dep.registry_override.as_ref();
+            let index_url = registry.map(|o| o.index_url.as_str());
+            let suffixed_version =
+                registry.and_then(|o| o.identifiers.maven_suffixed_version.as_deref());
+            let go_module_path = registry.and_then(|o| o.identifiers.go_module_path.as_deref());
+            let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
+            final_texts.iter().any(|text| {
+                // The rewriters' own predicate — raw, or the `\/`-escaped
+                // slashes an old composer.lock spells them with — so a
+                // writer's spelling can never be one this probe misses. It
+                // was: the composer rewriter emitted `\/`-escaped urls this
+                // probe never looked for, so a fully successful composer
+                // redirect reported `redirected: 0`, fetched no patch record
+                // into the ledger, and left the patch unattestable by `vex`.
+                socket_patch_core::patch::redirect::artifact_url_present(text, artifact_url)
+                    // The berry rewriter writes the URL percent-encoded into the
+                    // lock's `::__archiveUrl=` binding, so the raw form is absent.
+                    || text.contains(encoded.as_str())
+                    || index_url.is_some_and(|iu| text.contains(iu))
+                    || suffixed_version.is_some_and(|sv| text.contains(sv))
+                    || go_module_path.is_some_and(|gm| text.contains(gm))
+            })
+        })
+        .map(|c| (c.purl.clone(), c.dep.patch_uuid.clone()))
         .collect();
     // Dry-run mode-takeover previews were withheld from the rewriters (their
     // lock fragments still carry the vendored wiring the wet run reverts
@@ -1864,20 +2002,7 @@ pub(crate) async fn run_redirect_selected(
     )
     .await
     {
-        let message = format!(
-            "{linked} is a symbolic link; socket-patch rewrites files in place with an atomic \
-             rename, which would replace the link — replace the link with a regular file (or \
-             run socket-patch in the directory it points to) and re-run; nothing was written"
-        );
-        eprintln!("Error (redirect_symlinked_file_unsupported): {message}");
-        if common.json {
-            emit_json_error_with_code(
-                scan_result.take(),
-                Some("redirect_symlinked_file_unsupported"),
-                &message,
-            );
-        }
-        return 1;
+        return refuse_symlinked_file(common, scan_result.take(), linked);
     }
 
     if !common.dry_run {
@@ -1919,7 +2044,6 @@ pub(crate) async fn run_redirect_selected(
         // pre-redirect originals never reached any ledger (a healing re-run
         // records no edits for already-redirected entries).
         if !rewrite.edits.is_empty() || !records.is_empty() {
-            let mut ledger = existing_ledger.unwrap_or_else(RedirectState::new);
             // Ledgers written before the mode-string rename carry
             // `"mode": "redirect"`; normalize on rewrite so the on-disk
             // ledger converges on the documented "hosted" name (the
@@ -2081,7 +2205,7 @@ pub(crate) async fn run_redirect_selected(
             common.global_prefix.clone(),
             &confirmed,
             &records,
-            &ledger_records,
+            &ledger.records,
             &gem_artifact_shas,
         )
         .await
@@ -2094,7 +2218,7 @@ pub(crate) async fn run_redirect_selected(
             &confirmed,
             &rewrite.confirmed_pipenv_uuids,
             &records,
-            &ledger_records,
+            &ledger.records,
         )
         .await
     };
@@ -2125,10 +2249,7 @@ pub(crate) async fn run_redirect_selected(
     // path warns once up front in `run` (before this flow is entered).
     let mut prune_warnings: Vec<serde_json::Value> = Vec::new();
     if prune_requested {
-        prune_warnings.push(serde_json::json!({
-            "code": super::REDIRECT_PRUNE_IGNORED,
-            "detail": super::REDIRECT_PRUNE_IGNORED_DETAIL,
-        }));
+        prune_warnings.push(prune_ignored_warning());
     }
 
     // Emit an OpenVEX attestation when `--vex` was requested. The redirected
@@ -2200,17 +2321,8 @@ pub(crate) async fn run_redirect_selected(
         // scan envelopes — same top-level scan keys (scannedPackages,
         // totalPatches, canAccessPaidPatches) plus the `packages` enumeration —
         // instead of the bare `{status, redirect}` it used to emit.
-        let redirect = serde_json::json!({
-            // Final mode naming: `--redirect` IS hosted mode. Additive key so
-            // JSON consumers can dispatch on the mode without inferring it from
-            // which sub-object is present.
-            "mode": "hosted",
-            "redirected": confirmed.len(),
-            "rewrittenFiles": rewritten,
-            "skipped": skipped,
-            "warnings": warnings,
-            "dryRun": common.dry_run,
-        });
+        let redirect =
+            redirect_json_block(confirmed.len(), rewritten, skipped, warnings, common.dry_run);
         let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
         if let Some(statements) = vex_statements {
             result["vex"] = serde_json::json!({
@@ -2338,7 +2450,8 @@ mod tests {
         plan_workspace_trust, pnpm_heal_root, pnpm_lock_carries_hosted_redirect,
         pnpm_lock_version_major, pnpm_trust_configured_detail, pnpm_trust_legacy_detail,
         pnpm_trust_manual_guidance, pnpm_trust_workspace_unreadable_detail,
-        read_workspace_for_trust, TrustPlan, REDIRECT_CANDIDATE_FILES,
+        prune_ignored_warning, read_workspace_for_trust, redirect_json_block, TrustPlan,
+        REDIRECT_CANDIDATE_FILES,
     };
     use socket_patch_core::constants::npm_family;
     use socket_patch_core::patch::redirect::DepOverride;
@@ -2759,14 +2872,16 @@ mod tests {
         // `--json` envelope must carry the SAME top-level scan keys as a
         // zero-discovery / non-hosted scan (the old bare `{status, redirect}`
         // dropped them) AND nest the redirect summary under `redirect`.
-        let redirect = serde_json::json!({
-            "mode": "hosted",
-            "redirected": 1,
-            "rewrittenFiles": ["package-lock.json"],
-            "skipped": [],
-            "warnings": [],
-            "dryRun": false,
-        });
+        // Built through the ONE spelling of the block (the production
+        // site and `run`'s zero-discovery arm use the same helper), so the
+        // key set asserted below is the tested single source.
+        let redirect = redirect_json_block(
+            1,
+            vec!["package-lock.json".to_string()],
+            Vec::new(),
+            vec![prune_ignored_warning()],
+            false,
+        );
         let envelope = build_redirect_json_envelope(Some(classic_scan_result()), redirect);
 
         // Classic scan keys survive — the bug was that they did not.
