@@ -126,6 +126,15 @@ fn classify(version: String, source: String) -> BundlerProbe {
 /// Probe the bundler version that will run this project's installs. See the
 /// module docs for the source order and the fail-open contract.
 pub async fn probe_bundler(project: &BundlerProject) -> BundlerProbe {
+    probe_bundler_with(project, probe_machine_bundler(project)).await
+}
+
+/// Keep the machine fallback lazy and injectable without changing process-wide
+/// PATH. The lockfile always wins, even when the fallback would disagree.
+async fn probe_bundler_with(
+    project: &BundlerProject,
+    machine_version: impl std::future::Future<Output = Option<String>>,
+) -> BundlerProbe {
     let lock_path = lockfile_path(project);
     // Guarded read: a FIFO/device squatting on the lock path must fail fast
     // to the `bundle --version` fallback, not wedge `setup`/`--check`
@@ -140,6 +149,13 @@ pub async fn probe_bundler(project: &BundlerProject) -> BundlerProbe {
             return classify(version, format!("{lock_name} BUNDLED WITH"));
         }
     }
+    match machine_version.await {
+        Some(version) => classify(version, "`bundle --version`".to_string()),
+        None => BundlerProbe::Unknown,
+    }
+}
+
+async fn probe_machine_bundler(project: &BundlerProject) -> Option<String> {
     // No lock (or no BUNDLED WITH): ask the machine's bundler. stdin nulled
     // so the child can never block waiting for input; bounded by
     // [`BUNDLE_VERSION_TIMEOUT`] (with `kill_on_drop` so a timed-out child is
@@ -156,14 +172,10 @@ pub async fn probe_bundler(project: &BundlerProject) -> BundlerProbe {
     .await;
     if let Ok(Ok(out)) = output {
         if out.status.success() {
-            if let Some(version) =
-                parse_bundle_version_output(&String::from_utf8_lossy(&out.stdout))
-            {
-                return classify(version, "`bundle --version`".to_string());
-            }
+            return parse_bundle_version_output(&String::from_utf8_lossy(&out.stdout));
         }
     }
-    BundlerProbe::Unknown
+    None
 }
 
 /// The refusal message for an [`BundlerProbe::Unsupported`] project — shared
@@ -316,10 +328,9 @@ mod tests {
             ("Gemfile.lock", "BUNDLED WITH\n   1.17.3\n"),
         ])
         .await;
-        // Host bundler (if any) is >= 2.x on every dev/CI machine this suite
-        // runs on; the probe must still report the lock's 1.17.3.
+        // The fallback must not even be polled when the lock has a version.
         assert!(matches!(
-            probe_bundler(&project).await,
+            probe_bundler_with(&project, async { panic!("lock must bypass machine probe") }).await,
             BundlerProbe::Unsupported { .. }
         ));
     }
@@ -349,20 +360,24 @@ mod tests {
             ("Gemfile.lock", "GEM\n  specs:\n"),
         ])
         .await;
-        // Bound the wait like the FIFO test: the fallback carries its own
-        // BUNDLE_VERSION_TIMEOUT, so a prompt answer is part of the contract.
-        let deadline = BUNDLE_VERSION_TIMEOUT + Duration::from_secs(20);
-        let probe = tokio::time::timeout(deadline, probe_bundler(&project))
-            .await
-            .expect("probe_bundler must complete within the machine-probe bound");
-        // Only the machine probe can answer here: Supported (dev/CI bundler
-        // is >= 2.x wherever this suite runs) or Unknown (no bundler, or
-        // unparseable output). An Unsupported verdict would mean the
-        // sectionless lock was somehow consulted as a version source.
-        assert!(
-            matches!(probe, BundlerProbe::Supported | BundlerProbe::Unknown),
-            "unexpected probe verdict: {probe:?}"
-        );
+        // Every fallback outcome is valid, including old system Bundler.
+        // Inject it so this exercises the decision instead of the test host.
+        for (version, expected) in [
+            (Some("2.7.2"), BundlerProbe::Supported),
+            (
+                Some("1.17.2"),
+                BundlerProbe::Unsupported {
+                    version: "1.17.2".into(),
+                    source: "`bundle --version`".into(),
+                },
+            ),
+            (None, BundlerProbe::Unknown),
+        ] {
+            assert_eq!(
+                probe_bundler_with(&project, async { version.map(str::to_owned) }).await,
+                expected
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -384,26 +399,21 @@ mod tests {
             .await
             .expect("fixture project must be discoverable");
 
-        // Deadline covers the fallback's own 10s bound on hosts whose
-        // bundler also trips on the FIFO. On timeout the open is wedged in
+        // Inject a prompt machine reply so this tests only the guarded
+        // lockfile read. On timeout the open is wedged in
         // a `spawn_blocking` thread the runtime waits for on shutdown;
         // connect a writer to release it so the test can FAIL instead of
         // hanging the whole suite.
-        let deadline = BUNDLE_VERSION_TIMEOUT + Duration::from_secs(20);
-        let Ok(probe) = tokio::time::timeout(deadline, probe_bundler(&project)).await else {
+        let deadline = Duration::from_secs(5);
+        let probe = probe_bundler_with(&project, async { Some("2.7.2".to_string()) });
+        let Ok(probe) = tokio::time::timeout(deadline, probe).await else {
             let _ = std::fs::OpenOptions::new()
                 .write(true)
                 .open(dir.path().join("Gemfile.lock"));
             panic!("probe_bundler must complete promptly with a FIFO lockfile");
         };
-        // The FIFO has no bytes to parse, so only the machine probe can
-        // answer: Supported (dev/CI bundler is >= 2.x wherever this suite
-        // runs) or Unknown (no bundler). An Unsupported verdict would mean
-        // the FIFO was consulted as a lock.
-        assert!(
-            matches!(probe, BundlerProbe::Supported | BundlerProbe::Unknown),
-            "unexpected probe verdict: {probe:?}"
-        );
+        // The FIFO has no bytes to parse; the supplied machine reply wins.
+        assert_eq!(probe, BundlerProbe::Supported);
     }
 
     #[test]

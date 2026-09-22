@@ -994,7 +994,7 @@ pub(crate) async fn vendor_records(
     // Bun vendored preflight (see `crate::commands::bun_preflight`), run
     // ONCE per run over the in-scope npm records and consulted per
     // candidate in the dispatch loop BEFORE the hosted→vendored takeover.
-    // The bun engine refuses a pre-v2 `workspace:` lock (and a lockb-only /
+    // The bun engine refuses a pre-v2 text `workspace:` lock (and a malformed /
     // unreadable / unsupported-version project) before its own writes —
     // but the takeover below reverts a hosted purl's lockfile edits and
     // persists the redirect-ledger drop FIRST, so without this gate a

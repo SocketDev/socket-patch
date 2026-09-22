@@ -985,8 +985,8 @@ mod tests {
     }
 
     /// A FIFO squatting `bun.lockb` must fail fast (`InvalidInput`), never
-    /// block in open(2): the hosted driver refuses the lockb migration on
-    /// this error BEFORE spawning bun (which would block on the same FIFO).
+    /// block in open(2): binary discovery and patching must reject a
+    /// non-regular lockfile without waiting for another process to write it.
     #[cfg(unix)]
     #[test]
     fn read_regular_to_bytes_sync_rejects_a_fifo_without_blocking() {
