@@ -41,11 +41,14 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde_json::Value;
 
 use crate::utils::purl::{normalize_purl, parse_cargo_purl, strip_purl_qualifiers};
 
+use super::staged::{flush_staged, read_rel, staged_read, Staged, StagedBytes};
 use super::state::RedirectState;
 use super::FileEdit;
 
@@ -55,9 +58,6 @@ pub struct RedirectRevert {
     /// Repo-relative files this revert actually rewrote or removed.
     pub reverted_files: Vec<String>,
 }
-
-/// Pre-rename alias (the struct was cargo-only before the npm-family port).
-pub type CargoRedirectRevert = RedirectRevert;
 
 /// Does [`revert_redirect_purl`] have an implementation for this purl's
 /// ecosystem? Callers (the vendor dispatch loop's cross-mode takeover gate)
@@ -70,8 +70,14 @@ pub fn redirect_revert_supported(purl: &str) -> bool {
 /// drop that purl's record and edits from `state`. The caller persists the
 /// mutated ledger (see `persist_redirect_state`). Dispatches per ecosystem;
 /// purls outside [`redirect_revert_supported`] are refused (fail closed).
+///
 /// `dry_run` resolves every inverse and drift check exactly like a wet run
-/// but writes nothing and leaves `state` untouched.
+/// and skips ONLY the disk flush: the purl's record and edits are still
+/// dropped from `state`, so a composed preview (the whole-ledger replay run
+/// after the per-purl reverts inside one rollback) sees the post-claim
+/// ledger. Callers pass a throwaway clone and never persist it on a dry run
+/// (rollback.rs / vendor.rs do). Contrast `revert_remaining_redirect_edits`,
+/// whose dry run leaves its `state` untouched.
 pub async fn revert_redirect_purl(
     project_root: &Path,
     state: &mut RedirectState,
@@ -89,64 +95,39 @@ pub async fn revert_redirect_purl(
     }
 }
 
-/// Read a project file, distinguishing missing (`Ok(None)`) from unreadable.
-async fn read_rel(project_root: &Path, rel: &str) -> Result<Option<String>, String> {
-    match tokio::fs::read_to_string(project_root.join(rel)).await {
-        Ok(c) => Ok(Some(c)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("read {rel}: {e}")),
-    }
+/// The ledger record whose canonical purl (qualifiers stripped,
+/// percent-decoded) matches `purl`: `(record key as stored, canonical purl)`.
+/// Refused when the ledger records no hosted redirect for the purl.
+fn find_record_key(state: &RedirectState, purl: &str) -> Result<(String, String), String> {
+    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
+    let target = canon(purl);
+    let Some(record_key) = state.records.keys().find(|k| canon(k) == target).cloned() else {
+        return Err(format!(
+            "the redirect ledger records no hosted redirect for {purl}"
+        ));
+    };
+    Ok((record_key, target))
 }
 
-async fn write_rel(project_root: &Path, rel: &str, content: &str) -> Result<(), String> {
-    tokio::fs::write(project_root.join(rel), content)
-        .await
-        .map_err(|e| format!("write {rel}: {e}"))
+/// Drop the claimed edits (by ledger index) and the purl's record from the
+/// ledger — only after every inverse applied cleanly. The caller persists.
+fn drop_claimed(state: &mut RedirectState, claimed: Vec<usize>, record_key: &str) {
+    let drop: HashSet<usize> = claimed.into_iter().collect();
+    let mut idx = 0usize;
+    state.edits.retain(|_| {
+        let keep = !drop.contains(&idx);
+        idx += 1;
+        keep
+    });
+    state.records.remove(record_key);
 }
 
-/// Files the unwind has decided but not yet written: `Some(content)` to
-/// write, `None` to remove.
-type Staged = BTreeMap<String, Option<String>>;
-
-/// Read a project file through the staged writes, so each unwind step sees
-/// what the earlier steps decided. Both the re-redirect chain (a step's
-/// `original` is the previous step's `new`) and the registry block's
-/// still-referenced probe depend on that view, and neither may depend on the
-/// bytes having landed.
-async fn staged_read(
-    staged: &Staged,
-    project_root: &Path,
-    rel: &str,
-) -> Result<Option<String>, String> {
-    match staged.get(rel) {
-        Some(pending) => Ok(pending.clone()),
-        None => read_rel(project_root, rel).await,
-    }
-}
-
-/// Write the staged files. Only reached once every inverse resolved, so a
-/// drift refusal never gets here; an I/O fault partway through is the one
-/// remaining way to stop mid-set, and it surfaces as `Err` with the write
-/// already reported by path.
-async fn flush_staged(project_root: &Path, staged: &Staged) -> Result<(), String> {
-    for (rel, pending) in staged {
-        let Some(content) = pending else {
-            let path = project_root.join(rel);
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("remove {rel}: {e}")),
-            }
-            // Best-effort: prune a now-empty `.cargo/` dir.
-            if let Some(parent) = path.parent() {
-                let _ = tokio::fs::remove_dir(parent).await;
-            }
-            continue;
-        };
-        write_rel(project_root, rel, content).await?;
-    }
-    Ok(())
-}
+/// `socket-patch-<uuid>` registry names as they appear in Cargo.toml pins,
+/// Cargo.lock sources and `[registries.…]` headers.
+static SOCKET_REGISTRY_UUID: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"socket-patch-([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})")
+        .expect("static registry-uuid regex is valid")
+});
 
 /// Revert every hosted-redirect edit the ledger records for `purl` (a cargo
 /// package), then drop that purl's record and edits from `state`. The caller
@@ -157,21 +138,15 @@ async fn flush_staged(project_root: &Path, staged: &Staged) -> Result<(), String
 /// `original`, and an intermediate edit whose `original` is already live is a
 /// no-op. `[registries.socket-patch-…]` blocks tied to this purl's uuids are
 /// removed only when nothing in Cargo.toml / Cargo.lock still references them.
-/// `dry_run` resolves every inverse and drift check exactly like a wet run
-/// but writes nothing and leaves `state` untouched.
+/// `dry_run` skips only the disk flush; the in-memory ledger claim still
+/// happens (see [`revert_redirect_purl`]).
 pub async fn revert_cargo_redirect_purl(
     project_root: &Path,
     state: &mut RedirectState,
     purl: &str,
     dry_run: bool,
 ) -> Result<RedirectRevert, String> {
-    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-    let target = canon(purl);
-    let Some(record_key) = state.records.keys().find(|k| canon(k) == target).cloned() else {
-        return Err(format!(
-            "the redirect ledger records no hosted redirect for {purl}"
-        ));
-    };
+    let (record_key, target) = find_record_key(state, purl)?;
     let Some((name, version)) = parse_cargo_purl(&target) else {
         return Err(format!("not a cargo purl: {purl}"));
     };
@@ -188,13 +163,10 @@ pub async fn revert_cargo_redirect_purl(
     // claim another package's block).
     let mut uuids: HashSet<String> = HashSet::new();
     uuids.insert(state.records[&record_key].uuid.clone());
-    let uuid_re =
-        regex::Regex::new(r"socket-patch-([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})")
-            .expect("static regex");
     for e in state.edits.iter().filter(|e| is_wiring_edit(e)) {
         for v in [&e.original, &e.new] {
             if let Some(s) = v.as_ref().and_then(Value::as_str) {
-                for c in uuid_re.captures_iter(s) {
+                for c in SOCKET_REGISTRY_UUID.captures_iter(s) {
                     uuids.insert(c[1].to_string());
                 }
             }
@@ -223,7 +195,7 @@ pub async fn revert_cargo_redirect_purl(
     // previous step's `new`), and the registry-block removals — recorded
     // before their wiring edits — run last, after the references are gone.
     for &i in mine.iter().rev() {
-        let edit = state.edits[i].clone();
+        let edit = &state.edits[i];
         match edit.kind.as_str() {
             "redirect_cargo_toml_dep" | "redirect_cargo_lock_entry" => {
                 let (Some(new), Some(orig)) = (
@@ -328,19 +300,10 @@ pub async fn revert_cargo_redirect_purl(
     // wet run would hand them. The caller owns the state clone and never
     // persists it on a dry run, so nothing durable changes.
     if !dry_run {
-        flush_staged(project_root, &staged).await?;
+        flush_staged(project_root, &staged, &StagedBytes::new()).await?;
     }
 
-    // Only after every inverse applied cleanly: drop this purl's edits and
-    // record from the ledger (the caller persists it).
-    let drop: HashSet<usize> = mine.into_iter().collect();
-    let mut idx = 0usize;
-    state.edits.retain(|_| {
-        let keep = !drop.contains(&idx);
-        idx += 1;
-        keep
-    });
-    state.records.remove(&record_key);
+    drop_claimed(state, mine, &record_key);
     Ok(out)
 }
 
@@ -483,22 +446,16 @@ pub(super) fn hosted_url_names(url: &str, name: &str, version: &str) -> bool {
 /// Same fail-closed contract as [`revert_cargo_redirect_purl`]: every inverse
 /// is resolved against a staged view and NOTHING reaches disk until all of
 /// them have resolved, so a drift refusal leaves the project byte-identical
-/// across ALL the files the ledger claims. `dry_run` resolves every inverse
-/// and drift check exactly like a wet run but writes nothing and leaves
-/// `state` untouched.
+/// across ALL the files the ledger claims. `dry_run` skips only the disk
+/// flush; the in-memory ledger claim still happens (see
+/// [`revert_redirect_purl`]).
 pub async fn revert_npm_redirect_purl(
     project_root: &Path,
     state: &mut RedirectState,
     purl: &str,
     dry_run: bool,
 ) -> Result<RedirectRevert, String> {
-    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-    let target = canon(purl);
-    let Some(record_key) = state.records.keys().find(|k| canon(k) == target).cloned() else {
-        return Err(format!(
-            "the redirect ledger records no hosted redirect for {purl}"
-        ));
-    };
+    let (record_key, target) = find_record_key(state, purl)?;
     let Some((name, version)) = parse_npm_purl(&target) else {
         return Err(format!("not an npm purl: {purl}"));
     };
@@ -506,16 +463,21 @@ pub async fn revert_npm_redirect_purl(
     let lock_key = format!("{name}@{version}");
 
     // The package-lock/shrinkwrap files any `redirect_npm_lock_entry` edits
-    // touch, parsed once from disk: an ALIAS install (`npm i alias@npm:name`)
-    // keys its entry by the alias, so ownership is resolved through the
-    // entry's `name` field — exactly how the rewriter matched it (the rewrite
-    // never touches name/version, so the probe is symmetric).
+    // touch, read ONCE from disk: the raw text is kept (`disk_texts`) so the
+    // replay below never re-reads a lock this attribution pass already
+    // loaded, and the parse is used for ownership — an ALIAS install (`npm i
+    // alias@npm:name`) keys its entry by the alias, so ownership is resolved
+    // through the entry's `name` field, exactly how the rewriter matched it
+    // (the rewrite never touches name/version, so the probe is symmetric).
+    let mut disk_texts: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut disk_locks: BTreeMap<String, Option<Value>> = BTreeMap::new();
     for e in &state.edits {
-        if e.kind == "redirect_npm_lock_entry" && !disk_locks.contains_key(&e.path) {
-            let parsed = read_rel(project_root, &e.path)
-                .await?
-                .and_then(|c| serde_json::from_str::<Value>(&c).ok());
+        if e.kind == "redirect_npm_lock_entry" && !disk_texts.contains_key(&e.path) {
+            let text = read_rel(project_root, &e.path).await?;
+            let parsed = text
+                .as_deref()
+                .and_then(|c| serde_json::from_str::<Value>(c).ok());
+            disk_texts.insert(e.path.clone(), text);
             disk_locks.insert(e.path.clone(), parsed);
         }
     }
@@ -633,30 +595,35 @@ pub async fn revert_npm_redirect_purl(
 
     let mut out = RedirectRevert::default();
     let mut staged: Staged = Staged::new();
-    let mut binary: Option<Vec<u8>> = None;
+    let mut staged_bytes: StagedBytes = StagedBytes::new();
     // Newest-first: the hosted flow appends edits, so reverse index order
     // unwinds re-redirect chains correctly (each step's `original` is the
     // previous step's `new`).
     for &i in mine.iter().rev() {
-        let edit = state.edits[i].clone();
+        let edit = &state.edits[i];
         if edit.kind == super::bun_binary::KIND {
             if edit.path != "bun.lockb" {
                 return Err("unexpected binary lock edit path".into());
             }
-            let metadata = tokio::fs::symlink_metadata(project_root.join("bun.lockb"))
-                .await
-                .map_err(|e| format!("cannot inspect bun.lockb: {e}"))?;
-            if !metadata.is_file() {
-                return Err("bun.lockb is not a regular file".into());
-            }
-            let content = match binary.take() {
-                Some(v) => v,
+            let path = project_root.join("bun.lockb");
+            let content = match staged_bytes.remove(&edit.path) {
+                Some(pending) => pending,
                 None => {
-                    crate::utils::fs::read_regular_to_bytes_sync(&project_root.join("bun.lockb"))
+                    let metadata = tokio::fs::symlink_metadata(&path)
+                        .await
+                        .map_err(|e| format!("cannot inspect bun.lockb: {e}"))?;
+                    if !metadata.is_file() {
+                        return Err("bun.lockb is not a regular file".into());
+                    }
+                    crate::utils::fs::read_regular_to_bytes(&path)
+                        .await
                         .map_err(|e| format!("cannot read bun.lockb: {e}"))?
                 }
             };
-            binary = Some(super::bun_binary::restore(&content, &edit)?);
+            staged_bytes.insert(
+                edit.path.clone(),
+                super::bun_binary::restore(&content, edit)?,
+            );
             if !out.reverted_files.iter().any(|p| p == "bun.lockb") {
                 out.reverted_files.push("bun.lockb".into());
             }
@@ -719,8 +686,16 @@ pub async fn revert_npm_redirect_purl(
                 }
             }
         } else {
-            revert_npm_json_edit(project_root, &mut staged, &edit, &name, &version, &mut out)
-                .await?;
+            revert_npm_json_edit(
+                project_root,
+                &mut staged,
+                &disk_texts,
+                edit,
+                &name,
+                &version,
+                &mut out,
+            )
+            .await?;
         }
     }
 
@@ -732,27 +707,10 @@ pub async fn revert_npm_redirect_purl(
     // wet run would hand them. The caller owns the state clone and never
     // persists it on a dry run, so nothing durable changes.
     if !dry_run {
-        flush_staged(project_root, &staged).await?;
-        if let Some(bytes) = &binary {
-            crate::utils::fs::atomic_write_bytes_preserving_mode(
-                &project_root.join("bun.lockb"),
-                bytes,
-            )
-            .await
-            .map_err(|e| format!("cannot write bun.lockb: {e}"))?;
-        }
+        flush_staged(project_root, &staged, &staged_bytes).await?;
     }
 
-    // Only after every inverse applied cleanly: drop this purl's edits and
-    // record from the ledger (the caller persists it).
-    let drop: HashSet<usize> = mine.into_iter().collect();
-    let mut idx = 0usize;
-    state.edits.retain(|_| {
-        let keep = !drop.contains(&idx);
-        idx += 1;
-        keep
-    });
-    state.records.remove(&record_key);
+    drop_claimed(state, mine, &record_key);
     Ok(out)
 }
 
@@ -833,16 +791,24 @@ fn edit_references_package(edit: &FileEdit, name: &str, version: &str) -> bool {
 }
 
 /// Replay one recorded package-lock JSON edit (`redirect_npm_lock_entry` /
-/// `redirect_npm_lock_dep`) through the staged view.
+/// `redirect_npm_lock_dep`) through the staged view. `disk_texts` is the
+/// attribution pass's read of the lock (`None` = missing on disk), consulted
+/// before touching the disk again; `staged` still wins over both.
 async fn revert_npm_json_edit(
     project_root: &Path,
     staged: &mut Staged,
+    disk_texts: &BTreeMap<String, Option<String>>,
     edit: &FileEdit,
     name: &str,
     version: &str,
     out: &mut RedirectRevert,
 ) -> Result<(), String> {
-    let Some(content) = staged_read(staged, project_root, &edit.path).await? else {
+    let content = match (staged.get(&edit.path), disk_texts.get(&edit.path)) {
+        (Some(pending), _) => pending.clone(),
+        (None, Some(on_disk)) => on_disk.clone(),
+        (None, None) => read_rel(project_root, &edit.path).await?,
+    };
+    let Some(content) = content else {
         return Err(format!(
             "{} no longer exists; cannot revert the recorded hosted redirect \
              for {name}@{version}",
@@ -1375,6 +1341,95 @@ mod tests {
          \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a\"\n  \
          integrity sha512-original==\n"
             .to_string()
+    }
+
+    // ---------- shared staging guards (twins of the replay's) ----------
+
+    /// A FIFO planted at a lockfile the ledger claims refuses fast (`read
+    /// <rel>: … not a regular file`) instead of wedging the takeover in a
+    /// blocking open; the ledger is untouched for a retry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn npm_fifo_squatting_the_lock_refuses_instead_of_wedging() {
+        use std::os::unix::ffi::OsStrExt;
+        let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &classic_pristine()).await;
+        let root = tmp.path();
+        let path = root.join("yarn.lock");
+        tokio::fs::remove_file(&path).await.unwrap();
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o644) }, 0);
+        let edits_before = state.edits.len();
+        let err = revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect_err("a FIFO must refuse");
+        assert!(
+            err.starts_with("read yarn.lock:") && err.contains("not a regular file"),
+            "{err}"
+        );
+        assert_eq!(state.edits.len(), edits_before, "ledger untouched");
+        assert!(state.records.contains_key(NPM_PURL), "record kept");
+    }
+
+    /// A symlinked lockfile reads fine (the opener follows it) but refuses
+    /// at flush: a rename-over would replace the link with a detached
+    /// regular file. Nothing is written and the ledger is untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn npm_symlinked_lock_reads_fine_but_refuses_at_flush() {
+        let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &classic_pristine()).await;
+        let root = tmp.path();
+        let redirected = tokio::fs::read_to_string(root.join("yarn.lock"))
+            .await
+            .unwrap();
+        tokio::fs::rename(root.join("yarn.lock"), root.join("real.lock"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(root.join("real.lock"), root.join("yarn.lock")).unwrap();
+        let edits_before = state.edits.len();
+        let err = revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect_err("a symlinked lock must refuse");
+        assert_eq!(err, "yarn.lock is not a regular file");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("real.lock"))
+                .await
+                .unwrap(),
+            redirected,
+            "the symlink target must stay byte-identical"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("yarn.lock"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link itself must survive"
+        );
+        assert_eq!(state.edits.len(), edits_before, "ledger untouched");
+        assert!(state.records.contains_key(NPM_PURL), "record kept");
+    }
+
+    /// The text flush is the mode-preserving atomic writer: a `0600` lock
+    /// keeps its bits through the takeover revert.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn npm_text_lock_revert_keeps_the_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &classic_pristine()).await;
+        let root = tmp.path();
+        let path = root.join("yarn.lock");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("revert succeeds");
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            classic_pristine()
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the lockfile's mode must survive the atomic rewrite"
+        );
     }
 
     fn berry_pristine() -> String {
