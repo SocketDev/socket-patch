@@ -254,6 +254,15 @@ Mode support varies by ecosystem — e.g. Go can't do hosted, Rush monorepos can
 vendored. See the full **[mode × ecosystem matrix](docs/ecosystems.md#mode--ecosystem-matrix)**
 for details and per-ecosystem caveats.
 
+### Bun compatibility
+
+Both text `bun.lock` and binary `bun.lockb` support hosted and vendored
+patches, mode switching, repair, and rollback. Binary locks are read and
+patched natively: Socket Patch does not need Bun installed to discover or
+rewrite them, and does not convert them to text. If both filenames exist,
+`bun.lock` takes precedence. See [Bun compatibility](docs/testing/bun-compatibility.md)
+for the tested versions, workspace behavior, and installer integrity limits.
+
 ### Pipenv compatibility
 
 Hosted mode rewrites every `Pipfile.lock` category that pins the patched

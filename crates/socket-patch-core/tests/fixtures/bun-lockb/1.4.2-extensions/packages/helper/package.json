@@ -1,0 +1,10 @@
+{
+  "name": "helper",
+  "version": "1.0.0",
+  "dependencies": {
+    "left-pad": "catalog:"
+  },
+  "scripts": {
+    "postinstall": "echo helper-postinstall"
+  }
+}

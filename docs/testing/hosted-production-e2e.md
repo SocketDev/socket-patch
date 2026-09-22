@@ -234,8 +234,8 @@ reason the older live-API suites were pulled from the PR matrix.
 
 The job installs `bun@1` through npm, so its bun leg (`bun_hosted_install_proof`)
 runs against whatever 1.x release that resolves to (a lockfileVersion-2 lock
-today). Lock-era coverage — version-0 and version-1 locks, the `bun.lockb`
-migration, the 1.3.10 digest boundary — lives in `ci.yml`'s hermetic
+today). Lock-era coverage — version-0 and version-1 locks, native `bun.lockb`
+rewrites, the 1.3.10 digest boundary — lives in `ci.yml`'s hermetic
 `e2e_redirect_bun_build` legs and in `bun-compatibility.yml`; see
 [Bun compatibility](bun-compatibility.md).
 

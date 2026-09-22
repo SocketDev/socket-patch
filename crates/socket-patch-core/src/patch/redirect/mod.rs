@@ -23,6 +23,8 @@ use serde_json::{json, Value};
 use crate::crawlers::composer_crawler::normalize_version;
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
+mod bun_binary;
+pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
 pub mod golang_local;
 mod pdm;
 mod pipenv;
@@ -163,6 +165,9 @@ pub struct RewriteWarning {
 pub struct RewriteResult {
     /// Rewritten file contents keyed by repo-relative path — only CHANGED files.
     pub files: BTreeMap<String, String>,
+    /// Binary lockfiles rewritten natively, without text conversion.
+    pub binary_files: BTreeMap<String, Vec<u8>>,
+    pub confirmed_bun_binary_uuids: std::collections::BTreeSet<String>,
     pub edits: Vec<FileEdit>,
     pub warnings: Vec<RewriteWarning>,
     /// Patch uuids whose cargo redirect FULLY landed — the Cargo.toml pin plus
@@ -2374,9 +2379,9 @@ fn rewrite_yarn_berry(
 // A registry 4-tuple `["name@version", "<registry>", {deps}, "sha512-…"]` is
 // rewritten to a URL 3-tuple `["name@<artifactUrl>", {deps verbatim},
 // "<sha512>"]`: bun then fetches `<artifactUrl>` directly and verifies the SRI.
-// Binary `bun.lockb` is NEVER parsed — its presence (without a text `bun.lock`)
-// is a documented refusal. Uses the shared `bun_lock_text` grammar (fail-CLOSED
-// on any deviation). Byte-for-byte twin of the TS `rewriteBun`.
+// Binary locks use `rewrite_bun_binary`, which accepts bytes directly.
+// The text path uses the shared `bun_lock_text` grammar (fail-closed on
+// deviations). Byte-for-byte twin of the TS `rewriteBun`.
 /// Check a text Bun lock before reverting any existing vendored wiring.
 /// Uses the rewriter's own version, grammar and workspace compatibility rules.
 pub fn preflight_bun_hosted(content: &str) -> Result<(), RewriteWarning> {
@@ -2457,13 +2462,11 @@ fn rewrite_bun_lock(
     if npm.is_empty() {
         return;
     }
-    // Binary lockfile without a text one: presence-only refusal. NEVER parse
-    // `.lockb` content. The CLI auto-migrates it to text before rewriting.
+    // This API carries UTF-8 text. Binary callers must use the byte API.
     if files.contains_key("bun.lockb") && !files.contains_key("bun.lock") {
         result.warnings.push(RewriteWarning {
-            code: "redirect_bun_lockb_unsupported".into(),
-            detail: "bun.lockb is a binary lockfile; re-lock with a text lockfile \
-                     (`bun install --save-text-lockfile`) so the redirect can pin the hosted patch"
+            code: "redirect_bun_lockb_bytes_required".into(),
+            detail: "bun.lockb requires the native byte API: pass its original bytes to rewrite_bun_binary"
                 .into(),
         });
         return;
@@ -6631,7 +6634,7 @@ mod tests {
         let mut r = RewriteResult::default();
         rewrite_bun_lock(&files, std::slice::from_ref(&ovr), &mut r);
         assert!(r.files.is_empty());
-        assert_eq!(r.warnings[0].code, "redirect_bun_lockb_unsupported");
+        assert_eq!(r.warnings[0].code, "redirect_bun_lockb_bytes_required");
 
         // Both present → text lock wins, no lockb warning.
         let mut files = BTreeMap::new();
@@ -6649,7 +6652,7 @@ mod tests {
         assert!(!r
             .warnings
             .iter()
-            .any(|w| w.code == "redirect_bun_lockb_unsupported"));
+            .any(|w| w.code == "redirect_bun_lockb_bytes_required"));
 
         // lockfileVersion 2 (bun >= 1.4): SAME emitted grammar as 1 — the
         // bump gates stricter parse checks, not new entry shapes — so the

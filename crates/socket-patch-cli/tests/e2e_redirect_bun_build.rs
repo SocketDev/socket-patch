@@ -73,14 +73,12 @@
 //! lock. (The former forced-v2 leg proved nothing distinct: on ≥ 1.4 it
 //! was the native lock, below 1.4 unreadable.)
 //!
-//! `bun.lockb` (bun's legacy binary lockfile) auto-migration is NOT exercised
-//! here: every bun ≥ 1.2 writes the text `bun.lock` by default and offers no
-//! flag to emit the binary form, so a real lockb fixture cannot be generated
-//! on the toolchains this suite is wired to. That branch is covered by the
-//! in-process shim tests `scan_redirect_migrates_bun_lockb_then_redirects`
-//! and siblings in `tests/in_process_redirect.rs`, and against real bun
-//! 1.1.45 (lockb by default, migration-capable) by the bun-compatibility
-//! native matrix (`scripts/backtest-bun.py`).
+//! Native binary `bun.lockb` coverage lives in `tests/e2e_bun_lockb.rs`
+//! and its writer/reader matrix, `scripts/backtest-bun-lockb.py`. Modern
+//! binary fixtures use `install.saveTextLockfile = false` in bunfig.toml;
+//! the CLI patches them directly without converting to text. The public
+//! patch-service matrix (`scripts/backtest-bun.py`) also exercises binary
+//! inputs from historical writers.
 //!
 //! Gates: without `SOCKET_PATCH_BUN_E2E_REQUIRED` (set AND non-empty — CI
 //! passes an empty string for non-bun legs) a missing `bun`, a failed

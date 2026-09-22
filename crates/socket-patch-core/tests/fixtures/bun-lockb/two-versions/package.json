@@ -1,0 +1,1 @@
+{"name": "two-version-binary-fixture", "version": "1.0.0", "dependencies": {"minimist": "1.2.2", "newer": "npm:minimist@1.2.8", "is-number": "7.0.0"}}

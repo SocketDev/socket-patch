@@ -1,0 +1,9 @@
+{
+  "name": "binary-lock-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "minimist": "1.2.2",
+    "is-number": "7.0.0"
+  }
+}

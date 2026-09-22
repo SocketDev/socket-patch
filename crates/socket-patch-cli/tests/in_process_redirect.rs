@@ -1101,252 +1101,36 @@ async fn scan_redirect_heals_digestless_bun_tuple_and_rollback_restores_the_regi
     }
 }
 
-/// The bun.lockb auto-migration leg: a fake `bun` shim prepended to PATH writes
-/// a canned text bun.lock and deletes bun.lockb (the bun ≥ 1.2 shape),
-/// exercising the migration branch of `run_redirect` without a real bun. The
-/// migration removal is recorded in the ledger WITH the pre-migration bytes
-/// (standard base64 in `original`), and the freshly-written bun.lock is then
-/// redirected.
-///
-/// unix-only: this shim is a `#!/bin/sh` script; the `bun.cmd` twins further
-/// down (`#[cfg(windows)]`) cover the same arms through the PATHEXT-aware
-/// resolver. Real-bun coverage of the migration lives in the
-/// bun-compatibility matrix (`.github/workflows/bun-compatibility.yml`, the
-/// bun 1.1.45 hosted cells and the legacy-lockb shape) — NOT in
-/// e2e_redirect_bun_build, whose fixture is a text lock from the start.
-#[cfg(unix)]
-#[tokio::test]
-#[serial]
-async fn scan_redirect_migrates_bun_lockb_then_redirects() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
+// Native binary lockfiles are parsed and patched without invoking Bun.
+const INVALID_LOCKB_BYTES: &[u8] = b"\x00BUN-BINARY\xff\xfe\x00LOCK";
 
-    let tmp = tempfile::tempdir().unwrap();
-    // Project locked to a BINARY bun.lockb (placeholder bytes — never parsed).
-    std::fs::write(
-        tmp.path().join("package.json"),
-        format!(
-            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "^{VERSION}" }} }}"#
-        ),
-    )
-    .unwrap();
-    let pkg = tmp.path().join("node_modules").join(NAME);
-    std::fs::create_dir_all(&pkg).unwrap();
-    std::fs::write(
-        pkg.join("package.json"),
-        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
-    )
-    .unwrap();
-    std::fs::write(tmp.path().join("bun.lockb"), b"BUN-BINARY-PLACEHOLDER").unwrap();
-
-    // A fake `bun` on PATH: `bun install …` writes bun.lock and deletes lockb.
-    let bin_dir = tmp.path().join("fakebin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim = bin_dir.join("bun");
-    let bun_lock_body = format!(
-        "{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n    \
-         \"{NAME}\": [\"{NAME}@{VERSION}\", \"\", {{}}, \"sha512-UPSTREAMupstream==\"],\n  \
-         }}\n}}\n"
-    );
-    std::fs::write(
-        &shim,
-        format!(
-            "#!/bin/sh\n\
-             # emulate `bun install --save-text-lockfile`: write bun.lock, drop bun.lockb\n\
-             cat > bun.lock <<'LOCK'\n{bun_lock_body}LOCK\n\
-             rm -f bun.lockb\n\
-             exit 0\n"
-        ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let orig_path = std::env::var("PATH").unwrap_or_default();
-    // SAFETY: single-threaded #[serial] test; PATH restored below.
-    unsafe {
-        std::env::set_var("PATH", format!("{}:{orig_path}", bin_dir.display()));
-    }
-
-    let code = run(redirect_args(tmp.path(), server.uri())).await;
-
-    unsafe {
-        std::env::set_var("PATH", orig_path);
-    }
-    assert_eq!(code, 0, "scan --redirect (lockb migration) should succeed");
-
-    assert!(
-        !tmp.path().join("bun.lockb").exists(),
-        "the shim must have deleted bun.lockb"
-    );
-    let lock = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
-    assert!(
-        lock.contains(HOSTED_URL) && lock.contains(PATCHED_SHA512),
-        "the migrated bun.lock must be redirected; got:\n{lock}"
-    );
-    // The migration removal is recorded (action "removed") for revert, and
-    // carries the pre-migration bytes so `rollback` can put the binary lock
-    // back — standard base64 of the placeholder.
-    let ledger = read_ledger(tmp.path());
-    let migration = &ledger["edits"][0];
-    assert_eq!(migration["path"], "bun.lockb", "{ledger:#}");
-    assert_eq!(
-        migration["kind"], "redirect_bun_lockb_migrated",
-        "{ledger:#}"
-    );
-    assert_eq!(migration["action"], "removed", "{ledger:#}");
-    assert_eq!(
-        migration["original"],
-        serde_json::Value::String(standard_base64(b"BUN-BINARY-PLACEHOLDER")),
-        "the ledger must carry the pre-migration bytes: {ledger:#}"
-    );
-    assert_eq!(
-        ledger["edits"][1]["kind"], "redirect_bun_lock_package",
-        "{ledger:#}"
-    );
-}
-
-// ───────────── bun.lockb migration truthfulness (shim-driven, subprocess) ─────────────
-//
-// Real Bun behaviour the shims below emulate (measured against 1.1.38 … 1.4.2):
-//   • ≤ 1.1.38 fail on the flags (non-zero) — `redirect_bun_lockb_unsupported`;
-//   • 1.1.39 accepts them, exits 0 and writes NO bun.lock —
-//     `redirect_bun_lockb_manual_migration`;
-//   • 1.1.43–1.1.45 write bun.lock and KEEP bun.lockb — the CLI removes it so
-//     the ledger's `removed` is true;
-//   • ≥ 1.2 write bun.lock and delete bun.lockb.
-// Every run goes through the built binary (child-only PATH) so the `--json`
-// envelope and the `rollback` warnings can be read back without touching the
-// parent's environment.
-
-/// Placeholder binary lock: deliberately NOT valid UTF-8 (a real bun.lockb is
-/// binary) so the base64 round-trip is exercised on bytes a JSON string could
-/// never carry raw.
-const LOCKB_BYTES: &[u8] = b"\x00BUN-BINARY\xff\xfe\x00LOCK";
-
-fn standard_base64(bytes: &[u8]) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-/// The bun text lock the shims "write": the registry 4-tuple for NAME@VERSION
-/// in bun's emitted single-line grammar (lockfileVersion 1).
-fn canned_bun_lock() -> String {
-    format!(
-        "{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n    \
-         \"{NAME}\": [\"{NAME}@{VERSION}\", \"\", {{}}, \"sha512-UPSTREAMupstream==\"],\n  \
-         }}\n}}\n"
-    )
-}
-
-/// package.json + installed copy + the placeholder bun.lockb (never parsed).
-fn write_bun_lockb_project(root: &Path, lockb: &[u8]) {
-    std::fs::write(
-        root.join("package.json"),
-        format!(
-            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "^{VERSION}" }} }}"#
-        ),
-    )
-    .unwrap();
-    let pkg = root.join("node_modules").join(NAME);
-    std::fs::create_dir_all(&pkg).unwrap();
-    std::fs::write(
-        pkg.join("package.json"),
-        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
-    )
-    .unwrap();
-    std::fs::write(root.join("bun.lockb"), lockb).unwrap();
-}
-
-/// A fake `bun` (`#!/bin/sh` script) in `<root>/fakebin`; returns that dir.
-#[cfg(unix)]
-fn install_bun_shim(root: &Path, body: &str) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-    let bin_dir = root.join("fakebin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim = bin_dir.join("bun");
-    std::fs::write(&shim, body).unwrap();
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    bin_dir
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn symlinked_bun_lockb_refuses_before_migration_including_dry_run() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-    for dry_run in [false, true] {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        write_bun_lockb_project(root, LOCKB_BYTES);
-        std::fs::rename(root.join("bun.lockb"), root.join("shared.lockb")).unwrap();
-        std::os::unix::fs::symlink("shared.lockb", root.join("bun.lockb")).unwrap();
-        let bin = install_bun_shim(
-            root,
-            &format!(
-                "#!/bin/sh\ntouch bun-was-spawned\ncat > bun.lock <<'LOCK'\n{}LOCK\n",
-                canned_bun_lock(),
-            ),
-        );
-        let mut cmd = scrubbed_cli();
-        cmd.args([
-            "scan",
-            "--mode",
-            "hosted",
+/// `rollback --json --yes --offline` as a subprocess; returns (exit code,
+/// parsed envelope).
+fn rollback_json(cwd: &Path) -> (Option<i32>, serde_json::Value) {
+    let out = scrubbed_cli()
+        .args([
+            "rollback",
             "--json",
             "--yes",
+            "--offline",
             "--cwd",
-            root.to_str().unwrap(),
-            "--api-url",
-            &server.uri(),
-            "--org",
-            ORG,
-            "--api-token",
-            "fake",
+            cwd.to_str().unwrap(),
         ])
-        .env("PATH", path_with_first(&bin));
-        if dry_run {
-            cmd.arg("--dry-run");
-        }
-        let output = cmd.output().unwrap();
-        let env: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(output.status.code(), Some(1), "{env:#}");
-        assert_eq!(
-            env["errorCode"], "redirect_symlinked_file_unsupported",
-            "{env:#}"
-        );
-        assert_eq!(
-            std::fs::read_link(root.join("bun.lockb")).unwrap(),
-            std::path::Path::new("shared.lockb")
-        );
-        assert_eq!(
-            std::fs::read(root.join("shared.lockb")).unwrap(),
-            LOCKB_BYTES
-        );
-        assert!(!root.join("bun-was-spawned").exists());
-        assert!(!root.join("bun.lock").exists());
-        assert!(!root.join(".socket/vendor/redirect-state.json").exists());
-    }
+        .output()
+        .expect("run socket-patch rollback");
+    let env_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "rollback --json stdout must be JSON: {e}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code(), env_json)
 }
 
-/// A fake `bun.cmd` batch shim in `<root>/fakebin` (the npm-global `bun`
-/// layout: no bun.exe anywhere on PATH); returns that dir. `body` is joined
-/// with CRLF as cmd.exe expects.
-#[cfg(windows)]
-fn install_bun_cmd_shim(root: &Path, lines: &[&str]) -> std::path::PathBuf {
-    let bin_dir = root.join("fakebin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let mut body = String::from("@echo off\r\n");
-    for line in lines {
-        body.push_str(line);
-        body.push_str("\r\n");
-    }
-    std::fs::write(bin_dir.join("bun.cmd"), body).unwrap();
-    bin_dir
+fn read_ledger(root: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(root.join(".socket/vendor/redirect-state.json")).unwrap();
+    serde_json::from_str(&text).expect("the ledger is JSON")
 }
 
 /// A child-only PATH with `bin_dir` first, joined with the OS separator.
@@ -1394,42 +1178,6 @@ fn scan_redirect_json_with_path(
     (out.status.code(), env_json, stderr)
 }
 
-/// `rollback --json --yes --offline` as a subprocess; returns (exit code,
-/// parsed envelope).
-fn rollback_json(cwd: &Path) -> (Option<i32>, serde_json::Value) {
-    let out = scrubbed_cli()
-        .args([
-            "rollback",
-            "--json",
-            "--yes",
-            "--offline",
-            "--cwd",
-            cwd.to_str().unwrap(),
-        ])
-        .output()
-        .expect("run socket-patch rollback");
-    let env_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-        panic!(
-            "rollback --json stdout must be JSON: {e}\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        )
-    });
-    (out.status.code(), env_json)
-}
-
-/// The `code`s of a rollback envelope's top-level `warnings`.
-fn rollback_warning_codes(env: &serde_json::Value) -> Vec<String> {
-    env["warnings"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|w| w["code"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// The `detail` of the first redirect warning carrying `code`.
 fn redirect_warning_detail(env: &serde_json::Value, code: &str) -> String {
     env["redirect"]["warnings"]
@@ -1442,566 +1190,142 @@ fn redirect_warning_detail(env: &serde_json::Value, code: &str) -> String {
         .to_string()
 }
 
-fn read_ledger(root: &Path) -> serde_json::Value {
-    let text = std::fs::read_to_string(root.join(".socket/vendor/redirect-state.json")).unwrap();
-    serde_json::from_str(&text).expect("the ledger is JSON")
-}
-
-/// Shared oracle for the "migration landed, then rollback" round trip
-/// (unix `#!/bin/sh` shim and Windows `bun.cmd` shim twins call it).
-fn assert_migration_round_trip(tmp: &Path, scan: (Option<i32>, serde_json::Value, String)) {
-    let (code, env, stderr) = scan;
-    assert_eq!(
-        code,
-        Some(0),
-        "scan must succeed: {env:#}\nstderr:\n{stderr}"
-    );
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
-    let codes = warning_codes(&env);
-    assert!(
-        !codes.iter().any(|c| c.starts_with("redirect_bun_lockb_")),
-        "a landed migration carries no lockb warning: {codes:?}"
-    );
-    assert!(
-        !codes.contains(&"redirect_npm_no_lockfile".to_string()),
-        "a bun project never gets the npm no-lockfile noise: {codes:?}"
-    );
-    assert!(
-        !tmp.join("bun.lockb").exists(),
-        "the CLI must remove the bun.lockb the shim kept, so the project is text-only"
-    );
-    let lock = std::fs::read_to_string(tmp.join("bun.lock")).unwrap();
-    assert!(
-        lock.contains(HOSTED_URL) && lock.contains(PATCHED_SHA512),
-        "the migrated bun.lock must be redirected; got:\n{lock}"
-    );
-    let ledger = read_ledger(tmp);
-    let migration = &ledger["edits"][0];
-    assert_eq!(migration["path"], "bun.lockb", "{ledger:#}");
-    assert_eq!(
-        migration["kind"], "redirect_bun_lockb_migrated",
-        "{ledger:#}"
-    );
-    assert_eq!(migration["action"], "removed", "{ledger:#}");
-    assert_eq!(
-        migration["original"],
-        serde_json::Value::String(standard_base64(LOCKB_BYTES)),
-        "the ledger carries the pre-migration bytes as standard base64: {ledger:#}"
-    );
-
-    // rollback: bun.lock un-redirected (kept), bun.lockb byte-identical.
-    let (code, env) = rollback_json(tmp);
-    assert_eq!(code, Some(0), "rollback must succeed: {env:#}");
-    assert_eq!(env["status"], "success", "{env:#}");
-    let codes = rollback_warning_codes(&env);
-    assert!(
-        codes.contains(&"redirect_bun_lockb_restored".to_string()),
-        "rollback must say it restored the binary lock: {codes:?}"
-    );
-    assert!(
-        !codes.contains(&"redirect_bun_lockb_unrestorable".to_string()),
-        "the false unrestorable warning must be gone: {codes:?}"
-    );
-    assert_eq!(
-        std::fs::read(tmp.join("bun.lockb")).unwrap(),
-        LOCKB_BYTES,
-        "bun.lockb must come back byte-identical to the pre-migration placeholder"
-    );
-    let lock = std::fs::read_to_string(tmp.join("bun.lock")).unwrap();
-    assert!(
-        lock.contains(&format!("\"{NAME}@{VERSION}\"")) && !lock.contains(HOSTED_URL),
-        "the text lock is un-redirected and LEFT IN PLACE (never deleted on rollback):\n{lock}"
-    );
-    assert!(
-        !tmp.join(".socket/vendor/redirect-state.json").exists(),
-        "everything unwound: the ledger is gone"
-    );
-}
-
-/// bun 1.1.43–1.1.45 shape: the shim writes bun.lock but does NOT delete
-/// bun.lockb. The CLI removes it itself (ledger `removed` is true, `original`
-/// carries the bytes), and `rollback` restores bun.lockb byte-identical while
-/// leaving the un-redirected bun.lock in place — with `redirect_bun_lockb_restored`
-/// and NOT the old false `redirect_bun_lockb_unrestorable`.
-#[cfg(unix)]
-#[tokio::test]
-#[serial]
-async fn migration_that_keeps_bun_lockb_is_normalized_and_rollback_restores_it() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-    mock_view(&server).await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    write_bun_lockb_project(tmp.path(), LOCKB_BYTES);
-    let bin_dir = install_bun_shim(
-        tmp.path(),
-        &format!(
-            "#!/bin/sh\n\
-             # bun 1.1.45: writes bun.lock, KEEPS bun.lockb\n\
-             echo \"Saved bun.lock (2 packages)\"\n\
-             cat > bun.lock <<'LOCK'\n{}LOCK\n\
-             exit 0\n",
-            canned_bun_lock()
-        ),
-    );
-    let scan = scan_redirect_json_with_path(tmp.path(), &server.uri(), &path_with_first(&bin_dir));
-    assert_migration_round_trip(tmp.path(), scan);
-}
-
-/// bun 1.1.39 shape: the flags are accepted, exit 0, and NO bun.lock is
-/// written. That is neither "bun failed" nor "bun unavailable": the run must
-/// emit `redirect_bun_lockb_manual_migration` naming the working manual
-/// command, redirect nothing, leave bun.lockb untouched, write no bun.lock or
-/// ledger — and must NOT add the npm "no package-lock.json" noise.
-#[cfg(unix)]
-#[tokio::test]
-#[serial]
-async fn exit_zero_without_bun_lock_reports_manual_migration() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    write_bun_lockb_project(tmp.path(), LOCKB_BYTES);
-    let bin_dir = install_bun_shim(
-        tmp.path(),
-        "#!/bin/sh\n\
-         echo \"bun install v1.1.39 (aa123456)\"\n\
-         echo \"Checked 1 install across 2 packages (no changes)\"\n\
-         exit 0\n",
-    );
-    let (code, env, stderr) =
-        scan_redirect_json_with_path(tmp.path(), &server.uri(), &path_with_first(&bin_dir));
-    assert_eq!(
-        code,
-        Some(0),
-        "a refused migration is a warning, not an error: {env:#}\n{stderr}"
-    );
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
-    let codes = warning_codes(&env);
-    assert_eq!(
-        codes
-            .iter()
-            .filter(|c| *c == "redirect_bun_lockb_manual_migration")
-            .count(),
-        1,
-        "exactly one manual-migration warning: {codes:?}"
-    );
-    assert!(
-        !codes.contains(&"redirect_bun_lockb_unsupported".to_string()),
-        "exit 0 is not 'failed or unavailable': {codes:?}"
-    );
-    assert!(
-        !codes.contains(&"redirect_npm_no_lockfile".to_string()),
-        "a bun.lockb project never gets the npm no-lockfile noise: {codes:?}"
-    );
-    let detail = redirect_warning_detail(&env, "redirect_bun_lockb_manual_migration");
-    assert!(
-        detail.contains("wrote no text bun.lock")
-            && detail.contains("`bun install --save-text-lockfile`")
-            && detail.contains("1.1.38"),
-        "the detail must explain the no-op and name the manual command: {detail}"
-    );
-    assert_eq!(
-        std::fs::read(tmp.path().join("bun.lockb")).unwrap(),
-        LOCKB_BYTES,
-        "bun.lockb must be untouched"
-    );
-    assert!(
-        !tmp.path().join("bun.lock").exists(),
-        "no text lock may appear"
-    );
-    assert!(
-        !tmp.path()
-            .join(".socket/vendor/redirect-state.json")
-            .exists(),
-        "nothing was redirected: no ledger"
-    );
-}
-
-/// A failing bun (non-zero exit): `redirect_bun_lockb_unsupported` exactly
-/// once, with bun's own stderr/stdout tail in the detail (it used to be
-/// discarded), bun.lockb untouched, no bun.lock, no npm no-lockfile noise.
-#[cfg(unix)]
-#[tokio::test]
-#[serial]
-async fn failed_migration_detail_carries_bun_output_tail() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    write_bun_lockb_project(tmp.path(), LOCKB_BYTES);
-    let bin_dir = install_bun_shim(
-        tmp.path(),
-        "#!/bin/sh\n\
-         echo \"bun install v1.1.38 (bb654321)\"\n\
-         echo \"error: unknown option --save-text-lockfile\" >&2\n\
-         exit 1\n",
-    );
-    let (code, env, _stderr) =
-        scan_redirect_json_with_path(tmp.path(), &server.uri(), &path_with_first(&bin_dir));
-    assert_eq!(code, Some(0), "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
-    let codes = warning_codes(&env);
-    assert_eq!(
-        codes
-            .iter()
-            .filter(|c| *c == "redirect_bun_lockb_unsupported")
-            .count(),
-        1,
-        "exactly one unsupported warning (no duplicate from the core gate): {codes:?}"
-    );
-    assert!(
-        !codes.contains(&"redirect_npm_no_lockfile".to_string()),
-        "{codes:?}"
-    );
-    let detail = redirect_warning_detail(&env, "redirect_bun_lockb_unsupported");
-    assert!(
-        detail.contains("error: unknown option --save-text-lockfile")
-            && detail.contains("bun install v1.1.38 (bb654321)")
-            && detail.contains("exit status: 1")
-            && detail.contains("cannot pin a binary lockfile"),
-        "the detail must carry bun's output tail and exit status: {detail}"
-    );
-    assert_eq!(
-        std::fs::read(tmp.path().join("bun.lockb")).unwrap(),
-        LOCKB_BYTES
-    );
-    assert!(!tmp.path().join("bun.lock").exists());
-}
-
-/// A bun.lockb above the ledger's byte cap (8 MiB raw) is migrated but
-/// recorded WITHOUT `original`; `rollback` then emits
-/// `redirect_bun_lockb_unrestorable` — and only because the file is actually
-/// absent (bun ≥ 1.2 shape: the shim deletes it).
-#[cfg(unix)]
-#[tokio::test]
-#[serial]
-async fn oversize_bun_lockb_is_recorded_without_bytes_and_rollback_says_unrestorable() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-    mock_view(&server).await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    // One byte over `LOCKB_ORIGINAL_CAP` (hosted.rs): 8 MiB + 1.
-    let oversize = vec![0xABu8; 8 * 1024 * 1024 + 1];
-    write_bun_lockb_project(tmp.path(), &oversize);
-    let bin_dir = install_bun_shim(
-        tmp.path(),
-        &format!(
-            "#!/bin/sh\n\
-             cat > bun.lock <<'LOCK'\n{}LOCK\n\
-             rm -f bun.lockb\n\
-             exit 0\n",
-            canned_bun_lock()
-        ),
-    );
-    let (code, env, _stderr) =
-        scan_redirect_json_with_path(tmp.path(), &server.uri(), &path_with_first(&bin_dir));
-    assert_eq!(code, Some(0), "{env:#}");
-    assert_eq!(env["redirect"]["redirected"], 1, "{env:#}");
-    let ledger = read_ledger(tmp.path());
-    let migration = &ledger["edits"][0];
-    assert_eq!(
-        migration["kind"], "redirect_bun_lockb_migrated",
-        "{ledger:#}"
-    );
-    assert_eq!(migration["action"], "removed", "{ledger:#}");
-    assert!(
-        migration.get("original").is_none(),
-        "an oversize lock is recorded without its bytes: {migration:#}"
-    );
-
-    let (code, env) = rollback_json(tmp.path());
-    assert_eq!(code, Some(0), "{env:#}");
-    let codes = rollback_warning_codes(&env);
-    assert!(
-        codes.contains(&"redirect_bun_lockb_unrestorable".to_string()),
-        "no bytes + file absent → the honest unrestorable warning: {codes:?}"
-    );
-    assert!(
-        !codes.contains(&"redirect_bun_lockb_restored".to_string()),
-        "{codes:?}"
-    );
-    assert!(!tmp.path().join("bun.lockb").exists());
-    let lock = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
-    assert!(
-        lock.contains(&format!("\"{NAME}@{VERSION}\"")) && !lock.contains(HOSTED_URL),
-        "the text lock is un-redirected and kept:\n{lock}"
-    );
-}
-
-/// The resolver ignores relative PATH entries: with `.` on PATH and an
-/// executable `bun` PLANTED in the scanned project, the planted file must
-/// never run (the child's cwd IS the project). With no absolute entry
-/// holding a bun, the run degrades to `redirect_bun_lockb_unsupported`
-/// "bun not found on PATH".
-#[cfg(unix)]
-#[tokio::test]
-#[serial]
-async fn relative_path_entry_never_runs_a_repo_planted_bun() {
-    use std::os::unix::fs::PermissionsExt;
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    write_bun_lockb_project(tmp.path(), LOCKB_BYTES);
-    // The planted attacker script: proves execution via a marker file and
-    // would otherwise "migrate" the lock.
-    let planted = tmp.path().join("bun");
+/// package.json + installed copy + a binary lockfile.
+fn write_bun_lockb_project(root: &Path, lockb: &[u8]) {
     std::fs::write(
-        &planted,
-        format!(
-            "#!/bin/sh\n\
-             echo PLANTED > planted.marker\n\
-             cat > bun.lock <<'LOCK'\n{}LOCK\n\
-             rm -f bun.lockb\n\
-             exit 0\n",
-            canned_bun_lock()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // PATH = `.` + an EMPTY absolute dir: the only bun reachable is the
-    // planted one, and only through the relative entry.
-    let empty_bin = tmp.path().join("emptybin");
-    std::fs::create_dir_all(&empty_bin).unwrap();
-    let path = std::env::join_paths([std::path::PathBuf::from("."), empty_bin]).unwrap();
-
-    let (code, env, _stderr) = scan_redirect_json_with_path(tmp.path(), &server.uri(), &path);
-    assert_eq!(code, Some(0), "{env:#}");
-    assert!(
-        !tmp.path().join("planted.marker").exists(),
-        "the repo-planted bun must NEVER execute"
-    );
-    assert_eq!(
-        std::fs::read(tmp.path().join("bun.lockb")).unwrap(),
-        LOCKB_BYTES,
-        "bun.lockb untouched"
-    );
-    assert!(!tmp.path().join("bun.lock").exists());
-    let detail = redirect_warning_detail(&env, "redirect_bun_lockb_unsupported");
-    assert!(
-        detail.contains("bun not found on PATH"),
-        "with no absolute-entry bun the run says so: {detail}"
-    );
-}
-
-// ───────────── Windows twins: `bun.cmd` batch shims (npm-global bun layout) ─────────────
-//
-// `npm i -g bun` on Windows leaves `bun`, `bun.cmd` and `bun.ps1` shims on
-// PATH and NO bun.exe; Rust's `Command::new("bun")` appends only `.exe` and
-// reports NotFound. The PATHEXT-aware resolver finds `bun.cmd` and spawns the
-// resolved path directly — `std` (≥ 1.77.2) runs a `.cmd` through cmd.exe
-// with an outer quote pair, so a shim path with spaces and parentheses works
-// too. These twins can only run on a Windows host.
-
-/// Windows twin of `migration_that_keeps_bun_lockb_is_normalized_and_rollback_restores_it`.
-/// The shim copies a canned text lock into place (no `echo` quoting games)
-/// and keeps bun.lockb.
-#[cfg(windows)]
-#[tokio::test]
-#[serial]
-async fn migration_via_bun_cmd_shim_is_normalized_and_rollback_restores_it() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-    mock_view(&server).await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    write_bun_lockb_project(tmp.path(), LOCKB_BYTES);
-    let bin_dir = install_bun_cmd_shim(
-        tmp.path(),
-        &[
-            // %~dp0 = the shim's own directory (trailing backslash).
-            "copy /Y \"%~dp0bun.lock.canned\" \"bun.lock\" >nul",
-            "echo Saved bun.lock (2 packages)",
-            "exit /b 0",
-        ],
-    );
-    std::fs::write(bin_dir.join("bun.lock.canned"), canned_bun_lock()).unwrap();
-    let scan = scan_redirect_json_with_path(tmp.path(), &server.uri(), &path_with_first(&bin_dir));
-    assert_migration_round_trip(tmp.path(), scan);
-}
-
-/// Windows twin of `exit_zero_without_bun_lock_reports_manual_migration`.
-#[cfg(windows)]
-#[tokio::test]
-#[serial]
-async fn exit_zero_without_bun_lock_reports_manual_migration_via_bun_cmd() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    write_bun_lockb_project(tmp.path(), LOCKB_BYTES);
-    let bin_dir = install_bun_cmd_shim(
-        tmp.path(),
-        &[
-            "echo Checked 1 install across 2 packages (no changes)",
-            "exit /b 0",
-        ],
-    );
-    let (code, env, stderr) =
-        scan_redirect_json_with_path(tmp.path(), &server.uri(), &path_with_first(&bin_dir));
-    assert_eq!(code, Some(0), "{env:#}\n{stderr}");
-    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
-    let codes = warning_codes(&env);
-    assert!(
-        codes.contains(&"redirect_bun_lockb_manual_migration".to_string()),
-        "{codes:?}"
-    );
-    assert!(
-        !codes.contains(&"redirect_bun_lockb_unsupported".to_string()),
-        "{codes:?}"
-    );
-    assert!(
-        !codes.contains(&"redirect_npm_no_lockfile".to_string()),
-        "{codes:?}"
-    );
-    assert_eq!(
-        std::fs::read(tmp.path().join("bun.lockb")).unwrap(),
-        LOCKB_BYTES
-    );
-    assert!(!tmp.path().join("bun.lock").exists());
-}
-
-/// Windows twin of `failed_migration_detail_carries_bun_output_tail`.
-#[cfg(windows)]
-#[tokio::test]
-#[serial]
-async fn failed_migration_via_bun_cmd_carries_output_tail() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    write_bun_lockb_project(tmp.path(), LOCKB_BYTES);
-    let bin_dir = install_bun_cmd_shim(
-        tmp.path(),
-        &[
-            "echo error: unknown option --save-text-lockfile 1>&2",
-            "exit /b 1",
-        ],
-    );
-    let (code, env, _stderr) =
-        scan_redirect_json_with_path(tmp.path(), &server.uri(), &path_with_first(&bin_dir));
-    assert_eq!(code, Some(0), "{env:#}");
-    let codes = warning_codes(&env);
-    assert_eq!(
-        codes
-            .iter()
-            .filter(|c| *c == "redirect_bun_lockb_unsupported")
-            .count(),
-        1,
-        "{codes:?}"
-    );
-    assert!(
-        !codes.contains(&"redirect_npm_no_lockfile".to_string()),
-        "{codes:?}"
-    );
-    let detail = redirect_warning_detail(&env, "redirect_bun_lockb_unsupported");
-    assert!(
-        detail.contains("error: unknown option --save-text-lockfile")
-            && detail.contains("cannot pin a binary lockfile"),
-        "{detail}"
-    );
-    assert_eq!(
-        std::fs::read(tmp.path().join("bun.lockb")).unwrap(),
-        LOCKB_BYTES
-    );
-    assert!(!tmp.path().join("bun.lock").exists());
-}
-
-/// The lockb migration must be UNDONE when the rewrite lands nothing in the
-/// migrated bun.lock: here the shim's re-locked text lock holds a DIFFERENT
-/// version of the dep than the granted override, so nothing is redirectable —
-/// the run must restore the original bun.lockb bytes, remove the generated
-/// bun.lock, and write no ledger, instead of permanently converting the
-/// user's lockfile format as a side effect of a zero-redirect scan.
-#[cfg(unix)]
-#[tokio::test]
-#[serial]
-async fn zero_redirect_restores_bun_lockb_after_migration() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(
-        tmp.path().join("package.json"),
+        root.join("package.json"),
         format!(
             r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "^{VERSION}" }} }}"#
         ),
     )
     .unwrap();
-    let pkg = tmp.path().join("node_modules").join(NAME);
+    let pkg = root.join("node_modules").join(NAME);
     std::fs::create_dir_all(&pkg).unwrap();
     std::fs::write(
         pkg.join("package.json"),
         format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
     )
     .unwrap();
-    let lockb_bytes: &[u8] = b"BUN-BINARY-PLACEHOLDER";
-    std::fs::write(tmp.path().join("bun.lockb"), lockb_bytes).unwrap();
+    std::fs::write(root.join("bun.lockb"), lockb).unwrap();
+}
 
-    // The shim's text lock resolves the dep to a version the override does
-    // NOT target, so the bun rewriter finds no rewritable tuple.
-    let bin_dir = tmp.path().join("fakebin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim = bin_dir.join("bun");
-    let bun_lock_body = format!(
-        "{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n    \
-         \"{NAME}\": [\"{NAME}@2.0.0\", \"\", {{}}, \"sha512-UPSTREAMupstream==\"],\n  \
-         }}\n}}\n"
-    );
-    std::fs::write(
-        &shim,
-        format!(
-            "#!/bin/sh\n\
-             cat > bun.lock <<'LOCK'\n{bun_lock_body}LOCK\n\
-             rm -f bun.lockb\n\
-             exit 0\n"
-        ),
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+#[cfg(unix)]
+fn install_bun_shim(root: &Path, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = root.join("fakebin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let shim = bin.join("bun");
+    std::fs::write(&shim, body).unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_bun_lockb_refuses_before_editing_including_dry_run() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    for dry_run in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_bun_lockb_project(root, INVALID_LOCKB_BYTES);
+        std::fs::rename(root.join("bun.lockb"), root.join("shared.lockb")).unwrap();
+        std::os::unix::fs::symlink("shared.lockb", root.join("bun.lockb")).unwrap();
+        let bin = install_bun_shim(root, "#!/bin/sh\ntouch bun-was-spawned\nexit 1\n");
+        let mut cmd = scrubbed_cli();
+        cmd.args([
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            root.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ])
+        .env("PATH", path_with_first(&bin));
+        if dry_run {
+            cmd.arg("--dry-run");
+        }
+        let output = cmd.output().unwrap();
+        let env: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{env:#}");
+        assert_eq!(
+            env["errorCode"], "redirect_symlinked_file_unsupported",
+            "{env:#}"
+        );
+        assert_eq!(
+            std::fs::read_link(root.join("bun.lockb")).unwrap(),
+            std::path::Path::new("shared.lockb")
+        );
+        assert_eq!(
+            std::fs::read(root.join("shared.lockb")).unwrap(),
+            INVALID_LOCKB_BYTES
+        );
+        assert!(!root.join("bun-was-spawned").exists());
+        assert!(!root.join("bun.lock").exists());
+        assert!(!root.join(".socket/vendor/redirect-state.json").exists());
     }
-    let orig_path = std::env::var("PATH").unwrap_or_default();
-    // SAFETY: single-threaded #[serial] test; PATH restored below.
-    unsafe {
-        std::env::set_var("PATH", format!("{}:{orig_path}", bin_dir.display()));
-    }
+}
 
-    let code = run(redirect_args(tmp.path(), server.uri())).await;
-
-    unsafe {
-        std::env::set_var("PATH", orig_path);
-    }
-    assert_eq!(code, 0, "a zero-redirect run is not an error");
-
-    let restored = std::fs::read(tmp.path().join("bun.lockb"))
-        .expect("bun.lockb must be restored after a zero-redirect migration");
-    assert_eq!(
-        restored, lockb_bytes,
-        "restored bun.lockb must carry the original bytes"
-    );
-    assert!(
-        !tmp.path().join("bun.lock").exists(),
-        "the generated text lock must be removed with the migration undone"
-    );
-    assert!(
-        !tmp.path()
+#[cfg(unix)]
+#[tokio::test]
+async fn malformed_binary_lock_never_spawns_bun_or_changes_format() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    for bytes in [
+        INVALID_LOCKB_BYTES.to_vec(),
+        vec![0xAB; 8 * 1024 * 1024 + 1],
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bun_lockb_project(tmp.path(), &bytes);
+        let bin = install_bun_shim(
+            tmp.path(),
+            "#!/bin/sh\necho SHOULD-NOT-RUN\ntouch bun-was-spawned\nexit 1\n",
+        );
+        let (code, env, stderr) =
+            scan_redirect_json_with_path(tmp.path(), &server.uri(), &path_with_first(&bin));
+        assert_eq!(code, Some(0), "{env:#}\n{stderr}");
+        assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+        assert!(!redirect_warning_detail(&env, "redirect_bun_lockb_invalid").is_empty());
+        assert!(!warning_codes(&env).contains(&"redirect_npm_no_lockfile".to_string()));
+        assert_eq!(std::fs::read(tmp.path().join("bun.lockb")).unwrap(), bytes);
+        assert!(!tmp.path().join("bun.lock").exists());
+        assert!(!tmp.path().join("bun-was-spawned").exists());
+        assert!(!tmp
+            .path()
             .join(".socket/vendor/redirect-state.json")
-            .exists(),
-        "no ledger may record a migration that was undone"
-    );
+            .exists());
+    }
+}
+
+#[tokio::test]
+async fn native_binary_no_matching_version_preserves_exact_bytes() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    // This real Bun lock resolves minimist/is-number; the grant targets a
+    // different installed package, so no binary record may be rewritten.
+    let bytes = include_bytes!("../../socket-patch-core/tests/fixtures/bun-lockb/1.1.45/bun.lockb");
+    write_bun_lockb_project(tmp.path(), bytes);
+    let (code, env, stderr) =
+        scan_redirect_json_with_path(tmp.path(), &server.uri(), std::ffi::OsStr::new(""));
+    assert_eq!(code, Some(0), "{env:#}\n{stderr}");
+    assert_eq!(env["redirect"]["redirected"], 0, "{env:#}");
+    assert_eq!(std::fs::read(tmp.path().join("bun.lockb")).unwrap(), bytes);
+    assert!(!tmp.path().join("bun.lock").exists());
+    assert!(!tmp
+        .path()
+        .join(".socket/vendor/redirect-state.json")
+        .exists());
 }
 
 /// A `socket-patch` Command with the ambient `SOCKET_*` env surface scrubbed,
@@ -2035,120 +1359,8 @@ fn scrubbed_cli() -> std::process::Command {
     cmd
 }
 
-/// The bun migration's child output must NOT leak into the `--json` stdout
-/// envelope: bun prints its own install chatter, and inheriting the parent's
-/// stdout would interleave that chatter before the JSON document, breaking
-/// every consumer that parses stdout. A deliberately chatty shim emulates a
-/// noisy bun.
-#[cfg(unix)]
-#[tokio::test]
-#[serial]
-async fn bun_migration_output_does_not_corrupt_json_envelope() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-    mock_view(&server).await;
-
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(
-        tmp.path().join("package.json"),
-        format!(
-            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "^{VERSION}" }} }}"#
-        ),
-    )
-    .unwrap();
-    let pkg = tmp.path().join("node_modules").join(NAME);
-    std::fs::create_dir_all(&pkg).unwrap();
-    std::fs::write(
-        pkg.join("package.json"),
-        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
-    )
-    .unwrap();
-    std::fs::write(tmp.path().join("bun.lockb"), b"BUN-BINARY-PLACEHOLDER").unwrap();
-
-    let bin_dir = tmp.path().join("fakebin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim = bin_dir.join("bun");
-    let bun_lock_body = format!(
-        "{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n    \
-         \"{NAME}\": [\"{NAME}@{VERSION}\", \"\", {{}}, \"sha512-UPSTREAMupstream==\"],\n  \
-         }}\n}}\n"
-    );
-    std::fs::write(
-        &shim,
-        format!(
-            "#!/bin/sh\n\
-             # a chatty bun: install progress goes to STDOUT\n\
-             echo \"bun install v1.2.19 (canary)\"\n\
-             echo \"Saved bun.lock\"\n\
-             cat > bun.lock <<'LOCK'\n{bun_lock_body}LOCK\n\
-             rm -f bun.lockb\n\
-             exit 0\n"
-        ),
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    // Subprocess (not in-process) so the shim's PATH injection is scoped to
-    // the child and the child's stdout can be parsed back.
-    let out = scrubbed_cli()
-        .args([
-            "scan",
-            "--redirect",
-            "--json",
-            "--yes",
-            "--cwd",
-            tmp.path().to_str().unwrap(),
-            "--api-url",
-            &server.uri(),
-            "--org",
-            ORG,
-            "--api-token",
-            "fake",
-        ])
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin_dir.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
-        .output()
-        .expect("run socket-patch");
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "scan --redirect must succeed; stdout=\n{}\nstderr=\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    let env_json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
-        panic!(
-            "--json stdout must be a pure JSON envelope (bun's migration chatter \
-             must not leak into it): {e}\nstdout:\n{}",
-            String::from_utf8_lossy(&out.stdout)
-        )
-    });
-    assert_eq!(
-        env_json["redirect"]["redirected"], 1,
-        "envelope: {env_json}"
-    );
-    let lock = std::fs::read_to_string(tmp.path().join("bun.lock")).unwrap();
-    assert!(
-        lock.contains(HOSTED_URL),
-        "the migrated bun.lock must be redirected; got:\n{lock}"
-    );
-}
-
-/// A bun.lockb project where NOTHING is redirectable (the only patch's
-/// reference is denied) must NOT have its lockfile migrated: the migration
-/// exists solely so the bun rewriter can edit a text lock, and running it with
-/// no npm override would destructively re-lock the project — bun.lockb deleted,
-/// bun.lock created, a ledger written — as a pure side effect of a no-op scan.
+/// A denied patch reference never changes the project's binary lockfile
+/// or invokes an installer, even when a Bun shim is available on PATH.
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
@@ -2181,23 +1393,10 @@ async fn no_redirectable_patch_leaves_bun_lockb_alone() {
     .unwrap();
     std::fs::write(tmp.path().join("bun.lockb"), b"BUN-BINARY-PLACEHOLDER").unwrap();
 
-    // A fake `bun` on PATH that WOULD migrate if invoked — the assertion below
-    // is that it never runs (bun.lockb survives untouched).
-    let bin_dir = tmp.path().join("fakebin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim = bin_dir.join("bun");
-    std::fs::write(
-        &shim,
-        "#!/bin/sh\n\
-         echo '{ \"lockfileVersion\": 1, \"packages\": {} }' > bun.lock\n\
-         rm -f bun.lockb\n\
-         exit 0\n",
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let bin_dir = install_bun_shim(
+        tmp.path(),
+        "#!/bin/sh\n: > \"${0%/*}/bun-was-spawned\"\nexit 97\n",
+    );
     let orig_path = std::env::var("PATH").unwrap_or_default();
     // SAFETY: single-threaded #[serial] test; PATH restored below.
     unsafe {
@@ -2210,6 +1409,7 @@ async fn no_redirectable_patch_leaves_bun_lockb_alone() {
         std::env::set_var("PATH", orig_path);
     }
     assert_eq!(code, 0, "a fully-skipped redirect still exits 0");
+    assert!(!bin_dir.join("bun-was-spawned").exists());
     assert!(
         tmp.path().join("bun.lockb").exists(),
         "bun.lockb must survive a scan that redirected nothing"
@@ -2226,18 +1426,12 @@ async fn no_redirectable_patch_leaves_bun_lockb_alone() {
     );
 }
 
-/// The corrupt-ledger refusal must fire BEFORE the bun.lockb auto-migration,
-/// not after it. The migration deletes the binary lock and writes a text one,
-/// so running it ahead of the refusal would convert the project's lockfile
-/// format and then exit 1 without recording the migration or redirecting
-/// anything — the "byte-untouched on refusal" promise broken by the one write
-/// that precedes every rewriter. A redirectable npm override is granted here
-/// (the migration's gate) and a fake `bun` that WOULD migrate sits on PATH, so
-/// the surviving bun.lockb proves the ordering rather than a skipped gate.
+/// A corrupt redirect ledger refuses before any binary-lockfile edits.
+/// The existing binary remains byte-identical and no Bun process starts.
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
-async fn corrupt_ledger_refuses_before_the_bun_lockb_migration() {
+async fn corrupt_ledger_refuses_before_the_bun_lockb_edit() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
@@ -2266,21 +1460,10 @@ async fn corrupt_ledger_refuses_before_the_bun_lockb_migration() {
     let corrupt_bytes = b"{\"mode\":\"hosted\",\"edits\":[{\"path\":\"bun.lo";
     std::fs::write(&ledger_path, corrupt_bytes).unwrap();
 
-    let bin_dir = tmp.path().join("fakebin");
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let shim = bin_dir.join("bun");
-    std::fs::write(
-        &shim,
-        "#!/bin/sh\n\
-         echo '{ \"lockfileVersion\": 1, \"packages\": {} }' > bun.lock\n\
-         rm -f bun.lockb\n\
-         exit 0\n",
-    )
-    .unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let bin_dir = install_bun_shim(
+        tmp.path(),
+        "#!/bin/sh\n: > \"${0%/*}/bun-was-spawned\"\nexit 97\n",
+    );
     let orig_path = std::env::var("PATH").unwrap_or_default();
     // SAFETY: single-threaded #[serial] test; PATH restored below.
     unsafe {
@@ -2293,10 +1476,11 @@ async fn corrupt_ledger_refuses_before_the_bun_lockb_migration() {
         std::env::set_var("PATH", orig_path);
     }
     assert_eq!(code, 1, "a corrupt ledger must flip the exit code");
+    assert!(!bin_dir.join("bun-was-spawned").exists());
     assert_eq!(
         std::fs::read(tmp.path().join("bun.lockb")).ok().as_deref(),
         Some(b"BUN-BINARY-PLACEHOLDER".as_slice()),
-        "the binary lock must be byte-untouched: the refusal precedes the migration"
+        "the binary lock must be byte-untouched: the refusal precedes the rewrite"
     );
     assert!(
         !tmp.path().join("bun.lock").exists(),
@@ -2749,8 +1933,8 @@ packages:
 /// `--json` envelope: they carry the load-bearing "why nothing happened /
 /// what you must do" guidance (`redirect_npm_no_lockfile`,
 /// `redirect_gradle_manual_snippet`, the missing-integrity family).
-/// Regression guard: the human branch printed the skipped/record/migration/
-/// rush warnings but dropped `rewrite.warnings` entirely, so a default-mode
+/// Regression guard: the human branch printed skipped/record/rush warnings
+/// but dropped `rewrite.warnings` entirely, so a default-mode
 /// `scan --redirect` in a lockfile-less project reported "Redirected 0
 /// package(s)" with no explanation at all. Subprocess (not in-process) so
 /// stderr can be read back.
@@ -2814,7 +1998,7 @@ async fn redirect_human_mode_prints_rewriter_warnings() {
     );
 }
 
-/// Human-mode `skipped` lines and the record/migration/rush warnings are built
+/// Human-mode `skipped` lines and the record/rush warnings are built
 /// as `serde_json::Value`s and were printed with `{}` — `Display` for `Value`
 /// emits JSON, so every one of them reached the terminal wrapped in literal
 /// double quotes (`skipped "pkg:npm/x@1.0.0" ("forbidden")`, `warning: "…"`),

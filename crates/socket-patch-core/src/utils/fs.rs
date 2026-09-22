@@ -149,6 +149,17 @@ pub async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
     Ok(content)
 }
 
+/// Read a binary regular file through the same FIFO-safe opener as text
+/// lockfiles. A malformed or non-regular lockfile never blocks discovery.
+pub async fn read_regular_to_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut file, metadata) = open_regular_file(path).await?;
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut content).await?;
+    Ok(content)
+}
+
 /// True when `path` ITSELF is a symbolic link (lstat; the link target is not
 /// consulted, so a dangling link is still `true`). Writers that stage a
 /// replacement next to `path` and rename over it would replace the link with
@@ -974,8 +985,8 @@ mod tests {
     }
 
     /// A FIFO squatting `bun.lockb` must fail fast (`InvalidInput`), never
-    /// block in open(2): the hosted driver refuses the lockb migration on
-    /// this error BEFORE spawning bun (which would block on the same FIFO).
+    /// block in open(2): binary discovery and patching must reject a
+    /// non-regular lockfile without waiting for another process to write it.
     #[cfg(unix)]
     #[test]
     fn read_regular_to_bytes_sync_rejects_a_fifo_without_blocking() {

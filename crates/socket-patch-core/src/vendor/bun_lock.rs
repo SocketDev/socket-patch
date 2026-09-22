@@ -58,22 +58,41 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
 const BUN_LOCK: &str = "bun.lock";
 
+/// Restore Bun's workspace-local copies from a verified canonical artifact.
+/// Returned records can be merged into the entry's wiring without changing
+/// package-resolution originals. The bool reports changed artifact bytes.
+pub async fn repair_binary_workspace_artifacts(
+    project_root: &Path,
+    entry: &VendorEntry,
+    dry_run: bool,
+) -> Result<(Vec<WiringRecord>, bool), String> {
+    super::bun_workspace::repair(project_root, entry, dry_run).await
+}
+
+/// Reclaim mirrors of a superseded entry after all their fingerprints match.
+pub async fn cleanup_binary_workspace_artifacts(
+    project_root: &Path,
+    entry: &VendorEntry,
+    dry_run: bool,
+) -> Result<(), String> {
+    super::bun_workspace::cleanup(project_root, entry, dry_run).await
+}
+
+/// Snapshot member copies before a repair whose rebuilt bytes need checking
+/// against the original lockfile integrity. `None` records a missing file.
+pub type BinaryWorkspaceArtifactSnapshot = Vec<(std::path::PathBuf, Option<Vec<u8>>)>;
+
+/// Read the validated workspace artifacts, recording missing copies as well.
+pub fn snapshot_binary_workspace_artifacts(
+    project_root: &Path,
+    entry: &VendorEntry,
+) -> Result<BinaryWorkspaceArtifactSnapshot, String> {
+    super::bun_workspace::snapshot(project_root, entry)
+}
+
 /// The `WiringRecord.kind` this backend owns: key = the `packages` map key,
 /// original/new = the verbatim entry LINE.
 const KIND_LOCK_PACKAGE: &str = "bun_lock_package";
-
-/// The ONE remedy text for `vendor_bun_lockb_unsupported`, shared by the
-/// flavor router ([`super::npm_flavor::detect_npm_lock_flavor`], reached by
-/// `vendor` and detached runs) and [`preflight_vendor`] (reached by
-/// `get`/`scan --mode vendored` before any download) so the code never
-/// carries two different remedies. `bun install --save-text-lockfile` is
-/// the actual fix — plain `bun install` on ANY bun (1.2.x and 1.4.x
-/// included) keeps an in-sync bun.lockb as-is — and the flag exists only
-/// from 1.1.39 (1.1.38 accepts it silently and still writes bun.lockb), so
-/// the floor is spelled out too.
-pub(crate) const BUN_LOCKB_UNSUPPORTED_DETAIL: &str =
-    "bun.lockb is bun's legacy binary lockfile, which vendor cannot rewrite; run `bun install \
-     --save-text-lockfile` (Bun >= 1.1.39), commit the resulting bun.lock, and re-run";
 
 /// Workspace gate: a `workspace:` packages entry in a lock whose
 /// `lockfileVersion` is below 2 refuses with `vendor_bun_workspace_unsupported`.
@@ -155,12 +174,42 @@ pub async fn preflight_vendor(project_root: &Path) -> Result<(), (&'static str, 
     let text = match read_regular_to_string(&path).await {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if project_root.join("bun.lockb").exists() {
+            let binary = project_root.join("bun.lockb");
+            if crate::utils::fs::is_symlink(&binary).await {
                 return Err((
-                    "vendor_bun_lockb_unsupported",
-                    BUN_LOCKB_UNSUPPORTED_DETAIL.to_string(),
+                    "vendor_bun_lockb_invalid",
+                    "bun.lockb is a symbolic link; replace it with a regular file before vendoring"
+                        .into(),
                 ));
             }
+            let bytes = match crate::utils::fs::read_regular_to_bytes(&binary).await {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err((
+                        "vendor_bun_lockb_invalid",
+                        format!("cannot read bun.lockb: {error}"),
+                    ))
+                }
+            };
+            let lock = super::bun_lockb::BunLockb::parse(&bytes).map_err(|detail| {
+                (
+                    "vendor_bun_lockb_invalid",
+                    format!("cannot parse bun.lockb: {detail}"),
+                )
+            })?;
+            lock.validate_mutation().map_err(|detail| {
+                (
+                    "vendor_bun_lockb_invalid",
+                    format!("cannot rewrite bun.lockb: {detail}"),
+                )
+            })?;
+            lock.packages().map_err(|detail| {
+                (
+                    "vendor_bun_lockb_invalid",
+                    format!("cannot parse bun.lockb: {detail}"),
+                )
+            })?;
             return Ok(());
         }
         Err(error) => return Err(("vendor_lockfile_missing", error.to_string())),
@@ -200,9 +249,48 @@ pub async fn wired_instances_all_ours(
     let Some((name, version)) = super::npm_common::parse_npm_purl(purl) else {
         return Ok(false);
     };
-    let text = read_regular_to_string(&project_root.join(BUN_LOCK))
-        .await
-        .map_err(|error| ("vendor_lockfile_missing", error.to_string()))?;
+    let text = match read_regular_to_string(&project_root.join(BUN_LOCK)).await {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let bytes = crate::utils::fs::read_regular_to_bytes(&project_root.join("bun.lockb"))
+                .await
+                .map_err(|error| {
+                    (
+                        if error.kind() == std::io::ErrorKind::NotFound {
+                            "vendor_lockfile_missing"
+                        } else {
+                            "vendor_bun_lockb_invalid"
+                        },
+                        format!("cannot read bun.lockb: {error}"),
+                    )
+                })?;
+            let lock = super::bun_lockb::BunLockb::parse(&bytes).map_err(|detail| {
+                (
+                    "vendor_bun_lockb_invalid",
+                    format!("cannot parse bun.lockb: {detail}"),
+                )
+            })?;
+            let packages = lock.packages().map_err(|detail| {
+                (
+                    "vendor_bun_lockb_invalid",
+                    format!("cannot parse bun.lockb: {detail}"),
+                )
+            })?;
+            let leaf = tgz_rel_leaf(&name, &version);
+            let mut matched = false;
+            for package in packages.into_iter().filter(|package| package.name == name) {
+                let ours = parse_vendor_path(&package.resolution)
+                    .is_some_and(|path| path.eco == "npm" && path.leaf == leaf);
+                if ours {
+                    matched = true;
+                } else if package.version.as_deref() == Some(version.as_str()) {
+                    return Ok(false);
+                }
+            }
+            return Ok(matched);
+        }
+        Err(error) => return Err(("vendor_lockfile_missing", error.to_string())),
+    };
     check_lock_version(&text).map_err(|detail| ("vendor_lockfile_version_unsupported", detail))?;
     let lines = text.split('\n').map(str::to_string).collect::<Vec<_>>();
     let entries = parse_packages_section(&lines)
@@ -218,6 +306,22 @@ pub async fn wired_instances_all_ours(
         }
     }
     Ok(matched > 0)
+}
+
+/// Active vendor resolutions in a binary lock. Old string-pool contents are
+/// deliberately ignored so repair and garbage collection cannot resurrect
+/// a package whose resolution has already been reverted.
+pub async fn binary_vendor_paths(project_root: &Path) -> Result<Vec<String>, String> {
+    let bytes = crate::utils::fs::read_regular_to_bytes(&project_root.join("bun.lockb"))
+        .await
+        .map_err(|e| e.to_string())?;
+    let lock = super::bun_lockb::BunLockb::parse(&bytes)?;
+    Ok(lock
+        .packages()?
+        .into_iter()
+        .filter(|p| parse_vendor_path(&p.resolution).is_some_and(|v| v.eco == "npm"))
+        .map(|p| p.resolution)
+        .collect())
 }
 
 /// Vendor one installed npm package into a bun project (see the module doc).
@@ -236,6 +340,20 @@ pub(crate) async fn vendor_bun(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
+    if !project_root.join(BUN_LOCK).exists() && project_root.join("bun.lockb").exists() {
+        return super::bun_binary::vendor(
+            purl,
+            installed_dir,
+            project_root,
+            record,
+            sources,
+            vendored_at,
+            dry_run,
+            force,
+            service,
+        )
+        .await;
+    }
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // ── 1. Coordinates (shared fail-closed guard) ─────────────────────────
@@ -572,6 +690,16 @@ pub(crate) async fn revert_bun_opts(
     project_root: &Path,
     opts: RevertOpts,
 ) -> RevertOutcome {
+    if entry
+        .wiring
+        .iter()
+        .any(|r| r.kind == super::bun_binary::KIND || r.kind == "bun_lockb_workspace_artifact")
+        || (entry.wiring.is_empty()
+            && !project_root.join(BUN_LOCK).exists()
+            && project_root.join("bun.lockb").exists())
+    {
+        return super::bun_binary::revert(entry, project_root, opts).await;
+    }
     let RevertOpts {
         dry_run,
         keep_artifact,
@@ -1857,22 +1985,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_preflight_refuses_binary_and_malformed_bun_locks() {
+    async fn download_preflight_refuses_malformed_bun_locks() {
         let root = tempfile::tempdir().unwrap();
         assert!(preflight_vendor(root.path()).await.is_ok());
         tokio::fs::write(root.path().join("bun.lockb"), b"binary")
             .await
             .unwrap();
         let (code, detail) = preflight_vendor(root.path()).await.unwrap_err();
-        assert_eq!(code, "vendor_bun_lockb_unsupported");
-        // The contract's remedy, from the ONE shared text (the router emits
-        // the same string for the same code).
-        assert_eq!(detail, BUN_LOCKB_UNSUPPORTED_DETAIL);
-        assert!(
-            detail.contains("bun install --save-text-lockfile") && detail.contains("1.1.39"),
-            "remedy + version floor: {detail}"
-        );
-        assert!(!detail.contains("upgrade Bun"), "{detail}");
+        assert_eq!(code, "vendor_bun_lockb_invalid");
+        assert!(detail.contains("bun.lockb"), "{detail}");
         tokio::fs::write(root.path().join(BUN_LOCK), BN3_BEFORE_LOCK)
             .await
             .unwrap();

@@ -1263,8 +1263,8 @@ fn bun_vendored_install_proof() {
     let cache = tmp.path().join("bun-cache").display().to_string();
     let env = [("BUN_INSTALL_CACHE_DIR", cache.as_str())];
 
-    // Text `bun.lock` only — the binary `bun.lockb` is a separate auto-migration
-    // path, not what this leg covers.
+    // This leg covers text `bun.lock`; native binary coverage lives in
+    // e2e_bun_lockb and the Bun compatibility matrices.
     let install = tool(
         &proj,
         "bun",

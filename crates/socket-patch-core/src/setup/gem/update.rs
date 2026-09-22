@@ -349,6 +349,16 @@ mod tests {
 
     const GEMFILE: &str = "source 'https://rubygems.org'\ngem 'colorize', '1.1.0'\n";
 
+    async fn supported_project(root: &Path) -> BundlerProject {
+        // File-edit tests must reach the edit being exercised independently
+        // of whether the host has Bundler installed or which version it has.
+        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
+        fs::write(root.join("Gemfile.lock"), "BUNDLED WITH\n   2.7.2\n")
+            .await
+            .unwrap();
+        super::super::discover_bundler_project(root).await.unwrap()
+    }
+
     #[test]
     fn test_add_appends_block_and_is_idempotent() {
         let out = gemfile_add(GEMFILE).unwrap();
@@ -741,19 +751,19 @@ mod tests {
     async fn test_add_leaves_gemfile_unwired_when_plugin_dir_cannot_be_generated() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
+        let project = supported_project(root).await;
         // `.socket` as a regular FILE makes `create_dir_all(".socket/bundler-
         // plugin")` fail on every platform — the portable stand-in for a
         // read-only checkout / ENOSPC / a clobbered `.socket`.
         fs::write(root.join(".socket"), "not a directory\n")
             .await
             .unwrap();
-        let project = super::super::discover_bundler_project(root).await.unwrap();
-
         let results = add_plugin_directive(&project, false).await;
 
         assert!(
-            results.iter().any(|r| r.status == GemSetupStatus::Error),
+            results
+                .iter()
+                .any(|r| r.kind == "gem_plugin" && r.status == GemSetupStatus::Error),
             "the failed plugin-dir generation must surface as an error: {results:?}"
         );
         assert_eq!(
@@ -771,8 +781,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
-        let project = super::super::discover_bundler_project(root).await.unwrap();
+        let project = supported_project(root).await;
         assert!(add_plugin_directive(&project, false)
             .await
             .iter()
@@ -818,8 +827,7 @@ mod tests {
         // an error naming the manual remedy, not a "not_configured" no-op.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
-        let project = super::super::discover_bundler_project(root).await.unwrap();
+        let project = supported_project(root).await;
         assert!(add_plugin_directive(&project, false)
             .await
             .iter()
@@ -1005,8 +1013,7 @@ mod tests {
         // and report the cleanup as its own `gem_plugin_registration` entry.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
-        let project = super::super::discover_bundler_project(root).await.unwrap();
+        let project = supported_project(root).await;
         assert!(add_plugin_directive(&project, false)
             .await
             .iter()
@@ -1209,8 +1216,7 @@ mod tests {
     async fn test_full_roundtrip_via_project() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        fs::write(root.join("Gemfile"), GEMFILE).await.unwrap();
-        let project = super::super::discover_bundler_project(root).await.unwrap();
+        let project = supported_project(root).await;
 
         let added = add_plugin_directive(&project, false).await;
         assert!(added.iter().all(|r| r.status == GemSetupStatus::Updated));

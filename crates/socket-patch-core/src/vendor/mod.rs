@@ -46,8 +46,11 @@ pub mod path;
 pub mod state;
 
 mod berry_zip;
+mod bun_binary;
 pub mod bun_lock;
 pub(crate) mod bun_lock_text;
+pub(crate) mod bun_lockb;
+mod bun_workspace;
 pub mod cargo;
 pub mod cargo_config;
 pub mod cargo_lock;

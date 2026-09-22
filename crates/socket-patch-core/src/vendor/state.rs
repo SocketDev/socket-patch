@@ -339,14 +339,22 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
 
     for rec in &mut entry.wiring {
         if rec.action == WiringAction::Rewritten && rec.original.is_none() {
-            if let Some(prev_rec) = prev.wiring.iter().find(|p| {
-                p.file == rec.file
-                    && p.kind == rec.kind
-                    && match (p.key.as_deref(), rec.key.as_deref()) {
-                        (Some(a), Some(b)) => super::path::wiring_key_matches(a, b),
-                        (a, b) => a == b,
-                    }
-            }) {
+            let mut candidates = prev
+                .wiring
+                .iter()
+                .filter(|p| wiring_surface_matches(p, rec));
+            if let Some(prev_rec) = candidates.next() {
+                // Multiple equal binary resolutions can have different
+                // registry originals. Renumbered IDs cannot disambiguate
+                // them, so do not attach a guessed restore payload.
+                if rec.kind == "bun_lockb_package"
+                    && candidates.any(|p| match (&p.original, &prev_rec.original) {
+                        (Some(a), Some(b)) => !binary_snapshot_identity_matches(a, b),
+                        (a, b) => a != b,
+                    })
+                {
+                    continue;
+                }
                 rec.original = prev_rec.original.clone();
             }
         }
@@ -372,11 +380,44 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
         let present = entry
             .wiring
             .iter()
-            .any(|r| r.file == prev_rec.file && r.kind == prev_rec.kind && r.key == prev_rec.key);
+            .any(|r| wiring_surface_matches(prev_rec, r));
         if !present {
             entry.wiring.push(prev_rec.clone());
         }
     }
+}
+
+/// Binary IDs are offsets into Bun's package array and may change after an
+/// installer re-save. Match the predecessor's semantic resolution instead.
+fn wiring_surface_matches(previous: &WiringRecord, current: &WiringRecord) -> bool {
+    if previous.file != current.file || previous.kind != current.kind {
+        return false;
+    }
+    if current.kind == "bun_lockb_package" {
+        return match (&previous.new, &current.new) {
+            (Some(previous), Some(current)) => binary_snapshot_identity_matches(
+                previous,
+                current.get("previous").unwrap_or(current),
+            ),
+            _ => false,
+        };
+    }
+    match (previous.key.as_deref(), current.key.as_deref()) {
+        (Some(a), Some(b)) => super::path::wiring_key_matches(a, b),
+        (a, b) => a == b,
+    }
+}
+
+fn binary_snapshot_identity_matches(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    // Require the mandatory identity fields; a corrupt snapshot with missing
+    // fields must not accidentally compare equal to another corrupt record.
+    a.get("name").and_then(serde_json::Value::as_str).is_some()
+        && a.get("resolution")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        && ["name", "version", "resolution", "integrity"]
+            .iter()
+            .all(|key| a.get(key) == b.get(key))
 }
 
 /// The ledger entry addressable as `purl`: the exact map key first, then
@@ -951,6 +992,54 @@ mod tests {
             entry.wiring[0].original, None,
             "(None, Some) keys must not match"
         );
+    }
+
+    #[test]
+    fn binary_carry_forward_preserves_original_after_id_reordering_and_supersede() {
+        let snapshot = |name: &str, resolution: &str| {
+            serde_json::json!({
+                "name": name, "version": null, "resolution": resolution, "integrity": "sha512-ours",
+            })
+        };
+        let old = snapshot("minimist", "./.socket/vendor/npm/old/minimist-1.2.2.tgz");
+        let original = serde_json::json!({"name":"minimist", "version":"1.2.2", "resolution":"https://registry/minimist-1.2.2.tgz", "integrity":"sha512-original"});
+        let record = |key: &str, original, new| WiringRecord {
+            file: "bun.lockb".into(),
+            kind: "bun_lockb_package".into(),
+            key: Some(key.into()),
+            action: WiringAction::Rewritten,
+            original,
+            new: Some(new),
+        };
+        for supersede in [false, true] {
+            let mut previous = sample_entry();
+            previous.wiring = vec![record("2", Some(original.clone()), old.clone())];
+            let mut current = sample_entry();
+            if supersede {
+                current.uuid = "22222222-2222-4222-8222-222222222222".into();
+            }
+            let mut next = snapshot("minimist", "./.socket/vendor/npm/new/minimist-1.2.2.tgz");
+            next["previous"] = old.clone();
+            current.wiring = vec![record("7", None, next)];
+            carry_forward_wiring(&previous, &mut current);
+            assert_eq!(
+                current.wiring.len(),
+                1,
+                "moved IDs must not retain stale duplicate wiring"
+            );
+            assert_eq!(current.wiring[0].original, Some(original.clone()));
+            assert_eq!(current.wiring[0].key.as_deref(), Some("7"));
+        }
+
+        // Reusing the same numeric ID for another package must never copy
+        // that package's registry snapshot into the current record.
+        let mut previous = sample_entry();
+        previous.wiring = vec![record("2", Some(original), old)];
+        let mut current = sample_entry();
+        current.uuid = "22222222-2222-4222-8222-222222222222".into();
+        current.wiring = vec![record("2", None, snapshot("other", "file:other"))];
+        carry_forward_wiring(&previous, &mut current);
+        assert!(current.wiring[0].original.is_none());
     }
 
     #[tokio::test]

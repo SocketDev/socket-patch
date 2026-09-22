@@ -126,11 +126,27 @@ const WIRING_FILES: &[&str] = &[
 
 /// Scan the wiring-bearing files for vendored-artifact references,
 /// returning deduped `(ecosystem, uuid, artifact relpath)` triples. Pure
-/// text scan + the canonical path parser — the same recovery rule the CLI
-/// contract documents for external tools.
+/// text scan plus native binary Bun resolution records and the canonical
+/// path parser — the same recovery rule the CLI contract documents.
 pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, String, String)> {
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut out = Vec::new();
+    if !project_root.join("bun.lock").exists() {
+        if let Ok(paths) =
+            socket_patch_core::vendor::bun_lock::binary_vendor_paths(project_root).await
+        {
+            for path in paths {
+                if let Some(parts) = parse_vendor_path(&path) {
+                    if seen.insert((parts.eco.to_string(), parts.uuid.clone())) {
+                        let rel =
+                            format!(".socket/vendor/{}/{}/{}", parts.eco, parts.uuid, parts.leaf);
+                        out.push((parts.eco, parts.uuid, rel));
+                    }
+                }
+            }
+        }
+    }
+
     let mut files: Vec<String> = WIRING_FILES
         .iter()
         .map(|file| (*file).to_string())
@@ -272,6 +288,13 @@ async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> 
     };
     if read("bun.lock").await.is_some_and(|t| t.contains(&needle)) {
         return Some("bun".to_string());
+    }
+    if !project_root.join("bun.lock").exists()
+        && socket_patch_core::vendor::bun_lock::binary_vendor_paths(project_root)
+            .await
+            .is_ok_and(|paths| paths.iter().any(|p| p.contains(&needle)))
+    {
+        return Some("bun".into());
     }
     if let Some(text) = read("pnpm-lock.yaml").await {
         if text.contains(&needle) {
@@ -529,7 +552,53 @@ pub(crate) async fn repair_vendored_artifacts(
             );
             continue;
         }
-        match check_vendored_artifact(&common.cwd, &entry, &record).await {
+        let health = check_vendored_artifact(&common.cwd, &entry, &record).await;
+        if health == ArtifactHealth::Healthy || workspace_copy_issue(&health) {
+            let mut healed = entry.clone();
+            match repair_workspace_copies(&common.cwd, &mut healed, common.dry_run).await {
+                Ok(true) => {
+                    if common.dry_run {
+                        env.record(
+                            PatchEvent::new(PatchAction::Verified, purl.clone()).with_details(
+                                serde_json::json!({
+                                    "vendorArtifact": true, "wouldRestoreWorkspaceArtifacts": true,
+                                }),
+                            ),
+                        );
+                    } else if !persist_vendor_entry(
+                        common,
+                        env,
+                        &mut state,
+                        purl,
+                        healed,
+                        entry.detached,
+                        &record,
+                    )
+                    .await
+                    {
+                        env.record(
+                            PatchEvent::new(PatchAction::Rebuilt, purl.clone()).with_details(
+                                serde_json::json!({
+                                    "path": entry.artifact.path, "workspaceArtifactsRestored": true,
+                                    "artifactRebuilt": false,
+                                }),
+                            ),
+                        );
+                        rebuilt += 1;
+                    }
+                    continue;
+                }
+                Ok(false) => {}
+                Err(detail) => {
+                    fail(env, quiet, purl, "vendor_artifact_unrepairable", detail);
+                    continue;
+                }
+            }
+            if workspace_copy_issue(&health) {
+                continue;
+            }
+        }
+        match health {
             ArtifactHealth::Healthy => {
                 // Dir-shaped artifacts from pre-inventory vendors: the
                 // health check above could only verify the PATCHED members
@@ -723,7 +792,7 @@ pub(crate) async fn repair_vendored_artifacts(
             }
         }
         match check_vendored_artifact(&common.cwd, &entry, &record).await {
-            ArtifactHealth::Healthy => {
+            health if health == ArtifactHealth::Healthy || workspace_copy_issue(&health) => {
                 // The re-synthesized entry records no sha256/fileInventory,
                 // so the health check above verified only the patched
                 // members — whole-file drift (an altered UNPATCHED member)
@@ -771,6 +840,9 @@ pub(crate) async fn repair_vendored_artifacts(
                         "wouldRestoreLedgerEntry": true,
                         "path": relpath,
                     });
+                    if workspace_copy_issue(&health) {
+                        details["wouldRestoreWorkspaceArtifacts"] = serde_json::Value::Bool(true);
+                    }
                     if !anchored {
                         // The fingerprint would come from a rebuild, never
                         // the live tree.
@@ -789,6 +861,12 @@ pub(crate) async fn repair_vendored_artifacts(
                     // again — without it the next `scan --prune` would sweep
                     // the uuid dir as an orphan.
                     fill_artifact_fingerprint(&common.cwd, &mut entry).await;
+                    if let Err(detail) =
+                        repair_workspace_copies(&common.cwd, &mut entry, false).await
+                    {
+                        fail(env, quiet, &purl, "vendor_artifact_unrepairable", detail);
+                        continue;
+                    }
                     let save_failed = persist_vendor_entry(
                         common, env, &mut state, &purl, entry, detached, &record,
                     )
@@ -826,6 +904,12 @@ pub(crate) async fn repair_vendored_artifacts(
                     reason: "vendor_inventory_unverified",
                     soft: true,
                 });
+            }
+            ArtifactHealth::Unverifiable { reason }
+                if reason == "vendor_workspace_artifact_invalid" =>
+            {
+                fail(env, quiet, &purl, "vendor_artifact_unrepairable",
+                    "workspace tarball paths cannot be validated; fix the binary lock or symbolic links before repairing".into());
             }
             _ => {
                 candidates.push(Candidate {
@@ -1151,20 +1235,33 @@ pub(crate) async fn repair_vendored_artifacts(
         // them back byte-for-byte. The backend's re-wire may refresh the
         // recorded integrity/checksum to the rebuilt tarball's — blessing
         // exactly the drifted bytes the verify below is about to reject.
-        let wiring_snapshot: Option<Vec<(std::path::PathBuf, Vec<u8>)>> =
+        let wiring_snapshot: Option<vendor::bun_lock::BinaryWorkspaceArtifactSnapshot> =
             if must_verify.contains_key(&c.purl) {
-                let mut snap = Vec::new();
+                let mut snap = match vendor::bun_lock::snapshot_binary_workspace_artifacts(
+                    &common.cwd,
+                    &c.entry,
+                ) {
+                    Ok(snap) => snap,
+                    Err(detail) => {
+                        if let Some((live, kept)) = &aside {
+                            restore_aside_vendor_dir(live, kept).await;
+                        }
+                        fail(env, quiet, &c.purl, "vendor_artifact_unrepairable", detail);
+                        continue;
+                    }
+                };
                 for name in [
                     "package-lock.json",
                     "npm-shrinkwrap.json",
                     "pnpm-lock.yaml",
                     "yarn.lock",
                     "bun.lock",
+                    "bun.lockb",
                     "package.json",
                 ] {
                     let p = common.cwd.join(name);
                     if let Ok(bytes) = tokio::fs::read(&p).await {
-                        snap.push((p, bytes));
+                        snap.push((p, Some(bytes)));
                     }
                 }
                 Some(snap)
@@ -1254,7 +1351,11 @@ pub(crate) async fn repair_vendored_artifacts(
                         // integrity to the rejected rebuild's.
                         if let Some(snap) = &wiring_snapshot {
                             for (path, bytes) in snap {
-                                let _ = tokio::fs::write(path, bytes).await;
+                                if let Some(bytes) = bytes {
+                                    let _ = tokio::fs::write(path, bytes).await;
+                                } else {
+                                    let _ = tokio::fs::remove_file(path).await;
+                                }
                             }
                         }
                         fail(
@@ -1415,6 +1516,40 @@ async fn fill_artifact_fingerprint(project_root: &Path, entry: &mut VendorEntry)
     }
 }
 
+fn workspace_copy_issue(health: &ArtifactHealth) -> bool {
+    matches!(health, ArtifactHealth::Corrupt { reason }
+        if reason == "vendor_workspace_artifact_missing" || reason == "vendor_workspace_artifact_corrupt")
+}
+
+/// Preserve package originals while adopting/rebuilding every member-relative
+/// copy from a canonical tarball whose whole-file fingerprint is trusted.
+async fn repair_workspace_copies(
+    root: &Path,
+    entry: &mut VendorEntry,
+    dry_run: bool,
+) -> Result<bool, String> {
+    let (wiring, mut changed) =
+        vendor::bun_lock::repair_binary_workspace_artifacts(root, entry, dry_run).await?;
+    for record in wiring {
+        match entry
+            .wiring
+            .iter_mut()
+            .find(|previous| previous.kind == record.kind && previous.file == record.file)
+        {
+            Some(previous) if *previous != record => {
+                *previous = record;
+                changed = true;
+            }
+            Some(_) => {}
+            None => {
+                entry.wiring.push(record);
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}
+
 /// Fetch one patch view by uuid (proxy-aware) and shape it as a manifest
 /// record; `None` offline or on any API failure. `client_cache` holds the
 /// one API client the whole vendored-artifact phase shares — construction
@@ -1469,6 +1604,88 @@ fn npm_coords(base_purl: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a local native binary resolution through the public binary
+    /// rewrite entry point, which shares the codec with vendor's backend.
+    fn native_binary_vendor_fixture(uuid: &str) -> Vec<u8> {
+        use socket_patch_core::patch::redirect::{
+            rewrite_bun_binary, DepOverride, Integrity, RewriteResult,
+        };
+        let bytes =
+            include_bytes!("../../../socket-patch-core/tests/fixtures/bun-lockb/1.1.45/bun.lockb");
+        let mut result = RewriteResult::default();
+        rewrite_bun_binary(
+            bytes,
+            &[DepOverride {
+                ecosystem: "npm".into(),
+                name: "minimist".into(),
+                namespace: None,
+                version: "1.2.2".into(),
+                token: String::new(),
+                patch_uuid: uuid.into(),
+                artifact_url: format!("./.socket/vendor/npm/{uuid}/minimist-1.2.2.tgz"),
+                berry_zip_url: None,
+                registry_override: None,
+                integrity: Integrity {
+                    sha512: Some(format!("sha512-{}", "A".repeat(86) + "==")),
+                    ..Default::default()
+                },
+            }],
+            &mut result,
+        );
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        result.binary_files.remove("bun.lockb").unwrap()
+    }
+
+    #[tokio::test]
+    async fn binary_bun_repair_recovers_live_references_and_flavor_without_a_ledger() {
+        let root = tempfile::tempdir().unwrap();
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        tokio::fs::write(
+            root.path().join("bun.lockb"),
+            native_binary_vendor_fixture(uuid),
+        )
+        .await
+        .unwrap();
+        let references = scan_vendor_references(root.path()).await;
+        assert_eq!(
+            references,
+            vec![(
+                "npm".into(),
+                uuid.into(),
+                format!(".socket/vendor/npm/{uuid}/minimist-1.2.2.tgz")
+            )]
+        );
+        assert_eq!(
+            detect_reference_flavor(root.path(), "npm", uuid)
+                .await
+                .as_deref(),
+            Some("bun")
+        );
+        assert!(!root.path().join(".socket/vendor/state.json").exists());
+
+        // Text takes precedence even if the older binary still references
+        // an artifact. Reconstruction must not revive stale dependencies.
+        tokio::fs::write(root.path().join("bun.lock"), "{}\n")
+            .await
+            .unwrap();
+        assert!(scan_vendor_references(root.path()).await.is_empty());
+        assert_eq!(
+            detect_reference_flavor(root.path(), "npm", uuid).await,
+            None
+        );
+        tokio::fs::remove_file(root.path().join("bun.lock"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join("bun.lockb"), b"malformed")
+            .await
+            .unwrap();
+        assert!(scan_vendor_references(root.path()).await.is_empty());
+        assert_eq!(
+            detect_reference_flavor(root.path(), "npm", uuid).await,
+            None
+        );
+    }
 
     /// A FIFO under a wiring-file name (here the paired `<script>.py` of a
     /// `*.py.lock`, which the lister cannot filter because it derives the

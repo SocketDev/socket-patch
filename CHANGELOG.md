@@ -24,6 +24,10 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed (BREAKING)
 
+- **Binary Bun lockfiles are patched natively in place.** Hosted and vendored
+  modes read and rewrite `bun.lockb` formats 1–3 directly, including mode
+  changes, repair, and scoped rollback. Binary-to-text conversion, migration
+  ledger replay, and their warning codes and tests have been removed.
 - **`rollback` is now the full-state dual of `scan`.** `scan` and `rollback`
   are the batch primaries (`get`↔`remove` stay the single-patch duals): a
   bare `rollback` restores the SYSTEM to unpatched across all three modes —
@@ -248,12 +252,8 @@ into the new version's section — see docs/releasing.md.
   table, staged all-or-nothing per ecosystem group, covering gem, golang,
   pypi, composer, bun, and the non-package rideshare edits (pnpm
   `trustLockfile` auto-config — pristine scaffold deleted, modified
-  scaffold keeps the file and loses only the owned line). The bun.lockb
-  migration marker restores the binary lock from the bytes the ledger
-  captured (`redirect_bun_lockb_restored`; the generated `bun.lock` is kept)
-  and warns `redirect_bun_lockb_unrestorable` naming git history only when
-  the ledger holds no bytes and the file is absent, or a different
-  `bun.lockb` has appeared since;
+  scaffold keeps the file and loses only the owned line). Native `bun.lockb`
+  package snapshots restore binary resolutions directly;
   maven and nuget fail closed with `hosted_revert_unsupported` guidance
   (their structured-metadata edits keep their ledger records; re-run
   `scan --mode hosted` or restore from VCS). Refused groups keep their
@@ -272,7 +272,7 @@ into the new version's section — see docs/releasing.md.
   an existing vendored patch, including during dry-run. Vendored preflight
   exemptions require live local lock tuples; a ledger retained by
   `rollback --preserve-state` cannot bypass a refusal or hide it in a preview.
-  Symlinked `bun.lockb` files are refused before migration so their links
+  Symlinked `bun.lockb` files are refused before patching so their links
   survive, and `vendor --silent` keeps refusal diagnostics on stderr.
 
 - **Bun projects: every text-lock generation is accepted, vendored refusals
@@ -301,7 +301,7 @@ into the new version's section — see docs/releasing.md.
   `.socket/vendor/state.json` met by that preflight is reported as
   `vendor_state_unreadable` rather than a Bun lock code. `scan --mode vendored`,
   `get --mode vendored` (search and uuid paths) and `--detached` runs now
-  preflight the Bun lock BEFORE any download: a binary-only, unreadable,
+  preflight the Bun lock BEFORE any download: a malformed binary, unreadable,
   unsupported-version or pre-version-2 workspace lock marks the npm patches
   `failed` with the vendor refusal code and detail, fetches nothing and
   records no patch — the `scan` / `get <purl>` path still writes an unchanged
@@ -312,15 +312,10 @@ into the new version's section — see docs/releasing.md.
   `package_not_installed`). The refusals stay visible under `--silent`
   (code-tagged stderr line), `--dry-run` previews them as the additive
   `would_refuse` action (the human `scan` and `get` previews both print the
-  `[would-refuse]` lines), the `bun.lockb` refusal carries one remedy on every
-  path (`bun install --save-text-lockfile`, Bun ≥ 1.1.39), and a `scan` on a
-  `bun.lockb`-only project warns `bun_lockb_unsupported` instead of reporting
-  a clean empty inventory — the detail names a shadowed sibling
-  `package-lock.json` / `yarn.lock` / `pnpm-lock.yaml` and the
-  delete-the-stale-lockb remedy when one exists, and the warning is kept in
-  hosted mode too (beside the driver's own `redirect_bun_lockb_*` outcome on
-  the run that migrates) instead of being dropped on every non-empty hosted
-  run. Hosted → vendored
+  `[would-refuse]` lines). Valid binary locks are inventoried and patched
+  directly without a Bun runtime; malformed binary locks report
+  `bun_lockb_invalid`, `redirect_bun_lockb_invalid`, or
+  `vendor_bun_lockb_invalid` at the corresponding entry point. Hosted → vendored
   takeover now works for bun —
   `scan`/`get --mode vendored` and `vendor` over a hosted-redirected `bun.lock`
   claim and replay that purl's hosted edit instead of refusing
@@ -329,21 +324,10 @@ into the new version's section — see docs/releasing.md.
   several hosted bun records; on a lock the vendored backend refuses (a
   pre-version-2 workspace lock) `vendor` and its dry run report the refusal
   BEFORE the hosted revert, leaving the purl hosted-patched instead of
-  un-hosting it and then refusing. The hosted `bun.lockb` migration is truthful:
-  `bun` is resolved on absolute `PATH` entries (Windows `bun.cmd` shims
-  included, spawned directly — the standard library quotes batch-shim paths
-  with spaces and metacharacters correctly), a stale `bun.lockb` beside a
-  live npm / yarn / pnpm lock is left alone (`redirect_bun_lockb_sibling_lock`;
-  the redirect follows the sibling lock) instead of converting the project to
-  `bun.lock`, a `bun.lockb` that is not a regular file is refused before
-  `bun` is spawned, a `bun.lockb` that Bun 1.1.43–1.1.45 keep beside the new text
-  lock is removed by the CLI so the ledger's `removed` edit is true, the
-  pre-migration bytes ride the ledger and `rollback` restores `bun.lockb`
-  (`redirect_bun_lockb_restored`; the generated `bun.lock` is kept), Bun
-  1.1.39–1.1.42 — which accept the flags but write nothing — get
-  `redirect_bun_lockb_manual_migration` instead of a false "unavailable", and
-  a failed spawn's `redirect_bun_lockb_unsupported` carries bun's output tail.
-  The hosted rewrite keeps CRLF on the rewritten `bun.lock` line. Real-Bun
+  un-hosting it and then refusing. Native `bun.lockb` edits preserve the
+  dependency graph and unrelated package metadata while updating binary
+  pointers, tarball integrity, and the package metadata hash. The hosted text
+  rewrite keeps CRLF on the rewritten `bun.lock` line. Real-Bun
   coverage now runs in CI: the hermetic hosted and vendored suites on Linux,
   macOS and Windows (Bun 1.4.2, plus 1.1.45 and 1.2.23 lock-era legs), and
   the production native matrix — 16 releases from 0.8.1 to 1.4.2 in hosted,

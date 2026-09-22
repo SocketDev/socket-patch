@@ -25,8 +25,8 @@ Shapes (project layouts; `--shapes`):
   custom-registry                  bun's full-URL registry slot injected into the
                                    registry tuple (a non-default registry)
   text                             text-lock opt-in on 1.1.39-1.1.45
-  legacy-lockb                     bun.lockb written by Bun 1.1.38, then the
-                                   matrix release runs the CLI (the migration path)
+  legacy-lockb                     bun.lockb written by Bun 1.1.38, patched natively
+                                   and installed by the matrix release
   isolated / hoisted               bunfig [install] linker (>= 1.3.0)
   lockfile-only                    node_modules removed before the CLI runs
   get-uuid / get-search            `get <uuid>` / `get <purl>` instead of `scan`
@@ -42,21 +42,13 @@ Shapes (project layouts; `--shapes`):
 Boundaries the oracle encodes (measured against real releases):
   <= 1.1.38                 binary bun.lockb only; 1.1.39-1.1.45 write it by default
   1.1.39                    first text lock (lockfileVersion 0, --save-text-lockfile)
-  1.1.43                    first `--lockfile-only`: the CLI's bun.lockb->bun.lock
-                            migration writes bun.lock (1.1.39-1.1.42 accept the
-                            flags, exit 0 and write nothing ->
-                            redirect_bun_lockb_manual_migration)
   1.2.0                     text default, lockfileVersion 1;  1.4.0: lockfileVersion 2
   version-0 workspace lock  hosted refuses (redirect_bun_workspace_unsupported)
   pre-v2 workspace lock     vendored/detached refuse (vendor_bun_workspace_unsupported)
-  bun.lockb, vendored       vendor_bun_lockb_unsupported before any download
+  bun.lockb                native binary inventory and package-record rewrites
   1.3.10                    URL/local tarball sha512 enforced (registry tuples are
                             enforced on every text-lock release)
-  bun.lockb, scan           bun_lockb_unsupported (run-level, every mode incl.
-                            hosted: the inventory never read the binary lock)
-  0.8.1 / 1.0.0             peers not installed, overrides ignored (upstream);
-                            `transitive` still installs mkdirp and leaves a
-                            bun.lockb, so the scan carries that layout warning
+  0.8.1 / 1.0.0             peers not installed, overrides ignored (upstream)
 
 Every cell records the CLI exit codes (main, repeat, rollback, conversion),
 the exact refusal-code set, the repeat-run envelope semantics, digest
@@ -113,7 +105,6 @@ OTHER_PURL = 'pkg:npm/left-pad@1.3.0'
 # Release boundaries, measured against real binaries (docs/testing/bun-compatibility.md).
 LEGACY_BUN = '1.1.38'                         # last binary-only release; legacy-lockb baseline
 TEXT_LOCK_FROM = (1, 1, 39)                   # --save-text-lockfile (lockfileVersion 0)
-LOCKFILE_ONLY_FROM = (1, 1, 43)               # --lockfile-only: the lockb migration recipe works
 TEXT_DEFAULT_FROM = (1, 2, 0)                 # bun.lock by default (lockfileVersion 1)
 LOCK_V2_FROM = (1, 4, 0)                      # fresh locks are lockfileVersion 2
 LINKER_FROM = (1, 3, 0)                       # bunfig [install] linker
@@ -123,12 +114,11 @@ NO_PEER_OR_OVERRIDE = ('0.8.1', '1.0.0')      # peers not installed, overrides i
 # Advisory codes a SUPPORTED run may carry; everything else is a refusal.
 INFORMATIONAL = {
     'vendor_prebuilt_downloaded', 'vendor_prebuilt_unavailable', 'vendor_prebuilt_pending',
-    'vendor_fetched_missing', 'reinstall_required', 'redirect_bun_lockb_restored',
+    'vendor_fetched_missing', 'reinstall_required',
     'vendor_takeover_reverted_redirect', 'redirect_takeover_reverted_vendored',
 }
 # Codes that mean the rewriter or the takeover broke on a supported configuration.
 REGRESSION_CODES = {
-    'redirect_bun_lockb_migration_reverted', 'redirect_bun_lockb_migrated_without_redirect',
     'redirect_bun_entry_not_found', 'redirect_revert_failed',
 }
 
@@ -145,6 +135,43 @@ def ver(version):
 
 def save(path, data):
     path.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
+
+
+def has_transport_failure(value):
+    """Only explicit request transport errors qualify for a fresh-cell retry."""
+    if isinstance(value, dict):
+        return any(has_transport_failure(item) for item in value.values())
+    if isinstance(value, list):
+        return any(has_transport_failure(item) for item in value)
+    return isinstance(value, str) and 'error sending request for url (' in value
+
+
+def retry_network_cell(run_case, job, root, attempts=3):
+    """Keep failed evidence and retry transient service failures from a clean tree."""
+    name = '-'.join(job)
+    case = root / 'captures' / name
+    history = []
+    for attempt in range(1, attempts + 1):
+        row = run_case(job)
+        if row['passed'] or not has_transport_failure(row) or attempt == attempts:
+            if history:
+                row['networkRetryAttempts'] = history
+                save(case / 'result.json', row)
+            return row
+        evidence = root / 'attempts' / name / str(attempt)
+        evidence.mkdir(parents=True, exist_ok=True)
+        for source in case.iterdir():
+            if source.is_file() and source.suffix in ('.log', '.json'):
+                shutil.copy2(source, evidence / source.name)
+            elif source.name == 'tree':
+                shutil.copytree(source, evidence / source.name, dirs_exist_ok=True)
+        history.append(dict(attempt=attempt, evidence=evidence.relative_to(root).as_posix(),
+                            failedChecks=[key for key, passed in row.get('checks', {}).items() if not passed]))
+        # Remove the failed project's package-manager caches too. A retry is
+        # another cold proof, never a continuation from partially written state.
+        shutil.rmtree(case)
+        print(f'{name}: request transport failed; retrying fresh cell ({attempt}/{attempts})', flush=True)
+        time.sleep(5 * attempt)
 
 
 def run(command, cwd, env, log, required=True, timeout=180, tolerate_timeout=False):
@@ -231,7 +258,16 @@ def install_tool(root, version):
         sums = directory / 'SHASUMS256.txt'
         for attempt in range(1, 6):
             try:
-                fetch(f'{base}/SHASUMS256.txt', sums)
+                # Bun 0.1.x predates published checksum manifests. Those
+                # immutable release assets have reviewed SHA-256 pins in this
+                # repository; all later releases use upstream SHASUMS256.txt.
+                historical = json.loads(Path(__file__).with_name('bun-historical-shas.json').read_text())
+                pins = {key.split('/', 1)[1]: digest for key, digest in historical.items()
+                        if key.startswith(version + '/')}
+                if pins:
+                    sums.write_text(''.join(f'{digest}  {name}\n' for name, digest in pins.items()))
+                else:
+                    fetch(f'{base}/SHASUMS256.txt', sums)
                 fetch(f'{base}/{asset}.zip', archive)
                 expected = listed_sha256(sums, f'{asset}.zip')
                 actual = sha256(archive.read_bytes())
@@ -374,12 +410,12 @@ def cell_applies(version, shape, mode):
         return False  # both need a default text bun.lock to edit
     if shape in GET_SHAPES and mode == 'vendored-detached':
         return False  # `get` has no --detached
-    if shape in CONVERSION_SHAPES and v < TEXT_DEFAULT_FROM:
-        return False
+    if shape == 'already-vendored-workspace' and v < TEXT_DEFAULT_FROM:
+        return False  # this shape explicitly inspects text re-save syntax
     if shape in ('hosted-then-vendored', 'vendored-then-hosted') and mode == 'hosted':
         return False  # their `mode` is the vendored flavor of the conversion
-    if shape == 'preexisting-manifest' and (mode == 'hosted' or v >= LOCK_V2_FROM):
-        return False  # always a refused vendored run (bun.lockb or a pre-v2 workspace)
+    if shape == 'preexisting-manifest' and (mode == 'hosted' or v < TEXT_DEFAULT_FROM or v >= LOCK_V2_FROM):
+        return False  # always a refused pre-v2 text-workspace vendored run
     return True
 
 
@@ -398,52 +434,20 @@ def expected_outcome(version, shape, mode):
     workspace = shape in WORKSPACE_SHAPES
     text_lock = (v >= TEXT_DEFAULT_FROM or (shape in TEXT_OPT_IN_SHAPES and v >= TEXT_LOCK_FROM)) \
         and shape != 'legacy-lockb'
-    # lockfileVersion of the text lock this release writes (fresh or migrated).
+    # lockfileVersion of a freshly written text lock.
     lock_version = 2 if v >= LOCK_V2_FROM else 1 if v >= TEXT_DEFAULT_FROM else 0
 
     def outcome(supported, codes=(), exit='zero', limitation=None, rerun=False):
         return dict(supported=supported, codes=set(codes), exit=exit,
                     limitation=limitation, rerun=rerun)
 
-    # A bun.lockb-only project: `scan`'s lockfile inventory cannot read the
-    # binary lock and says so in EVERY mode with the run-level
-    # `bun_lockb_unsupported` layout warning — hosted included (the hosted
-    # driver's own `redirect_bun_lockb_*` outcome rides beside it on the run
-    # that migrates; nothing is deduplicated). `get` runs no inventory pass.
-    layout = {'bun_lockb_unsupported'} if scan else set()
     if version in NO_PEER_OR_OVERRIDE and shape in ('peer', 'transitive'):
-        # `transitive` still installs mkdirp, so a bun.lockb sits beside
-        # node_modules and the scan carries the layout warning. `peer`
-        # installs nothing and bun deletes the empty lockfile, so no lock
-        # exists to diagnose — `unchangedLockPresence` pins that split.
-        return outcome(False, layout if shape == 'transitive' else set(),
-                       limitation='This Bun release does not install the requested '
-                                  'peer or honor the transitive override')
+        return outcome(False, limitation='This Bun release does not install the requested '
+                                         'peer or honor the transitive override')
     if shape == 'already-vendored-workspace':
         return outcome(True, rerun=True)
     if not text_lock:
-        if shape == 'lockfile-only':
-            return outcome(False, layout,
-                           limitation='A binary bun.lockb without node_modules supplies no '
-                                      'package inventory')
-        if hosted:
-            if v < LOCKFILE_ONLY_FROM:
-                return outcome(False, layout | {'redirect_bun_lockb_manual_migration'},
-                               limitation='This Bun release accepts `bun install '
-                                          '--save-text-lockfile --frozen-lockfile '
-                                          '--lockfile-only` but writes no bun.lock')
-            if workspace and lock_version == 0:
-                # Migration lands a version-0 lock; its workspace entries are
-                # refused and the migration is unwound.
-                return outcome(False, layout | {'redirect_bun_workspace_unsupported',
-                                                'redirect_bun_lockb_migration_reverted'},
-                               limitation='The migrated version-0 workspace lock cannot '
-                                          'carry hosted tarballs; bun.lockb restored')
-            # The migration lands: the layout warning is the only code, and
-            # it describes the discovery pass that ran before the migration.
-            return outcome(True, layout)
-        return outcome(False, layout | {'vendor_bun_lockb_unsupported'}, 'nonzero',
-                       limitation='Vendored mode cannot rewrite a binary bun.lockb')
+        return outcome(True)
     if workspace:
         if hosted and lock_version == 0:
             return outcome(False, {'redirect_bun_workspace_unsupported'},
@@ -561,9 +565,10 @@ def wired_fragments(project, mode):
     vendored ledger's `bun_lock_package` wiring."""
     if mode == 'hosted':
         edits = load_json(project / '.socket/vendor/redirect-state.json')['edits']
-        return next(e for e in edits if e['path'] == 'bun.lock' and e['kind'] == 'redirect_bun_lock_package')
+        return next(e for e in edits if e['path'] in ('bun.lock', 'bun.lockb') and
+                    e['kind'] in ('redirect_bun_lock_package', 'redirect_bun_lockb_package'))
     wiring = load_json(project / '.socket/vendor/state.json')['entries'][PURL]['wiring']
-    return next(w for w in wiring if w['file'] == 'bun.lock')
+    return next(w for w in wiring if w['file'] in ('bun.lock', 'bun.lockb'))
 
 
 def wired_line(text, recorded_new):
@@ -639,7 +644,7 @@ def main():
         return 0
     # The legacy-lockb shape baselines every project with the last binary-only
     # release, whatever the matrix version — needed only where such a cell
-    # applies (the shape is gated to releases that can read the migrated lock).
+    # applies (the shape is gated to distinct, newer binary readers).
     legacy_needed = any(shape == 'legacy-lockb' for _, shape, _ in jobs)
     needed = list(dict.fromkeys([*args.versions, *([LEGACY_BUN] if legacy_needed else [])]))
     try:
@@ -680,9 +685,13 @@ def main():
             bun = tools[version]
 
             def env_for(binary, cache):
+                temporary = case / 'tool-tmp'
+                temporary.mkdir(exist_ok=True)
                 return dict(base_env, PATH=str(binary.parent) + os.pathsep + base_env['PATH'],
                             BUN_INSTALL_CACHE_DIR=str(case / cache),
-                            BUN_INSTALL=str(case / 'bun-home'))
+                            BUN_INSTALL=str(case / 'bun-home'),
+                            TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary),
+                            BUN_TMPDIR=str(temporary))
             env = env_for(bun, 'cache')
 
             def cli_command(verb, run_mode):
@@ -709,7 +718,7 @@ def main():
             run([baseline_bun, *install_args], project,
                 env_for(baseline_bun, 'cache-legacy' if shape == 'legacy-lockb' else 'cache'),
                 case / 'baseline.log')
-            lock = project / 'bun.lock'
+            lock = project / ('bun.lock' if (project / 'bun.lock').exists() else 'bun.lockb')
             if shape == 'crlf-lock':
                 lock.write_bytes(lock.read_bytes().replace(b'\r\n', b'\n').replace(b'\n', b'\r\n'))
                 code, _ = install(bun, 'crlf-accepted', ['--frozen-lockfile'])
@@ -727,6 +736,11 @@ def main():
             original = {name: (project / name).read_bytes()
                         for name in [*files, 'bun.lock', 'bun.lockb'] if (project / name).exists()}
             row['originalSha256'] = {n: sha256(b) for n, b in original.items()}
+            original_binary_dump = None
+            binary_schema_upgraded = False
+            if lock.name == 'bun.lockb' and lock.is_file():
+                _, original_binary_dump = run([bun, lock.name], project, env,
+                                              case / 'original-binary-dump.log')
             if shape in TEXT_OPT_IN_SHAPES:
                 checks['textLockWritten'] = 'bun.lock' in original and 'bun.lockb' not in original
             if shape == 'legacy-lockb':
@@ -851,20 +865,29 @@ def main():
                 if main_mode == 'vendored-detached':
                     checks['noManifest'] = not manifest.exists()
                 patched_lock = lock.read_bytes()
-                lock_text = patched_lock.decode('utf-8')
+                lockb_origin = lock.name == 'bun.lockb'
+                lock_text = patched_lock.decode('utf-8', errors='replace')
                 if shape == 'hosted-then-vendored':
                     checks['takeoverReported'] = 'vendor_takeover_reverted_redirect' in codes
-                    checks['localPathTuple'] = LOCAL_TUPLE_SPEC in lock_text
+                    checks['localPathTuple'] = (f'.socket/vendor/npm/{UUID}/minimist-1.2.2.tgz'
+                                                if lockb_origin else LOCAL_TUPLE_SPEC) in lock_text
                     redirect_ledger = load_json(project / '.socket/vendor/redirect-state.json')
                     checks['redirectLedgerRecordGone'] = (redirect_ledger is None
                                                           or PURL not in redirect_ledger.get('records', {}))
-                    pristine_line = next(line for line in original['bun.lock'].decode('utf-8').split('\n')
-                                         if '"minimist@1.2.2"' in line)
-                    checks['vendorLedgerOriginalPristine'] = (
-                        wired_fragments(project, main_mode)['original'] == pristine_line)
+                    original_wiring = wired_fragments(project, main_mode)['original']
+                    if lockb_origin:
+                        checks['vendorLedgerOriginalPristine'] = (
+                            original_wiring.get('name') == 'minimist' and
+                            original_wiring.get('version') == '1.2.2' and
+                            UUID not in original_wiring.get('resolution', ''))
+                    else:
+                        pristine_line = next(line for line in original['bun.lock'].decode('utf-8').split('\n')
+                                             if '"minimist@1.2.2"' in line)
+                        checks['vendorLedgerOriginalPristine'] = original_wiring == pristine_line
                 elif shape == 'vendored-then-hosted':
                     checks['takeoverReported'] = 'redirect_takeover_reverted_vendored' in codes
-                    checks['urlTuple'] = HOSTED_TUPLE_PREFIX in lock_text
+                    checks['urlTuple'] = ('https://patch.socket.dev/' if lockb_origin
+                                          else HOSTED_TUPLE_PREFIX) in lock_text
                     checks['vendorArtifactGone'] = not (project / '.socket/vendor/npm' / UUID).exists()
                     vendor_ledger = load_json(project / '.socket/vendor/state.json')
                     checks['vendorLedgerEntryGone'] = (vendor_ledger is None
@@ -883,21 +906,17 @@ def main():
                     checks['registrySlotDropped'] = REGISTRY_SLOT not in lock_text
                 if shape == 'crlf-lock':
                     checks['lockEolPreserved'] = crlf_only(patched_lock)
-                lockb_origin = 'bun.lockb' in original and 'bun.lock' not in original
                 if lockb_origin:
-                    # Migration normalizes every release to the >= 1.2 shape: text
-                    # lock present, bun.lockb gone, and the ledger holds its bytes.
-                    checks['lockbMigrated'] = lock.exists() and not (project / 'bun.lockb').exists()
-                    edits = load_json(project / '.socket/vendor/redirect-state.json').get('edits', [])
-                    removal = [e for e in edits if e.get('path') == 'bun.lockb'
-                               and e.get('kind') == 'redirect_bun_lockb_migrated' and e.get('action') == 'removed']
-                    checks['lockbLedgerRecord'] = len(removal) == 1 and isinstance(removal[0].get('original'), str) \
-                        and base64.b64decode(removal[0]['original']) == original['bun.lockb']
+                    checks['nativeBinaryPreserved'] = (project / 'bun.lockb').is_file() and not (project / 'bun.lock').exists()
+                    wiring = wired_fragments(project, main_mode)
+                    checks['binaryPackageSnapshot'] = (isinstance(wiring.get('original'), dict) and
+                                                       isinstance(wiring.get('new'), dict))
                 capture = case / 'tree'
                 if capture.exists():
                     shutil.rmtree(capture)
                 capture.mkdir()
-                for name in [*files, 'bun.lock', 'bun.lockb', '.socket/manifest.json']:
+                for name in [*files, 'bun.lock', 'bun.lockb', '.socket/manifest.json',
+                             '.socket/vendor/state.json', '.socket/vendor/redirect-state.json']:
                     source = project / name
                     if source.is_file():
                         destination = capture / name
@@ -905,14 +924,39 @@ def main():
                         shutil.copyfile(source, destination)
                 row['manifestSha256'] = {p.relative_to(capture).as_posix(): sha256(p.read_bytes())
                                          for p in capture.rglob('*') if p.is_file()}
-                for label, flags in [('frozen', ['--frozen-lockfile']), ('ordinary', [])]:
+                patched_binary_dump = None
+                if lockb_origin:
+                    _, patched_binary_dump = run([bun, lock.name], project, env,
+                                                 case / 'patched-binary-dump.log')
+                for label, flags, cache in [
+                        ('frozen', ['--frozen-lockfile'], None),
+                        ('ordinary', [], None),
+                        ('warmFrozen', ['--frozen-lockfile'], 'cache-frozen'),
+                        ('warmOrdinary', [], 'cache-ordinary')]:
                     if shape == 'production':
                         flags = [*flags, '--production']
-                    code, _ = install(bun, label, flags)
+                    code, _ = install(bun, label, flags, cache=cache)
                     correct, hashes = oracle(project, record, 'after')
                     checks[label + 'PatchedBytes'] = code == 0 and correct
                     row[label + 'Files'] = hashes
-                    checks[label + 'StableLock'] = lock.read_bytes() == patched_lock
+                    installed_lock = lock.read_bytes()
+                    if (lockb_origin and label == 'ordinary' and installed_lock != patched_lock
+                            and ver(version) >= (1, 2, 23)):
+                        # A modern ordinary install upgrades legacy binary
+                        # format 2 to format 3 even before any patch. Preserve
+                        # this real installer state for rerun and rollback.
+                        prefix = b'#!/usr/bin/env bun\nbun-lockfile-format-v0\n'
+                        old_revision = int.from_bytes(patched_lock[len(prefix):len(prefix) + 4], 'little')
+                        new_revision = int.from_bytes(installed_lock[len(prefix):len(prefix) + 4], 'little')
+                        _, installed_dump = run([bun, lock.name], project, env,
+                                                case / 'ordinary-binary-dump.log')
+                        checks['ordinaryBinarySchemaUpgrade'] = old_revision == 2 and new_revision == 3
+                        checks['ordinaryBinaryResolutionStable'] = installed_dump == patched_binary_dump
+                        binary_schema_upgraded = True
+                        row['binarySchemaUpgrade'] = {'from': old_revision, 'to': new_revision}
+                        patched_lock = installed_lock
+                    else:
+                        checks[label + 'StableLock'] = installed_lock == patched_lock
                 code, repeat = run(command, project, env, case / 'repeat.log', False)
                 exit_codes['repeat'] = code
                 row['repeat'] = parse_envelope(repeat)
@@ -940,7 +984,12 @@ def main():
                     code, _ = install(bun, 'repair-frozen', ['--frozen-lockfile'])
                     checks['repairFrozenPatchedBytes'] = code == 0 and oracle(project, record, 'after')[0]
                     checks['repairStableLock'] = lock.read_bytes() == patched_lock
-                tampered = tamper_digests(patched_lock, UUID.encode())
+                if lockb_origin:
+                    digest = wired_fragments(project, main_mode)['new']['integrity']
+                    raw_digest = base64.b64decode(digest.removeprefix('sha512-'))
+                    tampered = patched_lock.replace(raw_digest, bytes(len(raw_digest)))
+                else:
+                    tampered = tamper_digests(patched_lock, UUID.encode())
                 checks['tamperedDigest'] = tampered != patched_lock
                 lock.write_bytes(tampered)
                 remove_node_modules(project)
@@ -972,17 +1021,16 @@ def main():
                 rollback_codes = [w.get('code') for w in rolled.get('warnings', [])]
                 row['rollbackWarnings'] = rollback_codes
                 checks['rollbackSucceeded'] = code == 0 and rolled.get('status') == 'success'
-                checks['rollbackOriginalFiles'] = all((project / n).exists() and (project / n).read_bytes() == b
-                                                       for n, b in original.items())
-                if lockb_origin:
-                    # bun.lockb comes back from the ledger; the text lock generated
-                    # during the redirect stays (Bun >= 1.1.39 reads bun.lock).
-                    checks['rollbackLockPresence'] = (project / 'bun.lockb').exists() and lock.exists()
-                    checks['lockbRestoredWarning'] = ('redirect_bun_lockb_restored' in rollback_codes
-                                                      and 'redirect_bun_lockb_unrestorable' not in rollback_codes)
-                else:
-                    checks['rollbackLockPresence'] = lock.exists() and not (project / 'bun.lockb').exists()
-                    checks['rollbackWarningsClean'] = not set(rollback_codes) - INFORMATIONAL
+                checks['rollbackOriginalFiles'] = all(
+                    (project / n).exists() and (project / n).read_bytes() == b
+                    for n, b in original.items() if not (binary_schema_upgraded and n == 'bun.lockb'))
+                if binary_schema_upgraded:
+                    _, restored_dump = run([bun, lock.name], project, env,
+                                           case / 'rollback-binary-dump.log')
+                    checks['rollbackOriginalBinaryResolution'] = restored_dump == original_binary_dump
+                checks['rollbackLockPresence'] = all(
+                    (project / name).exists() == (name in original) for name in ['bun.lock', 'bun.lockb'])
+                checks['rollbackWarningsClean'] = not set(rollback_codes) - INFORMATIONAL
                 if shape == 'crlf-lock':
                     checks['rollbackEolPreserved'] = crlf_only(lock.read_bytes())
                 code, _ = install(bun, 'reinstall', cache='cache-rollback')
@@ -997,7 +1045,7 @@ def main():
         return row
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        rows = list(pool.map(backtest, jobs))
+        rows = list(pool.map(lambda job: retry_network_cell(backtest, job, root), jobs))
     save(root / 'summary.json', rows)
     for version in args.versions:
         mine = [r for r in rows if r['bun'] == version]
