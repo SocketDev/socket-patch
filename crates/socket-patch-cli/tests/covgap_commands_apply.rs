@@ -1041,6 +1041,65 @@ fn vendored_gem_base_with_installed_tree_is_skipped_not_repatched() {
     );
 }
 
+/// Vendored mode is manifest-free: a project vendored by `scan`/`get --mode
+/// vendored` has ONLY `.socket/vendor/state.json` (detached entries with
+/// embedded records) and no manifest. The hooked `apply` on such a project
+/// is the calm `noManifest` no-op — it never reads the ledger, never takes
+/// the lock (so never creates `apply.lock`) and leaves `.socket/` exactly as
+/// it found it: the committed artifacts ARE the patch.
+#[test]
+fn apply_on_ledger_only_vendored_project_is_a_no_manifest_no_op() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_root_package_json(root);
+    let uuid = "80808080-8080-4080-8080-808080808080";
+    let vendor_dir = root.join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    let ledger = serde_json::to_vec_pretty(&json!({
+        "version": 1,
+        "entries": { "pkg:npm/vend-only@1.0.0": {
+            "ecosystem": "npm",
+            "basePurl": "pkg:npm/vend-only@1.0.0",
+            "uuid": uuid,
+            "artifact": { "path": format!(".socket/vendor/npm/{uuid}/vend-only-1.0.0.tgz") },
+            "wiring": [],
+            "detached": true,
+            "record": patch_record(
+                uuid,
+                json!({ "package/index.js": {
+                    "beforeHash": git_sha256(MM_BEFORE),
+                    "afterHash": git_sha256(MM_AFTER),
+                }}),
+            ),
+        }}
+    }))
+    .unwrap();
+    std::fs::write(vendor_dir.join("state.json"), &ledger).unwrap();
+
+    let (code, stdout, stderr) = run_apply(root, &["--json"], &[]);
+    let env = parse_json_envelope(stdout.trim());
+    assert_eq!(code, 0, "envelope={env}\nstderr={stderr}");
+    assert_eq!(env["status"], "noManifest", "envelope: {env}");
+    assert_eq!(env["events"], json!([]), "envelope: {env}");
+
+    let mut names: Vec<String> = std::fs::read_dir(root.join(".socket"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["vendor"],
+        "apply must not touch .socket/ on a manifest-less project (no manifest, \
+         no blobs/, no apply.lock)"
+    );
+    assert_eq!(
+        std::fs::read(vendor_dir.join("state.json")).unwrap(),
+        ledger,
+        "the ledger survives byte-identical"
+    );
+}
+
 /// A QUALIFIED gem singleton whose record holds only NEW files (empty
 /// `beforeHash` ⇒ no representative file) has nothing to disqualify it:
 /// the gated apply loop must treat it as installed, attempt it, and

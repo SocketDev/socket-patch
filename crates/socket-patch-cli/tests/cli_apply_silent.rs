@@ -22,7 +22,9 @@
 //! it's printed by `get_api_client_with_overrides` in core for every ONLINE
 //! command (offline runs suppress it — see
 //! `apply_offline_suppresses_public_proxy_notice`) and is out of scope for
-//! `apply`'s `--silent` gating.
+//! `apply`'s `--silent` gating. `apply` builds that client only once a
+//! manifest exists and `--check` is not set, so the no-manifest hook path
+//! never prints it at all.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -70,6 +72,46 @@ fn write_corrupt_manifest(root: &Path) {
     let socket = root.join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
     std::fs::write(socket.join("manifest.json"), "{ not json").unwrap();
+}
+
+fn write_empty_manifest(root: &Path) {
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(socket.join("manifest.json"), r#"{"patches":{}}"#).unwrap();
+}
+
+/// Valid manifest with one npm patch whose afterHash blob is staged (so
+/// offline staging is Ready) but NO installed package anywhere: the crawl
+/// finds nothing and every in-scope patch is unmatched.
+fn write_unmatched_npm_manifest(root: &Path) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "silent-host", "version": "0.0.0" }"#,
+    )
+    .unwrap();
+    let socket = root.join(".socket");
+    let after = "b".repeat(64);
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(socket.join("blobs").join(&after), b"patched").unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        format!(
+            r#"{{ "patches": {{
+            "pkg:npm/ghost@1.0.0": {{
+                "uuid": "ghost-uuid-0000",
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": {{ "package/index.js": {{
+                    "beforeHash": "{before}",
+                    "afterHash":  "{after}"
+                }}}},
+                "vulnerabilities": {{}}, "description": "x",
+                "license": "MIT", "tier": "free"
+            }}
+        }}}}"#,
+            before = "a".repeat(64),
+        ),
+    )
+    .unwrap();
 }
 
 /// Valid manifest with one golang patch entry and NO committed copy under
@@ -179,22 +221,79 @@ fn apply_check_silent_drift_keeps_error_output() {
 /// must keep it (anti-vacuous half).
 #[test]
 fn apply_offline_suppresses_public_proxy_notice() {
-    // No .socket dir at all: apply exits 0 ("nothing to apply") either way,
-    // so the only stderr difference is the advisory under test.
+    // An EMPTY manifest: apply exits 0 ("No patches to apply") either way,
+    // so the only stderr difference is the advisory under test. (A dir with
+    // no manifest at all never reaches client construction — see the next
+    // test — so it cannot serve the anti-vacuous half.)
     let tmp = tempfile::tempdir().expect("create tempdir");
+    write_empty_manifest(tmp.path());
 
     let (code, _stdout, stderr) = run_apply(tmp.path(), &["--offline"]);
-    assert_eq!(code, 0, "no-manifest apply is a clean no-op: {stderr}");
+    assert_eq!(code, 0, "empty-manifest apply is a clean no-op: {stderr}");
     assert!(
         !stderr.contains("public patch API proxy"),
         "--offline must not claim proxy (network) use; stderr was: {stderr:?}"
     );
 
     let (code, _stdout, stderr) = run_apply(tmp.path(), &[]);
-    assert_eq!(code, 0, "no-manifest apply is a clean no-op: {stderr}");
+    assert_eq!(code, 0, "empty-manifest apply is a clean no-op: {stderr}");
     assert!(
         stderr.contains("public patch API proxy"),
         "anti-vacuous: the same tokenless run WITHOUT --offline must keep the \
          advisory; stderr was: {stderr:?}"
+    );
+}
+
+/// The hook path — `apply` on a project with no manifest — does nothing
+/// and must build nothing: no API client, so no tokenless advisory (and
+/// no org-slug round-trip in CI with a token set) on every `npm install`
+/// of a project that has no patches yet. Same for `--check`, documented
+/// as lock-free and offline-safe.
+#[test]
+fn apply_without_manifest_or_under_check_builds_no_api_client() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let (code, stdout, stderr) = run_apply(tmp.path(), &[]);
+    assert_eq!(code, 0, "no-manifest apply is a clean no-op: {stderr}");
+    assert!(
+        stdout.contains("No patch manifest found; nothing to apply."),
+        "the calm no-op names the manifest, not the folder: {stdout}"
+    );
+    assert!(
+        !stderr.contains("SOCKET_API_TOKEN"),
+        "no client is built before the no-manifest exit; stderr was: {stderr:?}"
+    );
+
+    write_empty_manifest(tmp.path());
+    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--check"]);
+    assert_eq!(code, 0, "--check on an empty manifest is in sync: {stderr}");
+    assert!(
+        !stderr.contains("SOCKET_API_TOKEN"),
+        "no client is built for the read-only --check; stderr was: {stderr:?}"
+    );
+}
+
+/// `apply --silent` on a manifest whose every in-scope patch matches no
+/// installed package exits 1 — so its diagnostic must print even under
+/// `--silent` ("errors only", never "nothing"). Regression: the warning
+/// block was gated on `!silent`, so the hooked `apply --silent` exited 1
+/// with zero output on exactly this manifest.
+#[test]
+fn apply_silent_unmatched_manifest_keeps_warning_output() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    write_unmatched_npm_manifest(tmp.path());
+
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--silent", "--offline"]);
+    assert_eq!(
+        code, 1,
+        "an in-scope patch with no installed package fails the run: {stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "silent human mode writes the diagnostic to stderr, not stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("Warning: No packages found that match available patches"),
+        "--silent must keep the exit-flipping diagnostic (errors only, never \
+         nothing); stderr was: {stderr:?}"
     );
 }

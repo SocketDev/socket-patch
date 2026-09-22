@@ -78,26 +78,7 @@ pub(crate) async fn bun_vendor_preflight(
     cwd: &Path,
     selected: &[PatchSearchResult],
 ) -> Option<BunVendorRefusal> {
-    let pairs = selection_pairs(selected);
-    if !pairs.iter().any(|(purl, _)| purl.starts_with("pkg:npm/")) {
-        return None;
-    }
-    let (code, detail) = socket_patch_core::vendor::bun_lock::preflight_vendor(cwd)
-        .await
-        .err()?;
-    // Loaded only once the project is known to refuse: an accepted project
-    // never touches the ledger here (the vendor step owns it).
-    let ledger = load_state(cwd).await;
-    Some(
-        refusal_with_exemptions(
-            cwd,
-            code,
-            detail,
-            &pairs,
-            ledger.as_ref().map(|s| &s.entries),
-        )
-        .await,
-    )
+    preflight_pairs(cwd, &selection_pairs(selected), None).await
 }
 
 /// [`bun_vendor_preflight`] for callers that already loaded the ledger (the
@@ -108,7 +89,7 @@ pub(crate) async fn bun_vendor_preflight_with_ledger(
     selected: &[PatchSearchResult],
     ledger: LedgerLoad<'_>,
 ) -> Option<BunVendorRefusal> {
-    bun_vendor_preflight_pairs(cwd, &selection_pairs(selected), ledger).await
+    preflight_pairs(cwd, &selection_pairs(selected), Some(ledger)).await
 }
 
 /// The preflight over bare `(purl, uuid)` pairs — the `vendor` command's
@@ -120,12 +101,32 @@ pub(crate) async fn bun_vendor_preflight_pairs(
     pairs: &[(&str, &str)],
     ledger: LedgerLoad<'_>,
 ) -> Option<BunVendorRefusal> {
+    preflight_pairs(cwd, pairs, Some(ledger)).await
+}
+
+/// The one preflight every entry point above funnels into. `ledger` is the
+/// caller's own load when it has one; `None` loads the ledger here — and
+/// only once the project is known to refuse, so an accepted project never
+/// touches `state.json` (the vendor step owns it).
+async fn preflight_pairs(
+    cwd: &Path,
+    pairs: &[(&str, &str)],
+    ledger: Option<LedgerLoad<'_>>,
+) -> Option<BunVendorRefusal> {
     if !pairs.iter().any(|(purl, _)| purl.starts_with("pkg:npm/")) {
         return None;
     }
     let (code, detail) = socket_patch_core::vendor::bun_lock::preflight_vendor(cwd)
         .await
         .err()?;
+    let loaded;
+    let ledger = match ledger {
+        Some(ledger) => ledger,
+        None => {
+            loaded = load_state(cwd).await;
+            loaded.as_ref().map(|s| &s.entries)
+        }
+    };
     Some(refusal_with_exemptions(cwd, code, detail, pairs, ledger).await)
 }
 

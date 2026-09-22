@@ -192,9 +192,19 @@ const VENDOR_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 /// Lay down the shared vendored fixture: hook wired, an installed
 /// `node_modules/vendpkg` at `installed` bytes, a committed dir-shaped
 /// vendored artifact at `vendored` bytes, the `.socket/vendor/state.json`
-/// ledger entry binding the purl to it, and a manifest record whose
-/// afterHash is the hash of `patched`.
-fn setup_vendored_fixture(proj: &Path, home: &Path, installed: &[u8], vendored: &[u8]) {
+/// ledger entry binding the purl to it, and the patch record whose
+/// afterHash is the hash of `patched` — in `.socket/manifest.json` for the
+/// legacy manifest-tracked shape, or (`detached`) embedded in the ledger
+/// entry with NO manifest at all: the manifest-free posture every
+/// `scan`/`get --mode vendored` run writes.
+fn setup_vendored_fixture(
+    proj: &Path,
+    home: &Path,
+    installed: &[u8],
+    vendored: &[u8],
+    detached: bool,
+) {
+    use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState};
 
     write(
@@ -221,6 +231,18 @@ fn setup_vendored_fixture(proj: &Path, home: &Path, installed: &[u8], vendored: 
         &String::from_utf8_lossy(vendored),
     );
 
+    let record_json = format!(
+        r#"{{
+    "uuid": "{VENDOR_UUID}",
+    "exportedAt": "2024-01-01T00:00:00Z",
+    "files": {{ "package/index.js": {{ "beforeHash": "{before}", "afterHash": "{after}" }} }},
+    "vulnerabilities": {{ "GHSA-aaaa-bbbb-cccc": {{ "cves": ["CVE-2024-0001"], "summary": "x", "severity": "high", "description": "d" }} }},
+    "description": "d", "license": "MIT", "tier": "free"
+  }}"#,
+        before = git_sha256(original),
+        after = git_sha256(patched),
+    );
+
     let mut state = VendorState::new();
     state.entries.insert(
         "pkg:npm/vendpkg@1.0.0".to_string(),
@@ -238,8 +260,10 @@ fn setup_vendored_fixture(proj: &Path, home: &Path, installed: &[u8], vendored: 
             wiring: Vec::new(),
             lock: None,
             took_over_go_patches: false,
-            detached: false,
-            record: None,
+            detached,
+            record: detached.then(|| {
+                serde_json::from_str::<PatchRecord>(&record_json).expect("record fixture")
+            }),
             flavor: None,
             uv: None,
             pnpm: None,
@@ -253,22 +277,17 @@ fn setup_vendored_fixture(proj: &Path, home: &Path, installed: &[u8], vendored: 
         &serde_json::to_string_pretty(&state).unwrap(),
     );
 
-    write(
-        &proj.join(".socket/manifest.json"),
-        &format!(
-            r#"{{ "patches": {{
-  "pkg:npm/vendpkg@1.0.0": {{
-    "uuid": "{VENDOR_UUID}",
-    "exportedAt": "2024-01-01T00:00:00Z",
-    "files": {{ "package/index.js": {{ "beforeHash": "{before}", "afterHash": "{after}" }} }},
-    "vulnerabilities": {{ "GHSA-aaaa-bbbb-cccc": {{ "cves": ["CVE-2024-0001"], "summary": "x", "severity": "high", "description": "d" }} }},
-    "description": "d", "license": "MIT", "tier": "free"
-  }}
-}} }}"#,
-            before = git_sha256(original),
-            after = git_sha256(patched),
-        ),
-    );
+    if detached {
+        assert!(
+            !proj.join(".socket/manifest.json").exists(),
+            "the detached fixture is manifest-free by construction"
+        );
+    } else {
+        write(
+            &proj.join(".socket/manifest.json"),
+            &format!(r#"{{ "patches": {{ "pkg:npm/vendpkg@1.0.0": {record_json} }} }}"#),
+        );
+    }
 }
 
 #[test]
@@ -278,7 +297,7 @@ fn setup_check_judges_vendored_patch_by_committed_artifact() {
 
     // Healthy vendored state: the artifact carries the patch; the installed
     // tree still holds the ORIGINAL bytes (expected until the next install).
-    setup_vendored_fixture(proj.path(), home.path(), b"original\n", b"patched\n");
+    setup_vendored_fixture(proj.path(), home.path(), b"original\n", b"patched\n", false);
 
     let (code, stdout) = run(proj.path(), home.path(), &["setup", "--check", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
@@ -301,7 +320,7 @@ fn setup_check_flags_tampered_vendored_artifact_despite_patched_tree() {
     // Laundering attempt: the committed artifact was tampered with, but the
     // installed tree LOOKS patched. The artifact is the sole evidence — the
     // consumed bytes on the next install — so check must fail.
-    setup_vendored_fixture(proj.path(), home.path(), b"patched\n", b"TAMPERED\n");
+    setup_vendored_fixture(proj.path(), home.path(), b"patched\n", b"TAMPERED\n", false);
 
     let (code, stdout) = run(proj.path(), home.path(), &["setup", "--check", "--json"]);
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
@@ -314,6 +333,55 @@ fn setup_check_flags_tampered_vendored_artifact_despite_patched_tree() {
         v["status"], "configured",
         "a patched-looking installed tree must not launder a tampered vendor \
          artifact; stdout=\n{stdout}"
+    );
+}
+
+// ===========================================================================
+// Property 4 (vendored, manifest-free) — vendored mode writes NO manifest:
+// the ledger entry is `detached` and carries the only copy of the patch
+// record. `setup --check` must judge those exactly like manifest-backed
+// vendored patches (it folds the ledger's embedded records in, as `vex`
+// does); without the fold a vendored-only project with a missing or
+// tampered committed artifact reported `configured`.
+// ===========================================================================
+
+#[test]
+fn setup_check_judges_detached_vendored_patch_without_manifest() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    setup_vendored_fixture(proj.path(), home.path(), b"original\n", b"patched\n", true);
+
+    let (code, stdout) = run(proj.path(), home.path(), &["setup", "--check", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(
+        code, 0,
+        "a healthy detached vendored patch (committed artifact carries the patch) \
+         is a correctly-patched state; stdout=\n{stdout}"
+    );
+    assert_eq!(v["status"], "configured", "stdout=\n{stdout}");
+}
+
+#[test]
+fn setup_check_flags_tampered_detached_vendored_artifact_without_manifest() {
+    let proj = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    setup_vendored_fixture(proj.path(), home.path(), b"patched\n", b"TAMPERED\n", true);
+
+    let (code, stdout) = run(proj.path(), home.path(), &["setup", "--check", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(
+        code, 1,
+        "a tampered detached vendored artifact must fail check even with no \
+         manifest and a patched-looking installed tree; stdout=\n{stdout}"
+    );
+    assert_eq!(v["status"], "needs_configuration", "stdout=\n{stdout}");
+    assert!(
+        v["files"].as_array().is_some_and(|files| files.iter().any(|f| {
+            f["kind"] == "patch"
+                && f["path"] == "pkg:npm/vendpkg@1.0.0"
+                && f["status"] == "needs_configuration"
+        })),
+        "the drifted vendored purl must be named as a `patch` entry; stdout=\n{stdout}"
     );
 }
 

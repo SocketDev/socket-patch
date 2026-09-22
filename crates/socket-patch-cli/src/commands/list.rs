@@ -1,11 +1,10 @@
-use std::path::{Path, PathBuf};
-
 use clap::Args;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::redirect::{RedirectState, REDIRECT_STATE_REL};
 use socket_patch_core::telemetry::track_patch_listed;
 use socket_patch_core::utils::socket_cli_config;
+use socket_patch_core::vendor::state::{VendorEntry, VENDOR_STATE_REL};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::json_envelope::{
@@ -18,55 +17,96 @@ pub struct ListArgs {
     pub common: GlobalArgs,
 }
 
-/// One listable patch record with its provenance: a `.socket/manifest.json`
-/// entry (agent/vendored modes) or a hosted redirect-ledger record
-/// (`scan --mode hosted` records its patches ONLY in
-/// `.socket/vendor/redirect-state.json` and never writes the manifest —
-/// without the ledger records, a purely hosted-wired project listed as
-/// `manifest_not_found` while its patches were demonstrably live).
+/// Where a listed record lives. Declaration order is the tie-break order
+/// when one purl appears in several stores: coexistence is real state (e.g.
+/// an agent-applied patch alongside live hosted wiring), so every copy is
+/// shown, labeled apart.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Source {
+    /// A `.socket/manifest.json` entry (agent mode).
+    Manifest,
+    /// A hosted redirect-ledger record: `scan --mode hosted` records its
+    /// patches ONLY in `.socket/vendor/redirect-state.json` and never
+    /// writes the manifest — without these, a purely hosted-wired project
+    /// listed as `manifest_not_found` while its patches were demonstrably
+    /// live.
+    Hosted,
+    /// A vendor-ledger record: vendored mode is manifest-free, so every
+    /// `scan`/`get --mode vendored` patch lives ONLY in
+    /// `.socket/vendor/state.json`, as a `detached` entry's embedded record
+    /// (the hosted rule again — a vendored-only project lists and exits 0).
+    Vendored,
+}
+
+/// The `(mode, ledger)` label pair for a ledger-sourced record — the shared
+/// constant labels, never a ledger's own opaque `mode` string (see
+/// `HOSTED_MODE_LABEL`'s docs) — or `None` for a manifest entry. Shared by
+/// the JSON `details` and the human `Mode:` line.
+fn ledger_label(source: Source) -> Option<(&'static str, &'static str)> {
+    match source {
+        Source::Manifest => None,
+        Source::Hosted => Some((crate::commands::HOSTED_MODE_LABEL, REDIRECT_STATE_REL)),
+        Source::Vendored => Some((crate::commands::VENDORED_MODE_LABEL, VENDOR_STATE_REL)),
+    }
+}
+
+/// One listable patch record with its provenance.
 struct ListEntry<'a> {
     purl: &'a str,
     record: &'a PatchRecord,
-    /// `true` when the record comes from the hosted redirect ledger.
-    hosted: bool,
+    source: Source,
 }
 
-/// Every listable record from both stores, in a stable order: by PURL, the
-/// manifest entry before the hosted-ledger record when one purl appears in
-/// BOTH (coexistence is real state — e.g. an agent-applied patch alongside
-/// live hosted wiring — so both are shown, labeled apart). The record maps
-/// (`HashMap` manifest / `BTreeMap` ledger) never impose an order shared
-/// consumers could diff, so the sort here is the contract.
+/// Every listable record from all three stores, in a stable order: by
+/// PURL, then manifest < hosted < vendored when one purl appears in more
+/// than one. The record maps (`HashMap` manifest and vendor ledger /
+/// `BTreeMap` redirect ledger) never impose an order shared consumers could
+/// diff, so the sort here is the contract. Only vendor entries that carry
+/// an embedded record fold in — a legacy manifest-tracked entry has no
+/// record of its own (the manifest's IS the record) and would otherwise
+/// double-list its purl.
 fn combined_entries<'a>(
     manifest: Option<&'a PatchManifest>,
     redirect: Option<&'a RedirectState>,
+    vendor: Option<&'a std::collections::HashMap<String, VendorEntry>>,
 ) -> Vec<ListEntry<'a>> {
     let mut entries: Vec<ListEntry<'a>> = Vec::new();
     if let Some(manifest) = manifest {
         entries.extend(manifest.patches.iter().map(|(purl, record)| ListEntry {
             purl,
             record,
-            hosted: false,
+            source: Source::Manifest,
         }));
     }
     if let Some(redirect) = redirect {
         entries.extend(redirect.records.iter().map(|(purl, record)| ListEntry {
             purl,
             record,
-            hosted: true,
+            source: Source::Hosted,
         }));
     }
-    entries.sort_by(|a, b| a.purl.cmp(b.purl).then(a.hosted.cmp(&b.hosted)));
+    if let Some(vendor) = vendor {
+        entries.extend(vendor.iter().filter_map(|(purl, entry)| {
+            let record = entry.record.as_ref().filter(|_| entry.detached)?;
+            Some(ListEntry {
+                purl,
+                record,
+                source: Source::Vendored,
+            })
+        }));
+    }
+    entries.sort_by(|a, b| a.purl.cmp(b.purl).then(a.source.cmp(&b.source)));
     entries
 }
 
 /// Build the `list --json` envelope: one `Discovered` event per entry, with
 /// the rich metadata (vulnerabilities, tier, license, description,
 /// exportedAt) under `details` per the per-command extension convention.
-/// Hosted-ledger records additionally carry `details.mode` (the constant
-/// [`crate::commands::HOSTED_MODE_LABEL`]) and `details.ledger` naming the
-/// redirect ledger (additive keys, absent on manifest entries), so
-/// consumers can tell the stores apart.
+/// Ledger records additionally carry `details.mode` (the constants
+/// [`crate::commands::HOSTED_MODE_LABEL`] /
+/// [`crate::commands::VENDORED_MODE_LABEL`]) and `details.ledger` naming
+/// the ledger they came from (additive keys, absent on manifest entries),
+/// so consumers can tell the stores apart.
 ///
 /// Events are emitted in the entries' given order — [`combined_entries`]
 /// owns the by-PURL event sort; this builder sorts each event's
@@ -116,12 +156,9 @@ fn build_list_envelope(entries: &[ListEntry<'_>]) -> Envelope {
             "description": patch.description,
             "vulnerabilities": vulnerabilities,
         });
-        if entry.hosted {
-            // The shared constant label, never the ledger's own opaque
-            // `mode` string — see HOSTED_MODE_LABEL's docs (scan's
-            // `redirectState` block emits the same label, one owner).
-            details["mode"] = serde_json::json!(crate::commands::HOSTED_MODE_LABEL);
-            details["ledger"] = serde_json::json!(REDIRECT_STATE_REL);
+        if let Some((mode, ledger)) = ledger_label(entry.source) {
+            details["mode"] = serde_json::json!(mode);
+            details["ledger"] = serde_json::json!(ledger);
         }
 
         env.record(
@@ -204,26 +241,6 @@ fn emit_error(args: &ListArgs, code: &str, message: String) {
     }
 }
 
-/// The project root whose redirect ledger accompanies the manifest being
-/// listed. Both stores must come from the SAME project, so the root is
-/// derived from the RESOLVED manifest path rather than hardcoding cwd:
-/// the manifest's directory, stepping out of a standard `.socket/` layout
-/// when the manifest lives in one. For the default
-/// `<cwd>/.socket/manifest.json` this is exactly `cwd`; for a
-/// `--manifest-path` into another project it is that project's root (its
-/// `.socket` parent's parent), or — for a bare file like
-/// `--manifest-path /tmp/x/abs.json` — the file's own directory.
-fn ledger_root(common: &GlobalArgs, manifest_path: &Path) -> PathBuf {
-    match manifest_path.parent() {
-        Some(dir) if dir.file_name() == Some(std::ffi::OsStr::new(".socket")) => dir
-            .parent()
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| common.cwd.clone()),
-        Some(dir) => dir.to_path_buf(),
-        None => common.cwd.clone(),
-    }
-}
-
 pub async fn run(args: ListArgs) -> i32 {
     apply_env_toggles(&args.common);
     let manifest_path = args.common.resolved_manifest_path();
@@ -257,26 +274,32 @@ pub async fn run(args: ListArgs) -> i32 {
         }
     };
 
-    // Hosted-mode patches live ONLY in the redirect ledger, so `list`
-    // consults it alongside the manifest — leniently (a malformed ledger
-    // degrades to "nothing to consult", surfaced on stderr unless --silent;
-    // the hosted write path hard-errors on it instead), and always from the
-    // SAME project as the manifest: with `--manifest-path` pointing at
-    // another project, reading the LOCAL cwd's ledger would interleave two
-    // projects' patch state (and a local ledger could suppress the flagged
-    // project's manifest_not_found).
-    let redirect_state = crate::commands::load_redirect_state_lenient(
-        &ledger_root(&args.common, &manifest_path),
-        args.common.silent,
-    )
-    .await;
+    // Hosted-mode patches live ONLY in the redirect ledger and vendored-mode
+    // patches ONLY in the vendor ledger, so `list` consults both alongside
+    // the manifest — leniently (a malformed ledger degrades to "nothing to
+    // consult", surfaced on stderr unless --silent; the write paths
+    // hard-error on it instead), and always from the SAME project as the
+    // manifest (`project_root` steps out of the manifest's `.socket/`):
+    // with `--manifest-path` pointing at another project, reading the LOCAL
+    // cwd's ledgers would interleave two projects' patch state (and a local
+    // ledger could suppress the flagged project's manifest_not_found).
+    let project_root = args.common.project_root();
+    let redirect_state =
+        crate::commands::load_redirect_state_lenient(&project_root, args.common.silent).await;
+    let vendor_state =
+        crate::commands::load_vendor_state_lenient(&project_root, args.common.silent).await;
 
-    // `combined_entries` folds only ledger RECORDS in (an edits-only ledger
-    // — post-takeover residue / a degraded record-fetch-failed run —
-    // asserts no patches), so entry emptiness is the whole exit predicate.
-    let entries = combined_entries(manifest.as_ref(), redirect_state.as_ref());
+    // `combined_entries` folds only ledger RECORDS in (an edits-only
+    // redirect ledger — post-takeover residue / a degraded record-fetch-
+    // failed run — and a record-less legacy vendor entry assert no
+    // patches), so entry emptiness is the whole exit predicate.
+    let entries = combined_entries(
+        manifest.as_ref(),
+        redirect_state.as_ref(),
+        vendor_state.as_ref().map(|s| &s.entries),
+    );
     if manifest.is_none() && entries.is_empty() {
-        // No manifest AND no hosted records: nothing is listable anywhere —
+        // No manifest AND no ledger records: nothing is listable anywhere —
         // the classic missing-manifest error. `read_manifest` returns
         // `Ok(None)` only when the file does not exist (its documented
         // contract), so this is `manifest_not_found`, NOT `manifest_invalid`
@@ -322,15 +345,13 @@ pub async fn run(args: ListArgs) -> i32 {
             let patch = entry.record;
             println!("Package: {}", entry.purl);
             println!("  UUID: {}", patch.uuid);
-            if entry.hosted {
+            if let Some((mode, ledger)) = ledger_label(entry.source) {
                 // Same labeling rule as the JSON details: the record comes
-                // from the hosted redirect ledger — installs resolve this
-                // package to the hosted patch server; no manifest entry
-                // exists or is needed.
-                println!(
-                    "  Mode: {} (recorded in {REDIRECT_STATE_REL})",
-                    crate::commands::HOSTED_MODE_LABEL
-                );
+                // from a ledger, not the manifest — hosted installs resolve
+                // the package to the hosted patch server, vendored ones to
+                // the committed `.socket/vendor/` artifact; no manifest
+                // entry exists or is needed.
+                println!("  Mode: {mode} (recorded in {ledger})");
             }
             println!("  Tier: {}", patch.tier);
             println!("  License: {}", patch.license);
@@ -386,7 +407,7 @@ mod tests {
     /// most tests below need; the hosted tests call `combined_entries`
     /// directly with a `RedirectState`.
     fn manifest_envelope(manifest: &PatchManifest) -> Envelope {
-        build_list_envelope(&combined_entries(Some(manifest), None))
+        build_list_envelope(&combined_entries(Some(manifest), None, None))
     }
 
     fn sample_manifest() -> PatchManifest {
@@ -651,7 +672,11 @@ mod tests {
             .records
             .insert("pkg:npm/aaa-hosted@1.0.0".to_string(), hosted_record);
 
-        let env = build_list_envelope(&combined_entries(Some(&manifest), Some(&redirect)));
+        let env = build_list_envelope(&combined_entries(
+            Some(&manifest),
+            Some(&redirect),
+            None,
+        ));
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         assert_eq!(v["summary"]["discovered"], 3);
         let events = v["events"].as_array().unwrap();
@@ -694,11 +719,103 @@ mod tests {
             "pkg:npm/minimist@1.2.2".to_string(),
             manifest.patches["pkg:npm/minimist@1.2.2"].clone(),
         );
-        let env = build_list_envelope(&combined_entries(None, Some(&redirect)));
+        let env = build_list_envelope(&combined_entries(None, Some(&redirect), None));
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         assert_eq!(v["status"], "success");
         assert_eq!(v["summary"]["discovered"], 1);
         assert_eq!(v["events"][0]["details"]["mode"], "hosted");
+    }
+
+    /// A vendor-ledger entry: `detached` with the embedded record when
+    /// `record` is given (the manifest-free vendored posture), a legacy
+    /// manifest-tracked entry (no record of its own) otherwise. Built from
+    /// the on-disk JSON shape so the fixture follows the ledger schema.
+    fn vendor_entry(purl: &str, record: Option<PatchRecord>) -> VendorEntry {
+        serde_json::from_value(serde_json::json!({
+            "ecosystem": "npm",
+            "basePurl": purl,
+            "uuid": record
+                .as_ref()
+                .map_or("legacy-uuid", |r| r.uuid.as_str()),
+            "artifact": { "path": ".socket/vendor/npm/x/pkg.tgz" },
+            "wiring": [],
+            "detached": record.is_some(),
+            "record": record,
+        }))
+        .expect("vendor entry fixture deserializes")
+    }
+
+    /// Vendor-ledger records fold in labeled `vendored` with their ledger,
+    /// sort after the hosted record on a purl tie, and a legacy
+    /// manifest-tracked entry (no embedded record) never double-lists its
+    /// manifest purl. A vendored-only listing is a success envelope — the
+    /// hosted-only rule applied to the manifest-free vendored mode.
+    #[test]
+    fn vendored_ledger_records_are_labeled_and_sorted_last() {
+        let manifest = sample_manifest();
+        let record = manifest.patches["pkg:npm/minimist@1.2.2"].clone();
+        let mut redirect = RedirectState::new();
+        redirect
+            .records
+            .insert("pkg:npm/minimist@1.2.2".to_string(), record.clone());
+        let mut detached = record.clone();
+        detached.uuid = "44444444-4444-4444-8444-444444444444".to_string();
+        let mut vendor = HashMap::new();
+        vendor.insert(
+            "pkg:npm/minimist@1.2.2".to_string(),
+            vendor_entry("pkg:npm/minimist@1.2.2", Some(detached)),
+        );
+        vendor.insert(
+            "pkg:npm/zzz-vendored@1.0.0".to_string(),
+            vendor_entry("pkg:npm/zzz-vendored@1.0.0", Some(record)),
+        );
+        // Legacy manifest-tracked vendoring: the manifest holds the record.
+        vendor.insert(
+            "pkg:npm/minimist@1.2.2#legacy".to_string(),
+            vendor_entry("pkg:npm/minimist@1.2.2", None),
+        );
+
+        let env = build_list_envelope(&combined_entries(
+            Some(&manifest),
+            Some(&redirect),
+            Some(&vendor),
+        ));
+        let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+        let listed: Vec<(&str, &str)> = v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e["purl"].as_str().unwrap(),
+                    e["details"]["mode"].as_str().unwrap_or("manifest"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("pkg:npm/minimist@1.2.2", "manifest"),
+                ("pkg:npm/minimist@1.2.2", "hosted"),
+                ("pkg:npm/minimist@1.2.2", "vendored"),
+                ("pkg:npm/zzz-vendored@1.0.0", "vendored"),
+            ],
+            "purl-sorted, manifest < hosted < vendored on a tie, record-less              entries skipped: {v}"
+        );
+        let events = v["events"].as_array().unwrap();
+        assert_eq!(
+            events[2]["details"]["ledger"], ".socket/vendor/state.json",
+            "{v}"
+        );
+        assert_eq!(
+            events[2]["uuid"], "44444444-4444-4444-8444-444444444444",
+            "the ledger's embedded record is the one listed: {v}"
+        );
+
+        let only = build_list_envelope(&combined_entries(None, None, Some(&vendor)));
+        let v: serde_json::Value = serde_json::from_str(&only.to_pretty_json()).unwrap();
+        assert_eq!(v["status"], "success", "{v}");
+        assert_eq!(v["summary"]["discovered"], 2, "{v}");
     }
 
     #[test]

@@ -227,8 +227,9 @@ pub async fn run(args: UpdateArgs) -> i32 {
             format!("socket-patch {current} is already the latest version.")
         };
         if args.common.json {
+            // `--dry-run` returned above, so this envelope's `dryRun` is
+            // always `Envelope::new`'s `false`.
             let mut env = Envelope::new(Command::Update);
-            env.dry_run = args.common.dry_run;
             env.record(
                 PatchEvent::artifact(PatchAction::Skipped)
                     .with_reason("already_latest", &msg)

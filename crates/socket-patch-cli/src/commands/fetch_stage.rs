@@ -14,12 +14,12 @@ use socket_patch_core::api::blob_fetcher::{
     fetch_missing_blobs, fetch_missing_sources, format_fetch_result, get_missing_archives,
     get_missing_blobs, DownloadMode,
 };
-use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::patch::apply::PatchSources;
+use socket_patch_core::patch::apply::{is_valid_blob_hash, PatchSources};
 use tempfile::TempDir;
 
-use super::get::{base64_decode, is_valid_blob_hash};
+use super::get::base64_decode;
 use crate::args::GlobalArgs;
 
 /// Resolved artifact locations for the patch pipeline. Holds the overlay
@@ -72,12 +72,25 @@ pub(crate) enum StageOutcome {
     Unavailable,
 }
 
+/// The disk stager's remedy: `repair` fills the persistent `.socket/`
+/// cache `apply` reads from.
+const APPLY_OFFLINE_REMEDY: &str =
+    "Run \"socket-patch repair\" to download missing artifacts.";
+
+/// The memory stager's remedy. Vendored content is fetched into memory and
+/// never lands under `.socket/`; sending a vendored project to `repair`
+/// instead would populate `.socket/blobs/` — exactly the residue vendored
+/// mode promises not to leave (and from inside `repair --offline` the hint
+/// was self-referential).
+const VENDOR_OFFLINE_REMEDY: &str = "Re-run without --offline to fetch the missing patch \
+                                     content (kept in memory; nothing is written under .socket/).";
+
 /// Shared offline diagnostic: patches with no usable local source while
-/// `--offline` is set (first five PURLs, then the `repair` hint).
+/// `--offline` is set (first five PURLs, then the caller's `remedy` line).
 /// Prints even under `--silent` (errors only, NEVER nothing — an exit-1
 /// run with zero output is undiagnosable); `--json` mutes stderr and the
 /// caller's envelope is the machine channel instead.
-fn report_offline_missing(common: &GlobalArgs, purls: &[&str]) {
+fn report_offline_missing(common: &GlobalArgs, purls: &[&str], remedy: &str) {
     if common.json {
         return;
     }
@@ -91,7 +104,7 @@ fn report_offline_missing(common: &GlobalArgs, purls: &[&str]) {
     if purls.len() > 5 {
         eprintln!("  ... and {} more", purls.len() - 5);
     }
-    eprintln!("Run \"socket-patch repair\" to download missing artifacts.");
+    eprintln!("{remedy}");
 }
 
 /// The manifest PURLs with no usable local source. A patch is "locally
@@ -156,13 +169,16 @@ async fn overlay_dir(src: &Path, dst: &Path) {
 
 /// Resolve patch sources for `manifest`: read straight from `.socket/` when
 /// everything needed is cached (or `--offline`), else stage an overlay
-/// tempdir and fetch the gap. `Err` is a hard setup failure (bad
-/// `--download-mode`, tempdir creation); `Ok(Unavailable)` is the soft
-/// "cannot proceed" path with diagnostics already printed.
+/// tempdir and fetch the gap through `client` (the run's one API client —
+/// building another here repeated its advisory and org-slug resolution).
+/// `Err` is a hard setup failure (bad `--download-mode`, tempdir creation);
+/// `Ok(Unavailable)` is the soft "cannot proceed" path with diagnostics
+/// already printed.
 pub(crate) async fn stage_patch_sources(
     common: &GlobalArgs,
     manifest: &PatchManifest,
     socket_dir: &Path,
+    client: &ApiClient,
 ) -> Result<StageOutcome, String> {
     let quiet = common.silent || common.json;
     let socket_blobs_path = socket_dir.join("blobs");
@@ -191,7 +207,7 @@ pub(crate) async fn stage_patch_sources(
         // verification on its own; we still surface the no-source
         // diagnosis so the user runs `repair` before retrying.
         if !no_source_purls.is_empty() {
-            report_offline_missing(common, &no_source_purls);
+            report_offline_missing(common, &no_source_purls, APPLY_OFFLINE_REMEDY);
             return Ok(StageOutcome::Unavailable);
         }
     }
@@ -247,10 +263,9 @@ pub(crate) async fn stage_patch_sources(
         );
     }
 
-    let (client, _) = get_api_client_with_overrides(common.api_client_overrides()).await;
     let sources = staged.as_patch_sources();
     let fetch_result =
-        fetch_missing_sources(manifest, &sources, download_mode, &client, None).await;
+        fetch_missing_sources(manifest, &sources, download_mode, client, None).await;
 
     if !quiet {
         println!("{}", format_fetch_result(&fetch_result));
@@ -269,7 +284,7 @@ pub(crate) async fn stage_patch_sources(
                     still_missing_blobs.len()
                 );
             }
-            let blob_result = fetch_missing_blobs(manifest, &staged.blobs, &client, None).await;
+            let blob_result = fetch_missing_blobs(manifest, &staged.blobs, client, None).await;
             if !quiet {
                 println!("{}", format_fetch_result(&blob_result));
             }
@@ -409,7 +424,7 @@ pub(crate) async fn stage_vendor_sources_in_memory(
     if !to_fetch.is_empty() {
         if common.offline {
             let purls: Vec<&str> = to_fetch.iter().map(|(purl, _)| *purl).collect();
-            report_offline_missing(common, &purls);
+            report_offline_missing(common, &purls, VENDOR_OFFLINE_REMEDY);
             return MemStageOutcome::Unavailable;
         }
 
@@ -529,6 +544,25 @@ mod tests {
         }
     }
 
+    /// A network-free client for the offline arms (never used: they return
+    /// before any fetch), built directly so no ambient token or socket-cli
+    /// config can leak into a unit test.
+    fn offline_client() -> ApiClient {
+        ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
+            api_url: "http://127.0.0.1:1".to_string(),
+            api_token: None,
+            use_public_proxy: false,
+            org_slug: None,
+        })
+    }
+
+    /// The client `dead_endpoint_args` describes (see there).
+    async fn dead_endpoint_client(args: &GlobalArgs) -> ApiClient {
+        get_api_client_with_overrides(args.api_client_overrides())
+            .await
+            .0
+    }
+
     /// Everything cached → read `.socket/` in place: no overlay tempdir, and
     /// the returned paths are the persistent cache dirs themselves.
     #[tokio::test]
@@ -538,9 +572,14 @@ mod tests {
         std::fs::create_dir_all(socket_dir.join("blobs")).unwrap();
         std::fs::write(socket_dir.join("blobs").join(HASH), b"patched").unwrap();
 
-        let outcome = stage_patch_sources(&offline_args(), &manifest_with_one_patch(), &socket_dir)
-            .await
-            .expect("no hard failure");
+        let outcome = stage_patch_sources(
+            &offline_args(),
+            &manifest_with_one_patch(),
+            &socket_dir,
+            &offline_client(),
+        )
+        .await
+        .expect("no hard failure");
         let StageOutcome::Ready(staged) = outcome else {
             panic!("fully-cached staging must be Ready");
         };
@@ -555,9 +594,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let socket_dir = tmp.path().join(".socket");
 
-        let outcome = stage_patch_sources(&offline_args(), &manifest_with_one_patch(), &socket_dir)
-            .await
-            .expect("no hard failure");
+        let outcome = stage_patch_sources(
+            &offline_args(),
+            &manifest_with_one_patch(),
+            &socket_dir,
+            &offline_client(),
+        )
+        .await
+        .expect("no hard failure");
         assert!(
             matches!(outcome, StageOutcome::Unavailable),
             "offline + no local source must be Unavailable"
@@ -581,9 +625,14 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = stage_patch_sources(&offline_args(), &manifest_with_one_patch(), &socket_dir)
-            .await
-            .expect("no hard failure");
+        let outcome = stage_patch_sources(
+            &offline_args(),
+            &manifest_with_one_patch(),
+            &socket_dir,
+            &offline_client(),
+        )
+        .await
+        .expect("no hard failure");
         assert!(
             matches!(outcome, StageOutcome::Ready(_)),
             "a present diff archive is a usable source for the disk stager"
@@ -656,10 +705,12 @@ mod tests {
         )
         .unwrap();
 
+        let args = dead_endpoint_args();
         let outcome = stage_patch_sources(
-            &dead_endpoint_args(),
+            &args,
             &manifest_with_one_patch(),
             &socket_dir,
+            &dead_endpoint_client(&args).await,
         )
         .await
         .expect("no hard failure");
@@ -687,9 +738,14 @@ mod tests {
             download_mode: "file".to_string(),
             ..dead_endpoint_args()
         };
-        let outcome = stage_patch_sources(&args, &manifest_with_one_patch(), &socket_dir)
-            .await
-            .expect("no hard failure");
+        let outcome = stage_patch_sources(
+            &args,
+            &manifest_with_one_patch(),
+            &socket_dir,
+            &dead_endpoint_client(&args).await,
+        )
+        .await
+        .expect("no hard failure");
         assert!(
             matches!(outcome, StageOutcome::Ready(_)),
             "a local diff archive covers the patch even when the blob download fails"
@@ -703,10 +759,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let socket_dir = tmp.path().join(".socket");
 
+        let args = dead_endpoint_args();
         let outcome = stage_patch_sources(
-            &dead_endpoint_args(),
+            &args,
             &manifest_with_one_patch(),
             &socket_dir,
+            &dead_endpoint_client(&args).await,
         )
         .await
         .expect("no hard failure");
@@ -726,7 +784,13 @@ mod tests {
             silent: true,
             ..GlobalArgs::default()
         };
-        let Err(err) = stage_patch_sources(&args, &manifest_with_one_patch(), tmp.path()).await
+        let Err(err) = stage_patch_sources(
+            &args,
+            &manifest_with_one_patch(),
+            tmp.path(),
+            &offline_client(),
+        )
+        .await
         else {
             panic!("an unparseable download mode is a hard failure");
         };
@@ -747,9 +811,14 @@ mod tests {
         std::fs::create_dir_all(socket_dir.join("blobs")).unwrap();
         std::fs::write(socket_dir.join("blobs").join(HASH), b"cached").unwrap();
 
-        let outcome = stage_patch_sources(&offline_args(), &manifest_with_one_patch(), &socket_dir)
-            .await
-            .expect("no hard failure");
+        let outcome = stage_patch_sources(
+            &offline_args(),
+            &manifest_with_one_patch(),
+            &socket_dir,
+            &offline_client(),
+        )
+        .await
+        .expect("no hard failure");
         let StageOutcome::Ready(mut staged) = outcome else {
             panic!("fully-cached staging must be Ready");
         };

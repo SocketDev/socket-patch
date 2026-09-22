@@ -793,6 +793,110 @@ fn exclude_already_persisted_skips_manifest_rewrite() {
 }
 
 // ---------------------------------------------------------------------------
+// `--exclude` persistence waits for the mutation gate: a directory with no
+// project writes nothing, an already-configured project still persists an
+// explicit exclusion, a dry run persists nothing, and a failed write is
+// reported — never silently lost.
+// ---------------------------------------------------------------------------
+
+/// `setup --exclude` in a directory with no project files reports `no_files`
+/// and must NOT leave a `.socket/manifest.json` behind (the exclude list
+/// used to be persisted before discovery).
+#[test]
+fn setup_exclude_in_empty_dir_writes_no_socket_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path();
+
+    let (code, v) = run_json(cwd, &["setup", "--yes", "--json", "--exclude", "packages/x"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["status"], "no_files", "{v}");
+    assert!(
+        !cwd.join(".socket").exists(),
+        "no project → nothing to set up → nothing to persist, no .socket/"
+    );
+}
+
+/// An explicit `--exclude` on an already-configured project (nothing to
+/// preview or confirm) is still the user's stated intent: it is persisted,
+/// under the manifest lock, which is released and removed again.
+#[test]
+fn setup_exclude_persists_when_hooks_are_already_configured() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path();
+    write(
+        &cwd.join("package.json"),
+        &format!("{{ \"name\": \"root\", \"version\": \"1.0.0\", {WIRED_SCRIPTS_FRAGMENT} }}"),
+    );
+
+    let (code, v) = run_json(cwd, &["setup", "--yes", "--json", "--exclude", "packages/b"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["status"], "already_configured", "{v}");
+    let manifest = read(&cwd.join(".socket/manifest.json"));
+    let mv: serde_json::Value = serde_json::from_str(&manifest).expect("manifest JSON");
+    assert_eq!(
+        mv["setup"]["exclude"],
+        serde_json::json!(["packages/b"]),
+        "the explicit exclusion must be persisted: {manifest}"
+    );
+    assert!(
+        !cwd.join(".socket/apply.lock").exists(),
+        "the persistence lock is released and its file removed"
+    );
+}
+
+/// `--dry-run` with `--exclude` previews and persists NOTHING.
+#[test]
+fn setup_dry_run_exclude_persists_nothing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path();
+    write(&cwd.join("package.json"), UNWIRED_PACKAGE_JSON);
+
+    let (code, v) = run_json(cwd, &["setup", "--dry-run", "--json", "--exclude", "packages/b"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["status"], "dry_run", "{v}");
+    assert!(
+        !cwd.join(".socket").exists(),
+        "a dry run must not persist the exclude list"
+    );
+}
+
+/// A persistence step that cannot write reports the skip instead of
+/// claiming success: a read-only `.socket/` refuses the manifest lock and
+/// write alike, the bytes on disk stay untouched, and the `--json`
+/// envelope carries the fail-closed warning (same channel as the corrupt-
+/// manifest skip).
+#[cfg(unix)]
+#[test]
+fn setup_exclude_write_failure_surfaces_persist_warning() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path();
+    write(&cwd.join("package.json"), UNWIRED_PACKAGE_JSON);
+    let manifest_path = cwd.join(".socket/manifest.json");
+    let original = r#"{"patches":{}}"#;
+    write(&manifest_path, original);
+    let socket = cwd.join(".socket");
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let (code, v) = run_json(cwd, &["setup", "--yes", "--json", "--exclude", "packages/b"]);
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(code, 0, "the hooks were written; only persistence was skipped: {v}");
+    assert_eq!(v["status"], "success", "{v}");
+    assert!(
+        v["warnings"].as_array().is_some_and(|w| w.iter().any(|x| x
+            .as_str()
+            .is_some_and(|x| x.contains("not persisting --exclude")))),
+        "the skipped persistence must appear in the --json warnings: {v}"
+    );
+    assert_eq!(
+        read(&manifest_path),
+        original,
+        "the manifest must be untouched when it cannot be rewritten"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Python edge matrix.
 // ---------------------------------------------------------------------------
 

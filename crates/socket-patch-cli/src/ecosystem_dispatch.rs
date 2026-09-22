@@ -49,7 +49,10 @@ pub fn partition_purls(
 /// PURLs and, on rollback, remaps base PURLs back to qualified ones).
 ///
 /// `$using_label` is the noun in "Using <X> at: <path>" for global
-/// scans; pass `""` to suppress that line.
+/// scans; pass `""` to suppress that line. The banner is progress chrome
+/// and goes to STDERR like the macro's two warnings: stdout belongs to
+/// `--json` envelopes and the VEX document, so a caller that forgets to
+/// fold `json` into `$silent` can no longer corrupt them.
 macro_rules! scan_ecosystem {
     (
         out = $out:ident,
@@ -76,7 +79,7 @@ macro_rules! scan_ecosystem {
                             && !$silent
                         {
                             if let Some(first) = paths.first() {
-                                println!("Using {} at: {}", using, first.display());
+                                eprintln!("Using {} at: {}", using, first.display());
                             }
                         }
                         for path in &paths {

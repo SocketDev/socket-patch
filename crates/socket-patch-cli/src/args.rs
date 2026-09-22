@@ -258,8 +258,10 @@ pub struct GlobalArgs {
     /// positive value retries with a 100 ms backoff until the lock
     /// frees or the budget elapses. Only meaningful for the lock-
     /// contending subcommands (`apply`, `rollback`, `repair`, `remove`,
-    /// `vendor`, and the vendored modes of `scan`/`get`); other
-    /// commands accept it silently.
+    /// `vendor`, `setup --exclude`'s manifest write, and the hosted /
+    /// vendored modes of `scan`/`get`); other commands accept it
+    /// silently. Every holder removes the lock file on exit, so a
+    /// leftover from a crashed run never contends.
     #[arg(long = "lock-timeout", env = "SOCKET_LOCK_TIMEOUT")]
     pub lock_timeout: Option<u64>,
 
@@ -308,6 +310,43 @@ impl GlobalArgs {
         }
     }
 
+    /// The project root whose `.socket/` state stores — manifest, vendor
+    /// ledger, redirect ledger — belong together: the RESOLVED manifest's
+    /// directory, stepping out of a standard `.socket/` layout when the
+    /// manifest lives in one. For the default `<cwd>/.socket/manifest.json`
+    /// this is exactly `cwd`; for a `--manifest-path` into another project
+    /// it is that project's root (its `.socket` parent's parent); for a
+    /// bare file like `--manifest-path /tmp/x/abs.json` it is the file's
+    /// own directory. Every command that reads more than one store must
+    /// derive them from THIS root, so `--manifest-path` can never
+    /// interleave two projects' state (CLI_CONTRACT.md: both stores always
+    /// come from the SAME project).
+    pub(crate) fn project_root(&self) -> PathBuf {
+        let manifest_path = self.resolved_manifest_path();
+        match manifest_path.parent() {
+            Some(dir)
+                if dir.file_name()
+                    == Some(std::ffi::OsStr::new(
+                        socket_patch_core::constants::SOCKET_DIR,
+                    )) =>
+            {
+                dir.parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.cwd.clone())
+            }
+            Some(dir) => dir.to_path_buf(),
+            None => self.cwd.clone(),
+        }
+    }
+
+    /// The directory the manifest lives in — where `apply.lock`, `blobs/`,
+    /// `diffs/` and `packages/` sit (`<cwd>/.socket` by default). The one
+    /// derivation every lock acquire and artifact probe uses; see
+    /// [`socket_dir_of`] for callers holding a raw manifest path.
+    pub(crate) fn socket_dir(&self) -> PathBuf {
+        socket_dir_of(&self.resolved_manifest_path(), &self.cwd)
+    }
+
     /// Build [`ApiClientEnvOverrides`] from the CLI flags.
     ///
     /// Every field is forwarded as `Some(_)` only when set and non-empty.
@@ -324,6 +363,19 @@ impl GlobalArgs {
             proxy_url: self.proxy_url.clone().filter(|s| !s.is_empty()),
         }
     }
+}
+
+/// The `.socket/`-role directory for `manifest_path`: its parent, falling
+/// back to `cwd` for a bare relative file name — never `"."`, which is
+/// wrong under a non-default `--cwd`. [`GlobalArgs::resolved_manifest_path`]
+/// always joins a relative path onto `cwd`, so the fallback is reachable
+/// only for callers handed an unresolved path.
+pub(crate) fn socket_dir_of(manifest_path: &Path, cwd: &Path) -> PathBuf {
+    manifest_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.to_path_buf())
 }
 
 /// Apply CLI-flag toggles for env-driven knobs by mirroring them into env
@@ -530,11 +582,11 @@ mod tests {
     }
 
     /// Clear the extra env the core telemetry gate reads beyond the
-    /// `SOCKET_*` set (`is_telemetry_disabled` also consults `VITEST` and the
-    /// legacy `SOCKET_PATCH_TELEMETRY_DISABLED` name), so the airgap tests
-    /// below can't pass or fail vacuously. Restores afterwards.
+    /// `SOCKET_*` set (`is_telemetry_disabled` also consults the legacy
+    /// `SOCKET_PATCH_TELEMETRY_DISABLED` name), so the airgap tests below
+    /// can't pass or fail vacuously. Restores afterwards.
     fn with_clean_telemetry_env(f: impl FnOnce()) {
-        with_env_cleared(&["VITEST", "SOCKET_PATCH_TELEMETRY_DISABLED"], f);
+        with_env_cleared(&["SOCKET_PATCH_TELEMETRY_DISABLED"], f);
     }
 
     /// `--offline` promises "never contact the network", but the telemetry
@@ -1000,6 +1052,68 @@ mod tests {
         assert_eq!(
             args.resolved_manifest_path(),
             PathBuf::from("/work/project/../manifest.json"),
+        );
+    }
+
+    /// The default layout: `<cwd>/.socket/manifest.json` → the project
+    /// root is `cwd` and the socket dir is `<cwd>/.socket`.
+    #[test]
+    fn project_root_and_socket_dir_for_default_layout() {
+        let args = GlobalArgs {
+            cwd: PathBuf::from("/work/project"),
+            ..GlobalArgs::default()
+        };
+        assert_eq!(args.project_root(), PathBuf::from("/work/project"));
+        assert_eq!(
+            args.socket_dir(),
+            PathBuf::from("/work/project").join(".socket")
+        );
+    }
+
+    /// `--manifest-path` into ANOTHER project's `.socket/`: every store
+    /// (manifest, vendor ledger, redirect ledger, lock) resolves against
+    /// that project — its `.socket` parent's parent — never the cwd.
+    #[test]
+    fn project_root_steps_out_of_a_foreign_socket_dir() {
+        let args = GlobalArgs {
+            cwd: PathBuf::from("/work/project"),
+            manifest_path: "../other/.socket/manifest.json".to_string(),
+            ..GlobalArgs::default()
+        };
+        let other = PathBuf::from("/work/project").join("../other");
+        assert_eq!(args.project_root(), other);
+        assert_eq!(args.socket_dir(), other.join(".socket"));
+    }
+
+    /// A bare manifest file outside any `.socket/` layout: the file's own
+    /// directory plays both roles.
+    #[test]
+    fn project_root_of_a_bare_manifest_file_is_its_directory() {
+        let args = GlobalArgs {
+            cwd: PathBuf::from("/work/project"),
+            manifest_path: "custom/mp.json".to_string(),
+            ..GlobalArgs::default()
+        };
+        let custom = PathBuf::from("/work/project").join("custom");
+        assert_eq!(args.project_root(), custom);
+        assert_eq!(args.socket_dir(), custom);
+    }
+
+    /// `socket_dir_of` on a raw relative file name falls back to `cwd`,
+    /// never to `"."` (wrong under a non-default `--cwd`); a resolved path
+    /// yields its parent.
+    #[test]
+    fn socket_dir_of_bare_relative_name_falls_back_to_cwd() {
+        assert_eq!(
+            socket_dir_of(Path::new("manifest.json"), Path::new("/work/project")),
+            PathBuf::from("/work/project"),
+        );
+        let resolved = PathBuf::from("/work/project")
+            .join(".socket")
+            .join("manifest.json");
+        assert_eq!(
+            socket_dir_of(&resolved, Path::new("/elsewhere")),
+            PathBuf::from("/work/project").join(".socket"),
         );
     }
 
