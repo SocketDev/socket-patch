@@ -17,6 +17,7 @@ on:
       - '.github/actions/upload-artifact/**'
       - '.github/workflows/bun-compatibility.yml'
       - 'scripts/backtest-bun*.py'
+      - 'scripts/probe-bun-historical-linux.py'
       - 'scripts/bun-historical-shas.json'
       - 'crates/socket-patch-cli/tests/e2e_bun_lockb.rs'
       - 'crates/socket-patch-core/tests/fixtures/bun-lockb/**'
@@ -49,6 +50,7 @@ on:
     paths:
       - '.github/workflows/bun-compatibility.yml'
       - 'scripts/backtest-bun*.py'
+      - 'scripts/probe-bun-historical-linux.py'
       - 'scripts/bun-historical-shas.json'
       - 'crates/socket-patch-cli/tests/e2e_bun_lockb.rs'
       - 'crates/socket-patch-core/tests/fixtures/bun-lockb/**'
@@ -129,6 +131,9 @@ jobs:
     needs: build
     strategy:
       fail-fast: false
+      # Each job runs three cells against the public patch service. Bound
+      # concurrent jobs so the full release matrix does not flood that API.
+      max-parallel: 6
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         # Every lock-format and behaviour boundary the CLI has to survive:
@@ -330,6 +335,7 @@ jobs:
             native-bun/captures/**/cli-output.json
             native-bun/captures/**/tree/**
             native-bun/captures/**/*.log
+            native-bun/attempts/**
           retention-days: 14
 
 
@@ -370,6 +376,13 @@ jobs:
             --tools native-binary/tools \
             --output native-binary/results \
             --jobs 2 "${versions[@]}"
+
+      - name: Diagnose historical Linux runtime failures
+        if: failure() && runner.os == 'Linux'
+        run: >-
+          python3 scripts/probe-bun-historical-linux.py
+          --tools native-binary/tools
+          --output native-binary/results/linux-diagnostics
 
       - name: Upload binary acceptance results
         if: always()

@@ -942,11 +942,17 @@ fn setup_configures_npm_workspace_members() {
 
 const GEMFILE_FIXTURE: &str = "source 'https://rubygems.org'\ngem 'colorize', '1.1.0'\n";
 
+fn write_supported_gem_project(root: &Path) {
+    write(&root.join("Gemfile"), GEMFILE_FIXTURE);
+    // These tests exercise setup, not discovery of the host's Bundler version.
+    write(&root.join("Gemfile.lock"), "BUNDLED WITH\n   2.7.2\n");
+}
+
 #[test]
 fn setup_gem_dry_run_does_not_modify_gemfile() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let gemfile = tmp.path().join("Gemfile");
-    write(&gemfile, GEMFILE_FIXTURE);
+    write_supported_gem_project(tmp.path());
 
     let (code, stdout) = run_setup(tmp.path(), &["--dry-run"]);
     assert_eq!(code, 0, "dry-run should succeed; stdout=\n{stdout}");
@@ -969,7 +975,7 @@ fn setup_gem_dry_run_does_not_modify_gemfile() {
 #[test]
 fn setup_configures_gem_alongside_npm() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    write(&tmp.path().join("Gemfile"), GEMFILE_FIXTURE);
+    write_supported_gem_project(tmp.path());
     write(
         &tmp.path().join("package.json"),
         r#"{ "name": "mixed", "version": "1.0.0" }
@@ -1030,7 +1036,7 @@ fn setup_gem_materialization_honors_manifest_path() {
     // the assertion below could pass for the wrong reason (e.g. the warning
     // vanishing for some unrelated change).
     let control = tempfile::tempdir().expect("tempdir");
-    write(&control.path().join("Gemfile"), GEMFILE_FIXTURE);
+    write_supported_gem_project(control.path());
     write(
         &control.path().join(".socket/manifest.json"),
         "not json {{{",
@@ -1046,7 +1052,7 @@ fn setup_gem_materialization_honors_manifest_path() {
     // Same fixture, but the run is pointed at a valid manifest elsewhere. The
     // nested apply must use it, so no materialization warning is emitted.
     let tmp = tempfile::tempdir().expect("tempdir");
-    write(&tmp.path().join("Gemfile"), GEMFILE_FIXTURE);
+    write_supported_gem_project(tmp.path());
     write(&tmp.path().join(".socket/manifest.json"), "not json {{{");
     write(&tmp.path().join("custom/patches.json"), r#"{"patches":{}}"#);
 

@@ -138,6 +138,43 @@ def save(path, data):
     path.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
 
 
+def has_transport_failure(value):
+    """Only explicit request transport errors qualify for a fresh-cell retry."""
+    if isinstance(value, dict):
+        return any(has_transport_failure(item) for item in value.values())
+    if isinstance(value, list):
+        return any(has_transport_failure(item) for item in value)
+    return isinstance(value, str) and 'error sending request for url (' in value
+
+
+def retry_network_cell(run_case, job, root, attempts=3):
+    """Keep failed evidence and retry transient service failures from a clean tree."""
+    name = '-'.join(job)
+    case = root / 'captures' / name
+    history = []
+    for attempt in range(1, attempts + 1):
+        row = run_case(job)
+        if row['passed'] or not has_transport_failure(row) or attempt == attempts:
+            if history:
+                row['networkRetryAttempts'] = history
+                save(case / 'result.json', row)
+            return row
+        evidence = root / 'attempts' / name / str(attempt)
+        evidence.mkdir(parents=True, exist_ok=True)
+        for source in case.iterdir():
+            if source.is_file() and source.suffix in ('.log', '.json'):
+                shutil.copy2(source, evidence / source.name)
+            elif source.name == 'tree':
+                shutil.copytree(source, evidence / source.name, dirs_exist_ok=True)
+        history.append(dict(attempt=attempt, evidence=evidence.relative_to(root).as_posix(),
+                            failedChecks=[key for key, passed in row.get('checks', {}).items() if not passed]))
+        # Remove the failed project's package-manager caches too. A retry is
+        # another cold proof, never a continuation from partially written state.
+        shutil.rmtree(case)
+        print(f'{name}: request transport failed; retrying fresh cell ({attempt}/{attempts})', flush=True)
+        time.sleep(5 * attempt)
+
+
 def run(command, cwd, env, log, required=True, timeout=180, tolerate_timeout=False):
     """(exit code, combined output). A hang is an error — except for the
     digest-tamper installs (`tolerate_timeout`), where Bun 1.3.9 and 1.3.10
@@ -649,9 +686,13 @@ def main():
             bun = tools[version]
 
             def env_for(binary, cache):
+                temporary = case / 'tool-tmp'
+                temporary.mkdir(exist_ok=True)
                 return dict(base_env, PATH=str(binary.parent) + os.pathsep + base_env['PATH'],
                             BUN_INSTALL_CACHE_DIR=str(case / cache),
-                            BUN_INSTALL=str(case / 'bun-home'))
+                            BUN_INSTALL=str(case / 'bun-home'),
+                            TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary),
+                            BUN_TMPDIR=str(temporary))
             env = env_for(bun, 'cache')
 
             def cli_command(verb, run_mode):
@@ -875,7 +916,8 @@ def main():
                 if capture.exists():
                     shutil.rmtree(capture)
                 capture.mkdir()
-                for name in [*files, 'bun.lock', 'bun.lockb', '.socket/manifest.json']:
+                for name in [*files, 'bun.lock', 'bun.lockb', '.socket/manifest.json',
+                             '.socket/vendor/state.json', '.socket/vendor/redirect-state.json']:
                     source = project / name
                     if source.is_file():
                         destination = capture / name
@@ -1004,7 +1046,7 @@ def main():
         return row
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        rows = list(pool.map(backtest, jobs))
+        rows = list(pool.map(lambda job: retry_network_cell(backtest, job, root), jobs))
     save(root / 'summary.json', rows)
     for version in args.versions:
         mine = [r for r in rows if r['bun'] == version]

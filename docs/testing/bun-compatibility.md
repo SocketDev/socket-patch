@@ -309,6 +309,15 @@ provenance); releases before 1.1.0 have no Windows binary. The `legacy-lockb`
 shape also needs Bun 1.1.38 (its baseline writer), fetched or reused the same
 way whenever a `legacy-lockb` cell applies to a requested release.
 
+Public-service cells retry at most three times when a captured CLI response
+contains an explicit request transport error. Every retry recreates the project
+and its caches, and preserves the failed attempt's logs, result and captured
+tree under `attempts/`; the final row records `networkRetryAttempts`. Functional
+failures without a transport error are never retried. CI limits the public
+matrix to six concurrent jobs, with three cells per job. Each cell has its own
+temporary directory so historical Bun processes cannot collide while extracting
+identically named packages.
+
 **Pinned versions:** 0.8.1, 1.0.0, 1.0.36, 1.1.0, 1.1.38 (binary lock),
 1.1.39 (first text lock, version 0), 1.1.43 (first `--lockfile-only`), 1.1.45
 (last version-0 writer), 1.2.0, 1.2.23, 1.3.0 (version 1), 1.3.9 / 1.3.10

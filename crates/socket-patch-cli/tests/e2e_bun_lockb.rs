@@ -48,7 +48,7 @@ fn require_success(output: Output, label: &str) -> Output {
     assert!(
         output.status.success(),
         "{label}: {:?}\nstdout: {}\nstderr: {}",
-        output.status.code(),
+        output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -228,7 +228,11 @@ impl Fixture {
             .collect();
         let captured_fixture = std::env::var_os("SOCKET_PATCH_BUN_LOCKB_WRITER").is_none()
             && major_minor.as_slice() >= [1, 2].as_slice();
-        let temp = tempfile::tempdir().unwrap();
+        // Windows runners keep the checkout on D: and the system tempdir on
+        // C:. Bun workspace writers cannot relativize paths across those
+        // drives; keep the fixture on the working drive, as the public matrix
+        // does, while retaining the space/Unicode project path below.
+        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let project = temp.path().join("binary project café");
         std::fs::create_dir_all(&project).unwrap();
         let dependencies = match shape {

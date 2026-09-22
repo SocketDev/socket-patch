@@ -21,6 +21,66 @@ def load_script(name):
 
 pipenv = load_script("backtest-pipenv")
 pdm = load_script("backtest-pdm")
+bun = load_script("backtest-bun")
+
+
+class BunTransportRetryTests(unittest.TestCase):
+    def test_retry_uses_clean_tree_and_keeps_failed_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            job = ('1.1.38', 'direct', 'vendored')
+            case = root / 'captures' / '-'.join(job)
+            calls = []
+
+            def run_case(_job):
+                self.assertFalse(case.exists(), 'retry must discard partial state and caches')
+                case.mkdir(parents=True)
+                (case / 'cache').mkdir()
+                (case / 'cli.log').write_text('failed request evidence')
+                calls.append(True)
+                row = dict(passed=len(calls) > 1, checks={'repeatStableLock': len(calls) > 1})
+                if len(calls) == 1:
+                    row['repeat'] = {'vendor': {'events': [{'reason':
+                        'Network error: error sending request for url (https://patch.socket.dev/example)'}]}}
+                bun.save(case / 'result.json', row)
+                return row
+
+            with patch.object(bun.time, 'sleep'):
+                row = bun.retry_network_cell(run_case, job, root)
+            self.assertTrue(row['passed'])
+            self.assertEqual(len(calls), 2)
+            evidence = root / row['networkRetryAttempts'][0]['evidence']
+            self.assertEqual((evidence / 'cli.log').read_text(), 'failed request evidence')
+            self.assertFalse((evidence / 'cache').exists())
+
+    def test_functional_failure_is_never_retried(self):
+        with tempfile.TemporaryDirectory() as temp:
+            row = dict(passed=False, checks={'frozenPatchedBytes': False}, error='installed bytes differ')
+            calls = []
+            result = bun.retry_network_cell(lambda job: calls.append(job) or row,
+                                           ('1.0.0', 'production', 'hosted'), Path(temp))
+            self.assertIs(result, row)
+            self.assertEqual(len(calls), 1)
+
+    def test_persistent_transport_failure_remains_failed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            job = ('1.1.38', 'direct', 'hosted')
+            case = root / 'captures' / '-'.join(job)
+            calls = []
+
+            def run_case(_job):
+                case.mkdir(parents=True)
+                calls.append(True)
+                row = dict(passed=False, error='error sending request for url (https://patches-api.socket.dev/patch/batch)')
+                bun.save(case / 'result.json', row)
+                return row
+
+            with patch.object(bun.time, 'sleep'):
+                row = bun.retry_network_cell(run_case, job, root)
+            self.assertFalse(row['passed'])
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(len(row['networkRetryAttempts']), 2)
 
 
 class PipenvShimTests(unittest.TestCase):

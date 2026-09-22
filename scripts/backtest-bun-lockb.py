@@ -86,7 +86,7 @@ def main():
                                     cwd=root, env=env, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, timeout=600)
             log = result.stdout.decode(errors='replace')
-            (output / f'{version}-writer-{writer_version}.log').write_text(log)
+            (output / f'{version}-writer-{writer_version}.log').write_text(log, encoding='utf-8')
             row.update(extendedLayouts='SOCKET_PATCH_BUN_LOCKB_EXTENDED' in env,
                        exitCode=result.returncode, passed=result.returncode == 0 and
                        '3 passed;' in log and 'SKIP binary Bun E2E' not in log,
