@@ -10,6 +10,7 @@ pub mod python_lock;
 pub mod python_script;
 pub(crate) mod serde;
 pub mod socket_cli_config;
+pub mod socket_dir;
 pub(crate) mod toml_edit_ext;
 pub mod uri;
 

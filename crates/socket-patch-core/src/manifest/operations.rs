@@ -256,14 +256,50 @@ mod tests {
         assert_eq!(manifest.patches.len(), 1);
     }
 
+    /// Well-formed JSON that violates the schema is a DATA error: it keeps
+    /// the historical "Invalid manifest" prefix (the syntax class below keeps
+    /// "Failed to parse manifest JSON"); both are `InvalidData`. The split
+    /// is decided by `serde_json::Error::is_data`, so pin it here — no
+    /// external test does.
     #[test]
     fn test_parse_manifest_invalid() {
         let json = serde_json::json!({
             "patches": "not-an-object"
         });
 
-        let result = parse_manifest(&json.to_string());
-        assert!(result.is_err());
+        let err = parse_manifest(&json.to_string()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().starts_with("Invalid manifest: "),
+            "schema errors keep the data-class prefix: {err}"
+        );
+
+        let err = parse_manifest("{ not json").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .starts_with("Failed to parse manifest JSON: "),
+            "syntax errors keep the parse-class prefix: {err}"
+        );
+    }
+
+    /// Deserializing straight into the struct rejects a REPEATED struct field
+    /// (the old `Value` round-trip silently kept the last value). A
+    /// hand-edited manifest with two `uuid` keys in one record is malformed
+    /// and classified as a data error. The fixture is a raw string on purpose:
+    /// `json!` would collapse the duplicate before the parser ever saw it.
+    #[test]
+    fn test_parse_manifest_rejects_duplicate_struct_field() {
+        let raw = r#"{"patches":{"pkg:npm/a@1.0.0":{"uuid":"x","uuid":"y",
+            "exportedAt":"t","files":{},"vulnerabilities":{},
+            "description":"","license":"MIT","tier":"free"}}}"#;
+        let err = parse_manifest(raw).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .starts_with("Invalid manifest: duplicate field `uuid`"),
+            "{err}"
+        );
     }
 
     #[test]

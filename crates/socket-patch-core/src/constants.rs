@@ -1,3 +1,8 @@
+/// The project-relative state directory every socket-patch file lives under
+/// (manifest, blob/archive stores, the vendor and hosted ledgers, the apply
+/// lock). Empty-directory prunes climb up to — never past — this level.
+pub const SOCKET_DIR: &str = ".socket";
+
 /// Default path for the patch manifest file relative to the project root.
 pub const DEFAULT_PATCH_MANIFEST_PATH: &str = ".socket/manifest.json";
 
@@ -10,9 +15,9 @@ pub const DEFAULT_SOCKET_API_URL: &str = "https://api.socket.dev";
 /// User-Agent header value for API requests.
 ///
 /// The version segment is derived from the crate version at compile time so it
-/// tracks the published release (currently `3.x`) instead of drifting from a
-/// hardcoded literal. Server-side analytics and any minimum-version gating rely
-/// on this reporting the real version.
+/// tracks the published release instead of drifting from a hardcoded literal.
+/// Server-side analytics and any minimum-version gating rely on this reporting
+/// the real version.
 pub(crate) const USER_AGENT: &str = concat!("SocketPatchCLI/", env!("CARGO_PKG_VERSION"));
 
 #[cfg(test)]
