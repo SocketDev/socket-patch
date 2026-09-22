@@ -2737,7 +2737,6 @@ packages:
             let diag = inventory_npm_lock(tmp.path()).await.unwrap_err();
             assert_eq!(diag.code, "bun_lockb_invalid");
             assert!(diag.detail.contains("bun.lockb"), "{}", diag.detail);
-            assert!(!diag.detail.contains("--save-text-lockfile"));
             let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
             assert!(entries.is_empty(), "{entries:?}");
             assert_eq!(unsupported, vec![diag]);

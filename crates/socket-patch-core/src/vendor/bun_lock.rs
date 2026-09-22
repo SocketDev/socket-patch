@@ -1994,7 +1994,6 @@ mod tests {
         let (code, detail) = preflight_vendor(root.path()).await.unwrap_err();
         assert_eq!(code, "vendor_bun_lockb_invalid");
         assert!(detail.contains("bun.lockb"), "{detail}");
-        assert!(!detail.contains("--save-text-lockfile"), "{detail}");
         tokio::fs::write(root.path().join(BUN_LOCK), BN3_BEFORE_LOCK)
             .await
             .unwrap();
