@@ -82,12 +82,17 @@ def main():
                 env['SOCKET_PATCH_BUN_LOCKB_EXTENDED'] = '1'
             else:
                 env.pop('SOCKET_PATCH_BUN_LOCKB_EXTENDED', None)
+            if bun_matrix.ver(writer_version) >= (0, 8, 1):
+                env['SOCKET_PATCH_BUN_LOCKB_PRODUCTION'] = '1'
+            else:
+                env.pop('SOCKET_PATCH_BUN_LOCKB_PRODUCTION', None)
             result = subprocess.run([binary, 'native_binary_', '--nocapture', '--test-threads=1'],
                                     cwd=root, env=env, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, timeout=600)
             log = result.stdout.decode(errors='replace')
             (output / f'{version}-writer-{writer_version}.log').write_text(log, encoding='utf-8')
             row.update(extendedLayouts='SOCKET_PATCH_BUN_LOCKB_EXTENDED' in env,
+                       productionLayouts='SOCKET_PATCH_BUN_LOCKB_PRODUCTION' in env,
                        exitCode=result.returncode, passed=result.returncode == 0 and
                        '3 passed;' in log and 'SKIP binary Bun E2E' not in log,
                        readerSha256=bun_matrix.sha256(reader.read_bytes()),

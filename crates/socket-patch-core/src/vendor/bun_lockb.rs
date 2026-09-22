@@ -7,7 +7,8 @@
 //! its tarball URL. Format 3 widens semver components to u64. 0.6.8 added the eighth package column (scripts). The six
 //! buffer arrays and optional tagged extension arrays use absolute offsets.
 //! We retain every unrelated byte, including padding and unknown trailers; unknown extensions refuse edits.
-//! Strings are appended without relocating existing string references.
+//! Strings normally append in place. Legacy production-filter graphs need a
+//! canonical string-pool layout, recorded reversibly in structural snapshots.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
@@ -244,7 +245,7 @@ impl BunLockb {
         let refs = self.resolution_strings(raw)?;
         let integrity = self.integrity_at(id);
         Ok(json!({
-            "layout_original": if self.format == 1 || self.needs_workspace_normalization()? {Some(STANDARD.encode(&self.data))} else {None},
+            "layout_original": if self.format == 1 || self.needs_workspace_normalization()? || self.needs_production_pool()? {Some(STANDARD.encode(&self.data))} else {None},
             "name": pkg.name,
             "version": pkg.version,
             "resolution": pkg.resolution,
@@ -341,6 +342,7 @@ impl BunLockb {
         self.data[at + 8..at + 16].copy_from_slice(&pointer);
         let integrity_at = self.integrity_at(id);
         self.data[integrity_at..integrity_at + INTEGRITY_LEN].copy_from_slice(&digest);
+        self.normalize_production_pool()?;
         self.update_hash(style)?;
         Ok(())
     }
@@ -462,6 +464,7 @@ impl BunLockb {
         {
             self.trim_unreferenced_tail(len)?;
         }
+        self.normalize_production_pool()?;
         self.update_hash(style)?;
         if let Some(encoded) = snapshot.get("layout_original").and_then(Value::as_str) {
             let original = STANDARD
@@ -471,8 +474,10 @@ impl BunLockb {
             let original_style = expected.hash_style()?;
             expected.promote_legacy_format()?;
             expected.normalize_workspace_behaviors()?;
+            expected.normalize_production_pool()?;
             expected.update_hash(original_style)?;
             let mut compacted = self.clone();
+            compacted.normalize_production_pool()?;
             compacted.trim_unreferenced_tail(expected.strings.data.len())?;
             if compacted.bytes() == expected.bytes() {
                 *self = Self::parse(&original)?;
@@ -557,6 +562,213 @@ impl BunLockb {
             self.data[at..at + 8].copy_from_slice(&pointer);
         }
         Ok(())
+    }
+
+    fn package_dependency_range(&self, id: usize) -> Result<Range<usize>, String> {
+        let at = self.package_start + self.count * (16 + self.resolution_size) + id * 8;
+        let off = u32_at(&self.data, at)? as usize;
+        let len = u32_at(&self.data, at + 4)? as usize;
+        let end = off
+            .checked_add(len)
+            .ok_or("bun.lockb: dependency slice overflow")?;
+        let dependencies = self.dependency_array()?;
+        let resolutions = self.buffer_array(2)?;
+        let resolved_at = at + self.count * 8;
+        if end > dependencies.data.len() / 26
+            || end > resolutions.data.len() / 4
+            || u32_at(&self.data, resolved_at)? as usize != off
+            || u32_at(&self.data, resolved_at + 4)? as usize != len
+        {
+            return Err("bun.lockb: invalid package dependency slice".into());
+        }
+        Ok(off..end)
+    }
+
+    fn needs_production_pool(&self) -> Result<bool, String> {
+        if self.format > 2 || self.count == 0 {
+            return Ok(false);
+        }
+        let dependencies = self.dependency_array()?;
+        let resolutions = self.buffer_array(2)?;
+        for index in self.package_dependency_range(0)? {
+            let behavior = self.data[dependencies.data.start + index * 26 + 16];
+            let id = u32_at(&self.data, resolutions.data.start + index * 4)? as usize;
+            // Bun's production features retain prod, optional, peer and
+            // workspace edges, but exclude a solely dev dependency.
+            if behavior & 0x36 == 0 && id < self.count {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Bun <=1.0.0 clones a production-only graph while its tarball cache
+    /// helper still reads string offsets from the original graph. An appended
+    /// tarball URL then downloads but never installs. Match the clone's pool
+    /// prefix, preserving all graph/behavior fields and all active strings.
+    /// https://github.com/oven-sh/bun/blob/bun-v0.8.1/src/install/lockfile.zig
+    /// https://github.com/oven-sh/bun/blob/bun-v0.8.1/src/install/install.zig
+    fn normalize_production_pool(&mut self) -> Result<(), String> {
+        if !self.needs_production_pool()? {
+            return Ok(());
+        }
+        let extension_pointers = self.legacy_extension_string_pointers()?;
+        let mut pointers = Vec::new();
+        let mut visited = vec![false; self.count];
+        let mut pending = vec![0];
+        let dependencies = self.dependency_array()?;
+        let resolutions = self.buffer_array(2)?;
+        while let Some(id) = pending.pop() {
+            if visited[id] {
+                continue;
+            }
+            visited[id] = true;
+            pointers.extend(self.package_clone_string_pointers(id)?);
+            // Bun's Cloner uses a LIFO queue and preserves the dependency
+            // declaration order while pushing its children.
+            for index in self.package_dependency_range(id)? {
+                let child = u32_at(&self.data, resolutions.data.start + index * 4)? as usize;
+                let behavior = self.data[dependencies.data.start + index * 26 + 16];
+                if child < self.count && (id != 0 || behavior & 0x36 != 0) {
+                    pending.push(child);
+                }
+            }
+        }
+        // Keep dev-only/unreachable packages and auxiliary metadata too;
+        // they follow the prefix used by the filtered production clone.
+        for (id, seen) in visited.into_iter().enumerate() {
+            if !seen {
+                pointers.extend(self.package_clone_string_pointers(id)?);
+            }
+        }
+        for at in (dependencies.data.start..dependencies.data.end).step_by(26) {
+            pointers.extend([at + 18, at]);
+        }
+        let external = self.buffer_array(4)?;
+        pointers.extend((external.data.start..external.data.end).step_by(16));
+        pointers.extend(extension_pointers);
+        let mut pool = Vec::new();
+        let mut interned = std::collections::HashMap::<String, [u8; 8]>::new();
+        let mut writes = std::collections::BTreeMap::new();
+        for at in pointers {
+            if writes.contains_key(&at) {
+                continue;
+            }
+            let value = self.string_at(at)?;
+            let pointer = if let Some(pointer) = interned.get(&value) {
+                *pointer
+            } else {
+                let raw = value.as_bytes();
+                let mut pointer = [0; 8];
+                if raw.len() < 8 || (raw.len() == 8 && raw[7] < 0x80) {
+                    pointer[..raw.len()].copy_from_slice(raw);
+                } else {
+                    let offset = u32::try_from(pool.len())
+                        .map_err(|_| "bun.lockb: string buffer exceeds 4 GiB")?;
+                    let len = u32::try_from(raw.len())
+                        .ok()
+                        .filter(|n| *n <= 0x7fff_ffff)
+                        .ok_or("bun.lockb: string exceeds format limit")?;
+                    pointer[..4].copy_from_slice(&offset.to_le_bytes());
+                    pointer[4..].copy_from_slice(&(len | 0x8000_0000).to_le_bytes());
+                    pool.extend_from_slice(raw);
+                }
+                interned.insert(value, pointer);
+                pointer
+            };
+            writes.insert(at, pointer);
+        }
+        let old_len = self.strings.data.len();
+        pool.resize(pool.len() + (old_len % 8 + 8 - pool.len() % 8) % 8, 0);
+        // Extension pointers have their old positions until resize_pool moves
+        // the extension arrays. Write them before changing the pool length.
+        for (at, pointer) in writes {
+            self.data[at..at + 8].copy_from_slice(&pointer);
+        }
+        let append = vec![0; pool.len().saturating_sub(old_len)];
+        self.resize_pool(pool.len(), &append)?;
+        self.data[self.strings.data.clone()].copy_from_slice(&pool);
+        Ok(())
+    }
+
+    fn package_clone_string_pointers(&self, id: usize) -> Result<Vec<usize>, String> {
+        let meta = self.package_start + self.count * (32 + self.resolution_size);
+        let bins = meta + self.count * 88;
+        let scripts = bins + self.count * 20;
+        let mut pointers = vec![self.package_start + id * 8];
+        let bin = bins + id * 20;
+        match self.data[bin] {
+            0 => {}
+            1 | 3 => pointers.push(bin + 4),
+            2 => pointers.extend([bin + 4, bin + 12]),
+            4 => {
+                let external = self.buffer_array(4)?;
+                let off = u32_at(&self.data, bin + 4)? as usize;
+                let len = u32_at(&self.data, bin + 8)? as usize;
+                let end = off
+                    .checked_add(len)
+                    .ok_or("bun.lockb: bin slice overflow")?;
+                if end > external.data.len() / 16 {
+                    return Err("bun.lockb: invalid bin string slice".into());
+                }
+                pointers.extend((off..end).map(|i| external.data.start + i * 16));
+            }
+            _ => return Err("bun.lockb: unsupported binary bin tag".into()),
+        }
+        pointers.push(meta + id * 88 + 12);
+        let resolution = self.resolution_at(id);
+        let offsets: &[usize] = match self.data[resolution] {
+            0 | 1 => &[],
+            2 if self.format == 1 => &[24, 40],
+            // VersionedURL.clone copies prerelease/build before the URL.
+            2 => &[32, 48, 8],
+            4 | 8 | 33 | 64 | 72 | 80 | 100 => &[8],
+            16 | 24 | 32 => &[8, 16, 24, 32, 40],
+            _ => return Err("bun.lockb: unsupported resolution string layout".into()),
+        };
+        pointers.extend(offsets.iter().map(|off| resolution + off));
+        if self.fields == 8 && self.data[scripts + id * 49 + 48] != 0 {
+            pointers.extend((0..6).map(|i| scripts + id * 49 + i * 8));
+        }
+        let dependencies = self.dependency_array()?;
+        for index in self.package_dependency_range(id)? {
+            let at = dependencies.data.start + index * 26;
+            // Dependency.clone appends the literal before the package name.
+            pointers.extend([at + 18, at]);
+        }
+        Ok(pointers)
+    }
+
+    fn legacy_extension_string_pointers(&self) -> Result<Vec<usize>, String> {
+        let mut pointers = Vec::new();
+        let mut pos = self.strings.data.end + 8;
+        while pos < self.total {
+            let tag = &self.data[pos..pos + 8];
+            pos += 8;
+            let widths: &[(usize, &[usize])] = match tag {
+                b"wOrKsPaC" => &[(8, &[]), (48, &[16, 32]), (8, &[]), (8, &[0])],
+                b"tRuStEDd" => &[(4, &[])],
+                b"eMpTrUsT" => &[],
+                b"oVeRriDs" => &[(8, &[]), (26, &[0, 18])],
+                b"pAtChEdD" => &[(8, &[]), (24, &[0])],
+                b"cNfGvRsN" => {
+                    pos += 8;
+                    continue;
+                }
+                _ => return Err("bun.lockb: unsupported legacy string extension".into()),
+            };
+            for (width, offsets) in widths {
+                let array = read_array(&self.data, pos, self.total)?;
+                pos = array.data.end;
+                if !array.data.len().is_multiple_of(*width) {
+                    return Err("bun.lockb: invalid legacy extension width".into());
+                }
+                for at in (array.data.start..array.data.end).step_by(*width) {
+                    pointers.extend(offsets.iter().map(|offset| at + offset));
+                }
+            }
+        }
+        Ok(pointers)
     }
 
     /// Bun versions capable of installing tarballs only accept binary format
@@ -835,7 +1047,11 @@ impl BunLockb {
 
     pub(crate) fn validate_mutation(&self) -> Result<(), String> {
         self.check_editable()?;
-        self.hash_style().map(|_| ())
+        self.hash_style()?;
+        if self.needs_production_pool()? {
+            self.clone().normalize_production_pool()?;
+        }
+        Ok(())
     }
 
     fn check_editable(&self) -> Result<(), String> {
@@ -1191,8 +1407,24 @@ mod tests {
     use super::*;
 
     const VERSIONS: &[&str] = &[
-        "0.1.1", "0.1.6", "0.1.7", "0.6.7", "0.6.8", "0.8.1", "1.0.0", "1.0.36", "1.1.0", "1.1.38",
-        "1.1.45", "1.2.0", "1.2.23", "1.3.0", "1.3.14", "1.4.2",
+        "0.1.1",
+        "0.1.6",
+        "0.1.7",
+        "0.6.7",
+        "0.6.8",
+        "0.8.1",
+        "1.0.0",
+        "1.0.36",
+        "1.1.0",
+        "1.1.38",
+        "1.1.45",
+        "1.2.0",
+        "1.2.23",
+        "1.3.0",
+        "1.3.14",
+        "1.4.2",
+        "0.8.1-production",
+        "1.0.0-production",
     ];
 
     fn fixture(version: &str) -> Vec<u8> {
@@ -1384,11 +1616,102 @@ mod tests {
     }
 
     #[test]
+    fn production_pool_rebuild_preserves_scoped_snapshots_and_reverse_replay() {
+        for version in [
+            "0.8.1-production",
+            "1.0.0-production",
+            "0.8.1-production-complex",
+        ] {
+            let original = fixture(version);
+            let mut lock = BunLockb::parse(&original).unwrap();
+            assert!(lock.needs_production_pool().unwrap());
+            let packages = lock.packages().unwrap();
+            let first_id = packages
+                .iter()
+                .find(|p| p.name == "minimist" && p.version.as_deref() == Some("1.2.2"))
+                .unwrap()
+                .id;
+            let second_id = packages
+                .iter()
+                .find(|p| p.name == "is-number" || p.version.as_deref() == Some("1.2.8"))
+                .unwrap()
+                .id;
+            let first = lock.snapshot(first_id).unwrap();
+            lock.set_package(first_id, "https://example.test/first.tgz", &digest())
+                .unwrap();
+            let second = lock.snapshot(second_id).unwrap();
+            lock.set_package(
+                second_id,
+                ".socket/vendor/npm/second/package.tgz",
+                &digest(),
+            )
+            .unwrap();
+            let patched_second = lock.snapshot(second_id).unwrap();
+            let canonical = lock.bytes();
+            lock.normalize_production_pool().unwrap();
+            assert_eq!(
+                lock.bytes(),
+                canonical,
+                "pool normalization must be idempotent"
+            );
+            let mut reverse = lock.clone();
+            reverse.restore(second_id, &second).unwrap();
+            reverse.restore(first_id, &first).unwrap();
+            assert_eq!(reverse.bytes(), original, "{version}");
+            lock.restore(first_id, &first).unwrap();
+            assert!(lock.matches_snapshot(second_id, &patched_second).unwrap());
+            let partial = lock.bytes();
+            lock.normalize_production_pool().unwrap();
+            assert_eq!(
+                lock.bytes(),
+                partial,
+                "scoped rollback must leave a canonical pool"
+            );
+            lock.restore(second_id, &second).unwrap();
+            assert!(lock.matches_snapshot(first_id, &first).unwrap());
+            assert!(lock.matches_snapshot(second_id, &second).unwrap());
+            lock.validate_mutation().unwrap();
+        }
+    }
+
+    #[test]
+    fn production_pool_rebuild_preserves_workspace_extensions() {
+        let mut lock = BunLockb::parse(&fixture("1.1.45-extensions")).unwrap();
+        let dependencies = lock.dependency_array().unwrap();
+        for index in lock.package_dependency_range(0).unwrap() {
+            let at = dependencies.data.start + index * 26;
+            if lock.string_at(at).unwrap() == "is-number" {
+                lock.data[at + 16] = 8;
+            }
+        }
+        assert!(lock.needs_production_pool().unwrap());
+        let original = lock.bytes();
+        let paths = lock.workspace_paths().unwrap();
+        let id = lock
+            .packages()
+            .unwrap()
+            .iter()
+            .find(|p| p.name == "minimist")
+            .unwrap()
+            .id;
+        let snapshot = lock.snapshot(id).unwrap();
+        lock.set_package(id, "https://example.test/minimist.tgz", &digest())
+            .unwrap();
+        lock.validate_mutation().unwrap();
+        assert_eq!(lock.workspace_paths().unwrap(), paths);
+        lock.restore(id, &snapshot).unwrap();
+        assert_eq!(lock.bytes(), original);
+    }
+
+    #[test]
     fn deterministic_malformed_byte_corpus_never_panics() {
-        let original = fixture("1.4.2-extensions");
         let mut seed = 0x8e73_2bad_19c4_aa01u64;
         for iteration in 0..512 {
-            let mut bytes = original.clone();
+            let mut bytes = fixture(if iteration % 2 == 0 {
+                "1.4.2-extensions"
+            } else {
+                "0.8.1-production"
+            });
             for _ in 0..1 + iteration % 4 {
                 seed ^= seed << 13;
                 seed ^= seed >> 7;

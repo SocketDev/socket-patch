@@ -1,0 +1,11 @@
+{
+  "name": "bun-patch-backtest",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "minimist": "1.2.2"
+  },
+  "devDependencies": {
+    "other": "npm:minimist@1.2.8"
+  }
+}

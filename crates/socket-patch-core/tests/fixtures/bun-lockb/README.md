@@ -14,6 +14,11 @@ and an empty `BUN_INSTALL_CACHE_DIR` to regenerate. Bun 1.2+ fixtures include
 - 1.3.14 / 1.4.2: current optional configuration extensions.
 - `*-extensions`: root and workspace scripts, a GitHub resolution, and
   catalogs on 1.2.23 and 1.4.2.
+- `0.8.1-production` / `1.0.0-production`: a production dependency and a
+  different version aliased in dev dependencies, pinning production-filter
+  string-pool reconstruction on early binary readers.
+- `0.8.1-production-complex`: two production patch targets, a transitive
+  dependency with a bin, root lifecycle scripts, and development dependencies.
 
 Other releases capture the stable major/minor eras. `two-versions` covers
 multiple package versions and scoped restoration. The earliest writers include

@@ -516,6 +516,161 @@ mod symlink_tests {
     }
 }
 
+#[cfg(test)]
+mod rebuild_tests {
+    use super::*;
+    use crate::api::client::{ApiClient, ApiClientOptions};
+    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+    use crate::vendor::state::carry_forward_wiring;
+    use crate::vendor::{VendorServiceConfig, VendorSource};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use sha2::Sha512;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A service outage can switch an existing UUID from a prebuilt archive
+    /// to a locally packed one. Different archive bytes must advance the
+    /// integrity snapshot without losing the pristine registry predecessor.
+    #[tokio::test]
+    async fn same_uuid_prebuilt_then_local_fallback_reverts_exact_binary_and_mirrors() {
+        const UUID: &str = "11111111-1111-4111-8111-111111111111";
+        const PURL: &str = "pkg:npm/minimist@1.2.2";
+        const BEFORE: &[u8] = b"module.exports = 'original';\n";
+        const AFTER: &[u8] = b"module.exports = 'patched';\n";
+        const PACKAGE: &[u8] = br#"{"name":"minimist","version":"1.2.2"}"#;
+        let root = tempfile::tempdir().unwrap();
+        let original = include_bytes!("../../tests/fixtures/bun-lockb/1.1.45-extensions/bun.lockb");
+        std::fs::write(root.path().join(LOCK), original).unwrap();
+        let installed = root.path().join("node_modules/minimist");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::write(installed.join("package.json"), PACKAGE).unwrap();
+        std::fs::write(installed.join("index.js"), BEFORE).unwrap();
+        let blobs = root.path().join(".socket/blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let after_hash = compute_git_sha256_from_bytes(AFTER);
+        std::fs::write(blobs.join(&after_hash), AFTER).unwrap();
+        let record: PatchRecord = serde_json::from_value(serde_json::json!({
+            "uuid": UUID, "exportedAt": "", "files": {"package/index.js": {
+                "beforeHash": compute_git_sha256_from_bytes(BEFORE), "afterHash": after_hash,
+            }}, "vulnerabilities": {}, "description": "", "license": "MIT", "tier": "free",
+        }))
+        .unwrap();
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (name, bytes) in [("package.json", PACKAGE), ("index.js", AFTER)] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            // Deliberately differ from the local packer's deterministic mtime.
+            header.set_mtime(123);
+            header.set_cksum();
+            tar.append_data(&mut header, format!("package/{name}"), bytes)
+                .unwrap();
+        }
+        let archive = tar.into_inner().unwrap().finish().unwrap();
+        let server = MockServer::start().await;
+        let url = format!("{}/minimist.tgz", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": {UUID: {"status": "granted", "url": url, "artifacts": [{
+                    "kind": "tarball", "url": url,
+                    "integrity": {"sha512": format!("sha512-{}", STANDARD.encode(Sha512::digest(&archive)))},
+                }]}},
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/minimist.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.clone()))
+            .mount(&server)
+            .await;
+        let config = VendorServiceConfig {
+            source: VendorSource::Auto,
+            client: Some(ApiClient::new(ApiClientOptions {
+                api_url: server.uri(),
+                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                use_public_proxy: false,
+                org_slug: Some("acme".into()),
+            })),
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline: false,
+        };
+        let mut prior: Option<VendorEntry> = None;
+        for prebuilt in [true, false] {
+            if !prebuilt {
+                server.reset().await;
+                Mock::given(method("POST"))
+                    .and(path("/v0/orgs/acme/patches/package"))
+                    .respond_with(ResponseTemplate::new(403))
+                    .mount(&server)
+                    .await;
+            }
+            let VendorOutcome::Done {
+                result,
+                entry: Some(mut entry),
+                warnings,
+            } = vendor(
+                PURL,
+                &installed,
+                root.path(),
+                &record,
+                &PatchSources::blobs_only(&blobs),
+                "",
+                false,
+                false,
+                Some(&config),
+            )
+            .await
+            else {
+                panic!("vendoring must write a new binary snapshot");
+            };
+            assert!(result.success, "{result:?}");
+            assert!(warnings.iter().any(|w| w.code
+                == if prebuilt {
+                    "vendor_prebuilt_downloaded"
+                } else {
+                    "vendor_prebuilt_unavailable"
+                }));
+            if let Some(previous) = prior.as_ref() {
+                assert_ne!(entry.artifact.sha256, previous.artifact.sha256);
+                carry_forward_wiring(previous, &mut entry);
+                let binary: Vec<_> = entry.wiring.iter().filter(|r| r.kind == KIND).collect();
+                assert_eq!(binary.len(), 1, "discard the superseded integrity snapshot");
+                assert_eq!(binary[0].original, previous.wiring[0].original);
+            }
+            let lock = BunLockb::parse(&std::fs::read(root.path().join(LOCK)).unwrap()).unwrap();
+            let binary = entry.wiring.iter().find(|r| r.kind == KIND).unwrap();
+            let id = binary.key.as_ref().unwrap().parse().unwrap();
+            assert!(lock
+                .matches_snapshot(id, binary.new.as_ref().unwrap())
+                .unwrap());
+            let bytes = std::fs::read(root.path().join(&entry.artifact.path)).unwrap();
+            assert_eq!(bytes == archive, prebuilt);
+            for mirror in entry.wiring.iter().filter(|r| r.kind == MIRROR_KIND) {
+                assert_eq!(
+                    std::fs::read(root.path().join(&mirror.file)).unwrap(),
+                    bytes
+                );
+            }
+            prior = Some(entry);
+        }
+        let entry = prior.unwrap();
+        let outcome = revert(&entry, root.path(), RevertOpts::new(false)).await;
+        assert!(outcome.success, "{outcome:?}");
+        assert!(outcome.warnings.is_empty(), "{outcome:?}");
+        assert_eq!(std::fs::read(root.path().join(LOCK)).unwrap(), original);
+        assert!(!root.path().join(&entry.artifact.path).exists());
+        for mirror in entry.wiring.iter().filter(|r| r.kind == MIRROR_KIND) {
+            assert!(!root.path().join(&mirror.file).exists());
+        }
+    }
+}
+
 /// Mirrors are confined to a workspace's own Socket artifact directory.
 /// Check every existing component so a workspace symlink cannot redirect a
 /// write or deletion outside the project.

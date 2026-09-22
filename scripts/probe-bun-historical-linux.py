@@ -3,7 +3,7 @@
 
 Run after a failed binary matrix. This never changes its acceptance result or
 downloads replacement tools. Each installed Bun gets a pristine package project
-and a 30-second total budget, including an optional strace reproduction.
+and a 30-second total budget, including optional strace and gdb reproductions.
 """
 
 import argparse
@@ -16,6 +16,13 @@ import signal
 import subprocess
 import tempfile
 import time
+
+
+def read_context(path):
+    try:
+        return path.read_text().strip()
+    except OSError as error:
+        return {'error': str(error)}
 
 
 def run(command, cwd, env, output, label, timeout):
@@ -43,9 +50,9 @@ def run(command, cwd, env, output, label, timeout):
     return row
 
 
-def fixture(root):
+def fixture(root, project_name='binary project café'):
     # Match the acceptance test's Unicode/spaced path and isolated cache/temp.
-    project = root / 'binary project café'
+    project = root / project_name
     project.mkdir(parents=True)
     (project / 'package.json').write_text(json.dumps({
         'name': 'native-binary-bun', 'version': '1.0.0', 'private': True,
@@ -77,13 +84,16 @@ def main():
         print('Historical Linux diagnostics require Linux; no probes run.')
         return
 
-    context = {'platform': platform.platform(), 'strace': shutil.which('strace')}
+    context = {'platform': platform.platform(), 'strace': shutil.which('strace'),
+               'gdb': shutil.which('gdb'),
+               'LD_LIBRARY_PATH': os.environ.get('LD_LIBRARY_PATH'),
+               'LD_PRELOAD': os.environ.get('LD_PRELOAD')}
     for name in ['kernel/io_uring_disabled', 'kernel/io_uring_group', 'vm/mmap_rnd_bits']:
-        path = Path('/proc/sys') / name
-        context[name] = path.read_text().strip() if path.exists() else None
+        context[name] = read_context(Path('/proc/sys') / name)
     for name in ['status', 'limits']:
-        path = Path('/proc/self') / name
-        (output / f'process-{name}.txt').write_text(path.read_text())
+        value = read_context(Path('/proc/self') / name)
+        (output / f'process-{name}.txt').write_text(
+            value if isinstance(value, str) else json.dumps(value))
     (output / 'context.json').write_text(json.dumps(context, indent=2) + '\n')
     for executable, arguments in [('uname', ['-a']), ('lscpu', []), ('ldd', ['--version'])]:
         if program := shutil.which(executable):
@@ -97,18 +107,32 @@ def main():
             continue
         bun = matches[0].resolve()
         deadline = time.monotonic() + 30
+        if ldd := shutil.which('ldd'):
+            run([ldd, bun], output, os.environ.copy(), output, f'{version}-libraries', 5)
         with tempfile.TemporaryDirectory(prefix=f'bun-linux-probe-{version}-', dir=output) as temporary:
             root = Path(temporary)
             project, env = fixture(root / 'pristine')
             plain = run([bun, 'install', '--ignore-scripts'], project, env, output,
                         f'{version}-pristine', min(10, deadline - time.monotonic()))
             row = {'version': version, 'pristine': plain}
-            if plain.get('returnCode') != 0 and context['strace']:
+            if plain.get('returnCode') != 0 and time.monotonic() < deadline:
+                project, env = fixture(root / 'ascii', 'binary-project')
+                row['ascii'] = run([bun, 'install', '--ignore-scripts'], project, env, output,
+                                   f'{version}-ascii', min(5, deadline - time.monotonic()))
+            if plain.get('returnCode') != 0 and context['strace'] and time.monotonic() < deadline:
                 project, env = fixture(root / 'traced')
                 row['strace'] = run([
                     context['strace'], '-f', '-tt', '-s', '160', '-o',
                     output / f'{version}.strace', bun, 'install', '--ignore-scripts',
                 ], project, env, output, f'{version}-traced', max(1, deadline - time.monotonic()))
+            if plain.get('returnCode', 0) < 0 and context['gdb'] and time.monotonic() < deadline:
+                project, env = fixture(root / 'debugged')
+                row['gdb'] = run([
+                    context['gdb'], '--batch', '-ex', 'set debuginfod enabled off',
+                    '-ex', 'run', '-ex', 'thread apply all bt', '-ex', 'info registers',
+                    '-ex', 'x/8i $pc', '-ex', 'info sharedlibrary',
+                    '--args', bun, 'install', '--ignore-scripts',
+                ], project, env, output, f'{version}-gdb', max(1, deadline - time.monotonic()))
             summary.append(row)
     (output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
 

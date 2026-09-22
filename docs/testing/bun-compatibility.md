@@ -157,6 +157,10 @@ artifact repair, detached mode and byte-exact rollback. Extended cells cover npm
 aliases, overridden transitives, workspace members, multiple versions, root and
 workspace scripts, and GitHub resolutions. Workspace cells also exercise missing
 and corrupt copies, with and without the local ledger.
+Production cells from writer 0.8.1 onward patch two packages, retain a transitive
+dependency and its bin plus root lifecycle-script metadata, and exclude a dev
+alias and another dev package. They verify cold frozen production installs after
+each scoped rollback, in both package orders.
 The public-service matrix additionally verifies ordinary installs, warmed-cache
 frozen and ordinary installs, and digest tampering.
 `SOCKET_PATCH_BUN_LOCKB_REQUIRED=1` makes missing tools a failure. A regular
@@ -196,6 +200,11 @@ passed 4,218 tests and failed six Ruby setup tests because the local system has
 unsupported Bundler 1.17.2. Eight focused CLI suites passed 210 tests. These are
 local macOS measurements; the Linux and Windows matrix jobs are configured in
 CI and were not run locally.
+
+On 2026-09-22, the production-filter regression passed all 33 public-service
+cases across the same 11 release eras, including cold and warmed-cache frozen
+and ordinary installs. A separate complex graph passed both scoped rollback
+orders on 0.8.1 and 1.0.0; that graph is now part of the permanent binary matrix.
 
 ## Installer boundaries (measured)
 

@@ -249,6 +249,12 @@ impl Fixture {
         if shape == "transitive" {
             package["overrides"] = json!({"minimist":"1.2.2"});
         }
+        if shape == "production" {
+            package["dependencies"]["mkdirp"] = json!("0.5.0");
+            package["devDependencies"] = json!({"other":"npm:minimist@1.2.8", "left-pad":"1.3.0"});
+            package["scripts"] =
+                json!({"preinstall":"echo root-pre", "postinstall":"echo root-post"});
+        }
         if shape.starts_with("workspace") || shape == "extensions" {
             package["workspaces"] = json!(["packages/*"]);
             std::fs::create_dir_all(project.join("packages/consumer")).unwrap();
@@ -350,6 +356,16 @@ impl Fixture {
     }
 
     fn frozen(&self, label: &str, expected: &[u8], _target: &str) {
+        self.frozen_install(label, expected, &self.bystander, false);
+    }
+
+    fn frozen_install(
+        &self,
+        label: &str,
+        expected: &[u8],
+        expected_bystander: &[u8],
+        production: bool,
+    ) -> PathBuf {
         let checkout = self.temp.path().join(label);
         std::fs::create_dir_all(&checkout).unwrap();
         for file in ["package.json", "bun.lockb", "bunfig.toml"] {
@@ -377,8 +393,12 @@ impl Fixture {
         } else {
             &self.reader
         };
-        let output = command(reader, &checkout)
-            .args(["install", "--frozen-lockfile", "--ignore-scripts"])
+        let mut install = command(reader, &checkout);
+        install.args(["install", "--frozen-lockfile", "--ignore-scripts"]);
+        if production {
+            install.arg("--production");
+        }
+        let output = install
             .env("BUN_INSTALL_CACHE_DIR", cache)
             .env(
                 "BUN_INSTALL",
@@ -406,7 +426,7 @@ impl Fixture {
         );
         assert_eq!(
             std::fs::read(checkout.join("node_modules/is-number/index.js")).unwrap(),
-            self.bystander,
+            expected_bystander,
             "{label}: bystander must be preserved"
         );
         let live_lock = self.lock();
@@ -439,6 +459,7 @@ impl Fixture {
             !checkout.join("bun.lock").exists(),
             "{label}: install must remain binary"
         );
+        checkout
     }
 
     fn pristine(&self) {
@@ -674,6 +695,9 @@ async fn native_binary_scan_vendored_and_detached() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn native_binary_alias_and_transitive() {
+    if std::env::var_os("SOCKET_PATCH_BUN_LOCKB_PRODUCTION").is_some() {
+        production_scoped_rollback();
+    }
     // Very early Bun lacks npm alias/override support; the release matrix
     // runs these layouts only on versions that implement those features.
     if std::env::var_os("SOCKET_PATCH_BUN_LOCKB_EXTENDED").is_none() {
@@ -742,5 +766,76 @@ async fn native_binary_alias_and_transitive() {
         }
         cli(&fixture.project, &["vendor", "--revert"]);
         fixture.pristine();
+    }
+}
+
+fn production_scoped_rollback() {
+    const SECOND_PURL: &str = "pkg:npm/is-number@7.0.0";
+    for first in [PURL, SECOND_PURL] {
+        let fixture = Fixture::new("production").expect("matrix requires its Bun writer");
+        fixture.stage();
+        let number_patched = [MARKER, fixture.bystander.as_slice()].concat();
+        let after = compute_git_sha256_from_bytes(&number_patched);
+        let manifest_path = fixture.project.join(".socket/manifest.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["patches"][SECOND_PURL] = json!({
+            "uuid":"33333333-3333-4333-8333-333333333333",
+            "exportedAt":"2026-01-01T00:00:00Z", "files":{"package/index.js":{
+                "beforeHash":compute_git_sha256_from_bytes(&fixture.bystander), "afterHash":after}},
+            "vulnerabilities":{}, "description":"second production patch", "license":"MIT", "tier":"free"});
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        std::fs::write(
+            fixture.project.join(".socket/blobs").join(after),
+            &number_patched,
+        )
+        .unwrap();
+        let result = cli(&fixture.project, &["vendor", "--offline"]);
+        assert_eq!(
+            result["summary"]["applied"], 2,
+            "two production patches: {result}"
+        );
+        let second = if first == PURL { SECOND_PURL } else { PURL };
+        for (label, unwind) in [
+            ("both", None),
+            ("partial", Some(first)),
+            ("all", Some(second)),
+        ] {
+            if let Some(purl) = unwind {
+                let result = cli(&fixture.project, &["rollback", purl, "--yes"]);
+                assert_eq!(result["status"], "success", "{label}: {result}");
+            }
+            let minimist = if label == "all" || (label == "partial" && first == PURL) {
+                &fixture.original
+            } else {
+                &fixture.patched
+            };
+            let number = if label == "all" || (label == "partial" && first == SECOND_PURL) {
+                &fixture.bystander
+            } else {
+                &number_patched
+            };
+            let checkout = fixture.frozen_install(label, minimist, number, true);
+            assert!(
+                !checkout.join("node_modules/other").exists(),
+                "dev alias must be omitted"
+            );
+            assert!(
+                !checkout.join("node_modules/left-pad").exists(),
+                "dev package must be omitted"
+            );
+            assert!(checkout.join("node_modules/mkdirp/package.json").is_file());
+            let bin = checkout.join("node_modules/.bin/mkdirp");
+            assert!(
+                bin.exists()
+                    || bin.with_extension("cmd").exists()
+                    || bin.with_extension("exe").exists(),
+                "production bin must be installed"
+            );
+            assert_eq!(
+                std::fs::read(fixture.project.join("package.json")).unwrap(),
+                fixture.original_manifest
+            );
+        }
     }
 }
