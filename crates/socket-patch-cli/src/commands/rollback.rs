@@ -2,7 +2,9 @@ use clap::Args;
 use socket_patch_core::api::blob_fetcher::{fetch_blobs_by_hash, format_fetch_result};
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
-use socket_patch_core::manifest::cleanup_blobs::{cleanup_unused_archives, cleanup_unused_blobs};
+use socket_patch_core::manifest::cleanup_blobs::{
+    cleanup_unused_archives, cleanup_unused_blobs, CleanupResult,
+};
 use socket_patch_core::manifest::operations::{
     get_before_hash_blobs, read_manifest, write_manifest,
 };
@@ -14,6 +16,7 @@ use socket_patch_core::patch::rollback::{
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::vendor::{save_state, RevertOpts, VendorState, VendorWarning};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -21,7 +24,8 @@ use std::time::Duration;
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::apply::is_local_go;
 use crate::commands::lock_cli::acquire_or_emit;
-use crate::commands::remove::patch_matches;
+use crate::commands::remove::{patch_matches, vendor_entry_covers_purl, vendor_entry_matches};
+use crate::commands::vendor::dispatch_revert_one_opts;
 use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls};
 use crate::json_envelope::Command as EnvelopeCommand;
 use crate::looks_like_uuid;
@@ -174,31 +178,31 @@ struct PatchToRollback {
 /// out not-installed exits 0 / `success`. Do not "fix" this into symmetry:
 /// `remove` also rides on it (it drops long-uninstalled entries from the
 /// manifest via its "No packages found to rollback" path).
-struct RollbackOutcome {
+pub(crate) struct RollbackOutcome {
     /// No attempted rollback failed (per-package; see above).
-    success: bool,
-    results: Vec<RollbackResult>,
+    pub(crate) success: bool,
+    pub(crate) results: Vec<RollbackResult>,
     /// Vendor-owned purls excluded from in-place rollback (benign).
-    vendored_skipped: Vec<String>,
+    pub(crate) vendored_skipped: Vec<String>,
     /// In-scope manifest entries with no installed package on disk —
     /// apply's `unmatched` twin (`package_not_installed`). Never in the
     /// before-blob plan, never a failed result. Sorted for determinism.
-    not_installed: Vec<String>,
+    pub(crate) not_installed: Vec<String>,
     /// Release-variant manifest entries narrowed away by
     /// `select_installed_variants` (their distribution is not on disk;
     /// an attempted sibling covered the group). The manifest-cleanup
     /// default drops them with their group. Empty on early returns.
-    narrowed_out: Vec<String>,
+    pub(crate) narrowed_out: Vec<String>,
     /// The run aborted at the before-blob gate BEFORE any restore ran
     /// (offline with missing blobs, or a failed download). The CLI
     /// boundary's manifest-cleanup default must skip entirely: nothing
     /// was restored, so nothing is removable and the GC must not sweep
     /// the revert data the retry needs.
-    aborted: bool,
+    pub(crate) aborted: bool,
 }
 
 /// How `rollback_patches_inner` selects manifest entries.
-enum InnerSelection<'a> {
+pub(crate) enum InnerSelection<'a> {
     /// The legacy single-identifier filter (`remove`'s delegation): a
     /// no-match identifier is an error, a missing manifest is an error,
     /// and `None` selects the whole manifest.
@@ -206,8 +210,10 @@ enum InnerSelection<'a> {
     /// A pre-resolved purl set from the CLI boundary's target resolver
     /// (identifiers ∪ path globs ∪ everything). No-match and
     /// missing-manifest handling already happened upstream, so an empty
-    /// selection is a quiet success; `announce_empty` keeps the unscoped
-    /// run's "No patches found in manifest" line.
+    /// selection is a quiet success; `announce_empty` keeps the "No
+    /// patches found in manifest" line for an unscoped run with no work
+    /// in ANY leg (a hosted-/vendored-only project has work, so it is
+    /// not "no patches").
     Scope {
         purls: &'a HashSet<String>,
         announce_empty: bool,
@@ -218,33 +224,27 @@ enum InnerSelection<'a> {
 // Local go rolls back by dropping the project-local redirect (go's `replace`
 // directive) + the patched copy — no in-place restore, no before-blob. Cargo
 // patches in place (vendored or registry cache), so it rolls back in place from
-// before-blobs like npm/pypi. The helper is an inert stub without `golang`.
-// `is_local_go` is shared with `apply`, which creates the same redirects.
+// before-blobs like npm/pypi. `is_local_go` is shared with `apply`, which
+// creates the same redirects.
 
-/// True when `purl` rolls back by dropping a project-local redirect (local-mode
-/// go) rather than restoring bytes from a before-blob. The before-blob gate uses
-/// this to skip those PURLs — they read no blobs, so a missing before-blob must
-/// not block (or trigger a needless download for) an offline redirect rollback.
-fn is_local_redirect(purl: &str, common: &GlobalArgs) -> bool {
-    if is_local_go(purl, common) {
-        return true;
-    }
-    let _ = (purl, common);
-    false
-}
-
-/// Copy of `manifest` with local-redirect PURLs (local-mode go) removed — used
-/// for the before-blob gate, which those PURLs never need. Avoids blocking an
-/// offline redirect rollback on absent blobs.
-fn exclude_local_redirects(manifest: &PatchManifest, common: &GlobalArgs) -> PatchManifest {
+/// The before-blob gate's manifest: the ATTEMPTED (crawler-discovered)
+/// entries of `scoped`, minus local-redirect PURLs (local-mode go). Those
+/// roll back by dropping a project-local redirect and read no blobs, so a
+/// missing before-blob must not block (or trigger a needless download for)
+/// an offline redirect rollback.
+fn before_blob_gate_manifest(
+    scoped: &PatchManifest,
+    attempted: &HashSet<&str>,
+    common: &GlobalArgs,
+) -> PatchManifest {
     PatchManifest {
-        patches: manifest
+        patches: scoped
             .patches
             .iter()
-            .filter(|(purl, _)| !is_local_redirect(purl, common))
+            .filter(|(purl, _)| attempted.contains(purl.as_str()) && !is_local_go(purl, common))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-        setup: manifest.setup.clone(),
+        setup: None,
     }
 }
 
@@ -534,96 +534,165 @@ pub(crate) struct HostedLegOutcome {
     pub(crate) edited_files: std::collections::BTreeSet<String>,
 }
 
+/// What one vendored ledger entry's revert did. Silent by design — the
+/// caller owns the print and envelope vocabulary. Shared by `rollback`'s
+/// vendored leg and both of `remove`'s vendored paths, so the drift-keep
+/// and `--preserve-state` rules are identical by construction.
+pub(crate) enum VendorRevertStep {
+    /// `key` has no ledger entry (a divergent ledger, or an earlier leg
+    /// already reverted it): a silent no-op.
+    Missing,
+    /// The backend refused; nothing changed for this entry.
+    Failed(String),
+    /// Drift-keep: the lock changed under us and the backend left both the
+    /// wiring and the artifact alone. Per `RevertOutcome`'s contract the
+    /// ledger entry — and any manifest record — must survive.
+    Kept,
+    /// Dry run: the revert (or, with `keep_artifact`, the unwire) would
+    /// succeed. Nothing changed.
+    WouldRevert,
+    /// `keep_artifact`: wiring restored; artifact and ledger entry kept
+    /// byte-identical. Its wiring records now describe already-reverted
+    /// fragments, which later reverts replay as silent no-ops (the
+    /// liveness contract), and a re-vendor re-wires from the live lock.
+    Preserved,
+    /// Reverted on disk, dropped from the ledger, ledger saved (per entry,
+    /// so the run is crash-consistent like `vendor --revert`).
+    Reverted,
+    /// Reverted on disk and dropped from the in-memory ledger, but the
+    /// ledger write failed.
+    LedgerWriteFailed(String),
+}
+
+pub(crate) struct VendorRevertResult {
+    pub(crate) warnings: Vec<VendorWarning>,
+    pub(crate) step: VendorRevertStep,
+}
+
+/// Revert the vendored ledger entry `key` (see [`VendorRevertStep`]).
+pub(crate) async fn revert_vendor_entry(
+    cwd: &Path,
+    key: &str,
+    state: &mut VendorState,
+    opts: RevertOpts,
+) -> VendorRevertResult {
+    let Some(entry) = state.entries.get(key).cloned() else {
+        return VendorRevertResult {
+            warnings: Vec::new(),
+            step: VendorRevertStep::Missing,
+        };
+    };
+    let outcome = dispatch_revert_one_opts(&entry, cwd, opts).await;
+    let step = if !outcome.success {
+        VendorRevertStep::Failed(outcome.error.unwrap_or_else(|| "unknown error".into()))
+    } else if outcome.kept_artifact {
+        VendorRevertStep::Kept
+    } else if opts.dry_run {
+        VendorRevertStep::WouldRevert
+    } else if opts.keep_artifact {
+        VendorRevertStep::Preserved
+    } else {
+        state.entries.remove(key);
+        match save_state(cwd, state).await {
+            Ok(()) => VendorRevertStep::Reverted,
+            Err(e) => VendorRevertStep::LedgerWriteFailed(e.to_string()),
+        }
+    };
+    VendorRevertResult {
+        warnings: outcome.warnings,
+        step,
+    }
+}
+
+/// One GC pass over `.socket/blobs`, `diffs` and `packages` against
+/// `reference` (the post-removal manifest with the revert blobs a later
+/// rollback needs pinned in). Each directory reports separately: callers
+/// own the warn-and-continue posture and the wording. The core sweep
+/// removes an emptied directory, so a fully reverted project keeps none
+/// of the three. Shared by rollback's GC, remove's post-removal sweep and
+/// repair's cleanup phase.
+pub(crate) struct ArtifactSweep {
+    pub(crate) blobs: std::io::Result<CleanupResult>,
+    pub(crate) diffs: std::io::Result<CleanupResult>,
+    pub(crate) packages: std::io::Result<CleanupResult>,
+}
+
+pub(crate) async fn sweep_unused_artifacts(
+    reference: &PatchManifest,
+    socket_dir: &Path,
+    dry_run: bool,
+) -> ArtifactSweep {
+    ArtifactSweep {
+        blobs: cleanup_unused_blobs(reference, &socket_dir.join("blobs"), dry_run).await,
+        diffs: cleanup_unused_archives(reference, &socket_dir.join("diffs"), dry_run).await,
+        packages: cleanup_unused_archives(reference, &socket_dir.join("packages"), dry_run).await,
+    }
+}
+
 /// Unwire the in-scope vendored entries. `preserve` keeps artifacts and
 /// ledger entries (only the lockfile wiring is restored); otherwise a
-/// clean revert drops the entry and saves the ledger per purl
-/// (crash-consistent, like `vendor --revert`).
+/// clean revert drops the entry and saves the ledger per purl.
 async fn run_vendored_leg(
     common: &GlobalArgs,
     keys: &[String],
-    state: &mut socket_patch_core::vendor::VendorState,
+    state: &mut VendorState,
     preserve: bool,
 ) -> VendoredLegOutcome {
-    use crate::commands::vendor::dispatch_revert_one_opts;
-    use socket_patch_core::vendor::{save_state, RevertOpts};
-
     let mut out = VendoredLegOutcome::default();
+    let opts = RevertOpts {
+        dry_run: common.dry_run,
+        keep_artifact: preserve,
+    };
+    let loud = !common.json && !common.silent;
     for key in keys {
-        let Some(entry) = state.entries.get(key).cloned() else {
-            continue;
-        };
-        let outcome = dispatch_revert_one_opts(
-            &entry,
-            &common.cwd,
-            RevertOpts {
-                dry_run: common.dry_run,
-                keep_artifact: preserve,
-            },
-        )
-        .await;
-        for w in &outcome.warnings {
-            if !common.json && !common.silent {
+        let result = revert_vendor_entry(&common.cwd, key, state, opts).await;
+        for w in &result.warnings {
+            if loud {
                 eprintln!("Warning ({}): {}", w.code, w.detail);
             }
             out.warnings.push((w.code.to_string(), w.detail.clone()));
         }
-        if !outcome.success {
-            let why = outcome
-                .error
-                .as_deref()
-                .unwrap_or("unknown error")
-                .to_string();
-            // Errors print even under --silent.
-            if !common.json {
-                eprintln!("Failed to revert vendoring for {key}: {why}");
+        match result.step {
+            VendorRevertStep::Missing => {}
+            VendorRevertStep::Failed(why) => {
+                // Errors print even under --silent.
+                if !common.json {
+                    eprintln!("Failed to revert vendoring for {key}: {why}");
+                }
+                out.failed.push((key.clone(), why));
             }
-            out.failed.push((key.clone(), why));
-            continue;
-        }
-        if outcome.kept_artifact {
-            // Drift-keep: the lock changed under us; the backend left both
-            // the wiring and the artifact alone. The entry (and the
-            // manifest record) must survive — see RevertOutcome's contract.
-            out.kept.push((
+            VendorRevertStep::Kept => out.kept.push((
                 key.clone(),
                 "lockfile wiring drifted; vendored state left untouched".to_string(),
-            ));
-            continue;
-        }
-        if common.dry_run {
-            if !common.json && !common.silent {
-                if preserve {
+            )),
+            VendorRevertStep::WouldRevert if preserve => {
+                if loud {
                     println!("Would unwire vendoring for {key} (artifact preserved)");
-                } else {
+                }
+                out.preserved.push(key.clone());
+            }
+            VendorRevertStep::WouldRevert => {
+                if loud {
                     println!("Would revert vendoring for {key}");
                 }
-            }
-            if preserve {
-                out.preserved.push(key.clone());
-            } else {
                 out.reverted.push(key.clone());
             }
-            continue;
-        }
-        if preserve {
-            // Ledger entry kept byte-identical: its wiring records now
-            // describe already-reverted fragments, which later reverts
-            // replay as silent no-ops (the liveness contract), and a
-            // re-vendor re-wires from the live lock probe.
-            if !common.json && !common.silent {
-                println!("Unwired vendoring for {key} (artifact preserved)");
+            VendorRevertStep::Preserved => {
+                if loud {
+                    println!("Unwired vendoring for {key} (artifact preserved)");
+                }
+                out.preserved.push(key.clone());
             }
-            out.preserved.push(key.clone());
-        } else {
-            state.entries.remove(key);
-            if let Err(e) = save_state(&common.cwd, state).await {
-                out.failed.push((key.clone(), format!("vendor ledger write failed: {e}")));
-                continue;
+            VendorRevertStep::Reverted => {
+                if loud {
+                    println!("Reverted vendoring for {key}");
+                }
+                out.reverted.push(key.clone());
             }
-            if !common.json && !common.silent {
-                println!("Reverted vendoring for {key}");
+            VendorRevertStep::LedgerWriteFailed(e) => {
+                out.failed
+                    .push((key.clone(), format!("vendor ledger write failed: {e}")));
             }
-            out.reverted.push(key.clone());
         }
     }
     out
@@ -792,8 +861,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // missing manifest is no longer fatal when a ledger holds work.
     //
     // Only cheap EXISTENCE probes happen before the lock (they decide the
-    // truly-empty error path, which never locks — the lock file would
-    // materialize `.socket/` in a project that has none). The stores
+    // truly-empty error path, which never locks: acquiring would create
+    // `.socket/` only for the guard's drop to prune it again, and a bare
+    // project must never see the directory flicker). The stores
     // themselves are LOADED UNDER the apply lock below: this run persists
     // mutated clones of the ledgers, so a pre-lock snapshot could clobber
     // a concurrent run's writes with stale state.
@@ -856,12 +926,20 @@ pub async fn run(args: RollbackArgs) -> i32 {
         Err(code) => return code,
     };
 
-    // Load the state stores UNDER the lock (see the discovery note above).
+    // Load the state stores UNDER the lock (see the discovery note above),
+    // each exactly once: the agent leg below receives the manifest and the
+    // vendor-ownership key set instead of re-reading them.
     let vendor_state_result = socket_patch_core::vendor::load_state(&cwd).await;
     let redirect_state_result =
         socket_patch_core::patch::redirect::load_redirect_state(&cwd).await;
     let vendor_corrupt = vendor_state_result.is_err();
     let redirect_corrupt = redirect_state_result.is_err();
+    // An unreadable ledger degrades to "nothing vendored" for the in-place
+    // leg (its own containment is the `vendor_state_unreadable` exit below).
+    let vendored_keys: HashSet<String> = vendor_state_result
+        .as_ref()
+        .map(vendored_purl_keys_of)
+        .unwrap_or_default();
 
     // ── scope resolution ────────────────────────────────────────────────
     let manifest = if manifest_missing {
@@ -931,9 +1009,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
         }
         for (key, entry) in &vendor_entries {
-            if patch_matches(key, &entry.uuid, id)
-                || patch_matches(&entry.base_purl, &entry.uuid, id)
-            {
+            if vendor_entry_matches(key, entry, id) {
                 vendor_scope.insert(key.clone());
                 matched = true;
             }
@@ -996,13 +1072,21 @@ pub async fn run(args: RollbackArgs) -> i32 {
             args.common.silent || args.common.json,
         )
         .await;
+        // One single-pattern scope per raw pattern, compiled once (not per
+        // discovered copy), so each pattern can be checked for a match.
+        let singles: Vec<crate::path_scope::PathScope> = path_scope
+            .raw()
+            .iter()
+            .map(|raw| {
+                crate::path_scope::PathScope::parse(std::slice::from_ref(raw))
+                    .expect("already parsed above")
+            })
+            .collect();
         let mut matched_patterns: HashSet<usize> = HashSet::new();
         let mut path_selected: HashSet<String> = HashSet::new();
         for (purl, paths) in &discovered {
             for path in paths {
-                for (idx, raw) in path_scope.raw().iter().enumerate() {
-                    let single = crate::path_scope::PathScope::parse(std::slice::from_ref(raw))
-                        .expect("already parsed above");
+                for (idx, single) in singles.iter().enumerate() {
                     if single.matches(&cwd, path) {
                         matched_patterns.insert(idx);
                         path_selected.insert(purl.clone());
@@ -1126,10 +1210,6 @@ pub async fn run(args: RollbackArgs) -> i32 {
         || !hosted_scope.is_empty()
         || hosted_leftover_edits > 0;
     if has_work && !args.common.dry_run && !args.preserve_state {
-        let detached_count = vendor_entries
-            .iter()
-            .filter(|(k, e)| vendor_scope.contains(k) && e.detached)
-            .count();
         // Compose only the clauses that apply, so a hosted-only run never
         // claims manifest entries it does not have.
         let mut clauses: Vec<String> = Vec::new();
@@ -1140,14 +1220,13 @@ pub async fn run(args: RollbackArgs) -> i32 {
             ));
         }
         if !vendor_scope.is_empty() {
-            let mut clause = format!("delete {} vendored artifact(s)", vendor_scope.len());
-            if detached_count > 0 {
-                clause.push_str(&format!(
-                    " ({detached_count} detached — their embedded patch records are the \
-                     only local copy)"
-                ));
-            }
-            clauses.push(clause);
+            // Vendored-mode entries live only in the ledger (their embedded
+            // patch record is the local copy), so name the ledger records
+            // as what goes, the way the manifest clause names its entries.
+            clauses.push(format!(
+                "delete {} vendored artifact(s) and their ledger records",
+                vendor_scope.len()
+            ));
         }
         if !hosted_scope.is_empty() {
             clauses.push(format!(
@@ -1174,13 +1253,18 @@ pub async fn run(args: RollbackArgs) -> i32 {
     }
 
     // ── agent leg (in-place restore) ────────────────────────────────────
+    // The "No patches found in manifest" line is for an unscoped run with
+    // nothing to do anywhere: a hosted-/vendored-only project has work in
+    // the other legs and is not "no patches".
     let selection = InnerSelection::Scope {
         purls: &manifest_scope,
-        announce_empty: !scoped,
+        announce_empty: !scoped && !has_work,
     };
     match rollback_patches_inner(
         &args.common,
-        &manifest_path,
+        &socket_dir,
+        &manifest,
+        &vendored_keys,
         selection,
         Some(&telemetry_client),
     )
@@ -1211,14 +1295,6 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 vendored_leg =
                     run_vendored_leg(&args.common, &keys, &mut vs, args.preserve_state).await;
             }
-            // `vendored` (the legacy "benign, untouched" array) is
-            // reserved-empty in v5.0: acted-on entries land in the
-            // vendoredReverted/vendoredPreserved/vendoredKept arrays, and
-            // the corrupt-ledger skip cannot name vendor-owned purls (the
-            // detection itself needs the ledger) — it surfaces via the
-            // `vendor_state_unreadable` warning and exit 1 instead.
-            let vendored: Vec<String> = Vec::new();
-            let _ = &vendored_excluded;
 
             // ── hosted leg ───────────────────────────────────────────────
             let mut hosted_leg = HostedLegOutcome::default();
@@ -1270,12 +1346,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // ledger-key / base-purl / qualifier-stripped triple).
             let vendored_reverted_ok = |purl: &str| {
                 vendored_leg.reverted.iter().any(|key| {
-                    key == purl
-                        || strip_purl_qualifiers(key) == strip_purl_qualifiers(purl)
-                        || vendor_entries
-                            .iter()
-                            .find(|(k, _)| k == key)
-                            .is_some_and(|(_, e)| e.base_purl == strip_purl_qualifiers(purl))
+                    vendor_entries
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .is_some_and(|(k, e)| vendor_entry_covers_purl(k, e, purl))
                 })
             };
             let succeeded_purls: HashSet<String> = results
@@ -1307,6 +1381,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .collect();
             removable.sort();
 
+            // The manifest is rewritten only when an entry actually leaves
+            // it; an emptied manifest stays on disk as `{"patches": {}}`
+            // (it carries the setup block and `list`/`apply`/`repair`'s
+            // empty-vs-missing exit codes) — never deleted.
             let mut removed: Vec<String> = Vec::new();
             let mut updated_manifest = manifest.clone();
             let mut manifest_write_failed: Option<String> = None;
@@ -1314,7 +1392,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 updated_manifest
                     .patches
                     .retain(|purl, _| !removable.contains(purl));
-                removed = removable.clone();
+                removed = removable;
                 if !args.common.dry_run {
                     if let Err(e) = write_manifest(&manifest_path, &updated_manifest).await {
                         manifest_write_failed = Some(e.to_string());
@@ -1335,60 +1413,46 @@ pub async fn run(args: RollbackArgs) -> i32 {
             let mut gc_json: serde_json::Value = serde_json::json!({ "skipped": true });
             let mut gc_bytes_freed: u64 = 0;
             if cleanup_allowed {
-                let mut cleanup_reference = updated_manifest.clone();
                 // Pin the beforeHash blobs of EVERY entry remaining in the
                 // manifest (still-active patches keep their revert data —
                 // an eco-scoped or failed run must never destroy the blobs
                 // a later rollback needs) plus removed-but-not-installed
                 // entries (remove's crawler-miss guard). Blobs referenced
                 // only by genuinely-removed entries are what gets swept.
-                let pinned_purls: Vec<&String> = removed
+                let pinned_purls: Vec<String> = removed
                     .iter()
                     .filter(|p| not_installed.contains(p))
                     .chain(updated_manifest.patches.keys())
+                    .cloned()
                     .collect();
-                pin_before_hash_blobs(&mut cleanup_reference, &manifest, pinned_purls);
-                let blobs_dir = socket_dir.join("blobs");
-                let mut removed_blobs = 0usize;
-                let mut removed_diffs = 0usize;
-                let mut removed_packages = 0usize;
-                match cleanup_unused_blobs(&cleanup_reference, &blobs_dir, args.common.dry_run)
-                    .await
-                {
-                    Ok(r) => {
-                        removed_blobs = r.blobs_removed;
-                        gc_bytes_freed += r.bytes_freed;
-                    }
-                    Err(e) => run_warnings.push((
-                        "cleanup_failed".into(),
-                        format!("blob cleanup failed: {e}"),
-                    )),
-                }
-                for (dir, slot) in [
-                    ("diffs", &mut removed_diffs),
-                    ("packages", &mut removed_packages),
-                ] {
-                    match cleanup_unused_archives(
-                        &cleanup_reference,
-                        &socket_dir.join(dir),
-                        args.common.dry_run,
-                    )
-                    .await
-                    {
+                // The post-removal manifest is not needed past the sweep:
+                // it becomes the (pin-augmented) reference in place.
+                let mut cleanup_reference = updated_manifest;
+                pin_before_hash_blobs(&mut cleanup_reference, &manifest, pinned_purls.iter());
+                let sweep =
+                    sweep_unused_artifacts(&cleanup_reference, &socket_dir, args.common.dry_run)
+                        .await;
+                let mut removed_counts = [0usize; 3];
+                for (slot, (label, result)) in removed_counts.iter_mut().zip([
+                    ("blob", sweep.blobs),
+                    ("diffs", sweep.diffs),
+                    ("packages", sweep.packages),
+                ]) {
+                    match result {
                         Ok(r) => {
                             *slot = r.blobs_removed;
                             gc_bytes_freed += r.bytes_freed;
                         }
                         Err(e) => run_warnings.push((
                             "cleanup_failed".into(),
-                            format!("{dir} cleanup failed: {e}"),
+                            format!("{label} cleanup failed: {e}"),
                         )),
                     }
                 }
                 gc_json = serde_json::json!({
-                    "removedBlobs": removed_blobs,
-                    "removedDiffArchives": removed_diffs,
-                    "removedPackageArchives": removed_packages,
+                    "removedBlobs": removed_counts[0],
+                    "removedDiffArchives": removed_counts[1],
+                    "removedPackageArchives": removed_counts[2],
                     "bytesFreed": gc_bytes_freed,
                 });
             }
@@ -1441,6 +1505,17 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 .iter()
                 .chain(hosted_leg.warnings.iter())
                 .for_each(|(code, detail)| run_warnings.push((code.clone(), detail.clone())));
+            // A restored package whose ownership could not be put back
+            // (the engine reports it on `error` with `success: true`) is
+            // restored but worth a note; `results[].error` carries it too.
+            for r in results.iter().filter(|r| r.success) {
+                if let Some(note) = &r.error {
+                    run_warnings.push((
+                        "ownership_not_restored".into(),
+                        format!("{}: {note}", r.package_key),
+                    ));
+                }
+            }
 
             // ── status / exit ────────────────────────────────────────────
             // Not-installed entries never flip the exit code (see
@@ -1493,10 +1568,13 @@ pub async fn run(args: RollbackArgs) -> i32 {
                                 "code": code, "detail": detail,
                             }))
                             .collect::<Vec<_>>(),
-                        // Vendor-owned purls the run did NOT act on (the
-                        // corrupt-ledger skip); acted-on entries are in the
-                        // vendored* arrays below.
-                        "vendored": vendored,
+                        // The legacy "benign, untouched" array is
+                        // reserved-empty in v5.0: acted-on entries land in
+                        // the vendored* arrays below, and the corrupt-ledger
+                        // skip cannot name vendor-owned purls (the detection
+                        // itself needs the ledger) — it surfaces via the
+                        // `vendor_state_unreadable` warning and exit 1.
+                        "vendored": [],
                         "vendoredReverted": vendored_leg.reverted,
                         "vendoredPreserved": vendored_leg.preserved,
                         "vendoredKept": vendored_leg.kept
@@ -1628,6 +1706,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 for (code, detail) in &run_warnings {
                     if code == "vendor_state_unreadable" || code == "redirect_state_unreadable" {
                         eprintln!("Error ({code}): {detail}");
+                    } else if code == "ownership_not_restored" && !args.common.silent {
+                        eprintln!("Warning ({code}): {detail}");
                     }
                 }
             }
@@ -1732,36 +1812,46 @@ pub async fn run(args: RollbackArgs) -> i32 {
     }
 }
 
-async fn rollback_patches_inner(
+/// Every purl spelling under which `state`'s entries are addressable —
+/// each entry's ledger key, its base purl and the qualifier-stripped key
+/// (the same triple as core's `vendored_purl_keys`, computed from an
+/// already-loaded ledger instead of re-reading it).
+pub(crate) fn vendored_purl_keys_of(state: &VendorState) -> HashSet<String> {
+    state
+        .entries
+        .iter()
+        .flat_map(|(key, entry)| {
+            [
+                key.clone(),
+                entry.base_purl.clone(),
+                strip_purl_qualifiers(key).to_string(),
+            ]
+        })
+        .collect()
+}
+
+/// The in-place (agent) rollback engine over an already-loaded `manifest`.
+/// `vendored_keys` is the ledger's ownership set (see
+/// [`vendored_purl_keys_of`]): vendor-owned purls are excluded from the
+/// in-place restore. Both `run()` and `remove`'s delegation load each
+/// store once under the lock and thread it in here.
+pub(crate) async fn rollback_patches_inner(
     common: &GlobalArgs,
-    manifest_path: &Path,
+    socket_dir: &Path,
+    manifest: &PatchManifest,
+    vendored_keys: &HashSet<String>,
     selection: InnerSelection<'_>,
-    // The client `run()` already built. Constructing one per phase printed
-    // the core client's "No SOCKET_API_TOKEN set" notice once per
-    // construction — twice in a single rollback. `None` (the `remove`
-    // delegation path) builds one on demand, only when the blob download
-    // below actually fires.
+    // The client the caller already built. Constructing one per phase
+    // printed the core client's "No SOCKET_API_TOKEN set" notice once per
+    // construction — twice in a single rollback. `None` builds one on
+    // demand, only when the blob download below actually fires.
     api_client: Option<&ApiClient>,
 ) -> Result<RollbackOutcome, String> {
-    // The Scope selection tolerates a missing manifest (ledger-only
-    // projects reach here with hosted/vendored work and no manifest);
-    // the Identifier selection keeps the legacy hard requirement.
-    let manifest = match read_manifest(manifest_path).await.map_err(|e| e.to_string())? {
-        Some(m) => m,
-        None => match &selection {
-            InnerSelection::Identifier(_) => return Err("Invalid manifest".to_string()),
-            InnerSelection::Scope { .. } => PatchManifest::new(),
-        },
-    };
-
-    let socket_dir = manifest_path
-        .parent()
-        .expect("manifest path names a file, so it has a parent");
     let mut blobs_path = socket_dir.join("blobs");
 
     let patches_to_rollback = match &selection {
         InnerSelection::Identifier(identifier) => {
-            find_patches_to_rollback(&manifest, identifier.as_deref())
+            find_patches_to_rollback(manifest, identifier.as_deref())
         }
         InnerSelection::Scope { purls, .. } => manifest
             .patches
@@ -1807,9 +1897,8 @@ async fn rollback_patches_inner(
     // in the installed tree, so before-blob restoration is meaningless
     // there (and would only hash-mismatch). `remove` reverts vendoring;
     // `vendor --revert` undoes it wholesale. Matching mirrors apply's
-    // ledger-key / base-purl / qualifier-stripped triple; unreadable state
-    // degrades to "nothing vendored".
-    let vendored_keys = socket_patch_core::vendor::vendored_purl_keys(&common.cwd).await;
+    // ledger-key / base-purl / qualifier-stripped triple; the caller
+    // degrades unreadable state to "nothing vendored".
     let is_vendored =
         |p: &str| vendored_keys.contains(p) || vendored_keys.contains(strip_purl_qualifiers(p));
     let (vendored_targets, patches_to_rollback): (Vec<_>, Vec<_>) = patches_to_rollback
@@ -1830,14 +1919,19 @@ async fn rollback_patches_inner(
         });
     }
 
-    // `--dry-run` must not mutate `.socket/` ("Preview, no mutations"):
-    // don't create the blobs dir; a throwaway stage replaces it below.
-    // Created only now that in-place work is known to exist, so a
-    // hosted-/vendored-only rollback leaves no empty blobs dir behind.
+    // Nothing here creates `.socket/blobs`: the engine only READS blobs,
+    // and the missing-blob download creates the directory itself when (and
+    // only when) it has something to write — so a rollback whose blobs are
+    // cached or whose files are already original leaves no empty blobs
+    // dir behind. A regular FILE squatting on the path is corrupt state,
+    // though: refuse up front rather than misreport it as N "Before blob
+    // not found" failures.
     if !common.dry_run {
-        tokio::fs::create_dir_all(&blobs_path)
-            .await
-            .map_err(|e| e.to_string())?;
+        if let Ok(meta) = tokio::fs::metadata(&blobs_path).await {
+            if !meta.is_dir() {
+                return Err(format!("{} is not a directory", blobs_path.display()));
+            }
+        }
     }
 
     // Create filtered manifest (a synthetic rollback-target subset, never
@@ -1911,7 +2005,7 @@ async fn rollback_patches_inner(
     let undiscovered_redirects: Vec<String> = scoped_manifest
         .patches
         .keys()
-        .filter(|purl| is_local_redirect(purl, common) && !all_packages.contains_key(*purl))
+        .filter(|purl| is_local_go(purl, common) && !all_packages.contains_key(*purl))
         .cloned()
         .collect();
 
@@ -2021,18 +2115,7 @@ async fn rollback_patches_inner(
     //     reads no blobs, so a missing before-blob must not block an
     //     offline redirect rollback.
     let attempted_purls: HashSet<&str> = rollback_targets.iter().map(|(p, _)| p.as_str()).collect();
-    let gate_manifest = exclude_local_redirects(
-        &PatchManifest {
-            patches: scoped_manifest
-                .patches
-                .iter()
-                .filter(|(purl, _)| attempted_purls.contains(purl.as_str()))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-            setup: None,
-        },
-        common,
-    );
+    let gate_manifest = before_blob_gate_manifest(&scoped_manifest, &attempted_purls, common);
 
     // Apply's `unmatched` twin: in-scope manifest entries the crawler found
     // no installed package for. Undiscovered local redirects are NOT
@@ -2344,10 +2427,12 @@ async fn rollback_patches_inner(
     })
 }
 
-// Export for use by remove command. The third tuple element lists
-// vendor-owned purls that were excluded from in-place rollback (benign);
-// the fourth is `RollbackOutcome::not_installed` — in-scope manifest
-// entries the crawler found no installed package for.
+// The legacy path-taking delegation shape, kept for the unit tests below
+// (`remove` now threads its already-loaded manifest and ledger straight
+// into `rollback_patches_inner`; this wrapper reads them from disk). The
+// third tuple element lists vendor-owned purls that were excluded from
+// in-place rollback (benign); the fourth is `RollbackOutcome::not_installed`
+// — in-scope manifest entries the crawler found no installed package for.
 //
 // The returned `bool` is `RollbackOutcome::success` — per-package semantics
 // only. Manifest entries whose package is not installed are NOT failures
@@ -2371,6 +2456,7 @@ async fn rollback_patches_inner(
 // passed as flags the nested client was unauthenticated and pointed at the
 // public proxy, so the download failed and the whole `remove` aborted with
 // `rollback_failed` (see tests/remove_rollback_api_overrides.rs).
+#[cfg(test)]
 pub(crate) async fn rollback_patches(
     common: &crate::args::GlobalArgs,
     manifest_path: &Path,
@@ -2379,8 +2465,17 @@ pub(crate) async fn rollback_patches(
     silent: bool,
     ecosystems: Option<Vec<String>>,
 ) -> Result<(bool, Vec<RollbackResult>, Vec<String>, Vec<String>), String> {
+    // The Identifier selection keeps the legacy hard requirement: a
+    // missing manifest is the (historical) "Invalid manifest" error.
+    let manifest = read_manifest(manifest_path)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Invalid manifest".to_string())?;
+    let socket_dir = manifest_path
+        .parent()
+        .expect("manifest path names a file, so it has a parent");
+    let vendored_keys = socket_patch_core::vendor::vendored_purl_keys(&common.cwd).await;
     let delegated_common = crate::args::GlobalArgs {
-        manifest_path: manifest_path.display().to_string(),
         ecosystems,
         silent,
         dry_run,
@@ -2388,7 +2483,9 @@ pub(crate) async fn rollback_patches(
     };
     let outcome = rollback_patches_inner(
         &delegated_common,
-        manifest_path,
+        socket_dir,
+        &manifest,
+        &vendored_keys,
         InnerSelection::Identifier(identifier),
         None,
     )
@@ -2818,14 +2915,15 @@ mod tests {
 
         // The gate must STILL report the cargo before-blob as missing — cargo
         // is an in-place rollback that genuinely needs it.
-        let gate = exclude_local_redirects(&manifest, &common);
+        let attempted: HashSet<&str> = manifest.patches.keys().map(String::as_str).collect();
+        let gate = before_blob_gate_manifest(&manifest, &attempted, &common);
         let gate_missing = get_missing_before_blobs(&gate, blobs).await;
         assert!(
             gate_missing.contains("cargo_before"),
             "gate must keep cargo before-blobs (in-place rollback), got {gate_missing:?}"
         );
         // And the cargo PURL must not be classified as a redirect.
-        assert!(!is_local_redirect("pkg:cargo/serde@1.0.0", &common));
+        assert!(!is_local_go("pkg:cargo/serde@1.0.0", &common));
     }
 
     /// Regression: local-GO redirects must be excluded from the before-blob
@@ -2869,17 +2967,29 @@ mod tests {
 
         // Gate manifest: the local-go PURL is excluded, so its before-blob is
         // not counted as missing. With the npm blob present, the gate reports
-        // nothing missing.
-        let gate = exclude_local_redirects(&manifest, &common);
+        // nothing missing. (Only ATTEMPTED purls enter the gate; every
+        // entry is attempted here.)
+        let attempted: HashSet<&str> = manifest.patches.keys().map(String::as_str).collect();
+        let gate = before_blob_gate_manifest(&manifest, &attempted, &common);
         let gate_missing = get_missing_before_blobs(&gate, blobs).await;
         assert!(
             gate_missing.is_empty(),
             "gate must exclude local-go before-blobs, got {gate_missing:?}"
         );
 
-        // And `is_local_redirect` must classify the go PURL as a redirect in
+        // A purl the crawler did not discover is not attempted, so it never
+        // gates either — even an in-place npm one.
+        let only_go: HashSet<&str> = ["pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1"].into();
+        assert!(
+            before_blob_gate_manifest(&manifest, &only_go, &common)
+                .patches
+                .is_empty(),
+            "an undiscovered in-place purl and a local-go purl both stay out of the gate"
+        );
+
+        // And `is_local_go` must classify the go PURL as a redirect in
         // local mode but a global PURL as in-place (gate must keep the latter).
-        assert!(is_local_redirect(
+        assert!(is_local_go(
             "pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1",
             &common
         ));
@@ -2887,10 +2997,18 @@ mod tests {
             global: true,
             ..crate::args::GlobalArgs::default()
         };
-        assert!(!is_local_redirect(
+        assert!(!is_local_go(
             "pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1",
             &global
         ));
+        let global_attempted: HashSet<&str> =
+            ["pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1"].into();
+        assert!(
+            before_blob_gate_manifest(&manifest, &global_attempted, &global)
+                .patches
+                .contains_key("pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1"),
+            "a global go purl rolls back in place, so its before-blob gates"
+        );
     }
 
     /// Regression: rolling back a local-GO patch must DROP the project-local

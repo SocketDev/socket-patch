@@ -509,10 +509,11 @@ fn corrupt_manifest_json_errors_in_both_modes() {
     );
 }
 
-/// `.socket/blobs` existing as a regular FILE makes the inner pipeline's
-/// `create_dir_all` fail — the boundary maps that to the legacy
-/// `{status: "error", rolledBack: 0, vendored: [], results: []}` envelope
-/// (and a bare `Error:` stderr line in human mode), exit 1.
+/// `.socket/blobs` existing as a regular FILE is corrupt state the inner
+/// pipeline refuses up front (its wet-run shape probe; the directory itself
+/// is only ever created by the blob download) — the boundary maps that to
+/// the legacy `{status: "error", rolledBack: 0, vendored: [], results: []}`
+/// envelope (and a bare `Error:` stderr line in human mode), exit 1.
 #[test]
 fn blobs_path_as_file_yields_legacy_error_envelope() {
     let build = || {
@@ -528,7 +529,7 @@ fn blobs_path_as_file_yields_legacy_error_envelope() {
                 &after_hash,
             )],
         );
-        // The blobs path is a regular FILE, so create_dir_all must fail.
+        // The blobs path is a regular FILE, so the wet run's shape probe refuses.
         std::fs::write(socket.join("blobs"), b"not a directory").expect("write blobs file");
         tmp
     };
@@ -1442,10 +1443,12 @@ fn write_two_record_fixture(root: &Path) {
     );
 }
 
-/// Human wet run over a hosted-only (manifest-less) project: the unscoped
-/// "No patches found in manifest" announce, the wet "Unwound hosted
-/// redirect for {purl}" line, and the reinstall note — with the wiring
-/// actually unwound and the emptied ledger deleted.
+/// Human wet run over a hosted-only (manifest-less) project: the wet
+/// "Unwound hosted redirect for {purl}" line and the reinstall note — with
+/// the wiring actually unwound, the emptied ledger deleted and no
+/// `.socket/` residue. The unscoped "No patches found in manifest" line is
+/// reserved for a run with no work in ANY leg: a project whose patches are
+/// all hosted has work, so the line must NOT print alongside the unwind.
 #[test]
 fn hosted_human_wet_announces_and_unwinds() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1457,8 +1460,9 @@ fn hosted_human_wet_announces_and_unwinds() {
         "the hosted-only rollback succeeds; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("No patches found in manifest"),
-        "the unscoped empty-manifest announce must print; stdout=\n{stdout}"
+        !stdout.contains("No patches found in manifest"),
+        "the empty-manifest announce must not print when the hosted leg has work; \
+         stdout=\n{stdout}"
     );
     assert!(
         stdout.contains(&format!("Unwound hosted redirect for {LP_PURL}")),
@@ -1476,6 +1480,11 @@ fn hosted_human_wet_announces_and_unwinds() {
     assert!(
         !ledger_path(tmp.path()).exists(),
         "the emptied ledger must be deleted"
+    );
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "a fully unwound hosted project keeps no .socket/ residue (vendor/ pruned \
+         with the ledger, apply.lock removed by the lock guard)"
     );
 }
 
@@ -1686,6 +1695,10 @@ fn leftover_edits_only_ledger_replays_unscoped() {
         !ledger_path(tmp.path()).exists(),
         "the emptied ledger must be deleted"
     );
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "the replayed-out project keeps no .socket/ residue"
+    );
 }
 
 /// A corrupt redirect ledger skips ONLY the hosted leg: exit 1 with the
@@ -1784,6 +1797,7 @@ fn ecosystems_filter_narrows_hosted_scope() {
         "the wiring must be unwound"
     );
     assert!(!ledger_path(tmp.path()).exists(), "ledger deleted");
+    assert!(!tmp.path().join(".socket").exists(), "no .socket/ residue");
 }
 
 /// A path-shaped target selects a HOSTED record through its installed
@@ -1822,6 +1836,7 @@ fn path_glob_selects_hosted_record() {
         "the wiring must be unwound"
     );
     assert!(!ledger_path(tmp.path()).exists(), "ledger deleted");
+    assert!(!tmp.path().join(".socket").exists(), "no .socket/ residue");
 }
 
 /// `persist_redirect_state` FAILURE after the hosted leg mutated the
@@ -1923,6 +1938,7 @@ fn bun_deferred_purl_unwinds_via_replay() {
         !ledger_path(tmp.path()).exists(),
         "record and edit both unwound: the ledger must be deleted"
     );
+    assert!(!tmp.path().join(".socket").exists(), "no .socket/ residue");
 }
 
 // ═══════════════ 4. GC-failure warnings (unix permissions) ═════════════════

@@ -136,4 +136,8 @@ async fn unscoped_rollback_still_replays_leftover_edits() {
         !ledger_path(tmp.path()).exists(),
         "the emptied ledger must be deleted"
     );
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "the replayed-out project keeps no .socket/ residue"
+    );
 }

@@ -1574,12 +1574,12 @@ fn remove_cleanup_failures_warn_not_fatal() {
 //     from the covered Ok(success=false) gate abort.
 // ---------------------------------------------------------------------------
 
-/// `.socket/blobs` planted as a regular FILE makes the wet rollback's
-/// `create_dir_all(blobs_path)` fail (an infrastructure `Err`, not the
-/// before-blob gate's Ok(success=false)): remove must surface it as
-/// `rollback_failed` with the "Error during rollback:" prefix and leave
-/// the manifest untouched. The package must be installed off its original
-/// bytes so the rollback has in-place work (the dir is created lazily).
+/// `.socket/blobs` planted as a regular FILE is refused by the wet
+/// rollback's shape probe (an infrastructure `Err`, not the before-blob
+/// gate's Ok(success=false)): remove must surface it as `rollback_failed`
+/// with the "Error during rollback:" prefix and leave the manifest
+/// untouched. The package must be installed off its original bytes so the
+/// rollback has in-place work (the probe runs only then).
 #[test]
 fn remove_rollback_infrastructure_error_surfaces_rollback_failed() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1766,4 +1766,208 @@ mod pty {
         assert_eq!(read_bytes(&ledger_path), ledger_before, "ledger untouched");
         assert_eq!(read_bytes(&lock_path), lock_before, "lock untouched");
     }
+}
+
+// ---------------------------------------------------------------------------
+// 14. Ledger-only path: --preserve-state, drift-keeps, and the missing
+//     `detached` flag — one revert loop shared with the manifest path.
+// ---------------------------------------------------------------------------
+
+/// `remove --preserve-state` on a ledger-only entry unwires the lockfile
+/// but KEEPS the artifact and the ledger entry — the documented
+/// `--preserve-state` promise, which the ledger-only path used to ignore
+/// (deleting the very state it promised to preserve). The empty wiring
+/// makes the unwire an offline no-op, so the keep-everything half is what
+/// shows: exit 0, a `skipped`/`vendor_state_preserved` event, no `removed`
+/// event, ledger byte-identical, artifact on disk. Dry-run twin previews
+/// the unwire and mutates nothing.
+#[test]
+fn remove_detached_preserve_state_keeps_artifact_and_ledger_entry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let purl = "pkg:npm/__covgap_detpreserve__@1.0.0";
+    let uuid = "77777777-7777-4777-8777-777777777777";
+    let artifact_dir =
+        write_vendor_ledger_entry(tmp.path(), purl, purl, uuid, "[]", "\"detached\": true,\n      ");
+    let ledger_path = tmp.path().join(".socket/vendor/state.json");
+    let ledger_before = read_bytes(&ledger_path);
+
+    let (code, stdout, stderr) = run_remove(
+        tmp.path(),
+        &[purl, "--json", "--yes", "--offline", "--preserve-state"],
+        &[],
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let v = parse_envelope(&stdout);
+    assert_eq!(v["status"], "success", "envelope={v}");
+    assert_eq!(
+        v["summary"]["removed"], 0,
+        "nothing is removed under --preserve-state; envelope={v}"
+    );
+    assert!(event_purls(&v, "removed").is_empty(), "envelope={v}");
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events.iter().any(|e| e["action"] == "skipped"
+            && e["errorCode"] == "vendor_state_preserved"
+            && e["purl"] == purl),
+        "expected a skipped/vendor_state_preserved event: {events:?}"
+    );
+    assert_eq!(
+        read_bytes(&ledger_path),
+        ledger_before,
+        "the ledger entry must be preserved byte-for-byte"
+    );
+    assert!(
+        artifact_dir.join("package.tgz").exists(),
+        "the artifact must be preserved"
+    );
+
+    // Dry-run twin: the listing and the preview line say what --preserve-state
+    // will do, and nothing moves.
+    let tmp2 = tempfile::tempdir().expect("tempdir");
+    let artifact_dir2 =
+        write_vendor_ledger_entry(tmp2.path(), purl, purl, uuid, "[]", "\"detached\": true,\n      ");
+    let ledger_path2 = tmp2.path().join(".socket/vendor/state.json");
+    let ledger_before2 = read_bytes(&ledger_path2);
+    let (code, stdout, stderr) = run_remove(
+        tmp2.path(),
+        &[purl, "--offline", "--preserve-state", "--dry-run"],
+        &[],
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stdout.contains(&format!("Would unwire vendoring for {purl} (artifact preserved)")),
+        "the preserve preview line must print; stdout=\n{stdout}"
+    );
+    assert!(
+        stderr.contains("will be unwired (artifacts and ledger entries preserved)"),
+        "the listing must be honest about --preserve-state; stderr=\n{stderr}"
+    );
+    assert_eq!(read_bytes(&ledger_path2), ledger_before2, "dry run: ledger untouched");
+    assert!(artifact_dir2.join("package.tgz").exists(), "dry run: artifact untouched");
+}
+
+/// A drifted lock on a ledger-only entry: the backend DRIFT-KEEPS
+/// (`kept_artifact`), and the ledger-only path must honor it exactly like
+/// the manifest path — keep the ledger entry and the artifact, report
+/// `skipped`/`vendor_revert_kept`, and fail the run (`partialFailure`,
+/// top-level `vendor_revert_kept` since every match kept, exit 1). Before
+/// the fix the entry was dropped from the ledger while its wiring and
+/// artifact stayed behind — the "wired but ledgerless" recovery state
+/// `repair` exists for — and the run reported a clean removal.
+#[test]
+fn remove_detached_drift_keep_holds_ledger_entry_and_exits_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let purl = "pkg:npm/__covgap_detdrift__@1.0.0";
+    let uuid = "88888888-8888-4888-8888-888888888888";
+    let artifact_dir = write_vendor_ledger_entry(
+        tmp.path(),
+        purl,
+        purl,
+        uuid,
+        DRIFTED_WIRING,
+        "\"detached\": true,\n      ",
+    );
+    let ledger_path = tmp.path().join(".socket/vendor/state.json");
+    let ledger_before = read_bytes(&ledger_path);
+
+    let (code, stdout, stderr) =
+        run_remove(tmp.path(), &[purl, "--json", "--yes", "--offline"], &[]);
+    assert_eq!(
+        code, 1,
+        "an all-kept remove is a partial failure; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    let v = parse_envelope(&stdout);
+    assert_eq!(v["status"], "partialFailure", "envelope={v}");
+    assert_eq!(
+        v["error"]["code"], "vendor_revert_kept",
+        "every match kept → top-level error; envelope={v}"
+    );
+    assert_eq!(v["summary"]["removed"], 0, "envelope={v}");
+    let events = v["events"].as_array().expect("events array");
+    assert!(
+        events.iter().any(|e| e["action"] == "skipped"
+            && e["errorCode"] == "vendor_revert_kept"
+            && e["purl"] == purl),
+        "expected a skipped/vendor_revert_kept event: {events:?}"
+    );
+    assert!(
+        event_purls(&v, "removed").is_empty(),
+        "nothing may be reported removed; envelope={v}"
+    );
+    assert_eq!(
+        read_bytes(&ledger_path),
+        ledger_before,
+        "the drift-kept ledger entry must survive byte-for-byte"
+    );
+    assert!(
+        artifact_dir.join("package.tgz").exists(),
+        "the drift-kept artifact must survive"
+    );
+
+    // Human twin: the per-key keep line and the errors-only summary line.
+    let tmp2 = tempfile::tempdir().expect("tempdir");
+    write_vendor_ledger_entry(
+        tmp2.path(),
+        purl,
+        purl,
+        uuid,
+        DRIFTED_WIRING,
+        "\"detached\": true,\n      ",
+    );
+    let (code, stdout, stderr) = run_remove(tmp2.path(), &[purl, "--yes", "--offline"], &[]);
+    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stderr.contains(&format!("Kept vendored state for {purl}: lockfile wiring drifted")),
+        "the per-key keep line must print; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("1 matching entry was drift-kept (vendored state and ledger record retained)"),
+        "the summary error line must print; stderr=\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("Reverted vendoring for"),
+        "nothing was reverted; stdout=\n{stdout}"
+    );
+}
+
+/// The ledger-only path is not gated on the entry's `detached` flag: ANY
+/// ledger entry with no manifest record — the shape `remove --skip-rollback`
+/// leaves behind, and every `scan/get --mode vendored` entry — is removable
+/// through the ledger. Before, a non-detached ledger-only match fell through
+/// to `not_found`, wired forever.
+#[test]
+fn remove_ledger_only_entry_without_detached_flag_reverts() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let purl = "pkg:npm/__covgap_ledgeronly__@1.0.0";
+    let uuid = "99999999-9999-4999-8999-999999999999";
+    // Empty manifest: the identifier matches only the ledger entry, which
+    // carries no `detached` flag at all.
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(socket.join("manifest.json"), r#"{ "patches": {} }"#).unwrap();
+    let artifact_dir = write_vendor_ledger_entry(tmp.path(), purl, purl, uuid, "[]", "");
+
+    let (code, stdout, stderr) =
+        run_remove(tmp.path(), &[purl, "--json", "--yes", "--offline"], &[]);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let v = parse_envelope(&stdout);
+    assert_eq!(v["status"], "success", "envelope={v}");
+    assert_eq!(
+        v["summary"]["removed"], 1,
+        "the revert IS the removal; envelope={v}"
+    );
+    assert_eq!(event_purls(&v, "removed"), vec![purl], "envelope={v}");
+    assert!(
+        !tmp.path().join(".socket/vendor").exists(),
+        "the emptied ledger and its vendor/ dir are pruned"
+    );
+    assert!(!artifact_dir.exists(), "the artifact is deleted");
+    assert!(
+        socket.join("manifest.json").exists(),
+        "the (empty) manifest is project state and stays"
+    );
+    assert!(
+        !socket.join("apply.lock").exists(),
+        "the lock file never outlives the run"
+    );
 }
