@@ -19,7 +19,12 @@
 //! * per-patch vulnerability rendering in the "Patches to apply" preview;
 //! * the human post-apply GC line (both pluralization arms) and the
 //!   `hosted_wiring_retained` stderr warning after an in-place apply;
-//! * the declined download confirm via a PTY (exit 0, hint, no mutation).
+//! * non-TTY human runs: a mode-less scan is report-only (no download, no
+//!   `.socket/`), while `--mode agent` / `--apply` / `--prune` auto-proceed;
+//! * the hosted human arm's results table, `[UPDATE]` detection and
+//!   confirm prompt (parity with the agent/vendored arms);
+//! * the declined download / redirect confirm via a PTY (exit 0, hint, no
+//!   mutation).
 //!
 //! Subprocess runs scrub the `SOCKET_*` flag environment (the
 //! `cli_scan_silent.rs` pattern) so ambient developer/CI configuration
@@ -774,12 +779,13 @@ async fn scan_human_preview_renders_vulnerability_details() {
 // hosted_wiring_retained warning after an in-place apply
 // ---------------------------------------------------------------------------
 
-/// Run the full human apply pipeline via `--sync --yes` with `orphans`
-/// pre-seeded manifest entries (plus one orphan blob file each), and
-/// return `(code, stdout, stderr, root)`.
-async fn run_sync_with_orphans(
+/// Run the full human apply pipeline with `flags` (e.g. `--sync --yes`)
+/// and `orphans` pre-seeded manifest entries (plus one orphan blob file
+/// each), and return `(code, stdout, stderr, root)`.
+async fn run_apply_with_orphans(
     mock: &MockServer,
     orphans: &[(&str, &str, char)],
+    flags: &[&str],
 ) -> (i32, String, String, tempfile::TempDir) {
     let purl = "pkg:npm/silent-target@1.0.0";
     let before = b"before\n";
@@ -796,16 +802,17 @@ async fn run_sync_with_orphans(
         std::fs::write(blobs.join(fill.to_string().repeat(64)), b"orphan").unwrap();
     }
 
-    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--sync", "--yes"]);
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), flags);
     (code, stdout, stderr, tmp)
 }
 
 #[tokio::test]
 async fn scan_sync_human_gc_line_singular_arms() {
     let mock = MockServer::start().await;
-    let (code, stdout, stderr, tmp) = run_sync_with_orphans(
+    let (code, stdout, stderr, tmp) = run_apply_with_orphans(
         &mock,
         &[("pkg:npm/gone@1.0.0", OLD_UUID, 'c')],
+        &["--sync", "--yes"],
     )
     .await;
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
@@ -834,12 +841,13 @@ async fn scan_sync_human_gc_line_singular_arms() {
 #[tokio::test]
 async fn scan_sync_human_gc_line_plural_arms() {
     let mock = MockServer::start().await;
-    let (code, stdout, stderr, _tmp) = run_sync_with_orphans(
+    let (code, stdout, stderr, _tmp) = run_apply_with_orphans(
         &mock,
         &[
             ("pkg:npm/gone@1.0.0", OLD_UUID, 'c'),
             ("pkg:npm/also-gone@2.0.0", "88888888-8888-4888-8888-888888888888", 'd'),
         ],
+        &["--sync", "--yes"],
     )
     .await;
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
@@ -1065,9 +1073,272 @@ async fn scan_human_pnp_refusal_prints_alongside_other_ecosystems() {
 }
 
 // ---------------------------------------------------------------------------
+// Non-TTY human scans: the mode-less scan is report-only, explicit intent
+// auto-proceeds
+// ---------------------------------------------------------------------------
+// Every `Command::output()` child here has a non-TTY stdin. A bare `scan`
+// (no `--mode`/`--apply`/`--sync`/`--vendor`/`--redirect`, no `--prune`,
+// no `--yes`) must stop BEFORE the download with exit 0 and the get-hint,
+// creating nothing under `.socket/`; any intent flag keeps `confirm()`'s
+// non-TTY auto-accept and applies.
+
+/// Bare `scan` piped: the discovery, table and per-patch preview print
+/// (the report IS the value), then the run stops — no view fetch, no
+/// `.socket/`, the installed file untouched — and `confirm()` was never
+/// consulted (no "Non-interactive mode" line).
+#[tokio::test]
+async fn scan_bare_human_non_tty_is_report_only() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    mount_one_patch_api(&mock, purl, b"x\n").await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "report-only is a success; stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains("Patches to apply:") && stdout.contains(purl),
+        "the per-patch preview still prints; got {stdout:?}"
+    );
+    assert!(
+        stdout.contains("To apply a patch, run:") && stdout.contains("socket-patch get <CVE-ID>"),
+        "the get-hint must print; got {stdout:?}"
+    );
+    assert!(
+        !stderr.contains("Non-interactive mode detected"),
+        "confirm() must not be consulted on the report-only path; got {stderr:?}"
+    );
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "a report-only scan must not create .socket/"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/minimist/index.js")).unwrap(),
+        b"x\n",
+        "a report-only scan must not patch the installed file"
+    );
+    let reqs = recorded(&mock).await;
+    assert_eq!(view_gets(&reqs), 0, "a report-only scan must not download the patch");
+}
+
+/// The same piped run with an explicit intent flag (each spelling that
+/// folds to `--mode agent`) auto-proceeds through `confirm()`'s non-TTY
+/// default and applies.
+#[tokio::test]
+async fn scan_human_non_tty_explicit_intent_auto_proceeds() {
+    for flags in [&["--mode", "agent"][..], &["--apply"][..]] {
+        let mock = MockServer::start().await;
+        let purl = "pkg:npm/silent-target@1.0.0";
+        let before = b"before\n";
+        mount_one_patch_api(&mock, purl, before).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "silent-target", "1.0.0", before);
+
+        let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), flags);
+        assert_eq!(code, 0, "flags={flags:?}: stdout={stdout}; stderr={stderr}");
+        assert!(
+            stderr.contains("Non-interactive mode detected, proceeding with default."),
+            "flags={flags:?}: explicit intent keeps confirm()'s non-TTY auto-accept; got {stderr:?}"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("node_modules/silent-target/index.js")).unwrap(),
+            b"after\n",
+            "flags={flags:?}: the apply must proceed"
+        );
+        let manifest =
+            std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).expect("manifest");
+        let v: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        assert_eq!(v["patches"][purl]["uuid"], UUID, "flags={flags:?}: {v}");
+    }
+}
+
+/// `--prune` alone is explicit intent too (it asks for a `.socket/`
+/// mutation): the piped run applies AND garbage-collects.
+#[tokio::test]
+async fn scan_human_non_tty_prune_counts_as_intent() {
+    let mock = MockServer::start().await;
+    let (code, stdout, stderr, tmp) = run_apply_with_orphans(
+        &mock,
+        &[("pkg:npm/gone@1.0.0", OLD_UUID, 'c')],
+        &["--prune"],
+    )
+    .await;
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stderr.contains("Non-interactive mode detected, proceeding with default."),
+        "--prune auto-proceeds through confirm(); got {stderr:?}"
+    );
+    assert!(
+        stdout.contains("GC: pruned 1 manifest entry and removed 1 orphan file ("),
+        "the GC still runs; got {stdout:?}"
+    );
+    let manifest =
+        std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).expect("manifest");
+    let v: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    assert!(v["patches"]["pkg:npm/gone@1.0.0"].is_null(), "{v}");
+    assert_eq!(v["patches"]["pkg:npm/silent-target@1.0.0"]["uuid"], UUID, "{v}");
+}
+
+/// An empty discovery stops every human mode at "No patches available"
+/// with exit 0 and no `.socket/`: vendored mode no longer falls through to
+/// its vendor step to re-vendor a committed manifest (scan vendors what
+/// discovery selects), and hosted mode no longer enters its engine for a
+/// zero-package redirect.
+#[tokio::test]
+async fn scan_human_empty_discovery_stops_in_every_mode() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&mock)
+        .await;
+    for flags in [
+        &[][..],
+        &["--mode", "vendored"][..],
+        &["--mode", "hosted"][..],
+        &["--mode", "agent"][..],
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+        let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), flags);
+        assert_eq!(code, 0, "flags={flags:?}: stdout={stdout}; stderr={stderr}");
+        assert!(
+            stdout.contains("No patches available for installed packages."),
+            "flags={flags:?}: got {stdout:?}"
+        );
+        assert!(
+            !tmp.path().join(".socket").exists(),
+            "flags={flags:?}: an empty discovery must create nothing"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Human `--mode hosted`: table + update detection parity and the confirm
+// ---------------------------------------------------------------------------
+// The hosted human arm used to return straight into the redirect engine —
+// no results table, no `[UPDATE]` marker, and no prompt (while `get --mode
+// hosted` and scan's agent/vendored arms all confirm). It now shares the
+// table/update block and confirms before the engine runs.
+
+/// Reference endpoint denying the grant: the engine runs (proving the
+/// prompt was accepted) but rewrites nothing, so no lockfile fixture is
+/// needed.
+async fn mount_forbidden_reference(mock: &MockServer, purl: &str) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": { UUID: {
+                "status": "forbidden", "url": null, "purl": purl,
+                "artifacts": [], "registryOverride": null
+            } }
+        })))
+        .mount(mock)
+        .await;
+}
+
+fn reference_posts(reqs: &[wiremock::Request]) -> usize {
+    reqs.iter()
+        .filter(|r| {
+            format!("{}", r.method) == "POST" && r.url.path().ends_with("/patches/package")
+        })
+        .count()
+}
+
+/// Seed a redirect ledger recording `uuid` for `purl` (hosted mode's only
+/// patch store), so update detection has an "old" side to compare. Written
+/// through the real ledger type so the hosted engine's strict loader
+/// accepts it.
+fn seed_redirect_ledger(root: &Path, purl: &str, uuid: &str) {
+    use socket_patch_core::manifest::schema::PatchRecord;
+    use socket_patch_core::patch::redirect::RedirectState;
+    let mut state = RedirectState::new();
+    state.records.insert(
+        purl.to_string(),
+        PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: "2024-01-01T00:00:00Z".to_string(),
+            files: std::collections::HashMap::new(),
+            vulnerabilities: std::collections::HashMap::new(),
+            description: "seed".to_string(),
+            license: "MIT".to_string(),
+            tier: "free".to_string(),
+        },
+    );
+    let vendor_dir = root.join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(
+        vendor_dir.join("redirect-state.json"),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn scan_hosted_human_prints_table_updates_and_confirms() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    mount_batch_one(&mock, purl, UUID, "free", &["CVE-2024-0001"], false).await;
+    mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+    mount_forbidden_reference(&mock, purl).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+    // The ledger records an OLDER patch: the shared update detection must
+    // flag the newer offer in hosted mode too.
+    seed_redirect_ledger(tmp.path(), purl, OLD_UUID);
+
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--mode", "hosted"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains("VULNERABILITIES") && stdout.contains("CVE-2024-0001"),
+        "the results table must print in hosted mode; got {stdout:?}"
+    );
+    assert!(
+        stdout.contains("Summary: 1 package(s) with 1 free patch(es)"),
+        "the summary must print in hosted mode; got {stdout:?}"
+    );
+    assert!(
+        stdout.contains("[UPDATE]") && stdout.contains("1 package(s) have newer patches available."),
+        "update detection must run in hosted mode; got {stdout:?}"
+    );
+    // `--mode hosted` is explicit intent: the new prompt auto-accepts on a
+    // non-TTY stdin and the engine runs.
+    assert!(
+        stderr.contains("Non-interactive mode detected, proceeding with default."),
+        "the hosted confirm must run (and auto-accept) on a non-TTY; got {stderr:?}"
+    );
+    assert!(
+        stdout.contains("Redirected 0 package(s)"),
+        "the engine must run after the prompt; got {stdout:?}"
+    );
+    let reqs = recorded(&mock).await;
+    assert_eq!(reference_posts(&reqs), 1, "the engine resolved the reference");
+
+    // `--dry-run` previews without confirming (the engine honors it itself).
+    let (code, _stdout, stderr) =
+        run_scan_human(tmp.path(), &mock.uri(), &["--mode", "hosted", "--dry-run"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        !stderr.contains("Non-interactive mode detected"),
+        "a hosted dry run never prompts; got {stderr:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Declined download confirm via PTY (unix only)
 // ---------------------------------------------------------------------------
-// `confirm()` returns the default in non-TTY runs, so only a PTY reaches
+// A non-TTY mode-less scan never reaches `confirm()` (report-only above),
+// and every explicit-intent run auto-accepts there, so only a PTY reaches
 // the decline arm: exit 0, the get-hint, and no mutation.
 
 #[cfg(unix)]
@@ -1201,6 +1472,70 @@ mod pty {
         );
         let reqs = recorded(&mock).await;
         assert_eq!(view_gets(&reqs), 0, "declining must not download the patch");
+    }
+
+    /// The hosted twin: declining "Redirect N package(s) …?" exits 0 with
+    /// the hosted get-hint and never enters the engine (no reference
+    /// resolve, no `.socket/`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_hosted_decline_at_redirect_prompt_exits_zero_without_mutation() {
+        let mock = MockServer::start().await;
+        let purl = "pkg:npm/minimist@1.2.2";
+        mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+        mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+        mount_forbidden_reference(&mock, purl).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+
+        let uri = mock.uri();
+        let cwd = tmp.path().to_path_buf();
+        let (code, output) = tokio::task::spawn_blocking(move || {
+            run_in_pty(
+                &[
+                    "scan",
+                    "--mode",
+                    "hosted",
+                    "--api-url",
+                    &uri,
+                    "--api-token",
+                    "fake-token-for-test",
+                    "--org",
+                    ORG_SLUG,
+                ],
+                &cwd,
+                "n\n",
+                Duration::from_secs(60),
+            )
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        assert_eq!(code, 0, "declining is not an error; output:\n{output}");
+        assert!(
+            output.contains("Redirect 1 package(s) to the hosted patch server?"),
+            "the hosted confirm prompt must have shown; got:\n{output}"
+        );
+        assert!(
+            output.contains("To redirect a package, run:")
+                && output.contains("socket-patch get <CVE-ID> --mode hosted"),
+            "the hosted decline hint must print; got:\n{output}"
+        );
+        assert!(
+            !output.contains("Redirected"),
+            "declining must not enter the redirect engine; got:\n{output}"
+        );
+        assert!(
+            !tmp.path().join(".socket").exists(),
+            "declining must create nothing under .socket/"
+        );
+        let reqs = recorded(&mock).await;
+        assert_eq!(
+            reference_posts(&reqs),
+            0,
+            "declining must not resolve the hosted reference"
+        );
     }
 }
 

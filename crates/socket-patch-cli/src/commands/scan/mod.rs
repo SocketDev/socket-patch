@@ -36,8 +36,9 @@ mod hosted;
 mod vendor_flow;
 
 use self::discovery::{
-    collect_vuln_ids, detect_updates, lockfile_supplement, merge_redirect_records_for_updates,
-    preverify_vendor_baselines, severity_order, vendored_ledger_supplement,
+    collect_vuln_ids, detect_updates, lockfile_only_contains, lockfile_supplement,
+    merge_ledger_records_for_updates, preverify_vendor_baselines, severity_order,
+    vendored_ledger_supplement, vendored_purl_keys, LockfileSupplement,
 };
 // Shared with `get --mode hosted|vendored` (commands::get): the advisory-
 // pinned entry into the hosted engine, the vendor step + its dry-run
@@ -199,8 +200,11 @@ pub struct ScanArgs {
     /// lists available patches plus an `updates` array but does not mutate
     /// the manifest. Designed for unattended workflows (cron jobs, bots
     /// that open PRs); pair with `--yes` for clarity though `--json`
-    /// already implies non-interactive confirmation. No effect outside
-    /// `--json` mode (the non-JSON path always prompts the user).
+    /// already implies non-interactive confirmation. On the non-JSON path
+    /// it is an explicit intent flag: a TTY prompts before downloading and
+    /// a non-TTY run auto-proceeds, whereas a mode-less human `scan`
+    /// without `--yes` on a non-TTY stdin is report-only (exit 0, nothing
+    /// downloaded, no `.socket/` created).
     #[arg(long, default_value_t = false)]
     pub apply: bool,
 
@@ -222,30 +226,27 @@ pub struct ScanArgs {
     pub sync: bool,
 
     /// Deprecated spelling of `--mode vendored` (kept for compatibility;
-    /// prefer `--mode`). Vendor every patched dependency into the
-    /// committable `.socket/vendor/` tree instead of applying patches in
-    /// place: download the selected patches, record them in the manifest,
-    /// then build + wire the vendored artifacts (the whole manifest is
-    /// vendored, so a package vendored at an older patch uuid is
-    /// re-vendored automatically). Conflicts with `--apply`/`--sync`
-    /// (vendoring replaces the in-place apply); combine with `--prune`
-    /// to drop uninstalled entries before they fail vendoring. JSON mode
-    /// is non-interactive like `--apply`; the interactive path prompts
-    /// before downloading.
+    /// prefer `--mode`). Vendor every patched dependency the scan selects
+    /// into the committable `.socket/vendor/` tree instead of applying
+    /// patches in place: the selected patch records are fetched in memory
+    /// (never written to `.socket/manifest.json` — the vendor ledger,
+    /// `.socket/vendor/state.json`, embeds each record), then the vendored
+    /// artifacts are built + wired; a package vendored at an older patch
+    /// uuid is re-vendored automatically. Conflicts with `--apply`/`--sync`
+    /// (vendoring replaces the in-place apply); combine with `--prune` to
+    /// garbage-collect stale state. JSON mode is non-interactive like
+    /// `--apply`; the interactive path prompts before downloading.
     #[arg(long, default_value_t = false, conflicts_with_all = ["apply", "sync"])]
     pub vendor: bool,
 
-    /// With vendored mode (`--mode vendored` / `--vendor`): do not write
-    /// `.socket/manifest.json` entries — the vendor ledger
-    /// (`.socket/vendor/state.json`) carries an embedded copy of each
-    /// patch record instead. Detached patches are invisible to
-    /// apply/rollback/repair (nothing is in the manifest); they are
-    /// undone per-purl via `remove <purl>` or wholesale via
-    /// `vendor --revert`, and are exempt from `vendor`'s manifest
-    /// reconcile. The vendored-mode requirement is enforced in
-    /// `resolve_mode_flags` (not clap `requires`) so `--mode vendored`
+    /// Accepted for compatibility (hidden): vendored mode is always
+    /// manifest-free — the vendor ledger (`.socket/vendor/state.json`)
+    /// embeds each patch record and `.socket/manifest.json` is never
+    /// written — so the flag is a no-op. It still requires vendored mode in
+    /// either spelling (`--mode vendored` / `--vendor`), enforced in
+    /// `resolve_mode_flags` rather than clap `requires` so `--mode vendored`
     /// satisfies it too.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, hide = true)]
     pub detached: bool,
 
     /// Redirect every patched dependency to Socket's HOSTED vendored patches
@@ -425,21 +426,8 @@ async fn discover_selected(
     packages: &[BatchPackagePatches],
     can_access_paid_patches: bool,
 ) -> Result<Vec<PatchSearchResult>, (i32, String)> {
-    let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
-    let mut error_count = 0usize;
-    let mut last_error: Option<String> = None;
-    for pkg in packages {
-        match api_client
-            .search_patches_by_package(org_slug, &pkg.purl)
-            .await
-        {
-            Ok(response) => all_search_results.extend(response.patches),
-            Err(e) => {
-                error_count += 1;
-                last_error = Some(e.to_string());
-            }
-        }
-    }
+    let (all_search_results, error_count, last_error) =
+        fetch_patch_details(api_client, org_slug, packages, false, false).await;
     if error_count > 0 && error_count == packages.len() {
         let err = last_error.unwrap_or_else(|| "all patch-detail queries failed".to_string());
         let message = format!("all {error_count} patch-detail queries failed: {err}");
@@ -451,6 +439,55 @@ async fn discover_selected(
     }
     select_patches(&all_search_results, can_access_paid_patches, false)
         .map_err(|code| (code, "patch selection failed".to_string()))
+}
+
+/// One `search_patches_by_package` query per package with patches, merged
+/// into one result list — the detail-fetch loop the apply, vendor, redirect
+/// and human-preview flows share. Returns the merged results plus the
+/// number of failed queries and the last error text; the CALLERS own the
+/// failure rule ([`discover_selected`] bails only when every query errored,
+/// the human arm treats an empty merged set as a fetch failure). The two
+/// output knobs are human-only: `show_progress` renders the
+/// `\r`-overwriting counter on stderr, `warn` the per-package failure line.
+async fn fetch_patch_details(
+    api_client: &socket_patch_core::api::client::ApiClient,
+    org_slug: Option<&str>,
+    packages: &[BatchPackagePatches],
+    show_progress: bool,
+    warn: bool,
+) -> (Vec<PatchSearchResult>, usize, Option<String>) {
+    let mut results: Vec<PatchSearchResult> = Vec::new();
+    let mut error_count = 0usize;
+    let mut last_error: Option<String> = None;
+    if show_progress && !packages.is_empty() {
+        eprint!("\nFetching patch details...");
+    }
+    for (i, pkg) in packages.iter().enumerate() {
+        if show_progress {
+            eprint!(
+                "\rFetching patch details... ({}/{})",
+                i + 1,
+                packages.len()
+            );
+        }
+        match api_client
+            .search_patches_by_package(org_slug, &pkg.purl)
+            .await
+        {
+            Ok(response) => results.extend(response.patches),
+            Err(e) => {
+                if warn {
+                    eprintln!("\n  Warning: could not fetch details for {}: {e}", pkg.purl);
+                }
+                error_count += 1;
+                last_error = Some(e.to_string());
+            }
+        }
+    }
+    if show_progress && !packages.is_empty() {
+        eprintln!();
+    }
+    (results, error_count, last_error)
 }
 
 /// Fold a [`discover_selected`] failure into a JSON caller's `result` and
@@ -468,9 +505,79 @@ fn emit_discovery_error_json(result: &mut serde_json::Value, message: &str) {
     );
 }
 
+/// The report-only / declined-prompt hint: how to consume one patch
+/// explicitly. Hosted runs name their mode (`get` defaults to agent mode).
+fn print_get_hint(hosted: bool) {
+    let (action, mode) = if hosted {
+        ("redirect a package", " --mode hosted")
+    } else {
+        ("apply a patch", "")
+    };
+    println!("\nTo {action}, run:");
+    println!("  socket-patch get <package-name-or-purl>{mode}");
+    println!("  socket-patch get <CVE-ID>{mode}");
+}
+
+/// The agent-flow selection split both arms (JSON + human) share. Vendor-
+/// owned purls leave first (any uuid: the committed artifact IS the patch,
+/// and a manifest moved past the vendored uuid would break VEX verification
+/// until a vendor run refreshes the artifact — a newer patch still surfaces
+/// in `updates[]`, the operator's signal to run `scan --vendor`), then
+/// lockfile-only purls (nothing installed to patch in place; `scan --vendor`
+/// fetches them pristine). Both classes become calm `skipped` records —
+/// never an error.
+struct AgentSelection {
+    /// What is left to download + apply.
+    kept: Vec<PatchSearchResult>,
+    /// Every skip record (`vendored` + `package_not_installed`), purl-sorted,
+    /// in the `{purl, uuid, action: "skipped", errorCode}` shape the apply
+    /// report folds in.
+    skip_records: Vec<serde_json::Value>,
+    /// The vendored partition's purls alone — feeds the run-level
+    /// `vendored_ownership_retained` warning and the human `[skip]` lines.
+    vendored_purls: Vec<String>,
+    /// The lockfile-only partition's purls alone (human `[skip]` lines).
+    not_installed_purls: Vec<String>,
+}
+
+fn partition_agent_selection(
+    selected: Vec<PatchSearchResult>,
+    vendored: &HashSet<String>,
+    lockfile_only: &LockfileSupplement,
+) -> AgentSelection {
+    let (kept, vendored_records) = partition_skipped_selected(
+        selected,
+        |p| vendored.contains(p) || vendored.contains(strip_purl_qualifiers(p)),
+        "vendored",
+    );
+    let (kept, not_installed_records) = partition_skipped_selected(
+        kept,
+        |p| lockfile_only_contains(&lockfile_only.purls, p),
+        "package_not_installed",
+    );
+    let purls_of = |records: &[serde_json::Value]| -> Vec<String> {
+        records
+            .iter()
+            .filter_map(|r| r["purl"].as_str().map(str::to_string))
+            .collect()
+    };
+    let vendored_purls = purls_of(&vendored_records);
+    let not_installed_purls = purls_of(&not_installed_records);
+    let mut skip_records = vendored_records;
+    skip_records.extend(not_installed_records);
+    skip_records.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
+    AgentSelection {
+        kept,
+        skip_records,
+        vendored_purls,
+        not_installed_purls,
+    }
+}
+
 /// The `DownloadParams` every scan-driven download shares. Only the output
-/// shape (`json`/`silent`) and `save_only` differ per flow; vendor mode
-/// never persists blobs (the vendor step consumes the staged sources).
+/// shape (`json`/`silent`) and `save_only` differ per flow; vendored mode
+/// never persists blobs (its records stay in memory and the vendor step
+/// consumes the staged sources).
 fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -> DownloadParams {
     DownloadParams {
         cwd: args.common.cwd.clone(),
@@ -1183,10 +1290,16 @@ pub(super) const VENDORED_OWNERSHIP_RETAINED: &str = "vendored_ownership_retaine
 /// * the live lock does not prove hosted wiring (registry-clean lock, an
 ///   ecosystem whose lock we cannot read) — never guess from ledger
 ///   presence alone.
+///
+/// `inventory` is the run's lockfile inventory (`LockfileSupplement::
+/// entries`, parsed once per run) — the same set the inventory proof in
+/// [`hosted_wiring_live`] reads; the text proof reads the recorded lockfiles
+/// directly.
 pub(super) async fn hosted_wiring_retained_purls(
     cwd: &Path,
     redirect_state: Option<&socket_patch_core::patch::redirect::RedirectState>,
-    scanned_purls: &HashSet<String>,
+    scanned_purls: impl IntoIterator<Item = impl AsRef<str>>,
+    inventory: &[socket_patch_core::vendor::lock_inventory::LockfileEntry],
 ) -> Vec<String> {
     let Some(redirect) = redirect_state else {
         return Vec::new();
@@ -1195,12 +1308,13 @@ pub(super) async fn hosted_wiring_retained_purls(
         return Vec::new();
     }
     let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-    let scanned: std::collections::BTreeSet<String> =
-        scanned_purls.iter().map(|p| canon(p)).collect();
+    let scanned: std::collections::BTreeSet<String> = scanned_purls
+        .into_iter()
+        .map(|p| canon(p.as_ref()))
+        .collect();
     // Cheap no-I/O gate: only ledger records naming a scanned purl can ever
     // prove live wiring, so when none do (a zero/filtered discovery, or a
-    // ledger about other packages) skip the lockfile inventory below — a
-    // full multi-file lock parse — entirely.
+    // ledger about other packages) skip the lockfile proofs below entirely.
     let candidates: Vec<(String, &str)> = redirect
         .records
         .iter()
@@ -1213,10 +1327,9 @@ pub(super) async fn hosted_wiring_retained_purls(
     let mut redirect_files: Vec<&str> = redirect.edits.iter().map(|e| e.path.as_str()).collect();
     redirect_files.sort();
     redirect_files.dedup();
-    let inventory = socket_patch_core::vendor::lock_inventory::inventory_project(cwd).await;
     let mut out = Vec::new();
     for (purl, uuid) in candidates {
-        if hosted_wiring_live(cwd, &purl, Some(uuid), &redirect_files, &inventory).await {
+        if hosted_wiring_live(cwd, &purl, Some(uuid), &redirect_files, inventory).await {
             out.push(purl);
         }
     }
@@ -1533,7 +1646,15 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         }
         all_crawled.extend(lockfile_only.packages.iter().cloned());
     }
-    let ledger_supplement = vendored_ledger_supplement(&args.common, &all_crawled).await;
+    // The vendor ledger, loaded ONCE and shared by the supplement here, the
+    // prune-exemption / vendored-skip key set below, and update detection —
+    // three read-only consumers of the same bytes. Their failure policies
+    // stay distinct on purpose: the supplement falls back to the committed
+    // artifacts (fail-closed for the prune), the key set degrades to empty
+    // (fail-open, its documented contract).
+    let vendor_state = socket_patch_core::vendor::load_state(&args.common.cwd).await;
+    let ledger_supplement =
+        vendored_ledger_supplement(&args.common, &all_crawled, &vendor_state).await;
     for pkg in &ledger_supplement {
         if let Some(eco) = Ecosystem::from_purl(&pkg.purl) {
             *eco_counts.entry(eco).or_insert(0) += 1;
@@ -1555,11 +1676,11 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // is wiped or partially installed.
     let scanned_purls: HashSet<String> = all_crawled.iter().map(|p| p.purl.clone()).collect();
 
-    // Vendor-ledger purl keys, loaded once and shared by the prune
-    // exemption (a vendored package is consumed from the committed
+    // Vendor-ledger purl keys (from the single load above), shared by the
+    // prune exemption (a vendored package is consumed from the committed
     // artifact, so "absent from the crawl" is its normal state, not
     // grounds for pruning) and the vendored-skip in the apply path.
-    let vendored_purls = socket_patch_core::vendor::vendored_purl_keys(&args.common.cwd).await;
+    let vendored_purls = vendored_purl_keys(&vendor_state);
 
     // Filter by --ecosystems if provided
     let filtered_crawled: Vec<_> = if let Some(ref allowed) = args.common.ecosystems {
@@ -1722,13 +1843,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         } else if args.common.global || args.common.global_prefix.is_some() {
             println!("No global packages found.");
         } else {
-            #[allow(unused_mut)]
-            let mut install_cmds = String::from("npm/yarn/pnpm/pip");
-            install_cmds.push_str("/cargo");
-            install_cmds.push_str("/go");
-            install_cmds.push_str("/mvn");
-            install_cmds.push_str("/composer");
-            println!("No packages found. Run {install_cmds} install first.");
+            println!("No packages found. Run your package manager's install first.");
         }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
@@ -1758,12 +1873,12 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         format!(" ({})", eco_parts.join(", "))
     };
 
+    // With progress on, a done-line overwrites the in-progress `eprint!`
+    // line before it (`\r`); otherwise it prints plain.
+    let cr = if show_progress { "\r" } else { "" };
+
     if !args.common.json && !args.common.silent {
-        if show_progress {
-            eprintln!("\rFound {package_count} packages{eco_summary}");
-        } else {
-            eprintln!("Found {package_count} packages{eco_summary}");
-        }
+        eprintln!("{cr}Found {package_count} packages{eco_summary}");
         if !lockfile_only.purls.is_empty() {
             eprintln!(
                 "Note: {} package(s) from project lockfiles are not yet installed (lockfile-only).",
@@ -1798,9 +1913,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             );
         }
 
-        let purls: Vec<String> = chunk.to_vec();
         let mut result = api_client
-            .search_patches_batch(effective_org_slug, &purls)
+            .search_patches_batch(effective_org_slug, chunk)
             .await;
 
         // Fallback: a 401/403 against the authenticated endpoint can
@@ -1820,7 +1934,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                     use_public_proxy = true;
                     fallback_to_proxy = true;
                     result = api_client
-                        .search_patches_batch(effective_org_slug, &purls)
+                        .search_patches_batch(effective_org_slug, chunk)
                         .await;
                 }
             }
@@ -1904,21 +2018,12 @@ pub async fn run(mut args: ScanArgs) -> i32 {
 
     if !args.common.json && !args.common.silent {
         if total_patches_found > 0 {
-            if show_progress {
-                eprintln!(
-                    "\rFound {total_patches_found} patches for {} packages",
-                    all_packages_with_patches.len()
-                );
-            } else {
-                eprintln!(
-                    "Found {total_patches_found} patches for {} packages",
-                    all_packages_with_patches.len()
-                );
-            }
-        } else if show_progress {
-            eprintln!("\rAPI query complete");
+            eprintln!(
+                "{cr}Found {total_patches_found} patches for {} packages",
+                all_packages_with_patches.len()
+            );
         } else {
-            eprintln!("API query complete");
+            eprintln!("{cr}API query complete");
         }
     }
 
@@ -1956,53 +2061,37 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     )
     .await;
 
-    // Registry-redirect (hosted) mode is a distinct, self-contained flow
-    // (rewrite lockfiles → hosted vendored patches). It reuses discovery
-    // above, then returns — it must NOT fall through to the apply/vendor
-    // branches. The HUMAN path returns here; the `--json` path returns from
-    // inside the JSON block below (after building the classic scan object)
-    // so the redirect result can be NESTED under a `redirect` key — keeping
-    // the hosted `--json` envelope schema-consistent with the zero-discovery
-    // and non-hosted paths (mirroring vendored mode's nested `vendor` block)
-    // rather than replacing the whole envelope with a bare `{status, redirect}`.
-    if hosted && !args.common.json {
-        return run_redirect(
-            &args,
-            &api_client,
-            effective_org_slug,
-            &all_packages_with_patches,
-            can_access_paid_patches,
-            None,
-        )
-        .await;
-    }
-
     // Read existing manifest once for update detection. Used by both the
     // JSON-mode emission (always includes an `updates` array) and the
     // non-JSON table-print path (counts `updates_available`).
     // (`manifest_path`/`socket_dir` are resolved at the top of `run`.)
     let existing_manifest = read_manifest(&manifest_path).await.ok().flatten();
-    // Hosted mode records its patches ONLY in the redirect ledger (it never
-    // writes the manifest), so fold the ledger's purl→uuid records into the
-    // view update detection sees — otherwise a pure hosted project's
-    // `updates[]` (the documented CI signal) stays structurally empty and a
-    // superseding patch is never reported. The envelope schema is unchanged.
-    // A malformed ledger is only warned about here (and muted by --silent —
-    // the warning is advisory) — this is a read-only consult, and the hosted
-    // write path hard-errors on it.
+    // Hosted and vendored modes record their patches ONLY in their ledgers
+    // (neither writes the manifest), so fold both ledgers' purl→uuid records
+    // into the view update detection sees — otherwise a pure hosted or
+    // vendored project's `updates[]` (the documented CI signal) stays
+    // structurally empty and a superseding patch is never reported. The
+    // envelope schema is unchanged. A malformed redirect ledger is only
+    // warned about here (and muted by --silent — the warning is advisory)
+    // — this is a read-only consult, and the hosted write path hard-errors
+    // on it; a malformed vendor ledger contributes nothing (the supplement
+    // above already recovered its purls from the committed artifacts).
     let redirect_state =
         crate::commands::load_redirect_state_lenient(&args.common.cwd, args.common.silent).await;
-    let update_manifest =
-        merge_redirect_records_for_updates(existing_manifest.clone(), redirect_state.as_ref());
-    let updates = detect_updates(update_manifest.as_ref(), &all_packages_with_patches);
+    let update_manifest = merge_ledger_records_for_updates(
+        existing_manifest.as_ref(),
+        redirect_state.as_ref(),
+        vendor_state.as_ref().ok(),
+    );
+    let updates = detect_updates(update_manifest.as_deref(), &all_packages_with_patches);
 
-    // Post-filter scanned set for the hosted-wiring probes: `wiringLive` and
-    // the agent-flow `hosted_wiring_retained` warning only ever name
-    // packages this run actually counted/queried (an `--ecosystems` filter
-    // narrows both — a filtered-out purl reads as "not covered this run",
-    // never as "wiring unwound"). Distinct from `scanned_purls` above, which
-    // deliberately stays PRE-filter for the GC prune (see its comment).
-    let wiring_scanned: HashSet<String> = all_purls.iter().cloned().collect();
+    // The hosted-wiring probes below (`wiringLive`, the agent-flow
+    // `hosted_wiring_retained` warning) take `all_purls` — the POST-filter
+    // scanned set: they only ever name packages this run actually
+    // counted/queried (an `--ecosystems` filter narrows both — a
+    // filtered-out purl reads as "not covered this run", never as "wiring
+    // unwound"). Distinct from `scanned_purls` above, which deliberately
+    // stays PRE-filter for the GC prune (see its comment).
 
     if args.common.json {
         let mut result = serde_json::json!({
@@ -2075,14 +2164,19 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         // reason (its takeover reconciliation may retire ledger records
         // mid-run — the `vendor_supersedes_redirect` warning covers it).
         //
-        // The live-wiring probe (a full lockfile-inventory parse behind its
-        // cheap no-I/O gate) runs ONCE here and is shared with the agent-flow
-        // warning in the apply branch below.
+        // The live-wiring probe (over the run's lockfile inventory, behind
+        // its cheap no-I/O gate) runs ONCE here and is shared with the
+        // agent-flow warning in the apply branch below.
         let hosted_retained = if vendor {
             Vec::new()
         } else {
-            hosted_wiring_retained_purls(&args.common.cwd, redirect_state.as_ref(), &wiring_scanned)
-                .await
+            hosted_wiring_retained_purls(
+                &args.common.cwd,
+                redirect_state.as_ref(),
+                &all_purls,
+                &lockfile_only.entries,
+            )
+            .await
         };
         if !vendor {
             if let Some(state) = redirect_state_json(redirect_state.as_ref(), &hosted_retained) {
@@ -2114,52 +2208,28 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 }
             };
 
-            // Vendor-owned purls are skipped BEFORE download (any uuid);
-            // a newer patch still surfaces in `updates[]` — the
-            // operator's signal to run `scan --vendor` (or `vendor`).
-            let (selected, vendored_records) = partition_skipped_selected(
-                selected,
-                |p| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p)),
-                "vendored",
-            );
-            // Captured from the vendored partition ONLY (before the
-            // not-installed skips merge in below — those are a different,
-            // already-calm class): feeds the run-level
+            // Vendor-owned and lockfile-only purls leave the selection as
+            // calm skip records BEFORE download (see `partition_agent_
+            // selection`); the vendored purls alone feed the run-level
             // `vendored_ownership_retained` warning emitted after apply.
-            let vendored_skip_purls: Vec<String> = vendored_records
-                .iter()
-                .filter_map(|r| r["purl"].as_str().map(str::to_string))
-                .collect();
-            // Lockfile-only purls leave the apply selection here (calm
-            // skip records, never an error); the union rides the same
-            // bookkeeping as the vendored skips.
-            let (selected, vendored_records) = {
-                let (kept, not_installed) = partition_skipped_selected(
-                    selected,
-                    |p| {
-                        lockfile_only
-                            .purls
-                            .contains(normalize_purl(strip_purl_qualifiers(p)).as_ref())
-                    },
-                    "package_not_installed",
-                );
-                let mut all = vendored_records;
-                all.extend(not_installed);
-                all.sort_by(|a, b| a["purl"].as_str().cmp(&b["purl"].as_str()));
-                (kept, all)
-            };
+            let AgentSelection {
+                kept: selected,
+                skip_records: vendored_records,
+                vendored_purls: vendored_skip_purls,
+                ..
+            } = partition_agent_selection(selected, &vendored_purls, &lockfile_only);
 
             if dry {
                 // Synthesize the per-patch outcome without touching disk.
                 // `decide_patch_action` consults the existing manifest,
                 // so it accurately reports what `--apply` *would* do.
-                let manifest_for_preview =
-                    existing_manifest.clone().unwrap_or_else(PatchManifest::new);
+                let empty_manifest = PatchManifest::new();
+                let manifest_for_preview = existing_manifest.as_ref().unwrap_or(&empty_manifest);
                 let mut patches: Vec<serde_json::Value> = selected
                     .iter()
                     .map(|p| {
                         match super::get::decide_patch_action(
-                            &manifest_for_preview,
+                            manifest_for_preview,
                             &p.purl,
                             &p.uuid,
                         ) {
@@ -2300,28 +2370,22 @@ pub async fn run(mut args: ScanArgs) -> i32 {
 
     let use_color = std::io::stdout().is_terminal();
 
+    // Every mode stops on an empty discovery — vendored mode included: scan
+    // vendors what THIS discovery selects (a fresh clone or wiped
+    // `.socket/vendor/` is `repair`'s job, from the committed ledger), so
+    // there is nothing for its vendor step to do and reaching it would only
+    // take the apply lock for a no-op.
     if all_packages_with_patches.is_empty() {
         if !args.common.silent {
             println!("\nNo patches available for installed packages.");
         }
-        // Vendored mode still has work to do on an empty discovery: the
-        // committed manifest is re-vendored wholesale, which is how a
-        // fresh clone (or a wiped `.socket/vendor/`) gets its artifacts
-        // back. The JSON arm states this outright — "the vendor step
-        // still runs when zero patches were downloaded (re-vendor after a
-        // wipe)" — and `selected.is_empty() && !vendor` below encodes the
-        // same rule; without this the interactive arm never reaches it.
-        if !vendor {
-            return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
-        }
+        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
     // The whole table + summary section is presentational only (nothing
     // computed inside is consumed downstream), so `--silent` skips it
-    // wholesale — as does an empty discovery, which vendored mode now
-    // falls through with (an all-header, no-row table plus a "0 package(s)"
-    // summary is noise, not information).
-    if !args.common.silent && !all_packages_with_patches.is_empty() {
+    // wholesale.
+    if !args.common.silent {
         let mut updates_available = 0usize;
 
         // Canonical set of PURLs with a newer patch available, computed once via
@@ -2403,10 +2467,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             // `normalize_purl` bridges the API's percent-encoded spelling
             // to the supplement's literal form, like the JSON flag and the
             // apply-path skip partitions.
-            let not_installed_marker = if lockfile_only
-                .purls
-                .contains(normalize_purl(strip_purl_qualifiers(&pkg.purl)).as_ref())
-            {
+            let not_installed_marker = if lockfile_only_contains(&lockfile_only.purls, &pkg.purl) {
                 color(" [NOT INSTALLED]", "33", use_color)
             } else {
                 String::new()
@@ -2468,6 +2529,59 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         }
     }
 
+    // Registry-redirect (hosted) mode is a distinct, self-contained flow
+    // (rewrite lockfiles → hosted vendored patches). It reuses the
+    // discovery, table and update detection above, confirms, then hands
+    // the selection to the redirect engine — it must NOT fall through to
+    // the apply/vendor branches. Same discovery/selection as `run_redirect`
+    // (the `--json` arm, which returned above with the redirect result
+    // NESTED in its envelope) and the same engine entry as `get --mode
+    // hosted`.
+    if hosted {
+        let selected = match discover_selected(
+            &api_client,
+            effective_org_slug,
+            &all_packages_with_patches,
+            can_access_paid_patches,
+        )
+        .await
+        {
+            Ok(s) => s,
+            // `discover_selected` already printed the failure to stderr.
+            Err((code, _)) => return code,
+        };
+        // The engine honors `--dry-run` itself (a preview mutates nothing),
+        // so only a wet run with work confirms. `--mode hosted` is explicit
+        // intent, so a non-TTY run auto-proceeds like every other mode —
+        // only the mode-less scan below is report-only.
+        if !selected.is_empty() && !args.common.dry_run {
+            let prompt = format!(
+                "Redirect {} package(s) to the hosted patch server?",
+                selected.len()
+            );
+            if !confirm(&prompt, true, args.common.yes, false) {
+                if !args.common.silent {
+                    print_get_hint(true);
+                }
+                return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
+            }
+        }
+        let pairs: Vec<(String, String)> = selected
+            .iter()
+            .map(|s| (s.purl.clone(), s.uuid.clone()))
+            .collect();
+        return boxed_run_redirect_selected(
+            &args.common,
+            &args.vex,
+            prune,
+            &api_client,
+            effective_org_slug,
+            &pairs,
+            None,
+        )
+        .await;
+    }
+
     // Count downloadable patches
     let downloadable_count = if can_access_paid_patches {
         all_packages_with_patches.len()
@@ -2479,57 +2593,25 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     };
 
     if downloadable_count == 0 {
-        // The paid-plan nudge only makes sense when the API DID return
-        // patches; with an empty discovery (vendored mode falls through
-        // the guard above) there is no gated catalog to point at.
-        if !args.common.silent && !all_packages_with_patches.is_empty() {
+        if !args.common.silent {
             println!("\nNo downloadable patches (paid subscription required).");
         }
-        // Same reason as above: vendored mode re-vendors the committed
-        // manifest regardless of what discovery turned up.
-        if !vendor {
-            return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
-        }
+        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
-    // Fetch full PatchSearchResult for each package that has patches
-    if show_progress && !all_packages_with_patches.is_empty() {
-        eprint!("\nFetching patch details...");
-    }
-
-    let mut all_search_results: Vec<PatchSearchResult> = Vec::new();
-    for (i, pkg) in all_packages_with_patches.iter().enumerate() {
-        if show_progress {
-            eprint!(
-                "\rFetching patch details... ({}/{})",
-                i + 1,
-                all_packages_with_patches.len()
-            );
-        }
-        match api_client
-            .search_patches_by_package(effective_org_slug, &pkg.purl)
-            .await
-        {
-            Ok(response) => {
-                all_search_results.extend(response.patches);
-            }
-            Err(e) => {
-                if !args.common.silent {
-                    eprintln!("\n  Warning: could not fetch details for {}: {e}", pkg.purl);
-                }
-            }
-        }
-    }
-
-    if show_progress && !all_packages_with_patches.is_empty() {
-        eprintln!();
-    }
-
-    // Empty details are a failure only when there WERE packages to fetch
-    // details for. Vendored mode now reaches here with nothing discovered
-    // (see the two guards above) and must fall through to the vendor step
-    // rather than report a fetch failure that never happened.
-    if all_search_results.is_empty() && !all_packages_with_patches.is_empty() {
+    // Fetch the full per-package patch lists — the same loop the JSON arms
+    // run through `discover_selected`, here with progress + per-package
+    // warnings. Discovery said these packages HAVE patches, so an empty
+    // merged set is a fetch failure.
+    let (all_search_results, _, _) = fetch_patch_details(
+        &api_client,
+        effective_org_slug,
+        &all_packages_with_patches,
+        show_progress,
+        !args.common.silent,
+    )
+    .await;
+    if all_search_results.is_empty() {
         eprintln!("Could not fetch patch details.");
         return 1;
     }
@@ -2541,59 +2623,34 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             Err(code) => return code,
         };
 
-    // Vendor-owned purls never download/apply here (mirrors the JSON
-    // path): the committed artifact is the patch, and a manifest moved
-    // past the vendored uuid would break VEX verification until a vendor
-    // run refreshes the artifact. In `--vendor` mode the partition is a
-    // no-op — re-vendoring a stale uuid is exactly what the flag is for.
-    let is_vendored =
-        |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
-    let (vendored_selected, selected): (Vec<_>, Vec<_>) = if vendor {
-        (Vec::new(), selected)
+    // Agent flow (mirrors the JSON arm): vendor-owned and lockfile-only
+    // purls leave the selection as calm skips. In vendored mode nothing is
+    // partitioned — re-vendoring a stale uuid is exactly what the flag is
+    // for, and the vendor engine fetches lockfile-resolved packages
+    // pristine.
+    let selected = if vendor {
+        selected
     } else {
-        selected.into_iter().partition(|p| is_vendored(&p.purl))
-    };
-    if !args.common.silent {
-        for p in &vendored_selected {
-            println!(
-                "  [skip] {} (vendored — run scan --vendor to update)",
-                normalize_purl(&p.purl)
-            );
+        let split = partition_agent_selection(selected, &vendored_purls, &lockfile_only);
+        if !args.common.silent {
+            for purl in &split.vendored_purls {
+                println!(
+                    "  [skip] {} (vendored — run scan --vendor to update)",
+                    normalize_purl(purl)
+                );
+            }
+            for purl in &split.not_installed_purls {
+                println!(
+                    "  [skip] {} (not installed — run your package manager's install first, \
+                     or `scan --vendor` to vendor it from the lockfile)",
+                    normalize_purl(purl)
+                );
+            }
         }
-    }
-
-    // Lockfile-only purls leave the in-place apply selection (calm skip,
-    // mirrors the JSON path). In `--vendor` mode they stay: the vendor
-    // engine fetches lockfile-resolved packages pristine.
-    let (selected, not_installed_selected): (Vec<_>, Vec<String>) = if vendor {
-        (selected, Vec::new())
-    } else {
-        let (kept, skipped) = partition_skipped_selected(
-            selected,
-            |p| {
-                lockfile_only
-                    .purls
-                    .contains(normalize_purl(strip_purl_qualifiers(p)).as_ref())
-            },
-            "package_not_installed",
-        );
-        let printed: Vec<String> = skipped
-            .iter()
-            .filter_map(|r| r["purl"].as_str().map(str::to_string))
-            .collect();
-        (kept, printed)
+        split.kept
     };
-    if !args.common.silent {
-        for purl in &not_installed_selected {
-            println!(
-                "  [skip] {} (not installed — run your package manager's install first, \
-                 or `scan --vendor` to vendor it from the lockfile)",
-                normalize_purl(purl)
-            );
-        }
-    }
 
-    if selected.is_empty() && !vendor {
+    if selected.is_empty() {
         if !args.common.silent {
             println!("No patches selected.");
         }
@@ -2716,14 +2773,22 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
-    // Prompt to download
+    // Prompt to download. A MODE-LESS human scan (no `--mode`/`--apply`/
+    // `--sync`/`--vendor`/`--redirect` and no `--prune`) with a non-TTY
+    // stdin and no `--yes` is report-only: it stops here with exit 0 and
+    // the hint below, never downloads, never creates `.socket/`. This is a
+    // scan-side pre-check — `confirm()` itself keeps its non-TTY
+    // auto-accept, so every explicit-intent flag (and every other command's
+    // prompt) still proceeds unattended, and a TTY always prompts.
     let verb = if vendor { "vendor" } else { "apply" };
     let prompt = format!("Download and {verb} {} patch(es)?", selected.len());
-    if !confirm(&prompt, true, args.common.yes, args.common.json) {
+    let report_only = args.mode.is_none()
+        && !args.prune
+        && !args.common.yes
+        && !crate::output::stdin_is_tty();
+    if report_only || !confirm(&prompt, true, args.common.yes, false) {
         if !args.common.silent {
-            println!("\nTo apply a patch, run:");
-            println!("  socket-patch get <package-name-or-purl>");
-            println!("  socket-patch get <CVE-ID>");
+            print_get_hint(false);
         }
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
@@ -2768,7 +2833,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         let hosted_retained = hosted_wiring_retained_purls(
             &args.common.cwd,
             redirect_state.as_ref(),
-            &wiring_scanned,
+            &all_purls,
+            &lockfile_only.entries,
         )
         .await;
         if !hosted_retained.is_empty() {
@@ -3074,6 +3140,15 @@ mod tests {
             .unwrap()
     }
 
+    /// The run's lockfile inventory (`LockfileSupplement::entries` in
+    /// production): re-taken after every lockfile write, like `run` parses
+    /// it once per run.
+    async fn inventory_of(
+        root: &Path,
+    ) -> Vec<socket_patch_core::vendor::lock_inventory::LockfileEntry> {
+        socket_patch_core::vendor::lock_inventory::inventory_project(root).await
+    }
+
     #[tokio::test]
     async fn hosted_only_wiring_fires_agent_probe_not_the_overlap_classifier() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3093,7 +3168,9 @@ mod tests {
         // …but the agent flow's direct probe sees it for scanned purls.
         let scanned: HashSet<String> = [purl.to_string()].into_iter().collect();
         let ledger = load_ledger(root).await;
-        let retained = hosted_wiring_retained_purls(root, ledger.as_ref(), &scanned).await;
+        let retained =
+            hosted_wiring_retained_purls(root, ledger.as_ref(), &scanned, &inventory_of(root).await)
+                .await;
         assert_eq!(retained, vec![purl.to_string()]);
     }
 
@@ -3112,9 +3189,14 @@ mod tests {
         write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
         let ledger = load_ledger(tmp.path()).await;
         assert!(
-            hosted_wiring_retained_purls(tmp.path(), ledger.as_ref(), &scanned)
-                .await
-                .is_empty(),
+            hosted_wiring_retained_purls(
+                tmp.path(),
+                ledger.as_ref(),
+                &scanned,
+                &inventory_of(tmp.path()).await
+            )
+            .await
+            .is_empty(),
             "records gone ⇒ silent (pre-reverted wiring must not re-warn)"
         );
 
@@ -3132,9 +3214,14 @@ mod tests {
         .unwrap();
         let ledger = load_ledger(tmp.path()).await;
         assert!(
-            hosted_wiring_retained_purls(tmp.path(), ledger.as_ref(), &scanned)
-                .await
-                .is_empty(),
+            hosted_wiring_retained_purls(
+                tmp.path(),
+                ledger.as_ref(),
+                &scanned,
+                &inventory_of(tmp.path()).await
+            )
+            .await
+            .is_empty(),
             "registry-clean lock ⇒ silent"
         );
 
@@ -3145,9 +3232,14 @@ mod tests {
         let other: HashSet<String> = ["pkg:npm/lodash@4.17.21".to_string()].into_iter().collect();
         let ledger = load_ledger(tmp.path()).await;
         assert!(
-            hosted_wiring_retained_purls(tmp.path(), ledger.as_ref(), &other)
-                .await
-                .is_empty(),
+            hosted_wiring_retained_purls(
+                tmp.path(),
+                ledger.as_ref(),
+                &other,
+                &inventory_of(tmp.path()).await
+            )
+            .await
+            .is_empty(),
             "unscanned purl ⇒ silent"
         );
 
@@ -3155,9 +3247,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
         assert!(
-            hosted_wiring_retained_purls(tmp.path(), None, &scanned)
-                .await
-                .is_empty(),
+            hosted_wiring_retained_purls(
+                tmp.path(),
+                None,
+                &scanned,
+                &inventory_of(tmp.path()).await
+            )
+            .await
+            .is_empty(),
             "no ledger ⇒ silent"
         );
     }
@@ -3217,7 +3314,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_redirect_ledger_with_edit(tmp.path(), &[purl]).await;
         let ledger = load_ledger(tmp.path()).await;
-        let wiring = hosted_wiring_retained_purls(tmp.path(), ledger.as_ref(), &scanned).await;
+        let wiring = hosted_wiring_retained_purls(
+            tmp.path(),
+            ledger.as_ref(),
+            &scanned,
+            &inventory_of(tmp.path()).await,
+        )
+        .await;
         assert_eq!(wiring, Vec::<String>::new());
         let block =
             redirect_state_json(ledger.as_ref(), &wiring).expect("records present ⇒ block present");
@@ -3229,9 +3332,16 @@ mod tests {
         );
         assert_eq!(block["wiringLive"], serde_json::json!([]));
 
-        // Live lock present too: the same purl graduates into wiringLive.
+        // Live lock present too: the same purl graduates into wiringLive
+        // (a fresh run re-parses the inventory, so re-take it here).
         write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
-        let wiring = hosted_wiring_retained_purls(tmp.path(), ledger.as_ref(), &scanned).await;
+        let wiring = hosted_wiring_retained_purls(
+            tmp.path(),
+            ledger.as_ref(),
+            &scanned,
+            &inventory_of(tmp.path()).await,
+        )
+        .await;
         let block =
             redirect_state_json(ledger.as_ref(), &wiring).expect("records present ⇒ block present");
         assert_eq!(block["wiringLive"], serde_json::json!([purl]));
@@ -3295,7 +3405,13 @@ mod tests {
 
         let scanned: HashSet<String> = [scoped_canon.to_string()].into_iter().collect();
         let ledger = load_ledger(tmp.path()).await;
-        let wiring = hosted_wiring_retained_purls(tmp.path(), ledger.as_ref(), &scanned).await;
+        let wiring = hosted_wiring_retained_purls(
+            tmp.path(),
+            ledger.as_ref(),
+            &scanned,
+            &inventory_of(tmp.path()).await,
+        )
+        .await;
         assert_eq!(
             wiring,
             vec![scoped_canon.to_string()],

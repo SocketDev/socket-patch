@@ -4,9 +4,12 @@
 
 use socket_patch_core::api::ranking::cmp_batch_infos;
 use socket_patch_core::api::types::{BatchPackagePatches, BatchPatchInfo, PatchSearchResult};
-use socket_patch_core::manifest::schema::PatchManifest;
+use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
-use std::collections::HashSet;
+use socket_patch_core::vendor::lock_inventory::LockfileEntry;
+use socket_patch_core::vendor::VendorState;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 
 use crate::args::GlobalArgs;
 
@@ -27,6 +30,10 @@ pub(super) struct LockfileSupplement {
     pub(super) packages: Vec<socket_patch_core::crawlers::types::CrawledPackage>,
     /// Literal crawler-form purls, for fast membership tests.
     pub(super) purls: HashSet<String>,
+    /// The FULL lockfile inventory the supplement was derived from (installed
+    /// packages included), kept so the hosted-wiring probes reuse it instead
+    /// of re-parsing every project lockfile. Empty for global scans.
+    pub(super) entries: Vec<LockfileEntry>,
     /// npm layouts the lockfile inventory REFUSED (Plug'n'Play loaders) —
     /// packages structurally unreachable, as opposed to nothing-to-inventory.
     /// Scan surfaces these as explicit refusal warnings: under yarn PnP the
@@ -93,7 +100,7 @@ pub(super) async fn lockfile_supplement(
         return out;
     }
     let crawled_purls: HashSet<&str> = crawled.iter().map(|p| p.purl.as_str()).collect();
-    for entry in entries {
+    for entry in &entries {
         if crawled_purls.contains(entry.purl.as_str()) {
             continue;
         }
@@ -103,7 +110,17 @@ pub(super) async fn lockfile_supplement(
         out.purls.insert(entry.purl.clone());
         out.packages.push(pkg);
     }
+    out.entries = entries;
     out
+}
+
+/// Whether an API-spelled purl (percent-encoded, possibly qualified) names
+/// a lockfile-only package: `purls` holds the crawler's literal spelling, so
+/// the comparison bridges the two via `normalize_purl`. The ONE predicate
+/// behind the `notInstalled` flag, the `[NOT INSTALLED]` marker, the
+/// `package_not_installed` skip partition and the vendor baseline pre-check.
+pub(super) fn lockfile_only_contains(purls: &HashSet<String>, api_purl: &str) -> bool {
+    purls.contains(normalize_purl(strip_purl_qualifiers(api_purl)).as_ref())
 }
 
 /// A displayable crawl entry fabricated from a purl (decoded form). The
@@ -130,19 +147,45 @@ fn crawled_from_purl(
     })
 }
 
+/// The vendor ledger's purl keys in every spelling the CLI matches on — the
+/// ledger map key, its qualifier-stripped form, and the entry's base purl
+/// (the same three `socket_patch_core::vendor::vendored_purl_keys` derives,
+/// minus the load: `run` loads the ledger ONCE and shares it). Feeds the
+/// prune exemption and the agent-path vendored skip. A corrupt ledger
+/// degrades to the EMPTY set — fail-open by that helper's documented
+/// contract (the supplement below is the fail-closed half).
+pub(super) fn vendored_purl_keys(state: &std::io::Result<VendorState>) -> HashSet<String> {
+    let Ok(state) = state else {
+        return HashSet::new();
+    };
+    state
+        .entries
+        .iter()
+        .flat_map(|(key, entry)| {
+            [
+                key.clone(),
+                entry.base_purl.clone(),
+                strip_purl_qualifiers(key).to_string(),
+            ]
+        })
+        .collect()
+}
+
 /// Vendored-ledger packages with no crawled counterpart: on a fresh clone
 /// the committed artifact IS the dependency, so these stay discoverable
 /// (updates[] detection, the table, and `scan --vendor` re-vendor/in-sync
 /// runs all keep working before any install). They are NOT "lockfile-only"
-/// — nothing needs installing; the artifact satisfies the lock.
+/// — nothing needs installing; the artifact satisfies the lock. `state` is
+/// the ledger `run` already loaded (`vendor::load_state`).
 pub(super) async fn vendored_ledger_supplement(
     common: &GlobalArgs,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
+    state: &std::io::Result<VendorState>,
 ) -> Vec<socket_patch_core::crawlers::types::CrawledPackage> {
     if common.global || common.global_prefix.is_some() {
         return Vec::new();
     }
-    let base_purls: Vec<String> = match socket_patch_core::vendor::load_state(&common.cwd).await {
+    let base_purls: Vec<String> = match state {
         Ok(state) => state
             .entries
             .values()
@@ -180,32 +223,44 @@ pub(super) async fn vendored_ledger_supplement(
 }
 
 /// Fallback source for [`vendored_ledger_supplement`] when the vendor ledger
-/// is unreadable: base purls of manifest entries whose patch uuid owns a
-/// live `.socket/vendor/<eco>/<uuid>` artifact dir. `vendor_uuid_dir_rel`
-/// validates the (committed, tamper-able) uuid grammar fail-closed before
-/// any disk probe. Entries without a live artifact dir are NOT recovered —
-/// nothing committed consumes them, so they stay prunable.
+/// is unreadable — the committed ground truth, read two ways:
+///
+/// 1. base purls of manifest entries whose patch uuid owns a live
+///    `.socket/vendor/<eco>/<uuid>` artifact dir (legacy manifest-mode
+///    vendored projects; `vendor_uuid_dir_rel` validates the committed,
+///    tamper-able uuid grammar fail-closed before any disk probe — entries
+///    without a live artifact dir are NOT recovered: nothing committed
+///    consumes them, so they stay prunable);
+/// 2. base purls reconstructed from the artifact leaves under every
+///    canonical `.socket/vendor/<eco>/<uuid>/` dir (`sweep_vendor_dirs`,
+///    the documented external-tool recovery rule) — the only source for a
+///    manifest-free vendored project, whose records live in the ledger
+///    alone.
+///
+/// Duplicates between the two are collapsed by the caller.
 async fn vendored_purls_from_artifacts(common: &GlobalArgs) -> Vec<String> {
     use socket_patch_core::manifest::operations::read_manifest;
     use socket_patch_core::vendor::ecosystem_dir_for_purl;
-    use socket_patch_core::vendor::path::vendor_uuid_dir_rel;
+    use socket_patch_core::vendor::path::{sweep_vendor_dirs, vendor_uuid_dir_rel};
 
-    let Ok(Some(manifest)) = read_manifest(common.resolved_manifest_path()).await else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for (purl, record) in &manifest.patches {
-        let base = strip_purl_qualifiers(purl);
-        let Some(eco) = ecosystem_dir_for_purl(base) else {
-            continue;
-        };
-        let Some(rel) = vendor_uuid_dir_rel(eco, &record.uuid) else {
-            continue;
-        };
-        match tokio::fs::metadata(common.cwd.join(&rel)).await {
-            Ok(md) if md.is_dir() => out.push(base.to_string()),
-            _ => {}
+    if let Ok(Some(manifest)) = read_manifest(common.resolved_manifest_path()).await {
+        for (purl, record) in &manifest.patches {
+            let base = strip_purl_qualifiers(purl);
+            let Some(eco) = ecosystem_dir_for_purl(base) else {
+                continue;
+            };
+            let Some(rel) = vendor_uuid_dir_rel(eco, &record.uuid) else {
+                continue;
+            };
+            match tokio::fs::metadata(common.cwd.join(&rel)).await {
+                Ok(md) if md.is_dir() => out.push(base.to_string()),
+                _ => {}
+            }
         }
+    }
+    for unit in sweep_vendor_dirs(&common.cwd).await {
+        out.extend(unit.purls);
     }
     out
 }
@@ -238,7 +293,7 @@ pub(super) async fn preverify_vendor_baselines(
         let base = strip_purl_qualifiers(&patch.purl);
         // Lockfile-only packages have no installed bytes to compare — the
         // vendor engine fetches them pristine (nothing to annotate).
-        if lockfile_only.contains(normalize_purl(base).as_ref()) {
+        if lockfile_only_contains(lockfile_only, base) {
             continue;
         }
         let Some(pkg) = crawled.iter().find(|c| purl_eq(&c.purl, base)) else {
@@ -265,30 +320,52 @@ pub(super) async fn preverify_vendor_baselines(
     mismatched
 }
 
-/// Fold the hosted redirect ledger's patch records into the manifest view
-/// update detection consults. Hosted mode persists its purl→uuid records ONLY
-/// in `.socket/vendor/redirect-state.json` — it never writes
-/// `.socket/manifest.json` — so without this fold a pure hosted project's
-/// `updates[]` (the documented CI signal, see CLI_CONTRACT.md) is structurally
-/// empty and a superseding patch is never reported. An existing manifest entry
-/// wins a collision (that PURL is manifest-owned), matching VEX's
-/// `augment_with_redirect`. Pure / no I/O so it's unit-testable.
-pub(super) fn merge_redirect_records_for_updates(
-    manifest: Option<PatchManifest>,
+/// Fold both ledgers' patch records into the manifest view update detection
+/// consults. Hosted mode persists its purl→uuid records ONLY in
+/// `.socket/vendor/redirect-state.json`, and vendored mode ONLY in
+/// `.socket/vendor/state.json` (each entry embeds its patch `record`) —
+/// neither writes `.socket/manifest.json` — so without this fold a pure
+/// hosted or vendored project's `updates[]` (the documented CI signal, see
+/// CLI_CONTRACT.md) is structurally empty and a superseding patch is never
+/// reported. Precedence on a collision: manifest > redirect ledger > vendor
+/// ledger (a manifest PURL is manifest-owned, matching VEX's
+/// `augment_with_redirect`). Vendor entries are keyed by their ledger map key
+/// (the manifest-form purl, qualifiers included — `detect_updates` bridges
+/// the spellings); a legacy entry without an embedded record contributes its
+/// uuid alone, which is all update detection reads. Borrows the manifest
+/// untouched when neither ledger contributes. Pure / no I/O so it's
+/// unit-testable.
+pub(super) fn merge_ledger_records_for_updates<'a>(
+    manifest: Option<&'a PatchManifest>,
     redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
-) -> Option<PatchManifest> {
-    let records = redirect.map(|s| &s.records).filter(|r| !r.is_empty());
-    let Some(records) = records else {
-        return manifest;
-    };
-    let mut merged = manifest.unwrap_or_default();
-    for (purl, record) in records {
+    vendor: Option<&VendorState>,
+) -> Option<Cow<'a, PatchManifest>> {
+    let redirect_records = redirect.map(|s| &s.records).filter(|r| !r.is_empty());
+    let vendor_entries = vendor.map(|s| &s.entries).filter(|e| !e.is_empty());
+    if redirect_records.is_none() && vendor_entries.is_none() {
+        return manifest.map(Cow::Borrowed);
+    }
+    let mut merged = manifest.cloned().unwrap_or_default();
+    for (purl, record) in redirect_records.into_iter().flatten() {
         merged
             .patches
             .entry(purl.clone())
             .or_insert_with(|| record.clone());
     }
-    Some(merged)
+    for (purl, entry) in vendor_entries.into_iter().flatten() {
+        merged.patches.entry(purl.clone()).or_insert_with(|| {
+            entry.record.clone().unwrap_or_else(|| PatchRecord {
+                uuid: entry.uuid.clone(),
+                exported_at: String::new(),
+                files: HashMap::new(),
+                vulnerabilities: HashMap::new(),
+                description: String::new(),
+                license: String::new(),
+                tier: String::new(),
+            })
+        });
+    }
+    Some(Cow::Owned(merged))
 }
 
 /// Cross-reference an existing manifest against discovery results to find
@@ -796,16 +873,46 @@ mod tests {
         assert_eq!(updates[0].new_uuid, "uuid-new");
     }
 
-    // ---- merge_redirect_records_for_updates ---------------------------------
-    // Hosted mode records patches ONLY in the redirect ledger — these pin that
-    // ledger-only projects still surface `updates[]` (the documented CI
-    // signal) through the merged manifest view.
+    // ---- merge_ledger_records_for_updates -----------------------------------
+    // Hosted mode records patches ONLY in the redirect ledger and vendored
+    // mode ONLY in the vendor ledger — these pin that ledger-only projects
+    // still surface `updates[]` (the documented CI signal) through the
+    // merged manifest view.
 
     fn ledger_with(entries: &[(&str, &str)]) -> socket_patch_core::patch::redirect::RedirectState {
         let mut state = socket_patch_core::patch::redirect::RedirectState::new();
         let manifest = crate::commands::scan::tests::manifest_with(entries);
         state.records.extend(manifest.patches);
         state
+    }
+
+    /// A vendor ledger with one entry per `(key, uuid, detached)`: detached
+    /// entries embed their record (the D2 posture), legacy ones carry only
+    /// the uuid.
+    fn vendor_ledger_with(entries: &[(&str, &str, bool)]) -> VendorState {
+        let entries: serde_json::Map<String, serde_json::Value> = entries
+            .iter()
+            .map(|(key, uuid, detached)| {
+                let record = crate::commands::scan::tests::manifest_with(&[(key, uuid)])
+                    .patches
+                    .remove(*key)
+                    .expect("manifest_with inserted the key");
+                let mut entry = serde_json::json!({
+                    "ecosystem": "npm",
+                    "basePurl": strip_purl_qualifiers(key),
+                    "uuid": uuid,
+                    "artifact": { "path": format!(".socket/vendor/npm/{uuid}/pkg.tgz") },
+                    "wiring": [],
+                    "detached": detached,
+                });
+                if *detached {
+                    entry["record"] = serde_json::to_value(record).unwrap();
+                }
+                ((*key).to_string(), entry)
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({ "version": 1, "entries": entries }))
+            .expect("the camelCase wire shape deserializes")
     }
 
     #[test]
@@ -815,9 +922,9 @@ mod tests {
         // uuid. The merged view must make detect_updates flag it — this was
         // structurally impossible before the fold (manifest-only detection).
         let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-old")]);
-        let merged = merge_redirect_records_for_updates(None, Some(&ledger));
+        let merged = merge_ledger_records_for_updates(None, Some(&ledger), None);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
-        let updates = detect_updates(merged.as_ref(), &pkgs);
+        let updates = detect_updates(merged.as_deref(), &pkgs);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].purl, "pkg:npm/foo@1.0");
         assert_eq!(updates[0].old_uuid, "uuid-old");
@@ -825,57 +932,93 @@ mod tests {
     }
 
     #[test]
+    fn vendored_only_project_reports_superseding_patch_in_updates() {
+        // Pure vendored project (manifest-free, D2): the ledger entry's
+        // embedded record is the "old" side. A legacy entry with no embedded
+        // record still contributes its uuid — all detection reads.
+        for detached in [true, false] {
+            let vendor = vendor_ledger_with(&[("pkg:npm/foo@1.0", "uuid-old", detached)]);
+            let merged = merge_ledger_records_for_updates(None, None, Some(&vendor));
+            let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
+            let updates = detect_updates(merged.as_deref(), &pkgs);
+            assert_eq!(updates.len(), 1, "detached={detached}");
+            assert_eq!(updates[0].old_uuid, "uuid-old");
+            assert_eq!(updates[0].new_uuid, "uuid-new");
+        }
+        // Still the top offer — no nag.
+        let vendor = vendor_ledger_with(&[("pkg:npm/foo@1.0", "uuid-a", true)]);
+        let merged = merge_ledger_records_for_updates(None, None, Some(&vendor));
+        let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a"])];
+        assert!(detect_updates(merged.as_deref(), &pkgs).is_empty());
+    }
+
+    #[test]
     fn ledger_record_matching_the_candidate_is_not_an_update() {
         // The redirected patch is still the top offer — no nag.
         let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
-        let merged = merge_redirect_records_for_updates(None, Some(&ledger));
+        let merged = merge_ledger_records_for_updates(None, Some(&ledger), None);
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-a"])];
-        assert!(detect_updates(merged.as_ref(), &pkgs).is_empty());
+        assert!(detect_updates(merged.as_deref(), &pkgs).is_empty());
     }
 
     #[test]
     fn manifest_entry_wins_a_collision_with_a_ledger_record() {
-        // A PURL present in both stores is manifest-owned (same precedence as
-        // VEX's augment_with_redirect): the manifest's uuid is the "old" side.
+        // A PURL present in every store is manifest-owned (same precedence as
+        // VEX's augment_with_redirect): the manifest's uuid is the "old"
+        // side; between the ledgers, the redirect record wins.
         let manifest =
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-manifest")]);
         let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-ledger")]);
-        let merged = merge_redirect_records_for_updates(Some(manifest), Some(&ledger));
+        let vendor = vendor_ledger_with(&[("pkg:npm/foo@1.0", "uuid-vendor", true)]);
+        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor));
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
-        let updates = detect_updates(merged.as_ref(), &pkgs);
+        let updates = detect_updates(merged.as_deref(), &pkgs);
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].old_uuid, "uuid-manifest");
+        let merged = merge_ledger_records_for_updates(None, Some(&ledger), Some(&vendor));
+        let updates = detect_updates(merged.as_deref(), &pkgs);
+        assert_eq!(updates[0].old_uuid, "uuid-ledger");
     }
 
     #[test]
     fn ledger_and_manifest_cover_disjoint_purls() {
         // A mixed project (some deps applied via manifest, some hosted via
-        // ledger) gets update detection across BOTH stores.
+        // the redirect ledger, some vendored) gets update detection across
+        // every store.
         let manifest =
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-f1")]);
         let ledger = ledger_with(&[("pkg:npm/bar@2.0", "uuid-b1")]);
-        let merged = merge_redirect_records_for_updates(Some(manifest), Some(&ledger));
+        let vendor = vendor_ledger_with(&[("pkg:npm/baz@3.0", "uuid-z1", true)]);
+        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor));
         let pkgs = vec![
             batch_with("pkg:npm/foo@1.0", &["uuid-f2"]),
             batch_with("pkg:npm/bar@2.0", &["uuid-b2"]),
+            batch_with("pkg:npm/baz@3.0", &["uuid-z2"]),
         ];
-        let mut updates = detect_updates(merged.as_ref(), &pkgs);
+        let mut updates = detect_updates(merged.as_deref(), &pkgs);
         updates.sort_by(|a, b| a.purl.cmp(&b.purl));
-        assert_eq!(updates.len(), 2);
+        assert_eq!(updates.len(), 3);
         assert_eq!(updates[0].old_uuid, "uuid-b1");
-        assert_eq!(updates[1].old_uuid, "uuid-f1");
+        assert_eq!(updates[1].old_uuid, "uuid-z1");
+        assert_eq!(updates[2].old_uuid, "uuid-f1");
     }
 
     #[test]
-    fn absent_or_empty_ledger_leaves_the_manifest_view_untouched() {
-        assert!(merge_redirect_records_for_updates(None, None).is_none());
+    fn absent_or_empty_ledgers_leave_the_manifest_view_untouched() {
+        assert!(merge_ledger_records_for_updates(None, None, None).is_none());
         let empty = socket_patch_core::patch::redirect::RedirectState::new();
-        assert!(merge_redirect_records_for_updates(None, Some(&empty)).is_none());
+        let empty_vendor = VendorState::new();
+        assert!(merge_ledger_records_for_updates(None, Some(&empty), Some(&empty_vendor)).is_none());
         let manifest =
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
-        let merged = merge_redirect_records_for_updates(Some(manifest.clone()), Some(&empty));
+        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&empty), None)
+            .expect("manifest present");
+        assert!(
+            matches!(merged, Cow::Borrowed(_)),
+            "empty ledgers must not clone the manifest"
+        );
         assert_eq!(
-            merged.unwrap().patches.len(),
+            merged.patches.len(),
             manifest.patches.len(),
             "an empty ledger adds nothing"
         );
@@ -934,7 +1077,29 @@ mod tests {
             cwd: root.to_path_buf(),
             ..GlobalArgs::default()
         };
-        vendored_ledger_supplement(&args, crawled).await
+        let state = socket_patch_core::vendor::load_state(root).await;
+        vendored_ledger_supplement(&args, crawled, &state).await
+    }
+
+    /// The shared-load key set: every spelling the prune exemption and the
+    /// agent-path vendored skip match on, and EMPTY (fail-open) on a corrupt
+    /// ledger — the supplement's artifact fallback is the fail-closed half.
+    #[tokio::test]
+    async fn vendored_purl_keys_carry_every_spelling_and_degrade_to_empty() {
+        let state = vendor_ledger_with(&[("pkg:npm/%40scope/pkg@1.0.0?artifact_id=x", "u", true)]);
+        let keys = vendored_purl_keys(&Ok(state));
+        for spelling in [
+            "pkg:npm/%40scope/pkg@1.0.0?artifact_id=x",
+            "pkg:npm/%40scope/pkg@1.0.0",
+        ] {
+            assert!(keys.contains(spelling), "missing {spelling}: {keys:?}");
+        }
+        assert!(vendored_purl_keys(&Ok(VendorState::new())).is_empty());
+        let tmp = tempfile::tempdir().unwrap();
+        seed_corrupt_ledger(tmp.path());
+        let corrupt = socket_patch_core::vendor::load_state(tmp.path()).await;
+        assert!(corrupt.is_err(), "the fixture must be unreadable");
+        assert!(vendored_purl_keys(&corrupt).is_empty());
     }
 
     #[tokio::test]
@@ -1050,6 +1215,36 @@ mod tests {
         }];
 
         assert!(supplement_in(tmp.path(), &crawled).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn corrupt_ledger_fallback_recovers_manifest_free_vendored_purls_from_leaves() {
+        // Manifest-free vendored project (the `scan --mode vendored` posture:
+        // records live in the ledger alone) with a corrupt ledger: the
+        // committed artifact leaves are the only ground truth left, and the
+        // documented leaf grammar recovers the purl. Non-uuid dirs and
+        // unparsable leaves stay out.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_corrupt_ledger(tmp.path());
+        let uuid_dir = tmp
+            .path()
+            .join(format!(".socket/vendor/npm/{VENDORED_UUID}"));
+        std::fs::create_dir_all(&uuid_dir).unwrap();
+        std::fs::write(uuid_dir.join("left-pad-1.3.0.tgz"), b"tgz").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".socket/vendor/npm/not-a-uuid")).unwrap();
+        std::fs::write(
+            tmp.path().join(".socket/vendor/npm/not-a-uuid/ghost-9.9.9.tgz"),
+            b"tgz",
+        )
+        .unwrap();
+
+        let out = supplement_in(tmp.path(), &[]).await;
+        assert_eq!(
+            out.iter().map(|p| p.purl.as_str()).collect::<Vec<_>>(),
+            vec!["pkg:npm/left-pad@1.3.0"],
+            "a manifest-free vendored project must recover its purls from the \
+             committed leaves when the ledger is unreadable"
+        );
     }
 
     // ---- collect_vuln_ids --------------------------------------------------
