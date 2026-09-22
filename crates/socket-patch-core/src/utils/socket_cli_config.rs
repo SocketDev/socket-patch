@@ -164,38 +164,6 @@ fn parse_config_bytes(raw: &[u8]) -> Result<SocketCliConfig, String> {
     })
 }
 
-/// Read the config bytes, requiring a regular file — the sync twin of
-/// [`open_regular_file`](crate::utils::fs::open_regular_file). `load()` runs
-/// synchronously during API-client construction, and a plain `open(2)` of a
-/// FIFO planted at the config path waits forever for a writer, wedging every
-/// networked command before it can do any work. `O_NONBLOCK` makes the open
-/// return immediately (it has no effect on regular-file reads); the
-/// handle-based `is_file` check then rejects FIFOs/devices/directories so
-/// the caller warns and treats the file as absent.
-fn read_regular_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-    use std::io::Read;
-    #[cfg(unix)]
-    let mut file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)?
-    };
-    #[cfg(not(unix))]
-    let mut file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
 /// Read the config from disk: the first candidate whose file exists wins.
 /// `None` covers every failure path; a present-but-unusable file warns and
 /// stops the probe — falling through to a stale lower-priority file would
@@ -203,7 +171,7 @@ fn read_regular_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 /// fires once per process.)
 fn read_from_disk() -> Option<SocketCliConfig> {
     for path in config_json_paths() {
-        let raw = match read_regular_file(&path) {
+        let raw = match crate::utils::fs::read_regular_to_bytes_sync(&path) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {

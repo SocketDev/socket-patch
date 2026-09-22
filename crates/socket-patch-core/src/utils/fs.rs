@@ -63,10 +63,15 @@ pub(crate) async fn list_dir_entries(path: &Path) -> Vec<DirEntry> {
 /// like `symlink_metadata`), so a symlink pointing at a directory
 /// would wrongly report `false`. To honor the documented
 /// symlink-following contract — which crawlers like deno/python/ruby
-/// rely on for symlinked package directories — we stat the resolved
-/// `entry.path()` via [`is_dir`], which does follow links.
+/// rely on for symlinked package directories — symlinks are resolved through
+/// [`is_dir`]. Ordinary entries use their cached file type, avoiding an extra
+/// stat for every directory visited by a crawler.
 pub(crate) async fn entry_is_dir(entry: &DirEntry) -> bool {
-    is_dir(&entry.path()).await
+    match entry.file_type().await {
+        Ok(kind) if kind.is_symlink() => is_dir(&entry.path()).await,
+        Ok(kind) => kind.is_dir(),
+        Err(_) => false,
+    }
 }
 
 /// Check whether `path` is a directory, following symlinks.

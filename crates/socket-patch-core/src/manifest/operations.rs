@@ -38,11 +38,16 @@ pub fn get_before_hash_blobs(manifest: &PatchManifest) -> HashSet<String> {
     blobs
 }
 
-/// Validate a parsed JSON value as a PatchManifest.
-/// Returns Ok(manifest) if valid, or Err(message) if invalid.
-fn validate_manifest(value: &serde_json::Value) -> Result<PatchManifest, String> {
-    serde_json::from_value::<PatchManifest>(value.clone())
-        .map_err(|e| format!("Invalid manifest: {}", e))
+/// Parse and validate a manifest directly, without an intermediate JSON tree.
+fn parse_manifest(content: &str) -> Result<PatchManifest, std::io::Error> {
+    serde_json::from_str(content).map_err(|e| {
+        let context = if e.is_data() {
+            "Invalid manifest"
+        } else {
+            "Failed to parse manifest JSON"
+        };
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{context}: {e}"))
+    })
 }
 
 /// Read and parse a manifest from the filesystem.
@@ -51,38 +56,12 @@ fn validate_manifest(value: &serde_json::Value) -> Result<PatchManifest, String>
 pub async fn read_manifest(
     path: impl AsRef<Path>,
 ) -> Result<Option<PatchManifest>, std::io::Error> {
-    let path = path.as_ref();
-
-    // Guarded open: a plain `read_to_string` open(2)s a FIFO squatting the
-    // manifest path with `O_RDONLY` and waits forever for a writer, wedging
-    // every manifest consumer (`apply` runs from install hooks, so this
-    // hangs `npm install` with no output). Non-regular files fail fast with
-    // `InvalidInput` instead; a missing file keeps mapping to `Ok(None)`.
-    let (mut file, metadata) = match crate::utils::fs::open_regular_file(path).await {
-        Ok(pair) => pair,
+    let content = match crate::utils::fs::read_regular_to_string(path.as_ref()).await {
+        Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let mut content = String::with_capacity(metadata.len() as usize);
-    {
-        use tokio::io::AsyncReadExt;
-        file.read_to_string(&mut content).await?;
-    }
-
-    let parsed: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to parse manifest JSON: {}", e),
-            ))
-        }
-    };
-
-    match validate_manifest(&parsed) {
-        Ok(manifest) => Ok(Some(manifest)),
-        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
-    }
+    parse_manifest(&content).map(Some)
 }
 
 /// Write a manifest to the filesystem with pretty-printed JSON.
@@ -256,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_manifest_valid() {
+    fn test_parse_manifest_valid() {
         let json = serde_json::json!({
             "patches": {
                 "pkg:npm/test@1.0.0": {
@@ -271,24 +250,24 @@ mod tests {
             }
         });
 
-        let result = validate_manifest(&json);
+        let result = parse_manifest(&json.to_string());
         assert!(result.is_ok());
         let manifest = result.unwrap();
         assert_eq!(manifest.patches.len(), 1);
     }
 
     #[test]
-    fn test_validate_manifest_invalid() {
+    fn test_parse_manifest_invalid() {
         let json = serde_json::json!({
             "patches": "not-an-object"
         });
 
-        let result = validate_manifest(&json);
+        let result = parse_manifest(&json.to_string());
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_validate_manifest_missing_fields() {
+    fn test_parse_manifest_missing_fields() {
         let json = serde_json::json!({
             "patches": {
                 "pkg:npm/test@1.0.0": {
@@ -297,7 +276,7 @@ mod tests {
             }
         });
 
-        let result = validate_manifest(&json);
+        let result = parse_manifest(&json.to_string());
         assert!(result.is_err());
     }
 
