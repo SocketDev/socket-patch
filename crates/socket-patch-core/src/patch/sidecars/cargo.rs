@@ -32,8 +32,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-use crate::patch::apply::{apply_file_patch, is_safe_relative_subpath, normalize_file_path};
-use crate::utils::fs::open_regular_file;
+use crate::patch::apply::{apply_file_patch_at, is_safe_relative_subpath, normalize_file_path};
+use crate::utils::fs::read_regular_to_bytes;
 
 use super::{SidecarError, SidecarFile, SidecarFileAction, SidecarPayload};
 
@@ -85,7 +85,15 @@ async fn sync_checksum(
     let checksum_path = pkg_path.join(CHECKSUM_FILE);
 
     // Read the existing file. NotFound is fine — no checksums to update.
-    let raw = match read_regular_file(&checksum_path).await {
+    // Both reads below go through the FIFO-safe `read_regular_to_bytes`
+    // (non-blocking open + regular-file check): the paths live inside the
+    // (untrusted) package tree, and a planted special file must fail fast
+    // rather than wedge the patch engine. Whole-file loads are fine — cargo
+    // source files are bounded (crates.io rejects `.crate`s over ~10MB
+    // unpacked) — and the open error passes through untouched, which the
+    // `dispatch_fixup_cargo_sha256_file_failure_arm` integration test drives
+    // via a non-existent path.
+    let raw = match read_regular_to_bytes(&checksum_path).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(None);
@@ -133,7 +141,7 @@ async fn sync_checksum(
     // read-only (files `0o444` inside `0o555` dirs) for tamper
     // detection. A plain in-place truncating write has three defects
     // there, all of which the rest of the patch engine was hardened
-    // against (see `apply::apply_file_patch` and `rollback`):
+    // against (see `apply::apply_file_patch_at` and `rollback`):
     //
     //   1. **Read-only-hostile.** Opening the existing `0o444` file
     //      `O_TRUNC` fails `EACCES`, so the fixup errored out exactly
@@ -147,15 +155,19 @@ async fn sync_checksum(
     //   3. **Copy-on-write-unsafe.** A vendored tree hardlinked into a
     //      shared store would have its sibling mutated in place.
     //
-    // `apply_file_patch` stages a sibling, fsyncs, and `rename(2)`s
-    // atomically; breaks CoW inodes; relaxes then restores BOTH the
-    // file's and the directory's read-only modes; and verifies the
-    // bytes that landed. The `expected_hash` is just the digest of the
-    // bytes we hand it (a self-check) — the file already exists, so
-    // its original mode is snapshotted and restored bit-for-bit.
+    // `apply_file_patch_at` stages a sibling, fsyncs, and `rename(2)`s
+    // atomically (the rename-over is the copy-on-write isolation for a
+    // hardlinked sibling — see `utils::fs::atomic_write_bytes`); relaxes
+    // then restores BOTH the file's and the directory's read-only modes;
+    // and verifies the bytes that landed. The `expected_hash` is just the
+    // digest of the bytes we hand it (a self-check) — the file already
+    // exists, so its original mode is snapshotted and restored
+    // bit-for-bit. The post-write ownership warning it may return is
+    // dropped: a `.cargo-checksum.json` is never chown-sensitive.
     let expected_hash = compute_git_sha256_from_bytes(&out);
-    apply_file_patch(pkg_path, CHECKSUM_FILE, &out, &expected_hash)
+    apply_file_patch_at(pkg_path, CHECKSUM_FILE, &out, &expected_hash)
         .await
+        .map(|_ownership_warning| ())
         .map_err(|source| SidecarError::Io {
             path: checksum_path.display().to_string(),
             source,
@@ -194,7 +206,7 @@ async fn update_entries(
         // hash an arbitrary out-of-tree file and embed its digest under a
         // bogus key in the committed checksum — an info leak that also
         // corrupts the checksum so cargo can no longer verify the crate.
-        // The apply *write* path (`apply_file_patch`) already refuses these,
+        // The apply *write* path (`apply_file_patch_at`) already refuses these,
         // but `fixup` is `pub(crate)` and reached directly via `dispatch_fixup`
         // and tests, so the *read* path must guard itself too. Mirror apply's
         // `InvalidData` refusal rather than silently skipping — an escaping
@@ -210,7 +222,7 @@ async fn update_entries(
         }
 
         let on_disk = pkg_path.join(&normalized);
-        let bytes = match read_regular_file(&on_disk).await {
+        let bytes = match read_regular_to_bytes(&on_disk).await {
             Ok(bytes) => bytes,
             Err(e) if remove_missing && e.kind() == std::io::ErrorKind::NotFound => {
                 // Rollback deleted this patch-added file; drop the entry
@@ -237,26 +249,6 @@ async fn update_entries(
         );
     }
     Ok(())
-}
-
-/// Read a whole file, refusing anything that isn't a regular file.
-///
-/// Both call sites read paths inside the (untrusted) package tree, so
-/// the open goes through [`open_regular_file`] — non-blocking on Unix,
-/// rejecting FIFOs/devices/directories — to keep a planted special
-/// file from hanging the patch engine (see its docs). Loading the
-/// whole file is fine: cargo source files are bounded (the registry
-/// rejects crates whose `.crate` tarball exceeds ~10MB unpacked), and
-/// the open error passes through untouched, which the
-/// `dispatch_fixup_cargo_sha256_file_failure_arm` integration test
-/// drives via a non-existent path.
-async fn read_regular_file(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-
-    let (mut file, metadata) = open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
 }
 
 #[cfg(test)]

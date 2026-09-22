@@ -19,6 +19,7 @@ use super::FileEdit;
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::utils::fs::read_regular_to_bytes;
+use crate::utils::purl::{canonical_purl, purl_name_version};
 use crate::utils::socket_dir::{remove_file_and_prune, write_json_ledger};
 
 /// Repo-relative path of the redirect ledger.
@@ -56,6 +57,19 @@ impl RedirectState {
             edits: Vec::new(),
             records: BTreeMap::new(),
         }
+    }
+
+    /// The stored record keys whose canonical purl (qualifiers stripped,
+    /// percent-decoded — [`canonical_purl`]) matches `purl`, in ledger
+    /// order. Normally zero or one; a hand-edited ledger may carry the same
+    /// package under two spellings, and every caller must drop them all.
+    pub(crate) fn record_keys_for(&self, purl: &str) -> Vec<String> {
+        let target = canonical_purl(purl);
+        self.records
+            .keys()
+            .filter(|k| canonical_purl(k) == target)
+            .cloned()
+            .collect()
     }
 }
 
@@ -212,16 +226,6 @@ pub async fn save_redirect_state(
     write_json_ledger(&project_root.join(REDIRECT_STATE_REL), state).await
 }
 
-/// `pkg:<type>/<name>@<version>` → `(<name>, <version>)`; the name keeps any
-/// namespace slashes (`@scope/pkg`). `None` when either part is missing.
-/// Input must already be canonicalized (qualifiers stripped, percent-decoded).
-fn purl_name_version(purl: &str) -> Option<(&str, &str)> {
-    let rest = purl.strip_prefix("pkg:")?;
-    let (_, coord) = rest.split_once('/')?;
-    let at = coord.rfind('@').filter(|&i| i > 0)?;
-    Some((&coord[..at], &coord[at + 1..]))
-}
-
 /// Drop one PURL's superseded takeover leftovers from the ledger: its
 /// `records` entry (canonical-purl match, qualifiers stripped and
 /// percent-decoded) and every recorded edit keyed to that package. This is
@@ -276,9 +280,7 @@ fn purl_name_version(purl: &str) -> Option<(&str, &str)> {
 /// ledger via [`persist_redirect_state`] (atomic; an emptied ledger is
 /// deleted).
 pub fn drop_superseded_purl(state: &mut RedirectState, purl: &str) -> bool {
-    use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
-    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-    let target = canon(purl);
+    let target = canonical_purl(purl);
     if target.starts_with("pkg:cargo/") {
         return false;
     }
@@ -287,12 +289,7 @@ pub fn drop_superseded_purl(state: &mut RedirectState, purl: &str) -> bool {
     };
     let (name, version) = (name.to_string(), version.to_string());
 
-    let record_keys: Vec<String> = state
-        .records
-        .keys()
-        .filter(|k| canon(k) == target)
-        .cloned()
-        .collect();
+    let record_keys = state.record_keys_for(purl);
     // THIS purl's patch uuid(s), captured before the records are removed —
     // the artifact anchor (see the doc comment). Distinct purls (including
     // two versions of one package) carry distinct patch uuids, so a uuid
@@ -328,7 +325,12 @@ pub fn drop_superseded_purl(state: &mut RedirectState, purl: &str) -> bool {
         // across raw / `\/`-escaped / percent-encoded URL forms).
         let anchored = !uuids.is_empty()
             && e.new.as_ref().is_some_and(|new| {
-                let text = new.to_string();
+                // A text-fragment payload is probed in place; only an object
+                // payload (a whole JSON lock entry) needs re-serializing.
+                let text: std::borrow::Cow<'_, str> = match new {
+                    serde_json::Value::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                    other => std::borrow::Cow::Owned(other.to_string()),
+                };
                 uuids.iter().any(|uuid| text.contains(uuid.as_str()))
             });
         !(version_exact || anchored)

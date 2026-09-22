@@ -1,8 +1,7 @@
 use std::path::Path;
 
 use super::detect::{remove_package_json_content, update_package_json_content, PackageManager};
-use super::find::read_project_file_to_string;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
 /// Result of updating a single package.json.
 #[derive(Debug, Clone)]
@@ -34,7 +33,7 @@ pub async fn update_package_json(
     // Guarded read: a FIFO planted as package.json would make a plain
     // `read_to_string` open block forever waiting for a writer — discovery
     // lists any path whose metadata stats, so it reaches here unopened.
-    let content = match read_project_file_to_string(package_json_path).await {
+    let content = match read_regular_to_string(package_json_path).await {
         Ok(c) => c,
         Err(e) => {
             return UpdateResult {
@@ -117,7 +116,7 @@ pub async fn remove_package_json(package_json_path: &Path, dry_run: bool) -> Rem
     let path_str = package_json_path.display().to_string();
 
     // Guarded read — see the matching note in `update_package_json`.
-    let content = match read_project_file_to_string(package_json_path).await {
+    let content = match read_regular_to_string(package_json_path).await {
         Ok(c) => c,
         Err(e) => {
             return RemoveResult {

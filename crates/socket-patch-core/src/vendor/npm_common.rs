@@ -655,12 +655,7 @@ pub(super) async fn done_failure_unstage(
     if !uuid_dir_preexisted {
         let uuid_dir = project_root.join(uuid_dir_rel);
         let _ = remove_tree(&uuid_dir).await;
-        if let Some(eco_dir) = uuid_dir.parent() {
-            let _ = tokio::fs::remove_dir(eco_dir).await;
-            if let Some(vendor_dir) = eco_dir.parent() {
-                let _ = tokio::fs::remove_dir(vendor_dir).await;
-            }
-        }
+        super::common::prune_empty_vendor_levels(&uuid_dir).await;
     }
     done_failure(purl, error)
 }

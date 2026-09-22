@@ -554,6 +554,25 @@ pub(crate) async fn write_marker(uuid_dir: &Path, marker: &VendorMarker) -> std:
     atomic_write_bytes(&uuid_dir.join(VENDOR_MARKER_FILE), &bytes).await
 }
 
+/// [`write_marker`], downgrading a failure to ONE `vendor_marker_write_failed`
+/// warning on `warnings`. The marker is belt-and-braces metadata — never a
+/// trust input (sweep/verify key off state.json + the path uuid) — so its
+/// failure must not undo an otherwise fully-wired vendor. Every backend's
+/// fresh and rebuild paths report it through here so the code and wording
+/// cannot drift.
+pub(crate) async fn write_marker_or_warn(
+    uuid_dir: &Path,
+    marker: &VendorMarker,
+    warnings: &mut Vec<super::VendorWarning>,
+) {
+    if let Err(e) = write_marker(uuid_dir, marker).await {
+        warnings.push(super::VendorWarning::new(
+            "vendor_marker_write_failed",
+            format!("could not write the informational vendor marker {VENDOR_MARKER_FILE}: {e}"),
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

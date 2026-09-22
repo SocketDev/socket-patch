@@ -1,13 +1,13 @@
 //! Native binary Bun vendoring. Package records are edited without re-resolving
 //! dependencies or requiring a Bun executable.
 use super::bun_lockb::{BinaryPackage, BunLockb};
-use super::common::{already_patched_result, prune_empty_vendor_levels, refused};
+use super::common::{already_patched_result, refused};
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
 use super::path::parse_vendor_path;
 use super::state::{
-    write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::manifest::schema::PatchRecord;
@@ -255,12 +255,7 @@ pub(crate) async fn vendor(
         .await;
     }
     let marker = VendorMarker::new("npm", &coords.base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&root.join(&coords.uuid_dir_rel), &marker).await {
-        warnings.push(VendorWarning::new(
-            "vendor_marker_write_failed",
-            e.to_string(),
-        ));
-    }
+    write_marker_or_warn(&root.join(&coords.uuid_dir_rel), &marker, &mut warnings).await;
     VendorOutcome::Done {
         result,
         warnings,
@@ -436,14 +431,19 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
             }
             prune_mirror_parents(&mirror).await;
         }
+        // The last npm-family entry leaves `.socket/vendor/npm/` (and
+        // `.socket/vendor/`) empty: the shared helper prunes them so a
+        // reverted project carries no vendor residue (non-recursive:
+        // siblings keep them).
         let uuid_dir = root.join(&dir);
-        if let Err(e) = crate::patch::copy_tree::remove_tree(&uuid_dir).await {
+        if let Err(e) = crate::utils::socket_dir::remove_tree_and_prune(
+            &uuid_dir,
+            &root.join(crate::constants::SOCKET_DIR),
+        )
+        .await
+        {
             return RevertOutcome::failed(format!("cannot remove {dir}: {e}"));
         }
-        // The last npm-family entry leaves `.socket/vendor/npm/` (and
-        // `.socket/vendor/`) empty: prune them so a reverted project carries
-        // no vendor residue (`remove_dir` keeps non-empty levels).
-        prune_empty_vendor_levels(&uuid_dir).await;
     }
     outcome
 }

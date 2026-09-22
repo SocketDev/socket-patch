@@ -409,7 +409,7 @@ fn fail(socket_dir: &Path, path: PathBuf, source: std::io::Error) -> LockError {
 /// `flock(2)`/`LockFileEx` failure are constructed from an OS error
 /// code. A non-OS error (`raw_os_error() == None`) can never be
 /// contention, so it correctly falls through to `Io`.
-fn is_lock_contended(err: &std::io::Error) -> bool {
+pub(crate) fn is_lock_contended(err: &std::io::Error) -> bool {
     err.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 

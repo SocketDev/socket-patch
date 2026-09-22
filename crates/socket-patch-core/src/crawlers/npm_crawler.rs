@@ -32,18 +32,14 @@ struct PackageJsonPartial {
 
 /// Read and parse a `package.json` file, returning `(name, version)` if valid.
 pub async fn read_package_json(pkg_json_path: &Path) -> Option<(String, String)> {
-    use tokio::io::AsyncReadExt;
-
     // The path lives inside the (untrusted) package tree: a planted FIFO
     // would make a plain `read_to_string` open block forever waiting for a
-    // writer, wedging scan (crawl_all) and apply (find_by_purls). Open via
-    // `open_regular_file` — non-blocking on Unix, rejecting
+    // writer, wedging scan (crawl_all) and apply (find_by_purls). Read via
+    // `read_regular_to_string` — non-blocking open on Unix, rejecting
     // FIFOs/devices/directories (see its docs).
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(pkg_json_path)
+    let content = crate::utils::fs::read_regular_to_string(pkg_json_path)
         .await
         .ok()?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await.ok()?;
     // npm and Node both tolerate a leading UTF-8 BOM in package.json
     // (Windows-authored packages ship them), but serde_json rejects it —
     // a BOM'd install would be invisible to scan and unpatchable.

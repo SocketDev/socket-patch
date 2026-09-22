@@ -208,8 +208,12 @@ pub fn read_regular_to_bytes_sync(path: &Path) -> std::io::Result<Vec<u8>> {
 
 /// The one regular-file guard: `O_NONBLOCK` open on Unix, then the
 /// handle-based regular-file check. The async [`open_regular_file`] and every
-/// reader above run this on the blocking pool.
-fn open_regular_file_sync(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+/// reader above run this on the blocking pool; `pub(crate)` for the few
+/// synchronous callers that must keep the handle (a `zip::ZipArchive` over a
+/// committed wheel) rather than read it whole.
+pub(crate) fn open_regular_file_sync(
+    path: &Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -327,6 +331,15 @@ pub(crate) fn normalize_lexically(path: &Path) -> Option<PathBuf> {
 /// sibling file, fsync it, then rename over the target (atomic on the same
 /// filesystem), so a reader or recovering process only ever sees the complete
 /// old or the complete new bytes.
+///
+/// **Copy-on-write guarantee** (the single source of truth the patch engine's
+/// comments point at): `rename(2)` replaces only the *directory entry*, never
+/// the bytes behind the old inode. A hardlinked sibling — pnpm's
+/// content-addressable store, the bun / uv caches, Go's module cache — keeps
+/// the old inode and its old content untouched, and a symlink sitting at the
+/// destination is replaced *as a link* by a private regular file, never
+/// written through to its target. No separate hardlink-break step is needed;
+/// the write path is CoW-safe by construction.
 pub(crate) async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
     atomic_write_bytes_as(path, content, None).await
 }

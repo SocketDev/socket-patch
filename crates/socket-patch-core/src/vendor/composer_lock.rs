@@ -32,6 +32,7 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
+use crate::constants::SOCKET_DIR;
 use crate::crawlers::composer_crawler::normalize_version;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
@@ -39,6 +40,7 @@ use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
+use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
     already_patched_result, copy_matches_after_hashes, done, prune_empty_vendor_levels, refused,
@@ -49,7 +51,7 @@ use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::extract_zip;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
-    write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -315,14 +317,7 @@ pub async fn vendor_composer(
     // ── marker + ledger entry ────────────────────────────────────────────
     let base_purl = build_composer_purl(&vendor, &name, version);
     let marker = VendorMarker::new("composer", &base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&uuid_dir, &marker).await {
-        // The marker is informational only (state.json is the ledger of
-        // record), so its failure must not fail an otherwise-wired vendor.
-        warnings.push(VendorWarning::new(
-            "vendor_marker_write_failed",
-            format!("could not write {}: {e}", super::state::VENDOR_MARKER_FILE),
-        ));
-    }
+    write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
 
     let entry = VendorEntry {
         ecosystem: "composer".to_string(),
@@ -465,7 +460,11 @@ pub async fn revert_composer_opts(
     // (and the caller keeps the ledger entry), so only the deletion is
     // skipped.
     if !dry_run && !keep_artifact {
-        if let Err(e) = remove_tree(&uuid_dir).await {
+        // The last composer entry leaves `.socket/vendor/composer/` (and
+        // `.socket/vendor/`) empty: the shared helper prunes them so a
+        // reverted project carries no vendor residue (non-recursive:
+        // siblings keep them).
+        if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
             return RevertOutcome {
                 kept_artifact: false,
                 success: false,
@@ -473,10 +472,6 @@ pub async fn revert_composer_opts(
                 error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
             };
         }
-        // The last composer entry leaves `.socket/vendor/composer/` (and
-        // `.socket/vendor/`) empty: prune them so a reverted project carries
-        // no vendor residue (`remove_dir` keeps non-empty levels).
-        prune_empty_vendor_levels(&uuid_dir).await;
     }
 
     warnings.push(VendorWarning::new(

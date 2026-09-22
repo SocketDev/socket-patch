@@ -342,28 +342,18 @@ pub(crate) async fn swap_stage_into_place(stage: &Path, copy_dir: &Path) -> std:
 /// `.socket/vendor/<eco>/` and `.socket/vendor/` levels a vendor run may have
 /// created (or a revert may have emptied), so neither a hard failure nor the
 /// reversal of the last entry of an ecosystem leaves a husk for the user to
-/// commit. `remove_dir` refuses non-empty dirs, so live copies, markers, the
-/// ledger and other entries' vendor dirs always survive; `.socket/` itself is
-/// never touched (the apply lock lives there while any operation runs).
+/// commit. The climb is the shared
+/// [`prune_empty_dirs`](crate::utils::socket_dir::prune_empty_dirs):
+/// non-recursive, so live copies, markers, the ledger and other entries'
+/// vendor dirs always survive, and a uuid level already unwound wholesale
+/// (`remove_tree` before the prune) still lets its parents go. `uuid_dir` is
+/// `<project>/.socket/vendor/<eco>/<uuid>`, so the stop dir — never removed —
+/// is three levels up: `.socket/` itself, which the apply lock guard owns.
 pub(crate) async fn prune_empty_vendor_levels(uuid_dir: &Path) {
-    // The uuid level may already be gone (the unwind paths `remove_tree` it
-    // before pruning): NotFound must continue to the parent levels this run
-    // created, or they survive as committable husks. Any other error (i.e.
-    // non-empty: a live copy or marker) still stops the prune.
-    match tokio::fs::remove_dir(uuid_dir).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return,
-    }
-    let Some(eco_dir) = uuid_dir.parent() else {
+    let Some(socket_dir) = uuid_dir.ancestors().nth(3) else {
         return;
     };
-    if tokio::fs::remove_dir(eco_dir).await.is_err() {
-        return;
-    }
-    if let Some(vendor_dir) = eco_dir.parent() {
-        let _ = tokio::fs::remove_dir(vendor_dir).await;
-    }
+    crate::utils::socket_dir::prune_empty_dirs(uuid_dir, socket_dir).await;
 }
 
 // ── pre-write guards shared by the pypi lock flavors ────────────────────────

@@ -46,7 +46,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::utils::purl::{normalize_purl, parse_cargo_purl, strip_purl_qualifiers};
+use crate::utils::purl::{canonical_purl, parse_cargo_purl, parse_name_version};
 
 use super::staged::{flush_staged, read_rel, staged_read, Staged, StagedBytes};
 use super::state::RedirectState;
@@ -99,14 +99,12 @@ pub async fn revert_redirect_purl(
 /// percent-decoded) matches `purl`: `(record key as stored, canonical purl)`.
 /// Refused when the ledger records no hosted redirect for the purl.
 fn find_record_key(state: &RedirectState, purl: &str) -> Result<(String, String), String> {
-    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-    let target = canon(purl);
-    let Some(record_key) = state.records.keys().find(|k| canon(k) == target).cloned() else {
+    let Some(record_key) = state.record_keys_for(purl).into_iter().next() else {
         return Err(format!(
             "the redirect ledger records no hosted redirect for {purl}"
         ));
     };
-    Ok((record_key, target))
+    Ok((record_key, canonical_purl(purl)))
 }
 
 /// Drop the claimed edits (by ledger index) and the purl's record from the
@@ -307,14 +305,6 @@ pub async fn revert_cargo_redirect_purl(
     Ok(out)
 }
 
-/// `pkg:npm/<name>@<version>` (canonical, percent-decoded form) →
-/// `(name, version)`; the name keeps its `@scope/` namespace.
-fn parse_npm_purl(canon: &str) -> Option<(&str, &str)> {
-    let rest = canon.strip_prefix("pkg:npm/")?;
-    let (name, version) = rest.rsplit_once('@')?;
-    (!name.is_empty() && !version.is_empty()).then_some((name, version))
-}
-
 /// The npm-family text-fragment edit kinds CLAIMED BY KEY: `original`/`new`
 /// hold the whole lock fragment as a string, the edit's `key` embeds
 /// `<name>@<version>`, and the revert is a `replacen(new, original)`.
@@ -456,7 +446,8 @@ pub async fn revert_npm_redirect_purl(
     dry_run: bool,
 ) -> Result<RedirectRevert, String> {
     let (record_key, target) = find_record_key(state, purl)?;
-    let Some((name, version)) = parse_npm_purl(&target) else {
+    // `target` is canonical (percent-decoded); the name keeps its `@scope/`.
+    let Some((name, version)) = parse_name_version(&target, "pkg:npm/") else {
         return Err(format!("not an npm purl: {purl}"));
     };
     let (name, version) = (name.to_string(), version.to_string());

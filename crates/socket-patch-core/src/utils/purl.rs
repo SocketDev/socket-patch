@@ -129,12 +129,34 @@ pub fn purl_qualifier<'a>(purl: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+/// The ledger / lookup spelling of a purl: `?qualifiers` and `#subpath`
+/// stripped, then percent-decoded per component ([`normalize_purl`]). Two
+/// purls naming the same package version compare equal after this, whatever
+/// URL escaping or `?artifact_id=` decoration they arrived with — the one
+/// composition every ledger key match (redirect takeover, vendor GC, the
+/// hosted→vendored reconciliation) goes through.
+pub fn canonical_purl(purl: &str) -> String {
+    normalize_purl(strip_purl_qualifiers(purl)).into_owned()
+}
+
+/// `pkg:<type>/<name>@<version>` → `(<name>, <version>)` for ANY type; the
+/// name keeps any namespace slashes (`@scope/pkg`). `None` when either part
+/// is missing. Input must already be canonicalized (qualifiers stripped,
+/// percent-decoded) — the redirect ledger's version-exact matcher feeds it
+/// [`canonical_purl`] output.
+pub(crate) fn purl_name_version(purl: &str) -> Option<(&str, &str)> {
+    let rest = purl.strip_prefix("pkg:")?;
+    let (_, coord) = rest.split_once('/')?;
+    let at = coord.rfind('@').filter(|&i| i > 0)?;
+    Some((&coord[..at], &coord[at + 1..]))
+}
+
 /// Shared split for `pkg:<type>/<name>@<version>` purls: strip
 /// `?qualifiers`/`#subpath` FIRST (a qualifier value can itself embed an
 /// `@`, e.g. a `git@github.com` source URL), require `prefix`, then split
 /// the version off at the LAST `@` — so the name/path keeps any internal
 /// slashes and `@`s.
-fn parse_name_version<'a>(purl: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
+pub(crate) fn parse_name_version<'a>(purl: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
     let rest = strip_purl_qualifiers(purl).strip_prefix(prefix)?;
     let at_idx = rest.rfind('@')?;
     let name = &rest[..at_idx];

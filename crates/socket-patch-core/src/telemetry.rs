@@ -121,6 +121,12 @@ struct PatchTelemetryEvent {
 /// Telemetry is disabled when:
 /// - `SOCKET_TELEMETRY_DISABLED` is `"1"` or `"true"`
 ///   (legacy `SOCKET_PATCH_TELEMETRY_DISABLED` still honored with warning)
+/// - `VITEST` is `"true"`. Load-bearing downstream dependency, not a relic:
+///   socket-cli's vitest integration suite
+///   (`packages/cli/test/integration/cli/cmd-patch*.test.mts`) spawns this
+///   binary with its inherited environment and sets no
+///   `SOCKET_TELEMETRY_DISABLED`, so this gate is the only thing keeping
+///   those runs from POSTing telemetry to the public proxy.
 /// - `SOCKET_OFFLINE` is `"1"` or `"true"` (airgap mode — the telemetry
 ///   endpoint is a network call, so honoring `--offline`/`SOCKET_OFFLINE`
 ///   here keeps every command compliant with the strict-airgap contract)
@@ -135,7 +141,8 @@ pub fn is_telemetry_disabled() -> bool {
     )
     .unwrap_or_default();
     let disabled_via_env = matches!(env_value.as_str(), "1" | "true");
-    disabled_via_env || is_offline_env()
+    let vitest = std::env::var("VITEST").unwrap_or_default() == "true";
+    disabled_via_env || vitest || is_offline_env()
 }
 
 /// Log debug messages when debug mode is enabled.
@@ -729,11 +736,13 @@ mod tests {
         // Save originals
         let orig_new = std::env::var("SOCKET_TELEMETRY_DISABLED").ok();
         let orig_legacy = std::env::var("SOCKET_PATCH_TELEMETRY_DISABLED").ok();
+        let orig_vitest = std::env::var("VITEST").ok();
         let orig_offline = std::env::var("SOCKET_OFFLINE").ok();
 
         // Default: not disabled
         std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
         std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
+        std::env::remove_var("VITEST");
         std::env::remove_var("SOCKET_OFFLINE");
         assert!(!is_telemetry_disabled());
 
@@ -776,6 +785,10 @@ mod tests {
         match orig_legacy {
             Some(v) => std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", v),
             None => std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED"),
+        }
+        match orig_vitest {
+            Some(v) => std::env::set_var("VITEST", v),
+            None => std::env::remove_var("VITEST"),
         }
         match orig_offline {
             Some(v) => std::env::set_var("SOCKET_OFFLINE", v),

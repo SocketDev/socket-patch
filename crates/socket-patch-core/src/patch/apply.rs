@@ -503,23 +503,6 @@ pub(crate) async fn apply_file_patch_at(
     restore_file_permissions(&filepath, existing_meta.as_ref()).await
 }
 
-/// Single-copy [`apply_file_patch_at`] with the post-write warning dropped
-/// — the entry point the cargo checksum sidecar writes through. The pnpm
-/// peer-variant fan-out lives at package level (`apply_package_patch`,
-/// `rollback_package_patch`), where every copy gets its own verify; a
-/// `.cargo-checksum.json` can never live in a pnpm store, so the per-file
-/// store discovery this wrapper used to run on every call was pure waste.
-pub(crate) async fn apply_file_patch(
-    pkg_path: &Path,
-    file_name: &str,
-    patched_content: &[u8],
-    expected_hash: &str,
-) -> Result<(), std::io::Error> {
-    apply_file_patch_at(pkg_path, file_name, patched_content, expected_hash)
-        .await
-        .map(|_ownership_warning| ())
-}
-
 /// Guard that temporarily grants owner-write on a directory so the
 /// stage+rename write path can create and move files inside it, then
 /// restores the directory's original mode.

@@ -32,8 +32,8 @@ use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_tgz;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
-    write_marker, CargoLockOriginal, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
-    WiringRecord, VENDOR_MARKER_FILE,
+    write_marker_or_warn, CargoLockOriginal, VendorArtifact, VendorEntry, VendorMarker,
+    WiringAction, WiringRecord, VENDOR_MARKER_FILE,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -591,12 +591,7 @@ pub async fn vendor_cargo_crate(
         {
             let marker =
                 VendorMarker::new("cargo", strip_purl_qualifiers(purl), record, vendored_at);
-            if let Err(e) = write_marker(&uuid_dir, &marker).await {
-                warnings.push(VendorWarning::new(
-                    "marker_write_failed",
-                    format!("could not write the vendor marker: {e}"),
-                ));
-            }
+            write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
         }
         return done(result, None, warnings);
     }
@@ -730,14 +725,7 @@ pub async fn vendor_cargo_crate(
     // ── marker + ledger entry ─────────────────────────────────────────────
     let base_purl = strip_purl_qualifiers(purl).to_string();
     let marker = VendorMarker::new("cargo", &base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&uuid_dir, &marker).await {
-        // The marker is belt-and-braces metadata (never a trust input); a
-        // failed write must not undo a fully-wired vendor — surface it.
-        warnings.push(VendorWarning::new(
-            "marker_write_failed",
-            format!("could not write the vendor marker: {e}"),
-        ));
-    }
+    write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
 
     let mut wiring = vec![WiringRecord {
         file: ".cargo/config.toml".to_string(),
@@ -2928,7 +2916,7 @@ mod tests {
 
     /// A failed marker write on a FRESH vendor (a directory squatting the
     /// marker path makes the atomic rename fail) must not undo the
-    /// fully-wired vendor: success + a `marker_write_failed` warning, with
+    /// fully-wired vendor: success + a `vendor_marker_write_failed` warning, with
     /// copy, config, and lock all wired.
     #[tokio::test]
     async fn marker_write_failure_warns_but_vendor_succeeds() {
@@ -2945,7 +2933,7 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "the wired vendor still emits its entry");
         assert!(
-            warnings.iter().any(|w| w.code == "marker_write_failed"),
+            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
             "the failed marker write is surfaced: {warnings:?}"
         );
         // The vendor is otherwise fully wired.

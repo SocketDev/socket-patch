@@ -33,25 +33,23 @@ use std::path::Path;
 use serde_json::Value;
 use sha2::{Digest, Sha512};
 
+use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{normalize_file_path, PatchSources};
-use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::{
     atomic_write_bytes_preserving_mode, read_regular_to_bytes, read_regular_to_string,
 };
+use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::utils::uri::encode_uri_component;
 
 use super::berry_zip::berry_cache_checksum_10c0;
-use super::common::{
-    already_patched_result, detect_eol, detect_indent, prune_empty_vendor_levels, refused,
-    serialize_json,
-};
+use super::common::{already_patched_result, detect_eol, detect_indent, refused, serialize_json};
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
 use super::path::parse_vendor_path;
 use super::state::{
-    write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::yarn_classic_lock::{
     body_field_line, lines_to_json, pattern_real_name, read_yarn_lock, replace_block,
@@ -433,12 +431,7 @@ pub async fn vendor_yarn_berry(
 
     // ── 12. Marker + ledger entry ─────────────────────────────────────────
     let marker = VendorMarker::new("npm", &base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&project_root.join(&uuid_dir_rel), &marker).await {
-        warnings.push(VendorWarning::new(
-            "vendor_marker_write_failed",
-            format!("could not write the informational vendor marker: {e}"),
-        ));
-    }
+    write_marker_or_warn(&project_root.join(&uuid_dir_rel), &marker, &mut warnings).await;
 
     let wiring = vec![
         WiringRecord {
@@ -719,14 +712,13 @@ pub async fn revert_yarn_berry_opts(
         }
     }
 
+    // The last npm-family entry leaves `.socket/vendor/npm/` (and
+    // `.socket/vendor/`) empty: the shared helper prunes them so a reverted
+    // project carries no vendor residue (non-recursive: siblings keep them).
     let uuid_dir = project_root.join(&uuid_dir_rel);
-    if let Err(e) = remove_tree(&uuid_dir).await {
+    if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
         return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
     }
-    // The last npm-family entry leaves `.socket/vendor/npm/` (and
-    // `.socket/vendor/`) empty: prune them so a reverted project carries no
-    // vendor residue (`remove_dir` keeps non-empty levels).
-    prune_empty_vendor_levels(&uuid_dir).await;
 
     outcome
 }

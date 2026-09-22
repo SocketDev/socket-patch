@@ -58,17 +58,15 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
-use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::{
     atomic_write_bytes_preserving_mode, read_regular_to_bytes, read_regular_to_string,
 };
+use crate::utils::socket_dir::remove_tree_and_prune;
 
-use super::common::{
-    already_patched_result, detect_indent, done, prune_empty_vendor_levels, refused,
-    serialize_json,
-};
+use super::common::{already_patched_result, detect_indent, done, refused, serialize_json};
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
@@ -80,7 +78,8 @@ use super::pnpm_lock::{
     vendor_value_is_for, yaml_key, yaml_key_like, KIND_LOCK_OVERRIDES,
 };
 use super::state::{
-    write_marker, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
+    WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -625,12 +624,12 @@ pub async fn vendor_pnpm_legacy(
 
     // ── 7. Marker + ledger entry ──────────────────────────────────────────
     let marker = VendorMarker::new("npm", &coords.base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&project_root.join(&coords.uuid_dir_rel), &marker).await {
-        warnings.push(VendorWarning::new(
-            "vendor_marker_write_failed",
-            format!("could not write the informational vendor marker: {e}"),
-        ));
-    }
+    write_marker_or_warn(
+        &project_root.join(&coords.uuid_dir_rel),
+        &marker,
+        &mut warnings,
+    )
+    .await;
 
     let entry = VendorEntry {
         ecosystem: "npm".to_string(),
@@ -1451,14 +1450,14 @@ pub async fn revert_pnpm_legacy_opts(
     // ran; the artifact dir stays behind (and the caller keeps the ledger
     // entry), so only the deletion is skipped.
     if !keep_artifact {
+        // The last npm-family entry leaves `.socket/vendor/npm/` (and
+        // `.socket/vendor/`) empty: the shared helper prunes them so a
+        // reverted project carries no vendor residue (non-recursive:
+        // siblings keep them).
         let uuid_dir = project_root.join(&uuid_dir_rel);
-        if let Err(e) = remove_tree(&uuid_dir).await {
+        if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
             return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
         }
-        // The last npm-family entry leaves `.socket/vendor/npm/` (and
-        // `.socket/vendor/`) empty: prune them so a reverted project carries
-        // no vendor residue (`remove_dir` keeps non-empty levels).
-        prune_empty_vendor_levels(&uuid_dir).await;
     }
     outcome
 }

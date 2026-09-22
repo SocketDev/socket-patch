@@ -5,7 +5,7 @@
 //! and the home-dir redaction were uncovered.
 //!
 //! Hardening notes: every disable-gate test runs inside `with_clean_env`,
-//! which scrubs ALL three disabling vars first. Each test then proves
+//! which scrubs ALL four disabling vars first. Each test then proves
 //! *causation*, not mere correlation:
 //!   1. clean env => NOT disabled  (kills an always-`true` impl + ambient
 //!      `SOCKET_OFFLINE=1` masking the result),
@@ -21,6 +21,7 @@ use socket_patch_core::telemetry::{is_telemetry_disabled, sanitize_error_message
 const DISABLE_VARS: &[&str] = &[
     "SOCKET_TELEMETRY_DISABLED",
     "SOCKET_PATCH_TELEMETRY_DISABLED",
+    "VITEST",
     "SOCKET_OFFLINE",
 ];
 
@@ -104,6 +105,44 @@ fn telemetry_not_disabled_when_socket_telemetry_disabled_falsy() {
             assert!(
                 !is_telemetry_disabled(),
                 "SOCKET_TELEMETRY_DISABLED={v:?} must NOT disable telemetry"
+            );
+        }
+    });
+}
+
+/// The `VITEST=true` kill-switch is load-bearing for a downstream consumer:
+/// socket-cli's vitest integration suite spawns this binary with its
+/// inherited env and sets no `SOCKET_TELEMETRY_DISABLED` (see the
+/// `is_telemetry_disabled` docs).
+#[test]
+#[serial]
+fn telemetry_disabled_when_vitest_env_is_true() {
+    with_clean_env(|| {
+        assert!(!is_telemetry_disabled(), "baseline must be enabled");
+        std::env::set_var("VITEST", "true");
+        assert!(
+            is_telemetry_disabled(),
+            "VITEST=true must disable telemetry"
+        );
+        std::env::remove_var("VITEST");
+        assert!(
+            !is_telemetry_disabled(),
+            "removing VITEST must re-enable telemetry"
+        );
+    });
+}
+
+/// VITEST is matched strictly against `"true"` (not "1"/truthy). Pin it so a
+/// regression that loosens the comparison is caught.
+#[test]
+#[serial]
+fn telemetry_not_disabled_when_vitest_is_not_literal_true() {
+    with_clean_env(|| {
+        for v in ["1", "", "false", "True", "TRUE", "yes"] {
+            std::env::set_var("VITEST", v);
+            assert!(
+                !is_telemetry_disabled(),
+                "VITEST={v:?} must NOT disable telemetry (only literal 'true' does)"
             );
         }
     });

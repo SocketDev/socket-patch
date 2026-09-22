@@ -55,6 +55,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
@@ -62,6 +63,7 @@ use crate::patch::path_safety::is_safe_single_segment;
 use crate::patch::redirect::gem_line_trailing_options;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::purl::{build_gem_purl, parse_gem_purl, purl_qualifier};
+use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
     already_patched_result, copy_matches_after_hashes, done, failed_result,
@@ -74,7 +76,7 @@ use super::service_fetch::{
     fetch_verified_archive, fetch_verified_secondary, SecondaryArtifactResult, ServiceArtifact,
 };
 use super::state::{
-    write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -512,14 +514,7 @@ pub async fn vendor_gem(
     // ── marker + ledger entry ────────────────────────────────────────────
     let base_purl = build_gem_purl(name, version);
     let marker = VendorMarker::new("gem", &base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&uuid_dir, &marker).await {
-        // Informational only (state.json is the ledger of record) — a marker
-        // failure must not fail an otherwise-wired vendor.
-        warnings.push(VendorWarning::new(
-            "vendor_marker_write_failed",
-            format!("could not write {}: {e}", super::state::VENDOR_MARKER_FILE),
-        ));
-    }
+    write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
 
     let gemfile_record = match &plan {
         GemfilePlan::Rewrite {
@@ -1264,15 +1259,14 @@ pub async fn revert_gem_opts(
     if keep_artifact {
         return outcome;
     }
-    if let Err(e) = remove_tree(&uuid_dir).await {
+    // The last gem entry leaves `.socket/vendor/gem/` (and `.socket/vendor/`)
+    // empty: the shared helper prunes them so a reverted project carries no
+    // vendor residue (non-recursive: siblings keep them).
+    if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
         outcome.success = false;
         outcome.error = Some(format!("failed to remove {}: {e}", uuid_dir.display()));
         return outcome;
     }
-    // The last gem entry leaves `.socket/vendor/gem/` (and `.socket/vendor/`)
-    // empty: prune them so a reverted project carries no vendor residue
-    // (`remove_dir` keeps non-empty levels).
-    prune_empty_vendor_levels(&uuid_dir).await;
     outcome
 }
 

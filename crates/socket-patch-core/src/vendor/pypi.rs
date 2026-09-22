@@ -11,11 +11,13 @@ use std::path::Path;
 use sha2::{Digest as _, Sha256};
 
 use crate::api::client::ApiClient;
+use crate::constants::SOCKET_DIR;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::utils::fs::{atomic_write_bytes, read_regular_to_string};
 use crate::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
+use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::utils::toml_edit_ext::has_table;
 
 use super::common::{
@@ -36,7 +38,7 @@ use super::pypi_wheel::{
 };
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
-    write_marker, PdmMeta, PipenvMeta, PoetryMeta, UvMeta, VendorArtifact, VendorEntry,
+    write_marker_or_warn, PdmMeta, PipenvMeta, PoetryMeta, UvMeta, VendorArtifact, VendorEntry,
     VendorMarker,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
@@ -896,27 +898,16 @@ pub async fn vendor_pypi_with_pipenv_version(
         ));
         // Restore the informational marker the deleted uuid dir lost.
         let marker = VendorMarker::new("pypi", base, record, vendored_at);
-        if let Err(e) = write_marker(&project_root.join(&uuid_dir_rel), &marker).await {
-            warnings.push(VendorWarning::new(
-                "marker_write_failed",
-                format!("could not write the vendor marker: {e}"),
-            ));
-        }
+        write_marker_or_warn(&project_root.join(&uuid_dir_rel), &marker, &mut warnings).await;
         return done(result, None, warnings);
     }
 
     // Marker: artifact-side breadcrumb in the uuid dir (informational only —
-    // sweep/verify key off state.json + the path uuid). Written before the
+    // sweep/verify key off state.json + the path uuid, so a failed write is
+    // a warning here exactly as in every other backend). Written before the
     // wiring so lockfile edits stay the last mutation.
     let marker = VendorMarker::new("pypi", base, record, vendored_at);
-    if let Err(e) = write_marker(&project_root.join(&uuid_dir_rel), &marker).await {
-        let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
-        prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
-        let mut result = result;
-        result.success = false;
-        result.error = Some(format!("cannot write vendor marker: {e}"));
-        return done(result, None, warnings);
-    }
+    write_marker_or_warn(&project_root.join(&uuid_dir_rel), &marker, &mut warnings).await;
 
     // Wiring LAST. On failure the wheel artifact is swept back out so a
     // failed vendor leaves no committed residue.
@@ -1324,19 +1315,22 @@ pub async fn revert_pypi_opts(
         ));
         return outcome;
     };
-    match tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => outcome.warnings.push(VendorWarning::new(
+    // Remove the unit (a missing dir is fine), then prune the
+    // `.socket/vendor/pypi/` and `.socket/vendor/` husks it leaves when it was
+    // the last entry (non-recursive: siblings keep them). A removal failure
+    // keeps the warning posture — the wiring restore above already succeeded
+    // — and skips the prune (the dir is still there).
+    if let Err(e) = remove_tree_and_prune(
+        &project_root.join(&uuid_dir_rel),
+        &project_root.join(SOCKET_DIR),
+    )
+    .await
+    {
+        outcome.warnings.push(VendorWarning::new(
             "vendor_artifact_remove_failed",
             format!("could not remove {uuid_dir_rel}: {e}"),
-        )),
+        ));
     }
-    // The last pypi entry leaves `.socket/vendor/pypi/` (and `.socket/vendor/`)
-    // empty: prune them so a reverted project carries no vendor residue
-    // (`remove_dir` keeps non-empty levels, and a dir the removal above could
-    // not delete stops the climb).
-    prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
     outcome
 }
 
@@ -4802,7 +4796,7 @@ wheels = [
             "{warnings:?}"
         );
         assert!(
-            !warnings.iter().any(|w| w.code == "marker_write_failed"),
+            !warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
             "rewriting the surviving marker file must succeed: {warnings:?}"
         );
         assert!(wheel.is_file(), "wheel rebuilt at the recorded path");
@@ -4821,34 +4815,38 @@ wheels = [
             .unwrap();
     }
 
-    /// Fresh path: a failed marker write flips the run to failure, sweeps
-    /// the uuid dir, and leaves the wiring untouched (it was never written —
-    /// the marker lands BEFORE the wiring).
+    /// Fresh path: the marker is advisory on a first vendor too (parity with
+    /// every other backend) — a failed write is a `vendor_marker_write_failed`
+    /// warning riding an otherwise successful run: the wheel stays, the
+    /// wiring lands (the marker is written BEFORE the wiring, and its failure
+    /// no longer short-circuits that), and the ledger entry is emitted.
     #[tokio::test]
-    async fn fresh_marker_write_failure_sweeps_artifact_and_fails() {
+    async fn fresh_marker_write_failure_warns_but_vendor_succeeds() {
         let fx = e2e_fixture().await;
         plant_marker_blocker(&fx).await;
         let sources = PatchSources::blobs_only(&fx.blobs);
         let outcome = vendor_six(&fx, &sources, None).await;
-        let VendorOutcome::Done { result, entry, .. } = outcome else {
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = outcome
+        else {
             panic!("expected Done, got {outcome:?}");
         };
-        assert!(!result.success, "the failed marker write must be reported");
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("a fully-wired vendor still emits its entry");
         assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("cannot write vendor marker"),
-            "{:?}",
-            result.error
+            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            "the failed marker write is surfaced: {warnings:?}"
         );
-        assert!(entry.is_none());
         assert!(
-            !uuid_dir_of(&fx).exists(),
-            "a failed fresh vendor must leave no committed residue"
+            fx.root.join(&entry.artifact.path).is_file(),
+            "the wheel is kept at the recorded path"
         );
-        assert_eq!(read_requirements(&fx).await, "six==1.16.0\n");
+        let wired = read_requirements(&fx).await;
+        assert_ne!(wired, "six==1.16.0\n", "the wiring still lands");
+        assert!(wired.contains(".socket/vendor/pypi/"), "{wired}");
     }
 
     /// In-sync rebuild path: the marker restore is advisory — its failure is
@@ -4892,7 +4890,7 @@ wheels = [
             "{warnings:?}"
         );
         assert!(
-            warnings.iter().any(|w| w.code == "marker_write_failed"),
+            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
             "{warnings:?}"
         );
         assert!(fx.root.join(&entry.artifact.path).is_file());

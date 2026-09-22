@@ -38,7 +38,7 @@ use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip_with_prefix;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
-    write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -272,12 +272,7 @@ pub async fn vendor_go_module(
             // a failed write only warns).
             let marker =
                 VendorMarker::new("golang", strip_purl_qualifiers(purl), record, vendored_at);
-            if let Err(e) = write_marker(&project_root.join(&base_rel), &marker).await {
-                warnings.push(VendorWarning::new(
-                    "marker_write_failed",
-                    format!("could not write the vendor marker: {e}"),
-                ));
-            }
+            write_marker_or_warn(&project_root.join(&base_rel), &marker, &mut warnings).await;
             if wired_version_ok {
                 warnings.push(VendorWarning::new(
                     "vendor_artifact_rebuilt",
@@ -355,14 +350,7 @@ pub async fn vendor_go_module(
     // ── marker + ledger entry ─────────────────────────────────────────────
     let base_purl = strip_purl_qualifiers(purl).to_string();
     let marker = VendorMarker::new("golang", &base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&project_root.join(&base_rel), &marker).await {
-        // The marker is belt-and-braces metadata (never a trust input); a
-        // failed write must not undo a fully-wired vendor — surface it.
-        warnings.push(VendorWarning::new(
-            "marker_write_failed",
-            format!("could not write the vendor marker: {e}"),
-        ));
-    }
+    write_marker_or_warn(&project_root.join(&base_rel), &marker, &mut warnings).await;
 
     let entry = VendorEntry {
         ecosystem: "golang".to_string(),

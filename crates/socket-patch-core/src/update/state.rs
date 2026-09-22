@@ -8,7 +8,7 @@
 //! clock skew by degrading to "never checked". Nothing in here may ever
 //! fail a command — callers treat all errors as "skip the check".
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -84,42 +84,16 @@ pub fn load_state() -> UpdateCheckState {
     let Some(path) = state_file_path() else {
         return UpdateCheckState::default();
     };
-    let Ok(bytes) = read_state_bytes(&path) else {
+    // `load_state` runs synchronously at the start of every command (the
+    // passive notifier's guard path), and a plain `open(2)` of a FIFO
+    // planted at this path would wait forever for a writer, wedging the
+    // whole CLI before the command even starts. The shared sync reader opens
+    // `O_NONBLOCK` and rejects FIFOs/devices/directories on the handle, so
+    // the caller degrades to never-checked like any other unreadable state.
+    let Ok(bytes) = crate::utils::fs::read_regular_to_bytes_sync(&path) else {
         return UpdateCheckState::default();
     };
     serde_json::from_slice(&bytes).unwrap_or_default()
-}
-
-/// Read the state bytes, requiring a regular file — the sync twin of
-/// [`open_regular_file`](crate::utils::fs::open_regular_file). `load_state`
-/// runs synchronously at the start of every command (the passive notifier's
-/// guard path), and a plain `open(2)` of a FIFO planted at this path waits
-/// forever for a writer, wedging the whole CLI before the command even
-/// starts. `O_NONBLOCK` makes the open return immediately; the handle-based
-/// `is_file` check then rejects FIFOs/devices/directories so the caller
-/// degrades to never-checked like any other unreadable state.
-fn read_state_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
-    use std::io::Read;
-    #[cfg(unix)]
-    let mut file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)?
-    };
-    #[cfg(not(unix))]
-    let mut file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
 }
 
 /// Persist the state atomically (stage + fsync + rename). Errors bubble so
@@ -254,7 +228,7 @@ mod tests {
     /// flakes under heavy parallel load (fork/exec starvation) and the
     /// syscall needs no process at all.
     #[cfg(unix)]
-    fn mkfifo(path: &Path) {
+    fn mkfifo(path: &std::path::Path) {
         use std::os::unix::ffi::OsStrExt;
         let c_path =
             std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");

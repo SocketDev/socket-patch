@@ -369,7 +369,7 @@ fn rewrite_hatch(
     // Overlay only the two documents the hatch planner reads, so the second
     // pypi dep sees the first dep's rewritten pyproject — without cloning
     // every candidate lockfile in `files` for it.
-    let mut current: BTreeMap<String, String> = ["pyproject.toml", "hatch.toml"]
+    let mut current: BTreeMap<String, String> = crate::utils::hatch::HATCH_FILES
         .into_iter()
         .filter_map(|k| files.get(k).map(|v| (k.to_owned(), v.clone())))
         .collect();

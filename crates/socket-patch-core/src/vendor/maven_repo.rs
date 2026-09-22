@@ -63,6 +63,7 @@ use serde_json::Value;
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 
+use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
@@ -72,6 +73,7 @@ use crate::utils::fs::{
     read_regular_to_string,
 };
 use crate::utils::purl::{build_maven_purl, parse_maven_purl};
+use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
     already_patched_result, done, failed_result, prune_empty_vendor_levels, read_zip_artifact,
@@ -81,7 +83,7 @@ use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
 use super::service_fetch::{service_archive_copy, ServiceCopy};
 use super::state::{
-    write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -380,14 +382,7 @@ pub async fn vendor_maven(
     // ── marker + ledger entry ─────────────────────────────────────────────
     let base_purl = build_maven_purl(group_id, artifact_id, version);
     let marker = VendorMarker::new("maven", &base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&uuid_dir, &marker).await {
-        // Informational only (state.json is the ledger of record) — a marker
-        // failure must not fail an otherwise-wired vendor.
-        warnings.push(VendorWarning::new(
-            "vendor_marker_write_failed",
-            format!("could not write {}: {e}", super::state::VENDOR_MARKER_FILE),
-        ));
-    }
+    write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
 
     // The single wiring record is the authoritative revert record: it carries
     // the whole-file pre/post pom.xml snapshot. `Added` because we ADD a
@@ -508,7 +503,11 @@ pub async fn revert_maven_opts(
     // (and the caller keeps the ledger entry), so only the deletion is
     // skipped.
     if !dry_run && !keep_artifact {
-        if let Err(e) = remove_tree(&uuid_dir).await {
+        // The last maven entry leaves `.socket/vendor/maven/` (and
+        // `.socket/vendor/`) empty: the shared helper prunes them so a
+        // reverted project carries no vendor residue (non-recursive:
+        // siblings keep them).
+        if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
             return RevertOutcome {
                 kept_artifact: false,
                 success: false,
@@ -516,10 +515,6 @@ pub async fn revert_maven_opts(
                 error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
             };
         }
-        // The last maven entry leaves `.socket/vendor/maven/` (and
-        // `.socket/vendor/`) empty: prune them so a reverted project carries
-        // no vendor residue (`remove_dir` keeps non-empty levels).
-        prune_empty_vendor_levels(&uuid_dir).await;
     }
 
     RevertOutcome {

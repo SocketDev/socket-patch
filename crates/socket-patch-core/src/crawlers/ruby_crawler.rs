@@ -409,18 +409,16 @@ impl RubyCrawler {
     /// `$BUNDLE_APP_CONFIG/config`, else `<cwd>/.bundle/config`, resolved by
     /// the shared [`crate::setup::gem::bundler_app_config_dir`] rule.
     async fn app_config_bundle_path(cwd: &Path, app_config_env: Option<&OsStr>) -> Option<String> {
-        use tokio::io::AsyncReadExt;
-
         let config = crate::setup::gem::bundler_app_config_dir(cwd, app_config_env).join("config");
         // The config lives inside the (untrusted) project tree: a planted
         // FIFO would make a plain `read_to_string` open block forever
         // waiting for a writer, wedging scan (crawl_all) and apply/get
-        // (find_by_purls path discovery). Open via `open_regular_file` —
-        // non-blocking on Unix, rejecting FIFOs/devices/directories (see
-        // its docs) — same as the npm/composer/python crawlers.
-        let (mut file, metadata) = crate::utils::fs::open_regular_file(&config).await.ok()?;
-        let mut contents = String::with_capacity(metadata.len() as usize);
-        file.read_to_string(&mut contents).await.ok()?;
+        // (find_by_purls path discovery). Read via `read_regular_to_string`
+        // — non-blocking open on Unix, rejecting FIFOs/devices/directories
+        // (see its docs) — same as the npm/composer/python crawlers.
+        let contents = crate::utils::fs::read_regular_to_string(&config)
+            .await
+            .ok()?;
         parse_bundle_config_path(&contents)
     }
 

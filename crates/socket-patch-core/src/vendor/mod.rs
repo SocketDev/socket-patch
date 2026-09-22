@@ -35,10 +35,12 @@
 //! and removes the artifacts. The rest of the CLI yields ownership of
 //! ledger-recorded purls (`apply`/`rollback` skip them, `scan --prune`
 //! exempts them) and `remove` reverts vendoring as part of removing a
-//! patch. Detached entries (`scan --vendor --detached`) carry an embedded
-//! patch record instead of a manifest entry. The path-level UUID makes "is
-//! this Socket-vendored, by which patch" recoverable from the lockfile
-//! string alone ([`path`]).
+//! patch. Every `scan --mode vendored` / `get --mode vendored` entry is
+//! detached: it embeds the patch `record` (the verification source —
+//! vendored runs never write `.socket/manifest.json`), while the standalone
+//! `vendor` command records `detached: false` entries that point at the
+//! manifest. The path-level UUID makes "is this Socket-vendored, by which
+//! patch" recoverable from the lockfile string alone ([`path`]).
 //!
 //! [`ReplaceOwner::Vendor`]: crate::vendor::go_mod_edit::ReplaceOwner
 
@@ -71,7 +73,6 @@ pub mod pnpm_lock;
 pub mod pnpm_lock_legacy;
 pub mod pypi;
 mod pypi_hatch;
-pub(crate) use pypi_lock::restore_document as restore_python_document;
 mod pypi_lock;
 pub mod pypi_pdm;
 pub mod pypi_pipenv;
@@ -89,6 +90,7 @@ pub(crate) mod yarn_classic_lock;
 mod yarn_layering_tests;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
+pub(crate) use pypi_lock::restore_document as restore_python_document;
 pub use pypi_requirements::requirements_include_names;
 pub use state::{
     carry_forward_wiring, load_state, lookup_entry, save_state, VendorEntry, VendorState,

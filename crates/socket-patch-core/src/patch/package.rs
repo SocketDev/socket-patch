@@ -57,11 +57,11 @@ pub enum ArchiveError {
 /// per-entry size, and entry count are all bounded.
 ///
 /// Note: we never call `tar::Archive::unpack`; the bytes are buffered
-/// and later written through `apply_file_patch` to an explicit
+/// and later written through `apply_file_patch_at` to an explicit
 /// `pkg_path.join(normalized)`. That avoids the classic
 /// symlink-followed-by-write class of tar-extraction attacks at the
 /// extraction step itself — the on-disk write site is the single,
-/// hash-verified path inside `apply_file_patch`.
+/// hash-verified path inside `apply_file_patch_at`.
 pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
     // Open non-blockingly and require a regular file. A plain `open(2)` of a
     // FIFO planted at the archive path waits for a writer that may never
