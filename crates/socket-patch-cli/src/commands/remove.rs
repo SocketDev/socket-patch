@@ -1221,8 +1221,8 @@ async fn remove_ledger_only(
             args.common.dry_run,
             "vendor_state_retained",
             format!(
-                "{} matches only detached vendored patch(es); removing one means reverting \
-                 its vendoring, which --skip-rollback prevents",
+                "{} matches only vendored patch(es) with no manifest record; removing one \
+                 means reverting its vendoring, which --skip-rollback prevents",
                 args.identifier
             ),
         );
@@ -1232,11 +1232,11 @@ async fn remove_ledger_only(
     if loud {
         if args.preserve_state {
             eprintln!(
-                "The following detached vendored patch(es) will be unwired (artifacts and \
-                 ledger entries preserved):"
+                "The following vendored patch(es) will be unwired (artifacts and ledger \
+                 entries preserved):"
             );
         } else {
-            eprintln!("The following detached vendored patch(es) will be reverted and removed:");
+            eprintln!("The following vendored patch(es) will be reverted and removed:");
         }
         for (key, entry) in &matches {
             eprintln!("  - {key} (UUID: {})", short_uuid(&entry.uuid));

@@ -347,7 +347,7 @@ fn remove_silent_suppresses_detached_revert_output() {
     let (loud_code, loud_stdout, loud_stderr) = run_remove(tmp2.path(), &[purl, "--yes"]);
     assert_eq!(loud_code, 0);
     assert!(
-        loud_stderr.contains("detached vendored patch(es) will be reverted"),
+        loud_stderr.contains("vendored patch(es) will be reverted and removed"),
         "non-silent detached run must print the listing; got {loud_stderr:?}"
     );
     assert!(

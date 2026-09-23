@@ -314,7 +314,10 @@ fn corrupt_redirect_ledger_json_envelope_carries_code_and_preserves_ledger() {
     assert_eq!(env["status"], "error", "{env}");
     assert_eq!(env["error"]["code"], "redirect_ledger_corrupt", "{env}");
     assert!(
-        env["error"]["message"].as_str().unwrap().contains("malformed"),
+        env["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("malformed"),
         "the envelope must carry the CorruptRedirectState detail: {env}"
     );
     // vex is a READ-ONLY ledger consumer: the malformed file may still hold
@@ -326,7 +329,8 @@ fn corrupt_redirect_ledger_json_envelope_carries_code_and_preserves_ledger() {
         "vex must not touch the malformed redirect ledger"
     );
     assert!(
-        !cwd.join(".socket/vendor/redirect-state.json.corrupt").exists(),
+        !cwd.join(".socket/vendor/redirect-state.json.corrupt")
+            .exists(),
         "vex must not quarantine the ledger (that is the writer's recovery flow)"
     );
     assert!(!vex_path.exists(), "no document on a hard error");
@@ -467,7 +471,11 @@ fn corrupt_vendor_ledger_json_mode_pins_channel_behavior() {
 /// Tempdir with package.json AND Cargo.toml (no .git), plus a one-patch
 /// manifest. Auto-detect must pick package.json → `pkg:npm/app@1.0.0`.
 fn scaffold_multi_manifest_project(cwd: &Path) {
-    std::fs::write(cwd.join("package.json"), r#"{"name":"app","version":"1.0.0"}"#).unwrap();
+    std::fs::write(
+        cwd.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
     std::fs::write(
         cwd.join("Cargo.toml"),
         "[package]\nname = \"app\"\nversion = \"1.0.0\"\n",
@@ -521,8 +529,7 @@ fn auto_detect_multi_manifest_warns_on_stderr() {
         "the warning must name the manifest actually used. got: {stderr}"
     );
     // The detection itself resolved via package.json.
-    let doc: Value =
-        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
     assert_eq!(
         doc["statements"][0]["products"][0]["@id"], "pkg:npm/app@1.0.0",
         "package.json wins the multi-manifest priority: {doc}"
@@ -564,9 +571,11 @@ fn auto_detect_multi_manifest_warning_suppressed_by_silent() {
         String::from_utf8_lossy(&out.stdout)
     );
     // The document is still produced with the auto-detected product.
-    let doc: Value =
-        serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
-    assert_eq!(doc["statements"][0]["products"][0]["@id"], "pkg:npm/app@1.0.0");
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&out_path).unwrap()).unwrap();
+    assert_eq!(
+        doc["statements"][0]["products"][0]["@id"],
+        "pkg:npm/app@1.0.0"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -831,5 +840,74 @@ fn go_patches_synthesis_skips_tampered_and_stale_replaces() {
     assert!(
         !stdout.contains("github.com/noversion"),
         "a version-less replace attests nothing:\n{stdout}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Corrupt vendor ledger on a MANIFEST-FREE project (the D2 vendored
+// posture): the ledger was the only possible source of records, so the
+// run still fails `manifest_not_found` (exit 2, read-only degrade posture
+// kept) — but the unreadable ledger is disclosed first, on stderr and in
+// the error's message, instead of only telling the operator a manifest
+// they never had is missing. `--silent` mutes the advisory, never the error.
+// ──────────────────────────────────────────────────────────────────────
+
+#[test]
+fn corrupt_vendor_ledger_without_manifest_is_disclosed_before_manifest_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let dir = cwd.join(".socket/vendor");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("state.json"), "not json").unwrap();
+
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    assert!(out.stdout.is_empty(), "no document");
+    assert!(
+        stderr.contains("unreadable vendor state") && stderr.contains("corrupt"),
+        "the unreadable ledger must be disclosed: {stderr}"
+    );
+    assert!(
+        stderr.contains("Manifest not found")
+            && stderr.contains("vendor ledger is also unreadable"),
+        "the error names both missing stores: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("state.json")).unwrap(),
+        b"not json",
+        "a read-only consumer never moves or rewrites the ledger"
+    );
+    assert!(!dir.join("state.json.corrupt").exists());
+
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+            "--silent",
+        ])
+        .output()
+        .expect("invoke vex --silent");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    assert!(
+        !stderr.contains("Warning: unreadable vendor state"),
+        "--silent mutes the advisory: {stderr}"
+    );
+    assert!(
+        stderr.contains("Manifest not found"),
+        "--silent never mutes the error: {stderr}"
     );
 }

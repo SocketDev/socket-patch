@@ -981,12 +981,35 @@ async fn append_patch_consistency_entries(
     // VendorContext below. Without the fold a project whose committed
     // `.socket/vendor/**` artifact is missing or corrupt reported
     // `configured` — the exact hooks-present-but-state-drifted case
-    // property 4 exists to catch.
+    // property 4 exists to catch. A ledger that cannot be read or parsed is
+    // that case too (contract: "never as a `configured` verdict"): it is
+    // surfaced BEFORE the emptiness return below — on a manifest-free
+    // vendored project the fold is the only source of purls, so returning
+    // early would report `configured` with no signal at all — as the shared
+    // `unreadable vendor state` warning plus a `vendor_ledger` error entry
+    // (verdict `error`, exit 1), and the verifier proceeds over an empty
+    // ledger (already reported, so not warned twice).
     let mut manifest = manifest.unwrap_or_default();
-    let ledger = socket_patch_core::vendor::load_state(&common.cwd).await;
-    if let Ok(state) = &ledger {
-        crate::commands::fold_detached_records(&mut manifest, &state.entries);
-    }
+    let ledger = match socket_patch_core::vendor::load_state(&common.cwd).await {
+        Ok(state) => {
+            crate::commands::fold_detached_records(&mut manifest, &state.entries);
+            Ok(state)
+        }
+        Err(e) => {
+            crate::commands::vex::warn_unreadable_vendor_state(common, &e);
+            entries.push((
+                "vendor_ledger",
+                common
+                    .cwd
+                    .join(socket_patch_core::vendor::VENDOR_STATE_REL)
+                    .display()
+                    .to_string(),
+                CheckState::Error,
+                Some(format!("unreadable vendor state ({e})")),
+            ));
+            Ok(socket_patch_core::vendor::VendorState::new())
+        }
+    };
     if manifest.patches.is_empty() {
         return;
     }

@@ -1679,3 +1679,92 @@ fn remove_json_surfaces_poetry_lock_refresh_warning() {
         "the refresh failure must ride the --json warnings: {v}"
     );
 }
+
+// ───────────── --check: unreadable vendor ledger on a manifest-free project ─────────────
+
+/// Contract §5: `--check` (property 4) reads the vendor ledger even without a
+/// manifest, and a ledger it cannot read or parse is surfaced as the
+/// `Warning: unreadable vendor state (…)` line plus a `vendor_ledger` error
+/// entry — verdict `error`, exit 1 — never as a `configured` verdict. The
+/// manifest-free vendored project (the only `scan`/`get --mode vendored`
+/// posture) is exactly where the corrupt ledger used to be swallowed: hooks
+/// wired, no manifest, garbage `state.json` → `configured`, exit 0, silence.
+#[test]
+fn check_reports_an_unreadable_vendor_ledger_instead_of_configured() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    write(&cwd.join("package.json"), UNWIRED_PACKAGE_JSON);
+    let (code, _stdout, stderr) = run(cwd, &["setup", "--json", "--yes"]);
+    assert_eq!(code, 0, "precondition: the hook wires; stderr=\n{stderr}");
+    assert!(!cwd.join(".socket/manifest.json").exists());
+    let vendor = cwd.join(".socket/vendor");
+    std::fs::create_dir_all(&vendor).unwrap();
+    std::fs::write(vendor.join("state.json"), b"not json").unwrap();
+
+    let (code, doc) = run_json(cwd, &["setup", "--check", "--json"]);
+    assert_eq!(
+        code, 1,
+        "an unreadable ledger is never a configured verdict: {doc}"
+    );
+    assert_eq!(doc["status"], "error", "{doc}");
+    let entry = doc["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["kind"] == "vendor_ledger")
+        .cloned()
+        .unwrap_or_else(|| panic!("a vendor_ledger entry must be reported: {doc}"));
+    assert_eq!(entry["status"], "error", "{doc}");
+    assert!(
+        entry["path"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with(".socket/vendor/state.json"),
+        "{doc}"
+    );
+    assert!(
+        entry["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("corrupt"),
+        "the entry carries load_state's detail: {doc}"
+    );
+    let (_code, _stdout, stderr) = run(cwd, &["setup", "--check", "--json"]);
+    assert!(
+        stderr.contains("unreadable vendor state") && stderr.contains("corrupt"),
+        "the contract's warning line reaches stderr; stderr=\n{stderr}"
+    );
+
+    // Human arm: same verdict, the `!` error row names the ledger.
+    let (code, stdout, stderr) = run(cwd, &["setup", "--check"]);
+    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stdout.contains(".socket/vendor/state.json") && stdout.contains("1 error(s)"),
+        "stdout=\n{stdout}"
+    );
+    assert!(
+        stderr.contains("unreadable vendor state"),
+        "stderr=\n{stderr}"
+    );
+
+    // --silent: errors only — the warning is muted, the error row is not.
+    let (code, stdout, stderr) = run(cwd, &["setup", "--check", "--silent"]);
+    assert_eq!(code, 1);
+    assert!(
+        stdout.is_empty(),
+        "--silent mutes the report; stdout=\n{stdout}"
+    );
+    assert!(
+        !stderr.contains("Warning:"),
+        "--silent mutes the advisory; stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Error:") && stderr.contains(".socket/vendor/state.json"),
+        "the error row survives --silent; stderr=\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(vendor.join("state.json")).unwrap(),
+        b"not json",
+        "--check never rewrites or quarantines the ledger"
+    );
+}

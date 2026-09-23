@@ -69,7 +69,7 @@ into the new version's section — see docs/releasing.md.
   a vendored run vendors is migrated into the ledger (dropped from the
   manifest; an emptied manifest is left as `{"patches": {}}`). `list` now
   reads the vendor ledger too, so a vendored-only project lists its patches
-  with a `(vendored)` marker and exits 0 instead of `manifest_not_found`;
+  with a `Mode: vendored` label and exits 0 instead of `manifest_not_found`;
   `scan --prune`'s lockfile-unused reconcile applies to every ledger entry
   (the check is about the lockfile, not the manifest); and standalone `vendor`
   with no manifest is a clean exit-0 no-op whose message names the missing
@@ -407,7 +407,10 @@ into the new version's section — see docs/releasing.md.
   under `apply.lock`; a held or unopenable lock, or a manifest that cannot
   be read or written, is reported as `not persisting --exclude: …` instead
   of being swallowed. `setup --check` reads the vendor ledger even without
-  a manifest and warns `unreadable vendor state` on a corrupt one; `list`
+  a manifest and, on a corrupt one, warns `unreadable vendor state` and
+  reports a `vendor_ledger` error entry (verdict `error`, exit 1) — never
+  `configured`; `vex` discloses the same unreadable ledger before its
+  `manifest_not_found` / `no_patches` exit on a manifest-free project; `list`
   degrades a corrupt vendor ledger to a `Warning: unreadable vendor ledger …`
   line (muted by `--silent`) rather than an error; `patch_setup` telemetry
   fires only for a successful, non-dry-run setup.

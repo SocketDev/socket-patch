@@ -725,7 +725,12 @@ async fn generate_vex_from_manifest_path_inner(
     // detached fold here, then either the `--no-verify` classification or
     // the verify-path `VendorContext` (where a read error is surfaced; an
     // unreadable ledger leaves the manifest view unchanged here and
-    // verification fails closed per entry downstream).
+    // verification fails closed per entry downstream). When that unreadable
+    // ledger was the ONLY possible source — a manifest-free vendored
+    // project, the D2 posture — the empty view below fails before any
+    // downstream report, so the read error is disclosed right there: the
+    // operator must learn the ledger is broken, not that a manifest they
+    // never had is missing.
     let ledger = socket_patch_core::vendor::load_state(&common.cwd).await;
     // Vendored patches (manifest-free by design: every `scan`/`get --mode
     // vendored` entry is detached with its embedded record) and redirected
@@ -742,18 +747,28 @@ async fn generate_vex_from_manifest_path_inner(
         }
     };
     if manifest.patches.is_empty() {
+        let ledger_note = match &ledger {
+            Err(e) => {
+                warn_unreadable_vendor_state(common, e);
+                format!("; the vendor ledger is also unreadable ({e})")
+            }
+            Ok(_) => String::new(),
+        };
         if !had_manifest_file {
             return Err(fail(
                 common,
                 "manifest_not_found",
-                format!("Manifest not found at {}", manifest_path.display()),
+                format!(
+                    "Manifest not found at {}{ledger_note}",
+                    manifest_path.display()
+                ),
             )
             .await);
         }
         return Err(fail(
             common,
             "no_patches",
-            "Manifest is empty — nothing to attest.".to_string(),
+            format!("Manifest is empty — nothing to attest.{ledger_note}"),
         )
         .await);
     }
@@ -829,6 +844,19 @@ async fn resolve_product_id(common: &GlobalArgs, product: Option<&str>) -> Resul
     })
 }
 
+/// The one `unreadable vendor state` advisory (contract: `setup --check`
+/// and `vex` surface a ledger they cannot read or parse as this line, muted
+/// by `--silent`): a read-only consumer degrades to "nothing vendored" and
+/// says so, on stderr, so the operator learns why nothing attests.
+pub(crate) fn warn_unreadable_vendor_state(common: &GlobalArgs, e: &std::io::Error) {
+    if !common.silent {
+        eprintln!(
+            "Warning: unreadable vendor state ({e}); vendored patches cannot be verified \
+             from the committed artifact"
+        );
+    }
+}
+
 /// Build the [`VendorContext`] for verification from `ledger` — the
 /// caller's ONE `load_state` of `.socket/vendor/state.json` (it also fed
 /// the detached-record fold) — plus synthesized entries for the legacy
@@ -856,12 +884,7 @@ pub(crate) async fn vendor_context_from(
     let entries = match ledger {
         Ok(state) => state.entries,
         Err(e) => {
-            if !common.silent {
-                eprintln!(
-                    "Warning: unreadable vendor state ({e}); vendored patches cannot be \
-                     verified from the committed artifact"
-                );
-            }
+            warn_unreadable_vendor_state(common, &e);
             HashMap::new()
         }
     };
