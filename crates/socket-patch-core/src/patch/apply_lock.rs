@@ -28,9 +28,15 @@
 //!   what makes the unlink safe: any waiter that already opened this
 //!   inode fails the identity check once it finally locks it, instead of
 //!   becoming a second live holder alongside whoever locked the
-//!   replacement file.
+//!   replacement file. The unlink is itself gated on the path still
+//!   naming the held inode — a replacement planted by a non-cooperating
+//!   `rm` + `touch` is another holder's (or nobody's) file and is left
+//!   for the next acquire to reclaim, rather than unlinked from under
+//!   whoever locked it.
 //!
-//! So no command leaves `apply.lock` behind, and a project that had no
+//! So no command leaves `apply.lock` behind (barring that non-cooperating
+//! replacement, which the next lock-taking command reclaims), and a
+//! project that had no
 //! `.socket/` before a run has none after it unless the run wrote real
 //! state there. A leftover file from a crashed run needs no removal to
 //! unblock anything — the kernel released the dead process's advisory
@@ -45,8 +51,9 @@
 //! `ERROR_SHARING_VIOLATION` (32) or `ERROR_DELETE_PENDING` (303). Two
 //! measures keep that window short and harmless: a waiter never holds
 //! the file open across its backoff sleep, and those three codes get a
-//! short fixed grace (5 ms × 40, independent of the caller's timeout)
-//! before they surface as `Io`. std's default share mode already
+//! short fixed grace (5 ms × 40 per streak, independent of the caller's
+//! timeout; a live holder observed in between resets it) before they
+//! surface as `Io`. std's default share mode already
 //! includes `FILE_SHARE_DELETE`, so a holder can unlink the file while
 //! waiters have it open.
 //!
@@ -74,9 +81,12 @@ const BACKOFF_CAP: Duration = Duration::from_millis(100);
 /// `Io`. Each one means a releaser pruned `.socket/` between two of our
 /// steps — i.e. a competitor completed a whole acquire→release cycle —
 /// so they are not contention and are bounded by count rather than by
-/// `timeout`. The bound is generous: two processes hammering the lock
-/// back-to-back (the unit tests do exactly that) can string dozens of
-/// these together, each costing only a `yield_now`.
+/// `timeout`. The bound is per streak: observing a live holder
+/// (`Contended`) resets it, so a long `--lock-timeout` wait behind a hot
+/// loop of short commands can never accumulate its way into `Io`. The
+/// bound is generous: two processes hammering the lock back-to-back (the
+/// unit tests do exactly that) can string dozens of these together, each
+/// costing only a `yield_now`.
 const VANISHED_LIMIT: u32 = 256;
 
 /// `EINVAL`: macOS reports an `O_CREAT` open inside a directory that was
@@ -85,9 +95,10 @@ const VANISHED_LIMIT: u32 = 256;
 #[cfg(unix)]
 const EINVAL: i32 = 22;
 
-/// Windows delete-pending grace: `attempts × sleep`, independent of
-/// `timeout` (a zero-timeout try-once still waits it out, because the
-/// name is free, just not reusable yet).
+/// Windows delete-pending grace: `attempts × sleep` per delete-pending
+/// streak, independent of `timeout` (a zero-timeout try-once still waits
+/// it out, because the name is free, just not reusable yet). Like
+/// `VANISHED_LIMIT`, a `Contended` outcome resets the streak.
 const DELETE_PENDING_ATTEMPTS: u32 = 40;
 const DELETE_PENDING_SLEEP: Duration = Duration::from_millis(5);
 
@@ -144,10 +155,26 @@ impl LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        // R1: unlink while still holding the lock. `NotFound` (a
-        // non-cooperating `rm`) and every other error are ignored: a
-        // leftover file is harmless and reclaimed by the next acquire.
-        let _ = std::fs::remove_file(&self.path);
+        // R1: unlink while still holding the lock — but only the file we
+        // hold. The unlink is gated on the path still naming the held
+        // inode: after a non-cooperating `rm` + `touch`, the path names a
+        // replacement that another acquirer may already hold, and
+        // unlinking it under them would turn one stray holder into a
+        // cascade of double-holds. Such a replacement is somebody else's
+        // (or nobody's) file and is left for the next acquire to reclaim.
+        // A `NotFound` probe means the file is already gone; any other
+        // probe failure (fd pressure at drop time) falls back to the
+        // unconditional unlink so a stale `apply.lock` is never left
+        // behind by a cooperating run. The probe→unlink window is a
+        // TOCTOU only a non-cooperating actor can hit, and there is no
+        // portable unlink-by-handle, so this is as tight as it gets.
+        let unlink = match Handle::from_path(&self.path) {
+            Ok(now) => self.handle.as_ref() == Some(&now),
+            Err(e) => e.kind() != ErrorKind::NotFound,
+        };
+        if unlink {
+            let _ = std::fs::remove_file(&self.path);
+        }
         // R2: close the handle; the OS releases the advisory lock.
         self.handle = None;
         // R3: prune an otherwise-empty `.socket/`. Non-recursive, so it
@@ -207,6 +234,11 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
         match attempt(&path, socket_dir) {
             Attempt::Acquired(guard) => return Ok(guard),
             Attempt::Contended => {
+                // A live holder was observed, so whatever vanished /
+                // delete-pending streak preceded it has ended: the bounds
+                // are per streak, never cumulative over the whole wait.
+                vanished = 0;
+                delete_pending = 0;
                 let now = Instant::now();
                 // A `None` deadline (timeout overflowed `Instant`) never
                 // elapses; otherwise give up once the budget is spent.
@@ -813,6 +845,41 @@ mod tests {
         // The orphan's drop finds nothing to unlink or prune and must not
         // panic.
         drop(orphan);
+        assert!(!socket.exists());
+    }
+
+    /// The converse order: the orphan is released while the holder of the
+    /// replacement file is still live. The orphan's drop must NOT unlink
+    /// the replacement (it never held that inode) — otherwise the live
+    /// holder's lock file vanishes, the next acquirer creates a third file
+    /// and co-holds alongside it, and one user-caused `rm` cascades into
+    /// a chain of double-holds.
+    #[cfg(unix)]
+    #[test]
+    fn orphan_drop_leaves_the_live_holders_replacement_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_dir(&dir);
+        let lock_path = socket.join("apply.lock");
+
+        let orphan = acquire(&socket, Duration::ZERO).unwrap();
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::File::create(&lock_path).unwrap();
+        let fresh = acquire(&socket, Duration::ZERO).unwrap();
+
+        drop(orphan);
+        assert!(
+            lock_path.is_file(),
+            "the orphan's drop must not unlink a file it does not hold"
+        );
+        assert!(socket.is_dir());
+        // `fresh` still excludes everyone else after the orphan's release.
+        assert!(matches!(
+            acquire(&socket, Duration::ZERO),
+            Err(LockError::Held)
+        ));
+
+        drop(fresh);
+        assert!(!lock_path.exists());
         assert!(!socket.exists());
     }
 
