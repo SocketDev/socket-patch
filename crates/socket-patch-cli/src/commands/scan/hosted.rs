@@ -2357,6 +2357,9 @@ pub(crate) async fn run_redirect_selected(
     // augment_with_redirect). Requested-but-failed VEX (including "nothing to
     // attest") flips the exit code, matching `scan --vex`.
     let mut vex_statements: Option<usize> = None;
+    // VEX run-level advisories: `note_warning` keeps them off stderr under
+    // --json, so the envelope's `vex.warnings` is their only channel there.
+    let mut vex_warnings: Vec<crate::json_envelope::RunWarning> = Vec::new();
     let mut vex_error: Option<(&'static str, String)> = None;
     let mut vex_code = 0;
     if vex.vex.is_some() && !common.dry_run {
@@ -2381,7 +2384,10 @@ pub(crate) async fn run_redirect_selected(
         params.known_stale = python_stale.stale_purls.iter().cloned().collect();
         let manifest_path = common.resolved_manifest_path();
         match generate_vex_from_manifest_path(common, &params, &manifest_path).await {
-            Ok(summary) => vex_statements = Some(summary.statements),
+            Ok(summary) => {
+                vex_statements = Some(summary.statements);
+                vex_warnings = summary.warnings;
+            }
             Err(e) => {
                 vex_code = 1;
                 vex_error = Some((e.code, e.message));
@@ -2433,6 +2439,11 @@ pub(crate) async fn run_redirect_selected(
                 "format": "openvex-0.2.0",
                 "verified": false,
             });
+            // Same skip-if-empty `warnings` key as the agent arm's VEX block.
+            if !vex_warnings.is_empty() {
+                result["vex"]["warnings"] = serde_json::to_value(&vex_warnings)
+                    .expect("RunWarning is a plain string struct: serialization cannot fail");
+            }
         } else if let Some((code, message)) = &vex_error {
             result["status"] = serde_json::json!("error");
             result["error"] = serde_json::json!({ "code": code, "message": message });

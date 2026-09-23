@@ -1076,13 +1076,14 @@ pub(crate) async fn run_locked(
                     Some(Ok(summary)) => {
                         if !args.common.silent {
                             println!(
-                                "Wrote OpenVEX document with {} to {}",
-                                plural(summary.statements, "statement", "statements"),
-                                args.vex
-                                    .vex
-                                    .as_ref()
-                                    .expect("vex_result is Some only when --vex was given")
-                                    .display(),
+                                "{}",
+                                crate::commands::vex::format_vex_written(
+                                    summary.statements,
+                                    args.vex
+                                        .vex
+                                        .as_ref()
+                                        .expect("vex_result is Some only when --vex was given"),
+                                )
                             );
                         }
                     }

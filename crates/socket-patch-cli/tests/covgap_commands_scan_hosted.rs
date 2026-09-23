@@ -1983,6 +1983,59 @@ async fn human_vex_success_summary_names_statements_path_and_ledger_caveat() {
     assert_eq!(doc["statements"][0]["vulnerability"]["name"], GHSA);
 }
 
+/// `--json` `--vex` run: VEX advisories are muted on stderr under --json,
+/// so the hosted envelope's `vex.warnings` must carry them (same
+/// skip-if-empty key as the agent arm), instead of dropping them.
+#[tokio::test]
+async fn json_vex_block_carries_the_vex_run_warnings() {
+    let server = MockServer::start().await;
+    mock_discovery(&server, PURL, UUID).await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    mock_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), NAME);
+
+    let (code, v) = scan_hosted_json(
+        tmp.path(),
+        &server.uri(),
+        &["--vex", "out.vex.json", "--vex-product", "consumer"],
+        &[],
+    );
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["vex"]["statements"], 1, "{v}");
+    let warnings = v["vex"]["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(warnings.len(), 1, "{v}");
+    assert_eq!(warnings[0]["code"], "product_not_iri", "{v}");
+    assert_eq!(
+        warnings[0]["detail"],
+        "Product override \"consumer\" (--vex-product) is neither a PURL (pkg:...) nor an \
+         absolute IRI; it is emitted verbatim as the OpenVEX product @id, which the spec \
+         requires to be an IRI — strict consumers may reject the document. Prefer \
+         pkg:<type>/<name>@<version>.",
+        "{v}"
+    );
+
+    // A clean product: no `warnings` key at all.
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), NAME);
+    let (code, v) = scan_hosted_json(
+        tmp.path(),
+        &server.uri(),
+        &[
+            "--vex",
+            "out.vex.json",
+            "--vex-product",
+            "pkg:npm/consumer@0.0.0",
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{v}");
+    assert!(v["vex"].get("warnings").is_none(), "{v}");
+}
+
 /// Human Rush run: the `redirect_rush_repo_state_stale` detail reaches
 /// stderr through the rush warning loop (the JSON twin is pinned in
 /// in_process_redirect.rs).

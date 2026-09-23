@@ -382,13 +382,14 @@ async fn embed_vex_human(
         Ok(summary) => {
             if !common.silent {
                 println!(
-                    "Wrote OpenVEX document with {} to {}",
-                    plural(summary.statements, "statement", "statements"),
-                    vex_args
-                        .vex
-                        .as_ref()
-                        .expect("--vex is Some: guarded by the early return above")
-                        .display(),
+                    "{}",
+                    crate::commands::vex::format_vex_written(
+                        summary.statements,
+                        vex_args
+                            .vex
+                            .as_ref()
+                            .expect("--vex is Some: guarded by the early return above"),
+                    )
                 );
             }
             0
