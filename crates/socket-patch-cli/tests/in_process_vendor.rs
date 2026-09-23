@@ -2234,6 +2234,86 @@ async fn scan_vendor_gem_detached_writes_no_manifest_and_reverts() {
     assert!(!fx.root().join(".socket/vendor").exists());
 }
 
+/// A wired gem whose committed copy went missing is rebuilt artifact-only,
+/// and the ledger entry the run persists must still describe it: the
+/// refreshed fingerprint (inventory) verifies against the rebuilt tree and
+/// the first run's pair-edit records ride along, so `vendor --revert` still
+/// byte-restores both files.
+#[tokio::test]
+async fn scan_vendor_gem_artifact_rebuild_keeps_ledger_verifiable_and_revertable() {
+    let mock = wiremock::MockServer::start().await;
+    mount_gem_patch_api(&mock, GEM_PURL).await;
+    let fx = gem_fixture();
+    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "first vendor: {env:#}");
+    let state1: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+
+    std::fs::remove_file(fx.vendored_lib()).unwrap();
+    let (code, env2) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "rebuild run: {env2:#}");
+    assert_eq!(std::fs::read(fx.vendored_lib()).unwrap(), GEM_PATCHED);
+    let state2: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    let entry2 = &state2["entries"][GEM_PURL];
+    assert_eq!(
+        entry2["wiring"], state1["entries"][GEM_PURL]["wiring"],
+        "the pair-edit revert records survive the artifact-only rebuild"
+    );
+    assert!(
+        entry2["artifact"]["fileInventory"].is_object(),
+        "the rebuilt tree is inventoried: {entry2:#}"
+    );
+
+    // `repair` re-checks every ledger fingerprint: nothing to rebuild.
+    let root = fx.root().to_str().unwrap();
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &["repair", "--json", "--dry-run", "--offline", "--cwd", root],
+        &[],
+    );
+    assert_eq!(code, 0, "repair --dry-run: {stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("wouldRebuild"),
+        "the persisted fingerprint must verify: {stdout}"
+    );
+
+    let (code, renv) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "revert: {renv:#}");
+    assert_eq!(
+        std::fs::read(fx.gemfile_path()).unwrap(),
+        GEM_GEMFILE.as_bytes()
+    );
+    assert_eq!(std::fs::read(fx.lock_path()).unwrap(), GEM_LOCK.as_bytes());
+}
+
+/// The same artifact-only rebuild with NO ledger entry to refresh (the
+/// state file was lost) must not invent one: the refreshed entry carries
+/// no wiring of its own, so recording it would give `vendor --revert` an
+/// entry that deletes the copy while the Gemfile still points at it.
+#[tokio::test]
+async fn scan_vendor_gem_artifact_rebuild_without_ledger_entry_records_none() {
+    let mock = wiremock::MockServer::start().await;
+    mount_gem_patch_api(&mock, GEM_PURL).await;
+    let fx = gem_fixture();
+    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "first vendor: {env:#}");
+
+    std::fs::remove_file(fx.state_path()).unwrap();
+    std::fs::remove_file(fx.vendored_lib()).unwrap();
+    let (code, env2) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "rebuild run: {env2:#}");
+    assert_eq!(
+        std::fs::read(fx.vendored_lib()).unwrap(),
+        GEM_PATCHED,
+        "the copy is still rebuilt"
+    );
+    let recorded = std::fs::read(fx.state_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .map(|s| !s["entries"][GEM_PURL].is_null())
+        .unwrap_or(false);
+    assert!(!recorded, "no wiring-less ledger entry invented: {env2:#}");
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // hosted → vendored mode conversion (takeover reconciliation, pnpm v9)
 // ─────────────────────────────────────────────────────────────────────

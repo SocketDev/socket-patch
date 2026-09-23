@@ -639,6 +639,21 @@ into the new version's section — see docs/releasing.md.
   contract; previously the entry was deleted, stranding a live ledger
   entry with no backing record. An all-kept run exits 1 `partialFailure`
   with `summary.removed: 0` (never `not_found` — the identifier matched).
+- **Rebuilding a missing gem, maven or nuget vendored artifact now updates
+  the ledger.** When `vendor` / `scan --vendor` found a wired project whose
+  committed artifact was missing or broken, it rebuilt the artifact but kept
+  the old fingerprint in `.socket/vendor/state.json` (the gem file
+  inventory, the maven/nuget `sha256`, and the nuget `packages.lock.json`
+  pin). If the rebuild came from the other source (the patch service instead
+  of a local build, or the reverse), the new bytes no longer matched the
+  ledger. VEX and verification then reported the artifact as tampered,
+  `repair` could fail, and `vendor --revert` left `packages.lock.json`
+  pinned to the patched `contentHash`. A rebuild from the patch service was
+  also reported as `already_vendored` instead of `applied`. The rebuild now
+  records the new fingerprint and keeps the entry's original wiring records,
+  so revert still restores the pre-vendor files. If `state.json` has no
+  entry for the package, the rebuild still runs but no entry is added,
+  because the run has no pre-vendor originals to record.
 
 ### Changed
 

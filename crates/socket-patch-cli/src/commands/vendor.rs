@@ -1781,6 +1781,16 @@ pub(crate) async fn vendor_records(
                             record_warning(env, candidate, w, common);
                         }
                     }
+                    // An artifact-only rebuild hands back a refreshed
+                    // fingerprint with no wiring of its own: it relies on
+                    // the ledger entry it replaces for the pre-vendor
+                    // originals. With no such entry, recording it would give
+                    // `--revert` an entry that deletes the artifact yet
+                    // cannot unwire the project — leave the ledger as is.
+                    let entry = entry.filter(|_| {
+                        state.entries.contains_key(candidate.as_str())
+                            || !warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt")
+                    });
                     if let Some(entry) = entry {
                         if let Some(flavor) = entry.flavor.as_deref() {
                             wired_flavors.insert(flavor.to_string());

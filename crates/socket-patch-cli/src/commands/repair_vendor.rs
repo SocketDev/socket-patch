@@ -1541,6 +1541,30 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                 // fingerprint computed from the rebuilt bytes.
                 let from_backend = entry.is_some();
                 let mut check_entry = entry.unwrap_or_else(|| c.entry.clone());
+                // An artifact-only rebuild hands back a refreshed entry with
+                // no wiring of its own: re-attach the repaired entry's
+                // records (a reconstructed entry is not in the ledger yet,
+                // so the persist below has nothing to carry them from).
+                if from_backend {
+                    vendor::carry_forward_wiring(&c.entry, &mut check_entry);
+                }
+                // The backend's refreshed entry already re-inventoried the
+                // member-verified rebuild; a changed inventory is the same
+                // provenance flip the post-verify refresh below reports.
+                if from_backend
+                    && c.entry.artifact.file_inventory.is_some()
+                    && check_entry.artifact.file_inventory != c.entry.artifact.file_inventory
+                {
+                    record_warning(
+                        env,
+                        &c.purl,
+                        &VendorWarning::new(
+                            "vendor_inventory_refreshed",
+                            INVENTORY_REFRESHED_DETAIL,
+                        ),
+                        common,
+                    );
+                }
                 if !from_backend && c.reconstructed {
                     fill_artifact_fingerprint(&common.cwd, &mut check_entry).await;
                 }
@@ -1588,13 +1612,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                                 &c.purl,
                                 &VendorWarning::new(
                                     "vendor_inventory_refreshed",
-                                    "the rebuilt artifact's patched files verify but its \
-                                     tree differs from the recorded file inventory (the \
-                                     entry was likely vendored from the patch service's \
-                                     prebuilt artifact; repair rebuilds locally); the \
-                                     inventory was refreshed from the verified rebuild — \
-                                     run `socket-patch vendor` to restore the \
-                                     service-built tree",
+                                    INVENTORY_REFRESHED_DETAIL,
                                 ),
                                 common,
                             );
@@ -1659,6 +1677,15 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
     drop(holders);
     rebuilt
 }
+
+/// Detail of the `vendor_inventory_refreshed` advisory.
+const INVENTORY_REFRESHED_DETAIL: &str = "the rebuilt artifact's patched files verify but its \
+     tree differs from the recorded file inventory (the \
+     entry was likely vendored from the patch service's \
+     prebuilt artifact; repair rebuilds locally); the \
+     inventory was refreshed from the verified rebuild — \
+     run `socket-patch vendor` to restore the \
+     service-built tree";
 
 /// Compute and record the artifact fingerprint on a re-synthesized ledger
 /// entry: sha256 + size for file-shaped artifacts, the whole-tree file
