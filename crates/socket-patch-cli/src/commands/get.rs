@@ -1009,6 +1009,12 @@ fn format_single_save(
     }
 }
 
+/// `  [skip] <purl> (<why>)` for a record the download phase reuses, with
+/// the purl decoded for display (`%40scope` reads as `@scope`).
+fn format_record_skip(purl: &str, why: &str) -> String {
+    format!("  [skip] {} ({why})", normalize_purl(purl))
+}
+
 /// The error printed when the nested apply failed. Under `--silent`
 /// apply's own per-patch failure lines are muted, so this one line is all
 /// the user gets: point at how to see the details.
@@ -1827,7 +1833,7 @@ async fn fetch_selected_patches(
                 .and_then(|e| e.record.clone())
             {
                 if !quiet {
-                    eprintln!("  [skip] {purl} (already vendored)");
+                    eprintln!("{}", format_record_skip(purl, "already vendored"));
                 }
                 batch.patches_json.push(serde_json::json!({
                     "purl": purl,
@@ -1888,10 +1894,7 @@ async fn fetch_selected_patches(
         };
         if action == PatchAction::Skipped {
             if !quiet {
-                eprintln!(
-                    "  [skip] {} (already in manifest)",
-                    normalize_purl(&patch.purl)
-                );
+                eprintln!("{}", format_record_skip(&patch.purl, "already in manifest"));
             }
             batch.patches_json.push(serde_json::json!({
                 "purl": patch.purl,
@@ -5450,6 +5453,18 @@ mod tests {
                 false
             ),
             "pkg:npm/a@1 already has this patch recorded in p/.socket/manifest.json."
+        );
+    }
+
+    #[test]
+    fn record_skip_line_decodes_the_purl() {
+        assert_eq!(
+            format_record_skip("pkg:npm/%40scope/a@1.0.0", "already vendored"),
+            "  [skip] pkg:npm/@scope/a@1.0.0 (already vendored)"
+        );
+        assert_eq!(
+            format_record_skip("pkg:npm/a@1", "already in manifest"),
+            "  [skip] pkg:npm/a@1 (already in manifest)"
         );
     }
 
