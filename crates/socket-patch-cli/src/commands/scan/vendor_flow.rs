@@ -735,9 +735,8 @@ pub(crate) fn format_vendor_step_error(code: &str, message: &str) -> String {
     };
     if code == "lock_held" {
         // Same advice as the other commands' lock error (lock_cli).
-        out.push_str(
-            "\n  Wait for it to finish, or retry with --lock-timeout <secs> to wait for the lock.",
-        );
+        out.push_str("\n  ");
+        out.push_str(crate::commands::lock_cli::HELD_RETRY_HINT);
     }
     out
 }

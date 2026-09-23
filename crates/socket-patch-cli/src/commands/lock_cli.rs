@@ -92,6 +92,12 @@ fn waiting_message(lock_path: &Path, timeout: Duration) -> String {
     )
 }
 
+/// The wait hint under a `lock_held` error from a step that builds its own
+/// error line (the scan/get vendor step, hosted scan), which has no lock
+/// path to name.
+pub(crate) const HELD_RETRY_HINT: &str =
+    "Wait for it to finish, or retry with --lock-timeout <secs> to wait for the lock.";
+
 /// Remediation printed under a human-mode `lock_held` error. `Held`
 /// always means a live process (leftover files never contend), so the
 /// only honest advice is to wait; how depends on whether this run already

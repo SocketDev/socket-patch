@@ -509,9 +509,7 @@ fn acquire_hosted_lock(
             // "nothing"): exit 1 with no message would be undiagnosable.
             eprintln!("Error ({code}): {message}");
             if matches!(err, LockError::Held) {
-                eprintln!(
-                    "  Wait for it to finish, or retry with --lock-timeout <secs> to wait for the lock."
-                );
+                eprintln!("  {}", crate::commands::lock_cli::HELD_RETRY_HINT);
             }
             if common.json {
                 emit_json_error_with_code(scan_result.take(), Some(code), &message);
