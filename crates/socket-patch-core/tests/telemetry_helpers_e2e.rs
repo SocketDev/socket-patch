@@ -110,6 +110,10 @@ fn telemetry_not_disabled_when_socket_telemetry_disabled_falsy() {
     });
 }
 
+/// The `VITEST=true` kill-switch is load-bearing for a downstream consumer:
+/// socket-cli's vitest integration suite spawns this binary with its
+/// inherited env and sets no `SOCKET_TELEMETRY_DISABLED` (see the
+/// `is_telemetry_disabled` docs).
 #[test]
 #[serial]
 fn telemetry_disabled_when_vitest_env_is_true() {

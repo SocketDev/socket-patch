@@ -665,14 +665,27 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
         "nested vendor envelope must report no failures: {env}"
     );
 
-    // The download phase writes ONLY the manifest — no blobs on disk.
-    let manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(proj.join(".socket/manifest.json")).unwrap())
-            .unwrap();
+    // The download phase writes NOTHING under .socket/ — no manifest, no
+    // blobs; the ledger's detached entry (written by the vendor step) is the
+    // record.
+    assert!(
+        !proj.join(".socket/manifest.json").exists(),
+        "get --mode vendored must NOT write the manifest (the ledger is the record)"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".socket/vendor/state.json"))
+            .expect("vendor ledger missing"),
+    )
+    .unwrap();
     assert_eq!(
-        manifest["patches"][purl.as_str()]["uuid"],
+        state["entries"][purl.as_str()]["uuid"],
         UUID,
-        "manifest must record the vendored patch: {manifest}"
+        "the ledger must record the vendored patch: {state}"
+    );
+    assert_eq!(
+        state["entries"][purl.as_str()]["detached"],
+        true,
+        "a get --mode vendored entry is detached: {state}"
     );
     assert!(
         !proj.join(".socket/blobs").exists(),

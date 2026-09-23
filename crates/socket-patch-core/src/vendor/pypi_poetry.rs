@@ -5,11 +5,11 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
 use super::common::{
-    item_get, lock_units_named, pep621_declared_names, record, revert_lock_fragment_splice_atomic,
-    unit_has_canon_name,
+    ensure_unchanged, item_get, lock_units_named, pep621_declared_names, record, refuse_symlinked,
+    revert_lock_fragment_splice_atomic, unit_has_canon_name,
 };
 use super::path::parse_vendor_path;
 use super::state::{PoetryMeta, VendorEntry, WiringAction, WiringRecord};
@@ -21,22 +21,6 @@ const LOCK_FILE: &str = "poetry.lock";
 
 /// The `WiringRecord.kind` discriminator this backend owns.
 const KIND_LOCK_PACKAGE: &str = "poetry_lock_package";
-
-/// Guarded read shared in shape with the sibling backend twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `poetry.lock` (or the diagnostics-only
-/// `pyproject.toml`) fails fast instead of wedging every poetry-project
-/// vendor run forever in an `open(2)` that waits for a writer — the
-/// flavor-routing probes ahead of the load are metadata-only, so these are
-/// the first opens.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// A loaded-and-guard-checked poetry project.
 #[derive(Debug)]
@@ -300,6 +284,8 @@ pub(super) async fn wire_poetry(
     wheel_sha256_hex: &str,
     record_uuid: &str,
 ) -> Result<(Vec<WiringRecord>, PoetryMeta), (&'static str, String)> {
+    // Before ANY write: a symlinked lock would be replaced by the rename-over.
+    refuse_symlinked(root, &[LOCK_FILE], "pypi_poetry_symlink_unsupported").await?;
     match check_target_guards(p, canon_name, version, record_uuid)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
@@ -349,6 +335,9 @@ pub(super) async fn wire_poetry(
     for (old_unit, new_unit) in &edits {
         new_lock = new_lock.replacen(old_unit, new_unit, 1);
     }
+    // The edit was computed from the pre-flight snapshot; a `poetry lock` /
+    // editor save that landed during the wheel build must not be clobbered.
+    ensure_unchanged(root, LOCK_FILE, &p.lock_text, "pypi_poetry_changed").await?;
     // Mode-preserving: the lock is a user-owned file we merely edit, so the
     // swapped-in inode must keep its permission bits rather than reset them
     // to umask defaults (same class as the revert leg in common.rs).
@@ -389,6 +378,19 @@ pub(super) async fn revert_poetry(
     root: &Path,
     dry_run: bool,
 ) -> RevertOutcome {
+    // A symlinked lock would be replaced by the atomic rewrite-over, leaving
+    // its target stale and never restoring the link. Keep the artifact (the
+    // wiring still routes through the linked file) and fail.
+    if let Err((code, detail)) =
+        refuse_symlinked(root, &[LOCK_FILE], "pypi_poetry_symlink_unsupported").await
+    {
+        return RevertOutcome {
+            kept_artifact: true,
+            success: false,
+            warnings: Vec::new(),
+            error: Some(format!("{code}: {detail}")),
+        };
+    }
     revert_lock_fragment_splice_atomic(entry, root, dry_run, LOCK_FILE, KIND_LOCK_PACKAGE, "poetry")
         .await
 }
@@ -940,14 +942,19 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
             Some("x".into()),
             "y".into(),
         ));
-        let outcome = revert_poetry(&entry_for(wiring.clone(), meta.clone()), tmp.path(), false).await;
+        let outcome =
+            revert_poetry(&entry_for(wiring.clone(), meta.clone()), tmp.path(), false).await;
         assert!(outcome.success);
         assert_eq!(outcome.warnings.len(), 2, "{:?}", outcome.warnings);
         assert!(outcome
             .warnings
             .iter()
             .all(|w| w.code == "vendor_lock_entry_drifted"));
-        assert_eq!(read_lock(tmp.path()).await, native, "known fragments restored");
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            native,
+            "known fragments restored"
+        );
 
         // Re-wire, then drift one fragment: now the atomic write must hold.
         let project = load_poetry_project(tmp.path()).await.unwrap();
@@ -1780,5 +1787,129 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
         assert!(!is_newer_2x("2.1"));
         assert!(!is_newer_2x("3.0"));
         assert!(!is_newer_2x("garbage"));
+    }
+
+    /// A symlinked poetry.lock is refused before any write by both wire and
+    /// revert: the rename-over would replace the link with a regular file
+    /// and leave its target stale, and revert would never restore the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_lock_refuses_wire_and_revert_without_writing() {
+        let outer = tempfile::tempdir().unwrap();
+        let real = outer.path().join("real.lock");
+        tokio::fs::write(&real, LOCK21_DIRECT_REGISTRY)
+            .await
+            .unwrap();
+        let root = outer.path().join("proj");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(root.join("pyproject.toml"), PYPROJECT_DIRECT)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&real, root.join(LOCK_FILE)).unwrap();
+
+        let p = load_poetry_project(&root).await.unwrap();
+        let err = wire_poetry(
+            &p, &root, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_poetry_symlink_unsupported");
+        assert!(std::fs::symlink_metadata(root.join(LOCK_FILE))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(read_lock(&root).await, LOCK21_DIRECT_REGISTRY);
+
+        // revert refuses the same way and keeps the artifact.
+        let meta = PoetryMeta {
+            dep_class: "direct".into(),
+            lock_version: "2.1".into(),
+        };
+        let wiring = vec![record(
+            LOCK_FILE,
+            KIND_LOCK_PACKAGE,
+            WiringAction::Rewritten,
+            "six",
+            Some("a".into()),
+            "b".into(),
+        )];
+        let outcome = revert_poetry(&entry_for(wiring, meta), &root, false).await;
+        assert!(!outcome.success);
+        assert!(outcome.kept_artifact);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("pypi_poetry_symlink_unsupported")),
+            "{:?}",
+            outcome.error
+        );
+    }
+
+    /// The lock changed between the pre-flight snapshot and the write (a
+    /// `poetry lock` landed during the wheel build): refuse instead of
+    /// clobbering it with the stale snapshot-derived text.
+    #[tokio::test]
+    async fn lock_changed_during_vendoring_is_refused_before_the_write() {
+        let tmp = write_project(LOCK21_DIRECT_REGISTRY, PYPROJECT_DIRECT).await;
+        let p = load_poetry_project(tmp.path()).await.unwrap();
+        let relocked = format!("{LOCK21_DIRECT_REGISTRY}# relocked\n");
+        tokio::fs::write(tmp.path().join(LOCK_FILE), &relocked)
+            .await
+            .unwrap();
+
+        let err = wire_poetry(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_poetry_changed");
+        assert!(err.1.contains("changed during vendoring"), "{}", err.1);
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            relocked,
+            "the live lock is left alone"
+        );
+    }
+
+    /// The lock was REMOVED between the pre-flight snapshot and the write
+    /// (`rm poetry.lock && poetry lock` mid-build): refused like any other
+    /// change, and the stage-and-rename write must not recreate it from the
+    /// stale snapshot and record it as wired.
+    #[tokio::test]
+    async fn lock_removed_during_vendoring_is_refused_and_not_recreated() {
+        let tmp = write_project(LOCK21_DIRECT_REGISTRY, PYPROJECT_DIRECT).await;
+        let p = load_poetry_project(tmp.path()).await.unwrap();
+        tokio::fs::remove_file(tmp.path().join(LOCK_FILE))
+            .await
+            .unwrap();
+
+        let err = wire_poetry(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_poetry_changed");
+        assert!(err.1.contains("changed during vendoring"), "{}", err.1);
+        assert!(
+            tokio::fs::metadata(tmp.path().join(LOCK_FILE))
+                .await
+                .is_err(),
+            "the removed lock must not be recreated from the snapshot"
+        );
     }
 }

@@ -34,7 +34,7 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item, Table};
 
 use super::state::CargoLockOriginal;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
 /// Why a lock edit could not be performed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,20 +64,6 @@ impl std::fmt::Display for LockEditError {
             Self::Parse(e) => write!(f, "Cargo.lock parse error: {e}"),
         }
     }
-}
-
-/// Guarded read shared in shape with the Cargo.toml / .cargo/config.toml
-/// twins: `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `Cargo.lock` fails fast instead of wedging
-/// every caller (scan's probe, vendor mode detection, wet detach/restore)
-/// forever in an `open(2)` that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Read + parse `<root>/Cargo.lock`, mapping errors to [`LockEditError`].

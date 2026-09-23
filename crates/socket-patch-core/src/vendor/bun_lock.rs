@@ -37,10 +37,11 @@ use base64::Engine as _;
 use serde_json::Value;
 use sha2::{Digest, Sha512};
 
+use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
-use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::bun_lock_text::{
     check_lock_version, decode_json_string, has_workspace_packages, lock_version, packages_bounds,
     parse_entry_line, parse_packages_section, split_name_spec, BunEntry,
@@ -52,7 +53,7 @@ use super::npm_common::{
 };
 use super::path::parse_vendor_path;
 use super::state::{
-    write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -427,14 +428,25 @@ pub(crate) async fn vendor_bun(
         }
     }
 
+    // BN3 spelling: BARE project-relative path, no `file:`/`./` prefix (the
+    // shared pipeline's `prepare_tgz_dest` builds the identical string).
+    let rel_tgz = format!("{}/{}", coords.uuid_dir_rel, target_leaf);
     // The sha512 of the artifact already sitting at the target path, if
     // any — the one witness a digest-less in-sync tuple (see `classify`)
     // still has of the digest Bun dropped: the lock line was written from
     // these bytes. Read BEFORE staging, which overwrites the file; a
     // missing or non-regular path (a `repair` rebuild after deletion, a
     // FIFO) yields `None`, which the in-sync check below treats as "not
-    // provably the same bytes".
-    let prior_artifact_integrity: Option<String> = {
+    // provably the same bytes". Only a digest-less 2-tuple of OURS at this
+    // path can consume it, so every other re-run skips the read + hash.
+    let has_digestless_own_tuple = entries.iter().any(|e| {
+        e.elems.len() == 2
+            && matches!(
+                classify(e, &target_spec, name, &target_leaf),
+                Some(TupleShape::Ours { path }) if path == rel_tgz
+            )
+    });
+    let prior_artifact_integrity: Option<String> = if has_digestless_own_tuple {
         let abs = project_root.join(&coords.uuid_dir_rel).join(&target_leaf);
         match tokio::fs::metadata(&abs).await {
             Ok(meta) if meta.is_file() => tokio::fs::read(&abs).await.ok().map(|bytes| {
@@ -445,15 +457,11 @@ pub(crate) async fn vendor_bun(
             }),
             _ => None,
         }
+    } else {
+        None
     };
 
     // ── 4. Stage → patch → pack (shared flavor-agnostic pipeline) ────────
-    // A wiring failure past this point must unwind the uuid dir staging is
-    // about to create — but never one that already existed (a same-uuid
-    // re-vendor's dir may still be referenced by live wiring).
-    let uuid_dir_preexisted = tokio::fs::metadata(project_root.join(&coords.uuid_dir_rel))
-        .await
-        .is_ok();
     let (staged, result) = match stage_patch_pack(
         purl,
         installed_dir,
@@ -478,8 +486,8 @@ pub(crate) async fn vendor_bun(
             warnings,
         };
     };
-    // BN3 spelling: BARE project-relative path, no `file:`/`./` prefix.
-    let rel_tgz = staged.rel_tgz;
+    let uuid_dir_preexisted = staged.uuid_dir_preexisted;
+    debug_assert_eq!(staged.rel_tgz, rel_tgz);
     let packed = staged.packed;
     if staged.staged_pkg_json.is_some() {
         // The tuple's deps object mirrors the package's own manifest; the
@@ -631,12 +639,12 @@ pub(crate) async fn vendor_bun(
 
     // ── 6. Marker + ledger entry ──────────────────────────────────────────
     let marker = VendorMarker::new("npm", &coords.base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&project_root.join(&coords.uuid_dir_rel), &marker).await {
-        warnings.push(VendorWarning::new(
-            "vendor_marker_write_failed",
-            format!("could not write the informational vendor marker: {e}"),
-        ));
-    }
+    write_marker_or_warn(
+        &project_root.join(&coords.uuid_dir_rel),
+        &marker,
+        &mut warnings,
+    )
+    .await;
 
     let entry = VendorEntry {
         ecosystem: "npm".to_string(),
@@ -756,7 +764,10 @@ pub(crate) async fn revert_bun_opts(
 
     let mut lines: Option<Vec<String>> = None;
     if touches_lock {
-        match tokio::fs::read_to_string(project_root.join(BUN_LOCK)).await {
+        // Guarded read (`read_regular_to_string`, like every sibling revert):
+        // a FIFO planted as the committed bun.lock fails fast instead of
+        // wedging revert / remove / rollback forever in `open(2)`.
+        match read_regular_to_string(&project_root.join(BUN_LOCK)).await {
             Ok(text) => lines = Some(text.split('\n').map(str::to_string).collect()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 outcome.warnings.push(VendorWarning::new(
@@ -799,7 +810,12 @@ pub(crate) async fn revert_bun_opts(
     // ran; the artifact dir stays behind (and the caller keeps the ledger
     // entry), so only the deletion is skipped.
     if !keep_artifact {
-        if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
+        // The last npm-family entry leaves `.socket/vendor/npm/` (and
+        // `.socket/vendor/`) empty: the shared helper prunes them so a
+        // reverted project carries no vendor residue (non-recursive:
+        // siblings keep them).
+        let uuid_dir = project_root.join(&uuid_dir_rel);
+        if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
             return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
         }
     }
@@ -950,6 +966,7 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::{ApplyResult, VerifyStatus};
+    use crate::patch::copy_tree::remove_tree;
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -3319,6 +3336,53 @@ mod tests {
                 .join(format!(".socket/vendor/npm/{UUID}"))
                 .exists(),
             "the re-run converges and removes the uuid dir"
+        );
+    }
+
+    /// A FIFO planted as bun.lock must fail the revert fast instead of
+    /// wedging it forever in an `open(2)` waiting for a writer (the vendor
+    /// and preflight halves already read through the guarded reader).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_lock_fails_fast_instead_of_wedging_revert() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let lock_path = fx.root().join(BUN_LOCK);
+        tokio::fs::remove_file(&lock_path).await.unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&lock_path)
+            .status()
+            .unwrap()
+            .success());
+
+        let deadline = std::time::Duration::from_secs(5);
+        let revert = revert_bun(&entry, fx.root(), false);
+        let Ok(outcome) = tokio::time::timeout(deadline, revert).await else {
+            // On timeout the open is wedged in a `spawn_blocking` thread the
+            // runtime waits for on shutdown; connect a non-blocking writer
+            // to release it so the test can FAIL instead of hanging the
+            // suite.
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&lock_path);
+            panic!("the revert lock read must fail fast on a FIFO");
+        };
+        assert!(!outcome.success, "a non-regular lock must fail the revert");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot read bun.lock"),
+            "{:?}",
+            outcome.error
+        );
+        assert!(
+            fx.root().join(fx.rel_tgz()).exists(),
+            "artifact survives the failure"
         );
     }
 }

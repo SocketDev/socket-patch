@@ -6,11 +6,12 @@
 //! 1. **pnpm**: `node_modules/<pkg>` is typically a symlink into the
 //!    content-addressed global store. Patching the link target would
 //!    corrupt every other project on the machine that points at the
-//!    same store entry. The CoW guard in
-//!    [`crate::patch::cow::break_hardlink_if_needed`] is what
-//!    actually fixes this; this detector just lets the CLI surface a
-//!    one-line "we detected pnpm, applied with CoW" notice so users
-//!    understand the layout was handled.
+//!    same store entry. The rename-over write in
+//!    [`crate::utils::fs::atomic_write_bytes`] is what actually fixes
+//!    this (the rename replaces only the directory entry, so the shared
+//!    inode is never written through); this detector just lets the CLI
+//!    surface a one-line "we detected pnpm, applied with CoW" notice so
+//!    users understand the layout was handled.
 //!
 //! 2. **yarn-berry / Plug'n'Play**: packages do not live on disk at
 //!    all — they're inside `.yarn/cache/<pkg>.zip` and resolved via
@@ -44,8 +45,9 @@ pub enum NpmPkgManager {
     /// bun-managed project — `bun.lock` (text, current default) or
     /// `bun.lockb` (binary, legacy) at the project root. Bun
     /// hard-links from `~/.bun/install/cache/` into `node_modules/`
-    /// by default on Linux/macOS, so apply must CoW the link before
-    /// rewriting (handled generically by `break_hardlink_if_needed`).
+    /// by default on Linux/macOS, so apply must never write through the
+    /// shared inode (handled generically by the rename-over write in
+    /// `utils::fs::atomic_write_bytes`).
     /// The operator gets a heads-up event so it's clear which package
     /// manager the patch landed against.
     Bun,

@@ -14,8 +14,12 @@ use crate::manifest::schema::PatchFileInfo;
 use crate::patch::apply::{
     is_safe_relative_subpath, normalize_file_path, ApplyResult, VerifyResult, VerifyStatus,
 };
+use crate::patch::copy_tree::remove_tree;
 use crate::patch::file_hash::compute_file_git_sha256;
-use crate::utils::fs::{atomic_write_bytes_preserving_mode, open_regular_file};
+use crate::utils::fs::{
+    atomic_write_bytes_preserving_mode, first_symlink, open_regular_file_sync,
+    read_regular_to_string,
+};
 
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
@@ -215,28 +219,56 @@ pub(crate) fn rebuild_zip(stage: &Path, skip_entry: Option<&str>) -> Result<Vec<
     write_zip_entries(&entries)
 }
 
-/// True when the committed archive (a plain zip: `.jar` / `.nupkg`) exists and
-/// every patched file in it already hashes to its `afterHash` (the zip twin of
+/// Bound on a committed `.jar` / `.nupkg` the in-sync probe is willing to
+/// read into memory: the whole-file cap `verify.rs` applies to the same
+/// artifacts (`MAX_HEALTH_HASH_BYTES`), which also covers everything the
+/// rebuild path can produce (`extract_zip` bounds the decompressed payload
+/// at 512 MiB and a deflated archive is never larger than its payload) — so
+/// a valid committed artifact can never read as stale because of the cap.
+const MAX_ZIP_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The committed archive's bytes, or `None` when it is missing, not a regular
+/// file, or over the cap. Guarded open (`open_regular_file`: O_NONBLOCK +
+/// regular-file check): a FIFO planted at the archive path must read as
+/// out-of-sync, not wedge the probe forever in an `open(2)` waiting for a
+/// writer. The archive is committed and tamper-able: the size gate runs on
+/// the open handle's metadata BEFORE anything is read, like the blob harvest
+/// in `vendor/mod.rs`, so an oversized file is never slurped into memory.
+/// Backends that need the bytes for more than the member check (a sidecar /
+/// content hash) read once through this and hand them to
+/// [`zip_bytes_match_after_hashes`].
+pub(crate) async fn read_zip_artifact(archive_path: &Path) -> Option<Vec<u8>> {
+    read_zip_artifact_capped(archive_path, MAX_ZIP_ARTIFACT_BYTES).await
+}
+
+async fn read_zip_artifact_capped(archive_path: &Path, cap: u64) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let path = archive_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let (mut file, metadata) = open_regular_file_sync(&path).ok()?;
+        if metadata.len() > cap {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut bytes).ok()?;
+        Some(bytes)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// True when the committed archive (a plain zip: `.jar` / `.nupkg`) — its
+/// bytes read once through [`read_zip_artifact`] — has every patched file
+/// already hashing to its `afterHash` (the zip twin of
 /// [`copy_matches_after_hashes`], reading the archive's entries).
-pub(crate) async fn zip_matches_after_hashes(
-    archive_path: &Path,
+pub(crate) fn zip_bytes_match_after_hashes(
+    bytes: &[u8],
     files: &HashMap<String, PatchFileInfo>,
 ) -> bool {
     use std::io::Read as _;
 
-    use tokio::io::AsyncReadExt as _;
-
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-    // Guarded read (`open_regular_file`: O_NONBLOCK + regular-file check): a
-    // FIFO planted at the archive path must read as out-of-sync, not wedge
-    // the probe forever in an `open(2)` waiting for a writer.
-    let Ok((mut file, metadata)) = open_regular_file(archive_path).await else {
-        return false;
-    };
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    if file.read_to_end(&mut bytes).await.is_err() {
-        return false;
-    }
     let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
         return false;
     };
@@ -259,6 +291,179 @@ pub(crate) async fn zip_matches_after_hashes(
         }
     }
     true
+}
+
+// ── staged materialisation (cargo / composer / gem / golang) ────────────────
+
+/// A swap sibling for a copy dir: `<parent>/<leaf><suffix>`. Same directory
+/// as the copy → every swap step is a real rename, never a cross-device copy.
+/// The suffixes can never collide with a copy dir: every backend creates
+/// exactly one validated `<name>-<version>` / `<module>@<version>` leaf per
+/// uuid dir, and no version token ends in `.socket-stage` / `.socket-old`.
+pub(crate) fn swap_sibling_for(copy_dir: &Path, suffix: &str) -> std::path::PathBuf {
+    let name = copy_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "copy".to_string());
+    match copy_dir.parent() {
+        Some(parent) => parent.join(format!("{name}{suffix}")),
+        None => copy_dir.join(suffix),
+    }
+}
+
+/// The staging sibling for a copy dir: `<copy>.socket-stage`. (Re)builds are
+/// materialised here and swapped into place only on success, so a failure
+/// can never destroy a pre-existing (possibly live-wired) copy.
+pub(crate) fn stage_dir_for(copy_dir: &Path) -> std::path::PathBuf {
+    swap_sibling_for(copy_dir, ".socket-stage")
+}
+
+/// The backup sibling the old copy is parked at mid-swap: `<copy>.socket-old`.
+pub(crate) fn backup_dir_for(copy_dir: &Path) -> std::path::PathBuf {
+    swap_sibling_for(copy_dir, ".socket-old")
+}
+
+/// Swap a fully-built stage into place without a destructive window: park the
+/// old copy (if any) at `<copy>.socket-old` with a same-dir rename, rename the
+/// stage over the now-vacant copy path, and only then delete the backup. Every
+/// step is a single atomic rename — unlike a remove-then-rename swap (where a
+/// partial `remove_dir_all`, realistic under Windows file locks, strands a
+/// half-deleted copy) no step can leave less recoverable state than it started
+/// with. If the stage rename fails the backup is renamed straight back; should
+/// even that restore fail (an external process racing the uuid dir), the old
+/// copy still exists intact at `<copy>.socket-old` instead of being destroyed.
+pub(crate) async fn swap_stage_into_place(stage: &Path, copy_dir: &Path) -> std::io::Result<()> {
+    let backup = backup_dir_for(copy_dir);
+    // A stale backup (crash mid-swap on an earlier run) would make the
+    // park rename fail; `remove_tree` is a no-op when it is absent.
+    remove_tree(&backup).await?;
+    let had_old = match tokio::fs::rename(copy_dir, &backup).await {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e),
+    };
+    match tokio::fs::rename(stage, copy_dir).await {
+        Ok(()) => {
+            if had_old {
+                let _ = remove_tree(&backup).await;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if had_old {
+                let _ = tokio::fs::rename(&backup, copy_dir).await;
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Best-effort removal of an EMPTY `<uuid>/` dir plus the empty
+/// `.socket/vendor/<eco>/` and `.socket/vendor/` levels a vendor run may have
+/// created (or a revert may have emptied), so neither a hard failure nor the
+/// reversal of the last entry of an ecosystem leaves a husk for the user to
+/// commit. The climb is the shared
+/// [`prune_empty_dirs`](crate::utils::socket_dir::prune_empty_dirs):
+/// non-recursive, so live copies, markers, the ledger and other entries'
+/// vendor dirs always survive, and a uuid level already unwound wholesale
+/// (`remove_tree` before the prune) still lets its parents go. `uuid_dir` is
+/// `<project>/.socket/vendor/<eco>/<uuid>`, so the stop dir — never removed —
+/// is three levels up: `.socket/` itself, which the apply lock guard owns.
+pub(crate) async fn prune_empty_vendor_levels(uuid_dir: &Path) {
+    let Some(socket_dir) = uuid_dir.ancestors().nth(3) else {
+        return;
+    };
+    crate::utils::socket_dir::prune_empty_dirs(uuid_dir, socket_dir).await;
+}
+
+/// True when any of `files` (root-relative wiring files a backend authored)
+/// still names `uuid_dir_rel`: the package manager can still be routed at
+/// the vendored artifact even though no wiring record could restore the
+/// fragment. This is the drift-keep gate of the whole-file backends
+/// (composer / maven / nuget). Unlike the lock backends, their drift
+/// classification is not liveness-aware — a converged file (our block
+/// already gone, a regenerated pom) reads as `vendor_lock_entry_drifted`
+/// too — so gating the keep on the drift warning alone would keep the
+/// artifact and ledger entry forever (the LIVENESS CONTRACT on
+/// [`RevertOutcome::drift_skipped`]). A live reference is the one thing a
+/// converged file never carries, so keeping exactly while one exists is
+/// both safe (nothing a file still routes at is deleted) and live (the
+/// user can always undo the drift). A file that cannot be read (absent,
+/// unreadable, not a regular file) references nothing.
+pub(crate) async fn any_live_file_references(
+    root: &Path,
+    files: &[&str],
+    uuid_dir_rel: &str,
+) -> bool {
+    for file in files {
+        if read_regular_to_string(&root.join(file))
+            .await
+            .is_ok_and(|live| live.contains(uuid_dir_rel))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// ── pre-write guards shared by the pypi lock flavors ────────────────────────
+
+/// Refuse (with the flavor's stable `code`) when any of `files` (root-relative)
+/// is itself a symbolic link. Every lock writer stages a replacement next to
+/// the path and renames over it, which REPLACES the link with a detached
+/// regular file: the shared target the link points at stays unpatched (git
+/// shows a 120000→100644 typechange), and `revert` restores bytes but never
+/// the link. Both wire and revert check before any write — the package
+/// managers themselves write THROUGH a linked lock.
+pub(crate) async fn refuse_symlinked(
+    root: &Path,
+    files: &[&str],
+    code: &'static str,
+) -> Result<(), (&'static str, String)> {
+    match first_symlink(root, files.iter().copied()).await {
+        Some(file) => Err((
+            code,
+            format!(
+                "{file} is a symbolic link; the atomic rewrite would replace the link with \
+                 a regular file and leave its target stale — vendor the real file's directory \
+                 instead"
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Refuse (with the flavor's stable `code`) when `file` (root-relative) no
+/// longer holds the `snapshot` the wiring plan was computed from. The lock
+/// flavors deliberately snapshot their files in the pre-flight (so refusals
+/// leave the tree byte-untouched) and only write after the wheel build — a
+/// `poetry lock` / `pdm lock` / editor save landing in between would
+/// otherwise be silently overwritten with stale snapshot-derived text and
+/// recorded as the entry's `original`. A file that has been REMOVED since
+/// the snapshot is refused the same way: the stage-and-rename write would
+/// otherwise recreate it from snapshot-derived text and record it as wired.
+/// Any other re-read failure is left to the write that follows — a
+/// directory squatting on the path fails the rename with the flavor's own
+/// write-failed code.
+pub(crate) async fn ensure_unchanged(
+    root: &Path,
+    file: &str,
+    snapshot: &str,
+    code: &'static str,
+) -> Result<(), (&'static str, String)> {
+    match read_regular_to_string(&root.join(file)).await {
+        Ok(live) if live != snapshot => Err((
+            code,
+            format!("{file} changed during vendoring; re-run to vendor against the new contents"),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err((
+            code,
+            format!(
+                "{file} changed during vendoring (it no longer exists); re-run to vendor against the new contents"
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Shared helper the vendor backends (and `go_redirect`) delegate to: true
@@ -396,10 +601,7 @@ pub(crate) async fn revert_lock_fragment_splice(
     kind: &str,
     flavor: &str,
 ) -> RevertOutcome {
-    revert_lock_fragment_splice_inner(
-        entry, root, dry_run, lock_file, kind, flavor, false,
-    )
-    .await
+    revert_lock_fragment_splice_inner(entry, root, dry_run, lock_file, kind, flavor, false).await
 }
 
 /// [`revert_lock_fragment_splice`] for backends whose records are COUPLED
@@ -417,10 +619,7 @@ pub(crate) async fn revert_lock_fragment_splice_atomic(
     kind: &str,
     flavor: &str,
 ) -> RevertOutcome {
-    revert_lock_fragment_splice_inner(
-        entry, root, dry_run, lock_file, kind, flavor, true,
-    )
-    .await
+    revert_lock_fragment_splice_inner(entry, root, dry_run, lock_file, kind, flavor, true).await
 }
 
 async fn revert_lock_fragment_splice_inner(
@@ -432,23 +631,21 @@ async fn revert_lock_fragment_splice_inner(
     flavor: &str,
     atomic: bool,
 ) -> RevertOutcome {
-    use tokio::io::AsyncReadExt as _;
-
     let lock_path = root.join(lock_file);
-    // Guarded read (`open_regular_file`: O_NONBLOCK + regular-file check): a
-    // FIFO planted as the lock must fail this revert fast and loudly, not
-    // wedge remove/rollback forever in an `open(2)` waiting for a writer.
-    let mut lock_text = match open_regular_file(&lock_path).await {
-        Ok((mut file, metadata)) => {
-            let mut t = String::with_capacity(metadata.len() as usize);
-            if let Err(e) = file.read_to_string(&mut t).await {
-                return RevertOutcome::failed(format!("cannot read {lock_file}: {e}"));
-            }
-            t
-        }
+    // Guarded read (`read_regular_to_string`: O_NONBLOCK + regular-file
+    // check): a FIFO planted as the lock must fail this revert fast and
+    // loudly, not wedge remove/rollback forever in an `open(2)` waiting for
+    // a writer.
+    let mut lock_text = match read_regular_to_string(&lock_path).await {
+        Ok(t) => t,
         Err(e) => return RevertOutcome::failed(format!("cannot read {lock_file}: {e}")),
     };
     let mut warnings: Vec<VendorWarning> = Vec::new();
+    // Set once a fragment was actually spliced: a fully converged revert (a
+    // second `vendor --revert`, a rollback after a relock) must not rewrite a
+    // byte-identical lock (new inode + mtime, spurious "modified" in
+    // editors and watchers).
+    let mut changed = false;
     // Set when a recorded fragment is neither present nor already restored:
     // the only condition under which the atomic flavor must hold the write
     // (restoring the source table while its integrity entry stays patched, or
@@ -486,7 +683,12 @@ async fn revert_lock_fragment_splice_inner(
         let new_text = rec.new.as_ref().and_then(Value::as_str);
         let original_text = rec.original.as_ref().and_then(Value::as_str);
         match super::toml_surgery::replace_fragment(&lock_text, new_text, original_text) {
-            Some(t) => lock_text = t,
+            Some(t) => {
+                if t != lock_text {
+                    lock_text = t;
+                    changed = true;
+                }
+            }
             None => {
                 // ALREADY CONVERGED (the LIVENESS CONTRACT, vendor/mod.rs):
                 // the lock already carries the recorded pre-vendor original
@@ -509,7 +711,7 @@ async fn revert_lock_fragment_splice_inner(
         }
     }
 
-    if !dry_run && (!atomic || !drifted) {
+    if changed && !dry_run && (!atomic || !drifted) {
         // Mode-preserving: the lock is a user-owned file we merely edit, so
         // the swapped-in inode must keep its permission bits rather than
         // reset them to umask defaults.
@@ -536,14 +738,67 @@ mod tests {
 
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 
+    /// An archive over the size cap reads as out-of-sync (`None`) without
+    /// being read, and one within it is returned whole.
+    #[tokio::test]
+    async fn read_zip_artifact_gates_on_size_before_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.jar");
+        tokio::fs::write(&path, b"0123456789").await.unwrap();
+        assert!(read_zip_artifact_capped(&path, 9).await.is_none());
+        assert_eq!(
+            read_zip_artifact_capped(&path, 10).await.as_deref(),
+            Some(&b"0123456789"[..])
+        );
+        assert!(
+            read_zip_artifact_capped(&tmp.path().join("missing.jar"), 10)
+                .await
+                .is_none()
+        );
+    }
+
+    /// A lock removed between the pre-flight snapshot and the write is a
+    /// change too: refused before the write would recreate it.
+    #[tokio::test]
+    async fn ensure_unchanged_refuses_a_removed_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = ensure_unchanged(tmp.path(), "poetry.lock", "snapshot", "x_changed")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "x_changed");
+        assert!(err.1.contains("changed during vendoring"), "{}", err.1);
+        assert!(!tmp.path().join("poetry.lock").exists());
+
+        tokio::fs::write(tmp.path().join("poetry.lock"), "snapshot")
+            .await
+            .unwrap();
+        ensure_unchanged(tmp.path(), "poetry.lock", "snapshot", "x_changed")
+            .await
+            .unwrap();
+    }
+
+    /// The path-taking shape the maven / nuget probes compose out of
+    /// [`read_zip_artifact`] + [`zip_bytes_match_after_hashes`]: one guarded,
+    /// capped read, then the member-hash check.
+    async fn zip_matches_after_hashes(
+        archive_path: &Path,
+        files: &HashMap<String, PatchFileInfo>,
+    ) -> bool {
+        match read_zip_artifact(archive_path).await {
+            Some(bytes) => zip_bytes_match_after_hashes(&bytes, files),
+            None => false,
+        }
+    }
+
     /// A one-entry `pkg.jar` (`lib/a.js` = `b"patched\n"`) written into `dir`,
     /// plus the files map whose `afterHash` matches it — the in-sync baseline
     /// each `zip_matches_after_hashes` case perturbs.
     fn in_sync_jar_fixture(
         dir: &Path,
     ) -> (std::path::PathBuf, HashMap<String, PatchFileInfo>, Vec<u8>) {
-        let zip_bytes = write_zip_entries(&[("lib/a.js".to_string(), b"patched\n".to_vec(), 0o644)])
-            .expect("fixture zip");
+        let zip_bytes =
+            write_zip_entries(&[("lib/a.js".to_string(), b"patched\n".to_vec(), 0o644)])
+                .expect("fixture zip");
         let jar = dir.join("pkg.jar");
         std::fs::write(&jar, &zip_bytes).unwrap();
         let files = HashMap::from([(
@@ -848,6 +1103,11 @@ mod tests {
             Some("OLD-FRAGMENT".into()),
             "NEW-FRAGMENT".into(),
         )];
+        #[cfg(unix)]
+        let inode_before = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(&lock).unwrap().ino()
+        };
 
         let outcome = revert_lock_fragment_splice(
             &entry,
@@ -869,6 +1129,18 @@ mod tests {
             "alpha\nOLD-FRAGMENT\nomega\n",
             "nothing to restore"
         );
+        // A converged revert must not churn the file either: the atomic
+        // writer would swap in a fresh inode (new mtime, spurious "modified"
+        // in editors and watchers) for byte-identical content.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(
+                std::fs::metadata(&lock).unwrap().ino(),
+                inode_before,
+                "a converged revert never rewrites the lock"
+            );
+        }
     }
 
     /// The lock file is user-owned: reverting the splice must not reset its

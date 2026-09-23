@@ -409,7 +409,10 @@ async fn scan_vendor_silent_gc_prints_nothing() {
     );
 
     // Silent suppresses output, not the work: the prune and the vendoring
-    // both still happened.
+    // both still happened. Vendored mode is manifest-free — the vendor
+    // ledger, not the manifest, records the vendored uuid — while the
+    // seeded agent-mode manifest still loses its uninstalled entry to the
+    // GC and survives, emptied, as `{"patches":{}}`.
     let manifest =
         std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).expect("read manifest");
     let v: serde_json::Value = serde_json::from_str(&manifest).expect("parse manifest");
@@ -417,7 +420,20 @@ async fn scan_vendor_silent_gc_prints_nothing() {
         v["patches"]["pkg:npm/gone@1.0.0"].is_null(),
         "the uninstalled entry must still be pruned under --silent: {v}"
     );
-    assert_eq!(v["patches"][purl]["uuid"], UUID, "manifest={v}");
+    assert!(
+        v["patches"][purl].is_null(),
+        "a vendored run never writes a manifest record: {v}"
+    );
+    let ledger = std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json"))
+        .expect("read vendor ledger");
+    let state: serde_json::Value = serde_json::from_str(&ledger).expect("parse vendor ledger");
+    let entry = &state["entries"][purl];
+    assert_eq!(
+        entry["uuid"], UUID,
+        "the ledger must still record the vendored uuid under --silent: {state}"
+    );
+    assert_eq!(entry["detached"], true, "ledger={state}");
+    assert_eq!(entry["record"]["uuid"], UUID, "ledger={state}");
     assert!(
         tmp.path()
             .join(format!(".socket/vendor/npm/{UUID}/silent-target-1.0.0.tgz"))

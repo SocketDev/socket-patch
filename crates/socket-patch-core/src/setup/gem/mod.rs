@@ -39,9 +39,16 @@ use std::path::{Path, PathBuf};
 
 use tokio::fs;
 
+// Guarded read for every raw read in this module tree: a FIFO planted at any
+// path setup reads (`plugins.rb`, the gemspec, `.socket/.gitignore`,
+// bundler's plugin index, `Gemfile.lock`) fails fast with `InvalidInput`
+// instead of wedging `setup`/`--check`/`--remove` forever in an `open(2)`
+// that waits for a writer.
+use crate::utils::fs::read_regular_to_string;
+
 pub use update::{
-    add_plugin_directive, is_plugin_directive_present, remove_plugin_directive, GemEditResult,
-    GemSetupStatus,
+    add_plugin_directive, add_plugin_directive_with, is_plugin_directive_present,
+    remove_plugin_directive, GemEditResult, GemSetupStatus,
 };
 pub use version::{probe_bundler, unsupported_bundler_message, BundlerProbe, MIN_BUNDLER};
 
@@ -161,22 +168,6 @@ fn stamp_path(root: &Path) -> PathBuf {
 
 fn stamp_gitignore_path(root: &Path) -> PathBuf {
     root.join(".socket").join(".gitignore")
-}
-
-/// Guarded read shared by every raw read in this module: `open_regular_file`
-/// opens with `O_NONBLOCK` and rejects non-regular files with `InvalidInput`,
-/// so a FIFO planted at any path setup reads (`plugins.rb`, the gemspec,
-/// `.socket/.gitignore`, bundler's plugin index) fails fast instead of
-/// wedging `setup`/`--check`/`--remove` forever in an `open(2)` that waits
-/// for a writer — the same guard as the composer/npm setup twins and the
-/// crawlers.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Whether `.socket/.gitignore` is missing the stamp entry (so `setup` still
@@ -695,8 +686,13 @@ async fn remove_plugin_files(root: &Path, dry_run: bool) -> GemEditResult {
                 remove_generated(&gemspec_path(root)).await?;
             }
             remove_stamp_artifacts(root).await;
-            // Prune the now-empty plugin dir (leave .socket/ — apply uses it).
+            // Prune the now-empty plugin dir, then `.socket/` itself when
+            // nothing else — manifest, blobs, vendor tree, a user
+            // `.gitignore` — is left in it: `remove_dir` refuses a non-empty
+            // dir, and every writer recreates `.socket/` on demand. Never
+            // `remove_dir_all`.
             let _ = fs::remove_dir(&dir).await;
+            let _ = fs::remove_dir(root.join(".socket")).await;
         }
         Ok(true)
     }
@@ -1021,6 +1017,10 @@ mod tests {
         assert!(
             !stamp_gitignore_path(root).exists(),
             "the .gitignore we created (nothing but our line) is removed too"
+        );
+        assert!(
+            !root.join(".socket").exists(),
+            "an emptied .socket/ is pruned: --remove restores the pre-setup tree"
         );
         // Remove again → already gone.
         assert_eq!(
@@ -2063,7 +2063,8 @@ mod tests {
         let root = dir.path();
         let plugin_root = root.join(".bundle/plugin");
         let index = plugin_root.join("index");
-        let body = "---\ncommands:\nhooks:\n  after-install:\n  - \"other\"\n  - \"socket-patch\"\n\
+        let body =
+            "---\ncommands:\nhooks:\n  after-install:\n  - \"other\"\n  - \"socket-patch\"\n\
              load_paths:\n  other:\n  - \"/x/other/.\"\n  socket-patch:\n  - \"/proj/p/.\"\n\
              plugin_paths:\n  other: \"/x/other\"\n  socket-patch: \"/proj/p\"\nsources:\n";
         write(&index, body).await;
@@ -2114,6 +2115,10 @@ mod tests {
             user_bytes,
             "a stamp-free user .gitignore must survive byte-identical (CRLF kept)"
         );
+        assert!(
+            root.join(".socket").is_dir(),
+            "a .socket/ that still holds user content is kept (prune is remove_dir, not _all)"
+        );
     }
 
     #[tokio::test]
@@ -2132,7 +2137,11 @@ mod tests {
         .await;
 
         let r = add_plugin_files(root, false).await;
-        assert_eq!(r.status, GemSetupStatus::Updated, "stale plugins.rb resynced");
+        assert_eq!(
+            r.status,
+            GemSetupStatus::Updated,
+            "stale plugins.rb resynced"
+        );
         assert_eq!(
             fs::read_to_string(plugins_rb_path(root)).await.unwrap(),
             PLUGINS_RB

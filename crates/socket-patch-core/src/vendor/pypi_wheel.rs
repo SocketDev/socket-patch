@@ -21,7 +21,9 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{
     is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
 };
-use crate::utils::fs::{atomic_write_bytes, list_dir_entries};
+use crate::utils::fs::{
+    atomic_write_bytes, list_dir_entries, read_regular_to_bytes, read_regular_to_string,
+};
 
 use super::common::{failed_result, is_executable, write_zip_entries};
 
@@ -51,23 +53,10 @@ pub struct WheelArtifact {
     pub size: u64,
 }
 
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted in the dist-info (or squatting a RECORD member)
-/// fails fast — surfacing as the same unreadable-file refusal/failure as a
-/// missing file — instead of wedging the vendor run forever in an `open(2)`
-/// that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
-
-/// Byte-reading twin of [`read_regular_to_string`], also handing back the
+/// Byte-reading twin of [`read_regular_to_string`] that also hands back the
 /// metadata from the already-open handle (the member staging loop needs the
-/// exec bit without a second stat).
+/// exec bit without a second stat — the one reason this is not the shared
+/// `read_regular_to_bytes`).
 async fn read_regular(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Metadata)> {
     use tokio::io::AsyncReadExt as _;
 
@@ -88,7 +77,23 @@ pub async fn locate_installed_dist(
     version: &str,
 ) -> Result<InstalledDist, (&'static str, String)> {
     let want = canonicalize_pypi_name(purl_name);
-    for entry in list_dir_entries(site_packages).await {
+    // Two passes over the one in-memory listing: dist-info stems that already
+    // spell `<name>-<version>` first (one METADATA read in the common case
+    // instead of one per installed dist), then every other dist-info as the
+    // fallback (a stem without a version part, or a stale install whose stem
+    // disagrees with its METADATA). Both passes run the same authoritative
+    // METADATA compare below.
+    let stem_matches = |dir_name: &str| {
+        dir_name
+            .strip_suffix(".dist-info")
+            .and_then(|stem| stem.rfind('-').map(|i| (&stem[..i], &stem[i + 1..])))
+            .is_some_and(|(n, v)| canonicalize_pypi_name(n) == want && v == version)
+    };
+    let (likely, rest): (Vec<_>, Vec<_>) = list_dir_entries(site_packages)
+        .await
+        .into_iter()
+        .partition(|e| stem_matches(&e.file_name().to_string_lossy()));
+    for entry in likely.into_iter().chain(rest) {
         let dir_name = entry.file_name().to_string_lossy().into_owned();
         let Some(stem) = dir_name.strip_suffix(".dist-info") else {
             continue;
@@ -532,7 +537,7 @@ fn is_installer_bookkeeping(path: &str, dist_info_name: &str) -> bool {
 
 /// True when `dist-info/direct_url.json` marks the install editable.
 async fn is_editable_install(dist_info_dir: &Path) -> bool {
-    let Ok((bytes, _)) = read_regular(&dist_info_dir.join("direct_url.json")).await else {
+    let Ok(bytes) = read_regular_to_bytes(&dist_info_dir.join("direct_url.json")).await else {
         return false;
     };
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -1234,7 +1239,10 @@ mod tests {
             record: vec![],
             wheel_tags: vec!["py3-none-any".into()],
         };
-        assert_eq!(wheel_file_name(&dist).unwrap(), "pkg-1!2.0-py3-none-any.whl");
+        assert_eq!(
+            wheel_file_name(&dist).unwrap(),
+            "pkg-1!2.0-py3-none-any.whl"
+        );
     }
 
     /// `mkfifo(2)` directly instead of shelling out to the binary — the

@@ -1,6 +1,6 @@
 //! End-to-end tests that exercise every ecosystem dispatch branch in
-//! `ecosystem_dispatch::find_packages_for_purls` and
-//! `find_packages_for_rollback`. Each ecosystem has a separate code
+//! `ecosystem_dispatch::find_all_packages_for_purls` (apply's resolver)
+//! and `find_packages_for_rollback`. Each ecosystem has a separate code
 //! branch in those functions; this file ensures every branch executes
 //! at least once AND that it actually routed the PURL to the right
 //! ecosystem — not merely that the binary exited without crashing.

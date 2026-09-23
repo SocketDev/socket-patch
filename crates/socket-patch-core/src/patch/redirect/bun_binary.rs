@@ -303,6 +303,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bytes = result.binary_files["bun.lockb"].clone();
         std::fs::write(dir.path().join("bun.lockb"), &bytes).unwrap();
+        // The whole-ledger replay restores the binary lock through the
+        // mode-preserving atomic writer, like the per-purl path.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.path().join("bun.lockb"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
         let mut ledger = state(result.edits);
         let replay = revert_remaining_redirect_edits(dir.path(), &mut ledger.clone(), false).await;
         assert!(replay.refusals.is_empty(), "{:?}", replay.refusals);
@@ -310,6 +321,19 @@ mod tests {
             std::fs::read(dir.path().join("bun.lockb")).unwrap(),
             FIXTURE
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(dir.path().join("bun.lockb"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "bun.lockb keeps its mode across the replay"
+            );
+        }
         let mut drift = BunLockb::parse(&bytes).unwrap();
         let first_id = ledger.edits[0].key.as_ref().unwrap().parse().unwrap();
         drift

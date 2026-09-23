@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use crate::utils::fs::read_regular_to_string;
 use crate::utils::toml_edit_ext::has_table;
 
 /// The dependency `setup` adds (PEP 508 form, used for `requirements.txt` and
@@ -64,21 +65,6 @@ impl PythonPackageManager {
     }
 }
 
-/// Guarded read shared with the gem/composer/npm setup twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
-/// so a FIFO planted at `pyproject.toml` fails fast to the `Pip` fallback
-/// instead of wedging `setup`/`--check` forever in an `open(2)` that waits
-/// for a writer — the `is_python_project` gate ahead of detection is
-/// metadata-only and does not filter these.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
-
 /// Detect the dependency manager from lockfiles and `pyproject.toml` tables.
 ///
 /// Lockfiles are the strongest signal; `[tool.*]` tables come next; a project
@@ -94,6 +80,11 @@ pub async fn detect_python_pm(cwd: &Path) -> PythonPackageManager {
     if tokio::fs::metadata(cwd.join("poetry.lock")).await.is_ok() {
         return PythonPackageManager::Poetry;
     }
+    // Guarded read (shared with the gem/composer/npm setup twins): a FIFO
+    // planted at `pyproject.toml` fails fast to the `Pip` fallback instead of
+    // wedging `setup`/`--check` forever in an `open(2)` that waits for a
+    // writer — the `is_python_project` gate ahead of detection is
+    // metadata-only and does not filter these.
     if let Ok(content) = read_regular_to_string(&cwd.join("pyproject.toml")).await {
         // Header-anchored checks so a stray substring in a value/comment does
         // not misclassify.

@@ -5,6 +5,16 @@ pub(crate) fn stdin_is_tty() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// Print one JSON document, pretty-printed, to stdout — the one writer
+/// behind every `--json` envelope, so each consumer parses stdout as
+/// exactly one document.
+pub(crate) fn print_json(v: &serde_json::Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(v).expect("serializing an in-memory JSON value cannot fail")
+    );
+}
+
 /// The update notifier's TTY gate reads *stderr*, not stdin: the notice
 /// prints there, and stdout may be legitimately piped (`list | jq`) in a
 /// perfectly interactive session.
@@ -65,18 +75,27 @@ pub(crate) fn confirm(prompt: &str, default_yes: bool, skip_prompt: bool, is_jso
     io::stderr()
         .flush()
         .expect("stderr is unbuffered, so flush cannot fail");
+    // An empty answer takes the default; an unreadable one declines.
+    read_yes_no().unwrap_or(default_yes)
+}
+
+/// Read one yes/no answer from stdin: `Some(true)` for `y`/`yes` (any
+/// case, surrounding whitespace ignored), `Some(false)` for any other
+/// answer — including a line that could not be read: terminals can deliver
+/// non-UTF-8 bytes (a Latin-1 paste), which `read_line` reports as
+/// `InvalidData`, and that is a decline, never a panic — and `None` when
+/// nothing was answered (an empty line), which callers map to their own
+/// default.
+pub(crate) fn read_yes_no() -> Option<bool> {
     let mut answer = String::new();
     if io::stdin().read_line(&mut answer).is_err() {
-        // Terminals can deliver non-UTF-8 bytes (e.g. a Latin-1 paste);
-        // `read_line` reports those as InvalidData. Treat any read
-        // failure like an unrecognized answer (decline), not a panic.
-        return false;
+        return Some(false);
     }
     let answer = answer.trim().to_lowercase();
     if answer.is_empty() {
-        return default_yes;
+        return None;
     }
-    answer == "y" || answer == "yes"
+    Some(answer == "y" || answer == "yes")
 }
 
 /// Prompt the user to select one option from a list using dialoguer.

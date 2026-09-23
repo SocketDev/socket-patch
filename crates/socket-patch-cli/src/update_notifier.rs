@@ -23,6 +23,7 @@ use socket_patch_core::update::{
     self as core_update, detect_channel, is_newer, upgrade_hint, ChannelEnv, InstallChannel,
     UpdateEndpoints, UpdateTimeouts,
 };
+use socket_patch_core::utils::socket_cli_config::env_truthy;
 
 use crate::args::GlobalArgs;
 use crate::output;
@@ -101,17 +102,6 @@ pub fn should_check(ctx: &GuardCtx) -> Result<(), SkipReason> {
     Ok(())
 }
 
-fn env_flag(name: &str) -> bool {
-    matches!(
-        std::env::var(name)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on" | "y" | "t"
-    )
-}
-
 /// `CI` set to anything non-empty except an explicit falsy counts;
 /// `GITHUB_ACTIONS` counts whenever non-empty. Deliberately short list —
 /// the TTY guard covers other vendors' runners anyway.
@@ -129,13 +119,13 @@ impl GuardCtx {
     /// Capture the real environment + the parsed global flags.
     pub fn capture(common: &GlobalArgs) -> Self {
         GuardCtx {
-            opted_out: env_flag("SOCKET_NO_UPDATE_CHECK"),
+            opted_out: env_truthy("SOCKET_NO_UPDATE_CHECK"),
             offline: common.offline,
             silent: common.silent,
             json: common.json,
             ci: in_ci(),
             stderr_tty: output::stderr_is_tty(),
-            forced: env_flag("SOCKET_UPDATE_NOTIFIER_FORCE"),
+            forced: env_truthy("SOCKET_UPDATE_NOTIFIER_FORCE"),
             state_dir_resolvable: core_update::state::state_dir().is_some(),
         }
     }

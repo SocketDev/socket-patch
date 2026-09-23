@@ -109,10 +109,11 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
             if path.is_dir() {
                 walk(root, &path, result);
             } else {
+                // Every run removes its `apply.lock` on exit, so the
+                // snapshot deliberately does NOT exclude it: a surviving
+                // lock file is a real before/after difference.
                 let relative = path.strip_prefix(root).unwrap();
-                if relative != Path::new(".socket/apply.lock") {
-                    result.insert(relative.to_path_buf(), std::fs::read(path).unwrap());
-                }
+                result.insert(relative.to_path_buf(), std::fs::read(path).unwrap());
             }
         }
     }
@@ -680,9 +681,11 @@ async fn native_binary_scan_vendored_and_detached() {
             result["vendor"]["summary"]["applied"], 1,
             "scan vendored detached={detached}: {result}"
         );
-        assert_eq!(
-            fixture.project.join(".socket/manifest.json").exists(),
-            !detached
+        // Vendored mode is manifest-free either way: `--detached` is an
+        // accepted no-op.
+        assert!(
+            !fixture.project.join(".socket/manifest.json").exists(),
+            "vendored scan must not write a manifest (detached={detached})"
         );
         fixture.frozen("scan-vendored", &fixture.patched, "minimist");
         let result = cli(&fixture.project, &["vendor", "--revert"]);

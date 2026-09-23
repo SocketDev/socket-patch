@@ -1327,6 +1327,252 @@ fn local_ledger_never_suppresses_flagged_manifest_not_found_via_binary() {
 }
 
 // ---------------------------------------------------------------------------
+// Vendor-ledger records — vendored mode is manifest-free: every `scan`/`get
+// --mode vendored` patch lives ONLY in `.socket/vendor/state.json`, as a
+// `detached` entry carrying its embedded record. The hosted rule applies
+// unchanged: a vendored-only project lists its records (labeled `vendored`)
+// and exits 0 instead of `manifest_not_found`; a legacy manifest-tracked
+// entry (no record of its own) never double-lists its manifest purl.
+// ---------------------------------------------------------------------------
+
+const VENDORED_PURL: &str = "pkg:npm/vendored-pkg@3.0.0";
+const VENDORED_UUID: &str = "44444444-4444-4444-8444-444444444444";
+
+/// Seed `.socket/vendor/state.json`. `Some(record)` writes the detached
+/// (manifest-free) shape; `None` a legacy manifest-tracked entry.
+fn write_vendor_ledger(root: &Path, entries: &[(&str, Option<PatchRecord>)]) {
+    let mut map = serde_json::Map::new();
+    for (purl, record) in entries {
+        let uuid = record
+            .as_ref()
+            .map_or("legacy-uuid".to_string(), |r| r.uuid.clone());
+        map.insert(
+            (*purl).to_string(),
+            serde_json::json!({
+                "ecosystem": "npm",
+                "basePurl": purl,
+                "uuid": uuid,
+                "artifact": { "path": format!(".socket/vendor/npm/{uuid}/pkg.tgz") },
+                "wiring": [],
+                "detached": record.is_some(),
+                "record": record,
+            }),
+        );
+    }
+    let vendor_dir = root.join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(
+        vendor_dir.join("state.json"),
+        serde_json::to_string_pretty(&serde_json::json!({ "version": 1, "entries": map })).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn vendored_only_project_list_json_lists_ledger_records_via_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_vendor_ledger(
+        tmp.path(),
+        &[(VENDORED_PURL, Some(hosted_record(VENDORED_UUID)))],
+    );
+
+    let out = run_list_binary(tmp.path(), &["--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "vendored-only list --json must exit 0 (records found), stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    assert_eq!(v["status"], "success", "envelope={v}");
+    assert_eq!(v["summary"]["discovered"], 1, "envelope={v}");
+    let event = &v["events"][0];
+    assert_eq!(event["purl"], VENDORED_PURL, "envelope={v}");
+    assert_eq!(event["uuid"], VENDORED_UUID, "envelope={v}");
+    assert_eq!(event["details"]["mode"], "vendored", "envelope={v}");
+    assert_eq!(
+        event["details"]["ledger"], ".socket/vendor/state.json",
+        "envelope={v}"
+    );
+    assert_eq!(event["details"]["tier"], "free", "envelope={v}");
+}
+
+#[test]
+fn vendored_only_project_list_plain_labels_vendored_via_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_vendor_ledger(
+        tmp.path(),
+        &[(VENDORED_PURL, Some(hosted_record(VENDORED_UUID)))],
+    );
+
+    let out = run_list_binary(tmp.path(), &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "vendored-only list must exit 0, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("Found 1 patch(es):"),
+        "count header must include the vendored record: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("Package: {VENDORED_PURL}")),
+        "missing vendored purl: {stdout}"
+    );
+    assert!(
+        stdout.contains("Mode: vendored"),
+        "vendored record must be labeled: {stdout}"
+    );
+    assert!(
+        stdout.contains(".socket/vendor/state.json"),
+        "the label must name the ledger the record came from: {stdout}"
+    );
+}
+
+#[test]
+fn manifest_hosted_and_vendored_ledgers_coexist_via_binary() {
+    // One purl in all three stores: every copy listed, purl-sorted, manifest
+    // then hosted then vendored on the tie.
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest_in(tmp.path(), &populated_manifest());
+    common::write_redirect_ledger(
+        tmp.path(),
+        &[("pkg:npm/test-pkg@1.0.0", hosted_record(HOSTED_UUID))],
+    );
+    write_vendor_ledger(
+        tmp.path(),
+        &[
+            ("pkg:npm/test-pkg@1.0.0", Some(hosted_record(VENDORED_UUID))),
+            // Legacy manifest-tracked vendoring of the same purl: no record
+            // of its own, so it must not add a fourth copy.
+            ("pkg:npm/test-pkg@1.0.0#legacy", None),
+        ],
+    );
+
+    let out = run_list_binary(tmp.path(), &["--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    let listed: Vec<(&str, &str)> = v["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .map(|e| {
+            (
+                e["uuid"].as_str().expect("uuid"),
+                e["details"]["mode"].as_str().unwrap_or("manifest"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            ("11111111-1111-4111-8111-111111111111", "manifest"),
+            (HOSTED_UUID, "hosted"),
+            (VENDORED_UUID, "vendored"),
+        ],
+        "manifest < hosted < vendored on a purl tie, record-less entries \
+         skipped; envelope={v}"
+    );
+}
+
+#[test]
+fn record_less_vendor_entry_without_manifest_still_manifest_not_found_via_binary() {
+    // A legacy manifest-tracked entry asserts no patch of its own: with no
+    // manifest and no other store, `list` stays on the manifest_not_found
+    // path (mirrors the edits-only redirect ledger).
+    let tmp = tempfile::tempdir().unwrap();
+    write_vendor_ledger(tmp.path(), &[(VENDORED_PURL, None)]);
+
+    let out = run_list_binary(tmp.path(), &["--json"]);
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "no records anywhere must exit 1"
+    );
+    assert_eq!(v["error"]["code"], "manifest_not_found", "envelope={v}");
+}
+
+#[test]
+fn silent_gates_the_malformed_vendor_ledger_warning_via_binary() {
+    // Same posture as the redirect ledger: a corrupt vendor ledger degrades
+    // to "nothing to consult" with an advisory stderr warning that --silent
+    // ("errors only") mutes; the manifest still lists, exit 0.
+    let tmp = tempfile::tempdir().unwrap();
+    write_manifest_in(tmp.path(), &populated_manifest());
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(vendor_dir.join("state.json"), "{ torn ledger").unwrap();
+
+    let loud = run_list_binary_scrubbed(tmp.path(), &[]);
+    assert_eq!(loud.status.code(), Some(0), "manifest still lists");
+    assert!(
+        String::from_utf8_lossy(&loud.stderr).contains("unreadable vendor ledger"),
+        "a corrupt vendor ledger must be surfaced on stderr when not silent; \
+         stderr={}",
+        String::from_utf8_lossy(&loud.stderr)
+    );
+
+    let out = run_list_binary_scrubbed(tmp.path(), &["--silent"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).trim().is_empty(),
+        "--silent must mute the vendor-ledger warning; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn manifest_path_scopes_vendor_ledger_to_target_project_via_binary() {
+    // The vendor ledger resolves at the SAME project root as the manifest
+    // and the redirect ledger — never the cwd's.
+    let cwd = tempfile::tempdir().unwrap();
+    write_vendor_ledger(
+        cwd.path(),
+        &[(
+            "pkg:npm/local-decoy@0.0.1",
+            Some(hosted_record(VENDORED_UUID)),
+        )],
+    );
+    let target = tempfile::tempdir().unwrap();
+    write_manifest_in(target.path(), &populated_manifest());
+    write_vendor_ledger(
+        target.path(),
+        &[(VENDORED_PURL, Some(hosted_record(VENDORED_UUID)))],
+    );
+
+    let manifest_path = target.path().join(".socket/manifest.json");
+    let out = run_list_binary(
+        cwd.path(),
+        &["--json", "--manifest-path", manifest_path.to_str().unwrap()],
+    );
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    let purls: Vec<&str> = v["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .map(|e| e["purl"].as_str().expect("purl"))
+        .collect();
+    assert_eq!(
+        purls,
+        vec!["pkg:npm/test-pkg@1.0.0", VENDORED_PURL],
+        "only the target project's manifest + vendor ledger may be listed — \
+         never the cwd's local ledger; envelope={v}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Telemetry — `patch_listed`'s `patches_count` predates the hosted folding
 // and dashboards consume it as "manifest patches". Folding hosted records
 // into the SAME field would silently redefine the metric (and double-count

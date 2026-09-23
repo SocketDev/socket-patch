@@ -79,7 +79,7 @@ fn non_utf8_arg_after_subcommand_is_clean_usage_error() {
 
 #[test]
 fn non_utf8_bare_first_arg_is_clean_usage_error() {
-    // First positional slot — the position `parse_with_uuid_fallback` probes
+    // First positional slot — the position `parse_argv_with_shortcuts` probes
     // for the bare-UUID rewrite. The argv collection must fail cleanly before
     // any of that machinery runs.
     let (code, stdout, stderr) = run(&[non_utf8_arg()]);

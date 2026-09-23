@@ -583,8 +583,8 @@ async fn reconcile_drops_stale_entries() {
 // 8b. reconcile: detached entries are exempt
 // ─────────────────────────────────────────────────────────────────────
 
-/// A detached entry (`scan --vendor --detached`) is never manifest-tracked,
-/// so "absent from the manifest" is its normal state — reconcile must leave
+/// A detached entry (the shape every `scan --mode vendored` run writes) is
+/// never manifest-tracked, so "absent from the manifest" is its normal state — reconcile must leave
 /// it alone. Only `vendor --revert` or `remove` may undo it.
 #[tokio::test]
 async fn reconcile_leaves_detached_entries_alone() {
@@ -592,7 +592,7 @@ async fn reconcile_leaves_detached_entries_alone() {
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
     let wired_lock = fx.lock_bytes();
 
-    // Mark the entry detached (the shape `scan --vendor --detached` writes)
+    // Mark the entry detached (the shape `scan --mode vendored` writes)
     // and drop the patch from the manifest.
     let mut state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap())
         .expect("state.json is JSON");
@@ -1131,7 +1131,7 @@ async fn remove_detached_only_purl_reverts() {
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
 
     // Detach the entry and drop the manifest record (the state a
-    // `scan --vendor --detached` run leaves behind).
+    // `scan --mode vendored` run leaves behind).
     let mut state: Value =
         serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
     state["entries"][PURL]["detached"] = json!(true);
@@ -1336,11 +1336,12 @@ fn lock_contention_exits_lock_held() {
 /// `vendor --revert` is documented to work without a manifest, and "a
 /// missing ledger is an empty ledger (clean no-op plus the orphan-dir
 /// sweep)" (CLI_CONTRACT, "Ownership, state, and reversal"). A project
-/// with no `.socket/` directory at all is exactly that case — but the
-/// apply lock lives INSIDE `.socket/`, and `apply_lock::acquire` only
-/// creates the lock *file*, never its parent. Taking the lock before
-/// noticing there is nothing to revert turns the documented no-op into a
-/// `lock_io` failure.
+/// with no `.socket/` directory at all is exactly that case. The apply
+/// lock lives INSIDE `.socket/`: `apply_lock::acquire` would create the
+/// directory for its lock file (and the guard's drop prune it again), but
+/// a no-op revert must never be the thing that creates `.socket/`, even
+/// transiently — so `vendor` skips the lock when there is no `.socket/`
+/// to serialize against.
 #[test]
 fn revert_without_a_socket_dir_is_a_clean_no_op() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1933,13 +1934,16 @@ fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, Value) 
     (code, env)
 }
 
-/// `scan --vendor` end to end on a gem project: discover → download
-/// (manifest written) → vendor lands the gem pair edit (Gemfile pin +
-/// `path:`, lock PATH section + `(= …)!` DEPENDENCIES pin) and the patched
-/// artifact dir — then reconcile auto-reverts once the manifest drops the
-/// patch, byte-restoring both halves.
+/// `scan --vendor` end to end on a gem project: discover → download →
+/// vendor lands the gem pair edit (Gemfile pin + `path:`, lock PATH section
+/// + `(= …)!` DEPENDENCIES pin) and the patched artifact dir, keyed in the
+/// ledger by the gem purl; a re-run is an `already_vendored` no-op; and
+/// `vendor --revert` (the vendored entry's exit path) byte-restores both
+/// halves and prunes the vendor tree. Manifest-agnostic on purpose: the
+/// vendored mode never writes `.socket/manifest.json` (its ledger owns the
+/// entries), so nothing here reads one.
 #[tokio::test]
-async fn scan_vendor_gem_end_to_end_and_reconcile() {
+async fn scan_vendor_gem_end_to_end_and_reverts() {
     let mock = wiremock::MockServer::start().await;
     mount_gem_patch_api(&mock, GEM_PURL).await;
     let fx = gem_fixture();
@@ -1950,12 +1954,6 @@ async fn scan_vendor_gem_end_to_end_and_reconcile() {
     assert_eq!(env["download"]["downloaded"], 1, "envelope: {env:#}");
     assert_eq!(env["vendor"]["summary"]["applied"], 1, "envelope: {env:#}");
     assert_eq!(env["vendor"]["summary"]["failed"], 0, "envelope: {env:#}");
-
-    // Manifest written by the download phase, keyed by the gem purl.
-    let manifest: Value =
-        serde_json::from_slice(&std::fs::read(fx.root().join(".socket/manifest.json")).unwrap())
-            .unwrap();
-    assert_eq!(manifest["patches"][GEM_PURL]["uuid"], GEM_UUID);
 
     // Artifact: patched bytes + the stub gemspec a path source needs.
     assert_eq!(
@@ -1997,15 +1995,11 @@ async fn scan_vendor_gem_end_to_end_and_reconcile() {
     );
 
     // The installed tree stays pristine (vendoring is not an in-place apply)
-    // and the ledger entry is manifest-tracked (not detached).
+    // and the ledger entry is keyed by the served gem purl.
     assert_eq!(std::fs::read(fx.installed_lib()).unwrap(), GEM_ORIG);
     let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
     assert_eq!(state["entries"][GEM_PURL]["ecosystem"], "gem");
     assert_eq!(state["entries"][GEM_PURL]["uuid"], GEM_UUID);
-    assert!(
-        state["entries"][GEM_PURL]["detached"].is_null(),
-        "manifest-mode entries are not detached: {state:#}"
-    );
 
     // Idempotent re-run through the same JSON arm.
     let gemfile_wired = std::fs::read(fx.gemfile_path()).unwrap();
@@ -2024,34 +2018,29 @@ async fn scan_vendor_gem_end_to_end_and_reconcile() {
     assert_eq!(std::fs::read(fx.gemfile_path()).unwrap(), gemfile_wired);
     assert_eq!(std::fs::read(fx.lock_path()).unwrap(), lock_wired);
 
-    // Reconcile: the patch dropped from the manifest is auto-reverted by the
-    // next plain vendor run — BOTH pair-edit halves byte-restored.
-    std::fs::write(
-        fx.root().join(".socket/manifest.json"),
-        b"{\"patches\": {}}\n",
-    )
-    .unwrap();
-    let (code, renv) = vendor_cli(fx.root(), &[]);
-    assert_eq!(code, 0, "reconcile-only run must exit 0: {renv:#}");
-    let removed = find_event(&renv, "removed", Some("vendor_reconciled"));
+    // `vendor --revert` is the vendored entry's exit path — BOTH pair-edit
+    // halves byte-restored, the vendor tree fully pruned.
+    let (code, renv) = vendor_cli(fx.root(), &["--revert"]);
+    assert_eq!(code, 0, "revert must undo the vendored entry: {renv:#}");
+    let removed = find_event(&renv, "removed", None);
     assert_eq!(removed["purl"], GEM_PURL);
     assert_eq!(
         std::fs::read(fx.gemfile_path()).unwrap(),
         GEM_GEMFILE.as_bytes(),
-        "reconcile must byte-restore the Gemfile"
+        "revert must byte-restore the Gemfile"
     );
     assert_eq!(
         std::fs::read(fx.lock_path()).unwrap(),
         GEM_LOCK.as_bytes(),
-        "reconcile must byte-restore Gemfile.lock"
+        "revert must byte-restore Gemfile.lock"
     );
     assert!(
         !fx.root().join(".socket/vendor").exists(),
-        "the reconciled vendor tree must be fully pruned"
+        "the reverted vendor tree must be fully pruned"
     );
 }
 
-/// Same in-process flow as [`scan_vendor_gem_end_to_end_and_reconcile`], but
+/// Same in-process flow as [`scan_vendor_gem_end_to_end_and_reverts`], but
 /// the served patch records carry the QUALIFIED gem purl (`?platform=ruby`)
 /// — the spelling production has published since the 2026-08-18 gem catalog
 /// republish. `platform=ruby` is the portable default: the vendor gate
@@ -2088,20 +2077,14 @@ async fn scan_vendor_gem_qualified_platform_ruby_purl_vendors() {
          an `applied` event for {GEM_PURL_QUALIFIED}: {env:#}"
     );
 
-    // Manifest and ledger entry are keyed by the SERVED (qualified) purl;
-    // the ledger entry additionally records the qualifier-stripped
-    // `basePurl` (built by `build_gem_purl`) — both halves of the mapping.
-    let manifest: Value =
-        serde_json::from_slice(&std::fs::read(fx.root().join(".socket/manifest.json")).unwrap())
-            .unwrap();
-    assert_eq!(
-        manifest["patches"][GEM_PURL_QUALIFIED]["uuid"], GEM_UUID,
-        "manifest keys by the served purl: {manifest:#}"
-    );
+    // The ledger entry is keyed by the SERVED (qualified) purl and
+    // additionally records the qualifier-stripped `basePurl` (built by
+    // `build_gem_purl`) — both halves of the mapping. (The ledger is the
+    // vendored mode's owner of record; no manifest is consulted.)
     let state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
     assert_eq!(
         state["entries"][GEM_PURL_QUALIFIED]["uuid"], GEM_UUID,
-        "ledger keys by the manifest (qualified) purl: {state:#}"
+        "ledger keys by the served (qualified) purl: {state:#}"
     );
     assert_eq!(
         state["entries"][GEM_PURL_QUALIFIED]["basePurl"], GEM_PURL,

@@ -7,7 +7,7 @@ use super::npm_common::{
 };
 use super::path::parse_vendor_path;
 use super::state::{
-    write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::manifest::schema::PatchRecord;
@@ -255,12 +255,7 @@ pub(crate) async fn vendor(
         .await;
     }
     let marker = VendorMarker::new("npm", &coords.base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&root.join(&coords.uuid_dir_rel), &marker).await {
-        warnings.push(VendorWarning::new(
-            "vendor_marker_write_failed",
-            e.to_string(),
-        ));
-    }
+    write_marker_or_warn(&root.join(&coords.uuid_dir_rel), &marker, &mut warnings).await;
     VendorOutcome::Done {
         result,
         warnings,
@@ -436,7 +431,17 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
             }
             prune_mirror_parents(&mirror).await;
         }
-        if let Err(e) = crate::patch::copy_tree::remove_tree(&root.join(&dir)).await {
+        // The last npm-family entry leaves `.socket/vendor/npm/` (and
+        // `.socket/vendor/`) empty: the shared helper prunes them so a
+        // reverted project carries no vendor residue (non-recursive:
+        // siblings keep them).
+        let uuid_dir = root.join(&dir);
+        if let Err(e) = crate::utils::socket_dir::remove_tree_and_prune(
+            &uuid_dir,
+            &root.join(crate::constants::SOCKET_DIR),
+        )
+        .await
+        {
             return RevertOutcome::failed(format!("cannot remove {dir}: {e}"));
         }
     }

@@ -10,25 +10,27 @@
 //!
 //! The rest of the CLI is vendor-aware: `apply`/`rollback` yield ownership of
 //! ledger-recorded purls, `remove` reverts vendoring as part of removing a
-//! patch, `scan --prune` exempts vendored entries, and `scan --vendor`
-//! drives this module's [`vendor_records`] engine directly (optionally
-//! `--detached`, writing ledger entries with embedded patch records instead
-//! of manifest entries). See CLI_CONTRACT.md "Ownership, state, and
-//! reversal".
+//! patch, `scan --prune` exempts vendored entries, and `scan`/`get --mode
+//! vendored` drive this module's [`vendor_records`] engine directly in
+//! DETACHED mode: every entry they write carries its patch record embedded
+//! in the ledger and no `.socket/manifest.json` is ever written — this
+//! command is the one manifest-driven writer (`detached: false`). See
+//! CLI_CONTRACT.md "Ownership, state, and reversal".
 
 use clap::Args;
 use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::constants::SOCKET_DIR;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
-use socket_patch_core::patch::copy_tree::remove_tree;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::{
     self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, registry_fetch,
     save_state, RevertOpts, RevertOutcome, VendorEntry, VendorOutcome, VendorServiceConfig,
-    VendorSource, VendorState, VendorWarning,
+    VendorState, VendorWarning,
 };
 use socket_patch_core::vex::time::now_rfc3339;
 use std::collections::{HashMap, HashSet};
@@ -40,6 +42,7 @@ use crate::commands::apply::{representative_file, result_to_event, variant_match
 use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
+use crate::commands::rollback::VendorRevertStep;
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::json_envelope::{
@@ -102,9 +105,9 @@ pub(crate) async fn dispatch_vendor_one(
     dry_run: bool,
     force: bool,
     // The patch.socket.dev vendoring-service config. `None` = build-only (the
-    // pre-service behavior); used by the `vendor` command, `None` from `scan
-    // --vendor` / repair. Per-ecosystem backends consume it as they gain a
-    // service path.
+    // pre-service behavior). `vendor` and `scan`/`get --mode vendored` pass
+    // `Some(_)` (honoring `--vendor-source`); repair passes `None` — it
+    // rebuilds locally from the recorded patch.
     service: Option<&VendorServiceConfig>,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
 ) -> Option<VendorOutcome> {
@@ -274,13 +277,19 @@ async fn sweep_orphan_vendor_dirs(cwd: &Path, state: &VendorState, dry_run: bool
             .into_iter()
             .map(|(eco, uuid, _path)| (eco, uuid))
             .collect();
+    // Each removal also prunes the `<eco>/` and `vendor/` levels it
+    // emptied (never `.socket/` — the lock guard owns that level): the
+    // sweep runs AFTER the per-entry reverts and their ledger saves, so it
+    // is the last thing that can leave a fully reverted project with empty
+    // `.socket/vendor/<eco>/` husks.
+    let stop_dir = cwd.join(SOCKET_DIR);
     for unit in candidates {
         if wired.contains(&(unit.eco.clone(), unit.uuid.clone())) {
             out.still_wired.push(unit);
             continue;
         }
         if !dry_run {
-            let _ = remove_tree(&unit.dir).await;
+            let _ = remove_tree_and_prune(&unit.dir, &stop_dir).await;
         }
         out.removed.push(unit);
     }
@@ -364,33 +373,18 @@ pub(crate) fn note_classic_migration_risk(
 
 pub async fn run(args: VendorArgs) -> i32 {
     apply_env_toggles(&args.common);
-    let (telemetry_client, use_public_proxy) =
-        get_api_client_with_overrides(args.common.api_client_overrides()).await;
-    let api_token = telemetry_client.api_token().cloned();
-    let org_slug = telemetry_client.org_slug().cloned();
-
-    // Vendoring-service config, built once from the run-level client + flags.
-    // `vendor_source` was validated by clap, so the parse cannot fail; fall
-    // back to the `auto` default defensively. The same client is reused for
-    // the package-reference request (no second auth round-trip).
-    let vendor_service = VendorServiceConfig {
-        source: VendorSource::parse(&args.common.vendor_source).unwrap_or_default(),
-        client: Some(telemetry_client.clone()),
-        use_public_proxy,
-        vendor_url: args.common.vendor_url.clone(),
-        patch_server_url: args.common.patch_server_url.clone(),
-        offline: args.common.offline,
-    };
 
     let manifest_path = args.common.resolved_manifest_path();
-    let socket_dir = manifest_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
+    let socket_dir = crate::args::socket_dir_of(&manifest_path, &args.common.cwd);
 
     // `--revert` derives everything from state.json + the vendor tree; it
     // must work after the manifest was deleted. Plain vendor needs the
-    // manifest and exits clean without one (same contract as apply).
+    // manifest and exits clean without one (same contract as apply). This
+    // is a MANIFEST check, not a `.socket/` check: it also fires on
+    // hosted-only projects and on every `scan`/`get --mode vendored`
+    // project (those never write a manifest — the vendor ledger owns their
+    // entries and `repair` is what verifies them), where `.socket/` exists.
+    // Nothing is locked or written on this path.
     if !args.revert && tokio::fs::metadata(&manifest_path).await.is_err() {
         if args.common.json {
             let mut env = Envelope::new(Command::Vendor);
@@ -398,22 +392,50 @@ pub async fn run(args: VendorArgs) -> i32 {
             env.dry_run = args.common.dry_run;
             println!("{}", env.to_pretty_json());
         } else if !args.common.silent {
-            println!("No .socket folder found, nothing to vendor.");
+            let tracked = load_state(&args.common.cwd)
+                .await
+                .map(|s| s.entries.len())
+                .unwrap_or(0);
+            println!("{}", no_manifest_message(tracked));
         }
         return 0;
     }
 
+    // The API client and the vendoring-service config exist for the
+    // vendoring arm alone — `--revert` never talks to the API (no service
+    // downloads, no telemetry) — so they are built after the no-manifest
+    // no-op and only when this run vendors. Built BEFORE the lock, like
+    // apply/rollback: the client's org-resolve round-trip must not run
+    // while other commands wait on `apply.lock`. `vendor_source` was
+    // validated by clap, so the parse cannot fail; fall back to the `auto`
+    // default defensively. The client moves into the config and is reused
+    // for the package-reference request (no second auth round-trip); the
+    // telemetry ids ride alongside for the post-run report.
+    let vendor_service = if args.revert {
+        None
+    } else {
+        let (client, use_public_proxy) =
+            get_api_client_with_overrides(args.common.api_client_overrides()).await;
+        let telemetry_ids = (client.api_token().cloned(), client.org_slug().cloned());
+        Some((
+            args.common
+                .vendor_service_config(Some(client), use_public_proxy),
+            telemetry_ids,
+        ))
+    };
+
     // Same lock as apply/rollback: vendor mutates the same lockfiles and
     // `.socket/` tree, so a separate lock would allow an apply↔vendor race.
     //
-    // The lock file lives INSIDE `.socket/`, and `acquire` creates the file
-    // but never its parent. `--revert` skipped the manifest check above, so
-    // it is the one path that can reach here with no `.socket/` dir at all —
-    // the documented clean no-op ("a missing ledger is an empty ledger").
-    // Locking first would turn that into a `lock_io` failure, so skip it:
-    // with no `.socket/` there is no ledger to read and nothing to write,
-    // hence nothing to serialize against.
-    let _lock = if args.revert && tokio::fs::metadata(&socket_dir).await.is_err() {
+    // `--revert` skipped the manifest check above, so it is the one path
+    // that can reach here with no `.socket/` dir at all — the documented
+    // clean no-op ("a missing ledger is an empty ledger"). `acquire` would
+    // create `.socket/` for its lock file and the guard's drop would prune
+    // it again, but a no-op revert must never be the thing that creates a
+    // `.socket/` dir, even transiently: with no `.socket/` there is no
+    // ledger to read and nothing to write, hence nothing to serialize
+    // against. Skip the lock.
+    let lock = if args.revert && tokio::fs::metadata(&socket_dir).await.is_err() {
         None
     } else {
         match acquire_or_emit(
@@ -431,10 +453,9 @@ pub async fn run(args: VendorArgs) -> i32 {
     let mut env = Envelope::new(Command::Vendor);
     env.dry_run = args.common.dry_run;
 
-    let mut exit = if args.revert {
-        run_revert(&args, &mut env).await
-    } else {
-        run_vendor(&args, &manifest_path, &mut env, &vendor_service).await
+    let mut exit = match &vendor_service {
+        None => run_revert(&args, &mut env).await,
+        Some((service, _)) => run_vendor(&args, &manifest_path, &mut env, service).await,
     };
 
     // Embedded VEX: same contract as `apply --vex` — only on success, and a
@@ -487,11 +508,19 @@ pub async fn run(args: VendorArgs) -> i32 {
     // ledger feeding VEX indefinitely.
     super::scan::note_vendor_supersedes_redirect(&mut env, &args.common.cwd, &args.common).await;
 
+    // That advisory may persist the redirect ledger, so it ran under the
+    // lock; everything below is output and telemetry — nothing touches
+    // `.socket/` or the lockfiles — so release the lock first (the drop also
+    // unlinks `apply.lock` and prunes an emptied `.socket/`) rather than
+    // holding it across a network round-trip while competitors see
+    // `lock_held`.
+    drop(lock);
+
     if args.common.json {
         println!("{}", env.to_pretty_json());
     }
 
-    if !args.revert {
+    if let Some((_, (api_token, org_slug))) = &vendor_service {
         track_outcomes_for_vendor(
             exit != 0,
             &env,
@@ -503,6 +532,24 @@ pub async fn run(args: VendorArgs) -> i32 {
     }
 
     exit
+}
+
+/// The human no-op line for a plain `vendor` with no manifest. Names the
+/// MANIFEST (the thing actually missing), and — when the vendor ledger
+/// tracks entries, i.e. a `scan`/`get --mode vendored` project — says so
+/// instead of implying nothing is vendored: their refresh path is `scan
+/// --mode vendored`, and `repair` is what re-verifies the ledger.
+fn no_manifest_message(tracked_entries: usize) -> String {
+    match tracked_entries {
+        0 => "No manifest found, nothing to vendor.".to_string(),
+        1 => "No manifest to vendor from; 1 vendored entry is tracked in the ledger — \
+              `socket-patch repair` verifies it."
+            .to_string(),
+        n => format!(
+            "No manifest to vendor from; {n} vendored entries are tracked in the ledger — \
+             `socket-patch repair` verifies them."
+        ),
+    }
 }
 
 /// Telemetry for a vendor run's success/failure split, shared by
@@ -542,24 +589,36 @@ async fn run_vendor(
 
     // Reconcile first (mirrors apply's placement): entries vendored by a
     // previous run whose patches were dropped from the manifest are reverted
-    // even when zero in-scope patches remain.
-    let mut has_errors = reconcile_dropped(&manifest, common, env).await;
+    // even when zero in-scope patches remain. Its post-reconcile ledger
+    // feeds the staging harvest below and then the engine (one load, not
+    // three).
+    let (mut has_errors, ledger) = reconcile_dropped(&manifest, common, env).await;
 
-    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let socket_dir = crate::args::socket_dir_of(manifest_path, &common.cwd);
     // Vendor stages patch content IN MEMORY: existing .socket artifacts are
     // read in place, missing content is fetched per patch — vendoring never
-    // writes blobs or temp files (the committed artifact is the patch).
-    let staged =
-        match stage_vendor_sources_in_memory(common, &manifest, socket_dir, &common.cwd).await {
-            MemStageOutcome::Ready(s) => s,
-            MemStageOutcome::Unavailable => {
-                env.mark_error(EnvelopeError::new(
-                    "no_local_source",
-                    "patch artifacts unavailable (offline or download failure)",
-                ));
-                return 1;
-            }
-        };
+    // writes blobs or temp files (the committed artifact is the patch). No
+    // seed: this manifest-driven command has no download phase.
+    let staged = match stage_vendor_sources_in_memory(
+        common,
+        &manifest,
+        &socket_dir,
+        &common.cwd,
+        ledger.as_ref().map(|s| &s.entries),
+        HashMap::new(),
+        service.client.as_ref(),
+    )
+    .await
+    {
+        MemStageOutcome::Ready(s) => s,
+        MemStageOutcome::Unavailable => {
+            env.mark_error(EnvelopeError::new(
+                "no_local_source",
+                "patch artifacts unavailable (offline or download failure)",
+            ));
+            return 1;
+        }
+    };
     let sources = staged.as_patch_sources();
 
     has_errors |= vendor_records(
@@ -570,6 +629,7 @@ async fn run_vendor(
         args.force,
         env,
         Some(service),
+        ledger,
     )
     .await;
 
@@ -660,7 +720,11 @@ pub(crate) async fn persist_vendor_entry(
                 return has_errors;
             }
             if !common.dry_run {
-                let _ = remove_tree(&common.cwd.join(rel)).await;
+                // Prunes the emptied `<eco>/` level too (a uuid change
+                // within one ecosystem never empties it, but a re-vendor
+                // that moved ecosystems would otherwise leave a husk).
+                let _ = remove_tree_and_prune(&common.cwd.join(rel), &common.cwd.join(SOCKET_DIR))
+                    .await;
             }
             env.record(
                 PatchEvent::new(PatchAction::Removed, candidate.clone()).with_reason(
@@ -729,13 +793,22 @@ pub(crate) async fn fetch_pristine_package(
 
 /// The vendoring engine, decoupled from the manifest file. `records` is the
 /// purl → [`PatchRecord`] view to vendor: `manifest.patches` for the
-/// manifest-driven `vendor` command (and `scan --vendor`), or the
-/// freshly-fetched record map for `scan --vendor --detached`. Entries written
-/// in `detached` mode carry [`VendorEntry::detached`] plus an embedded copy
-/// of their record, so revert/verify/VEX work without a manifest entry.
+/// manifest-driven `vendor` command, or the in-memory record map
+/// `scan`/`get --mode vendored` fetched (`detached`). Entries written in
+/// `detached` mode carry [`VendorEntry::detached`] plus an embedded copy of
+/// their record, so revert/verify/VEX work without a manifest entry — the
+/// vendored modes never write one; only this command's `detached: false`
+/// entries are manifest-tracked.
 ///
-/// Does NOT lock, read the manifest, or print the envelope — callers own all
-/// three. Returns whether any non-benign failure occurred.
+/// Does NOT lock, read the manifest, load the ledger or print the envelope —
+/// callers own all four. `ledger` is the vendor ledger the caller loaded
+/// once under its apply lock (the same load that fed its staging harvest),
+/// handed over for this run's persists; an unreadable one is reported here
+/// as `vendor_state_unreadable`. Returns whether any non-benign failure
+/// occurred.
+// The eighth parameter is the caller's one ledger load; bundling it with the
+// run flags would only move the same arguments into a struct.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn vendor_records(
     common: &GlobalArgs,
     records: &HashMap<String, PatchRecord>,
@@ -746,6 +819,7 @@ pub(crate) async fn vendor_records(
     // Vendoring-service config (`None` = build-only). Both the `vendor`
     // command and `scan --vendor` pass `Some(_)`, honoring `--vendor-source`.
     service: Option<&VendorServiceConfig>,
+    ledger: std::io::Result<VendorState>,
 ) -> bool {
     let mut has_errors = false;
     // Lockfile flavors the backends wired THIS run (from the returned ledger
@@ -791,17 +865,33 @@ pub(crate) async fn vendor_records(
         })
         .collect();
 
+    // The vendor ledger, loaded ONCE per run by the caller (under its lock,
+    // for its staging harvest) and handed over here: the artifact-staging
+    // path below, the Bun preflight and every per-package persist read or
+    // mutate this copy. An unreadable ledger is the hard error it is —
+    // failing here, before the crawler walk and any registry traffic, is
+    // what keeps a corrupt state.json from running the whole fetch ladder
+    // first (and pushing its warnings into the envelope) only to fail the
+    // run afterwards.
+    let mut state = match ledger {
+        Ok(s) => s,
+        Err(e) => {
+            env.mark_error(EnvelopeError::new("vendor_state_unreadable", e.to_string()));
+            return true;
+        }
+    };
+
     let crawler_options = CrawlerOptions {
         cwd: common.cwd.clone(),
         global: common.global,
         global_prefix: common.global_prefix.clone(),
     };
-    // Resolve installed packages with the qualified-purl-aware resolver, NOT
-    // `find_packages_for_purls`: the manifest keys release-variant ecosystems
-    // (gem `?platform=`, pypi `?artifact_id=`, maven `?classifier=&ext=`) by
-    // *qualified* purls, but the crawler only knows the *base* purl.
-    // `find_packages_for_purls` keys the result map by the base purl, so the
-    // `missing`/`contains_key` check below would miss every installed
+    // Resolve installed packages with the qualified-purl-aware resolver, never
+    // a base-keyed one: the manifest keys release-variant ecosystems (gem
+    // `?platform=`, pypi `?artifact_id=`, maven `?classifier=&ext=`) by
+    // *qualified* purls, but the crawler only knows the *base* purl. A
+    // base-keyed result map would make the `missing`/`contains_key` check
+    // below miss every installed
     // qualified-purl package and falsely classify it "not installed" —
     // triggering a spurious `vendor_fetched_missing`, a redundant per-run
     // registry download, and (for gem) a HashMap-order platform coin-flip.
@@ -829,7 +919,7 @@ pub(crate) async fn vendor_records(
         let crawler = socket_patch_core::crawlers::npm_crawler::NpmCrawler::new();
         for package in crawler.crawl_all(&crawler_options).await {
             for purl in &missing_npm {
-                if normalize_purl(strip_purl_qualifiers(purl)) == normalize_purl(&package.purl) {
+                if canonical_purl(purl) == normalize_purl(&package.purl) {
                     all_packages
                         .entry(purl.clone())
                         .or_insert_with(|| package.path.clone());
@@ -850,6 +940,13 @@ pub(crate) async fn vendor_records(
     // Fetch failures must keep their distinct Failed event; this set
     // suppresses the later duplicate `package_not_installed` skip.
     let mut fetch_failed: HashSet<String> = HashSet::new();
+    // The lockfile inventory (every recognized lockfile parsed) — a local
+    // read, fine offline — built lazily at the first site that consumes it
+    // and shared by the registry-fetch rung below and the `--offline`
+    // "the lockfile resolves it" detail at the end, so a run parses the
+    // lockfiles at most once (and not at all when every missing purl
+    // stages from its committed artifact or nothing is missing).
+    let mut inventory: Option<Vec<lock_inventory::LockfileEntry>> = None;
     {
         let missing: Vec<String> = vendorable
             .iter()
@@ -857,17 +954,13 @@ pub(crate) async fn vendor_records(
             .cloned()
             .collect();
         if !missing.is_empty() {
-            // The inventory is a local file read — fine offline; only the
-            // fetch itself needs the network.
-            let inventory = lock_inventory::inventory_project(&common.cwd).await;
             let client = registry_fetch::build_registry_client();
-            // Pre-loaded vendor ledger for the artifact-staging path: an
-            // already-vendored purl with no installed copy (fresh clone)
-            // stages from its own committed artifact, sha256-verified
-            // against the ledger — offline-safe, no registry traffic.
-            let ledger = load_state(&common.cwd).await.unwrap_or_default();
+            // Artifact-staging path: an already-vendored purl with no
+            // installed copy (fresh clone) stages from its own committed
+            // artifact, sha256-verified against the ledger — offline-safe,
+            // no registry traffic.
             for purl in &missing {
-                let ledger_entry = lookup_entry(&ledger.entries, purl);
+                let ledger_entry = lookup_entry(&state.entries, purl);
                 if let Some(entry) = ledger_entry
                     .filter(|e| e.ecosystem == "npm" && e.artifact.path.ends_with(".tgz"))
                 {
@@ -929,9 +1022,11 @@ pub(crate) async fn vendor_records(
                     // pass (the purl stays unmatched).
                     continue;
                 }
-                match fetch_pristine_package(&common.cwd, &inventory, &client, purl, ledger_entry)
-                    .await
-                {
+                if inventory.is_none() {
+                    inventory = Some(lock_inventory::inventory_project(&common.cwd).await);
+                }
+                let inv = inventory.as_deref().expect("filled just above");
+                match fetch_pristine_package(&common.cwd, inv, &client, purl, ledger_entry).await {
                     PristineFetch::Fetched(fetched) => {
                         record_warning(
                             env,
@@ -983,13 +1078,6 @@ pub(crate) async fn vendor_records(
     }
 
     let vendored_at = now_rfc3339();
-    let mut state = match load_state(&common.cwd).await {
-        Ok(s) => s,
-        Err(e) => {
-            env.mark_error(EnvelopeError::new("vendor_state_unreadable", e.to_string()));
-            return true;
-        }
-    };
 
     // Bun vendored preflight (see `crate::commands::bun_preflight`), run
     // ONCE per run over the in-scope npm records and consulted per
@@ -1157,10 +1245,11 @@ pub(crate) async fn vendor_records(
                     }
                     continue;
                 }
-                let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-                let claimed = redirect_ledger
-                    .as_ref()
-                    .is_some_and(|l| l.records.keys().any(|k| canon(k) == canon(candidate)));
+                let claimed = redirect_ledger.as_ref().is_some_and(|l| {
+                    l.records
+                        .keys()
+                        .any(|k| canonical_purl(k) == canonical_purl(candidate))
+                });
                 if claimed && common.dry_run {
                     // Probe the takeover exactly as the wet run would — the
                     // per-purl revert's dry run resolves every inverse and
@@ -1446,12 +1535,16 @@ pub(crate) async fn vendor_records(
     if !unmatched.is_empty() {
         has_errors = true;
         // Offline runs name the packages the lockfile COULD have fetched —
-        // the inventory is a local file read, allowed offline.
+        // the inventory is a local file read, allowed offline (and reused
+        // when the fetch rung above already built it).
         let lock_resolvable: HashSet<String> = if common.offline {
-            let entries = lock_inventory::inventory_project(&common.cwd).await;
+            if inventory.is_none() {
+                inventory = Some(lock_inventory::inventory_project(&common.cwd).await);
+            }
+            let entries = inventory.as_deref().expect("filled just above");
             unmatched
                 .iter()
-                .filter(|p| lock_inventory::lookup(&entries, p).is_some())
+                .filter(|p| lock_inventory::lookup(entries, p).is_some())
                 .cloned()
                 .collect()
         } else {
@@ -1551,9 +1644,10 @@ fn flavor_install_command(flavor: &str) -> Option<&'static str> {
 /// run's --ecosystems scope: a `vendor --ecosystems npm` invocation must
 /// not silently revert a cargo/go entry (restoring its lockfile and
 /// deleting its artifact) as a cross-ecosystem side effect. Detached
-/// entries (`scan --vendor --detached`) are never manifest-tracked, so
-/// "absent from the manifest" is their normal state, not a drop — only
-/// `vendor --revert` or `remove` may undo them.
+/// entries — every `scan`/`get --mode vendored` entry — are never
+/// manifest-tracked, so "absent from the manifest" is their normal state,
+/// not a drop — only `vendor --revert`, `remove`, or the lockfile-driven
+/// half of [`run_vendor_gc`] may undo them.
 fn manifest_dropped_purls(
     state: &VendorState,
     manifest: &PatchManifest,
@@ -1573,15 +1667,17 @@ fn manifest_dropped_purls(
 }
 
 /// Revert vendored entries whose patches were dropped from the manifest.
-/// Shared with `scan --vendor` (which runs the same engine in-process).
+/// Returns `(had_error, ledger)`: the post-reconcile ledger load, for the
+/// caller's staging harvest (an unreadable ledger is `Err` — reported by
+/// the engine, not here).
 pub(crate) async fn reconcile_dropped(
     manifest: &PatchManifest,
     common: &GlobalArgs,
     env: &mut Envelope,
-) -> bool {
+) -> (bool, std::io::Result<VendorState>) {
     let mut state = match load_state(&common.cwd).await {
         Ok(s) => s,
-        Err(_) => return false, // unreadable state is reported by the main path
+        Err(e) => return (false, Err(e)),
     };
     let stale = manifest_dropped_purls(&state, manifest, common);
     let mut had_error = false;
@@ -1612,6 +1708,18 @@ pub(crate) async fn reconcile_dropped(
             );
             if !common.dry_run {
                 state.entries.remove(&purl);
+                // Per-purl save, exactly like `--revert`: crash-consistent
+                // with the wiring just restored, no write at all on the
+                // (normal) run that reverted nothing, and a failed write is
+                // the failure it is — the reverted purl would otherwise
+                // linger in the ledger with exit 0 and no event.
+                if let Err(e) = save_state(&common.cwd, &state).await {
+                    had_error = true;
+                    env.record(
+                        PatchEvent::new(PatchAction::Failed, purl.clone())
+                            .with_error("vendor_state_write_failed", e.to_string()),
+                    );
+                }
             }
         } else {
             had_error = true;
@@ -1623,10 +1731,7 @@ pub(crate) async fn reconcile_dropped(
             );
         }
     }
-    if !common.dry_run {
-        let _ = save_state(&common.cwd, &state).await;
-    }
-    had_error
+    (had_error, Ok(state))
 }
 
 async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
@@ -1646,50 +1751,58 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     let mut recorded: Vec<String> = state.entries.keys().cloned().collect();
     recorded.sort();
 
+    // The one vendored-revert primitive every reverting command shares
+    // (rollback's vendored leg, both of remove's paths): dispatch →
+    // drift-keep → per-entry ledger save. Only the event vocabulary and
+    // the human lines are this command's.
     for purl in &recorded {
-        let entry = state.entries.get(purl).cloned().expect("key listed above");
-        let outcome = dispatch_revert_one(&entry, &common.cwd, common.dry_run).await;
-        for w in &outcome.warnings {
+        let result = crate::commands::rollback::revert_vendor_entry(
+            &common.cwd,
+            purl,
+            &mut state,
+            RevertOpts::new(common.dry_run),
+        )
+        .await;
+        for w in &result.warnings {
             record_warning(env, purl, w, common);
         }
-        if outcome.success {
-            if outcome.kept_artifact {
-                // Drift-skip keep (residual #131): the backend left the
-                // drifted lock alone and kept the artifacts, so the ledger
-                // entry must survive too — and the genuine outcome is a
-                // COUNTED skip, not a removal. (`record_warning` above
-                // already surfaced the per-record details as uncounted
-                // advisory events.)
+        match result.step {
+            // Every key came from this ledger; `--revert` never preserves.
+            VendorRevertStep::Missing | VendorRevertStep::Preserved => {}
+            VendorRevertStep::Failed(why) => {
+                has_errors = true;
                 env.record(
-                    PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
-                        "vendor_revert_kept",
-                        "lock entries drifted since vendoring; artifacts and ledger entry kept \
-                         — undo the drift and re-run `vendor --revert` to finish",
-                    ),
+                    PatchEvent::new(PatchAction::Failed, purl.clone())
+                        .with_error("revert_failed", why),
                 );
-                continue;
-            }
-            env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
-            if !common.dry_run {
-                state.entries.remove(purl);
-                if let Err(e) = save_state(&common.cwd, &state).await {
-                    has_errors = true;
-                    env.record(
-                        PatchEvent::new(PatchAction::Failed, purl.clone())
-                            .with_error("vendor_state_write_failed", e.to_string()),
-                    );
+                if !common.silent && !common.json {
+                    eprintln!("Failed to revert {purl}");
                 }
             }
-        } else {
-            has_errors = true;
-            env.record(
-                PatchEvent::new(PatchAction::Failed, purl.clone()).with_error(
-                    "revert_failed",
-                    outcome.error.unwrap_or_else(|| "unknown error".into()),
+            // Drift-skip keep (residual #131): the backend left the
+            // drifted lock alone and kept the artifacts, so the ledger
+            // entry must survive too — and the genuine outcome is a
+            // COUNTED skip, not a removal. (`record_warning` above
+            // already surfaced the per-record details as uncounted
+            // advisory events.)
+            VendorRevertStep::Kept => env.record(
+                PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                    "vendor_revert_kept",
+                    "lock entries drifted since vendoring; artifacts and ledger entry kept \
+                     — undo the drift and re-run `vendor --revert` to finish",
                 ),
-            );
-            if !common.silent && !common.json {
-                eprintln!("Failed to revert {purl}");
+            ),
+            VendorRevertStep::WouldRevert | VendorRevertStep::Reverted => {
+                env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
+            }
+            // Reverted on disk; the record of it could not be persisted.
+            VendorRevertStep::LedgerWriteFailed(e) => {
+                env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
+                has_errors = true;
+                env.record(
+                    PatchEvent::new(PatchAction::Failed, purl.clone())
+                        .with_error("vendor_state_write_failed", e),
+                );
             }
         }
     }
@@ -1779,9 +1892,14 @@ pub(crate) struct VendorGcSummary {
     pub kept: Vec<String>,
     /// (c) orphan uuid dirs (no owning ledger entry) swept.
     pub orphan_dirs: usize,
-    /// Entries that could not be reverted (kept in the ledger), plus any
-    /// pass-level skip marker (e.g. lock contention).
+    /// Entries (ledger keys) that could not be reverted — kept in the
+    /// ledger, nothing reclaimed. Only purls; the pass-level outcomes below
+    /// have their own fields.
     pub failed: Vec<String>,
+    /// Post-revert rewrites that failed: `("vendor_state_write_failed" |
+    /// "manifest_write_failed", <detail>)`. The reverts themselves already
+    /// happened on disk; the stale record is what the caller must report.
+    pub write_failures: Vec<(&'static str, String)>,
 }
 
 /// The vendored-state GC behind `scan --prune`:
@@ -1803,15 +1921,24 @@ pub(crate) struct VendorGcSummary {
 /// before the wiring replay that detects drift, so the dry lists still
 /// carry such an entry as revertable.
 ///
-/// Detached entries are exempt from BOTH (a) (never manifest-tracked) and
-/// (b) (lockfile-invisible by design — the probe would always call them
-/// unused). A missing/unreadable manifest skips (a) only (a prune must
-/// not mass-revert on a deleted manifest — that is `vendor --revert`'s
-/// explicit contract).
+/// Detached entries — every `scan`/`get --mode vendored` entry — are exempt
+/// from (a) alone: they are never manifest-tracked, so "absent from the
+/// manifest" is their normal state, not a drop. (b) applies to every entry:
+/// it asks the lockfile, not the manifest, and a detached entry is wired
+/// into the lock exactly like a manifest-tracked one, so a dependency that
+/// left the lock graph is reclaimed either way. A missing/unreadable
+/// manifest skips (a) only (a prune must not mass-revert on a deleted
+/// manifest — that is `vendor --revert`'s explicit contract).
 ///
-/// Wet runs take the apply lock (lockfiles + the manifest are rewritten);
-/// contention records a skip marker and returns — it never fails the
-/// scan. Dry runs are read-only, lock-free, and list-only.
+/// Lock-free: the caller holds the apply lock for a wet pass (`scan
+/// --prune`'s `run_apply_gc` takes ONE lock for the vendored half and the
+/// manifest prune — flock is per open file description, so a nested acquire
+/// here would read as a live holder and silently skip every revert); a dry
+/// run needs none (read-only, list-only). Re-reads the ledger itself — under
+/// the caller's lock it is the authoritative copy. The ledger and manifest
+/// are rewritten only when a pass removed something; a failed rewrite is
+/// recorded in [`VendorGcSummary::write_failures`] (the reverts themselves
+/// already happened on disk).
 pub(crate) async fn run_vendor_gc(
     common: &GlobalArgs,
     manifest_path: &Path,
@@ -1825,30 +1952,16 @@ pub(crate) async fn run_vendor_gc(
         _ => return out,
     };
 
-    let socket_dir = manifest_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| common.cwd.clone());
-    let _guard = if dry_run {
-        None
-    } else {
-        match socket_patch_core::patch::apply_lock::acquire(&socket_dir, Duration::from_secs(0)) {
-            Ok(g) => Some(g),
-            Err(_) => {
-                out.failed.push(
-                    "vendor GC skipped: another socket-patch run holds the apply lock".to_string(),
-                );
-                return out;
-            }
-        }
-    };
-
     // (a) manifest-dropped entries. Everything (a) touches is excluded from
     // (b): in a dry run the ledger keeps the entry, and after a wet revert
     // failure it does too — either way (b) would list/fail the same purl a
     // second time, which the wet success path (entry removed before (b)'s
     // candidate scan) never does.
     let mut handled_by_a: HashSet<String> = HashSet::new();
+    // Set at the two `state.entries.remove` sites: the ledger is rewritten
+    // only when a pass reclaimed something (the common `scan --prune` with
+    // nothing reclaimable must not churn a committed file).
+    let mut ledger_dirty = false;
     let mut manifest = read_manifest(manifest_path).await.ok().flatten();
     if let Some(m) = &manifest {
         for purl in manifest_dropped_purls(&state, m, common) {
@@ -1871,20 +1984,20 @@ pub(crate) async fn run_vendor_gc(
                 out.kept.push(purl);
             } else {
                 state.entries.remove(&purl);
+                ledger_dirty = true;
                 out.dropped_reverted.push(purl);
             }
         }
     }
 
-    // (b) lockfile-unused entries.
+    // (b) lockfile-unused entries — detached ones included: the probe asks
+    // the live lockfile wiring, which a detached entry has like any other.
     let mut manifest_dirty = false;
     let candidates: Vec<String> = state
         .entries
         .iter()
         .filter(|(purl, entry)| {
-            !entry.detached
-                && ecosystem_in_scope(common, &entry.ecosystem)
-                && !handled_by_a.contains(*purl)
+            ecosystem_in_scope(common, &entry.ecosystem) && !handled_by_a.contains(*purl)
         })
         .map(|(purl, _)| purl.clone())
         .collect();
@@ -1911,6 +2024,7 @@ pub(crate) async fn run_vendor_gc(
             continue;
         }
         state.entries.remove(&purl);
+        ledger_dirty = true;
         if let Some(m) = manifest.as_mut() {
             let base = strip_purl_qualifiers(&entry.base_purl).to_string();
             let dropped: Vec<String> = m
@@ -1928,10 +2042,31 @@ pub(crate) async fn run_vendor_gc(
     }
 
     if !dry_run {
-        let _ = save_state(&common.cwd, &state).await;
+        // The reverts above already restored the wiring and removed the
+        // artifacts; a failed ledger/manifest rewrite leaves records for
+        // state that is gone, which must not pass silently (the sibling
+        // callers all report `vendor_state_write_failed`).
+        if ledger_dirty {
+            if let Err(e) = save_state(&common.cwd, &state).await {
+                let detail = format!(
+                    "reverted vendored entries but could not update \
+                     .socket/vendor/state.json: {e}"
+                );
+                gc_note(common, "vendor_state_write_failed", &detail);
+                out.write_failures
+                    .push(("vendor_state_write_failed", detail));
+            }
+        }
         if manifest_dirty {
             if let Some(m) = &manifest {
-                let _ = write_manifest(manifest_path, m).await;
+                if let Err(e) = write_manifest(manifest_path, m).await {
+                    let detail = format!(
+                        "reverted vendored entries but could not update {}: {e}",
+                        manifest_path.display()
+                    );
+                    gc_note(common, "manifest_write_failed", &detail);
+                    out.write_failures.push(("manifest_write_failed", detail));
+                }
             }
         }
     }
@@ -1943,6 +2078,15 @@ pub(crate) async fn run_vendor_gc(
         .removed
         .len();
     out
+}
+
+/// Human-mode stderr line for a pass-level GC problem (the GC has no
+/// envelope of its own; JSON consumers see it as `scan --prune --json`'s
+/// `gc.skipped` / `gc.warnings`). Muted under `--json` and `--silent`.
+fn gc_note(common: &GlobalArgs, code: &str, detail: &str) {
+    if !common.json && !common.silent {
+        eprintln!("Warning ({code}): {detail}");
+    }
 }
 
 #[cfg(test)]
@@ -1974,14 +2118,12 @@ mod dispatch_tests {
             diffs_path: None,
             mem_blobs: None,
         };
-        let service = VendorServiceConfig {
-            source: VendorSource::Service,
-            client: None,
-            use_public_proxy: false,
-            vendor_url: None,
-            patch_server_url: None,
-            offline: false,
-        };
+        let service = GlobalArgs {
+            vendor_source: "service".to_string(),
+            ..Default::default()
+        }
+        .vendor_service_config(None, false);
+        assert_eq!(service.source, VendorSource::Service);
         let outcome = dispatch_vendor_one(
             "pkg:maven/org.apache.logging.log4j/log4j-core@2.17.0",
             tmp.path(),
@@ -2219,7 +2361,17 @@ mod variant_probe_tests {
             );
 
             let mut env = Envelope::new(Command::Vendor);
-            vendor_records(&common, &records, &sources, false, false, &mut env, None).await;
+            vendor_records(
+                &common,
+                &records,
+                &sources,
+                false,
+                false,
+                &mut env,
+                None,
+                load_state(&common.cwd).await,
+            )
+            .await;
 
             assert!(
                 !env.events.iter().any(|e| e.purl.as_deref() == Some(SDIST)),
@@ -2279,7 +2431,17 @@ mod variant_probe_tests {
             record(&[("brand_new_file.py", "", &after)]),
         );
         let mut env = Envelope::new(Command::Vendor);
-        vendor_records(&common, &records, &sources, false, false, &mut env, None).await;
+        vendor_records(
+            &common,
+            &records,
+            &sources,
+            false,
+            false,
+            &mut env,
+            None,
+            load_state(&common.cwd).await,
+        )
+        .await;
 
         assert!(
             env.events.iter().any(|e| e.purl.as_deref() == Some(WHEEL)),
@@ -2541,10 +2703,16 @@ mod gc_tests {
         );
     }
 
-    /// A missing/undeterminable lockfile keeps the entry (fail-safe), and a
-    /// DETACHED entry is exempt from both (a) and (b).
+    /// A missing/undeterminable lockfile keeps the entry (fail-safe). A
+    /// DETACHED entry — the shape every `scan`/`get --mode vendored` run
+    /// writes — is exempt from (a) alone (never manifest-tracked, so its
+    /// absence from the manifest is not a drop) but NOT from (b): it is
+    /// wired into the lock like any other entry, so once the dependency
+    /// leaves the lock graph the GC reclaims it. Pre-fix (b) skipped
+    /// detached entries as "lockfile-invisible", which made the unused GC
+    /// dead for every vendored-mode project.
     #[tokio::test]
-    async fn vendor_gc_keeps_undeterminable_and_detached_entries() {
+    async fn vendor_gc_keeps_undeterminable_entries_and_reclaims_unused_detached() {
         // Lock removed entirely: probe says None → keep.
         let (tmp, common, manifest_path) = gc_fixture(false).await;
         tokio::fs::remove_file(tmp.path().join("package-lock.json"))
@@ -2558,13 +2726,10 @@ mod gc_tests {
             .entries
             .contains_key(PURL));
 
-        // Detached entry: absent from the manifest AND lockfile-invisible —
-        // exactly its normal state. Never reverted by the GC.
+        // Detached entry, still wired: (a) exempts it and (b) sees it in
+        // use — kept.
         let (tmp, common, manifest_path) = gc_fixture(true).await;
         write_manifest(&manifest_path, &PatchManifest::new())
-            .await
-            .unwrap();
-        tokio::fs::write(tmp.path().join("package-lock.json"), "{\"packages\":{}}")
             .await
             .unwrap();
         let out = run_vendor_gc(&common, &manifest_path, false).await;
@@ -2575,6 +2740,33 @@ mod gc_tests {
             .unwrap()
             .entries
             .contains_key(PURL));
+
+        // Detached entry whose dependency left the lock graph: (a) still
+        // exempts it (no manifest drop to detect), (b) reclaims it.
+        tokio::fs::write(tmp.path().join("package-lock.json"), "{\"packages\":{}}")
+            .await
+            .unwrap();
+        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        assert!(
+            out.dropped_reverted.is_empty(),
+            "(a) never touches a detached entry: {out:?}"
+        );
+        assert_eq!(
+            out.unused_reverted,
+            vec![PURL.to_string()],
+            "(b) reclaims a lockfile-unused detached entry: {out:?}"
+        );
+        assert!(out.failed.is_empty(), "{out:?}");
+        assert!(
+            load_state(tmp.path()).await.unwrap().entries.is_empty(),
+            "the reclaimed detached entry leaves the ledger"
+        );
+        assert!(
+            !tmp.path()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "the reclaimed detached entry's artifacts are removed"
+        );
     }
 
     /// An entry that is BOTH manifest-dropped and lockfile-unused must be
@@ -2935,7 +3127,9 @@ mod gc_tests {
         tokio::fs::write(root.join("requirements.txt"), "-r requirements/base.txt\n")
             .await
             .unwrap();
-        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        tokio::fs::create_dir(root.join("requirements"))
+            .await
+            .unwrap();
         tokio::fs::write(
             root.join("requirements/base.txt"),
             format!(
@@ -2960,6 +3154,17 @@ mod gc_tests {
         assert_eq!(sweep.removed.len(), 1, "{:?}", sweep.removed);
         assert!(sweep.still_wired.is_empty());
         assert!(!wheel.exists(), "the unreferenced orphan is reclaimed");
+        // The sweep was the last unit under `.socket/vendor/`: the emptied
+        // `<eco>/` and `vendor/` husks go with it, `.socket/` itself stays
+        // (the lock guard's level).
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "the orphan sweep prunes the emptied vendor tree"
+        );
+        assert!(
+            root.join(".socket").is_dir(),
+            ".socket/ is never the sweep's to remove"
+        );
     }
 
     /// (c) uuid dirs with no owning ledger entry are swept (wet) / counted
@@ -2988,12 +3193,13 @@ mod gc_tests {
             .exists());
     }
 
-    /// Wet GC under apply-lock contention: the run records the single skip
-    /// marker and reclaims NOTHING (the scan-must-not-fail contract), while
-    /// a dry-run preview with the same lock held still lists (dry runs are
-    /// read-only and lock-free).
+    /// The GC body is lock-free and runs under the CALLER's guard: with the
+    /// apply lock held by the caller (as `scan --prune`'s `run_apply_gc`
+    /// holds it), a dry pass lists and a wet pass reclaims — the held lock
+    /// is no obstacle because nothing here acquires (flock is per open file
+    /// description, so a nested acquire would have read as a live holder).
     #[tokio::test]
-    async fn vendor_gc_lock_contention_skips_without_reverting() {
+    async fn vendor_gc_body_runs_under_callers_held_lock() {
         let (tmp, common, manifest_path) = gc_fixture(false).await;
         // Both passes WOULD reclaim: patch dropped + dependency gone.
         write_manifest(&manifest_path, &PatchManifest::new())
@@ -3009,37 +3215,33 @@ mod gc_tests {
         )
         .expect("test holds the apply lock first");
 
-        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        let dry = run_vendor_gc(&common, &manifest_path, true).await;
         assert_eq!(
-            out.failed,
-            vec!["vendor GC skipped: another socket-patch run holds the apply lock".to_string()],
-            "{out:?}"
+            dry.dropped_reverted,
+            vec![PURL.to_string()],
+            "the lock-free dry preview lists under the held lock: {dry:?}"
         );
-        assert!(out.dropped_reverted.is_empty(), "{out:?}");
-        assert!(out.unused_reverted.is_empty(), "{out:?}");
-        assert_eq!(out.orphan_dirs, 0, "{out:?}");
+        assert!(dry.failed.is_empty(), "{dry:?}");
         assert!(
             load_state(tmp.path())
                 .await
                 .unwrap()
                 .entries
                 .contains_key(PURL),
-            "a contended GC must not touch the ledger"
-        );
-        assert!(
-            tmp.path()
-                .join(format!(".socket/vendor/npm/{UUID}"))
-                .exists(),
-            "a contended GC must not touch artifacts"
+            "a dry pass reverts nothing"
         );
 
-        let dry = run_vendor_gc(&common, &manifest_path, true).await;
-        assert_eq!(
-            dry.dropped_reverted,
-            vec![PURL.to_string()],
-            "the lock-free dry preview still lists: {dry:?}"
+        let wet = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(wet.dropped_reverted, vec![PURL.to_string()], "{wet:?}");
+        assert!(wet.failed.is_empty(), "{wet:?}");
+        assert!(
+            !load_state(tmp.path())
+                .await
+                .unwrap()
+                .entries
+                .contains_key(PURL),
+            "the wet body reverts under the caller's guard"
         );
-        assert!(dry.failed.is_empty(), "{dry:?}");
     }
 
     /// (a) revert FAILURE accounting: a ledger entry whose ecosystem has no
@@ -3175,6 +3377,36 @@ mod scope_and_hint_tests {
         assert_eq!(flavor_install_command("bun"), Some("bun install"));
         assert_eq!(flavor_install_command("cargo"), None);
         assert_eq!(flavor_install_command(""), None);
+    }
+
+    /// The no-manifest no-op names the MANIFEST (the thing missing) and,
+    /// on a ledger-tracked project (`scan`/`get --mode vendored` never
+    /// write a manifest), says what IS vendored instead of "nothing" —
+    /// the old "No .socket folder found" text was false on every such
+    /// project (`.socket/vendor/` exists).
+    #[test]
+    fn no_manifest_message_names_the_manifest_and_tracked_entries() {
+        assert_eq!(
+            no_manifest_message(0),
+            "No manifest found, nothing to vendor."
+        );
+        let one = no_manifest_message(1);
+        assert!(
+            one.starts_with("No manifest to vendor from; 1 vendored entry is tracked"),
+            "{one}"
+        );
+        assert!(one.contains("`socket-patch repair`"), "{one}");
+        let many = no_manifest_message(3);
+        assert!(
+            many.contains("3 vendored entries are tracked in the ledger"),
+            "{many}"
+        );
+        for msg in [&one, &many] {
+            assert!(
+                !msg.contains(".socket folder"),
+                "never claims .socket/ is missing: {msg}"
+            );
+        }
     }
 
     fn with_scope(list: Option<&[&str]>) -> GlobalArgs {

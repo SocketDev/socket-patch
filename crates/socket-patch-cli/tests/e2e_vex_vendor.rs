@@ -15,8 +15,9 @@
 //!   4. legacy `.socket/go-patches/` redirect regression: an apply-redirected
 //!      Go patch verifies against the redirect copy dir, not the (pristine)
 //!      module cache
-//!   5. detached entries (`scan --vendor --detached`): attested from the
-//!      ledger's embedded record with no manifest at all
+//!   5. detached entries (vendored, ledger-only — `scan --mode vendored`
+//!      writes no manifest): attested from the ledger's embedded record
+//!      with no manifest at all
 //!   6. the cross-ecosystem matrix: one detached entry per vendor-backend
 //!      ecosystem (npm/cargo/golang/composer/gem/pypi/nuget/maven), each
 //!      verified against its real artifact shape and attested `(vendored)`
@@ -557,7 +558,8 @@ fn golang_go_patches_redirect_attested_without_module_cache() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// 5. detached entries (scan --vendor --detached): no manifest at all
+// 5. detached entries (vendored, ledger-only — `scan --mode vendored`
+//    writes no manifest): no manifest at all
 // ──────────────────────────────────────────────────────────────────────
 
 /// Ledger writer for the detached shape: `detached: true` plus the

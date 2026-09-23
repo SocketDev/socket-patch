@@ -909,3 +909,28 @@ fn mode_aliases_hidden_from_help() {
         );
     }
 }
+
+/// `--detached` is a compatibility no-op (vendored mode is always
+/// manifest-free): still parsed, still requiring vendored mode, but hidden
+/// from help like the legacy `--redirect` spelling.
+#[test]
+#[serial_test::serial]
+fn detached_flag_is_hidden_from_help() {
+    use clap::CommandFactory;
+    let long = with_clean_env(|| {
+        let mut cmd = Cli::command();
+        let scan = cmd.find_subcommand_mut("scan").expect("scan subcommand");
+        scan.render_long_help().to_string()
+    });
+    assert!(
+        !long.contains("--detached"),
+        "--detached must be hidden from scan --help; help was:\n{long}"
+    );
+    assert!(
+        long.contains("--prune"),
+        "control: a documented flag renders; help was:\n{long}"
+    );
+    // Still parsed (compatibility), still folded under vendored mode.
+    let folded = parse_and_resolve(&["--mode", "vendored", "--detached"]).expect("fold ok");
+    assert!(folded.detached);
+}

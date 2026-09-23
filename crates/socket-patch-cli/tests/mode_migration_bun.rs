@@ -463,10 +463,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
 
 /// Every regular file under `root` (relative `/`-joined path → bytes),
 /// `node_modules` excluded — the write-free oracle for the dry-run legs.
-/// `.socket/apply.lock` is excluded too: it is the apply lock's flock
-/// target, created by every run that takes the lock (dry runs included,
-/// since they read state a concurrent wet run could be mutating) and left
-/// in place by design — a lock file, not project state.
+/// `.socket/apply.lock` is deliberately NOT excluded: every run removes its
+/// lock file on exit (dry runs included), so a surviving one is a real
+/// before/after difference.
 fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -484,9 +483,6 @@ fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
                     .map(|c| c.as_os_str().to_string_lossy().into_owned())
                     .collect::<Vec<_>>()
                     .join("/");
-                if rel == ".socket/apply.lock" {
-                    continue;
-                }
                 out.insert(rel, std::fs::read(&p).unwrap());
             }
         }
@@ -1150,13 +1146,12 @@ fn assert_pure_vendored(fx: &Fixture, proj: &Path, dep: &Dep, uuid: &str, hosted
 }
 
 /// After a full unwind: bun.lock and package.json byte-identical to the
-/// pristine snapshots, and no `.socket/vendor/` artifacts or ledgers left.
-/// The vendor ledger's delete-when-empty prunes the emptied `.socket/vendor/`
-/// dir itself (`expect_dir_pruned` — `vendor --revert`); the redirect
-/// ledger's removes only its file, so a `rollback` whose last act is the
-/// hosted unwind leaves the empty dir behind — asserted EMPTY, never
-/// holding a ledger or an `npm/` artifact dir.
-fn assert_pristine_unwound(fx: &Fixture, proj: &Path, what: &str, expect_dir_pruned: bool) {
+/// pristine snapshots, and nothing left under `.socket/vendor/` — both
+/// ledgers delete themselves when emptied and prune the emptied
+/// `.socket/vendor/` dir (the redirect ledger's persist included, so a
+/// `rollback` whose last act is the hosted unwind leaves no dir behind
+/// either).
+fn assert_pristine_unwound(fx: &Fixture, proj: &Path, what: &str) {
     assert_eq!(
         std::fs::read(proj.join("bun.lock")).unwrap(),
         fx.lock_pristine,
@@ -1177,21 +1172,10 @@ fn assert_pristine_unwound(fx: &Fixture, proj: &Path, what: &str, expect_dir_pru
         !vendor.join("npm").exists(),
         "{what}: no committed artifact may survive under .socket/vendor/npm/"
     );
-    if expect_dir_pruned {
-        assert!(
-            !vendor.exists(),
-            "{what}: the emptied .socket/vendor/ dir must be pruned"
-        );
-    } else if vendor.exists() {
-        let leftovers: Vec<String> = std::fs::read_dir(&vendor)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "{what}: .socket/vendor/ must be empty after the unwind; found {leftovers:?}"
-        );
-    }
+    assert!(
+        !vendor.exists(),
+        "{what}: the emptied .socket/vendor/ dir must be pruned"
+    );
 }
 
 /// `rollback --yes --json` (unscoped) must exit 0 with `status: success`
@@ -1210,7 +1194,7 @@ fn assert_unscoped_rollback_restores_pristine(fx: &Fixture, proj: &Path, tag: &s
         json!([]),
         "rollback ({tag}) must not fail any hosted purl: {env:#}"
     );
-    assert_pristine_unwound(fx, proj, &format!("rollback ({tag})"), false);
+    assert_pristine_unwound(fx, proj, &format!("rollback ({tag})"));
     let fresh = fresh_frozen_install(fx, proj, &format!("fresh-rolled-back-{tag}"));
     assert_installed(&fresh, &DEP_A, &fx.a.orig, "after rollback");
     assert_installed(&fresh, &DEP_B, &fx.b.orig, "after rollback");
@@ -1252,9 +1236,11 @@ fn take_over_to_hosted(fx: &Fixture, proj: &Path, api: &str, hp: &HostedPatch, t
 
 /// The hosted → vendored takeover on `proj` (already hosted for DEP_A),
 /// driven by `driver`: the takeover must be announced, the project left
-/// purely vendored at the uuid the driver vendors under, the manifest must
-/// hold that record, and a fresh frozen install from an empty cache must
-/// land the MARKER bytes from the committed artifact. Returns that uuid.
+/// purely vendored at the uuid the driver vendors under, the vendor ledger
+/// must hold that record (manifest-free for `scan --mode vendored`; the
+/// manifest-fed `vendor` driver keeps its manifest record too), and a fresh
+/// frozen install from an empty cache must land the MARKER bytes from the
+/// committed artifact. Returns that uuid.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum VendoredDriver {
     /// `vendor --json --offline` over a hand-staged manifest (uuid_v).
@@ -1314,11 +1300,39 @@ fn take_over_to_vendored(
         "the hosted revert must not be refused ({tag}, {driver:?}): {vendor_env:#}"
     );
     assert_pure_vendored(fx, proj, dep, uuid, &hp.url);
-    let manifest = read_json(proj, ".socket/manifest.json");
+    let state = read_json(proj, ".socket/vendor/state.json");
     assert_eq!(
-        manifest["patches"][dep.purl]["uuid"], uuid,
-        "the manifest must record the vendored patch ({tag}, {driver:?}): {manifest:#}"
+        state["entries"][dep.purl]["uuid"], uuid,
+        "the vendor ledger must record the vendored patch ({tag}, {driver:?}): {state:#}"
     );
+    match driver {
+        // Standalone `vendor` is fed by the staged manifest and leaves its
+        // record in place — the legacy manifest-tracked shape.
+        VendoredDriver::VendorOffline => {
+            let manifest = read_json(proj, ".socket/manifest.json");
+            assert_eq!(
+                manifest["patches"][dep.purl]["uuid"], uuid,
+                "the manifest must record the vendored patch ({tag}, {driver:?}): {manifest:#}"
+            );
+        }
+        // Vendored mode is manifest-free: the ledger entry embeds the record
+        // and nothing else is written under `.socket/`.
+        VendoredDriver::ScanVendored => {
+            assert_eq!(
+                state["entries"][dep.purl]["detached"],
+                json!(true),
+                "scan --mode vendored writes a detached entry ({tag}): {state:#}"
+            );
+            assert_eq!(
+                state["entries"][dep.purl]["record"]["uuid"], uuid,
+                "the embedded record is the vendored patch ({tag}): {state:#}"
+            );
+            assert!(
+                !proj.join(".socket/manifest.json").exists(),
+                "scan --mode vendored must not write a manifest ({tag})"
+            );
+        }
+    }
     let fresh = fresh_frozen_install(fx, proj, &format!("fresh-vendored-{tag}"));
     assert_installed(&fresh, &DEP_A, &fx.a.patched, "vendored fresh install");
     assert_installed(
@@ -1343,7 +1357,7 @@ fn assert_vendor_revert_restores_pristine(fx: &Fixture, proj: &Path, tag: &str) 
     let env = envelope(&stdout, &stderr);
     assert_eq!(env["status"], "success", "{env:#}");
     assert_eq!(env["summary"]["removed"], 1, "{env:#}");
-    assert_pristine_unwound(fx, proj, &format!("vendor --revert ({tag})"), true);
+    assert_pristine_unwound(fx, proj, &format!("vendor --revert ({tag})"));
     eprintln!("VENDOR REVERT OK ({tag})");
 }
 
@@ -1785,7 +1799,7 @@ async fn bun_rollback_from_each_mixed_state_restores_pristine() {
         "rollback must unwire the vendored purl: {env:#}"
     );
     assert_eq!(env["vendoredFailed"], json!([]), "{env:#}");
-    assert_pristine_unwound(&fx, &two, "rollback (mixed-2)", false);
+    assert_pristine_unwound(&fx, &two, "rollback (mixed-2)");
     let fresh = fresh_frozen_install(&fx, &two, "fresh-rolled-back-mixed-2");
     assert_installed(&fresh, &DEP_A, &fx.a.orig, "after rollback (mixed-2)");
     assert_installed(&fresh, &DEP_B, &fx.b.orig, "after rollback (mixed-2)");

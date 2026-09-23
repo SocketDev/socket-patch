@@ -22,10 +22,12 @@
 //!
 //! # Symlinks
 //!
-//! `entry_is_dir` follows symlinks (uses `metadata()`, not
-//! `symlink_metadata()`), matching the historical behavior of the
-//! crawlers (pnpm's content-addressed store relies on resolving
-//! symlinks into `node_modules/.pnpm/*`).
+//! `entry_is_dir` follows symlinks: ordinary entries answer from the
+//! `DirEntry`'s cached file type (no extra stat), and symlink entries are
+//! resolved through [`is_dir`] (follow-links `metadata()`), so a link to a
+//! directory reports `true` — matching the historical behavior of the
+//! crawlers (pnpm's content-addressed store relies on resolving symlinks
+//! into `node_modules/.pnpm/*`).
 
 use std::path::{Path, PathBuf};
 
@@ -63,10 +65,15 @@ pub(crate) async fn list_dir_entries(path: &Path) -> Vec<DirEntry> {
 /// like `symlink_metadata`), so a symlink pointing at a directory
 /// would wrongly report `false`. To honor the documented
 /// symlink-following contract — which crawlers like deno/python/ruby
-/// rely on for symlinked package directories — we stat the resolved
-/// `entry.path()` via [`is_dir`], which does follow links.
+/// rely on for symlinked package directories — symlinks are resolved through
+/// [`is_dir`]. Ordinary entries use their cached file type, avoiding an extra
+/// stat for every directory visited by a crawler.
 pub(crate) async fn entry_is_dir(entry: &DirEntry) -> bool {
-    is_dir(&entry.path()).await
+    match entry.file_type().await {
+        Ok(kind) if kind.is_symlink() => is_dir(&entry.path()).await,
+        Ok(kind) => kind.is_dir(),
+        Err(_) => false,
+    }
 }
 
 /// Check whether `path` is a directory, following symlinks.
@@ -112,52 +119,48 @@ pub(crate) async fn is_file(path: &Path) -> bool {
 /// FIFOs/devices/directories with `InvalidInput` instead of reading
 /// them (on some platforms a directory reads as zero bytes, which
 /// would otherwise be silently hashed as the empty blob).
+///
+/// One blocking-pool hop: the open + fstat run together in
+/// [`open_regular_file_sync`], the single copy of the guard.
 pub(crate) async fn open_regular_file(
     path: &Path,
 ) -> std::io::Result<(tokio::fs::File, std::fs::Metadata)> {
-    #[cfg(unix)]
-    let file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-        .await?;
-    #[cfg(not(unix))]
-    let file = tokio::fs::File::open(path).await?;
-
-    let metadata = file.metadata().await?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
-    Ok((file, metadata))
+    let path = path.to_path_buf();
+    let (file, metadata) = asyncify(move || open_regular_file_sync(&path)).await?;
+    Ok((tokio::fs::File::from_std(file), metadata))
 }
 
-/// Read a regular file to a `String` through [`open_regular_file`]: the
-/// FIFO-safe reader (non-blocking open, fstat regular-file check on the
-/// opened descriptor) that the ecosystem modules had each re-declared
-/// privately. Follows a symlink to a regular file; a FIFO, directory or
-/// socket fails fast with `InvalidInput` instead of wedging in open(2).
-/// `pub` so the CLI crate's raw `read_to_string` sites can share it.
+/// Read a regular file to a `String` through the FIFO-safe opener
+/// (non-blocking open, fstat regular-file check on the opened descriptor)
+/// that the ecosystem modules had each re-declared privately. Follows a
+/// symlink to a regular file; a FIFO, directory or socket fails fast with
+/// `InvalidInput` instead of wedging in open(2). Open + read are one
+/// blocking-pool hop (like tokio's own `fs::read_to_string`). `pub` so the
+/// CLI crate's raw `read_to_string` sites can share it.
 pub async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
+    let path = path.to_path_buf();
+    asyncify(move || read_regular_to_string_sync(&path)).await
 }
 
 /// Read a binary regular file through the same FIFO-safe opener as text
 /// lockfiles. A malformed or non-regular lockfile never blocks discovery.
 pub async fn read_regular_to_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
+    let path = path.to_path_buf();
+    asyncify(move || read_regular_to_bytes_sync(&path)).await
+}
 
-    let (mut file, metadata) = open_regular_file(path).await?;
-    let mut content = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut content).await?;
-    Ok(content)
+/// Run one blocking filesystem operation on tokio's blocking pool — the
+/// same shape as tokio's internal `asyncify`, including its mapping of a
+/// panicked/cancelled task to an `io::Error`.
+async fn asyncify<T, F>(f: F) -> std::io::Result<T>
+where
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::other("background task failed")),
+    }
 }
 
 /// True when `path` ITSELF is a symbolic link (lstat; the link target is not
@@ -203,10 +206,14 @@ pub fn read_regular_to_bytes_sync(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(content)
 }
 
-/// Blocking twin of [`open_regular_file`]: `O_NONBLOCK` open on Unix, then
-/// the handle-based regular-file check, so the two sync readers above share
-/// one guard instead of re-declaring it.
-fn open_regular_file_sync(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+/// The one regular-file guard: `O_NONBLOCK` open on Unix, then the
+/// handle-based regular-file check. The async [`open_regular_file`] and every
+/// reader above run this on the blocking pool; `pub(crate)` for the few
+/// synchronous callers that must keep the handle (a `zip::ZipArchive` over a
+/// committed wheel) rather than read it whole.
+pub(crate) fn open_regular_file_sync(
+    path: &Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -324,6 +331,15 @@ pub(crate) fn normalize_lexically(path: &Path) -> Option<PathBuf> {
 /// sibling file, fsync it, then rename over the target (atomic on the same
 /// filesystem), so a reader or recovering process only ever sees the complete
 /// old or the complete new bytes.
+///
+/// **Copy-on-write guarantee** (the single source of truth the patch engine's
+/// comments point at): `rename(2)` replaces only the *directory entry*, never
+/// the bytes behind the old inode. A hardlinked sibling — pnpm's
+/// content-addressable store, the bun / uv caches, Go's module cache — keeps
+/// the old inode and its old content untouched, and a symlink sitting at the
+/// destination is replaced *as a link* by a private regular file, never
+/// written through to its target. No separate hardlink-break step is needed;
+/// the write path is CoW-safe by construction.
 pub(crate) async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
     atomic_write_bytes_as(path, content, None).await
 }
@@ -362,43 +378,14 @@ async fn atomic_write_bytes_as(
         .unwrap_or_else(|| "file".to_string());
     let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
 
-    let mut file = tokio::fs::OpenOptions::new()
+    // `create_new` failing leaves no stage to clean up; every step after it
+    // does, so they share one error arm.
+    let file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&stage)
         .await?;
-
-    use tokio::io::AsyncWriteExt;
-    if let Err(e) = file.write_all(content).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    // `write_all` only buffers into tokio's background writer, and
-    // `sync_all` stores an in-flight write error back into the handle
-    // instead of returning it — this flush is the only point where a
-    // failed stage write (ENOSPC, EIO, quota) actually surfaces. Without
-    // it the truncated stage would be renamed over the intact target.
-    if let Err(e) = file.flush().await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    if let Err(e) = file.sync_all().await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
-    // Set the preserved mode on the stage *before* the rename so the file
-    // never appears at the destination with the wrong bits, even briefly.
-    // The content is already written through the open handle, so a
-    // restrictive mode (0400, 0000) cannot fail the write.
-    if let Some(p) = perms {
-        if let Err(e) = file.set_permissions(p).await {
-            let _ = tokio::fs::remove_file(&stage).await;
-            return Err(e);
-        }
-    }
-    drop(file);
-
-    if let Err(e) = tokio::fs::rename(&stage, path).await {
+    if let Err(e) = commit_stage(file, content, perms, &stage, path).await {
         let _ = tokio::fs::remove_file(&stage).await;
         return Err(e);
     }
@@ -413,6 +400,37 @@ async fn atomic_write_bytes_as(
     }
 
     Ok(())
+}
+
+/// Write, flush, fsync, (re-mode) and close the stage, then rename it over
+/// `path`. Takes the handle by value so it is closed before the rename
+/// (Windows refuses to rename an open file) and before the caller's
+/// error-path unlink of the stage.
+async fn commit_stage(
+    mut file: tokio::fs::File,
+    content: &[u8],
+    perms: Option<std::fs::Permissions>,
+    stage: &Path,
+    path: &Path,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    file.write_all(content).await?;
+    // `write_all` only buffers into tokio's background writer, and
+    // `sync_all` stores an in-flight write error back into the handle
+    // instead of returning it — this flush is the only point where a
+    // failed stage write (ENOSPC, EIO, quota) actually surfaces. Without
+    // it the truncated stage would be renamed over the intact target.
+    file.flush().await?;
+    file.sync_all().await?;
+    // Set the preserved mode on the stage *before* the rename so the file
+    // never appears at the destination with the wrong bits, even briefly.
+    // The content is already written through the open handle, so a
+    // restrictive mode (0400, 0000) cannot fail the write.
+    if let Some(p) = perms {
+        file.set_permissions(p).await?;
+    }
+    drop(file);
+    tokio::fs::rename(stage, path).await
 }
 
 #[cfg(test)]

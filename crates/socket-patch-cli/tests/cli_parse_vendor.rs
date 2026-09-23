@@ -25,7 +25,7 @@
 
 use clap::Parser;
 use socket_patch_cli::commands::vendor::VendorArgs;
-use socket_patch_cli::{parse_with_uuid_fallback, Cli, Commands};
+use socket_patch_cli::{parse_argv_with_shortcuts, Cli, Commands};
 use std::path::PathBuf;
 
 /// Every `SOCKET_*` env var that clap consults while parsing `vendor` (its
@@ -577,7 +577,7 @@ fn vendor_appears_in_top_level_help() {
 fn bare_uuid_fallback_still_routes_to_get_not_vendor() {
     let _scrub = EnvScrub::new();
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
-    let cli = parse_with_uuid_fallback(vec!["socket-patch".to_string(), UUID.to_string()])
+    let cli = parse_argv_with_shortcuts(vec!["socket-patch".to_string(), UUID.to_string()])
         .expect("bare uuid must parse via the get fallback");
     match cli.command {
         Commands::Get(a) => assert_eq!(a.identifier, UUID),

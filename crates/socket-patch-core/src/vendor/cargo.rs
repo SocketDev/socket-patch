@@ -19,20 +19,21 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety::is_safe_single_segment;
+use crate::utils::fs::read_regular_to_string;
 use crate::utils::purl::{parse_cargo_purl, strip_purl_qualifiers};
 
-use super::cargo_config::{self, LEGACY_CARGO_PATCHES_DIR};
+use super::cargo_config;
 use super::cargo_lock::{self, LockEditError};
 use super::common::{
-    already_patched_result, copy_matches_after_hashes, done, refused, service_offline_conflict,
-    synthesized_result,
+    already_patched_result, copy_matches_after_hashes, done, prune_empty_vendor_levels, refused,
+    service_offline_conflict, stage_dir_for, swap_stage_into_place, synthesized_result,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_tgz;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
-    write_marker, CargoLockOriginal, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
-    WiringRecord, VENDOR_MARKER_FILE,
+    write_marker_or_warn, CargoLockOriginal, VendorArtifact, VendorEntry, VendorMarker,
+    WiringAction, WiringRecord, VENDOR_MARKER_FILE,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -53,15 +54,6 @@ async fn is_vendored(project_root: &Path, name: &str, version: &str) -> bool {
         }
     }
     false
-}
-
-/// True iff a config-entry path points into the retired redirect backend's
-/// `.socket/cargo-patches/` tree (vendor takes such entries over and reports
-/// the takeover, rather than treating them as a silent refresh).
-fn is_legacy_redirect_path(path: &str) -> bool {
-    let norm = path.replace('\\', "/");
-    let norm = norm.strip_prefix("./").unwrap_or(&norm);
-    norm.starts_with(&format!("{LEGACY_CARGO_PATCHES_DIR}/"))
 }
 
 /// Is this vendored cargo entry still consumed by the project's `Cargo.lock`
@@ -95,18 +87,6 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
             Some(wired)
         }
     }
-}
-
-/// Guarded read shared in shape with the setup/crawler twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
-/// so a FIFO fails fast instead of wedging the caller forever.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// A LIVE hosted-redirect wiring for `name`+`version`: the lock resolves it
@@ -163,96 +143,6 @@ async fn wiring_in_sync(project_root: &Path, name: &str, version: &str, copy_rel
     )
 }
 
-/// A swap sibling for a copy dir: `<uuid>/<name>-<version><suffix>`. Same
-/// directory as the copy → every swap step is a real rename, never a
-/// cross-device copy. The suffixes can never collide with a copy dir:
-/// `<version>` is a validated single segment and cargo versions never end in
-/// `.socket-stage` / `.socket-old`.
-fn swap_sibling_for(copy_dir: &Path, suffix: &str) -> std::path::PathBuf {
-    let name = copy_dir
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "copy".to_string());
-    match copy_dir.parent() {
-        Some(parent) => parent.join(format!("{name}{suffix}")),
-        None => copy_dir.join(suffix),
-    }
-}
-
-/// The staging sibling for a copy dir: `<uuid>/<name>-<version>.socket-stage`.
-/// Rebuilds are materialised here and swapped into place only on success, so
-/// a failure can never destroy a pre-existing (possibly live-wired) copy.
-fn stage_dir_for(copy_dir: &Path) -> std::path::PathBuf {
-    swap_sibling_for(copy_dir, ".socket-stage")
-}
-
-/// The backup sibling the old copy is parked at mid-swap:
-/// `<uuid>/<name>-<version>.socket-old`.
-fn backup_dir_for(copy_dir: &Path) -> std::path::PathBuf {
-    swap_sibling_for(copy_dir, ".socket-old")
-}
-
-/// Swap a fully-built stage into place without a destructive window: park the
-/// old copy (if any) at `<copy>.socket-old` with a same-dir rename, rename the
-/// stage over the now-vacant copy path, and only then delete the backup. Every
-/// step is a single atomic rename — unlike a remove-then-rename swap (where a
-/// partial `remove_dir_all`, realistic under Windows file locks, strands a
-/// half-deleted copy) no step can leave less recoverable state than it started
-/// with. If the stage rename fails the backup is renamed straight back; should
-/// even that restore fail (an external process racing the uuid dir), the old
-/// copy still exists intact at `<copy>.socket-old` instead of being destroyed.
-async fn swap_stage_into_place(stage: &Path, copy_dir: &Path) -> std::io::Result<()> {
-    let backup = backup_dir_for(copy_dir);
-    // A stale backup (crash mid-swap on an earlier run) would make the
-    // park rename fail; `remove_tree` is a no-op when it is absent.
-    remove_tree(&backup).await?;
-    let had_old = match tokio::fs::rename(copy_dir, &backup).await {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e),
-    };
-    match tokio::fs::rename(stage, copy_dir).await {
-        Ok(()) => {
-            if had_old {
-                let _ = remove_tree(&backup).await;
-            }
-            Ok(())
-        }
-        Err(e) => {
-            if had_old {
-                let _ = tokio::fs::rename(&backup, copy_dir).await;
-            }
-            Err(e)
-        }
-    }
-}
-
-/// Best-effort removal of an EMPTY `<uuid>/` dir plus the empty
-/// `.socket/vendor/cargo/` and `.socket/vendor/` levels a failed run may have
-/// created, so a hard failure leaves no husk for the user to commit.
-/// `remove_dir` refuses non-empty dirs, so live copies, markers, and other
-/// crates' vendor dirs always survive.
-async fn prune_empty_vendor_dirs(uuid_dir: &Path) {
-    // The uuid level may already be gone (the unwind paths `remove_tree` it
-    // before pruning): NotFound must continue to the parent levels this run
-    // created, or they survive as committable husks. Any other error (i.e.
-    // non-empty: a live copy or marker) still stops the prune.
-    match tokio::fs::remove_dir(uuid_dir).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return,
-    }
-    let Some(eco_dir) = uuid_dir.parent() else {
-        return;
-    };
-    if tokio::fs::remove_dir(eco_dir).await.is_err() {
-        return;
-    }
-    if let Some(vendor_dir) = eco_dir.parent() {
-        let _ = tokio::fs::remove_dir(vendor_dir).await;
-    }
-}
-
 /// Failure cleanup for a staged (re)build: always remove the stage, then
 /// either unwind the whole `<uuid>/` dir (`unwind_uuid_dir` — a fresh vendor
 /// with no pre-existing state worth keeping) or leave existing state
@@ -262,7 +152,7 @@ async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bo
     if unwind_uuid_dir {
         let _ = remove_tree(uuid_dir).await;
     }
-    prune_empty_vendor_dirs(uuid_dir).await;
+    prune_empty_vendor_levels(uuid_dir).await;
 }
 
 /// Outcome of attempting to materialise the cargo copy from the patch service.
@@ -701,12 +591,7 @@ pub async fn vendor_cargo_crate(
         {
             let marker =
                 VendorMarker::new("cargo", strip_purl_qualifiers(purl), record, vendored_at);
-            if let Err(e) = write_marker(&uuid_dir, &marker).await {
-                warnings.push(VendorWarning::new(
-                    "marker_write_failed",
-                    format!("could not write the vendor marker: {e}"),
-                ));
-            }
+            write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
         }
         return done(result, None, warnings);
     }
@@ -775,19 +660,13 @@ pub async fn vendor_cargo_crate(
         if !prior_points_here {
             let _ = remove_tree(&uuid_dir).await;
         }
-        prune_empty_vendor_dirs(&uuid_dir).await;
+        prune_empty_vendor_levels(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to update .cargo/config.toml: {e}"));
         return done(result, None, warnings);
     }
 
     let prior_path = prior_entry.as_ref().and_then(|i| i.path.clone());
-    if prior_path.as_deref().is_some_and(is_legacy_redirect_path) {
-        warnings.push(VendorWarning::new(
-            "vendor_takeover",
-            format!("took over the legacy `.socket/cargo-patches/` [patch] entry for `{name}`"),
-        ));
-    }
 
     // ── detach the lock entry ─────────────────────────────────────────────
     let lock_original: Option<CargoLockOriginal> =
@@ -833,7 +712,7 @@ pub async fn vendor_cargo_crate(
                 if !prior_points_here {
                     let _ = remove_tree(&uuid_dir).await;
                 }
-                prune_empty_vendor_dirs(&uuid_dir).await;
+                prune_empty_vendor_levels(&uuid_dir).await;
                 result.success = false;
                 result.error = Some(format!(
                     "failed to detach the Cargo.lock entry for {name}@{version}: {e} \
@@ -846,14 +725,7 @@ pub async fn vendor_cargo_crate(
     // ── marker + ledger entry ─────────────────────────────────────────────
     let base_purl = strip_purl_qualifiers(purl).to_string();
     let marker = VendorMarker::new("cargo", &base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&uuid_dir, &marker).await {
-        // The marker is belt-and-braces metadata (never a trust input); a
-        // failed write must not undo a fully-wired vendor — surface it.
-        warnings.push(VendorWarning::new(
-            "marker_write_failed",
-            format!("could not write the vendor marker: {e}"),
-        ));
-    }
+    write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
 
     let mut wiring = vec![WiringRecord {
         file: ".cargo/config.toml".to_string(),
@@ -993,12 +865,10 @@ pub async fn revert_cargo_vendor_opts(
     if !dry_run && !keep_artifact {
         let uuid_dir = project_root.join(&base_rel);
         let _ = remove_tree(&uuid_dir).await; // ignore NotFound
-                                              // Best-effort: prune the now-empty `.socket/vendor/cargo/` level so a
-                                              // fully-reverted project carries no vendor residue (`save_state` then
-                                              // prunes `.socket/vendor/` itself). `remove_dir` fails on non-empty.
-        if let Some(eco_dir) = uuid_dir.parent() {
-            let _ = tokio::fs::remove_dir(eco_dir).await;
-        }
+                                              // Best-effort: prune the now-empty `.socket/vendor/cargo/` and
+                                              // `.socket/vendor/` levels so a fully-reverted project carries no
+                                              // vendor residue. `remove_dir` fails on non-empty.
+        prune_empty_vendor_levels(&uuid_dir).await;
     }
 
     out
@@ -1009,6 +879,7 @@ mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::{PatchFileInfo, VulnerabilityInfo};
+    use crate::vendor::common::backup_dir_for;
     use crate::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1937,44 +1808,35 @@ mod tests {
         assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
     }
 
+    /// `.socket/cargo-patches/` was the retired `[patch]`-redirect backend's
+    /// copy root; no tagged release ever wrote it (it lived only between two
+    /// main commits), so an entry pointing there is an unknown user path and
+    /// refuses like any other user-authored same-name entry.
     #[tokio::test]
-    async fn test_legacy_redirect_entry_is_taken_over() {
+    async fn test_retired_redirect_path_entry_is_user_authored() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
-        // Residue from the retired redirect backend: a legacy-path entry.
         tokio::fs::create_dir_all(root.join(".cargo"))
             .await
             .unwrap();
-        tokio::fs::write(
-            root.join(".cargo/config.toml"),
-            "[patch.crates-io]\ncfg-if = { path = \".socket/cargo-patches/cfg-if-1.0.4\" }\n",
-        )
-        .await
-        .unwrap();
+        let config =
+            "[patch.crates-io]\ncfg-if = { path = \".socket/cargo-patches/cfg-if-1.0.4\" }\n";
+        tokio::fs::write(root.join(".cargo/config.toml"), config)
+            .await
+            .unwrap();
 
-        let (result, entry, warnings) =
-            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
-        assert!(result.success, "{:?}", result.error);
-        assert!(
-            warnings.iter().any(|w| w.code == "vendor_takeover"),
-            "legacy takeover surfaced: {warnings:?}"
+        expect_refused(
+            run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
+            "user_authored_patch_entry",
         );
-        let entry = entry.unwrap();
-        let cfg = &entry.wiring[0];
-        assert_eq!(cfg.action, WiringAction::Rewritten);
         assert_eq!(
-            cfg.original,
-            Some(serde_json::Value::from(
-                ".socket/cargo-patches/cfg-if-1.0.4"
-            ))
+            tokio::fs::read_to_string(root.join(".cargo/config.toml"))
+                .await
+                .unwrap(),
+            config,
+            "the user's entry is never rewritten"
         );
-        // The live entry now points at the vendor copy.
-        assert_eq!(
-            cargo_config::read_patch_entries(root).await["cfg-if"]
-                .path
-                .as_deref(),
-            Some(copy_rel().as_str())
-        );
+        assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
     }
 
     // ── filesystem-safety: coordinate traversal ──────────────────────────
@@ -3055,15 +2917,15 @@ mod tests {
 
     /// A failed marker write on a FRESH vendor (a directory squatting the
     /// marker path makes the atomic rename fail) must not undo the
-    /// fully-wired vendor: success + a `marker_write_failed` warning, with
+    /// fully-wired vendor: success + a `vendor_marker_write_failed` warning, with
     /// copy, config, and lock all wired.
     #[tokio::test]
     async fn marker_write_failure_warns_but_vendor_succeeds() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
-        tokio::fs::create_dir_all(root.join(format!(
-            ".socket/vendor/cargo/{UUID}/{VENDOR_MARKER_FILE}"
-        )))
+        tokio::fs::create_dir_all(
+            root.join(format!(".socket/vendor/cargo/{UUID}/{VENDOR_MARKER_FILE}")),
+        )
         .await
         .unwrap();
 
@@ -3072,7 +2934,9 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "the wired vendor still emits its entry");
         assert!(
-            warnings.iter().any(|w| w.code == "marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "the failed marker write is surfaced: {warnings:?}"
         );
         // The vendor is otherwise fully wired.
@@ -3103,7 +2967,10 @@ mod tests {
         let out = revert_cargo_vendor(&entry, root, false).await;
         assert!(!out.success);
         assert!(
-            out.error.as_deref().unwrap_or("").contains("not a cargo purl"),
+            out.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not a cargo purl"),
             "{:?}",
             out.error
         );

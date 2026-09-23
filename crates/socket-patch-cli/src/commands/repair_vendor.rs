@@ -52,6 +52,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
+use socket_patch_core::constants::SOCKET_DIR;
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::copy_tree::remove_tree;
@@ -62,8 +63,8 @@ use socket_patch_core::utils::purl::{
 use socket_patch_core::vendor::state::{VendorArtifact, WiringRecord};
 use socket_patch_core::vendor::{
     self, artifact_is_file_shaped, check_vendored_artifact, compute_dir_inventory, file_sha256_hex,
-    load_state, lock_inventory, parse_vendor_path, registry_fetch, ArtifactHealth, VendorEntry,
-    VendorOutcome, VendorWarning,
+    lock_inventory, parse_vendor_path, registry_fetch, ArtifactHealth, VendorEntry, VendorOutcome,
+    VendorState, VendorWarning,
 };
 use socket_patch_core::vex::time::now_rfc3339;
 
@@ -73,7 +74,7 @@ use crate::commands::vendor::{
     dispatch_vendor_one, ecosystem_in_scope, fetch_pristine_package, persist_vendor_entry,
     record_warning, PristineFetch,
 };
-use crate::ecosystem_dispatch::{find_packages_for_purls, partition_purls};
+use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::json_envelope::{Envelope, PatchAction, PatchEvent, RunWarning};
 
 /// One broken vendored unit queued for rebuild.
@@ -168,8 +169,7 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
     // would delete the include-referenced wheel). An unreadable include
     // tree degrades to the root file, matching the per-file tolerance
     // below.
-    if let Ok(includes) =
-        socket_patch_core::vendor::requirements_include_names(project_root).await
+    if let Ok(includes) = socket_patch_core::vendor::requirements_include_names(project_root).await
     {
         files.extend(includes);
     }
@@ -282,9 +282,7 @@ async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> 
     }
     let needle = format!(".socket/vendor/npm/{uuid}/");
     let read = |name: &'static str| async move {
-        read_regular_to_string(&project_root.join(name))
-            .await
-            .ok()
+        read_regular_to_string(&project_root.join(name)).await.ok()
     };
     if read("bun.lock").await.is_some_and(|t| t.contains(&needle)) {
         return Some("bun".to_string());
@@ -425,12 +423,17 @@ fn warn_wiring_unknown(env: &mut Envelope, common: &GlobalArgs, detail: String) 
     });
 }
 
-/// Best-effort removal of a vendored uuid dir — ahead of a rebuild (corrupt
-/// bytes must never blend into one) or after a failed post-verify (never
-/// leave unverifiable bytes behind).
+/// Best-effort removal of a vendored uuid dir after a failed post-verify
+/// (never leave unverifiable bytes behind). Prunes the emptied
+/// `.socket/vendor/<eco>/` (and `vendor/`) husks like every other artifact
+/// removal, stopping at `.socket/`; a sibling unit or the ledger keeps them.
 async fn remove_vendor_dir(cwd: &Path, eco: &str, uuid: &str) {
     if let Some(rel) = vendor::path::vendor_uuid_dir_rel(eco, uuid) {
-        let _ = remove_tree(&cwd.join(rel)).await;
+        let _ = socket_patch_core::utils::socket_dir::remove_tree_and_prune(
+            &cwd.join(rel),
+            &cwd.join(SOCKET_DIR),
+        )
+        .await;
     }
 }
 
@@ -466,22 +469,79 @@ async fn restore_aside_vendor_dir(live: &Path, kept: &Path) {
     let _ = tokio::fs::rename(kept, live).await;
 }
 
+/// Crash recovery for [`set_aside_vendor_dir`]'s transient: a run killed
+/// between the move-aside and the backend's replacement leaves
+/// `.socket/vendor/<eco>/<uuid>.pre-rebuild` as the ONLY copy of bytes the
+/// rewired lockfiles still point at, with the live path a bare ENOENT. Put
+/// every such leftover back where the wiring expects it before pass 1
+/// classifies the unit (it then re-derives corrupt/soft/healthy from the
+/// restored bytes exactly as the crashed run did). A leftover whose live
+/// sibling EXISTS is left alone: the live dir may be the completed
+/// replacement or a partial husk, and only the health pass can tell — a
+/// unit it condemns is set aside again, which clears the leftover. Wet
+/// runs only; scope-gated like every other unit; best-effort throughout.
+async fn restore_orphaned_pre_rebuild_dirs(common: &GlobalArgs) {
+    const SUFFIX: &str = ".pre-rebuild";
+    let vendor_root = common.cwd.join(".socket/vendor");
+    let Ok(mut ecos) = tokio::fs::read_dir(&vendor_root).await else {
+        return;
+    };
+    while let Ok(Some(eco_dir)) = ecos.next_entry().await {
+        let eco = eco_dir.file_name().to_string_lossy().into_owned();
+        if !ecosystem_in_scope(common, &eco) || !eco_dir.path().is_dir() {
+            continue;
+        }
+        let Ok(mut units) = tokio::fs::read_dir(eco_dir.path()).await else {
+            continue;
+        };
+        while let Ok(Some(unit)) = units.next_entry().await {
+            let name = unit.file_name().to_string_lossy().into_owned();
+            let Some(uuid) = name.strip_suffix(SUFFIX) else {
+                continue;
+            };
+            let live = eco_dir.path().join(uuid);
+            if unit.path().is_dir() && tokio::fs::symlink_metadata(&live).await.is_err() {
+                let _ = tokio::fs::rename(unit.path(), &live).await;
+            }
+        }
+    }
+}
+
 /// The vendored-artifact phase of `repair`. Runs between the download and
 /// cleanup phases (and under `--download-only` — restoring artifacts IS
 /// repair's job). `manifest` is `None` when the project has no
 /// `.socket/manifest.json` (detached/reconstruction-only repairs).
 /// Returns the number of artifacts rebuilt (for the human summary line);
 /// failures are carried by `env` (`Failed` events + partial-failure status).
-pub(crate) async fn repair_vendored_artifacts(
+///
+/// `references` is [`scan_vendor_references`]'s `(ecosystem, uuid,
+/// artifact relpath)` output for `common.cwd` and `ledger` the caller's
+/// `load_state` outcome — both taken by repair.rs under the apply lock
+/// this phase runs under (the lockfiles and ledger they describe are the
+/// ones the reconstruction below rewires), so neither is re-read here. An
+/// unreadable ledger fails this phase loudly (`vendor_state_unreadable`);
+/// the caller's own degrade-to-empty policy for its download scoping is
+/// its own. `run_client` is the run's API client when the caller already
+/// built one (repair.rs's `telemetry_client`): the uuid lookups and the
+/// staging fetch reuse it instead of constructing a second (or third) one
+/// and re-printing its token advisory; `None` builds lazily on first need.
+pub(crate) async fn repair_vendored_artifacts_with_references(
     common: &GlobalArgs,
     manifest: Option<&PatchManifest>,
     socket_dir: &Path,
     env: &mut Envelope,
+    references: &[(String, String, String)],
+    ledger: std::io::Result<VendorState>,
+    run_client: Option<&ApiClient>,
 ) -> usize {
     let quiet = common.json || common.silent;
     let mut rebuilt = 0usize;
 
-    let mut state = match load_state(&common.cwd).await {
+    if !common.dry_run {
+        restore_orphaned_pre_rebuild_dirs(common).await;
+    }
+
+    let mut state = match ledger {
         Ok(s) => s,
         Err(e) => {
             env.record(
@@ -495,8 +555,9 @@ pub(crate) async fn repair_vendored_artifacts(
 
     // ── Pass 1: ledger-driven health check ───────────────────────────────
     // Shared across both passes so the API client (and its one-time
-    // token-shape stderr advisory) is constructed at most once per run.
-    let mut api_client: Option<ApiClient> = None;
+    // token-shape stderr advisory) is constructed at most once per run —
+    // seeded from the run's client when the caller has one.
+    let mut api_client: Option<ApiClient> = run_client.cloned();
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut ledger_purls: Vec<String> = state.entries.keys().cloned().collect();
     ledger_purls.sort();
@@ -729,7 +790,7 @@ pub(crate) async fn repair_vendored_artifacts(
         .values()
         .map(|e| (e.ecosystem.clone(), e.uuid.clone()))
         .collect();
-    for (eco, uuid, relpath) in scan_vendor_references(&common.cwd).await {
+    for (eco, uuid, relpath) in references.iter().cloned() {
         if covered.contains(&(eco.clone(), uuid.clone())) || !ecosystem_in_scope(common, &eco) {
             continue;
         }
@@ -998,7 +1059,18 @@ pub(crate) async fn repair_vendored_artifacts(
         patches: records_map,
         setup: None,
     };
-    let staged = match stage_vendor_sources_in_memory(common, &synth, socket_dir, &common.cwd).await
+    // The ledger this pass already holds feeds the staging harvest; repair
+    // has no download phase, so no seed.
+    let staged = match stage_vendor_sources_in_memory(
+        common,
+        &synth,
+        socket_dir,
+        &common.cwd,
+        Ok(&state.entries),
+        HashMap::new(),
+        api_client.as_ref(),
+    )
+    .await
     {
         MemStageOutcome::Ready(s) => s,
         MemStageOutcome::Unavailable => {
@@ -1047,7 +1119,16 @@ pub(crate) async fn repair_vendored_artifacts(
         global: common.global,
         global_prefix: common.global_prefix.clone(),
     };
-    let mut all_packages = find_packages_for_purls(&partitioned, &crawler_options, quiet).await;
+    // Ledger keys are the manifest spelling — QUALIFIED for release-variant
+    // ecosystems (gem `?platform=`, pypi `?artifact_id=`, maven
+    // `?classifier=&ext=`) — while the crawler knows only base purls. A
+    // base-keyed result map would make the `contains_key(&c.purl)` checks
+    // below miss every installed
+    // qualified-key package and fall through to a needless registry fetch
+    // (or, offline, a spurious unrepairable / fingerprint-less restore).
+    // The rollback variant fans each base path back out to every qualified
+    // caller purl — the same fix `vendor_records` carries.
+    let mut all_packages = find_packages_for_rollback(&partitioned, &crawler_options, quiet).await;
     let inventory = lock_inventory::inventory_project(&common.cwd).await;
     let client = registry_fetch::build_registry_client();
     let mut holders: Vec<registry_fetch::FetchedPackage> = Vec::new();
@@ -1574,10 +1655,7 @@ async fn fetch_record_by_uuid(
     let client = client_cache
         .as_ref()
         .expect("client_cache was just initialized above");
-    let patch = client
-        .fetch_patch(common.org.as_deref(), uuid)
-        .await
-        .ok()??;
+    let patch = client.fetch_patch(uuid).await.ok()??;
     Some(crate::commands::get::record_from_patch_response(&patch))
 }
 
@@ -1709,7 +1787,11 @@ mod tests {
         let fifos = ["tool.py", "bun.lock"];
         for name in fifos {
             let c = std::ffi::CString::new(root.join(name).to_str().unwrap()).unwrap();
-            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "mkfifo {name}");
+            assert_eq!(
+                unsafe { libc::mkfifo(c.as_ptr(), 0o644) },
+                0,
+                "mkfifo {name}"
+            );
         }
         // Release valve: if a read DID wedge in open(2), connecting a
         // writer lets the blocking thread finish so the runtime can shut
@@ -1759,7 +1841,9 @@ mod tests {
         tokio::fs::write(root.join("requirements.txt"), "-r requirements/base.txt\n")
             .await
             .unwrap();
-        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        tokio::fs::create_dir(root.join("requirements"))
+            .await
+            .unwrap();
         tokio::fs::write(
             root.join("requirements/base.txt"),
             format!(
@@ -1923,6 +2007,14 @@ mod tests {
         assert!(dir.is_dir(), "a non-canonical uuid must remove nothing");
         remove_vendor_dir(tmp.path(), "npm", uuid).await;
         assert!(!dir.exists(), "the canonical pair removes its uuid dir");
+        assert!(
+            !tmp.path().join(".socket/vendor").exists(),
+            "the emptied <eco>/ and vendor/ husks are pruned"
+        );
+        assert!(
+            tmp.path().join(".socket").is_dir(),
+            ".socket/ is never removed"
+        );
     }
 
     /// The empty-component rejects: a purl with no name or no version can

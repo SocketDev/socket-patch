@@ -499,6 +499,12 @@ async fn npm_hosted_round_trip() {
         !tmp.path().join(".socket/manifest.json").exists(),
         "a hosted-only rollback must not materialize a manifest"
     );
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "a fully unwound hosted project keeps no .socket/ residue: the ledger's \
+         vendor/ dir is pruned with it and the lock guard removes apply.lock and \
+         the emptied directory"
+    );
 }
 
 /// Dry-run twin of the round trip — the review-caught regression: the
@@ -704,7 +710,10 @@ async fn pypi_requirements_hosted_round_trip() {
     );
 
     let code = rollback_in_process(tmp.path(), Vec::new(), false).await;
-    assert_eq!(code, 0, "bare rollback over the pypi redirect should exit 0");
+    assert_eq!(
+        code, 0,
+        "bare rollback over the pypi redirect should exit 0"
+    );
 
     let restored = std::fs::read_to_string(tmp.path().join("requirements.txt")).unwrap();
     assert_eq!(
@@ -718,6 +727,10 @@ async fn pypi_requirements_hosted_round_trip() {
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
         "hosted mode never touches the manifest"
+    );
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "a fully unwound hosted project keeps no .socket/ residue"
     );
 }
 
@@ -834,14 +847,18 @@ async fn hosted_only_project_without_manifest() {
     );
     assert!(!ledger_path(tmp.path()).exists(), "ledger must be deleted");
     assert!(
-        !tmp.path().join(".socket/manifest.json").exists(),
-        "no manifest may be materialized"
+        !tmp.path().join(".socket").exists(),
+        "no manifest may be materialized, and the emptied .socket/ (ledger and \
+         vendor/ pruned, apply.lock removed) must be gone"
     );
 
     // Truly empty: all three stores absent keeps the legacy error.
     let empty = tempfile::tempdir().unwrap();
     let (code, envelope) = run_rollback_subprocess(empty.path(), &[]);
-    assert_eq!(code, 1, "a truly-empty project must keep exit 1: {envelope}");
+    assert_eq!(
+        code, 1,
+        "a truly-empty project must keep exit 1: {envelope}"
+    );
     assert_eq!(envelope["status"], "error", "{envelope}");
     assert!(
         envelope["error"]
@@ -867,7 +884,10 @@ async fn preserve_state_still_unwinds_hosted() {
     write_single_npm_fixture(tmp.path()).await;
 
     let (code, envelope) = run_rollback_subprocess(tmp.path(), &["--preserve-state"]);
-    assert_eq!(code, 0, "preserve-state hosted rollback exits 0: {envelope}");
+    assert_eq!(
+        code, 0,
+        "preserve-state hosted rollback exits 0: {envelope}"
+    );
     assert_eq!(envelope["status"], "success", "{envelope}");
     assert_eq!(
         envelope["hosted"]["reverted"],
@@ -895,5 +915,9 @@ async fn preserve_state_still_unwinds_hosted() {
     assert!(
         !ledger_path(tmp.path()).exists(),
         "hosted ledger records are dropped with the wiring — no preservable state"
+    );
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "with nothing preservable, the emptied .socket/ is gone too"
     );
 }

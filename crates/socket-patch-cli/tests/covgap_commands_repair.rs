@@ -12,7 +12,8 @@
 //!     `format_cleanup_result`'s exact wording,
 //!   * the archive-cleanup failure arm (stderr warning + `cleanup_failed`
 //!     skip event, exit stays 0, loop continues to the packages pass),
-//!   * the lock-file unlink-failure warning (exit stays 0),
+//!   * an unremovable `apply.lock` (read-only `.socket`) stays non-fatal
+//!     and silent (exit stays 0),
 //!   * the loud "Rebuilt N vendored artifact(s)." summary after the
 //!     vendored-repair phase.
 //!
@@ -276,7 +277,8 @@ fn repair_offline_warning_truncates_missing_list_after_five() {
         "offline missing artifacts are a warning, not a failure; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("Warning: 12 file artifact(s) are missing (offline mode - not downloading)"),
+        stdout
+            .contains("Warning: 12 file artifact(s) are missing (offline mode - not downloading)"),
         "the warning header must carry the full missing count; stdout=\n{stdout}"
     );
     let items = item_lines(&stdout);
@@ -433,8 +435,9 @@ fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
 /// pass still sweeps its orphan after the diffs pass failed.
 ///
 /// Deterministic cross-platform fixture: `.socket/diffs` is a regular FILE,
-/// so `cleanup_dir`'s metadata() succeeds (no early return) and read_dir()
-/// fails with ENOTDIR.
+/// so `cleanup_dir`'s read_dir() fails with ENOTDIR/NotADirectory (not
+/// NotFound, which is the silent "nothing to sweep" case) and that error
+/// propagates as `cleanup_failed`.
 #[test]
 fn repair_archive_cleanup_failure_warns_and_continues() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -497,7 +500,10 @@ fn repair_archive_cleanup_failure_warns_and_continues() {
             panic!("json: envelope must record the failed archive cleanup; got events={events:?}")
         });
     assert!(
-        skip["reason"].as_str().unwrap_or("").contains("diff cleanup failed"),
+        skip["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("diff cleanup failed"),
         "the skip reason must name the failing archive pass; got {skip}"
     );
     // The packages pass still swept its orphan: one batched removal event.
@@ -517,20 +523,23 @@ fn stdout_reports_package_sweep(stdout: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Lock-file unlink failure (housekeeping stays non-fatal)
+// Lock-file unlink failure (the guard's cleanup stays non-fatal)
 // ---------------------------------------------------------------------------
 
-/// A failed `apply.lock` unlink at the tail of a finished repair is
-/// housekeeping: human mode warns on stderr WITHOUT flipping the exit code.
-/// Unix-only: unlink needs write on the parent dir, so a 0o555 `.socket`
-/// makes the delete fail deterministically while opening the pre-created
-/// lock file (no dir write needed) and reading the manifest still work.
-/// Same chmod choreography as `repair_cleanup_failure_is_reported_in_json_
-/// and_silent_modes` in `repair_invariants.rs` (running as root would let
-/// the unlink through and fail this test loudly, not vacuously).
+/// A failed `apply.lock` unlink when the lock guard drops at the tail of a
+/// finished repair is best-effort housekeeping: it must neither panic (a
+/// panicking drop would abort the process with exit 101) nor flip the exit
+/// code, and it is silent — the core guard cannot see `--silent`/`--json`,
+/// so it never prints. Unix-only: unlink needs write on the parent dir, so
+/// a 0o555 `.socket` makes the delete fail deterministically while opening
+/// the pre-created lock file (no dir write needed) and reading the manifest
+/// still work. Same chmod choreography as
+/// `repair_cleanup_failure_is_reported_in_json_and_silent_modes` in
+/// `repair_invariants.rs` (running as root would let the unlink through and
+/// fail this test loudly, not vacuously).
 #[cfg(unix)]
 #[test]
-fn repair_warns_but_exits_zero_when_lock_file_unremovable() {
+fn repair_exits_zero_and_stays_quiet_when_lock_file_unremovable() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -559,8 +568,8 @@ fn repair_warns_but_exits_zero_when_lock_file_unremovable() {
          finished repair; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Warning: could not remove lock file"),
-        "human mode must warn about the undeletable lock file; stderr=\n{stderr}"
+        !stderr.contains("lock file"),
+        "the guard's best-effort unlink is silent; stderr=\n{stderr}"
     );
     assert!(
         socket.join("apply.lock").exists(),
@@ -702,7 +711,14 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str], json: bool) -> (i32, Stri
     if json {
         cmd.arg("--json");
     }
-    cmd.args(["--api-url", mock_uri, "--api-token", "fake-token", "--org", ORG_SLUG]);
+    cmd.args([
+        "--api-url",
+        mock_uri,
+        "--api-token",
+        "fake-token",
+        "--org",
+        ORG_SLUG,
+    ]);
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch");
     (
@@ -731,7 +747,10 @@ async fn repair_offline_rebuild_human_mode_prints_rebuilt_summary() {
         &["scan", "--vendor", "--yes"],
         true,
     );
-    assert_eq!(code, 0, "vendor setup failed: stdout={stdout} stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor setup failed: stdout={stdout} stderr={stderr}"
+    );
     let tgz = tmp
         .path()
         .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));

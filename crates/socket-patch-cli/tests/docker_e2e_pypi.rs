@@ -423,8 +423,7 @@ exit 0
 /// into the venv site-packages by default — a patch that rewrites the
 /// venv file in place would corrupt every other venv on the machine
 /// that shares the same cached wheel. The script proves the CoW
-/// guard (`break_hardlink_if_needed` in `patch/cow.rs`) works for
-/// uv specifically by:
+/// guard (the rename-over write in `socket_patch_core::utils::fs::atomic_write_bytes` (see its CoW guarantee doc)) works for uv specifically by:
 ///
 ///   1. Recording the venv file's inode AND the cache file's content
 ///      hash BEFORE apply.
@@ -885,8 +884,7 @@ async fn pypi_global_install_full_apply_chain() {
 }
 
 /// uv-managed venv install + apply. Verifies the apply pipeline's
-/// CoW guard (`break_hardlink_if_needed`) works for uv's
-/// hard-link-from-cache layout. See `uv_venv_script` for the
+/// CoW guard (the rename-over write in `socket_patch_core::utils::fs::atomic_write_bytes` (see its CoW guarantee doc)) works for uv's hard-link-from-cache layout. See `uv_venv_script` for the
 /// inode-change + cache-integrity assertions inside the container.
 #[tokio::test]
 async fn pypi_uv_venv_install_full_apply_chain() {

@@ -25,10 +25,11 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
-use crate::patch::copy_tree::remove_tree;
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{already_patched_result, detect_eol, refused};
 use super::npm_common::{
@@ -36,7 +37,7 @@ use super::npm_common::{
 };
 use super::path::parse_vendor_path;
 use super::state::{
-    write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -134,12 +135,6 @@ pub async fn vendor_yarn_classic(
     drop(blocks);
 
     // ── 4–7. Stage → patch → pack (shared flavor-agnostic pipeline) ───────
-    // A wiring failure past this point must unwind the uuid dir staging is
-    // about to create — but never one that already existed (a same-uuid
-    // re-vendor's dir may still be referenced by live wiring).
-    let uuid_dir_preexisted = tokio::fs::metadata(project_root.join(&uuid_dir_rel))
-        .await
-        .is_ok();
     let (staged, result) = match stage_patch_pack(
         purl,
         installed_dir,
@@ -164,6 +159,7 @@ pub async fn vendor_yarn_classic(
             warnings,
         };
     };
+    let uuid_dir_preexisted = staged.uuid_dir_preexisted;
     let rel_tgz = staged.rel_tgz;
     let packed = staged.packed;
     let staged_pkg_json = staged.staged_pkg_json;
@@ -259,12 +255,7 @@ pub async fn vendor_yarn_classic(
 
     // ── 9. Marker + ledger entry ──────────────────────────────────────────
     let marker = VendorMarker::new("npm", &base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&project_root.join(&uuid_dir_rel), &marker).await {
-        warnings.push(VendorWarning::new(
-            "vendor_marker_write_failed",
-            format!("could not write the informational vendor marker: {e}"),
-        ));
-    }
+    write_marker_or_warn(&project_root.join(&uuid_dir_rel), &marker, &mut warnings).await;
 
     let entry = VendorEntry {
         ecosystem: "npm".to_string(),
@@ -335,7 +326,7 @@ pub async fn revert_yarn_classic_opts(
     // advertises a revert the wet run refuses. Skipped under
     // `keep_artifact`: the refusal exists only to protect the deletion,
     // which a preserve-state revert never performs.
-    if entry.wiring.is_empty() {
+    if !keep_artifact && entry.wiring.is_empty() {
         if let Some(blocked) = super::npm_lock::guard_unwired_textual_revert(
             project_root,
             &entry.uuid,
@@ -454,7 +445,11 @@ pub async fn revert_yarn_classic_opts(
         return outcome;
     }
 
-    if let Err(e) = remove_tree(&project_root.join(&uuid_dir_rel)).await {
+    // The last npm-family entry leaves `.socket/vendor/npm/` (and
+    // `.socket/vendor/`) empty: the shared helper prunes them so a reverted
+    // project carries no vendor residue (non-recursive: siblings keep them).
+    let uuid_dir = project_root.join(&uuid_dir_rel);
+    if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
         return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
     }
 
@@ -713,28 +708,6 @@ pub(super) async fn read_yarn_lock(project_root: &Path) -> Result<String, Box<Ve
             format!("cannot read {YARN_LOCK}: {e}"),
         ))),
     }
-}
-
-/// Guarded read shared in shape with the vendor siblings' twins
-/// (npm_lock.rs, pnpm_lock.rs, lock_inventory.rs): `open_regular_file`
-/// opens with `O_NONBLOCK` and rejects non-regular files, so a FIFO planted
-/// as yarn.lock / package.json / .yarnrc.yml fails fast instead of wedging
-/// vendor / revert forever in an `open(2)` waiting for a writer.
-pub(super) async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
-/// [`read_regular`], decoded as UTF-8 (`InvalidData` on failure, matching
-/// `read_to_string`'s error kind).
-pub(super) async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    let bytes = read_regular(path).await?;
-    String::from_utf8(bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// One key-line block of a yarn lockfile (classic or berry).
@@ -1477,8 +1450,14 @@ left-pad@^1.3.0:
         for lock in [wrong_version_dup, both_candidates_dup] {
             let fx = fixture_with_lock(lock).await;
             let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_ambiguous");
-            assert!(detail.contains("left-pad@^1.3.0"), "names the key: {detail}");
-            assert!(detail.contains("yarn install"), "actionable detail: {detail}");
+            assert!(
+                detail.contains("left-pad@^1.3.0"),
+                "names the key: {detail}"
+            );
+            assert!(
+                detail.contains("yarn install"),
+                "actionable detail: {detail}"
+            );
             assert_eq!(
                 tokio::fs::read(fx.lock_path()).await.unwrap(),
                 fx.lock_bytes,
@@ -2079,7 +2058,9 @@ left-pad@^1.3.0:
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
         assert!(
-            !warnings.iter().any(|w| w.code == "vendor_link_entry_skipped"),
+            !warnings
+                .iter()
+                .any(|w| w.code == "vendor_link_entry_skipped"),
             "a file: TARBALL range is rewritable, not a link-skip: {warnings:?}"
         );
         let entry = entry.expect("success carries a ledger entry");
@@ -2263,7 +2244,11 @@ left-pad@^1.3.0:
         // (c) Recorded key gone AND the original block not live anywhere:
         // deleted-since-vendoring drift.
         let absent = vec!["absent@^9:".to_string(), "  version \"9.0.0\"".to_string()];
-        let rec = wrec(Some("absent@^9"), KIND_LOCK_BLOCK, Some(lines_to_json(&absent)));
+        let rec = wrec(
+            Some("absent@^9"),
+            KIND_LOCK_BLOCK,
+            Some(lines_to_json(&absent)),
+        );
         let (changed, text, warnings) = run(Y2_AFTER, &rec);
         assert!(!changed);
         assert_eq!(text, Y2_AFTER);
@@ -2437,16 +2422,18 @@ left-pad@^1.3.0:
         // A DIRECTORY squatting on the marker path: the tarball pack into
         // the (pre-existing) uuid dir succeeds, the marker's atomic rename
         // onto a directory fails.
-        let marker_path = fx
-            .root()
-            .join(format!(".socket/vendor/npm/{UUID}/socket-patch.vendor.json"));
+        let marker_path = fx.root().join(format!(
+            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+        ));
         tokio::fs::create_dir_all(&marker_path).await.unwrap();
 
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "the vendor itself succeeded");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "{warnings:?}"
         );
         assert!(fx.tgz_path().exists(), "tarball packed");
@@ -2555,12 +2542,54 @@ left-pad@^1.3.0:
             outcome.warnings
         );
         assert!(
-            !fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
             "artifact removed on the re-run"
         );
         assert_eq!(
             tokio::fs::read(fx.lock_path()).await.unwrap(),
             fx.lock_bytes
         );
+    }
+
+    /// `--preserve-state` with a repair-reconstructed (empty-wiring) entry:
+    /// the deletion-protecting refusal must be SKIPPED (the fn doc, bun and
+    /// pnpm-legacy all promise it — a preserve-state revert deletes
+    /// nothing), so the revert completes as a successful no-op with lock and
+    /// artifact intact. Dry-run preview included.
+    #[tokio::test]
+    async fn empty_wiring_preserve_state_revert_skips_the_deletion_refusal() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring.clear();
+        let lock_vendored = tokio::fs::read(fx.lock_path()).await.unwrap();
+
+        for dry_run in [true, false] {
+            let outcome = revert_yarn_classic_opts(
+                &entry,
+                fx.root(),
+                RevertOpts {
+                    dry_run,
+                    keep_artifact: true,
+                },
+            )
+            .await;
+            assert!(
+                outcome.success,
+                "dry_run={dry_run}: preserve-state deletes nothing, so the \
+                 deletion guard must not fire: {:?}",
+                outcome.error
+            );
+            assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+            assert!(!outcome.kept_artifact, "preserve-state is not a drift-keep");
+            assert!(fx.tgz_path().exists(), "artifact kept");
+            assert_eq!(
+                tokio::fs::read(fx.lock_path()).await.unwrap(),
+                lock_vendored,
+                "empty wiring replays nothing"
+            );
+        }
     }
 }

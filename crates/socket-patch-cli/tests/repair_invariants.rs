@@ -563,7 +563,12 @@ fn repair_cleanup_failure_is_reported_in_json_and_silent_modes() {
 }
 
 // ---------------------------------------------------------------------------
-// Advisory-lock cleanup — repair owns the old `unlock --release` behavior
+// Advisory lock — the lock file never outlives the run
+//
+// Every mutating command's lock guard reclaims a leftover `apply.lock` in
+// place and removes it (plus an otherwise-empty `.socket/`) when it drops;
+// repair — the historical home of the old `unlock --release` fold-in — is
+// where that contract is pinned.
 // ---------------------------------------------------------------------------
 
 /// Take an exclusive flock on the binary's lock file path (the same
@@ -584,8 +589,8 @@ fn take_external_lock(socket_dir: &Path) -> std::fs::File {
     file
 }
 
-/// A leftover `apply.lock` from an earlier (or crashed) run is removed
-/// by a successful repair — the fold-in of the old `unlock --release`.
+/// A leftover `apply.lock` from an earlier (or crashed) run is reclaimed
+/// in place and gone once a successful repair's lock guard drops.
 #[test]
 fn repair_deletes_leftover_lock_file_on_success() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -619,9 +624,12 @@ fn repair_deletes_probe_created_lock_file() {
     );
 }
 
-/// `--dry-run` mutates nothing — including the lock file.
+/// The lock file is runtime state, not project state: `--dry-run` mutates
+/// nothing that belongs to the project, but its guard still reclaims a
+/// leftover `apply.lock` and removes it on the way out — no `if !dry_run`
+/// gate may creep back around the release.
 #[test]
-fn repair_dry_run_preserves_lock_file() {
+fn repair_dry_run_also_removes_leftover_lock_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
     write_blob(&socket, REFERENCED_HASH, b"patched content");
@@ -630,8 +638,13 @@ fn repair_dry_run_preserves_lock_file() {
     let (code, stdout) = run_repair(tmp.path(), &["--dry-run"]);
     assert_eq!(code, 0, "expected exit 0; stdout=\n{stdout}");
     assert!(
-        socket.join("apply.lock").exists(),
-        "--dry-run must not delete apply.lock"
+        !socket.join("apply.lock").exists(),
+        "a dry run leaves no apply.lock behind either"
+    );
+    assert!(
+        socket.join("manifest.json").exists()
+            && socket.join("blobs").join(REFERENCED_HASH).exists(),
+        "project state is untouched by the dry run"
     );
 }
 
@@ -656,9 +669,9 @@ fn repair_refuses_and_keeps_lock_when_live_holder() {
     );
 }
 
-/// The lock-file cleanup is housekeeping that runs on every completion
-/// path, not a success reward: a repair that fails past the lock (here:
-/// an unparseable manifest → `repair_failed`) still deletes the file.
+/// The lock-file cleanup runs on every completion path, not as a success
+/// reward: a repair that fails past the lock (here: an unparseable
+/// manifest → `repair_failed`) still drops its guard and the file with it.
 #[test]
 fn repair_deletes_lock_file_even_when_repair_fails() {
     let tmp = tempfile::tempdir().expect("tempdir");

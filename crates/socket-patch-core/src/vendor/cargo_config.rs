@@ -10,10 +10,7 @@
 //! ## Ownership model (no sidecar manifest)
 //! A `[patch.crates-io]` entry is *socket-owned* iff its `path` value is a
 //! root-anchored relative path (not absolute, no `..`) under THIS project's
-//! `.socket/vendor/cargo/` (this backend's committed copies) **or** the
-//! legacy `.socket/cargo-patches/` (the retired `[patch]`-redirect backend) —
-//! recognising the legacy prefix lets vendor take over / clean up entries left
-//! by old releases instead of refusing them as user-authored. Anything else —
+//! `.socket/vendor/cargo/` (this backend's committed copies). Anything else —
 //! a `git`/`registry` source, or a `path` pointing elsewhere (including one
 //! that merely traverses a *foreign* checkout's `.socket/vendor/cargo/`) — is
 //! user-authored and is never modified or removed. The path prefix is the
@@ -32,17 +29,11 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
 /// Project-relative root of the vendor backend's committed crate copies. An
 /// entry whose `path` is under this prefix is socket-owned.
 const CARGO_VENDOR_DIR: &str = ".socket/vendor/cargo";
-
-/// Project-relative root of the retired `[patch]`-redirect backend's copies.
-/// Entries under this prefix are still recognised as socket-owned so vendor
-/// can rewrite (take over) or drop residue from old releases rather than
-/// refusing it as user-authored.
-pub const LEGACY_CARGO_PATCHES_DIR: &str = ".socket/cargo-patches";
 
 /// Info about one `[patch.crates-io]` entry, for vendor pre-flight / verify.
 #[derive(Debug, Clone)]
@@ -50,8 +41,7 @@ pub struct PatchEntryInfo {
     /// The `path` value as written (verbatim), or `None` for a non-path
     /// source (e.g. `git`/`registry`).
     pub path: Option<String>,
-    /// True iff `path` is under `CARGO_VENDOR_DIR` or
-    /// [`LEGACY_CARGO_PATCHES_DIR`].
+    /// True iff `path` is under `CARGO_VENDOR_DIR`.
     pub socket_owned: bool,
 }
 
@@ -60,10 +50,9 @@ pub struct PatchEntryInfo {
 /// Upsert `[patch.crates-io].<name> = { path = "<rel_path>" }`, where
 /// `rel_path` is the project-relative copy path
 /// (`.socket/vendor/cargo/<uuid>/<name>-<version>`). Idempotent. A
-/// socket-owned same-name entry (either prefix) is refreshed in place — the
-/// legacy-prefix rewrite is how vendor takes over an old redirect entry.
-/// Returns whether the file changed. Errors (without writing) if a same-name
-/// entry exists but is user-authored.
+/// socket-owned same-name entry is refreshed in place. Returns whether the
+/// file changed. Errors (without writing) if a same-name entry exists but is
+/// user-authored.
 pub async fn ensure_patch_entry(
     project_root: &Path,
     name: &str,
@@ -85,19 +74,6 @@ pub async fn drop_patch_entry(
     dry_run: bool,
 ) -> Result<bool, String> {
     edit_config(project_root, dry_run, |c| remove_patch_entry(c, name)).await
-}
-
-/// Guarded read shared in shape with the vendor/cargo.rs + setup twins:
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
-/// so a FIFO planted as `.cargo/config(.toml)` fails fast instead of wedging
-/// scan / vendor apply forever in an `open(2)` that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Read all `[patch.crates-io]` entries. Read-only; a missing or malformed
@@ -229,8 +205,9 @@ async fn edit_config(
 
 /// True if a `[patch]` `path` value denotes one of THIS project's
 /// socket-owned copies: a relative path that escapes nothing (not absolute,
-/// no `..` segment) and sits under [`CARGO_VENDOR_DIR`] or the legacy
-/// [`LEGACY_CARGO_PATCHES_DIR`]. Cargo resolves relative `[patch]` paths
+/// no `..` segment) and sits under [`CARGO_VENDOR_DIR`] (the retired
+/// `.socket/cargo-patches/` redirect root never shipped in a tagged release,
+/// so an entry there is a user path). Cargo resolves relative `[patch]` paths
 /// against the project root, so only a root-anchored relative prefix can be a
 /// copy this backend wrote — a path that merely *traverses* some other
 /// checkout's `.socket/vendor/cargo/` (`../shared/.socket/vendor/cargo/…`,
@@ -251,12 +228,8 @@ fn path_is_socket_owned(path: &str) -> bool {
     if segments.contains(&"..") {
         return false;
     }
-    [CARGO_VENDOR_DIR, LEGACY_CARGO_PATCHES_DIR]
-        .iter()
-        .any(|dir| {
-            let prefix: Vec<&str> = dir.split('/').collect();
-            segments.len() > prefix.len() && segments[..prefix.len()] == prefix[..]
-        })
+    let prefix: Vec<&str> = CARGO_VENDOR_DIR.split('/').collect();
+    segments.len() > prefix.len() && segments[..prefix.len()] == prefix[..]
 }
 
 /// The `path` string of a `[patch]` entry (inline table or sub-table), if any.
@@ -397,9 +370,10 @@ mod tests {
         assert!(path_is_socket_owned(&vendor_path("cfg-if", "1.0.4")));
         assert!(path_is_socket_owned("./.socket/vendor/cargo/u/x-1.0.0")); // "." segment normalised
         assert!(path_is_socket_owned(r".socket\vendor\cargo\u\x-1.0.0")); // backslash normalised
-                                                                          // Legacy redirect copies are recognised as ours (takeover / cleanup).
-        assert!(path_is_socket_owned(".socket/cargo-patches/cfg-if-1.0.0"));
-        assert!(path_is_socket_owned("./.socket/cargo-patches/x-1.0.0"));
+                                                                          // The retired redirect backend's `.socket/cargo-patches/` never
+                                                                          // shipped in a tagged release: an entry there is a user path.
+        assert!(!path_is_socket_owned(".socket/cargo-patches/cfg-if-1.0.0"));
+        assert!(!path_is_socket_owned("./.socket/cargo-patches/x-1.0.0"));
         // User paths are not.
         assert!(!path_is_socket_owned("vendor/cfg-if"));
         assert!(!path_is_socket_owned("../cfg-if"));
@@ -554,19 +528,14 @@ mod tests {
     }
 
     #[test]
-    fn test_upsert_takes_over_legacy_redirect_entry() {
-        // An entry left by the retired redirect backend is socket-owned →
-        // rewritten to the vendor copy, never refused.
+    fn test_upsert_refuses_retired_redirect_path_entry() {
+        // `.socket/cargo-patches/` (the retired redirect backend) never
+        // shipped: a same-name entry pointing there is user-authored and
+        // refused, never rewritten.
         let toml =
             "[patch.crates-io]\ncfg-if = { path = \".socket/cargo-patches/cfg-if-1.0.4\" }\n";
         let want = vendor_path("cfg-if", "1.0.4");
-        let out = upsert_patch_entry(toml, "cfg-if", &want).unwrap().unwrap();
-        let doc = parse(&out);
-        assert_eq!(
-            entry_path(&doc["patch"]["crates-io"]["cfg-if"]),
-            Some(want.as_str())
-        );
-        assert!(!out.contains("cargo-patches"), "legacy path gone");
+        assert!(upsert_patch_entry(toml, "cfg-if", &want).is_err());
     }
 
     // ── remove ───────────────────────────────────────────────────────
@@ -583,11 +552,13 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_legacy_entry_is_socket_owned() {
+    fn test_remove_leaves_retired_redirect_path_entry() {
         let toml =
             "[patch.crates-io]\ncfg-if = { path = \".socket/cargo-patches/cfg-if-1.0.4\" }\n";
-        let out = remove_patch_entry(toml, "cfg-if").unwrap().unwrap();
-        assert!(!out.contains("cfg-if"), "legacy entry removable: {out}");
+        assert!(
+            remove_patch_entry(toml, "cfg-if").unwrap().is_none(),
+            "a user-authored entry is never removed"
+        );
     }
 
     #[test]
@@ -701,7 +672,10 @@ mod tests {
         );
         let entries = parse_patch_entries(&toml);
         assert!(entries["mine"].socket_owned);
-        assert!(entries["legacy"].socket_owned, "legacy prefix is ours");
+        assert!(
+            !entries["legacy"].socket_owned,
+            "the retired redirect prefix is a user path"
+        );
         assert!(!entries["yours"].socket_owned);
         assert_eq!(entries["yours"].path, None);
         assert!(!entries["theirs"].socket_owned);

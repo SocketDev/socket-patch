@@ -183,9 +183,9 @@ async fn mount_patch_api(mock: &MockServer) {
         .await;
 }
 
-/// Serve the after-blob for `--download-mode file` repairs (test 7's step 1
-/// runs before the ledger is reconstructed, so its vendored entry is not
-/// yet excluded from the download phase).
+/// Serve the after-blob for the `--download-mode file` repairs below. A
+/// vendored project has no manifest, so repair's download step (manifest
+/// records only) never fires and the route is a harmless safety net.
 async fn mount_blob(mock: &MockServer) {
     Mock::given(method("GET"))
         .and(path(format!(
@@ -483,12 +483,14 @@ async fn repair_fails_closed_on_tampered_ledger_sha() {
     );
 }
 
-/// 5. Fresh-clone `vendor` re-run with the committed artifact AND
-///    node_modules gone: the ledger's wiring original recovers the registry
-///    resolution, the pristine tarball is fetched + verified, and the
-///    artifact is rebuilt — exit 0 (previously a hard vendor_fetch_failed).
+/// 5. Fresh clone with the committed artifact AND node_modules gone. A
+///    vendored project has no manifest, so a standalone `vendor` re-run is
+///    a clean `noManifest` no-op (it never re-vendors from the ledger);
+///    `repair` is the rebuild path: the ledger's wiring original recovers
+///    the registry resolution, the pristine tarball is fetched + verified,
+///    and the artifact is rebuilt — exit 0.
 #[tokio::test]
-async fn vendor_rerun_recovers_registry_resolution_from_ledger() {
+async fn vendor_rerun_is_a_noop_and_repair_recovers_registry_resolution_from_ledger() {
     let mock = MockServer::start().await;
     mount_patch_api(&mock).await;
     let tgz_bytes = pristine_tgz();
@@ -515,11 +517,18 @@ async fn vendor_rerun_recovers_registry_resolution_from_ledger() {
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["vendor"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);
+    assert_eq!(v["status"], "noManifest", "envelope={v}");
+    assert!(events_of(&v).is_empty(), "envelope={v}");
+    assert!(!tgz.exists(), "`vendor` never re-vendors from the ledger");
+
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
     assert!(
         events_of(&v)
             .iter()
-            .any(|e| e["errorCode"] == "vendor_artifact_missing"),
-        "the missing artifact is surfaced as a warning skip: {v}"
+            .any(|e| e["action"] == "rebuilt" && e["purl"] == PURL),
+        "the missing artifact is rebuilt from the recovered fetch: {v}"
     );
     assert!(tgz.is_file(), "artifact rebuilt from the recovered fetch");
     assert_eq!(
@@ -529,8 +538,8 @@ async fn vendor_rerun_recovers_registry_resolution_from_ledger() {
     );
 }
 
-/// 6. Detached vendoring (no manifest ever): repair rebuilds via the
-///    ledger-embedded record.
+/// 6. Vendored entries are detached (no manifest ever): repair rebuilds via
+///    the ledger-embedded record.
 #[tokio::test]
 async fn repair_rebuilds_detached_entry_without_manifest() {
     let mock = MockServer::start().await;
@@ -541,10 +550,10 @@ async fn repair_rebuilds_detached_entry_without_manifest() {
         "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
         "sha512-orig==",
     );
-    let tgz = vendor_project(tmp.path(), &mock.uri(), &["--detached"]);
+    let tgz = vendor_project(tmp.path(), &mock.uri(), &[]);
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
-        "detached mode writes no manifest"
+        "vendored runs write no manifest"
     );
     std::fs::remove_file(&tgz).unwrap();
 
@@ -553,11 +562,29 @@ async fn repair_rebuilds_detached_entry_without_manifest() {
     let v = parse_env(&stdout);
     assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
     assert!(tgz.is_file());
+    assert_socket_dir_lean(tmp.path());
 }
 
-/// 7. The whole `.socket/vendor` tree (state.json included) deleted while
-///    the manifest survives: repair reconstructs the ledger entry from the
-///    lockfile's vendor-path reference and rebuilds the artifact.
+/// G6 for a manifest-free vendored project: after the run, `.socket/` holds
+/// exactly `vendor/` — no `apply.lock` outlives it, no blobs/diffs/packages
+/// are conjured by a repair that rebuilds from the ledger's embedded record.
+fn assert_socket_dir_lean(root: &Path) {
+    let mut names: Vec<String> = std::fs::read_dir(root.join(".socket"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["vendor".to_string()],
+        "a vendored project's .socket/ holds only vendor/"
+    );
+}
+
+/// 7. The whole `.socket/vendor` tree (state.json included) deleted: repair
+///    reconstructs the ledger entry from the lockfile's vendor-path
+///    reference — the record comes back from the patch API by uuid, since a
+///    vendored project has no manifest — and rebuilds the artifact.
 #[tokio::test]
 async fn repair_reconstructs_ledger_from_lockfile_references() {
     let mock = MockServer::start().await;
@@ -573,14 +600,7 @@ async fn repair_reconstructs_ledger_from_lockfile_references() {
 
     std::fs::remove_dir_all(tmp.path().join(".socket/vendor")).unwrap();
 
-    // With the ledger gone, step 1 sees the manifest entry as un-vendored
-    // and downloads its source; serve the blob and use file mode.
-    mount_blob(&mock).await;
-    let (code, stdout, stderr) = run_cli(
-        tmp.path(),
-        &mock.uri(),
-        &["repair", "--download-mode", "file"],
-    );
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);
     assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
@@ -610,19 +630,22 @@ async fn repair_reconstructs_ledger_from_lockfile_references() {
     );
 
     // The re-synthesized ledger entry: same uuid, fingerprint of the
-    // rebuilt bytes, NOT detached (the manifest still has the record).
+    // rebuilt bytes, DETACHED with the API-recovered record embedded (no
+    // manifest owns it).
     let state: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
     )
     .unwrap();
     let entry = &state["entries"][PURL];
     assert_eq!(entry["uuid"], UUID, "state={state}");
-    assert!(entry["detached"].is_null(), "state={state}");
+    assert_eq!(entry["detached"], serde_json::json!(true), "state={state}");
+    assert_eq!(entry["record"]["uuid"], UUID, "state={state}");
     assert_eq!(
         entry["artifact"]["sha256"],
         sha256_hex(&std::fs::read(&tgz).unwrap()),
         "recomputed fingerprint matches the rebuilt artifact: {state}"
     );
+    assert_socket_dir_lean(tmp.path());
 
     // Revert fails CLOSED: there are no recorded originals to replay and
     // the rewired lock still resolves through the artifact — removing it

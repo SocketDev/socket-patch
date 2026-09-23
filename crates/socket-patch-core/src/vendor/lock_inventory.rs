@@ -27,6 +27,7 @@ use toml_edit::{DocumentMut, Item, TableLike, Value as TomlValue};
 use crate::crawlers::composer_crawler::normalize_version;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::patch::path_safety;
+use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 use crate::vendor::bun_lock_text;
 
@@ -398,31 +399,6 @@ fn dedup_prefer_integrity(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
     out
 }
 
-/// Guarded read shared in shape with the vendor siblings' twins
-/// (cargo_lock.rs, gem.rs, go_mod_edit.rs): `open_regular_file` opens with
-/// `O_NONBLOCK` and rejects non-regular files, so a FIFO planted as any
-/// inventoried lockfile fails fast instead of wedging every consumer —
-/// scan's lockfile supplement, vendor's auto-fetch, repair's no-ledger
-/// reconstruction — forever in an `open(2)` that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
-
-/// Bytes twin of [`read_regular_to_string`] for the JSON locks.
-async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
 // ──────────────────────────────── Cargo.lock ────────────────────────────────
 
 /// Inventory `Cargo.lock` `[[package]]` blocks. Only crates.io-sourced
@@ -553,7 +529,7 @@ async fn inventory_package_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
     // Shrinkwrap wins, mirroring `npm_lock::select_lockfile`.
     let mut bytes = None;
     for lock in ["npm-shrinkwrap.json", "package-lock.json"] {
-        if let Ok(b) = read_regular(&root.join(lock)).await {
+        if let Ok(b) = read_regular_to_bytes(&root.join(lock)).await {
             bytes = Some(b);
             break;
         }
@@ -853,7 +829,7 @@ async fn inventory_bun_binary(root: &Path) -> Result<Vec<LockfileEntry>, Unsuppo
         code: "bun_lockb_invalid",
         detail: format!("cannot inventory bun.lockb: {detail}"),
     };
-    let bytes = read_regular(&root.join("bun.lockb"))
+    let bytes = read_regular_to_bytes(&root.join("bun.lockb"))
         .await
         .map_err(|error| invalid(error.to_string()))?;
     let lock = super::bun_lockb::BunLockb::parse(&bytes).map_err(invalid)?;
@@ -937,7 +913,7 @@ async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
 /// versions drop the pretty leading `v`/`V` through the crawler's
 /// [`normalize_version`], so installed and lockfile rows agree.
 async fn inventory_composer_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let bytes = read_regular(&project_root.join("composer.lock"))
+    let bytes = read_regular_to_bytes(&project_root.join("composer.lock"))
         .await
         .ok()?;
     let doc: Value = serde_json::from_slice(&bytes).ok()?;
@@ -1449,7 +1425,11 @@ fn socket_reference_coords(reference: &str) -> Option<(String, String)> {
     if let Some(rest) = reference.strip_prefix("https://") {
         let path = rest.split_once('/')?.1;
         let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() == 7 && parts[0] == "patch" && parts[1] == "pypi" && parts[6].ends_with(".whl") {
+        if parts.len() == 7
+            && parts[0] == "patch"
+            && parts[1] == "pypi"
+            && parts[6].ends_with(".whl")
+        {
             return Some((canonicalize_pypi_name(parts[2]), parts[3].to_string()));
         }
         return None;
@@ -1481,7 +1461,8 @@ async fn inventory_pipfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
     let text = read_regular_to_string(&project_root.join("Pipfile.lock"))
         .await
         .ok()?;
-    let value: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    let value: serde_json::Value =
+        serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
     let root = value.as_object()?;
     // Digests are only fetchable through PyPI's JSON API when the lock
     // resolves from PyPI: a lock whose `_meta.sources` name only private
@@ -2007,7 +1988,7 @@ pub async fn wired_vendor_integrity(
         .await
         .is_err()
     {
-        if let Ok(bytes) = read_regular(&project_root.join("bun.lockb")).await {
+        if let Ok(bytes) = read_regular_to_bytes(&project_root.join("bun.lockb")).await {
             if let Ok(lock) = super::bun_lockb::BunLockb::parse(&bytes) {
                 if let Ok(packages) = lock.packages() {
                     let mut pinned: Option<String> = None;
@@ -2036,7 +2017,7 @@ pub async fn wired_vendor_integrity(
 
     // JSON locks: resolved == "file:<rel>" (npm writes exactly this form).
     for lock in ["npm-shrinkwrap.json", "package-lock.json"] {
-        let Ok(bytes) = read_regular(&project_root.join(lock)).await else {
+        let Ok(bytes) = read_regular_to_bytes(&project_root.join(lock)).await else {
             continue;
         };
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -3816,7 +3797,11 @@ source = { editable = "." }
         names.sort_unstable();
         // requirements.txt is read alongside the Pipfile.lock, not hidden by
         // it; our own vendored reference stays discoverable (discovery-only).
-        assert_eq!(names, vec!["flask", "six", "urllib3", "wired"], "{entries:?}");
+        assert_eq!(
+            names,
+            vec!["flask", "six", "urllib3", "wired"],
+            "{entries:?}"
+        );
         assert_eq!(entry(&entries, "wired").integrity, LockIntegrity::None);
         assert_eq!(entry(&entries, "wired").purl, "pkg:pypi/wired@1.0");
         let urllib3 = entry(&entries, "urllib3");
@@ -3867,7 +3852,8 @@ source = { editable = "." }
     /// whose sources are private indexes only never carries a fetchable
     /// digest set (no pypi.org lookups for it).
     #[tokio::test]
-    async fn pipfile_lock_inventory_keeps_socket_references_discoverable_and_respects_private_indexes() {
+    async fn pipfile_lock_inventory_keeps_socket_references_discoverable_and_respects_private_indexes(
+    ) {
         let hosted = r#"{"_meta": {"pipfile-spec": 6, "sources": [{"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true}]},
 "default": {
  "urllib3": {"file": "https://patch.socket.dev/patch/pypi/urllib3/1.26.18/grant/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl#sha256=cc", "hashes": ["sha256:cc"], "markers": "x"},
@@ -3882,27 +3868,50 @@ source = { editable = "." }
         names.sort_unstable();
         assert_eq!(names, vec!["requests", "six", "urllib3"], "{entries:?}");
         assert_eq!(entry(&entries, "urllib3").purl, "pkg:pypi/urllib3@1.26.18");
-        assert_eq!(entry(&entries, "urllib3").integrity, LockIntegrity::None, "a hosted reference is discovery-only");
+        assert_eq!(
+            entry(&entries, "urllib3").integrity,
+            LockIntegrity::None,
+            "a hosted reference is discovery-only"
+        );
         assert_eq!(entry(&entries, "six").purl, "pkg:pypi/six@1.16.0");
         assert_eq!(entry(&entries, "six").integrity, LockIntegrity::None);
-        assert!(matches!(entry(&entries, "requests").integrity, LockIntegrity::Sha256AnyOf(_)));
+        assert!(matches!(
+            entry(&entries, "requests").integrity,
+            LockIntegrity::Sha256AnyOf(_)
+        ));
 
         // Private index only → the registry pin is discovery-only.
-        let private = hosted.replace("https://pypi.org/simple", "https://pypi.internal.example/simple");
+        let private = hosted.replace(
+            "https://pypi.org/simple",
+            "https://pypi.internal.example/simple",
+        );
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "Pipfile.lock", &private).await;
         let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
-        assert_eq!(entry(&entries, "requests").integrity, LockIntegrity::None, "no pypi.org lookup for a private-index lock");
+        assert_eq!(
+            entry(&entries, "requests").integrity,
+            LockIntegrity::None,
+            "no pypi.org lookup for a private-index lock"
+        );
         // A mirror listed next to PyPI keeps the digest set.
         let mixed = hosted.replace(r#"[{"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true}]"#, r#"[{"name": "mirror", "url": "https://mirror.example/simple", "verify_ssl": true}, {"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": true}]"#);
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "Pipfile.lock", &mixed).await;
         let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
-        assert!(matches!(entry(&entries, "requests").integrity, LockIntegrity::Sha256AnyOf(_)));
+        assert!(matches!(
+            entry(&entries, "requests").integrity,
+            LockIntegrity::Sha256AnyOf(_)
+        ));
         assert!(is_public_pypi_url("https://user:tok@pypi.org/simple"));
         assert!(!is_public_pypi_url("https://pypi.org.evil.example/simple"));
-        assert_eq!(socket_reference_coords("./forks/fork-1.0-py3-none-any.whl"), None);
-        assert_eq!(socket_reference_coords("https://example.org/patch/pypi/a/1/g/u/a-1-py3-none-any.whl"), Some(("a".into(), "1".into())));
+        assert_eq!(
+            socket_reference_coords("./forks/fork-1.0-py3-none-any.whl"),
+            None
+        );
+        assert_eq!(
+            socket_reference_coords("https://example.org/patch/pypi/a/1/g/u/a-1-py3-none-any.whl"),
+            Some(("a".into(), "1".into()))
+        );
     }
 
     /// A lock that lists a pure-Python wheel carries its sha256 (lock 2.x
@@ -3920,7 +3929,10 @@ source = { editable = "." }
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "poetry.lock", &lock2).await;
         let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
-        assert_eq!(entry(&entries, "urllib3").integrity, LockIntegrity::Sha256Hex(sha.into()));
+        assert_eq!(
+            entry(&entries, "urllib3").integrity,
+            LockIntegrity::Sha256Hex(sha.into())
+        );
         assert_eq!(entry(&entries, "urllib3").resolved, None);
         assert_eq!(entry(&entries, "numpy").integrity, LockIntegrity::None);
 
@@ -3931,7 +3943,11 @@ source = { editable = "." }
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "poetry.lock", &lock1).await;
         let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
-        assert_eq!(entry(&entries, "urllib3").integrity, LockIntegrity::Sha256Hex(sha.into()), "lowercased");
+        assert_eq!(
+            entry(&entries, "urllib3").integrity,
+            LockIntegrity::Sha256Hex(sha.into()),
+            "lowercased"
+        );
 
         let lock0 = format!(
             "[[package]]\nname = \"urllib3\"\nversion = \"1.26.18\"\n\n[metadata]\ncontent-hash = \"x\"\n\n[metadata.hashes]\nurllib3 = [\"{sha}\"]\n"
@@ -3939,7 +3955,11 @@ source = { editable = "." }
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "poetry.lock", &lock0).await;
         let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
-        assert_eq!(entry(&entries, "urllib3").integrity, LockIntegrity::None, "bare digests name no wheel");
+        assert_eq!(
+            entry(&entries, "urllib3").integrity,
+            LockIntegrity::None,
+            "bare digests name no wheel"
+        );
     }
 
     #[tokio::test]
@@ -4937,9 +4957,14 @@ mod recover_tests {
         let digestless = entry(
             "pypi",
             "pkg:pypi/six@1.16.0",
-            vec![rec("pipenv_lock_entry", serde_json::json!({"version": "==1.16.0"}))],
+            vec![rec(
+                "pipenv_lock_entry",
+                serde_json::json!({"version": "==1.16.0"}),
+            )],
         );
-        let err = recover_lock_entry(tmp.path(), &digestless).await.unwrap_err();
+        let err = recover_lock_entry(tmp.path(), &digestless)
+            .await
+            .unwrap_err();
         assert!(err.contains("no sha256 digests"), "pipenv: {err}");
 
         // A ledger with no pypi fragment at all is still a hard error.

@@ -72,17 +72,13 @@ fn write_project(root: &Path) {
 /// each file's relative path and bytes into a single SHA-256 so any
 /// change — adding, removing, or rewriting a file — flips the digest.
 ///
-/// Excludes `apply.lock` (advisory lock file created by `apply` /
-/// `rollback` / `repair` / `remove`). That file is deliberate
-/// ephemeral session state — not patch content — and persists by
-/// design so subsequent runs can re-flock the same inode without a
-/// create race. The "apply is read-only against .socket/" invariant
-/// is about the patch payload (manifest, blobs, diffs, packages),
-/// not session metadata.
+/// Nothing is excluded: the advisory `apply.lock` that `apply` takes
+/// exists only while the command holds it (the guard unlinks it on
+/// exit), so a snapshot taken after the run must not see it either. A
+/// lock file surviving a run is itself a regression this hash catches.
 fn dir_hash(dir: &Path) -> String {
     let mut files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     collect_files(dir, dir, &mut files);
-    files.retain(|(rel, _)| rel.file_name().and_then(|n| n.to_str()) != Some("apply.lock"));
     files.sort_by(|a, b| a.0.cmp(&b.0));
     let mut hasher = Sha256::new();
     for (rel, bytes) in files {
@@ -505,7 +501,7 @@ fn apply_with_no_socket_dir_silent_emits_nothing() {
     assert_eq!(loud.status.code(), Some(0));
     let loud_stdout = String::from_utf8_lossy(&loud.stdout);
     assert!(
-        loud_stdout.contains("No .socket folder found"),
+        loud_stdout.contains("No patch manifest found; nothing to apply."),
         "non-silent no-manifest run must print the skip message; got {loud_stdout:?}"
     );
 }

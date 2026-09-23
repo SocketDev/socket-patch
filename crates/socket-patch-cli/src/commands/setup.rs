@@ -1,5 +1,6 @@
 use clap::Args;
 use socket_patch_core::crawlers::python_crawler::is_python_project;
+use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, SetupConfig};
 use socket_patch_core::package_json::detect::{is_setup_configured_str, PackageManager};
@@ -10,6 +11,7 @@ use socket_patch_core::package_json::update::{
     remove_package_json, update_package_json, RemoveResult, RemoveStatus, UpdateResult,
     UpdateStatus,
 };
+use socket_patch_core::patch::apply_lock::acquire;
 use socket_patch_core::setup::composer::{self, ComposerSetupStatus};
 use socket_patch_core::setup::gem::{self, GemSetupStatus};
 use socket_patch_core::setup::pypi::detect::{
@@ -23,10 +25,11 @@ use socket_patch_core::telemetry::track_patch_setup;
 use socket_patch_core::vex::applied_patches_with_vendor;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::ecosystem_dispatch::find_manifest_package_paths;
-use crate::output::stdin_is_tty;
+use crate::output::{read_yes_no, stdin_is_tty};
 
 /// Stringify the detected npm-family manager for telemetry.
 fn manager_name(pm: PackageManager) -> &'static str {
@@ -113,7 +116,7 @@ pub async fn run(args: SetupArgs) -> i32 {
 /// applying the pnpm "root-only" filtering. Returns an empty vec when none are
 /// found (callers also consider Python before reporting `no_files`).
 async fn discover(args: &SetupArgs, excludes: &[String]) -> Vec<PackageJsonLocation> {
-    if !eco_in_scope(&args.common, ECO_NPM) {
+    if !eco_in_scope(&args.common, Ecosystem::Npm) {
         return Vec::new();
     }
     let find_result = find_package_json_files(&args.common.cwd).await;
@@ -184,31 +187,21 @@ fn confirm_proceed(prompt: &str) -> bool {
     io::stdout()
         .flush()
         .expect("failed to write the confirmation prompt to stdout");
-    let mut answer = String::new();
-    if io::stdin().read_line(&mut answer).is_err() {
-        // Terminals can deliver non-UTF-8 bytes (e.g. a Latin-1 paste);
-        // `read_line` reports those as InvalidData. Treat any read
-        // failure like an unrecognized answer (abort), not a panic.
-        return false;
-    }
-    let answer = answer.trim().to_lowercase();
-    answer == "y" || answer == "yes"
+    // Only an explicit yes proceeds: empty and unreadable answers abort.
+    read_yes_no() == Some(true)
 }
 
 /// Whether an ecosystem is in scope for this run, honoring the global
 /// `--ecosystems` filter (`CLI_CONTRACT.md` → "Setup command contract",
 /// property 2). With no filter (or an empty one) every ecosystem is in scope.
-/// `names` lists the accepted tokens for the ecosystem — its canonical
-/// `Ecosystem::cli_name()` plus any friendly alias (e.g. `pypi`/`python`,
-/// `gem`/`ruby`) — matched case-insensitively, mirroring the scoping semantics
-/// `apply` uses for the in-place ecosystems.
-fn eco_in_scope(common: &GlobalArgs, names: &[&str]) -> bool {
+/// The exact `cli_name` match is the only one that can ever fire — clap's
+/// value parser admits no alias or case variant — and it is the same rule
+/// `partition_purls` applies, so setup's scope never diverges from apply's.
+fn eco_in_scope(common: &GlobalArgs, eco: Ecosystem) -> bool {
     match &common.ecosystems {
         None => true,
         Some(list) if list.is_empty() => true,
-        Some(list) => list
-            .iter()
-            .any(|e| names.iter().any(|n| e.eq_ignore_ascii_case(n))),
+        Some(list) => list.iter().any(|e| e == eco.cli_name()),
     }
 }
 
@@ -257,21 +250,30 @@ fn is_member_excluded(manifest_path: &Path, cwd: &Path, excludes: &[String]) -> 
     })
 }
 
+/// This run's ONE read of `.socket/manifest.json`, shared by the exclude
+/// resolution, the `--exclude` persistence's already-persisted check and
+/// `--check`'s patch-consistency pass (each used to parse the same bytes
+/// again).
+async fn read_setup_manifest(common: &GlobalArgs) -> io::Result<Option<PatchManifest>> {
+    read_manifest(&common.resolved_manifest_path()).await
+}
+
+/// The manifest as the read-only consumers see it: absent OR unreadable
+/// contribute nothing (the persistence step is what reports an unreadable
+/// manifest).
+fn manifest_view(existing: &io::Result<Option<PatchManifest>>) -> Option<&PatchManifest> {
+    existing.as_ref().ok().and_then(Option::as_ref)
+}
+
 /// The exclude set in effect for this run: the persisted `setup.exclude` list
-/// from `.socket/manifest.json` (empty if no manifest / no setup state) union
-/// the `--exclude` flag values (all normalized). This is what a clone inherits
-/// — a clone with no flag still reads the persisted set. Read-only.
-async fn effective_excludes(common: &GlobalArgs, flag: &[String]) -> Vec<String> {
-    let mut set: Vec<String> = match read_manifest(&common.resolved_manifest_path()).await {
-        Ok(Some(m)) => m
-            .setup
-            .map(|s| s.exclude)
-            .unwrap_or_default()
-            .iter()
-            .map(|e| normalize_rel_path(e))
-            .collect(),
-        _ => Vec::new(),
-    };
+/// from the manifest (empty if no manifest / no setup state) union the
+/// `--exclude` flag values (all normalized). This is what a clone inherits —
+/// a clone with no flag still reads the persisted set.
+fn effective_excludes(manifest: Option<&PatchManifest>, flag: &[String]) -> Vec<String> {
+    let mut set: Vec<String> = manifest
+        .and_then(|m| m.setup.as_ref())
+        .map(|s| s.exclude.iter().map(|e| normalize_rel_path(e)).collect())
+        .unwrap_or_default();
     for e in flag {
         let n = normalize_rel_path(e);
         if !n.is_empty() && !set.contains(&n) {
@@ -283,19 +285,60 @@ async fn effective_excludes(common: &GlobalArgs, flag: &[String]) -> Vec<String>
 
 /// Persist the effective exclude set into `.socket/manifest.json` (creating a
 /// minimal manifest if none exists) so `--check` and a fresh clone honor it
-/// without re-passing `--exclude`. No-op when the set is empty or already
-/// exactly persisted (keeps the manifest byte-stable). Never called under
-/// `--dry-run`.
-/// Returns a warning string when persistence was SKIPPED (fail-closed) —
-/// the caller folds it into the run's warnings so it reaches the human
-/// summary AND the `--json` envelope; a `--silent`/`--json` automation run
-/// must not see a fully-successful setup whose excludes silently evaporate
-/// on the next flag-less invocation.
-async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) -> Option<String> {
+/// without re-passing `--exclude`. No-op when the set is empty or `existing`
+/// (this run's read) already carries it exactly — no lock, no rewrite, the
+/// manifest stays byte-stable. Called only past the run's mutation gate
+/// (discovery found work, the preview was confirmed or nothing needed
+/// confirming) and never under `--dry-run`, so a no-project directory or an
+/// aborted prompt leaves no `.socket/` behind.
+///
+/// The write is a read-modify-write of the file `apply`/`get`/`remove`/
+/// `rollback` rewrite under `apply.lock`, so it takes the same lock and
+/// re-reads under it; a missing `.socket/` is created by the acquire and
+/// pruned again by the guard's drop if nothing gets written.
+///
+/// Returns a warning string when persistence was SKIPPED (fail-closed: the
+/// lock is held elsewhere, the manifest cannot be read, or the write
+/// failed) — the caller folds it into the run's warnings so it reaches the
+/// human summary AND the `--json` envelope; a `--silent`/`--json`
+/// automation run must not see a fully-successful setup whose excludes
+/// silently evaporate on the next flag-less invocation.
+async fn persist_setup_excludes(
+    common: &GlobalArgs,
+    existing: &io::Result<Option<PatchManifest>>,
+    excludes: &[String],
+) -> Option<String> {
     if excludes.is_empty() {
         return None;
     }
+    let mut merged: Vec<String> = excludes.to_vec();
+    merged.sort();
+    merged.dedup();
+    let persisted_exactly = |manifest: &Option<PatchManifest>| {
+        manifest
+            .as_ref()
+            .and_then(|m| m.setup.as_ref())
+            .map(|s| &s.exclude)
+            == Some(&merged)
+    };
+    if matches!(existing, Ok(manifest) if persisted_exactly(manifest)) {
+        return None; // already persisted exactly — don't lock, don't rewrite
+    }
+
     let path = common.resolved_manifest_path();
+    let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
+    let _lock = match acquire(&common.socket_dir(), timeout) {
+        Ok(guard) => guard,
+        Err(err) => {
+            let (code, message) = crate::commands::lock_cli::lock_failure(&err, timeout);
+            let hint = if code == "lock_held" {
+                "re-run `setup` (or pass --lock-timeout <secs>) to persist it"
+            } else {
+                "the exclude list will need re-passing"
+            };
+            return Some(format!("not persisting --exclude: {message} — {hint}"));
+        }
+    };
     // Fail closed on a manifest that exists but cannot be read or parsed: it
     // may still hold recoverable patch records, and flattening the error to
     // "no manifest yet" would rewrite the file down to a bare setup block —
@@ -311,16 +354,8 @@ async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) -> Opt
             ));
         }
     };
-    let mut merged: Vec<String> = excludes.to_vec();
-    merged.sort();
-    merged.dedup();
-    if existing
-        .as_ref()
-        .and_then(|m| m.setup.as_ref())
-        .map(|s| &s.exclude)
-        == Some(&merged)
-    {
-        return None; // already persisted exactly — don't rewrite
+    if persisted_exactly(&existing) {
+        return None; // a concurrent run persisted it meanwhile
     }
     // Preserve any existing `manual` declarations (property 7) when rewriting.
     let manual = existing
@@ -333,10 +368,16 @@ async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) -> Opt
         exclude: merged,
         manual,
     });
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
+    // The acquire created the manifest's directory; a failed write is the
+    // same fail-closed skip as an unreadable manifest, never a silent
+    // "persisted".
+    if let Err(e) = write_manifest(&path, &manifest).await {
+        return Some(format!(
+            "not persisting --exclude: cannot write {}: {e} — the exclude list will \
+             need re-passing",
+            path.display()
+        ));
     }
-    let _ = write_manifest(&path, &manifest).await;
     None
 }
 
@@ -347,8 +388,7 @@ async fn persist_setup_excludes(common: &GlobalArgs, excludes: &[String]) -> Opt
 /// `--ecosystems` filter (it reports real on-disk state).
 pub(crate) async fn configured_ecosystems(
     common: &GlobalArgs,
-) -> std::collections::HashSet<socket_patch_core::crawlers::Ecosystem> {
-    use socket_patch_core::crawlers::Ecosystem;
+) -> std::collections::HashSet<Ecosystem> {
     let mut set = std::collections::HashSet::new();
 
     // npm: any discovered package.json whose hook scripts are present.
@@ -397,12 +437,6 @@ pub(crate) async fn configured_ecosystems(
 
     set
 }
-
-// Canonical `--ecosystems` token sets per setup branch (see `eco_in_scope`).
-const ECO_NPM: &[&str] = &["npm"];
-const ECO_PYPI: &[&str] = &["pypi", "python"];
-const ECO_GEM: &[&str] = &["gem", "ruby"];
-const ECO_COMPOSER: &[&str] = &["composer", "php"];
 
 // ─────────────────────────────────────────────────────────────────────────
 // Python (.pth hook) helpers
@@ -467,7 +501,7 @@ async fn choose_python_manifests(
 }
 
 async fn plan_python(common: &GlobalArgs) -> Option<PythonPlan> {
-    if !eco_in_scope(common, ECO_PYPI) {
+    if !eco_in_scope(common, Ecosystem::Pypi) {
         return None;
     }
     if !is_python_project(&common.cwd).await {
@@ -592,16 +626,49 @@ struct SetupOutcome {
 // Gem (Bundler plugin) helpers
 // ─────────────────────────────────────────────────────────────────────────
 
+/// The Bundler project this run acts on, discovered ONCE per run (honoring
+/// `--ecosystems`); `None` when gem is out of scope or no Gemfile is found.
+async fn discover_gem_project(common: &GlobalArgs) -> Option<gem::BundlerProject> {
+    if !eco_in_scope(common, Ecosystem::Gem) {
+        return None;
+    }
+    gem::discover_bundler_project(&common.cwd).await
+}
+
+/// The gem project a setup run wires, paired with the run's ONE bundler
+/// probe (a `Gemfile.lock` read, or a `bundle --version` spawn bounded by
+/// its timeout): the preview and the real edit share both, so the probe
+/// runs at most once per run.
+async fn discover_gem_target(
+    common: &GlobalArgs,
+) -> Option<(gem::BundlerProject, gem::BundlerProbe)> {
+    let project = discover_gem_project(common).await?;
+    let probe = gem::probe_bundler(&project).await;
+    Some((project, probe))
+}
+
+/// What the gem branch does to a project.
+enum GemEdit<'a> {
+    /// Wire the plugin; `add_plugin_directive_with` refuses below the
+    /// bundler floor, judged from the run's probe.
+    Add(&'a gem::BundlerProbe),
+    /// Unwire. Deliberately ungated and never probes: it is the recovery
+    /// path for an already-wired bundler-1.x project.
+    Remove,
+}
+
 /// Build the gem branch's contribution to a setup/remove run: add (or remove)
 /// the managed `plugin "socket-patch"` block in the Gemfile + the generated
-/// `.socket/bundler-plugin/` plugin files.
-async fn build_gem_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
-    if !eco_in_scope(common, ECO_GEM) {
+/// `.socket/bundler-plugin/` plugin files. `target` is the discovered project
+/// with the edit to make ([`discover_gem_target`] pairs the add path with the
+/// run's one probe); `None` when the project has no Gemfile.
+async fn build_gem_outcome(
+    common: &GlobalArgs,
+    target: Option<(&gem::BundlerProject, GemEdit<'_>)>,
+    dry_run: bool,
+) -> SetupOutcome {
+    let Some((project, edit)) = target else {
         return SetupOutcome::default();
-    }
-    let project = match gem::discover_bundler_project(&common.cwd).await {
-        Some(p) => p,
-        None => return SetupOutcome::default(),
     };
 
     let mut out = SetupOutcome {
@@ -609,10 +676,10 @@ async fn build_gem_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> 
         ..Default::default()
     };
 
-    let results = if remove {
-        gem::remove_plugin_directive(&project, dry_run).await
-    } else {
-        gem::add_plugin_directive(&project, dry_run).await
+    let remove = matches!(edit, GemEdit::Remove);
+    let results = match edit {
+        GemEdit::Add(probe) => gem::add_plugin_directive_with(project, probe, dry_run).await,
+        GemEdit::Remove => gem::remove_plugin_directive(project, dry_run).await,
     };
 
     let mut added_paths: Vec<String> = Vec::new();
@@ -663,16 +730,28 @@ fn gem_status_str(s: &GemSetupStatus, for_remove: bool) -> &'static str {
 // Composer (composer.json scripts post-install/post-update hook) helpers
 // ─────────────────────────────────────────────────────────────────────────
 
+/// The `composer.json` this run acts on, discovered ONCE per run (honoring
+/// `--ecosystems`).
+async fn discover_composer_json(common: &GlobalArgs) -> Option<PathBuf> {
+    if !eco_in_scope(common, Ecosystem::Composer) {
+        return None;
+    }
+    composer::discover_composer_project(&common.cwd).await
+}
+
 /// Build the composer branch's contribution to a setup/remove run: add (or
 /// remove) the `socket-patch apply` command in `composer.json`'s
-/// `post-install-cmd` / `post-update-cmd` script events.
-async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool) -> SetupOutcome {
-    if !eco_in_scope(common, ECO_COMPOSER) {
+/// `post-install-cmd` / `post-update-cmd` script events. `composer_json`
+/// comes from [`discover_composer_json`], shared by the preview and the
+/// real edit.
+async fn build_composer_outcome(
+    common: &GlobalArgs,
+    composer_json: Option<&Path>,
+    remove: bool,
+    dry_run: bool,
+) -> SetupOutcome {
+    let Some(composer_json) = composer_json else {
         return SetupOutcome::default();
-    }
-    let composer_json = match composer::discover_composer_project(&common.cwd).await {
-        Some(p) => p,
-        None => return SetupOutcome::default(),
     };
 
     let mut out = SetupOutcome {
@@ -681,9 +760,9 @@ async fn build_composer_outcome(common: &GlobalArgs, remove: bool, dry_run: bool
     };
 
     let r = if remove {
-        composer::remove_hook(&composer_json, dry_run).await
+        composer::remove_hook(composer_json, dry_run).await
     } else {
-        composer::add_hook(&composer_json, dry_run).await
+        composer::add_hook(composer_json, dry_run).await
     };
 
     let mut added_paths: Vec<String> = Vec::new();
@@ -736,7 +815,7 @@ async fn append_composer_check_entries(
     common: &GlobalArgs,
     entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
 ) -> bool {
-    if !eco_in_scope(common, ECO_COMPOSER) {
+    if !eco_in_scope(common, Ecosystem::Composer) {
         return false;
     }
     let composer_json = match composer::discover_composer_project(&common.cwd).await {
@@ -818,7 +897,7 @@ async fn append_gem_check_entries(
     common: &GlobalArgs,
     entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
 ) -> bool {
-    if !eco_in_scope(common, ECO_GEM) {
+    if !eco_in_scope(common, Ecosystem::Gem) {
         return false;
     }
     let project = match gem::discover_bundler_project(&common.cwd).await {
@@ -883,23 +962,57 @@ async fn append_gem_check_entries(
 ///
 /// Reuses the same machinery `vex` uses — the qualified-aware rollback resolver
 /// (so release-variant PURLs resolve) honoring `--ecosystems`, the committed
-/// vendor ledger ([`crate::commands::vex::load_vendor_context`]: a vendored
+/// vendor ledger ([`crate::commands::vex::vendor_context_from`]: a vendored
 /// patch is judged by its `.socket/vendor/` artifact — the bytes the next
 /// install consumes — never the expectedly-unpatched installed tree), then
 /// [`applied_patches_with_vendor`]. An *uninstalled* package (`package_not_found`, also the
 /// bucket for out-of-scope PURLs absent from the map) cannot be patched yet, and
 /// a degenerate zero-file record (`no_files`) has nothing to hash — neither is
 /// drift, so both are skipped. A missing/empty/unreadable manifest contributes
-/// nothing (hook presence alone decides). Read-only: it crawls but never writes.
+/// nothing of its own; the vendor ledger's detached records (vendored mode is
+/// manifest-free) are folded in exactly as `vex` does, so a vendored-only
+/// project is judged too. Read-only: it crawls but never writes.
 async fn append_patch_consistency_entries(
     common: &GlobalArgs,
+    manifest: Option<PatchManifest>,
     entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
 ) {
-    let manifest_path = common.resolved_manifest_path();
-    let manifest = match read_manifest(&manifest_path).await {
-        Ok(Some(m)) if !m.patches.is_empty() => m,
-        _ => return,
+    // ONE ledger read serves both the detached fold and the verifier's
+    // VendorContext below. Without the fold a project whose committed
+    // `.socket/vendor/**` artifact is missing or corrupt reported
+    // `configured` — the exact hooks-present-but-state-drifted case
+    // property 4 exists to catch. A ledger that cannot be read or parsed is
+    // that case too (contract: "never as a `configured` verdict"): it is
+    // surfaced BEFORE the emptiness return below — on a manifest-free
+    // vendored project the fold is the only source of purls, so returning
+    // early would report `configured` with no signal at all — as the shared
+    // `unreadable vendor state` warning plus a `vendor_ledger` error entry
+    // (verdict `error`, exit 1), and the verifier proceeds over an empty
+    // ledger (already reported, so not warned twice).
+    let mut manifest = manifest.unwrap_or_default();
+    let ledger = match socket_patch_core::vendor::load_state(&common.cwd).await {
+        Ok(state) => {
+            crate::commands::fold_detached_records(&mut manifest, &state.entries);
+            Ok(state)
+        }
+        Err(e) => {
+            crate::commands::vex::warn_unreadable_vendor_state(common, &e);
+            entries.push((
+                "vendor_ledger",
+                common
+                    .cwd
+                    .join(socket_patch_core::vendor::VENDOR_STATE_REL)
+                    .display()
+                    .to_string(),
+                CheckState::Error,
+                Some(format!("unreadable vendor state ({e})")),
+            ));
+            Ok(socket_patch_core::vendor::VendorState::new())
+        }
     };
+    if manifest.patches.is_empty() {
+        return;
+    }
 
     let purls: Vec<String> = manifest.patches.keys().cloned().collect();
     // `--json` reserves stdout for the check report: silence the dispatch's
@@ -907,7 +1020,7 @@ async fn append_patch_consistency_entries(
     let package_paths =
         find_manifest_package_paths(&purls, common, common.silent || common.json).await;
 
-    let vendor = crate::commands::vex::load_vendor_context(common, &manifest).await;
+    let vendor = crate::commands::vex::vendor_context_from(common, &manifest, ledger).await;
     let outcome = applied_patches_with_vendor(&manifest, &package_paths, vendor.as_ref()).await;
     for failed in &outcome.failed {
         match failed.reason.as_str() {
@@ -961,7 +1074,8 @@ async fn run_check(args: &SetupArgs) -> i32 {
 
     // Excluded members (persisted in the manifest + any passed via `--exclude`)
     // are skipped by discovery. Read-only: `--check` never persists.
-    let excludes = effective_excludes(&args.common, &args.exclude).await;
+    let existing = read_setup_manifest(&args.common).await;
+    let excludes = effective_excludes(manifest_view(&existing), &args.exclude);
     let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(&args.common).await;
 
@@ -1018,7 +1132,7 @@ async fn run_check(args: &SetupArgs) -> i32 {
     // Property 4: prove a correctly-patched state, not just hook presence —
     // every in-scope manifest patch must be applied on disk (`apply --check`
     // invariant). Drifted/un-applied patches add `needs_configuration` entries.
-    append_patch_consistency_entries(&args.common, &mut entries).await;
+    append_patch_consistency_entries(&args.common, existing.ok().flatten(), &mut entries).await;
 
     if entries.is_empty() {
         return report_no_files(
@@ -1141,11 +1255,22 @@ async fn run_remove(args: &SetupArgs) -> i32 {
 
     // Honor the persisted/`--exclude` member set so we never touch a member that
     // was deliberately excluded from setup. Remove does not change the set.
-    let excludes = effective_excludes(common, &args.exclude).await;
+    let existing = read_setup_manifest(common).await;
+    let excludes = effective_excludes(manifest_view(&existing), &args.exclude);
     let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(common).await;
-    let gem_preview = build_gem_outcome(common, true, true).await;
-    let composer_preview = build_composer_outcome(common, true, true).await;
+    // Gem + Composer projects are discovered ONCE; the preview and the real
+    // removal below share them.
+    let gem_project = discover_gem_project(common).await;
+    let composer_json = discover_composer_json(common).await;
+    let gem_preview = build_gem_outcome(
+        common,
+        gem_project.as_ref().map(|p| (p, GemEdit::Remove)),
+        true,
+    )
+    .await;
+    let composer_preview =
+        build_composer_outcome(common, composer_json.as_deref(), true, true).await;
     if npm_files.is_empty()
         && py_plan.is_none()
         && !gem_preview.present
@@ -1254,8 +1379,13 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     // Real gem + composer removal (gem Gemfile `plugin` block + generated plugin
     // dir; composer.json script-event command).
     let extra_results = merge_outcomes(
-        build_gem_outcome(common, true, false).await,
-        build_composer_outcome(common, true, false).await,
+        build_gem_outcome(
+            common,
+            gem_project.as_ref().map(|p| (p, GemEdit::Remove)),
+            false,
+        )
+        .await,
+        build_composer_outcome(common, composer_json.as_deref(), true, false).await,
     );
 
     let errs = npm_results
@@ -1542,21 +1672,26 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         println!("Configuring socket-patch install hooks...");
     }
 
-    // Resolve the effective exclude set (persisted + `--exclude`) and, on a real
-    // run, persist it so `--check` and a fresh clone honor it without the flag.
-    // Dry-run never writes the manifest. Excluded members are then skipped by
-    // discovery.
-    let excludes = effective_excludes(common, &args.exclude).await;
-    let persist_warning = if !common.dry_run {
-        persist_setup_excludes(common, &excludes).await
-    } else {
-        None
-    };
+    // Resolve the effective exclude set (persisted + `--exclude`); excluded
+    // members are skipped by discovery. Persisting it waits for the mutation
+    // gate below (past discovery and the confirm prompt) so a no-project
+    // directory or an aborted run leaves no `.socket/` behind.
+    let existing = read_setup_manifest(common).await;
+    let excludes = effective_excludes(manifest_view(&existing), &args.exclude);
     let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(common).await;
+    // Gem + Composer projects are discovered ONCE and bundler probed ONCE:
+    // the preview and the real edit below share both.
+    let gem = discover_gem_target(common).await;
+    let gem_add = || {
+        gem.as_ref()
+            .map(|(project, probe)| (project, GemEdit::Add(probe)))
+    };
+    let composer_json = discover_composer_json(common).await;
     // Gem + Composer previews (dry-run); `.present` also tells us each project exists.
-    let gem_preview = build_gem_outcome(common, false, true).await;
-    let composer_preview = build_composer_outcome(common, false, true).await;
+    let gem_preview = build_gem_outcome(common, gem_add(), true).await;
+    let composer_preview =
+        build_composer_outcome(common, composer_json.as_deref(), false, true).await;
 
     if npm_files.is_empty()
         && py_plan.is_none()
@@ -1575,28 +1710,19 @@ async fn run_setup(args: &SetupArgs) -> i32 {
 
     let npm_pm = detect_package_manager(&common.cwd).await;
 
-    let telemetry_manager = telemetry_manager_str(
-        !npm_files.is_empty(),
-        py_plan.is_some(),
-        gem_present,
-        composer_present,
-        npm_pm,
-    );
-    // Attribute the event through the same layered credential chain as every
-    // other command — flag / env / socket-cli `config.json` — not the raw flag
-    // values. `setup` builds no API client (it is a purely local edit), so the
-    // config layer has to be consulted explicitly, exactly as `list` does:
-    // otherwise a caller authenticated by `socket login` alone reports
-    // anonymously to the public patch proxy, which with an on-prem
-    // `apiBaseUrl` also sends the event to a different host than the one the
-    // client would talk to.
-    let (telemetry_token, telemetry_org) = crate::commands::list::telemetry_credentials(common);
-    track_patch_setup(
-        &telemetry_manager,
-        telemetry_token.as_deref(),
-        telemetry_org.as_deref(),
-    )
-    .await;
+    // `patch_setup` telemetry ("a successful setup") fires only on the two
+    // exit-0, non-dry-run paths below — never for a dry run, an aborted
+    // prompt, a no-project directory or an errored run.
+    let track_setup = || {
+        track_setup_success(
+            common,
+            !npm_files.is_empty(),
+            py_plan.is_some(),
+            gem_present,
+            composer_present,
+            npm_pm,
+        )
+    };
 
     // Preview (always dry-run first).
     let mut npm_preview = Vec::new();
@@ -1632,6 +1758,19 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         + extra_preview.errors;
 
     if n_changes == 0 {
+        // No hook needs editing, so there is no preview to confirm — but an
+        // EXPLICIT new `--exclude` is the user's stated intent and is still
+        // persisted (never under --dry-run, which returns below with the
+        // preview). A skipped (fail-closed) persistence rides the warnings
+        // channel exactly like on the mutating path.
+        let warnings: Vec<String> = if !common.dry_run && !args.exclude.is_empty() {
+            persist_setup_excludes(common, &existing, &excludes)
+                .await
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
         if common.json {
             print_setup_envelope(
                 if preview_errors > 0 {
@@ -1644,7 +1783,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 &extra_preview,
                 npm_pm,
                 py_plan.as_ref(),
-                &[],
+                &warnings,
             );
         } else if !common.silent {
             if preview_errors > 0 {
@@ -1652,12 +1791,21 @@ async fn run_setup(args: &SetupArgs) -> i32 {
             } else {
                 println!("All install hooks are already configured with socket-patch!");
             }
+            for w in &warnings {
+                println!("  warning: {w}");
+            }
         }
         eprint_errors_when_silent(
             common,
             &setup_error_messages(&npm_preview, &py_preview, &extra_preview),
         );
-        return if preview_errors > 0 { 1 } else { 0 };
+        if preview_errors > 0 {
+            return 1;
+        }
+        if !common.dry_run {
+            track_setup().await;
+        }
+        return 0;
     }
 
     if common.dry_run {
@@ -1687,6 +1835,10 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         return 0;
     }
 
+    // Past the mutation gate: persist the exclude set now (a dry run
+    // returned above; an aborted or no-project run never gets here).
+    let persist_warning = persist_setup_excludes(common, &existing, &excludes).await;
+
     if !quiet {
         println!("\nApplying changes...");
     }
@@ -1707,8 +1859,8 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     // Real gem + composer edits (gem Gemfile `plugin` block + generated plugin
     // dir; composer.json script-event command).
     let extra_results = merge_outcomes(
-        build_gem_outcome(common, false, false).await,
-        build_composer_outcome(common, false, false).await,
+        build_gem_outcome(common, gem_add(), false).await,
+        build_composer_outcome(common, composer_json.as_deref(), false, false).await,
     );
 
     // Materialise gem patches now so the first `bundle install` finds them
@@ -1726,6 +1878,9 @@ async fn run_setup(args: &SetupArgs) -> i32 {
             .filter(|r| r.status == PthStatus::Error)
             .count()
         + extra_results.errors;
+    if errors == 0 {
+        track_setup().await;
+    }
 
     if common.json {
         print_setup_envelope(
@@ -1786,6 +1941,26 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     } else {
         0
     }
+}
+
+/// Fire `patch_setup` — "a successful `setup`". Attributed through the same
+/// layered credential chain as every other command (flag / env / socket-cli
+/// `config.json`), not the raw flag values: `setup` builds no API client (it
+/// is a purely local edit), so the config layer is consulted explicitly,
+/// exactly as `list` does — otherwise a caller authenticated by `socket
+/// login` alone reports anonymously to the public patch proxy (and, with an
+/// on-prem `apiBaseUrl`, to a different host than the client would use).
+async fn track_setup_success(
+    common: &GlobalArgs,
+    npm: bool,
+    py: bool,
+    gem: bool,
+    composer: bool,
+    npm_pm: PackageManager,
+) {
+    let manager = telemetry_manager_str(npm, py, gem, composer, npm_pm);
+    let (token, org) = common.telemetry_credentials();
+    track_patch_setup(&manager, token.as_deref(), org.as_deref()).await;
 }
 
 fn print_setup_preview(

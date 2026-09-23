@@ -89,19 +89,13 @@ pub async fn read_python_metadata(dist_info_path: &Path) -> Option<(String, Stri
 /// Returns `None` if the file is absent, unreadable, or does not yield a
 /// non-empty `Name` and `Version` before the header/body separator.
 async fn parse_metadata_headers(dist_info_path: &Path) -> Option<(String, String)> {
-    use tokio::io::AsyncReadExt;
-
     let metadata_path = dist_info_path.join("METADATA");
     // The path lives inside the (untrusted) package tree: a planted FIFO
     // would make a plain `read_to_string` open block forever waiting for a
-    // writer, wedging scan (crawl_all) and apply (find_by_purls). Open via
-    // `open_regular_file` — non-blocking on Unix, rejecting
+    // writer, wedging scan (crawl_all) and apply (find_by_purls). Read via
+    // `read_regular_to_string` — non-blocking open on Unix, rejecting
     // FIFOs/devices/directories (see its docs).
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(&metadata_path)
-        .await
-        .ok()?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await.ok()?;
+    let content = read_regular_to_string(&metadata_path).await.ok()?;
 
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
@@ -339,12 +333,17 @@ impl PoetryVirtualenvConfig {
         let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
             return Self::default();
         };
-        let venvs = doc.get("virtualenvs").and_then(toml_edit::Item::as_table_like);
+        let venvs = doc
+            .get("virtualenvs")
+            .and_then(toml_edit::Item::as_table_like);
         let get_bool = |key: &str| {
             venvs.and_then(|t| t.get(key)).and_then(|item| {
                 item.as_bool().or_else(|| {
                     item.as_str().map(|s| {
-                        matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+                        matches!(
+                            s.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes" | "on"
+                        )
                     })
                 })
             })
@@ -373,14 +372,19 @@ fn poetry_user_config_path(var: &impl Fn(&str) -> Option<String>) -> Option<Path
     if let Some(dir) = var("POETRY_CONFIG_DIR").filter(|v| !v.trim().is_empty()) {
         return Some(PathBuf::from(dir).join("config.toml"));
     }
-    let home = var("HOME").or_else(|| var("USERPROFILE")).map(PathBuf::from);
+    let home = var("HOME")
+        .or_else(|| var("USERPROFILE"))
+        .map(PathBuf::from);
     let dir = if cfg!(windows) {
         var("APPDATA")
             .map(PathBuf::from)
             .or_else(|| home.map(|h| h.join("AppData").join("Roaming")))?
             .join("pypoetry")
     } else if cfg!(target_os = "macos") {
-        home?.join("Library").join("Application Support").join("pypoetry")
+        home?
+            .join("Library")
+            .join("Application Support")
+            .join("pypoetry")
     } else {
         var("XDG_CONFIG_HOME")
             .filter(|v| !v.trim().is_empty())
@@ -395,7 +399,9 @@ fn poetry_user_config_path(var: &impl Fn(&str) -> Option<String>) -> Option<Path
 /// `$XDG_CACHE_HOME`/`~/.cache` + `/pypoetry` (other unix),
 /// `%LOCALAPPDATA%\pypoetry\Cache` (Windows).
 fn poetry_default_cache_dir(var: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    let home = var("HOME").or_else(|| var("USERPROFILE")).map(PathBuf::from);
+    let home = var("HOME")
+        .or_else(|| var("USERPROFILE"))
+        .map(PathBuf::from);
     if cfg!(windows) {
         Some(
             var("LOCALAPPDATA")
@@ -432,7 +438,10 @@ fn poetry_env_name_prefix(project_name: &str, normalized_cwd: &str) -> String {
     let sanitized: String = lowered
         .chars()
         .map(|c| {
-            if matches!(c, ' ' | '$' | '`' | '!' | '*' | '@' | '"' | '\\' | '\r' | '\n' | '\t') {
+            if matches!(
+                c,
+                ' ' | '$' | '`' | '!' | '*' | '@' | '"' | '\\' | '\r' | '\n' | '\t'
+            ) {
                 '_'
             } else {
                 c
@@ -545,7 +554,8 @@ pub async fn find_poetry_virtualenv_site_packages(cwd: &Path) -> Vec<PathBuf> {
         Ok(text) => text,
         Err(_) => return Vec::new(),
     };
-    let poetry_project = has("poetry.lock") || has("poetry.toml") || pyproject.contains("[tool.poetry");
+    let poetry_project =
+        has("poetry.lock") || has("poetry.toml") || pyproject.contains("[tool.poetry");
     if !poetry_project {
         return Vec::new();
     }
@@ -928,9 +938,12 @@ fn pipenv_workon_home_venvs(
         let Some(leaf) = file_name.to_str() else {
             continue;
         };
-        let direct = exact
-            .iter()
-            .any(|c| leaf == c || leaf.strip_prefix(c.as_str()).is_some_and(|rest| rest.starts_with('-')));
+        let direct = exact.iter().any(|c| {
+            leaf == c
+                || leaf
+                    .strip_prefix(c.as_str())
+                    .is_some_and(|rest| rest.starts_with('-'))
+        });
         if direct {
             found.push(entry.path());
             continue;
@@ -1447,7 +1460,10 @@ mod tests {
         assert_eq!(pipenv_sanitize("My App", true), "My_App");
         assert_eq!(pipenv_sanitize("a(b)[c]&d", true), "a_b__c__d");
         assert_eq!(pipenv_sanitize("a(b)[c]&d", false), "a(b)[c]&d");
-        assert_eq!(pipenv_sanitize("we$ird`na!me*@\"x\\", false), "we_ird_na_me___x_");
+        assert_eq!(
+            pipenv_sanitize("we$ird`na!me*@\"x\\", false),
+            "we_ird_na_me___x_"
+        );
         let long = "p".repeat(60);
         assert_eq!(pipenv_sanitize(&long, true).chars().count(), 42);
         // Case is preserved (Pipenv does not lowercase the project name).
@@ -1461,7 +1477,10 @@ mod tests {
             "X" => Some("/x".to_string()),
             _ => None,
         };
-        assert_eq!(pipenv_expand_path("$X/venvs", &var), PathBuf::from("/x/venvs"));
+        assert_eq!(
+            pipenv_expand_path("$X/venvs", &var),
+            PathBuf::from("/x/venvs")
+        );
         assert_eq!(pipenv_expand_path("${X}/v", &var), PathBuf::from("/x/v"));
         assert_eq!(pipenv_expand_path("~/w", &var), PathBuf::from("/home/u/w"));
         assert_eq!(pipenv_expand_path("~", &var), PathBuf::from("/home/u"));
@@ -1486,24 +1505,40 @@ mod tests {
             };
             pipenv_workon_home(&var)
         };
-        assert_eq!(with(Some("~/envs"), None), Some(PathBuf::from("/home/u/envs")));
+        assert_eq!(
+            with(Some("~/envs"), None),
+            Some(PathBuf::from("/home/u/envs"))
+        );
         if cfg!(windows) {
-            assert_eq!(with(None, None), Some(PathBuf::from("/home/u").join(".virtualenvs")));
+            assert_eq!(
+                with(None, None),
+                Some(PathBuf::from("/home/u").join(".virtualenvs"))
+            );
             // USERPROFILE wins over a Git-Bash style HOME, like Python's expanduser.
             let var = |name: &str| match name {
                 "HOME" => Some("/c/Users/u".to_string()),
                 "USERPROFILE" => Some(r"C:\Users\u".to_string()),
                 _ => None,
             };
-            assert_eq!(pipenv_workon_home(&var), Some(PathBuf::from(r"C:\Users\u").join(".virtualenvs")));
+            assert_eq!(
+                pipenv_workon_home(&var),
+                Some(PathBuf::from(r"C:\Users\u").join(".virtualenvs"))
+            );
         } else {
             assert_eq!(
                 with(None, None),
                 Some(PathBuf::from("/home/u/.local/share/virtualenvs"))
             );
-            assert_eq!(with(None, Some("/data")), Some(PathBuf::from("/data/virtualenvs")));
+            assert_eq!(
+                with(None, Some("/data")),
+                Some(PathBuf::from("/data/virtualenvs"))
+            );
         }
-        assert_eq!(with(Some("  "), None).is_some(), true, "blank WORKON_HOME falls through");
+        assert_eq!(
+            with(Some("  "), None).is_some(),
+            true,
+            "blank WORKON_HOME falls through"
+        );
         let no_home = |_: &str| None::<String>;
         assert_eq!(pipenv_workon_home(&no_home), None);
     }
@@ -1556,7 +1591,10 @@ mod tests {
         found.sort();
         let mut want = vec![plain.clone(), suffixed.clone()];
         want.sort();
-        assert_eq!(found, want, "name+hash (and the PIPENV_PYTHON-suffixed twin) only");
+        assert_eq!(
+            found, want,
+            "name+hash (and the PIPENV_PYTHON-suffixed twin) only"
+        );
 
         // Not a Pipenv project → nothing, even with a matching directory.
         let plain_dir = tmp.path().join("plain");
@@ -1760,11 +1798,15 @@ mod tests {
     #[test]
     fn poetry_project_names_prefer_tool_poetry_and_return_both_spellings() {
         assert_eq!(
-            poetry_project_names("[tool.poetry]\nname = \"Flask_Login\"\n[project]\nname = \"other\"\n"),
+            poetry_project_names(
+                "[tool.poetry]\nname = \"Flask_Login\"\n[project]\nname = \"other\"\n"
+            ),
             vec!["flask-login".to_string(), "Flask_Login".to_string()]
         );
         assert_eq!(
-            poetry_project_names("[project]\nname = \"my-app\"\n[tool.poetry]\npackage-mode = false\n"),
+            poetry_project_names(
+                "[project]\nname = \"my-app\"\n[tool.poetry]\npackage-mode = false\n"
+            ),
             vec!["my-app".to_string()]
         );
         assert!(poetry_project_names("[tool.poetry]\nversion = \"1\"\n").is_empty());
@@ -1776,7 +1818,9 @@ mod tests {
         let local = PoetryVirtualenvConfig::from_toml(
             "[virtualenvs]\nin-project = false\npath = \"{cache-dir}/venvs\"\n",
         );
-        let user = PoetryVirtualenvConfig::from_toml("cache-dir = \"/srv/poetry-cache\"\n[virtualenvs]\ncreate = false\n");
+        let user = PoetryVirtualenvConfig::from_toml(
+            "cache-dir = \"/srv/poetry-cache\"\n[virtualenvs]\ncreate = false\n",
+        );
         let env = PoetryVirtualenvConfig::from_env(|k| match k {
             "POETRY_VIRTUALENVS_CREATE" => Some("true".into()),
             _ => None,
@@ -1807,10 +1851,19 @@ mod tests {
             path: Some("~/venvs".into()),
             ..Default::default()
         };
-        assert_eq!(poetry_virtualenvs_root(cwd, &tilde, &var), Some(PathBuf::from("/home/dev/venvs")));
+        assert_eq!(
+            poetry_virtualenvs_root(cwd, &tilde, &var),
+            Some(PathBuf::from("/home/dev/venvs"))
+        );
         for disabled in [
-            PoetryVirtualenvConfig { create: Some(false), ..Default::default() },
-            PoetryVirtualenvConfig { in_project: Some(true), ..Default::default() },
+            PoetryVirtualenvConfig {
+                create: Some(false),
+                ..Default::default()
+            },
+            PoetryVirtualenvConfig {
+                in_project: Some(true),
+                ..Default::default()
+            },
         ] {
             assert_eq!(poetry_virtualenvs_root(cwd, &disabled, &var), None);
         }
@@ -1818,7 +1871,10 @@ mod tests {
         // there is nothing to resolve against.
         let default = PoetryVirtualenvConfig::default();
         assert!(poetry_virtualenvs_root(cwd, &default, &var).is_some());
-        assert_eq!(poetry_virtualenvs_root(cwd, &default, &|_: &str| None), None);
+        assert_eq!(
+            poetry_virtualenvs_root(cwd, &default, &|_: &str| None),
+            None
+        );
     }
 
     /// End to end against the filesystem: a Poetry project with no `.venv`
@@ -1865,12 +1921,15 @@ mod tests {
         .unwrap();
         std::fs::write(project.join("poetry.lock"), "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\n[metadata]\nlock-version = \"2.1\"\n").unwrap();
         let venvs = tmp.path().join("venvs");
-        let prefix = poetry_env_name_prefix("poetry-patch-fixture", &poetry_normalized_cwd(&project));
+        let prefix =
+            poetry_env_name_prefix("poetry-patch-fixture", &poetry_normalized_cwd(&project));
         let site = |venv: &Path, minor: &str| {
             if cfg!(windows) {
                 venv.join("Lib").join("site-packages")
             } else {
-                venv.join("lib").join(format!("python{minor}")).join("site-packages")
+                venv.join("lib")
+                    .join(format!("python{minor}"))
+                    .join("site-packages")
             }
         };
         let venv312 = venvs.join(format!("{prefix}-py3.12"));
@@ -1885,27 +1944,49 @@ mod tests {
             ("POETRY_VIRTUALENVS_IN_PROJECT", None),
             ("POETRY_VIRTUALENVS_CREATE", None),
             ("POETRY_CACHE_DIR", None),
-            ("POETRY_CONFIG_DIR", Some(tmp.path().join("no-config").to_str().unwrap())),
+            (
+                "POETRY_CONFIG_DIR",
+                Some(tmp.path().join("no-config").to_str().unwrap()),
+            ),
         ]);
 
         let found = find_local_venv_site_packages(&project).await;
-        assert_eq!(found, vec![site(&venv311, "3.11"), site(&venv312, "3.12")], "{found:?}");
+        assert_eq!(
+            found,
+            vec![site(&venv311, "3.11"), site(&venv312, "3.12")],
+            "{found:?}"
+        );
 
         // A project-local `.venv` wins and the out-of-tree probe is skipped.
         std::fs::create_dir_all(site(&project.join(".venv"), "3.12")).unwrap();
-        assert_eq!(find_local_venv_site_packages(&project).await, vec![site(&project.join(".venv"), "3.12")]);
+        assert_eq!(
+            find_local_venv_site_packages(&project).await,
+            vec![site(&project.join(".venv"), "3.12")]
+        );
         std::fs::remove_dir_all(project.join(".venv")).unwrap();
 
         // `poetry.toml` opting into in-project venvs (or disabling creation)
         // means Poetry never used the shared root: nothing is probed.
-        std::fs::write(project.join("poetry.toml"), "[virtualenvs]\nin-project = true\n").unwrap();
+        std::fs::write(
+            project.join("poetry.toml"),
+            "[virtualenvs]\nin-project = true\n",
+        )
+        .unwrap();
         assert!(find_local_venv_site_packages(&project).await.is_empty());
-        std::fs::write(project.join("poetry.toml"), "[virtualenvs]\ncreate = false\n").unwrap();
+        std::fs::write(
+            project.join("poetry.toml"),
+            "[virtualenvs]\ncreate = false\n",
+        )
+        .unwrap();
         assert!(find_local_venv_site_packages(&project).await.is_empty());
         std::fs::remove_file(project.join("poetry.toml")).unwrap();
 
         // Not a Poetry project (no lock, no [tool.poetry]): untouched.
-        std::fs::write(project.join("pyproject.toml"), "[project]\nname = \"poetry-patch-fixture\"\n").unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"poetry-patch-fixture\"\n",
+        )
+        .unwrap();
         std::fs::remove_file(project.join("poetry.lock")).unwrap();
         assert!(find_local_venv_site_packages(&project).await.is_empty());
     }

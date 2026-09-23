@@ -11,27 +11,47 @@ pub struct CleanupResult {
     pub blobs_removed: usize,
     pub bytes_freed: u64,
     pub removed_blobs: Vec<String>,
+    /// Orphans the wet sweep could not unlink, as `<file name>: <error>`.
+    /// The pass keeps going past each failure, so the counts above are
+    /// what was actually reclaimed; a non-empty list is the caller's cue
+    /// to warn (`cleanup_failed`) without discarding them.
+    pub failed: Vec<String>,
 }
 
 /// Shared core for `cleanup_unused_blobs` / `cleanup_unused_archives`.
 ///
 /// Walks `dir`, treats it as authoritative socket-patch state (so any
 /// regular non-hidden file is considered for removal), and asks
-/// `is_used(filename) -> bool` whether each file should be kept.
+/// `is_used(filename) -> bool` whether each file should be kept. A missing
+/// `dir` yields an empty result; every other I/O error on the directory
+/// itself propagates. A wet sweep that empties the directory removes it too
+/// (non-recursively — kept files, hidden files or subdirectories keep it), so
+/// a fully rolled-back project leaves no empty `blobs/`, `diffs/` or
+/// `packages/` husk behind.
+///
+/// Per-file unlink failures do not abort the sweep: every other orphan is
+/// still attempted, only files actually removed are counted, and each
+/// failure is recorded in [`CleanupResult::failed`] so the partial counts
+/// survive alongside it.
 async fn cleanup_dir<F: Fn(&str) -> bool>(
     dir: &Path,
     dry_run: bool,
     is_used: F,
 ) -> Result<CleanupResult, std::io::Error> {
-    if tokio::fs::metadata(dir).await.is_err() {
-        return Ok(CleanupResult::default());
-    }
-
-    let mut read_dir = tokio::fs::read_dir(dir).await?;
+    let mut read_dir = match tokio::fs::read_dir(dir).await {
+        Ok(read_dir) => read_dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CleanupResult::default());
+        }
+        Err(e) => return Err(e),
+    };
     let mut entries = Vec::new();
     while let Some(entry) = read_dir.next_entry().await? {
         entries.push(entry);
     }
+    // Close the enumeration handle before the directory itself may be
+    // removed below (Windows refuses to delete a directory with one open).
+    drop(read_dir);
 
     let mut result = CleanupResult::default();
 
@@ -61,14 +81,22 @@ async fn cleanup_dir<F: Fn(&str) -> bool>(
         if is_used(&file_name_str) {
             continue;
         }
+        if !dry_run {
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                result.failed.push(format!("{file_name_str}: {e}"));
+                continue;
+            }
+        }
         result.blobs_removed += 1;
         result.bytes_freed += metadata.len();
         result.removed_blobs.push(file_name_str);
-        if !dry_run {
-            tokio::fs::remove_file(&path).await?;
-        }
     }
 
+    if !dry_run {
+        // Best-effort: a directory still holding kept files, hidden files,
+        // subdirectories or the orphans that failed to unlink stays.
+        let _ = tokio::fs::remove_dir(dir).await;
+    }
     Ok(result)
 }
 
@@ -123,7 +151,8 @@ pub async fn cleanup_unused_archives(
 /// Formats the cleanup result for human-readable output.
 pub fn format_cleanup_result(result: &CleanupResult, dry_run: bool) -> String {
     if result.blobs_checked == 0 {
-        return "No blobs directory found, nothing to clean up.".to_string();
+        // Absent directory, or one holding no regular non-hidden files.
+        return "No blobs to clean up.".to_string();
     }
 
     if result.blobs_removed == 0 {
@@ -338,6 +367,14 @@ mod tests {
         assert!(tokio::fs::metadata(blobs_dir.join(AFTER_HASH_1))
             .await
             .is_ok());
+
+        // A dry run never touches the directory either, even when every
+        // file in it would go.
+        let result = cleanup_unused_blobs(&PatchManifest::new(), &blobs_dir, true)
+            .await
+            .unwrap();
+        assert_eq!(result.blobs_removed, 2);
+        assert!(blobs_dir.is_dir(), "dry run keeps the directory");
     }
 
     #[tokio::test]
@@ -360,6 +397,73 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.blobs_removed, 2);
+        // A wet sweep that orphaned everything leaves no empty `blobs/` husk
+        // behind (the residue a full agent-mode rollback used to leave).
+        assert!(
+            !blobs_dir.exists(),
+            "an emptied store directory is removed with its last orphan"
+        );
+        assert!(dir.path().exists(), "only the store dir itself goes");
+    }
+
+    /// A per-file unlink failure must not abort the sweep: the remaining
+    /// orphans are still attempted, and every failure is recorded in
+    /// `failed` beside the counts of what WAS reclaimed (the pass is `Ok`).
+    /// Pinned on Unix by a read-only store dir — every unlink fails, so
+    /// both orphans land in `failed` and nothing is counted as removed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_cleanup_unlink_failures_are_recorded_after_the_pass() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let blobs_dir = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+        tokio::fs::write(blobs_dir.join(ORPHAN_HASH), "orphan")
+            .await
+            .unwrap();
+        tokio::fs::write(blobs_dir.join(BEFORE_HASH_1), "orphan too")
+            .await
+            .unwrap();
+        std::fs::set_permissions(&blobs_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::File::create(blobs_dir.join("probe")).is_ok() {
+            let _ = std::fs::set_permissions(&blobs_dir, std::fs::Permissions::from_mode(0o755));
+            eprintln!("skipping: running as root, 0555 does not block unlinks");
+            return;
+        }
+
+        let result = cleanup_unused_blobs(&create_test_manifest(), &blobs_dir, false).await;
+        std::fs::set_permissions(&blobs_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = result.expect("unlink failures do not fail the pass");
+        assert_eq!(result.blobs_checked, 2, "both orphans were considered");
+        assert_eq!(
+            result.blobs_removed, 0,
+            "a failed unlink is not counted as removed"
+        );
+        assert_eq!(result.bytes_freed, 0);
+        assert!(result.removed_blobs.is_empty());
+        let mut failed = result.failed.clone();
+        failed.sort();
+        assert_eq!(
+            failed.len(),
+            2,
+            "every failed unlink is recorded: {failed:?}"
+        );
+        let mut expected = [ORPHAN_HASH, BEFORE_HASH_1];
+        expected.sort();
+        for (entry, name) in failed.iter().zip(expected) {
+            assert!(
+                entry.starts_with(&format!("{name}: ")),
+                "each failure names its file: {entry}"
+            );
+            assert!(
+                entry.to_lowercase().contains("permission denied"),
+                "each failure carries the OS error: {entry}"
+            );
+        }
+        assert!(blobs_dir.join(ORPHAN_HASH).exists());
+        assert!(blobs_dir.join(BEFORE_HASH_1).exists());
+        assert!(blobs_dir.is_dir(), "a non-empty store dir is never removed");
     }
 
     #[tokio::test]
@@ -388,17 +492,21 @@ mod tests {
         assert_eq!(format_bytes(1073741824), "1.00 GB");
     }
 
+    /// Zero checked covers BOTH an absent store dir and an existing one that
+    /// holds no regular non-hidden files, so the wording must be true for
+    /// either — it never claims the directory was not found.
     #[test]
-    fn test_format_cleanup_result_no_blobs_dir() {
+    fn test_format_cleanup_result_nothing_checked() {
         let result = CleanupResult {
             blobs_checked: 0,
             blobs_removed: 0,
             bytes_freed: 0,
             removed_blobs: vec![],
+            ..Default::default()
         };
         assert_eq!(
             format_cleanup_result(&result, false),
-            "No blobs directory found, nothing to clean up."
+            "No blobs to clean up."
         );
     }
 
@@ -409,6 +517,7 @@ mod tests {
             blobs_removed: 0,
             bytes_freed: 0,
             removed_blobs: vec![],
+            ..Default::default()
         };
         assert_eq!(
             format_cleanup_result(&result, false),
@@ -423,6 +532,7 @@ mod tests {
             blobs_removed: 2,
             bytes_freed: 2048,
             removed_blobs: vec!["aaa".to_string(), "bbb".to_string()],
+            ..Default::default()
         };
         assert_eq!(
             format_cleanup_result(&result, false),
@@ -626,7 +736,8 @@ mod tests {
     #[tokio::test]
     async fn test_cleanup_empty_existing_dir_checks_nothing() {
         // An existing-but-empty directory must report zero checked (no entries
-        // to consider), distinct from a populated one.
+        // to consider), distinct from a populated one — and, being an empty
+        // husk, a wet sweep removes it.
         let dir = tempfile::tempdir().unwrap();
         let blobs_dir = dir.path().join("blobs");
         tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
@@ -637,6 +748,7 @@ mod tests {
 
         assert_eq!(result.blobs_checked, 0);
         assert_eq!(result.blobs_removed, 0);
+        assert!(!blobs_dir.exists(), "an empty store dir is pruned");
     }
 
     #[cfg(unix)]
@@ -756,6 +868,7 @@ mod tests {
             blobs_removed: 2,
             bytes_freed: 2048,
             removed_blobs: vec!["aaa".to_string(), "bbb".to_string()],
+            ..Default::default()
         };
         let formatted = format_cleanup_result(&result, true);
         assert!(formatted.starts_with("Would remove 2 unused blob(s)"));

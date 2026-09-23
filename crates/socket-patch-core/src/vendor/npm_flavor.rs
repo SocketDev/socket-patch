@@ -23,6 +23,7 @@ use std::path::Path;
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
+use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 
 use super::pnpm_lock_legacy::PnpmLockGrammar;
 use super::state::VendorEntry;
@@ -255,21 +256,6 @@ pub(crate) async fn detect_npm_lock_flavor(
     Ok((detected, warnings))
 }
 
-/// Guarded read shared in shape with the vendor siblings' twins
-/// (lock_inventory.rs, cargo_lock.rs, gem.rs): `open_regular_file` opens
-/// with `O_NONBLOCK` and rejects non-regular files, so a FIFO planted as a
-/// sniffed lockfile fails fast instead of wedging the flavor probe (every
-/// npm `vendor`), the in-use probe, and the unwired-revert guard forever in
-/// an `open(2)` that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
-
 /// Read a lockfile for content-sniffing. An unreadable-but-present file maps
 /// to the same stable code as a missing one.
 async fn read_lock(project_root: &Path, name: &str) -> Result<String, (&'static str, String)> {
@@ -384,8 +370,8 @@ pub async fn vendor_npm_any(
 /// `overrides:` section is excluded by the flavor probe, and the other
 /// flavors carry no declaration inside the lock at all). `None`: cannot
 /// determine (missing lock, unknown flavor) — callers keep the entry,
-/// fail-safe. Detached entries are lockfile-invisible BY DESIGN and must
-/// never be routed here (the probe would always call them unused).
+/// fail-safe. Detached entries are wired into the lock exactly like
+/// manifest-tracked ones, so the probe applies to every entry.
 pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.flavor.as_deref() {
         Some("pnpm") => pnpm_lock::pnpm_entry_in_use(entry, project_root).await,
@@ -415,7 +401,7 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
             {
                 return lock_text_mentions_uuid(project_root, &["bun.lock"], &entry.uuid).await;
             }
-            let bytes = crate::utils::fs::read_regular_to_bytes(&project_root.join("bun.lockb"))
+            let bytes = read_regular_to_bytes(&project_root.join("bun.lockb"))
                 .await
                 .ok()?;
             let lock = super::bun_lockb::BunLockb::parse(&bytes).ok()?;
@@ -1269,10 +1255,8 @@ mod tests {
             (
                 detect_npm_lock_flavor(pnpm_dir.path()).await,
                 detect_npm_lock_flavor(yarn_dir.path()).await,
-                vendored_entry_in_use(&probe_entry(Some("package-lock")), in_use_dir.path())
-                    .await,
-                vendored_entry_in_use(&probe_entry(Some("yarn-classic")), in_use_dir.path())
-                    .await,
+                vendored_entry_in_use(&probe_entry(Some("package-lock")), in_use_dir.path()).await,
+                vendored_entry_in_use(&probe_entry(Some("yarn-classic")), in_use_dir.path()).await,
                 vendored_entry_in_use(&probe_entry(Some("bun")), in_use_dir.path()).await,
             )
         };

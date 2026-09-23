@@ -39,6 +39,10 @@ pub struct RollbackResult {
     pub success: bool,
     pub files_verified: Vec<VerifyRollbackResult>,
     pub files_rolled_back: Vec<String>,
+    /// Why the package failed (`success == false`). On a SUCCESSFUL result
+    /// it is an advisory instead: a restored file whose ownership the
+    /// caller was not privileged to put back (the bytes ARE restored — see
+    /// `apply::apply_file_patch_at`).
     pub error: Option<String>,
     /// Ecosystem sidecar resync outcome — the rollback-side twin of
     /// [`ApplyResult::sidecar`](crate::patch::apply::ApplyResult::sidecar).
@@ -161,21 +165,20 @@ pub async fn verify_file_rollback(
         };
     }
 
-    // Check if file exists
-    if tokio::fs::metadata(&filepath).await.is_err() {
-        return VerifyRollbackResult {
-            file: file_name.to_string(),
-            status: VerifyRollbackStatus::NotFound,
-            message: Some("File not found".to_string()),
-            current_hash: None,
-            expected_hash: None,
-            target_hash: None,
-        };
-    }
-
-    // Compute current hash
+    // Hash the file straight away — the opener's own NotFound is the
+    // existence probe (see `verify_file_patch`).
     let current_hash = match compute_file_git_sha256(&filepath).await {
         Ok(h) => h,
+        Err(e) if crate::patch::apply::is_missing_path(&e) => {
+            return VerifyRollbackResult {
+                file: file_name.to_string(),
+                status: VerifyRollbackStatus::NotFound,
+                message: Some("File not found".to_string()),
+                current_hash: None,
+                expected_hash: None,
+                target_hash: None,
+            };
+        }
         Err(e) => {
             return VerifyRollbackResult {
                 file: file_name.to_string(),
@@ -218,6 +221,25 @@ pub async fn verify_file_rollback(
             status: VerifyRollbackStatus::MissingBlob,
             message: Some(format!(
                 "Unsafe before-blob hash (escapes blobs directory): {}",
+                file_info.before_hash
+            )),
+            current_hash: Some(current_hash),
+            expected_hash: None,
+            target_hash: None,
+        };
+    }
+    // The one path-component invariant the apply engine enforces
+    // (`read_blob`): a blob hash is 64 hex chars, so it can never carry a
+    // separator. The relative-path guard above stops `..`/absolute escapes
+    // but still lets `sub/x` through, where an intermediate `blobs/sub`
+    // symlink would defeat the entry-type checks below (they only inspect
+    // the FINAL component).
+    if !crate::patch::apply::is_valid_blob_hash(&file_info.before_hash) {
+        return VerifyRollbackResult {
+            file: file_name.to_string(),
+            status: VerifyRollbackStatus::MissingBlob,
+            message: Some(format!(
+                "Refusing to read blob with invalid hash {:?} (expected 64 hex chars)",
                 file_info.before_hash
             )),
             current_hash: Some(current_hash),
@@ -305,9 +327,75 @@ pub fn cannot_rollback_error(file: &str, why: &str) -> String {
 ///
 /// For each file in `files`, this function:
 /// 1. Verifies the file is ready to be rolled back (or already original).
-/// 2. If not dry_run, reads the before-hash blob and writes it back.
+/// 2. If not dry_run, reads the before-hash blob and writes it back (or
+///    deletes the file, for a patch-added one).
 /// 3. Returns a summary of what happened.
+///
+/// pnpm peer-variant copies are handled exactly as in
+/// [`apply_package_patch`](crate::patch::apply::apply_package_patch):
+/// after the primary, the same verify+rollback engine runs against every
+/// other physical store copy of an npm package — including when the
+/// primary is already original, which is the state an earlier single-copy
+/// rollback left behind (original primary, still-patched twin), and on
+/// dry-run (verify only, so a preview fails closed on a copy that cannot
+/// be rolled back). Apply materializes patch-ADDED files in every copy
+/// too, so the deletes must reach every copy as well. A failed copy fails
+/// the whole result; the primary's per-file records are what the returned
+/// `RollbackResult` carries.
 pub async fn rollback_package_patch(
+    package_key: &str,
+    pkg_path: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+    blobs_path: &Path,
+    dry_run: bool,
+) -> RollbackResult {
+    let mut result =
+        rollback_package_patch_at(package_key, pkg_path, files, blobs_path, dry_run).await;
+    // Only npm purls can name pnpm store copies; everything else skips the
+    // (already cheap) discovery outright.
+    if result.success && package_key.starts_with("pkg:npm/") {
+        for copy in crate::crawlers::npm_crawler::find_pnpm_peer_variant_copies(pkg_path).await {
+            let copy_result =
+                rollback_package_patch_at(package_key, &copy, files, blobs_path, dry_run).await;
+            fold_copy_result(&mut result, &copy, copy_result);
+        }
+    }
+    result
+}
+
+/// Merge one pnpm store copy's result into the primary's. A failed copy
+/// fails the whole result with a `pnpm store copy <path> failed to roll
+/// back: …` note; a copy that restored fine but carries an advisory
+/// (`success: true, error: Some(…)` — e.g. "…ownership could not be
+/// restored…") keeps `success` and appends the advisory verbatim, so the
+/// CLI's `ownership_not_restored` warning sees every copy, not just the
+/// primary. The advisory already names the copy's full file path.
+fn fold_copy_result(result: &mut RollbackResult, copy: &Path, copy_result: RollbackResult) {
+    let note = if copy_result.success {
+        match copy_result.error {
+            Some(advisory) => advisory,
+            None => return,
+        }
+    } else {
+        result.success = false;
+        format!(
+            "pnpm store copy {} failed to roll back: {}",
+            copy.display(),
+            copy_result
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        )
+    };
+    result.error = Some(match result.error.take() {
+        Some(prev) => format!("{prev}; {note}"),
+        None => note,
+    });
+}
+
+/// The single-copy rollback engine behind [`rollback_package_patch`]:
+/// verifies and rolls back the package at exactly the one `pkg_path` it is
+/// given.
+async fn rollback_package_patch_at(
     package_key: &str,
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
@@ -355,6 +443,11 @@ pub async fn rollback_package_patch(
         return result;
     }
 
+    // Advisory notes from restores that committed but could not put the
+    // ownership back (see `apply_file_patch_at`); reported on `error`
+    // alongside `success`.
+    let mut warnings: Vec<String> = Vec::new();
+
     // Rollback files that need it
     for (file_name, file_info) in files {
         let already_original = result
@@ -369,7 +462,7 @@ pub async fn rollback_package_patch(
         if file_info.before_hash.is_empty() {
             let normalized = normalize_file_path(file_name);
             // SECURITY: this delete path constructs the target itself and
-            // does NOT go through `apply_file_patch`, so it must enforce the
+            // does NOT go through `apply_file_patch_at`, so it must enforce the
             // same path-escape guard. Without it a poisoned manifest entry
             // (empty beforeHash + a `../../`/absolute key) would unlink an
             // arbitrary file outside the package directory. Verify already
@@ -411,27 +504,31 @@ pub async fn rollback_package_patch(
             ));
             return result;
         }
-
-        // Read original content from blobs.
-        // SECURITY: defense-in-depth twin of the verify-time entry-type
-        // guard (exactly like the string guard above) — never read through
-        // a symlinked / non-regular blobs entry at the syscall either. The
-        // lstat rejects the entry itself; it must run here because the
-        // read must not depend on verify having blocked it.
-        let blob_path = blobs_path.join(&file_info.before_hash);
-        let entry_is_regular = matches!(
-            tokio::fs::symlink_metadata(&blob_path).await,
-            Ok(meta) if meta.is_file()
-        );
-        if !entry_is_regular {
+        // Twin of the verify-time 64-hex gate (see `verify_file_rollback`):
+        // shared with the apply engine's `read_blob`.
+        if !crate::patch::apply::is_valid_blob_hash(&file_info.before_hash) {
             result.error = Some(format!(
-                "Before blob is not a regular file: {}",
+                "Refusing to read blob with invalid hash {:?} (expected 64 hex chars)",
                 file_info.before_hash
             ));
             return result;
         }
-        let original_content = match tokio::fs::read(&blob_path).await {
+
+        // Read the original content from the blob. SECURITY: defense-in-depth
+        // twin of the verify-time entry-type guard (exactly like the string
+        // guard above) — `read_blob_entry` lstat's the ENTRY (a planted
+        // symlink is refused, never followed) and opens FIFO-safe, so this
+        // read does not depend on verify having blocked a bad entry.
+        let blob_path = blobs_path.join(&file_info.before_hash);
+        let original_content = match crate::patch::apply::read_blob_entry(&blob_path).await {
             Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                result.error = Some(format!(
+                    "Before blob is not a regular file: {}",
+                    file_info.before_hash
+                ));
+                return result;
+            }
             Err(e) => {
                 result.error = Some(format!(
                     "Failed to read blob {}: {}",
@@ -441,14 +538,16 @@ pub async fn rollback_package_patch(
             }
         };
 
-        // Restore via `apply_file_patch`, the hardened write path shared
-        // with apply — rolling a file back is the same operation as patching
-        // it forward ("safely overwrite this file with these hash-verified
-        // bytes") and must get the same guarantees: atomic stage+rename,
-        // hardlink/symlink broken into a private inode before writing (pnpm /
-        // Go-cache stores), blob hash-checked in memory before any disk
-        // write, and the file's original mode + uid/gid restored afterward.
-        if let Err(e) = crate::patch::apply::apply_file_patch(
+        // Restore via `apply_file_patch_at`, the hardened single-copy write
+        // path shared with apply — rolling a file back is the same operation
+        // as patching it forward ("safely overwrite this file with these
+        // hash-verified bytes") and gets the same guarantees: blob
+        // hash-checked in memory before any disk write, atomic stage+rename
+        // (which also isolates shared pnpm / Go-cache inodes), and the
+        // file's original mode + uid/gid restored afterward. pnpm store
+        // copies are rolled back by the package-level wrapper, one full
+        // verify each.
+        match crate::patch::apply::apply_file_patch_at(
             pkg_path,
             file_name,
             &original_content,
@@ -456,8 +555,11 @@ pub async fn rollback_package_patch(
         )
         .await
         {
-            result.error = Some(e.to_string());
-            return result;
+            Ok(warning) => warnings.extend(warning),
+            Err(e) => {
+                result.error = Some(e.to_string());
+                return result;
+            }
         }
 
         result.files_rolled_back.push(file_name.clone());
@@ -506,6 +608,9 @@ pub async fn rollback_package_patch(
         }
     }
 
+    if !warnings.is_empty() {
+        result.error = Some(warnings.join("; "));
+    }
     result.success = true;
     result
 }
@@ -514,10 +619,10 @@ pub async fn rollback_package_patch(
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-    // The rollback write path IS `apply_file_patch` (see the restore loop in
-    // `rollback_package_patch`); these tests pin the guarantees rollback
-    // relies on from it.
-    use crate::patch::apply::apply_file_patch;
+    // The rollback write path IS `apply_file_patch_at` (see the restore loop
+    // in `rollback_package_patch_at`); these tests pin the guarantees
+    // rollback relies on from it.
+    use crate::patch::apply::apply_file_patch_at;
 
     #[tokio::test]
     async fn test_verify_file_rollback_not_found() {
@@ -550,7 +655,8 @@ mod tests {
             .unwrap();
 
         let file_info = PatchFileInfo {
-            before_hash: "missing_blob_hash".to_string(),
+            // A well-formed (64-hex) hash that no blob carries.
+            before_hash: "0".repeat(64),
             after_hash: compute_git_sha256_from_bytes(content),
         };
 
@@ -659,7 +765,7 @@ mod tests {
             .await
             .unwrap();
 
-        apply_file_patch(dir.path(), "index.js", original, &original_hash)
+        apply_file_patch_at(dir.path(), "index.js", original, &original_hash)
             .await
             .unwrap();
 
@@ -675,7 +781,7 @@ mod tests {
             .unwrap();
 
         let result =
-            apply_file_patch(dir.path(), "index.js", b"original content", "wrong_hash").await;
+            apply_file_patch_at(dir.path(), "index.js", b"original content", "wrong_hash").await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -698,7 +804,7 @@ mod tests {
             .unwrap();
 
         let result =
-            apply_file_patch(dir.path(), "index.js", b"original content", "wrong_hash").await;
+            apply_file_patch_at(dir.path(), "index.js", b"original content", "wrong_hash").await;
         assert!(result.is_err());
 
         // The file must NOT have been overwritten with the bad blob.
@@ -739,7 +845,7 @@ mod tests {
 
         let original = b"original bytes";
         let original_hash = compute_git_sha256_from_bytes(original);
-        apply_file_patch(
+        apply_file_patch_at(
             project.parent().unwrap(),
             "foo.js",
             original,
@@ -775,7 +881,7 @@ mod tests {
             .await
             .unwrap();
 
-        apply_file_patch(dir.path(), "index.js", original, &original_hash)
+        apply_file_patch_at(dir.path(), "index.js", original, &original_hash)
             .await
             .unwrap();
 
@@ -1015,7 +1121,8 @@ mod tests {
         files.insert(
             "index.js".to_string(),
             PatchFileInfo {
-                before_hash: "missing_hash".to_string(),
+                // A well-formed (64-hex) hash that no blob carries.
+                before_hash: "0".repeat(64),
                 after_hash: "bbbb".to_string(),
             },
         );
@@ -1161,7 +1268,7 @@ mod tests {
 
     /// SECURITY (new-file delete path-escape): the new-file deletion
     /// branch builds the path itself and calls `remove_file` directly,
-    /// bypassing `apply_file_patch`'s guard. A poisoned manifest with an
+    /// bypassing `apply_file_patch_at`'s guard. A poisoned manifest with an
     /// empty `beforeHash` and an escaping key must NOT unlink a file
     /// outside the package dir. Regression: the bare `remove_file` would
     /// delete an arbitrary host file.
@@ -1805,6 +1912,114 @@ mod tests {
         );
     }
 
+    /// SECURITY (intermediate symlink component): the relative-path guard
+    /// lets `sub/x` through, and the entry-type checks only inspect the
+    /// FINAL component — so a committed `blobs/sub -> <out of tree>`
+    /// symlink plus a `beforeHash` of `sub/secret.txt` would read the
+    /// out-of-tree file through the link and leak its content hash in the
+    /// mismatch error. The 64-hex gate shared with the apply engine
+    /// (`is_valid_blob_hash`) closes it: a hash can never carry a separator.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rollback_refuses_before_hash_with_path_components() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = root.path().join("pkg");
+        let blobs_dir = root.path().join("blobs");
+        tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+        let secret = b"top secret contents\n";
+        tokio::fs::write(root.path().join("secret.txt"), secret)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("..", blobs_dir.join("sub")).unwrap();
+
+        let patched = b"patched content";
+        tokio::fs::write(pkg_dir.join("index.js"), patched)
+            .await
+            .unwrap();
+        let file_info = PatchFileInfo {
+            before_hash: "sub/secret.txt".to_string(),
+            after_hash: compute_git_sha256_from_bytes(patched),
+        };
+
+        let verify = verify_file_rollback(&pkg_dir, "index.js", &file_info, &blobs_dir).await;
+        assert_eq!(verify.status, VerifyRollbackStatus::MissingBlob);
+        assert!(
+            verify.message.as_deref().unwrap().contains("invalid hash"),
+            "{verify:?}"
+        );
+
+        let mut files = HashMap::new();
+        files.insert("index.js".to_string(), file_info);
+        let result =
+            rollback_package_patch("pkg:npm/test@1.0.0", &pkg_dir, &files, &blobs_dir, false).await;
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(
+            !err.contains(&compute_git_sha256_from_bytes(secret)),
+            "the out-of-tree file's hash must never leak: {err}"
+        );
+        assert_eq!(
+            tokio::fs::read(pkg_dir.join("index.js")).await.unwrap(),
+            patched,
+            "nothing is restored"
+        );
+    }
+
+    /// The pnpm fan-out merge: a failed copy fails the whole result with the
+    /// `pnpm store copy … failed to roll back` note; a copy that restored fine
+    /// but carries an ownership advisory keeps `success` and appends the
+    /// advisory verbatim (it already names the copy's file path); a clean copy
+    /// changes nothing.
+    #[test]
+    fn fold_copy_result_carries_advisories_and_failures() {
+        let copy = Path::new("/store/pkg@1.0.0_peer");
+        let clean = || RollbackResult {
+            package_key: "pkg:npm/a@1.0.0".to_string(),
+            package_path: "/store/pkg@1.0.0".to_string(),
+            success: true,
+            files_verified: vec![],
+            files_rolled_back: vec![],
+            error: None,
+            sidecar: None,
+        };
+
+        let mut primary = clean();
+        fold_copy_result(&mut primary, copy, clean());
+        assert!(primary.success && primary.error.is_none());
+
+        let advisory = "/store/pkg@1.0.0_peer/index.js: patched, but ownership could not be \
+                        restored to uid 1 gid 2: EPERM";
+        let mut primary = clean();
+        fold_copy_result(
+            &mut primary,
+            copy,
+            RollbackResult {
+                error: Some(advisory.to_string()),
+                ..clean()
+            },
+        );
+        assert!(primary.success, "an advisory never fails the result");
+        assert_eq!(primary.error.as_deref(), Some(advisory));
+
+        let mut primary = clean();
+        primary.error = Some("first".to_string());
+        fold_copy_result(
+            &mut primary,
+            copy,
+            RollbackResult {
+                success: false,
+                error: Some("boom".to_string()),
+                ..clean()
+            },
+        );
+        assert!(!primary.success);
+        assert_eq!(
+            primary.error.as_deref(),
+            Some("first; pnpm store copy /store/pkg@1.0.0_peer failed to roll back: boom")
+        );
+    }
+
     /// SECURITY (symlinked blob entry at the read site): a poisoned repo
     /// that commits `blobs/<hex>` as a symlink to an out-of-tree file must
     /// fail the package rollback WITHOUT reading through the link.
@@ -2068,7 +2283,7 @@ mod tests {
     /// Validate-before-write through the PACKAGE engine: verify never
     /// content-checks the blob (only lstat), so `blobs/<beforeHash>` holding
     /// wrong bytes verifies `Ready` — the corruption must then be caught by
-    /// `apply_file_patch`'s in-memory hash check BEFORE any disk write. The
+    /// `apply_file_patch_at`'s in-memory hash check BEFORE any disk write. The
     /// user-facing contract: corrupt blob => rollback fails, the patched
     /// file is left byte-identical, and no stage/cow litter is dropped.
     /// Package-engine twin of
@@ -2087,12 +2302,9 @@ mod tests {
             .await
             .unwrap();
         // Blob whose CONTENT does not match its name — verifies Ready.
-        tokio::fs::write(
-            blobs_dir.path().join(&before_hash),
-            b"corrupted blob bytes",
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(blobs_dir.path().join(&before_hash), b"corrupted blob bytes")
+            .await
+            .unwrap();
 
         let mut files = HashMap::new();
         files.insert(
@@ -2199,5 +2411,94 @@ mod tests {
         );
         // The entry survives — it must not be reported as removed.
         assert!(tokio::fs::symlink_metadata(&path).await.is_ok());
+    }
+
+    /// pnpm materializes one physical store copy per peer combination and
+    /// apply writes a patch-ADDED file into every copy. Rollback must
+    /// delete it from every copy too — including the heal case where the
+    /// primary is already original and only a twin still carries the file
+    /// (what an earlier single-copy rollback left behind).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rollback_package_patch_new_file_deleted_in_every_pnpm_peer_variant_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        let store = nm.join(".pnpm");
+
+        let added = b"file added by the patch\n";
+        let after_hash = compute_git_sha256_from_bytes(added);
+
+        let variants = [
+            store.join("foo@1.0.0(react@17.0.2)").join("node_modules"),
+            store.join("foo@1.0.0(react@18.2.0)").join("node_modules"),
+        ];
+        for entry_nm in &variants {
+            let pkg = entry_nm.join("foo");
+            tokio::fs::create_dir_all(&pkg).await.unwrap();
+            tokio::fs::write(
+                pkg.join("package.json"),
+                r#"{"name":"foo","version":"1.0.0"}"#,
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(pkg.join("added.js"), added).await.unwrap();
+        }
+        // Importer root: the direct dep symlinks to ONE of the variants —
+        // that is the primary the resolver hands rollback.
+        std::os::unix::fs::symlink(variants[0].join("foo"), nm.join("foo")).unwrap();
+        let primary = nm.join("foo");
+
+        let mut files = HashMap::new();
+        files.insert(
+            "package/added.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash,
+            },
+        );
+
+        let result = rollback_package_patch(
+            "pkg:npm/foo@1.0.0",
+            &primary,
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
+        assert!(result.success, "expected success: {:?}", result.error);
+        assert_eq!(
+            result.files_rolled_back,
+            vec!["package/added.js".to_string()]
+        );
+        for entry_nm in &variants {
+            assert!(
+                tokio::fs::symlink_metadata(entry_nm.join("foo").join("added.js"))
+                    .await
+                    .is_err(),
+                "the patch-added file must be deleted from EVERY store copy ({})",
+                entry_nm.display()
+            );
+        }
+
+        // Heal: primary already original, the twin still carries the file.
+        tokio::fs::write(variants[1].join("foo").join("added.js"), added)
+            .await
+            .unwrap();
+        let result = rollback_package_patch(
+            "pkg:npm/foo@1.0.0",
+            &primary,
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
+        assert!(result.success, "expected success: {:?}", result.error);
+        assert!(
+            tokio::fs::symlink_metadata(variants[1].join("foo").join("added.js"))
+                .await
+                .is_err(),
+            "an already-original primary must still heal a patched twin"
+        );
     }
 }

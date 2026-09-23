@@ -14,13 +14,14 @@ use socket_patch_core::api::blob_fetcher::{
     fetch_missing_blobs, fetch_missing_sources, format_fetch_result, get_missing_archives,
     get_missing_blobs, DownloadMode,
 };
-use socket_patch_core::api::client::get_api_client_with_overrides;
-use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::patch::apply::PatchSources;
+use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
+use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::patch::apply::{is_valid_blob_hash, PatchSources};
 use tempfile::TempDir;
 
-use super::get::{base64_decode, is_valid_blob_hash};
+use super::get::base64_decode;
 use crate::args::GlobalArgs;
+use crate::commands::bun_preflight::LedgerLoad;
 
 /// Resolved artifact locations for the patch pipeline. Holds the overlay
 /// `TempDir` alive — sources become invalid when this is dropped.
@@ -72,12 +73,24 @@ pub(crate) enum StageOutcome {
     Unavailable,
 }
 
+/// The disk stager's remedy: `repair` fills the persistent `.socket/`
+/// cache `apply` reads from.
+const APPLY_OFFLINE_REMEDY: &str = "Run \"socket-patch repair\" to download missing artifacts.";
+
+/// The memory stager's remedy. Vendored content is fetched into memory and
+/// never lands under `.socket/`; sending a vendored project to `repair`
+/// instead would populate `.socket/blobs/` — exactly the residue vendored
+/// mode promises not to leave (and from inside `repair --offline` the hint
+/// was self-referential).
+const VENDOR_OFFLINE_REMEDY: &str = "Re-run without --offline to fetch the missing patch \
+                                     content (kept in memory; nothing is written under .socket/).";
+
 /// Shared offline diagnostic: patches with no usable local source while
-/// `--offline` is set (first five PURLs, then the `repair` hint).
+/// `--offline` is set (first five PURLs, then the caller's `remedy` line).
 /// Prints even under `--silent` (errors only, NEVER nothing — an exit-1
 /// run with zero output is undiagnosable); `--json` mutes stderr and the
 /// caller's envelope is the machine channel instead.
-fn report_offline_missing(common: &GlobalArgs, purls: &[&str]) {
+fn report_offline_missing(common: &GlobalArgs, purls: &[&str], remedy: &str) {
     if common.json {
         return;
     }
@@ -91,7 +104,7 @@ fn report_offline_missing(common: &GlobalArgs, purls: &[&str]) {
     if purls.len() > 5 {
         eprintln!("  ... and {} more", purls.len() - 5);
     }
-    eprintln!("Run \"socket-patch repair\" to download missing artifacts.");
+    eprintln!("{remedy}");
 }
 
 /// The manifest PURLs with no usable local source. A patch is "locally
@@ -156,13 +169,16 @@ async fn overlay_dir(src: &Path, dst: &Path) {
 
 /// Resolve patch sources for `manifest`: read straight from `.socket/` when
 /// everything needed is cached (or `--offline`), else stage an overlay
-/// tempdir and fetch the gap. `Err` is a hard setup failure (bad
-/// `--download-mode`, tempdir creation); `Ok(Unavailable)` is the soft
-/// "cannot proceed" path with diagnostics already printed.
+/// tempdir and fetch the gap through `client` (the run's one API client —
+/// building another here repeated its advisory and org-slug resolution).
+/// `Err` is a hard setup failure (bad `--download-mode`, tempdir creation);
+/// `Ok(Unavailable)` is the soft "cannot proceed" path with diagnostics
+/// already printed.
 pub(crate) async fn stage_patch_sources(
     common: &GlobalArgs,
     manifest: &PatchManifest,
     socket_dir: &Path,
+    client: &ApiClient,
 ) -> Result<StageOutcome, String> {
     let quiet = common.silent || common.json;
     let socket_blobs_path = socket_dir.join("blobs");
@@ -191,7 +207,7 @@ pub(crate) async fn stage_patch_sources(
         // verification on its own; we still surface the no-source
         // diagnosis so the user runs `repair` before retrying.
         if !no_source_purls.is_empty() {
-            report_offline_missing(common, &no_source_purls);
+            report_offline_missing(common, &no_source_purls, APPLY_OFFLINE_REMEDY);
             return Ok(StageOutcome::Unavailable);
         }
     }
@@ -247,10 +263,8 @@ pub(crate) async fn stage_patch_sources(
         );
     }
 
-    let (client, _) = get_api_client_with_overrides(common.api_client_overrides()).await;
     let sources = staged.as_patch_sources();
-    let fetch_result =
-        fetch_missing_sources(manifest, &sources, download_mode, &client, None).await;
+    let fetch_result = fetch_missing_sources(manifest, &sources, download_mode, client, None).await;
 
     if !quiet {
         println!("{}", format_fetch_result(&fetch_result));
@@ -269,7 +283,7 @@ pub(crate) async fn stage_patch_sources(
                     still_missing_blobs.len()
                 );
             }
-            let blob_result = fetch_missing_blobs(manifest, &staged.blobs, &client, None).await;
+            let blob_result = fetch_missing_blobs(manifest, &staged.blobs, client, None).await;
             if !quiet {
                 println!("{}", format_fetch_result(&blob_result));
             }
@@ -351,11 +365,25 @@ pub(crate) enum MemStageOutcome {
 /// disk stager there is no hard-failure mode (no download-mode parse, no
 /// tempdir), so this returns the outcome directly — every failure is the
 /// soft `Unavailable`.
+///
+/// `ledger` is the caller's single `load_state` outcome (the harvest reads
+/// the committed artifacts it names; an unreadable ledger harvests
+/// nothing). `seed` pre-populates the in-memory blob set — the vendored
+/// download phase already holds every fetched view's `blobContent`, so a
+/// fresh `scan`/`get --mode vendored` never fetches a view a second time
+/// here; manifest-driven callers pass an empty map. `client` is the run's
+/// one API client (every CLI caller has one — building another here
+/// repeated its token advisory and org-slug round-trip, under the apply
+/// lock in `vendor`'s case); `None` builds one on demand, only once a fetch
+/// is actually needed (the unit tests' offline arms never get that far).
 pub(crate) async fn stage_vendor_sources_in_memory(
     common: &GlobalArgs,
     manifest: &PatchManifest,
     socket_dir: &Path,
     project_root: &Path,
+    ledger: LedgerLoad<'_>,
+    seed: HashMap<String, Vec<u8>>,
+    client: Option<&ApiClient>,
 ) -> MemStageOutcome {
     let quiet = common.silent || common.json;
     let blobs = socket_dir.join("blobs");
@@ -364,52 +392,57 @@ pub(crate) async fn stage_vendor_sources_in_memory(
 
     let missing_blobs = get_missing_blobs(manifest, &blobs).await;
     let missing_package_archives = get_missing_archives(manifest, &packages).await;
+    let mut mem = seed;
 
     // A diff archive alone is NOT a sufficient source here, unlike the disk
     // stager: vendoring runs the auto-force policy, where a beforeHash
     // mismatch (already-applied tree, patch built against different bytes)
     // is overwritten with the FULL after-blob — which a diff cannot
     // produce. On-disk diffs still serve Strategy 2 for clean files; the
-    // after-blob content must additionally exist (disk, harvest, or fetch).
+    // after-blob content must additionally exist (disk, seed/harvest, or
+    // fetch).
+    let covered = |record: &PatchRecord, mem: &HashMap<String, Vec<u8>>| {
+        record
+            .files
+            .values()
+            .all(|f| !missing_blobs.contains(&f.after_hash) || mem.contains_key(&f.after_hash))
+            || !missing_package_archives.contains(&record.uuid)
+    };
     let mut to_fetch: Vec<(&str, &str)> = manifest
         .patches
         .iter()
-        .filter_map(|(purl, record)| {
-            let all_blobs_present = record
-                .files
-                .values()
-                .all(|f| !missing_blobs.contains(&f.after_hash));
-            let pkg_present = !missing_package_archives.contains(&record.uuid);
-            if all_blobs_present || pkg_present {
-                None
-            } else {
-                Some((purl.as_str(), record.uuid.as_str()))
-            }
-        })
+        .filter(|(_, record)| !covered(record, &mem))
+        .map(|(purl, record)| (purl.as_str(), record.uuid.as_str()))
         .collect();
 
-    let mut mem = HashMap::new();
     if !to_fetch.is_empty() {
         // The committed vendor artifact IS the patched content: harvest its
         // afterHash blobs into memory so in-sync re-runs and fresh clones of
         // already-vendored projects stage with no network and no disk blobs.
-        mem = socket_patch_core::vendor::harvest_artifact_blobs(project_root, &manifest.patches)
-            .await;
-        if !mem.is_empty() {
-            to_fetch.retain(|(purl, _)| {
-                manifest.patches.get(*purl).is_none_or(|record| {
-                    !record.files.values().all(|f| {
-                        !missing_blobs.contains(&f.after_hash) || mem.contains_key(&f.after_hash)
-                    })
-                })
-            });
+        // Harvested bytes are hash-verified, so they win over a same-hash
+        // seed entry.
+        if let Ok(entries) = ledger {
+            mem.extend(
+                socket_patch_core::vendor::harvest_artifact_blobs_from(
+                    project_root,
+                    entries,
+                    &manifest.patches,
+                )
+                .await,
+            );
         }
+        to_fetch.retain(|(purl, _)| {
+            manifest
+                .patches
+                .get(*purl)
+                .is_none_or(|record| !covered(record, &mem))
+        });
     }
 
     if !to_fetch.is_empty() {
         if common.offline {
             let purls: Vec<&str> = to_fetch.iter().map(|(purl, _)| *purl).collect();
-            report_offline_missing(common, &purls);
+            report_offline_missing(common, &purls, VENDOR_OFFLINE_REMEDY);
             return MemStageOutcome::Unavailable;
         }
 
@@ -420,10 +453,19 @@ pub(crate) async fn stage_vendor_sources_in_memory(
             );
         }
 
-        let (client, _) = get_api_client_with_overrides(common.api_client_overrides()).await;
+        let built;
+        let client = match client {
+            Some(client) => client,
+            None => {
+                built = get_api_client_with_overrides(common.api_client_overrides())
+                    .await
+                    .0;
+                &built
+            }
+        };
         let mut failed: Vec<&str> = Vec::new();
         for (purl, uuid) in &to_fetch {
-            match client.fetch_patch(common.org.as_deref(), uuid).await {
+            match client.fetch_patch(uuid).await {
                 Ok(Some(patch)) => {
                     let mut complete = true;
                     for (file, info) in &patch.files {
@@ -529,6 +571,25 @@ mod tests {
         }
     }
 
+    /// A network-free client for the offline arms (never used: they return
+    /// before any fetch), built directly so no ambient token or socket-cli
+    /// config can leak into a unit test.
+    fn offline_client() -> ApiClient {
+        ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
+            api_url: "http://127.0.0.1:1".to_string(),
+            api_token: None,
+            use_public_proxy: false,
+            org_slug: None,
+        })
+    }
+
+    /// The client `dead_endpoint_args` describes (see there).
+    async fn dead_endpoint_client(args: &GlobalArgs) -> ApiClient {
+        get_api_client_with_overrides(args.api_client_overrides())
+            .await
+            .0
+    }
+
     /// Everything cached → read `.socket/` in place: no overlay tempdir, and
     /// the returned paths are the persistent cache dirs themselves.
     #[tokio::test]
@@ -538,9 +599,14 @@ mod tests {
         std::fs::create_dir_all(socket_dir.join("blobs")).unwrap();
         std::fs::write(socket_dir.join("blobs").join(HASH), b"patched").unwrap();
 
-        let outcome = stage_patch_sources(&offline_args(), &manifest_with_one_patch(), &socket_dir)
-            .await
-            .expect("no hard failure");
+        let outcome = stage_patch_sources(
+            &offline_args(),
+            &manifest_with_one_patch(),
+            &socket_dir,
+            &offline_client(),
+        )
+        .await
+        .expect("no hard failure");
         let StageOutcome::Ready(staged) = outcome else {
             panic!("fully-cached staging must be Ready");
         };
@@ -555,9 +621,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let socket_dir = tmp.path().join(".socket");
 
-        let outcome = stage_patch_sources(&offline_args(), &manifest_with_one_patch(), &socket_dir)
-            .await
-            .expect("no hard failure");
+        let outcome = stage_patch_sources(
+            &offline_args(),
+            &manifest_with_one_patch(),
+            &socket_dir,
+            &offline_client(),
+        )
+        .await
+        .expect("no hard failure");
         assert!(
             matches!(outcome, StageOutcome::Unavailable),
             "offline + no local source must be Unavailable"
@@ -581,9 +652,14 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = stage_patch_sources(&offline_args(), &manifest_with_one_patch(), &socket_dir)
-            .await
-            .expect("no hard failure");
+        let outcome = stage_patch_sources(
+            &offline_args(),
+            &manifest_with_one_patch(),
+            &socket_dir,
+            &offline_client(),
+        )
+        .await
+        .expect("no hard failure");
         assert!(
             matches!(outcome, StageOutcome::Ready(_)),
             "a present diff archive is a usable source for the disk stager"
@@ -612,12 +688,114 @@ mod tests {
             &manifest_with_one_patch(),
             &socket_dir,
             &project_root,
+            Ok(&HashMap::new()),
+            HashMap::new(),
+            None,
         )
         .await;
         assert!(
             matches!(outcome, MemStageOutcome::Unavailable),
             "vendor staging must not treat a diff archive as a usable source"
         );
+    }
+
+    /// The download phase's blob seed IS a source: with every after-hash
+    /// seeded, an offline run with no disk blobs, no archives and no
+    /// committed artifact is Ready and stages the seeded bytes (no fetch,
+    /// no harvest needed) — the vendored flows never fetch a view twice.
+    #[tokio::test]
+    async fn mem_stage_seeded_blobs_are_ready_offline_without_any_disk_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().join(".socket");
+        let project_root = tmp.path().join("proj");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let seed: HashMap<String, Vec<u8>> = [(HASH.to_string(), b"seeded".to_vec())].into();
+
+        let outcome = stage_vendor_sources_in_memory(
+            &offline_args(),
+            &manifest_with_one_patch(),
+            &socket_dir,
+            &project_root,
+            Ok(&HashMap::new()),
+            seed,
+            None,
+        )
+        .await;
+        let MemStageOutcome::Ready(staged) = outcome else {
+            panic!("a fully seeded stage must be Ready");
+        };
+        assert_eq!(
+            staged.mem.get(HASH).map(Vec::as_slice),
+            Some(&b"seeded"[..]),
+            "the seeded bytes are the staged content"
+        );
+        assert!(
+            !socket_dir.exists(),
+            "in-memory staging must not create .socket/"
+        );
+    }
+
+    /// A seed covering only SOME hashes still leaves the rest to the
+    /// ladder: offline with nothing else, the record is Unavailable (the
+    /// seed is merged, never treated as complete coverage).
+    #[tokio::test]
+    async fn mem_stage_partial_seed_still_needs_the_missing_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().join(".socket");
+        let project_root = tmp.path().join("proj");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let mut manifest = manifest_with_one_patch();
+        manifest
+            .patches
+            .get_mut("pkg:npm/left-pad@1.3.0")
+            .unwrap()
+            .files
+            .insert(
+                "other.js".to_string(),
+                PatchFileInfo {
+                    before_hash: "d".repeat(64),
+                    after_hash: "e".repeat(64),
+                },
+            );
+        let seed: HashMap<String, Vec<u8>> = [(HASH.to_string(), b"seeded".to_vec())].into();
+
+        let outcome = stage_vendor_sources_in_memory(
+            &offline_args(),
+            &manifest,
+            &socket_dir,
+            &project_root,
+            Ok(&HashMap::new()),
+            seed,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, MemStageOutcome::Unavailable),
+            "one seeded hash out of two is not coverage"
+        );
+    }
+
+    /// An unreadable ledger (`Err`) harvests nothing — and is not an
+    /// error here: the caller reports the corrupt ledger itself.
+    #[tokio::test]
+    async fn mem_stage_unreadable_ledger_skips_the_harvest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_dir = tmp.path().join(".socket");
+        let project_root = tmp.path().join("proj");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let err = std::io::Error::other("corrupt state.json");
+
+        let outcome = stage_vendor_sources_in_memory(
+            &offline_args(),
+            &manifest_with_one_patch(),
+            &socket_dir,
+            &project_root,
+            Err(&err),
+            HashMap::new(),
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, MemStageOutcome::Unavailable));
     }
 
     /// GlobalArgs wired to a guaranteed-unreachable API endpoint: explicit
@@ -656,10 +834,12 @@ mod tests {
         )
         .unwrap();
 
+        let args = dead_endpoint_args();
         let outcome = stage_patch_sources(
-            &dead_endpoint_args(),
+            &args,
             &manifest_with_one_patch(),
             &socket_dir,
+            &dead_endpoint_client(&args).await,
         )
         .await
         .expect("no hard failure");
@@ -687,9 +867,14 @@ mod tests {
             download_mode: "file".to_string(),
             ..dead_endpoint_args()
         };
-        let outcome = stage_patch_sources(&args, &manifest_with_one_patch(), &socket_dir)
-            .await
-            .expect("no hard failure");
+        let outcome = stage_patch_sources(
+            &args,
+            &manifest_with_one_patch(),
+            &socket_dir,
+            &dead_endpoint_client(&args).await,
+        )
+        .await
+        .expect("no hard failure");
         assert!(
             matches!(outcome, StageOutcome::Ready(_)),
             "a local diff archive covers the patch even when the blob download fails"
@@ -703,10 +888,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let socket_dir = tmp.path().join(".socket");
 
+        let args = dead_endpoint_args();
         let outcome = stage_patch_sources(
-            &dead_endpoint_args(),
+            &args,
             &manifest_with_one_patch(),
             &socket_dir,
+            &dead_endpoint_client(&args).await,
         )
         .await
         .expect("no hard failure");
@@ -726,7 +913,13 @@ mod tests {
             silent: true,
             ..GlobalArgs::default()
         };
-        let Err(err) = stage_patch_sources(&args, &manifest_with_one_patch(), tmp.path()).await
+        let Err(err) = stage_patch_sources(
+            &args,
+            &manifest_with_one_patch(),
+            tmp.path(),
+            &offline_client(),
+        )
+        .await
         else {
             panic!("an unparseable download mode is a hard failure");
         };
@@ -747,9 +940,14 @@ mod tests {
         std::fs::create_dir_all(socket_dir.join("blobs")).unwrap();
         std::fs::write(socket_dir.join("blobs").join(HASH), b"cached").unwrap();
 
-        let outcome = stage_patch_sources(&offline_args(), &manifest_with_one_patch(), &socket_dir)
-            .await
-            .expect("no hard failure");
+        let outcome = stage_patch_sources(
+            &offline_args(),
+            &manifest_with_one_patch(),
+            &socket_dir,
+            &offline_client(),
+        )
+        .await
+        .expect("no hard failure");
         let StageOutcome::Ready(mut staged) = outcome else {
             panic!("fully-cached staging must be Ready");
         };

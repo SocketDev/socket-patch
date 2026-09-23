@@ -384,18 +384,14 @@ fn normalize_config_vendor_dir(raw: &str) -> Option<String> {
     (!segments.is_empty()).then(|| segments.join("/"))
 }
 
-/// Read `config.vendor-dir` from a composer.json on disk. Opened with
-/// [`crate::utils::fs::open_regular_file`] for the same reason
+/// Read `config.vendor-dir` from a composer.json on disk. Read with
+/// [`crate::utils::fs::read_regular_to_string`] for the same reason
 /// installed.json is: the manifest belongs to the untrusted project, and
 /// a FIFO planted at that path would wedge a plain read forever.
 async fn read_config_vendor_dir(manifest_path: &Path) -> Option<String> {
-    use tokio::io::AsyncReadExt;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(manifest_path)
+    let content = crate::utils::fs::read_regular_to_string(manifest_path)
         .await
         .ok()?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await.ok()?;
     parse_config_vendor_dir(&content)
 }
 
@@ -528,8 +524,6 @@ fn is_safe_composer_name(name: &str) -> bool {
 /// `version`, or extra unexpected fields) is skipped rather than
 /// discarding every package in the file.
 async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
-    use tokio::io::AsyncReadExt;
-
     let installed_path = vendor_path.join("composer").join("installed.json");
 
     // The path lives inside the (untrusted) vendor tree: a planted FIFO
@@ -539,17 +533,12 @@ async fn read_installed_json(vendor_path: &Path) -> Vec<ComposerPackageEntry> {
     // mode (`--global` / `--global-prefix`) hands the vendor directory
     // straight here having only checked `is_dir`, and local mode's
     // `is_file` probe is a separate stat that the file can change under.
-    // Open via `open_regular_file` — non-blocking on Unix, rejecting
-    // FIFOs/devices/directories (see its docs). Twin of the npm
+    // Read via `read_regular_to_string` — non-blocking open on Unix,
+    // rejecting FIFOs/devices/directories (see its docs). Twin of the npm
     // crawler's `read_package_json` guard.
-    let Ok((mut file, metadata)) = crate::utils::fs::open_regular_file(&installed_path).await
-    else {
+    let Ok(content) = crate::utils::fs::read_regular_to_string(&installed_path).await else {
         return Vec::new();
     };
-    let mut content = String::with_capacity(metadata.len() as usize);
-    if file.read_to_string(&mut content).await.is_err() {
-        return Vec::new();
-    }
 
     let root: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,

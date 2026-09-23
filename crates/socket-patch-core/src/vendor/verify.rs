@@ -140,24 +140,13 @@ async fn verify_dir_members(dir: &Path, record: &PatchRecord) -> Result<(), Stri
 }
 
 fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
-    // Open non-blockingly and require a regular file: a FIFO planted at the
-    // artifact path would otherwise wedge the audit in `open(2)` waiting for
-    // a writer that never comes (mirrors `read_archive_to_map`; O_NONBLOCK
-    // has no effect on regular-file reads).
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(whl)
-            .map_err(|_| "vendor_artifact_unreadable".to_string())?
-    };
-    #[cfg(not(unix))]
-    let file = std::fs::File::open(whl).map_err(|_| "vendor_artifact_unreadable".to_string())?;
-    if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
-        return Err("vendor_artifact_unreadable".to_string());
-    }
+    // The shared guarded opener: non-blocking open + regular-file check on
+    // the handle, so a FIFO planted at the artifact path fails the audit
+    // instead of wedging it in `open(2)` waiting for a writer that never
+    // comes (mirrors `read_archive_to_map`). The handle is kept — the zip
+    // reader streams from it.
+    let (file, _metadata) = crate::utils::fs::open_regular_file_sync(whl)
+        .map_err(|_| "vendor_artifact_unreadable".to_string())?;
     let mut zip =
         zip::ZipArchive::new(file).map_err(|_| "vendor_artifact_unreadable".to_string())?;
     if zip.len() > MAX_WHEEL_ENTRIES {
@@ -403,16 +392,18 @@ pub async fn check_vendored_artifact(
 
 /// Plain sha256 hex of a regular file, size-capped; `None` on any read
 /// failure or cap breach. Public for repair's ledger re-synthesis (the
-/// rebuilt artifact's recorded sha).
+/// rebuilt artifact's recorded sha). Opens once through the shared guarded
+/// opener (`O_NONBLOCK` + fstat on the handle), so the size gate and the
+/// bytes hashed come from the same inode and a FIFO swapped in at the path
+/// can never wedge the health check in `open(2)`.
 pub async fn file_sha256_hex(path: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncReadExt;
 
-    let meta = tokio::fs::metadata(path).await.ok()?;
-    if !meta.is_file() || meta.len() > MAX_HEALTH_HASH_BYTES {
+    let (mut file, meta) = crate::utils::fs::open_regular_file(path).await.ok()?;
+    if meta.len() > MAX_HEALTH_HASH_BYTES {
         return None;
     }
-    let mut file = tokio::fs::File::open(path).await.ok()?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {

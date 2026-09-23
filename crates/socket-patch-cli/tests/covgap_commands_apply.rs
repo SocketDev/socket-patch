@@ -271,9 +271,7 @@ fn check_reports_wrong_replace_path_drift() {
     );
     // Committed copy whose file hashes exactly to afterHash — no
     // MissingCopy/StaleCopy noise.
-    let copy_dir = tmp
-        .path()
-        .join(".socket/go-patches/example.com/mod@v1.0.0");
+    let copy_dir = tmp.path().join(".socket/go-patches/example.com/mod@v1.0.0");
     std::fs::create_dir_all(&copy_dir).unwrap();
     std::fs::write(copy_dir.join("file.go"), patched).unwrap();
     // Socket-owned directive (target under .socket/go-patches/) pointing at
@@ -328,7 +326,10 @@ fn reconcile_announces_removed_stale_go_redirect_in_human_mode() {
     write_stale_go_redirect(tmp.path());
 
     let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
-    assert_eq!(code, 0, "pruning an orphan is a clean no-op; stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "pruning an orphan is a clean no-op; stderr={stderr}"
+    );
     assert!(
         stdout.contains("Removed 1 stale go patch redirect(s):"),
         "the removal must be announced; stdout={stdout}"
@@ -358,7 +359,10 @@ fn reconcile_dry_run_says_would_remove_and_touches_nothing() {
     let original_go_mod = write_stale_go_redirect(tmp.path());
 
     let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline", "--dry-run"], &[]);
-    assert_eq!(code, 0, "dry-run reconcile is a clean no-op; stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "dry-run reconcile is a clean no-op; stderr={stderr}"
+    );
     assert!(
         stdout.contains("Would remove 1 stale go patch redirect(s):"),
         "dry-run must use the conditional verb; stdout={stdout}"
@@ -540,7 +544,10 @@ fn empty_manifest_prints_no_patches_to_apply_in_human_mode() {
     write_manifest(tmp.path(), json!({}));
 
     let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
-    assert_eq!(code, 0, "an empty manifest is a clean no-op; stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "an empty manifest is a clean no-op; stderr={stderr}"
+    );
     assert!(
         stdout.contains("No patches to apply."),
         "the human no-op line must print; stdout={stdout}"
@@ -620,7 +627,10 @@ fn dry_run_after_apply_reports_already_patched_count() {
     );
 
     let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline", "--dry-run"], &[]);
-    assert_eq!(code, 0, "the dry-run re-check must succeed; stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "the dry-run re-check must succeed; stderr={stderr}"
+    );
     assert!(
         stdout.contains("Patch verification complete:"),
         "stdout={stdout}"
@@ -681,10 +691,7 @@ fn verbose_dry_run_prints_per_file_labels_and_hashes() {
         code, 1,
         "strict must fail the mismatched and missing packages; stderr={stderr}"
     );
-    assert!(
-        stdout.contains("Detailed verification:"),
-        "stdout={stdout}"
-    );
+    assert!(stdout.contains("Detailed verification:"), "stdout={stdout}");
     assert!(
         stdout.contains("package/index.js [already patched]"),
         "the already-patched label must render; stdout={stdout}"
@@ -752,7 +759,10 @@ fn bun_layout_prints_informational_note_in_human_mode() {
     std::fs::write(tmp.path().join("bun.lock"), "{}\n").unwrap();
 
     let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
-    assert_eq!(code, 0, "the bun note is informational only; stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "the bun note is informational only; stderr={stderr}"
+    );
     assert!(
         stderr.contains("Note: bun layout detected."),
         "the bun layout note must print on human stderr; stderr={stderr}"
@@ -862,11 +872,7 @@ mod gem_fallback_home_human {
 
     /// Human-mode apply with SOCKET_*/BUNDLE_* scrubbed, PATH = the
     /// fake-gem bin dir only, BUNDLE_PATH = the store root.
-    fn run_apply_human(
-        project: &Path,
-        bin_dir: &Path,
-        store_root: &Path,
-    ) -> (i32, String, String) {
+    fn run_apply_human(project: &Path, bin_dir: &Path, store_root: &Path) -> (i32, String, String) {
         let mut cmd = Command::new(common::binary());
         cmd.args(["apply", "--offline", "--ecosystems", "gem", "--cwd"])
             .arg(project);
@@ -1012,7 +1018,8 @@ fn vendored_gem_base_with_installed_tree_is_skipped_not_repatched() {
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run_apply(root, &["--offline", "--ecosystems", "gem", "--json"], &[]);
+    let (code, stdout, stderr) =
+        run_apply(root, &["--offline", "--ecosystems", "gem", "--json"], &[]);
     let env = parse_json_envelope(stdout.trim());
     assert_eq!(
         code, 0,
@@ -1038,6 +1045,65 @@ fn vendored_gem_base_with_installed_tree_is_skipped_not_repatched() {
         std::fs::read(&file).unwrap(),
         GEM_PRISTINE,
         "the loop-level skip must prevent a re-patch of the installed tree"
+    );
+}
+
+/// Vendored mode is manifest-free: a project vendored by `scan`/`get --mode
+/// vendored` has ONLY `.socket/vendor/state.json` (detached entries with
+/// embedded records) and no manifest. The hooked `apply` on such a project
+/// is the calm `noManifest` no-op — it never reads the ledger, never takes
+/// the lock (so never creates `apply.lock`) and leaves `.socket/` exactly as
+/// it found it: the committed artifacts ARE the patch.
+#[test]
+fn apply_on_ledger_only_vendored_project_is_a_no_manifest_no_op() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_root_package_json(root);
+    let uuid = "80808080-8080-4080-8080-808080808080";
+    let vendor_dir = root.join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    let ledger = serde_json::to_vec_pretty(&json!({
+        "version": 1,
+        "entries": { "pkg:npm/vend-only@1.0.0": {
+            "ecosystem": "npm",
+            "basePurl": "pkg:npm/vend-only@1.0.0",
+            "uuid": uuid,
+            "artifact": { "path": format!(".socket/vendor/npm/{uuid}/vend-only-1.0.0.tgz") },
+            "wiring": [],
+            "detached": true,
+            "record": patch_record(
+                uuid,
+                json!({ "package/index.js": {
+                    "beforeHash": git_sha256(MM_BEFORE),
+                    "afterHash": git_sha256(MM_AFTER),
+                }}),
+            ),
+        }}
+    }))
+    .unwrap();
+    std::fs::write(vendor_dir.join("state.json"), &ledger).unwrap();
+
+    let (code, stdout, stderr) = run_apply(root, &["--json"], &[]);
+    let env = parse_json_envelope(stdout.trim());
+    assert_eq!(code, 0, "envelope={env}\nstderr={stderr}");
+    assert_eq!(env["status"], "noManifest", "envelope: {env}");
+    assert_eq!(env["events"], json!([]), "envelope: {env}");
+
+    let mut names: Vec<String> = std::fs::read_dir(root.join(".socket"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["vendor"],
+        "apply must not touch .socket/ on a manifest-less project (no manifest, \
+         no blobs/, no apply.lock)"
+    );
+    assert_eq!(
+        std::fs::read(vendor_dir.join("state.json")).unwrap(),
+        ledger,
+        "the ledger survives byte-identical"
     );
 }
 
@@ -1071,7 +1137,8 @@ fn qualified_singleton_with_only_new_files_is_attempted_and_applied() {
     );
     stage_blob(root, &after_hash, SHIM);
 
-    let (code, stdout, stderr) = run_apply(root, &["--offline", "--ecosystems", "gem", "--json"], &[]);
+    let (code, stdout, stderr) =
+        run_apply(root, &["--offline", "--ecosystems", "gem", "--json"], &[]);
     let env = parse_json_envelope(stdout.trim());
     assert_eq!(
         code, 0,

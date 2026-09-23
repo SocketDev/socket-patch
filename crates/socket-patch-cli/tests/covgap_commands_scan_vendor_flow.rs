@@ -7,18 +7,19 @@
 //!   `scan_vendor_e2e.rs`);
 //! * the legal-but-never-executed `--dry-run --prune` combination in the
 //!   vendor JSON path (GC preview field names, nothing mutated);
-//! * every None-envelope error constructor of `run_scan_vendor_step` —
-//!   `lock_held`, `lock_io`, `invalid_manifest`, `socket_dir_unwritable` —
-//!   through the JSON error fold (which must NOT emit a `vendor` key when
-//!   no reconcile envelope rides the error);
-//! * the interactive (non-JSON) vendor-step error arm — the only error
-//!   output a terminal user sees when `scan --vendor` aborts at
-//!   lock/stage/manifest (the JSON twin is `scan_vendor_step_error_e2e.rs`).
+//! * every error constructor of `run_scan_vendor_step` — `lock_held`,
+//!   `lock_io` (a directory squatting on `apply.lock`; a file squatting on
+//!   `.socket` itself) and `no_local_source` — through the JSON error fold
+//!   (a lock failure precedes the step and carries NO `vendor` key; a
+//!   staging failure carries the step's envelope demoted to
+//!   `partialFailure`, events-less because nothing mutates before staging)
+//!   and the interactive `Error (code): message` line;
+//! * a corrupt legacy manifest, which vendored mode reports and steps
+//!   around (the manifest is not its record source).
 //!
-//! Fixtures are clones of `scan_vendor_e2e.rs` /
-//! `scan_vendor_step_error_e2e.rs` (each e2e file carries its own copy —
-//! the established pattern), plus `e2e_safety_lock.rs`'s external-flock
-//! trick for lock contention. Mock API only; no real hosts.
+//! Fixtures are clones of `scan_vendor_e2e.rs` (each e2e file carries its
+//! own copy — the established pattern), plus `e2e_safety_lock.rs`'s
+//! external-flock trick for lock contention. Mock API only; no real hosts.
 
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
@@ -39,9 +40,6 @@ const PURL: &str = "pkg:npm/left-pad@1.3.0";
 const ENCODED: &str = "pkg%3Anpm%2Fleft-pad%401.3.0";
 /// A manifest patch for a package that is NOT installed — prunable.
 const STALE_PURL: &str = "pkg:npm/uninstalled@1.0.0";
-/// A ledger entry with NO manifest patch — the reconcile reverts it.
-const DROPPED_PURL: &str = "pkg:npm/gone@9.9.9";
-const DROPPED_UUID: &str = "33333333-3333-4333-8333-333333333333";
 const BEFORE: &[u8] = b"before\n";
 const AFTER: &[u8] = b"after\n";
 /// base64 of AFTER, inlined as the view response's blobContent.
@@ -99,8 +97,12 @@ fn write_fixture(root: &Path) {
 /// Mount discovery (batch), per-package search, and the full view for
 /// `uuid` on the mock server.
 async fn mount_patch_api(mock: &MockServer, uuid: &str) {
-    let before_hash = git_sha256(BEFORE);
-    let after_hash = git_sha256(AFTER);
+    mount_discovery(mock, uuid).await;
+    mount_view(mock, uuid, /*with_blob_content=*/ true).await;
+}
+
+/// Mount discovery (batch) and the per-package search for `uuid`.
+async fn mount_discovery(mock: &MockServer, uuid: &str) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -138,19 +140,29 @@ async fn mount_patch_api(mock: &MockServer, uuid: &str) {
         })))
         .mount(mock)
         .await;
+}
+
+/// Mount the full patch view for `uuid`. Without `with_blob_content` the
+/// view carries the file hashes but no `blobContent`: the download phase
+/// still records the patch (it needs only the hashes), but the vendor
+/// step cannot obtain the patched bytes and staging fails
+/// (`no_local_source`) — independent of how many times the view is
+/// fetched along the way.
+async fn mount_view(mock: &MockServer, uuid: &str, with_blob_content: bool) {
+    let mut file = serde_json::json!({
+        "beforeHash": git_sha256(BEFORE),
+        "afterHash": git_sha256(AFTER),
+    });
+    if with_blob_content {
+        file["blobContent"] = serde_json::json!(AFTER_B64);
+    }
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{uuid}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "uuid": uuid,
             "purl": PURL,
             "publishedAt": "2026-01-01T00:00:00Z",
-            "files": {
-                "package/index.js": {
-                    "beforeHash": before_hash,
-                    "afterHash":  after_hash,
-                    "blobContent": AFTER_B64,
-                }
-            },
+            "files": { "package/index.js": file },
             "vulnerabilities": {},
             "description": "Vendor patch",
             "license": "MIT",
@@ -280,67 +292,12 @@ fn seed_stale_manifest(root: &Path) {
     .unwrap();
 }
 
-/// A committed manifest whose afterHash blob is NOT on disk: the vendor
-/// step must fetch the patch view to stage it, and the mock refuses
-/// (`mount_empty_discovery` mounts no view route).
-fn seed_unstageable_manifest(root: &Path) {
-    let socket = root.join(".socket");
-    std::fs::create_dir_all(&socket).unwrap();
-    let manifest = serde_json::json!({
-        "patches": {
-            PURL: {
-                "uuid": UUID,
-                "exportedAt": "2026-01-01T00:00:00Z",
-                "files": {
-                    "package/index.js": {
-                        "beforeHash": git_sha256(BEFORE),
-                        "afterHash": git_sha256(AFTER),
-                    }
-                },
-                "vulnerabilities": {},
-                "description": "Vendor patch",
-                "license": "MIT",
-                "tier": "free",
-            }
-        }
-    });
-    std::fs::write(
-        socket.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
-}
-
-/// A ledger holding one entry the manifest does not mention: the vendor
-/// step's `reconcile_dropped` reverts it (and rewrites `state.json`)
-/// before staging is even attempted.
-fn seed_dropped_ledger_entry(root: &Path) {
-    let vendor = root.join(".socket/vendor");
-    std::fs::create_dir_all(&vendor).unwrap();
-    std::fs::write(
-        vendor.join("state.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "version": 1,
-            "entries": { DROPPED_PURL: {
-                "ecosystem": "npm",
-                "basePurl": DROPPED_PURL,
-                "uuid": DROPPED_UUID,
-                "artifact": {
-                    "path": format!(".socket/vendor/npm/{DROPPED_UUID}/gone-9.9.9.tgz"),
-                },
-                "wiring": []
-            }}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-}
-
-/// Shared assertions for the None-envelope error fold: exit 1, a JSON
-/// envelope with `status: "error"`, the given `error.code`, a `download`
+/// Shared assertions for the vendor-step error fold: exit 1, a JSON
+/// envelope with `status: "error"`, the given `error.code` and a `download`
 /// sub-object (proof the run got PAST the download phase and died inside
-/// the vendor step) and NO `vendor` key (no reconcile envelope rode the
-/// error — `run_vendor_json_path`'s `if let Some(venv)` fall-through).
+/// the vendor step). Whether a `vendor` sub-object rides along depends on
+/// WHERE the step died — see [`assert_no_vendor_envelope`] (lock failures)
+/// and [`assert_demoted_empty_vendor_envelope`] (staging failures).
 fn assert_vendor_step_error(
     code: i32,
     stdout: &str,
@@ -356,11 +313,34 @@ fn assert_vendor_step_error(
         v["download"].is_object(),
         "the run must reach the vendor step (download phase completed); envelope={v}"
     );
+    v
+}
+
+/// A lock failure happens BEFORE the step builds its envelope: no `vendor`
+/// sub-object may be fabricated for it (get's fold pins the same in
+/// `covgap_commands_get::vendored_lock_held_vendor_step_errors_without_vendor_envelope`).
+fn assert_no_vendor_envelope(v: &serde_json::Value) {
     assert!(
         !v.as_object().unwrap().contains_key("vendor"),
-        "a None-envelope error must not fabricate a vendor sub-object; envelope={v}"
+        "a pre-lock failure has no vendor envelope to carry; envelope={v}"
     );
-    v
+}
+
+/// A staging failure happens AFTER the lock, inside the step: the fold
+/// carries the step's envelope demoted to `partialFailure` (a consumer
+/// reading `.vendor.status` inside a `"status":"error"` result must not
+/// see the fresh-envelope default `success`) and events-less — nothing
+/// mutates before staging, so there is no work to report.
+fn assert_demoted_empty_vendor_envelope(v: &serde_json::Value) {
+    assert_eq!(
+        v["vendor"]["status"], "partialFailure",
+        "the carried envelope's status must be demoted; envelope={v}"
+    );
+    assert_eq!(
+        v["vendor"]["events"],
+        serde_json::json!([]),
+        "nothing mutates before staging, so the aborted step reports no events; envelope={v}"
+    );
 }
 
 /// Dry-run preview, same-uuid case: an entry already vendored at the
@@ -429,7 +409,11 @@ async fn scan_vendor_dry_run_prune_previews_gc_without_mutating() {
 
     // The vendor dry-run preview ran (empty discovery ⇒ empty preview).
     assert_eq!(v["vendor"]["dryRun"], true, "envelope={v}");
-    assert_eq!(v["vendor"]["patches"], serde_json::json!([]), "envelope={v}");
+    assert_eq!(
+        v["vendor"]["patches"],
+        serde_json::json!([]),
+        "envelope={v}"
+    );
 
     // The GC preview: the stale entry is PRUNABLE (preview vocabulary),
     // not "pruned" (the mutating pass's vocabulary).
@@ -456,27 +440,59 @@ async fn scan_vendor_dry_run_prune_previews_gc_without_mutating() {
         manifest_before,
         "a dry-run prune must not GC the manifest"
     );
+    // Residue-free: no lock file left behind, no vendor tree conjured (the
+    // fixture seeds `.socket/manifest.json`, so a leak would hide inside the
+    // pre-existing directory).
+    assert!(
+        !tmp.path().join(".socket/apply.lock").exists(),
+        "a dry-run prune leaves no lock file"
+    );
+    assert!(
+        !tmp.path().join(".socket/vendor").exists(),
+        "a dry-run prune conjures no .socket/vendor"
+    );
+
+    // And it TAKES no lock: under an externally held apply.lock the preview
+    // still lists (a lock-taking run would report lock_held instead).
+    let _held = take_external_lock(&tmp.path().join(".socket"));
+    let (code, stdout, stderr) =
+        run_scan_vendor(tmp.path(), &mock.uri(), &["--dry-run", "--prune"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["vendor"]["dryRun"], true, "envelope={v}");
+    assert_eq!(
+        v["gc"]["prunableManifestEntries"],
+        serde_json::json!([STALE_PURL]),
+        "the lock-free preview lists under a held lock: {v}"
+    );
+    assert!(
+        v.get("error").is_none(),
+        "no lock_held under a held lock: {v}"
+    );
 }
 
-/// An externally-held `.socket/apply.lock` fails the vendor step with the
-/// contract `lock_held` code + the stable contention message, folded into
-/// scan's own JSON error shape (not an `acquire_or_emit` Envelope).
+/// An externally-held `.socket/apply.lock` fails the vendor step (after
+/// the manifest-free download phase fetched the record) with the contract
+/// `lock_held` code + the stable contention message — no `--lock-timeout`,
+/// so no "(waited …)" clause — folded into scan's own JSON error shape
+/// (not an `acquire_or_emit` Envelope). Nothing is vendored.
 #[tokio::test]
 async fn scan_vendor_lock_held_reports_json_error() {
     let mock = MockServer::start().await;
-    mount_empty_discovery(&mock).await;
+    mount_patch_api(&mock, UUID).await;
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path());
-    seed_unstageable_manifest(tmp.path());
     let _external = take_external_lock(&tmp.path().join(".socket"));
 
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     let v = assert_vendor_step_error(code, &stdout, &stderr, "lock_held");
+    assert_no_vendor_envelope(&v);
     assert_eq!(
-        v["error"]["message"],
-        "another socket-patch process is operating in this directory",
+        v["error"]["message"], "another socket-patch process is operating in this directory",
         "the contention message is contract; envelope={v}"
     );
+    assert_eq!(v["download"]["downloaded"], 1, "envelope={v}");
+    assert!(!tmp.path().join(".socket/vendor").exists());
 }
 
 /// A DIRECTORY squatting on `.socket/apply.lock` makes the lock file
@@ -486,63 +502,126 @@ async fn scan_vendor_lock_held_reports_json_error() {
 #[tokio::test]
 async fn scan_vendor_lock_io_reports_json_error() {
     let mock = MockServer::start().await;
-    mount_empty_discovery(&mock).await;
+    mount_patch_api(&mock, UUID).await;
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path());
-    seed_unstageable_manifest(tmp.path());
     std::fs::create_dir_all(tmp.path().join(".socket/apply.lock")).unwrap();
 
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
-    assert_vendor_step_error(code, &stdout, &stderr, "lock_io");
+    let v = assert_vendor_step_error(code, &stdout, &stderr, "lock_io");
+    assert_no_vendor_envelope(&v);
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("apply.lock")),
+        "the I/O reason names the lock file; envelope={v}"
+    );
 }
 
-/// A corrupt committed manifest: scan's EARLY tolerant read swallows the
-/// parse error (`.ok().flatten()`), so the run proceeds all the way to
-/// the vendor step, whose own `read_manifest` surfaces the corruption as
-/// `invalid_manifest` — the same code the `vendor` command uses.
+/// A corrupt committed manifest is not vendored mode's record source:
+/// scan's early tolerant read swallows the parse error, the run vendors
+/// normally (exit 0), and only the post-vendor legacy-record migration
+/// notices — reporting `vendor_manifest_migration_failed` on the vendor
+/// envelope's `warnings[]` and leaving the file byte-identical for the
+/// operator (the `vendor` command, whose work list it is, still fails
+/// closed on it).
 #[tokio::test]
-async fn scan_vendor_corrupt_manifest_reports_invalid_manifest() {
+async fn scan_vendor_corrupt_manifest_is_reported_and_stepped_around() {
     let mock = MockServer::start().await;
-    mount_empty_discovery(&mock).await;
+    mount_patch_api(&mock, UUID).await;
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path());
     std::fs::create_dir_all(tmp.path().join(".socket")).unwrap();
     std::fs::write(tmp.path().join(".socket/manifest.json"), b"{not json").unwrap();
 
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
-    assert_vendor_step_error(code, &stdout, &stderr, "invalid_manifest");
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success", "envelope={v}");
+    assert_eq!(v["vendor"]["summary"]["applied"], 1, "envelope={v}");
+    assert!(
+        v["vendor"]["warnings"]
+            .as_array()
+            .is_some_and(|ws| ws.iter().any(|w| {
+                w["code"] == "vendor_manifest_migration_failed"
+                    && w["detail"].as_str().unwrap_or("").contains("manifest.json")
+            })),
+        "the unreadable manifest must be reported; envelope={v}"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join(".socket/manifest.json")).unwrap(),
+        b"{not json",
+        "the corrupt manifest is left for the operator"
+    );
+    assert!(tmp
+        .path()
+        .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"))
+        .is_file());
 }
 
 /// A regular FILE squatting on `.socket` itself: scan's earlier phases
-/// tolerate it (the manifest read degrades to None, the ledger load to an
-/// empty set), so the run reaches the vendor step and dies exactly at its
-/// `create_dir_all(socket_dir)` guard — `socket_dir_unwritable`.
+/// tolerate it (the ledger load degrades to an empty set on a non-Bun
+/// project), so the run reaches the vendor step, whose `acquire` cannot
+/// create the lock directory — `lock_io`, the file left untouched.
 #[tokio::test]
-async fn scan_vendor_socket_dir_file_reports_unwritable() {
+async fn scan_vendor_socket_dir_file_reports_lock_io() {
     let mock = MockServer::start().await;
-    mount_empty_discovery(&mock).await;
+    mount_patch_api(&mock, UUID).await;
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path());
     std::fs::write(tmp.path().join(".socket"), b"not a dir").unwrap();
 
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
-    assert_vendor_step_error(code, &stdout, &stderr, "socket_dir_unwritable");
+    let v = assert_vendor_step_error(code, &stdout, &stderr, "lock_io");
+    assert_no_vendor_envelope(&v);
+    assert_eq!(
+        std::fs::read(tmp.path().join(".socket")).unwrap(),
+        b"not a dir",
+        "the squatting file survives"
+    );
 }
 
-/// The interactive (non-JSON) vendor-step error arm: same unstageable
-/// fixture as `scan_vendor_step_error_e2e.rs`, `--json` dropped. The
-/// human arm must exit 1 with the `Error (code): message` line on stderr
-/// — and the reconcile that ran BEFORE the staging failure must still
-/// have persisted its ledger rewrite (human mode reports less, it must
-/// not DO less).
+/// The JSON vendor-step error fold for a staging failure: the download
+/// phase recorded the patch (hashes only), but the view serves no blob
+/// content, so the vendor step cannot stage it and the run aborts
+/// `no_local_source` with a `download` object and the step's own `vendor`
+/// envelope carried through the fold — demoted to `partialFailure`, with
+/// no events (nothing mutated before staging) — and creates nothing under
+/// `.socket/`. Contract: the `vendor` sub-object is present whenever the
+/// step ran; `get --mode vendored` shares the fold
+/// (`covgap_commands_get::get_uuid_vendored_vendor_step_error_leaves_legacy_state_alone`).
+#[tokio::test]
+async fn scan_vendor_staging_error_reports_json_error() {
+    let mock = MockServer::start().await;
+    mount_discovery(&mock, UUID).await;
+    mount_view(&mock, UUID, /*with_blob_content=*/ false).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    let v = assert_vendor_step_error(code, &stdout, &stderr, "no_local_source");
+    assert_demoted_empty_vendor_envelope(&v);
+    assert_eq!(
+        v["error"]["message"], "patch artifacts unavailable (offline or download failure)",
+        "envelope={v}"
+    );
+    assert_eq!(v["download"]["downloaded"], 1, "envelope={v}");
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "an aborted step leaves no .socket/ behind (lock file and empty dir removed)"
+    );
+}
+
+/// The interactive (non-JSON) twin of the staging failure: exit 1 with
+/// the `Error (code): message` line on stderr, no JSON envelope on
+/// stdout, nothing vendored.
 #[tokio::test]
 async fn scan_vendor_staging_error_interactive_prints_error_line() {
     let mock = MockServer::start().await;
-    mount_empty_discovery(&mock).await;
+    mount_discovery(&mock, UUID).await;
+    mount_view(&mock, UUID, /*with_blob_content=*/ false).await;
     let tmp = tempfile::tempdir().unwrap();
     write_fixture(tmp.path());
-    seed_unstageable_manifest(tmp.path());
-    seed_dropped_ledger_entry(tmp.path());
 
     let (code, stdout, stderr) = run_cli(
         tmp.path(),
@@ -561,7 +640,7 @@ async fn scan_vendor_staging_error_interactive_prints_error_line() {
 
     assert_eq!(
         code, 1,
-        "an unstageable manifest must fail the run; stdout={stdout}; stderr={stderr}"
+        "an unstageable record must fail the run; stdout={stdout}; stderr={stderr}"
     );
     assert!(
         stderr.contains(
@@ -575,12 +654,8 @@ async fn scan_vendor_staging_error_interactive_prints_error_line() {
         serde_json::from_str::<serde_json::Value>(stdout.trim()).is_err(),
         "the interactive arm must not print a JSON envelope; stdout={stdout}"
     );
-    // The pre-failure reconcile still persisted: the ledger's only entry
-    // was reverted, so `save_state` deleted state.json (disk truth is the
-    // human arm's only record of the mutation).
     assert!(
-        !tmp.path().join(".socket/vendor/state.json").exists(),
-        "the reconcile must persist even when the run aborts at staging; \
-         stdout={stdout}; stderr={stderr}"
+        !tmp.path().join(".socket").exists(),
+        "an aborted step leaves no .socket/ behind; stdout={stdout}; stderr={stderr}"
     );
 }

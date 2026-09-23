@@ -117,13 +117,22 @@ async fn remove_with_rollback_full_chain() {
         serde_json::from_str(&std::fs::read_to_string(socket.join("manifest.json")).unwrap())
             .unwrap();
     assert_eq!(m["patches"].as_object().unwrap().len(), 0);
-    // 3. Blobs no longer referenced — cleanup should have removed them.
-    let blobs_remaining: Vec<_> = std::fs::read_dir(&blobs).unwrap().flatten().collect();
+    // 3. Blobs no longer referenced — cleanup removed them, and the
+    //    emptied store directory with them.
     assert!(
-        blobs_remaining.is_empty(),
-        "blob cleanup must remove orphaned blobs after remove; still present: {:?}",
-        blobs_remaining
+        !blobs.exists(),
+        "blob cleanup must remove the orphaned blobs and the emptied .socket/blobs/; left: {:?}",
+        std::fs::read_dir(&blobs)
+            .map(|rd| rd.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+            .unwrap_or_default()
     );
+    // 4. The lock file never outlives the run; the (now empty) manifest is
+    //    project state and keeps `.socket/` alive.
+    assert!(
+        !socket.join("apply.lock").exists(),
+        "apply.lock must be removed when the command's lock guard drops"
+    );
+    assert!(socket.join("manifest.json").exists());
 }
 
 #[tokio::test]
@@ -710,13 +719,13 @@ async fn repair_offline_with_present_blobs_succeeds() {
     );
 }
 
-/// Regression: `remove` is the documented per-purl exit path for detached
-/// vendored patches (`scan --vendor --detached`), and detached mode writes
-/// NO manifest (scan_vendor_e2e pins "detached mode must not create a
-/// manifest"). But `remove`'s pre-flight manifest-existence gate returned
-/// `manifest_not_found` (exit 1) before the detached branch could run, so
-/// on a pure-detached project — the primary detached scenario — the exit
-/// path was unreachable. The ledger stayed wired forever.
+/// Regression: `remove` is the documented per-purl exit path for vendored
+/// (ledger-only) patches — `scan --mode vendored` keeps its records in the
+/// vendor ledger and writes NO manifest (scan_vendor_e2e pins that). But
+/// `remove`'s pre-flight manifest-existence gate returned
+/// `manifest_not_found` (exit 1) before the ledger branch could run, so on
+/// a vendored project — the primary scenario — the exit path was
+/// unreachable. The ledger stayed wired forever.
 #[tokio::test]
 #[serial]
 async fn remove_detached_vendored_without_manifest_reverts() {
@@ -724,9 +733,9 @@ async fn remove_detached_vendored_without_manifest_reverts() {
     let purl = "pkg:npm/detached-only@1.0.0";
     let uuid = "55555555-5555-4555-8555-555555555555";
 
-    // What `scan --vendor --detached` leaves behind: ledger + artifact,
-    // no `.socket/manifest.json`. Empty wiring makes the npm revert a
-    // pure offline artifact-dir delete.
+    // What `scan --mode vendored` leaves behind: ledger + artifact, no
+    // `.socket/manifest.json`. Empty wiring makes the npm revert a pure
+    // offline artifact-dir delete.
     let vendor = tmp.path().join(".socket/vendor");
     let artifact_dir = vendor.join("npm").join(uuid);
     std::fs::create_dir_all(&artifact_dir).unwrap();
@@ -780,10 +789,13 @@ async fn remove_detached_vendored_without_manifest_reverts() {
         !artifact_dir.exists(),
         "the vendored artifact must be deleted on remove"
     );
-    // And no manifest was conjured into being along the way.
+    // And no manifest was conjured into being along the way — in fact the
+    // full reversal leaves NO `.socket/` at all: the emptied ledger and
+    // its `vendor/` levels are pruned, and the lock guard removes
+    // `apply.lock` and the then-empty directory.
     assert!(
-        !tmp.path().join(".socket/manifest.json").exists(),
-        "remove must not create a manifest on a pure-detached project"
+        !tmp.path().join(".socket").exists(),
+        "a fully reverted vendored project keeps no .socket/ residue"
     );
 }
 
@@ -834,7 +846,7 @@ async fn repair_telemetry_attributed_to_env_credentials() {
     std::env::set_var("SOCKET_ORG_SLUG", ORG);
     // The telemetry kill-switch must not be ambiently on, or the oracle
     // below would fail for the wrong reason (`is_telemetry_disabled`
-    // reads these at runtime).
+    // reads these at runtime — `VITEST=true` included).
     std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
     std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
     std::env::remove_var("SOCKET_OFFLINE");

@@ -112,40 +112,11 @@ pub async fn fetch_missing_blobs(
         return FetchMissingBlobsResult::default();
     }
 
-    // Ensure blobs directory exists
-    if let Err(e) = tokio::fs::create_dir_all(blobs_path).await {
-        return all_failed_result(
-            missing.iter(),
-            &format!("Cannot create blobs directory: {}", e),
-        );
-    }
-
+    // `blobs_path` is created by the first successful write
+    // (`write_cache_entry_atomic`), never up front: a fetch that lands
+    // nothing leaves no `.socket/blobs/` husk behind.
     let hashes: Vec<String> = missing.into_iter().collect();
     download_hashes(&hashes, blobs_path, client, on_progress).await
-}
-
-/// Build a [`FetchMissingBlobsResult`] whose entries are all failures
-/// for the same reason. Used by the early-return branches that hit a
-/// blocker (e.g. cannot create blobs dir) before any download attempt.
-fn all_failed_result<'a>(
-    items: impl IntoIterator<Item = &'a String>,
-    error: &str,
-) -> FetchMissingBlobsResult {
-    let results: Vec<BlobFetchResult> = items
-        .into_iter()
-        .map(|hash| BlobFetchResult {
-            hash: hash.clone(),
-            success: false,
-            error: Some(error.to_string()),
-        })
-        .collect();
-    let failed = results.len();
-    FetchMissingBlobsResult {
-        total: failed,
-        failed,
-        results,
-        ..FetchMissingBlobsResult::default()
-    }
 }
 
 /// Download specific blobs identified by their hashes.
@@ -164,15 +135,9 @@ pub async fn fetch_blobs_by_hash(
         return FetchMissingBlobsResult::default();
     }
 
-    // Ensure blobs directory exists
-    if let Err(e) = tokio::fs::create_dir_all(blobs_path).await {
-        return all_failed_result(
-            hashes.iter(),
-            &format!("Cannot create blobs directory: {}", e),
-        );
-    }
-
-    // Filter out hashes that already exist on disk
+    // Filter out hashes that already exist on disk (an absent `blobs_path`
+    // simply means none do; the dir is created by the first successful
+    // write, never up front).
     let mut to_download: Vec<String> = Vec::new();
     let mut skipped: usize = 0;
     let mut results: Vec<BlobFetchResult> = Vec::new();
@@ -271,13 +236,8 @@ async fn fetch_missing_diff_archives(
         return FetchMissingBlobsResult::default();
     }
 
-    if let Err(e) = tokio::fs::create_dir_all(archives_dir).await {
-        return all_failed_result(
-            missing.iter(),
-            &format!("Cannot create archives directory: {}", e),
-        );
-    }
-
+    // `archives_dir` is created by the first successful write, never up
+    // front (see `fetch_missing_blobs`).
     let uuids: Vec<String> = missing.into_iter().collect();
     let total = uuids.len();
     let mut downloaded = 0usize;
@@ -422,6 +382,13 @@ async fn write_cache_entry_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "blob".to_string());
+    // The cache directory (`.socket/blobs/`, `.socket/diffs/`) is created
+    // here, on the first verified download, and nowhere earlier: a fetch
+    // that lands nothing (all 404, offline, every hash mismatched) must not
+    // leave an empty directory behind for the user to commit. An
+    // uncreatable parent surfaces as this entry's write failure, like any
+    // other disk error.
+    tokio::fs::create_dir_all(parent).await?;
     // Leading dot keeps the stage out of editor/glob views; the uuid suffix
     // keeps concurrent writers of the same entry from colliding.
     let stage = parent.join(format!(".socket-dl-{}-{}", stem, uuid::Uuid::new_v4()));

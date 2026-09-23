@@ -745,11 +745,20 @@ def main():
         return sorted({p.get("errorCode") for p in envelope.get("apply", {}).get("patches", []) if p.get("errorCode")})
 
     def record_hashes(project, mode):
-        ledger = project / (".socket/vendor/redirect-state.json" if mode == "hosted" else ".socket/manifest.json")
+        """The first patch record the mode's store holds: the redirect ledger's
+        `records` (hosted), the vendor ledger entry's embedded `record`
+        (vendored — vendored mode never writes `.socket/manifest.json`), or the
+        manifest's `patches` (agent)."""
+        ledger = project / {"hosted": ".socket/vendor/redirect-state.json", "vendored": ".socket/vendor/state.json"}.get(mode, ".socket/manifest.json")
         if not ledger.exists():
             return {}, {}, None
         data = json.loads(ledger.read_text(encoding="utf-8"))
-        recs = data.get("records" if mode == "hosted" else "patches") or {}
+        if mode == "hosted":
+            recs = data.get("records") or {}
+        elif mode == "vendored":
+            recs = {k: e.get("record") for k, e in (data.get("entries") or {}).items() if e.get("record")}
+        else:
+            recs = data.get("patches") or {}
         if not recs:
             return {}, {}, None
         rec = next(iter(recs.values()))
@@ -764,12 +773,12 @@ def main():
         if mode == "hosted":
             p = project / ".socket/vendor/redirect-state.json"
             return not p.exists() or not json.loads(p.read_text(encoding="utf-8")).get("records")
-        mf = project / ".socket/manifest.json"
-        cleared = not mf.exists() or json.loads(mf.read_text(encoding="utf-8")).get("patches") in ({}, None)
         if mode == "vendored":
+            # Vendored mode is manifest-free: the ledger is the only store.
             st = project / ".socket/vendor/state.json"
-            cleared = cleared and (not st.exists() or not json.loads(st.read_text(encoding="utf-8")).get("entries"))
-        return cleared
+            return not st.exists() or not json.loads(st.read_text(encoding="utf-8")).get("entries")
+        mf = project / ".socket/manifest.json"
+        return not mf.exists() or json.loads(mf.read_text(encoding="utf-8")).get("patches") in ({}, None)
 
     def oracle(version, project, penv, hashes, log):
         _, pdm, _ = tool_paths(version)
@@ -972,11 +981,10 @@ def main():
                 st = project / ".socket/vendor/state.json"
                 entries = json.loads(st.read_text(encoding="utf-8")).get("entries") if st.exists() else None
                 check("noPatchWiring", not entries and not any((project / ".socket/vendor/pypi").glob("*/*.whl")), {"vendorEntries": sorted(entries or {})})
-            # A refused vendored patch still leaves a `.socket/manifest.json`
-            # record behind (observed on the PR head); recorded, not judged.
-            mf = project / ".socket/manifest.json"
-            leftover = sorted((json.loads(mf.read_text(encoding="utf-8")).get("patches") or {}) if mf.exists() else {})
-            info["manifestLeftover"] = leftover
+            # Vendored mode is manifest-free (v5.0): a refused vendored scan
+            # must not leave a `.socket/manifest.json` record behind either.
+            if mode == "vendored":
+                check("noManifestWritten", not (project / ".socket/manifest.json").exists())
             uninstall("uninstall.log")
             r, ok = native_sync("native-install.log")
             if not ok and applied == 0:
@@ -989,9 +997,6 @@ def main():
                 # Not refused after all: run the full flow and say so.
                 row["unexpected"] = "the CLI rewrote a lock the harness expected it to refuse"
             else:
-                if leftover:
-                    rb = Run(cli_cmd(project, "rollback"), project, cenv, case / "rollback.log", timeout=900)
-                    info["rollbackAfterRefusal"] = {"exit": rb.rc, "manifestCleared": ledger_cleared(project, "agent"), "lockUnchanged": (project / lockname).read_bytes() == pristine_lock}
                 return finish("REFUSED-EXPECTED" if all(checks.values()) else "FAIL")
 
         if mode == "agent":
@@ -1262,8 +1267,8 @@ def render_details(summary):
         if "ordinaryInstall" in info:
             o = info["ordinaryInstall"]
             notes.append(f"pdm install exit {o.get('exit')} lockStable={o.get('lockStable')} baselineFresh={o.get('baselineFresh')} patched={info.get('ordinaryInstallPatched')}")
-        if info.get("manifestLeftover"):
-            notes.append(f"refusal left {len(info['manifestLeftover'])} manifest record(s); rollback exit {info.get('rollbackAfterRefusal', {}).get('exit')} cleared={info.get('rollbackAfterRefusal', {}).get('manifestCleared')}")
+        if r.get("checks", {}).get("noManifestWritten") is False:
+            notes.append("refused vendored scan wrote a `.socket/manifest.json` record (vendored mode must be manifest-free)")
         if "lockCheck" in info:
             notes.append(f"lock --check exit {info['lockCheck'].get('exit')}")
         if "tamper" in info:
@@ -1355,8 +1360,8 @@ def render_doc_table(summary):
         dropped = [c for c in hosted + vendored if c.get("info", {}).get("relock", {}).get("targetKept") is False]
         if dropped:
             notes.append("relock dropped urllib3 1.26.18 (`" + ",".join(sorted({c["shape"] for c in dropped})) + "`: pinned resolution, no overrides on this release); re-scan then has nothing to redirect and rollback of the stale ledger exits " + "/".join(sorted({str(c["info"].get("rollbackAfterRelock", {}).get("exit")) for c in dropped})))
-        if any(c.get("info", {}).get("manifestLeftover") for c in vendored):
-            notes.append("refused vendored scan still writes a `.socket/manifest.json` record")
+        if any(c.get("checks", {}).get("noManifestWritten") is False for c in vendored):
+            notes.append("refused vendored scan wrote a `.socket/manifest.json` record (vendored mode must be manifest-free)")
         relocked = [c for c in hosted + vendored if c.get("info", {}).get("ordinaryInstall", {}).get("lockStable") is False]
         if relocked:
             shapes_ = ",".join(sorted({c["shape"] for c in relocked}))

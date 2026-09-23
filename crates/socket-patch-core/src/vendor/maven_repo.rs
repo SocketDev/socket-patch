@@ -63,22 +63,28 @@ use serde_json::Value;
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 
+use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::utils::fs::{atomic_write_bytes, atomic_write_bytes_preserving_mode};
+use crate::utils::fs::{
+    atomic_write_bytes, atomic_write_bytes_preserving_mode, read_regular_to_bytes,
+    read_regular_to_string,
+};
 use crate::utils::purl::{build_maven_purl, parse_maven_purl};
+use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
-    already_patched_result, done, failed_result, rebuild_zip, refused, synthesized_result,
-    zip_matches_after_hashes,
+    already_patched_result, any_live_file_references, done, failed_result,
+    prune_empty_vendor_levels, read_zip_artifact, rebuild_zip, refused, synthesized_result,
+    zip_bytes_match_after_hashes,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
 use super::service_fetch::{service_archive_copy, ServiceCopy};
 use super::state::{
-    write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -135,32 +141,6 @@ fn group_id_to_path(group_id: &str) -> String {
 /// `is_safe_maven_coordinate` group half. Fails closed on tampered coordinates.
 fn is_safe_group_id(group_id: &str) -> bool {
     group_id.split('.').all(is_safe_single_segment)
-}
-
-/// Guarded read shared in shape with the vendor twins (cargo.rs, gem.rs,
-/// composer_lock.rs …): `open_regular_file` opens with `O_NONBLOCK` and
-/// rejects non-regular files, so a FIFO planted at any of this backend's read
-/// paths — the committed vendored tree, the project `pom.xml`, the `~/.m2`
-/// cache — fails fast instead of wedging the caller forever in an `open(2)`
-/// waiting for a writer that never comes.
-async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
-/// String twin of [`read_regular`] (invalid UTF-8 errors as `InvalidData`,
-/// matching `tokio::fs::read_to_string`).
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Vendor a Maven package: rebuild a patched `.jar` under a committed maven2
@@ -385,6 +365,7 @@ pub async fn vendor_maven(
         Ok(text) => text,
         Err(detail) => {
             let _ = remove_tree(&uuid_dir).await;
+            prune_empty_vendor_levels(&uuid_dir).await;
             result.success = false;
             result.error = Some(detail);
             return done(result, None, warnings);
@@ -393,6 +374,7 @@ pub async fn vendor_maven(
     if let Err(e) = atomic_write_bytes_preserving_mode(&pom_xml_path, new_pom_xml.as_bytes()).await
     {
         let _ = remove_tree(&uuid_dir).await;
+        prune_empty_vendor_levels(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write {}: {e}", pom_xml_path.display()));
         return done(result, None, warnings);
@@ -401,14 +383,7 @@ pub async fn vendor_maven(
     // ── marker + ledger entry ─────────────────────────────────────────────
     let base_purl = build_maven_purl(group_id, artifact_id, version);
     let marker = VendorMarker::new("maven", &base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&uuid_dir, &marker).await {
-        // Informational only (state.json is the ledger of record) — a marker
-        // failure must not fail an otherwise-wired vendor.
-        warnings.push(VendorWarning::new(
-            "vendor_marker_write_failed",
-            format!("could not write {}: {e}", super::state::VENDOR_MARKER_FILE),
-        ));
-    }
+    write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
 
     // The single wiring record is the authoritative revert record: it carries
     // the whole-file pre/post pom.xml snapshot. `Added` because we ADD a
@@ -458,6 +433,13 @@ pub async fn vendor_maven(
 /// edits survive) and remove the validated uuid dir. A drifted live pom.xml —
 /// our block already gone, a re-generated pom — is left alone with a
 /// `vendor_lock_entry_drifted` warning.
+///
+/// Drift-keep: when a record was left alone and the live pom.xml STILL names
+/// the uuid dir (an unrecognized or truncated record over a wired pom, a
+/// hand-edited `<repository>`), the artifact is kept and `kept_artifact`
+/// tells the caller to keep the ledger entry too — deleting it would strand
+/// the `<repository>` at a gone path. A pom that no longer references the
+/// dir has converged: the drift is warned about and the artifact removed.
 pub async fn revert_maven(
     entry: &VendorEntry,
     project_root: &Path,
@@ -525,26 +507,38 @@ pub async fn revert_maven_opts(
         }
     }
 
-    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
-    // (and the caller keeps the ledger entry), so only the deletion is
-    // skipped.
-    if !dry_run && !keep_artifact {
-        if let Err(e) = remove_tree(&uuid_dir).await {
-            return RevertOutcome {
-                kept_artifact: false,
-                success: false,
-                warnings,
-                error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
-            };
-        }
-    }
-
-    RevertOutcome {
+    let mut outcome = RevertOutcome {
         kept_artifact: false,
         success: true,
         warnings,
         error: None,
+    };
+    if dry_run {
+        return outcome;
     }
+    // Drift-keep (see the fn doc): never delete a uuid dir the live pom
+    // still routes Maven at.
+    if outcome.drift_skipped()
+        && any_live_file_references(project_root, &[PROJECT_POM], &uuid_dir_rel).await
+    {
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
+    // (and the caller keeps the ledger entry), so only the deletion is
+    // skipped.
+    if keep_artifact {
+        return outcome;
+    }
+    // The last maven entry leaves `.socket/vendor/maven/` (and
+    // `.socket/vendor/`) empty: the shared helper prunes them so a
+    // reverted project carries no vendor residue (non-recursive:
+    // siblings keep them).
+    if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
+        outcome.success = false;
+        outcome.error = Some(format!("failed to remove {}: {e}", uuid_dir.display()));
+    }
+    outcome
 }
 
 // ── materialisation (service download / local rebuild) ──────────────────────────
@@ -627,6 +621,7 @@ async fn materialise_and_write(
     if let Err(e) = write_maven_artifact(leaf_dir, jar_leaf, &jar_bytes, pom_leaf, &pom_bytes).await
     {
         let _ = remove_tree(uuid_dir).await;
+        prune_empty_vendor_levels(uuid_dir).await;
         return Ok((Vec::new(), failed_result(purl, jar_path, e)));
     }
     Ok((jar_bytes, result))
@@ -722,7 +717,7 @@ async fn acquire_upstream_pom(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<Vec<u8>, String> {
     let local = installed_dir.join(format!("{artifact_id}-{version}.pom"));
-    match read_regular(&local).await {
+    match read_regular_to_bytes(&local).await {
         Ok(bytes) => return Ok(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("unreadable local pom {}: {e}", local.display())),
@@ -773,17 +768,13 @@ async fn fetch_pom_bytes(url: &str) -> Result<Vec<u8>, String> {
     if !resp.status().is_success() {
         return Err(format!("GET {url}: HTTP {}", resp.status()));
     }
-    let bytes = resp
-        .bytes()
+    // Enforce the cap on the declared Content-Length AND on the streamed
+    // bytes (the shared reader every other registry download uses): a
+    // mirror serving a huge body is refused mid-stream instead of being
+    // buffered whole before the size check.
+    crate::utils::http::read_capped(resp, MAX_POM_BYTES as u64, "pom")
         .await
-        .map_err(|e| format!("read body of {url}: {e}"))?;
-    if bytes.len() > MAX_POM_BYTES {
-        return Err(format!(
-            "pom at {url} is {} bytes (cap {MAX_POM_BYTES})",
-            bytes.len()
-        ));
-    }
-    Ok(bytes.to_vec())
+        .map_err(|e| format!("{url}: {e}"))
 }
 
 /// Dry-run verify-only: extract the local jar to a private stage and run the
@@ -841,7 +832,7 @@ async fn dry_run_verify(
 /// entry fail-closed. Returns the live [`tempfile::TempDir`] (the caller holds
 /// it for the stage's lifetime).
 async fn extract_jar_to_stage(src_jar: &Path) -> Result<tempfile::TempDir, String> {
-    let bytes = read_regular(src_jar)
+    let bytes = read_regular_to_bytes(src_jar)
         .await
         .map_err(|e| format!("cannot read {}: {e}", src_jar.display()))?;
     let stage = tempfile::tempdir().map_err(|e| format!("cannot create stage dir: {e}"))?;
@@ -884,16 +875,28 @@ async fn artifact_in_sync(
     pom_leaf: &str,
     files: &HashMap<String, PatchFileInfo>,
 ) -> bool {
-    if !zip_matches_after_hashes(&leaf_dir.join(jar_leaf), files).await {
+    // One guarded read of the jar serves both the member-hash check and its
+    // `.sha1` sidecar compare (the hot path runs on every re-run).
+    let Some(jar) = read_zip_artifact(&leaf_dir.join(jar_leaf)).await else {
+        return false;
+    };
+    if !zip_bytes_match_after_hashes(&jar, files) {
         return false;
     }
-    // The pom + both sidecars must exist and match their bytes.
-    sidecar_matches(leaf_dir, jar_leaf).await && sidecar_matches(leaf_dir, pom_leaf).await
+    let Ok(recorded) = read_regular_to_string(&leaf_dir.join(format!("{jar_leaf}.sha1"))).await
+    else {
+        return false;
+    };
+    if recorded.trim() != sha1_hex(&jar) {
+        return false;
+    }
+    // The pom + its sidecar must exist and match their bytes too.
+    sidecar_matches(leaf_dir, pom_leaf).await
 }
 
 /// True when `<leaf>.sha1` exists and equals the hex sha1 of `<leaf>`'s bytes.
 async fn sidecar_matches(leaf_dir: &Path, leaf: &str) -> bool {
-    let Ok(bytes) = read_regular(&leaf_dir.join(leaf)).await else {
+    let Ok(bytes) = read_regular_to_bytes(&leaf_dir.join(leaf)).await else {
         return false;
     };
     let Ok(recorded) = read_regular_to_string(&leaf_dir.join(format!("{leaf}.sha1"))).await else {
@@ -1783,9 +1786,10 @@ mod tests {
             drifted,
             "drifted pom.xml left alone"
         );
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
         assert!(
             !root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
-            "uuid dir still removed"
+            "a converged pom names nothing under .socket/vendor: the uuid dir is removed"
         );
     }
 
@@ -1932,6 +1936,11 @@ mod tests {
                 .unwrap(),
             regenerated,
             "the user's regenerated pom is left alone"
+        );
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            !root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
+            "a regenerated pom names nothing under .socket/vendor: the uuid dir is removed"
         );
     }
 
@@ -2581,8 +2590,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (r2, e2, _w2) =
-            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let (r2, e2, _w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(!r2.success, "a blob-less rebuild cannot succeed");
         assert!(r2.error.is_some(), "the failure carries a detail");
         assert!(e2.is_none(), "a failed rebuild must not re-record");
@@ -2760,7 +2768,9 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "the vendor is recorded despite the marker");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "the marker failure is surfaced as a warning: {warnings:?}"
         );
         let pom_xml = tokio::fs::read_to_string(root.join(PROJECT_POM))
@@ -2808,9 +2818,11 @@ mod tests {
     }
 
     /// An unrecognized wiring kind (forward-compat / tampered state.json) is
-    /// warned about and left alone while the artifact is still removed.
+    /// warned about and left alone; the live pom still names the uuid dir,
+    /// so the artifact is drift-kept (deleting it would strand the
+    /// `<repository>` at a gone path).
     #[tokio::test]
-    async fn revert_unrecognized_wiring_kind_warns_but_removes_artifact() {
+    async fn revert_unrecognized_wiring_kind_warns_and_keeps_the_referenced_artifact() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
         let (result, entry, _w) =
@@ -2836,14 +2848,24 @@ mod tests {
             wired,
             "the unrecognized wiring is left in place"
         );
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
         assert!(
-            !root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
-            "the artifact is still removed"
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep is surfaced: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
+            "the artifact the live pom still names is kept"
         );
     }
 
     /// A wiring record missing its `key` (tampered/truncated state.json) is
-    /// tolerated as drift — `<unknown>` in the warning, pom.xml untouched.
+    /// tolerated as drift — `<unknown>` in the warning, pom.xml untouched;
+    /// the still-wired pom keeps the artifact.
     #[tokio::test]
     async fn revert_tolerates_wiring_key_missing() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
@@ -2870,14 +2892,23 @@ mod tests {
             wired,
             "pom.xml untouched when the record is unusable"
         );
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
         assert!(
-            !root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
-            "the artifact is still removed"
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep is surfaced: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
+            "the artifact the live pom still names is kept"
         );
     }
 
     /// A wiring record whose `original` is not a string is tolerated as drift;
-    /// pom.xml is untouched.
+    /// pom.xml is untouched and, still wired, keeps the artifact.
     #[tokio::test]
     async fn revert_tolerates_wiring_original_missing() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
@@ -2903,6 +2934,19 @@ mod tests {
             tokio::fs::read(root.join(PROJECT_POM)).await.unwrap(),
             wired,
             "pom.xml untouched when the record is unusable"
+        );
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep is surfaced: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
+            "the artifact the live pom still names is kept"
         );
     }
 
@@ -2955,7 +2999,9 @@ mod tests {
             unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(result.success);
         let entry = entry.unwrap();
-        tokio::fs::remove_file(root.join(PROJECT_POM)).await.unwrap();
+        tokio::fs::remove_file(root.join(PROJECT_POM))
+            .await
+            .unwrap();
 
         let outcome = revert_maven(&entry, root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
@@ -3075,7 +3121,9 @@ mod tests {
             unwrap_done(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
         assert!(result.success, "{:?}", result.error);
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_prebuilt_downloaded"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_downloaded"),
             "the service download is surfaced: {warnings:?}"
         );
         assert_eq!(
@@ -3105,10 +3153,13 @@ mod tests {
     async fn service_mode_offline_refuses_before_any_write() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
-        let cfg = service_cfg(None, crate::vendor::VendorSource::Service, /*offline=*/ true);
-        let (code, _d) = unwrap_refused(
-            run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await,
+        let cfg = service_cfg(
+            None,
+            crate::vendor::VendorSource::Service,
+            /*offline=*/ true,
         );
+        let (code, _d) =
+            unwrap_refused(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
         assert_eq!(code, "vendor_service_offline_conflict");
         assert!(!root.join(".socket").exists(), "refusal writes nothing");
         let pom_xml = tokio::fs::read_to_string(root.join(PROJECT_POM))
@@ -3126,7 +3177,9 @@ mod tests {
         let uuid_dir = root.join(format!(".socket/vendor/maven/{UUID}"));
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         // create_dir_all of <uuid>/org/... fails on the planted regular file.
-        tokio::fs::write(uuid_dir.join("org"), b"squatter").await.unwrap();
+        tokio::fs::write(uuid_dir.join("org"), b"squatter")
+            .await
+            .unwrap();
 
         let (result, entry, _w) =
             unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
@@ -3210,13 +3263,19 @@ mod tests {
         let (dir, blobs, installed, record) =
             fixture(Some(project_pom()), true, /*with_local_pom=*/ false).await;
         let root = dir.path();
-        let cfg = service_cfg(Some(&server.uri()), crate::vendor::VendorSource::Auto, false);
+        let cfg = service_cfg(
+            Some(&server.uri()),
+            crate::vendor::VendorSource::Auto,
+            false,
+        );
         let (result, entry, warnings) =
             unwrap_done(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some());
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_maven_pom_downloaded"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_maven_pom_downloaded"),
             "the pom download is surfaced: {warnings:?}"
         );
         let vendored_pom = root.join(format!("{}/commons-text-1.10.0.pom", leaf_rel()));
@@ -3225,10 +3284,9 @@ mod tests {
             UPSTREAM_POM,
             "the downloaded pom is vendored verbatim"
         );
-        let pom_sha1 = tokio::fs::read_to_string(root.join(format!(
-            "{}/commons-text-1.10.0.pom.sha1",
-            leaf_rel()
-        )))
+        let pom_sha1 = tokio::fs::read_to_string(
+            root.join(format!("{}/commons-text-1.10.0.pom.sha1", leaf_rel())),
+        )
         .await
         .unwrap();
         assert_eq!(pom_sha1.trim(), sha1_hex(UPSTREAM_POM));
@@ -3254,10 +3312,13 @@ mod tests {
         let (dir, blobs, installed, record) =
             fixture(Some(project_pom()), true, /*with_local_pom=*/ false).await;
         let root = dir.path();
-        let cfg = service_cfg(Some(&server.uri()), crate::vendor::VendorSource::Auto, false);
-        let (code, detail) = unwrap_refused(
-            run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await,
+        let cfg = service_cfg(
+            Some(&server.uri()),
+            crate::vendor::VendorSource::Auto,
+            false,
         );
+        let (code, detail) =
+            unwrap_refused(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
         assert_eq!(code, "vendor_maven_pom_unavailable");
         assert!(
             detail.contains("registry fetch failed"),
@@ -3299,9 +3360,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(pom_route))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_bytes(vec![0u8; MAX_POM_BYTES + 1]),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; MAX_POM_BYTES + 1]))
             .mount(&server)
             .await;
         let err = fetch_pom_bytes(&format!("{}{pom_route}", server.uri()))
@@ -3390,8 +3449,10 @@ mod tests {
     #[test]
     fn profiles_masking_edge_branches() {
         // Decoy: <profilesX> is not <profiles> — the real section is wireable.
-        let decoy = "<project><profilesX>x</profilesX>\n  <repositories>\n  </repositories>\n</project>\n";
-        let out = build_repo_edit(decoy, "socket-patch-vendor-x", ".socket/vendor/maven/x").unwrap();
+        let decoy =
+            "<project><profilesX>x</profilesX>\n  <repositories>\n  </repositories>\n</project>\n";
+        let out =
+            build_repo_edit(decoy, "socket-patch-vendor-x", ".socket/vendor/maven/x").unwrap();
         assert!(out.contains("<id>socket-patch-vendor-x</id>"));
         assert_eq!(
             out.matches("</repositories>").count(),
@@ -3492,7 +3553,9 @@ mod tests {
             "  <properties>\n  </properties>\n</project>",
             1,
         );
-        tokio::fs::write(root.join(PROJECT_POM), &edited).await.unwrap();
+        tokio::fs::write(root.join(PROJECT_POM), &edited)
+            .await
+            .unwrap();
 
         let outcome = revert_maven(&entry, root, /*dry_run=*/ true).await;
         assert!(outcome.success, "{:?}", outcome.error);

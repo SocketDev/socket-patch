@@ -1,4 +1,4 @@
-use socket_patch_cli::{commands, parse_with_uuid_fallback, Commands};
+use socket_patch_cli::{commands, parse_argv_with_shortcuts, Commands};
 use socket_patch_core::utils::env_compat::{promote_legacy_env_vars, promote_peer_env_vars};
 use socket_patch_core::utils::socket_cli_config;
 
@@ -65,7 +65,7 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let cli = match parse_with_uuid_fallback(argv) {
+    let cli = match parse_argv_with_shortcuts(argv) {
         Ok(cli) => cli,
         Err(err) => err.exit(),
     };

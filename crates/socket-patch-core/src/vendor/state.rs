@@ -23,14 +23,17 @@
 //! flavor strings they have no backend for. Both keep an old binary safe
 //! against a newer project checkout.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::{atomic_write_bytes, read_regular_to_bytes};
+use crate::utils::purl::{patch_matches, strip_purl_qualifiers};
 use crate::utils::serde::serialize_sorted;
+use crate::utils::socket_dir::{prune_empty_dirs, remove_file_and_prune, write_json_ledger};
 
 use super::path::VENDOR_DIR;
 
@@ -246,19 +249,44 @@ pub struct VendorEntry {
     /// pypi/pipenv extras.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipenv: Option<PipenvMeta>,
-    /// True when vendored without a manifest record (`scan --vendor
-    /// --detached`). The manifest reconcile must not revert such an entry —
-    /// it is never "dropped from the manifest" because it was never in it;
-    /// [`VendorEntry::record`] is the verification source instead.
+    /// True when vendored WITHOUT a manifest record — the posture of every
+    /// `scan` / `get --mode vendored` entry (vendored mode writes no
+    /// `.socket/manifest.json`); only the manifest-driven standalone
+    /// `vendor` command records `false`. The manifest reconcile must not
+    /// revert a detached entry — it is never "dropped from the manifest"
+    /// because it was never in it; [`VendorEntry::record`] is the
+    /// verification source instead. Always serialized when true so older
+    /// readers keep the same exemption.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub detached: bool,
     /// The embedded patch record for detached entries (afterHashes,
-    /// vulnerabilities, description, tier) — present iff `detached`. Trust
-    /// class: the same committed-file trust as `.socket/manifest.json`; the
-    /// artifact is still re-verified against these afterHashes and
-    /// `checked_artifact_path`'s uuid cross-checks before any disk access.
+    /// vulnerabilities, description, tier) — present iff `detached`, and the
+    /// ONLY verification source for such an entry. Trust class: the same
+    /// committed-file trust as `.socket/manifest.json`; the artifact is still
+    /// re-verified against these afterHashes and `checked_artifact_path`'s
+    /// uuid cross-checks before any disk access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub record: Option<crate::manifest::schema::PatchRecord>,
+    pub record: Option<PatchRecord>,
+}
+
+impl VendorEntry {
+    /// Does this entry, stored under ledger `key`, match a remove/rollback
+    /// identifier? By its ledger key or by its base purl (mirroring the
+    /// manifest matching of [`patch_matches`]; a golang key is case-encoded
+    /// while `base_purl` holds the decoded spelling users type), or by uuid.
+    pub fn matches_identifier(&self, key: &str, identifier: &str) -> bool {
+        patch_matches(key, &self.uuid, identifier)
+            || patch_matches(&self.base_purl, &self.uuid, identifier)
+    }
+
+    /// Does this entry, stored under ledger `key`, own the manifest purl
+    /// `purl`? The ledger-key / qualifier-stripped-key / base-purl triple —
+    /// the per-entry form of the set [`VendorState::purl_keys`] flattens.
+    pub fn covers_purl(&self, key: &str, purl: &str) -> bool {
+        key == purl
+            || strip_purl_qualifiers(key) == strip_purl_qualifiers(purl)
+            || self.base_purl == strip_purl_qualifiers(purl)
+    }
 }
 
 /// The ledger.
@@ -275,6 +303,25 @@ impl VendorState {
             version: VENDOR_STATE_VERSION,
             entries: HashMap::new(),
         }
+    }
+
+    /// Every purl spelling under which this ledger's entries are
+    /// addressable: each entry's map key (the manifest purl, possibly
+    /// qualified), its resolved base purl, and the qualifier-stripped key.
+    /// The one derivation behind every whole-set vendor-ownership match
+    /// (apply / rollback / remove / scan prune); [`super::vendored_purl_keys`]
+    /// is its load-then-derive convenience.
+    pub fn purl_keys(&self) -> HashSet<String> {
+        self.entries
+            .iter()
+            .flat_map(|(key, entry)| {
+                [
+                    key.clone(),
+                    entry.base_purl.clone(),
+                    strip_purl_qualifiers(key).to_string(),
+                ]
+            })
+            .collect()
     }
 }
 
@@ -446,9 +493,15 @@ fn state_path(project_root: &Path) -> PathBuf {
 /// instead of bricking every vendor-adjacent command (`remove`, `vendor`,
 /// `repair`) with `vendor_state_unreadable`. Such a file carries no vendor
 /// data by construction, so nothing is guessed.
+///
+/// The bytes come from the (untrusted) project tree through the FIFO-safe
+/// [`read_regular_to_bytes`] — non-blocking on Unix, rejecting FIFOs /
+/// devices / directories — so a planted special file fails loudly instead of
+/// wedging every vendor-adjacent command on an `open(2)` that waits forever
+/// for a writer; same guard as the sibling redirect ledger.
 pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
     let path = state_path(project_root);
-    match read_state_bytes(&path).await {
+    match read_regular_to_bytes(&path).await {
         Ok(bytes) => serde_json::from_slice(&bytes).or_else(|e| {
             if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if value.get("mode").is_some() && value.get("entries").is_none() {
@@ -465,48 +518,30 @@ pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
     }
 }
 
-/// Read the ledger bytes from the (untrusted) project tree. Opens via
-/// [`open_regular_file`](crate::utils::fs::open_regular_file) — non-blocking
-/// on Unix, rejecting FIFOs/devices/directories — so a planted special file
-/// fails loudly instead of wedging every vendor-adjacent command (`vendor`,
-/// `remove`, `repair`) on a FIFO `open(2)` that waits forever for a writer;
-/// same guard as the sibling redirect ledger.
-async fn read_state_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
 /// Persist the ledger atomically with sorted keys + 2-space indent + trailing
-/// newline (deterministic bytes — the file is committed). An EMPTY ledger
-/// deletes `state.json` and prunes `.socket/vendor/` when that leaves it
-/// empty, so a fully-reverted project carries no vendor residue.
+/// newline (deterministic bytes — the file is committed; a byte-identical
+/// ledger is not rewritten). An EMPTY ledger deletes `state.json` and prunes
+/// `.socket/vendor/` when that leaves it empty, so a fully-reverted project
+/// carries no vendor residue below `.socket/` itself (the lock guard's
+/// level). A failed unlink propagates before any prune.
 pub async fn save_state(project_root: &Path, state: &VendorState) -> std::io::Result<()> {
     let path = state_path(project_root);
-    if state.entries.is_empty() {
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        // Prune now-empty ecosystem levels, then .socket/vendor itself.
-        // `remove_dir` is non-recursive: a dir still holding artifacts (or
-        // anything we don't own) fails harmlessly and is kept.
-        let vendor_root = project_root.join(VENDOR_DIR);
-        for eco in super::path::ECOSYSTEM_DIRS {
-            let _ = tokio::fs::remove_dir(vendor_root.join(eco)).await;
-        }
-        let _ = tokio::fs::remove_dir(&vendor_root).await;
-        return Ok(());
+    if !state.entries.is_empty() {
+        return write_json_ledger(&path, state).await;
     }
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    let socket_dir = project_root.join(SOCKET_DIR);
+    // Delete the ledger; a read-only parent surfaces here, before anything
+    // is pruned.
+    remove_file_and_prune(&path, &socket_dir).await?;
+    // Backstop for ecosystem-level husks left by per-unit reverts that did
+    // not prune their own parents. `remove_dir` is non-recursive: a dir
+    // still holding artifacts (or anything we don't own) is kept, and then
+    // so is `.socket/vendor/`.
+    let vendor_root = project_root.join(VENDOR_DIR);
+    for eco in super::path::ECOSYSTEM_DIRS {
+        prune_empty_dirs(&vendor_root.join(eco), &socket_dir).await;
     }
-    let mut bytes = serde_json::to_vec_pretty(state).map_err(std::io::Error::other)?;
-    bytes.push(b'\n');
-    atomic_write_bytes(&path, &bytes).await
+    Ok(())
 }
 
 /// The informational marker written inside each vendored unit
@@ -559,6 +594,25 @@ pub(crate) async fn write_marker(uuid_dir: &Path, marker: &VendorMarker) -> std:
     atomic_write_bytes(&uuid_dir.join(VENDOR_MARKER_FILE), &bytes).await
 }
 
+/// [`write_marker`], downgrading a failure to ONE `vendor_marker_write_failed`
+/// warning on `warnings`. The marker is belt-and-braces metadata — never a
+/// trust input (sweep/verify key off state.json + the path uuid) — so its
+/// failure must not undo an otherwise fully-wired vendor. Every backend's
+/// fresh and rebuild paths report it through here so the code and wording
+/// cannot drift.
+pub(crate) async fn write_marker_or_warn(
+    uuid_dir: &Path,
+    marker: &VendorMarker,
+    warnings: &mut Vec<super::VendorWarning>,
+) {
+    if let Err(e) = write_marker(uuid_dir, marker).await {
+        warnings.push(super::VendorWarning::new(
+            "vendor_marker_write_failed",
+            format!("could not write the informational vendor marker {VENDOR_MARKER_FILE}: {e}"),
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,6 +658,72 @@ mod tests {
             pdm: None,
             pipenv: None,
         }
+    }
+
+    /// Every spelling `purl_keys` promises: the (possibly qualified,
+    /// percent-encoded) map key, the entry's base purl and the
+    /// qualifier-stripped key; an empty ledger yields the empty set.
+    #[test]
+    fn purl_keys_carry_every_spelling() {
+        let mut state = VendorState::new();
+        let mut entry = sample_entry();
+        entry.base_purl = "pkg:npm/@scope/pkg@1.0.0".into();
+        state
+            .entries
+            .insert("pkg:npm/%40scope/pkg@1.0.0?artifact_id=x".into(), entry);
+        let keys = state.purl_keys();
+        for spelling in [
+            "pkg:npm/%40scope/pkg@1.0.0?artifact_id=x",
+            "pkg:npm/%40scope/pkg@1.0.0",
+            "pkg:npm/@scope/pkg@1.0.0",
+        ] {
+            assert!(keys.contains(spelling), "missing {spelling}: {keys:?}");
+        }
+        assert_eq!(keys.len(), 3);
+        assert!(VendorState::new().purl_keys().is_empty());
+    }
+
+    /// `matches_identifier`: ledger key, base purl (the decoded spelling a
+    /// golang user types) and uuid all address the entry; a foreign purl or
+    /// uuid does not.
+    #[test]
+    fn entry_matches_identifier_by_key_base_purl_or_uuid() {
+        let mut entry = sample_entry();
+        entry.ecosystem = "golang".into();
+        entry.base_purl = "pkg:golang/github.com/BurntSushi/toml@1.0.0".into();
+        let key = "pkg:golang/github.com/!burnt!sushi/toml@1.0.0";
+        assert!(entry.matches_identifier(key, key));
+        assert!(entry.matches_identifier(key, "pkg:golang/github.com/BurntSushi/toml@1.0.0"));
+        assert!(entry.matches_identifier(key, UUID));
+        assert!(!entry.matches_identifier(key, "pkg:golang/github.com/BurntSushi/toml@2.0.0"));
+        assert!(!entry.matches_identifier(key, "00000000-0000-4000-8000-000000000000"));
+
+        // A qualified pypi key: the base identifier covers it, another
+        // variant's qualifier does not.
+        let mut entry = sample_entry();
+        entry.base_purl = "pkg:pypi/requests@2.28.0".into();
+        let key = "pkg:pypi/requests@2.28.0?artifact_id=abc";
+        assert!(entry.matches_identifier(key, "pkg:pypi/requests@2.28.0"));
+        assert!(entry.matches_identifier(key, key));
+        assert!(!entry.matches_identifier(key, "pkg:pypi/requests@2.28.0?artifact_id=zzz"));
+    }
+
+    /// `covers_purl`: the exact key, a qualifier-stripped twin of the key
+    /// and the base purl all belong to the entry; a different package does
+    /// not, and the match is by spelling (no percent-decoding — the set
+    /// form `purl_keys` carries the same three spellings).
+    #[test]
+    fn entry_covers_purl_by_key_stripped_key_or_base_purl() {
+        let mut entry = sample_entry();
+        entry.base_purl = "pkg:npm/@scope/pkg@1.0.0".into();
+        let key = "pkg:npm/%40scope/pkg@1.0.0?artifact_id=x";
+        assert!(entry.covers_purl(key, key));
+        assert!(entry.covers_purl(key, "pkg:npm/%40scope/pkg@1.0.0"));
+        assert!(entry.covers_purl(key, "pkg:npm/%40scope/pkg@1.0.0?artifact_id=other"));
+        assert!(entry.covers_purl(key, "pkg:npm/@scope/pkg@1.0.0"));
+        assert!(entry.covers_purl(key, "pkg:npm/@scope/pkg@1.0.0?artifact_id=y"));
+        assert!(!entry.covers_purl(key, "pkg:npm/@scope/pkg@1.0.1"));
+        assert!(!entry.covers_purl(key, "pkg:npm/other@1.0.0"));
     }
 
     #[tokio::test]
@@ -1101,12 +1221,24 @@ mod tests {
         save_state(root, &state).await.unwrap();
         assert!(root.join(VENDOR_STATE_REL).exists());
 
+        // An empty ecosystem husk left by a per-unit revert goes too.
+        tokio::fs::create_dir_all(root.join(".socket/vendor/npm"))
+            .await
+            .unwrap();
+        // `.socket/` holds something else (the lock, a manifest…).
+        tokio::fs::write(root.join(".socket/apply.lock"), b"")
+            .await
+            .unwrap();
         state.entries.clear();
         save_state(root, &state).await.unwrap();
         assert!(!root.join(VENDOR_STATE_REL).exists());
         assert!(
             !root.join(VENDOR_DIR).exists(),
-            ".socket/vendor pruned when empty"
+            ".socket/vendor (and its empty eco husks) pruned when empty"
+        );
+        assert!(
+            root.join(SOCKET_DIR).exists(),
+            ".socket/ itself is never pruned here"
         );
 
         // But a vendor dir that still holds artifacts is NOT pruned.
@@ -1127,6 +1259,15 @@ mod tests {
             root.join(".socket/vendor/npm").exists(),
             "non-empty dir kept"
         );
+    }
+
+    /// The ledger path is spelled as a literal (a `const` cannot be built
+    /// from another with `concat!`); pin it to the directory constant it
+    /// re-spells so the two can never drift apart.
+    #[test]
+    fn vendor_state_rel_lives_directly_under_vendor_dir() {
+        assert_eq!(VENDOR_STATE_REL, format!("{VENDOR_DIR}/state.json"));
+        assert!(VENDOR_DIR.starts_with(&format!("{SOCKET_DIR}/")));
     }
 
     #[tokio::test]

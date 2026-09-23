@@ -6,7 +6,7 @@
 //! `rollback`. Verifies the file is restored to the original content.
 //!
 //! Exercises `find_packages_for_rollback` for every ecosystem — a
-//! distinct code path from `find_packages_for_purls`.
+//! distinct code path from apply's `find_all_packages_for_purls`.
 //!
 //! That distinction is only *observable* for the release-variant
 //! ecosystems (PyPI / RubyGems / Maven): there the rollback resolver
@@ -21,7 +21,7 @@
 //!
 //! For those three ecosystems we therefore deliberately use a QUALIFIED
 //! manifest PURL: a regression that swapped the rollback resolver back to
-//! `find_packages_for_purls` would silently leave the file patched and
+//! a base-keyed `find_all_packages_for_purls` would silently leave the file patched and
 //! the byte-restore assertion below would fail. With a bare PURL both
 //! merge functions behave identically, so the test would prove nothing —
 //! that is the loophole this file used to have.
@@ -223,7 +223,7 @@ async fn rollback_pypi_restores_original_content() {
     // QUALIFIED PURL on purpose — see module header. The crawler emits the
     // base `pkg:pypi/rbpypi@1.0.0`; only `merge_qualified` (used by
     // `find_packages_for_rollback`) fans it back out to this `?artifact_id=`
-    // key so the manifest lookup hits. `find_packages_for_purls`
+    // key so the manifest lookup hits. A base-keyed `find_all_packages_for_purls`
     // (`merge_first_wins`) would key it under the bare base, the patch
     // lookup would miss, and the file below would stay patched.
     write_manifest_with_patch(

@@ -3,9 +3,9 @@
 //!
 //! pnpm installs packages into a global content-addressed store and
 //! gives each project a symlink (or symlink + hardlinked file) into
-//! that store. Without the copy-on-write defense in
-//! `crates/socket-patch-core/src/patch/cow.rs`, patching a file in
-//! project A would silently mutate the same on-disk bytes that
+//! that store. Without the copy-on-write defense — the rename-over write in `socket_patch_core::utils::fs::atomic_write_bytes` (see its CoW guarantee doc) —
+//! patching a file in project A would silently mutate the same on-disk
+//! bytes that
 //! project B and every other project on the machine reference. This
 //! suite proves that does NOT happen — patching A's view leaves B's
 //! view and the store entry byte-identical.
@@ -244,9 +244,8 @@ fn pnpm_install_produces_symlinked_layout() {
 /// **Headline test**: socket-patch apply in proj_a patches proj_a,
 /// but leaves proj_b and the pnpm store entry byte-unchanged.
 ///
-/// Without the CoW defense in
-/// `socket-patch-core::patch::cow::break_hardlink_if_needed`, this
-/// test would fail: writing through proj_a's symlink would mutate
+/// Without the CoW defense (the rename-over write in `socket_patch_core::utils::fs::atomic_write_bytes` (see its CoW guarantee doc)), this test would fail:
+/// writing through proj_a's symlink would mutate
 /// the shared store inode and, transitively, every other project
 /// that points at the same store entry.
 #[test]

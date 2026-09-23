@@ -9,6 +9,13 @@
 //!
 //! Fixtures and helpers mirror `repair_vendor_e2e.rs` (this suite owns its
 //! own copies; that file is owned by another agent).
+//!
+//! A vendored run (`scan --vendor`) is manifest-free: every ledger entry is
+//! `detached` with its record embedded and `.socket/manifest.json` is never
+//! written. The manifest-backed repair arms (dropped / moved-on manifest
+//! records, the `(None, None)` uuid recovery, pass 2's manifest-by-uuid
+//! reconstruction) belong to LEGACY manifest-mode projects, which the tests
+//! build by hand-migrating the fixture with [`to_legacy_manifest_mode`].
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,6 +40,9 @@ const GEM_UUID: &str = "22222222-2222-4222-8222-222222222222";
 const GEM_NAME: &str = "padlock";
 const GEM_VERSION: &str = "1.2.0";
 const GEM_PURL: &str = "pkg:gem/padlock@1.2.0";
+/// The qualified spelling production publishes for gems (`platform=ruby`,
+/// the portable default): the ledger key when the served record carries it.
+const GEM_PURL_QUALIFIED: &str = "pkg:gem/padlock@1.2.0?platform=ruby";
 const GEM_ENCODED: &str = "pkg%3Agem%2Fpadlock%401.2.0";
 const GEMSPEC_STUB: &[u8] = b"Gem::Specification.new do |s|\n  s.name = \"padlock\"\n  s.version = \"1.2.0\"\n  s.summary = \"repair fixture\"\n  s.authors = [\"socket-patch e2e\"]\n  s.require_paths = [\"lib\"]\nend\n";
 
@@ -432,10 +442,8 @@ fn warnings_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
 }
 
 fn read_state(root: &Path) -> serde_json::Value {
-    serde_json::from_str(
-        &std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap(),
-    )
-    .unwrap()
+    serde_json::from_str(&std::fs::read_to_string(root.join(".socket/vendor/state.json")).unwrap())
+        .unwrap()
 }
 
 fn write_state(root: &Path, state: &serde_json::Value) {
@@ -444,6 +452,32 @@ fn write_state(root: &Path, state: &serde_json::Value) {
         serde_json::to_vec_pretty(state).unwrap(),
     )
     .unwrap();
+}
+
+/// Hand-migrate the vendored fixture to the LEGACY manifest-mode shape: every
+/// ledger entry's embedded record moves into `.socket/manifest.json` (keyed
+/// by the ledger key) and the entry loses `detached` + `record` — exactly
+/// what a pre-D2 `scan --vendor` (or a standalone `vendor` from a manifest)
+/// left behind. Returns the manifest path.
+fn to_legacy_manifest_mode(root: &Path) -> PathBuf {
+    let mut state = read_state(root);
+    let mut patches = serde_json::Map::new();
+    for (key, entry) in state["entries"].as_object_mut().unwrap() {
+        let entry = entry.as_object_mut().unwrap();
+        let record = entry
+            .remove("record")
+            .expect("a vendored ledger entry embeds its record");
+        entry.remove("detached");
+        patches.insert(key.clone(), record);
+    }
+    write_state(root, &state);
+    let manifest_path = root.join(".socket/manifest.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&serde_json::json!({ "patches": patches })).unwrap(),
+    )
+    .unwrap();
+    manifest_path
 }
 
 // ───────────────────────── pass-1 record resolution ─────────────────────────
@@ -485,9 +519,9 @@ async fn repair_fails_loudly_on_corrupt_vendor_state() {
     );
 }
 
-/// A ledger entry whose record was DROPPED from the manifest is silently
-/// skipped — the vendor reconcile owns reverting it, so repair must neither
-/// fail nor rebuild the disowned artifact.
+/// A legacy manifest-mode ledger entry whose record was DROPPED from the
+/// manifest is silently skipped — the vendor reconcile owns reverting it, so
+/// repair must neither fail nor rebuild the disowned artifact.
 #[tokio::test]
 async fn repair_skips_entry_dropped_from_manifest() {
     let mock = MockServer::start().await;
@@ -500,7 +534,7 @@ async fn repair_skips_entry_dropped_from_manifest() {
     );
     let tgz = vendor_project(tmp.path(), &mock.uri());
 
-    let manifest_path = tmp.path().join(".socket/manifest.json");
+    let manifest_path = to_legacy_manifest_mode(tmp.path());
     let mut manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
     manifest["patches"]
@@ -508,7 +542,11 @@ async fn repair_skips_entry_dropped_from_manifest() {
         .unwrap()
         .remove(PURL)
         .expect("the vendored patch must be in the manifest");
-    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
     std::fs::remove_file(&tgz).unwrap();
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
@@ -524,9 +562,9 @@ async fn repair_skips_entry_dropped_from_manifest() {
     );
 }
 
-/// The manifest record's uuid MOVED ON (a patch update is pending): repair
-/// skips with `vendor_uuid_mismatch` instead of rebuilding a stale-uuid
-/// artifact.
+/// A legacy manifest-mode project whose manifest record's uuid MOVED ON (a
+/// patch update is pending): repair skips with `vendor_uuid_mismatch`
+/// instead of rebuilding a stale-uuid artifact.
 #[tokio::test]
 async fn repair_skips_when_manifest_uuid_moved_on() {
     let mock = MockServer::start().await;
@@ -541,12 +579,15 @@ async fn repair_skips_when_manifest_uuid_moved_on() {
     let tgz = vendor_project(tmp.path(), &mock.uri());
     let tgz_bytes = std::fs::read(&tgz).unwrap();
 
-    let manifest_path = tmp.path().join(".socket/manifest.json");
+    let manifest_path = to_legacy_manifest_mode(tmp.path());
     let mut manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
-    manifest["patches"][PURL]["uuid"] =
-        serde_json::json!("99999999-9999-4999-8999-999999999999");
-    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    manifest["patches"][PURL]["uuid"] = serde_json::json!("99999999-9999-4999-8999-999999999999");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
 
     let (code, stdout, stderr) = run_cli(
         tmp.path(),
@@ -569,11 +610,11 @@ async fn repair_skips_when_manifest_uuid_moved_on() {
     );
 }
 
-/// Non-detached ledger entry with NO manifest at all: the record is
-/// recovered from the patch API by uuid (rebuild succeeds), and the same
-/// shape under `--offline` fails loudly with `vendor_artifact_unrepairable`
-/// naming the missing record (covers `fetch_record_by_uuid`'s offline
-/// early-return too).
+/// Non-detached (legacy manifest-mode) ledger entry with NO manifest at
+/// all: the record is recovered from the patch API by uuid (rebuild
+/// succeeds), and the same shape under `--offline` fails loudly with
+/// `vendor_artifact_unrepairable` naming the missing record (covers
+/// `fetch_record_by_uuid`'s offline early-return too).
 #[tokio::test]
 async fn repair_recovers_record_by_uuid_without_manifest_then_fails_offline() {
     let mock = MockServer::start().await;
@@ -587,7 +628,7 @@ async fn repair_recovers_record_by_uuid_without_manifest_then_fails_offline() {
     let tgz = vendor_project(tmp.path(), &mock.uri());
     let tgz_bytes = std::fs::read(&tgz).unwrap();
 
-    std::fs::remove_file(tmp.path().join(".socket/manifest.json")).unwrap();
+    std::fs::remove_file(to_legacy_manifest_mode(tmp.path())).unwrap();
     std::fs::remove_file(&tgz).unwrap();
 
     // Online: the (None, None) arm fetches the record by uuid and rebuilds.
@@ -715,7 +756,8 @@ async fn repair_fails_closed_on_unsafe_ledger_artifact_path() {
 
 // ───────────── pass 2: reference with no ledger, no manifest, offline ─────────────
 
-/// Lockfile reference with the ledger AND manifest both gone, `--offline`:
+/// Lockfile reference with the ledger gone (a vendored run never writes a
+/// manifest, so no local record survives), `--offline`:
 /// the failure is attributed to a SYNTHETIC purl carrying the recovered
 /// uuid (`pkg:npm/unknown@<uuid>`) and advises restoring state.json or
 /// re-running online. Nothing on disk is touched.
@@ -734,7 +776,10 @@ async fn repair_no_ledger_no_manifest_offline_fails_with_synthetic_purl() {
     let lock_bytes = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
 
     std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
-    std::fs::remove_file(tmp.path().join(".socket/manifest.json")).unwrap();
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "vendored runs write no manifest"
+    );
 
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
@@ -866,7 +911,9 @@ async fn repair_dry_run_previews_gem_wiring_backfill() {
     );
     let state = read_state(tmp.path());
     assert_eq!(
-        state["entries"][GEM_PURL]["wiring"].as_array().map(Vec::len),
+        state["entries"][GEM_PURL]["wiring"]
+            .as_array()
+            .map(Vec::len),
         Some(0),
         "dry run must not persist the backfilled wiring: {state}"
     );
@@ -953,7 +1000,9 @@ async fn repair_backfill_failure_warns_wiring_unknown() {
     );
     let state = read_state(tmp.path());
     assert_eq!(
-        state["entries"][GEM_PURL]["wiring"].as_array().map(Vec::len),
+        state["entries"][GEM_PURL]["wiring"]
+            .as_array()
+            .map(Vec::len),
         Some(0),
         "an unreconstructable wiring stays empty: {state}"
     );
@@ -1006,7 +1055,9 @@ async fn repair_reconstruction_without_gemfile_warns_wiring_unknown() {
     );
     let state = read_state(tmp.path());
     assert_eq!(
-        state["entries"][GEM_PURL]["wiring"].as_array().map(Vec::len),
+        state["entries"][GEM_PURL]["wiring"]
+            .as_array()
+            .map(Vec::len),
         Some(0),
         "no guessed wiring on the re-synthesized entry: {state}"
     );
@@ -1222,7 +1273,8 @@ async fn repair_rebuild_fails_when_installed_patch_file_missing() {
 /// and counted rebuilt, while the non-soft sibling fails — one run, both
 /// arms. The gem's content IS harvestable from its healthy artifact, but
 /// staging is all-or-nothing across the candidate set, exactly the shape
-/// this fallback exists for.
+/// this fallback exists for. Legacy manifest-mode fixture: offline, the
+/// manifest is the only record source once the ledger is gone.
 #[tokio::test]
 async fn repair_soft_restore_when_staging_unavailable() {
     const AFTER_GEM: &[u8] = b"gem after\n";
@@ -1250,9 +1302,11 @@ async fn repair_soft_restore_when_staging_unavailable() {
         "setup must vendor the patched gem copy"
     );
 
-    // Ledger gone; npm artifact broken (non-soft), gem artifact healthy
-    // (soft). Offline: the npm after-blob has no local source, so the
-    // in-memory staging is Unavailable for the whole candidate set.
+    // Legacy manifest-mode project with its ledger gone; npm artifact
+    // broken (non-soft), gem artifact healthy (soft). Offline: the npm
+    // after-blob has no local source, so the in-memory staging is
+    // Unavailable for the whole candidate set.
+    to_legacy_manifest_mode(tmp.path());
     std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
     std::fs::remove_file(&tgz).unwrap();
 
@@ -1299,7 +1353,8 @@ async fn repair_soft_restore_when_staging_unavailable() {
 /// `--offline` + soft candidate + package NOT installed: staging succeeds
 /// (the healthy artifact's own blobs are harvested), but the pristine
 /// ladder cannot fetch — the entry is soft-restored fingerprint-less with
-/// the offline cause named.
+/// the offline cause named. Legacy manifest-mode fixture (the manifest is
+/// the offline record source once the ledger is gone).
 #[tokio::test]
 async fn repair_offline_soft_restore_without_installed_copy() {
     let mock = MockServer::start().await;
@@ -1308,6 +1363,7 @@ async fn repair_offline_soft_restore_without_installed_copy() {
     write_gem_fixture(tmp.path(), false);
     let copy = vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
 
+    to_legacy_manifest_mode(tmp.path());
     std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
     std::fs::remove_dir_all(tmp.path().join("vendor/bundle")).unwrap();
 
@@ -1347,6 +1403,136 @@ async fn repair_offline_soft_restore_without_installed_copy() {
         std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
         AFTER,
         "the artifact bytes are untouched"
+    );
+}
+
+// ─────────────── qualified ledger keys resolve the installed copy ───────────────
+
+/// Ledger keys are the manifest spelling — for release-variant ecosystems
+/// the QUALIFIED purl production publishes (`pkg:gem/…?platform=ruby`) —
+/// while the crawler knows only base purls. Repair must resolve the
+/// installed copy through the qualified-aware resolver (the one
+/// `vendor_records` uses): pre-fix the base-keyed lookup never matched a
+/// qualified ledger key, so an INSTALLED package read as absent and an
+/// offline rebuild of a missing artifact failed `vendor_artifact_missing`
+/// instead of rebuilding from the copy on disk (online, it fell through to
+/// the registry-fetch rung — a needless network round-trip that, with no
+/// rubygems route mounted here, fails the repair outright).
+#[tokio::test]
+async fn repair_rebuilds_qualified_ledger_key_from_installed_copy() {
+    let mock = MockServer::start().await;
+    mount_gem_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_gem_fixture(tmp.path(), false);
+    let copy = vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
+
+    // Re-key the ledger entry to the qualified spelling (`basePurl` stays
+    // bare — exactly what `scan --vendor` records for a served qualified
+    // purl).
+    let mut state = read_state(tmp.path());
+    let entry = state["entries"]
+        .as_object_mut()
+        .unwrap()
+        .remove(GEM_PURL)
+        .expect("the vendored ledger entry");
+    state["entries"][GEM_PURL_QUALIFIED] = entry;
+    write_state(tmp.path(), &state);
+    // The artifact is gone: the installed copy is the pristine source (the
+    // patch content itself comes from the mocked patch view, as in every
+    // online rebuild here).
+    std::fs::remove_dir_all(&copy).unwrap();
+
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v)
+            .iter()
+            .any(|e| e["action"] == "rebuilt" && e["purl"] == GEM_PURL_QUALIFIED),
+        "the installed copy must drive the rebuild of the qualified-keyed entry: {v}"
+    );
+    assert!(
+        !events_of(&v).iter().any(|e| e["action"] == "failed"
+            || e["errorCode"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("vendor_fetch"))),
+        "an installed package is never 'not installed' — no registry rung, no failure: {v}"
+    );
+    assert_eq!(
+        std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
+        AFTER,
+        "rebuilt from the installed copy plus the recorded patch"
+    );
+    let state = read_state(tmp.path());
+    assert!(
+        state["entries"][GEM_PURL_QUALIFIED].is_object(),
+        "the qualified key survives the rebuild: {state}"
+    );
+    assert!(
+        state["entries"][GEM_PURL].is_null(),
+        "no duplicate base-keyed entry is invented: {state}"
+    );
+}
+
+// ─────────────── crashed set-aside leftovers ───────────────
+
+/// A repair killed between the move-aside and the backend's replacement
+/// leaves `<uuid>.pre-rebuild` as the ONLY copy of the bytes the rewired
+/// Gemfile/lock still point at, and a bare ENOENT at the live path. The
+/// next wet repair puts the leftover back first — the healthy bytes need no
+/// rebuild, and no `.pre-rebuild` survives — while `--dry-run` (which
+/// mutates nothing) leaves the leftover exactly where it was. Pre-fix the
+/// leftover lingered forever: the orphan sweeps skip non-uuid names, and
+/// the entry classified Missing so set-aside (the only other clearer) never
+/// ran for it.
+#[tokio::test]
+async fn repair_restores_crashed_set_aside_leftover_before_classifying() {
+    let mock = MockServer::start().await;
+    mount_gem_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_gem_fixture(tmp.path(), false);
+    let copy = vendor_gem_project(tmp.path(), &mock.uri(), AFTER);
+    // `set_aside_vendor_dir` moves the whole UUID dir (marker + copy), so
+    // the crash leaves `<eco>/<uuid>.pre-rebuild` beside a missing
+    // `<eco>/<uuid>`.
+    let uuid_dir = tmp.path().join(format!(".socket/vendor/gem/{GEM_UUID}"));
+    let kept = tmp
+        .path()
+        .join(format!(".socket/vendor/gem/{GEM_UUID}.pre-rebuild"));
+    std::fs::rename(&uuid_dir, &kept).unwrap();
+    // The installed copy is gone too: nothing but the leftover can serve
+    // the wiring, so a run that ignores it has no source at all.
+    std::fs::remove_dir_all(tmp.path().join("vendor/bundle")).unwrap();
+
+    let (_, stdout, stderr) = run_cli(
+        tmp.path(),
+        &mock.uri(),
+        &["repair", "--offline", "--dry-run"],
+    );
+    assert!(
+        kept.is_dir(),
+        "--dry-run must not move the leftover: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !uuid_dir.exists(),
+        "--dry-run must not restore the live dir"
+    );
+
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        !events_of(&v).iter().any(|e| e["action"] == "failed"),
+        "the restored bytes are healthy — nothing to rebuild, nothing failed: {v}"
+    );
+    assert_eq!(
+        std::fs::read(copy.join("lib/padlock.rb")).unwrap(),
+        AFTER,
+        "the leftover is back at the live path the wiring points at"
+    );
+    assert!(
+        !kept.exists(),
+        "no .pre-rebuild leftover survives the wet run"
     );
 }
 
@@ -1455,11 +1641,8 @@ async fn repair_ecosystems_scope_skips_out_of_scope_entries() {
     let tgz = vendor_project(tmp.path(), &mock.uri());
     std::fs::remove_file(&tgz).unwrap();
 
-    let (code, stdout, stderr) = run_cli(
-        tmp.path(),
-        &mock.uri(),
-        &["repair", "--ecosystems", "gem"],
-    );
+    let (code, stdout, stderr) =
+        run_cli(tmp.path(), &mock.uri(), &["repair", "--ecosystems", "gem"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);
     assert!(
@@ -1471,11 +1654,8 @@ async fn repair_ecosystems_scope_skips_out_of_scope_entries() {
         "repair --ecosystems gem must not touch the npm artifact"
     );
 
-    let (code, stdout, stderr) = run_cli(
-        tmp.path(),
-        &mock.uri(),
-        &["repair", "--ecosystems", "npm"],
-    );
+    let (code, stdout, stderr) =
+        run_cli(tmp.path(), &mock.uri(), &["repair", "--ecosystems", "npm"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     let v = parse_env(&stdout);
     assert!(
@@ -1749,10 +1929,10 @@ async fn repair_soft_restore_when_pristine_fetch_fails() {
 
 // ────────────── record recovery shares ONE api client per run ──────────────
 
-/// TWO manifest-less ledger entries recovered by uuid in one run: the
-/// second lookup must reuse the cached API client (constructing per-lookup
-/// would re-print the token-shape advisory N times) and still resolve its
-/// record — both artifacts rebuild.
+/// TWO manifest-less, record-less (legacy manifest-mode) ledger entries
+/// recovered by uuid in one run: the second lookup must reuse the cached
+/// API client (constructing per-lookup would re-print the token-shape
+/// advisory N times) and still resolve its record — both artifacts rebuild.
 #[tokio::test]
 async fn repair_recovers_multiple_records_by_uuid_sharing_one_client() {
     let mock = MockServer::start().await;
@@ -1774,7 +1954,7 @@ async fn repair_recovers_multiple_records_by_uuid_sharing_one_client() {
     let copy = tmp.path().join(gem_copy_rel());
     assert!(tgz.is_file() && copy.is_dir(), "setup must vendor both");
 
-    std::fs::remove_file(tmp.path().join(".socket/manifest.json")).unwrap();
+    std::fs::remove_file(to_legacy_manifest_mode(tmp.path())).unwrap();
     std::fs::remove_file(&tgz).unwrap();
     std::fs::remove_dir_all(&copy).unwrap();
 
@@ -1842,20 +2022,14 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
     );
     vendor_project(tmp.path(), &mock.uri());
 
-    // Manifest record for the jsr purl (same patch content, its own uuid).
-    let manifest_path = tmp.path().join(".socket/manifest.json");
-    let mut manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
-    let mut jsr_record = manifest["patches"][PURL].clone();
-    jsr_record["uuid"] = serde_json::json!(JSR_UUID);
-    manifest["patches"][JSR_PURL] = jsr_record;
-    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
-
-    // Ledger entry for the jsr purl with a CORRUPT committed artifact.
+    // Ledger entry for the jsr purl with a CORRUPT committed artifact; its
+    // embedded record is the npm one re-stamped with the jsr uuid (same
+    // patch content, its own uuid).
     let corrupt_rel = format!(".socket/vendor/npm/{JSR_UUID}/left-pad-1.3.0.tgz");
     let mut state = read_state(tmp.path());
     let mut jsr_entry = state["entries"][PURL].clone();
     jsr_entry["uuid"] = serde_json::json!(JSR_UUID);
+    jsr_entry["record"]["uuid"] = serde_json::json!(JSR_UUID);
     jsr_entry["basePurl"] = serde_json::json!(JSR_PURL);
     jsr_entry["artifact"]["path"] = serde_json::json!(corrupt_rel);
     jsr_entry["wiring"] = serde_json::json!([]);
@@ -1870,9 +2044,7 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
     // deno.json project marker.
     std::fs::write(tmp.path().join("deno.json"), b"{}\n").unwrap();
     let deno_home = tempfile::tempdir().unwrap();
-    let jsr_pkg = deno_home
-        .path()
-        .join("npm/jsr.io/@std/path/0.220.0");
+    let jsr_pkg = deno_home.path().join("npm/jsr.io/@std/path/0.220.0");
     std::fs::create_dir_all(&jsr_pkg).unwrap();
     std::fs::write(jsr_pkg.join("index.js"), AFTER).unwrap();
 
@@ -1931,10 +2103,11 @@ async fn repair_no_backend_for_purl_restores_set_aside_bytes() {
         "envelope={v}"
     );
     assert!(
-        !corrupt_abs.exists() && !tmp
-            .path()
-            .join(format!(".socket/vendor/npm/{JSR_UUID}.pre-rebuild"))
-            .exists(),
+        !corrupt_abs.exists()
+            && !tmp
+                .path()
+                .join(format!(".socket/vendor/npm/{JSR_UUID}.pre-rebuild"))
+                .exists(),
         "a missing artifact stays missing: nothing is invented or set aside"
     );
 }
@@ -1987,7 +2160,9 @@ async fn repair_reconstruction_renamed_leaf_fails_closed_and_restores_lock() {
         "the unreadable reconstructed path is the named cause: {failed}"
     );
     assert!(
-        !tmp.path().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+        !tmp.path()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists(),
         "nothing is kept from the rejected rebuild"
     );
     assert_eq!(
@@ -2125,7 +2300,9 @@ async fn repair_backfill_persist_failure_stays_loud() {
     );
     let state = read_state(tmp.path());
     assert_eq!(
-        state["entries"][GEM_PURL]["wiring"].as_array().map(Vec::len),
+        state["entries"][GEM_PURL]["wiring"]
+            .as_array()
+            .map(Vec::len),
         Some(0),
         "the committed ledger still has the empty wiring: {state}"
     );
@@ -2219,8 +2396,7 @@ async fn repair_soft_persist_failure_skips_downstream_ladder() {
     assert_eq!(failed[0]["errorCode"], "vendor_state_write_failed", "{v}");
     assert!(
         !events_of(&v).iter().any(|e| e["purl"] == GEM_PURL
-            && (e["action"] == "rebuilt"
-                || e["errorCode"] == "vendor_inventory_unverified")),
+            && (e["action"] == "rebuilt" || e["errorCode"] == "vendor_inventory_unverified")),
         "no restore is claimed and no fingerprint advisory rides a dead restore: {v}"
     );
     assert_eq!(
@@ -2234,7 +2410,8 @@ async fn repair_soft_persist_failure_skips_downstream_ladder() {
 /// persist already failed: one combined run — the gem soft candidate's
 /// state write fails, the npm blob has no offline source — yields the state
 /// failure for the gem (no soft-restore advisory) and the offline failure
-/// for the npm candidate.
+/// for the npm candidate. Legacy manifest-mode fixture (the manifest is the
+/// offline record source once the ledger is gone).
 #[cfg(unix)]
 #[tokio::test]
 async fn repair_unavailable_staging_skips_unpersistable_soft_candidate() {
@@ -2260,6 +2437,7 @@ async fn repair_unavailable_staging_skips_unpersistable_soft_candidate() {
         .path()
         .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));
 
+    to_legacy_manifest_mode(tmp.path());
     std::fs::remove_file(tmp.path().join(".socket/vendor/state.json")).unwrap();
     std::fs::remove_file(&tgz).unwrap();
     readonly_vendor_dir(tmp.path());
@@ -2281,8 +2459,9 @@ async fn repair_unavailable_staging_skips_unpersistable_soft_candidate() {
         "the non-soft candidate still fails on the missing source: {v}"
     );
     assert!(
-        !events_of(&v).iter().any(|e| e["action"] == "rebuilt"
-            || e["errorCode"] == "vendor_inventory_unverified"),
+        !events_of(&v)
+            .iter()
+            .any(|e| e["action"] == "rebuilt" || e["errorCode"] == "vendor_inventory_unverified"),
         "no restore is claimed for the unpersistable candidate: {v}"
     );
 }

@@ -3,10 +3,8 @@ use socket_patch_core::api::blob_fetcher::{
     fetch_missing_sources, format_fetch_result, get_missing_archives, get_missing_blobs,
     DownloadMode, FetchMissingBlobsResult,
 };
-use socket_patch_core::api::client::get_api_client_with_overrides;
-use socket_patch_core::manifest::cleanup_blobs::{
-    cleanup_unused_archives, cleanup_unused_blobs, format_cleanup_result,
-};
+use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
+use socket_patch_core::manifest::cleanup_blobs::format_cleanup_result;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::patch::apply::PatchSources;
 use socket_patch_core::telemetry::{track_patch_repair_failed, track_patch_repaired};
@@ -15,6 +13,7 @@ use std::time::Duration;
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::lock_cli::{acquire_or_emit, error_envelope};
+use crate::commands::rollback::{sweep_failure, sweep_unused_artifacts};
 use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent, Status};
 
 #[derive(Args)]
@@ -69,13 +68,20 @@ pub async fn run(args: RepairArgs) -> i32 {
 
     let manifest_path = args.common.resolved_manifest_path();
 
+    // The lockfile scan (`scan_vendor_references` opens every wiring file)
+    // runs at most once per repair: the existence gate below needs it only
+    // for a ledger-less project, and that result is reused under the lock.
+    let mut vendor_references: Option<Vec<(String, String, String)>> = None;
+
     if tokio::fs::metadata(&manifest_path).await.is_err() {
         // Hosted (redirect) mode leaves no local artifacts to repair: the
         // lockfiles point at patch.socket.dev URLs, not `.socket/vendor/...`,
         // and there is no manifest or vendor ledger. A project whose only
         // trace is `redirect-state.json` is therefore a no-op for repair —
         // exit success with an informational skip rather than the
-        // `manifest_not_found` error a bare directory would get.
+        // `manifest_not_found` error a bare directory would get. Only cheap
+        // existence probes (and the read-only lockfile scan) run before the
+        // lock, so a project with nothing to repair never grows `.socket/`.
         let redirect_state = args
             .common
             .cwd
@@ -84,10 +90,13 @@ pub async fn run(args: RepairArgs) -> i32 {
             .common
             .cwd
             .join(socket_patch_core::vendor::VENDOR_STATE_REL);
-        let has_vendor_traces = tokio::fs::metadata(&state_file).await.is_ok()
-            || !crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd)
-                .await
-                .is_empty();
+        let mut has_vendor_traces = tokio::fs::metadata(&state_file).await.is_ok();
+        if !has_vendor_traces {
+            let refs =
+                crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd).await;
+            has_vendor_traces = !refs.is_empty();
+            vendor_references = Some(refs);
+        }
         if !has_vendor_traces {
             if tokio::fs::metadata(&redirect_state).await.is_ok() {
                 let msg = "hosted redirects need no local repair; re-run \
@@ -120,19 +129,18 @@ pub async fn run(args: RepairArgs) -> i32 {
             }
             return 1;
         }
-        // The vendor-only repair still serializes on the .socket lock; the
-        // lock layer deliberately refuses to mkdir.
-        if let Some(dir) = manifest_path.parent() {
-            let _ = tokio::fs::create_dir_all(dir).await;
-        }
     }
 
     // Serialize against concurrent socket-patch runs targeting the
-    // same `.socket/` directory. See `apply_lock`. A live holder makes
-    // repair refuse with `lock_held` — it never steals the lock.
-    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
-    let lock = match acquire_or_emit(
-        socket_dir,
+    // same `.socket/` directory. See `apply_lock`: acquire creates the
+    // directory when needed (the vendor-only repair of a ledger-less
+    // project), and the guard's drop removes `apply.lock` — and an
+    // otherwise-empty `.socket/` — on every exit path, dry-run included.
+    // A live holder makes repair refuse with `lock_held`; it never steals
+    // the lock.
+    let socket_dir = crate::args::socket_dir_of(&manifest_path, &args.common.cwd);
+    let _lock = match acquire_or_emit(
+        &socket_dir,
         Command::Repair,
         args.common.json,
         args.common.dry_run,
@@ -142,7 +150,22 @@ pub async fn run(args: RepairArgs) -> i32 {
         Err(code) => return code,
     };
 
-    let exit_code = match repair_inner(&args, &manifest_path).await {
+    // Lockfile references are read under the lock (a concurrent vendor run
+    // rewrites them under the same lock) unless the gate above already
+    // scanned this ledger-less project.
+    let vendor_references = match vendor_references {
+        Some(refs) => refs,
+        None => crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd).await,
+    };
+
+    match repair_inner(
+        &args,
+        &manifest_path,
+        Some(&telemetry_client),
+        vendor_references,
+    )
+    .await
+    {
         Ok((env, counts)) => {
             // A repair where some artifacts failed to download is marked a
             // partial failure inside `repair_inner` (a `Failed` event plus
@@ -186,36 +209,7 @@ pub async fn run(args: RepairArgs) -> i32 {
             }
             1
         }
-    };
-
-    // Clean slate: repair owns the lock-file cleanup (the mutating
-    // commands deliberately leave `apply.lock` behind between runs).
-    // Drop our guard FIRST so the unlink races nothing we hold, then
-    // best-effort delete. A live holder never reaches here — contention
-    // already returned above. The residual window (a competitor that
-    // acquires between the drop and the unlink gets its file orphaned)
-    // is microseconds at the tail of a finished repair and worth the
-    // trade; see `apply_lock`'s module doc.
-    drop(lock);
-    if !args.common.dry_run {
-        let lock_file = socket_dir.join("apply.lock");
-        match std::fs::remove_file(&lock_file) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                // Housekeeping only: a leftover lock file is harmless, so
-                // a failed delete warns (human mode) without flipping the
-                // exit code of an otherwise-finished repair.
-                if !args.common.silent && !args.common.json {
-                    eprintln!(
-                        "Warning: could not remove lock file {}: {e}",
-                        lock_file.display()
-                    );
-                }
-            }
-        }
     }
-    exit_code
 }
 
 /// Aggregate counts surfaced by `repair_inner` for telemetry use.
@@ -228,6 +222,13 @@ struct RepairCounts {
 async fn repair_inner(
     args: &RepairArgs,
     manifest_path: &Path,
+    // The client `run()` already built: constructing another one for the
+    // download printed the core client's "No SOCKET_API_TOKEN set" notice
+    // twice per repair. `None` (unit tests) builds one on demand, only when
+    // the download below actually fires.
+    api_client: Option<&ApiClient>,
+    // `(eco, uuid, rel)` lockfile vendor references, scanned once by `run`.
+    vendor_references: Vec<(String, String, String)>,
 ) -> Result<(Envelope, RepairCounts), String> {
     // `Ok(None)` = no manifest (vendor-only repair); present-but-invalid
     // stays a hard error.
@@ -235,9 +236,7 @@ async fn repair_inner(
         .await
         .map_err(|e| e.to_string())?;
 
-    let socket_dir = manifest_path
-        .parent()
-        .expect("manifest path names a file, so it has a parent");
+    let socket_dir = crate::args::socket_dir_of(manifest_path, &args.common.cwd);
     let blobs_path = socket_dir.join("blobs");
     let diffs_path = socket_dir.join("diffs");
     let packages_path = socket_dir.join("packages");
@@ -275,25 +274,27 @@ async fn repair_inner(
     // packages` — repair must not re-litter them (or fail trying). The
     // cleanup phase below still uses the FULL manifest, so it never sweeps
     // sources an in-place apply may need for rollback.
-    let vendor_state = socket_patch_core::vendor::load_state(&args.common.cwd)
-        .await
-        .unwrap_or_default();
+    // Loaded ONCE under the lock; the vendored phase below takes the raw
+    // result (an unreadable ledger is ITS loud failure), while this scoping
+    // degrades to "nothing vendored" — a corrupt ledger must not hide the
+    // manifest's own missing sources.
+    let ledger = socket_patch_core::vendor::load_state(&args.common.cwd).await;
+    let no_entries = std::collections::HashMap::new();
+    let vendor_entries = ledger.as_ref().map(|s| &s.entries).unwrap_or(&no_entries);
     // Lockfile vendor references count as vendored even before the ledger
     // is reconstructed, so a no-ledger repair doesn't download sources for
     // entries the vendored phase is about to own.
-    let referenced_uuids: std::collections::HashSet<String> =
-        crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd)
-            .await
-            .into_iter()
-            .map(|(_, uuid, _)| uuid)
-            .collect();
+    let referenced_uuids: std::collections::HashSet<String> = vendor_references
+        .iter()
+        .map(|(_, uuid, _)| uuid.clone())
+        .collect();
     let scoped_manifest = manifest.as_ref().map(|m| {
         let patches = m
             .patches
             .iter()
             .filter(|(purl, rec)| {
                 !referenced_uuids.contains(&rec.uuid)
-                    && socket_patch_core::vendor::lookup_entry(&vendor_state.entries, purl)
+                    && socket_patch_core::vendor::lookup_entry(vendor_entries, purl)
                         .is_none_or(|e| e.uuid != rec.uuid)
             })
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -366,8 +367,17 @@ async fn repair_inner(
             if !quiet {
                 println!("\nDownloading missing {}s...", download_mode.as_tag());
             }
-            let (client, _) =
-                get_api_client_with_overrides(args.common.api_client_overrides()).await;
+            let built_client;
+            let client = match api_client {
+                Some(c) => c,
+                None => {
+                    built_client =
+                        get_api_client_with_overrides(args.common.api_client_overrides())
+                            .await
+                            .0;
+                    &built_client
+                }
+            };
             let sources = PatchSources {
                 blobs_path: &blobs_path,
                 packages_path: Some(&packages_path),
@@ -380,7 +390,7 @@ async fn repair_inner(
                 .as_ref()
                 .expect("step 1 requires a manifest");
             let fetch_result =
-                fetch_missing_sources(m, &sources, download_mode, &client, None).await;
+                fetch_missing_sources(m, &sources, download_mode, client, None).await;
             downloaded_count = fetch_result.downloaded;
             download_failed_count = fetch_result.failed;
             if !quiet {
@@ -403,12 +413,16 @@ async fn repair_inner(
     // Step 1.5: vendored artifacts — health-check the ledger (and any
     // lockfile vendor references with no ledger coverage) and rebuild
     // missing/corrupt artifacts. Runs under `--download-only` too:
-    // restoring artifacts IS repair's download half.
-    let vendor_rebuilt = crate::commands::repair_vendor::repair_vendored_artifacts(
+    // restoring artifacts IS repair's download half. The reference scan
+    // and ledger load above are handed over, not repeated.
+    let vendor_rebuilt = crate::commands::repair_vendor::repair_vendored_artifacts_with_references(
         &args.common,
         manifest.as_ref(),
-        socket_dir,
+        &socket_dir,
         &mut env,
+        &vendor_references,
+        ledger,
+        api_client,
     )
     .await;
     if !quiet && vendor_rebuilt > 0 {
@@ -420,70 +434,49 @@ async fn repair_inner(
         if !quiet {
             println!();
         }
-        match cleanup_unused_blobs(manifest, &blobs_path, args.common.dry_run).await {
-            Ok(cleanup_result) => {
-                blobs_checked += cleanup_result.blobs_checked;
-                blobs_cleaned += cleanup_result.blobs_removed;
-                bytes_freed += cleanup_result.bytes_freed;
-                if !quiet {
-                    if cleanup_result.blobs_checked == 0 {
-                        println!("No blobs directory found, nothing to clean up.");
-                    } else if cleanup_result.blobs_removed == 0 {
-                        println!(
-                            "Checked {} blob(s), all are in use.",
-                            cleanup_result.blobs_checked
-                        );
-                    } else {
-                        println!(
-                            "{}",
-                            format_cleanup_result(&cleanup_result, args.common.dry_run)
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                // A failed cleanup is error output: `--silent` (suppress
-                // NON-error output) must not mute it, and the JSON envelope
-                // must carry it — a bare `status: success` with no events is
-                // indistinguishable from "nothing to clean". Recorded as an
-                // informational skip (not `Failed`) to preserve the human
-                // path's warn-and-continue contract: status stays success,
-                // exit stays 0.
+        let sweep = sweep_unused_artifacts(manifest, &socket_dir, args.common.dry_run).await;
+        // The blob pass prints its status unconditionally ("all are in
+        // use" included — the core helper owns that wording); the archive
+        // passes print only when they removed something, relabeled.
+        let passes = [
+            ("blob", None, sweep.blobs),
+            ("diff", Some("diff archive(s)"), sweep.diffs),
+            ("package", Some("package archive(s)"), sweep.packages),
+        ];
+        for (label, relabel, result) in passes {
+            // A failed cleanup — the pass aborted, or it could not unlink
+            // every orphan — is error output: `--silent` (suppress
+            // NON-error output) must not mute it, and the JSON envelope
+            // must carry it — a bare `status: success` with no events is
+            // indistinguishable from "nothing to clean". Recorded as an
+            // informational skip (not `Failed`) to preserve the human
+            // path's warn-and-continue contract: status stays success,
+            // exit stays 0, and the loop goes on to the next directory.
+            if let Some(detail) = sweep_failure(label, &result) {
                 if !args.common.json {
-                    eprintln!("Warning: blob cleanup failed: {e}");
+                    eprintln!("Warning: {detail}");
                 }
                 env.record(
                     PatchEvent::artifact(PatchAction::Skipped)
-                        .with_reason("cleanup_failed", format!("blob cleanup failed: {e}")),
+                        .with_reason("cleanup_failed", detail),
                 );
             }
-        }
-
-        // Diff and package archives.
-        for (path, label) in [(&diffs_path, "diff"), (&packages_path, "package")] {
-            match cleanup_unused_archives(manifest, path, args.common.dry_run).await {
-                Ok(cleanup_result) => {
-                    blobs_checked += cleanup_result.blobs_checked;
-                    blobs_cleaned += cleanup_result.blobs_removed;
-                    bytes_freed += cleanup_result.bytes_freed;
-                    if !quiet && cleanup_result.blobs_removed > 0 {
-                        println!(
-                            "{}",
-                            format_cleanup_result(&cleanup_result, args.common.dry_run)
-                                .replace("blob(s)", &format!("{label} archive(s)"))
-                        );
-                    }
+            let Ok(cleanup_result) = result else {
+                continue;
+            };
+            blobs_checked += cleanup_result.blobs_checked;
+            blobs_cleaned += cleanup_result.blobs_removed;
+            bytes_freed += cleanup_result.bytes_freed;
+            if quiet {
+                continue;
+            }
+            let text = format_cleanup_result(&cleanup_result, args.common.dry_run);
+            match relabel {
+                None => println!("{text}"),
+                Some(relabel) if cleanup_result.blobs_removed > 0 => {
+                    println!("{}", text.replace("blob(s)", relabel));
                 }
-                Err(e) => {
-                    // Same contract as the blob-cleanup arm above.
-                    if !args.common.json {
-                        eprintln!("Warning: {label} cleanup failed: {e}");
-                    }
-                    env.record(
-                        PatchEvent::artifact(PatchAction::Skipped)
-                            .with_reason("cleanup_failed", format!("{label} cleanup failed: {e}")),
-                    );
-                }
+                Some(_) => {}
             }
         }
     }
@@ -634,7 +627,7 @@ mod tests {
         let mut args = offline_args(tmp.path());
         args.common.dry_run = true;
 
-        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"))
+        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
             .await
             .expect("repair_inner");
 
@@ -659,7 +652,7 @@ mod tests {
         args.common.offline = false;
         args.common.dry_run = true;
 
-        let (env, _counts) = repair_inner(&args, &socket.join("manifest.json"))
+        let (env, _counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
             .await
             .expect("repair_inner");
 
@@ -683,7 +676,7 @@ mod tests {
         write_blob(&socket, &orphan_hash, orphan_bytes);
 
         let args = offline_args(tmp.path());
-        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"))
+        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
             .await
             .expect("repair_inner");
 
@@ -716,7 +709,7 @@ mod tests {
         args.common.offline = false;
         args.download_only = true;
 
-        let (_env, counts) = repair_inner(&args, &socket.join("manifest.json"))
+        let (_env, counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
             .await
             .expect("repair_inner");
 
@@ -758,7 +751,7 @@ mod tests {
         );
 
         let args = offline_args(tmp.path());
-        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"))
+        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
             .await
             .expect("repair_inner");
 
@@ -838,7 +831,7 @@ mod tests {
         let mut args = offline_args(tmp.path());
         args.common.json = false;
 
-        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"))
+        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
             .await
             .expect("repair_inner");
 
@@ -857,7 +850,7 @@ mod tests {
         args.common.dry_run = true;
         args.common.json = false;
 
-        let (env, _counts) = repair_inner(&args, &socket.join("manifest.json"))
+        let (env, _counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
             .await
             .expect("repair_inner");
 
@@ -879,7 +872,7 @@ mod tests {
         // No blob on disk → manifest afterHash is "missing". Not dry-run.
         let args = offline_args(tmp.path());
 
-        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"))
+        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
             .await
             .expect("repair_inner");
 

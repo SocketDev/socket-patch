@@ -1,11 +1,12 @@
 //! Coverage-gap tests for `api::blob_fetcher`'s never-executed error
 //! branches (audit of commit d5e1815):
 //!
-//! * the three `create_dir_all` early-return branches and the shared
-//!   `all_failed_result` envelope they drive (blob_fetcher.rs ~117-119,
-//!   ~130-149, ~169-171, ~275-277) — driven cross-platform via ENOTDIR
-//!   (the target directory is routed *through a regular file*, which
-//!   fails even as root, unlike permission tricks);
+//! * an uncreatable cache directory — the dir is created by the first
+//!   verified download inside `write_cache_entry_atomic`, never up front,
+//!   so the failure is a per-entry "Failed to write ... to disk" and a
+//!   fetch that lands nothing leaves no `.socket/blobs/` husk — driven
+//!   cross-platform via ENOTDIR (the target directory is routed *through
+//!   a regular file*, which fails even as root, unlike permission tricks);
 //! * the blob-download loop's progress callback (~471) — the diff-loop
 //!   twin is tested in `blob_fetcher_edges_e2e.rs`, this one never ran;
 //! * the "Failed to write blob/archive to disk" arms (~501-508,
@@ -117,31 +118,42 @@ fn dir_entry_count(dir: &Path) -> usize {
     std::fs::read_dir(dir).unwrap().count()
 }
 
-// ── create_dir_all failure trio → all_failed_result ─────────────────
+// ── uncreatable cache directory → per-entry write failure ───────────
 //
 // The target directory path is routed through a REGULAR FILE
-// (`tmp/notadir/<dir>`), so `create_dir_all` fails with ENOTDIR on every
-// platform, even as root. The presence probes that run first
-// (`get_missing_blobs` / `get_missing_archives`) also fail to stat
-// through the file, so everything is reported missing and the branch is
-// reached with a non-empty work set — making the all-failed envelope
-// assertions discriminating.
+// (`tmp/notadir/<dir>`), so the writer's on-demand `create_dir_all` fails
+// with ENOTDIR on every platform, even as root. The presence probes that
+// run first (`get_missing_blobs` / `get_missing_archives`) also fail to
+// stat through the file, so everything is reported missing and every
+// entry is fetched. Each download succeeds and hash-verifies; only the
+// disk write fails — so the outcome is the ordinary per-entry
+// "Failed to write ... to disk" arm, and the blocking file survives.
 
 /// `fetch_missing_blobs` when the blobs directory cannot be created:
-/// every missing blob is reported failed with the create-dir message,
-/// nothing is downloaded or skipped, and no fetch was attempted (a
-/// closed-port fetch would surface a connection error instead).
+/// every blob is fetched (the mocks pin one call each) and reported as a
+/// per-blob disk-write failure; nothing is downloaded or skipped.
 #[tokio::test]
-async fn fetch_missing_blobs_cannot_create_blobs_dir_reports_all_failed() {
+async fn fetch_missing_blobs_uncreatable_blobs_dir_is_per_blob_write_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let notadir = tmp.path().join("notadir");
     std::fs::write(&notadir, b"a regular file, not a directory").unwrap();
     let blobs = notadir.join("blobs");
 
-    let h1 = "a".repeat(64);
-    let h2 = "b".repeat(64);
+    let c1 = b"first blob body";
+    let c2 = b"second blob body";
+    let h1 = compute_git_sha256_from_bytes(c1);
+    let h2 = compute_git_sha256_from_bytes(c2);
+    let server = MockServer::start().await;
+    for (hash, body) in [(&h1, c1.to_vec()), (&h2, c2.to_vec())] {
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/patch/blob/{hash}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
     let manifest = manifest_with_after_hashes(&[&h1, &h2]);
-    let client = dummy_client();
+    let client = proxy_client(&server.uri());
 
     let result = fetch_missing_blobs(&manifest, &blobs, &client, None).await;
     assert_eq!(result.total, 2, "both missing blobs are accounted for");
@@ -155,40 +167,49 @@ async fn fetch_missing_blobs_cannot_create_blobs_dir_reports_all_failed() {
         assert!(!entry.success);
         let err = entry.error.as_deref().unwrap();
         assert!(
-            err.contains("Cannot create blobs directory"),
-            "early-return message expected (a fetch attempt would say \
-             connection refused instead): {err}"
+            err.contains("Failed to write blob to disk"),
+            "per-blob disk-write message expected: {err}"
         );
     }
     // The path through the file is untouched: still a regular file.
     assert!(notadir.is_file(), "the blocking file must be left alone");
 }
 
-/// `fetch_blobs_by_hash`'s own create-dir early return (the
-/// rollback-path beforeHash fetcher): bypasses its skip/download
-/// bookkeeping entirely. Pins the `all_failed_result` invariant
+/// `fetch_blobs_by_hash` (the rollback-path beforeHash fetcher) with an
+/// uncreatable blobs directory: the skip bookkeeping sees nothing present,
+/// every hash is fetched, and each is a per-blob disk-write failure —
 /// `total == failed == results.len()`, `downloaded == skipped == 0`.
 #[tokio::test]
-async fn fetch_blobs_by_hash_cannot_create_blobs_dir_reports_all_failed() {
+async fn fetch_blobs_by_hash_uncreatable_blobs_dir_is_per_blob_write_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let notadir = tmp.path().join("notadir");
     std::fs::write(&notadir, b"file blocking the path").unwrap();
     let blobs = notadir.join("blobs");
 
-    let h1 = "c".repeat(64);
-    let h2 = "d".repeat(64);
+    let c1 = b"rollback blob one";
+    let c2 = b"rollback blob two";
+    let h1 = compute_git_sha256_from_bytes(c1);
+    let h2 = compute_git_sha256_from_bytes(c2);
+    let server = MockServer::start().await;
+    for (hash, body) in [(&h1, c1.to_vec()), (&h2, c2.to_vec())] {
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/patch/blob/{hash}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
     let hashes: HashSet<String> = [h1.clone(), h2.clone()].into_iter().collect();
-    let client = dummy_client();
+    let client = proxy_client(&server.uri());
 
     let result = fetch_blobs_by_hash(&hashes, &blobs, &client, None).await;
-    // The all_failed_result envelope: total == failed == results.len().
     assert_eq!(result.total, 2);
     assert_eq!(result.failed, 2);
     assert_eq!(result.results.len(), 2);
     assert_eq!(result.downloaded, 0);
     assert_eq!(
         result.skipped, 0,
-        "the skip bookkeeping must not run when the dir cannot be created"
+        "nothing can be present under a path that is not a directory"
     );
     let seen: HashSet<&str> = result.results.iter().map(|r| r.hash.as_str()).collect();
     assert_eq!(seen, HashSet::from([h1.as_str(), h2.as_str()]));
@@ -198,17 +219,18 @@ async fn fetch_blobs_by_hash_cannot_create_blobs_dir_reports_all_failed() {
             .error
             .as_deref()
             .unwrap()
-            .contains("Cannot create blobs directory"));
+            .contains("Failed to write blob to disk"));
     }
+    assert!(notadir.is_file(), "the blocking file must be left alone");
 }
 
 /// `fetch_missing_sources` in Diff mode when the archives directory
-/// cannot be created — the only producer of the "Cannot create archives
-/// directory" message. `get_missing_archives` runs first and correctly
-/// reports the uuid missing through the broken path, so the branch is
-/// reached with a non-empty set.
+/// cannot be created: `get_missing_archives` reports the uuid missing
+/// through the broken path, the archive is fetched, and the write is a
+/// per-archive "Failed to write archive to disk" failure. The blobs dir
+/// is not involved and stays empty.
 #[tokio::test]
-async fn fetch_missing_sources_diff_cannot_create_archives_dir_reports_all_failed() {
+async fn fetch_missing_sources_diff_uncreatable_archives_dir_is_per_archive_write_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let blobs = tmp.path().join("blobs");
     std::fs::create_dir(&blobs).unwrap();
@@ -223,8 +245,15 @@ async fn fetch_missing_sources_diff_cannot_create_archives_dir_reports_all_faile
     };
 
     let uuid = "11111111-1111-4111-8111-111111111111";
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_matcher(format!("/patch/diff/{uuid}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
     let manifest = manifest_with_uuids(&[uuid]);
-    let client = dummy_client();
+    let client = proxy_client(&server.uri());
 
     let result =
         fetch_missing_sources(&manifest, &sources, DownloadMode::Diff, &client, None).await;
@@ -238,11 +267,50 @@ async fn fetch_missing_sources_diff_cannot_create_archives_dir_reports_all_faile
     assert!(!entry.success);
     let err = entry.error.as_deref().unwrap();
     assert!(
-        err.contains("Cannot create archives directory"),
-        "archive-specific create-dir message expected: {err}"
+        err.contains("Failed to write archive to disk"),
+        "per-archive disk-write message expected: {err}"
     );
-    // No fetch was attempted, so nothing landed in the blobs dir either.
+    assert!(notadir.is_file(), "the blocking file must be left alone");
+    // Diff mode never touches the blobs dir.
     assert_eq!(dir_entry_count(&blobs), 0);
+}
+
+/// A fetch that lands nothing creates nothing: with every blob 404 the
+/// blobs directory — and the `.socket/` above it — must not come into
+/// existence. The dir is the writer's to create, on the first verified
+/// download only.
+#[tokio::test]
+async fn fetch_missing_blobs_all_not_found_leaves_blobs_dir_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join(".socket");
+    let blobs = socket.join("blobs");
+
+    let h1 = "a".repeat(64);
+    let h2 = "b".repeat(64);
+    let server = MockServer::start().await;
+    for hash in [&h1, &h2] {
+        Mock::given(method("GET"))
+            .and(path_matcher(format!("/patch/blob/{hash}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let manifest = manifest_with_after_hashes(&[&h1, &h2]);
+    let client = proxy_client(&server.uri());
+
+    let result = fetch_missing_blobs(&manifest, &blobs, &client, None).await;
+    assert_eq!(result.total, 2);
+    assert_eq!(result.failed, 2);
+    assert_eq!(result.downloaded, 0);
+    for entry in &result.results {
+        assert!(!entry.success);
+        assert!(entry.error.as_deref().unwrap().contains("not found"));
+    }
+    assert!(
+        !blobs.exists() && !socket.exists(),
+        "a fetch that lands nothing must leave no .socket/blobs/ residue"
+    );
 }
 
 // ── Blob-loop progress callback ──────────────────────────────────────
@@ -346,7 +414,10 @@ async fn fetch_missing_blobs_disk_write_failure_is_per_blob_failure() {
 
     let result = fetch_missing_blobs(&manifest, &blobs, &client, None).await;
     assert_eq!(result.total, 1);
-    assert_eq!(result.downloaded, 0, "an unwritable blob is not 'downloaded'");
+    assert_eq!(
+        result.downloaded, 0,
+        "an unwritable blob is not 'downloaded'"
+    );
     assert_eq!(result.failed, 1);
     assert_eq!(result.skipped, 0);
     let err = result.results[0].error.as_deref().unwrap();
@@ -358,7 +429,11 @@ async fn fetch_missing_blobs_disk_write_failure_is_per_blob_failure() {
     // run's presence check would trust it), and no staging turd either —
     // the stage was never created, which is the invariant callers need.
     assert!(!blobs.join(&hash).exists());
-    assert_eq!(dir_entry_count(&blobs), 0, "no partial file, no stage litter");
+    assert_eq!(
+        dir_entry_count(&blobs),
+        0,
+        "no partial file, no stage litter"
+    );
 
     // Restore so tempdir teardown can't mask a failure.
     std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -414,7 +489,11 @@ async fn fetch_missing_sources_diff_disk_write_failure_is_per_archive_failure() 
         "archive disk-write arm message expected: {err}"
     );
     assert!(!diffs.join(format!("{uuid}.tar.gz")).exists());
-    assert_eq!(dir_entry_count(&diffs), 0, "no partial file, no stage litter");
+    assert_eq!(
+        dir_entry_count(&diffs),
+        0,
+        "no partial file, no stage litter"
+    );
 
     std::fs::set_permissions(&diffs, std::fs::Permissions::from_mode(0o755)).unwrap();
 }

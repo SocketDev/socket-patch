@@ -121,6 +121,12 @@ pub(super) struct NpmStagedPack {
     /// lockfile's dependency-mirror fields are then stale and the flavor
     /// wiring must recompute them from this parsed manifest).
     pub staged_pkg_json: Option<Value>,
+    /// True iff `<project>/.socket/vendor/npm/<uuid>` existed BEFORE this
+    /// run wrote into it. A wiring failure after the pack must unwind the
+    /// uuid dir the pipeline created — but never one that already existed
+    /// (a same-uuid re-vendor's dir may still be referenced by live wiring);
+    /// backends feed this to [`done_failure_unstage`].
+    pub uuid_dir_preexisted: bool,
 }
 
 /// Stage → patch → pack one installed npm package.
@@ -308,6 +314,7 @@ pub(super) async fn stage_patch_pack(
             rel_tgz,
             packed,
             staged_pkg_json,
+            uuid_dir_preexisted,
         }),
         result,
     ))
@@ -500,6 +507,7 @@ async fn staged_pack_from_service_bytes(
         rel_tgz,
         packed,
         staged_pkg_json,
+        uuid_dir_preexisted,
     })
 }
 
@@ -633,7 +641,10 @@ pub(super) fn done_failure(purl: &str, error: String) -> VendorOutcome {
 /// ever persisted for a failed wiring, so `--revert` could never clean it up
 /// and the module contract ("a failure leaves the project byte-untouched")
 /// would be broken by an orphaned, possibly defective artifact dir. Empty
-/// parent dirs are pruned non-recursively (a sibling artifact keeps them).
+/// parent dirs are pruned non-recursively (a sibling artifact keeps them) up
+/// to and including `.socket/vendor/`; `.socket/` itself is never pruned
+/// here — the CLI holds `.socket/apply.lock` for the whole run, and its lock
+/// guard removes the emptied directory when it releases.
 pub(super) async fn done_failure_unstage(
     purl: &str,
     error: String,
@@ -644,12 +655,7 @@ pub(super) async fn done_failure_unstage(
     if !uuid_dir_preexisted {
         let uuid_dir = project_root.join(uuid_dir_rel);
         let _ = remove_tree(&uuid_dir).await;
-        if let Some(eco_dir) = uuid_dir.parent() {
-            let _ = tokio::fs::remove_dir(eco_dir).await;
-            if let Some(vendor_dir) = eco_dir.parent() {
-                let _ = tokio::fs::remove_dir(vendor_dir).await;
-            }
-        }
+        super::common::prune_empty_vendor_levels(&uuid_dir).await;
     }
     done_failure(purl, error)
 }
@@ -785,9 +791,8 @@ mod tests {
     /// pruned.
     #[test]
     fn declares_bundled_deps_matches_npm_value_shapes() {
-        let with = |key: &str, v: serde_json::Value| {
-            declares_bundled_deps(&serde_json::json!({ key: v }))
-        };
+        let with =
+            |key: &str, v: serde_json::Value| declares_bundled_deps(&serde_json::json!({ key: v }));
         for key in ["bundleDependencies", "bundledDependencies"] {
             assert!(with(key, serde_json::json!(true)), "{key}: true = all deps");
             assert!(!with(key, serde_json::json!(false)), "{key}: false");
@@ -1268,7 +1273,8 @@ mod tests {
     async fn service_bytes_integrity_string_guard_fires_before_any_write() {
         let tmp = tempfile::tempdir().unwrap();
         let record = record_with_uuid(UUID);
-        let err = expect_err(service_bytes(tmp.path(), &record, b"tarball bytes", "sha512-AAAA").await);
+        let err =
+            expect_err(service_bytes(tmp.path(), &record, b"tarball bytes", "sha512-AAAA").await);
         let error = expect_done_failure(err, "disagrees with the service integrity sha512-AAAA");
         assert!(error.contains("recomputed integrity"), "{error}");
         assert!(
@@ -1449,8 +1455,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome =
-            done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
+        let outcome = done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
         expect_done_error(outcome, "boom");
         assert!(!failed_dir.exists(), "the failed artifact dir is removed");
         assert!(
@@ -1474,8 +1479,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome =
-            done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
+        let outcome = done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
         expect_done_error(outcome, "boom");
         assert!(
             !root.join(".socket/vendor").exists(),
@@ -1504,7 +1508,9 @@ mod tests {
         let outcome = done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, true).await;
         expect_done_error(outcome, "boom");
         assert_eq!(
-            tokio::fs::read(dir.join("left-pad-1.3.0.tgz")).await.unwrap(),
+            tokio::fs::read(dir.join("left-pad-1.3.0.tgz"))
+                .await
+                .unwrap(),
             b"live artifact",
             "a pre-existing (possibly live) artifact dir survives untouched"
         );

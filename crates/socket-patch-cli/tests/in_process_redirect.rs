@@ -3155,6 +3155,15 @@ async fn corrupt_ledger_fails_closed_and_preserves_the_bytes() {
         message.contains("redirect-state.json.corrupt"),
         "error must point at the moved-aside file: {message}"
     );
+    // The corruption is reported ONCE, as the engine's hard error: the
+    // read-only `updates[]` consult of the same file must not also print
+    // its advisory warning for a hosted run.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("is malformed").count(),
+        1,
+        "the corrupt-ledger message must print exactly once; stderr=\n{stderr}"
+    );
 
     // Nothing was rewritten, and the corrupt bytes survived verbatim in the
     // quarantine file — never overwritten by a fresh ledger.

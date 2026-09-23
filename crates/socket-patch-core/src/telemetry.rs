@@ -121,7 +121,12 @@ struct PatchTelemetryEvent {
 /// Telemetry is disabled when:
 /// - `SOCKET_TELEMETRY_DISABLED` is `"1"` or `"true"`
 ///   (legacy `SOCKET_PATCH_TELEMETRY_DISABLED` still honored with warning)
-/// - `VITEST` is `"true"` (test environment)
+/// - `VITEST` is `"true"`. Load-bearing downstream dependency, not a relic:
+///   socket-cli's vitest integration suite
+///   (`packages/cli/test/integration/cli/cmd-patch*.test.mts`) spawns this
+///   binary with its inherited environment and sets no
+///   `SOCKET_TELEMETRY_DISABLED`, so this gate is the only thing keeping
+///   those runs from POSTing telemetry to the public proxy.
 /// - `SOCKET_OFFLINE` is `"1"` or `"true"` (airgap mode — the telemetry
 ///   endpoint is a network call, so honoring `--offline`/`SOCKET_OFFLINE`
 ///   here keeps every command compliant with the strict-airgap contract)
@@ -257,7 +262,11 @@ fn resolve_telemetry_endpoint(api_token: Option<&str>, org_slug: Option<&str>) -
 /// Send a telemetry event to the API.
 ///
 /// This is fire-and-forget: errors are logged in debug mode but never
-/// propagated. Uses `reqwest` with a 5-second timeout.
+/// propagated. Uses `reqwest` with a 5-second request timeout and a
+/// 2-second connect timeout: the send is awaited inline by every command
+/// before it prints, so a network that blackholes the endpoint (dropped
+/// SYNs, no RST) must give up on the handshake quickly rather than stall
+/// even a read-only `scan --json` for the full request budget.
 async fn send_telemetry_event(
     event: &PatchTelemetryEvent,
     api_token: Option<&str>,
@@ -268,6 +277,7 @@ async fn send_telemetry_event(
     debug_log(&format!("Sending telemetry to {url}"));
 
     let client = match reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(5))
         .build()
     {

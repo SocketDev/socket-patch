@@ -21,7 +21,7 @@
 //! on every copy of the selected package.
 
 use glob::{MatchOptions, Pattern};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// `*` and `?` stay within one path component; `**` is the only way to
 /// cross directories. Case-sensitive on Unix; case-insensitive on Windows,
@@ -99,22 +99,56 @@ impl PathScope {
         &self.raw
     }
 
+    /// Bind the scope to one `--cwd`, absolutizing it ONCE (for the default
+    /// relative `.` that is a `getcwd` syscall plus an allocation) so a
+    /// caller filtering a whole crawl asks [`BoundScope::matches`] per
+    /// package without repeating it.
+    pub fn bind(&self, cwd: &Path) -> BoundScope<'_> {
+        BoundScope {
+            scope: self,
+            cwd: cwd.to_path_buf(),
+            abs_cwd: std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+        }
+    }
+
     /// Is `candidate` (an absolute package directory from a crawler) in
-    /// scope? An empty scope matches everything.
+    /// scope? An empty scope matches everything. One-off form of
+    /// [`PathScope::bind`] + [`BoundScope::matches`]; loops should bind.
     pub fn matches(&self, cwd: &Path, candidate: &Path) -> bool {
         if self.patterns.is_empty() {
             return true;
         }
+        self.bind(cwd).matches(candidate)
+    }
+}
+
+/// A [`PathScope`] bound to one `--cwd` (see [`PathScope::bind`]).
+#[derive(Debug)]
+pub struct BoundScope<'a> {
+    scope: &'a PathScope,
+    /// The cwd exactly as given, kept beside its absolutized form: crawler
+    /// paths are NOT absolutized (the default `--cwd .` yields candidates
+    /// like `./node_modules/foo`), so the relative form is the prefix that
+    /// actually strips in the common case.
+    cwd: PathBuf,
+    abs_cwd: PathBuf,
+}
+
+impl BoundScope<'_> {
+    /// Is `candidate` in scope? An empty scope matches everything.
+    pub fn matches(&self, candidate: &Path) -> bool {
+        if self.scope.patterns.is_empty() {
+            return true;
+        }
         // Textual prefix-strip against the absolutized cwd; crawler paths
         // are already absolute, so this stays a pure string operation.
-        let abs_cwd = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let abs = slashed(candidate);
         let rel = candidate
-            .strip_prefix(&abs_cwd)
+            .strip_prefix(&self.abs_cwd)
             .ok()
-            .or_else(|| candidate.strip_prefix(cwd).ok())
+            .or_else(|| candidate.strip_prefix(&self.cwd).ok())
             .map(slashed);
-        self.patterns.iter().any(|(pattern, is_absolute)| {
+        self.scope.patterns.iter().any(|(pattern, is_absolute)| {
             let target = if *is_absolute {
                 Some(abs.as_str())
             } else {
@@ -179,24 +213,15 @@ mod tests {
     fn directory_pattern_scopes_its_subtree() {
         // No `/**` needed: matching an ancestor is enough.
         let s = scope(&["packages/foo"]);
-        assert!(s.matches(
-            &cwd(),
-            Path::new("/proj/packages/foo/node_modules/lodash")
-        ));
-        assert!(!s.matches(
-            &cwd(),
-            Path::new("/proj/packages/bar/node_modules/lodash")
-        ));
+        assert!(s.matches(&cwd(), Path::new("/proj/packages/foo/node_modules/lodash")));
+        assert!(!s.matches(&cwd(), Path::new("/proj/packages/bar/node_modules/lodash")));
     }
 
     #[test]
     fn star_does_not_cross_separators() {
         let s = scope(&["packages/*"]);
         // `packages/*` matches the ancestor `packages/foo`, scoping its tree…
-        assert!(s.matches(
-            &cwd(),
-            Path::new("/proj/packages/foo/node_modules/lodash")
-        ));
+        assert!(s.matches(&cwd(), Path::new("/proj/packages/foo/node_modules/lodash")));
         // …but `nested/*` must not match a deeper path component-wise.
         let s2 = scope(&["*"]);
         assert!(s2.matches(&cwd(), Path::new("/proj/anything")));
@@ -207,10 +232,7 @@ mod tests {
     #[test]
     fn double_star_spans_directories() {
         let s = scope(&["packages/**/lodash"]);
-        assert!(s.matches(
-            &cwd(),
-            Path::new("/proj/packages/foo/node_modules/lodash")
-        ));
+        assert!(s.matches(&cwd(), Path::new("/proj/packages/foo/node_modules/lodash")));
         assert!(!s.matches(&cwd(), Path::new("/proj/apps/foo/node_modules/lodash")));
     }
 
@@ -249,6 +271,31 @@ mod tests {
         let s = scope(&["Packages/foo"]);
         let matches = s.matches(&cwd(), Path::new("/proj/packages/foo/x"));
         assert_eq!(matches, cfg!(windows));
+    }
+
+    /// `bind` absolutizes the cwd once and answers exactly like the
+    /// per-call form for every candidate, relative and absolute patterns
+    /// alike.
+    #[test]
+    fn bound_scope_matches_like_the_per_call_form() {
+        let s = scope(&["packages/foo", "/global/store"]);
+        let bound = s.bind(&cwd());
+        for candidate in [
+            "/proj/packages/foo/node_modules/lodash",
+            "/proj/packages/bar/node_modules/lodash",
+            "/global/store/lib/node_modules/x",
+            "/other/store/lib",
+        ] {
+            let candidate = Path::new(candidate);
+            assert_eq!(
+                bound.matches(candidate),
+                s.matches(&cwd(), candidate),
+                "{candidate:?}"
+            );
+        }
+        assert!(bound.matches(Path::new("/proj/packages/foo/x")));
+        assert!(!bound.matches(Path::new("/proj/packages/bar/x")));
+        assert!(scope(&[]).bind(&cwd()).matches(Path::new("/anywhere")));
     }
 
     #[test]

@@ -50,22 +50,28 @@ use base64::Engine as _;
 use serde_json::Value;
 use sha2::{Digest as _, Sha512};
 
+use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::utils::fs::{atomic_write_bytes, atomic_write_bytes_preserving_mode, list_dir_entries};
+use crate::utils::fs::{
+    atomic_write_bytes, atomic_write_bytes_preserving_mode, list_dir_entries,
+    read_regular_to_bytes, read_regular_to_string,
+};
 use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
+use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
-    already_patched_result, done, failed_result, rebuild_zip, refused, synthesized_result,
-    zip_matches_after_hashes,
+    already_patched_result, any_live_file_references, done, failed_result,
+    prune_empty_vendor_levels, read_zip_artifact, rebuild_zip, refused, synthesized_result,
+    zip_bytes_match_after_hashes,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
 use super::service_fetch::{service_archive_copy, ServiceCopy};
 use super::state::{
-    write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -145,32 +151,6 @@ fn is_plain_nuget_token(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
-}
-
-/// Guarded read shared in shape with the vendor twins (cargo.rs, gem.rs,
-/// maven_repo.rs …): `open_regular_file` opens with `O_NONBLOCK` and rejects
-/// non-regular files, so a FIFO planted at any of this backend's read paths —
-/// the committed vendored tree, the project `nuget.config` /
-/// `packages.lock.json`, the `~/.nuget` cache — fails fast instead of wedging
-/// the caller forever in an `open(2)` waiting for a writer that never comes.
-async fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes).await?;
-    Ok(bytes)
-}
-
-/// String twin of [`read_regular`] (invalid UTF-8 errors as `InvalidData`,
-/// matching `tokio::fs::read_to_string`).
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
 }
 
 /// Vendor a NuGet package: rebuild a patched `.nupkg` under
@@ -272,22 +252,27 @@ pub async fn vendor_nuget(
         .as_deref()
         .is_some_and(|t| t.contains(&source_key));
     if config_wired {
-        let nupkg_ok = zip_matches_after_hashes(&nupkg_path, &record.files).await;
-        let lock_ok = match &lock_text {
-            None => true,
-            Some(text) => match read_regular(&nupkg_path).await {
-                Ok(bytes) => {
-                    let expected = content_hash(&bytes);
-                    // Pinned at our bytes, or no matching resolved entry at
-                    // all — the same absence `edit_lock` tolerates with a
-                    // warning on the first run. Treating absence as stale
-                    // would misreport "missing or stale; rebuilt" on every
-                    // rerun with nothing to actually pin.
-                    lock_pinned(text, name, &version_norm, &expected)
-                        || matches!(edit_lock(text, name, &version_norm, &expected), Ok(None))
-                }
-                Err(_) => false,
-            },
+        // One guarded read of the committed nupkg serves both the member-hash
+        // check and the lock's content-hash pin.
+        let nupkg_bytes = read_zip_artifact(&nupkg_path).await;
+        let nupkg_ok = nupkg_bytes
+            .as_deref()
+            .is_some_and(|bytes| zip_bytes_match_after_hashes(bytes, &record.files));
+        // Only worth computing when the artifact itself is in sync (a stale
+        // nupkg rebuilds regardless of what the lock pins).
+        let lock_ok = match (&lock_text, &nupkg_bytes) {
+            (None, _) => true,
+            (Some(text), Some(bytes)) if nupkg_ok => {
+                let expected = content_hash(bytes);
+                // Pinned at our bytes, or no matching resolved entry at
+                // all — the same absence `edit_lock` tolerates with a
+                // warning on the first run. Treating absence as stale
+                // would misreport "missing or stale; rebuilt" on every
+                // rerun with nothing to actually pin.
+                lock_pinned(text, name, &version_norm, &expected)
+                    || matches!(edit_lock(text, name, &version_norm, &expected), Ok(None))
+            }
+            _ => false,
         };
         if nupkg_ok && lock_ok {
             return done(
@@ -417,6 +402,7 @@ pub async fn vendor_nuget(
             Ok(edit) => edit,
             Err(detail) => {
                 let _ = remove_tree(&uuid_dir).await;
+                prune_empty_vendor_levels(&uuid_dir).await;
                 result.success = false;
                 result.error = Some(detail);
                 return done(result, None, warnings);
@@ -429,6 +415,7 @@ pub async fn vendor_nuget(
         atomic_write_bytes_preserving_mode(&config_target, config_edit.new_text.as_bytes()).await
     {
         let _ = remove_tree(&uuid_dir).await;
+        prune_empty_vendor_levels(&uuid_dir).await;
         result.success = false;
         result.error = Some(format!("failed to write {}: {e}", config_target.display()));
         return done(result, None, warnings);
@@ -488,14 +475,7 @@ pub async fn vendor_nuget(
     // ── marker + ledger entry ────────────────────────────────────────────
     let base_purl = build_nuget_purl(name, version);
     let marker = VendorMarker::new("nuget", &base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&uuid_dir, &marker).await {
-        // Informational only (state.json is the ledger of record) — a marker
-        // failure must not fail an otherwise-wired vendor.
-        warnings.push(VendorWarning::new(
-            "vendor_marker_write_failed",
-            format!("could not write {}: {e}", super::state::VENDOR_MARKER_FILE),
-        ));
-    }
+    write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
 
     // The source record is the authoritative revert record: it carries the
     // whole-file pre/post config snapshot. When the config pre-existed it is a
@@ -570,6 +550,15 @@ pub async fn vendor_nuget(
 /// longer looks like what vendor wrote — a hand edit, a `dotnet restore`
 /// re-resolution, a newer vendor run — is left alone with a
 /// `vendor_lock_entry_drifted` warning.
+///
+/// Drift-keep: when a record was left alone and a live wiring file (the
+/// config) STILL names the uuid dir — tooling re-serialized `nuget.config`
+/// so neither authored element matches verbatim, a truncated record over a
+/// wired config — the artifact is kept and `kept_artifact` tells the caller
+/// to keep the ledger entry too: under the exclusive `packageSourceMapping`
+/// a source pointing at a gone dir bricks every cold restore. A config that
+/// no longer references the dir has converged: the drift is warned about
+/// and the artifact removed.
 pub async fn revert_nuget(
     entry: &VendorEntry,
     project_root: &Path,
@@ -643,26 +632,47 @@ pub async fn revert_nuget_opts(
         }
     }
 
-    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
-    // (and the caller keeps the ledger entry), so only the deletion is
-    // skipped.
-    if !dry_run && !keep_artifact {
-        if let Err(e) = remove_tree(&uuid_dir).await {
-            return RevertOutcome {
-                kept_artifact: false,
-                success: false,
-                warnings,
-                error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
-            };
-        }
-    }
-
-    RevertOutcome {
+    let mut outcome = RevertOutcome {
         kept_artifact: false,
         success: true,
         warnings,
         error: None,
+    };
+    if dry_run {
+        return outcome;
     }
+    // Drift-keep (see the fn doc): never delete a uuid dir a live wiring
+    // file still routes NuGet at. Only the root-level basenames vendor
+    // records are probed (a tampered `../` path is never read).
+    let mut wired_files: Vec<&str> = entry
+        .wiring
+        .iter()
+        .map(|w| w.file.as_str())
+        .filter(|f| is_safe_single_segment(f))
+        .collect();
+    wired_files.sort_unstable();
+    wired_files.dedup();
+    if outcome.drift_skipped()
+        && any_live_file_references(project_root, &wired_files, &uuid_dir_rel).await
+    {
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
+    // (and the caller keeps the ledger entry), so only the deletion is
+    // skipped.
+    if keep_artifact {
+        return outcome;
+    }
+    // The last nuget entry leaves `.socket/vendor/nuget/` (and
+    // `.socket/vendor/`) empty: the shared helper prunes them so a
+    // reverted project carries no vendor residue (non-recursive:
+    // siblings keep them).
+    if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
+        outcome.success = false;
+        outcome.error = Some(format!("failed to remove {}: {e}", uuid_dir.display()));
+    }
+    outcome
 }
 
 // ── materialisation (service download / local rebuild) ─────────────────────────
@@ -698,6 +708,7 @@ async fn materialise_patched_nupkg(
             if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &bytes).await {
                 if !config_wired {
                     let _ = remove_tree(uuid_dir).await;
+                    prune_empty_vendor_levels(uuid_dir).await;
                 }
                 return Err(Box::new(refused("vendor_prebuilt_write_failed", e)));
             }
@@ -756,7 +767,7 @@ async fn local_rebuild(
             ),
         )));
     };
-    let bytes = match read_regular(&src_nupkg).await {
+    let bytes = match read_regular_to_bytes(&src_nupkg).await {
         Ok(b) => b,
         Err(e) => {
             return Ok((
@@ -835,6 +846,7 @@ async fn local_rebuild(
         // the marker) must stay — the config still routes restores here.
         if !config_wired {
             let _ = remove_tree(uuid_dir).await;
+            prune_empty_vendor_levels(uuid_dir).await;
         }
         return Ok((Vec::new(), failed_result(purl, nupkg_path, e)));
     }
@@ -1405,6 +1417,7 @@ async fn unwind_config(config_target: &Path, original: Option<&str>, uuid_dir: &
         }
     }
     let _ = remove_tree(uuid_dir).await;
+    prune_empty_vendor_levels(uuid_dir).await;
 }
 
 #[cfg(test)]
@@ -2238,6 +2251,11 @@ mod tests {
                 .unwrap(),
             regenerated,
             "the user's regenerated config is left alone"
+        );
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            !root.join(format!(".socket/vendor/nuget/{UUID}")).exists(),
+            "a regenerated config names nothing under .socket/vendor: the uuid dir is removed"
         );
     }
 
@@ -3668,6 +3686,78 @@ mod tests {
             cfg,
             "a key-less record must not touch the live config"
         );
+        assert!(
+            !outcome.kept_artifact,
+            "a config that names no uuid dir keeps nothing: {:?}",
+            outcome.warnings
+        );
+    }
+
+    /// A drift-skipped config record whose live `nuget.config` STILL routes
+    /// the package at the uuid dir — re-serialized by tooling, so neither
+    /// authored element matches verbatim — keeps the artifact (and, through
+    /// `kept_artifact`, the ledger entry): deleting it would point the
+    /// exclusive `packageSourceMapping` at a gone dir and brick every cold
+    /// restore. Parity with the lock backends' drift-keep.
+    #[tokio::test]
+    async fn revert_drift_keeps_the_artifact_while_the_config_still_routes_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let uuid_dir = root.join(format!(".socket/vendor/nuget/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::write(uuid_dir.join("x.nupkg"), b"zip")
+            .await
+            .unwrap();
+        // Same routing as vendor wrote, different spelling (`/>` without the
+        // space, no mapping block): case (c) of the config restore.
+        let cfg = format!(
+            "<configuration>\n  <packageSources>\n    <add key=\"socket-patch-{UUID}\" \
+             value=\".socket/vendor/nuget/{UUID}\"/>\n  </packageSources>\n</configuration>\n"
+        );
+        tokio::fs::write(root.join("nuget.config"), &cfg)
+            .await
+            .unwrap();
+        let entry = entry_with_wiring(
+            UUID,
+            vec![WiringRecord {
+                file: "nuget.config".to_string(),
+                kind: CONFIG_SOURCE_WIRING_KIND.to_string(),
+                action: WiringAction::Rewritten,
+                key: Some(format!("socket-patch-{UUID}")),
+                original: None,
+                new: None,
+            }],
+        );
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep is surfaced: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            uuid_dir.join("x.nupkg").is_file(),
+            "the artifact the live config still routes at is kept"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("nuget.config"))
+                .await
+                .unwrap(),
+            cfg,
+            "the drifted config is left alone"
+        );
     }
 
     /// The vendored config already deleted by hand: the source record treats
@@ -3843,7 +3933,9 @@ mod tests {
         let root = dir.path();
         let parent = root.join(".socket/vendor/nuget");
         tokio::fs::create_dir_all(&parent).await.unwrap();
-        tokio::fs::write(parent.join(UUID), b"squatter").await.unwrap();
+        tokio::fs::write(parent.join(UUID), b"squatter")
+            .await
+            .unwrap();
 
         let (result, entry, _w) =
             unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
@@ -4106,17 +4198,11 @@ mod tests {
         // original missing → drift, and the file is never touched.
         let w = lock_wiring(None, Some("OURS=="));
         assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
-        assert_eq!(
-            tokio::fs::read_to_string(&lock_path).await.unwrap(),
-            text
-        );
+        assert_eq!(tokio::fs::read_to_string(&lock_path).await.unwrap(), text);
         // new missing → same drift.
         let w = lock_wiring(Some("OLD=="), None);
         assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
-        assert_eq!(
-            tokio::fs::read_to_string(&lock_path).await.unwrap(),
-            text
-        );
+        assert_eq!(tokio::fs::read_to_string(&lock_path).await.unwrap(), text);
     }
 
     #[tokio::test]
@@ -4447,7 +4533,9 @@ mod tests {
         let root = dir.path();
         let parent = root.join(".socket/vendor/nuget");
         tokio::fs::create_dir_all(&parent).await.unwrap();
-        tokio::fs::write(parent.join(UUID), b"squatter").await.unwrap();
+        tokio::fs::write(parent.join(UUID), b"squatter")
+            .await
+            .unwrap();
 
         let server = MockServer::start().await;
         let served = make_nupkg(PATCHED);

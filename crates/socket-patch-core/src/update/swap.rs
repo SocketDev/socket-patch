@@ -51,7 +51,8 @@ pub fn acquire_update_lock() -> Result<Option<UpdateLock>, UpdateError> {
     // forever waiting for a reader; O_NONBLOCK makes it return immediately
     // (ENXIO, or a handle the is_file check below rejects). A no-op for the
     // regular file this normally is — the fd is only ever flock(2)ed, never
-    // read or written. Same guard as state.rs's read_state_bytes.
+    // read or written. Same guard as `utils::fs::open_regular_file_sync`,
+    // which state.rs's `load_state` reads through.
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -71,7 +72,17 @@ pub fn acquire_update_lock() -> Result<Option<UpdateLock>, UpdateError> {
     }
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(UpdateLock { _file: file })),
-        Err(_) => Err(UpdateError::InProgress),
+        // Only a genuine contention errno is "another update is running";
+        // every other flock(2) failure (ENOLCK on an NFS-homed state dir,
+        // ENOTSUP on a lockless filesystem, ...) must surface with its real
+        // cause instead of masquerading as `update_in_progress` — the same
+        // split `patch/apply_lock.rs` makes for apply.lock, through the same
+        // errno test.
+        Err(e) if crate::patch::apply_lock::is_lock_contended(&e) => Err(UpdateError::InProgress),
+        Err(e) => Err(UpdateError::SwapFailed(format!(
+            "cannot lock {}: {e}",
+            path.display()
+        ))),
     }
 }
 
@@ -272,8 +283,8 @@ mod tests {
     /// A FIFO planted at the lock path must not wedge the updater: a plain
     /// `O_WRONLY` open(2) of a FIFO waits forever for a reader that never
     /// comes, hanging `--update` with no output before it does anything.
-    /// Same class as the `read_state_bytes` guard one file over in
-    /// state.rs — same directory, even.
+    /// Same class as the `read_regular_to_bytes_sync` guard `load_state`
+    /// uses one file over in state.rs — same directory, even.
     #[cfg(unix)]
     #[test]
     #[serial(update_state_dir_env)]

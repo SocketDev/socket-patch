@@ -35,10 +35,12 @@
 //! and removes the artifacts. The rest of the CLI yields ownership of
 //! ledger-recorded purls (`apply`/`rollback` skip them, `scan --prune`
 //! exempts them) and `remove` reverts vendoring as part of removing a
-//! patch. Detached entries (`scan --vendor --detached`) carry an embedded
-//! patch record instead of a manifest entry. The path-level UUID makes "is
-//! this Socket-vendored, by which patch" recoverable from the lockfile
-//! string alone ([`path`]).
+//! patch. Every `scan --mode vendored` / `get --mode vendored` entry is
+//! detached: it embeds the patch `record` (the verification source —
+//! vendored runs never write `.socket/manifest.json`), while the standalone
+//! `vendor` command records `detached: false` entries that point at the
+//! manifest. The path-level UUID makes "is this Socket-vendored, by which
+//! patch" recoverable from the lockfile string alone ([`path`]).
 //!
 //! [`ReplaceOwner::Vendor`]: crate::vendor::go_mod_edit::ReplaceOwner
 
@@ -71,7 +73,6 @@ pub mod pnpm_lock;
 pub mod pnpm_lock_legacy;
 pub mod pypi;
 mod pypi_hatch;
-pub(crate) use pypi_lock::restore_document as restore_python_document;
 mod pypi_lock;
 pub mod pypi_pdm;
 pub mod pypi_pipenv;
@@ -89,6 +90,7 @@ pub(crate) mod yarn_classic_lock;
 mod yarn_layering_tests;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
+pub(crate) use pypi_lock::restore_document as restore_python_document;
 pub use pypi_requirements::requirements_include_names;
 pub use state::{
     carry_forward_wiring, load_state, lookup_entry, save_state, VendorEntry, VendorState,
@@ -107,6 +109,7 @@ use crate::patch::apply::{
     apply_package_patch, is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
     VerifyStatus,
 };
+use crate::utils::fs::read_regular_to_string_sync;
 use crate::utils::purl::strip_purl_qualifiers;
 
 /// A non-fatal advisory surfaced as a warning event (`code` is a stable
@@ -124,39 +127,6 @@ impl VendorWarning {
             detail: detail.into(),
         }
     }
-}
-
-/// Read a UTF-8 file, requiring a regular file — the sync twin of
-/// [`crate::utils::fs::open_regular_file`] for the advisory probe below.
-/// The probe runs unconditionally at envelope-finalize time on every
-/// vendor / scan --vendor run, and a plain `open(2)` of a FIFO planted at
-/// `yarn.lock` or `package.json` waits for a writer that may never come —
-/// wedging the whole run after all the real work already happened.
-/// `O_NONBLOCK` makes the open return immediately; the handle-based
-/// `is_file` check then rejects FIFOs/devices/directories so the probe
-/// degrades to its unreadable-file behavior.
-fn read_regular_file_to_string(path: &Path) -> std::io::Result<String> {
-    use std::io::Read as _;
-    #[cfg(unix)]
-    let mut file = {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)?
-    };
-    #[cfg(not(unix))]
-    let mut file = std::fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
-    let mut s = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut s)?;
-    Ok(s)
 }
 
 /// Advisory probe: is this project one `yarn install` away from silently
@@ -177,11 +147,15 @@ fn read_regular_file_to_string(path: &Path) -> std::io::Result<String> {
 /// callers can invoke it unconditionally at envelope-finalize time: it stays
 /// silent on unwired projects and after a full revert.
 pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWarning> {
-    let lock = read_regular_file_to_string(&project_root.join("yarn.lock")).ok()?;
+    // The guarded sync reader (`O_NONBLOCK` open + fstat regular-file check):
+    // this probe runs at envelope-finalize time on every vendor / scan
+    // --vendor run, and a plain `open(2)` of a FIFO planted at `yarn.lock` or
+    // `package.json` would wedge the whole run after the real work is done.
+    let lock = read_regular_to_string_sync(&project_root.join("yarn.lock")).ok()?;
     if !lock.contains("# yarn lockfile v1") || !lock.contains(".socket/vendor/") {
         return None;
     }
-    if let Some(pm) = read_regular_file_to_string(&project_root.join("package.json"))
+    if let Some(pm) = read_regular_to_string_sync(&project_root.join("package.json"))
         .ok()
         .and_then(|pkg| serde_json::from_str::<serde_json::Value>(&pkg).ok())
         .and_then(|v| {
@@ -387,16 +361,26 @@ pub async fn harvest_artifact_blobs(
     project_root: &Path,
     manifest_patches: &HashMap<String, PatchRecord>,
 ) -> HashMap<String, Vec<u8>> {
+    let Ok(state) = load_state(project_root).await else {
+        return HashMap::new();
+    };
+    harvest_artifact_blobs_from(project_root, &state.entries, manifest_patches).await
+}
+
+/// [`harvest_artifact_blobs`] over an already-loaded ledger (`entries`),
+/// for callers that hold the run's single `load_state` result.
+pub async fn harvest_artifact_blobs_from(
+    project_root: &Path,
+    entries: &HashMap<String, VendorEntry>,
+    manifest_patches: &HashMap<String, PatchRecord>,
+) -> HashMap<String, Vec<u8>> {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 
     const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
     const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
     let mut out: HashMap<String, Vec<u8>> = HashMap::new();
-    let Ok(state) = load_state(project_root).await else {
-        return out;
-    };
-    if state.entries.is_empty() {
+    if entries.is_empty() {
         return out;
     }
 
@@ -410,9 +394,8 @@ pub async fn harvest_artifact_blobs(
         if needed.is_empty() {
             continue;
         }
-        let Some(entry) = state.entries.get(purl).or_else(|| {
-            state
-                .entries
+        let Some(entry) = entries.get(purl).or_else(|| {
+            entries
                 .values()
                 .find(|e| e.base_purl == strip_purl_qualifiers(purl))
         }) else {
@@ -432,7 +415,15 @@ pub async fn harvest_artifact_blobs(
         // Tarball/wheel artifacts: read entries in memory.
         let lower = entry.artifact.path.to_ascii_lowercase();
         if lower.ends_with(".tgz") || lower.ends_with(".tar.gz") {
-            if let Ok(map) = crate::patch::package::read_archive_to_map(&artifact) {
+            // The tarball reader is synchronous (gzip + tar decode): run it
+            // off the async thread like `verify` does, so a large committed
+            // artifact never stalls the runtime.
+            let tgz = artifact.clone();
+            let read = tokio::task::spawn_blocking(move || {
+                crate::patch::package::read_archive_to_map(&tgz)
+            })
+            .await;
+            if let Ok(Ok(map)) = read {
                 for bytes in map.into_values() {
                     let h = compute_git_sha256_from_bytes(&bytes);
                     if needed.contains(h.as_str()) {
@@ -722,28 +713,16 @@ pub fn is_vendorable(purl: &str) -> bool {
     ecosystem_dir_for_purl(purl).is_some()
 }
 
-/// Every purl spelling under which the ledger's entries are addressable:
-/// each entry's map key (the manifest purl, possibly qualified), its
-/// resolved base purl, and the qualifier-stripped key. Loaded once for
-/// callers that match whole purl sets against vendor ownership (apply /
-/// rollback / scan prune). An unreadable ledger degrades to the empty set
-/// (fail-open); mutating callers that need fail-closed semantics use
-/// [`load_state`] directly.
+/// [`VendorState::purl_keys`] over the ledger in `project_root`, loaded
+/// once for callers that match whole purl sets against vendor ownership
+/// (apply / rollback / scan prune). An unreadable ledger degrades to the
+/// empty set (fail-open); mutating callers that need fail-closed semantics
+/// use [`load_state`] directly.
 pub async fn vendored_purl_keys(project_root: &Path) -> HashSet<String> {
-    match load_state(project_root).await {
-        Ok(state) => state
-            .entries
-            .iter()
-            .flat_map(|(key, entry)| {
-                [
-                    key.clone(),
-                    entry.base_purl.clone(),
-                    strip_purl_qualifiers(key).to_string(),
-                ]
-            })
-            .collect(),
-        Err(_) => HashSet::new(),
-    }
+    load_state(project_root)
+        .await
+        .map(|state| state.purl_keys())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1394,7 +1373,9 @@ mod harvest_tests {
         let (k, r) = record(purl, UUID, "lib/__init__.py", PATCHED);
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "a corrupt zip-shaped artifact contributes nothing"
         );
     }
@@ -1436,7 +1417,9 @@ mod harvest_tests {
         let (k, r) = record("pkg:npm/left-pad@1.3.0", UUID, "package/index.js", PATCHED);
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "an un-vendored record must not harvest another package's artifact"
         );
     }
@@ -1455,7 +1438,9 @@ mod harvest_tests {
         let (k, r) = record(purl, UUID, "package/index.js", PATCHED);
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "an unreadable ledger contributes nothing"
         );
     }
@@ -1474,7 +1459,9 @@ mod harvest_tests {
         r.files.get_mut("package/index.js").unwrap().after_hash = String::new();
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "a deletion-only record needs no blobs, even with a readable artifact"
         );
     }
@@ -1525,16 +1512,14 @@ mod harvest_tests {
         std::fs::create_dir_all(tmp.path().join(&rel)).unwrap();
         write_ledger(tmp.path(), purl, UUID, &rel);
         // <artifact>/../../outside.rs resolves here:
-        std::fs::write(
-            tmp.path().join(".socket/vendor/cargo/outside.rs"),
-            PATCHED,
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join(".socket/vendor/cargo/outside.rs"), PATCHED).unwrap();
 
         let (k, r) = record(purl, UUID, "../../outside.rs", PATCHED);
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "an escaping record key must never be resolved against the artifact dir"
         );
     }
@@ -1703,10 +1688,7 @@ mod berry_migration_risk_tests {
     /// `open(2)` forever — and the probe runs unconditionally at
     /// envelope-finalize time on EVERY vendor / scan --vendor run.
     #[cfg(unix)]
-    fn probe_with_timeout(
-        root: &Path,
-        fifo: &Path,
-    ) -> Option<VendorWarning> {
+    fn probe_with_timeout(root: &Path, fifo: &Path) -> Option<VendorWarning> {
         let root = root.to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {

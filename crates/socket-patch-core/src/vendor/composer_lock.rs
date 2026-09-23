@@ -32,42 +32,31 @@ use std::path::Path;
 
 use serde_json::{json, Map, Value};
 
+use crate::constants::SOCKET_DIR;
 use crate::crawlers::composer_crawler::normalize_version;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
-use crate::utils::fs::atomic_write_bytes_preserving_mode;
+use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
+use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
-    already_patched_result, copy_matches_after_hashes, done, refused, serialize_json,
-    service_offline_conflict, synthesized_result,
+    already_patched_result, any_live_file_references, copy_matches_after_hashes, done,
+    prune_empty_vendor_levels, refused, serialize_json, service_offline_conflict, stage_dir_for,
+    swap_stage_into_place, synthesized_result,
 };
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::extract_zip;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
-    write_marker, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
+    write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// Project-relative lockfile this backend wires.
 const COMPOSER_LOCK: &str = "composer.lock";
-
-/// Guarded read shared in shape with the Cargo.lock / .cargo/config.toml
-/// twins: `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `composer.lock` fails fast instead of wedging
-/// every caller (vendor's presence read, revert's stranded scan and restore)
-/// forever in an `open(2)` that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// Wiring-record discriminator. The record's `key` is
 /// `"<section>:<vendor>/<name>"` where `<section>` is `packages` or
@@ -328,14 +317,7 @@ pub async fn vendor_composer(
     // ── marker + ledger entry ────────────────────────────────────────────
     let base_purl = build_composer_purl(&vendor, &name, version);
     let marker = VendorMarker::new("composer", &base_purl, record, vendored_at);
-    if let Err(e) = write_marker(&uuid_dir, &marker).await {
-        // The marker is informational only (state.json is the ledger of
-        // record), so its failure must not fail an otherwise-wired vendor.
-        warnings.push(VendorWarning::new(
-            "vendor_marker_write_failed",
-            format!("could not write {}: {e}", super::state::VENDOR_MARKER_FILE),
-        ));
-    }
+    write_marker_or_warn(&uuid_dir, &marker, &mut warnings).await;
 
     let entry = VendorEntry {
         ecosystem: "composer".to_string(),
@@ -376,6 +358,14 @@ pub async fn vendor_composer(
 /// validated uuid dir. A drifted live entry — rewritten by a `composer
 /// update`, a hand edit, or a newer vendor run — is left alone with a
 /// `vendor_lock_entry_drifted` warning.
+///
+/// Drift-keep: when a record was left alone and the live composer.lock STILL
+/// names the uuid dir (reachable only past the stranded refusal below, i.e.
+/// under `keep_artifact`, or through a reference the refusal's structural
+/// scan does not see), the artifact is kept and `kept_artifact` tells the
+/// caller to keep the ledger entry too. A lock that no longer references
+/// the dir has converged: the drift is warned about and the artifact
+/// removed — nothing wired consumes it any more.
 ///
 /// Refused fail-closed when composer.lock still wires a package to our uuid
 /// dir that NO wiring record can restore (a `repair`-reconstructed entry
@@ -474,21 +464,35 @@ pub async fn revert_composer_opts(
         }
     }
 
-    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
-    // (and the caller keeps the ledger entry), so only the deletion is
-    // skipped.
-    if !dry_run && !keep_artifact {
-        if let Err(e) = remove_tree(&uuid_dir).await {
-            return RevertOutcome {
-                kept_artifact: false,
-                success: false,
-                warnings,
-                error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
-            };
+    let mut outcome = RevertOutcome {
+        kept_artifact: false,
+        success: true,
+        warnings,
+        error: None,
+    };
+    if !dry_run {
+        if outcome.drift_skipped()
+            && any_live_file_references(project_root, &[COMPOSER_LOCK], &uuid_dir_rel).await
+        {
+            // Drift-keep (see the fn doc): never delete a uuid dir the live
+            // lock still routes composer at.
+            outcome.keep_artifact(&uuid_dir_rel);
+        } else if !keep_artifact {
+            // `--preserve-state` (`keep_artifact`) skips only this deletion:
+            // the artifact dir stays behind and the caller keeps the ledger
+            // entry. The last composer entry leaves `.socket/vendor/composer/`
+            // (and `.socket/vendor/`) empty: the shared helper prunes them so
+            // a reverted project carries no vendor residue (non-recursive:
+            // siblings keep them).
+            if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
+                outcome.success = false;
+                outcome.error = Some(format!("failed to remove {}: {e}", uuid_dir.display()));
+                return outcome;
+            }
         }
     }
 
-    warnings.push(VendorWarning::new(
+    outcome.warnings.push(VendorWarning::new(
         "vendor_installed_copy_stale",
         format!(
             "the installed vendor/{} copy keeps the patched bytes until the next `composer install`",
@@ -500,93 +504,28 @@ pub async fn revert_composer_opts(
                 .unwrap_or("<package>")
         ),
     ));
-
-    RevertOutcome {
-        kept_artifact: false,
-        success: true,
-        warnings,
-        error: None,
-    }
+    outcome
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn swap_sibling_for(copy_dir: &Path, suffix: &str) -> std::path::PathBuf {
-    let name = copy_dir
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "copy".to_string());
-    match copy_dir.parent() {
-        Some(parent) => parent.join(format!("{name}{suffix}")),
-        None => copy_dir.join(suffix),
-    }
-}
-
-/// The staging sibling for a copy dir:
-/// `<uuid>/<vendor>/<name>@<version>.socket-stage`. (Re)builds are
-/// materialised here and swapped into place only on success, so a failure can
-/// never destroy a pre-existing (possibly live-wired) copy.
-fn stage_dir_for(copy_dir: &Path) -> std::path::PathBuf {
-    swap_sibling_for(copy_dir, ".socket-stage")
-}
-
-/// The backup sibling the old copy is parked at mid-swap:
-/// `<uuid>/<vendor>/<name>@<version>.socket-old`.
-fn backup_dir_for(copy_dir: &Path) -> std::path::PathBuf {
-    swap_sibling_for(copy_dir, ".socket-old")
-}
-
-/// Swap a fully-built stage into place without a destructive window: park the
-/// old copy (if any) at `<copy>.socket-old` with a same-dir rename, rename the
-/// stage over the now-vacant copy path, and only then delete the backup.
-/// Every step is a single atomic rename — no step can leave less recoverable
-/// state than it started with (see the cargo twin for the full rationale).
-async fn swap_stage_into_place(stage: &Path, copy_dir: &Path) -> std::io::Result<()> {
-    let backup = backup_dir_for(copy_dir);
-    // A stale backup (crash mid-swap on an earlier run) would make the
-    // park rename fail; `remove_tree` is a no-op when it is absent.
-    remove_tree(&backup).await?;
-    let had_old = match tokio::fs::rename(copy_dir, &backup).await {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e),
-    };
-    match tokio::fs::rename(stage, copy_dir).await {
-        Ok(()) => {
-            if had_old {
-                let _ = remove_tree(&backup).await;
-            }
-            Ok(())
-        }
-        Err(e) => {
-            if had_old {
-                let _ = tokio::fs::rename(&backup, copy_dir).await;
-            }
-            Err(e)
-        }
-    }
-}
-
 /// Best-effort removal of the EMPTY dir levels a failed run may have created
-/// above the copy — `<uuid>/<vendor>/`, `<uuid>/`, `.socket/vendor/composer/`
-/// and `.socket/vendor/` — so a hard failure leaves no husk for sweep to
-/// enumerate as a vendored unit (or for the user to commit). `remove_dir`
-/// refuses non-empty dirs, so live copies, markers, and other patches' vendor
-/// dirs always survive. `copy_dir` may be the copy or its stage sibling
-/// (same parent); pruning starts at its parent.
+/// above the copy — `<uuid>/<vendor>/`, then `<uuid>/`,
+/// `.socket/vendor/composer/` and `.socket/vendor/` via the shared prune — so
+/// a hard failure leaves no husk for sweep to enumerate as a vendored unit (or
+/// for the user to commit). `remove_dir` refuses non-empty dirs, so live
+/// copies, markers, and other patches' vendor dirs always survive. `copy_dir`
+/// may be the copy or its stage sibling (same parent); pruning starts at its
+/// parent.
 async fn prune_empty_vendor_dirs(copy_dir: &Path) {
-    let mut level = copy_dir.parent();
-    for _ in 0..4 {
-        let Some(dir) = level else { return };
-        match tokio::fs::remove_dir(dir).await {
-            Ok(()) => {}
-            // Already unwound wholesale (`remove_tree(uuid_dir)`): keep
-            // pruning the parent levels this run created.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            // Non-empty (a live copy or marker) or otherwise busy: stop.
-            Err(_) => return,
-        }
-        level = dir.parent();
+    let Some(vendor_level) = copy_dir.parent() else {
+        return;
+    };
+    // Already unwound wholesale (`remove_tree(uuid_dir)`) reads as NotFound
+    // and the shared prune below still walks the levels this run created.
+    let _ = tokio::fs::remove_dir(vendor_level).await;
+    if let Some(uuid_dir) = vendor_level.parent() {
+        prune_empty_vendor_levels(uuid_dir).await;
     }
 }
 
@@ -1006,6 +945,7 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::{ApplyResult, VerifyStatus};
+    use crate::vendor::common::backup_dir_for;
     use crate::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1587,7 +1527,9 @@ mod tests {
 
         // Drift the committed copy so the rerun takes the rebuild path…
         let drifted = root.join(copy_rel()).join("src/LoggerInterface.php");
-        tokio::fs::write(&drifted, b"<?php // drifted\n").await.unwrap();
+        tokio::fs::write(&drifted, b"<?php // drifted\n")
+            .await
+            .unwrap();
         // …and make the rebuild fail: the patch bytes cannot be sourced.
         let empty = root.join("empty-blobs");
         tokio::fs::create_dir_all(&empty).await.unwrap();
@@ -1699,11 +1641,12 @@ mod tests {
             drifted_bytes,
             "drifted lock left alone"
         );
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
         assert!(
             !root
                 .join(format!(".socket/vendor/composer/{UUID}"))
                 .exists(),
-            "uuid dir still removed"
+            "a lock rewired to the registry names nothing under .socket/vendor: the uuid dir is removed"
         );
     }
 
@@ -2265,7 +2208,9 @@ mod tests {
         assert!(e1.is_some());
 
         let drifted = root.join(copy_rel()).join("src/LoggerInterface.php");
-        tokio::fs::write(&drifted, b"<?php // drifted\n").await.unwrap();
+        tokio::fs::write(&drifted, b"<?php // drifted\n")
+            .await
+            .unwrap();
 
         // Integrity-valid garbage: the download verifies, the extract fails.
         let garbage = b"not a zip at all".to_vec();
@@ -2453,7 +2398,9 @@ mod tests {
         );
         assert!(entry.is_some(), "the wiring is live, the entry is recorded");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "{warnings:?}"
         );
         // The surgery really landed despite the marker failure.
@@ -2494,10 +2441,8 @@ mod tests {
     impl Drop for ModeGuard {
         fn drop(&mut self) {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &self.path,
-                std::fs::Permissions::from_mode(self.mode),
-            );
+            let _ =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
         }
     }
 
@@ -2562,7 +2507,9 @@ mod tests {
             PATCHED
         );
         assert!(
-            warnings.iter().all(|w| !w.code.starts_with("vendor_prebuilt")),
+            warnings
+                .iter()
+                .all(|w| !w.code.starts_with("vendor_prebuilt")),
             "build source must never touch the service: {warnings:?}"
         );
     }
@@ -2721,7 +2668,9 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some());
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_prebuilt_unavailable"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_unavailable"),
             "the fallback must record why the service was skipped: {warnings:?}"
         );
         assert_eq!(
@@ -2901,8 +2850,7 @@ mod tests {
             vec!["psr/log".to_string()]
         );
         // The same entry is no longer stranded once a record can restore it.
-        let restorable: HashSet<String> =
-            std::iter::once("packages:psr/log".to_string()).collect();
+        let restorable: HashSet<String> = std::iter::once("packages:psr/log".to_string()).collect();
         assert!(stranded_wired_packages(&lock_path, UUID, &restorable)
             .await
             .is_empty());
@@ -2937,7 +2885,8 @@ mod tests {
             outcome.error
         );
         assert!(
-            root.join(format!(".socket/vendor/composer/{UUID}")).exists(),
+            root.join(format!(".socket/vendor/composer/{UUID}"))
+                .exists(),
             "fail-closed: nothing deleted"
         );
         assert_eq!(
@@ -3060,8 +3009,11 @@ mod tests {
         .await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"
-                && w.detail.contains("unrecognized wiring kind")),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("unrecognized wiring kind")),
             "{:?}",
             outcome.warnings
         );
@@ -3071,6 +3023,11 @@ mod tests {
             "unknown wiring left alone"
         );
         assert!(root.join(copy_rel()).exists(), "artifact kept");
+        assert!(
+            outcome.kept_artifact,
+            "the still-wired lock drift-keeps the artifact: {:?}",
+            outcome.warnings
+        );
     }
 
     /// Malformed wiring records — no key, a colon-less key, an unknown
@@ -3129,13 +3086,18 @@ mod tests {
                 "{label}: lock untouched"
             );
             assert!(root.join(copy_rel()).exists(), "{label}: artifact kept");
+            assert!(
+                outcome.kept_artifact,
+                "{label}: the still-wired lock drift-keeps the artifact: {:?}",
+                outcome.warnings
+            );
         }
     }
 
     /// Drift shapes beyond the covered registry-dist rewrite: the whole lock
     /// section vanished, or the package entry was dropped from the lock. Both
-    /// warn and still remove the artifact (composer's documented
-    /// delete-on-drift behavior — nothing wired consumes it any more).
+    /// warn and still remove the artifact: nothing in the lock names the uuid
+    /// dir any more, so there is nothing a drift-keep would protect.
     #[tokio::test]
     async fn test_revert_drift_section_or_entry_gone_still_removes_artifact() {
         for strip_section in [true, false] {
@@ -3182,7 +3144,14 @@ mod tests {
                 "strip_section={strip_section}: drifted lock left alone"
             );
             assert!(
-                !root.join(format!(".socket/vendor/composer/{UUID}")).exists(),
+                !outcome.kept_artifact,
+                "strip_section={strip_section}: {:?}",
+                outcome.warnings
+            );
+            assert!(
+                !root
+                    .join(format!(".socket/vendor/composer/{UUID}"))
+                    .exists(),
                 "strip_section={strip_section}: uuid dir still removed"
             );
         }
@@ -3231,7 +3200,8 @@ mod tests {
             "the lock restore lands BEFORE the failed deletion"
         );
         assert!(
-            root.join(format!(".socket/vendor/composer/{UUID}")).exists(),
+            root.join(format!(".socket/vendor/composer/{UUID}"))
+                .exists(),
             "the undeletable uuid dir is still there"
         );
     }
@@ -3296,7 +3266,10 @@ mod tests {
             stage_dir_for(Path::new("/")),
             PathBuf::from("/.socket-stage")
         );
-        assert_eq!(backup_dir_for(Path::new("/")), PathBuf::from("/.socket-old"));
+        assert_eq!(
+            backup_dir_for(Path::new("/")),
+            PathBuf::from("/.socket-old")
+        );
     }
 
     /// A swap whose stage is gone (crash window / concurrent cleanup) must
@@ -3345,7 +3318,9 @@ mod tests {
             .unwrap();
         let stage = stage_dir_for(&copy);
         tokio::fs::create_dir_all(&stage).await.unwrap();
-        tokio::fs::write(stage.join("new.php"), b"rebuilt").await.unwrap();
+        tokio::fs::write(stage.join("new.php"), b"rebuilt")
+            .await
+            .unwrap();
 
         let guard = ModeGuard::set(&hold, 0o555);
         let result = swap_stage_into_place(&stage, &copy).await;
@@ -3383,7 +3358,9 @@ mod tests {
 
         // Drift the committed copy (a hand edit); the rerun rebuilds it.
         let drifted = root.join(copy_rel()).join("src/LoggerInterface.php");
-        tokio::fs::write(&drifted, b"<?php // drifted\n").await.unwrap();
+        tokio::fs::write(&drifted, b"<?php // drifted\n")
+            .await
+            .unwrap();
 
         let (r2, e2, w2) =
             unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);

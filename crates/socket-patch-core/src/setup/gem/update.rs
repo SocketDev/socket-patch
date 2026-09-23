@@ -249,8 +249,21 @@ async fn edit_gemfile_remove(gemfile: &Path, dry_run: bool) -> GemEditResult {
 /// an undetectable version; `remove_plugin_directive` is never gated (it is
 /// the recovery path for an already-wired 1.x project).
 pub async fn add_plugin_directive(project: &BundlerProject, dry_run: bool) -> Vec<GemEditResult> {
-    if let BundlerProbe::Unsupported { version, source } = probe_bundler(project).await {
-        let mut message = unsupported_bundler_message(&version, &source);
+    let probe = probe_bundler(project).await;
+    add_plugin_directive_with(project, &probe, dry_run).await
+}
+
+/// [`add_plugin_directive`] with the bundler probe supplied by the caller.
+/// `probe_bundler` may spawn `bundle --version` (10 s cap) when the lock has
+/// no `BUNDLED WITH`, so a caller that runs a dry-run preview and then the
+/// real edit (the CLI's `setup`) probes once and passes the result to both.
+pub async fn add_plugin_directive_with(
+    project: &BundlerProject,
+    probe: &BundlerProbe,
+    dry_run: bool,
+) -> Vec<GemEditResult> {
+    if let BundlerProbe::Unsupported { version, source } = probe {
+        let mut message = unsupported_bundler_message(version, source);
         // An ALREADY-wired project (wired before the floor existed, or on
         // another machine) gets the recovery path by name — "Not wiring this
         // project" alone would be misleading when the wiring is the problem.
@@ -1170,11 +1183,8 @@ mod tests {
         // runtime waits for on shutdown; connect a writer to release it so
         // the test can FAIL instead of hanging the whole suite.
         let deadline = std::time::Duration::from_secs(5);
-        let Ok(results) = tokio::time::timeout(
-            deadline,
-            remove_plugin_directive_at(&project, None, false),
-        )
-        .await
+        let Ok(results) =
+            tokio::time::timeout(deadline, remove_plugin_directive_at(&project, None, false)).await
         else {
             let _ = std::fs::OpenOptions::new().write(true).open(&index);
             panic!("remove must complete promptly with a FIFO index");

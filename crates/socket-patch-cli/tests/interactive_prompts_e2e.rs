@@ -489,8 +489,8 @@ fn remove_interactive_non_utf8_answer_declines_without_panic() {
 }
 
 /// Write a vendor ledger with one DETACHED npm entry (no manifest at all —
-/// the pure `scan --vendor --detached` layout), so `remove <purl>` routes to
-/// the detached-only path and its own confirm prompt.
+/// the ledger-only layout every `scan --mode vendored` run writes), so
+/// `remove <purl>` routes to the ledger-only path and its own confirm prompt.
 fn write_detached_vendor_state(root: &Path, purl: &str, uuid: &str) {
     let vendor = root.join(".socket/vendor");
     let artifact_dir = vendor.join("npm").join(uuid);
@@ -534,7 +534,10 @@ fn remove_detached_interactive_n_cancel_message_respects_silent() {
         "n\n",
         Duration::from_secs(15),
     );
-    assert_eq!(code, 0, "declined detached remove must exit cleanly; got: {output}");
+    assert_eq!(
+        code, 0,
+        "declined detached remove must exit cleanly; got: {output}"
+    );
     // Vacuity guard: the detached confirm prompt MUST have run — otherwise
     // an early error (e.g. a broken ledger fixture) would pass the absence
     // assertion below without ever reaching the cancel branch.
@@ -567,7 +570,10 @@ fn remove_detached_interactive_n_cancel_message_respects_silent() {
         "n\n",
         Duration::from_secs(15),
     );
-    assert_eq!(loud_code, 0, "declined detached remove must exit cleanly; got: {loud_output}");
+    assert_eq!(
+        loud_code, 0,
+        "declined detached remove must exit cleanly; got: {loud_output}"
+    );
     assert!(
         loud_output.contains("Removal cancelled"),
         "non-silent declined detached remove must report cancellation; got: {loud_output}"
@@ -589,9 +595,11 @@ fn apply_in_pty_with_no_manifest_prints_friendly_message() {
     let (code, output) = run_in_pty(&["apply"], tmp.path(), "", Duration::from_secs(15));
     assert_eq!(code, 0);
     // Assert the full message, not either half of it. The `||` previously
-    // let a truncated/garbled message ("...skipping...") pass.
+    // let a truncated/garbled message ("...nothing to apply...") pass.
+    // v5.0 wording names the missing manifest, not the `.socket/` folder
+    // (hosted/vendored projects have one with nothing for `apply` to do).
     assert!(
-        output.contains("No .socket folder found, skipping patch application."),
+        output.contains("No patch manifest found; nothing to apply."),
         "PTY apply no-manifest must print the friendly message; got: {output}"
     );
 }

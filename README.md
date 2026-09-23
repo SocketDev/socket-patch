@@ -175,8 +175,7 @@ automatically:
 
 ```bash
 socket-patch setup           # e.g. adds a postinstall script for npm projects
-echo '.socket/apply.lock' >> .gitignore   # lock state, not part of the patch record
-git add .gitignore .socket package.json   # npm example — setup prints which files it changed
+git add .socket package.json # npm example — setup prints which files it changed
 git commit -m "apply Socket security patches"
 ```
 
@@ -215,13 +214,17 @@ committed:
 
 | Path | Contents |
 |------|----------|
-| `.socket/manifest.json` | The record of downloaded patches: PURLs, file hashes, vulnerability metadata ([format](#manifest-format)) |
-| `.socket/blobs/` | Patched file contents, named by git-sha256 hash |
-| `.socket/vendor/` | Vendored package artifacts and the vendor/redirect ledgers (only in vendored/hosted modes) |
+| `.socket/manifest.json` | Agent mode: the record of downloaded patches — PURLs, file hashes, vulnerability metadata ([format](#manifest-format)) |
+| `.socket/blobs/` | Agent mode: patched file contents, named by git-sha256 hash |
+| `.socket/vendor/` | Vendored package artifacts and the vendor/redirect ledgers — the **only** state vendored and hosted modes write (the vendor ledger embeds the patch records; neither mode touches `manifest.json`) |
 
-> Mutating commands also leave a `.socket/apply.lock` file there between runs. It is
-> lock state, not part of the patch record — add it to your `.gitignore`
-> ([`repair`](#repair) deletes it).
+> While a command runs it holds a transient advisory lock, `.socket/apply.lock`, and
+> removes it when it finishes — the file never outlives the command, so there is nothing
+> to `.gitignore`. A crashed run can leave one behind; the next command reclaims and
+> removes it. Nothing in the table is written until there is something to record: a
+> report-only `scan`, a `--dry-run`, or a run that changes nothing leaves no `.socket/` at
+> all, and a full [`rollback`](#rollback) removes everything it created (only the
+> zero-patch `manifest.json` and any [`setup`](#setup) files stay).
 
 ### Three patch modes
 
@@ -232,7 +235,7 @@ The same patched bytes can reach your build three different ways. The modes diff
 | Mode | Where the patch lives | Install-time requirement | Trade-off |
 |------|----------------------|--------------------------|-----------|
 | **agent** — `scan --mode agent` (or [`apply`](#apply)) | `.socket/` manifest + blobs, committed; the CLI re-applies after each install | The `socket-patch` CLI must run (install hook via [`setup`](#setup), or an `apply` step in CI) | Small repo footprint (per-file blobs, not whole packages); no lockfile edits; the only mode that needs CI / install-hook changes |
-| **vendored** — `scan --mode vendored` (or [`vendor`](#vendor)) | Patched packages committed under `.socket/vendor/`; the lockfile is rewired to consume them | **None** — the package manager installs the committed bytes | Fully airgapped and hermetic, at the cost of repo size |
+| **vendored** — `scan --mode vendored` (or [`vendor`](#vendor)) | Patched packages committed under `.socket/vendor/` (with a ledger that embeds the patch records — no manifest); the lockfile is rewired to consume them | **None** — the package manager installs the committed bytes | Fully airgapped and hermetic, at the cost of repo size |
 | **hosted** — `scan --mode hosted` | No patched bytes in your repo: the lockfile is rewritten so **only** the patched dependencies resolve to Socket-hosted, integrity-pinned packages on `patch.socket.dev`; the edits + patch records are ledgered in `.socket/vendor/redirect-state.json` (commit it — [`vex`](#vex) reads it, and [`rollback`](#rollback) replays its recorded pre-redirect originals to unwind the redirect, see [Undo things](#undo-things)) | Installs must be able to reach `patch.socket.dev` (no CLI, no install hook) | Smallest possible diff (lockfile + ledger); not for airgapped installs |
 
 Every mode pins the patched bytes: in agent mode the CLI verifies every file on each
@@ -343,8 +346,7 @@ Go, Maven, NuGet, Deno) have no hook and are patched on demand instead.
 ```bash
 # Vendored: commit the patched packages themselves (airgap-friendly)
 socket-patch scan --json --mode vendored --yes
-echo '.socket/apply.lock' >> .gitignore
-git add .gitignore .socket package-lock.json # your lockfile may differ
+git add .socket package-lock.json            # your lockfile may differ
 
 # Hosted: smallest diff — patched deps resolve from patch.socket.dev
 socket-patch scan --json --mode hosted --yes
@@ -402,11 +404,11 @@ and repair; pick by what you want back:
 
 | Command | What it does |
 |---------|--------------|
-| [`rollback`](#rollback) | Restores the original file bytes but **keeps the manifest entry** — the next `apply` re-applies the patch |
-| [`remove`](#remove) | Everything `rollback` does, **plus** it deletes the manifest entry and reverts any vendoring — **permanent**, the patch is fully gone in one command |
+| [`rollback`](#rollback) | **Fully unpatches, in every mode**: restores the original file bytes, unwinds vendored and hosted lockfile wiring, removes the rolled-back entries from the manifest (a zero-patch `{"patches": {}}` husk stays) and garbage-collects their blobs — everything, or just the given targets; `--preserve-state` keeps the local patch state for a later re-apply |
+| [`remove`](#remove) | The single-patch dual of `rollback`: everything `rollback <id>` does for one PURL/UUID (restore, unwind its vendoring or hosted redirect, drop the entry, GC), plus `--skip-rollback` to drop only the record — **permanent**, the patch is fully gone in one command |
 | [`vendor --revert`](#vendor) | **Un-vendors wholesale**: restores the recorded original lockfile fragments byte-for-byte and removes the `.socket/vendor/` artifacts — works without a manifest |
 | [`scan --prune`](#scan) | **Reconciles, doesn't reverse**: drops manifest entries for packages that have left the project and garbage-collects orphan blob/diff/archive files — installed patches stay |
-| [`repair`](#repair) (alias `gc`) | **Restores health, not originals**: re-downloads missing blobs, rebuilds missing/corrupt vendored artifacts, cleans up unused ones, and removes the leftover `apply.lock` file (housekeeping — mutating commands leave it behind after every run) |
+| [`repair`](#repair) (alias `gc`) | **Restores health, not originals**: re-downloads missing blobs, rebuilds missing/corrupt vendored artifacts, and cleans up unused ones |
 
 And `setup --remove` reverts the install hooks that `setup` added.
 
@@ -426,11 +428,11 @@ And `setup --remove` reverts the install hooks that `setup` added.
 | [`vex`](#vex) | Generate an OpenVEX attestation for the applied patches |
 | [`vendor`](#vendor) | Eject patched dependencies into committable `.socket/vendor/` |
 | [`setup`](#setup) | Wire install hooks so patches re-apply automatically |
-| [`rollback`](#rollback) | Restore original files (keeps the manifest) |
+| [`rollback`](#rollback) | Fully unpatch everything (or the given targets) in every mode and drop the rolled-back manifest entries (`--preserve-state` keeps them) |
 | [`get`](#get) | Fetch and apply a patch by UUID / CVE / GHSA / PURL / name (alias: `download`) |
-| [`list`](#list) | List all patches in the local manifest |
+| [`list`](#list) | List recorded patches: manifest entries plus vendor-ledger and redirect-ledger records |
 | [`remove`](#remove) | Remove a patch: roll back files + delete the manifest entry |
-| [`repair`](#repair) | Download missing blobs, clean up unused ones, tidy lock state (alias: `gc`) |
+| [`repair`](#repair) | Download missing blobs, rebuild vendored artifacts, clean up unused ones (alias: `gc`) |
 
 ### Global options
 
@@ -466,7 +468,7 @@ settings, described in [Configuration sources](#configuration-sources) below.
 | `-s, --silent` | `SOCKET_SILENT` | Suppress non-error output. |
 | `--dry-run` | `SOCKET_DRY_RUN` | Preview the operation without making any mutations. |
 | `-y, --yes` | `SOCKET_YES` | Skip interactive confirmation prompts. |
-| `--lock-timeout <secs>` | `SOCKET_LOCK_TIMEOUT` | Seconds to wait for `.socket/apply.lock` before giving up. `0`/unset = a single non-blocking try; a positive value retries with backoff. Only meaningful for mutating commands (`apply`, `rollback`, `repair`, `remove`). |
+| `--lock-timeout <secs>` | `SOCKET_LOCK_TIMEOUT` | Seconds to wait for `.socket/apply.lock` before giving up. `0`/unset = a single non-blocking try; a positive value retries with backoff. Only meaningful for the commands that take the lock — `apply`, `rollback`, `repair`, `remove`, `vendor`, `setup` (while persisting `--exclude`), and `scan`/`get` whenever they write (agent-mode download + apply, vendored, hosted). The lock file exists only while a command runs. |
 | `--debug` | `SOCKET_DEBUG` | Emit verbose debug logs to stderr. |
 | `--no-telemetry` | `SOCKET_TELEMETRY_DISABLED` | Disable anonymous usage telemetry. |
 
@@ -516,12 +518,15 @@ it finds. `scan` is the entry point for all three [patch modes](#three-patch-mod
 - `--mode agent` downloads and applies the selected patches in place;
 - `--mode vendored` discovers, downloads, and builds + wires the committable
   `.socket/vendor/` artifacts in one pass (re-vendoring automatically when a newer patch
-  is selected);
+  is selected); it is manifest-free — the vendor ledger embeds the patch records and
+  nothing else is written under `.socket/`;
 - `--mode hosted` rewrites lockfiles / registry configs so only the patched dependencies
   resolve to Socket-hosted packages.
 
-Without a mode, interactive `scan` prompts before applying, and `scan --json` is
-read-only (discovery plus an `updates[]` array; no mutation).
+Without a mode, interactive `scan` prompts before applying (in a TTY — when stdin is not a
+TTY and neither `--yes` nor a mode/`--prune` flag is given, it is report-only: it prints what
+it found plus the "To apply a patch, run: …" hint, writes nothing, and exits 0), and
+`scan --json` is read-only (discovery plus an `updates[]` array; no mutation).
 
 `scan --mode agent --prune` is the single command bots need for full auto-update: it
 discovers patches, applies them, and garbage-collects orphan blob files plus manifest
@@ -536,8 +541,8 @@ socket-patch scan [options]
 | Flag | Env var | Description |
 |------|---------|-------------|
 | `--mode <hosted\|vendored\|agent>` | — | Selects one of the three [patch modes](#three-patch-modes), summarized above. Combining `--mode` with a legacy boolean flag of a *different* mode is an error (exit 2); the same mode spelled both ways is accepted. |
-| `--prune` | — | Garbage-collect after the scan: remove manifest entries for packages no longer present in the crawl (installed trees + lockfiles — a wiped `node_modules` alone doesn't prune lockfile-listed entries) and delete orphan blob/diff/package-archive files. Off by default. [Vendored](#vendor) packages are exempt from the crawl-based prune (an absent installed copy is their normal state), but a vendored entry whose dependency has left the lockfile is reverted and its manifest entry dropped. Orthogonal to `--mode` — combines with any mode. |
-| `--detached` | — | With `--mode vendored`: skip all `.socket/manifest.json` writes — the vendor ledger embeds the patch records instead. For projects that want the vendored patches *only* in the lockfile + `.socket/vendor/`. Detached patches are invisible to `apply`/`rollback`/`repair`; undo them with `remove <purl>` or `vendor --revert`. |
+| `--prune` | — | Garbage-collect after the scan: remove manifest entries for packages no longer present in the crawl (installed trees + lockfiles — a wiped `node_modules` alone doesn't prune lockfile-listed entries) and delete orphan blob/diff/package-archive files. Off by default. [Vendored](#vendor) packages are exempt from the crawl-based prune (an absent installed copy is their normal state), but a vendored entry whose dependency has left the lockfile is reverted (and any manifest entry it still had dropped). Orthogonal to `--mode` — combines with any mode. |
+| `--detached` | — | Hidden compatibility no-op. Vendored mode is manifest-free by default: the vendor ledger (`.socket/vendor/state.json`) embeds the patch records and `.socket/manifest.json` is never written, so this former opt-in changes nothing. Still an error without `--mode vendored`. |
 | `--batch-size <n>` | `SOCKET_BATCH_SIZE` | Packages per API request (default: `100`). |
 | `--all-releases` | `SOCKET_ALL_RELEASES` | Store patches for every release/distribution variant, not just the installed one — PyPI wheel/sdist, RubyGems platform, Maven classifier. Makes the manifest portable across environments (e.g. cross-platform CI caches). |
 | `--vex <path>` | `SOCKET_VEX` | On a successful scan, also write an OpenVEX 0.2.0 document to this path. See [Inline VEX generation](#inline-vex-on-apply--scan--vendor). |
@@ -582,9 +587,6 @@ socket-patch scan --json --mode agent --prune --yes --vex socket.vex.json
 # lockfile but not yet installed are fetched pristine from their registry and
 # integrity-verified against the lockfile before vendoring.
 socket-patch scan --json --mode vendored --yes
-
-# Same, but keep the manifest out of it entirely
-socket-patch scan --json --mode vendored --detached --yes
 
 # Preview a vendored run (would_vendor / would_revendor / already_vendored)
 socket-patch scan --json --mode vendored --yes --dry-run
@@ -686,9 +688,10 @@ socket-patch vex --no-verify --output socket.vex.json
 [vendored mode](#three-patch-modes) (`scan --mode vendored` runs discovery + this engine
 in one pass). Instead of patching installed packages in place (machine-local state),
 `vendor` ejects each patched package into `.socket/vendor/<ecosystem>/<patch-uuid>/…` and
-rewires your lockfile so the project consumes the vendored copy. Commit `.socket/` — the
-vendored artifacts plus the manifest that [`vex`](#vex), [`list`](#list), and
-[`repair`](#repair) read — along with the lockfile edits, and **every fresh checkout
+rewires your lockfile so the project consumes the vendored copy. Commit `.socket/vendor/` —
+the vendored artifacts plus the ledger whose embedded patch records [`vex`](#vex),
+[`list`](#list), and [`repair`](#repair) read (vendored mode writes nothing else under
+`.socket/`) — along with the lockfile edits, and **every fresh checkout
 builds with the patched dependency**: no `socket-patch` binary, no Socket API access, no
 install hook required on the consuming machine.
 
@@ -722,8 +725,10 @@ it:
   `updates[]` as the signal to re-run `scan --mode vendored`.
 - [`vex`](#vex) attests vendored patches by verifying the **committed artifact** (marked
   `(vendored)` in the impact statement) — no `setup` install hook needed.
-- Re-running `vendor` is idempotent; patches dropped from the manifest are auto-reverted
-  on the next run.
+- Re-running `vendor` is idempotent. Standalone `vendor` (no flags) is driven by
+  `.socket/manifest.json` — patches dropped from that manifest are auto-reverted on the
+  next run — so on a project vendored by `scan --mode vendored` (no manifest) it is a
+  clean no-op; use [`repair`](#repair) to verify or rebuild the committed artifacts there.
 
 **Examples:**
 ```bash
@@ -733,8 +738,7 @@ socket-patch vendor
 # Preview without writing anything
 socket-patch vendor --dry-run
 
-# Then make it stick: commit .socket/ (vendor artifacts + manifest) and the lockfile
-# (gitignore .socket/apply.lock — see "How Socket Patch works")
+# Then make it stick: commit .socket/ (vendor artifacts + ledger) and the lockfile
 git add .socket package-lock.json && git commit -m "vendor Socket patches"
 
 # Undo everything (restores the original lockfile byte-for-byte)
@@ -869,25 +873,33 @@ socket-patch setup --json -y
 
 ### `rollback`
 
-Roll back patches to restore the original files. If no identifier is given, all patches
-are rolled back. The manifest entries are kept, so a later `apply` re-applies the patches
-— use [`remove`](#remove) to delete a patch permanently.
+Roll back patches to restore the system to unpatched. If no target is given, everything
+is rolled back, across all three modes: in-place file restores (agent), vendored unwire +
+artifact deletion + ledger-entry drop, and hosted lockfile-redirect unwind + record drop.
+The rolled-back entries are then removed from `.socket/manifest.json` (a zero-patch
+`{"patches": {}}` husk stays) and their blobs are garbage-collected — a later `apply` has
+nothing to re-apply. Pass `--preserve-state` to keep the local patch state (manifest
+entries, vendored artifacts + ledger entries) for a later re-apply; use
+[`remove`](#remove) for a single patch.
 
-Packages managed by [`vendor`](#vendor) are excluded — their patch lives in the committed
-artifact, not the installed tree — and are listed in the JSON output's `vendored` array
-(use `remove` or `vendor --revert` to undo them).
+A wet run confirms once (auto-accepted under `--yes`/`--json`/non-TTY). Vendor-owned purls
+the run did NOT act on (today: a corrupt vendor ledger) are listed in the JSON output's
+`vendored` array; acted-on entries ride `vendoredReverted` / `vendoredPreserved` /
+`vendoredKept`.
 
 **Usage:**
 ```bash
-socket-patch rollback [identifier] [options]
+socket-patch rollback [targets]... [options]
 ```
 
 **Arguments:**
-- `identifier` — package PURL or patch UUID to roll back. Omit to roll back all patches.
+- `targets` — zero or more package PURLs, patch UUIDs or path globs (unioned). Omit to roll
+  back everything.
 
 **Command-specific options** (plus all [Global options](#global-options)):
 | Flag | Env var | Description |
 |------|---------|-------------|
+| `--preserve-state` | `SOCKET_PRESERVE_STATE` | Unpatch the system but keep the local patch state — manifest entries, vendored artifacts + ledger entries — for a later re-apply, and skip GC. Hosted redirects have no preservable state and are unwound either way. |
 | `--one-off` | `SOCKET_ONE_OFF` | Reserved: rollback by fetching original (`beforeHash`) files from the API, no manifest required. **Not yet implemented** — the command currently errors up front. |
 
 **Examples:**
@@ -967,7 +979,9 @@ socket-patch get CVE-2024-12345 --json -y
 
 ### `list`
 
-List all patches in the local manifest.
+List all patches recorded locally: the manifest's entries plus the vendor ledger's
+(labeled `Mode: vendored`) and the hosted redirect ledger's records, so it works on
+manifest-less vendored or hosted projects too.
 
 **Usage:**
 ```bash
@@ -1010,8 +1024,9 @@ Package: pkg:npm/flatted@3.3.1
 Remove a patch from the manifest (rolls back files first by default). If the package is
 [vendored](#vendor), `remove` also **reverts the vendoring** — the lockfile is restored
 byte-for-byte and the `.socket/vendor/` artifact is deleted — so the patch is fully gone
-in one command. Detached-vendored patches (from `scan --mode vendored --detached`) are
-removable by PURL or UUID too, even though they have no manifest entry.
+in one command. Patches vendored by `scan --mode vendored` have no manifest entry and are
+removable by PURL or UUID all the same (reverting the vendoring *is* the removal, so
+`--skip-rollback` is refused for them).
 
 **Usage:**
 ```bash
@@ -1024,7 +1039,7 @@ socket-patch remove <identifier> [options]
 **Command-specific options** (plus all [Global options](#global-options)):
 | Flag | Env var | Description |
 |------|---------|-------------|
-| `--skip-rollback` | `SOCKET_SKIP_ROLLBACK` | Only update the manifest, do not restore original files (for vendored packages this also leaves the vendor wiring + artifact in place). |
+| `--skip-rollback` | `SOCKET_SKIP_ROLLBACK` | Only update the manifest, do not restore original files (for a vendored package that still has a manifest entry this also leaves the vendor wiring + artifact in place; refused for manifest-less vendored patches, where the revert *is* the removal). |
 
 **Examples:**
 ```bash
@@ -1043,7 +1058,8 @@ socket-patch remove "pkg:npm/lodash@4.17.20" --json
 
 ### `repair`
 
-Download missing blobs, clean up unused blobs, and reset the advisory lock state.
+Download missing blobs, rebuild missing or corrupt vendored artifacts, and clean up unused
+blobs.
 
 Alias: `gc`
 
@@ -1053,12 +1069,10 @@ free space. It also rebuilds missing or corrupt vendored artifacts. For the comb
 workflow (discover + apply + GC in one pass), use
 `scan --json --mode agent --prune --yes` instead.
 
-As its final step, `repair` removes the leftover `.socket/apply.lock` file that mutating
-commands retain between runs (skipped under `--dry-run`). A leftover file from a crashed
-run never blocks anything — the OS releases a dead process's lock automatically — so this
-is pure housekeeping. If another `socket-patch` process is actively running, `repair`
-refuses up front with `lock_held` (exit 1); it never steals a live lock — wait for the
-other process to finish, or budget a wait with `--lock-timeout`.
+Like every other mutating command, `repair` takes the `.socket/apply.lock` advisory lock
+while it runs and removes it when it finishes. If another `socket-patch` process is
+actively running, `repair` refuses up front with `lock_held` (exit 1); it never steals a
+live lock — wait for the other process to finish, or budget a wait with `--lock-timeout`.
 
 **Usage:**
 ```bash
@@ -1098,9 +1112,8 @@ place — without bumping the package version.
    patched file's hash on disk so the attestation only covers patches that are actually
    applied. [Vendored](#vendor) patches are verified against the **committed artifact**
    instead of the installed tree (their impact statement carries a `(vendored)` marker),
-   and need no `setup` install hook to be attested. Detached-vendored patches
-   (`scan --mode vendored --detached`)
-   attest from the vendor ledger's embedded records, and
+   and need no `setup` install hook to be attested. Patches vendored by
+   `scan --mode vendored` attest from the vendor ledger's embedded records, and
    [hosted-mode](#three-patch-modes) patches attest from the redirect ledger
    (`.socket/vendor/redirect-state.json`, marker `(redirected)` — hash-verified against
    the installed tree post-install), so `vex` works even with no manifest file at all.
@@ -1155,8 +1168,8 @@ trivy image --vex socket.vex.json <image>
 ```
 
 Apply patches first (in any mode) — `vex` errors with `no_patches` when there is nothing
-to attest (an empty manifest, no detached-vendored patches, and no hosted redirect
-records).
+to attest (an empty or missing manifest, no vendored ledger entries, and no hosted
+redirect records).
 
 ### Inline VEX on `apply` / `scan` / `vendor`
 
@@ -1170,7 +1183,7 @@ socket-patch apply --vex socket.vex.json
 # Discover, apply, prune, and attest — the full auto-update-bot pass
 socket-patch scan --json --mode agent --prune --yes --vex socket.vex.json
 
-# Vendor and attest — works manifest-less with --detached too
+# Vendor and attest — manifest-less by construction
 socket-patch scan --json --mode vendored --yes --vex socket.vex.json
 ```
 
@@ -1223,7 +1236,10 @@ socket-patch apply --json | jq '.status'
 ```
 
 When stdin is not a TTY (e.g. in CI pipelines), interactive prompts auto-proceed instead
-of blocking. Progress indicators and ANSI colors are automatically suppressed when output
+of blocking — with one deliberate exception: a plain `scan` (no `--mode`/`--apply`/`--sync`/
+`--vendor`/`--prune` and no `--yes`) is report-only there. It prints what it found and the
+"To apply a patch, run: …" hint, writes nothing, and exits 0; add `--yes` or a mode flag
+to mutate. Progress indicators and ANSI colors are automatically suppressed when output
 is piped.
 
 The exact JSON shapes, exit codes, and stability guarantees are specified in

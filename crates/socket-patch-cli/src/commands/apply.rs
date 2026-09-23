@@ -1,5 +1,6 @@
 use clap::Args;
-use socket_patch_core::api::client::get_api_client_with_overrides;
+use socket_patch_core::api::blob_fetcher::get_missing_blobs;
+use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
 use socket_patch_core::crawlers::{
     detect_npm_pkg_manager, CrawlerOptions, Ecosystem, NpmPkgManager, RubyCrawler,
@@ -9,6 +10,7 @@ use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRec
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, MismatchPolicy, PatchSources, VerifyStatus,
 };
+use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::redirect::golang_local::{
     apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
 };
@@ -72,6 +74,7 @@ async fn ensure_blobs_for_mismatches(
     all_packages: &HashMap<String, Vec<PathBuf>>,
     vendored_purls: &HashSet<String>,
     staged: &mut StagedSources,
+    client: &ApiClient,
 ) {
     if args.common.strict && !args.force {
         return; // strict fails on mismatch — nothing to fetch
@@ -116,9 +119,8 @@ async fn ensure_blobs_for_mismatches(
         }
         return;
     };
-    let (client, _) = get_api_client_with_overrides(args.common.api_client_overrides()).await;
     let _ = socket_patch_core::api::blob_fetcher::fetch_blobs_by_hash(
-        &needed, blobs_path, &client, None,
+        &needed, blobs_path, client, None,
     )
     .await;
 }
@@ -150,6 +152,11 @@ async fn ensure_blobs_for_mismatches(
 /// by contrast, mirrors the apply loop's representative check against the
 /// FIRST copy (release-variant ecosystems install one directory per
 /// `package@version`).
+///
+/// Only a mismatched file whose afterHash blob is NOT staged can queue a
+/// fetch, so the probe first decides that with metadata probes alone and
+/// hashes only the files that can still matter: the common fully-cached
+/// run hashes nothing here (the apply loop re-verifies everything anyway).
 async fn mismatch_blob_gaps(
     manifest: &PatchManifest,
     all_packages: &HashMap<String, Vec<PathBuf>>,
@@ -158,6 +165,18 @@ async fn mismatch_blob_gaps(
     force: bool,
 ) -> HashSet<String> {
     let mut needed: HashSet<String> = HashSet::new();
+    let missing = get_missing_blobs(manifest, blobs_path).await;
+    if missing.is_empty() {
+        return needed;
+    }
+    // A record can queue a fetch only through a content-modifying file
+    // (non-empty beforeHash) whose afterHash blob is missing.
+    let can_queue = |record: &PatchRecord| {
+        record
+            .files
+            .values()
+            .any(|f| !f.before_hash.is_empty() && missing.contains(&f.after_hash))
+    };
     for (purl, pkg_paths) in all_packages {
         let Some(first_path) = pkg_paths.first() else {
             continue;
@@ -177,6 +196,9 @@ async fn mismatch_blob_gaps(
         {
             continue;
         }
+        if !records.iter().any(|(_, record)| can_queue(record)) {
+            continue;
+        }
         let gated = variant_eco
             && !force
             && (records.len() > 1
@@ -184,6 +206,9 @@ async fn mismatch_blob_gaps(
                     .first()
                     .is_some_and(|(key, _)| key.as_str() != stripped));
         for (_, record) in records {
+            if !can_queue(record) {
+                continue;
+            }
             if gated {
                 if let Some((file_name, file_info)) = representative_file(&record.files) {
                     let status = verify_file_patch(first_path, file_name, file_info)
@@ -195,16 +220,12 @@ async fn mismatch_blob_gaps(
                 }
             }
             for (file_name, info) in &record.files {
-                if info.before_hash.is_empty() {
+                if info.before_hash.is_empty() || !missing.contains(&info.after_hash) {
                     continue;
                 }
                 for pkg_path in pkg_paths {
                     let verify = verify_file_patch(pkg_path, file_name, info).await;
-                    if verify.status == VerifyStatus::HashMismatch
-                        && tokio::fs::metadata(blobs_path.join(&info.after_hash))
-                            .await
-                            .is_err()
-                    {
+                    if verify.status == VerifyStatus::HashMismatch {
                         needed.insert(info.after_hash.clone());
                         break; // the fetch is per-hash; one drifted copy queues it
                     }
@@ -273,17 +294,23 @@ pub(crate) fn is_local_go(purl: &str, common: &GlobalArgs) -> bool {
         && Ecosystem::from_purl(purl) == Some(Ecosystem::Golang)
 }
 
-/// Whether local-go redirects are in scope (local mode + golang not filtered out
-/// by `--ecosystems`). Gates reconcile / `--check`.
-fn go_in_local_scope(common: &GlobalArgs) -> bool {
+/// Whether this run can touch `eco`'s LOCAL install tree at all: local mode
+/// (a `--global` / `--global-prefix` run crawls a different tree, so the
+/// checkout says nothing about what it will patch) with the ecosystem not
+/// filtered out by `--ecosystems`. The filter check is the exact `cli_name`
+/// match `partition_purls` applies — clap admits no alias or case variant —
+/// so a scope decided here can never diverge from the crawl scope. Gates
+/// the local-go reconcile / `--check` (golang) and the yarn-PnP refusal
+/// (npm: the refusal is about THIS run's packages living inside
+/// `.yarn/cache/*.zip`, so a run that never crawls the checkout's
+/// `node_modules` must not be refused by its layout).
+fn eco_in_local_scope(common: &GlobalArgs, eco: Ecosystem) -> bool {
     if common.global || common.global_prefix.is_some() {
         return false;
     }
     match &common.ecosystems {
         None => true,
-        Some(list) => list
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case("golang") || e.eq_ignore_ascii_case("go")),
+        Some(list) => list.iter().any(|e| e == eco.cli_name()),
     }
 }
 
@@ -329,7 +356,7 @@ async fn try_local_go_apply(
 /// After the apply loop: prune local-go redirects whose patches were dropped
 /// from the manifest. No-op unless local go is in scope.
 async fn reconcile_local_go(common: &GlobalArgs, target_manifest_purls: &HashSet<String>) {
-    if !go_in_local_scope(common) {
+    if !eco_in_local_scope(common, Ecosystem::Golang) {
         return;
     }
     let desired: HashSet<String> = target_manifest_purls
@@ -387,7 +414,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
 
     {
         use socket_patch_core::patch::redirect::golang_local::Drift as GoDrift;
-        if go_in_local_scope(&args.common) {
+        if eco_in_local_scope(&args.common, Ecosystem::Golang) {
             // Vendored modules are excluded: their replace directives point at
             // `.socket/vendor/golang/` (the verify engine skips Vendor-owned
             // entries) and their state is audited by `vendor`, not `--check`.
@@ -605,38 +632,14 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
     PatchEvent::new(PatchAction::Applied, purl).with_files(files)
 }
 
-/// Whether this run can touch `--cwd`'s npm `node_modules` at all: local
-/// mode (a `--global` / `--global-prefix` run crawls a different tree, so
-/// the checkout's layout says nothing about what it will patch) with npm
-/// not filtered out by `--ecosystems`. Gates the yarn-PnP refusal — the
-/// refusal is about THIS run's packages living inside `.yarn/cache/*.zip`,
-/// so a run that never crawls the checkout's `node_modules` must not be
-/// refused by its layout. The filter check is the exact `cli_name` match
-/// `partition_purls` applies, so the refusal scope can never diverge from
-/// the crawl scope.
-fn npm_in_local_scope(common: &GlobalArgs) -> bool {
-    if common.global || common.global_prefix.is_some() {
-        return false;
-    }
-    match &common.ecosystems {
-        None => true,
-        Some(list) => list.iter().any(|e| e == Ecosystem::Npm.cli_name()),
-    }
-}
-
 /// True when the manifest records at least one npm patch — the only kind a
 /// PnP layout can block (a polyglot repo's pypi/gem/go patches live outside
-/// `node_modules` and apply fine). An unreadable or vanished manifest
-/// returns false so the ordinary manifest error paths surface instead of a
-/// misdirected layout refusal.
-async fn manifest_targets_npm(manifest_path: &Path) -> bool {
-    match read_manifest(manifest_path).await {
-        Ok(Some(m)) => m
-            .patches
-            .keys()
-            .any(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Npm)),
-        _ => false,
-    }
+/// `node_modules` and apply fine).
+fn manifest_targets_npm(manifest: &PatchManifest) -> bool {
+    manifest
+        .patches
+        .keys()
+        .any(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Npm))
 }
 
 /// Print the yarn-PnP refusal (JSON envelope or human stderr) and return
@@ -668,14 +671,12 @@ fn refuse_yarn_pnp(args: &ApplyArgs) -> i32 {
 
 pub async fn run(args: ApplyArgs) -> i32 {
     apply_env_toggles(&args.common);
-    let (telemetry_client, _) =
-        get_api_client_with_overrides(args.common.api_client_overrides()).await;
-    let api_token = telemetry_client.api_token().cloned();
-    let org_slug = telemetry_client.org_slug().cloned();
-
     let manifest_path = args.common.resolved_manifest_path();
 
-    // Check if manifest exists - exit successfully if no .socket folder is set up
+    // No manifest → nothing to apply: a clean exit-0 no-op (load-bearing
+    // for the install hooks, which run `apply --silent` on every install).
+    // Nothing below this gate is touched — no API client (its config read,
+    // stderr advisory and org-slug round-trip), no lock, no `.socket/`.
     if tokio::fs::metadata(&manifest_path).await.is_err() {
         // A yarn-PnP layout refuses loudly even with no manifest: scan
         // cannot discover PnP packages (they live inside .yarn/cache zips),
@@ -686,7 +687,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
         // Scoped to runs that would actually crawl this checkout's
         // node_modules: a --global/--global-prefix run or an --ecosystems
         // filter excluding npm never touches it.
-        if npm_in_local_scope(&args.common)
+        if eco_in_local_scope(&args.common, Ecosystem::Npm)
             && matches!(
                 detect_npm_pkg_manager(&args.common.cwd),
                 NpmPkgManager::YarnBerryPnP
@@ -700,7 +701,10 @@ pub async fn run(args: ApplyArgs) -> i32 {
             env.dry_run = args.common.dry_run;
             println!("{}", env.to_pretty_json());
         } else if !args.common.silent {
-            println!("No .socket folder found, skipping patch application.");
+            // Names the manifest, not the folder: hosted- and vendored-mode
+            // projects have a `.socket/` (their ledgers live under
+            // `.socket/vendor/`) and still nothing for `apply` to do.
+            println!("No patch manifest found; nothing to apply.");
         }
         return 0;
     }
@@ -713,12 +717,17 @@ pub async fn run(args: ApplyArgs) -> i32 {
         return run_check(&args, &manifest_path).await;
     }
 
+    // The run's ONE API client — built past both read-only exits above (a
+    // hook on a manifest-less project or a CI `--check` never pays its
+    // config read, stderr advisory or org-slug round-trip) and BEFORE the
+    // lock, so none of that lengthens the lock hold. It serves the staging
+    // fetch, the mismatch blob top-up and telemetry.
+    let (client, _) = get_api_client_with_overrides(args.common.api_client_overrides()).await;
+
     // Serialize against concurrent socket-patch runs targeting the same
-    // `.socket/` directory. The guard releases on function return; see
-    // `socket_patch_core::patch::apply_lock`.
-    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
-    let _lock = match acquire_or_emit(
-        socket_dir,
+    // `.socket/` directory; see `socket_patch_core::patch::apply_lock`.
+    let lock = match acquire_or_emit(
+        &args.common.socket_dir(),
         Command::Apply,
         args.common.json,
         args.common.dry_run,
@@ -728,6 +737,45 @@ pub async fn run(args: ApplyArgs) -> i32 {
         Err(code) => return code,
     };
 
+    run_locked(args, manifest_path, &client, lock).await
+}
+
+/// The locked half of `apply`: everything from the manifest read on — the
+/// package-manager layout gate, the apply loop, embedded VEX, output and
+/// telemetry — over a `lock` the caller already holds and the caller's
+/// `client`. [`run`] takes the lock itself; agent-mode `get` and
+/// `scan --apply/--sync` call this straight after their manifest write, so
+/// download → manifest write → apply is ONE lock window (a same-process
+/// re-acquire would contend) and the nested apply never builds a second
+/// client. `lock` is released explicitly once every mutation is done
+/// (output and a possibly slow telemetry POST must not keep a sibling
+/// waiting), otherwise on return.
+pub(crate) async fn run_locked(
+    args: ApplyArgs,
+    manifest_path: PathBuf,
+    client: &ApiClient,
+    lock: LockGuard,
+) -> i32 {
+    let api_token = client.api_token().cloned();
+    let org_slug = client.org_slug().cloned();
+
+    // ONE parse of the manifest for the whole run — the PnP gate and the
+    // apply loop (embedded VEX re-reads it by design, after the writes).
+    // Apply never modifies it, so a read under the lock is final. `Ok(None)`
+    // (vanished since the existence probe above) and a read/parse error take
+    // the same exit as every other apply failure.
+    let manifest = match read_manifest(&manifest_path).await {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            lock.release();
+            return report_apply_failure(&args, "Invalid manifest", &api_token, &org_slug).await;
+        }
+        Err(e) => {
+            lock.release();
+            return report_apply_failure(&args, &e.to_string(), &api_token, &org_slug).await;
+        }
+    };
+
     // Package-manager layout detection. yarn-berry PnP keeps packages
     // inside `.yarn/cache/*.zip` and resolves them via `.pnp.cjs` —
     // the npm crawler can't reach them and rewriting zips is a
@@ -735,12 +783,13 @@ pub async fn run(args: ApplyArgs) -> i32 {
     // `yarn patch` — but only when an npm patch is actually in scope:
     // a polyglot repo's pypi/gem/go patches apply fine under PnP, and a
     // global-tree or non-npm `--ecosystems` run never crawls this
-    // checkout's node_modules at all. pnpm gets an informational event;
-    // the CoW guard in `apply_file_patch` does the substantive safety
-    // work.
+    // checkout's node_modules at all. pnpm gets an informational note;
+    // the substantive safety is core's rename-over write
+    // (`utils::fs::atomic_write_bytes` never touches the store's shared
+    // inode).
     match detect_npm_pkg_manager(&args.common.cwd) {
         NpmPkgManager::YarnBerryPnP => {
-            if npm_in_local_scope(&args.common) && manifest_targets_npm(&manifest_path).await {
+            if eco_in_local_scope(&args.common, Ecosystem::Npm) && manifest_targets_npm(&manifest) {
                 return refuse_yarn_pnp(&args);
             }
         }
@@ -750,9 +799,9 @@ pub async fn run(args: ApplyArgs) -> i32 {
                     "Note: pnpm layout detected. Copy-on-write will keep the global store untouched."
                 );
             }
-            // Non-fatal — CoW handles the safety. JSON consumers see
-            // the layout-detected info in the apply envelope's
-            // existing events (no separate event added here yet).
+            // Non-fatal — the rename-over write handles the safety. JSON
+            // consumers see the layout-detected info in the apply
+            // envelope's existing events (no separate event added here yet).
         }
         NpmPkgManager::Bun => {
             if !args.common.json && !args.common.silent {
@@ -761,7 +810,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 );
             }
             // Same shape as pnpm: bun hard-links from its global
-            // install cache by default. The CoW guard handles the
+            // install cache by default. The rename-over write handles the
             // safety; this is informational only.
         }
         // Exhaustive on purpose (no `_`): a new package-manager layout must
@@ -770,7 +819,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
         NpmPkgManager::Npm | NpmPkgManager::YarnClassic | NpmPkgManager::Unknown => {}
     }
 
-    match apply_patches_inner(&args, &manifest_path).await {
+    match apply_patches_inner(&args, manifest, client).await {
         Ok(ApplyOutcome {
             success,
             results,
@@ -782,6 +831,21 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 .iter()
                 .filter(|r| r.success && !r.files_patched.is_empty())
                 .count();
+
+            // Applied-with-advisory results: the bytes ARE patched, but a
+            // post-write ownership restore was not permitted (core carries
+            // it as `error` on a SUCCESSFUL result, where the event mapper
+            // rightly ignores it). It rides the run-warning channel so it
+            // is never silent.
+            let mut run_warnings = run_warnings;
+            run_warnings.extend(results.iter().filter_map(|r| {
+                let note = r.error.as_deref().filter(|_| r.success)?;
+                note.contains(socket_patch_core::patch::apply::OWNERSHIP_NOT_RESTORED_MARKER)
+                    .then(|| RunWarning {
+                        code: "ownership_not_restored".to_string(),
+                        detail: format!("{}: {note}", normalize_purl(&r.package_key)),
+                    })
+            }));
 
             // Run-level advisories + best-effort fallback-home skips on the
             // human path: one gated stderr line each. `--silent` is
@@ -815,6 +879,9 @@ pub async fn run(args: ApplyArgs) -> i32 {
                 None
             };
             let vex_failed = matches!(vex_result, Some(Err(_)));
+            // Every mutation — the patches and the VEX attestation — is
+            // done: release the lock before output and telemetry.
+            lock.release();
 
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
@@ -1036,26 +1103,39 @@ pub async fn run(args: ApplyArgs) -> i32 {
             }
         }
         Err(e) => {
-            track_patch_apply_failed(
-                &e,
-                args.common.dry_run,
-                api_token.as_deref(),
-                org_slug.as_deref(),
-            )
-            .await;
-            if args.common.json {
-                let mut env = Envelope::new(Command::Apply);
-                env.dry_run = args.common.dry_run;
-                env.mark_error(EnvelopeError::new("apply_failed", e.clone()));
-                println!("{}", env.to_pretty_json());
-            } else {
-                // Errors print even under --silent ("errors only", never
-                // "nothing"): exit 1 with no message would be undiagnosable.
-                eprintln!("Error: {e}");
-            }
-            1
+            lock.release();
+            report_apply_failure(&args, &e, &api_token, &org_slug).await
         }
     }
+}
+
+/// The one apply-failure exit: `apply_failed` telemetry, then the error
+/// envelope (`--json`) or an `Error:` line that prints even under
+/// `--silent` ("errors only", never "nothing" — exit 1 with no message
+/// would be undiagnosable), exit 1. Shared by the manifest read in `run`
+/// and `apply_patches_inner`'s `Err` arm.
+async fn report_apply_failure(
+    args: &ApplyArgs,
+    error: &str,
+    api_token: &Option<String>,
+    org_slug: &Option<String>,
+) -> i32 {
+    track_patch_apply_failed(
+        error,
+        args.common.dry_run,
+        api_token.as_deref(),
+        org_slug.as_deref(),
+    )
+    .await;
+    if args.common.json {
+        let mut env = Envelope::new(Command::Apply);
+        env.dry_run = args.common.dry_run;
+        env.mark_error(EnvelopeError::new("apply_failed", error.to_string()));
+        println!("{}", env.to_pretty_json());
+    } else {
+        eprintln!("Error: {error}");
+    }
+    1
 }
 
 /// Synthesize one vendor-owned `Skipped`/`vendored` result per in-scope
@@ -1166,18 +1246,12 @@ impl FallbackHomeSkip {
 
 async fn apply_patches_inner(
     args: &ApplyArgs,
-    manifest_path: &Path,
+    mut manifest: PatchManifest,
+    client: &ApiClient,
 ) -> Result<ApplyOutcome, String> {
-    let manifest = read_manifest(manifest_path)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Invalid manifest".to_string())?;
-
     // Resolve patch sources (read `.socket/` directly, or stage an overlay
     // tempdir + download the gap). Shared with `vendor` via fetch_stage.
-    let socket_dir = manifest_path
-        .parent()
-        .expect("manifest path names a file, so it has a parent");
+    let socket_dir = args.common.socket_dir();
     // Partition manifest PURLs by ecosystem up front. The source probes,
     // the offline guard, and the download planner in `fetch_stage` must only
     // consider patches this run can actually apply — the `--ecosystems`
@@ -1192,15 +1266,17 @@ async fn apply_patches_inner(
         .flat_map(|purls| purls.iter().cloned())
         .collect();
 
-    // In-scope view of the manifest for source probing and fetching. The
-    // apply loop keeps using the full `manifest` for per-PURL lookups —
-    // those are already scoped by `partitioned`.
-    let mut scoped_manifest = manifest.clone();
-    scoped_manifest
+    // Narrow the manifest to the `--ecosystems` scope IN PLACE: every later
+    // lookup key comes from `partitioned` / `all_packages`, which are
+    // already in scope, so nothing downstream needs the full map (and the
+    // source probes, the offline guard and the download planner must only
+    // ever see in-scope patches).
+    manifest
         .patches
         .retain(|purl, _| target_manifest_purls.contains(purl));
 
-    let mut staged = match stage_patch_sources(&args.common, &scoped_manifest, socket_dir).await? {
+    let mut staged = match stage_patch_sources(&args.common, &manifest, &socket_dir, client).await?
+    {
         StageOutcome::Ready(s) => s,
         StageOutcome::Unavailable => {
             return Ok(ApplyOutcome {
@@ -1212,6 +1288,35 @@ async fn apply_patches_inner(
             })
         }
     };
+
+    // Local go: prune `replace`-redirects whose patches were dropped from the
+    // manifest (orphans). Done here — before the crawl + the "no packages
+    // found" early returns — so orphans are reconciled even when the manifest
+    // now lists zero in-scope go patches (the all-removed case). No-op unless
+    // local go is in scope.
+    reconcile_local_go(&args.common, &target_manifest_purls).await;
+
+    if partitioned.is_empty() {
+        // Nothing in scope: the manifest lists no patches (or every patch was
+        // filtered out by `--ecosystems`). There is genuinely no work to do,
+        // so this is a clean no-op SUCCESS — not a failure. Returning `false`
+        // here used to exit 1 / `partialFailure`, which broke the npm
+        // `postinstall` hook (it runs `apply` on every install, including
+        // fresh projects whose manifest has no matching patches yet). Decided
+        // BEFORE the ledger read, gem discovery and the crawl — none of which
+        // can add work to an empty scope — but AFTER the staging above, which
+        // is where `--download-mode` is validated at runtime.
+        if !args.common.silent && !args.common.json {
+            println!("No patches to apply.");
+        }
+        return Ok(ApplyOutcome {
+            success: true,
+            results: Vec::new(),
+            unmatched: Vec::new(),
+            run_warnings: Vec::new(),
+            fallback_skips: Vec::new(),
+        });
+    }
 
     // Vendor ownership wins for EVERY ecosystem: a purl recorded in
     // `.socket/vendor/state.json` is managed by the explicit `vendor`
@@ -1225,13 +1330,6 @@ async fn apply_patches_inner(
         |p: &str| vendored_purls.contains(p) || vendored_purls.contains(strip_purl_qualifiers(p));
     let (mut results, mut matched_manifest_purls, vendored_bases) =
         synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);
-
-    // Local go: prune `replace`-redirects whose patches were dropped from the
-    // manifest (orphans). Done here — before the crawl + the "no packages
-    // found" early returns — so orphans are reconciled even when the manifest
-    // now lists zero in-scope go patches (the all-removed case). No-op unless
-    // local go is in scope.
-    reconcile_local_go(&args.common, &target_manifest_purls).await;
 
     let crawler_options = CrawlerOptions {
         cwd: args.common.cwd.clone(),
@@ -1290,25 +1388,6 @@ async fn apply_patches_inner(
     )
     .await;
 
-    if all_packages.is_empty() && partitioned.is_empty() {
-        // Nothing in scope: the manifest lists no patches (or every patch was
-        // filtered out by `--ecosystems`). There is genuinely no work to do,
-        // so this is a clean no-op SUCCESS — not a failure. Returning `false`
-        // here used to exit 1 / `partialFailure`, which broke the npm
-        // `postinstall` hook (it runs `apply` on every install, including
-        // fresh projects whose manifest has no matching patches yet).
-        if !args.common.silent && !args.common.json {
-            println!("No patches to apply.");
-        }
-        return Ok(ApplyOutcome {
-            success: true,
-            results: Vec::new(),
-            unmatched: Vec::new(),
-            run_warnings,
-            fallback_skips,
-        });
-    }
-
     if all_packages.is_empty() {
         // Vendored purls are already accounted for (synthesized Skipped/
         // vendored results above); only the remainder is genuinely
@@ -1319,7 +1398,11 @@ async fn apply_patches_inner(
             &matched_manifest_purls,
             &vendored_bases,
         );
-        if !unmatched.is_empty() && !args.common.silent && !args.common.json {
+        // This diagnostic flips the exit code, so it prints even under
+        // --silent ("errors only", never nothing — the hooked `apply
+        // --silent` used to exit 1 mutely here); `--json` mutes stderr and
+        // the envelope's `package_not_installed` events are the channel.
+        if !unmatched.is_empty() && !args.common.json {
             eprintln!("Warning: No packages found that match available patches");
             eprintln!(
                 "  {} targeted manifest patch(es) were in scope, but no matching packages were found on disk.",
@@ -1339,7 +1422,15 @@ async fn apply_patches_inner(
     }
 
     // Apply patches
-    ensure_blobs_for_mismatches(args, &manifest, &all_packages, &vendored_purls, &mut staged).await;
+    ensure_blobs_for_mismatches(
+        args,
+        &manifest,
+        &all_packages,
+        &vendored_purls,
+        &mut staged,
+        client,
+    )
+    .await;
     let sources = staged.as_patch_sources();
     let policy = mismatch_policy(args.force, args.common.strict);
     let mut has_errors = false;

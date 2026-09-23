@@ -31,15 +31,15 @@ use crate::json_envelope::{Command, Envelope, EnvelopeError};
 /// try-once shape. Positive values wait with a 100 ms backoff —
 /// see `socket_patch_core::patch::apply_lock::acquire`.
 ///
-/// A leftover `apply.lock` from a crashed run never contends: the
-/// kernel released the dead holder's advisory lock along with its
-/// file handle, so the acquire reclaims the file in place. `Held`
-/// therefore always means a *live* process. The file is never
-/// unlinked here — an unlink defeats mutual exclusion, because a
-/// competitor (live holder or mid-acquire racer) can keep or take an
-/// advisory lock on the orphaned inode while a fresh acquire locks
-/// its replacement. The only sanctioned deletion is `repair`'s final
-/// cleanup, which runs after its own guard is released.
+/// The lock's whole lifecycle lives in the core guard: `acquire`
+/// creates a missing `.socket/` itself, and the returned guard's drop
+/// unlinks `apply.lock` while still holding the lock, releases it, and
+/// prunes an otherwise-empty `.socket/` — so no command leaves a lock
+/// file (or a bare `.socket/`) behind, and this wrapper never has to
+/// touch the file. A leftover from a crashed run never contends: the
+/// kernel released the dead holder's advisory lock along with its file
+/// handle, so the acquire reclaims the file in place and removes it on
+/// exit. `Held` therefore always means a *live* process.
 pub(crate) fn acquire_or_emit(
     socket_dir: &Path,
     command: Command,
@@ -49,22 +49,31 @@ pub(crate) fn acquire_or_emit(
 ) -> Result<LockGuard, i32> {
     match acquire(socket_dir, timeout) {
         Ok(guard) => Ok(guard),
-        Err(LockError::Held) => {
-            emit(
-                command,
-                json,
-                dry_run,
-                "lock_held",
-                &held_message(timeout),
-                Hint::Wait,
-            );
+        Err(err) => {
+            let hint = match err {
+                LockError::Held => Hint::Wait,
+                LockError::Io { .. } => Hint::None,
+            };
+            let (code, message) = lock_failure(&err, timeout);
+            emit(command, json, dry_run, code, &message, hint);
             Err(1)
         }
-        Err(LockError::Io { path, source }) => {
-            let msg = format!("failed to open lock file at {}: {}", path.display(), source);
-            emit(command, json, dry_run, "lock_io", &msg, Hint::None);
-            Err(1)
-        }
+    }
+}
+
+/// The one `LockError` → (`errorCode`, message) mapping every lock
+/// site renders: `Held` → `lock_held` with the wait budget spelled out
+/// by [`held_message`], `Io` → `lock_io` naming the path and the OS
+/// error. Callers that build their own envelope (the scan/vendor step,
+/// GC, hosted) use this rather than re-deriving the strings, so the
+/// contention text and the waited clause cannot drift between commands.
+pub(crate) fn lock_failure(err: &LockError, timeout: Duration) -> (&'static str, String) {
+    match err {
+        LockError::Held => ("lock_held", held_message(timeout)),
+        LockError::Io { path, source } => (
+            "lock_io",
+            format!("failed to open lock file at {}: {}", path.display(), source),
+        ),
     }
 }
 
@@ -165,17 +174,33 @@ mod tests {
         assert_eq!(code, 1);
     }
 
+    /// A missing `.socket/` is not an error: `acquire` creates it, and
+    /// the guard's drop removes the lock file and the now-empty
+    /// directory again, so a lock-only run leaves no trace.
     #[test]
-    fn acquire_or_emit_returns_one_when_socket_dir_missing() {
+    fn acquire_or_emit_creates_missing_socket_dir_and_prunes_it_on_drop() {
         let dir = tempfile::tempdir().unwrap();
-        let code = acquire_or_emit(
-            &dir.path().join("nope"),
-            Command::Apply,
-            false,
-            false,
-            Duration::ZERO,
-        )
-        .unwrap_err();
+        let socket = dir.path().join(".socket");
+        assert!(!socket.exists());
+
+        let guard = acquire_or_emit(&socket, Command::Apply, false, false, Duration::ZERO).unwrap();
+        assert!(socket.join("apply.lock").is_file());
+
+        drop(guard);
+        assert!(!socket.join("apply.lock").exists());
+        assert!(!socket.exists(), "empty .socket/ must be pruned on release");
+    }
+
+    /// A file squatting where `.socket/` should be still surfaces as
+    /// `lock_io` / exit 1 — the acquire-mkdirs change did not turn
+    /// genuine faults into silent successes.
+    #[test]
+    fn acquire_or_emit_returns_one_when_socket_dir_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(".socket");
+        std::fs::write(&socket, b"squatter").unwrap();
+        let code =
+            acquire_or_emit(&socket, Command::Apply, false, false, Duration::ZERO).unwrap_err();
         assert_eq!(code, 1);
     }
 
@@ -208,27 +233,32 @@ mod tests {
 
     /// A leftover lock file from a crashed run never contends — the
     /// kernel released the dead holder's advisory lock along with its
-    /// file handle, so a plain acquire reclaims the file in place.
-    /// This is the fact that made `--break-lock` redundant (and, with
-    /// it, the `unlock` subcommand): there is no stale-lock state a
-    /// user ever needs to clear before running a mutating command.
+    /// file handle, so a plain acquire reclaims the file in place and
+    /// the guard's drop removes it. This is the fact that made
+    /// `--break-lock` redundant (and, with it, the `unlock`
+    /// subcommand): there is no stale-lock state a user ever needs to
+    /// clear before running a mutating command.
     #[test]
     fn acquire_or_emit_reclaims_stale_leftover_file() {
         let dir = tempfile::tempdir().unwrap();
         // Pre-stage a lock file with no holder — simulates the
         // post-crash leftover scenario.
-        std::fs::write(dir.path().join("apply.lock"), b"").unwrap();
+        std::fs::write(dir.path().join("apply.lock"), b"leftover").unwrap();
 
         let guard =
             acquire_or_emit(dir.path(), Command::Apply, false, false, Duration::ZERO).unwrap();
-        // The file persists (never unlinked here) and we hold the lock:
-        // a competitor's acquire is contended while the guard is live.
+        // The reclaimed file is the live lock while the guard is held: a
+        // competitor's acquire is contended.
         assert!(dir.path().join("apply.lock").is_file());
         assert!(matches!(
             acquire(dir.path(), Duration::ZERO),
             Err(LockError::Held)
         ));
         drop(guard);
+        assert!(
+            !dir.path().join("apply.lock").exists(),
+            "the reclaimed leftover is removed on release"
+        );
     }
 
     /// Regression guard carried over from the `--break-lock` era: the
@@ -238,22 +268,26 @@ mod tests {
     /// re-acquired: a competitor that flocked (or had merely *opened*)
     /// the file before the unlink kept a valid lock on the orphaned
     /// inode while the re-acquire locked a fresh one — two live holders
-    /// at once. `acquire_or_emit` never unlinks: the acquire's guard is
-    /// the lock.
+    /// at once. Today every guard drop unlinks the file, so this is the
+    /// live stress test of the core protocol that makes that safe:
+    /// unlink WHILE holding the lock, and re-check the locked handle's
+    /// identity against the path after every successful lock.
     ///
     /// The competitor thread increments a shared holder count only
     /// while it genuinely holds the OS lock, as does the main thread
     /// for the guard `acquire_or_emit` hands back. With real mutual
     /// exclusion the count can never exceed 1, so the test is
     /// deterministic-green on correct code; under a buggy unlink window
-    /// the hammer lands in the gap within a handful of iterations.
+    /// the hammer lands in the gap within a handful of iterations. The
+    /// lock dir is a `.socket/` so every release also prunes the
+    /// directory and every acquire recreates it.
     #[test]
     fn acquire_or_emit_preserves_mutual_exclusion() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
-        let lock_dir = dir.path().to_path_buf();
+        let lock_dir = dir.path().join(".socket");
         let holders = Arc::new(AtomicUsize::new(0));
         let violated = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
@@ -301,8 +335,41 @@ mod tests {
 
         assert!(
             !violated.load(Ordering::SeqCst),
-            "two processes held the apply lock at once: \
-             the lock file must never be unlinked by the acquire path"
+            "two processes held the apply lock at once: the acquire path must never \
+             unlink, and a release must not orphan a competitor's open handle \
+             (unlink under the lock + post-lock identity check)"
+        );
+        assert!(
+            !lock_dir.join("apply.lock").exists() && !lock_dir.exists(),
+            "no lock residue may outlive the last holder"
+        );
+    }
+
+    /// `lock_failure` is the single rendering every lock site shares:
+    /// `Held` carries the waited clause, `Io` names the path and the OS
+    /// error under `lock_io`.
+    #[test]
+    fn lock_failure_maps_both_variants() {
+        assert_eq!(
+            lock_failure(&LockError::Held, Duration::from_secs(2)),
+            (
+                "lock_held",
+                "another socket-patch process is operating in this directory (waited 2s)"
+                    .to_string()
+            )
+        );
+        let io = LockError::Io {
+            path: std::path::PathBuf::from(".socket/apply.lock"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        let (code, message) = lock_failure(&io, Duration::ZERO);
+        assert_eq!(code, "lock_io");
+        assert_eq!(
+            message,
+            format!(
+                "failed to open lock file at {}: denied",
+                std::path::Path::new(".socket/apply.lock").display()
+            )
         );
     }
 

@@ -17,10 +17,12 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
-use socket_patch_core::api::client::ApiClientEnvOverrides;
+use socket_patch_core::api::client::{
+    resolve_ambient_credentials, ApiClient, ApiClientEnvOverrides,
+};
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::Ecosystem;
-use socket_patch_core::vendor::VendorSource;
+use socket_patch_core::vendor::{VendorServiceConfig, VendorSource};
 
 /// clap value-parser for each `--ecosystems` / `SOCKET_ECOSYSTEMS` token.
 ///
@@ -258,8 +260,10 @@ pub struct GlobalArgs {
     /// positive value retries with a 100 ms backoff until the lock
     /// frees or the budget elapses. Only meaningful for the lock-
     /// contending subcommands (`apply`, `rollback`, `repair`, `remove`,
-    /// `vendor`, and the vendored modes of `scan`/`get`); other
-    /// commands accept it silently.
+    /// `vendor`, `setup --exclude`'s manifest write, and the hosted /
+    /// vendored modes of `scan`/`get`); other commands accept it
+    /// silently. Every holder removes the lock file on exit, so a
+    /// leftover from a crashed run never contends.
     #[arg(long = "lock-timeout", env = "SOCKET_LOCK_TIMEOUT")]
     pub lock_timeout: Option<u64>,
 
@@ -308,6 +312,43 @@ impl GlobalArgs {
         }
     }
 
+    /// The project root whose `.socket/` state stores — manifest, vendor
+    /// ledger, redirect ledger — belong together: the RESOLVED manifest's
+    /// directory, stepping out of a standard `.socket/` layout when the
+    /// manifest lives in one. For the default `<cwd>/.socket/manifest.json`
+    /// this is exactly `cwd`; for a `--manifest-path` into another project
+    /// it is that project's root (its `.socket` parent's parent); for a
+    /// bare file like `--manifest-path /tmp/x/abs.json` it is the file's
+    /// own directory. Every command that reads more than one store must
+    /// derive them from THIS root, so `--manifest-path` can never
+    /// interleave two projects' state (CLI_CONTRACT.md: both stores always
+    /// come from the SAME project).
+    pub(crate) fn project_root(&self) -> PathBuf {
+        let manifest_path = self.resolved_manifest_path();
+        match manifest_path.parent() {
+            Some(dir)
+                if dir.file_name()
+                    == Some(std::ffi::OsStr::new(
+                        socket_patch_core::constants::SOCKET_DIR,
+                    )) =>
+            {
+                dir.parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| self.cwd.clone())
+            }
+            Some(dir) => dir.to_path_buf(),
+            None => self.cwd.clone(),
+        }
+    }
+
+    /// The directory the manifest lives in — where `apply.lock`, `blobs/`,
+    /// `diffs/` and `packages/` sit (`<cwd>/.socket` by default). The one
+    /// derivation every lock acquire and artifact probe uses; see
+    /// [`socket_dir_of`] for callers holding a raw manifest path.
+    pub(crate) fn socket_dir(&self) -> PathBuf {
+        socket_dir_of(&self.resolved_manifest_path(), &self.cwd)
+    }
+
     /// Build [`ApiClientEnvOverrides`] from the CLI flags.
     ///
     /// Every field is forwarded as `Some(_)` only when set and non-empty.
@@ -324,6 +365,57 @@ impl GlobalArgs {
             proxy_url: self.proxy_url.clone().filter(|s| !s.is_empty()),
         }
     }
+
+    /// The `(api_token, org_slug)` telemetry is attributed with, resolved
+    /// through the API client's own credential chain (flag → the
+    /// `SOCKET_NO_API_TOKEN` veto → env → `socket login` config) WITHOUT
+    /// building a client. For the purely local commands (`list`, `setup`,
+    /// `vex`): a client would add the org-slug auto-resolve round-trip and
+    /// the "No SOCKET_API_TOKEN set" advisory to a command that needs
+    /// neither, while anything less than the full chain reported a
+    /// `socket login`-only caller's events anonymously to the public proxy
+    /// — off the on-prem host every other command reports to.
+    pub(crate) fn telemetry_credentials(&self) -> (Option<String>, Option<String>) {
+        let overrides = self.api_client_overrides();
+        resolve_ambient_credentials(overrides.api_token, overrides.org_slug)
+    }
+
+    /// The vendoring-service config every vendor entry point (`vendor`,
+    /// `scan`/`get --mode vendored`) builds from the same flags —
+    /// `--vendor-source` / `--vendor-url` / `--patch-server-url` /
+    /// `--offline` — so they commit byte-identical artifacts and lock
+    /// integrity for the same patch. `client` is the run-level API client
+    /// (moved in; the service reuses it for the package-reference request)
+    /// and `use_public_proxy` its proxy-fallback state. `vendor_source` was
+    /// validated by clap, so the parse cannot fail; the `auto` default is
+    /// the defensive fallback. A pure assembler (no async, no network).
+    pub(crate) fn vendor_service_config(
+        &self,
+        client: Option<ApiClient>,
+        use_public_proxy: bool,
+    ) -> VendorServiceConfig {
+        VendorServiceConfig {
+            source: VendorSource::parse(&self.vendor_source).unwrap_or_default(),
+            client,
+            use_public_proxy,
+            vendor_url: self.vendor_url.clone(),
+            patch_server_url: self.patch_server_url.clone(),
+            offline: self.offline,
+        }
+    }
+}
+
+/// The `.socket/`-role directory for `manifest_path`: its parent, falling
+/// back to `cwd` for a bare relative file name — never `"."`, which is
+/// wrong under a non-default `--cwd`. [`GlobalArgs::resolved_manifest_path`]
+/// always joins a relative path onto `cwd`, so the fallback is reachable
+/// only for callers handed an unresolved path.
+pub(crate) fn socket_dir_of(manifest_path: &Path, cwd: &Path) -> PathBuf {
+    manifest_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.to_path_buf())
 }
 
 /// Apply CLI-flag toggles for env-driven knobs by mirroring them into env
@@ -530,9 +622,10 @@ mod tests {
     }
 
     /// Clear the extra env the core telemetry gate reads beyond the
-    /// `SOCKET_*` set (`is_telemetry_disabled` also consults `VITEST` and the
-    /// legacy `SOCKET_PATCH_TELEMETRY_DISABLED` name), so the airgap tests
-    /// below can't pass or fail vacuously. Restores afterwards.
+    /// `SOCKET_*` set (`is_telemetry_disabled` also consults `VITEST` — the
+    /// kill-switch socket-cli's vitest suite relies on — and the legacy
+    /// `SOCKET_PATCH_TELEMETRY_DISABLED` name), so the airgap tests below
+    /// can't pass or fail vacuously. Restores afterwards.
     fn with_clean_telemetry_env(f: impl FnOnce()) {
         with_env_cleared(&["VITEST", "SOCKET_PATCH_TELEMETRY_DISABLED"], f);
     }
@@ -735,6 +828,76 @@ mod tests {
                 "an unknown vendor source must fail the parse",
             );
         });
+    }
+
+    // ---- vendor_service_config ------------------------------------------
+    // Moved from scan's vendored flow: the config every vendor entry point
+    // builds must be the same assembler, so `scan --mode vendored` and a
+    // plain `vendor` commit byte-identical artifacts for the same patch.
+
+    fn common_with_source(source: &str) -> GlobalArgs {
+        GlobalArgs {
+            vendor_source: source.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Regression: scan's vendored flow must build its service config FROM
+    /// `--vendor-source`, not hardcode build-only (the pre-fix `service =
+    /// None`). Under the default (`auto`), the config must permit the
+    /// vendoring service exactly as the `vendor` command's default does —
+    /// otherwise `scan --mode vendored` silently builds locally while a
+    /// plain `vendor` service-downloads, and the two commit different bytes /
+    /// lock integrity for the same patch (lock churn / merge conflicts).
+    #[test]
+    fn vendor_service_config_default_source_permits_service() {
+        let cfg = common_with_source("auto").vendor_service_config(None, false);
+        assert_eq!(cfg.source, VendorSource::Auto);
+        assert!(
+            cfg.source.may_use_service(),
+            "the default must be able to use the service (matching `vendor`)"
+        );
+        assert!(!cfg.source.requires_service());
+        assert!(cfg.client.is_none());
+        assert!(!cfg.use_public_proxy);
+    }
+
+    /// `--vendor-source service` reaches the fail-closed service path and
+    /// `--vendor-source build` never contacts the service.
+    #[test]
+    fn vendor_service_config_honors_service_and_build_sources() {
+        let cfg = common_with_source("service").vendor_service_config(None, true);
+        assert_eq!(cfg.source, VendorSource::Service);
+        assert!(cfg.source.requires_service());
+        assert!(
+            cfg.use_public_proxy,
+            "the proxy-fallback state threads through"
+        );
+
+        let cfg = common_with_source("build").vendor_service_config(None, false);
+        assert_eq!(cfg.source, VendorSource::Build);
+        assert!(!cfg.source.may_use_service());
+    }
+
+    /// The service overrides (`--vendor-url` / `--patch-server-url` /
+    /// `--offline`) thread through unchanged, so every entry point targets
+    /// the same hosts.
+    #[test]
+    fn vendor_service_config_threads_overrides_through() {
+        let common = GlobalArgs {
+            vendor_source: "service".to_string(),
+            vendor_url: Some("https://vendor.example".to_string()),
+            patch_server_url: Some("https://patch.example".to_string()),
+            offline: true,
+            ..Default::default()
+        };
+        let cfg = common.vendor_service_config(None, false);
+        assert_eq!(cfg.vendor_url.as_deref(), Some("https://vendor.example"));
+        assert_eq!(
+            cfg.patch_server_url.as_deref(),
+            Some("https://patch.example")
+        );
+        assert!(cfg.offline);
     }
 
     /// The new URL knobs flow through to the parsed args from CLI and env.
@@ -941,6 +1104,37 @@ mod tests {
         assert!(o.org_slug.is_none());
     }
 
+    /// Telemetry attribution runs the client's credential chain over the
+    /// same overrides: explicit values — the flag, or the env var clap folds
+    /// into the same field — are used verbatim, and empty means "unset"
+    /// (`Some("")` would build a malformed `/v0/orgs//telemetry` URL and an
+    /// empty `Bearer ` header). The ambient layers below the flags are
+    /// pinned in core (`resolve_ambient_credentials_*`) and end-to-end by
+    /// `tests/cli_config_fallback.rs::list_telemetry_follows_socket_cli_login`.
+    #[test]
+    fn telemetry_credentials_prefer_explicit_values_and_treat_empty_as_unset() {
+        let explicit = GlobalArgs {
+            api_token: Some("sktsec_flag_api".to_string()),
+            org: Some("flag-org".to_string()),
+            ..GlobalArgs::default()
+        };
+        assert_eq!(
+            explicit.telemetry_credentials(),
+            (
+                Some("sktsec_flag_api".to_string()),
+                Some("flag-org".to_string())
+            )
+        );
+        let empty = GlobalArgs {
+            api_token: Some(String::new()),
+            org: Some(String::new()),
+            ..GlobalArgs::default()
+        };
+        let (api_token, org_slug) = empty.telemetry_credentials();
+        assert_ne!(api_token.as_deref(), Some(""));
+        assert_ne!(org_slug.as_deref(), Some(""));
+    }
+
     /// Empty strings for url/token/org are filtered out, not forwarded as
     /// `Some("")` — otherwise an empty CLI value would mask env-var fallback.
     #[test]
@@ -1000,6 +1194,68 @@ mod tests {
         assert_eq!(
             args.resolved_manifest_path(),
             PathBuf::from("/work/project/../manifest.json"),
+        );
+    }
+
+    /// The default layout: `<cwd>/.socket/manifest.json` → the project
+    /// root is `cwd` and the socket dir is `<cwd>/.socket`.
+    #[test]
+    fn project_root_and_socket_dir_for_default_layout() {
+        let args = GlobalArgs {
+            cwd: PathBuf::from("/work/project"),
+            ..GlobalArgs::default()
+        };
+        assert_eq!(args.project_root(), PathBuf::from("/work/project"));
+        assert_eq!(
+            args.socket_dir(),
+            PathBuf::from("/work/project").join(".socket")
+        );
+    }
+
+    /// `--manifest-path` into ANOTHER project's `.socket/`: every store
+    /// (manifest, vendor ledger, redirect ledger, lock) resolves against
+    /// that project — its `.socket` parent's parent — never the cwd.
+    #[test]
+    fn project_root_steps_out_of_a_foreign_socket_dir() {
+        let args = GlobalArgs {
+            cwd: PathBuf::from("/work/project"),
+            manifest_path: "../other/.socket/manifest.json".to_string(),
+            ..GlobalArgs::default()
+        };
+        let other = PathBuf::from("/work/project").join("../other");
+        assert_eq!(args.project_root(), other);
+        assert_eq!(args.socket_dir(), other.join(".socket"));
+    }
+
+    /// A bare manifest file outside any `.socket/` layout: the file's own
+    /// directory plays both roles.
+    #[test]
+    fn project_root_of_a_bare_manifest_file_is_its_directory() {
+        let args = GlobalArgs {
+            cwd: PathBuf::from("/work/project"),
+            manifest_path: "custom/mp.json".to_string(),
+            ..GlobalArgs::default()
+        };
+        let custom = PathBuf::from("/work/project").join("custom");
+        assert_eq!(args.project_root(), custom);
+        assert_eq!(args.socket_dir(), custom);
+    }
+
+    /// `socket_dir_of` on a raw relative file name falls back to `cwd`,
+    /// never to `"."` (wrong under a non-default `--cwd`); a resolved path
+    /// yields its parent.
+    #[test]
+    fn socket_dir_of_bare_relative_name_falls_back_to_cwd() {
+        assert_eq!(
+            socket_dir_of(Path::new("manifest.json"), Path::new("/work/project")),
+            PathBuf::from("/work/project"),
+        );
+        let resolved = PathBuf::from("/work/project")
+            .join(".socket")
+            .join("manifest.json");
+        assert_eq!(
+            socket_dir_of(&resolved, Path::new("/elsewhere")),
+            PathBuf::from("/work/project").join(".socket"),
         );
     }
 

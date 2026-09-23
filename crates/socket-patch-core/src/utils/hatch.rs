@@ -6,6 +6,11 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::python_lock::preserve_line_endings;
 use crate::vendor::common::pep508_name;
 
+/// The two documents the hatch planner reads and rewrites, in the order
+/// [`plan`] parses them. The redirect overlay (`redirect/mod.rs`) clones
+/// exactly these from the candidate set, so the lists cannot drift.
+pub const HATCH_FILES: [&str; 2] = ["pyproject.toml", "hatch.toml"];
+
 pub fn is_hatch(files: &BTreeMap<String, String>) -> bool {
     files.contains_key("hatch.toml")
         || files.get("pyproject.toml").is_some_and(|text| {
@@ -316,7 +321,7 @@ pub fn plan(
 ) -> Result<HatchPlan, String> {
     let name = canonicalize_pypi_name(name);
     let mut documents = BTreeMap::new();
-    for file in ["pyproject.toml", "hatch.toml"] {
+    for file in HATCH_FILES {
         if let Some(text) = files.get(file) {
             documents.insert(
                 file,

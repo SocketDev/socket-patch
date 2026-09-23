@@ -70,15 +70,18 @@ fn run_setup_with_bundle_shim(cwd: &Path, bin_dir: &Path) -> (i32, serde_json::V
     (code, v)
 }
 
-/// Assert the shim's argv log shows the probe ran exactly `bundle --version`
-/// — proof the verdict under test came from the machine probe, not from some
-/// other source (or from the real host bundler further down PATH).
+/// Assert the shim's argv log shows the probe ran `bundle --version` exactly
+/// ONCE — proof the verdict under test came from the machine probe, not from
+/// some other source (or from the real host bundler further down PATH), and
+/// that setup probes once per run: the dry-run preview and the real edit
+/// share the one probe instead of each spawning their own.
 fn assert_probe_spawned_bundle_version(log: &Path) {
     let argvs = std::fs::read_to_string(log)
         .expect("the bundle shim must have been invoked (argv log missing)");
-    assert!(
-        argvs.lines().any(|l| l == "--version"),
-        "the machine probe must spawn `bundle --version`; argv log:\n{argvs}"
+    assert_eq!(
+        argvs.lines().filter(|l| *l == "--version").count(),
+        1,
+        "the machine probe must spawn `bundle --version` exactly once per run; argv log:\n{argvs}"
     );
 }
 

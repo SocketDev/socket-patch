@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs;
 
 use super::detect::{strip_bom, PackageManager};
-use crate::utils::fs::{entry_file_type, is_dir, list_dir_entries};
+use crate::utils::fs::{entry_file_type, is_dir, list_dir_entries, read_regular_to_string};
 
 /// Detect the package manager based on lockfiles in the project root.
 /// The accepted pnpm marker spellings (including the `pnpm-lock.yml`
@@ -106,23 +106,6 @@ pub async fn find_package_json_files(start_path: &Path) -> PackageJsonFindResult
     }
 }
 
-/// Read a manifest/config that lives inside the (untrusted) project tree.
-/// A planted FIFO would make a plain `read_to_string` open block forever
-/// waiting for a writer, wedging `setup`'s discovery — and the workspace
-/// walk reads the package.json of *every* glob-discovered member. Open via
-/// [`open_regular_file`](crate::utils::fs::open_regular_file) — non-blocking
-/// on Unix, rejecting FIFOs/devices/directories (see its docs) — same as the
-/// npm/composer/python/ruby crawlers. Shared with `update.rs`, which reads
-/// the same discovered manifests back for editing.
-pub(super) async fn read_project_file_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
-
 /// Detect workspace configuration from package.json.
 async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
     let default = WorkspaceConfig {
@@ -139,7 +122,12 @@ async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
     // workspace to "no workspace".
     let dir = package_json_path.parent().unwrap_or(Path::new("."));
     let pnpm_workspace = dir.join("pnpm-workspace.yaml");
-    if let Ok(yaml_content) = read_project_file_to_string(&pnpm_workspace).await {
+    // Every manifest/config read here lives inside the (untrusted) project
+    // tree — and the workspace walk reads the package.json of *every*
+    // glob-discovered member — so reads go through the FIFO-safe
+    // `read_regular_to_string` (non-blocking open, regular-file check): a
+    // planted FIFO fails fast instead of wedging `setup`'s discovery.
+    if let Ok(yaml_content) = read_regular_to_string(&pnpm_workspace).await {
         let patterns = parse_pnpm_workspace_patterns(&yaml_content);
         return WorkspaceConfig {
             ws_type: WorkspaceType::Pnpm,
@@ -147,7 +135,7 @@ async fn detect_workspaces(package_json_path: &Path) -> WorkspaceConfig {
         };
     }
 
-    let content = match read_project_file_to_string(package_json_path).await {
+    let content = match read_regular_to_string(package_json_path).await {
         Ok(c) => c,
         Err(_) => return default,
     };
@@ -846,10 +834,7 @@ mod tests {
         // below); if the team decides such values should degrade to
         // WorkspaceType::None (npm semantics), update detect_workspaces and
         // flip these assertions together.
-        for spelling in [
-            r#"{"workspaces": "packages/*"}"#,
-            r#"{"workspaces": null}"#,
-        ] {
+        for spelling in [r#"{"workspaces": "packages/*"}"#, r#"{"workspaces": null}"#] {
             let dir = tempfile::tempdir().unwrap();
             let pkg = dir.path().join("package.json");
             fs::write(&pkg, spelling).await.unwrap();

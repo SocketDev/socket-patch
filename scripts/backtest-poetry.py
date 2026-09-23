@@ -284,6 +284,11 @@ def main():
         if mode == "hosted":
             ledger = json.loads((project / ".socket/vendor/redirect-state.json").read_text())
             recs = ledger["records"]
+        elif mode == "vendored":
+            # Vendored mode never writes `.socket/manifest.json`: the ledger
+            # entry embeds the patch record.
+            entries = json.loads((project / ".socket/vendor/state.json").read_text())["entries"]
+            recs = {k: e["record"] for k, e in entries.items() if e.get("record")}
         else:
             recs = json.loads((project / ".socket/manifest.json").read_text())["patches"]
         rec = next(iter(recs.values()))
@@ -622,7 +627,12 @@ def main():
             res = oracle(python, list(after), project, case / "oracle-rollback.log")
             check("rollbackRestoresUpstreamBytes", bool(before) and all(res.get(n) == h for n, h in before.items()), res)
         mf = project / ".socket/manifest.json"
-        check("rollbackClearsManifest", not mf.exists() or json.loads(mf.read_text()).get("patches") in ({}, None))
+        if mode == "agent":
+            check("rollbackClearsManifest", not mf.exists() or json.loads(mf.read_text()).get("patches") in ({}, None))
+        else:
+            # Hosted and vendored runs are manifest-free (v5.0): nothing may
+            # have been written to `.socket/manifest.json` at any point.
+            check("noManifestWritten", not mf.exists())
         info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "rolledBack", "failed", "hosted", "vendoredReverted", "manifest") if k in erb}
         informational = {"lockOnlyVendorApplies", "warmInstallReplacesUpstream"}
         row["passed"] = all(val for k, val in checks.items() if k not in informational)

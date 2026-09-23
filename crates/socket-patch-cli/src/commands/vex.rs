@@ -21,6 +21,7 @@ use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated};
+use socket_patch_core::vendor::state::VendorState;
 use socket_patch_core::vex::{
     build_document, detect_product, BuildOptions, Document, FailedPatch, VendorContext,
     VerifyOutcome,
@@ -218,15 +219,15 @@ pub async fn run(args: VexArgs) -> i32 {
     // on the same stdout stream. Bail out with a clear error before
     // doing any work.
     if args.common.json && args.output.is_none() {
-        let e = fail(
-            &args.common,
+        // A usage error, not a generation failure: no telemetry POST and no
+        // config read (argument errors never report), just the envelope.
+        emit_envelope_error(
+            &args,
             "json_requires_output",
             "--json requires --output (the VEX document is itself JSON; \
-             route it to a file so the envelope can use stdout)"
-                .to_string(),
-        )
-        .await;
-        emit_envelope_error(&args, e.code, &e.message, &[]);
+             route it to a file so the envelope can use stdout)",
+            &[],
+        );
         return 2;
     }
 
@@ -319,6 +320,7 @@ async fn generate_vex(
     params: &VexBuildParams,
     manifest: &PatchManifest,
     redirected: &[String],
+    ledger: std::io::Result<VendorState>,
 ) -> Result<VexWriteSummary, VexGenError> {
     // Resolve product.
     let product_id = match resolve_product_id(common, params.product.as_deref()).await {
@@ -362,10 +364,7 @@ async fn generate_vex(
         // not whether this run hashed it. The committed ledger is as
         // trustworthy as the manifest beside it, and reading it hashes
         // nothing. An unreadable ledger degrades to "nothing vendored".
-        let entries = socket_patch_core::vendor::load_state(&common.cwd)
-            .await
-            .map(|state| state.entries)
-            .unwrap_or_default();
+        let entries = ledger.map(|state| state.entries).unwrap_or_default();
         let vendored = manifest
             .patches
             .keys()
@@ -385,7 +384,7 @@ async fn generate_vex(
         let quiet = common.silent || common.json || params.output.is_none();
         let purls: Vec<String> = manifest.patches.keys().cloned().collect();
         let package_paths = find_manifest_package_paths(&purls, common, quiet).await;
-        let vendor = load_vendor_context(common, manifest).await;
+        let vendor = vendor_context_from(common, manifest, ledger).await;
         socket_patch_core::vex::applied_patches_with_vendor(
             manifest,
             &package_paths,
@@ -435,12 +434,16 @@ async fn generate_vex(
         let is_stale = |purl: &str| stale.contains(strip_purl_qualifiers(purl));
         outcome.applied.retain(|purl| !is_stale(purl));
         outcome.failed.retain(|failure| !is_stale(&failure.purl));
-        outcome.failed.extend(manifest.patches.keys().filter(|purl| is_stale(purl)).map(
-            |purl| FailedPatch {
-                purl: purl.clone(),
-                reason: "stale_install".to_string(),
-            },
-        ));
+        outcome.failed.extend(
+            manifest
+                .patches
+                .keys()
+                .filter(|purl| is_stale(purl))
+                .map(|purl| FailedPatch {
+                    purl: purl.clone(),
+                    reason: "stale_install".to_string(),
+                }),
+        );
     }
 
     // Vendored disclosure: the committed artifact verified (the attestation
@@ -548,7 +551,7 @@ async fn generate_vex(
     ) {
         Some(doc) => doc,
         None => {
-            let (token, org) = crate::commands::list::telemetry_credentials(common);
+            let (token, org) = common.telemetry_credentials();
             track_vex_failed("no_applicable_patches", token.as_deref(), org.as_deref()).await;
             // When nothing attested and EVERY omission was the property-7
             // filter, say so: those patches ARE applied with vulnerability
@@ -614,7 +617,7 @@ async fn generate_vex(
         }
     };
 
-    let (token, org) = crate::commands::list::telemetry_credentials(common);
+    let (token, org) = common.telemetry_credentials();
     track_vex_generated(
         doc.statements.len(),
         "openvex-0.2.0",
@@ -718,11 +721,25 @@ async fn generate_vex_from_manifest_path_inner(
         Err(e) => return Err(fail(common, "manifest_unreadable", e.to_string()).await),
     };
     let had_manifest_file = manifest_file.is_some();
-    // Detached vendored patches (`scan --vendor --detached`) and redirected
+    // ONE read of the committed vendor ledger for the whole run: the
+    // detached fold here, then either the `--no-verify` classification or
+    // the verify-path `VendorContext` (where a read error is surfaced; an
+    // unreadable ledger leaves the manifest view unchanged here and
+    // verification fails closed per entry downstream). When that unreadable
+    // ledger was the ONLY possible source — a manifest-free vendored
+    // project, the D2 posture — the empty view below fails before any
+    // downstream report, so the read error is disclosed right there: the
+    // operator must learn the ledger is broken, not that a manifest they
+    // never had is missing.
+    let ledger = socket_patch_core::vendor::load_state(&common.cwd).await;
+    // Vendored patches (manifest-free by design: every `scan`/`get --mode
+    // vendored` entry is detached with its embedded record) and redirected
     // patches (`scan --redirect`) have no manifest record; the vendor and
     // redirect ledgers' embedded copies must still attest.
-    let manifest =
-        augment_with_detached(common, manifest_file.unwrap_or_else(PatchManifest::new)).await;
+    let mut manifest = manifest_file.unwrap_or_else(PatchManifest::new);
+    if let Ok(state) = &ledger {
+        crate::commands::fold_detached_records(&mut manifest, &state.entries);
+    }
     let (manifest, redirected) = match augment_with_redirect(common, manifest).await {
         Ok(augmented) => augmented,
         Err(corrupt) => {
@@ -730,43 +747,32 @@ async fn generate_vex_from_manifest_path_inner(
         }
     };
     if manifest.patches.is_empty() {
+        let ledger_note = match &ledger {
+            Err(e) => {
+                warn_unreadable_vendor_state(common, e);
+                format!("; the vendor ledger is also unreadable ({e})")
+            }
+            Ok(_) => String::new(),
+        };
         if !had_manifest_file {
             return Err(fail(
                 common,
                 "manifest_not_found",
-                format!("Manifest not found at {}", manifest_path.display()),
+                format!(
+                    "Manifest not found at {}{ledger_note}",
+                    manifest_path.display()
+                ),
             )
             .await);
         }
         return Err(fail(
             common,
             "no_patches",
-            "Manifest is empty — nothing to attest.".to_string(),
+            format!("Manifest is empty — nothing to attest.{ledger_note}"),
         )
         .await);
     }
-    generate_vex(common, params, &manifest, &redirected).await
-}
-
-/// Fold detached vendor entries' embedded records into a manifest view so
-/// verification and document building see them — `scan --vendor
-/// --detached` patches have no manifest record by design. Keyed by the
-/// ledger key; an existing manifest entry wins a collision (that purl is
-/// manifest-owned and verifies against the manifest's record). An
-/// unreadable ledger leaves the manifest unchanged here — verification
-/// still fails closed per-entry downstream, and `load_vendor_context`
-/// already warns about the unreadable state.
-async fn augment_with_detached(common: &GlobalArgs, mut manifest: PatchManifest) -> PatchManifest {
-    if let Ok(state) = socket_patch_core::vendor::load_state(&common.cwd).await {
-        for (key, entry) in state.entries {
-            if !entry.detached {
-                continue;
-            }
-            let Some(record) = entry.record else { continue };
-            manifest.patches.entry(key).or_insert(record);
-        }
-    }
-    manifest
+    generate_vex(common, params, &manifest, &redirected, ledger).await
 }
 
 /// Fold the `scan --redirect` ledger's embedded records into a manifest view
@@ -801,7 +807,7 @@ async fn augment_with_redirect(
 /// `list`/`setup` (flag / env / socket-cli `config.json`), not the raw
 /// flags — a `socket login`-only user must not report anonymously.
 async fn fail(common: &GlobalArgs, code: &'static str, message: String) -> VexGenError {
-    let (token, org) = crate::commands::list::telemetry_credentials(common);
+    let (token, org) = common.telemetry_credentials();
     track_vex_failed(code, token.as_deref(), org.as_deref()).await;
     VexGenError {
         code,
@@ -838,11 +844,25 @@ async fn resolve_product_id(common: &GlobalArgs, product: Option<&str>) -> Resul
     })
 }
 
-/// Build the [`VendorContext`] for verification: the committed
-/// `.socket/vendor/state.json` ledger plus synthesized entries for the
-/// legacy `.socket/go-patches/` redirect backend. Shared by `vex` and
-/// `setup --check`'s patch-consistency pass — both must judge a vendored
-/// patch by the committed artifact, never the installed tree.
+/// The one `unreadable vendor state` advisory (contract: `setup --check`
+/// and `vex` surface a ledger they cannot read or parse as this line, muted
+/// by `--silent`): a read-only consumer degrades to "nothing vendored" and
+/// says so, on stderr, so the operator learns why nothing attests.
+pub(crate) fn warn_unreadable_vendor_state(common: &GlobalArgs, e: &std::io::Error) {
+    if !common.silent {
+        eprintln!(
+            "Warning: unreadable vendor state ({e}); vendored patches cannot be verified \
+             from the committed artifact"
+        );
+    }
+}
+
+/// Build the [`VendorContext`] for verification from `ledger` — the
+/// caller's ONE `load_state` of `.socket/vendor/state.json` (it also fed
+/// the detached-record fold) — plus synthesized entries for the legacy
+/// `.socket/go-patches/` redirect backend. Shared by `vex` and `setup
+/// --check`'s patch-consistency pass — both must judge a vendored patch by
+/// the committed artifact, never the installed tree.
 ///
 /// The go-patches synthesis fixes a latent bug: an apply-redirected Go
 /// patch leaves the module cache pristine (the `replace` directive routes
@@ -856,19 +876,15 @@ async fn resolve_product_id(common: &GlobalArgs, product: Option<&str>) -> Resul
 /// installed tree, fail verification there, and are omitted — fail-closed,
 /// never falsely attested. Returns `None` when there is nothing vendored
 /// and no redirect to synthesize (the common case).
-pub(crate) async fn load_vendor_context(
+pub(crate) async fn vendor_context_from(
     common: &GlobalArgs,
     manifest: &PatchManifest,
+    ledger: std::io::Result<VendorState>,
 ) -> Option<VendorContext> {
-    let entries = match socket_patch_core::vendor::load_state(&common.cwd).await {
+    let entries = match ledger {
         Ok(state) => state.entries,
         Err(e) => {
-            if !common.silent {
-                eprintln!(
-                    "Warning: unreadable vendor state ({e}); vendored patches cannot be \
-                     verified from the committed artifact"
-                );
-            }
+            warn_unreadable_vendor_state(common, &e);
             HashMap::new()
         }
     };

@@ -26,6 +26,7 @@
 //! refused group keeps both its edits and its records — the
 //! intermediate-but-coherent ledger a retry needs. The caller persists.
 
+use super::staged::{flush_staged, staged_read, Staged, StagedBytes};
 use super::state::RedirectState;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -227,43 +228,6 @@ fn safe_rel_path(path: &str) -> bool {
         && !path.split(['/', '\\']).any(|c| c == "..")
 }
 
-/// FIFO-guarded read: a planted FIFO squatting a lockfile path must fail
-/// fast (`InvalidInput`) instead of wedging the replay on a blocking open
-/// — the same posture as every other raw read in the patch engine.
-async fn read_rel(project_root: &Path, rel: &str) -> Result<Option<String>, String> {
-    use tokio::io::AsyncReadExt;
-    let path = project_root.join(rel);
-    let (mut file, _) = match crate::utils::fs::open_regular_file(&path).await {
-        Ok(pair) => pair,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("read {rel}: {e}")),
-    };
-    let mut content = String::new();
-    file.read_to_string(&mut content)
-        .await
-        .map_err(|e| format!("read {rel}: {e}"))?;
-    Ok(Some(content))
-}
-
-/// Files the group's unwind has decided but not yet written:
-/// `Some(content)` to write, `None` to delete.
-type Staged = BTreeMap<String, Option<String>>;
-
-/// Native binary lockfiles staged after restoring their package snapshots.
-/// The atomic writer prevents partial binary lockfile writes.
-type StagedBytes = BTreeMap<String, Vec<u8>>;
-
-async fn staged_read(
-    staged: &Staged,
-    project_root: &Path,
-    rel: &str,
-) -> Result<Option<String>, String> {
-    match staged.get(rel) {
-        Some(pending) => Ok(pending.clone()),
-        None => read_rel(project_root, rel).await,
-    }
-}
-
 /// Remove one inserted fragment, eating the separators the writer added
 /// around it. Position-based: several writers record the fragment WITHOUT
 /// the indentation they inserted it with (the gem DEPENDENCIES pin and
@@ -362,7 +326,7 @@ pub async fn revert_remaining_redirect_edits(
         // Newest-first: chained re-redirects unwind through each step's
         // `new` -> `original` until the first run's insertion is removed.
         for &idx in indices.iter().rev() {
-            let edit = state.edits[idx].clone();
+            let edit = &state.edits[idx];
             let (_, inverse) = classify(&edit.kind, &edit.action);
             if !matches!(inverse, Inverse::NoopDrop | Inverse::Unsupported)
                 && !safe_rel_path(&edit.path)
@@ -395,7 +359,7 @@ pub async fn revert_remaining_redirect_edits(
                                 }
                             })?,
                         };
-                        super::bun_binary::restore(&content, &edit)
+                        super::bun_binary::restore(&content, edit)
                     }
                     .await;
                     match restored {
@@ -438,7 +402,7 @@ pub async fn revert_remaining_redirect_edits(
                 }
                 Inverse::PipenvEntry => {
                     let restored = match staged_read(&staged, project_root, &edit.path).await {
-                        Ok(Some(content)) => super::pipenv::restore(&content, &edit)
+                        Ok(Some(content)) => super::pipenv::restore(&content, edit)
                             .map(|restored| (content, restored)),
                         Ok(None) => Err(format!("{} no longer exists", edit.path)),
                         Err(error) => Err(error),
@@ -487,7 +451,14 @@ pub async fn revert_remaining_redirect_edits(
                     if inverse == Inverse::HatchDocument {
                         match crate::vendor::restore_python_document(&content, original, new) {
                             Ok((restored, false)) => {
-                                staged.insert(edit.path.clone(), Some(restored));
+                                // Already at its original (the restore
+                                // short-circuits on `live == original`): no
+                                // write, no `editedFiles` credit; the ledger
+                                // edit still retires (mirrors the PipenvEntry
+                                // arm).
+                                if restored != content {
+                                    staged.insert(edit.path.clone(), Some(restored));
+                                }
                                 group_drops.insert(idx);
                             }
                             _ => {
@@ -699,50 +670,16 @@ pub async fn revert_remaining_redirect_edits(
             }
         }
 
-        // Commit the group: flush staged files (unless dry-run), then mark
-        // its edits for dropping. A flush error refuses the group late —
-        // some files may already have landed (the same residual exposure
-        // the per-purl reverts document) — and keeps its ledger entries.
+        // Commit the group: flush staged files (unless dry-run) through the
+        // shared guarded atomic writer, then mark its edits for dropping. A
+        // flush error refuses the group late — some files may already have
+        // landed (the same residual exposure the per-purl reverts document)
+        // — and keeps its ledger entries.
         if !dry_run {
-            for (rel, pending) in &staged {
-                let path = project_root.join(rel);
-                // FIFO/device guard on the write side too: writing to a
-                // planted FIFO blocks forever. Refuse the group instead.
-                if let Ok(meta) = tokio::fs::symlink_metadata(&path).await {
-                    if !meta.is_file() {
-                        refuse(format!("{rel} is not a regular file"), &mut outcome);
-                        refused_groups.insert(group);
-                        continue 'group;
-                    }
-                }
-                let write_result = match pending {
-                    Some(content) => tokio::fs::write(&path, content).await,
-                    None => match tokio::fs::remove_file(&path).await {
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                        other => other,
-                    },
-                };
-                if let Err(e) = write_result {
-                    refuse(format!("write {rel}: {e}"), &mut outcome);
-                    refused_groups.insert(group);
-                    continue 'group;
-                }
-            }
-            // Commit native binary package restores atomically.
-            for (rel, bytes) in &staged_bytes {
-                let path = project_root.join(rel);
-                if let Ok(meta) = tokio::fs::symlink_metadata(&path).await {
-                    if !meta.is_file() {
-                        refuse(format!("{rel} is not a regular file"), &mut outcome);
-                        refused_groups.insert(group);
-                        continue 'group;
-                    }
-                }
-                if let Err(e) = crate::utils::fs::atomic_write_bytes(&path, bytes).await {
-                    refuse(format!("write {rel}: {e}"), &mut outcome);
-                    refused_groups.insert(group);
-                    continue 'group;
-                }
+            if let Err(reason) = flush_staged(project_root, &staged, &staged_bytes).await {
+                refuse(reason, &mut outcome);
+                refused_groups.insert(group);
+                continue 'group;
             }
         }
         outcome.reverted_files.extend(staged.keys().cloned());
@@ -1870,6 +1807,7 @@ mod tests {
             ("redirect_maven_config", "created"),
             ("redirect_maven_trusted_checksums", "created"),
             ("redirect_nuget_source", "rewritten"),
+            ("redirect_nuget_source", "added"),
             ("redirect_nuget_lock", "rewritten"),
         ];
         for (kind, action) in known {
@@ -2319,10 +2257,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
         write(dir.path(), "composer.lock", "https://patch.example/a\n").await;
-        let path = dir.path().join("composer.lock");
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o444);
-        std::fs::set_permissions(&path, perms).unwrap();
+        // The flush is an atomic stage + rename, so a read-only TARGET no
+        // longer blocks it (rename needs only the parent): make the parent
+        // directory read-only so the stage file cannot be created.
+        let writable = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
         let mut state = state_with(
             vec![edit(
                 "composer.lock",
@@ -2334,6 +2273,8 @@ mod tests {
             &[],
         );
         let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        // Restore before asserting so the TempDir can clean up on failure.
+        std::fs::set_permissions(dir.path(), writable).unwrap();
         assert_eq!(out.refusals.len(), 1, "{out:?}");
         assert!(
             out.refusals[0].reason.starts_with("write composer.lock:"),
@@ -2346,6 +2287,77 @@ mod tests {
             "https://patch.example/a\n",
             "the redirected fragment must still be present"
         );
+        let litter: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".socket-stage-"))
+            .collect();
+        assert!(litter.is_empty(), "no stage litter on failure: {litter:?}");
+    }
+
+    /// The text flush goes through the mode-preserving atomic writer: a
+    /// `0600` lockfile keeps its bits across the revert (the plain writer
+    /// would swap in a fresh umask-mode inode).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn flush_keeps_the_lockfile_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "composer.lock", "https://patch.example/a\n").await;
+        let path = dir.path().join("composer.lock");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut state = state_with(
+            vec![edit(
+                "composer.lock",
+                "redirect_composer_dist",
+                "rewritten",
+                Some("https://upstream.example/a"),
+                Some("https://patch.example/a"),
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(
+            read(dir.path(), "composer.lock").await,
+            "https://upstream.example/a\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the lockfile's mode must survive the atomic rewrite"
+        );
+    }
+
+    /// A Hatch document already at its recorded original (an interrupted
+    /// earlier revert, or a hand-fix) retires its ledger edit without a
+    /// byte-identical rewrite or an `editedFiles` credit — the same rule the
+    /// PipenvEntry and ReplaceFragment arms follow.
+    #[tokio::test]
+    async fn hatch_document_already_at_original_retires_without_a_write() {
+        let original = "[project]\nname = \"app\"\ndependencies = [\"one==1\"]\n";
+        let redirected =
+            "[project]\nname = \"app\"\ndependencies = [\"one @ https://patch.example/one.whl\"]\n";
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "pyproject.toml", original).await;
+        let mut state = state_with(
+            vec![edit(
+                "pyproject.toml",
+                "redirect_hatch_document",
+                "rewritten",
+                Some(original),
+                Some(redirected),
+            )],
+            &[],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert!(
+            out.reverted_files.is_empty(),
+            "nothing was written: {out:?}"
+        );
+        assert!(state.edits.is_empty(), "the edit still retires");
+        assert_eq!(read(dir.path(), "pyproject.toml").await, original);
     }
 
     // ---------- record hold/drop per purl ecosystem ----------

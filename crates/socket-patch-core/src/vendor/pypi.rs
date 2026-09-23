@@ -11,14 +11,18 @@ use std::path::Path;
 use sha2::{Digest as _, Sha256};
 
 use crate::api::client::ApiClient;
+use crate::constants::SOCKET_DIR;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::{atomic_write_bytes, read_regular_to_string};
 use crate::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
+use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::utils::toml_edit_ext::has_table;
 
-use super::common::{already_patched_result, done, refused, service_offline_conflict};
+use super::common::{
+    already_patched_result, done, prune_empty_vendor_levels, refused, service_offline_conflict,
+};
 use super::path::vendor_uuid_dir_rel;
 use super::pypi_pdm::{PdmProject, PdmTarget};
 use super::pypi_pipenv::{PipenvProject, PipenvTarget};
@@ -34,7 +38,7 @@ use super::pypi_wheel::{
 };
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::state::{
-    write_marker, PdmMeta, PipenvMeta, PoetryMeta, UvMeta, VendorArtifact, VendorEntry,
+    write_marker_or_warn, PdmMeta, PipenvMeta, PoetryMeta, UvMeta, VendorArtifact, VendorEntry,
     VendorMarker,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
@@ -132,20 +136,6 @@ pub async fn fetch_hosted_wheel_metadata(
 const SETUP_ALTERNATIVE: &str =
     "use the `socket-patch setup` .pth install hook instead, which patches installed \
      site-packages without lockfile edits";
-
-/// `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular files,
-/// so a FIFO planted as `pyproject.toml` fails fast — read as "no pyproject",
-/// falling through to the requirements routing — instead of wedging flavor
-/// detection (and every lockless-project vendor run) forever in an `open(2)`
-/// that waits for a writer.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// Route the project to a wiring flavor, first match wins. Lockfiles are the
 /// authoritative "this tool manages installs" signal, so locks are compared
@@ -352,7 +342,7 @@ enum WiringPlan {
 
 /// Which `VendorEntry` meta slot a flavor's wiring produced.
 enum MetaSlot {
-    Uv(Option<UvMeta>),
+    Uv(UvMeta),
     Poetry(PoetryMeta),
     Pdm(PdmMeta),
     Pipenv(PipenvMeta),
@@ -714,33 +704,30 @@ pub async fn vendor_pypi_with_pipenv_version(
                     ),
                 ));
             }
-            match super::pypi_pipenv::check_target_guards(
+            let target = match super::pypi_pipenv::check_target_guards(
                 &project,
                 &canon_name,
                 &record.uuid,
                 version,
             ) {
-                Ok(PipenvTarget::InSync) => {
-                    // A re-run over an already-wired lock keeps warning while
-                    // the venv still holds the upstream release.
-                    if let Some(stale) =
-                        pipenv_stale_install_warning(project_root, purl, record).await
-                    {
-                        warnings.push(stale);
-                    }
+                Ok(target) => target,
+                // A refusal carries no warnings: probe nothing for it.
+                Err((code, detail)) => return refused(code, detail),
+            };
+            if target == PipenvTarget::Fresh {
+                warnings.extend(project.warnings.iter().cloned());
+            }
+            // Both a fresh vendor and a re-run over an already-wired lock
+            // keep warning while the venv still holds the upstream release.
+            if let Some(stale) = pipenv_stale_install_warning(project_root, purl, record).await {
+                warnings.push(stale);
+            }
+            match target {
+                PipenvTarget::InSync => {
                     wired_pin = pipenv_wired_pin(&project.lock, &uuid_dir_rel);
                     WiringPlan::InSync
                 }
-                Ok(PipenvTarget::Fresh) => {
-                    warnings.extend(project.warnings.iter().cloned());
-                    if let Some(stale) =
-                        pipenv_stale_install_warning(project_root, purl, record).await
-                    {
-                        warnings.push(stale);
-                    }
-                    WiringPlan::Pipenv(Box::new(project))
-                }
-                Err((code, detail)) => return refused(code, detail),
+                PipenvTarget::Fresh => WiringPlan::Pipenv(Box::new(project)),
             }
         }
     };
@@ -824,9 +811,22 @@ pub async fn vendor_pypi_with_pipenv_version(
     .await
     {
         Ok(a) => a,
-        Err(outcome) => return outcome,
+        Err(outcome) => {
+            // A refused/hard-failed acquisition may have scaffolded the
+            // empty uuid dir (and the ecosystem / vendor levels on a fresh
+            // project) before failing: prune them so the failure leaves no
+            // committable husk. Dry runs create nothing.
+            if !dry_run {
+                prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
+            }
+            return outcome;
+        }
     };
-    if dry_run || !result.success {
+    if !result.success {
+        prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
+        return done(result, None, warnings);
+    }
+    if dry_run {
         return done(result, None, warnings);
     }
     let Some(artifact) = artifact else {
@@ -875,6 +875,7 @@ pub async fn vendor_pypi_with_pipenv_version(
         if let Some((pin_path, pin_sha)) = &expected_pin {
             if *pin_path != rel_wheel || *pin_sha != artifact.sha256_hex {
                 let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
+                prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
                 let mut result = result;
                 result.success = false;
                 result.error = Some(format!(
@@ -897,26 +898,16 @@ pub async fn vendor_pypi_with_pipenv_version(
         ));
         // Restore the informational marker the deleted uuid dir lost.
         let marker = VendorMarker::new("pypi", base, record, vendored_at);
-        if let Err(e) = write_marker(&project_root.join(&uuid_dir_rel), &marker).await {
-            warnings.push(VendorWarning::new(
-                "marker_write_failed",
-                format!("could not write the vendor marker: {e}"),
-            ));
-        }
+        write_marker_or_warn(&project_root.join(&uuid_dir_rel), &marker, &mut warnings).await;
         return done(result, None, warnings);
     }
 
     // Marker: artifact-side breadcrumb in the uuid dir (informational only —
-    // sweep/verify key off state.json + the path uuid). Written before the
+    // sweep/verify key off state.json + the path uuid, so a failed write is
+    // a warning here exactly as in every other backend). Written before the
     // wiring so lockfile edits stay the last mutation.
     let marker = VendorMarker::new("pypi", base, record, vendored_at);
-    if let Err(e) = write_marker(&project_root.join(&uuid_dir_rel), &marker).await {
-        let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
-        let mut result = result;
-        result.success = false;
-        result.error = Some(format!("cannot write vendor marker: {e}"));
-        return done(result, None, warnings);
-    }
+    write_marker_or_warn(&project_root.join(&uuid_dir_rel), &marker, &mut warnings).await;
 
     // Wiring LAST. On failure the wheel artifact is swept back out so a
     // failed vendor leaves no committed residue.
@@ -934,7 +925,7 @@ pub async fn vendor_pypi_with_pipenv_version(
         .await
         .map(|(wiring, meta, advisories)| {
             warnings.extend(advisories);
-            (wiring, MetaSlot::Uv(Some(meta)))
+            (wiring, MetaSlot::Uv(meta))
         }),
         WiringPlan::PythonLocks(project) => super::pypi_lock::wire_python_locks(
             &project,
@@ -993,6 +984,7 @@ pub async fn vendor_pypi_with_pipenv_version(
             &project,
             project_root,
             &canon_name,
+            version,
             &rel_wheel,
             &artifact.sha256_hex,
             &record.uuid,
@@ -1006,6 +998,7 @@ pub async fn vendor_pypi_with_pipenv_version(
         Ok(pair) => pair,
         Err((code, detail)) => {
             let _ = tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await;
+            prune_empty_vendor_levels(&project_root.join(&uuid_dir_rel)).await;
             let mut result = result;
             result.success = false;
             result.error = Some(format!("{code}: {detail}"));
@@ -1037,7 +1030,7 @@ pub async fn vendor_pypi_with_pipenv_version(
         pipenv: None,
     };
     match meta {
-        MetaSlot::Uv(m) => entry.uv = m,
+        MetaSlot::Uv(m) => entry.uv = Some(m),
         MetaSlot::Poetry(m) => entry.poetry = Some(m),
         MetaSlot::Pdm(m) => entry.pdm = Some(m),
         MetaSlot::Pipenv(m) => entry.pipenv = Some(m),
@@ -1176,14 +1169,13 @@ async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Optio
     }
     for name in &names {
         let path = project_root.join(name);
-        if matches!(tokio::fs::try_exists(&path).await, Ok(false)) {
-            continue;
-        }
         match read_regular_to_string(&path).await {
             Ok(text) if text.contains(&needle) => {
                 return Some(format!("{name} still resolves through it"));
             }
             Ok(_) => {}
+            // A file that no longer exists cannot reference it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             // Fail-closed: a file we cannot read may still reference it.
             Err(_) => {
                 return Some(format!(
@@ -1323,13 +1315,21 @@ pub async fn revert_pypi_opts(
         ));
         return outcome;
     };
-    match tokio::fs::remove_dir_all(project_root.join(&uuid_dir_rel)).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => outcome.warnings.push(VendorWarning::new(
+    // Remove the unit (a missing dir is fine), then prune the
+    // `.socket/vendor/pypi/` and `.socket/vendor/` husks it leaves when it was
+    // the last entry (non-recursive: siblings keep them). A removal failure
+    // keeps the warning posture — the wiring restore above already succeeded
+    // — and skips the prune (the dir is still there).
+    if let Err(e) = remove_tree_and_prune(
+        &project_root.join(&uuid_dir_rel),
+        &project_root.join(SOCKET_DIR),
+    )
+    .await
+    {
+        outcome.warnings.push(VendorWarning::new(
             "vendor_artifact_remove_failed",
             format!("could not remove {uuid_dir_rel}: {e}"),
-        )),
+        ));
     }
     outcome
 }
@@ -3447,7 +3447,12 @@ wheels = [
                 !outcome.success,
                 "{flavor}: revert under an unlistable root must refuse: {outcome:?}"
             );
-            assert_eq!(outcome.warnings.len(), 1, "{flavor}: {:?}", outcome.warnings);
+            assert_eq!(
+                outcome.warnings.len(),
+                1,
+                "{flavor}: {:?}",
+                outcome.warnings
+            );
             assert_eq!(
                 outcome.warnings[0].code,
                 "vendor_wiring_unknown_revert_blocked"
@@ -3522,8 +3527,7 @@ wheels = [
                 "vendor_wiring_unknown_revert_blocked"
             );
             assert!(
-                outcome
-                    .warnings[0]
+                outcome.warnings[0]
                     .detail
                     .contains(&format!("{lock_name} exists but could not be read")),
                 "{lock_name}: {}",
@@ -3639,7 +3643,9 @@ wheels = [
         tokio::fs::write(root.join("requirements.txt"), "-r requirements/base.txt\n")
             .await
             .unwrap();
-        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        tokio::fs::create_dir(root.join("requirements"))
+            .await
+            .unwrap();
         let include = format!(
             "./{rel_wheel} --hash=sha256:{}  # socket-patch vendor: six==1.16.0\n",
             "0".repeat(64)
@@ -3718,9 +3724,10 @@ wheels = [
             .unwrap();
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
         let p = load_pipenv_project(root).await.unwrap();
-        let (wiring, _meta) = wire_pipenv(&p, root, "six", &rel_wheel, &"0".repeat(64), UUID)
-            .await
-            .unwrap();
+        let (wiring, _meta) =
+            wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
+                .await
+                .unwrap();
         let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
@@ -3773,9 +3780,12 @@ wheels = [
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
         let (wiring2, _meta2) = wire_pipenv(
-            &load_pipenv_project(root).await.unwrap_or_else(|e| panic!("{e:?}")),
+            &load_pipenv_project(root)
+                .await
+                .unwrap_or_else(|e| panic!("{e:?}")),
             root,
             "six",
+            "1.16.0",
             &rel_wheel,
             &"0".repeat(64),
             UUID,
@@ -3797,15 +3807,25 @@ wheels = [
         let entry = revert_entry("pipenv", &rel_wheel, wiring2);
         let outcome = revert_pypi(&entry, root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(!outcome.drift_skipped() && !outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            !outcome.drift_skipped() && !outcome.kept_artifact,
+            "{:?}",
+            outcome.warnings
+        );
         let restored: serde_json::Value = serde_json::from_str(
             &tokio::fs::read_to_string(root.join("Pipfile.lock"))
                 .await
                 .unwrap(),
         )
         .unwrap();
-        assert!(restored["default"]["six"].get("file").is_none(), "{restored}");
-        assert_eq!(restored["default"]["six"]["version"], serde_json::json!("==1.16.0"));
+        assert!(
+            restored["default"]["six"].get("file").is_none(),
+            "{restored}"
+        );
+        assert_eq!(
+            restored["default"]["six"]["version"],
+            serde_json::json!("==1.16.0")
+        );
 
         // Foreign file reference → still drift, still kept.
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
@@ -3820,7 +3840,11 @@ wheels = [
         let entry = revert_entry("pipenv", &rel_wheel, wiring);
         let outcome = revert_pypi(&entry, root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.drift_skipped() && outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome.drift_skipped() && outcome.kept_artifact,
+            "{:?}",
+            outcome.warnings
+        );
         assert!(wheel.is_file());
     }
 
@@ -3840,9 +3864,10 @@ wheels = [
             .unwrap();
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
         let p = load_pipenv_project(root).await.unwrap();
-        let (wiring, _meta) = wire_pipenv(&p, root, "six", &rel_wheel, &"0".repeat(64), UUID)
-            .await
-            .unwrap();
+        let (wiring, _meta) =
+            wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
+                .await
+                .unwrap();
         let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
@@ -3974,9 +3999,10 @@ wheels = [
             .unwrap();
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
         let p = load_pipenv_project(root).await.unwrap();
-        let (wiring, _meta) = wire_pipenv(&p, root, "six", &rel_wheel, &"0".repeat(64), UUID)
-            .await
-            .unwrap();
+        let (wiring, _meta) =
+            wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
+                .await
+                .unwrap();
         let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         tokio::fs::write(uuid_dir.join("six-1.16.0-py2.py3-none-any.whl"), b"wheel")
@@ -4795,7 +4821,9 @@ wheels = [
             "{warnings:?}"
         );
         assert!(
-            !warnings.iter().any(|w| w.code == "marker_write_failed"),
+            !warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "rewriting the surviving marker file must succeed: {warnings:?}"
         );
         assert!(wheel.is_file(), "wheel rebuilt at the recorded path");
@@ -4814,34 +4842,40 @@ wheels = [
             .unwrap();
     }
 
-    /// Fresh path: a failed marker write flips the run to failure, sweeps
-    /// the uuid dir, and leaves the wiring untouched (it was never written —
-    /// the marker lands BEFORE the wiring).
+    /// Fresh path: the marker is advisory on a first vendor too (parity with
+    /// every other backend) — a failed write is a `vendor_marker_write_failed`
+    /// warning riding an otherwise successful run: the wheel stays, the
+    /// wiring lands (the marker is written BEFORE the wiring, and its failure
+    /// no longer short-circuits that), and the ledger entry is emitted.
     #[tokio::test]
-    async fn fresh_marker_write_failure_sweeps_artifact_and_fails() {
+    async fn fresh_marker_write_failure_warns_but_vendor_succeeds() {
         let fx = e2e_fixture().await;
         plant_marker_blocker(&fx).await;
         let sources = PatchSources::blobs_only(&fx.blobs);
         let outcome = vendor_six(&fx, &sources, None).await;
-        let VendorOutcome::Done { result, entry, .. } = outcome else {
+        let VendorOutcome::Done {
+            result,
+            entry,
+            warnings,
+        } = outcome
+        else {
             panic!("expected Done, got {outcome:?}");
         };
-        assert!(!result.success, "the failed marker write must be reported");
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("a fully-wired vendor still emits its entry");
         assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("cannot write vendor marker"),
-            "{:?}",
-            result.error
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
+            "the failed marker write is surfaced: {warnings:?}"
         );
-        assert!(entry.is_none());
         assert!(
-            !uuid_dir_of(&fx).exists(),
-            "a failed fresh vendor must leave no committed residue"
+            fx.root.join(&entry.artifact.path).is_file(),
+            "the wheel is kept at the recorded path"
         );
-        assert_eq!(read_requirements(&fx).await, "six==1.16.0\n");
+        let wired = read_requirements(&fx).await;
+        assert_ne!(wired, "six==1.16.0\n", "the wiring still lands");
+        assert!(wired.contains(".socket/vendor/pypi/"), "{wired}");
     }
 
     /// In-sync rebuild path: the marker restore is advisory — its failure is
@@ -4885,7 +4919,9 @@ wheels = [
             "{warnings:?}"
         );
         assert!(
-            warnings.iter().any(|w| w.code == "marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "{warnings:?}"
         );
         assert!(fx.root.join(&entry.artifact.path).is_file());
@@ -5384,10 +5420,9 @@ wheels = [
             "six==1.16.0\n",
             "the wiring is only ever written after a successful wheel"
         );
-        // Pin of CURRENT residue behavior: the refusal does not sweep the
-        // (pre-existing) uuid dir — nothing references it, since the wiring
-        // was never touched. FIXME(no-residue): candidate cleanup gap if the
-        // dir was created by this very run.
+        // The refusal prunes only EMPTY levels this run may have created:
+        // the pre-existing, non-empty uuid dir is never collateral (nothing
+        // references it, and `remove_dir` refuses a non-empty dir).
         assert!(blocker.is_dir());
     }
 
@@ -5947,9 +5982,25 @@ mod hatch_routing_tests {
     async fn hatchling_with_requirements_preserves_pip_routing() {
         let dir = tempfile::tempdir().unwrap();
         tokio::fs::write(dir.path().join("pyproject.toml"), "[build-system]\nbuild-backend=\"hatchling.build\"\n[project]\ndependencies=[\"urllib3==1.26.18\"]\n").await.unwrap();
-        tokio::fs::write(dir.path().join("requirements.txt"), "urllib3==1.26.18\n").await.unwrap();
-        assert_eq!(detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18"))).await.unwrap().0, PypiFlavor::Requirements);
-        tokio::fs::remove_file(dir.path().join("requirements.txt")).await.unwrap();
-        assert_eq!(detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18"))).await.unwrap().0, PypiFlavor::Hatch);
+        tokio::fs::write(dir.path().join("requirements.txt"), "urllib3==1.26.18\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18")))
+                .await
+                .unwrap()
+                .0,
+            PypiFlavor::Requirements
+        );
+        tokio::fs::remove_file(dir.path().join("requirements.txt"))
+            .await
+            .unwrap();
+        assert_eq!(
+            detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18")))
+                .await
+                .unwrap()
+                .0,
+            PypiFlavor::Hatch
+        );
     }
 }

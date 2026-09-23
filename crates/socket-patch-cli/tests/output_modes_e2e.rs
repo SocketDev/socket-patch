@@ -191,7 +191,7 @@ fn apply_no_manifest_non_json_prints_message() {
     let (code, stdout, _stderr) = common::run_with_env(tmp.path(), &["apply"], &[]);
     assert_eq!(code, 0);
     assert!(
-        stdout.contains("No .socket folder found, skipping patch application"),
+        stdout.contains("No patch manifest found; nothing to apply."),
         "non-JSON no-manifest must print friendly message; got: {stdout}"
     );
 }

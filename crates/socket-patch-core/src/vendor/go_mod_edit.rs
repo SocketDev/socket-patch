@@ -36,6 +36,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::utils::fs::read_regular_to_string;
+
 /// Project-relative directory holding `apply`'s patched module copies. A
 /// `replace` whose target path is under this prefix is owned by
 /// [`ReplaceOwner::GoPatches`].
@@ -125,20 +127,6 @@ impl ReplaceEntry {
 }
 
 // ── public async API ─────────────────────────────────────────────────────────
-
-/// Guarded read shared in shape with the Cargo.lock / .cargo/config.toml
-/// twins: `open_regular_file` opens with `O_NONBLOCK` and rejects non-regular
-/// files, so a FIFO planted as `go.mod` fails fast instead of wedging every
-/// caller (apply's redirect + reconcile, `--check`'s verify, vex's directive
-/// scan) forever in an `open(2)` that waits for a writer that never comes.
-async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
-    use tokio::io::AsyncReadExt as _;
-
-    let (mut file, metadata) = crate::utils::fs::open_regular_file(path).await?;
-    let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content).await?;
-    Ok(content)
-}
 
 /// Read all `replace` directives. Read-only; a missing/unreadable `go.mod`
 /// yields an empty vec (callers treat that as "no managed entries").
