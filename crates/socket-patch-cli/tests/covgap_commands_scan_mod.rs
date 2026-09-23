@@ -30,6 +30,8 @@
 //! `cli_scan_silent.rs` pattern) so ambient developer/CI configuration
 //! cannot reroute the branch under test. Network tests use wiremock.
 
+#[path = "common/pty_io.rs"]
+mod pty_io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -146,23 +148,50 @@ async fn mount_batch_one(
     cve_ids: &[&str],
     can_access_paid: bool,
 ) {
+    mount_batch_one_delayed(
+        mock,
+        purl,
+        uuid,
+        tier,
+        cve_ids,
+        can_access_paid,
+        std::time::Duration::ZERO,
+    )
+    .await;
+}
+
+/// [`mount_batch_one`], answering only after `delay`.
+async fn mount_batch_one_delayed(
+    mock: &MockServer,
+    purl: &str,
+    uuid: &str,
+    tier: &str,
+    cve_ids: &[&str],
+    can_access_paid: bool,
+    delay: std::time::Duration,
+) {
+    let body = serde_json::json!({
+        "packages": [{
+            "purl": purl,
+            "patches": [{
+                "uuid": uuid,
+                "purl": purl,
+                "tier": tier,
+                "cveIds": cve_ids,
+                "ghsaIds": [],
+                "severity": "high",
+                "title": "covgap test patch"
+            }]
+        }],
+        "canAccessPaidPatches": can_access_paid,
+    });
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "packages": [{
-                "purl": purl,
-                "patches": [{
-                    "uuid": uuid,
-                    "purl": purl,
-                    "tier": tier,
-                    "cveIds": cve_ids,
-                    "ghsaIds": [],
-                    "severity": "high",
-                    "title": "covgap test patch"
-                }]
-            }],
-            "canAccessPaidPatches": can_access_paid,
-        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(body)
+                .set_delay(delay),
+        )
         .mount(mock)
         .await;
 }
@@ -206,9 +235,19 @@ async fn mount_by_package(
 /// by-package, and the patch view with an inline blob (fixture shape
 /// mirrors `cli_scan_silent.rs` / `scan_sync_e2e.rs`).
 async fn mount_one_patch_api(mock: &MockServer, purl: &str, before: &[u8]) {
+    mount_one_patch_api_delayed(mock, purl, before, std::time::Duration::ZERO).await;
+}
+
+/// [`mount_one_patch_api`] with the batch query answering after `delay`.
+async fn mount_one_patch_api_delayed(
+    mock: &MockServer,
+    purl: &str,
+    before: &[u8],
+    delay: std::time::Duration,
+) {
     let before_hash = git_sha256(before);
     let after_hash = git_sha256(b"after\n");
-    mount_batch_one(mock, purl, UUID, "free", &[], false).await;
+    mount_batch_one_delayed(mock, purl, UUID, "free", &[], false, delay).await;
     mount_by_package(mock, purl, UUID, serde_json::json!({})).await;
     // base64 of "after\n" — inline so the apply step needs no blob endpoint.
     Mock::given(method("GET"))
@@ -490,11 +529,11 @@ async fn scan_paid_patch_without_access_nudges_and_downloads_nothing() {
         "the table column must render free+paid counts; got {stdout:?}"
     );
     assert!(
-        stdout.contains("Summary: 1 package(s) with 0 free patch(es)"),
+        stdout.contains("Summary: 1 package with 0 free patches"),
         "the no-access summary counts FREE patches only; got {stdout:?}"
     );
     assert!(
-        stdout.contains("+ 1 additional patch(es) available with paid subscription"),
+        stdout.contains("+ 1 additional patch is available with a paid subscription"),
         "the paid nudge must print; got {stdout:?}"
     );
     assert!(
@@ -542,7 +581,7 @@ async fn scan_paid_patch_with_access_counts_all_and_reports_detail_failure() {
         "a failed detail fetch fails the scan; stdout={stdout}"
     );
     assert!(
-        stdout.contains("Summary: 1 package(s) with 1 available patch(es)"),
+        stdout.contains("Summary: 1 package with 1 available patch"),
         "the can-access summary counts all patches; got {stdout:?}"
     );
     assert!(
@@ -554,7 +593,7 @@ async fn scan_paid_patch_with_access_counts_all_and_reports_detail_failure() {
         "no nudge for a subscriber; got {stdout:?}"
     );
     assert!(
-        stderr.contains("Could not fetch patch details."),
+        stderr.contains("Error: could not fetch patch details for"),
         "the terminal detail-failure must reach stderr; got {stderr:?}"
     );
 }
@@ -615,7 +654,7 @@ async fn scan_human_table_renders_update_marker_and_vuln_overflow() {
         "the human update marker must render; got {stdout:?}"
     );
     assert!(
-        stdout.contains("1 package(s) have newer patches available."),
+        stdout.contains("1 package has a newer patch available."),
         "the newer-patches summary must print; got {stdout:?}"
     );
     // Deterministic order: collect_vuln_ids sorts CVEs, so the first two
@@ -625,16 +664,15 @@ async fn scan_human_table_renders_update_marker_and_vuln_overflow() {
         "3+ vuln ids must truncate to two plus (+N); got {stdout:?}"
     );
     assert!(
-        stdout.contains("[dry-run] Would download and apply 1 patch(es). No changes made."),
+        stdout.contains("[dry-run] Would download and apply 1 patch. No changes made."),
         "dry-run must stop before the confirm; got {stdout:?}"
     );
 }
 
-/// The per-package detail-fetch warning on the non-silent human path (the
-/// terminal "Could not fetch patch details." was previously reached only
-/// via --silent runs, skipping the warning line).
+/// When every detail fetch fails, the human path prints ONE Error line that
+/// names the package and the cause (no per-package Warning repeating it).
 #[tokio::test]
-async fn scan_human_detail_fetch_failure_warns_per_package() {
+async fn scan_human_detail_fetch_failure_errors_once() {
     let mock = MockServer::start().await;
     let purl = "pkg:npm/minimist@1.2.2";
     mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
@@ -654,12 +692,69 @@ async fn scan_human_detail_fetch_failure_warns_per_package() {
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 1, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stderr.contains(&format!("Warning: could not fetch details for {purl}")),
-        "the per-package warning must name the purl on stderr; got {stderr:?}"
+        stderr.contains(&format!("Error: could not fetch patch details for {purl}: ")),
+        "the terminal error names the purl and the cause; got {stderr:?}"
     );
     assert!(
-        stderr.contains("Could not fetch patch details."),
-        "the terminal error follows the warning; got {stderr:?}"
+        !stderr.contains("Warning: could not fetch details"),
+        "a total failure must not repeat the cause as a Warning first; got {stderr:?}"
+    );
+}
+
+/// A partial detail-fetch failure warns per failed package on stderr and
+/// carries on with the packages that did resolve.
+#[tokio::test]
+async fn scan_human_partial_detail_fetch_failure_warns_per_package() {
+    let mock = MockServer::start().await;
+    let ok = "pkg:npm/minimist@1.2.2";
+    let bad = "pkg:npm/lodash@4.17.20";
+    let body = serde_json::json!({
+        "packages": [
+            {"purl": ok, "patches": [{
+                "uuid": UUID, "purl": ok, "tier": "free", "cveIds": [],
+                "ghsaIds": [], "severity": "high", "title": "t"
+            }]},
+            {"purl": bad, "patches": [{
+                "uuid": "33333333-3333-4333-8333-333333333333", "purl": bad,
+                "tier": "free", "cveIds": [], "ghsaIds": [], "severity": "high",
+                "title": "t"
+            }]}
+        ],
+        "canAccessPaidPatches": false,
+    });
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&mock)
+        .await;
+    mount_by_package(&mock, ok, UUID, serde_json::json!({})).await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/by-package/{}",
+            encode_purl(bad)
+        )))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+    write_npm_package(tmp.path(), "lodash", "4.17.20", b"x\n");
+
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--dry-run"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert_eq!(
+        stderr
+            .matches(&format!("Warning: could not fetch details for {bad}: "))
+            .count(),
+        1,
+        "one warning naming the failed purl; got {stderr:?}"
+    );
+    assert!(!stderr.contains("Error:"), "a partial failure is not an error: {stderr:?}");
+    assert!(
+        stdout.contains("[dry-run] Would download and apply 1 patch."),
+        "the resolved package still goes through; got {stdout:?}"
     );
 }
 
@@ -703,9 +798,7 @@ async fn scan_human_skips_vendored_purls_without_downloading() {
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--yes"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stdout.contains(&format!(
-            "[skip] {purl} (vendored — run scan --vendor to update)"
-        )),
+        stdout.contains(&format!("[skip] {purl} (vendored; run `socket-patch scan --mode vendored` to update it)")),
         "the vendored skip line must name the purl and the remedy; got {stdout:?}"
     );
     assert!(
@@ -779,11 +872,11 @@ async fn scan_human_preview_renders_vulnerability_details() {
         "the per-vuln summary line carries its CVE label; got {stdout:?}"
     );
     assert!(
-        stdout.contains("- no-cve issue"),
-        "a CVE-less vuln's summary prints without a label; got {stdout:?}"
+        stdout.contains("- GHSA-dddd-eeee-ffff: no-cve issue"),
+        "a CVE-less vuln's summary is labeled with its advisory id; got {stdout:?}"
     );
     assert!(
-        stdout.contains("[dry-run] Would download and apply 1 patch(es). No changes made."),
+        stdout.contains("[dry-run] Would download and apply 1 patch. No changes made."),
         "dry-run stops before any mutation; got {stdout:?}"
     );
 }
@@ -1022,7 +1115,7 @@ fn scan_human_vex_success_prints_wrote_line() {
     );
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stdout.contains("Wrote OpenVEX document with 1 statement(s) to"),
+        stdout.contains("Wrote OpenVEX document with 1 statement to"),
         "the human VEX success line must print; got {stdout:?}"
     );
     assert!(
@@ -1072,7 +1165,7 @@ async fn scan_human_pnp_refusal_prints_alongside_other_ecosystems() {
         "refusals never flip the exit; stdout={stdout}; stderr={stderr}"
     );
     assert!(
-        stderr.contains("Found 1 packages"),
+        stderr.contains("Found 1 package ("),
         "the gem must be discovered (non-empty path); got {stderr:?}"
     );
     assert!(
@@ -1093,6 +1186,40 @@ async fn scan_human_pnp_refusal_prints_alongside_other_ecosystems() {
         bodies[0].contains("pkg:gem/rack@2.2.0"),
         "the batch body must carry the crawled gem purl; got {}",
         bodies[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Empty batch response: the human result line
+// ---------------------------------------------------------------------------
+
+/// One installed package, a batch response with no patches: the status
+/// line finishes with exactly `No patches found for 1 package` (singular,
+/// on its own line — no stale status tail).
+#[tokio::test]
+async fn scan_human_empty_batch_reports_no_patches_for_one_package() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [],
+            "canAccessPaidPatches": false,
+        })))
+        .expect(1)
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.5", b"module.exports = {};\n");
+
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l == "No patches found for 1 package"),
+        "expected the exact result line; got {stderr:?}"
     );
 }
 
@@ -1130,7 +1257,7 @@ async fn scan_bare_human_non_tty_is_report_only() {
         "the per-patch preview still prints; got {stdout:?}"
     );
     assert!(
-        stdout.contains("To apply a patch, run:") && stdout.contains("socket-patch get <CVE-ID>"),
+        stdout.contains("To apply a single patch, run:") && stdout.contains("socket-patch get <CVE-ID>"),
         "the get-hint must print; got {stdout:?}"
     );
     assert!(
@@ -1172,7 +1299,7 @@ async fn scan_human_non_tty_explicit_intent_auto_proceeds() {
         let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), flags);
         assert_eq!(code, 0, "flags={flags:?}: stdout={stdout}; stderr={stderr}");
         assert!(
-            stderr.contains("Non-interactive mode detected, proceeding with default."),
+            stderr.contains("Non-interactive mode detected, proceeding automatically."),
             "flags={flags:?}: explicit intent keeps confirm()'s non-TTY auto-accept; got {stderr:?}"
         );
         assert_eq!(
@@ -1200,7 +1327,7 @@ async fn scan_human_non_tty_prune_counts_as_intent() {
     .await;
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stderr.contains("Non-interactive mode detected, proceeding with default."),
+        stderr.contains("Non-interactive mode detected, proceeding automatically."),
         "--prune auto-proceeds through confirm(); got {stderr:?}"
     );
     assert!(
@@ -1336,22 +1463,22 @@ async fn scan_hosted_human_prints_table_updates_and_confirms() {
         "the results table must print in hosted mode; got {stdout:?}"
     );
     assert!(
-        stdout.contains("Summary: 1 package(s) with 1 free patch(es)"),
+        stdout.contains("Summary: 1 package with 1 free patch"),
         "the summary must print in hosted mode; got {stdout:?}"
     );
     assert!(
         stdout.contains("[UPDATE]")
-            && stdout.contains("1 package(s) have newer patches available."),
+            && stdout.contains("1 package has a newer patch available."),
         "update detection must run in hosted mode; got {stdout:?}"
     );
     // `--mode hosted` is explicit intent: the new prompt auto-accepts on a
     // non-TTY stdin and the engine runs.
     assert!(
-        stderr.contains("Non-interactive mode detected, proceeding with default."),
+        stderr.contains("Non-interactive mode detected, proceeding automatically."),
         "the hosted confirm must run (and auto-accept) on a non-TTY; got {stderr:?}"
     );
     assert!(
-        stdout.contains("Redirected 0 package(s)"),
+        stdout.contains("Redirected 0 packages"),
         "the engine must run after the prompt; got {stdout:?}"
     );
     let reqs = recorded(&mock).await;
@@ -1381,7 +1508,6 @@ async fn scan_hosted_human_prints_table_updates_and_confirms() {
 #[cfg(unix)]
 mod pty {
     use super::*;
-    use std::io::{Read, Write};
     use std::time::Duration;
 
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -1390,6 +1516,20 @@ mod pty {
     /// until exit (the `interactive_prompts_e2e.rs` harness pattern:
     /// reader thread + kill-after-timeout watchdog, no polling).
     fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, String) {
+        run_in_pty_with(args, cwd, &[], "", input, timeout)
+    }
+
+    /// [`run_in_pty`] with extra child `env`, first writing `typeahead`
+    /// straight after spawn — keystrokes a user types while the scan is
+    /// still running, before any prompt is on screen.
+    fn run_in_pty_with(
+        args: &[&str],
+        cwd: &Path,
+        env: &[(&str, &str)],
+        typeahead: &str,
+        input: &str,
+        timeout: Duration,
+    ) -> (i32, String) {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -1417,16 +1557,16 @@ mod pty {
         }
         cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
         cmd.env("SOCKET_NO_UPDATE_CHECK", "1");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
 
         let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().expect("clone reader");
-        let reader_handle = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
-        });
+        let reader_handle = crate::pty_io::PtyOutput::spawn(
+            pair.master.try_clone_reader().expect("clone reader"),
+        );
 
         let mut killer = child.clone_killer();
         std::thread::spawn(move || {
@@ -1435,14 +1575,18 @@ mod pty {
         });
 
         let mut writer = pair.master.take_writer().expect("take writer");
-        let _ = writer.write_all(input.as_bytes());
-        let _ = writer.flush();
+        if !typeahead.is_empty() {
+            use std::io::Write as _;
+            let _ = writer.write_all(typeahead.as_bytes());
+            let _ = writer.flush();
+        }
+        crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input.as_bytes());
         drop(writer);
 
         let status = child.wait().expect("child.wait");
         drop(pair.master);
 
-        let output = reader_handle.join().expect("reader thread join");
+        let output = reader_handle.finish();
         (
             status.exit_code() as i32,
             String::from_utf8_lossy(&output).to_string(),
@@ -1485,11 +1629,11 @@ mod pty {
         // The prompt genuinely ran (a regression auto-proceeding in a TTY
         // would skip it — and would mutate, failing below too).
         assert!(
-            output.contains("Download and apply 1 patch(es)?"),
+            output.contains("Download and apply 1 patch?"),
             "the confirm prompt must have shown; got:\n{output}"
         );
         assert!(
-            output.contains("To apply a patch, run:"),
+            output.contains("To apply a single patch, run:"),
             "the decline hint must print; got:\n{output}"
         );
         assert!(
@@ -1511,7 +1655,341 @@ mod pty {
         assert_eq!(view_gets(&reqs), 0, "declining must not download the patch");
     }
 
-    /// The hosted twin: declining "Redirect N package(s) …?" exits 0 with
+    /// Declining the vendored-mode prompt points at the vendored `get`,
+    /// not the in-place one (which would apply instead of vendoring).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_vendored_decline_hint_names_vendored_get() {
+        let mock = MockServer::start().await;
+        let purl = "pkg:npm/minimist@1.2.2";
+        mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+        mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+
+        let uri = mock.uri();
+        let cwd = tmp.path().to_path_buf();
+        let (code, output) = tokio::task::spawn_blocking(move || {
+            run_in_pty(
+                &[
+                    "scan",
+                    "--mode",
+                    "vendored",
+                    "--api-url",
+                    &uri,
+                    "--api-token",
+                    "fake-token-for-test",
+                    "--org",
+                    ORG_SLUG,
+                ],
+                &cwd,
+                "n\n",
+                Duration::from_secs(60),
+            )
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        assert_eq!(code, 0, "declining is not an error; output:\n{output}");
+        assert!(
+            output.contains("Download and vendor 1 patch?"),
+            "the vendored prompt must have shown; got:\n{output}"
+        );
+        assert!(
+            output.contains("To vendor a single patch, run:")
+                && output.contains("socket-patch get <package-name-or-purl> --mode vendored"),
+            "the decline hint must name the vendored get; got:\n{output}"
+        );
+        assert!(
+            !output.contains("To apply a single patch"),
+            "no agent-mode hint in vendored mode; got:\n{output}"
+        );
+    }
+
+    /// `scan --json` on a real terminal must never open the interactive
+    /// "Select one" menu over its machine-read output: with several free
+    /// patches for one package it picks the top-ranked one, like a non-TTY
+    /// run, and finishes on its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_json_on_a_tty_never_opens_the_select_menu() {
+        let mock = MockServer::start().await;
+        let purl = "pkg:npm/minimist@1.2.2";
+        let second = "22222222-2222-4222-8222-222222222222";
+        let body = serde_json::json!({
+            "packages": [{
+                "purl": purl,
+                "patches": [
+                    { "uuid": UUID, "purl": purl, "tier": "free", "cveIds": ["CVE-2024-1"],
+                      "ghsaIds": [], "severity": "high", "title": "a" },
+                    { "uuid": second, "purl": purl, "tier": "free", "cveIds": ["CVE-2024-2"],
+                      "ghsaIds": [], "severity": "high", "title": "b" },
+                ]
+            }],
+            "canAccessPaidPatches": false,
+        });
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&mock)
+            .await;
+        let patch = |uuid: &str, published: &str| {
+            serde_json::json!({
+                "uuid": uuid, "purl": purl, "publishedAt": published,
+                "description": "d", "license": "MIT", "tier": "free",
+                "vulnerabilities": {},
+            })
+        };
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v0/orgs/{ORG_SLUG}/patches/by-package/{}",
+                encode_purl(purl)
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "patches": [patch(UUID, "2024-01-01T00:00:00Z"), patch(second, "2025-01-01T00:00:00Z")],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(&mock)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+
+        let uri = mock.uri();
+        let cwd = tmp.path().to_path_buf();
+        let (code, output) = tokio::task::spawn_blocking(move || {
+            run_in_pty(
+                &[
+                    "scan",
+                    "--json",
+                    "--mode",
+                    "agent",
+                    "--dry-run",
+                    "--api-url",
+                    &uri,
+                    "--api-token",
+                    "fake-token-for-test",
+                    "--org",
+                    ORG_SLUG,
+                ],
+                &cwd,
+                "",
+                Duration::from_secs(30),
+            )
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        assert!(
+            !output.contains("Select one") && !output.contains("Multiple patches available"),
+            "no interactive menu under --json; got:\n{output}"
+        );
+        assert_eq!(code, 0, "the run must finish on its own; output:\n{output}");
+        // The pty merges stdout and stderr; the envelope is the only `{…}`.
+        let text = output.replace("\r\n", "\n");
+        let json_text = &text[text.find('{').expect("JSON envelope")
+            ..=text.rfind('}').expect("JSON envelope end")];
+        let json: serde_json::Value = serde_json::from_str(json_text)
+            .unwrap_or_else(|e| panic!("envelope must parse ({e}); got:\n{output}"));
+        assert_eq!(json["status"], "success", "{json}");
+        let planned = json["apply"]["patches"]
+            .as_array()
+            .unwrap_or_else(|| panic!("apply.patches must be an array: {json}"));
+        assert_eq!(planned.len(), 1, "exactly one patch selected: {json}");
+        assert_eq!(
+            planned[0]["uuid"], second,
+            "the top-ranked (newer) patch is picked, not the first listed: {json}"
+        );
+    }
+
+    /// The live status line on a real terminal: every progress message is
+    /// replaced (never overwritten in place), so what the user sees is the
+    /// result lines only — no "Found 1 patch for 1 packagesatch 1/1)"
+    /// residue from the longer "Querying API ... (batch 1/1)" line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_progress_on_a_tty_renders_without_stale_tail() {
+        let mock = MockServer::start().await;
+        let purl = "pkg:npm/minimist@1.2.2";
+        mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+        mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+
+        let uri = mock.uri();
+        let cwd = tmp.path().to_path_buf();
+        let (code, output) = tokio::task::spawn_blocking(move || {
+            run_in_pty(
+                &[
+                    "scan",
+                    "--api-url",
+                    &uri,
+                    "--api-token",
+                    "fake-token-for-test",
+                    "--org",
+                    ORG_SLUG,
+                ],
+                &cwd,
+                "n\n",
+                Duration::from_secs(60),
+            )
+        })
+        .await
+        .expect("spawn_blocking join");
+        assert_eq!(code, 0, "output:\n{output}");
+
+        // The raw stream really used the live line (so this test would
+        // catch a regression to bare `\r` rewrites)...
+        assert!(
+            output.contains("\r\x1b[2KQuerying API for patches... (batch 1/1)"),
+            "expected a live status update; raw={output:?}"
+        );
+        // ...and the screen shows only clean result lines.
+        let screen = crate::pty_io::render(output.as_bytes());
+        assert!(
+            screen.iter().any(|l| l == "Found 1 package (1 npm)"),
+            "screen:\n{}",
+            screen.join("\n")
+        );
+        assert!(
+            screen.iter().any(|l| l == "Found 1 patch for 1 package"),
+            "screen:\n{}",
+            screen.join("\n")
+        );
+        for transient in ["Scanning packages", "Querying API", "Fetching patch details"] {
+            assert!(
+                !screen.iter().any(|l| l.contains(transient)),
+                "transient status {transient:?} must not stay on screen:\n{}",
+                screen.join("\n")
+            );
+        }
+    }
+
+    /// Keystrokes typed while the scan is still querying the API must not
+    /// answer the default-yes download prompt: `confirm` discards
+    /// typeahead before showing it. Without the flush, the early "n\n"
+    /// would decline; with it, the Enter sent at the prompt takes the
+    /// default (yes) and the patch is applied.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_typeahead_before_the_prompt_is_discarded() {
+        let mock = MockServer::start().await;
+        let purl = "pkg:npm/typeahead-target@1.0.0";
+        let before = b"before\n";
+        // The batch answers late, so the early "n\n" is certainly sitting
+        // in the terminal's input queue before the prompt appears.
+        mount_one_patch_api_delayed(&mock, purl, before, Duration::from_millis(1500)).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "typeahead-target", "1.0.0", before);
+
+        let uri = mock.uri();
+        let cwd = tmp.path().to_path_buf();
+        let (code, output) = tokio::task::spawn_blocking(move || {
+            run_in_pty_with(
+                &[
+                    "scan",
+                    "--api-url",
+                    &uri,
+                    "--api-token",
+                    "fake-token-for-test",
+                    "--org",
+                    ORG_SLUG,
+                ],
+                &cwd,
+                &[],
+                "n\n",
+                "\n",
+                Duration::from_secs(60),
+            )
+        })
+        .await
+        .expect("spawn_blocking join");
+
+        assert_eq!(code, 0, "output:\n{output}");
+        assert!(
+            output.contains("Download and apply 1 patch? [Y/n] "),
+            "the default-yes prompt must have shown; got:\n{output}"
+        );
+        assert!(
+            !output.contains("To apply a single patch, run:"),
+            "the early \"n\" must not have declined the prompt; got:\n{output}"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("node_modules/typeahead-target/index.js")).unwrap(),
+            b"after\n",
+            "the Enter at the prompt takes the default and applies; got:\n{output}"
+        );
+    }
+
+    /// Under `SOCKET_DEBUG` core prints `[socket-patch debug] ...` lines
+    /// straight to stderr. The live status line is off then, so those
+    /// lines never land glued onto the end of a progress message.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_debug_mode_on_a_tty_keeps_debug_lines_off_the_status() {
+        let mock = MockServer::start().await;
+        let purl = "pkg:npm/minimist@1.2.2";
+        mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+        mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+
+        let uri = mock.uri();
+        let cwd = tmp.path().to_path_buf();
+        let (code, output) = tokio::task::spawn_blocking(move || {
+            run_in_pty_with(
+                &[
+                    "scan",
+                    "--api-url",
+                    &uri,
+                    "--api-token",
+                    "fake-token-for-test",
+                    "--org",
+                    ORG_SLUG,
+                ],
+                &cwd,
+                &[("SOCKET_DEBUG", "1")],
+                "",
+                "n\n",
+                Duration::from_secs(60),
+            )
+        })
+        .await
+        .expect("spawn_blocking join");
+        assert_eq!(code, 0, "output:\n{output}");
+
+        let screen = crate::pty_io::render(output.as_bytes());
+        let debug: Vec<&String> = screen
+            .iter()
+            .filter(|l| l.contains("[socket-patch debug]"))
+            .collect();
+        assert!(
+            !debug.is_empty(),
+            "SOCKET_DEBUG must produce debug lines; screen:\n{}",
+            screen.join("\n")
+        );
+        for line in debug {
+            assert!(
+                line.starts_with("[socket-patch debug]"),
+                "a debug line was glued onto other output: {line:?}"
+            );
+        }
+        assert!(
+            !output.contains("Querying API for patches..."),
+            "no transient status is drawn in debug mode; raw={output:?}"
+        );
+        assert!(
+            screen.iter().any(|l| l == "Found 1 patch for 1 package"),
+            "the result lines still print; screen:\n{}",
+            screen.join("\n")
+        );
+    }
+
+    /// The hosted twin: declining "Redirect N packages …?" exits 0 with
     /// the hosted get-hint and never enters the engine (no reference
     /// resolve, no `.socket/`).
     #[tokio::test(flavor = "multi_thread")]
@@ -1551,7 +2029,7 @@ mod pty {
 
         assert_eq!(code, 0, "declining is not an error; output:\n{output}");
         assert!(
-            output.contains("Redirect 1 package(s) to the hosted patch server?"),
+            output.contains("Redirect 1 package to the hosted patch server?"),
             "the hosted confirm prompt must have shown; got:\n{output}"
         );
         assert!(
@@ -1749,7 +2227,7 @@ async fn scan_human_vendored_dry_run_names_would_refuse_records() {
         "a preview never flips the exit; stdout={stdout}; stderr={stderr}"
     );
     assert!(
-        stdout.contains("[dry-run] Would download and vendor 1 patch(es). No changes made."),
+        stdout.contains("[dry-run] Would download and vendor 0 of 1 patch (1 would be refused). No changes made."),
         "the count line stays; got {stdout:?}"
     );
     assert!(
@@ -1781,4 +2259,219 @@ async fn scan_human_vendored_dry_run_names_would_refuse_records() {
         stdout.trim().is_empty(),
         "silent dry run prints nothing:\n{stdout}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Human-path wording and flow fixes (terminal UI polish)
+// ---------------------------------------------------------------------------
+
+/// Mount a batch endpoint that finds no patches at all.
+async fn mount_empty_batch(mock: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(mock)
+        .await;
+}
+
+/// `scan --prune` with nothing to apply still garbage-collects, like the
+/// JSON path (it used to return early and silently skip the GC), and a
+/// `--dry-run` previews it without touching the manifest.
+#[tokio::test]
+async fn scan_human_prune_runs_gc_even_when_no_patches_are_available() {
+    let mock = MockServer::start().await;
+    mount_empty_batch(&mock).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.5", b"x\n");
+    seed_manifest(tmp.path(), &[("pkg:npm/gone@1.0.0", OLD_UUID)]);
+
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--prune", "--dry-run"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains("[dry-run] GC would prune 1 manifest entry and remove 0 orphan files"),
+        "the dry run previews the GC; got {stdout:?}"
+    );
+    let manifest = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
+    assert!(manifest.contains("pkg:npm/gone@1.0.0"), "a preview must not prune");
+
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--prune"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains("No patches available for installed packages."),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.contains("GC: pruned 1 manifest entry and removed 0 orphan files"),
+        "the GC must run on the early exit; got {stdout:?}"
+    );
+    let manifest = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
+    assert!(!manifest.contains("pkg:npm/gone@1.0.0"), "{manifest}");
+}
+
+/// An empty crawl never prunes (too destructive), but says so instead of
+/// silently dropping `--prune`; `--silent` keeps it quiet.
+#[test]
+fn scan_prune_on_empty_crawl_warns_the_gc_was_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_scan(tmp.path(), &["--prune"]);
+    assert_eq!(code, 0, "stderr={stderr:?}");
+    assert!(
+        stderr.contains("Warning: --prune skipped: no installed packages were found"),
+        "{stderr:?}"
+    );
+    assert!(stdout.contains("No packages found."), "{stdout:?}");
+    let (code, stdout, stderr) = run_scan(tmp.path(), &["--prune", "--silent"]);
+    assert_eq!(code, 0);
+    assert!(stdout.is_empty() && stderr.is_empty(), "{stdout:?} {stderr:?}");
+}
+
+/// `--ecosystems` that filters everything out names the filter instead of
+/// telling the user to run `cargo install`/`go install`.
+#[test]
+fn scan_empty_after_ecosystem_filter_names_the_filter() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.5", b"x\n");
+    let (code, stdout, stderr) = run_scan(tmp.path(), &["-e", "pypi"]);
+    assert_eq!(code, 0, "stderr={stderr:?}");
+    assert!(stdout.contains("No pypi packages found."), "{stdout:?}");
+}
+
+/// Global installs have no project lockfile: `--mode hosted --global` is
+/// a usage error, not a silent "redirected 0 packages".
+#[test]
+fn scan_hosted_rejects_global() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = run_scan(tmp.path(), &["--mode", "hosted", "--global"]);
+    assert_eq!(code, 2, "stderr={stderr:?}");
+    assert!(
+        stderr.starts_with(
+            "Error: --global cannot be used with --mode hosted: global installs have no \
+             project lockfile to redirect"
+        ),
+        "{stderr:?}"
+    );
+    assert!(stdout.is_empty());
+    // Like every usage error (and clap's own), no JSON envelope under --json.
+    let (code, stdout, _) = run_scan(tmp.path(), &["--mode", "hosted", "--global", "--json"]);
+    assert_eq!(code, 2);
+    assert!(stdout.trim().is_empty(), "{stdout:?}");
+    let prefix = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run_scan(
+        tmp.path(),
+        &[
+            "--mode",
+            "hosted",
+            "--global-prefix",
+            prefix.path().to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 2);
+    assert!(
+        stderr.starts_with("Error: --global-prefix cannot be used with --mode hosted"),
+        "{stderr:?}"
+    );
+}
+
+/// Usage errors from scan's own flag checks use the capitalized `Error:`
+/// prefix like every other error line.
+#[test]
+fn scan_mode_conflict_error_is_capitalized_and_names_no_hidden_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, _, stderr) = run_scan(tmp.path(), &["--mode", "hosted", "--vendor"]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.starts_with("Error: --mode hosted cannot be used with --vendor"),
+        "{stderr:?}"
+    );
+    assert!(!stderr.contains("--redirect"), "{stderr:?}");
+    // Typing the hidden --redirect gets it explained.
+    let (code, _, stderr) = run_scan(tmp.path(), &["--mode", "agent", "--redirect"]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.starts_with(
+            "Error: --mode agent cannot be used with --redirect: the flags select \
+             different modes (--redirect means --mode hosted)"
+        ),
+        "{stderr:?}"
+    );
+    let (code, _, stderr) = run_scan(tmp.path(), &["--detached"]);
+    assert_eq!(code, 2);
+    assert!(
+        stderr.starts_with("Error: --detached requires vendored mode"),
+        "{stderr:?}"
+    );
+}
+
+/// A selection the manifest already records at the same uuid is not
+/// offered again (it would only be downloaded to be skipped).
+#[tokio::test]
+async fn scan_human_does_not_offer_an_already_recorded_patch() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+    mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+    seed_manifest(tmp.path(), &[(purl, UUID)]);
+
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--yes"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains(&format!("[skip] {purl} (already recorded: 11111111)")),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.contains("All selected patches are already recorded in the manifest"),
+        "{stdout:?}"
+    );
+    assert!(!stdout.contains("Patches to apply:"), "{stdout:?}");
+    assert!(!stderr.contains("Download and apply"), "{stderr:?}");
+    assert_eq!(view_gets(&recorded(&mock).await), 0, "nothing is downloaded");
+}
+
+/// The human table's PACKAGE column grows to fit the PURL (the old fixed
+/// 40-column cut dropped the version), and the rule matches the table.
+#[tokio::test]
+async fn scan_human_table_shows_full_purl_with_version() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/@typescript-eslint/typescript-estree@6.0.0";
+    mount_batch_one(&mock, purl, UUID, "free", &["CVE-2024-1"], false).await;
+    mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    let pkg_dir = tmp
+        .path()
+        .join("node_modules/@typescript-eslint/typescript-estree");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{ "name": "@typescript-eslint/typescript-estree", "version": "6.0.0" }"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--dry-run"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let row = stdout
+        .lines()
+        .find(|l| l.contains("CVE-2024-1") && l.starts_with("pkg:npm/"))
+        .unwrap_or_else(|| panic!("no table row in {stdout:?}"));
+    assert!(row.starts_with(&format!("{purl}  ")), "{row:?}");
+    let header = stdout.lines().find(|l| l.starts_with("PACKAGE")).unwrap();
+    // The right-aligned count ends where the PATCHES header ends.
+    assert_eq!(
+        header.find("PATCHES").map(|i| i + "PATCHES".len()),
+        row.find(" 1  ").map(|i| i + 2),
+        "PATCHES header sits over the count: {stdout}"
+    );
+    // The rule is exactly as wide as the widest table line.
+    let rule = stdout.lines().find(|l| l.starts_with("===")).unwrap();
+    assert_eq!(rule.len(), header.len().max(row.len()), "{stdout}");
 }

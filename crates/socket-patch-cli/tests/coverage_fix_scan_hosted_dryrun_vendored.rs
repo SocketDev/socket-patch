@@ -402,3 +402,99 @@ async fn dry_run_refuses_unrevertable_vendored_state_like_the_wet_run() {
         "dry-run must leave the vendored lock byte-identical"
     );
 }
+
+/// `scan --mode hosted [--dry-run]` in HUMAN mode → `(code, stdout,
+/// stderr)`.
+fn scan_hosted_human(cwd: &Path, api_url: &str, dry_run: bool) -> (i32, String, String) {
+    let mut args = vec![
+        "scan",
+        "--mode",
+        "hosted",
+        "--yes",
+        "--cwd",
+        cwd.to_str().unwrap(),
+        "--api-url",
+        api_url,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    if dry_run {
+        args.push("--dry-run");
+    }
+    run_cli(cwd, &args)
+}
+
+/// The first line of `stdout` (the summary).
+/// The engine's one-line summary. Human hosted `scan` prints the results
+/// table and discovery summary above it, so find it by its lead words.
+fn summary_line(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .find(|l| l.starts_with("Would redirect ") || l.starts_with("Redirected "))
+        .unwrap_or_default()
+}
+
+/// Human takeover output: the dry run announces the planned migration and
+/// the wet run the landed one, each as its own line on stderr, and both
+/// summaries count the same 3 files — the lock and workspace the hosted
+/// rewriter touches plus the package.json `pnpm.overrides` wiring only the
+/// vendored revert touches (the wet count used to omit it: "rewrote 2
+/// files"). The wet run's next steps name `.socket/vendor/` and
+/// package.json, so the deleted vendored ledger entry and artifact and the
+/// reverted wiring are committed too.
+#[tokio::test]
+#[serial]
+async fn human_takeover_prints_migration_lines_and_matching_file_counts() {
+    let server = MockServer::start().await;
+    mock_hosted_api(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    vendored_project(root);
+
+    let (code, dry_out, dry_err) = scan_hosted_human(root, &server.uri(), true);
+    assert_eq!(code, 0, "stdout=\n{dry_out}\nstderr=\n{dry_err}");
+    assert!(
+        dry_err.lines().any(|l| l
+            == format!(
+                "Would migrate {PURL} from vendored to hosted (its vendored wiring, ledger \
+                 entry, and committed artifact would be reverted first)."
+            )),
+        "stderr=\n{dry_err}"
+    );
+    assert!(
+        !dry_err.contains("redirect_would_revert_vendored"),
+        "the planned takeover is a progress line, not a warning; stderr=\n{dry_err}"
+    );
+    assert_eq!(
+        summary_line(&dry_out),
+        "Would redirect 1 package and rewrite 3 files (--dry-run: nothing was changed).",
+        "stdout=\n{dry_out}"
+    );
+
+    let (code, wet_out, wet_err) = scan_hosted_human(root, &server.uri(), false);
+    assert_eq!(code, 0, "stdout=\n{wet_out}\nstderr=\n{wet_err}");
+    assert!(
+        wet_err.lines().any(|l| l
+            == format!(
+                "Migrated {PURL} from vendored to hosted (reverted its vendored wiring, ledger \
+                 entry, and committed artifact)."
+            )),
+        "stderr=\n{wet_err}"
+    );
+    assert_eq!(
+        summary_line(&wet_out),
+        "Redirected 1 package; rewrote 3 files.",
+        "the wet count must equal the dry-run preview; stdout=\n{wet_out}"
+    );
+    assert!(
+        wet_out.contains(
+            "Commit .socket/vendor/ (the redirect ledger, plus the removed vendored ledger \
+             entries and artifacts), package.json, pnpm-lock.yaml, and pnpm-workspace.yaml \
+             to keep the redirect."
+        ),
+        "stdout=\n{wet_out}"
+    );
+}

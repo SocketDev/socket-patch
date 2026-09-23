@@ -76,6 +76,7 @@ use crate::commands::vendor::{
 };
 use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::json_envelope::{Envelope, PatchAction, PatchEvent, RunWarning};
+use crate::ui::plural;
 
 /// One broken vendored unit queued for rebuild.
 struct Candidate {
@@ -360,15 +361,46 @@ async fn reconstruct_entry_wiring(
     }
 }
 
-fn fail(env: &mut Envelope, quiet: bool, purl: &str, code: &str, detail: String) {
-    if !quiet {
-        eprintln!(
-            "Cannot repair vendored artifact for {}: {detail}",
-            normalize_purl(purl)
-        );
+/// Record one artifact that cannot be repaired. An error, so the line
+/// prints even under `--silent` (`json` mutes it: the envelope carries it).
+fn fail(env: &mut Envelope, json: bool, purl: &str, code: &str, detail: String) {
+    if !json {
+        eprintln!("{}", format_repair_failure(purl, &detail));
     }
     env.record(PatchEvent::new(PatchAction::Failed, purl.to_string()).with_error(code, detail));
     env.mark_partial_failure();
+}
+
+/// `Error: Cannot repair vendored artifact for <purl>: <detail>`.
+fn format_repair_failure(purl: &str, detail: &str) -> String {
+    format!(
+        "Error: Cannot repair vendored artifact for {}: {detail}",
+        normalize_purl(purl)
+    )
+}
+
+/// The `repair --dry-run` preview of vendored rebuilds: a heading, then
+/// `  - <purl> (<why>: <path>)` per artifact. `items` are
+/// `(purl, reason code, artifact path)`.
+fn format_rebuild_preview(items: &[(String, &str, &str)]) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Dry run - would rebuild {}:",
+        plural(items.len(), "vendored artifact", "vendored artifacts")
+    )];
+    lines.extend(items.iter().map(|(purl, reason, path)| {
+        format!("  - {purl} ({}: {path})", rebuild_reason_label(reason))
+    }));
+    lines
+}
+
+/// Plain words for a rebuild candidate's reason code.
+fn rebuild_reason_label(code: &str) -> &str {
+    match code {
+        "vendor_artifact_missing" => "missing",
+        "vendor_artifact_corrupt" => "corrupt",
+        "vendor_inventory_unverified" => "unverified",
+        other => other,
+    }
 }
 
 /// A soft (healthy-by-members, unanchored) reconstruction whose trustworthy
@@ -544,6 +576,14 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
     let mut state = match ledger {
         Ok(s) => s,
         Err(e) => {
+            // Errors print even under --silent; without this line the
+            // run exits 1 after a clean-looking repair report.
+            if !common.json {
+                eprintln!(
+                    "{}",
+                    crate::commands::vendor::format_state_unreadable(&e.to_string())
+                );
+            }
             env.record(
                 PatchEvent::artifact(PatchAction::Failed)
                     .with_error("vendor_state_unreadable", e.to_string()),
@@ -589,7 +629,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                     None => {
                         fail(
                             env,
-                            quiet,
+                            common.json,
                             purl,
                             "vendor_artifact_unrepairable",
                             format!(
@@ -651,7 +691,13 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                 }
                 Ok(false) => {}
                 Err(detail) => {
-                    fail(env, quiet, purl, "vendor_artifact_unrepairable", detail);
+                    fail(
+                        env,
+                        common.json,
+                        purl,
+                        "vendor_artifact_unrepairable",
+                        detail,
+                    );
                     continue;
                 }
             }
@@ -758,7 +804,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
             ArtifactHealth::Unverifiable { reason } => {
                 fail(
                     env,
-                    quiet,
+                    common.json,
                     purl,
                     "vendor_artifact_unrepairable",
                     format!("the ledger entry cannot be verified ({reason}); fix state.json"),
@@ -804,7 +850,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                     None => {
                         fail(
                             env,
-                            quiet,
+                            common.json,
                             &format!("pkg:{eco}/unknown@{uuid}"),
                             "vendor_artifact_missing",
                             format!(
@@ -925,7 +971,13 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                     if let Err(detail) =
                         repair_workspace_copies(&common.cwd, &mut entry, false).await
                     {
-                        fail(env, quiet, &purl, "vendor_artifact_unrepairable", detail);
+                        fail(
+                            env,
+                            common.json,
+                            &purl,
+                            "vendor_artifact_unrepairable",
+                            detail,
+                        );
                         continue;
                     }
                     let save_failed = persist_vendor_entry(
@@ -969,7 +1021,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
             ArtifactHealth::Unverifiable { reason }
                 if reason == "vendor_workspace_artifact_invalid" =>
             {
-                fail(env, quiet, &purl, "vendor_artifact_unrepairable",
+                fail(env, common.json, &purl, "vendor_artifact_unrepairable",
                     "workspace tarball paths cannot be validated; fix the binary lock or symbolic links before repairing".into());
             }
             _ => {
@@ -992,6 +1044,19 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
 
     // ── Dry run: preview only ────────────────────────────────────────────
     if common.dry_run {
+        if !quiet {
+            let items: Vec<(String, &str, &str)> = candidates
+                .iter()
+                .map(|c| {
+                    let purl = normalize_purl(&c.purl).into_owned();
+                    (purl, c.reason, c.entry.artifact.path.as_str())
+                })
+                .collect();
+            println!();
+            for line in format_rebuild_preview(&items) {
+                println!("{line}");
+            }
+        }
         for c in &candidates {
             env.record(
                 PatchEvent::new(PatchAction::Verified, c.purl.clone()).with_details(
@@ -1008,9 +1073,14 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
     }
 
     if !quiet {
+        println!();
         println!(
-            "\nRebuilding {} broken vendored artifact(s)...",
-            candidates.len()
+            "Rebuilding {}...",
+            plural(
+                candidates.len(),
+                "broken vendored artifact",
+                "broken vendored artifacts"
+            )
         );
     }
 
@@ -1091,7 +1161,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                 }
                 fail(
                     env,
-                    quiet,
+                    common.json,
                     &c.purl,
                     c.reason,
                     format!(
@@ -1173,7 +1243,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
             } else {
                 fail(
                     env,
-                    quiet,
+                    common.json,
                     &c.purl,
                     c.reason,
                     format!(
@@ -1225,7 +1295,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                                 }
                                 Err(registry_fetch::FetchError::Failed(d))
                                 | Err(registry_fetch::FetchError::Unverifiable(d)) => {
-                                    fail(env, quiet, &c.purl, "vendor_fetch_failed", d);
+                                    fail(env, common.json, &c.purl, "vendor_fetch_failed", d);
                                     unrebuildable.insert(c.purl.clone());
                                     continue;
                                 }
@@ -1261,7 +1331,13 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                      ledger records no recoverable registry fragment"
                         .to_string()
                 };
-                fail(env, quiet, &c.purl, "vendor_artifact_unrepairable", detail);
+                fail(
+                    env,
+                    common.json,
+                    &c.purl,
+                    "vendor_artifact_unrepairable",
+                    detail,
+                );
                 unrebuildable.insert(c.purl.clone());
             }
             PristineFetch::Failed(detail) => {
@@ -1275,7 +1351,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                     );
                     rebuilt += 1;
                 } else {
-                    fail(env, quiet, &c.purl, "vendor_fetch_failed", detail);
+                    fail(env, common.json, &c.purl, "vendor_fetch_failed", detail);
                 }
                 unrebuildable.insert(c.purl.clone());
             }
@@ -1327,7 +1403,13 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                         if let Some((live, kept)) = &aside {
                             restore_aside_vendor_dir(live, kept).await;
                         }
-                        fail(env, quiet, &c.purl, "vendor_artifact_unrepairable", detail);
+                        fail(
+                            env,
+                            common.json,
+                            &c.purl,
+                            "vendor_artifact_unrepairable",
+                            detail,
+                        );
                         continue;
                     }
                 };
@@ -1370,7 +1452,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                 }
                 fail(
                     env,
-                    quiet,
+                    common.json,
                     &c.purl,
                     "vendor_artifact_unrepairable",
                     "no vendor backend for this ecosystem in this build".to_string(),
@@ -1380,7 +1462,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                 if let Some((live, kept)) = &aside {
                     restore_aside_vendor_dir(live, kept).await;
                 }
-                fail(env, quiet, &c.purl, code, detail);
+                fail(env, common.json, &c.purl, code, detail);
             }
             Some(VendorOutcome::Done {
                 result,
@@ -1393,7 +1475,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                     }
                     fail(
                         env,
-                        quiet,
+                        common.json,
                         &c.purl,
                         "vendor_artifact_rebuild_failed",
                         result.error.unwrap_or_else(|| "rebuild failed".to_string()),
@@ -1441,7 +1523,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                         }
                         fail(
                             env,
-                            quiet,
+                            common.json,
                             &c.purl,
                             "vendor_artifact_rebuild_failed",
                             format!(
@@ -1560,7 +1642,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                             .await;
                         fail(
                             env,
-                            quiet,
+                            common.json,
                             &c.purl,
                             "vendor_artifact_rebuild_failed",
                             format!(
@@ -2145,5 +2227,56 @@ mod tests {
             Some(("left-pad".to_string(), "1.3.0".to_string()))
         );
         assert_eq!(npm_coords("pkg:npm/left-pad"), None);
+    }
+}
+
+/// Exact-string tests for the vendored-repair human lines.
+#[cfg(test)]
+mod ui_format_tests {
+    use super::*;
+
+    #[test]
+    fn repair_failure_line_has_error_prefix() {
+        assert_eq!(
+            format_repair_failure("pkg:npm/%40s/x@1.0.0", "no pristine source"),
+            "Error: Cannot repair vendored artifact for pkg:npm/@s/x@1.0.0: no pristine source"
+        );
+    }
+
+    #[test]
+    fn rebuild_preview_singular_and_plural() {
+        let one = vec![(
+            "pkg:npm/minimist@1.2.5".to_string(),
+            "vendor_artifact_missing",
+            ".socket/vendor/npm/u/minimist-1.2.5.tgz",
+        )];
+        assert_eq!(
+            format_rebuild_preview(&one),
+            vec![
+                "Dry run - would rebuild 1 vendored artifact:",
+                "  - pkg:npm/minimist@1.2.5 (missing: .socket/vendor/npm/u/minimist-1.2.5.tgz)",
+            ]
+        );
+        let two = vec![
+            (
+                "pkg:npm/a@1".to_string(),
+                "vendor_artifact_corrupt",
+                "p/a.tgz",
+            ),
+            (
+                "pkg:gem/b@1".to_string(),
+                "vendor_inventory_unverified",
+                "p/b",
+            ),
+        ];
+        assert_eq!(
+            format_rebuild_preview(&two),
+            vec![
+                "Dry run - would rebuild 2 vendored artifacts:",
+                "  - pkg:npm/a@1 (corrupt: p/a.tgz)",
+                "  - pkg:gem/b@1 (unverified: p/b)",
+            ]
+        );
+        assert_eq!(rebuild_reason_label("something_else"), "something_else");
     }
 }

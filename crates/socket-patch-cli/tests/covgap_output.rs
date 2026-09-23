@@ -1,13 +1,13 @@
-//! Coverage-gap tests for `src/output.rs`'s interactive TTY branches
+//! Coverage-gap tests for the interactive TTY branches of `src/ui/prompt.rs`
 //! (2026-09 coverage audit):
 //!
-//! * `confirm()`'s bare-Enter -> `default_yes` return (output.rs:77).
-//!   Every production caller passes `default_yes = true`, so this line IS
-//!   the "Enter proceeds with the destructive action" contract — the
-//!   sibling pty suite drives `y`, `n`, and non-UTF-8 answers through
-//!   `output::confirm` but never a bare Enter (its bare-Enter test hits
-//!   `setup`'s separate `confirm_proceed` reader).
-//! * `select_one()`'s `dialoguer::Select` branch (output.rs:101-107), whose
+//! * `confirm()`'s bare-Enter -> `default_yes` return. Every production
+//!   caller passes `default_yes = true`, so this IS the "Enter proceeds
+//!   with the destructive action" contract — the sibling pty suite drives
+//!   `y`, `n`, and non-UTF-8 answers through `ui::confirm` but never a
+//!   bare Enter (its bare-Enter test hits `setup`'s default-no
+//!   `confirm_or_proceed`).
+//! * `select_one()`'s `dialoguer::Select` branch, whose
 //!   sole production caller is `get`'s free-user multi-patch selection:
 //!   the Enter-accepts-first-ranked-option happy path and the
 //!   quit -> `interact_opt` `Ok(None)` -> `SelectError::Cancelled` exit path.
@@ -16,7 +16,8 @@
 
 #![cfg(unix)]
 
-use std::io::{Read, Write};
+#[path = "common/pty_io.rs"]
+mod pty_io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -42,12 +43,63 @@ fn binary() -> PathBuf {
 /// all output until the child exits. Returns `(exit_code, output)`.
 ///
 /// Same choreography as the sibling `interactive_prompts_e2e.rs` harness
-/// (reader thread on the master, detached SIGKILL watchdog, write-then-EOF
-/// on the writer, no polling/sleeps), which this file cannot edit — plus a
+/// (reader thread on the master, detached SIGKILL watchdog, input written
+/// once a prompt is on screen via `pty_io::send_when_prompted` — `confirm`
+/// discards earlier typeahead — then EOF on the writer) — plus a
 /// pinned `TERM` because the `dialoguer`/`console` menu these tests drive
 /// derives key handling and rendering from the terminal type, which the
 /// ambient environment (some CI shells) may not set at all.
 fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, String) {
+    let (code, _signal, output) = run_in_pty_raw(Sigint::Default, args, cwd, input, timeout);
+    (code, output)
+}
+
+/// [`run_in_pty`] with a second answer: `then` is written once the y/n
+/// confirm (`[Y/n] `) is on screen, after `input` answered the first
+/// prompt (the dialoguer menu).
+fn run_in_pty_then(
+    args: &[&str],
+    cwd: &Path,
+    input: &str,
+    then: &str,
+    timeout: Duration,
+) -> (i32, String) {
+    let (code, _signal, output) =
+        run_in_pty_inner(Sigint::Default, args, cwd, input, Some(then), timeout);
+    (code, output)
+}
+
+/// The SIGINT disposition the binary starts with under [`run_in_pty_raw`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sigint {
+    /// Inherited default: Ctrl-C kills the process.
+    Default,
+    /// Ignored (as `nohup` and some launchers do), via
+    /// `sh -c 'trap "" INT; exec ...'`.
+    Ignored,
+}
+
+/// [`run_in_pty`], also returning the name of the signal that ended the
+/// child (`None` for a normal exit), with the binary started under the
+/// given [`Sigint`] disposition.
+fn run_in_pty_raw(
+    sigint: Sigint,
+    args: &[&str],
+    cwd: &Path,
+    input: &str,
+    timeout: Duration,
+) -> (i32, Option<String>, String) {
+    run_in_pty_inner(sigint, args, cwd, input, None, timeout)
+}
+
+fn run_in_pty_inner(
+    sigint: Sigint,
+    args: &[&str],
+    cwd: &Path,
+    input: &str,
+    then: Option<&str>,
+    timeout: Duration,
+) -> (i32, Option<String>, String) {
     let input = input.as_bytes();
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -59,7 +111,15 @@ fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32
         })
         .expect("openpty");
 
-    let mut cmd = CommandBuilder::new(binary());
+    let mut cmd = if sigint == Sigint::Ignored {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-c");
+        cmd.arg("trap '' INT; exec \"$0\" \"$@\"");
+        cmd.arg(binary());
+        cmd
+    } else {
+        CommandBuilder::new(binary())
+    };
     for a in args {
         cmd.arg(a);
     }
@@ -113,12 +173,9 @@ fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32
         .expect("spawn socket-patch in PTY");
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().expect("clone reader");
-    let reader_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        buf
-    });
+    let reader_handle = crate::pty_io::PtyOutput::spawn(
+        pair.master.try_clone_reader().expect("clone reader"),
+    );
 
     // Watchdog: detached kill after `timeout`; a no-op if the child exits
     // naturally first.
@@ -129,20 +186,44 @@ fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32
     });
 
     let mut writer = pair.master.take_writer().expect("take writer");
-    let _ = writer.write_all(input);
-    let _ = writer.flush();
+    crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input);
+    if let Some(then) = then {
+        use std::io::Write;
+        reader_handle.wait_for_count("[Y/n] ", 1, Duration::from_secs(10));
+        let _ = writer.write_all(then.as_bytes());
+        let _ = writer.flush();
+    }
     drop(writer);
 
     let status = child.wait().expect("child.wait");
     drop(pair.master);
 
-    let output = reader_handle.join().expect("reader thread join");
+    let output = reader_handle.finish();
     let code = status.exit_code() as i32;
-    (code, String::from_utf8_lossy(&output).to_string())
+    (
+        code,
+        status.signal().map(str::to_string),
+        String::from_utf8_lossy(&output).to_string(),
+    )
+}
+
+const HIDE_CURSOR: &str = "\x1b[?25l";
+const SHOW_CURSOR: &str = "\x1b[?25h";
+
+/// The menu hid the cursor at least once, and the last hide was followed
+/// by a show: the user's terminal is left with a visible cursor.
+fn assert_cursor_restored(output: &str) {
+    let hidden = output
+        .rfind(HIDE_CURSOR)
+        .unwrap_or_else(|| panic!("the menu must have hidden the cursor; got: {output:?}"));
+    assert!(
+        output[hidden..].contains(SHOW_CURSOR),
+        "the cursor must be shown again after the menu; got: {output:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
-// output::confirm — bare Enter takes the printed [Y/n] default (line 77)
+// ui::confirm — bare Enter takes the printed [Y/n] default
 // ---------------------------------------------------------------------------
 
 const REMOVE_MANIFEST: &str = r#"{
@@ -167,7 +248,7 @@ fn write_remove_manifest(root: &Path) {
 
 #[test]
 fn remove_interactive_bare_enter_proceeds_with_default_yes() {
-    // `output::confirm`'s empty-answer arm returns `default_yes`, and every
+    // `ui::confirm`'s empty-answer arm returns `default_yes`, and every
     // production caller passes `default_yes = true` — so a bare Enter at
     // remove's "[Y/n]" prompt must PROCEED with the removal, matching the
     // hint the prompt printed. The sibling pty suite covers `y`, `n`, and
@@ -191,7 +272,7 @@ fn remove_interactive_bare_enter_proceeds_with_default_yes() {
     // auto-proceeds. Match the distinctive prompt verbatim (the loose
     // "Remove"/"patch(es)" pair is also satisfied by the success line).
     assert!(
-        output.contains("Remove 1 patch(es) and rollback files?"),
+        output.contains("Remove 1 patch from the manifest without rolling back its files?"),
         "remove must have shown the interactive confirm prompt verbatim; got: {output}"
     );
     // Pin the printed default: the hint must advertise YES-by-default —
@@ -222,7 +303,7 @@ fn remove_interactive_bare_enter_proceeds_with_default_yes() {
 }
 
 // ---------------------------------------------------------------------------
-// output::select_one — the dialoguer::Select interactive branch (101-107)
+// ui::select_one — the dialoguer::Select interactive branch (ui/prompt.rs)
 // ---------------------------------------------------------------------------
 
 /// Collect the paths of every request the mock actually received. Used to
@@ -309,7 +390,7 @@ async fn mount_two_free_patches(mock: &MockServer, purl: &str, encoded: &str) {
 #[test]
 fn get_interactive_dialoguer_enter_accepts_first_ranked_option() {
     // Free user + two free patches for one PURL → `select_one` reaches its
-    // `dialoguer::Select` branch (output.rs:101-105). Enter must accept the
+    // `dialoguer::Select` branch (ui/prompt.rs). Enter must accept the
     // menu's `.default(0)` — the FIRST-ranked patch (UUID_A by the uuid
     // tiebreak) — and `get` must then fetch exactly that patch's view.
     //
@@ -326,16 +407,14 @@ fn get_interactive_dialoguer_enter_accepts_first_ranked_option() {
     let uri = mock.uri();
 
     let tmp = tempfile::tempdir().unwrap();
-    // `--yes` skips only the later "Download 1 patch(es)?" confirm — it does
-    // NOT bypass select_one, whose interactive gate is stdin_is_tty() alone —
-    // keeping this test's single keystroke aimed at the dialoguer menu.
-    // "\r" is the Enter key at a raw-mode terminal.
-    let (code, output) = run_in_pty(
+    // No `--yes`: it answers the menu with its default without showing it.
+    // "\r" (Enter at a raw-mode terminal) accepts the menu's default, then
+    // "\n" answers the "Download 1 patch?" confirm that follows.
+    let (code, output) = run_in_pty_then(
         &[
             "get",
             purl,
             "--save-only",
-            "--yes",
             "--api-url",
             &uri,
             "--api-token",
@@ -345,6 +424,7 @@ fn get_interactive_dialoguer_enter_accepts_first_ranked_option() {
         ],
         tmp.path(),
         "\r",
+        "\n",
         Duration::from_secs(20),
     );
     assert_eq!(
@@ -398,9 +478,58 @@ fn get_interactive_dialoguer_enter_accepts_first_ranked_option() {
 }
 
 #[test]
+fn get_yes_answers_the_menu_with_its_default_without_showing_it() {
+    // `--yes` skips interactive prompts, the patch menu included: it takes
+    // the menu's default (the top-ranked patch) — even at a terminal.
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let purl = "pkg:npm/covgap-multi-yes@1.0.0";
+    let encoded = "pkg%3Anpm%2Fcovgap-multi-yes%401.0.0";
+    let mock = rt.block_on(async {
+        let mock = MockServer::start().await;
+        mount_two_free_patches(&mock, purl, encoded).await;
+        mock
+    });
+    let uri = mock.uri();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, output) = run_in_pty(
+        &[
+            "get",
+            purl,
+            "--save-only",
+            "--yes",
+            "--api-url",
+            &uri,
+            "--api-token",
+            "fake",
+            "--org",
+            ORG_SLUG,
+        ],
+        tmp.path(),
+        "",
+        Duration::from_secs(20),
+    );
+    assert_eq!(code, 0, "{output}");
+    assert!(
+        !output.contains("Multiple patches available"),
+        "--yes must not open the menu; got: {output}"
+    );
+    let body = std::fs::read_to_string(tmp.path().join(".socket/manifest.json"))
+        .expect("get --save-only must write .socket/manifest.json");
+    let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(manifest["patches"][purl]["uuid"], UUID_A, "{body}");
+    // The listing showed two patches; the pick is named before saving.
+    let screen = crate::pty_io::render(output.as_bytes()).join("\n");
+    assert!(
+        screen.contains("Selected:\n  pkg:npm/covgap-multi-yes@1.0.0 [FREE] 11111111"),
+        "{screen}"
+    );
+}
+
+#[test]
 fn get_interactive_dialoguer_quit_cancels_with_exit_zero() {
     // Cancelling the dialoguer menu → `interact_opt()` returns `Ok(None)` →
-    // `select_one` maps it to `SelectError::Cancelled` (output.rs:107) →
+    // `select_one` maps it to `SelectError::Cancelled` (ui/prompt.rs) →
     // get prints "Selection cancelled." and exits 0 without downloading
     // anything (get.rs:660-663).
     //
@@ -427,7 +556,6 @@ fn get_interactive_dialoguer_quit_cancels_with_exit_zero() {
             "get",
             purl,
             "--save-only",
-            "--yes",
             "--api-url",
             &uri,
             "--api-token",
@@ -454,6 +582,10 @@ fn get_interactive_dialoguer_quit_cancels_with_exit_zero() {
         output.contains("Selection cancelled."),
         "Esc must surface the Cancelled message; got: {output}"
     );
+    // dialoguer shows the cursor again itself on a clean q/Esc cancel, so
+    // this passes even without CursorGuard; the Ctrl-C test below
+    // (`..._ctrl_c_restores_cursor_and_dies_by_sigint`) is the real guard.
+    assert_cursor_restored(&output);
     assert_eq!(
         code, 0,
         "a user-cancelled selection is a clean exit, not an error; got: {output}"
@@ -478,4 +610,106 @@ fn get_interactive_dialoguer_quit_cancels_with_exit_zero() {
         paths.iter().any(|p| p.contains("/by-package/")),
         "the by-package listing must have been queried before the menu; recorded paths={paths:?}"
     );
+}
+
+#[test]
+fn get_interactive_dialoguer_ctrl_c_restores_cursor_and_dies_by_sigint() {
+    // Ctrl-C at the menu: console reads the raw ^C byte and raises SIGINT.
+    // `select_one`'s guard must show the cursor again before the default
+    // SIGINT action kills the process — dialoguer leaves it hidden.
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let purl = "pkg:npm/covgap-multi-ctrlc@1.0.0";
+    let encoded = "pkg%3Anpm%2Fcovgap-multi-ctrlc%401.0.0";
+    let mock = rt.block_on(async {
+        let mock = MockServer::start().await;
+        mount_two_free_patches(&mock, purl, encoded).await;
+        mock
+    });
+    let uri = mock.uri();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, signal, output) = run_in_pty_raw(
+        Sigint::Default,
+        &[
+            "get",
+            purl,
+            "--save-only",
+            "--api-url",
+            &uri,
+            "--api-token",
+            "fake",
+            "--org",
+            ORG_SLUG,
+        ],
+        tmp.path(),
+        "\x03",
+        Duration::from_secs(20),
+    );
+    assert!(
+        output.contains(&format!("Multiple patches available for {purl}")),
+        "the dialoguer select prompt must have rendered; got: {output}"
+    );
+    // Died of the re-raised SIGINT, not the watchdog's SIGKILL and not a
+    // normal exit.
+    let signal = signal.unwrap_or_else(|| {
+        panic!("Ctrl-C must end the process by SIGINT; exited with {code}; got: {output:?}")
+    });
+    assert!(
+        signal.contains("Interrupt"),
+        "expected SIGINT, got signal {signal:?}; output: {output:?}"
+    );
+    assert_cursor_restored(&output);
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "an interrupted selection must not write a manifest"
+    );
+}
+
+#[test]
+fn get_interactive_dialoguer_ctrl_c_with_sigint_ignored_cancels_cleanly() {
+    // Started with SIGINT ignored, the raised SIGINT must stay ignored:
+    // the cursor guard may not swap in a handler that re-raises into the
+    // default (fatal) action. The menu then just returns Cancelled.
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let purl = "pkg:npm/covgap-multi-sigign@1.0.0";
+    let encoded = "pkg%3Anpm%2Fcovgap-multi-sigign%401.0.0";
+    let mock = rt.block_on(async {
+        let mock = MockServer::start().await;
+        mount_two_free_patches(&mock, purl, encoded).await;
+        mock
+    });
+    let uri = mock.uri();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (code, signal, output) = run_in_pty_raw(
+        Sigint::Ignored,
+        &[
+            "get",
+            purl,
+            "--save-only",
+            "--api-url",
+            &uri,
+            "--api-token",
+            "fake",
+            "--org",
+            ORG_SLUG,
+        ],
+        tmp.path(),
+        "\x03",
+        Duration::from_secs(20),
+    );
+    assert!(
+        output.contains(&format!("Multiple patches available for {purl}")),
+        "the dialoguer select prompt must have rendered; got: {output}"
+    );
+    assert_eq!(
+        signal, None,
+        "an ignored SIGINT must not kill the process; got: {output:?}"
+    );
+    assert!(
+        output.contains("Selection cancelled."),
+        "Ctrl-C with SIGINT ignored must cancel the menu; got: {output}"
+    );
+    assert_eq!(code, 0, "{output}");
+    assert_cursor_restored(&output);
 }

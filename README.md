@@ -158,7 +158,7 @@ socket-patch list
 ```
 
 ```
-Found 1 patch(es):
+Found 1 patch:
 
 Package: pkg:npm/flatted@3.3.1
   UUID: 5cac955f-eab1-4d29-8f4f-c408a6cc9647
@@ -525,7 +525,7 @@ it finds. `scan` is the entry point for all three [patch modes](#three-patch-mod
 
 Without a mode, interactive `scan` prompts before applying (in a TTY — when stdin is not a
 TTY and neither `--yes` nor a mode/`--prune` flag is given, it is report-only: it prints what
-it found plus the "To apply a patch, run: …" hint, writes nothing, and exits 0), and
+it found plus the "To apply a single patch, run: …" hint, writes nothing, and exits 0), and
 `scan --json` is read-only (discovery plus an `updates[]` array; no mutation).
 
 `scan --mode agent --prune` is the single command bots need for full auto-update: it
@@ -946,7 +946,7 @@ socket-patch get <identifier> [options]
 | `--ghsa` | — | Force identifier to be treated as a GHSA ID. |
 | `-p, --package` | — | Force identifier to be treated as a package name. |
 | `--save-only` | `SOCKET_SAVE_ONLY` | Download the patch without applying it (alias: `--no-apply`). |
-| `--one-off` | `SOCKET_ONE_OFF` | Reserved: apply the patch immediately without saving to the `.socket` folder. **Not yet implemented** — the command currently errors up front. |
+| `--one-off` | `SOCKET_ONE_OFF` | Reserved (hidden from `--help`): apply the patch immediately without saving to the `.socket` folder. **Not yet implemented** — the command currently errors up front. |
 | `--all-releases` | `SOCKET_ALL_RELEASES` | Download patches for every release/distribution variant of a matched package (PyPI wheel/sdist, RubyGems platform, Maven classifier), not just the installed one. |
 
 > Authenticated lookups run against an org. The slug is auto-resolved from your token
@@ -1002,7 +1002,7 @@ socket-patch list --json
 
 **Sample output:**
 ```
-Found 1 patch(es):
+Found 1 patch:
 
 Package: pkg:npm/flatted@3.3.1
   UUID: 5cac955f-eab1-4d29-8f4f-c408a6cc9647
@@ -1238,7 +1238,7 @@ socket-patch apply --json | jq '.status'
 When stdin is not a TTY (e.g. in CI pipelines), interactive prompts auto-proceed instead
 of blocking — with one deliberate exception: a plain `scan` (no `--mode`/`--apply`/`--sync`/
 `--vendor`/`--prune` and no `--yes`) is report-only there. It prints what it found and the
-"To apply a patch, run: …" hint, writes nothing, and exits 0; add `--yes` or a mode flag
+"To apply a single patch, run: …" hint, writes nothing, and exits 0; add `--yes` or a mode flag
 to mutate. Progress indicators and ANSI colors are automatically suppressed when output
 is piped.
 

@@ -9,8 +9,8 @@ pub mod args;
 pub mod commands;
 pub(crate) mod ecosystem_dispatch;
 pub mod json_envelope;
-pub mod output;
 pub mod path_scope;
+pub mod ui;
 pub mod update_notifier;
 
 use clap::{Parser, Subcommand};
@@ -64,13 +64,14 @@ pub enum Commands {
     /// (no socket-patch or Socket API needed). `--revert` undoes it.
     Vendor(commands::vendor::VendorArgs),
 
-    /// Configure package.json postinstall scripts to apply patches
+    /// Wire install hooks (npm, Python, Bundler, Composer) that re-apply
+    /// patches after install
     Setup(commands::setup::SetupArgs),
 
-    /// Rollback patches to restore original files
+    /// Roll back patches to restore original files
     Rollback(commands::rollback::RollbackArgs),
 
-    /// Get security patches from Socket API and apply them
+    /// Get security patches from the Socket API and apply them
     #[command(visible_alias = "download")]
     Get(commands::get::GetArgs),
 
@@ -90,11 +91,19 @@ pub enum Commands {
     #[command(visible_alias = "gc")]
     Repair(commands::repair::RepairArgs),
 
-    /// Internal parse target of the root `--update` flag (see the rewrite
-    /// in [`parse_argv_with_shortcuts`]). Hidden: the public contract
-    /// surface is `socket-patch --update`, and this name carries no
-    /// stability guarantee (documented as internal in CLI_CONTRACT.md).
-    #[command(hide = true, name = "self-update")]
+    // Internal parse target of the root `--update` flag (see the rewrite
+    // in `parse_argv_with_shortcuts`). Hidden: the public contract
+    // surface is `socket-patch --update`, and this name carries no
+    // stability guarantee (documented as internal in CLI_CONTRACT.md).
+    // Plain `//` comments plus an explicit `about`/`override_usage`: a doc
+    // comment here is what `socket-patch --update --help` printed, and the
+    // derived usage line named the hidden subcommand.
+    #[command(
+        hide = true,
+        name = "self-update",
+        about = "Update socket-patch itself to the latest (or a pinned) release",
+        override_usage = "socket-patch --update [VERSION] [OPTIONS]"
+    )]
     SelfUpdate(commands::update::UpdateArgs),
 }
 
@@ -608,7 +617,14 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
         assert!(!err.use_stderr());
         assert_eq!(err.exit_code(), 0);
-        assert!(err.to_string().contains("self-update"), "{err}");
+        // The page is self-update's, but spelled the public way: the hidden
+        // subcommand name must not leak into its usage line.
+        let text = err.to_string();
+        assert!(
+            text.contains("Usage: socket-patch --update [VERSION]"),
+            "{text}"
+        );
+        assert!(!text.contains("self-update"), "{text}");
     }
 
     #[test]

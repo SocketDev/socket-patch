@@ -10,6 +10,8 @@
 //! self_update_e2e.rs / interactive_prompts_e2e.rs (do not edit those
 //! files).
 
+#[path = "common/pty_io.rs"]
+mod pty_io;
 #[path = "common/mod.rs"]
 mod common;
 #[path = "common/update_fixture.rs"]
@@ -205,7 +207,7 @@ async fn update_dry_run_human_reports_update_available() {
 }
 
 // ---------------------------------------------------------------------------
-// Interactive decline (update.rs:251-255) — PTY-driven: output::confirm
+// Interactive decline (update.rs:251-255) — PTY-driven: ui::confirm
 // auto-proceeds with default-yes on non-TTY stdin (and under --yes/--json),
 // so only a real terminal reaches the cancel branch. Runner copied from
 // interactive_prompts_e2e.rs (do not edit that file), adapted to spawn the
@@ -218,7 +220,6 @@ async fn update_dry_run_human_reports_update_available() {
 mod pty {
     use super::*;
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-    use std::io::{Read, Write};
     use std::path::Path;
     use std::time::Duration;
 
@@ -274,12 +275,9 @@ mod pty {
         let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().expect("clone reader");
-        let reader_handle = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
-        });
+        let reader_handle = crate::pty_io::PtyOutput::spawn(
+            pair.master.try_clone_reader().expect("clone reader"),
+        );
 
         let mut killer = child.clone_killer();
         std::thread::spawn(move || {
@@ -288,13 +286,12 @@ mod pty {
         });
 
         let mut writer = pair.master.take_writer().expect("take writer");
-        let _ = writer.write_all(input.as_bytes());
-        let _ = writer.flush();
+        crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input.as_bytes());
         drop(writer);
 
         let status = child.wait().expect("child.wait");
         drop(pair.master);
-        let output = reader_handle.join().expect("reader thread join");
+        let output = reader_handle.finish();
         (
             status.exit_code() as i32,
             String::from_utf8_lossy(&output).to_string(),
@@ -331,7 +328,8 @@ mod pty {
         // auto-proceeds (which the intact-binary check below would catch
         // only by accident of the dead endpoint).
         assert!(
-            output.contains(&format!("Update socket-patch {CURRENT} \u{2192} {CURRENT}?")),
+            // Pinned to the running version + --force: a reinstall.
+            output.contains(&format!("Reinstall socket-patch {CURRENT}?")),
             "update must have shown the interactive confirm prompt; got: {output}"
         );
         assert!(
@@ -339,15 +337,15 @@ mod pty {
             "update must NOT have taken the non-TTY auto-proceed branch in a PTY; got: {output}"
         );
         assert!(
-            output.contains("Update cancelled."),
-            "'n' must report cancellation; got: {output}"
+            output.contains("Reinstall cancelled."),
+            "'n' must report cancellation, naming the reinstall; got: {output}"
         );
         assert_eq!(
             code, 1,
             "a declined update exits 1 (codebase convention); got: {output}"
         );
         assert!(
-            !output.contains("Updated socket-patch"),
+            !output.contains("Updated socket-patch") && !output.contains("Reinstalled socket-patch"),
             "a declined update must not report a swap; got: {output}"
         );
 

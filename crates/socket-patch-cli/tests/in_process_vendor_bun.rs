@@ -858,7 +858,7 @@ async fn dry_run_human_names_would_refuse_records() {
     let (exit, stdout, stderr) = get_vendored(tmp.path(), &mock.uri(), PURL, &["--dry-run"]);
     assert_eq!(exit, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stdout.contains("[dry-run] Would download and vendor 1 patch(es)."),
+        stdout.contains("[dry-run] Would download and vendor 1 patch. No changes made."),
         "{stdout}"
     );
     assert!(

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::atomic::AtomicBool;
 
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::StatusCode;
@@ -12,7 +13,33 @@ use crate::api::ranking::{cmp_batch_infos, cmp_search_results};
 use crate::api::types::*;
 use crate::constants::USER_AGENT as USER_AGENT_VALUE;
 use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
+use crate::utils::notice::{notice_once, Notice};
 use crate::utils::socket_cli_config;
+
+// Each client advisory prints at most once per process: commands build
+// several clients (telemetry, discovery, download) in one run.
+static PROXY_NOTICE_SHOWN: AtomicBool = AtomicBool::new(false);
+static TOKEN_SHAPE_SHOWN: AtomicBool = AtomicBool::new(false);
+static ORG_DETECT_SHOWN: AtomicBool = AtomicBool::new(false);
+static MULTI_ORG_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// A transport error with its whole cause chain. reqwest's `Display` stops
+/// at "error sending request for url (...)", dropping the part a user can
+/// act on ("Connection refused", a DNS or TLS failure). Causes already
+/// spelled out by an outer message are skipped.
+fn network_error_detail(e: &reqwest::Error) -> String {
+    let mut msg = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        let part = cause.to_string();
+        if !part.is_empty() && !msg.contains(&part) {
+            msg.push_str(": ");
+            msg.push_str(&part);
+        }
+        source = cause.source();
+    }
+    msg
+}
 
 /// Log debug messages when debug mode is enabled.
 fn debug_log(message: &str) {
@@ -132,12 +159,9 @@ impl ApiClient {
         let url = format!("{}{}", self.api_url, path);
         debug_log(&format!("GET {}", url));
 
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| ApiError::Network(format!("Network error: {}", e)))?;
+        let resp = self.client.get(&url).send().await.map_err(|e| {
+            ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
+        })?;
 
         Self::handle_json_response(resp, self.use_public_proxy).await
     }
@@ -158,7 +182,9 @@ impl ApiClient {
             .json(body)
             .send()
             .await
-            .map_err(|e| ApiError::Network(format!("Network error: {}", e)))?;
+            .map_err(|e| {
+                ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
+            })?;
 
         Self::handle_json_response(resp, self.use_public_proxy).await
     }
@@ -390,7 +416,9 @@ impl ApiClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ApiError::Network(format!("Network error: {}", e)))?;
+            .map_err(|e| {
+                ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
+            })?;
 
         let status = resp.status();
 
@@ -594,7 +622,9 @@ impl ApiClient {
             .map_err(|e| {
                 ApiError::Network(format!(
                     "Network error fetching {} {}: {}",
-                    kind, identifier, e
+                    kind,
+                    identifier,
+                    network_error_detail(&e)
                 ))
             })?;
 
@@ -822,7 +852,9 @@ impl ApiClient {
                 .await
         };
 
-        let resp = resp.map_err(|e| ApiError::Network(format!("Network error: {e}")))?;
+        let resp = resp.map_err(|e| {
+            ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
+        })?;
         let status = resp.status();
         if status == StatusCode::OK {
             let parsed = resp
@@ -863,7 +895,8 @@ impl ApiClient {
             Ok(r) => r,
             Err(e) => {
                 return ServeDownload::Failed(ApiError::Network(format!(
-                    "Network error fetching vendor package: {e}"
+                    "Network error fetching vendor package: {}",
+                    network_error_detail(&e)
                 )))
             }
         };
@@ -1083,22 +1116,46 @@ pub fn resolve_ambient_credentials(
     api_token: Option<String>,
     org_slug: Option<String>,
 ) -> (Option<String>, Option<String>) {
-    let api_token = api_token.filter(|t| !t.is_empty()).or_else(|| {
-        if socket_cli_config::no_api_token_veto() {
-            debug_log("api token: suppressed by SOCKET_NO_API_TOKEN");
-            return None;
+    let (api_token, _, org_slug) = resolve_credentials_with_origin(api_token, org_slug);
+    (api_token, org_slug)
+}
+
+/// [`resolve_ambient_credentials`], also reporting which layer the token
+/// came from, for messages that must say which token is wrong. (The CLI's
+/// `--api-token` flag is also filled from SOCKET_API_TOKEN by clap, so an
+/// override equal to that env var is reported as the env var.)
+fn resolve_credentials_with_origin(
+    api_token: Option<String>,
+    org_slug: Option<String>,
+) -> (Option<String>, TokenSource, Option<String>) {
+    let env_value = std::env::var("SOCKET_API_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    let (api_token, origin) = match api_token.filter(|t| !t.is_empty()) {
+        Some(t) => {
+            let origin = if env_value.as_deref() == Some(t.as_str()) {
+                TokenSource::Env
+            } else {
+                TokenSource::Flag
+            };
+            (Some(t), origin)
         }
-        std::env::var("SOCKET_API_TOKEN")
-            .ok()
-            .filter(|t| !t.is_empty())
-            .or_else(|| {
-                socket_cli_config::load()
+        None if socket_cli_config::no_api_token_veto() => {
+            debug_log("api token: suppressed by SOCKET_NO_API_TOKEN");
+            (None, TokenSource::Env)
+        }
+        None => match env_value {
+            Some(t) => (Some(t), TokenSource::Env),
+            None => {
+                let t = socket_cli_config::load()
                     .and_then(|c| c.api_token.clone())
                     .inspect(|_| {
                         debug_log("api token: from socket-cli config (`socket login`)");
-                    })
-            })
-    });
+                    });
+                (t, TokenSource::Config)
+            }
+        },
+    };
     let org_slug = org_slug
         .filter(|s| !s.is_empty())
         // Treat an empty slug as "not provided" (mirroring the api_token
@@ -1117,7 +1174,7 @@ pub fn resolve_ambient_credentials(
                     debug_log(&format!("org slug: `{slug}` from socket-cli config"));
                 })
         });
-    (api_token, org_slug)
+    (api_token, origin, org_slug)
 }
 
 /// Like [`get_api_client_from_env`] but with explicit overrides for every
@@ -1126,8 +1183,8 @@ pub fn resolve_ambient_credentials(
 /// `--api-token`, `--org`, `--proxy-url` flags via [`crate::utils`] in the
 /// CLI crate.
 pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> (ApiClient, bool) {
-    let (api_token, resolved_org_slug) =
-        resolve_ambient_credentials(overrides.api_token, overrides.org_slug);
+    let (api_token, origin, resolved_org_slug) =
+        resolve_credentials_with_origin(overrides.api_token, overrides.org_slug);
 
     if api_token.is_none() {
         let proxy_url = overrides
@@ -1142,11 +1199,12 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
         // mirrored into SOCKET_OFFLINE (normalized to "1") before any
         // client is built.
         if !is_offline_env() {
-            eprintln!(
+            notice_once(Notice::Info, &PROXY_NOTICE_SHOWN, || {
                 "No SOCKET_API_TOKEN set (and no socket-cli login found) — using the \
                  public patch API proxy (free patches only). Run `socket login` or set \
                  SOCKET_API_TOKEN to access org patches."
-            );
+                    .to_string()
+            });
         }
         let client = ApiClient::new(ApiClientOptions {
             api_url: proxy_url,
@@ -1160,8 +1218,8 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
     // Shape check the configured token before the network round-trip so
     // a "you set the hash, not the token" mistake is loud and immediate.
     if let Some(ref t) = api_token {
-        if let Some(msg) = validate_token_shape(t) {
-            eprintln!("{msg}");
+        if let Some(msg) = validate_token_shape(t, origin) {
+            notice_once(Notice::Warning, &TOKEN_SHAPE_SHOWN, || msg);
         }
     }
 
@@ -1190,19 +1248,23 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
         match client.resolve_org_slug().await {
             Ok(slug) => client.org_slug = Some(slug),
             Err(e) => {
-                eprintln!("Warning: Could not auto-detect organization: {e}");
-                if matches!(e, ApiError::Unauthorized(_)) {
-                    if let Some(t) = client.api_token.as_deref() {
-                        if looks_like_token_hash(t) {
-                            eprintln!(
-                                "  Hint: SOCKET_API_TOKEN starts with `{}-` \
-                                 which is the stored hash format. Set it to \
-                                 the raw `sktsec_..._api` value instead.",
-                                t.split('-').next().unwrap_or("sha512")
-                            );
+                notice_once(Notice::Warning, &ORG_DETECT_SHOWN, || {
+                    let mut msg = format!("Warning: Could not auto-detect organization: {e}");
+                    if matches!(e, ApiError::Unauthorized(_)) {
+                        if let Some(t) = client.api_token.as_deref() {
+                            if looks_like_token_hash(t) {
+                                msg.push_str(&format!(
+                                    "\n  Hint: {} starts with `{}-`, which is the \
+                                     stored hash format. Set it to the raw \
+                                     `sktsec_..._api` value instead.",
+                                    origin.label(),
+                                    t.split('-').next().unwrap_or("sha512")
+                                ));
+                            }
                         }
                     }
-                }
+                    msg
+                });
             }
         }
     }
@@ -1257,7 +1319,7 @@ fn looks_like_token_hash(token: &str) -> bool {
 /// The returned message redacts the middle of the token (first 8 +
 /// last 4 chars) so a real token doesn't leak into stderr if a user
 /// pastes one with a wrong suffix.
-fn validate_token_shape(token: &str) -> Option<String> {
+fn validate_token_shape(token: &str, source: TokenSource) -> Option<String> {
     let has_prefix = token.starts_with("sktsec_");
     let has_suffix = token.ends_with("_api") || token.ends_with("_agent");
     // Measure in characters, not bytes: the preview/length reporting below
@@ -1286,11 +1348,33 @@ fn validate_token_shape(token: &str) -> Option<String> {
         ""
     };
     Some(format!(
-        "Warning: SOCKET_API_TOKEN does not look like a Socket API token \
+        "Warning: {} does not look like a Socket API token \
          (expected `sktsec_<44 chars>_api`).{hash_hint}\n  \
          Got: {preview} ({len} chars). Continuing anyway; the server may \
-         reject this with 401."
+         reject this with 401.",
+        source.label()
     ))
+}
+
+/// Where the resolved API token came from (named in token warnings).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TokenSource {
+    /// The CLI's `--api-token` flag (an explicit override).
+    Flag,
+    /// The `SOCKET_API_TOKEN` environment variable.
+    Env,
+    /// The socket-cli config file written by `socket login`.
+    Config,
+}
+
+impl TokenSource {
+    fn label(self) -> &'static str {
+        match self {
+            TokenSource::Flag => "--api-token",
+            TokenSource::Env => "SOCKET_API_TOKEN",
+            TokenSource::Config => "The socket-cli login token (`socket login`)",
+        }
+    }
 }
 
 /// Classify an [`ApiError`] as a candidate for the auth → proxy
@@ -1384,12 +1468,14 @@ fn select_org_slug(mut orgs: Vec<crate::api::types::OrganizationInfo>) -> Result
         _ => {
             let slugs: Vec<_> = orgs.iter().map(|o| o.slug.as_str()).collect();
             let first = orgs[0].slug.clone();
-            eprintln!(
-                "Multiple organizations found: {}. Using \"{}\". \
-                 Pass --org to select a different one.",
-                slugs.join(", "),
-                first
-            );
+            notice_once(Notice::Info, &MULTI_ORG_SHOWN, || {
+                format!(
+                    "Multiple organizations found: {}. Using \"{}\". \
+                     Pass --org to select a different one.",
+                    slugs.join(", "),
+                    first
+                )
+            });
             Ok(first)
         }
     }
@@ -1724,7 +1810,7 @@ mod tests {
     #[test]
     fn test_severity_order_moderate_is_medium_tier() {
         // Regression: GHSA emits `moderate` for the medium tier (the same
-        // convention output.rs `format_severity` and get.rs `severity_rank`
+        // convention the CLI's `ui::severity` and get.rs `severity_rank`
         // already follow). The moderate-blind ordering lumped it in with
         // "unknown" (rank 4), ranking it *below* low.
         assert_eq!(
@@ -2295,20 +2381,20 @@ mod tests {
         // matching the server's SOCKET_TOKEN_REGEXP.
         let raw = format!("sktsec_{}_api", "x".repeat(44));
         assert_eq!(raw.len(), 55);
-        assert!(validate_token_shape(&raw).is_none());
+        assert!(validate_token_shape(&raw, TokenSource::Env).is_none());
     }
 
     #[test]
     fn validate_token_shape_accepts_agent_token() {
         let raw = format!("sktsec_{}_agent", "x".repeat(44));
-        assert!(validate_token_shape(&raw).is_none());
+        assert!(validate_token_shape(&raw, TokenSource::Env).is_none());
     }
 
     #[test]
     fn validate_token_shape_flags_sha512_hash() {
         let hash = "sha512-7aegAloeNsCqF1mpNL2J9MJ2dpIxQEwgKvXPml8XY2rrV2Za+\
                     bfj0yhG7RcqvqqLZ4iAH/drJjHjOqFkTGhddg==";
-        let msg = validate_token_shape(hash).expect("hash must be flagged");
+        let msg = validate_token_shape(hash, TokenSource::Env).expect("hash must be flagged");
         assert!(
             msg.contains("does not look like a Socket API token"),
             "missing core warning; got: {msg}"
@@ -2330,7 +2416,8 @@ mod tests {
 
     #[test]
     fn validate_token_shape_flags_too_short() {
-        let msg = validate_token_shape("sktsec_abc_api").expect("short token must be flagged");
+        let msg = validate_token_shape("sktsec_abc_api", TokenSource::Env)
+            .expect("short token must be flagged");
         assert!(msg.contains("does not look like a Socket API token"));
         assert!(!msg.contains("SRI-format hash"));
     }
@@ -2338,7 +2425,55 @@ mod tests {
     #[test]
     fn validate_token_shape_flags_missing_suffix() {
         let raw = format!("sktsec_{}", "x".repeat(50));
-        assert!(validate_token_shape(&raw).is_some());
+        assert!(validate_token_shape(&raw, TokenSource::Env).is_some());
+    }
+
+    #[test]
+    fn validate_token_shape_names_the_token_source() {
+        for (source, head) in [
+            (TokenSource::Flag, "Warning: --api-token does not look like"),
+            (
+                TokenSource::Env,
+                "Warning: SOCKET_API_TOKEN does not look like",
+            ),
+            (
+                TokenSource::Config,
+                "Warning: The socket-cli login token (`socket login`) does not look like",
+            ),
+        ] {
+            let msg = validate_token_shape("sktsec_abc_api", source).expect("flagged");
+            assert!(msg.starts_with(head), "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn network_error_detail_keeps_the_root_cause() {
+        // A port that was just free: connecting is refused, deterministically.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let err = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .await
+            .expect_err("nothing listens there");
+        let top = err.to_string();
+        let detail = network_error_detail(&err);
+        assert!(detail.starts_with(&top), "{detail}");
+        assert!(
+            detail.len() > top.len(),
+            "the cause chain must be appended: {detail}"
+        );
+        assert!(
+            detail.to_lowercase().contains("refused"),
+            "the actionable cause must survive: {detail}"
+        );
+        // No cause is repeated.
+        let parts: Vec<&str> = detail.split(": ").collect();
+        for (i, p) in parts.iter().enumerate() {
+            assert!(!parts[i + 1..].contains(p), "{detail}");
+        }
     }
 
     #[test]
@@ -2355,7 +2490,8 @@ mod tests {
         assert_eq!(token.chars().count(), 21);
         assert_ne!(token.len(), token.chars().count(), "must be multi-byte");
 
-        let msg = validate_token_shape(&token).expect("non-canonical token must be flagged");
+        let msg = validate_token_shape(&token, TokenSource::Env)
+            .expect("non-canonical token must be flagged");
         assert!(
             msg.contains("(21 chars)"),
             "length must be reported in characters; got: {msg}"

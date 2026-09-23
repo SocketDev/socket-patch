@@ -78,6 +78,8 @@ macro_rules! scan_ecosystem {
                             && ($options.global || $options.global_prefix.is_some())
                             && !$silent
                         {
+                            // Status chrome: stderr, so it can never reach a
+                            // machine stream (`--json` envelope, vex document).
                             if let Some(first) = paths.first() {
                                 eprintln!("Using {} at: {}", using, first.display());
                             }
@@ -101,7 +103,7 @@ macro_rules! scan_ecosystem {
                     }
                     Err(e) => {
                         if !$silent {
-                            eprintln!("Failed to find {}: {}", $err_label, e);
+                            eprintln!("Warning: Failed to find {}: {}", $err_label, e);
                         }
                     }
                 }

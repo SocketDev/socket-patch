@@ -1,5 +1,6 @@
 pub mod env_compat;
 pub mod fs;
+pub mod notice;
 pub(crate) mod http;
 pub mod pdm_lock;
 pub mod pipenv;

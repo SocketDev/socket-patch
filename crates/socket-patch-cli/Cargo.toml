@@ -22,8 +22,8 @@ clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+console = { workspace = true }
 dialoguer = { workspace = true }
-indicatif = { workspace = true }
 uuid = { workspace = true }
 regex = { workspace = true }
 glob = { workspace = true }
@@ -33,6 +33,11 @@ tempfile = { workspace = true }
 # main.rs restores the default SIGPIPE disposition so piped invocations
 # (`socket-patch scan | head -1`) die quietly instead of panicking.
 libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# ui::prompt flushes console typeahead before a confirm (the Unix twin is
+# tcflush). Same major as console's own windows-sys, so no new crate.
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
 
 [features]
 # Every ecosystem (npm, PyPI, Ruby gems, Go, Cargo, NuGet, Maven, Composer,

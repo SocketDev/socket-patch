@@ -667,7 +667,7 @@ async fn get_uuid_readonly_socket_dir_fails_manifest_write_preserving_manifest()
 }
 
 /// Human-mode uuid path: an update prints `Updated: 1 (replacing …)`, and
-/// a same-uuid re-get lands on the `Skipped: 1 (already exists)` print —
+/// a same-uuid re-get lands on the `already has this patch recorded` note —
 /// both exiting 0 with the manifest converged on the fetched uuid.
 #[tokio::test]
 #[serial]
@@ -686,7 +686,7 @@ async fn get_uuid_human_update_then_rerun_skips_preserving_manifest() {
     assert_eq!(run(args).await, 0, "the update run must succeed");
     assert_eq!(manifest_json(tmp.path())["patches"][PURL]["uuid"], UUID);
 
-    // Second run: same uuid → the human `Skipped: 1` print; still exit 0
+    // Second run: same uuid → the human "already recorded" note; still exit 0
     // and the manifest still records the same uuid.
     let mut args = default_args(UUID, tmp.path());
     args.common.api_url = Some(uri);
@@ -784,7 +784,7 @@ async fn package_search_without_fuzzy_match_is_no_match_in_both_modes() {
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         install_npm_fixture(tmp.path(), "leftpad", "1.0.0");
-        let (code, stdout, _stderr) = run_get_bin(
+        let (code, stdout, stderr) = run_get_bin(
             tmp.path(),
             &server.uri(),
             &["zzqxjvwq", "--package", "--save-only"],
@@ -794,8 +794,11 @@ async fn package_search_without_fuzzy_match_is_no_match_in_both_modes() {
             stdout.contains("No packages matching \"zzqxjvwq\" found."),
             "human no_match message; stdout={stdout}"
         );
+        // Crawl progress is stderr narration: the transient
+        // "Enumerating packages..." line never reaches a pipe, the result
+        // line does (singular for one package).
         assert!(
-            stdout.contains("Enumerating packages...") && stdout.contains("packages"),
+            !stdout.contains("Enumerating packages") && stderr.contains("Found 1 package\n"),
             "the crawl progress prints must appear; stdout={stdout}"
         );
         assert!(received_paths(&server).await.is_empty());
@@ -828,8 +831,8 @@ async fn human_package_search_api_error_reports_fetch_failure() {
         "a 500 from the package search must exit 1; stdout={stdout}\nstderr={stderr}"
     );
     assert!(
-        stdout.contains("checking for available patches"),
-        "the match-count progress line must print first; stdout={stdout}"
+        stderr.contains(&format!("Best match: pkg:npm/{NAME}@1.0.0\n")),
+        "the best-match line must print first; stderr={stderr}"
     );
     assert!(
         stderr.contains("Error:"),
@@ -1036,7 +1039,7 @@ async fn engine_readonly_socket_fails_closed_before_any_fetch() {
 /// Read-only `.socket` with the lock file pre-staged (so the acquire
 /// succeeds) and no blobs to write (`persist_blobs: false`): the fetched
 /// record's manifest write is the first write — its failure must surface as
-/// the `Error writing manifest` envelope, with no manifest materializing.
+/// the `Failed to write manifest` envelope, with no manifest materializing.
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
@@ -1068,7 +1071,7 @@ async fn engine_readonly_socket_fails_manifest_write() {
         json["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("writing manifest"),
+            .contains("Failed to write manifest"),
         "the error must name the manifest write; json={json}"
     );
     assert!(
@@ -1116,7 +1119,7 @@ async fn engine_manifest_write_failure_unwinds_the_blobs_it_wrote() {
         json["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("writing manifest"),
+            .contains("Failed to write manifest"),
         "json={json}"
     );
     let mut left: Vec<String> = std::fs::read_dir(&blobs)
@@ -1515,13 +1518,13 @@ async fn human_vendored_uuid_dry_run_prints_line() {
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stdout.contains("[dry-run] Would download and vendor 1 patch(es)."),
+        stdout.contains("[dry-run] Would download and vendor 1 patch. No changes made."),
         "stdout={stdout}"
     );
     assert!(!tmp.path().join(".socket").exists());
 }
 
-/// Human search-path vendored dry-run line (the `patch(es)` count flavor).
+/// Human search-path vendored dry-run line (the pluralized count flavor).
 #[tokio::test]
 async fn human_vendored_search_dry_run_prints_count() {
     let server = MockServer::start().await;
@@ -1538,7 +1541,7 @@ async fn human_vendored_search_dry_run_prints_count() {
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stdout.contains("[dry-run] Would download and vendor 1 patch(es)."),
+        stdout.contains("[dry-run] Would download and vendor 1 patch. No changes made."),
         "the narrowed selection is exactly one patch; stdout={stdout}"
     );
     assert!(!tmp.path().join(".socket").exists());
@@ -1815,9 +1818,11 @@ async fn human_cve_search_empty_prints_search_label_and_not_found() {
         &["CVE-2099-40990", "--save-only"],
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    // The search progress is a transient stderr status line: it never
+    // lands on stdout (or in a pipe at all).
     assert!(
-        stdout.contains("Searching patches for CVE: CVE-2099-40990"),
-        "stdout={stdout}"
+        !stdout.contains("Searching patches for") && !stderr.contains("Searching patches for"),
+        "stdout={stdout}\nstderr={stderr}"
     );
     assert!(
         stdout.contains("No patches found for CVE: CVE-2099-40990"),
@@ -1969,13 +1974,21 @@ async fn human_ghsa_all_uninstalled_advises_all_releases() {
     let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[GHSA]);
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stdout.contains("none of those versions are installed here")
+        stdout.contains("none of them are installed here")
             && stdout.contains("Use --all-releases to fetch them anyway."),
         "stdout={stdout}"
     );
+    // The terminal message already says it: no per-version [skip] flood
+    // unless --verbose asks for the detail.
     assert!(
-        stderr.contains("version not installed"),
-        "the per-version [skip] lines must print; stderr={stderr}"
+        !stderr.contains("[skip]"),
+        "per-version [skip] lines are verbose-only; stderr={stderr}"
+    );
+    let (code, _stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[GHSA, "--verbose"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        stderr.contains("(version not installed)"),
+        "--verbose prints the per-version [skip] lines; stderr={stderr}"
     );
     assert!(!tmp.path().join(".socket").exists());
 }
@@ -2071,7 +2084,7 @@ async fn engine_human_readonly_socket_manifest_write_failure_still_errors() {
         json["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("writing manifest"),
+            .contains("Failed to write manifest"),
         "json={json}"
     );
     assert!(!socket.join("manifest.json").exists());
@@ -2124,15 +2137,21 @@ async fn human_search_fixes_line_falls_back_to_advisory_id_without_cves() {
         .mount(&server)
         .await;
 
-    // Empty project: the run ends in the all-uninstalled terminal, but the
-    // search listing (the surface under test) prints first.
+    // Empty project + --all-releases (no installed-version narrowing, so
+    // the listing — the surface under test — prints) + --dry-run (stop
+    // at the preview: no view fetch, no writes).
     let tmp = tempfile::tempdir().unwrap();
-    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[cve]);
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[cve, "--all-releases", "--dry-run"],
+    );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
         stdout.contains("Fixes: GHSA-nocv-1111-2222 (high)"),
         "a CVE-less advisory must be summarized by its id; stdout={stdout}"
     );
+    assert!(!tmp.path().join(".socket").exists());
 }
 
 /// Human search-path vendored SUCCESS: the vendored flow commits the
@@ -2606,4 +2625,378 @@ async fn vendored_uuid_json_leaves_unselected_ledger_entries_alone() {
         .join(UUID)
         .join(format!("{NAME}-1.0.0.tgz"));
     assert!(artifact.is_file(), "stdout={stdout}\nstderr={stderr}");
+}
+
+// ===========================================================================
+// (9) terminal-UI polish: agent dry-run, --silent failures, forced-type
+//     validation, proxy 403 → paid_required, narrowed listing.
+// ===========================================================================
+
+/// Agent-mode `--dry-run` (search path) previews and writes NOTHING: no
+/// `.socket/`, no view fetch, no prompt, exit 0.
+#[tokio::test]
+async fn agent_search_dry_run_writes_nothing() {
+    let server = MockServer::start().await;
+    mount_ghsa_fanout(&server).await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let index_before = std::fs::read(tmp.path().join("node_modules/covgap-pkg/index.js")).unwrap();
+
+    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[GHSA, "--dry-run"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains(&format!("  [would-add] {PURL}\n"))
+            && stdout.contains("[dry-run] Would download and apply 1 patch. No changes made."),
+        "stdout={stdout}"
+    );
+    // The listing shows only the installed version; the other one is
+    // summarized once on stderr.
+    assert!(
+        stdout.contains("Found 1 patch:") && !stdout.contains(PURL_V2),
+        "stdout={stdout}"
+    );
+    assert!(
+        stderr.contains(
+            "Skipped 1 patch for 1 package version not installed here \
+             (use --all-releases to include it)."
+        ),
+        "stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("[Y/n]"),
+        "a dry run never prompts; stderr={stderr}"
+    );
+    assert!(!tmp.path().join(".socket").exists());
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/covgap-pkg/index.js")).unwrap(),
+        index_before
+    );
+    assert!(
+        !received_paths(&server)
+            .await
+            .iter()
+            .any(|p| p.contains("/patches/view/")),
+        "a dry run must not fetch patch views"
+    );
+}
+
+/// Agent-mode `--dry-run --json` (uuid path): one envelope with
+/// `dryRun: true` and a `would_update` record carrying `oldUuid`; the
+/// manifest bytes stay untouched.
+#[tokio::test]
+async fn agent_uuid_dry_run_json_classifies_against_the_manifest() {
+    let server = MockServer::start().await;
+    mount_real_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    seed_manifest_with(tmp.path(), PURL, UUID_B);
+    let before = std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap();
+
+    let (code, stdout, stderr) =
+        run_get_bin(tmp.path(), &server.uri(), &[UUID, "--dry-run", "--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["status"], "success", "{v}");
+    assert_eq!(v["dryRun"], true, "{v}");
+    assert_eq!(v["applied"], 0, "{v}");
+    assert_eq!(v["patches"][0]["action"], "would_update", "{v}");
+    assert_eq!(v["patches"][0]["oldUuid"], UUID_B, "{v}");
+    assert_eq!(
+        before,
+        std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).unwrap()
+    );
+}
+
+/// `--silent` is "errors only", never "nothing": a failed nested apply
+/// still says why the run exits 1.
+#[tokio::test]
+async fn silent_apply_failure_still_prints_an_error() {
+    let server = MockServer::start().await;
+    // A view whose beforeHash matches nothing on disk and whose file is
+    // missing: the nested apply fails.
+    mount_view_files(
+        &server,
+        UUID,
+        PURL,
+        serde_json::json!({
+            "package/missing.js": {
+                "beforeHash": "0".repeat(64),
+                "afterHash": git_hash(AFTER_BYTES),
+                "blobContent": b64(AFTER_BYTES),
+            }
+        }),
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID, "--silent"]);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains(
+            "Error: Some patches could not be applied (re-run without --silent for details)."
+        ),
+        "stderr={stderr}"
+    );
+
+    // Loud twin: the plain error line, no --silent hint.
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let (code, _stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID]);
+    assert_eq!(code, 1, "stderr={stderr}");
+    assert!(
+        stderr.contains("Error: Some patches could not be applied.\n"),
+        "stderr={stderr}"
+    );
+}
+
+/// A forced `--id` / `--cve` / `--ghsa` identifier is shape-checked before
+/// any network call: a readable error, exit 1, zero requests.
+#[tokio::test]
+async fn forced_identifier_type_is_validated_locally() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    for (flag, what) in [
+        ("--id", "is not a valid patch UUID"),
+        ("--cve", "is not a valid CVE ID"),
+        ("--ghsa", "is not a valid GHSA ID"),
+    ] {
+        let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &["lodash", flag]);
+        assert_eq!(code, 1, "{flag}: stdout={stdout}\nstderr={stderr}");
+        assert!(
+            stderr.contains(&format!("Error: \"lodash\" {what} (expected ")),
+            "{flag}: stderr={stderr}"
+        );
+        let (code, stdout, _) = run_get_bin(tmp.path(), &server.uri(), &["lodash", flag, "--json"]);
+        assert_eq!(code, 1);
+        let v = parse_single_json_doc(&stdout);
+        assert_eq!(v["status"], "error", "{v}");
+        assert!(v["error"].as_str().unwrap().contains(what), "{v}");
+    }
+    assert!(
+        received_paths(&server).await.is_empty(),
+        "no request may be sent"
+    );
+}
+
+/// The public proxy answers a paid patch with 403: that is the same clean
+/// `paid_required` outcome (exit 0) as a tier=paid view, not a raw
+/// "Forbidden" error.
+#[tokio::test]
+async fn proxy_403_on_uuid_is_paid_required() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/patch/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    let uri = server.uri();
+    let tmp = tempfile::tempdir().unwrap();
+    let run = |extra: &[&str]| {
+        let mut args = vec!["get", UUID, "--yes", "--api-url", uri.as_str()];
+        args.extend_from_slice(extra);
+        common::run_with_env(
+            tmp.path(),
+            &args,
+            &[
+                ("SOCKET_PATCH_PROXY_URL", uri.as_str()),
+                ("SOCKET_TELEMETRY_DISABLED", "1"),
+            ],
+        )
+    };
+
+    let (code, stdout, stderr) = run(&["--json"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["status"], "paid_required", "{v}");
+    assert_eq!(v["patches"][0]["uuid"], UUID, "{v}");
+    assert_eq!(v["patches"][0]["tier"], "paid", "{v}");
+
+    let (code, stdout, stderr) = run(&[]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "This patch requires a paid subscription to download.\n  Patch: {UUID}\n  \
+             Upgrade at: https://socket.dev/pricing"
+        )),
+        "stdout={stdout}"
+    );
+    assert!(!stderr.contains("Forbidden"), "stderr={stderr}");
+    assert!(!tmp.path().join(".socket").exists());
+}
+
+/// A free user's CVE search: a free patch for one installed package and a
+/// paid patch for ANOTHER installed package. The narrowed listing must
+/// still show the paid fix as `[PAID] (no access)` (an installed package's
+/// fix is never silently hidden), while a paid patch for a version that is
+/// not installed stays out of it. No `Selected:` block (the one free patch
+/// was the only candidate), and stdout starts with the result itself.
+#[tokio::test]
+async fn narrowed_listing_keeps_installed_paid_no_access_patch() {
+    let server = MockServer::start().await;
+    let cve = "CVE-2024-5151";
+    let paid = |uuid: &str, purl: &str| {
+        serde_json::json!({
+            "uuid": uuid, "purl": purl,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "description": "paid", "license": "MIT", "tier": "paid",
+            "vulnerabilities": {}
+        })
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-cve/{cve}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [
+                {
+                    "uuid": UUID, "purl": PURL,
+                    "publishedAt": "2024-01-01T00:00:00Z",
+                    "description": "free", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {}
+                },
+                paid(UUID_B, "pkg:npm/covgap-paid-other@2.0.0"),
+                paid(UUID_V2, "pkg:npm/covgap-paid-other@9.0.0"),
+            ],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    install_npm_fixture(tmp.path(), "covgap-paid-other", "2.0.0");
+    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[cve, "--dry-run"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.starts_with("Found 2 patches:\n"),
+        "stdout must start with the listing; stdout={stdout:?}"
+    );
+    assert!(
+        stdout.contains("pkg:npm/covgap-paid-other@2.0.0 [PAID] (no access)"),
+        "stdout={stdout}"
+    );
+    assert!(
+        !stdout.contains("covgap-paid-other@9.0.0"),
+        "a paid patch for an uninstalled version must not be listed; stdout={stdout}"
+    );
+    assert!(!stdout.contains("Selected:"), "stdout={stdout}");
+    assert!(
+        stdout.contains(&format!("  [would-add] {PURL}\n")),
+        "stdout={stdout}"
+    );
+    // The paid skip is not the user's to act on: no skip summary counts it.
+    assert!(!stderr.contains("Skipped "), "stderr={stderr}");
+    assert!(!tmp.path().join(".socket").exists());
+}
+
+/// Agent `--dry-run` runs the same per-release variant narrowing as the
+/// wet run: of two PyPI variants of one installed version, only the one
+/// matching the installed distribution is previewed.
+#[tokio::test]
+async fn agent_dry_run_previews_only_the_installed_release_variant() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let installed = b"installed wheel bytes\n".as_slice();
+    fake_pypi_venv(tmp.path(), "covgapsix", "1.0.0", installed);
+    let venv = tmp.path().join(".venv");
+
+    let base = "pkg:pypi/covgapsix@1.0.0";
+    let purl_wheel = format!("{base}?artifact_id=wheel");
+    let purl_sdist = format!("{base}?artifact_id=sdist");
+    let files_for = |before: &[u8]| {
+        serde_json::json!({
+            "covgapsix.py": {
+                "beforeHash": git_hash(before),
+                "afterHash": git_hash(b"patched\n"),
+                "blobContent": b64(b"patched\n"),
+            }
+        })
+    };
+    mount_view_files(&server, UUID, &purl_wheel, files_for(installed)).await;
+    mount_view_files(&server, UUID_B, &purl_sdist, files_for(b"other dist\n")).await;
+    let patch = |uuid: &str, purl: &str| {
+        serde_json::json!({
+            "uuid": uuid, "purl": purl,
+            "publishedAt": "2024-01-01T00:00:00Z",
+            "description": "x", "license": "MIT", "tier": "free",
+            "vulnerabilities": {}
+        })
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/by-ghsa/{GHSA}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [patch(UUID, &purl_wheel), patch(UUID_B, &purl_sdist)],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+
+    let venv_str = venv.to_string_lossy().into_owned();
+    let (code, stdout, stderr) = common::run_with_env(
+        tmp.path(),
+        &[
+            "get",
+            GHSA,
+            "--dry-run",
+            "--json",
+            "--api-url",
+            &server.uri(),
+            "--api-token",
+            "fake-token-for-tests",
+            "--org",
+            ORG,
+            "--yes",
+        ],
+        &[
+            ("SOCKET_TELEMETRY_DISABLED", "1"),
+            ("VIRTUAL_ENV", venv_str.as_str()),
+        ],
+    );
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["dryRun"], true, "{v}");
+    let adds: Vec<&serde_json::Value> = v["patches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["action"] == "would_add")
+        .collect();
+    assert_eq!(adds.len(), 1, "only the installed variant; {v}");
+    assert_eq!(adds[0]["purl"], purl_wheel.as_str(), "{v}");
+    assert!(!tmp.path().join(".socket").exists());
+}
+
+/// Human `get --mode vendored` whose every download fails: no record
+/// reaches the vendor step, the vendor engine is quiet about an empty record
+/// set, and the scan vendor step (in its `get` flavor) closes the run with
+/// "No vendorable patches in scope." instead of ending with no summary.
+#[tokio::test]
+async fn human_vendored_search_all_downloads_failed_prints_empty_run_line() {
+    let server = MockServer::start().await;
+    mount_ghsa_fanout(&server).await;
+    // No views mounted -> every view fetch 404s.
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[
+            GHSA,
+            "--mode",
+            "vendored",
+            "--vendor-source",
+            "build",
+            "--all-releases",
+        ],
+    );
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("No vendorable patches in scope."),
+        "stdout={stdout}\nstderr={stderr}"
+    );
 }

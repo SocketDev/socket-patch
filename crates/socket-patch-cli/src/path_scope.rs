@@ -70,6 +70,9 @@ impl PathScope {
     pub fn parse(raw_patterns: &[String]) -> Result<Self, String> {
         let mut patterns = Vec::with_capacity(raw_patterns.len());
         let mut raw = Vec::with_capacity(raw_patterns.len());
+        // Lowercase on purpose: scan and rollback print this after a clap-style
+        // `error: ` usage-error prefix. Capitalize it together with those
+        // call sites if they move to `Error: `.
         for r in raw_patterns {
             let normalized = normalize_pattern(r);
             if normalized.is_empty() {
@@ -258,7 +261,10 @@ mod tests {
     #[test]
     fn invalid_pattern_is_a_parse_error() {
         let err = PathScope::parse(&["packages/[".to_string()]).unwrap_err();
-        assert!(err.contains("invalid path pattern"), "{err}");
+        assert!(
+            err.starts_with("invalid path pattern \"packages/[\": "),
+            "{err}"
+        );
         let err = PathScope::parse(&["".to_string()]).unwrap_err();
         assert!(err.contains("empty pattern"), "{err}");
     }

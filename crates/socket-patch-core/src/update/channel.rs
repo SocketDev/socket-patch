@@ -112,6 +112,60 @@ pub fn upgrade_hint(channel: InstallChannel) -> &'static str {
     }
 }
 
+/// [`upgrade_hint`] for the binary at `canonical_exe`. An npm install is
+/// either global (`<prefix>/lib/node_modules`, `%APPDATA%\npm\node_modules`,
+/// a yarn/pnpm `global` store, a Windows version-manager dir such as
+/// nvm-windows' `%APPDATA%\nvm\v20.11.0\node_modules`), where
+/// `npm update -g` is right, or a project dependency
+/// (`<project>/node_modules`), where `-g` would update some other copy and
+/// leave this one alone.
+pub fn upgrade_hint_for(channel: InstallChannel, canonical_exe: &Path) -> &'static str {
+    if channel == InstallChannel::Npm && !is_global_npm_install(canonical_exe) {
+        return "npm install @socketsecurity/socket-patch@latest";
+    }
+    upgrade_hint(channel)
+}
+
+/// Whether the outermost `node_modules` of `path` belongs to a global
+/// install. The well-known global layouts (directly under `lib` on a Unix
+/// prefix or `npm` on Windows, or anywhere below a yarn/pnpm `global`
+/// store) decide without touching the disk. Otherwise the directory that
+/// holds the outermost `node_modules` decides: a project has a
+/// `package.json` there, while a global prefix without a `lib/` level
+/// (nvm-windows `…\nvm\v20.11.0`, fnm `…\installation`, Volta's image
+/// dirs) does not. Defaulting to global when unsure is the safer miss:
+/// `npm install …` run from an arbitrary cwd would scaffold a stray
+/// `node_modules`/`package.json` there and leave the real copy stale.
+fn is_global_npm_install(path: &Path) -> bool {
+    let names: Vec<&std::ffi::OsStr> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(os) => Some(os),
+            _ => None,
+        })
+        .collect();
+    let Some(first_nm) = names.iter().position(|n| *n == "node_modules") else {
+        return false;
+    };
+    let parent = first_nm.checked_sub(1).map(|i| names[i]);
+    if matches!(parent, Some(p) if p == "lib" || p == "npm")
+        || names[..first_nm].iter().any(|n| *n == "global")
+    {
+        return true;
+    }
+    // `ancestors` walks innermost-first, so the LAST `node_modules` is the
+    // outermost one; its parent keeps the path's own prefix (drive, root).
+    let holder = path
+        .ancestors()
+        .filter(|a| a.file_name().is_some_and(|n| n == "node_modules"))
+        .last()
+        .and_then(Path::parent);
+    match holder {
+        Some(dir) => !dir.join("package.json").is_file(),
+        None => true,
+    }
+}
+
 /// Short human label for refusal messages ("managed by npm").
 pub fn channel_label(channel: InstallChannel) -> &'static str {
     match channel {
@@ -432,6 +486,76 @@ mod tests {
             "the RubyGems launcher"
         );
         assert_eq!(channel_label(InstallChannel::Homebrew), "Homebrew");
+    }
+
+    #[test]
+    fn npm_hint_tells_global_from_project_installs() {
+        let global = [
+            "/usr/local/lib/node_modules/@socketsecurity/socket-patch/node_modules/@socketsecurity/socket-patch-darwin-arm64/bin/socket-patch",
+            "/home/u/.nvm/versions/node/v20.1.0/lib/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
+            "/home/u/.config/yarn/global/node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
+            "/Users/u/Library/pnpm/global/5/node_modules/@socketsecurity/socket-patch-darwin-arm64/bin/socket-patch",
+        ];
+        for p in global {
+            assert_eq!(
+                upgrade_hint_for(InstallChannel::Npm, Path::new(p)),
+                "npm update -g @socketsecurity/socket-patch",
+                "{p}"
+            );
+        }
+        // A project install: the dir holding the outermost node_modules has
+        // a package.json.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("package.json"), "{}").unwrap();
+        let local = [
+            "node_modules/@socketsecurity/socket-patch-linux-x64/bin/socket-patch",
+            // `lib` deeper than the outermost node_modules is not a prefix.
+            "node_modules/x/lib/node_modules/y/bin/socket-patch",
+        ];
+        for rel in local {
+            let p = project.path().join(rel);
+            assert_eq!(
+                upgrade_hint_for(InstallChannel::Npm, &p),
+                "npm install @socketsecurity/socket-patch@latest",
+                "{}",
+                p.display()
+            );
+        }
+        // A node_modules with no package.json beside it and no lib/ level:
+        // a version-manager global prefix (nvm-windows, fnm, Volta), so
+        // `npm update -g` (running `npm install` from an arbitrary cwd
+        // would scaffold a stray project there).
+        let prefixes = ["nvm/v20.11.0", "fnm/node-versions/v20.11.0/installation"];
+        for prefix in prefixes {
+            let root = tempfile::tempdir().unwrap();
+            let p = root
+                .path()
+                .join(prefix)
+                .join("node_modules/@socketsecurity/socket-patch-win32-x64/bin/socket-patch.exe");
+            assert_eq!(
+                upgrade_hint_for(InstallChannel::Npm, &p),
+                "npm update -g @socketsecurity/socket-patch",
+                "{}",
+                p.display()
+            );
+        }
+        // Other channels are path-independent.
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Pypi, Path::new("/work/app/node_modules/x")),
+            upgrade_hint(InstallChannel::Pypi)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn npm_hint_windows_global_prefix() {
+        let p = Path::new(
+            r"C:\Users\u\AppData\Roaming\npm\node_modules\@socketsecurity\socket-patch-win32-x64\bin\socket-patch.exe",
+        );
+        assert_eq!(
+            upgrade_hint_for(InstallChannel::Npm, p),
+            "npm update -g @socketsecurity/socket-patch"
+        );
     }
 
     #[test]

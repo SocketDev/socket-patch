@@ -170,7 +170,7 @@ fn lock_held_human_mode_mentions_other_process() {
     // the wait hint. Held always means a live process, so the only
     // honest advice is to wait (or budget a wait via --lock-timeout).
     assert!(
-        stderr.contains("Error: another socket-patch process is operating in this directory"),
+        stderr.contains("Error: Another socket-patch process is operating in this directory"),
         "stderr should carry the lock_held error line, got:\n{stderr}"
     );
     assert!(
@@ -204,7 +204,7 @@ fn lock_held_silent_mode_still_reports_error() {
         "silent human mode must not print to stdout, got:\n{stdout}"
     );
     assert!(
-        stderr.contains("Error: another socket-patch process is operating in this directory"),
+        stderr.contains("Error: Another socket-patch process is operating in this directory"),
         "--silent means errors only, not no errors: the lock_held line \
          must reach stderr, got:\n{stderr}"
     );

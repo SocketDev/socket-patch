@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use socket_patch_core::api::blob_fetcher::{
-    fetch_missing_blobs, fetch_missing_sources, format_fetch_result, get_missing_archives,
-    get_missing_blobs, DownloadMode,
+    fetch_missing_blobs, fetch_missing_sources, get_missing_archives, get_missing_blobs,
+    DownloadMode, FetchMissingBlobsResult,
 };
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
@@ -22,6 +22,7 @@ use tempfile::TempDir;
 use super::get::base64_decode;
 use crate::args::GlobalArgs;
 use crate::commands::bun_preflight::LedgerLoad;
+use crate::ui::plural;
 
 /// Resolved artifact locations for the patch pipeline. Holds the overlay
 /// `TempDir` alive — sources become invalid when this is dropped.
@@ -75,7 +76,7 @@ pub(crate) enum StageOutcome {
 
 /// The disk stager's remedy: `repair` fills the persistent `.socket/`
 /// cache `apply` reads from.
-const APPLY_OFFLINE_REMEDY: &str = "Run \"socket-patch repair\" to download missing artifacts.";
+const APPLY_OFFLINE_REMEDY: &str = "Run `socket-patch repair` to download missing artifacts.";
 
 /// The memory stager's remedy. Vendored content is fetched into memory and
 /// never lands under `.socket/`; sending a vendored project to `repair`
@@ -94,17 +95,97 @@ fn report_offline_missing(common: &GlobalArgs, purls: &[&str], remedy: &str) {
     if common.json {
         return;
     }
-    eprintln!(
-        "Error: {} patch(es) have no local source and --offline is set:",
-        purls.len()
+    let n = purls.len();
+    let (count, verb) = (
+        plural(n, "patch", "patches"),
+        if n == 1 { "has" } else { "have" },
     );
-    for purl in purls.iter().take(5) {
-        eprintln!("  - {}", purl);
-    }
-    if purls.len() > 5 {
-        eprintln!("  ... and {} more", purls.len() - 5);
+    eprintln!("Error: {count} {verb} no local source and --offline is set:");
+    for line in format_purl_list(purls, 5) {
+        eprintln!("{line}");
     }
     eprintln!("{remedy}");
+}
+
+/// `  - <purl>` for the first `max` purls, then `  ... and N more`.
+fn format_purl_list(purls: &[&str], max: usize) -> Vec<String> {
+    let mut lines: Vec<String> = purls.iter().take(max).map(|p| format!("  - {p}")).collect();
+    if purls.len() > max {
+        lines.push(format!("  ... and {} more", purls.len() - max));
+    }
+    lines
+}
+
+/// Singular and plural names of one kind of downloaded artifact.
+type Noun = (&'static str, &'static str);
+const BLOB: Noun = ("blob", "blobs");
+const DIFF_ARCHIVE: Noun = ("diff archive", "diff archives");
+
+/// What a fetch did, one line per non-zero outcome (`Downloaded 2 diff
+/// archives`, `1 blob already present locally`), plus the failures (up to
+/// five, then `... and N more`) when `with_failures`. The core formatter
+/// always says "blob(s)", whatever was fetched.
+fn format_fetch_summary(
+    result: &FetchMissingBlobsResult,
+    (one, many): Noun,
+    with_failures: bool,
+) -> Vec<String> {
+    if result.total == 0 {
+        return vec![format!("All {many} are present locally.")];
+    }
+    let mut lines = Vec::new();
+    if result.downloaded > 0 {
+        lines.push(format!(
+            "Downloaded {}",
+            plural(result.downloaded, one, many)
+        ));
+    }
+    if result.skipped > 0 {
+        lines.push(format!(
+            "{} already present locally",
+            plural(result.skipped, one, many)
+        ));
+    }
+    if with_failures && result.failed > 0 {
+        lines.extend(format_fetch_failures(result, (one, many)));
+    }
+    lines
+}
+
+/// `Failed to download N <noun>:` and the per-item reasons.
+fn format_fetch_failures(result: &FetchMissingBlobsResult, (one, many): Noun) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Failed to download {}:",
+        plural(result.failed, one, many)
+    )];
+    let failed: Vec<_> = result.results.iter().filter(|r| !r.success).collect();
+    for r in failed.iter().take(5) {
+        // Chars, not bytes: the hash is an unvalidated manifest string.
+        let short: String = r.hash.chars().take(12).collect();
+        let err = r.error.as_deref().unwrap_or("unknown error");
+        lines.push(format!("  - {short}...: {err}"));
+    }
+    if failed.len() > 5 {
+        lines.push(format!("  ... and {} more", failed.len() - 5));
+    }
+    lines
+}
+
+/// Announce the per-file blob top-up that follows a diff-mode fetch. It
+/// runs even when every diff archive arrived — a diff cannot patch a file
+/// whose bytes differ from `beforeHash`, and the pipeline then falls back
+/// to the blob — so it is worded as a complement, not a failure, unless
+/// some archives really were unavailable.
+fn format_blob_fallback(diff_failed: usize, blobs: usize) -> String {
+    let blobs = plural(blobs, "per-file blob", "per-file blobs");
+    if diff_failed == 0 {
+        format!("Also fetching {blobs} (used where a diff does not apply)...")
+    } else {
+        format!(
+            "{} unavailable; fetching {blobs} instead...",
+            plural(diff_failed, "diff archive", "diff archives")
+        )
+    }
 }
 
 /// The manifest PURLs with no usable local source. A patch is "locally
@@ -256,8 +337,9 @@ pub(crate) async fn stage_patch_sources(
     overlay_dir(&socket_diffs_path, &staged.diffs).await;
     overlay_dir(&socket_packages_path, &staged.packages).await;
 
+    // Progress: stderr, like every other status line (stdout is data).
     if !quiet {
-        println!(
+        eprintln!(
             "Downloading missing patch artifacts (mode: {})...",
             download_mode.as_tag()
         );
@@ -266,8 +348,18 @@ pub(crate) async fn stage_patch_sources(
     let sources = staged.as_patch_sources();
     let fetch_result = fetch_missing_sources(manifest, &sources, download_mode, client, None).await;
 
+    // In diff mode an unavailable archive is routine (the blob top-up
+    // below covers it), so its failure detail is held back and printed
+    // only if the patch really ends up with no source.
+    let primary_noun = match download_mode {
+        DownloadMode::File => BLOB,
+        DownloadMode::Diff => DIFF_ARCHIVE,
+    };
+    let defer_failures = download_mode != DownloadMode::File;
     if !quiet {
-        println!("{}", format_fetch_result(&fetch_result));
+        for line in format_fetch_summary(&fetch_result, primary_noun, !defer_failures) {
+            eprintln!("{line}");
+        }
     }
 
     // For non-file modes, automatically fetch any still-missing file blobs as
@@ -278,14 +370,16 @@ pub(crate) async fn stage_patch_sources(
         let still_missing_blobs = get_missing_blobs(manifest, &staged.blobs).await;
         if !still_missing_blobs.is_empty() {
             if !quiet {
-                println!(
-                    "Falling back to per-file blob downloads for {} blob(s)...",
-                    still_missing_blobs.len()
+                eprintln!(
+                    "{}",
+                    format_blob_fallback(fetch_result.failed, still_missing_blobs.len())
                 );
             }
             let blob_result = fetch_missing_blobs(manifest, &staged.blobs, client, None).await;
             if !quiet {
-                println!("{}", format_fetch_result(&blob_result));
+                for line in format_fetch_summary(&blob_result, BLOB, true) {
+                    eprintln!("{line}");
+                }
             }
             blob_fetch_failed = blob_result.failed > 0;
         }
@@ -311,7 +405,14 @@ pub(crate) async fn stage_patch_sources(
             // An error, not progress chatter: prints even under --silent
             // (same rule as report_offline_missing above).
             if !common.json {
-                eprintln!("Some artifacts could not be downloaded. Cannot apply patches.");
+                eprintln!(
+                    "Error: Some patch artifacts could not be downloaded; cannot apply patches."
+                );
+                if defer_failures && fetch_result.failed > 0 {
+                    for line in format_fetch_failures(&fetch_result, primary_noun) {
+                        eprintln!("{line}");
+                    }
+                }
             }
             return Ok(StageOutcome::Unavailable);
         }
@@ -447,9 +548,9 @@ pub(crate) async fn stage_vendor_sources_in_memory(
         }
 
         if !quiet {
-            println!(
-                "Fetching {} patch(es)' content (kept in memory)...",
-                to_fetch.len()
+            eprintln!(
+                "Fetching content for {}...",
+                plural(to_fetch.len(), "patch", "patches")
             );
         }
 
@@ -510,11 +611,11 @@ pub(crate) async fn stage_vendor_sources_in_memory(
             // for the disk stager's arms above.
             if !common.json {
                 eprintln!(
-                    "Error: could not fetch patch content for {} patch(es):",
-                    failed.len()
+                    "Error: Could not fetch patch content for {}:",
+                    plural(failed.len(), "patch", "patches")
                 );
-                for purl in failed.iter().take(5) {
-                    eprintln!("  - {}", purl);
+                for line in format_purl_list(&failed, 5) {
+                    eprintln!("{line}");
                 }
             }
             return MemStageOutcome::Unavailable;
@@ -1042,5 +1143,120 @@ mod tests {
             "proof the copy arm ran: only a write-through-the-link copy \
              creates the link target"
         );
+    }
+}
+
+/// Exact-string tests for the staging progress / error lines.
+#[cfg(test)]
+mod ui_format_tests {
+    use super::*;
+    use socket_patch_core::api::blob_fetcher::BlobFetchResult;
+
+    fn result(
+        downloaded: usize,
+        skipped: usize,
+        failures: &[(&str, &str)],
+    ) -> FetchMissingBlobsResult {
+        let mut results: Vec<BlobFetchResult> = failures
+            .iter()
+            .map(|(hash, err)| BlobFetchResult {
+                hash: hash.to_string(),
+                success: false,
+                error: Some(err.to_string()),
+            })
+            .collect();
+        results.push(BlobFetchResult {
+            hash: "ok".into(),
+            success: true,
+            error: None,
+        });
+        FetchMissingBlobsResult {
+            total: downloaded + skipped + failures.len(),
+            downloaded,
+            failed: failures.len(),
+            skipped,
+            results,
+        }
+    }
+
+    #[test]
+    fn fetch_summary_uses_the_right_noun_and_plurals() {
+        assert_eq!(
+            format_fetch_summary(&result(0, 0, &[]), BLOB, true),
+            vec!["All blobs are present locally."]
+        );
+        assert_eq!(
+            format_fetch_summary(&result(1, 0, &[]), DIFF_ARCHIVE, true),
+            vec!["Downloaded 1 diff archive"]
+        );
+        assert_eq!(
+            format_fetch_summary(&result(7, 1, &[]), BLOB, true),
+            vec!["Downloaded 7 blobs", "1 blob already present locally"]
+        );
+    }
+
+    #[test]
+    fn fetch_summary_failures_are_optional_and_capped() {
+        let fails: Vec<(String, String)> = (0..7)
+            .map(|i| (format!("{i}{}", "a".repeat(20)), "404".to_string()))
+            .collect();
+        let refs: Vec<(&str, &str)> = fails
+            .iter()
+            .map(|(h, e)| (h.as_str(), e.as_str()))
+            .collect();
+        let r = result(1, 0, &refs);
+        assert_eq!(
+            format_fetch_summary(&r, DIFF_ARCHIVE, false),
+            vec!["Downloaded 1 diff archive"]
+        );
+        let lines = format_fetch_summary(&r, DIFF_ARCHIVE, true);
+        assert_eq!(lines[1], "Failed to download 7 diff archives:");
+        assert_eq!(lines[2], "  - 0aaaaaaaaaaa...: 404");
+        assert_eq!(lines.last().unwrap(), "  ... and 2 more");
+        assert_eq!(lines.len(), 1 + 1 + 5 + 1);
+        // A multibyte hash is cut by chars, never mid-byte.
+        let r = result(0, 0, &[("é".repeat(20).as_str(), "boom")]);
+        assert_eq!(
+            format_fetch_failures(&r, BLOB),
+            vec![
+                "Failed to download 1 blob:".to_string(),
+                format!("  - {}...: boom", "é".repeat(12))
+            ]
+        );
+    }
+
+    #[test]
+    fn blob_fallback_wording() {
+        assert_eq!(
+            format_blob_fallback(0, 1),
+            "Also fetching 1 per-file blob (used where a diff does not apply)..."
+        );
+        assert_eq!(
+            format_blob_fallback(0, 7),
+            "Also fetching 7 per-file blobs (used where a diff does not apply)..."
+        );
+        assert_eq!(
+            format_blob_fallback(1, 3),
+            "1 diff archive unavailable; fetching 3 per-file blobs instead..."
+        );
+        assert_eq!(
+            format_blob_fallback(2, 1),
+            "2 diff archives unavailable; fetching 1 per-file blob instead..."
+        );
+    }
+
+    #[test]
+    fn purl_list_caps_at_max_with_remainder() {
+        assert!(format_purl_list(&[], 5).is_empty());
+        assert_eq!(
+            format_purl_list(&["pkg:npm/a@1"], 5),
+            vec!["  - pkg:npm/a@1"]
+        );
+        let many = ["a", "b", "c", "d", "e", "f", "g"];
+        let lines = format_purl_list(&many, 5);
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[4], "  - e");
+        assert_eq!(lines[5], "  ... and 2 more");
+        assert_eq!(format_purl_list(&many[..5], 5).len(), 5);
     }
 }

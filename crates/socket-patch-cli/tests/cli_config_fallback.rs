@@ -57,7 +57,9 @@ fn write_config(data_dir: &Path, json: &serde_json::Value) {
 /// project so the crawl finds nothing and no batch request fires.
 fn scan_cmd(project: &Path, data_dir: &Path) -> Command {
     let mut cmd = Command::new(BINARY);
-    cmd.args(["scan", "--json", "-e", "npm", "--cwd"])
+    // Human mode: core's proxy advisory (the oracle below) is muted under
+    // `--json`/`--silent`.
+    cmd.args(["scan", "-e", "npm", "--cwd"])
         .arg(project);
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
@@ -292,6 +294,14 @@ async fn corrupt_config_warns_and_keeps_json_stdout_clean() {
         Some(0),
         "a corrupt config must never break the run"
     );
+    let mut json_cmd = scan_cmd(project.path(), data.path());
+    json_cmd.arg("--json");
+    let json_out = run(json_cmd);
+    assert!(
+        json_out.stderr.contains("could not parse socket-cli config"),
+        "the parse warning must reach stderr under --json too; got:\n{}",
+        json_out.stderr
+    );
     assert!(
         out.stderr.contains("could not parse socket-cli config")
             && out.stderr.contains("config.json"),
@@ -303,10 +313,10 @@ async fn corrupt_config_warns_and_keeps_json_stdout_clean() {
         "with the config unusable the run falls back to the public proxy; stderr:\n{}",
         out.stderr
     );
-    serde_json::from_str::<serde_json::Value>(&out.stdout).unwrap_or_else(|e| {
+    serde_json::from_str::<serde_json::Value>(&json_out.stdout).unwrap_or_else(|e| {
         panic!(
             "--json stdout must stay parseable despite the warning ({e}); stdout:\n{}",
-            out.stdout
+            json_out.stdout
         )
     });
 }

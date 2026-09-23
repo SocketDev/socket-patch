@@ -8,6 +8,8 @@
 //! default (non-`setup-e2e`) test configuration never compiles — these
 //! always-on ports are what actually count for coverage.
 
+#[path = "common/pty_io.rs"]
+mod pty_io;
 use std::path::Path;
 
 #[path = "common/mod.rs"]
@@ -577,7 +579,7 @@ fn vex_drops_all_patches_when_projects_present_but_unwired() {
 }
 
 // ---------------------------------------------------------------------------
-// confirm_proceed's non-TTY branch (180-181): piped stdin, no --yes, no
+// ui::confirm_or_proceed's non-TTY branch: piped stdin, no --yes, no
 // --json — the normal CI shape. Auto-proceeds with a stderr note.
 // ---------------------------------------------------------------------------
 
@@ -588,7 +590,7 @@ fn setup_non_tty_auto_proceeds_without_yes() {
     write(&cwd.join("package.json"), UNWIRED_PACKAGE_JSON);
 
     // `Command::output()` (inside the shared runner) closes the child's
-    // stdin, so stdin_is_tty() is false.
+    // stdin, so stdin is not a terminal.
     let (code, stdout, stderr) = run(cwd, &["setup"]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
@@ -606,11 +608,10 @@ fn setup_non_tty_auto_proceeds_without_yes() {
 }
 
 #[test]
-fn setup_non_tty_auto_proceed_note_prints_under_silent() {
-    // Documents the CURRENT contract: `--silent` mutes the human report but
-    // prompting (and therefore the non-TTY auto-proceed note) follows the
-    // shared confirm semantics unchanged — the note still reaches stderr.
-    // If the contract is later tightened to mute it, flip this assertion.
+fn setup_non_tty_auto_proceed_note_is_muted_under_silent() {
+    // `--silent` is errors-only: the non-TTY auto-proceed note is
+    // informational, so it is muted like the rest of the human report —
+    // while the run still proceeds and wires the hook.
     let tmp = tempfile::tempdir().expect("tempdir");
     let cwd = tmp.path();
     write(&cwd.join("package.json"), UNWIRED_PACKAGE_JSON);
@@ -622,9 +623,8 @@ fn setup_non_tty_auto_proceed_note_prints_under_silent() {
         "--silent must mute stdout; got: {stdout:?}"
     );
     assert!(
-        stderr.contains("Non-interactive mode detected"),
-        "current contract: the auto-proceed note is confirm-flow output, not \
-         muted by --silent; stderr=\n{stderr}"
+        !stderr.contains("Non-interactive mode detected"),
+        "--silent must mute the auto-proceed note; stderr=\n{stderr}"
     );
     assert!(
         read(&cwd.join("package.json")).contains("socket-patch"),
@@ -639,7 +639,6 @@ fn setup_non_tty_auto_proceed_note_prints_under_silent() {
 
 #[cfg(unix)]
 mod pty {
-    use std::io::{Read, Write};
     use std::path::Path;
     use std::time::Duration;
 
@@ -682,12 +681,9 @@ mod pty {
         let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().expect("clone reader");
-        let reader_handle = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
-        });
+        let reader_handle = crate::pty_io::PtyOutput::spawn(
+            pair.master.try_clone_reader().expect("clone reader"),
+        );
 
         let mut killer = child.clone_killer();
         std::thread::spawn(move || {
@@ -696,13 +692,12 @@ mod pty {
         });
 
         let mut writer = pair.master.take_writer().expect("take writer");
-        let _ = writer.write_all(input.as_bytes());
-        let _ = writer.flush();
+        crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input.as_bytes());
         drop(writer);
 
         let status = child.wait().expect("child.wait");
         drop(pair.master);
-        let output = reader_handle.join().expect("reader join");
+        let output = reader_handle.finish();
         (
             status.exit_code() as i32,
             String::from_utf8_lossy(&output).to_string(),
@@ -730,7 +725,7 @@ fn remove_interactive_decline_aborts_without_change() {
         "declining the remove must exit cleanly; got: {output}"
     );
     assert!(
-        output.contains("Remove these install hooks? (y/N):"),
+        output.contains("Remove these install hooks? [y/N]"),
         "the interactive remove confirm must have been shown; got: {output}"
     );
     assert!(
@@ -847,10 +842,16 @@ fn setup_exclude_in_empty_dir_writes_no_socket_dir() {
 fn setup_exclude_persists_when_hooks_are_already_configured() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cwd = tmp.path();
+    // A real `packages/b` member: an `--exclude` that matches nothing is
+    // dropped before persistence (a typo must not be persisted).
     write(
         &cwd.join("package.json"),
-        &format!("{{ \"name\": \"root\", \"version\": \"1.0.0\", {WIRED_SCRIPTS_FRAGMENT} }}"),
+        &format!(
+            "{{ \"name\": \"root\", \"version\": \"1.0.0\", \"workspaces\": [\"packages/*\"], \
+             {WIRED_SCRIPTS_FRAGMENT} }}"
+        ),
     );
+    write(&cwd.join("packages/b/package.json"), UNWIRED_PACKAGE_JSON);
 
     let (code, v) = run_json(
         cwd,
@@ -901,7 +902,13 @@ fn setup_exclude_write_failure_surfaces_persist_warning() {
     use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().expect("tempdir");
     let cwd = tmp.path();
-    write(&cwd.join("package.json"), UNWIRED_PACKAGE_JSON);
+    // A real `packages/b` member: an `--exclude` that matches nothing is
+    // dropped before persistence and never reaches the write.
+    write(
+        &cwd.join("package.json"),
+        r#"{ "name": "root", "workspaces": ["packages/*"] }"#,
+    );
+    write(&cwd.join("packages/b/package.json"), UNWIRED_PACKAGE_JSON);
     let manifest_path = cwd.join(".socket/manifest.json");
     let original = r#"{"patches":{}}"#;
     write(&manifest_path, original);
@@ -1173,7 +1180,9 @@ fn check_human_report_renders_needs_and_error_lines() {
     );
     assert!(
         stdout.contains(
-            "1 manifest(s) need configuration, 1 error(s). Run `socket-patch setup` to fix."
+            "1 manifest needs configuration, 1 error. Run `socket-patch setup` to add the \
+             missing install hooks. Fix the errors above, then re-run `socket-patch setup \
+             --check`."
         ),
         "the summary must count needs and errors; stdout=\n{stdout}"
     );
@@ -1283,7 +1292,7 @@ fn remove_human_dry_run_summary_renders_both_removed_forms() {
         "a deleted lifecycle key must render as (removed); stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("1 item(s) would have socket-patch removed"),
+        stdout.contains("1 item would have socket-patch removed"),
         "the human dry-run summary must count the pending removals; stdout=\n{stdout}"
     );
     assert_eq!(
@@ -1381,7 +1390,7 @@ fn remove_human_write_stage_error_counts_and_exits_nonzero() {
 
     assert_eq!(code, 1, "a failed write must exit 1; stdout=\n{stdout}");
     assert!(
-        stdout.contains("1 error(s)"),
+        stdout.contains("  1 error\n"),
         "the human summary must count the write failure; stdout=\n{stdout}"
     );
     assert!(
@@ -1538,7 +1547,7 @@ fn setup_human_preview_counts_already_configured() {
         "the wired root must be counted as a skip; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("1 item(s) updated"),
+        stdout.contains("1 item updated"),
         "the unwired member must still be updated; stdout=\n{stdout}"
     );
     assert!(
@@ -1554,18 +1563,33 @@ fn setup_human_preview_counts_already_configured() {
 fn setup_human_summary_surfaces_persist_warning() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cwd = tmp.path();
-    write(&cwd.join("package.json"), UNWIRED_PACKAGE_JSON);
+    // A real `packages/b` member: an `--exclude` that matches nothing is
+    // dropped before persistence and never reaches the fail-closed read.
+    write(
+        &cwd.join("package.json"),
+        r#"{ "name": "root", "workspaces": ["packages/*"] }"#,
+    );
+    write(&cwd.join("packages/b/package.json"), UNWIRED_PACKAGE_JSON);
     let corrupt = "not json {{{";
     write(&cwd.join(".socket/manifest.json"), corrupt);
 
-    let (code, stdout, _stderr) = run(cwd, &["setup", "--yes", "--exclude", "packages/b"]);
+    let (code, stdout, stderr) = run(cwd, &["setup", "--yes", "--exclude", "packages/b"]);
     assert_eq!(
         code, 0,
         "the skip is a warning, not an error; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("warning: not persisting --exclude"),
-        "the human summary must surface the fail-closed persistence skip; stdout=\n{stdout}"
+        stderr.contains("Warning: Not persisting --exclude"),
+        "stderr must surface the fail-closed persistence skip; stderr=\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("Not persisting --exclude").count(),
+        1,
+        "reported once, not again in the summary; stderr=\n{stderr}"
+    );
+    assert!(
+        !stdout.to_lowercase().contains("not persisting"),
+        "warnings stay off stdout; stdout=\n{stdout}"
     );
     assert_eq!(
         read(&cwd.join(".socket/manifest.json")),
@@ -1597,11 +1621,11 @@ fn setup_human_summary_counts_errors() {
 
     assert_eq!(code, 1, "a partial failure must exit 1; stdout=\n{stdout}");
     assert!(
-        stdout.contains("1 item(s) updated"),
+        stdout.contains("1 item updated"),
         "the readable root must still be updated; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("1 error(s)"),
+        stdout.contains("  1 error\n"),
         "the human summary must count the unreadable member; stdout=\n{stdout}"
     );
 }
@@ -1640,8 +1664,8 @@ fn remove_human_surfaces_poetry_lock_refresh_warning() {
         "a failed lock refresh is a warning, not an error; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("warning: could not run `poetry"),
-        "the human summary must warn that the refresh could not run; stdout=\n{stdout}"
+        stderr.contains("Warning: Could not run `poetry"),
+        "stderr must warn that the refresh could not run; stderr=\n{stderr}"
     );
     // The edit itself must still have happened: the hook extra is gone. (For
     // the classic-Poetry inline-table form, current remove semantics strip
@@ -1680,11 +1704,73 @@ fn remove_json_surfaces_poetry_lock_refresh_warning() {
     );
 }
 
+/// `--yes` shows no prompt, so the prompt separator must not stack on the
+/// blank line that opens "Applying changes..." / "Removing install hooks...".
+#[test]
+fn setup_and_remove_with_yes_print_no_double_blank_line() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path();
+    write(&cwd.join("package.json"), UNWIRED_PACKAGE_JSON);
+
+    let (code, stdout, stderr) = run(cwd, &["setup", "--yes"]);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stderr.contains("\nApplying changes..."),
+        "stderr=\n{stderr}"
+    );
+    assert!(!stderr.contains("\n\n\n"), "stderr=\n{stderr:?}");
+
+    let (code, stdout, stderr) = run(cwd, &["setup", "--remove", "--yes"]);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(
+        stderr.contains("\nRemoving install hooks..."),
+        "stderr=\n{stderr}"
+    );
+    assert!(!stderr.contains("\n\n\n"), "stderr=\n{stderr:?}");
+}
+
+/// A mistyped `--exclude` is warned about and NOT persisted, so later runs
+/// and clones do not inherit the typo; a matching value in the same run is.
+#[test]
+fn setup_does_not_persist_an_unmatched_exclude() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path();
+    write(
+        &cwd.join("package.json"),
+        r#"{ "name": "root", "workspaces": ["packages/*"] }"#,
+    );
+    write(&cwd.join("packages/a/package.json"), UNWIRED_PACKAGE_JSON);
+
+    let (code, stdout, stderr) = run(
+        cwd,
+        &["setup", "--yes", "--exclude", "nope", "--exclude", "packages/a"],
+    );
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert_eq!(
+        stderr
+            .matches("Warning: --exclude \"nope\" matched no workspace member")
+            .count(),
+        1,
+        "stderr=\n{stderr}"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&read(&cwd.join(".socket/manifest.json"))).expect("manifest json");
+    assert_eq!(
+        manifest["setup"]["exclude"],
+        serde_json::json!(["packages/a"]),
+        "only the matching exclude is persisted"
+    );
+    assert!(
+        !read(&cwd.join("packages/a/package.json")).contains("socket-patch"),
+        "the excluded member stays unwired"
+    );
+}
+
 // ───────────── --check: unreadable vendor ledger on a manifest-free project ─────────────
 
 /// Contract §5: `--check` (property 4) reads the vendor ledger even without a
 /// manifest, and a ledger it cannot read or parse is surfaced as the
-/// `Warning: unreadable vendor state (…)` line plus a `vendor_ledger` error
+/// `Warning: Unreadable vendor state (…)` line plus a `vendor_ledger` error
 /// entry — verdict `error`, exit 1 — never as a `configured` verdict. The
 /// manifest-free vendored project (the only `scan`/`get --mode vendored`
 /// posture) is exactly where the corrupt ledger used to be swallowed: hooks
@@ -1731,7 +1817,7 @@ fn check_reports_an_unreadable_vendor_ledger_instead_of_configured() {
     );
     let (_code, _stdout, stderr) = run(cwd, &["setup", "--check", "--json"]);
     assert!(
-        stderr.contains("unreadable vendor state") && stderr.contains("corrupt"),
+        stderr.contains("Warning: Unreadable vendor state") && stderr.contains("corrupt"),
         "the contract's warning line reaches stderr; stderr=\n{stderr}"
     );
 
@@ -1739,11 +1825,11 @@ fn check_reports_an_unreadable_vendor_ledger_instead_of_configured() {
     let (code, stdout, stderr) = run(cwd, &["setup", "--check"]);
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains(".socket/vendor/state.json") && stdout.contains("1 error(s)"),
+        stdout.contains(".socket/vendor/state.json") && stdout.contains("1 error."),
         "stdout=\n{stdout}"
     );
     assert!(
-        stderr.contains("unreadable vendor state"),
+        stderr.contains("Warning: Unreadable vendor state"),
         "stderr=\n{stderr}"
     );
 

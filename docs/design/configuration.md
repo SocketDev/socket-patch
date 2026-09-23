@@ -102,8 +102,9 @@ UX policy and are ignored.
   bool-parsing dialects (`parse_bool_flag` vs stock `BoolishValueParser` on
   `--all-releases`, bare clap bool on `get --one-off`, `env_truthy`'s
   `1|true`-only match on the experimental gates and core's `SOCKET_OFFLINE`
-  reader); honor `NO_COLOR` (and `FORCE_COLOR`/`CLICOLOR_FORCE`) in
-  `output.rs`, which today keys only off `is_terminal()`; document
+  reader); consider `FORCE_COLOR` as an alias for `CLICOLOR_FORCE` in
+  `ui::color_enabled` (which already honors `NO_COLOR`, `CLICOLOR`,
+  `CLICOLOR_FORCE` and `TERM=dumb`); document
   `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` support in the README.
 - **`SOCKET_API_TOKEN_FILE` / keychain sourcing** for the token — the
   conventional next step for secret hygiene; not urgent now that the

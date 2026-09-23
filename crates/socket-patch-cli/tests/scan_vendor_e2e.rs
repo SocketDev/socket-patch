@@ -737,6 +737,18 @@ async fn scan_vendor_detached_fetch_failure_reports_error() {
         "the failed fetch must be reported on stderr, not swallowed; \
          stdout={stdout}; stderr={stderr}"
     );
+    // With --yes no prompt was answered, so the header gets no blank line
+    // of its own (the listing's trailing blank line separates the sections).
+    assert!(
+        stderr.contains("Downloading 1 patch...")
+            && !stderr.starts_with('\n')
+            && !stderr.contains("\n\nDownloading"),
+        "no extra blank line before the header under --yes; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("Nothing was vendored: 1 patch failed (see above)."),
+        "the run ends with the empty-run line; stdout={stdout}"
+    );
 }
 
 #[tokio::test]

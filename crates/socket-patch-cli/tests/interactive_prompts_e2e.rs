@@ -1,13 +1,14 @@
-//! End-to-end tests that drive interactive `dialoguer` prompts via a
-//! pseudo-terminal. These exercise the `stdin_is_tty()`-gated
-//! confirmation paths in `setup`, `remove`, and `get` that
-//! subprocess-with-piped-stdin tests can't reach.
+//! End-to-end tests that drive interactive prompts (`ui::confirm`,
+//! `ui::confirm_or_proceed`) via a pseudo-terminal. These exercise the
+//! stdin-is-a-terminal-gated confirmation paths in `setup`, `remove`, and
+//! `get` that subprocess-with-piped-stdin tests can't reach.
 //!
 //! PTY support: macOS + Linux. Skipped on Windows.
 
 #![cfg(unix)]
 
-use std::io::{Read, Write};
+#[path = "common/pty_io.rs"]
+mod pty_io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -113,12 +114,9 @@ fn run_in_pty_bytes(args: &[&str], cwd: &Path, input: &[u8], timeout: Duration) 
     // closed. The previous design used a chunked read+mpsc loop
     // because it interleaved with a try_wait poll; the simplified
     // design serializes wait → drop master → read_to_end joins.
-    let mut reader = pair.master.try_clone_reader().expect("clone reader");
-    let reader_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        buf
-    });
+    let reader_handle = crate::pty_io::PtyOutput::spawn(
+        pair.master.try_clone_reader().expect("clone reader"),
+    );
 
     // Watchdog: detach a thread that kills the child after `timeout`.
     // The cloned ChildKiller is independent of the main `child`
@@ -131,12 +129,12 @@ fn run_in_pty_bytes(args: &[&str], cwd: &Path, input: &[u8], timeout: Duration) 
         let _ = killer.kill();
     });
 
-    // Writer: send input then close. PTY buffers absorb the write so
-    // no pre-sleep is needed — dialoguer/rustyline will read it when
-    // their prompt loop polls stdin.
+    // Writer: send input once a prompt is on screen, then close.
+    // `ui::confirm` discards typeahead right before it prompts, so input
+    // written any earlier would be thrown away (see
+    // `pty_io::send_when_prompted`).
     let mut writer = pair.master.take_writer().expect("take writer");
-    let _ = writer.write_all(input);
-    let _ = writer.flush();
+    crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input);
     drop(writer);
 
     // Block until the child exits (watchdog enforces the timeout).
@@ -145,7 +143,7 @@ fn run_in_pty_bytes(args: &[&str], cwd: &Path, input: &[u8], timeout: Duration) 
     // returns.
     drop(pair.master);
 
-    let output = reader_handle.join().expect("reader thread join");
+    let output = reader_handle.finish();
     let code = status.exit_code() as i32;
     (code, String::from_utf8_lossy(&output).to_string())
 }
@@ -163,7 +161,7 @@ fn setup_interactive_y_proceeds_with_update() {
     )
     .unwrap();
 
-    // Without --yes, setup prompts "Proceed with these changes? (y/N): ".
+    // Without --yes, setup prompts "Proceed with these changes? [y/N] ".
     // Sending "y\n" should make it proceed with the update.
     let (code, output) = run_in_pty(&["setup"], tmp.path(), "y\n", Duration::from_secs(15));
     assert_eq!(code, 0, "setup with 'y' must succeed");
@@ -265,10 +263,9 @@ fn setup_interactive_default_no_aborts() {
 #[test]
 fn setup_interactive_non_utf8_answer_aborts_without_panic() {
     // Same regression class as remove_interactive_non_utf8_answer_
-    // declines_without_panic below, but for setup's own prompt reader
-    // (`confirm_proceed`), a separate implementation from
-    // `output::confirm`: a Latin-1 paste (`é` = 0xE9) at
-    // "Proceed with these changes? (y/N): " makes `read_line` return
+    // declines_without_panic below, but for setup's default-no gate
+    // (`ui::confirm_or_proceed`): a Latin-1 paste (`é` = 0xE9) at
+    // "Proceed with these changes? [y/N] " makes `read_line` return
     // InvalidData, and unwrapping it panics the CLI (exit 101) instead
     // of treating the unreadable answer as "not yes" (abort).
     let tmp = tempfile::tempdir().unwrap();
@@ -350,13 +347,13 @@ fn remove_interactive_y_proceeds() {
     assert_eq!(code, 0);
     // The interactive confirm MUST have run (printed to the tty via stderr),
     // not the non-interactive auto-default branch. Match the DISTINCTIVE
-    // prompt text ("...and rollback files?") rather than the loose pair
+    // prompt text ("...without rolling back its files?") rather than the loose pair
     // `contains("Remove") && contains("patch(es)")` — the latter is also
     // satisfied by the SUCCESS line "Removed 1 patch(es) from manifest:",
     // so it would stay green even if the confirm prompt were dropped and the
     // command auto-removed. The exact count ("1") pins single-entry preview.
     assert!(
-        output.contains("Remove 1 patch(es) and rollback files?"),
+        output.contains("Remove 1 patch from the manifest without rolling back its files?"),
         "remove must have shown the interactive confirm prompt verbatim; got: {output}"
     );
     assert!(
@@ -401,7 +398,7 @@ fn remove_interactive_n_cancels() {
     // `contains("Remove") && contains("patch(es)")` pair could also be matched
     // by the preview banner, masking a dropped confirm prompt.
     assert!(
-        output.contains("Remove 1 patch(es) and rollback files?"),
+        output.contains("Remove 1 patch from the manifest without rolling back its files?"),
         "remove must have shown the interactive confirm prompt verbatim; got: {output}"
     );
     assert!(
@@ -467,7 +464,7 @@ fn remove_interactive_non_utf8_answer_declines_without_panic() {
     // The interactive confirm MUST have run (same vacuity guard as the
     // y/n tests above), and the unreadable answer must land on "no".
     assert!(
-        output.contains("Remove 1 patch(es) and rollback files?"),
+        output.contains("Remove 1 patch from the manifest without rolling back its files?"),
         "remove must have shown the interactive confirm prompt; got: {output}"
     );
     assert!(
@@ -542,7 +539,7 @@ fn remove_detached_interactive_n_cancel_message_respects_silent() {
     // an early error (e.g. a broken ledger fixture) would pass the absence
     // assertion below without ever reaching the cancel branch.
     assert!(
-        output.contains("Remove 1 vendored patch(es) and revert their vendoring?"),
+        output.contains("Remove 1 vendored patch and revert its vendoring?"),
         "detached remove must have shown its confirm prompt; got: {output}"
     );
     assert!(

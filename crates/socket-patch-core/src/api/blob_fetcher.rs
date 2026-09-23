@@ -301,52 +301,148 @@ async fn fetch_missing_diff_archives(
     }
 }
 
-/// Format a [`FetchMissingBlobsResult`] as a human-readable string.
+/// What kind of artifact a fetch or cleanup result counts, for human
+/// output: the singular/plural noun and whether ids are long enough to be
+/// worth abbreviating (64-hex blob hashes are; patch UUIDs are the lookup
+/// key a user greps for, so they print in full).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactNoun {
+    pub one: &'static str,
+    pub many: &'static str,
+    pub abbreviate_ids: bool,
+}
+
+impl ArtifactNoun {
+    /// `"1 blob"` / `"2 blobs"` / `"0 blobs"`.
+    pub fn count(&self, n: usize) -> String {
+        format!("{n} {}", if n == 1 { self.one } else { self.many })
+    }
+
+    /// An id as listed under a result: abbreviated to 12 characters plus
+    /// `...` only when that actually shortens it. Counts characters, not
+    /// bytes: ids are unvalidated manifest strings, and a byte slice
+    /// panics when index 12 lands inside a multibyte char.
+    pub fn display_id(&self, id: &str) -> String {
+        const SHORT: usize = 12;
+        if self.abbreviate_ids && id.chars().count() > SHORT {
+            format!("{}...", id.chars().take(SHORT).collect::<String>())
+        } else {
+            id.to_string()
+        }
+    }
+}
+
+/// Per-file content blobs (`.socket/blobs/<hash>`).
+pub const BLOB: ArtifactNoun = ArtifactNoun {
+    one: "blob",
+    many: "blobs",
+    abbreviate_ids: true,
+};
+
+/// Per-patch diff archives (`.socket/diffs/<uuid>.tar.gz`).
+pub const DIFF_ARCHIVE: ArtifactNoun = ArtifactNoun {
+    one: "diff archive",
+    many: "diff archives",
+    abbreviate_ids: false,
+};
+
+/// Per-patch package archives (`.socket/packages/<uuid>.tar.gz`).
+pub const PACKAGE_ARCHIVE: ArtifactNoun = ArtifactNoun {
+    one: "package archive",
+    many: "package archives",
+    abbreviate_ids: false,
+};
+
+impl DownloadMode {
+    /// The artifact noun a download in this mode fetches.
+    pub fn noun(&self) -> ArtifactNoun {
+        match self {
+            DownloadMode::Diff => DIFF_ARCHIVE,
+            DownloadMode::File => BLOB,
+        }
+    }
+}
+
+/// How many failures a fetch result lists before "... and N more".
+const MAX_LISTED_FAILURES: usize = 5;
+
+/// Format a [`FetchMissingBlobsResult`] of per-file blobs as a
+/// human-readable string (see [`format_fetch_result_for`]).
 pub fn format_fetch_result(result: &FetchMissingBlobsResult) -> String {
-    if result.total == 0 {
-        return "All blobs are present locally.".to_string();
+    format_fetch_result_for(result, BLOB)
+}
+
+/// Format a [`FetchMissingBlobsResult`] counting `noun`s: the success
+/// counts first, then the failures sorted by id (the result's order comes
+/// from a `HashSet`), at most five listed.
+pub fn format_fetch_result_for(result: &FetchMissingBlobsResult, noun: ArtifactNoun) -> String {
+    let mut lines = format_fetch_successes(result, noun);
+    lines.extend(format_fetch_failures(result, noun));
+    if lines.is_empty() {
+        // `total > 0` with nothing downloaded, skipped, or failed should
+        // not be reachable; never emit a misleading blank string.
+        return format!("All {} are present locally.", noun.many);
     }
+    lines.join("\n")
+}
 
-    let mut lines: Vec<String> = Vec::new();
-
+/// The success half of [`format_fetch_result_for`] ("Downloaded 2 blobs",
+/// "1 blob already present locally"), for callers that route failures to
+/// a different stream. Empty when nothing succeeded.
+pub fn format_fetch_successes(result: &FetchMissingBlobsResult, noun: ArtifactNoun) -> Vec<String> {
+    let mut lines = Vec::new();
     if result.downloaded > 0 {
-        lines.push(format!("Downloaded {} blob(s)", result.downloaded));
+        lines.push(format!("Downloaded {}", noun.count(result.downloaded)));
     }
-
     if result.skipped > 0 {
         lines.push(format!(
-            "{} blob(s) already present locally",
-            result.skipped
+            "{} already present locally",
+            noun.count(result.skipped)
         ));
     }
+    lines
+}
 
-    if result.failed > 0 {
-        lines.push(format!("Failed to download {} blob(s)", result.failed));
+/// The failure half of [`format_fetch_result_for`]: a "Failed to download
+/// N <noun>s" header and up to five `  - <id>: <error>` lines, sorted by
+/// id. Empty when nothing failed.
+pub fn format_fetch_failures(result: &FetchMissingBlobsResult, noun: ArtifactNoun) -> Vec<String> {
+    if result.failed == 0 {
+        return Vec::new();
+    }
+    let mut lines = vec![format!("Failed to download {}", noun.count(result.failed))];
+    let mut failed: Vec<&BlobFetchResult> = result.results.iter().filter(|r| !r.success).collect();
+    failed.sort_by(|a, b| a.hash.cmp(&b.hash));
+    for r in failed.iter().take(MAX_LISTED_FAILURES) {
+        let err = r.error.as_deref().unwrap_or("unknown error");
+        lines.push(format!(
+            "  - {}: {}",
+            noun.display_id(&r.hash),
+            concise_fetch_error(err, &r.hash)
+        ));
+    }
+    if failed.len() > MAX_LISTED_FAILURES {
+        lines.push(format!(
+            "  ... and {} more",
+            failed.len() - MAX_LISTED_FAILURES
+        ));
+    }
+    lines
+}
 
-        let failed_results: Vec<&BlobFetchResult> =
-            result.results.iter().filter(|r| !r.success).collect();
-
-        for r in failed_results.iter().take(5) {
-            // Truncate by characters, not bytes: the hash field carries
-            // arbitrary manifest strings, and a byte slice panics when index
-            // 12 lands inside a multibyte char.
-            let short_hash: String = r.hash.chars().take(12).collect();
-            let err = r.error.as_deref().unwrap_or("unknown error");
-            lines.push(format!("  - {}...: {}", short_hash, err));
-        }
-
-        if failed_results.len() > 5 {
-            lines.push(format!("  ... and {} more", failed_results.len() - 5));
+/// Drop the id the client's error repeats: the line already starts with
+/// it, so `Network error fetching diff <uuid>: <cause>` reads as
+/// `network error: <cause>`. Anything else is returned unchanged.
+fn concise_fetch_error<'a>(err: &'a str, id: &str) -> std::borrow::Cow<'a, str> {
+    if let Some(rest) = err.strip_prefix("Network error fetching ") {
+        // `<kind> <id>: <cause>`
+        if let Some((_kind, tail)) = rest.split_once(' ') {
+            if let Some(cause) = tail.strip_prefix(id).and_then(|t| t.strip_prefix(": ")) {
+                return format!("network error: {cause}").into();
+            }
         }
     }
-
-    // `total > 0` but nothing downloaded, skipped, or failed should not be
-    // reachable, but guard against emitting a misleading blank string.
-    if lines.is_empty() {
-        return "All blobs are present locally.".to_string();
-    }
-
-    lines.join("\n")
+    err.into()
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────
@@ -630,10 +726,10 @@ mod tests {
             ],
         };
         let output = format_fetch_result(&result);
-        assert!(output.contains("Downloaded 2 blob(s)"));
-        assert!(output.contains("Failed to download 1 blob(s)"));
-        assert!(output.contains("cccccccccccc..."));
-        assert!(output.contains("Blob not found on server"));
+        assert_eq!(
+            output,
+            "Downloaded 2 blobs\nFailed to download 1 blob\n  - cccccccccccc...: Blob not found on server"
+        );
     }
 
     #[test]
@@ -685,7 +781,7 @@ mod tests {
             ],
         };
         let output = format_fetch_result(&result);
-        assert!(output.contains("Downloaded 3 blob(s)"));
+        assert_eq!(output, "Downloaded 3 blobs");
         assert!(!output.contains("Failed"));
     }
 
@@ -703,8 +799,8 @@ mod tests {
             }],
         };
         let output = format_fetch_result(&result);
-        // Hash is < 12 chars, should show full hash
-        assert!(output.contains("abc..."));
+        // Hash is < 12 chars: shown in full, with no false ellipsis.
+        assert_eq!(output, "Failed to download 1 blob\n  - abc: not found");
     }
 
     #[test]
@@ -728,7 +824,7 @@ mod tests {
             }],
         };
         let output = format_fetch_result(&result);
-        assert!(output.contains("Failed to download 1 blob(s)"));
+        assert!(output.contains("Failed to download 1 blob\n"));
         assert!(
             output.contains("aaaaaaaaaaa→..."),
             "12-char prefix expected: {output:?}"
@@ -879,7 +975,7 @@ mod tests {
         };
         let output = format_fetch_result(&result);
         assert!(!output.trim().is_empty(), "must not be blank: {:?}", output);
-        assert!(output.contains("2 blob(s) already present"));
+        assert_eq!(output, "2 blobs already present locally");
         assert!(!output.contains("Downloaded"));
         assert!(!output.contains("Failed"));
     }
@@ -910,8 +1006,7 @@ mod tests {
             ],
         };
         let output = format_fetch_result(&result);
-        assert!(output.contains("Downloaded 1 blob(s)"));
-        assert!(output.contains("2 blob(s) already present"));
+        assert_eq!(output, "Downloaded 1 blob\n2 blobs already present locally");
     }
 
     // ── Regression: hash comparison is case-insensitive ──────────────
@@ -1066,6 +1161,139 @@ mod tests {
         };
         let output = format_fetch_result(&result);
         assert!(!output.contains("Downloaded"));
-        assert!(output.contains("Failed to download 2 blob(s)"));
+        assert!(
+            output.starts_with("Failed to download 2 blobs\n"),
+            "{output}"
+        );
+    }
+
+    fn failure(id: &str, error: &str) -> BlobFetchResult {
+        BlobFetchResult {
+            hash: id.to_string(),
+            success: false,
+            error: Some(error.to_string()),
+        }
+    }
+
+    fn failed_result(results: Vec<BlobFetchResult>) -> FetchMissingBlobsResult {
+        FetchMissingBlobsResult {
+            total: results.len(),
+            failed: results.len(),
+            results,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn artifact_noun_counts_singular_and_plural() {
+        assert_eq!(BLOB.count(0), "0 blobs");
+        assert_eq!(BLOB.count(1), "1 blob");
+        assert_eq!(BLOB.count(2), "2 blobs");
+        assert_eq!(DIFF_ARCHIVE.count(1), "1 diff archive");
+        assert_eq!(DIFF_ARCHIVE.count(3), "3 diff archives");
+        assert_eq!(PACKAGE_ARCHIVE.count(1), "1 package archive");
+        assert_eq!(DownloadMode::Diff.noun(), DIFF_ARCHIVE);
+        assert_eq!(DownloadMode::File.noun(), BLOB);
+    }
+
+    #[test]
+    fn display_id_abbreviates_only_long_blob_hashes() {
+        assert_eq!(BLOB.display_id(&"a".repeat(64)), "aaaaaaaaaaaa...");
+        // Exactly 12 characters: nothing cut, so no ellipsis.
+        assert_eq!(BLOB.display_id("abcdefabcdef"), "abcdefabcdef");
+        assert_eq!(BLOB.display_id("22"), "22");
+        assert_eq!(BLOB.display_id(""), "");
+        // Multibyte: counted in chars, never sliced mid-char.
+        assert_eq!(
+            BLOB.display_id(&"é".repeat(13)),
+            format!("{}...", "é".repeat(12))
+        );
+        // UUIDs are the lookup key: always in full.
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        assert_eq!(DIFF_ARCHIVE.display_id(uuid), uuid);
+    }
+
+    #[test]
+    fn diff_mode_result_names_diff_archives_and_full_uuids_sorted() {
+        let result = failed_result(vec![
+            failure(
+                "22222222-2222-4222-8222-222222222222",
+                "Diff archive not found on server",
+            ),
+            failure(
+                "11111111-1111-4111-8111-111111111111",
+                "Network error fetching diff 11111111-1111-4111-8111-111111111111: \
+                 error sending request for url (http://127.0.0.1:9/patch/diff/x)",
+            ),
+        ]);
+        assert_eq!(
+            format_fetch_result_for(&result, DIFF_ARCHIVE),
+            "Failed to download 2 diff archives\n\
+             \x20 - 11111111-1111-4111-8111-111111111111: network error: \
+             error sending request for url (http://127.0.0.1:9/patch/diff/x)\n\
+             \x20 - 22222222-2222-4222-8222-222222222222: Diff archive not found on server"
+        );
+        let empty = FetchMissingBlobsResult::default();
+        assert_eq!(
+            format_fetch_result_for(&empty, DIFF_ARCHIVE),
+            "All diff archives are present locally."
+        );
+    }
+
+    #[test]
+    fn failures_are_listed_in_sorted_order_regardless_of_input_order() {
+        let ids = ["e", "b", "a", "d", "c", "g", "f"];
+        let result = failed_result(ids.iter().map(|id| failure(id, "x")).collect());
+        assert_eq!(
+            format_fetch_failures(&result, BLOB),
+            vec![
+                "Failed to download 7 blobs",
+                "  - a: x",
+                "  - b: x",
+                "  - c: x",
+                "  - d: x",
+                "  - e: x",
+                "  ... and 2 more",
+            ]
+        );
+    }
+
+    #[test]
+    fn successes_and_failures_split_cleanly() {
+        let mut result = failed_result(vec![failure("abc", "boom")]);
+        result.total = 3;
+        result.downloaded = 1;
+        result.skipped = 1;
+        assert_eq!(
+            format_fetch_successes(&result, BLOB),
+            vec!["Downloaded 1 blob", "1 blob already present locally"]
+        );
+        assert_eq!(
+            format_fetch_failures(&result, BLOB),
+            vec!["Failed to download 1 blob", "  - abc: boom"]
+        );
+        assert!(format_fetch_failures(&FetchMissingBlobsResult::default(), BLOB).is_empty());
+        assert!(format_fetch_successes(&FetchMissingBlobsResult::default(), BLOB).is_empty());
+    }
+
+    #[test]
+    fn concise_fetch_error_drops_only_the_repeated_id() {
+        assert_eq!(
+            concise_fetch_error("Network error fetching blob abc: timed out", "abc"),
+            "network error: timed out"
+        );
+        // A different id (or any other shape) is left alone.
+        assert_eq!(
+            concise_fetch_error("Network error fetching blob zzz: timed out", "abc"),
+            "Network error fetching blob zzz: timed out"
+        );
+        assert_eq!(
+            concise_fetch_error("Blob not found on server", "abc"),
+            "Blob not found on server"
+        );
+        assert_eq!(
+            concise_fetch_error("Network error fetching ", "abc"),
+            "Network error fetching "
+        );
     }
 }

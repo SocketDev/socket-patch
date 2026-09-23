@@ -260,7 +260,7 @@ fn list_non_json_minimal_record_omits_empty_sections() {
     );
     assert_eq!(code, 0, "stderr:\n{stderr}");
     assert!(
-        stdout.contains("Found 2 patch(es)"),
+        stdout.contains("Found 2 patches:"),
         "both records must list; got: {stdout}"
     );
 
@@ -278,7 +278,7 @@ fn list_non_json_minimal_record_omits_empty_sections() {
     // omission assertions on B below cannot pass vacuously.
     let ghsa_block = package_block(&stdout, "pkg:npm/ghsa-only@1.0.0");
     assert!(
-        ghsa_block.contains("Vulnerabilities (1):") && ghsa_block.contains("Severity: high"),
+        ghsa_block.contains("Vulnerabilities (1):") && ghsa_block.contains("Severity: HIGH"),
         "the populated record must print its vulnerability section; got: {ghsa_block}"
     );
     assert!(

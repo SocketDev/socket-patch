@@ -28,6 +28,7 @@ use crate::commands::vendor::dispatch_revert_one_opts;
 use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls};
 use crate::json_envelope::Command as EnvelopeCommand;
 use crate::looks_like_uuid;
+use crate::ui::{plural, StatusLine};
 
 /// Pin the beforeHash blobs of `purls` into `reference` as synthetic keep
 /// records: `cleanup_unused_blobs` keeps only afterHash blobs (beforeHash
@@ -98,14 +99,13 @@ pub struct RollbackArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    /// Rollback a patch by fetching beforeHash blobs from API (no manifest required).
-    ///
-    /// `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
-    /// clap's default bool parser accepts only the literal strings
-    /// `true`/`false` from the env binding, so `SOCKET_ONE_OFF=1` (or an
-    /// exported-but-empty `SOCKET_ONE_OFF=`) aborted every `rollback`
-    /// invocation. This flag is also outside `GLOBAL_ARG_ENV_VARS`, so
-    /// `main`'s empty-var scrub never rescues it.
+    // `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
+    // clap's default bool parser accepts only the literal strings
+    // `true`/`false` from the env binding, so `SOCKET_ONE_OFF=1` (or an
+    // exported-but-empty `SOCKET_ONE_OFF=`) aborted every `rollback`
+    // invocation. This flag is also outside `GLOBAL_ARG_ENV_VARS`, so
+    // `main`'s empty-var scrub never rescues it.
+    /// Roll back a patch by fetching beforeHash blobs from the API (no manifest required).
     #[arg(
         long = "one-off",
         env = "SOCKET_ONE_OFF",
@@ -127,6 +127,315 @@ pub struct RollbackArgs {
         value_parser = parse_bool_flag,
     )]
     pub preserve_state: bool,
+}
+
+/// Join prompt clauses as an English list: `a`, `a and b`, `a, b, and c`.
+pub(crate) fn join_clauses(clauses: &[String]) -> String {
+    match clauses {
+        [] => String::new(),
+        [one] => one.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [init @ .., last] => format!("{}, and {last}", init.join(", ")),
+    }
+}
+
+/// `msg` with its first character uppercased: human `Error: …` lines
+/// start with a capital even when the message (shared with the JSON
+/// envelope, which keeps it verbatim) does not. A message that opens with
+/// a value rather than a word — a purl, a patch UUID, a path, a flag — is
+/// returned unchanged: capitalizing it would corrupt text the user may
+/// copy and paste.
+pub(crate) fn capitalize_first(msg: &str) -> String {
+    let first_word = msg
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches([',', '.', ';', ':']);
+    let is_plain_word = !first_word.is_empty()
+        && first_word
+            .chars()
+            .all(|c| c.is_alphabetic() || c == '\'' || c == '-')
+        && first_word.chars().next().is_some_and(char::is_alphabetic);
+    if !is_plain_word {
+        return msg.to_string();
+    }
+    let mut chars = msg.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
+}
+
+/// Capitalize the first character and end with `?`.
+pub(crate) fn as_question(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    format!("{}?", capitalize_first(text))
+}
+
+/// The default (destructive) rollback's confirmation prompt, naming only
+/// the legs that have work.
+fn rollback_prompt(
+    manifest: usize,
+    vendored: usize,
+    hosted: usize,
+    leftover_edits: usize,
+) -> String {
+    let mut clauses: Vec<String> = Vec::new();
+    if manifest > 0 {
+        clauses.push(format!(
+            "roll back {}",
+            plural(manifest, "patch", "patches")
+        ));
+        clauses.push(format!(
+            "remove {} from the local manifest",
+            if manifest == 1 { "it" } else { "them" }
+        ));
+    }
+    if vendored > 0 {
+        // Vendored-mode entries live only in the ledger (their embedded
+        // patch record is the local copy), so name the ledger records as
+        // what goes, the way the manifest clause names its entries.
+        clauses.push(format!(
+            "delete {} and {} ledger {}",
+            plural(vendored, "vendored artifact", "vendored artifacts"),
+            if vendored == 1 { "its" } else { "their" },
+            if vendored == 1 { "record" } else { "records" }
+        ));
+    }
+    if hosted > 0 {
+        clauses.push(format!(
+            "unwind {}",
+            plural(hosted, "hosted redirect", "hosted redirects")
+        ));
+    } else if leftover_edits > 0 {
+        clauses.push(format!(
+            "replay {}",
+            plural(
+                leftover_edits,
+                "leftover hosted redirect edit",
+                "leftover hosted redirect edits"
+            )
+        ));
+    }
+    as_question(&join_clauses(&clauses))
+}
+
+/// Where a physical copy lives, relative to `cwd` when it is inside it.
+/// Shared with `apply`.
+pub(crate) fn display_copy_path(package_path: &str, cwd: &Path) -> String {
+    let path = Path::new(package_path);
+    let canonical = std::fs::canonicalize(path).ok();
+    let rel = path
+        .strip_prefix(cwd)
+        .ok()
+        .or_else(|| canonical.as_deref().and_then(|c| c.strip_prefix(cwd).ok()));
+    match rel {
+        Some(r) if !r.as_os_str().is_empty() => r.display().to_string(),
+        _ => package_path.to_string(),
+    }
+}
+
+/// `Error: Failed to roll back <purl>: <why>` — the per-package failure
+/// line `--silent` runs print inline (their summary is muted).
+pub(crate) fn format_rollback_failure(purl: &str, why: &str) -> String {
+    format!("Error: Failed to roll back {purl}: {why}")
+}
+
+/// Per-package counts, keyed by `package_key` so two physical copies of
+/// one purl count once (apply's summary counts the same way). A package
+/// with any failed copy counts as failed; otherwise it is "already
+/// original" only when every copy is.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RollbackTally {
+    /// Some copy had files restored (wet run).
+    pub(crate) rolled_back: usize,
+    /// Some copy is not yet original (dry run: would be rolled back).
+    pub(crate) can_roll_back: usize,
+    /// Every copy already matches its beforeHash.
+    pub(crate) already: usize,
+    /// Some copy failed.
+    pub(crate) failed: usize,
+}
+
+pub(crate) fn tally_rollback_results(results: &[RollbackResult]) -> RollbackTally {
+    let mut by_key: std::collections::BTreeMap<&str, Vec<&RollbackResult>> =
+        std::collections::BTreeMap::new();
+    for r in results {
+        by_key.entry(r.package_key.as_str()).or_default().push(r);
+    }
+    let mut tally = RollbackTally::default();
+    for copies in by_key.values() {
+        if copies.iter().any(|r| !r.success) {
+            tally.failed += 1;
+            continue;
+        }
+        if copies.iter().all(|r| all_files_already_original(r)) {
+            tally.already += 1;
+            continue;
+        }
+        tally.can_roll_back += 1;
+        if copies.iter().any(|r| !r.files_rolled_back.is_empty()) {
+            tally.rolled_back += 1;
+        }
+    }
+    tally
+}
+
+/// The dry-run verification block, followed by the reason for each
+/// package that cannot be rolled back (a dry run prints no other
+/// failure report).
+fn format_rollback_dry_run_counts(results: &[RollbackResult], cwd: &Path) -> Vec<String> {
+    let tally = tally_rollback_results(results);
+    let mut lines = vec![
+        String::new(),
+        "Rollback verification complete:".to_string(),
+        format!(
+            "  {} can be rolled back",
+            plural(tally.can_roll_back, "package", "packages")
+        ),
+    ];
+    if tally.already > 0 {
+        lines.push(format!(
+            "  {} already in original state",
+            plural(tally.already, "package", "packages")
+        ));
+    }
+    if tally.failed > 0 {
+        lines.push(format!(
+            "  {} cannot be rolled back",
+            plural(tally.failed, "package", "packages")
+        ));
+    }
+    lines.extend(format_rollback_failures(results, cwd));
+    lines
+}
+
+/// `  <purl> (<copy>)` — the copy path only when the package has several.
+fn copy_label(
+    results: &[RollbackResult],
+    r: &RollbackResult,
+    note: Option<&str>,
+    cwd: &Path,
+) -> String {
+    let copies = results
+        .iter()
+        .filter(|o| o.package_key == r.package_key)
+        .count();
+    let copy = (copies > 1).then(|| display_copy_path(&r.package_path, cwd));
+    match (copy, note) {
+        (Some(c), Some(n)) => format!("  {} ({c}, {n})", r.package_key),
+        (Some(c), None) => format!("  {} ({c})", r.package_key),
+        (None, Some(n)) => format!("  {} ({n})", r.package_key),
+        (None, None) => format!("  {}", r.package_key),
+    }
+}
+
+/// The `Failed to roll back:` section (empty when nothing failed).
+fn format_rollback_failures(results: &[RollbackResult], cwd: &Path) -> Vec<String> {
+    let failed: Vec<String> = results
+        .iter()
+        .filter(|r| !r.success)
+        .map(|r| {
+            format!(
+                "{}: {}",
+                copy_label(results, r, None, cwd),
+                r.error.as_deref().unwrap_or("unknown error")
+            )
+        })
+        .collect();
+    let mut lines = Vec::new();
+    if !failed.is_empty() {
+        lines.push(String::new());
+        lines.push("Failed to roll back:".to_string());
+        lines.extend(failed);
+    }
+    lines
+}
+
+/// Purls (qualifiers stripped) whose installed tree this run leaves
+/// original: restored now, restorable on a dry run, or already original.
+/// Any successful in-place result that verified files qualifies — so a
+/// dry run's reinstall note matches the wet run's, and a never-patched
+/// tree is not reported as still holding patched bytes.
+fn handled_in_place(results: &[RollbackResult]) -> HashSet<&str> {
+    results
+        .iter()
+        .filter(|r| r.success && (!r.files_rolled_back.is_empty() || !r.files_verified.is_empty()))
+        .map(|r| strip_purl_qualifiers(&r.package_key))
+        .collect()
+}
+
+/// The wet run's per-package blocks: what was rolled back (naming each
+/// physical copy when a package has several) and what failed.
+fn format_rollback_results(results: &[RollbackResult], cwd: &Path) -> Vec<String> {
+    let rolled_back: Vec<String> = results
+        .iter()
+        .filter(|r| r.success && !r.files_rolled_back.is_empty())
+        .map(|r| copy_label(results, r, None, cwd))
+        .chain(
+            results
+                .iter()
+                .filter(|r| r.success && all_files_already_original(r))
+                .map(|r| copy_label(results, r, Some("already original"), cwd)),
+        )
+        .collect();
+    let mut lines = Vec::new();
+    if !rolled_back.is_empty() {
+        lines.push(String::new());
+        lines.push("Rolled back packages:".to_string());
+        lines.extend(rolled_back);
+    }
+    lines.extend(format_rollback_failures(results, cwd));
+    lines
+}
+
+/// `--preserve-state`'s closing line (names vendored artifacts only when
+/// some were preserved). Shared with `remove --preserve-state`.
+pub(crate) fn format_preserved_note(entries: usize, vendored: usize) -> String {
+    let entries_part = if entries == 1 {
+        "Manifest entry"
+    } else {
+        "Manifest entries"
+    };
+    let (what, reapply) = match vendored {
+        0 => (entries_part.to_string(), "`socket-patch apply`"),
+        1 => (
+            format!("{entries_part} and vendored artifact"),
+            "`socket-patch apply` or `socket-patch vendor`",
+        ),
+        _ => (
+            format!("{entries_part} and vendored artifacts"),
+            "`socket-patch apply` or `socket-patch vendor`",
+        ),
+    };
+    format!("{what} preserved (--preserve-state); re-apply with {reapply}.")
+}
+
+/// The GC line: `Freed 328.28 KB of unused blobs and archives`.
+fn format_gc_freed(bytes: u64, dry_run: bool) -> String {
+    format!(
+        "{} {} of unused blobs and archives",
+        if dry_run { "Would free" } else { "Freed" },
+        socket_patch_core::manifest::cleanup_blobs::format_bytes(bytes)
+    )
+}
+
+/// The reinstall note for packages whose wiring was undone but whose
+/// installed tree still holds patched bytes.
+fn format_reinstall_note(still_patched: usize, dry_run: bool) -> String {
+    let keep = match (still_patched == 1, dry_run) {
+        (true, false) => "keeps its",
+        (true, true) => "would keep its",
+        (false, false) => "keep their",
+        (false, true) => "would keep their",
+    };
+    format!(
+        "Note: {} {keep} patched bytes in installed trees until the next \
+         package-manager install.",
+        plural(still_patched, "unwired package", "unwired packages")
+    )
 }
 
 /// One classified rollback target token.
@@ -358,15 +667,6 @@ pub(crate) fn all_files_already_original(result: &RollbackResult) -> bool {
 /// are no-ops reported on their own line, so they are excluded here —
 /// mirroring apply's dry-run split — to avoid double-counting them
 /// against "can be rolled back".
-fn can_rollback_count(results: &[RollbackResult]) -> usize {
-    let successful = results.iter().filter(|r| r.success).count();
-    let already_original = results
-        .iter()
-        .filter(|r| r.success && all_files_already_original(r))
-        .count();
-    successful.saturating_sub(already_original)
-}
-
 fn result_to_json(result: &RollbackResult) -> serde_json::Value {
     serde_json::json!({
         "purl": result.package_key,
@@ -500,7 +800,7 @@ fn emit_rollback_error(json: bool, msg: &str) {
             .expect("serializing an in-memory JSON value cannot fail")
         );
     } else {
-        eprintln!("Error: {msg}");
+        eprintln!("Error: {}", capitalize_first(msg));
     }
 }
 
@@ -671,7 +971,7 @@ async fn run_vendored_leg(
             VendorRevertStep::Failed(why) => {
                 // Errors print even under --silent.
                 if !common.json {
-                    eprintln!("Failed to revert vendoring for {key}: {why}");
+                    eprintln!("Error: Failed to revert vendoring for {key}: {why}");
                 }
                 out.failed.push((key.clone(), why));
             }
@@ -704,8 +1004,12 @@ async fn run_vendored_leg(
                 out.reverted.push(key.clone());
             }
             VendorRevertStep::LedgerWriteFailed(e) => {
-                out.failed
-                    .push((key.clone(), format!("vendor ledger write failed: {e}")));
+                let why = format!("vendor ledger write failed: {e}");
+                // Errors print even under --silent: this drives exit 1.
+                if !common.json {
+                    eprintln!("Error: Failed to revert vendoring for {key}: {why}");
+                }
+                out.failed.push((key.clone(), why));
             }
         }
     }
@@ -756,7 +1060,7 @@ pub(crate) async fn run_hosted_leg(
                 }
                 Err(e) => {
                     if !common.json {
-                        eprintln!("Failed to unwind hosted redirect for {purl}: {e}");
+                        eprintln!("Error: Failed to unwind hosted redirect for {purl}: {e}");
                     }
                     out.failed.push((purl.clone(), e));
                 }
@@ -766,7 +1070,7 @@ pub(crate) async fn run_hosted_leg(
         } else {
             if !common.json {
                 eprintln!(
-                    "Cannot unwind hosted redirect for {purl}: no per-purl revert exists for \
+                    "Error: Cannot unwind hosted redirect for {purl}: no per-purl revert exists for \
                      this ecosystem. Run an unscoped `socket-patch rollback` to unwind ALL \
                      hosted redirects, or re-run `scan --mode hosted` to normalize."
                 );
@@ -786,7 +1090,7 @@ pub(crate) async fn run_hosted_leg(
             let why = format!("{} ({})", refusal.reason, files.join(", "));
             if !common.json {
                 eprintln!(
-                    "Cannot unwind hosted redirect edits ({}): {why}",
+                    "Error: Cannot unwind hosted redirect edits ({}): {why}",
                     refusal.group
                 );
             }
@@ -807,8 +1111,12 @@ pub(crate) async fn run_hosted_leg(
                 }
                 out.reverted.push(purl);
             } else if !out.failed.iter().any(|(p, _)| p.starts_with("group:")) {
-                out.failed
-                    .push((purl, "hosted redirect edits could not be replayed".into()));
+                let why = "hosted redirect edits could not be replayed";
+                // Errors print even under --silent: this drives exit 1.
+                if !common.json {
+                    eprintln!("Error: Failed to unwind hosted redirect for {purl}: {why}");
+                }
+                out.failed.push((purl, why.into()));
             }
         }
     }
@@ -859,7 +1167,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let path_scope = match crate::path_scope::PathScope::parse(&path_patterns) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("Error: {}", capitalize_first(&e.to_string()));
             return 2;
         }
     };
@@ -920,7 +1228,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
         } else {
             // Errors print even under --silent ("errors only", never
             // "nothing"): exit 1 with no message would be undiagnosable.
-            eprintln!("Manifest not found at {}", manifest_path.display());
+            eprintln!("Error: Manifest not found at {}", manifest_path.display());
         }
         return 1;
     }
@@ -1137,9 +1445,18 @@ pub async fn run(args: RollbackArgs) -> i32 {
         }
     }
 
-    // `--ecosystems` narrows every leg (the manifest side is scoped inside
-    // the agent engine as before).
-    if args.common.ecosystems.is_some() {
+    // `--ecosystems` narrows every leg. The agent engine scopes the
+    // manifest side again internally; narrowing it here too keeps the
+    // confirmation prompt's count honest (an npm-only manifest under
+    // `-e pypi` has nothing to roll back, so there is nothing to confirm).
+    let scope_before_eco_filter = manifest_scope.len() + vendor_scope.len() + hosted_scope.len();
+    if let Some(ecosystems) = args.common.ecosystems.as_deref() {
+        let manifest_purls: Vec<String> = manifest_scope.iter().cloned().collect();
+        let in_eco: HashSet<String> = partition_purls(&manifest_purls, Some(ecosystems))
+            .into_values()
+            .flatten()
+            .collect();
+        manifest_scope.retain(|purl| in_eco.contains(purl));
         vendor_scope.retain(|key| {
             vendor_entries
                 .iter()
@@ -1194,9 +1511,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
     if redirect_corrupt {
         run_warnings.push((
             "redirect_state_unreadable".into(),
+            // The core error already carries the recovery steps; only say
+            // what this run skipped.
             format!(
-                "cannot read the hosted redirect ledger: {} — the hosted leg was skipped; \
-                 quarantine or restore .socket/vendor/redirect-state.json and re-run",
+                "the hosted leg was skipped: cannot read the hosted redirect ledger: {}",
                 redirect_state_result
                     .as_ref()
                     .expect_err("checked corrupt above")
@@ -1224,39 +1542,29 @@ pub async fn run(args: RollbackArgs) -> i32 {
         || !vendor_scope.is_empty()
         || !hosted_scope.is_empty()
         || hosted_leftover_edits > 0;
+    // Everything in scope was filtered out by `--ecosystems`: say so,
+    // instead of the misleading "No patches found in manifest".
+    let eco_filtered_everything = !has_work && scope_before_eco_filter > 0;
+    if eco_filtered_everything && !args.common.json && !args.common.silent {
+        println!(
+            "No patches in scope for --ecosystems {}",
+            args.common
+                .ecosystems
+                .as_deref()
+                .unwrap_or_default()
+                .join(",")
+        );
+    }
     if has_work && !args.common.dry_run && !args.preserve_state {
         // Compose only the clauses that apply, so a hosted-only run never
         // claims manifest entries it does not have.
-        let mut clauses: Vec<String> = Vec::new();
-        if !manifest_scope.is_empty() {
-            clauses.push(format!(
-                "roll back {} patch(es) and remove them from the local manifest",
-                manifest_scope.len()
-            ));
-        }
-        if !vendor_scope.is_empty() {
-            // Vendored-mode entries live only in the ledger (their embedded
-            // patch record is the local copy), so name the ledger records
-            // as what goes, the way the manifest clause names its entries.
-            clauses.push(format!(
-                "delete {} vendored artifact(s) and their ledger records",
-                vendor_scope.len()
-            ));
-        }
-        if !hosted_scope.is_empty() {
-            clauses.push(format!("unwind {} hosted redirect(s)", hosted_scope.len()));
-        } else if hosted_leftover_edits > 0 {
-            clauses.push(format!(
-                "replay {hosted_leftover_edits} leftover hosted redirect edit(s)"
-            ));
-        }
-        let mut prompt = clauses.join(", and ");
-        if let Some(first) = prompt.get(..1) {
-            let capitalized = first.to_uppercase();
-            prompt.replace_range(..1, &capitalized);
-        }
-        prompt.push('?');
-        if !crate::output::confirm(&prompt, true, args.common.yes, args.common.json) {
+        let prompt = rollback_prompt(
+            manifest_scope.len(),
+            vendor_scope.len(),
+            hosted_scope.len(),
+            hosted_leftover_edits,
+        );
+        if !crate::ui::confirm(&prompt, true, &args.common) {
             if !args.common.json && !args.common.silent {
                 println!("Rollback cancelled.");
             }
@@ -1267,10 +1575,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // ── agent leg (in-place restore) ────────────────────────────────────
     // The "No patches found in manifest" line is for an unscoped run with
     // nothing to do anywhere: a hosted-/vendored-only project has work in
-    // the other legs and is not "no patches".
+    // the other legs and is not "no patches". A manifest-less project, or
+    // one whose scope `--ecosystems` filtered out entirely (announced
+    // above), is not told its manifest is empty either.
     let selection = InnerSelection::Scope {
         purls: &manifest_scope,
-        announce_empty: !scoped && !has_work,
+        announce_empty: !scoped && !manifest_missing && !has_work && !eco_filtered_everything,
     };
     match rollback_patches_inner(
         &args.common,
@@ -1330,7 +1640,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                                 let msg =
                                     format!("failed to persist the hosted redirect ledger: {e}");
                                 if !args.common.json {
-                                    eprintln!("Error: {msg}");
+                                    eprintln!("Error: {}", capitalize_first(&msg));
                                 }
                                 hosted_leg.failed.push(("ledger".to_string(), msg));
                             }
@@ -1513,6 +1823,24 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     ));
                 }
             }
+            // The human path's warning lines: every run warning except the
+            // ones already said another way — the corrupt-ledger skips
+            // (printed as errors below), `reinstall_required` (the Note
+            // below), and the vendored leg's own warnings (printed inline
+            // as they happened). Hosted replay warnings are printed here.
+            let mut human_warnings: Vec<(String, String)> = run_warnings
+                .iter()
+                .filter(|(code, _)| {
+                    !matches!(
+                        code.as_str(),
+                        "vendor_state_unreadable"
+                            | "redirect_state_unreadable"
+                            | "reinstall_required"
+                    )
+                })
+                .chain(hosted_leg.warnings.iter())
+                .cloned()
+                .collect();
             vendored_leg
                 .warnings
                 .iter()
@@ -1523,10 +1851,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // restored but worth a note; `results[].error` carries it too.
             for r in results.iter().filter(|r| r.success) {
                 if let Some(note) = &r.error {
-                    run_warnings.push((
-                        "ownership_not_restored".into(),
+                    let warning = (
+                        "ownership_not_restored".to_string(),
                         format!("{}: {note}", r.package_key),
-                    ));
+                    );
+                    human_warnings.push(warning.clone());
+                    run_warnings.push(warning);
                 }
             }
 
@@ -1556,7 +1886,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
 
             if let Some(e) = &manifest_write_failed {
                 if !args.common.json {
-                    eprintln!("Error: failed to update the manifest: {e}");
+                    eprintln!("Error: Failed to update the manifest: {e}");
                 }
                 run_warnings.push((
                     "manifest_write_failed".into(),
@@ -1633,52 +1963,14 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     .expect("serializing an in-memory JSON value cannot fail")
                 );
             } else if !args.common.silent && !results.is_empty() {
-                let rolled_back: Vec<_> = results
-                    .iter()
-                    .filter(|r| r.success && !r.files_rolled_back.is_empty())
-                    .collect();
-                let already_original: Vec<_> = results
-                    .iter()
-                    .filter(|r| r.success && all_files_already_original(r))
-                    .collect();
-                let failed: Vec<_> = results.iter().filter(|r| !r.success).collect();
-
-                if args.common.dry_run {
-                    println!("\nRollback verification complete:");
-                    // Exclude already-original packages — they are
-                    // reported separately just below, so counting them
-                    // here too would double-report each no-op.
-                    let can_rollback = can_rollback_count(&results);
-                    println!("  {can_rollback} package(s) can be rolled back");
-                    if !already_original.is_empty() {
-                        println!(
-                            "  {} package(s) already in original state",
-                            already_original.len()
-                        );
-                    }
-                    if !failed.is_empty() {
-                        println!("  {} package(s) cannot be rolled back", failed.len());
-                    }
+                let cwd_abs = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+                let lines = if args.common.dry_run {
+                    format_rollback_dry_run_counts(&results, &cwd_abs)
                 } else {
-                    if !rolled_back.is_empty() || !already_original.is_empty() {
-                        println!("\nRolled back packages:");
-                        for result in &rolled_back {
-                            println!("  {}", result.package_key);
-                        }
-                        for result in &already_original {
-                            println!("  {} (already original)", result.package_key);
-                        }
-                    }
-                    if !failed.is_empty() {
-                        println!("\nFailed to rollback:");
-                        for result in &failed {
-                            println!(
-                                "  {}: {}",
-                                result.package_key,
-                                result.error.as_deref().unwrap_or("unknown error")
-                            );
-                        }
-                    }
+                    format_rollback_results(&results, &cwd_abs)
+                };
+                for line in lines {
+                    println!("{line}");
                 }
 
                 if args.common.verbose {
@@ -1709,70 +2001,104 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 }
             }
 
-            // Error-class notices print even under --silent ("errors only,
-            // never nothing"): drift-keeps and corrupt-ledger skips drive
-            // exit 1, so a silent run must still say why.
-            if !args.common.json {
-                for (key, reason) in &vendored_leg.kept {
-                    eprintln!("Kept vendored state for {key}: {reason}");
+            // Apply's unmatched warning, rollback-side — informational only
+            // (the run still exits 0; see `RollbackOutcome`), so --silent
+            // mutes it like every other non-error notice. Printed before
+            // the manifest-removal list that names the same purls.
+            if !args.common.json && !args.common.silent && !not_installed.is_empty() {
+                // Separate it from the per-package report only when one
+                // was printed above.
+                if !results.is_empty() {
+                    eprintln!();
                 }
-                for (code, detail) in &run_warnings {
-                    if code == "vendor_state_unreadable" || code == "redirect_state_unreadable" {
-                        eprintln!("Error ({code}): {detail}");
-                    } else if code == "ownership_not_restored" && !args.common.silent {
-                        eprintln!("Warning ({code}): {detail}");
-                    }
+                eprintln!(
+                    "Warning: {} had no matching installed package:",
+                    plural(not_installed.len(), "manifest patch", "manifest patches")
+                );
+                for purl in &not_installed {
+                    eprintln!("  - {purl}");
                 }
             }
+
             if !args.common.json && !args.common.silent {
                 if args.common.dry_run {
                     if cleanup_allowed && !removed.is_empty() {
-                        println!("\nWould remove {} patch(es) from manifest:", removed.len());
+                        println!(
+                            "\nWould remove {} from manifest:",
+                            plural(removed.len(), "patch", "patches")
+                        );
                         for purl in &removed {
                             println!("  - {purl}");
                         }
                     }
                 } else if !removed.is_empty() {
-                    println!("\nRemoved {} patch(es) from manifest:", removed.len());
+                    println!(
+                        "\nRemoved {} from manifest:",
+                        plural(removed.len(), "patch", "patches")
+                    );
                     for purl in &removed {
                         println!("  - {purl}");
                     }
                 } else if args.preserve_state && has_work {
                     println!(
-                        "\nManifest entries and vendored artifacts preserved \
-                         (--preserve-state); re-apply with `socket-patch apply` or \
-                         `socket-patch vendor`."
+                        "\n{}",
+                        format_preserved_note(manifest_scope.len(), vendored_leg.preserved.len())
                     );
                 }
                 if gc_bytes_freed > 0 {
-                    println!(
-                        "{} {} bytes of unused blobs/archives",
-                        if args.common.dry_run {
-                            "Would free"
-                        } else {
-                            "Freed"
-                        },
-                        gc_bytes_freed
-                    );
+                    println!("\n{}", format_gc_freed(gc_bytes_freed, args.common.dry_run));
                 }
-                if unwired_any {
+                // Only packages that are NOT also handled in place keep
+                // patched bytes. A successful in-place result that verified
+                // files leaves the installed tree original: restored now,
+                // restorable (dry run), or already original (never
+                // patched). None of those has anything left to reinstall.
+                let restored = handled_in_place(&results);
+                let base_of = |key: &str| {
+                    vendor_entries
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, e)| e.base_purl.clone())
+                };
+                let still_patched = vendored_leg
+                    .reverted
+                    .iter()
+                    .chain(vendored_leg.preserved.iter())
+                    .chain(hosted_leg.reverted.iter())
+                    .filter(|key| {
+                        !restored.contains(strip_purl_qualifiers(key))
+                            && !base_of(key).is_some_and(|b| restored.contains(b.as_str()))
+                    })
+                    .count();
+                if still_patched > 0 {
                     println!(
-                        "\nNote: unwired packages keep their patched bytes in installed \
-                         trees until the next package-manager install."
+                        "\n{}",
+                        format_reinstall_note(still_patched, args.common.dry_run)
                     );
                 }
             }
 
-            // Apply's unmatched warning, rollback-side — informational only
-            // (the run still exits 0; see `RollbackOutcome`), so --silent
-            // mutes it like every other non-error notice.
-            if !args.common.json && !args.common.silent && !not_installed.is_empty() {
-                eprintln!(
-                    "\nWarning: {} manifest patch(es) had no matching installed package:",
-                    not_installed.len()
-                );
-                for purl in &not_installed {
-                    eprintln!("  - {purl}");
+            // Non-error run warnings (out-of-scope copies restored, cleanup
+            // failures, hosted replay notes, ...): the JSON envelope's
+            // `warnings[]`, one stderr line each here.
+            if !args.common.json && !args.common.silent {
+                for (code, detail) in &human_warnings {
+                    eprintln!("Warning ({code}): {detail}");
+                }
+            }
+
+            // Error-class notices print even under --silent ("errors only,
+            // never nothing"): drift-keeps and corrupt-ledger skips drive
+            // exit 1, so a silent run must still say why. Printed after
+            // the summary blocks so they are the last thing on screen.
+            if !args.common.json {
+                for (key, reason) in &vendored_leg.kept {
+                    eprintln!("Error: Kept vendored state for {key}: {reason}");
+                }
+                for (code, detail) in &run_warnings {
+                    if code == "vendor_state_unreadable" || code == "redirect_state_unreadable" {
+                        eprintln!("Error ({code}): {}", capitalize_first(detail));
+                    }
                 }
             }
 
@@ -1818,7 +2144,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             } else {
                 // Errors print even under --silent ("errors only", never
                 // "nothing"): exit 1 with no message would be undiagnosable.
-                eprintln!("Error: {e}");
+                eprintln!("Error: {}", capitalize_first(&e));
             }
             1
         }
@@ -2221,8 +2547,8 @@ pub(crate) async fn rollback_patches_inner(
             // the synthesized per-package failures below.
             if !common.json {
                 eprintln!(
-                    "Error: {} blob(s) are missing and --offline mode is enabled.",
-                    missing_blobs.len()
+                    "Error: {} missing and --offline is set.",
+                    plural(missing_blobs.len(), "blob is", "blobs are")
                 );
                 eprintln!("Run \"socket-patch repair\" to download missing blobs.");
             }
@@ -2247,9 +2573,12 @@ pub(crate) async fn rollback_patches_inner(
             });
         }
 
-        if !common.silent && !common.json {
-            println!("Downloading {} missing blob(s)...", missing_blobs.len());
-        }
+        // Transient progress on stderr; the result line replaces it.
+        let mut status = StatusLine::stderr(common.json, common.silent);
+        status.set(format!(
+            "Downloading {}...",
+            plural(missing_blobs.len(), "missing blob", "missing blobs")
+        ));
 
         let built_client;
         let client = match api_client {
@@ -2263,9 +2592,7 @@ pub(crate) async fn rollback_patches_inner(
         };
         let fetch_result = fetch_blobs_by_hash(&missing_blobs, &blobs_path, client, None).await;
 
-        if !common.silent && !common.json {
-            println!("{}", format_fetch_result(&fetch_result));
-        }
+        status.finish_with(format_fetch_result(&fetch_result));
 
         // Re-check ONLY the needed-missing set the download targeted (built
         // from the local-go-excluded, installed-only gate above) — never the
@@ -2283,8 +2610,8 @@ pub(crate) async fn rollback_patches_inner(
             // offline bail above (and same `--json` carrier).
             if !common.json {
                 eprintln!(
-                    "{} blob(s) could not be downloaded. Cannot rollback.",
-                    still_missing.len()
+                    "Error: {} not be downloaded; cannot roll back.",
+                    plural(still_missing.len(), "blob could", "blobs could")
                 );
             }
             // Per-hash download outcomes; a hash the fetch never reported
@@ -2327,9 +2654,10 @@ pub(crate) async fn rollback_patches_inner(
     }
 
     if all_packages.is_empty() && undiscovered_redirects.is_empty() {
-        if !common.silent && !common.json {
-            println!("No packages found that match patches to rollback");
-        }
+        // Nothing printed here: every caller reports `not_installed` itself
+        // (rollback's "had no matching installed package" warning,
+        // remove's crawler-miss warning).
+        //
         // `success: true` — per-package semantics for the `remove`
         // delegation. The CLI boundary layers apply's "nothing matched at
         // all" exit-1 on top via `not_installed`.
@@ -2366,14 +2694,17 @@ pub(crate) async fn rollback_patches_inner(
 
         if !result.success {
             has_errors = true;
-            // Errors print even under --silent ("errors only", never
-            // "nothing"): with the summary muted, this line is the
-            // silent run's only failure diagnostic.
-            if !common.json {
+            // Under --silent (the summary muted) this line is the run's
+            // only failure diagnostic ("errors only", never "nothing").
+            // Otherwise the failure is reported once, in the summary's
+            // "Failed to roll back:" section (or by `remove`).
+            if common.silent && !common.json {
                 eprintln!(
-                    "Failed to rollback {}: {}",
-                    purl,
-                    result.error.as_deref().unwrap_or("unknown error")
+                    "{}",
+                    format_rollback_failure(
+                        purl,
+                        result.error.as_deref().unwrap_or("unknown error")
+                    )
                 );
             }
         }
@@ -2393,13 +2724,14 @@ pub(crate) async fn rollback_patches_inner(
         };
         if !result.success {
             has_errors = true;
-            // Errors print even under --silent — same contract as the
-            // in-place loop above.
-            if !common.json {
+            // Same contract as the in-place loop above.
+            if common.silent && !common.json {
                 eprintln!(
-                    "Failed to rollback {}: {}",
-                    purl,
-                    result.error.as_deref().unwrap_or("unknown error")
+                    "{}",
+                    format_rollback_failure(
+                        purl,
+                        result.error.as_deref().unwrap_or("unknown error")
+                    )
                 );
             }
         }
@@ -2681,42 +3013,71 @@ mod tests {
         assert!(!all_files_already_original(&r));
     }
 
+    /// `make_result` with a distinct package key (the tally is per package).
+    fn keyed(key: &str, r: RollbackResult) -> RollbackResult {
+        RollbackResult {
+            package_key: key.to_string(),
+            ..r
+        }
+    }
+
     /// Regression: the dry-run "can be rolled back" count must exclude
     /// already-original packages, which are reported on their own line.
     /// Otherwise each no-op is double-counted (once as can-rollback, once
     /// as already-original).
     #[test]
-    fn can_rollback_count_excludes_already_original() {
+    fn can_roll_back_tally_excludes_already_original() {
         let results = vec![
             // Genuinely needs restoring.
-            make_result(&[VerifyRollbackStatus::Ready], &[]),
+            keyed(
+                "pkg:npm/a@1",
+                make_result(&[VerifyRollbackStatus::Ready], &[]),
+            ),
             // No-op: already at beforeHash.
-            make_result(&[VerifyRollbackStatus::AlreadyOriginal], &[]),
+            keyed(
+                "pkg:npm/b@1",
+                make_result(&[VerifyRollbackStatus::AlreadyOriginal], &[]),
+            ),
             // Mixed → still needs restoring.
-            make_result(
-                &[
-                    VerifyRollbackStatus::Ready,
-                    VerifyRollbackStatus::AlreadyOriginal,
-                ],
-                &[],
+            keyed(
+                "pkg:npm/c@1",
+                make_result(
+                    &[
+                        VerifyRollbackStatus::Ready,
+                        VerifyRollbackStatus::AlreadyOriginal,
+                    ],
+                    &[],
+                ),
             ),
             // Failed (e.g. HashMismatch) → not counted as rollbackable.
-            make_result(&[VerifyRollbackStatus::HashMismatch], &[]),
+            keyed(
+                "pkg:npm/d@1",
+                make_result(&[VerifyRollbackStatus::HashMismatch], &[]),
+            ),
         ];
-        // 2 successful non-no-op packages; the already-original one is
-        // excluded and the failed one was never successful.
-        assert_eq!(can_rollback_count(&results), 2);
+        let t = tally_rollback_results(&results);
+        assert_eq!(t.can_roll_back, 2);
+        assert_eq!(t.already, 1);
+        assert_eq!(t.failed, 1);
     }
 
     /// A summary made entirely of no-ops reports zero rollbackable
-    /// packages (and `saturating_sub` keeps it from underflowing).
+    /// packages.
     #[test]
-    fn can_rollback_count_all_already_original_is_zero() {
+    fn can_roll_back_tally_all_already_original_is_zero() {
         let results = vec![
-            make_result(&[VerifyRollbackStatus::AlreadyOriginal], &[]),
-            make_result(&[VerifyRollbackStatus::AlreadyOriginal], &[]),
+            keyed(
+                "pkg:npm/a@1",
+                make_result(&[VerifyRollbackStatus::AlreadyOriginal], &[]),
+            ),
+            keyed(
+                "pkg:npm/b@1",
+                make_result(&[VerifyRollbackStatus::AlreadyOriginal], &[]),
+            ),
         ];
-        assert_eq!(can_rollback_count(&results), 0);
+        let t = tally_rollback_results(&results);
+        assert_eq!(t.can_roll_back, 0);
+        assert_eq!(t.already, 2);
     }
 
     // --- Missing-blob gate consistency ----------------------------------
@@ -4215,6 +4576,347 @@ mod tests {
             state.entries.is_empty(),
             "the ledger must be untouched, got {:?}",
             state.entries.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ── human output formatters ──────────────────────────────────────────
+
+    fn rb(purl: &str, path: &str, status: VerifyRollbackStatus, rolled: bool) -> RollbackResult {
+        RollbackResult {
+            package_key: purl.to_string(),
+            package_path: path.to_string(),
+            success: true,
+            files_verified: vec![VerifyRollbackResult {
+                file: "index.js".to_string(),
+                status,
+                message: None,
+                current_hash: None,
+                expected_hash: None,
+                target_hash: None,
+            }],
+            files_rolled_back: if rolled {
+                vec!["index.js".to_string()]
+            } else {
+                Vec::new()
+            },
+            error: None,
+            sidecar: None,
+        }
+    }
+
+    #[test]
+    fn join_clauses_is_an_english_list() {
+        let c = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(join_clauses(&[]), "");
+        assert_eq!(join_clauses(&c(&["a"])), "a");
+        assert_eq!(join_clauses(&c(&["a", "b"])), "a and b");
+        assert_eq!(join_clauses(&c(&["a", "b", "c"])), "a, b, and c");
+        assert_eq!(as_question(""), "");
+        assert_eq!(as_question("roll back"), "Roll back?");
+        assert_eq!(as_question("éclair"), "Éclair?");
+    }
+
+    #[test]
+    fn rollback_prompt_singular_plural_and_clauses() {
+        assert_eq!(
+            rollback_prompt(1, 0, 0, 0),
+            "Roll back 1 patch and remove it from the local manifest?"
+        );
+        assert_eq!(
+            rollback_prompt(2, 0, 0, 0),
+            "Roll back 2 patches and remove them from the local manifest?"
+        );
+        // Never "..., and unwind" after an inner "and".
+        assert_eq!(
+            rollback_prompt(1, 0, 1, 0),
+            "Roll back 1 patch, remove it from the local manifest, and unwind 1 hosted \
+             redirect?"
+        );
+        assert_eq!(rollback_prompt(0, 0, 3, 0), "Unwind 3 hosted redirects?");
+        assert_eq!(
+            rollback_prompt(0, 0, 0, 1),
+            "Replay 1 leftover hosted redirect edit?"
+        );
+        assert_eq!(
+            rollback_prompt(0, 1, 0, 0),
+            "Delete 1 vendored artifact and its ledger record?"
+        );
+        assert_eq!(
+            rollback_prompt(0, 2, 0, 0),
+            "Delete 2 vendored artifacts and their ledger records?"
+        );
+    }
+
+    #[test]
+    fn copy_path_outside_cwd_stays_absolute() {
+        assert_eq!(
+            display_copy_path("/elsewhere/node_modules/x", Path::new("/p")),
+            "/elsewhere/node_modules/x"
+        );
+        assert_eq!(display_copy_path("/p", Path::new("/p")), "/p");
+        assert_eq!(
+            display_copy_path("/p/node_modules/é", Path::new("/p")),
+            "node_modules/é"
+        );
+    }
+
+    #[test]
+    fn capitalize_first_is_char_safe() {
+        assert_eq!(capitalize_first(""), "");
+        assert_eq!(capitalize_first("path pattern x"), "Path pattern x");
+        assert_eq!(capitalize_first("Already"), "Already");
+        assert_eq!(capitalize_first("ülk"), "Ülk");
+        assert_eq!(capitalize_first("--one-off"), "--one-off");
+        assert_eq!(capitalize_first("cannot read x: y"), "Cannot read x: y");
+        assert_eq!(capitalize_first("can't, really"), "Can't, really");
+        // Values the user may copy back are never altered.
+        assert_eq!(
+            capitalize_first("pkg:npm/a@1 matches only hosted redirect records"),
+            "pkg:npm/a@1 matches only hosted redirect records"
+        );
+        assert_eq!(
+            capitalize_first("a1b2c3d4-0000-4000-8000-000000000000 matches nothing"),
+            "a1b2c3d4-0000-4000-8000-000000000000 matches nothing"
+        );
+        assert_eq!(capitalize_first("abcdef matches"), "Abcdef matches");
+        assert_eq!(capitalize_first(".socket/x is bad"), ".socket/x is bad");
+    }
+
+    #[test]
+    fn rollback_failure_line() {
+        assert_eq!(
+            format_rollback_failure("pkg:npm/a@1", "boom"),
+            "Error: Failed to roll back pkg:npm/a@1: boom"
+        );
+    }
+
+    #[test]
+    fn dry_run_counts_block() {
+        let p = Path::new("/p");
+        let results = vec![
+            rb("pkg:npm/a@1", "/p/a", VerifyRollbackStatus::Ready, false),
+            rb(
+                "pkg:npm/b@1",
+                "/p/b",
+                VerifyRollbackStatus::AlreadyOriginal,
+                false,
+            ),
+        ];
+        assert_eq!(
+            format_rollback_dry_run_counts(&results, p),
+            vec![
+                "",
+                "Rollback verification complete:",
+                "  1 package can be rolled back",
+                "  1 package already in original state",
+            ]
+        );
+        // Failures carry their reason: a dry run has no other report.
+        let mut failed = rb(
+            "pkg:npm/c@1",
+            "/p/c",
+            VerifyRollbackStatus::HashMismatch,
+            false,
+        );
+        failed.success = false;
+        failed.error = Some("modified after patching".into());
+        let mut other = failed.clone();
+        other.package_key = "pkg:npm/d@1".into();
+        assert_eq!(
+            format_rollback_dry_run_counts(&[failed, other], p),
+            vec![
+                "",
+                "Rollback verification complete:",
+                "  0 packages can be rolled back",
+                "  2 packages cannot be rolled back",
+                "",
+                "Failed to roll back:",
+                "  pkg:npm/c@1: modified after patching",
+                "  pkg:npm/d@1: modified after patching",
+            ]
+        );
+        assert_eq!(format_rollback_dry_run_counts(&[], p).len(), 3);
+    }
+
+    #[test]
+    fn dry_run_counts_each_package_once_across_copies() {
+        // Two installed copies of one purl: "1 package", matching apply.
+        let results = vec![
+            rb(
+                "pkg:npm/nuxt@4.5.0",
+                "/p/node_modules/nuxt",
+                VerifyRollbackStatus::Ready,
+                false,
+            ),
+            rb(
+                "pkg:npm/nuxt@4.5.0",
+                "/p/node_modules/vite/node_modules/nuxt",
+                VerifyRollbackStatus::Ready,
+                false,
+            ),
+        ];
+        assert_eq!(
+            format_rollback_dry_run_counts(&results, Path::new("/p"))[2],
+            "  1 package can be rolled back"
+        );
+        assert_eq!(
+            tally_rollback_results(&results),
+            RollbackTally {
+                can_roll_back: 1,
+                ..RollbackTally::default()
+            }
+        );
+    }
+
+    #[test]
+    fn handled_in_place_covers_restored_restorable_and_original() {
+        let restored = rb("pkg:npm/a@1", "/p/a", VerifyRollbackStatus::Ready, true);
+        let dry = rb("pkg:npm/b@1", "/p/b", VerifyRollbackStatus::Ready, false);
+        let orig = rb(
+            "pkg:npm/c@1",
+            "/p/c",
+            VerifyRollbackStatus::AlreadyOriginal,
+            false,
+        );
+        let mut failed = rb(
+            "pkg:npm/d@1",
+            "/p/d",
+            VerifyRollbackStatus::HashMismatch,
+            false,
+        );
+        failed.success = false;
+        let mut empty = rb("pkg:npm/e@1", "/p/e", VerifyRollbackStatus::Ready, false);
+        empty.files_verified.clear();
+        let all = [restored, dry, orig, failed, empty];
+        let got = handled_in_place(&all);
+        let mut got: Vec<&str> = got.into_iter().collect();
+        got.sort();
+        assert_eq!(got, vec!["pkg:npm/a@1", "pkg:npm/b@1", "pkg:npm/c@1"]);
+    }
+
+    #[test]
+    fn tally_buckets_per_package() {
+        let done = rb("pkg:npm/a@1", "/p/a1", VerifyRollbackStatus::Ready, true);
+        let done_twin = rb(
+            "pkg:npm/a@1",
+            "/p/a2",
+            VerifyRollbackStatus::AlreadyOriginal,
+            false,
+        );
+        let orig = rb(
+            "pkg:npm/b@1",
+            "/p/b",
+            VerifyRollbackStatus::AlreadyOriginal,
+            false,
+        );
+        let ok_copy = rb("pkg:npm/c@1", "/p/c1", VerifyRollbackStatus::Ready, true);
+        let mut bad_copy = rb(
+            "pkg:npm/c@1",
+            "/p/c2",
+            VerifyRollbackStatus::HashMismatch,
+            false,
+        );
+        bad_copy.success = false;
+        assert_eq!(
+            tally_rollback_results(&[done, done_twin, orig, ok_copy, bad_copy]),
+            RollbackTally {
+                rolled_back: 1,
+                can_roll_back: 1,
+                already: 1,
+                failed: 1,
+            }
+        );
+        assert_eq!(tally_rollback_results(&[]), RollbackTally::default());
+    }
+
+    #[test]
+    fn results_block_names_duplicate_copies_and_failures_once() {
+        let results = vec![
+            rb(
+                "pkg:npm/nuxt@4.5.0",
+                "/p/node_modules/nuxt",
+                VerifyRollbackStatus::Ready,
+                true,
+            ),
+            rb(
+                "pkg:npm/nuxt@4.5.0",
+                "/p/node_modules/vite/node_modules/nuxt",
+                VerifyRollbackStatus::Ready,
+                true,
+            ),
+            rb(
+                "pkg:npm/ok@1",
+                "/p/node_modules/ok",
+                VerifyRollbackStatus::AlreadyOriginal,
+                false,
+            ),
+        ];
+        assert_eq!(
+            format_rollback_results(&results, Path::new("/p")),
+            vec![
+                "",
+                "Rolled back packages:",
+                "  pkg:npm/nuxt@4.5.0 (node_modules/nuxt)",
+                "  pkg:npm/nuxt@4.5.0 (node_modules/vite/node_modules/nuxt)",
+                "  pkg:npm/ok@1 (already original)",
+            ]
+        );
+        let mut failed = rb(
+            "pkg:npm/x@1",
+            "/p/x",
+            VerifyRollbackStatus::HashMismatch,
+            false,
+        );
+        failed.success = false;
+        failed.error = Some("modified".into());
+        assert_eq!(
+            format_rollback_results(&[failed], Path::new("/p")),
+            vec!["", "Failed to roll back:", "  pkg:npm/x@1: modified"]
+        );
+        assert!(format_rollback_results(&[], Path::new("/p")).is_empty());
+    }
+
+    #[test]
+    fn preserved_note_names_only_what_was_kept() {
+        assert_eq!(
+            format_preserved_note(1, 0),
+            "Manifest entry preserved (--preserve-state); re-apply with `socket-patch apply`."
+        );
+        assert_eq!(
+            format_preserved_note(1, 1),
+            "Manifest entry and vendored artifact preserved (--preserve-state); re-apply \
+             with `socket-patch apply` or `socket-patch vendor`."
+        );
+        assert_eq!(
+            format_preserved_note(2, 2),
+            "Manifest entries and vendored artifacts preserved (--preserve-state); re-apply \
+             with `socket-patch apply` or `socket-patch vendor`."
+        );
+    }
+
+    #[test]
+    fn gc_freed_uses_human_bytes() {
+        assert_eq!(
+            format_gc_freed(336161, false),
+            "Freed 328.28 KB of unused blobs and archives"
+        );
+        assert_eq!(
+            format_gc_freed(12, true),
+            "Would free 12 B of unused blobs and archives"
+        );
+    }
+
+    #[test]
+    fn reinstall_note_tense_and_number() {
+        assert_eq!(
+            format_reinstall_note(1, false),
+            "Note: 1 unwired package keeps its patched bytes in installed trees until the \
+             next package-manager install."
+        );
+        assert_eq!(
+            format_reinstall_note(2, true),
+            "Note: 2 unwired packages would keep their patched bytes in installed trees \
+             until the next package-manager install."
         );
     }
 }

@@ -5,7 +5,8 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, SetupConfig};
 use socket_patch_core::package_json::detect::{is_setup_configured_str, PackageManager};
 use socket_patch_core::package_json::find::{
-    detect_package_manager, find_package_json_files, PackageJsonLocation, WorkspaceType,
+    detect_package_manager, find_package_json_files, PackageJsonFindResult, PackageJsonLocation,
+    WorkspaceType,
 };
 use socket_patch_core::package_json::update::{
     remove_package_json, update_package_json, RemoveResult, RemoveStatus, UpdateResult,
@@ -23,13 +24,13 @@ use socket_patch_core::setup::pypi::edit::{
 };
 use socket_patch_core::telemetry::track_patch_setup;
 use socket_patch_core::vex::applied_patches_with_vendor;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::ecosystem_dispatch::find_manifest_package_paths;
-use crate::output::{read_yes_no, stdin_is_tty};
+use crate::ui::plural;
 
 /// Stringify the detected npm-family manager for telemetry.
 fn manager_name(pm: PackageManager) -> &'static str {
@@ -92,8 +93,8 @@ pub struct SetupArgs {
 
     /// Workspace-member path(s) to exclude from setup (comma-separated, relative
     /// to the repo root). The exclusion is persisted in `.socket/manifest.json`
-    /// so `setup --check` and a fresh clone honor it without re-passing the flag
-    /// (CLI_CONTRACT property 9).
+    /// so `setup --check` and a fresh clone honor it without re-passing the flag.
+    // CLI_CONTRACT property 9.
     #[arg(long = "exclude", env = "SOCKET_SETUP_EXCLUDE", value_delimiter = ',')]
     pub exclude: Vec<String>,
 
@@ -116,27 +117,76 @@ pub async fn run(args: SetupArgs) -> i32 {
 /// applying the pnpm "root-only" filtering. Returns an empty vec when none are
 /// found (callers also consider Python before reporting `no_files`).
 async fn discover(args: &SetupArgs, excludes: &[String]) -> Vec<PackageJsonLocation> {
-    if !eco_in_scope(&args.common, Ecosystem::Npm) {
+    let Some(found) = find_members(args).await else {
         return Vec::new();
-    }
-    let find_result = find_package_json_files(&args.common.cwd).await;
+    };
+    warn_unmatched_excludes(
+        &args.common,
+        &unmatched_excludes(&found, &args.common.cwd, excludes),
+    );
+    select_members(found, &args.common.cwd, excludes)
+}
 
+/// Walk for package.json files; `None` when npm is out of `--ecosystems` scope.
+async fn find_members(args: &SetupArgs) -> Option<PackageJsonFindResult> {
+    if !eco_in_scope(&args.common, Ecosystem::Npm) {
+        return None;
+    }
+    Some(find_package_json_files(&args.common.cwd).await)
+}
+
+/// The exclude values (normalized) that cover no discovered member. Such a
+/// value is almost always a typo. Checked against every member, before the
+/// pnpm root-only filter.
+fn unmatched_excludes(
+    found: &PackageJsonFindResult,
+    cwd: &Path,
+    excludes: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in excludes {
+        let n = normalize_rel_path(e);
+        if n.is_empty() || out.contains(&n) {
+            continue;
+        }
+        let matched = found.files.iter().any(|loc| {
+            !loc.is_root && is_member_excluded(&loc.path, cwd, std::slice::from_ref(&n))
+        });
+        if !matched {
+            out.push(n);
+        }
+    }
+    out
+}
+
+/// Say so (human mode only) rather than silently doing nothing.
+fn warn_unmatched_excludes(common: &GlobalArgs, unmatched: &[String]) {
+    if common.json || common.silent {
+        return;
+    }
+    for e in unmatched {
+        eprintln!("Warning: {}", format_unmatched_exclude(e));
+    }
+}
+
+/// Apply the pnpm root-only rule and drop excluded members.
+fn select_members(
+    found: PackageJsonFindResult,
+    cwd: &Path,
+    excludes: &[String],
+) -> Vec<PackageJsonLocation> {
     // For pnpm monorepos, only update root package.json. pnpm runs root
     // postinstall on `pnpm install`, so workspace-level postinstall scripts are
     // unnecessary and would fail under pnpm's strict module isolation.
-    let files: Vec<PackageJsonLocation> = match find_result.workspace_type {
-        WorkspaceType::Pnpm => find_result
-            .files
-            .into_iter()
-            .filter(|loc| loc.is_root)
-            .collect(),
-        _ => find_result.files,
+    let files: Vec<PackageJsonLocation> = match found.workspace_type {
+        WorkspaceType::Pnpm => found.files.into_iter().filter(|loc| loc.is_root).collect(),
+        _ => found.files,
     };
 
     // Property 9: drop excluded workspace members (the root is never excludable).
     files
         .into_iter()
-        .filter(|loc| loc.is_root || !is_member_excluded(&loc.path, &args.common.cwd, excludes))
+        .filter(|loc| loc.is_root || !is_member_excluded(&loc.path, cwd, excludes))
         .collect()
 }
 
@@ -161,9 +211,57 @@ fn report_no_files(args: &SetupArgs, counts: &[(&str, i64)]) -> i32 {
                 .expect("serializing an in-memory JSON value cannot fail")
         );
     } else if !args.common.silent {
-        println!("No package.json, Python, Bundler, or Composer project found");
+        println!("{}", no_files_message(&args.common));
     }
     0
+}
+
+/// The setup-capable ecosystems (their `--ecosystems` tokens) and the name
+/// of the project each one looks for, in discovery order.
+const SETUP_ECOSYSTEMS: &[(Ecosystem, &str)] = &[
+    (Ecosystem::Npm, "package.json"),
+    (Ecosystem::Pypi, "Python"),
+    (Ecosystem::Gem, "Bundler"),
+    (Ecosystem::Composer, "Composer"),
+];
+
+/// The human `no_files` line for this run's `--ecosystems` scope.
+fn no_files_message(common: &GlobalArgs) -> String {
+    let in_scope: Vec<&str> = SETUP_ECOSYSTEMS
+        .iter()
+        .filter(|(eco, _)| eco_in_scope(common, *eco))
+        .map(|(_, label)| *label)
+        .collect();
+    format_no_files(&in_scope, common.ecosystems.as_deref().unwrap_or(&[]))
+}
+
+/// `No package.json, Python, Bundler, or Composer project found`, narrowed
+/// to the in-scope ecosystems. When `--ecosystems` names none that `setup`
+/// can wire, "no project found" would be false (the project may well
+/// exist), so say that setup has no hook for them instead.
+fn format_no_files(in_scope: &[&str], requested: &[String]) -> String {
+    if in_scope.is_empty() {
+        return format!(
+            "Setup has no install hook for: {} (supported: npm, pypi, gem, composer)",
+            requested.join(", ")
+        );
+    }
+    format!("No {} project found", join_or(in_scope))
+}
+
+/// `a`, `a or b`, `a, b, or c`.
+fn join_or(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [a, b] => format!("{a} or {b}"),
+        [init @ .., last] => format!("{}, or {last}", init.join(", ")),
+    }
+}
+
+/// The warning for an `--exclude` value that matches no workspace member.
+fn format_unmatched_exclude(value: &str) -> String {
+    format!("--exclude {:?} matched no workspace member", value.trim())
 }
 
 fn pathdiff(path: &str, base: &Path) -> String {
@@ -171,24 +269,6 @@ fn pathdiff(path: &str, base: &Path) -> String {
     p.strip_prefix(base)
         .map(|r| r.display().to_string())
         .unwrap_or_else(|_| path.to_string())
-}
-
-/// The setup/remove mutation gate (shared verbatim by both flows): default-no
-/// prompt on a TTY, auto-proceed with a stderr note when stdin is not
-/// interactive. Returns whether to go ahead. (Deliberately NOT
-/// `output::confirm`, whose semantics differ: stderr prompt, `default_yes`
-/// honored on non-TTY and empty input.)
-fn confirm_proceed(prompt: &str) -> bool {
-    if !stdin_is_tty() {
-        eprintln!("Non-interactive mode detected, proceeding automatically.");
-        return true;
-    }
-    print!("{prompt}");
-    io::stdout()
-        .flush()
-        .expect("failed to write the confirmation prompt to stdout");
-    // Only an explicit yes proceeds: empty and unreadable answers abort.
-    read_yes_no() == Some(true)
 }
 
 /// Whether an ecosystem is in scope for this run, honoring the global
@@ -707,9 +787,10 @@ async fn build_gem_outcome(
             "Gem: add the socket-patch Bundler plugin wiring to:"
         };
         out.preview.push(header.to_string());
+        let marker = if remove { "-" } else { "+" };
         for p in &added_paths {
             out.preview
-                .push(format!("  + {}", pathdiff(p, &common.cwd)));
+                .push(format!("  {marker} {}", pathdiff(p, &common.cwd)));
         }
     }
 
@@ -788,9 +869,10 @@ async fn build_composer_outcome(
             "Composer: add the socket-patch re-apply hook to:"
         };
         out.preview.push(header.to_string());
+        let marker = if remove { "-" } else { "+" };
         for p in &added_paths {
             out.preview
-                .push(format!("  + {}", pathdiff(p, &common.cwd)));
+                .push(format!("  {marker} {}", pathdiff(p, &common.cwd)));
         }
     }
 
@@ -1020,7 +1102,10 @@ async fn append_patch_consistency_entries(
     let package_paths =
         find_manifest_package_paths(&purls, common, common.silent || common.json).await;
 
-    let vendor = crate::commands::vex::vendor_context_from(common, &manifest, ledger).await;
+    // The ledger passed here is always readable (an unreadable one was
+    // reported above and replaced by an empty one), so there is no
+    // degrade warning left to surface.
+    let (vendor, _) = crate::commands::vex::vendor_context_from(common, &manifest, ledger).await;
     let outcome = applied_patches_with_vendor(&manifest, &package_paths, vendor.as_ref()).await;
     for failed in &outcome.failed {
         match failed.reason.as_str() {
@@ -1053,11 +1138,56 @@ fn merge_outcomes(mut a: SetupOutcome, b: SetupOutcome) -> SetupOutcome {
 // check
 // ─────────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum CheckState {
     Configured,
     NeedsConfiguration,
     Error,
+}
+
+/// One `setup --check` status line. A drifted patch (`kind == "patch"`)
+/// shows why it is not applied instead of "needs setup", which re-running
+/// `setup` would not fix.
+fn format_check_line(kind: &str, rel: &str, state: CheckState, err: Option<&str>) -> String {
+    match (state, err) {
+        (CheckState::Configured, _) => format!("  ✓ {rel} (configured)"),
+        (CheckState::NeedsConfiguration, _) if kind == "patch" => {
+            format!("  ✗ {rel}: {}", err.unwrap_or("patch not applied on disk"))
+        }
+        (CheckState::NeedsConfiguration, Some(e)) => format!("  ✗ {rel} (needs setup: {e})"),
+        (CheckState::NeedsConfiguration, None) => format!("  ✗ {rel} (needs setup)"),
+        (CheckState::Error, e) => format!("  ! {rel}: {}", e.unwrap_or("unknown error")),
+    }
+}
+
+/// The `setup --check` verdict: what is wrong, then the command that fixes
+/// each kind of problem (`setup` for missing hooks, `apply` for drifted
+/// patches; invalid files need a hand edit).
+fn format_check_footer(hooks: usize, drifted: usize, errors: usize) -> String {
+    if hooks + drifted + errors == 0 {
+        return "All manifests are configured with socket-patch.".to_string();
+    }
+    let mut problems = Vec::new();
+    let mut advice = Vec::new();
+    if hooks > 0 {
+        problems.push(format!(
+            "{} configuration",
+            plural(hooks, "manifest needs", "manifests need")
+        ));
+        advice.push("Run `socket-patch setup` to add the missing install hooks.");
+    }
+    if drifted > 0 {
+        problems.push(format!(
+            "{} not applied on disk",
+            plural(drifted, "patch is", "patches are")
+        ));
+        advice.push("Run `socket-patch apply` to re-apply the patches.");
+    }
+    if errors > 0 {
+        problems.push(plural(errors, "error", "errors"));
+        advice.push("Fix the errors above, then re-run `socket-patch setup --check`.");
+    }
+    format!("{}. {}", problems.join(", "), advice.join(" "))
 }
 
 /// Read-only verification that every discovered manifest (npm package.json and
@@ -1069,7 +1199,7 @@ async fn run_check(args: &SetupArgs) -> i32 {
     // human-readable report, mirroring `list`/`repair`/`get`/`remove`/`scan`.
     // The exit code still distinguishes the configuration states.
     if !args.common.json && !args.common.silent {
-        println!("Searching for package.json / Python / Bundler / Composer manifests...");
+        eprintln!("Searching for package.json / Python / Bundler / Composer manifests...");
     }
 
     // Excluded members (persisted in the manifest + any passed via `--exclude`)
@@ -1091,8 +1221,13 @@ async fn run_check(args: &SetupArgs) -> i32 {
                 // or a BOM'd configured file fails `--check` as "Invalid
                 // package.json" while `setup` calls it already_configured.
                 let json = content.strip_prefix('\u{feff}').unwrap_or(&content);
-                if serde_json::from_str::<serde_json::Value>(json).is_err() {
-                    (CheckState::Error, Some("Invalid package.json".to_string()))
+                if let Err(e) = serde_json::from_str::<serde_json::Value>(json) {
+                    // Keep the parser's detail (line/column): "Invalid
+                    // package.json" alone leaves the user hunting.
+                    (
+                        CheckState::Error,
+                        Some(format!("Invalid package.json: {e}")),
+                    )
                 } else if is_setup_configured_str(&content).needs_update {
                     (CheckState::NeedsConfiguration, None)
                 } else {
@@ -1149,6 +1284,12 @@ async fn run_check(args: &SetupArgs) -> i32 {
         .iter()
         .filter(|(_, _, s, _)| *s == CheckState::NeedsConfiguration)
         .count();
+    // Drifted patches need `apply`, not `setup`: counted apart so the
+    // footer can say which command fixes what.
+    let drifted = entries
+        .iter()
+        .filter(|(k, _, s, _)| *k == "patch" && *s == CheckState::NeedsConfiguration)
+        .count();
     let errs = entries
         .iter()
         .filter(|(_, _, s, _)| *s == CheckState::Error)
@@ -1188,24 +1329,12 @@ async fn run_check(args: &SetupArgs) -> i32 {
         );
     } else if !args.common.silent {
         println!("\nConfiguration status:\n");
-        for (_, path, state, err) in &entries {
+        for (kind, path, state, err) in &entries {
             let rel = pathdiff(path, &args.common.cwd);
-            match state {
-                CheckState::Configured => println!("  ✓ {rel} (configured)"),
-                CheckState::NeedsConfiguration => println!("  ✗ {rel} (needs setup)"),
-                CheckState::Error => {
-                    println!("  ! {rel}: {}", err.as_deref().unwrap_or("unknown error"))
-                }
-            }
+            println!("{}", format_check_line(kind, &rel, *state, err.as_deref()));
         }
         println!();
-        if all_ok {
-            println!("All manifests are configured with socket-patch.");
-        } else {
-            println!(
-                "{needs} manifest(s) need configuration, {errs} error(s). Run `socket-patch setup` to fix."
-            );
-        }
+        println!("{}", format_check_footer(needs - drifted, drifted, errs));
     } else {
         // `--silent` is "errors only": the status report is muted, but
         // read/parse failures must still reach stderr. A plain
@@ -1250,7 +1379,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     // unaffected, and prompting follows the shared `confirm()` semantics.
     let quiet = common.json || common.silent;
     if !quiet {
-        println!("Searching for package.json / Python / Bundler / Composer manifests...");
+        eprintln!("Searching for package.json / Python / Bundler / Composer manifests...");
     }
 
     // Honor the persisted/`--exclude` member set so we never touch a member that
@@ -1292,7 +1421,10 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     };
 
     if !quiet {
-        print_remove_preview(&npm_preview, &py_preview, &extra_preview, common);
+        print!(
+            "{}",
+            format_remove_preview(&npm_preview, &py_preview, &extra_preview, &common.cwd)
+        );
     }
 
     let n_remove = npm_preview
@@ -1330,14 +1462,21 @@ async fn run_remove(args: &SetupArgs) -> i32 {
             );
         } else if !common.silent {
             if preview_errs > 0 {
-                println!("Nothing removed; {preview_errs} item(s) could not be processed (see errors above).");
+                println!(
+                    "\nNothing removed; {} (see errors above).",
+                    plural(
+                        preview_errs,
+                        "item could not be processed",
+                        "items could not be processed"
+                    )
+                );
             } else {
                 println!("No socket-patch install hooks found to remove.");
             }
         }
         eprint_errors_when_silent(
             common,
-            &remove_error_messages(&npm_preview, &py_preview, &extra_preview),
+            &remove_error_messages(&npm_preview, &py_preview, &extra_preview, &common.cwd),
         );
         return if preview_errs > 0 { 1 } else { 0 };
     }
@@ -1347,24 +1486,40 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         if common.json {
             print_remove_envelope("dry_run", &npm_preview, &py_preview, &extra_preview, &[]);
         } else if !common.silent {
-            println!("\nSummary:");
-            println!("  {n_remove} item(s) would have socket-patch removed");
+            println!("\nSummary (dry run):");
+            println!(
+                "  {}",
+                plural(
+                    n_remove,
+                    "item would have socket-patch removed",
+                    "items would have socket-patch removed"
+                )
+            );
         }
         eprint_errors_when_silent(
             common,
-            &remove_error_messages(&npm_preview, &py_preview, &extra_preview),
+            &remove_error_messages(&npm_preview, &py_preview, &extra_preview, &common.cwd),
         );
         return if preview_errs > 0 { 1 } else { 0 };
     }
 
     // Confirm before mutating.
-    if !common.yes && !common.json && !confirm_proceed("Remove these install hooks? (y/N): ") {
-        println!("Aborted");
+    // Default-no on a terminal; proceeds when stdin is not interactive.
+    // Keep the prompt (or its non-interactive note) off the last preview
+    // line. With --yes nothing is printed there, and the progress line below
+    // already opens with its own blank line.
+    if !quiet && !common.yes {
+        eprintln!();
+    }
+    if !crate::ui::confirm_or_proceed("Remove these install hooks?", common) {
+        if !common.silent {
+            eprintln!("Aborted.");
+        }
         return 0;
     }
 
     if !quiet {
-        println!("\nRemoving changes...");
+        eprintln!("\nRemoving install hooks...");
     }
     let mut npm_results = Vec::new();
     for loc in &npm_files {
@@ -1421,12 +1576,16 @@ async fn run_remove(args: &SetupArgs) -> i32 {
                 .count()
             + extra_results.changed;
         println!("\nSummary:");
-        println!("  {removed} item(s) had socket-patch removed");
+        println!(
+            "  {}",
+            plural(
+                removed,
+                "item had socket-patch removed",
+                "items had socket-patch removed"
+            )
+        );
         if errs > 0 {
-            println!("  {errs} error(s)");
-        }
-        for w in &warnings {
-            println!("  warning: {w}");
+            println!("  {}", plural(errs, "error", "errors"));
         }
         if py_plan.is_some() {
             println!("\nAlso run `pip uninstall socket-patch-hook` to remove the installed .pth.");
@@ -1439,9 +1598,10 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         }
     }
 
+    print_warnings(common, &warnings);
     eprint_errors_when_silent(
         common,
-        &remove_error_messages(&npm_results, &py_results, &extra_results),
+        &remove_error_messages(&npm_results, &py_results, &extra_results, &common.cwd),
     );
 
     if errs > 0 {
@@ -1455,13 +1615,49 @@ async fn run_remove(args: &SetupArgs) -> i32 {
 /// entries — the only place per-edit errors for those ecosystems are retained.
 /// The setup/remove previews use this so their human-mode "Errors:" sections
 /// actually list gem/composer failures, honoring the "(see errors above)" line
-/// both flows print when `preview_errors > 0`.
-fn outcome_error_messages(o: &SetupOutcome) -> Vec<String> {
+/// both flows print when `preview_errors > 0`. Each message is prefixed with
+/// the file's path (relative to `cwd`).
+fn outcome_error_messages(o: &SetupOutcome, cwd: &Path) -> Vec<String> {
     o.json_files
         .iter()
         .filter(|f| f.get("status").and_then(|s| s.as_str()) == Some("error"))
-        .filter_map(|f| f.get("error").and_then(|e| e.as_str()).map(str::to_string))
+        .filter_map(|f| {
+            let err = f.get("error").and_then(|e| e.as_str())?;
+            let path = f.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            Some(format_item_error(path, err, cwd))
+        })
         .collect()
+}
+
+/// `packages/a/package.json: Invalid package.json: ...` — in a workspace
+/// there can be dozens of manifests, so an error must say which one.
+fn format_item_error(path: &str, err: &str, cwd: &Path) -> String {
+    if path.is_empty() {
+        err.to_string()
+    } else {
+        format!("{}: {err}", pathdiff(path, cwd))
+    }
+}
+
+/// Print run warnings to stderr (`Warning: ...`) in human mode; `--json`
+/// carries them in the envelope and `--silent` mutes them.
+fn print_warnings(common: &GlobalArgs, warnings: &[String]) {
+    if common.json || common.silent {
+        return;
+    }
+    for w in warnings {
+        eprintln!("{}", format_warning(w));
+    }
+}
+
+/// `Warning: <Message>` — the warning texts start lowercase because they
+/// double as JSON `warnings[]` strings; the human line capitalizes them.
+fn format_warning(w: &str) -> String {
+    let mut chars = w.chars();
+    match chars.next() {
+        Some(first) => format!("Warning: {}{}", first.to_uppercase(), chars.as_str()),
+        None => "Warning:".to_string(),
+    }
 }
 
 /// `--silent` is "errors only" (CLI_CONTRACT.md): the previews, summaries,
@@ -1485,18 +1681,19 @@ fn remove_error_messages(
     npm: &[RemoveResult],
     py: &[PthEditResult],
     extra: &SetupOutcome,
+    cwd: &Path,
 ) -> Vec<String> {
     let mut errs: Vec<String> = npm
         .iter()
         .filter(|r| r.status == RemoveStatus::Error)
-        .filter_map(|r| r.error.clone())
+        .filter_map(|r| Some(format_item_error(&r.path, r.error.as_deref()?, cwd)))
         .chain(
             py.iter()
                 .filter(|r| r.status == PthStatus::Error)
-                .filter_map(|r| r.error.clone()),
+                .filter_map(|r| Some(format_item_error(&r.path, r.error.as_deref()?, cwd))),
         )
         .collect();
-    errs.extend(outcome_error_messages(extra));
+    errs.extend(outcome_error_messages(extra, cwd));
     errs
 }
 
@@ -1507,74 +1704,89 @@ fn setup_error_messages(
     npm: &[UpdateResult],
     py: &[PthEditResult],
     extra: &SetupOutcome,
+    cwd: &Path,
 ) -> Vec<String> {
     let mut errs: Vec<String> = npm
         .iter()
         .filter(|r| r.status == UpdateStatus::Error)
-        .filter_map(|r| r.error.clone())
+        .filter_map(|r| Some(format_item_error(&r.path, r.error.as_deref()?, cwd)))
         .chain(
             py.iter()
                 .filter(|r| r.status == PthStatus::Error)
-                .filter_map(|r| r.error.clone()),
+                .filter_map(|r| Some(format_item_error(&r.path, r.error.as_deref()?, cwd))),
         )
         .collect();
-    errs.extend(outcome_error_messages(extra));
+    errs.extend(outcome_error_messages(extra, cwd));
     errs
 }
 
-fn print_remove_preview(
+/// The `setup --remove` preview. Every section starts with a blank line (so
+/// the block never ends in a stray one before the summary or prompt).
+fn format_remove_preview(
     npm: &[RemoveResult],
     py: &[PthEditResult],
     extra: &SetupOutcome,
-    common: &GlobalArgs,
-) {
+    cwd: &Path,
+) -> String {
+    let mut out = String::from("\nProposed changes:\n");
     let to_remove: Vec<_> = npm
         .iter()
         .filter(|r| r.status == RemoveStatus::Removed)
         .collect();
+    if !to_remove.is_empty() {
+        out.push_str("\nWill remove socket-patch from:\n");
+        for r in &to_remove {
+            out.push_str(&format!("  - {}\n", pathdiff(&r.path, cwd)));
+            out.push_str(&format!("    postinstall:   \"{}\"\n", r.old_script));
+            out.push_str(&format!(
+                "    -> postinstall: {}\n",
+                render_removed(&r.new_script)
+            ));
+            out.push_str(&format!(
+                "    dependencies:  \"{}\"\n",
+                r.old_dependencies_script
+            ));
+            out.push_str(&format!(
+                "    -> dependencies: {}\n",
+                render_removed(&r.new_dependencies_script)
+            ));
+        }
+    }
     let py_remove: Vec<_> = py
         .iter()
         .filter(|r| r.status == PthStatus::Updated)
         .collect();
-    println!("\nProposed changes:\n");
-    if !to_remove.is_empty() {
-        println!("Will remove socket-patch from:");
-        for r in &to_remove {
-            let rel = pathdiff(&r.path, &common.cwd);
-            println!("  - {rel}");
-            println!("    postinstall:   \"{}\"", r.old_script);
-            println!("    -> postinstall: {}", render_removed(&r.new_script));
-            println!("    dependencies:  \"{}\"", r.old_dependencies_script);
-            println!(
-                "    -> dependencies: {}",
-                render_removed(&r.new_dependencies_script)
-            );
-        }
-        println!();
-    }
     if !py_remove.is_empty() {
-        println!("Will remove the socket-patch-hook dependency from:");
+        out.push_str("\nWill remove the socket-patch-hook dependency from:\n");
         for r in &py_remove {
-            println!("  - {}", pathdiff(&r.path, &common.cwd));
+            out.push_str(&format!("  - {}\n", pathdiff(&r.path, cwd)));
         }
-        println!();
     }
-    if !extra.preview.is_empty() {
-        for line in &extra.preview {
-            println!("{line}");
-        }
-        println!();
-    }
-
+    push_extra_preview(&mut out, extra);
     // Surface failures so the "(see errors above)" line `run_remove` prints when
     // nothing could be removed actually points at something.
-    let errs = remove_error_messages(npm, py, extra);
-    if !errs.is_empty() {
-        println!("Errors:");
-        for e in &errs {
-            println!("  ! {e}");
+    push_errors(&mut out, &remove_error_messages(npm, py, extra, cwd));
+    out
+}
+
+/// The gem/composer preview lines, as their own blank-line-led section.
+fn push_extra_preview(out: &mut String, extra: &SetupOutcome) {
+    if !extra.preview.is_empty() {
+        out.push('\n');
+        for line in &extra.preview {
+            out.push_str(line);
+            out.push('\n');
         }
-        println!();
+    }
+}
+
+/// The preview's "Errors:" section (nothing when there are none).
+fn push_errors(out: &mut String, errs: &[String]) {
+    if !errs.is_empty() {
+        out.push_str("\nErrors:\n");
+        for e in errs {
+            out.push_str(&format!("  ! {e}\n"));
+        }
     }
 }
 
@@ -1669,7 +1881,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     // unaffected, and prompting follows the shared `confirm()` semantics.
     let quiet = common.json || common.silent;
     if !quiet {
-        println!("Configuring socket-patch install hooks...");
+        eprintln!("Configuring socket-patch install hooks...");
     }
 
     // Resolve the effective exclude set (persisted + `--exclude`); excluded
@@ -1678,7 +1890,25 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     // directory or an aborted run leaves no `.socket/` behind.
     let existing = read_setup_manifest(common).await;
     let excludes = effective_excludes(manifest_view(&existing), &args.exclude);
-    let npm_files = discover(args, &excludes).await;
+    let found = find_members(args).await;
+    let unmatched = found
+        .as_ref()
+        .map(|f| unmatched_excludes(f, &common.cwd, &excludes))
+        .unwrap_or_default();
+    warn_unmatched_excludes(common, &unmatched);
+    // A new `--exclude` value that matches no member is warned about above
+    // and not persisted, so a typo does not ride into every later run and
+    // clone. Values already persisted stay (they warn on every run instead
+    // of being silently dropped from the user's manifest).
+    let persisted = effective_excludes(manifest_view(&existing), &[]);
+    let to_persist: Vec<String> = excludes
+        .iter()
+        .filter(|e| !unmatched.contains(e) || persisted.contains(e))
+        .cloned()
+        .collect();
+    let npm_files = found
+        .map(|f| select_members(f, &common.cwd, &excludes))
+        .unwrap_or_default();
     let py_plan = plan_python(common).await;
     // Gem + Composer projects are discovered ONCE and bundler probed ONCE:
     // the preview and the real edit below share both.
@@ -1734,10 +1964,6 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         None => Vec::new(),
     };
 
-    if !quiet {
-        print_setup_preview(&npm_preview, &py_preview, &extra_preview, common);
-    }
-
     let n_changes = npm_preview
         .iter()
         .filter(|r| r.status == UpdateStatus::Updated)
@@ -1747,6 +1973,19 @@ async fn run_setup(args: &SetupArgs) -> i32 {
             .filter(|r| r.status == PthStatus::Updated)
             .count()
         + extra_preview.changed;
+    if !quiet {
+        print!(
+            "{}",
+            format_setup_preview(
+                &npm_preview,
+                &py_preview,
+                &extra_preview,
+                &common.cwd,
+                n_changes
+            )
+        );
+    }
+
     let preview_errors = npm_preview
         .iter()
         .filter(|r| r.status == UpdateStatus::Error)
@@ -1764,7 +2003,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         // preview). A skipped (fail-closed) persistence rides the warnings
         // channel exactly like on the mutating path.
         let warnings: Vec<String> = if !common.dry_run && !args.exclude.is_empty() {
-            persist_setup_excludes(common, &existing, &excludes)
+            persist_setup_excludes(common, &existing, &to_persist)
                 .await
                 .into_iter()
                 .collect()
@@ -1787,17 +2026,22 @@ async fn run_setup(args: &SetupArgs) -> i32 {
             );
         } else if !common.silent {
             if preview_errors > 0 {
-                println!("No hooks were changed; {preview_errors} item(s) could not be processed (see errors above).");
+                println!(
+                    "\nNo hooks were changed; {} (see errors above).",
+                    plural(
+                        preview_errors,
+                        "item could not be processed",
+                        "items could not be processed"
+                    )
+                );
             } else {
                 println!("All install hooks are already configured with socket-patch!");
             }
-            for w in &warnings {
-                println!("  warning: {w}");
-            }
         }
+        print_warnings(common, &warnings);
         eprint_errors_when_silent(
             common,
-            &setup_error_messages(&npm_preview, &py_preview, &extra_preview),
+            &setup_error_messages(&npm_preview, &py_preview, &extra_preview, &common.cwd),
         );
         if preview_errors > 0 {
             return 1;
@@ -1821,26 +2065,38 @@ async fn run_setup(args: &SetupArgs) -> i32 {
             );
         } else if !common.silent {
             println!("\nSummary (dry run):");
-            println!("  {n_changes} item(s) would be updated");
+            println!(
+                "  {}",
+                plural(n_changes, "item would be updated", "items would be updated")
+            );
         }
         eprint_errors_when_silent(
             common,
-            &setup_error_messages(&npm_preview, &py_preview, &extra_preview),
+            &setup_error_messages(&npm_preview, &py_preview, &extra_preview, &common.cwd),
         );
         return if preview_errors > 0 { 1 } else { 0 };
     }
 
-    if !common.yes && !common.json && !confirm_proceed("Proceed with these changes? (y/N): ") {
-        println!("Aborted");
+    // Default-no on a terminal; proceeds when stdin is not interactive.
+    // Keep the prompt (or its non-interactive note) off the last preview
+    // line. With --yes nothing is printed there, and the progress line below
+    // already opens with its own blank line.
+    if !quiet && !common.yes {
+        eprintln!();
+    }
+    if !crate::ui::confirm_or_proceed("Proceed with these changes?", common) {
+        if !common.silent {
+            eprintln!("Aborted.");
+        }
         return 0;
     }
 
     // Past the mutation gate: persist the exclude set now (a dry run
     // returned above; an aborted or no-project run never gets here).
-    let persist_warning = persist_setup_excludes(common, &existing, &excludes).await;
+    let persist_warning = persist_setup_excludes(common, &existing, &to_persist).await;
 
     if !quiet {
-        println!("\nApplying changes...");
+        eprintln!("\nApplying changes...");
     }
 
     let mut npm_results = Vec::new();
@@ -1907,12 +2163,9 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 .count()
             + extra_results.changed;
         println!("\nSummary:");
-        println!("  {updated} item(s) updated");
+        println!("  {}", plural(updated, "item updated", "items updated"));
         if errors > 0 {
-            println!("  {errors} error(s)");
-        }
-        for w in &warnings {
-            println!("  warning: {w}");
+            println!("  {}", plural(errors, "error", "errors"));
         }
         if let Some(plan) = &py_plan {
             println!(
@@ -1931,9 +2184,10 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         }
     }
 
+    print_warnings(common, &warnings);
     eprint_errors_when_silent(
         common,
-        &setup_error_messages(&npm_results, &py_results, &extra_results),
+        &setup_error_messages(&npm_results, &py_results, &extra_results, &common.cwd),
     );
 
     if errors > 0 {
@@ -1963,63 +2217,55 @@ async fn track_setup_success(
     track_patch_setup(&manager, token.as_deref(), org.as_deref()).await;
 }
 
-fn print_setup_preview(
+/// The `setup` preview (same blank-line-led sections as
+/// [`format_remove_preview`]). `n_changes == 0` leaves out the "already
+/// configured" count: the caller then says everything is configured, and
+/// the count would only repeat it.
+fn format_setup_preview(
     npm: &[UpdateResult],
     py: &[PthEditResult],
     extra: &SetupOutcome,
-    common: &GlobalArgs,
-) {
+    cwd: &Path,
+    n_changes: usize,
+) -> String {
+    let mut out = String::new();
     let npm_changes: Vec<_> = npm
         .iter()
         .filter(|r| r.status == UpdateStatus::Updated)
         .collect();
+    if !npm_changes.is_empty() {
+        out.push_str("\npackage.json files to update:\n");
+        for r in &npm_changes {
+            out.push_str(&format!("  + {}\n", pathdiff(&r.path, cwd)));
+            out.push_str(&format!("    -> postinstall: \"{}\"\n", r.new_script));
+        }
+    }
     let py_changes: Vec<_> = py
         .iter()
         .filter(|r| r.status == PthStatus::Updated)
         .collect();
-
-    if !npm_changes.is_empty() {
-        println!("\npackage.json files to update:");
-        for r in &npm_changes {
-            println!("  + {}", pathdiff(&r.path, &common.cwd));
-            println!("    -> postinstall: \"{}\"", r.new_script);
-        }
-    }
     if !py_changes.is_empty() {
-        println!("\nPython manifests to update (socket-patch-hook):");
+        out.push_str("\nPython manifests to update (socket-patch-hook):\n");
         for r in &py_changes {
-            println!("  + {}", pathdiff(&r.path, &common.cwd));
+            out.push_str(&format!("  + {}\n", pathdiff(&r.path, cwd)));
         }
     }
-    if !extra.preview.is_empty() {
-        println!();
-        for line in &extra.preview {
-            println!("{line}");
-        }
-    }
+    push_extra_preview(&mut out, extra);
 
-    let npm_already = npm
+    let already = npm
         .iter()
         .filter(|r| r.status == UpdateStatus::AlreadyConfigured)
-        .count();
-    let py_already = py
-        .iter()
-        .filter(|r| r.status == PthStatus::AlreadyConfigured)
-        .count();
-    if npm_already + py_already + extra.already > 0 {
-        println!(
-            "\nAlready configured (will skip): {}",
-            npm_already + py_already + extra.already
-        );
+        .count()
+        + py.iter()
+            .filter(|r| r.status == PthStatus::AlreadyConfigured)
+            .count()
+        + extra.already;
+    if already > 0 && n_changes > 0 {
+        out.push_str(&format!("\nAlready configured (will skip): {already}\n"));
     }
 
-    let errs = setup_error_messages(npm, py, extra);
-    if !errs.is_empty() {
-        println!("\nErrors:");
-        for e in &errs {
-            println!("  ! {e}");
-        }
-    }
+    push_errors(&mut out, &setup_error_messages(npm, py, extra, cwd));
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2105,4 +2351,269 @@ fn print_setup_envelope(
         serde_json::to_string_pretty(&obj)
             .expect("serializing an in-memory JSON value cannot fail")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    //! Exact-string tests for setup's human output builders.
+    use super::*;
+
+    fn cwd() -> PathBuf {
+        PathBuf::from("/proj")
+    }
+
+    fn update(path: &str, status: UpdateStatus, err: Option<&str>) -> UpdateResult {
+        UpdateResult {
+            path: path.to_string(),
+            status,
+            old_script: String::new(),
+            new_script: "npx @socketsecurity/socket-patch apply --silent".to_string(),
+            error: err.map(str::to_string),
+        }
+    }
+
+    fn remove(path: &str, status: RemoveStatus) -> RemoveResult {
+        RemoveResult {
+            path: path.to_string(),
+            status,
+            old_script: "socket-patch apply && echo hi".to_string(),
+            new_script: Some("echo hi".to_string()),
+            old_dependencies_script: "socket-patch apply".to_string(),
+            new_dependencies_script: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn no_files_message_follows_scope() {
+        let all = ["package.json", "Python", "Bundler", "Composer"];
+        assert_eq!(
+            format_no_files(&all, &[]),
+            "No package.json, Python, Bundler, or Composer project found"
+        );
+        assert_eq!(
+            format_no_files(&["package.json"], &["npm".to_string()]),
+            "No package.json project found"
+        );
+        assert_eq!(
+            format_no_files(&["Python", "Bundler"], &[]),
+            "No Python or Bundler project found"
+        );
+        assert_eq!(
+            format_no_files(&[], &["cargo".to_string(), "maven".to_string()]),
+            "Setup has no install hook for: cargo, maven (supported: npm, pypi, gem, composer)"
+        );
+    }
+
+    #[test]
+    fn no_files_message_reads_the_ecosystems_filter() {
+        let mut common = GlobalArgs::default();
+        assert_eq!(
+            no_files_message(&common),
+            "No package.json, Python, Bundler, or Composer project found"
+        );
+        common.ecosystems = Some(vec!["cargo".to_string()]);
+        assert!(no_files_message(&common).starts_with("Setup has no install hook for: cargo"));
+        common.ecosystems = Some(vec!["cargo".to_string(), "pypi".to_string()]);
+        assert_eq!(no_files_message(&common), "No Python project found");
+    }
+
+    #[test]
+    fn warnings_are_capitalized_for_humans() {
+        assert_eq!(
+            format_warning("not persisting --exclude: x"),
+            "Warning: Not persisting --exclude: x"
+        );
+        assert_eq!(
+            format_warning("`uv lock` failed"),
+            "Warning: `uv lock` failed"
+        );
+        assert_eq!(format_warning("écrit"), "Warning: Écrit");
+        assert_eq!(format_warning(""), "Warning:");
+    }
+
+    #[test]
+    fn unmatched_exclude_message_is_trimmed() {
+        assert_eq!(
+            format_unmatched_exclude(" nope"),
+            "--exclude \"nope\" matched no workspace member"
+        );
+        assert_eq!(
+            format_unmatched_exclude("pkgs/ü"),
+            "--exclude \"pkgs/ü\" matched no workspace member"
+        );
+    }
+
+    #[test]
+    fn check_lines_render_each_state() {
+        use CheckState::*;
+        assert_eq!(
+            format_check_line("package_json", "package.json", Configured, None),
+            "  ✓ package.json (configured)"
+        );
+        assert_eq!(
+            format_check_line("package_json", "package.json", NeedsConfiguration, None),
+            "  ✗ package.json (needs setup)"
+        );
+        assert_eq!(
+            format_check_line(
+                "patch",
+                "pkg:npm/minimist@1.2.5",
+                NeedsConfiguration,
+                Some("patch not applied on disk (hash_mismatch)")
+            ),
+            "  ✗ pkg:npm/minimist@1.2.5: patch not applied on disk (hash_mismatch)"
+        );
+        assert_eq!(
+            format_check_line("gemfile", "Gemfile", NeedsConfiguration, Some("x")),
+            "  ✗ Gemfile (needs setup: x)"
+        );
+        assert_eq!(
+            format_check_line(
+                "package_json",
+                "a/package.json",
+                Error,
+                Some("Invalid package.json: EOF")
+            ),
+            "  ! a/package.json: Invalid package.json: EOF"
+        );
+        assert_eq!(
+            format_check_line("pth", "req.txt", Error, None),
+            "  ! req.txt: unknown error"
+        );
+    }
+
+    #[test]
+    fn check_footer_names_the_fixing_command() {
+        assert_eq!(
+            format_check_footer(0, 0, 0),
+            "All manifests are configured with socket-patch."
+        );
+        assert_eq!(
+            format_check_footer(1, 0, 0),
+            "1 manifest needs configuration. Run `socket-patch setup` to add the missing \
+             install hooks."
+        );
+        assert_eq!(
+            format_check_footer(0, 1, 0),
+            "1 patch is not applied on disk. Run `socket-patch apply` to re-apply the patches."
+        );
+        assert_eq!(
+            format_check_footer(0, 0, 2),
+            "2 errors. Fix the errors above, then re-run `socket-patch setup --check`."
+        );
+        assert_eq!(
+            format_check_footer(3, 2, 1),
+            "3 manifests need configuration, 2 patches are not applied on disk, 1 error. \
+             Run `socket-patch setup` to add the missing install hooks. Run `socket-patch \
+             apply` to re-apply the patches. Fix the errors above, then re-run `socket-patch \
+             setup --check`."
+        );
+        for f in [format_check_footer(1, 1, 1), format_check_footer(2, 2, 2)] {
+            assert!(!f.contains("(s)"), "{f}");
+        }
+    }
+
+    #[test]
+    fn item_errors_name_the_file() {
+        assert_eq!(
+            format_item_error(
+                "/proj/packages/a/package.json",
+                "Invalid package.json: x",
+                &cwd()
+            ),
+            "packages/a/package.json: Invalid package.json: x"
+        );
+        assert_eq!(format_item_error("", "boom", &cwd()), "boom");
+        assert_eq!(
+            format_item_error("/elsewhere/p.json", "boom", &cwd()),
+            "/elsewhere/p.json: boom"
+        );
+    }
+
+    #[test]
+    fn setup_preview_layout() {
+        let npm = vec![
+            update("/proj/package.json", UpdateStatus::Updated, None),
+            update(
+                "/proj/packages/b/package.json",
+                UpdateStatus::AlreadyConfigured,
+                None,
+            ),
+            update(
+                "/proj/packages/bad/package.json",
+                UpdateStatus::Error,
+                Some("Invalid package.json: EOF"),
+            ),
+        ];
+        let out = format_setup_preview(&npm, &[], &SetupOutcome::default(), &cwd(), 1);
+        assert_eq!(
+            out,
+            "\npackage.json files to update:\n  + package.json\n    -> postinstall: \"npx \
+             @socketsecurity/socket-patch apply --silent\"\n\nAlready configured (will skip): \
+             1\n\nErrors:\n  ! packages/bad/package.json: Invalid package.json: EOF\n"
+        );
+        assert!(!out.contains("\n\n\n"), "{out:?}");
+    }
+
+    #[test]
+    fn setup_preview_skips_already_count_when_nothing_changes() {
+        let npm = vec![update(
+            "/proj/package.json",
+            UpdateStatus::AlreadyConfigured,
+            None,
+        )];
+        assert_eq!(
+            format_setup_preview(&npm, &[], &SetupOutcome::default(), &cwd(), 0),
+            ""
+        );
+    }
+
+    #[test]
+    fn setup_preview_lists_gem_and_composer_lines() {
+        let extra = SetupOutcome {
+            preview: vec![
+                "Gem: add the socket-patch Bundler plugin wiring to:".to_string(),
+                "  + Gemfile".to_string(),
+            ],
+            changed: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_setup_preview(&[], &[], &extra, &cwd(), 1),
+            "\nGem: add the socket-patch Bundler plugin wiring to:\n  + Gemfile\n"
+        );
+    }
+
+    #[test]
+    fn remove_preview_layout_has_no_double_blank_lines() {
+        let npm = vec![remove("/proj/package.json", RemoveStatus::Removed)];
+        let py = vec![PthEditResult {
+            path: "/proj/requirements.txt".to_string(),
+            status: PthStatus::Updated,
+            error: None,
+        }];
+        let extra = SetupOutcome {
+            preview: vec![
+                "Gem: remove the socket-patch Bundler plugin wiring from:".to_string(),
+                "  - Gemfile".to_string(),
+            ],
+            ..Default::default()
+        };
+        let out = format_remove_preview(&npm, &py, &extra, &cwd());
+        assert_eq!(
+            out,
+            "\nProposed changes:\n\nWill remove socket-patch from:\n  - package.json\n    \
+             postinstall:   \"socket-patch apply && echo hi\"\n    -> postinstall: \"echo \
+             hi\"\n    dependencies:  \"socket-patch apply\"\n    -> dependencies: \
+             (removed)\n\nWill remove the socket-patch-hook dependency from:\n  - \
+             requirements.txt\n\nGem: remove the socket-patch Bundler plugin wiring from:\n  \
+             - Gemfile\n"
+        );
+        assert!(!out.contains("\n\n\n"), "{out:?}");
+        assert!(
+            out.ends_with("Gemfile\n"),
+            "no trailing blank line: {out:?}"
+        );
+    }
 }

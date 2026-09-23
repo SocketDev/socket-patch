@@ -1,10 +1,12 @@
 use clap::Args;
 use socket_patch_core::api::blob_fetcher::{
-    fetch_missing_sources, format_fetch_result, get_missing_archives, get_missing_blobs,
-    DownloadMode, FetchMissingBlobsResult,
+    fetch_missing_sources, format_fetch_failures, format_fetch_successes, get_missing_archives,
+    get_missing_blobs, ArtifactNoun, DownloadMode, BLOB, DIFF_ARCHIVE, PACKAGE_ARCHIVE,
 };
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
-use socket_patch_core::manifest::cleanup_blobs::format_cleanup_result;
+use socket_patch_core::manifest::cleanup_blobs::{
+    format_all_in_use, format_cleanup_result_for, CleanupResult,
+};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::patch::apply::PatchSources;
 use socket_patch_core::telemetry::{track_patch_repair_failed, track_patch_repaired};
@@ -23,13 +25,13 @@ pub struct RepairArgs {
 
     /// Only download missing artifacts; skip the cleanup phase.
     /// Incompatible with `--offline`.
-    ///
-    /// `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
-    /// clap's default bool parser accepts only the literal strings
-    /// `true`/`false` from the env binding, so `SOCKET_DOWNLOAD_ONLY=1` (or
-    /// an exported-but-empty `SOCKET_DOWNLOAD_ONLY=`) aborted every `repair`
-    /// invocation. This flag is also outside `GLOBAL_ARG_ENV_VARS`, so
-    /// `main`'s empty-var scrub never rescues it.
+    //
+    // `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
+    // clap's default bool parser accepts only the literal strings
+    // `true`/`false` from the env binding, so `SOCKET_DOWNLOAD_ONLY=1` (or
+    // an exported-but-empty `SOCKET_DOWNLOAD_ONLY=`) aborted every `repair`
+    // invocation. This flag is also outside `GLOBAL_ARG_ENV_VARS`, so
+    // `main`'s empty-var scrub never rescues it.
     #[arg(
         long = "download-only",
         env = "SOCKET_DOWNLOAD_ONLY",
@@ -54,17 +56,6 @@ pub async fn run(args: RepairArgs) -> i32 {
         }
         return 2;
     }
-
-    // Resolve telemetry credentials through the API client the way
-    // apply/rollback/remove do: passing the raw `--api-token`/`--org` flag
-    // values meant env-provided SOCKET_API_TOKEN/SOCKET_ORG_SLUG (the
-    // standard configuration) never reached telemetry, which then fell
-    // back to the anonymous public-proxy endpoint instead of the
-    // org-scoped one.
-    let (telemetry_client, _) =
-        get_api_client_with_overrides(args.common.api_client_overrides()).await;
-    let api_token = telemetry_client.api_token().cloned();
-    let org_slug = telemetry_client.org_slug().cloned();
 
     let manifest_path = args.common.resolved_manifest_path();
 
@@ -99,7 +90,7 @@ pub async fn run(args: RepairArgs) -> i32 {
         }
         if !has_vendor_traces {
             if tokio::fs::metadata(&redirect_state).await.is_ok() {
-                let msg = "hosted redirects need no local repair; re-run \
+                let msg = "Hosted redirects need no local repair; re-run \
                            `scan --mode hosted` to refresh the lockfile redirects \
                            (it also re-checks for stale pre-redirect installs)";
                 if args.common.json {
@@ -125,7 +116,7 @@ pub async fn run(args: RepairArgs) -> i32 {
                 );
                 println!("{}", env.to_pretty_json());
             } else {
-                eprintln!("{msg}");
+                eprintln!("Error: {msg}");
             }
             return 1;
         }
@@ -158,14 +149,35 @@ pub async fn run(args: RepairArgs) -> i32 {
         None => crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd).await,
     };
 
-    match repair_inner(
-        &args,
-        &manifest_path,
-        Some(&telemetry_client),
-        vendor_references,
-    )
-    .await
-    {
+    // The API client is built lazily: `repair_inner` constructs it only on
+    // the download branch, so a run that downloads nothing (an invalid or
+    // empty manifest, every artifact present, a dry run) never prints the
+    // client's public-proxy advisory ahead of its own output.
+    let mut client: Option<ApiClient> = None;
+    let result = repair_inner(&args, &manifest_path, &mut client, vendor_references).await;
+
+    // Resolve telemetry credentials through the API client the way
+    // apply/rollback/remove do: passing the raw `--api-token`/`--org` flag
+    // values meant env-provided SOCKET_API_TOKEN/SOCKET_ORG_SLUG (the
+    // standard configuration) never reached telemetry, which then fell
+    // back to the anonymous public-proxy endpoint instead of the
+    // org-scoped one. Reuse the download phase's client when there was
+    // one. Otherwise build one only when a token is available (so the
+    // org auto-resolve still attributes the event, and no proxy advisory
+    // is printed): without a token telemetry goes to the public endpoint
+    // whatever the org slug, so `(None, None)` is equivalent.
+    if client.is_none() && api_token_available(&args.common) {
+        client = Some(
+            get_api_client_with_overrides(args.common.api_client_overrides())
+                .await
+                .0,
+        );
+    }
+    let (api_token, org_slug) = client.as_ref().map_or((None, None), |c| {
+        (c.api_token().cloned(), c.org_slug().cloned())
+    });
+
+    match result {
         Ok((env, counts)) => {
             // A repair where some artifacts failed to download is marked a
             // partial failure inside `repair_inner` (a `Failed` event plus
@@ -219,14 +231,106 @@ struct RepairCounts {
     bytes_freed: u64,
 }
 
+/// How many missing ids the offline warning lists.
+const OFFLINE_LIST_CAP: usize = 5;
+/// How many missing ids the dry-run preview lists.
+const DRY_RUN_LIST_CAP: usize = 10;
+
+/// `  - <id>` lines for `ids`, sorted (they come from a `HashSet`), at
+/// most `cap` of them, then `  ... and N more`.
+fn format_id_list(ids: &[String], noun: ArtifactNoun, cap: usize) -> Vec<String> {
+    let mut sorted: Vec<&String> = ids.iter().collect();
+    sorted.sort();
+    let mut lines: Vec<String> = sorted
+        .iter()
+        .take(cap)
+        .map(|id| format!("  - {}", noun.display_id(id)))
+        .collect();
+    if sorted.len() > cap {
+        lines.push(format!("  ... and {} more", sorted.len() - cap));
+    }
+    lines
+}
+
+/// `Found 2 missing diff archives` / `Found 1 missing blob`.
+fn format_found_missing(n: usize, noun: ArtifactNoun) -> String {
+    format!("Found {}", noun.count(n).replacen(' ', " missing ", 1))
+}
+
+/// The `--offline` warning (stderr) for artifacts that cannot be fetched.
+fn format_offline_warning(ids: &[String], noun: ArtifactNoun) -> String {
+    let verb = if ids.len() == 1 { "is" } else { "are" };
+    let mut lines = vec![format!(
+        "Warning: {} {verb} missing (offline mode - not downloading):",
+        noun.count(ids.len())
+    )];
+    lines.extend(format_id_list(ids, noun, OFFLINE_LIST_CAP));
+    lines.join("\n")
+}
+
+/// The cleanup phase's summary: one result block per kind that had
+/// something to remove; otherwise a single line saying what was checked.
+fn format_cleanup_summary(results: &[(ArtifactNoun, CleanupResult)], dry_run: bool) -> String {
+    let removed: Vec<String> = results
+        .iter()
+        .filter(|(_, r)| r.blobs_removed > 0)
+        .map(|(noun, r)| format_cleanup_result_for(r, dry_run, *noun))
+        .collect();
+    if !removed.is_empty() {
+        return removed.join("\n");
+    }
+    let checked: Vec<String> = results
+        .iter()
+        .filter(|(_, r)| r.blobs_checked > 0)
+        .map(|(noun, r)| noun.count(r.blobs_checked))
+        .collect();
+    if checked.is_empty() {
+        return "Nothing to clean up.".to_string();
+    }
+    let total = results.iter().map(|(_, r)| r.blobs_checked).sum();
+    format_all_in_use(&checked, total)
+}
+
+/// The closing line of a human repair run.
+fn format_final_line(download_failed: usize, noun: ArtifactNoun, dry_run: bool) -> String {
+    if download_failed > 0 {
+        let verb = if download_failed == 1 { "was" } else { "were" };
+        format!(
+            "Repair finished with errors: {} {verb} not downloaded.",
+            noun.count(download_failed)
+        )
+    } else if dry_run {
+        "Dry run: no changes made.".to_string()
+    } else {
+        "Repair complete.".to_string()
+    }
+}
+
+/// Whether an API token will be found, mirroring the client's chain: the
+/// `--api-token` flag (clap also maps SOCKET_API_TOKEN into it), then —
+/// unless `SOCKET_NO_API_TOKEN` vetoes ambient tokens — the env var and the
+/// socket-cli config. Checked without building a client, which would print
+/// the public-proxy advisory when there is none.
+fn api_token_available(common: &GlobalArgs) -> bool {
+    use socket_patch_core::utils::socket_cli_config;
+    if common.api_token.as_deref().is_some_and(|t| !t.is_empty()) {
+        return true;
+    }
+    if socket_cli_config::no_api_token_veto() {
+        return false;
+    }
+    std::env::var("SOCKET_API_TOKEN").is_ok_and(|t| !t.is_empty())
+        || socket_cli_config::load().is_some_and(|c| c.api_token.is_some())
+}
+
 async fn repair_inner(
     args: &RepairArgs,
     manifest_path: &Path,
-    // The client `run()` already built: constructing another one for the
-    // download printed the core client's "No SOCKET_API_TOKEN set" notice
-    // twice per repair. `None` (unit tests) builds one on demand, only when
-    // the download below actually fires.
-    api_client: Option<&ApiClient>,
+    // Built lazily on the download branch (see `run`) and handed on to
+    // the vendored phase, so one repair constructs at most one client and
+    // prints the core client's "No SOCKET_API_TOKEN set" notice at most
+    // once. Unit tests pass `&mut None`.
+    client: &mut Option<ApiClient>,
     // `(eco, uuid, rel)` lockfile vendor references, scanned once by `run`.
     vendor_references: Vec<(String, String, String)>,
 ) -> Result<(Envelope, RepairCounts), String> {
@@ -234,7 +338,7 @@ async fn repair_inner(
     // stays a hard error.
     let manifest = read_manifest(manifest_path)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::commands::list::manifest_error_message(manifest_path, &e))?;
 
     let socket_dir = crate::args::socket_dir_of(manifest_path, &args.common.cwd);
     let blobs_path = socket_dir.join("blobs");
@@ -316,68 +420,52 @@ async fn repair_inner(
             .collect(),
     };
     let missing_count = missing_artifacts.len();
+    let noun = download_mode.noun();
+    // Whether stdout already carries a line, so the blank separators
+    // between sections never open the output (the offline warning goes
+    // to stderr).
+    let mut stdout_started = true;
 
     if missing_artifacts.is_empty() {
         if !quiet {
-            println!(
-                "All {} artifacts are present locally.",
-                download_mode.as_tag()
-            );
+            if manifest.as_ref().is_some_and(|m| m.patches.is_empty()) {
+                println!("No patches in manifest; nothing to download.");
+            } else {
+                println!("All {} are present locally.", noun.many);
+            }
         }
     } else if args.common.offline {
         if !quiet {
-            println!(
-                "Warning: {} {} artifact(s) are missing (offline mode - not downloading)",
-                missing_artifacts.len(),
-                download_mode.as_tag()
-            );
-            for id in missing_artifacts.iter().take(5) {
-                // Truncate by characters, not bytes: manifest hashes are
-                // unvalidated strings, and a byte slice panics when index
-                // 12 lands inside a multibyte char (see format_fetch_result).
-                let short: String = id.chars().take(12).collect();
-                println!("  - {short}...");
-            }
-            if missing_artifacts.len() > 5 {
-                println!("  ... and {} more", missing_artifacts.len() - 5);
-            }
+            eprintln!("{}", format_offline_warning(&missing_artifacts, noun));
         }
+        stdout_started = false;
     } else {
         if !quiet {
-            println!(
-                "Found {} missing {} artifact(s)",
-                missing_artifacts.len(),
-                download_mode.as_tag()
-            );
+            println!("{}", format_found_missing(missing_artifacts.len(), noun));
         }
 
         if args.common.dry_run {
             if !quiet {
-                println!("\nDry run - would download:");
-                for id in missing_artifacts.iter().take(10) {
-                    // Chars, not bytes — same constraint as the offline list.
-                    let short: String = id.chars().take(12).collect();
-                    println!("  - {short}...");
-                }
-                if missing_artifacts.len() > 10 {
-                    println!("  ... and {} more", missing_artifacts.len() - 10);
+                println!();
+                println!("Dry run - would download:");
+                for line in format_id_list(&missing_artifacts, noun, DRY_RUN_LIST_CAP) {
+                    println!("{line}");
                 }
             }
         } else {
-            if !quiet {
-                println!("\nDownloading missing {}s...", download_mode.as_tag());
+            let mut status = crate::ui::StatusLine::stderr(args.common.json, args.common.silent);
+            status.set(format!(
+                "Downloading {}...",
+                noun.count(missing_artifacts.len())
+            ));
+            if client.is_none() {
+                *client = Some(
+                    get_api_client_with_overrides(args.common.api_client_overrides())
+                        .await
+                        .0,
+                );
             }
-            let built_client;
-            let client = match api_client {
-                Some(c) => c,
-                None => {
-                    built_client =
-                        get_api_client_with_overrides(args.common.api_client_overrides())
-                            .await
-                            .0;
-                    &built_client
-                }
-            };
+            let client = client.as_ref().expect("client built just above");
             let sources = PatchSources {
                 blobs_path: &blobs_path,
                 packages_path: Some(&packages_path),
@@ -391,21 +479,27 @@ async fn repair_inner(
                 .expect("step 1 requires a manifest");
             let fetch_result =
                 fetch_missing_sources(m, &sources, download_mode, client, None).await;
+            status.finish();
             downloaded_count = fetch_result.downloaded;
             download_failed_count = fetch_result.failed;
             if !quiet {
-                println!("{}", format_fetch_result(&fetch_result));
-            } else if fetch_result.failed > 0 && !args.common.json {
-                // `--silent` suppresses NON-error output only: a failed
-                // download must still reach stderr (`--json` runs carry it
-                // in the envelope instead). Zeroing the success counters
-                // makes `format_fetch_result` emit just the failure lines.
-                let failures_only = FetchMissingBlobsResult {
-                    downloaded: 0,
-                    skipped: 0,
-                    ..fetch_result
-                };
-                eprintln!("{}", format_fetch_result(&failures_only));
+                for line in format_fetch_successes(&fetch_result, noun) {
+                    println!("{line}");
+                }
+            }
+            // Failures are error output: stderr, and not muted by
+            // `--silent` (`--json` runs carry them in the envelope).
+            if !args.common.json {
+                for (i, line) in format_fetch_failures(&fetch_result, noun)
+                    .iter()
+                    .enumerate()
+                {
+                    if i == 0 {
+                        eprintln!("Error: {line}");
+                    } else {
+                        eprintln!("{line}");
+                    }
+                }
             }
         }
     }
@@ -422,28 +516,29 @@ async fn repair_inner(
         &mut env,
         &vendor_references,
         ledger,
-        api_client,
+        client.as_ref(),
     )
     .await;
     if !quiet && vendor_rebuilt > 0 {
-        println!("Rebuilt {} vendored artifact(s).", vendor_rebuilt);
+        stdout_started = true;
+        println!(
+            "Rebuilt {}.",
+            crate::ui::plural(vendor_rebuilt, "vendored artifact", "vendored artifacts")
+        );
     }
 
-    // Step 2: Clean up unused artifacts across all three directories.
+    // Step 2: Clean up unused artifacts across all three directories. The
+    // summary prints once all three passes are in, so "nothing to clean
+    // up" is only said when all three really are empty.
     if let (false, Some(manifest)) = (args.download_only, manifest.as_ref()) {
-        if !quiet {
-            println!();
-        }
         let sweep = sweep_unused_artifacts(manifest, &socket_dir, args.common.dry_run).await;
-        // The blob pass prints its status unconditionally ("all are in
-        // use" included — the core helper owns that wording); the archive
-        // passes print only when they removed something, relabeled.
         let passes = [
-            ("blob", None, sweep.blobs),
-            ("diff", Some("diff archive(s)"), sweep.diffs),
-            ("package", Some("package archive(s)"), sweep.packages),
+            ("blob", BLOB, sweep.blobs),
+            ("diff", DIFF_ARCHIVE, sweep.diffs),
+            ("package", PACKAGE_ARCHIVE, sweep.packages),
         ];
-        for (label, relabel, result) in passes {
+        let mut results: Vec<(ArtifactNoun, CleanupResult)> = Vec::new();
+        for (label, noun, result) in passes {
             // A failed cleanup — the pass aborted, or it could not unlink
             // every orphan — is error output: `--silent` (suppress
             // NON-error output) must not mute it, and the JSON envelope
@@ -452,6 +547,8 @@ async fn repair_inner(
             // informational skip (not `Failed`) to preserve the human
             // path's warn-and-continue contract: status stays success,
             // exit stays 0, and the loop goes on to the next directory.
+            // A pass that swept past unlink failures still counts what it
+            // did reclaim.
             if let Some(detail) = sweep_failure(label, &result) {
                 if !args.common.json {
                     eprintln!("Warning: {detail}");
@@ -461,28 +558,41 @@ async fn repair_inner(
                         .with_reason("cleanup_failed", detail),
                 );
             }
-            let Ok(cleanup_result) = result else {
-                continue;
-            };
-            blobs_checked += cleanup_result.blobs_checked;
-            blobs_cleaned += cleanup_result.blobs_removed;
-            bytes_freed += cleanup_result.bytes_freed;
-            if quiet {
-                continue;
+            if let Ok(cleanup_result) = result {
+                results.push((noun, cleanup_result));
             }
-            let text = format_cleanup_result(&cleanup_result, args.common.dry_run);
-            match relabel {
-                None => println!("{text}"),
-                Some(relabel) if cleanup_result.blobs_removed > 0 => {
-                    println!("{}", text.replace("blob(s)", relabel));
-                }
-                Some(_) => {}
+        }
+
+        for (_, r) in &results {
+            blobs_checked += r.blobs_checked;
+            blobs_cleaned += r.blobs_removed;
+            bytes_freed += r.bytes_freed;
+        }
+        if !quiet {
+            if stdout_started {
+                println!();
             }
+            stdout_started = true;
+            println!("{}", format_cleanup_summary(&results, args.common.dry_run));
         }
     }
 
-    if !args.common.dry_run && !quiet {
-        println!("\nRepair complete.");
+    if !quiet {
+        // The blank separator goes to the same stream as the final line,
+        // so a piped stdout never ends in a stray blank line when the
+        // line itself goes to stderr.
+        let line = format_final_line(download_failed_count, noun, args.common.dry_run);
+        if download_failed_count > 0 {
+            if stdout_started {
+                eprintln!();
+            }
+            eprintln!("{line}");
+        } else {
+            if stdout_started {
+                println!();
+            }
+            println!("{line}");
+        }
     }
 
     // Translate the aggregate counts into envelope events. `repair`
@@ -509,7 +619,7 @@ async fn repair_inner(
     if download_failed_count > 0 {
         env.record(PatchEvent::artifact(PatchAction::Failed).with_error(
             "download_failed",
-            format!("{} artifact(s) failed to download", download_failed_count),
+            format!("{} failed to download", noun.count(download_failed_count)),
         ));
         env.mark_partial_failure();
     }
@@ -627,9 +737,10 @@ mod tests {
         let mut args = offline_args(tmp.path());
         args.common.dry_run = true;
 
-        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
-            .await
-            .expect("repair_inner");
+        let (env, counts) =
+            repair_inner(&args, &socket.join("manifest.json"), &mut None, Vec::new())
+                .await
+                .expect("repair_inner");
 
         assert!(
             !has_download_event(&env),
@@ -652,9 +763,10 @@ mod tests {
         args.common.offline = false;
         args.common.dry_run = true;
 
-        let (env, _counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
-            .await
-            .expect("repair_inner");
+        let (env, _counts) =
+            repair_inner(&args, &socket.join("manifest.json"), &mut None, Vec::new())
+                .await
+                .expect("repair_inner");
 
         assert!(
             has_download_event(&env),
@@ -676,9 +788,10 @@ mod tests {
         write_blob(&socket, &orphan_hash, orphan_bytes);
 
         let args = offline_args(tmp.path());
-        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
-            .await
-            .expect("repair_inner");
+        let (env, counts) =
+            repair_inner(&args, &socket.join("manifest.json"), &mut None, Vec::new())
+                .await
+                .expect("repair_inner");
 
         assert_eq!(counts.cleaned, 1, "one orphan should be cleaned");
         assert_eq!(
@@ -709,9 +822,10 @@ mod tests {
         args.common.offline = false;
         args.download_only = true;
 
-        let (_env, counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
-            .await
-            .expect("repair_inner");
+        let (_env, counts) =
+            repair_inner(&args, &socket.join("manifest.json"), &mut None, Vec::new())
+                .await
+                .expect("repair_inner");
 
         assert_eq!(counts.cleaned, 0, "download-only must skip cleanup");
         assert_eq!(counts.bytes_freed, 0);
@@ -751,9 +865,10 @@ mod tests {
         );
 
         let args = offline_args(tmp.path());
-        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
-            .await
-            .expect("repair_inner");
+        let (env, counts) =
+            repair_inner(&args, &socket.join("manifest.json"), &mut None, Vec::new())
+                .await
+                .expect("repair_inner");
 
         // Two orphans removed (one diff, one package); the referenced ones stay.
         assert_eq!(counts.cleaned, 2, "both orphan archives should be swept");
@@ -831,9 +946,10 @@ mod tests {
         let mut args = offline_args(tmp.path());
         args.common.json = false;
 
-        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
-            .await
-            .expect("repair_inner");
+        let (env, counts) =
+            repair_inner(&args, &socket.join("manifest.json"), &mut None, Vec::new())
+                .await
+                .expect("repair_inner");
 
         assert_eq!(counts.downloaded, 0);
         assert_eq!(env.status, Status::Success);
@@ -850,9 +966,10 @@ mod tests {
         args.common.dry_run = true;
         args.common.json = false;
 
-        let (env, _counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
-            .await
-            .expect("repair_inner");
+        let (env, _counts) =
+            repair_inner(&args, &socket.join("manifest.json"), &mut None, Vec::new())
+                .await
+                .expect("repair_inner");
 
         // The preview event is still recorded once the print survives.
         assert!(
@@ -872,9 +989,10 @@ mod tests {
         // No blob on disk → manifest afterHash is "missing". Not dry-run.
         let args = offline_args(tmp.path());
 
-        let (env, counts) = repair_inner(&args, &socket.join("manifest.json"), None, Vec::new())
-            .await
-            .expect("repair_inner");
+        let (env, counts) =
+            repair_inner(&args, &socket.join("manifest.json"), &mut None, Vec::new())
+                .await
+                .expect("repair_inner");
 
         assert!(
             !has_download_event(&env),
@@ -887,5 +1005,169 @@ mod tests {
             Status::Success,
             "missing artifacts in offline mode are a warning, not a failure"
         );
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn id_list_is_sorted_capped_and_honest_about_truncation() {
+        let uuids = ids(&[
+            "22222222-2222-4222-8222-222222222222",
+            "11111111-1111-4111-8111-111111111111",
+        ]);
+        // Diff-mode UUIDs print in full, in sorted order.
+        assert_eq!(
+            format_id_list(&uuids, DIFF_ARCHIVE, 5),
+            vec![
+                "  - 11111111-1111-4111-8111-111111111111",
+                "  - 22222222-2222-4222-8222-222222222222",
+            ]
+        );
+        // File-mode hashes: 64-hex cut to 12 + "...", a short one kept whole.
+        let hashes = ids(&[&"b".repeat(64), "22"]);
+        assert_eq!(
+            format_id_list(&hashes, BLOB, 5),
+            vec!["  - 22", "  - bbbbbbbbbbbb..."]
+        );
+        let many: Vec<String> = (0..7).map(|i| format!("id{i}")).collect();
+        let lines = format_id_list(&many, BLOB, 5);
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[5], "  ... and 2 more");
+        assert!(format_id_list(&[], BLOB, 5).is_empty());
+        // Multibyte ids never panic and are counted in chars.
+        assert_eq!(
+            format_id_list(&ids(&[MULTIBYTE_HASH]), BLOB, 5),
+            vec!["  - aéééééééé"]
+        );
+    }
+
+    #[test]
+    fn found_missing_line() {
+        assert_eq!(format_found_missing(1, BLOB), "Found 1 missing blob");
+        assert_eq!(
+            format_found_missing(12, DIFF_ARCHIVE),
+            "Found 12 missing diff archives"
+        );
+    }
+
+    #[test]
+    fn offline_warning_singular_and_plural() {
+        assert_eq!(
+            format_offline_warning(
+                &ids(&["11111111-1111-4111-8111-111111111111"]),
+                DIFF_ARCHIVE
+            ),
+            "Warning: 1 diff archive is missing (offline mode - not downloading):\n\
+             \x20 - 11111111-1111-4111-8111-111111111111"
+        );
+        assert_eq!(
+            format_offline_warning(&ids(&["b", "a"]), BLOB),
+            "Warning: 2 blobs are missing (offline mode - not downloading):\n  - a\n  - b"
+        );
+    }
+
+    #[test]
+    fn cleanup_summary_names_each_kind() {
+        let checked = |n: usize| CleanupResult {
+            blobs_checked: n,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_cleanup_summary(
+                &[
+                    (BLOB, checked(0)),
+                    (DIFF_ARCHIVE, checked(0)),
+                    (PACKAGE_ARCHIVE, checked(0))
+                ],
+                false
+            ),
+            "Nothing to clean up."
+        );
+        assert_eq!(format_cleanup_summary(&[], false), "Nothing to clean up.");
+        assert_eq!(
+            format_cleanup_summary(&[(BLOB, checked(1)), (DIFF_ARCHIVE, checked(0))], false),
+            "Checked 1 blob: in use."
+        );
+        assert_eq!(
+            format_cleanup_summary(
+                &[
+                    (BLOB, checked(2)),
+                    (DIFF_ARCHIVE, checked(1)),
+                    (PACKAGE_ARCHIVE, checked(3))
+                ],
+                false
+            ),
+            "Checked 2 blobs, 1 diff archive and 3 package archives: all in use."
+        );
+        let orphan = CleanupResult {
+            blobs_checked: 2,
+            blobs_removed: 1,
+            bytes_freed: 3,
+            removed_blobs: vec!["3333.tar.gz".into()],
+            ..Default::default()
+        };
+        let pkg = CleanupResult {
+            blobs_checked: 1,
+            blobs_removed: 1,
+            bytes_freed: 2,
+            removed_blobs: vec!["4444.tar.gz".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            format_cleanup_summary(
+                &[
+                    (BLOB, checked(0)),
+                    (DIFF_ARCHIVE, orphan),
+                    (PACKAGE_ARCHIVE, pkg)
+                ],
+                true
+            ),
+            "Would remove 1 unused diff archive (3 B freed)\n\
+             Unused diff archives:\n  - 3333.tar.gz\n\
+             Would remove 1 unused package archive (2 B freed)\n\
+             Unused package archives:\n  - 4444.tar.gz"
+        );
+    }
+
+    #[test]
+    fn final_line_reflects_failures_and_dry_run() {
+        assert_eq!(format_final_line(0, BLOB, false), "Repair complete.");
+        assert_eq!(
+            format_final_line(0, BLOB, true),
+            "Dry run: no changes made."
+        );
+        assert_eq!(
+            format_final_line(1, DIFF_ARCHIVE, false),
+            "Repair finished with errors: 1 diff archive was not downloaded."
+        );
+        assert_eq!(
+            format_final_line(2, BLOB, false),
+            "Repair finished with errors: 2 blobs were not downloaded."
+        );
+    }
+
+    #[test]
+    fn help_has_no_developer_commentary() {
+        use clap::CommandFactory;
+        let mut cmd = crate::Cli::command();
+        let help = cmd
+            .find_subcommand_mut("repair")
+            .expect("repair subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("Only download missing artifacts; skip the cleanup phase."),
+            "{help}"
+        );
+        for internal in [
+            "value_parser",
+            "GLOBAL_ARG_ENV_VARS",
+            "`main`'s",
+            "parse_bool_flag",
+        ] {
+            assert!(!help.contains(internal), "leaked {internal:?} into --help");
+        }
     }
 }

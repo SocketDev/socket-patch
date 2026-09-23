@@ -48,18 +48,18 @@ use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning, Status, VexSummary,
 };
+use crate::ui::plural;
 
 #[derive(Args)]
 pub struct VendorArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    /// Tolerate MISSING patch-target files in the staged copy (they are
-    /// skipped instead of failing the vendor) and bypass the variant
-    /// probe for multi-release ecosystems. A plain beforeHash mismatch
-    /// no longer needs this: vendor staging always overwrites mismatched
-    /// content with the verified patched bytes (surfaced as a
-    /// `vendor_content_mismatch_overwritten` warning).
+    /// Tolerate missing patch-target files in the staged copy (skip them
+    /// instead of failing) and bypass the variant probe for multi-release
+    /// ecosystems. Not needed for a beforeHash mismatch: vendoring always
+    /// overwrites mismatched content with the verified patched bytes and
+    /// warns (`vendor_content_mismatch_overwritten`).
     #[arg(
         short = 'f',
         long,
@@ -339,12 +339,235 @@ pub(crate) fn record_warning(
     common: &GlobalArgs,
 ) {
     if !common.silent && !common.json {
-        eprintln!("Warning ({}): {}", warning.code, warning.detail);
+        if let Some(line) = format_advisory(warning.code, &warning.detail, common.verbose) {
+            eprintln!("{line}");
+        }
     }
+    push_advisory_event(env, purl, warning);
+}
+
+/// The JSON half of [`record_warning`]: the uncounted advisory event,
+/// with no human line (for an advisory that would mislead in context).
+fn push_advisory_event(env: &mut Envelope, purl: &str, warning: &VendorWarning) {
     env.events.push(
         PatchEvent::new(PatchAction::Skipped, purl.to_string())
             .with_reason(warning.code, warning.detail.clone()),
     );
+}
+
+/// How loudly a vendor advisory prints for humans.
+#[derive(Debug, PartialEq, Eq)]
+enum AdvisoryTier {
+    /// Routine success detail: shown only under `--verbose`.
+    Verbose,
+    /// Worth knowing, but nothing is wrong: `Note: ...`.
+    Note,
+    /// Something the user may need to act on: `Warning (<code>): ...`.
+    Warning,
+}
+
+fn advisory_tier(code: &str) -> AdvisoryTier {
+    match code {
+        // Every successful service vendor emits this, one per package.
+        "vendor_prebuilt_downloaded" => AdvisoryTier::Verbose,
+        // The run did what was asked; these explain how.
+        "vendor_fetched_missing"
+        | "vendor_would_revert_redirect"
+        | "vendor_takeover_reverted_redirect" => AdvisoryTier::Note,
+        _ => AdvisoryTier::Warning,
+    }
+}
+
+/// The human line for a vendor advisory, or `None` when it is hidden at
+/// this verbosity. The stable code is kept on real warnings (it is what
+/// a user searches for); notes carry only the detail.
+fn format_advisory(code: &str, detail: &str, verbose: bool) -> Option<String> {
+    match advisory_tier(code) {
+        AdvisoryTier::Verbose if !verbose => None,
+        AdvisoryTier::Verbose | AdvisoryTier::Note => Some(format!("Note: {detail}")),
+        AdvisoryTier::Warning => Some(format!("Warning ({code}): {detail}")),
+    }
+}
+
+/// `Error: Cannot vendor <purl>: <detail>`.
+fn format_vendor_failure(purl: &str, detail: &str) -> String {
+    format!("Error: Cannot vendor {}: {detail}", normalize_purl(purl))
+}
+
+/// Report one package that failed to vendor. An error, so it prints even
+/// under `--silent` ("errors only", never nothing); `--json` carries it
+/// in the envelope instead.
+fn report_vendor_failure(common: &GlobalArgs, purl: &str, detail: &str) {
+    if !common.json {
+        eprintln!("{}", format_vendor_failure(purl, detail));
+    }
+}
+
+/// The unreadable-ledger error, shared by the vendor and revert paths.
+fn report_state_unreadable(common: &GlobalArgs, err: &dyn std::fmt::Display) {
+    if !common.json {
+        eprintln!("{}", format_state_unreadable(&err.to_string()));
+    }
+}
+
+/// `Error: Could not read the vendor ledger: <err>`, naming the ledger
+/// file only when `err` doesn't already (a parse error carries the path,
+/// a bare I/O error doesn't).
+pub(crate) fn format_state_unreadable(err: &str) -> String {
+    if err.contains("state.json") {
+        format!("Error: Could not read the vendor ledger: {err}")
+    } else {
+        format!("Error: Could not read the vendor ledger (.socket/vendor/state.json): {err}")
+    }
+}
+
+/// Per-outcome counts behind the human vendor summary line.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct VendorTally {
+    /// Vendored this run (or, on a dry run, would be).
+    vendored: u32,
+    /// Already in sync with the manifest's patch.
+    already: u32,
+    /// Not installed and not fetchable (these fail the run).
+    not_installed: u32,
+    /// Every other skip.
+    skipped: u32,
+    failed: u32,
+}
+
+impl VendorTally {
+    /// Derive the tally from the envelope. `dry_in_sync` is the number of
+    /// dry-run previews whose ledger entry already records the patch (the
+    /// backends preview those as `verified`, like a fresh vendor).
+    fn from_envelope(env: &Envelope, dry_run: bool, dry_in_sync: u32) -> Self {
+        let code_count = |code: &str| {
+            env.events
+                .iter()
+                .filter(|e| {
+                    e.action == PatchAction::Skipped && e.error_code.as_deref() == Some(code)
+                })
+                .count() as u32
+        };
+        let already_wet = code_count("already_vendored");
+        let not_installed = code_count("package_not_installed");
+        let vendored = if dry_run {
+            (env.summary.applied + env.summary.verified).saturating_sub(dry_in_sync)
+        } else {
+            env.summary.applied
+        };
+        VendorTally {
+            vendored,
+            already: already_wet + dry_in_sync,
+            not_installed,
+            skipped: env
+                .summary
+                .skipped
+                .saturating_sub(already_wet + not_installed),
+            failed: env.summary.failed,
+        }
+    }
+}
+
+/// `Vendored 2 packages.` / `Would vendor 1 package; 1 already vendored;
+/// 1 failed.` Zero clauses are left out; the headline count never is.
+fn format_vendor_summary(dry_run: bool, t: &VendorTally) -> String {
+    let verb = if dry_run { "Would vendor" } else { "Vendored" };
+    let mut line = format!(
+        "{verb} {}",
+        plural(t.vendored as usize, "package", "packages")
+    );
+    for (n, what) in [
+        (t.already, "already vendored"),
+        (t.not_installed, "not installed"),
+        (t.skipped, "skipped"),
+        (t.failed, "failed"),
+    ] {
+        if n > 0 {
+            line.push_str(&format!("; {n} {what}"));
+        }
+    }
+    line.push('.');
+    line
+}
+
+/// Report an entry that could not be reverted (an error: prints even
+/// under `--silent`).
+fn report_revert_failure(common: &GlobalArgs, purl: &str, detail: &str) {
+    if !common.json {
+        eprintln!("Error: Failed to revert {}: {detail}", normalize_purl(purl));
+    }
+}
+
+/// The line for a vendored entry reverted because its patch left the
+/// manifest.
+fn format_reconciled(purl: &str, dry_run: bool) -> String {
+    let verb = if dry_run { "Would revert" } else { "Reverted" };
+    format!(
+        "{verb} vendoring of {} (patch no longer in manifest).",
+        normalize_purl(purl)
+    )
+}
+
+/// Counts behind the `vendor --revert` summary.
+#[derive(Debug, Default)]
+struct RevertSummary {
+    /// Ledger entries reverted (orphan dirs excluded).
+    reverted: u32,
+    failed: u32,
+    /// Drift-kept entries.
+    kept: u32,
+    /// Orphaned uuid dirs (no ledger entry) removed, as display paths.
+    orphans: Vec<String>,
+}
+
+/// The `vendor --revert` summary lines. Orphaned dirs are reported on
+/// their own line (they are not packages); the package line is left out
+/// when only orphans were swept.
+fn format_revert_summary(dry_run: bool, s: &RevertSummary) -> Vec<String> {
+    let mut lines = Vec::new();
+    if s.reverted > 0 || s.failed > 0 || (s.orphans.is_empty() && s.kept == 0) {
+        let verb = if dry_run { "Would revert" } else { "Reverted" };
+        let mut line = format!(
+            "{verb} {}",
+            plural(s.reverted as usize, "vendored package", "vendored packages")
+        );
+        if s.failed > 0 {
+            line.push_str(&format!("; {} failed", s.failed));
+        }
+        line.push('.');
+        lines.push(line);
+    }
+    if !s.orphans.is_empty() {
+        let verb = if dry_run { "Would remove" } else { "Removed" };
+        lines.push(format!(
+            "{verb} {} with no ledger entry: {}.",
+            plural(
+                s.orphans.len(),
+                "orphaned vendor directory",
+                "orphaned vendor directories"
+            ),
+            s.orphans.join(", ")
+        ));
+    }
+    if s.kept > 0 {
+        lines.push(format!(
+            "Kept {}: lock entries were re-resolved since vendoring, so their artifacts \
+             and ledger entries were retained — undo the drift and re-run `vendor --revert` \
+             to finish.",
+            plural(s.kept as usize, "drifted package", "drifted packages")
+        ));
+    }
+    lines
+}
+
+/// After a revert the lockfile points at the registry again. The installed
+/// tree holds the vendored bytes only if it was reinstalled after vendoring
+/// (vendoring itself rewires the lockfile only), so the hint is conditional.
+fn format_revert_install_hint(cmd: &str) -> String {
+    format!(
+        "Run `{cmd}` to resync the installed tree with the restored lockfile (it may \
+         still hold the vendored bytes if you reinstalled after vendoring)."
+    )
 }
 
 /// Run-level advisory shared by the `vendor` command and the scan-driven
@@ -580,8 +803,8 @@ async fn run_vendor(
         Ok(None) => return 0, // vanished since the existence check (TOCTOU)
         Err(e) => {
             env.mark_error(EnvelopeError::new("invalid_manifest", e.to_string()));
-            if !common.json && !common.silent {
-                eprintln!("Error: could not read manifest: {e}");
+            if !common.json {
+                eprintln!("Error: Could not read manifest: {e}");
             }
             return 1;
         }
@@ -621,6 +844,9 @@ async fn run_vendor(
     };
     let sources = staged.as_patch_sources();
 
+    if manifest.patches.is_empty() && !common.json && !common.silent {
+        println!("The manifest has no patches; nothing to vendor.");
+    }
     has_errors |= vendor_records(
         common,
         &manifest.patches,
@@ -845,8 +1071,11 @@ pub(crate) async fn vendor_records(
         );
     }
 
+    // An empty record set says nothing about scope: the caller knows why
+    // it is empty (an empty manifest, or a download phase that refused or
+    // failed every patch and already said so) and reports it.
     if vendorable.is_empty() {
-        if !common.json && !common.silent {
+        if !records.is_empty() && !common.json && !common.silent {
             println!("No vendorable patches in scope.");
         }
         return has_errors;
@@ -877,6 +1106,7 @@ pub(crate) async fn vendor_records(
         Ok(s) => s,
         Err(e) => {
             env.mark_error(EnvelopeError::new("vendor_state_unreadable", e.to_string()));
+            report_state_unreadable(common, &e);
             return true;
         }
     };
@@ -1005,9 +1235,7 @@ pub(crate) async fn vendor_records(
                                     PatchEvent::new(PatchAction::Failed, purl.clone())
                                         .with_error("vendor_fetch_failed", detail.clone()),
                                 );
-                                if !common.silent && !common.json {
-                                    eprintln!("Cannot vendor {}: {detail}", normalize_purl(purl));
-                                }
+                                report_vendor_failure(common, purl, &detail);
                                 continue;
                             }
                             Err(registry_fetch::FetchError::Unverifiable(_)) => {
@@ -1065,12 +1293,7 @@ pub(crate) async fn vendor_records(
                             PatchEvent::new(PatchAction::Failed, purl.clone())
                                 .with_error("vendor_fetch_failed", detail.clone()),
                         );
-                        if !common.silent && !common.json {
-                            eprintln!(
-                                "Cannot vendor {}: fetch failed: {detail}",
-                                normalize_purl(purl)
-                            );
-                        }
+                        report_vendor_failure(common, purl, &format!("fetch failed: {detail}"));
                     }
                 }
             }
@@ -1136,6 +1359,10 @@ pub(crate) async fn vendor_records(
         };
 
     let pipenv_version = tokio::sync::OnceCell::new();
+    let mut dry_in_sync: u32 = 0;
+    // Sorted, so per-package lines print in the same order every run.
+    let mut all_packages: Vec<(String, std::path::PathBuf)> = all_packages.into_iter().collect();
+    all_packages.sort();
     for (purl, pkg_path) in &all_packages {
         let is_variant_eco =
             Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
@@ -1198,13 +1425,7 @@ pub(crate) async fn vendor_records(
                     PatchEvent::new(PatchAction::Failed, candidate.clone())
                         .with_error(refusal.code, refusal.detail.clone()),
                 );
-                if !common.json {
-                    eprintln!(
-                        "Cannot vendor {}: {}",
-                        normalize_purl(candidate),
-                        refusal.detail
-                    );
-                }
+                report_vendor_failure(common, candidate, &refusal.detail);
                 continue;
             }
 
@@ -1240,9 +1461,7 @@ pub(crate) async fn vendor_records(
                             ),
                         ),
                     );
-                    if !common.silent && !common.json {
-                        eprintln!("Cannot vendor {}: {corrupt}", normalize_purl(candidate));
-                    }
+                    report_vendor_failure(common, candidate, &corrupt.to_string());
                     continue;
                 }
                 let claimed = redirect_ledger.as_ref().is_some_and(|l| {
@@ -1318,13 +1537,11 @@ pub(crate) async fn vendor_records(
                                     ),
                                 ),
                             );
-                            if !common.silent && !common.json {
-                                eprintln!(
-                                    "Cannot vendor {}: cannot revert the hosted redirect: \
-                                     {detail}",
-                                    normalize_purl(candidate)
-                                );
-                            }
+                            report_vendor_failure(
+                                common,
+                                candidate,
+                                &format!("cannot revert the hosted redirect: {detail}"),
+                            );
                             continue;
                         }
                     }
@@ -1351,15 +1568,14 @@ pub(crate) async fn vendor_records(
                                 // a ledger asserting wiring that is gone. Fail
                                 // closed for this purl.
                                 has_errors = true;
+                                let detail = format!(
+                                    "reverted the hosted redirect but could not update \
+                                     .socket/vendor/redirect-state.json: {e}"
+                                );
+                                report_vendor_failure(common, candidate, &detail);
                                 env.record(
                                     PatchEvent::new(PatchAction::Failed, candidate.clone())
-                                        .with_error(
-                                            "redirect_ledger_write_failed",
-                                            format!(
-                                                "reverted the hosted redirect but could not \
-                                                 update .socket/vendor/redirect-state.json: {e}"
-                                            ),
-                                        ),
+                                        .with_error("redirect_ledger_write_failed", detail),
                                 );
                                 continue;
                             }
@@ -1396,13 +1612,11 @@ pub(crate) async fn vendor_records(
                                     ),
                                 ),
                             );
-                            if !common.silent && !common.json {
-                                eprintln!(
-                                    "Cannot vendor {}: cannot revert the hosted redirect: \
-                                     {detail}",
-                                    normalize_purl(candidate)
-                                );
-                            }
+                            report_vendor_failure(
+                                common,
+                                candidate,
+                                &format!("cannot revert the hosted redirect: {detail}"),
+                            );
                             continue;
                         }
                     }
@@ -1434,19 +1648,21 @@ pub(crate) async fn vendor_records(
                 }
                 Some(VendorOutcome::Refused { code, detail }) => {
                     if refusal_is_benign(code) {
+                        // An expected skip, not an error: informational.
+                        if !common.silent && !common.json {
+                            eprintln!("Skipping {}: {detail}", normalize_purl(candidate));
+                        }
                         env.record(
                             PatchEvent::new(PatchAction::Skipped, candidate.clone())
                                 .with_reason(code, detail.clone()),
                         );
                     } else {
                         has_errors = true;
+                        report_vendor_failure(common, candidate, &detail);
                         env.record(
                             PatchEvent::new(PatchAction::Failed, candidate.clone())
                                 .with_error(code, detail.clone()),
                         );
-                    }
-                    if !common.silent && !common.json {
-                        eprintln!("Cannot vendor {}: {detail}", normalize_purl(candidate));
                     }
                 }
                 Some(VendorOutcome::Done {
@@ -1456,9 +1672,10 @@ pub(crate) async fn vendor_records(
                 }) => {
                     if !result.success {
                         has_errors = true;
-                        if !common.silent && !common.json {
+                        // The patch itself failed to apply to the staged copy.
+                        if !common.json {
                             eprintln!(
-                                "Failed to vendor {}: {}",
+                                "Error: Failed to vendor {}: {}",
                                 normalize_purl(candidate),
                                 result.error.as_deref().unwrap_or("unknown error")
                             );
@@ -1499,9 +1716,27 @@ pub(crate) async fn vendor_records(
                                 .with_files(files);
                         }
                     }
+                    // A dry run previews an in-sync package as `verified`
+                    // (the backends cannot tell without writing); the
+                    // ledger recording this exact patch is the tell.
+                    if common.dry_run
+                        && event.action == PatchAction::Verified
+                        && lookup_entry(&state.entries, candidate)
+                            .is_some_and(|e| e.uuid == record.uuid)
+                    {
+                        dry_in_sync += 1;
+                    }
+                    let in_sync = event.error_code.as_deref() == Some("already_vendored");
                     env.record(event);
                     for w in &warnings {
-                        record_warning(env, candidate, w, common);
+                        // "vendored X from the patch service" on a package
+                        // this run left untouched would contradict the
+                        // "already vendored" count: JSON only.
+                        if in_sync && w.code == "vendor_prebuilt_downloaded" {
+                            push_advisory_event(env, candidate, w);
+                        } else {
+                            record_warning(env, candidate, w, common);
+                        }
                     }
                     if let Some(entry) = entry {
                         if let Some(flavor) = entry.flavor.as_deref() {
@@ -1562,26 +1797,18 @@ pub(crate) async fn vendor_records(
             } else {
                 "no installed package found on disk"
             };
+            // Fails the run (exit 1), so it is an error line.
+            report_vendor_failure(common, purl, detail);
             env.record(
                 PatchEvent::new(PatchAction::Skipped, purl.clone())
                     .with_reason("package_not_installed", detail),
             );
-            if !common.silent && !common.json {
-                eprintln!("Cannot vendor {}: {detail}", normalize_purl(purl));
-            }
         }
     }
 
     if !common.json && !common.silent {
-        let verb = if common.dry_run {
-            "Would vendor"
-        } else {
-            "Vendored"
-        };
-        println!(
-            "{verb} {} package(s); {} skipped; {} failed.",
-            env.summary.applied, env.summary.skipped, env.summary.failed
-        );
+        let tally = VendorTally::from_envelope(env, common.dry_run, dry_in_sync);
+        println!("{}", format_vendor_summary(common.dry_run, &tally));
         if env.summary.applied > 0 && !common.dry_run {
             // pnpm >=11 reads `overrides` ONLY from pnpm-workspace.yaml (the
             // package.json `pnpm.overrides` mirror is ignored), so pnpm-wired
@@ -1702,6 +1929,9 @@ pub(crate) async fn reconcile_dropped(
                 );
                 continue;
             }
+            if !common.json && !common.silent {
+                println!("{}", format_reconciled(&purl, common.dry_run));
+            }
             env.record(
                 PatchEvent::new(PatchAction::Removed, purl.clone())
                     .with_reason("vendor_reconciled", "patch no longer in manifest"),
@@ -1723,11 +1953,11 @@ pub(crate) async fn reconcile_dropped(
             }
         } else {
             had_error = true;
+            let detail = outcome.error.unwrap_or_else(|| "unknown error".into());
+            report_revert_failure(common, &purl, &detail);
             env.record(
-                PatchEvent::new(PatchAction::Failed, purl.clone()).with_error(
-                    "revert_failed",
-                    outcome.error.unwrap_or_else(|| "unknown error".into()),
-                ),
+                PatchEvent::new(PatchAction::Failed, purl.clone())
+                    .with_error("revert_failed", detail),
             );
         }
     }
@@ -1740,9 +1970,7 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
         Ok(s) => s,
         Err(e) => {
             env.mark_error(EnvelopeError::new("vendor_state_unreadable", e.to_string()));
-            if !common.json && !common.silent {
-                eprintln!("Error: could not read .socket/vendor/state.json: {e}");
-            }
+            report_state_unreadable(common, &e);
             return 1;
         }
     };
@@ -1750,12 +1978,17 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     let mut has_errors = false;
     let mut recorded: Vec<String> = state.entries.keys().cloned().collect();
     recorded.sort();
+    // Lockfile flavors of the entries this run reverted: the installed
+    // tree still holds the vendored bytes until a reinstall.
+    let mut reverted_flavors: HashSet<String> = HashSet::new();
 
     // The one vendored-revert primitive every reverting command shares
     // (rollback's vendored leg, both of remove's paths): dispatch →
     // drift-keep → per-entry ledger save. Only the event vocabulary and
     // the human lines are this command's.
     for purl in &recorded {
+        // Captured before the revert drops the entry from the ledger.
+        let flavor = state.entries.get(purl).and_then(|e| e.flavor.clone());
         let result = crate::commands::rollback::revert_vendor_entry(
             &common.cwd,
             purl,
@@ -1771,13 +2004,11 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             VendorRevertStep::Missing | VendorRevertStep::Preserved => {}
             VendorRevertStep::Failed(why) => {
                 has_errors = true;
+                report_revert_failure(common, purl, &why);
                 env.record(
                     PatchEvent::new(PatchAction::Failed, purl.clone())
                         .with_error("revert_failed", why),
                 );
-                if !common.silent && !common.json {
-                    eprintln!("Failed to revert {purl}");
-                }
             }
             // Drift-skip keep (residual #131): the backend left the
             // drifted lock alone and kept the artifacts, so the ledger
@@ -1794,10 +2025,12 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
             ),
             VendorRevertStep::WouldRevert | VendorRevertStep::Reverted => {
                 env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
+                reverted_flavors.extend(flavor);
             }
             // Reverted on disk; the record of it could not be persisted.
             VendorRevertStep::LedgerWriteFailed(e) => {
                 env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
+                reverted_flavors.extend(flavor);
                 has_errors = true;
                 env.record(
                     PatchEvent::new(PatchAction::Failed, purl.clone())
@@ -1844,24 +2077,32 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     }
 
     if !common.json && !common.silent {
-        let verb = if common.dry_run {
-            "Would revert"
-        } else {
-            "Reverted"
-        };
-        println!(
-            "{verb} {} vendored package(s); {} failed.",
-            env.summary.removed, env.summary.failed
-        );
+        let orphans: Vec<String> = sweep
+            .removed
+            .iter()
+            .map(|u| format!(".socket/vendor/{}/{}", u.eco, u.uuid))
+            .collect();
         // In this command summary.skipped counts only genuine drift-skip
         // keeps (advisory warnings are pushed uncounted by record_warning).
-        if env.summary.skipped > 0 {
-            println!(
-                "Kept {} drifted package(s): lock entries were re-resolved since vendoring, so \
-                 their artifacts and ledger entries were retained — undo the drift and re-run \
-                 `vendor --revert` to finish.",
-                env.summary.skipped
-            );
+        let summary = RevertSummary {
+            reverted: env.summary.removed.saturating_sub(orphans.len() as u32),
+            failed: env.summary.failed,
+            kept: env.summary.skipped,
+            orphans,
+        };
+        for line in format_revert_summary(common.dry_run, &summary) {
+            println!("{line}");
+        }
+        if summary.reverted > 0 && !common.dry_run {
+            let mut installs: Vec<&str> = reverted_flavors
+                .iter()
+                .filter_map(|f| flavor_install_command(f))
+                .collect();
+            installs.sort_unstable();
+            installs.dedup();
+            for cmd in installs {
+                println!("{}", format_revert_install_hint(cmd));
+            }
         }
     }
 
@@ -3747,6 +3988,246 @@ mod pristine_fetch_tests {
         assert!(
             matches!(out, PristineFetch::NoSource),
             "expected NoSource for a purl with no lock and no ledger entry"
+        );
+    }
+}
+
+/// Exact-string tests for the human output of `vendor` / `vendor --revert`.
+#[cfg(test)]
+mod ui_format_tests {
+    use super::*;
+
+    fn tally(
+        vendored: u32,
+        already: u32,
+        not_installed: u32,
+        skipped: u32,
+        failed: u32,
+    ) -> VendorTally {
+        VendorTally {
+            vendored,
+            already,
+            not_installed,
+            skipped,
+            failed,
+        }
+    }
+
+    #[test]
+    fn vendor_summary_singular_plural_and_zero() {
+        assert_eq!(
+            format_vendor_summary(false, &tally(0, 0, 0, 0, 0)),
+            "Vendored 0 packages."
+        );
+        assert_eq!(
+            format_vendor_summary(false, &tally(1, 0, 0, 0, 0)),
+            "Vendored 1 package."
+        );
+        assert_eq!(
+            format_vendor_summary(false, &tally(2, 0, 0, 0, 0)),
+            "Vendored 2 packages."
+        );
+        assert_eq!(
+            format_vendor_summary(true, &tally(1, 0, 0, 0, 0)),
+            "Would vendor 1 package."
+        );
+        assert_eq!(
+            format_vendor_summary(true, &tally(0, 0, 0, 0, 2)),
+            "Would vendor 0 packages; 2 failed."
+        );
+    }
+
+    #[test]
+    fn vendor_summary_lists_only_nonzero_clauses_in_order() {
+        assert_eq!(
+            format_vendor_summary(false, &tally(1, 2, 1, 3, 1)),
+            "Vendored 1 package; 2 already vendored; 1 not installed; 3 skipped; 1 failed."
+        );
+        assert_eq!(
+            format_vendor_summary(false, &tally(0, 2, 0, 0, 0)),
+            "Vendored 0 packages; 2 already vendored."
+        );
+        assert_eq!(
+            format_vendor_summary(true, &tally(0, 2, 0, 0, 0)),
+            "Would vendor 0 packages; 2 already vendored."
+        );
+        assert_eq!(
+            format_vendor_summary(false, &tally(1, 0, 1, 0, 0)),
+            "Vendored 1 package; 1 not installed."
+        );
+    }
+
+    #[test]
+    fn tally_splits_skips_and_counts_dry_run_previews() {
+        let mut env = Envelope::new(Command::Vendor);
+        env.record(
+            PatchEvent::new(PatchAction::Skipped, "pkg:npm/a@1")
+                .with_reason("already_vendored", "in sync"),
+        );
+        env.record(
+            PatchEvent::new(PatchAction::Skipped, "pkg:npm/b@1")
+                .with_reason("package_not_installed", "not on disk"),
+        );
+        env.record(
+            PatchEvent::new(PatchAction::Skipped, "pkg:jsr/c@1")
+                .with_reason("vendor_unsupported_ecosystem", "no backend"),
+        );
+        env.record(PatchEvent::new(PatchAction::Applied, "pkg:npm/d@1"));
+        env.record(PatchEvent::new(PatchAction::Failed, "pkg:npm/e@1").with_error("x", "y"));
+        // An uncounted advisory event must not count as anything.
+        push_advisory_event(
+            &mut env,
+            "pkg:npm/d@1",
+            &VendorWarning::new("vendor_prebuilt_downloaded", "detail"),
+        );
+        assert_eq!(
+            VendorTally::from_envelope(&env, false, 0),
+            tally(1, 1, 1, 1, 1)
+        );
+
+        let mut dry = Envelope::new(Command::Vendor);
+        dry.record(PatchEvent::new(PatchAction::Verified, "pkg:npm/a@1"));
+        dry.record(PatchEvent::new(PatchAction::Verified, "pkg:npm/b@1"));
+        dry.record(PatchEvent::new(PatchAction::Verified, "pkg:npm/c@1"));
+        assert_eq!(
+            VendorTally::from_envelope(&dry, true, 0),
+            tally(3, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            VendorTally::from_envelope(&dry, true, 2),
+            tally(1, 2, 0, 0, 0)
+        );
+        assert_eq!(
+            format_vendor_summary(true, &VendorTally::from_envelope(&dry, true, 3)),
+            "Would vendor 0 packages; 3 already vendored."
+        );
+    }
+
+    #[test]
+    fn advisories_are_tiered() {
+        assert_eq!(
+            format_advisory("vendor_prebuilt_downloaded", "d", false),
+            None
+        );
+        assert_eq!(
+            format_advisory(
+                "vendor_prebuilt_downloaded",
+                "vendored x from the service",
+                true
+            ),
+            Some("Note: vendored x from the service".to_string())
+        );
+        assert_eq!(
+            format_advisory("vendor_fetched_missing", "fetched", false),
+            Some("Note: fetched".to_string())
+        );
+        assert_eq!(
+            format_advisory("vendor_lock_entry_drifted", "drifted", false),
+            Some("Warning (vendor_lock_entry_drifted): drifted".to_string())
+        );
+    }
+
+    #[test]
+    fn failure_lines_normalize_the_purl() {
+        assert_eq!(
+            format_vendor_failure(
+                "pkg:npm/%40scope/pkg@1.0.0",
+                "no installed package found on disk"
+            ),
+            "Error: Cannot vendor pkg:npm/@scope/pkg@1.0.0: no installed package found on disk"
+        );
+        assert_eq!(
+            format_reconciled("pkg:npm/left-pad@1.3.0", false),
+            "Reverted vendoring of pkg:npm/left-pad@1.3.0 (patch no longer in manifest)."
+        );
+        assert_eq!(
+            format_reconciled("pkg:npm/left-pad@1.3.0", true),
+            "Would revert vendoring of pkg:npm/left-pad@1.3.0 (patch no longer in manifest)."
+        );
+    }
+
+    fn revert(reverted: u32, failed: u32, kept: u32, orphans: &[&str]) -> RevertSummary {
+        RevertSummary {
+            reverted,
+            failed,
+            kept,
+            orphans: orphans.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn revert_summary_package_line() {
+        assert_eq!(
+            format_revert_summary(false, &revert(1, 0, 0, &[])),
+            vec!["Reverted 1 vendored package."]
+        );
+        assert_eq!(
+            format_revert_summary(false, &revert(2, 1, 0, &[])),
+            vec!["Reverted 2 vendored packages; 1 failed."]
+        );
+        assert_eq!(
+            format_revert_summary(true, &revert(2, 0, 0, &[])),
+            vec!["Would revert 2 vendored packages."]
+        );
+        // Every entry failed: the line still explains the exit code.
+        assert_eq!(
+            format_revert_summary(false, &revert(0, 1, 0, &[])),
+            vec!["Reverted 0 vendored packages; 1 failed."]
+        );
+    }
+
+    #[test]
+    fn revert_summary_reports_orphans_separately() {
+        let one = ".socket/vendor/npm/4444";
+        assert_eq!(
+            format_revert_summary(false, &revert(0, 0, 0, &[one])),
+            vec!["Removed 1 orphaned vendor directory with no ledger entry: .socket/vendor/npm/4444."]
+        );
+        assert_eq!(
+            format_revert_summary(true, &revert(1, 0, 0, &["a", "b"])),
+            vec![
+                "Would revert 1 vendored package.",
+                "Would remove 2 orphaned vendor directories with no ledger entry: a, b.",
+            ]
+        );
+    }
+
+    #[test]
+    fn revert_summary_kept_line() {
+        let lines = format_revert_summary(false, &revert(0, 0, 1, &[]));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("Kept 1 drifted package: lock entries were re-resolved"),
+            "{lines:?}"
+        );
+        let lines = format_revert_summary(false, &revert(1, 0, 2, &[]));
+        assert_eq!(lines[0], "Reverted 1 vendored package.");
+        assert!(
+            lines[1].starts_with("Kept 2 drifted packages: "),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn state_unreadable_names_the_file_once() {
+        assert_eq!(
+            format_state_unreadable("corrupt ./.socket/vendor/state.json: key must be a string"),
+            "Error: Could not read the vendor ledger: corrupt ./.socket/vendor/state.json: \
+             key must be a string"
+        );
+        assert_eq!(
+            format_state_unreadable("Permission denied (os error 13)"),
+            "Error: Could not read the vendor ledger (.socket/vendor/state.json): \
+             Permission denied (os error 13)"
+        );
+    }
+
+    #[test]
+    fn revert_install_hint_names_the_command() {
+        assert_eq!(
+            format_revert_install_hint("npm install"),
+            "Run `npm install` to resync the installed tree with the restored lockfile (it \
+             may still hold the vendored bytes if you reinstalled after vendoring)."
         );
     }
 }

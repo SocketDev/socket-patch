@@ -266,13 +266,15 @@ async fn vendored_purls_from_artifacts(common: &GlobalArgs) -> Vec<String> {
 ///
 /// Best-effort and read-only: a detail-fetch failure or an unresolvable
 /// installed path just skips the annotation — it never blocks the flow and
-/// writes nothing.
-pub(super) async fn preverify_vendor_baselines(
+/// writes nothing. One API round-trip per uncached patch, so progress
+/// shows on `status`.
+pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
     api_client: &socket_patch_core::api::client::ApiClient,
     selected: &[PatchSearchResult],
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     lockfile_only: &HashSet<String>,
     vendor: Option<&HashMap<String, socket_patch_core::vendor::VendorEntry>>,
+    status: &mut crate::ui::StatusLine<W>,
 ) -> (HashSet<String>, HashMap<String, PatchResponse>) {
     use socket_patch_core::manifest::schema::PatchFileInfo;
     use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
@@ -281,7 +283,12 @@ pub(super) async fn preverify_vendor_baselines(
 
     let mut mismatched: HashSet<String> = HashSet::new();
     let mut views: HashMap<String, PatchResponse> = HashMap::new();
-    for patch in selected {
+    for (i, patch) in selected.iter().enumerate() {
+        status.set(format!(
+            "Checking installed files against patch baselines... ({}/{})",
+            i + 1,
+            selected.len()
+        ));
         // API purls come percent-encoded, crawler purls literal — purl_eq
         // bridges the two spellings.
         let base = strip_purl_qualifiers(&patch.purl);
@@ -336,6 +343,7 @@ pub(super) async fn preverify_vendor_baselines(
             }
         }
     }
+    status.finish();
     (mismatched, views)
 }
 
@@ -544,27 +552,63 @@ fn candidate_supersedes(candidate: &BatchPatchInfo, applied: &BatchPatchInfo) ->
     matches!((cand_date, applied_date), (Some(c), Some(a)) if c > a)
 }
 
-/// Collect the deduplicated CVE and GHSA identifiers across every patch of
-/// a package, for the scan table's VULNERABILITIES column. CVEs are listed
-/// before GHSAs and each group is sorted, so the rendered output is stable —
-/// the per-patch ID lists and set-based dedup are otherwise nondeterministic
-/// in order. Pure / no I/O so it's unit-testable.
-pub(super) fn collect_vuln_ids(pkg: &BatchPackagePatches) -> Vec<String> {
-    let mut cves: HashSet<String> = HashSet::new();
-    let mut ghsas: HashSet<String> = HashSet::new();
+/// The scan table's VULNERABILITIES data for one package, built from the
+/// batch results (see [`collect_vuln_ids`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct VulnIds {
+    /// Ids to show first: every CVE, then the GHSAs that only ever appear
+    /// on patches listing no CVE (those cannot be aliases). Each group is
+    /// sorted.
+    pub primary: Vec<String>,
+    /// Every CVE and GHSA id (CVEs first, each group sorted), for `--verbose`.
+    pub all: Vec<String>,
+    /// How many distinct vulnerabilities the ids stand for, for `(+N)`.
+    pub count: usize,
+}
+
+/// Collect a package's vulnerability ids across all its patches, for the
+/// scan table's VULNERABILITIES column. The output is sorted and deduped,
+/// so the rendered table is stable (the per-patch lists and set-based
+/// dedup are otherwise nondeterministic in order). Pure / no I/O so it's
+/// unit-testable.
+///
+/// A GHSA id is usually an alias of a CVE listed beside it, but the batch
+/// endpoint gives the two lists without their pairing, so listing both made
+/// `(+N)` count most vulnerabilities twice. Each vulnerability has at least
+/// one of the two ids, so the count is the larger of the distinct CVEs and
+/// the distinct GHSAs. That is exact when every GHSA has at most one CVE,
+/// and never counts an alias twice.
+pub(super) fn collect_vuln_ids(pkg: &BatchPackagePatches) -> VulnIds {
+    let mut cves: HashSet<&str> = HashSet::new();
+    let mut ghsas: HashSet<&str> = HashSet::new();
+    let mut ghsa_only: HashSet<&str> = HashSet::new();
+    let mut ghsa_beside_cve: HashSet<&str> = HashSet::new();
     for patch in &pkg.patches {
-        for cve in &patch.cve_ids {
-            cves.insert(cve.clone());
-        }
-        for ghsa in &patch.ghsa_ids {
-            ghsas.insert(ghsa.clone());
-        }
+        cves.extend(patch.cve_ids.iter().map(String::as_str));
+        ghsas.extend(patch.ghsa_ids.iter().map(String::as_str));
+        let bucket = if patch.cve_ids.is_empty() {
+            &mut ghsa_only
+        } else {
+            &mut ghsa_beside_cve
+        };
+        bucket.extend(patch.ghsa_ids.iter().map(String::as_str));
     }
-    let mut cves: Vec<String> = cves.into_iter().collect();
-    cves.sort();
-    let mut ghsas: Vec<String> = ghsas.into_iter().collect();
-    ghsas.sort();
-    cves.into_iter().chain(ghsas).collect()
+    // A GHSA listed beside a CVE on any patch may be its alias.
+    ghsa_only.retain(|g| !ghsa_beside_cve.contains(g));
+    let sorted = |set: &HashSet<&str>| {
+        let mut v: Vec<String> = set.iter().map(|s| (*s).to_string()).collect();
+        v.sort();
+        v
+    };
+    let cves = sorted(&cves);
+    let ghsas = sorted(&ghsas);
+    let primary: Vec<String> = cves.iter().cloned().chain(sorted(&ghsa_only)).collect();
+    let count = cves.len().max(ghsas.len()).max(primary.len());
+    VulnIds {
+        primary,
+        all: cves.into_iter().chain(ghsas).collect(),
+        count,
+    }
 }
 
 /// Severity ordering for the scan table's SEVERITY column: lower = worse.
@@ -606,7 +650,7 @@ mod tests {
     fn severity_order_moderate_is_medium_tier() {
         // Regression: GHSA emits `moderate` for the medium tier, and scan
         // passes raw API severities straight through. get.rs
-        // `severity_rank`, output.rs `format_severity`, and core's
+        // `severity_rank`, `ui::severity`, and core's
         // `get_severity_order` all map it to medium; ranking it 4 here
         // (= unknown, below `low`) made the table's max-severity column
         // show `low` for a package whose worst vuln is moderate.
@@ -1270,10 +1314,27 @@ mod tests {
         }
     }
 
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn patch_with(uuid: &str, cves: &[&str], ghsas: &[&str]) -> BatchPatchInfo {
+        BatchPatchInfo {
+            uuid: uuid.to_string(),
+            purl: "pkg:npm/foo@1.0".to_string(),
+            tier: "free".to_string(),
+            cve_ids: strs(cves),
+            ghsa_ids: strs(ghsas),
+            severity: None,
+            title: String::new(),
+            published_at: None,
+        }
+    }
+
     #[test]
     fn collect_vuln_ids_empty_when_no_vulns() {
         let pkg = batch_with_vulns("pkg:npm/foo@1.0", &[], &[]);
-        assert!(collect_vuln_ids(&pkg).is_empty());
+        assert_eq!(collect_vuln_ids(&pkg), VulnIds::default());
     }
 
     #[test]
@@ -1283,17 +1344,96 @@ mod tests {
         let pkg = batch_with_vulns(
             "pkg:npm/foo@1.0",
             &["CVE-2024-2", "CVE-2024-1"],
-            &["GHSA-zzzz-zzzz-zzzz", "GHSA-aaaa-aaaa-aaaa"],
-        );
-        assert_eq!(
-            collect_vuln_ids(&pkg),
-            vec![
-                "CVE-2024-1".to_string(),
-                "CVE-2024-2".to_string(),
-                "GHSA-aaaa-aaaa-aaaa".to_string(),
-                "GHSA-zzzz-zzzz-zzzz".to_string(),
+            &[
+                "GHSA-zzzz-zzzz-zzzz",
+                "GHSA-aaaa-aaaa-aaaa",
+                "GHSA-mmmm-mmmm-mmmm",
             ],
         );
+        let ids = collect_vuln_ids(&pkg);
+        assert_eq!(
+            ids.all,
+            strs(&[
+                "CVE-2024-1",
+                "CVE-2024-2",
+                "GHSA-aaaa-aaaa-aaaa",
+                "GHSA-mmmm-mmmm-mmmm",
+                "GHSA-zzzz-zzzz-zzzz",
+            ]),
+        );
+        // The GHSAs sit beside CVEs, so none is shown first; there are at
+        // least three vulnerabilities (one GHSA has no CVE of its own).
+        assert_eq!(ids.primary, strs(&["CVE-2024-1", "CVE-2024-2"]));
+        assert_eq!(ids.count, 3);
+    }
+
+    #[test]
+    fn collect_vuln_ids_drops_ghsa_aliases_of_listed_cves() {
+        // minimist: one CVE and its GHSA alias are one vulnerability.
+        let pkg = batch_with_vulns(
+            "pkg:npm/minimist@1.2.5",
+            &["CVE-2021-44906"],
+            &["GHSA-xvch-5gv4-984h"],
+        );
+        let ids = collect_vuln_ids(&pkg);
+        assert_eq!(ids.primary, strs(&["CVE-2021-44906"]));
+        assert_eq!(ids.all, strs(&["CVE-2021-44906", "GHSA-xvch-5gv4-984h"]));
+        assert_eq!(ids.count, 1);
+        // A GHSA-only advisory has no CVE to alias: it stays.
+        let pkg = batch_with_vulns("pkg:npm/x@1", &[], &["GHSA-r4q5-vmmm-2653"]);
+        let ids = collect_vuln_ids(&pkg);
+        assert_eq!(ids.primary, strs(&["GHSA-r4q5-vmmm-2653"]));
+        assert_eq!(ids.count, 1);
+    }
+
+    #[test]
+    fn collect_vuln_ids_one_cve_plus_alias_plus_ghsa_only() {
+        // CVE-1 (alias GHSA-a) and a GHSA-only GHSA-b on one patch: two
+        // vulnerabilities, not three.
+        let pkg = batch_with_vulns("pkg:npm/foo@1.0", &["CVE-1"], &["GHSA-a", "GHSA-b"]);
+        let ids = collect_vuln_ids(&pkg);
+        assert_eq!(ids.count, 2);
+        assert_eq!(ids.primary, strs(&["CVE-1"]));
+    }
+
+    #[test]
+    fn collect_vuln_ids_two_cves_one_ghsa_alias_plus_ghsa_only() {
+        // GHSA-a aliases both CVEs, GHSA-b has none. The batch data cannot
+        // tell this from two CVE/GHSA pairs, so the count is the lower
+        // bound (2) and every id is still listed under --verbose.
+        let pkg = batch_with_vulns(
+            "pkg:npm/foo@1.0",
+            &["CVE-1", "CVE-2"],
+            &["GHSA-a", "GHSA-b"],
+        );
+        let ids = collect_vuln_ids(&pkg);
+        assert_eq!(ids.count, 2);
+        assert_eq!(ids.all, strs(&["CVE-1", "CVE-2", "GHSA-a", "GHSA-b"]));
+        // On its own patch, the GHSA-only advisory is known and shown.
+        let pkg = BatchPackagePatches {
+            purl: "pkg:npm/foo@1.0".to_string(),
+            patches: vec![
+                patch_with("u1", &["CVE-1", "CVE-2"], &["GHSA-a"]),
+                patch_with("u2", &[], &["GHSA-b"]),
+            ],
+        };
+        let ids = collect_vuln_ids(&pkg);
+        assert_eq!(ids.primary, strs(&["CVE-1", "CVE-2", "GHSA-b"]));
+        assert_eq!(ids.count, 3);
+    }
+
+    #[test]
+    fn collect_vuln_ids_ghsa_beside_a_cve_elsewhere_is_not_ghsa_only() {
+        let pkg = BatchPackagePatches {
+            purl: "pkg:npm/foo@1.0".to_string(),
+            patches: vec![
+                patch_with("u1", &["CVE-1"], &["GHSA-a"]),
+                patch_with("u2", &[], &["GHSA-a"]),
+            ],
+        };
+        let ids = collect_vuln_ids(&pkg);
+        assert_eq!(ids.primary, strs(&["CVE-1"]));
+        assert_eq!(ids.count, 1);
     }
 
     // ---- unsupported_layout_warnings -----------------------------------
@@ -1508,8 +1648,28 @@ mod tests {
         let lockfile_only: HashSet<String> =
             std::iter::once("pkg:npm/@scope/lockonly@1.0.0".to_string()).collect();
 
-        let (mismatched, views) =
-            preverify_vendor_baselines(&client, &selected, &crawled, &lockfile_only, None).await;
+        // A live status line: every step is shown, and the line is gone
+        // once the check returns (nothing left over for the preview).
+        let mut status = crate::ui::StatusLine::new(Vec::new(), true, true, 80);
+        let (mismatched, views) = preverify_vendor_baselines(
+            &client,
+            &selected,
+            &crawled,
+            &lockfile_only,
+            None,
+            &mut status,
+        )
+        .await;
+        let out = status.into_inner();
+        let raw = String::from_utf8_lossy(&out);
+        assert!(
+            raw.contains("Checking installed files against patch baselines... (2/2)"),
+            "{raw:?}"
+        );
+        assert!(
+            crate::ui::test_support::render(&out).is_empty(),
+            "the status line must be cleared: {raw:?}"
+        );
         assert!(mismatched.is_empty());
         assert!(
             mock.received_requests().await.unwrap().is_empty(),
@@ -1563,8 +1723,15 @@ mod tests {
         let crawled = vec![crawled_pkg("newfile", "pkg:npm/newfile@1.0.0", pkg_dir)];
         let selected = vec![search_result("u3", "pkg:npm/newfile@1.0.0")];
 
-        let (mismatched, views) =
-            preverify_vendor_baselines(&client, &selected, &crawled, &HashSet::new(), None).await;
+        let (mismatched, views) = preverify_vendor_baselines(
+            &client,
+            &selected,
+            &crawled,
+            &HashSet::new(),
+            None,
+            &mut crate::ui::StatusLine::new(Vec::new(), false, false, 80),
+        )
+        .await;
         assert!(
             mismatched.is_empty(),
             "a new-file-only patch never annotates a baseline mismatch"
@@ -1592,8 +1759,15 @@ mod tests {
         let crawled = vec![crawled_pkg("newfile", "pkg:npm/newfile@1.0.0", pkg_dir)];
         let selected = vec![search_result("u404", "pkg:npm/newfile@1.0.0")];
 
-        let (mismatched, views) =
-            preverify_vendor_baselines(&client, &selected, &crawled, &HashSet::new(), None).await;
+        let (mismatched, views) = preverify_vendor_baselines(
+            &client,
+            &selected,
+            &crawled,
+            &HashSet::new(),
+            None,
+            &mut crate::ui::StatusLine::new(Vec::new(), false, false, 80),
+        )
+        .await;
         assert!(mismatched.is_empty());
         assert_eq!(
             mock.received_requests().await.unwrap().len(),
@@ -1632,8 +1806,15 @@ mod tests {
         let crawled = vec![crawled_pkg("newfile", "pkg:npm/newfile@1.0.0", pkg_dir)];
         let selected = vec![search_result("u4", "pkg:npm/newfile@1.0.0")];
 
-        let (mismatched, views) =
-            preverify_vendor_baselines(&client, &selected, &crawled, &HashSet::new(), None).await;
+        let (mismatched, views) = preverify_vendor_baselines(
+            &client,
+            &selected,
+            &crawled,
+            &HashSet::new(),
+            None,
+            &mut crate::ui::StatusLine::new(Vec::new(), false, false, 80),
+        )
+        .await;
         assert_eq!(
             mismatched,
             std::iter::once("u4".to_string()).collect::<HashSet<_>>(),
@@ -1711,6 +1892,7 @@ mod tests {
             &crawled,
             &HashSet::new(),
             Some(&ledger),
+            &mut crate::ui::StatusLine::new(Vec::new(), false, false, 80),
         )
         .await;
         assert_eq!(
@@ -1739,6 +1921,7 @@ mod tests {
                 &crawled,
                 &HashSet::new(),
                 Some(&ledger),
+                &mut crate::ui::StatusLine::new(Vec::new(), false, false, 80),
             )
             .await;
             assert!(mismatched.is_empty());
@@ -1779,9 +1962,9 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(
-            collect_vuln_ids(&pkg),
-            vec!["CVE-2024-1".to_string(), "GHSA-aaaa-aaaa-aaaa".to_string(),],
-        );
+        // (u2's GHSA is the alias of its one CVE, so it is not counted.)
+        let ids = collect_vuln_ids(&pkg);
+        assert_eq!(ids.primary, vec!["CVE-2024-1".to_string()]);
+        assert_eq!(ids.count, 1);
     }
 }

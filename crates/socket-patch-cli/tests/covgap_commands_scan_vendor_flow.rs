@@ -644,7 +644,7 @@ async fn scan_vendor_staging_error_interactive_prints_error_line() {
     );
     assert!(
         stderr.contains(
-            "Error (no_local_source): patch artifacts unavailable (offline or download failure)"
+            "Error (no_local_source): Patch artifacts unavailable (offline or download failure)."
         ),
         "the human arm must name the code and message on stderr; \
          stdout={stdout}; stderr={stderr}"

@@ -30,6 +30,7 @@ use socket_patch_core::vex::{
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::ecosystem_dispatch::find_manifest_package_paths;
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning};
+use crate::ui::plural;
 
 /// Routing tag for a patch omitted from VEX by the property-7 ecosystem
 /// filter alone: the patch IS applied (byte-verified, or trusted under
@@ -45,19 +46,23 @@ pub struct VexArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    /// Write the VEX document to this path instead of stdout.
+    /// Write the VEX document to this path instead of stdout (`-` means
+    /// stdout). A relative path resolves against the current directory, not
+    /// `--cwd`.
     #[arg(long = "output", short = 'O', env = "SOCKET_VEX_OUTPUT")]
     pub output: Option<PathBuf>,
 
-    /// Override the auto-detected top-level product PURL/identifier.
-    /// Auto-detection probes (in order):
-    /// 1. `.git/config` `[remote "origin"]` — converted to
-    ///    `pkg:github/<owner>/<repo>` for github.com, similar for
-    ///    gitlab.com/bitbucket.org, raw URL otherwise.
-    /// 2. `package.json` → `pkg:npm/<name>@<version>`
-    /// 3. `pyproject.toml` → `pkg:pypi/<name>@<version>`
-    /// 4. `Cargo.toml` → `pkg:cargo/<name>@<version>`
-    #[arg(long = "product", env = "SOCKET_VEX_PRODUCT")]
+    /// Override the auto-detected top-level product PURL/identifier
+    ///
+    /// Auto-detection tries, in order:
+    ///   1. the git `origin` remote: pkg:github/<owner>/<repo> for github.com
+    ///      (likewise gitlab.com and bitbucket.org), the raw URL otherwise
+    ///   2. package.json:   pkg:npm/<name>@<version>
+    ///   3. pyproject.toml: pkg:pypi/<name>@<version>
+    ///   4. Cargo.toml:     pkg:cargo/<name>@<version>
+    // `verbatim_doc_comment`: clap otherwise joins the numbered list into
+    // one run-on line.
+    #[arg(long = "product", env = "SOCKET_VEX_PRODUCT", verbatim_doc_comment)]
     pub product: Option<String>,
 
     /// Skip the on-disk file-hash check and trust the manifest.
@@ -65,13 +70,13 @@ pub struct VexArgs {
     /// emitted; this flag flips that off — useful when generating a
     /// VEX doc on a build machine that doesn't have the patched files
     /// laid out yet.
-    ///
-    /// `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
-    /// clap's default bool parser accepts only the literal strings
-    /// `true`/`false` from the env binding, so `SOCKET_VEX_NO_VERIFY=1` (or
-    /// an exported-but-empty `SOCKET_VEX_NO_VERIFY=`) aborted the parse.
-    /// This var is also outside `GLOBAL_ARG_ENV_VARS`, so `main`'s empty-var
-    /// scrub never rescues it.
+    //
+    // `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
+    // clap's default bool parser accepts only the literal strings
+    // `true`/`false` from the env binding, so `SOCKET_VEX_NO_VERIFY=1` (or
+    // an exported-but-empty `SOCKET_VEX_NO_VERIFY=`) aborted the parse.
+    // This var is also outside `GLOBAL_ARG_ENV_VARS`, so `main`'s empty-var
+    // scrub never rescues it.
     #[arg(
         long = "no-verify",
         env = "SOCKET_VEX_NO_VERIFY",
@@ -119,11 +124,11 @@ pub struct VexEmbedArgs {
 
     /// Skip the on-disk file-hash check when building the VEX document and
     /// trust the manifest. See `socket-patch vex --no-verify`.
-    ///
-    /// `value_parser = parse_bool_flag`: these embedded flags share their
-    /// env vars with the standalone `vex` flags, so without it an ambient
-    /// `SOCKET_VEX_NO_VERIFY=1` (or `=`) aborted every host command parse —
-    /// including `apply` running from a postinstall hook.
+    //
+    // `value_parser = parse_bool_flag`: these embedded flags share their
+    // env vars with the standalone `vex` flags, so without it an ambient
+    // `SOCKET_VEX_NO_VERIFY=1` (or `=`) aborted every host command parse —
+    // including `apply` running from a postinstall hook.
     #[arg(
         long = "vex-no-verify",
         env = "SOCKET_VEX_NO_VERIFY",
@@ -159,6 +164,9 @@ impl VexEmbedArgs {
             compact: self.vex_compact,
             assume_applied: Vec::new(),
             known_stale: Vec::new(),
+            // Embedded callers skip VEX entirely under `--dry-run`.
+            dry_run: false,
+            product_flag: "--vex-product",
         }
     }
 }
@@ -185,6 +193,13 @@ pub(crate) struct VexBuildParams {
     /// Hosted probes positively identified unpatched installed bytes. These
     /// PURLs cannot be attested by another interpreter or --no-verify.
     pub known_stale: Vec<String>,
+    /// `vex --dry-run`: build and verify, but write nothing to `output` and
+    /// leave any previous document there alone. Printing to stdout is not a
+    /// mutation, so it still happens.
+    pub dry_run: bool,
+    /// The flag that carried `product`, named in the non-IRI advisory
+    /// (`--product` standalone, `--vex-product` embedded).
+    pub product_flag: &'static str,
 }
 
 /// Successful result of [`generate_vex`].
@@ -200,6 +215,9 @@ pub(crate) struct VexWriteSummary {
     /// folds them into the envelope's `warnings[]` (which is the only
     /// channel `--json` has — it silences stderr).
     pub warnings: Vec<RunWarning>,
+    /// Whether the document was written to `output` (false under
+    /// `--dry-run`, and when it went to stdout).
+    pub wrote_file: bool,
 }
 
 /// Failure from [`generate_vex`], carrying a stable code + message the
@@ -210,15 +228,21 @@ pub(crate) struct VexGenError {
     /// Patches omitted by verification, populated only for the
     /// `no_applicable_patches` case (so callers can list them).
     pub failed: Vec<FailedPatch>,
+    /// Advisories raised before the failure (already printed in human
+    /// mode); the standalone `vex --json` error envelope carries them.
+    pub warnings: Vec<RunWarning>,
 }
 
 pub async fn run(args: VexArgs) -> i32 {
     apply_env_toggles(&args.common);
 
+    // `-O -` is the conventional spelling of stdout, not a file named `-`.
+    let output = args.output.clone().filter(|p| p.as_os_str() != "-");
+
     // --json without --output would race the envelope and the VEX doc
     // on the same stdout stream. Bail out with a clear error before
     // doing any work.
-    if args.common.json && args.output.is_none() {
+    if args.common.json && output.is_none() {
         // A usage error, not a generation failure: no telemetry POST and no
         // config read (argument errors never report), just the envelope.
         emit_envelope_error(
@@ -227,35 +251,52 @@ pub async fn run(args: VexArgs) -> i32 {
             "--json requires --output (the VEX document is itself JSON; \
              route it to a file so the envelope can use stdout)",
             &[],
+            &[],
         );
         return 2;
     }
 
+    // `-o` is `--org`, `-O` is `--output`: a file-shaped org slug is almost
+    // certainly a mistyped `-O` (the document then silently went to stdout).
+    let mut run_warnings: Vec<RunWarning> = Vec::new();
+    if let Some(detail) = org_looks_like_path(args.common.org.as_deref()) {
+        note_warning(
+            &mut run_warnings,
+            &args.common,
+            "org_looks_like_path",
+            detail,
+        );
+    }
+
     let params = VexBuildParams {
-        output: args.output.clone(),
+        output: output.clone(),
         product: args.product.clone(),
         no_verify: args.no_verify,
         doc_id: args.doc_id.clone(),
         compact: args.compact,
         assume_applied: Vec::new(),
         known_stale: Vec::new(),
+        dry_run: args.common.dry_run,
+        product_flag: "--product",
     };
 
     let manifest_path = args.common.resolved_manifest_path();
     match generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await {
-        Ok(summary) => {
+        Ok(mut summary) => {
+            run_warnings.append(&mut summary.warnings);
+            summary.warnings = run_warnings;
             if args.common.json {
-                emit_envelope_success(&summary);
-            } else if let Some(path) = &args.output {
-                if !args.common.silent {
-                    println!(
-                        "Wrote OpenVEX document with {} statement(s) to {}",
-                        summary.statements,
-                        path.display()
-                    );
-                }
+                emit_envelope_success(&summary, params.dry_run);
             } else if !args.common.silent {
-                eprintln!("Emitted {} VEX statement(s)", summary.statements);
+                match &output {
+                    Some(path) if summary.wrote_file => {
+                        println!("{}", format_vex_written(summary.statements, path));
+                    }
+                    Some(path) => {
+                        println!("{}", format_vex_dry_run(summary.statements, path));
+                    }
+                    None => eprintln!("{}", format_vex_emitted(summary.statements)),
+                }
             }
             0
         }
@@ -263,28 +304,84 @@ pub async fn run(args: VexArgs) -> i32 {
         // attest" cases (exit 1); every other error is a hard failure
         // (exit 2). `generate_vex_from_manifest_path` already fired
         // telemetry, so these emit-only sinks must not re-track.
-        Err(e) if e.code == "no_applicable_patches" => {
-            emit_envelope_error(&args, e.code, &e.message, &e.failed);
-            1
-        }
-        // Standalone-only remediation hint: after an embedded `apply --vex`
-        // / `scan --vex` run the advice would be circular, so the shared
-        // path keeps the bare message and it is appended here.
-        Err(e) if e.code == "no_patches" => {
-            emit_envelope_error(
-                &args,
-                e.code,
-                "Manifest is empty — nothing to attest. Run `socket-patch get` \
-                 or `socket-patch scan --sync` first.",
-                &[],
-            );
-            1
-        }
-        Err(e) => {
-            emit_envelope_error(&args, e.code, &e.message, &[]);
-            2
+        Err(mut e) => {
+            run_warnings.append(&mut e.warnings);
+            let (message, exit) = match e.code {
+                "no_applicable_patches" => (e.message, 1),
+                // Standalone-only remediation hints: after an embedded
+                // `apply --vex` / `scan --vex` run the advice would be
+                // circular, so the shared path keeps the bare message and
+                // it is appended here.
+                "no_patches" => (
+                    "Manifest is empty — nothing to attest. Run `socket-patch get` \
+                     or `socket-patch scan --sync` first."
+                        .to_string(),
+                    1,
+                ),
+                "manifest_not_found" => (
+                    format_manifest_not_found_hint(&e.message, &args.common.manifest_path),
+                    2,
+                ),
+                _ => (e.message, 2),
+            };
+            emit_envelope_error(&args, e.code, &message, &e.failed, &run_warnings);
+            exit
         }
     }
+}
+
+/// `Manifest not found at <path>. Run ... first[, or pass --manifest-path].`
+/// The `--manifest-path` hint only makes sense while the default path is in
+/// use; a user who already pointed elsewhere gets just the next step.
+fn format_manifest_not_found_hint(message: &str, manifest_path: &str) -> String {
+    let base = message.trim_end().trim_end_matches('.');
+    if manifest_path == socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH {
+        format!(
+            "{base}. Run `socket-patch scan` or `socket-patch get` first, or pass \
+             --manifest-path."
+        )
+    } else {
+        format!("{base}. Run `socket-patch scan` or `socket-patch get` first.")
+    }
+}
+
+/// `Wrote OpenVEX document with 1 statement to out.json` — the one-line
+/// summary after writing a document to a file.
+pub(crate) fn format_vex_written(statements: usize, path: &Path) -> String {
+    format!(
+        "Wrote OpenVEX document with {} to {}",
+        plural(statements, "statement", "statements"),
+        path.display()
+    )
+}
+
+/// The `--dry-run` twin of [`format_vex_written`]: nothing was written.
+pub(crate) fn format_vex_dry_run(statements: usize, path: &Path) -> String {
+    format!(
+        "[dry-run] Would write OpenVEX document with {} to {}",
+        plural(statements, "statement", "statements"),
+        path.display()
+    )
+}
+
+/// The stderr summary after the document went to stdout.
+pub(crate) fn format_vex_emitted(statements: usize) -> String {
+    format!(
+        "Emitted {}",
+        plural(statements, "VEX statement", "VEX statements")
+    )
+}
+
+/// A warning when the `--org` slug looks like a file path, i.e. a `-o`
+/// typed for `-O`/`--output`. Slugs never contain slashes or end in
+/// `.json`.
+fn org_looks_like_path(org: Option<&str>) -> Option<String> {
+    let org = org?.trim();
+    let pathy =
+        org.contains('/') || org.contains('\\') || org.to_ascii_lowercase().ends_with(".json");
+    pathy.then(|| {
+        format!("--org {org:?} looks like a file path; did you mean -O/--output? (-o is --org)")
+    })
 }
 
 /// Map a `setup.manual` entry to an `Ecosystem`. Accepts the canonical
@@ -321,14 +418,13 @@ async fn generate_vex(
     manifest: &PatchManifest,
     redirected: &[String],
     ledger: std::io::Result<VendorState>,
+    warnings: &mut Vec<RunWarning>,
 ) -> Result<VexWriteSummary, VexGenError> {
     // Resolve product.
-    let product_id = match resolve_product_id(common, params.product.as_deref()).await {
+    let product_id = match resolve_product_id(common, params.product.as_deref(), warnings).await {
         Ok(id) => id,
         Err(reason) => return Err(fail(common, "product_undetected", reason).await),
     };
-
-    let mut warnings: Vec<RunWarning> = Vec::new();
 
     // The help text promises "PURL/identifier", so an arbitrary string is
     // accepted — but the OpenVEX spec types the product `@id` as an IRI, and
@@ -343,14 +439,15 @@ async fn generate_vex(
     {
         if !has_iri_scheme(p) {
             note_warning(
-                &mut warnings,
+                warnings,
                 common,
                 "product_not_iri",
                 format!(
-                    "product override {p:?} (--product / --vex-product) is neither a PURL \
+                    "Product override {p:?} ({}) is neither a PURL \
                      (pkg:...) nor an absolute IRI; it is emitted verbatim as the OpenVEX \
                      product @id, which the spec requires to be an IRI — strict consumers may \
-                     reject the document. Prefer pkg:<type>/<name>@<version>."
+                     reject the document. Prefer pkg:<type>/<name>@<version>.",
+                    params.product_flag
                 ),
             );
         }
@@ -363,8 +460,20 @@ async fn generate_vex(
         // `outcome.vendored`, and both are about how the patch persists,
         // not whether this run hashed it. The committed ledger is as
         // trustworthy as the manifest beside it, and reading it hashes
-        // nothing. An unreadable ledger degrades to "nothing vendored".
-        let entries = ledger.map(|state| state.entries).unwrap_or_default();
+        // nothing. An unreadable ledger degrades to "nothing vendored"
+        // (and says so).
+        let entries = match ledger {
+            Ok(state) => state.entries,
+            Err(e) => {
+                note_warning(
+                    warnings,
+                    common,
+                    "vendor_state_unreadable",
+                    vendor_state_unreadable_message(&e.to_string()),
+                );
+                HashMap::new()
+            }
+        };
         let vendored = manifest
             .patches
             .keys()
@@ -384,7 +493,10 @@ async fn generate_vex(
         let quiet = common.silent || common.json || params.output.is_none();
         let purls: Vec<String> = manifest.patches.keys().cloned().collect();
         let package_paths = find_manifest_package_paths(&purls, common, quiet).await;
-        let vendor = vendor_context_from(common, manifest, ledger).await;
+        let (vendor, vendor_warning) = vendor_context_from(common, manifest, ledger).await;
+        if let Some(detail) = vendor_warning {
+            note_warning(warnings, common, "vendor_state_unreadable", detail);
+        }
         socket_patch_core::vex::applied_patches_with_vendor(
             manifest,
             &package_paths,
@@ -453,7 +565,7 @@ async fn generate_vex(
     // package-manager install.
     for purl in &outcome.vendored_out_of_sync {
         note_warning(
-            &mut warnings,
+            warnings,
             common,
             "vendored_tree_out_of_sync",
             format!(
@@ -500,12 +612,7 @@ async fn generate_vex(
         }
         keep
     });
-    if !setup_filtered.is_empty() && !common.silent && !common.json {
-        eprintln!(
-            "Note: omitting patches for ecosystems that are not set up (and not declared `manual` \
-             in .socket/manifest.json's `setup.manual`) from VEX."
-        );
-    }
+    let any_setup_filtered = !setup_filtered.is_empty();
     // The filter drops join the omission channel (`failed`) with their own
     // routing tag so they surface as per-purl `skipped` events in the
     // envelope — success and error paths alike. Before this they existed
@@ -517,13 +624,31 @@ async fn generate_vex(
             purl,
             reason: ECOSYSTEM_NOT_SETUP.to_string(),
         }));
+    // `manifest.patches` is a HashMap: without a sort the omission order
+    // (stderr, the error list and the JSON `skipped` events) changes run
+    // to run.
+    outcome
+        .failed
+        .sort_by(|a, b| (&a.purl, &a.reason).cmp(&(&b.purl, &b.reason)));
 
-    if !outcome.failed.is_empty() && !common.silent && !common.json {
-        for f in &outcome.failed {
+    // When nothing attests and EVERY omission was the property-7 filter,
+    // the run fails with a message that explains the setup cause itself
+    // (see below), so the generic note would only repeat it.
+    let all_setup_drops = outcome.applied.is_empty()
+        && !outcome.failed.is_empty()
+        && outcome
+            .failed
+            .iter()
+            .all(|f| f.reason == ECOSYSTEM_NOT_SETUP);
+    if !common.silent && !common.json {
+        if any_setup_filtered && !all_setup_drops {
             eprintln!(
-                "Warning: omitting patch for {} from VEX ({})",
-                f.purl, f.reason
+                "Note: patches for ecosystems that are not set up (and not declared `manual` \
+                 in .socket/manifest.json's `setup.manual`) are omitted from VEX."
             );
+        }
+        for f in &outcome.failed {
+            eprintln!("{}", format_omission_warning(&f.purl, &f.reason));
         }
     }
 
@@ -560,20 +685,8 @@ async fn generate_vex(
             // it is the documented exit-1 routing tag consumers already
             // branch on; the per-event `ecosystem_not_setup` errorCode is
             // the machine-readable discriminator.
-            let all_setup_drops = outcome.applied.is_empty()
-                && !outcome.failed.is_empty()
-                && outcome
-                    .failed
-                    .iter()
-                    .all(|f| f.reason == ECOSYSTEM_NOT_SETUP);
             let message = if all_setup_drops {
-                format!(
-                    "{} applied patch(es) with vulnerability metadata were omitted from VEX \
-                     because their ecosystems are not set up (no install hook) and not declared \
-                     `manual` in .socket/manifest.json's `setup.manual`. Run `socket-patch \
-                     setup`, or add the ecosystem to `setup.manual`, then re-run.",
-                    outcome.failed.len()
-                )
+                format_setup_drops_message(outcome.failed.len())
             } else {
                 "No applied patches with vulnerability metadata to attest.".to_string()
             };
@@ -581,6 +694,7 @@ async fn generate_vex(
                 code: "no_applicable_patches",
                 message,
                 failed: outcome.failed,
+                warnings: Vec::new(),
             });
         }
     };
@@ -595,17 +709,19 @@ async fn generate_vex(
         Err(e) => return Err(fail(common, "serialize_failed", e.to_string()).await),
     };
 
-    // Write.
+    // Write. The file gets the same trailing newline `println!` gives the
+    // stdout form, so `cat out.json` does not glue the prompt to the `}`.
     let wrote_to_file = match &params.output {
+        Some(_) if params.dry_run => false,
         Some(path) => {
-            if let Err(e) = tokio::fs::write(path, &serialized).await {
+            if let Err(e) = tokio::fs::write(path, format!("{serialized}\n")).await {
                 // The raw io::Error ("No such file or directory (os error
                 // 2)") names neither the file nor the operation — useless
                 // in a CI log. Say what was being written and where.
                 return Err(fail(
                     common,
                     "write_failed",
-                    format!("failed to write VEX document to {}: {e}", path.display()),
+                    format!("Failed to write VEX document to {}: {e}", path.display()),
                 )
                 .await);
             }
@@ -621,7 +737,11 @@ async fn generate_vex(
     track_vex_generated(
         doc.statements.len(),
         "openvex-0.2.0",
-        if wrote_to_file { "file" } else { "stdout" },
+        if params.output.is_some() {
+            "file"
+        } else {
+            "stdout"
+        },
         token.as_deref(),
         org.as_deref(),
     )
@@ -631,7 +751,8 @@ async fn generate_vex(
         statements: doc.statements.len(),
         failed: outcome.failed,
         doc,
-        warnings,
+        warnings: Vec::new(),
+        wrote_file: wrote_to_file,
     })
 }
 
@@ -679,11 +800,36 @@ pub(crate) async fn generate_vex_from_manifest_path(
     params: &VexBuildParams,
     manifest_path: &Path,
 ) -> Result<VexWriteSummary, VexGenError> {
-    let result = generate_vex_from_manifest_path_inner(common, params, manifest_path).await;
-    if result.is_err() {
-        remove_stale_vex_doc(params.output.as_deref()).await;
+    let mut warnings = Vec::new();
+    let result =
+        generate_vex_from_manifest_path_inner(common, params, manifest_path, &mut warnings).await;
+    match result {
+        Ok(mut summary) => {
+            summary.warnings = warnings;
+            Ok(summary)
+        }
+        Err(mut e) => {
+            // A dry run mutates nothing, a stale document included.
+            if !params.dry_run {
+                if let Some(path) = params.output.as_deref() {
+                    if remove_stale_vex_doc(path).await {
+                        note_warning(
+                            &mut warnings,
+                            common,
+                            "vex_stale_doc_removed",
+                            format!(
+                                "Removed the previous VEX document at {} (this run could not \
+                                 attest it).",
+                                path.display()
+                            ),
+                        );
+                    }
+                }
+            }
+            e.warnings = warnings;
+            Err(e)
+        }
     }
-    result
 }
 
 /// Delete a PRIOR run's OpenVEX document at `output` after a failed run.
@@ -691,11 +837,10 @@ pub(crate) async fn generate_vex_from_manifest_path(
 /// openvex.dev) is removed — the guard keeps a mistyped `--output` pointing
 /// at an unrelated file from being destroyed by an unrelated failure.
 /// Removal errors are swallowed: the non-zero exit is the contract, the
-/// deletion is hygiene.
-async fn remove_stale_vex_doc(output: Option<&Path>) {
-    let Some(path) = output else { return };
+/// deletion is hygiene. Returns whether a document was actually removed.
+async fn remove_stale_vex_doc(path: &Path) -> bool {
     let Ok(bytes) = tokio::fs::read(path).await else {
-        return;
+        return false;
     };
     let is_openvex = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
@@ -705,9 +850,7 @@ async fn remove_stale_vex_doc(output: Option<&Path>) {
                 .map(|c| c.contains("openvex.dev"))
         })
         .unwrap_or(false);
-    if is_openvex {
-        let _ = tokio::fs::remove_file(path).await;
-    }
+    is_openvex && tokio::fs::remove_file(path).await.is_ok()
 }
 
 /// [`generate_vex_from_manifest_path`] without the failure-cleanup wrapper.
@@ -715,10 +858,16 @@ async fn generate_vex_from_manifest_path_inner(
     common: &GlobalArgs,
     params: &VexBuildParams,
     manifest_path: &Path,
+    warnings: &mut Vec<RunWarning>,
 ) -> Result<VexWriteSummary, VexGenError> {
     let manifest_file = match read_manifest(manifest_path).await {
         Ok(m) => m,
-        Err(e) => return Err(fail(common, "manifest_unreadable", e.to_string()).await),
+        Err(e) => {
+            // Core's text ("Failed to parse manifest JSON: ...") does not
+            // say which file; in a workspace that matters.
+            let message = format!("{e} (in {})", manifest_path.display());
+            return Err(fail(common, "manifest_unreadable", message).await);
+        }
     };
     let had_manifest_file = manifest_file.is_some();
     // ONE read of the committed vendor ledger for the whole run: the
@@ -743,13 +892,27 @@ async fn generate_vex_from_manifest_path_inner(
     let (manifest, redirected) = match augment_with_redirect(common, manifest).await {
         Ok(augmented) => augmented,
         Err(corrupt) => {
-            return Err(fail(common, "redirect_ledger_corrupt", corrupt.to_string()).await);
+            // Not core's Display: that text ("... so it will not be
+            // overwritten") is written for the `scan --redirect` writer, and
+            // `vex` only reads the ledger.
+            let message = format!(
+                "The redirect ledger {} is malformed ({}); cannot attest redirected patches. \
+                 Repair its JSON or restore it from version control, then re-run.",
+                corrupt.path.display(),
+                corrupt.detail
+            );
+            return Err(fail(common, "redirect_ledger_corrupt", message).await);
         }
     };
     if manifest.patches.is_empty() {
         let ledger_note = match &ledger {
             Err(e) => {
-                warn_unreadable_vendor_state(common, e);
+                note_warning(
+                    warnings,
+                    common,
+                    "vendor_state_unreadable",
+                    vendor_state_unreadable_message(&e.to_string()),
+                );
                 format!("; the vendor ledger is also unreadable ({e})")
             }
             Ok(_) => String::new(),
@@ -772,7 +935,7 @@ async fn generate_vex_from_manifest_path_inner(
         )
         .await);
     }
-    generate_vex(common, params, &manifest, &redirected, ledger).await
+    generate_vex(common, params, &manifest, &redirected, ledger, warnings).await
 }
 
 /// Fold the `scan --redirect` ledger's embedded records into a manifest view
@@ -813,12 +976,18 @@ async fn fail(common: &GlobalArgs, code: &'static str, message: String) -> VexGe
         code,
         message,
         failed: Vec::new(),
+        warnings: Vec::new(),
     }
 }
 
 /// Pick the product PURL from an explicit override or by filesystem
-/// auto-detect.
-async fn resolve_product_id(common: &GlobalArgs, product: Option<&str>) -> Result<String, String> {
+/// auto-detect. Auto-detect advisories (several project manifests) join
+/// `warnings`.
+async fn resolve_product_id(
+    common: &GlobalArgs,
+    product: Option<&str>,
+    warnings: &mut Vec<RunWarning>,
+) -> Result<String, String> {
     // An empty (or whitespace-only) override means "unset" — the semantics
     // `scrub_empty_env_vars` already gives the `SOCKET_VEX_PRODUCT=` twin and
     // `api_client_overrides` gives `--api-url ""`. Without the filter,
@@ -830,29 +999,65 @@ async fn resolve_product_id(common: &GlobalArgs, product: Option<&str>) -> Resul
         return Ok(p.to_string());
     }
     let detect = detect_product(&common.cwd).await;
-    for w in &detect.warnings {
-        if !common.silent && !common.json {
-            eprintln!("Warning: {w}");
+    for w in detect.warnings {
+        note_warning(warnings, common, "product_multiple_manifests", w);
+    }
+    if let Some(purl) = detect.purl {
+        return Ok(purl);
+    }
+    let mut found = Vec::new();
+    for name in PRODUCT_MANIFESTS {
+        if tokio::fs::metadata(common.cwd.join(name)).await.is_ok() {
+            found.push(*name);
         }
     }
-    detect.purl.ok_or_else(|| {
-        format!(
-            "Could not auto-detect a top-level product PURL in {}. \
-             Provide one with --product <purl> (e.g. pkg:npm/my-app@1.0.0).",
-            common.cwd.display()
-        )
-    })
+    Err(format_product_undetected(&common.cwd, &found))
+}
+
+/// The project manifests product auto-detection reads (after the git
+/// remote), in its probe order.
+const PRODUCT_MANIFESTS: &[&str] = &["package.json", "pyproject.toml", "Cargo.toml"];
+
+/// The `product_undetected` message. `found` names the manifests that exist
+/// but yielded no PURL (no name/version), so the user knows which file to
+/// fix instead of guessing.
+fn format_product_undetected(cwd: &Path, found: &[&str]) -> String {
+    let why = match found {
+        [] => String::new(),
+        [one] => format!(" ({one} was found but has no usable name and version)"),
+        many => format!(
+            " ({} were found but have no usable name and version)",
+            join_and(many)
+        ),
+    };
+    format!(
+        "Could not auto-detect a top-level product PURL in {}{why}. \
+         Provide one with --product <purl> (e.g. pkg:npm/my-app@1.0.0).",
+        cwd.display()
+    )
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn join_and(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
 }
 
 /// The one `unreadable vendor state` advisory (contract: `setup --check`
 /// and `vex` surface a ledger they cannot read or parse as this line, muted
 /// by `--silent`): a read-only consumer degrades to "nothing vendored" and
-/// says so, on stderr, so the operator learns why nothing attests.
+/// says so, on stderr, so the operator learns why nothing attests. `vex`
+/// routes the same [`vendor_state_unreadable_message`] through its
+/// warnings channel instead (stderr in human mode, `warnings[]` under
+/// `--json`); this direct form is `setup --check`'s.
 pub(crate) fn warn_unreadable_vendor_state(common: &GlobalArgs, e: &std::io::Error) {
     if !common.silent {
         eprintln!(
-            "Warning: unreadable vendor state ({e}); vendored patches cannot be verified \
-             from the committed artifact"
+            "Warning: {}",
+            vendor_state_unreadable_message(&e.to_string())
         );
     }
 }
@@ -871,37 +1076,48 @@ pub(crate) fn warn_unreadable_vendor_state(common: &GlobalArgs, e: &std::io::Err
 /// silently omitted from the VEX document. The redirect copy dir holds the
 /// bytes the build actually consumes, so it is what verification must hash.
 ///
-/// An unreadable/corrupt vendor ledger degrades to "no vendor entries"
-/// (with a stderr warning): vendored PURLs then fall through to the
-/// installed tree, fail verification there, and are omitted — fail-closed,
-/// never falsely attested. Returns `None` when there is nothing vendored
-/// and no redirect to synthesize (the common case).
+/// An unreadable/corrupt vendor ledger degrades to "no vendor entries":
+/// vendored PURLs then fall through to the installed tree, fail
+/// verification there, and are omitted — fail-closed, never falsely
+/// attested. The degrade is returned as a warning detail for the caller to
+/// report in its own channel. The context is `None` when there is nothing
+/// vendored and no redirect to synthesize (the common case).
 pub(crate) async fn vendor_context_from(
     common: &GlobalArgs,
     manifest: &PatchManifest,
     ledger: std::io::Result<VendorState>,
-) -> Option<VendorContext> {
-    let entries = match ledger {
-        Ok(state) => state.entries,
-        Err(e) => {
-            warn_unreadable_vendor_state(common, &e);
-            HashMap::new()
-        }
+) -> (Option<VendorContext>, Option<String>) {
+    let (entries, warning) = match ledger {
+        Ok(state) => (state.entries, None),
+        Err(e) => (
+            HashMap::new(),
+            Some(vendor_state_unreadable_message(&e.to_string())),
+        ),
     };
 
     let go_patches = synthesize_go_patches(common, manifest, &entries).await;
 
     if entries.is_empty() && go_patches.is_empty() {
-        return None;
+        return (None, warning);
     }
-    Some(VendorContext {
+    let context = VendorContext {
         project_root: common.cwd.clone(),
         entries,
         go_patches,
-    })
+    };
+    (Some(context), warning)
 }
 
-/// Synthesize go-patches redirect targets for [`load_vendor_context`]: for
+/// The unreadable-`.socket/vendor/state.json` advisory (`cause` is
+/// `load_state`'s error, which names the file).
+pub(crate) fn vendor_state_unreadable_message(cause: &str) -> String {
+    format!(
+        "Unreadable vendor state ({cause}); vendored patches cannot be verified from the \
+         committed artifact"
+    )
+}
+
+/// Synthesize go-patches redirect targets for [`vendor_context_from`]: for
 /// every socket-owned (`.socket/go-patches/`) `replace` in `go.mod` whose
 /// module+version maps to a manifest golang PURL with no explicit vendor
 /// entry, record the absolute redirect copy dir for dir-hash verification.
@@ -954,9 +1170,16 @@ async fn synthesize_go_patches(
 /// stdout in `--json` mode, a stderr message otherwise. `failures` lists
 /// patches omitted by verification (populated for `no_applicable_patches`,
 /// empty everywhere else).
-fn emit_envelope_error(args: &VexArgs, code: &str, message: &str, failures: &[FailedPatch]) {
+fn emit_envelope_error(
+    args: &VexArgs,
+    code: &str,
+    message: &str,
+    failures: &[FailedPatch],
+    warnings: &[RunWarning],
+) {
     if args.common.json {
         let mut env = Envelope::new(Command::Vex);
+        env.dry_run = args.common.dry_run;
         for f in failures {
             env.record(
                 PatchEvent::new(PatchAction::Skipped, f.purl.clone())
@@ -964,29 +1187,79 @@ fn emit_envelope_error(args: &VexArgs, code: &str, message: &str, failures: &[Fa
             );
         }
         env.mark_error(EnvelopeError::new(code, message.to_string()));
+        env.warnings = warnings.to_vec();
         println!("{}", env.to_pretty_json());
     } else {
         eprintln!("Error: {message}");
-        for f in failures {
-            eprintln!("  omitted: {} ({})", f.purl, f.reason);
+        // The per-patch "Warning: omitting ..." lines already named each
+        // omission; `--silent` muted them, so list them with the error.
+        if args.common.silent {
+            for f in failures {
+                eprintln!("  omitted: {} ({})", f.purl, f.reason);
+            }
         }
     }
 }
 
-/// Human `reason` string for an omission event; the routing tag rides
-/// `errorCode`. The property-7 drop gets its own phrasing — that patch IS
-/// applied and verified, which the generic "omitted" alone doesn't convey.
-fn omission_reason_message(reason: &str) -> &'static str {
-    if reason == ECOSYSTEM_NOT_SETUP {
-        "applied patch omitted from VEX: its ecosystem has no install hook set up and is not \
-         declared `manual` in setup.manual"
-    } else {
-        "patch omitted from VEX"
+/// What an omission routing tag means, in words (the tag itself stays the
+/// machine-readable `errorCode`).
+fn omission_phrase(reason: &str) -> &'static str {
+    match reason {
+        ECOSYSTEM_NOT_SETUP => {
+            "applied, but its ecosystem has no install hook set up and is not declared \
+             `manual` in setup.manual"
+        }
+        "package_not_found" => "the package is not installed",
+        "not_applied" => "the patched files still hold the original content",
+        "hash_mismatch" => "a patched file matches neither the original nor the patched content",
+        "file_not_found" => "a patched file is missing",
+        "no_files" => "the patch record lists no files",
+        "vendor_hash_mismatch" => "the vendored artifact does not match the patch",
+        "stale_install" => "the installed copy is not patched",
+        _ => "the patch could not be verified",
     }
 }
 
-fn emit_envelope_success(summary: &VexWriteSummary) {
+/// The per-patch stderr line: the readable phrase, then the tag in
+/// parentheses (what `--json` reports as `errorCode`).
+fn format_omission_warning(purl: &str, reason: &str) -> String {
+    format!(
+        "Warning: omitting {purl} from VEX: {} ({reason})",
+        omission_phrase(reason)
+    )
+}
+
+/// Human `reason` string for an omission event; the routing tag rides
+/// `errorCode`.
+fn omission_reason_message(reason: &str) -> String {
+    if reason == ECOSYSTEM_NOT_SETUP {
+        "applied patch omitted from VEX: its ecosystem has no install hook set up and is not \
+         declared `manual` in setup.manual"
+            .to_string()
+    } else {
+        format!("patch omitted from VEX: {}", omission_phrase(reason))
+    }
+}
+
+/// The `no_applicable_patches` message when every omission was the
+/// property-7 setup filter.
+fn format_setup_drops_message(n: usize) -> String {
+    let (subject, verb, their, ecosystems) = if n == 1 {
+        ("applied patch", "was", "its", "ecosystem is")
+    } else {
+        ("applied patches", "were", "their", "ecosystems are")
+    };
+    format!(
+        "{n} {subject} with vulnerability metadata {verb} omitted from VEX because {their} \
+         {ecosystems} not set up (no install hook) and not declared `manual` in \
+         .socket/manifest.json's `setup.manual`. Run `socket-patch setup`, or add the \
+         ecosystem to `setup.manual`, then re-run."
+    )
+}
+
+fn emit_envelope_success(summary: &VexWriteSummary, dry_run: bool) {
     let mut env = Envelope::new(Command::Vex);
+    env.dry_run = dry_run;
     for st in &summary.doc.statements {
         for prod in &st.products {
             for sub in &prod.subcomponents {
@@ -1121,6 +1394,150 @@ mod tests {
         assert!(!has_iri_scheme(":no-scheme"));
         assert!(!has_iri_scheme("1pkg:starts-with-digit"));
         assert!(!has_iri_scheme("bad scheme:rest"));
+    }
+
+    #[test]
+    fn vex_summary_lines_pluralize() {
+        let p = Path::new("out.json");
+        assert_eq!(
+            format_vex_written(1, p),
+            "Wrote OpenVEX document with 1 statement to out.json"
+        );
+        assert_eq!(
+            format_vex_written(0, p),
+            "Wrote OpenVEX document with 0 statements to out.json"
+        );
+        assert_eq!(
+            format_vex_written(3, Path::new("dir/é.json")),
+            "Wrote OpenVEX document with 3 statements to dir/é.json"
+        );
+        assert_eq!(
+            format_vex_dry_run(1, p),
+            "[dry-run] Would write OpenVEX document with 1 statement to out.json"
+        );
+        assert_eq!(
+            format_vex_dry_run(2, p),
+            "[dry-run] Would write OpenVEX document with 2 statements to out.json"
+        );
+        assert_eq!(format_vex_emitted(1), "Emitted 1 VEX statement");
+        assert_eq!(format_vex_emitted(12), "Emitted 12 VEX statements");
+    }
+
+    #[test]
+    fn setup_drops_message_agrees_in_number() {
+        let one = format_setup_drops_message(1);
+        assert!(
+            one.starts_with(
+                "1 applied patch with vulnerability metadata was omitted from VEX because its \
+                 ecosystem is not set up (no install hook)"
+            ),
+            "{one}"
+        );
+        let two = format_setup_drops_message(2);
+        assert!(
+            two.starts_with(
+                "2 applied patches with vulnerability metadata were omitted from VEX because \
+                 their ecosystems are not set up (no install hook)"
+            ),
+            "{two}"
+        );
+        for m in [&one, &two] {
+            assert!(!m.contains("(s)"), "{m}");
+            assert!(m.ends_with("then re-run."), "{m}");
+        }
+    }
+
+    #[test]
+    fn omission_warning_names_phrase_and_tag() {
+        assert_eq!(
+            format_omission_warning("pkg:npm/a@1.0.0", "not_applied"),
+            "Warning: omitting pkg:npm/a@1.0.0 from VEX: the patched files still hold the \
+             original content (not_applied)"
+        );
+        assert_eq!(
+            format_omission_warning("pkg:npm/b@2.0.0", "package_not_found"),
+            "Warning: omitting pkg:npm/b@2.0.0 from VEX: the package is not installed \
+             (package_not_found)"
+        );
+        // Unknown tags still read as a sentence and keep the raw tag.
+        assert_eq!(
+            format_omission_warning("pkg:npm/c@3.0.0", "brand_new_tag"),
+            "Warning: omitting pkg:npm/c@3.0.0 from VEX: the patch could not be verified \
+             (brand_new_tag)"
+        );
+        for tag in [
+            ECOSYSTEM_NOT_SETUP,
+            "package_not_found",
+            "not_applied",
+            "hash_mismatch",
+            "file_not_found",
+            "no_files",
+            "vendor_hash_mismatch",
+            "stale_install",
+        ] {
+            assert_ne!(
+                omission_phrase(tag),
+                omission_phrase("brand_new_tag"),
+                "{tag} has no phrase of its own"
+            );
+            let reason = omission_reason_message(tag);
+            assert!(reason.contains("omitted from VEX"), "{reason}");
+        }
+        assert_eq!(
+            omission_reason_message("hash_mismatch"),
+            "patch omitted from VEX: a patched file matches neither the original nor the \
+             patched content"
+        );
+    }
+
+    #[test]
+    fn product_undetected_names_unusable_manifests() {
+        let cwd = Path::new("proj");
+        assert_eq!(
+            format_product_undetected(cwd, &[]),
+            "Could not auto-detect a top-level product PURL in proj. Provide one with \
+             --product <purl> (e.g. pkg:npm/my-app@1.0.0)."
+        );
+        assert_eq!(
+            format_product_undetected(cwd, &["package.json"]),
+            "Could not auto-detect a top-level product PURL in proj (package.json was found \
+             but has no usable name and version). Provide one with --product <purl> (e.g. \
+             pkg:npm/my-app@1.0.0)."
+        );
+        let many =
+            format_product_undetected(cwd, &["package.json", "pyproject.toml", "Cargo.toml"]);
+        assert!(
+            many.contains(
+                "(package.json, pyproject.toml and Cargo.toml were found but have no usable \
+                 name and version)"
+            ),
+            "{many}"
+        );
+        assert_eq!(join_and(&["a", "b"]), "a and b");
+        assert_eq!(join_and(&[]), "");
+    }
+
+    #[test]
+    fn org_path_heuristic() {
+        assert_eq!(org_looks_like_path(None), None);
+        assert_eq!(org_looks_like_path(Some("socketdev")), None);
+        assert_eq!(org_looks_like_path(Some("my-org_2")), None);
+        assert_eq!(
+            org_looks_like_path(Some("out.json")).as_deref(),
+            Some("--org \"out.json\" looks like a file path; did you mean -O/--output? (-o is --org)")
+        );
+        assert!(org_looks_like_path(Some("reports/vex")).is_some());
+        assert!(org_looks_like_path(Some("C:\\vex")).is_some());
+        assert!(org_looks_like_path(Some("OUT.JSON")).is_some());
+    }
+
+    #[test]
+    fn vendor_state_message_is_capitalized_and_keeps_cause() {
+        assert_eq!(
+            vendor_state_unreadable_message("corrupt x/state.json: eof"),
+            "Unreadable vendor state (corrupt x/state.json: eof); vendored patches cannot be \
+             verified from the committed artifact"
+        );
     }
 
     #[derive(Parser)]

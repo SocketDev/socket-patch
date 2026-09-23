@@ -26,6 +26,7 @@ use socket_patch_core::telemetry::track_patch_vendor_failed;
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Duration;
 
@@ -38,7 +39,7 @@ use crate::commands::vendor::{
     note_classic_migration_risk, track_outcomes_for_vendor, vendor_records,
 };
 use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
-use crate::output::print_json;
+use crate::ui::{plural, print_json};
 
 use super::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
 use super::{
@@ -174,10 +175,17 @@ async fn run_scan_vendor_step(
     seed: HashMap<String, Vec<u8>>,
     client: ApiClient,
     use_public_proxy: bool,
+    // Print "No vendorable patches in scope." when there are no records at
+    // all (the step is a silent no-op then). `get --mode vendored` wants
+    // it; scan's interactive arm prints its own closing line instead.
+    report_empty: bool,
 ) -> VendorStepResult {
     let mut env = Envelope::new(EnvelopeCommand::Vendor);
     env.dry_run = common.dry_run;
     if records.is_empty() {
+        if report_empty && !common.json && !common.silent {
+            println!("No vendorable patches in scope.");
+        }
         return Ok((false, env));
     }
     // The one socket-dir / manifest-path derivation every caller shares.
@@ -413,10 +421,8 @@ async fn migrate_legacy_manifest_records(
             common,
             VENDOR_MANIFEST_RECORD_MIGRATED,
             format!(
-                "{} manifest record{} moved to the vendor ledger (vendored mode is \
-                 manifest-free): {}",
-                dropped.len(),
-                if dropped.len() == 1 { "" } else { "s" },
+                "{} moved to the vendor ledger (vendored mode is manifest-free): {}",
+                plural(dropped.len(), "manifest record", "manifest records"),
                 dropped.join(", ")
             ),
         ),
@@ -466,6 +472,7 @@ async fn run_vendor_json_path(
         api_client,
         all_packages_with_patches,
         can_access_paid_patches,
+        &args.common,
         false,
         false,
     )
@@ -616,10 +623,28 @@ async fn run_vendor_interactive_path(
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
 ) -> i32 {
-    let (dl_code, _, records, blobs) =
+    // The download phase is quiet about its own header in vendored mode
+    // (only the manifest-mode download prints it), so this arm does.
+    if !args.common.silent && !selected.is_empty() {
+        // A blank line after an answered prompt; otherwise the listing's
+        // trailing blank line already separates the sections.
+        if !args.common.yes && std::io::stdin().is_terminal() {
+            eprintln!();
+        }
+        eprintln!(
+            "Downloading {}...",
+            plural(selected.len(), "patch", "patches")
+        );
+    }
+    let (dl_code, dl_json, records, blobs) =
         boxed_download_patch_records(selected, params, api_client, prefetched).await;
     let mut has_errors = dl_code != 0;
-    let code = match boxed_scan_vendor_step(
+    // Patches the download phase could not get (it reported each one).
+    let download_failed = dl_json["failed"].as_u64().unwrap_or(0);
+    // The vendor step is a silent no-op on an empty record set (it can't
+    // know why it is empty); this arm can.
+    let nothing_to_vendor = records.is_empty();
+    let code = match boxed_scan_vendor_step_quiet_empty(
         &args.common,
         records,
         blobs,
@@ -630,6 +655,9 @@ async fn run_vendor_interactive_path(
     {
         Ok((vendor_errors, venv)) => {
             has_errors |= vendor_errors;
+            if nothing_to_vendor && !args.common.silent {
+                println!("{}", format_nothing_vendored(download_failed));
+            }
             // Run-outcome telemetry, same as the JSON arm above.
             track_outcomes_for_vendor(
                 has_errors,
@@ -641,6 +669,9 @@ async fn run_vendor_interactive_path(
             .await;
             i32::from(has_errors)
         }
+        // Human mode prints no per-event lines even on success, so the
+        // carried envelope has no human rendering to feed — JSON mode is
+        // where the reconcile events must survive (see the JSON fold above).
         Err((code, message, _envelope)) => {
             track_patch_vendor_failed(
                 &message,
@@ -649,7 +680,7 @@ async fn run_vendor_interactive_path(
                 telemetry_org,
             )
             .await;
-            eprintln!("Error ({code}): {message}");
+            eprintln!("{}", format_vendor_step_error(code, &message));
             return 1;
         }
     };
@@ -665,9 +696,8 @@ async fn run_vendor_interactive_path(
         .await;
         if !args.common.silent && !gc.pruned.is_empty() {
             println!(
-                "GC: pruned {} manifest entr{}.",
-                gc.pruned.len(),
-                if gc.pruned.len() == 1 { "y" } else { "ies" },
+                "GC: pruned {}.",
+                plural(gc.pruned.len(), "manifest entry", "manifest entries")
             );
         }
         if !args.common.silent {
@@ -675,6 +705,43 @@ async fn run_vendor_interactive_path(
         }
     }
     code
+}
+
+/// The closing line when the vendor step had no patch records at all:
+/// either the download phase failed or refused every patch (and listed
+/// why), or there was nothing to vendor in the first place.
+fn format_nothing_vendored(download_failed: u64) -> String {
+    if download_failed > 0 {
+        format!(
+            "Nothing was vendored: {} failed (see above).",
+            plural(download_failed as usize, "patch", "patches")
+        )
+    } else {
+        "No vendorable patches in scope.".to_string()
+    }
+}
+
+/// The human error line (plus any remediation hint) for a failed vendor
+/// step: `Error (<code>): <Message>.`. The code and message are the ones
+/// the JSON envelope carries.
+pub(crate) fn format_vendor_step_error(code: &str, message: &str) -> String {
+    let mut chars = message.trim_end_matches('.').chars();
+    let message: String = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    };
+    let mut out = if message.is_empty() {
+        format!("Error ({code}).")
+    } else {
+        format!("Error ({code}): {message}.")
+    };
+    if code == "lock_held" {
+        // Same advice as the other commands' lock error (lock_cli).
+        out.push_str(
+            "\n  Wait for it to finish, or retry with --lock-timeout <secs> to wait for the lock.",
+        );
+    }
+    out
 }
 
 /// Partition purls matching `skip` out of the selected set and pre-render
@@ -834,6 +901,26 @@ pub(crate) fn boxed_scan_vendor_step<'a>(
         seed,
         client,
         use_public_proxy,
+        true,
+    ))
+}
+
+/// [`boxed_scan_vendor_step`] without the empty-run line, for scan's
+/// interactive arm, which prints its own (see [`format_nothing_vendored`]).
+fn boxed_scan_vendor_step_quiet_empty<'a>(
+    common: &'a GlobalArgs,
+    records: HashMap<String, PatchRecord>,
+    seed: HashMap<String, Vec<u8>>,
+    client: ApiClient,
+    use_public_proxy: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = VendorStepResult> + 'a>> {
+    Box::pin(run_scan_vendor_step(
+        common,
+        records,
+        seed,
+        client,
+        use_public_proxy,
+        false,
     ))
 }
 
@@ -1391,6 +1478,54 @@ mod fold_vendored_skips_tests {
                 "patches": [{ "purl": "pkg:npm/a@1.0.0" }],
             }),
             "only the status may change on the zero-record fold"
+        );
+    }
+}
+
+/// Exact-string tests for the scan-driven vendor step's human lines.
+#[cfg(test)]
+mod ui_format_tests {
+    use super::{format_nothing_vendored, format_vendor_step_error};
+
+    #[test]
+    fn nothing_vendored_line() {
+        assert_eq!(
+            format_nothing_vendored(0),
+            "No vendorable patches in scope."
+        );
+        assert_eq!(
+            format_nothing_vendored(1),
+            "Nothing was vendored: 1 patch failed (see above)."
+        );
+        assert_eq!(
+            format_nothing_vendored(2),
+            "Nothing was vendored: 2 patches failed (see above)."
+        );
+    }
+
+    #[test]
+    fn step_error_is_capitalized_with_one_period() {
+        assert_eq!(
+            format_vendor_step_error(
+                "no_local_source",
+                "patch artifacts unavailable (offline or download failure)"
+            ),
+            "Error (no_local_source): Patch artifacts unavailable (offline or download failure)."
+        );
+        assert_eq!(format_vendor_step_error("x", "done."), "Error (x): Done.");
+        assert_eq!(format_vendor_step_error("x", ""), "Error (x).");
+        assert_eq!(format_vendor_step_error("x", "état"), "Error (x): État.");
+    }
+
+    #[test]
+    fn lock_held_carries_the_wait_hint() {
+        assert_eq!(
+            format_vendor_step_error(
+                "lock_held",
+                "another socket-patch process is operating in this directory"
+            ),
+            "Error (lock_held): Another socket-patch process is operating in this directory.\n  \
+             Wait for it to finish, or retry with --lock-timeout <secs> to wait for the lock."
         );
     }
 }

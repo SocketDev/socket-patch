@@ -549,9 +549,15 @@ fn setup_honors_exclude_for_a_workspace_member() {
 fn exclude_persistence_fails_closed_on_corrupt_manifest() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
+    // A real `packages/b` member: an `--exclude` that matches nothing is
+    // dropped before persistence, which would make this test vacuous.
     write(
         &proj.path().join("package.json"),
-        r#"{ "name": "root", "version": "1.0.0" }"#,
+        r#"{ "name": "root", "version": "1.0.0", "workspaces": ["packages/*"] }"#,
+    );
+    write(
+        &proj.path().join("packages/b/package.json"),
+        r#"{ "name": "b", "version": "1.0.0" }"#,
     );
     let manifest_path = proj.path().join(".socket/manifest.json");
     let corrupt = r#"{ "patches": { "pkg:npm/left-pad@1.3.0": TRUNCATED-MID-WRITE"#;
@@ -604,9 +610,15 @@ fn exclude_persistence_fails_closed_on_corrupt_manifest() {
 fn exclude_persistence_fails_closed_silently_under_silent() {
     let proj = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
+    // A real `packages/b` member: an `--exclude` that matches nothing is
+    // dropped before persistence, which would make this test vacuous.
     write(
         &proj.path().join("package.json"),
-        r#"{ "name": "root", "version": "1.0.0" }"#,
+        r#"{ "name": "root", "version": "1.0.0", "workspaces": ["packages/*"] }"#,
+    );
+    write(
+        &proj.path().join("packages/b/package.json"),
+        r#"{ "name": "b", "version": "1.0.0" }"#,
     );
     let manifest_path = proj.path().join(".socket/manifest.json");
     let corrupt = r#"{ "patches": { "pkg:npm/left-pad@1.3.0": TRUNCATED-MID-WRITE"#;

@@ -886,7 +886,7 @@ fn verify_mode_includes_applied_omits_unapplied() {
 
     // Both omissions must surface on stderr, each routed with its own
     // verification reason (the warning format is
-    // "omitting patch for <purl> from VEX (<reason>)").
+    // "Warning: omitting <purl> from VEX: <phrase> (<tag>)").
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("unapplied-pkg") && stderr.contains("file_not_found"),

@@ -84,7 +84,7 @@ async fn fetch_archive(
         .get(&url)
         .send()
         .await
-        .map_err(|e| UpdateError::Network(format!("GET {url}: {e}")))?;
+        .map_err(|e| super::release::request_error(&url, &e))?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Err(UpdateError::AssetNotFound {

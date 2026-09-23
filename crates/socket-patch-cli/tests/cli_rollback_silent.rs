@@ -285,7 +285,7 @@ fn rollback_silent_per_package_failure_keeps_error_output() {
     assert!(
         chatter
             .iter()
-            .any(|l| l.contains("Failed to rollback") && l.contains("mismatch-target")),
+            .any(|l| l.contains("Failed to roll back") && l.contains("mismatch-target")),
         "--silent must keep the per-package failure line; stderr was: {stderr:?}"
     );
     // The mismatched file must be left untouched (fail-safe).

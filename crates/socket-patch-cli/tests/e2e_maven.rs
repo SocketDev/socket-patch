@@ -182,7 +182,8 @@ async fn scan_discovers_maven_artifacts() {
     // the word "packages", which is exactly what let the old assertion
     // pass when discovery was disabled.
     assert!(
-        !combined.contains("No packages found"),
+        !combined.contains("No packages found")
+            && !combined.contains("No packages found"),
         "scan reported zero packages — Maven discovery did not run:\n{combined}"
     );
     assert!(
@@ -313,7 +314,7 @@ async fn scan_discovers_gradle_project_artifacts() {
         String::from_utf8_lossy(&human.stderr)
     );
     assert!(
-        h_combined.contains("Found 1 packages") && h_combined.contains("(1 maven)"),
+        h_combined.contains("Found 1 package (1 maven)"),
         "expected the Gradle project to discover exactly 1 Maven artifact, got:\n{h_combined}"
     );
 

@@ -41,8 +41,8 @@ into the new version's section — see docs/releasing.md.
   (hosted-only and vendored projects; the truly-empty project
   keeps the "Manifest not found" exit 1, and a wired-but-ledgerless project
   errors naming `socket-patch repair`). Wet non-preserve runs confirm once
-  ("Roll back N patch(es), remove them from the local manifest, and delete
-  M vendored artifact(s)?" — auto-accepted under `--yes`/`--json`/non-TTY;
+  ("Roll back N patches, remove them from the local manifest, and delete
+  M vendored artifacts and their ledger records?" — auto-accepted under `--yes`/`--json`/non-TTY;
   declining prints "Rollback cancelled." and exits 0). Drift-keeps, hosted
   refusals/unsupported targets, corrupt ledgers, and a failed manifest
   write exit 1 `partial_failure`; not-installed entries still exit 0.
@@ -78,16 +78,16 @@ into the new version's section — see docs/releasing.md.
 - **A plain `scan` without a TTY is report-only.** When stdin is not a TTY,
   `--yes` is absent, and no intent flag (`--mode`, `--apply`, `--sync`,
   `--vendor`, `--redirect`, `--prune`) is given, human-mode `scan` prints the
-  discovery report and the "To apply a patch, run: …" hint, downloads
+  discovery report and the "To apply a single patch, run: …" hint, downloads
   nothing, creates no `.socket/`, and exits 0 — it no longer auto-accepts the
   apply prompt. Any intent flag, `--yes`, or a TTY keeps the previous
   behavior; `rollback`/`remove`/`get`'s non-TTY auto-accept is unchanged.
   Human `scan --mode hosted` now prints the results table and update
-  detection like the other modes and confirms once ("Redirect N package(s)
+  detection like the other modes and confirms once ("Redirect N packages
   to the hosted patch server?" — the same prompt as `get --mode hosted` —
   default yes, skipped by `--yes`/`--json`/`--dry-run`; on a non-TTY stdin
-  without `--yes` it prints `Non-interactive mode detected, proceeding with
-  default.` and proceeds), fetches patch details with the agent arm's
+  without `--yes` it prints `Non-interactive mode detected, proceeding
+  automatically.` and proceeds), fetches patch details with the agent arm's
   progress counter and per-package warnings, and an empty hosted discovery
   prints `No patches available for installed packages.` and exits 0 without
   entering the redirect engine (was `Redirected 0 package(s)`); a discovery
@@ -374,7 +374,7 @@ into the new version's section — see docs/releasing.md.
   record for a purl the vendor ledger holds at another uuid carries `oldUuid`
   and the human `[fetch]` line reads `(replacing <uuid>)`;
   `get --mode vendored --dry-run` prints `[dry-run] Would download and vendor
-  N patch(es).` on both identifier paths; the `[note]` and
+  N patches. No changes made.` on both identifier paths; the `[note]` and
   `Patch record saved to` lines are gone with the manifest.
 - **Agent-mode `get` leaves nothing behind when it records nothing.**
   `.socket/` and `.socket/blobs/` are created only when a record is

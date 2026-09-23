@@ -67,7 +67,7 @@ fn warn_legacy_once(legacy_name: &'static str, new_name: &'static str) {
 
 /// Check if debug mode is enabled via `SOCKET_DEBUG` (with the legacy
 /// `SOCKET_PATCH_DEBUG` shim).
-pub(crate) fn is_debug_enabled() -> bool {
+pub fn is_debug_enabled() -> bool {
     matches!(
         read_env_with_legacy("SOCKET_DEBUG", "SOCKET_PATCH_DEBUG").as_deref(),
         Some("1" | "true")

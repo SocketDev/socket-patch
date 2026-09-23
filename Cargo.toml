@@ -24,8 +24,8 @@ tokio = { version = "=1.50.0", features = ["full"] }
 thiserror = "=2.0.18"
 walkdir = "=2.5.0"
 uuid = { version = "=1.21.0", features = ["v4"] }
+console = "=0.15.11"
 dialoguer = "=0.11.0"
-indicatif = "=0.17.11"
 tempfile = "=3.26.0"
 regex = "=1.12.3"
 glob = "=0.3.4"
@@ -38,6 +38,7 @@ zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 fs2 = "=0.4.3"
 same-file = "=1.0.6"
 libc = "=0.2.182"
+windows-sys = "=0.59.0"
 semver = "=1.0.27"
 self-replace = "=1.5.0"
 wiremock = "=0.6.5"

@@ -1519,7 +1519,7 @@ fn standalone_output_write_failure_names_path_and_exits_2() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("failed to write VEX document") && stderr.contains("no-such-dir"),
+        stderr.contains("Failed to write VEX document") && stderr.contains("no-such-dir"),
         "the error must name the operation and the path; got {stderr:?}"
     );
 }

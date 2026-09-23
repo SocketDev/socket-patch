@@ -248,13 +248,13 @@ async fn scan_discovers_composer1_packages() {
     );
 
     // --- Human path: the single package must be attributed *entirely* to the
-    // php ecosystem. Assert the contiguous `Found 1 packages (1 php)` string
+    // php ecosystem. Assert the contiguous `Found 1 package (1 php)` string
     // (see the Composer 2 test for why two independent substrings are too
     // weak).
     let combined = scan_human(&project_dir, &proxy.uri()).await;
     assert!(
-        combined.contains("Found 1 packages (1 php)"),
-        "Expected human scan to report exactly 'Found 1 packages (1 php)', got:\n{combined}"
+        combined.contains("Found 1 package (1 php)"),
+        "Expected human scan to report exactly 'Found 1 package (1 php)', got:\n{combined}"
     );
     assert!(
         !combined.contains("No packages found"),

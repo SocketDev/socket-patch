@@ -275,8 +275,8 @@ fn pnpm_trust_configured_detail(server: &str, created: bool, dry_run: bool) -> S
     let how = match (created, dry_run) {
         (true, false) => "`trustLockfile: true` was written to a new",
         (false, false) => "`trustLockfile: true` was merged into the existing",
-        (true, true) => "`trustLockfile: true` would be written to a new (--dry-run)",
-        (false, true) => "`trustLockfile: true` would be merged into the existing (--dry-run)",
+        (true, true) => "`trustLockfile: true` would be written to a new",
+        (false, true) => "`trustLockfile: true` would be merged into the existing",
     };
     format!(
         "{}, so {how} {PNPM_WORKSPACE_REL} — commit it alongside the lock; \
@@ -296,6 +296,29 @@ fn pnpm_lock_version_major(lock_text: &str) -> Option<u32> {
         let rest = line.strip_prefix("lockfileVersion:")?;
         let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
         value.split('.').next()?.parse::<u32>().ok()
+    })
+}
+
+/// Whether a pnpm lock may belong to pnpm 1–4, which spell the store flag
+/// `--store` (pnpm 1–3 can silently ignore `--store-dir`; early pnpm 4
+/// rejects it): a `shrinkwrapVersion` lock (pnpm 1–2) or lockfileVersion
+/// 5.0–5.2 (pnpm 3–5). Later locks never get the `--store` note.
+fn pnpm_lock_may_need_store_flag(lock_text: &str) -> bool {
+    lock_text.lines().any(|line| {
+        if line.starts_with("shrinkwrapVersion:") {
+            return true;
+        }
+        let Some(rest) = line.strip_prefix("lockfileVersion:") else {
+            return false;
+        };
+        let value = rest.trim().trim_matches(|c| c == '\'' || c == '"');
+        let mut parts = value.split('.');
+        let major = parts.next().and_then(|m| m.parse::<u32>().ok());
+        let minor = parts
+            .next()
+            .and_then(|m| m.parse::<u32>().ok())
+            .unwrap_or(0);
+        major == Some(5) && minor <= 2
     })
 }
 
@@ -844,6 +867,7 @@ pub(super) async fn run_redirect(
         api_client,
         all_packages_with_patches,
         can_access_paid_patches,
+        &args.common,
         false,
         false,
     )
@@ -858,6 +882,10 @@ pub(super) async fn run_redirect(
         Err((code, message)) => {
             if args.common.json {
                 emit_json_error(scan_result.take(), &message);
+            } else if code == 0 && !args.common.silent {
+                // Exit 0 without an error is the cancelled selection
+                // (`Selection cancelled.` already printed).
+                eprintln!("Nothing was redirected.");
             }
             return code;
         }
@@ -930,14 +958,27 @@ pub(crate) async fn run_redirect_selected(
         dep: DepOverride,
     }
     let mut candidates: Vec<Candidate> = Vec::new();
+    // The network phases below (reference grants, wheel metadata, patch
+    // records) would otherwise be silent gaps on a terminal. Inert under
+    // --json/--silent and off a terminal.
+    let mut status = crate::ui::StatusLine::stderr(common.json, common.silent);
 
     if !selected.is_empty() {
         let uuids: Vec<String> = selected.iter().map(|(_, uuid)| uuid.clone()).collect();
-        let references = match api_client.fetch_registry_references(&uuids).await {
+        status.set(format!(
+            "Resolving hosted artifacts for {}...",
+            crate::ui::plural(uuids.len(), "patch", "patches")
+        ));
+        let fetched = api_client.fetch_registry_references(&uuids).await;
+        status.finish();
+        let references = match fetched {
             Ok(r) => r,
             Err(e) => {
                 let message = format!("failed to resolve patch references: {e}");
-                eprintln!("{message}");
+                eprintln!(
+                    "{} (nothing was changed; re-run to retry)",
+                    format_error_line(&message)
+                );
                 if common.json {
                     emit_json_error(scan_result.take(), &message);
                 }
@@ -1117,7 +1158,7 @@ pub(crate) async fn run_redirect_selected(
                     corrupt.quarantine().await;
                 }
                 let message = corrupt.to_string();
-                eprintln!("{message}");
+                eprintln!("{}", format_error_line(&message));
                 if common.json {
                     emit_json_error(scan_result.take(), &message);
                 }
@@ -1161,6 +1202,13 @@ pub(crate) async fn run_redirect_selected(
     // wet run reverts FIRST) and counted as redirected below, so the
     // preview's envelope matches the wet run's outcome.
     let mut dry_run_takeover: Vec<(String, String)> = Vec::new();
+    // Human output: the purls migrated (or, on --dry-run, to be migrated)
+    // from vendored to hosted, and the files their revert touches (or would
+    // touch). Both modes count `rewritten ∪ takeover_files`, so the
+    // preview's file count matches the wet run's even for wiring files the
+    // hosted rewriter does not also rewrite (a Gemfile line, a uv source).
+    let mut takeover_migrated: Vec<String> = Vec::new();
+    let mut takeover_files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     if !candidates.iter().any(|c| takeover_capable(&c.purl)) {
         // No takeover-capable candidates — nothing to reconcile.
     } else {
@@ -1300,6 +1348,8 @@ pub(crate) async fn run_redirect_selected(
                         ),
                     }));
                     dry_run_takeover.push((purl.clone(), uuid.clone()));
+                    takeover_migrated.push(purl.clone());
+                    takeover_files.extend(entry.wiring.iter().map(|w| w.file.clone()));
                     continue;
                 }
                 let outcome =
@@ -1351,6 +1401,8 @@ pub(crate) async fn run_redirect_selected(
                          takeover: the project is now fully hosted for this package)"
                     ),
                 }));
+                takeover_migrated.push(purl.clone());
+                takeover_files.extend(entry.wiring.iter().map(|w| w.file.clone()));
             } else {
                 // No usable ledger entry. If socket-owned vendored wiring for
                 // this crate is nevertheless present, the ledger is missing or
@@ -1527,6 +1579,10 @@ pub(crate) async fn run_redirect_selected(
         if !native_target {
             continue;
         }
+        status.set(format!(
+            "Fetching hosted wheel metadata for {}...",
+            dep.name
+        ));
         match socket_patch_core::vendor::pypi::fetch_hosted_wheel_metadata(
             api_client,
             &dep.artifact_url,
@@ -1549,6 +1605,7 @@ pub(crate) async fn run_redirect_selected(
             }
         }
     }
+    status.finish();
     candidates.retain(|c| !unavailable_python_artifacts.contains(&c.dep.artifact_url));
     // The rewriters' override slice — materialized ONCE, after the last
     // candidate filter, so it can never disagree with `candidates`.
@@ -1687,6 +1744,10 @@ pub(crate) async fn run_redirect_selected(
     // the rewrite set (decided inside the borrow scope, applied after it).
     let mut trust_config_write: Option<(String, socket_patch_core::patch::redirect::FileEdit)> =
         None;
+    // Human mode only: this run touched nothing pnpm-related (no lock
+    // spliced, trust already configured), so the full guidance, printed by
+    // the run that made the change, shrinks to a one-line reminder.
+    let mut pnpm_rerun_only = false;
     {
         // pnpm locks spliced THIS run (any depth — the rewriter is
         // basename-generalized).
@@ -1714,6 +1775,7 @@ pub(crate) async fn run_redirect_selected(
             files.get("pnpm-lock.yaml"),
             &overrides,
         );
+        let spliced_pnpm_locks = pnpm_lock_texts.len();
         if let Some(text) = heal_root {
             pnpm_lock_texts.push(text);
         }
@@ -1810,12 +1872,15 @@ pub(crate) async fn run_redirect_selected(
                             ));
                             pnpm_trust_configured_detail(&server, false, common.dry_run)
                         }
-                        TrustPlan::AlreadyTrue => format!(
-                            "{}, and {PNPM_WORKSPACE_REL} already carries `trustLockfile: \
-                         true` — keep it committed alongside the lock; installs need \
-                         no extra flags. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
-                            pnpm_trust_policy_preamble(&server),
-                        ),
+                        TrustPlan::AlreadyTrue => {
+                            pnpm_rerun_only = spliced_pnpm_locks == 0;
+                            format!(
+                                "{}, and {PNPM_WORKSPACE_REL} already carries `trustLockfile: \
+                                 true` — keep it committed alongside the lock; installs need \
+                                 no extra flags. {PNPM_TRUST_TRADEOFF_AND_CAUTION}",
+                                pnpm_trust_policy_preamble(&server),
+                            )
+                        }
                         TrustPlan::UserSet(value) => format!(
                             "{}. {PNPM_WORKSPACE_REL} explicitly sets `trustLockfile: \
                          {value}`, which was respected and left untouched — install \
@@ -1827,16 +1892,26 @@ pub(crate) async fn run_redirect_selected(
                     },
                 }
             };
+            // The `--store` spelling only matters to pnpm 1–4, so it is
+            // named only when a touched lock may be that old.
+            let store_note = if pnpm_lock_texts
+                .iter()
+                .any(|text| pnpm_lock_may_need_store_flag(text))
+            {
+                " (pnpm 1–4 spell the option `--store`)"
+            } else {
+                ""
+            };
             pnpm_warnings.push(serde_json::json!({
                 "code": "redirect_pnpm_trust_lockfile",
                 "detail": format!(
                     "{}. After a lock-only change, existing node_modules or a warm pnpm store \
                      can still contain upstream files. For a reliable reinstall, use a clean \
                      node_modules tree and an empty store with \
-                     `pnpm install --frozen-lockfile --store-dir <new-empty-directory>` \
-                     (pnpm 1–4 accepts the option `--store`). Do not rely on `--force`: some \
-                     versions re-resolve the upstream artifact. Run `socket-patch vex` after \
-                     installation to verify the patched files.",
+                     `pnpm install --frozen-lockfile --store-dir <new-empty-directory>`\
+                     {store_note}. Do not rely on `--force`: some versions re-resolve the \
+                     upstream artifact. Run `socket-patch vex` after installation to verify \
+                     the patched files.",
                     detail.trim_end_matches('.')
                 ),
             }));
@@ -2011,7 +2086,9 @@ pub(crate) async fn run_redirect_selected(
     }
 
     if !common.dry_run {
-        for (purl, uuid) in &confirmed {
+        let total = confirmed.len();
+        for (i, (purl, uuid)) in confirmed.iter().enumerate() {
+            status.set(format!("Fetching patch records... ({}/{total})", i + 1));
             match api_client.fetch_patch(uuid).await {
                 Ok(Some(resp)) => {
                     let (rec_purl, record) =
@@ -2023,14 +2100,18 @@ pub(crate) async fn run_redirect_selected(
                         "code": "record_fetch_failed",
                         "detail": format!(
                             "{purl} redirected, but its patch record could not be fetched; \
-                             it will be missing from VEX until `scan --redirect` is re-run"
+                             it will be missing from VEX until `socket-patch scan --mode \
+                             hosted` is re-run"
                         ),
                     }));
                 }
             }
         }
+        status.finish();
     }
 
+    // Whether this run persisted the redirect ledger (human next steps).
+    let mut ledger_written = false;
     if !common.dry_run {
         // Ledger (mirrors the vendor state.json shape): recorded edits for a
         // future revert + the patch records (file hashes + vulnerabilities) so
@@ -2139,11 +2220,12 @@ pub(crate) async fn run_redirect_selected(
             // The ledger is the only revert path and the VEX record store —
             // a swallowed write failure would let the lockfile writes below
             // proceed with no revert data persisted while reporting success.
-            if let Err(e) =
-                socket_patch_core::patch::redirect::save_redirect_state(&common.cwd, &ledger).await
-            {
+            let saved =
+                socket_patch_core::patch::redirect::save_redirect_state(&common.cwd, &ledger).await;
+            ledger_written = saved.is_ok();
+            if let Err(e) = saved {
                 let message = format!("failed to write .socket/vendor/redirect-state.json: {e}");
-                eprintln!("{message}");
+                eprintln!("{}", format_error_line(&message));
                 if common.json {
                     emit_json_error(scan_result.take(), &message);
                 }
@@ -2168,7 +2250,7 @@ pub(crate) async fn run_redirect_selected(
                     .await
             {
                 let message = format!("failed to write {rel}: {e}");
-                eprintln!("{message}");
+                eprintln!("{}", format_error_line(&message));
                 if common.json {
                     emit_json_error(scan_result.take(), &message);
                 }
@@ -2307,24 +2389,28 @@ pub(crate) async fn run_redirect_selected(
         }
     }
 
-    if common.json {
-        let mut warnings: Vec<serde_json::Value> = rewrite
-            .warnings
-            .iter()
-            .map(|w| {
-                serde_json::json!({
-                    "code": w.code, "detail": w.detail,
-                })
+    // One merged warning list, in one order, for both channels: the
+    // rewriter's own warnings first (e.g. `no package-lock.json`), then the
+    // record, package-manager, stale-install, takeover and prune warnings.
+    let mut warnings: Vec<serde_json::Value> = rewrite
+        .warnings
+        .iter()
+        .map(|w| {
+            serde_json::json!({
+                "code": w.code, "detail": w.detail,
             })
-            .collect();
-        warnings.extend(record_warnings.iter().cloned());
-        warnings.extend(rush_warnings.iter().cloned());
-        warnings.extend(pnpm_warnings.iter().cloned());
-        warnings.extend(gem_stale.warnings.iter().cloned());
-        warnings.extend(python_stale.warnings.iter().cloned());
-        warnings.extend(takeover_pre_warnings.iter().cloned());
-        warnings.extend(takeover_warnings.iter().cloned());
-        warnings.extend(prune_warnings.iter().cloned());
+        })
+        .collect();
+    warnings.extend(record_warnings.iter().cloned());
+    warnings.extend(rush_warnings.iter().cloned());
+    warnings.extend(pnpm_warnings.iter().cloned());
+    warnings.extend(gem_stale.warnings.iter().cloned());
+    warnings.extend(python_stale.warnings.iter().cloned());
+    warnings.extend(takeover_pre_warnings.iter().cloned());
+    warnings.extend(takeover_warnings.iter().cloned());
+    warnings.extend(prune_warnings.iter().cloned());
+
+    if common.json {
         // Nest the redirect result under `redirect` inside the classic scan
         // object (built by `run`, threaded in via `scan_result`), mirroring
         // vendored mode's nested `vendor` block. This keeps the hosted `--json`
@@ -2358,70 +2444,111 @@ pub(crate) async fn run_redirect_selected(
         );
     } else {
         if !common.silent {
-            let verb = if common.dry_run {
-                "would rewrite"
-            } else {
-                "rewrote"
-            };
+            // Wrap long warnings only on a terminal: logs and pipes keep one
+            // line per sentence so CI can grep them.
+            let width =
+                std::io::IsTerminal::is_terminal(&std::io::stderr()).then(crate::ui::stderr_width);
+            for purl in &takeover_migrated {
+                eprintln!("{}", format_takeover_line(purl, common.dry_run));
+            }
+            // The files a takeover's revert touched (or, on --dry-run,
+            // would touch) count alongside the rewriters' own: a dry-run
+            // takeover is withheld from the rewriters, and a wet revert can
+            // touch a wiring file the hosted rewriter never rewrites. The
+            // same union in both modes keeps preview and wet counts equal.
+            let mut human_files = rewritten.clone();
+            human_files.extend(takeover_files.iter().cloned());
+            human_files.sort();
+            human_files.dedup();
+            // The one stdout line: scripts read it, so it stays on stdout;
+            // everything below is on stderr and names its package itself.
             println!(
-                "Redirected {} package(s); {verb} {} file(s).",
-                confirmed.len(),
-                rewritten.len()
+                "{}",
+                format_redirect_summary(confirmed.len(), human_files.len(), common.dry_run)
             );
+            let human_warnings: Vec<(&str, &str)> = warnings
+                .iter()
+                .map(|w| {
+                    (
+                        w["code"].as_str().unwrap_or_default(),
+                        w["detail"].as_str().unwrap_or_default(),
+                    )
+                })
+                // The prune notice already printed up front (in `run`);
+                // successful takeovers printed above as progress lines.
+                .filter(|(code, _)| {
+                    *code != super::REDIRECT_PRUNE_IGNORED && !TAKEOVER_INFO_CODES.contains(code)
+                })
+                .collect();
             // Human output prints the bare strings — `Value`'s `Display`
-            // would JSON-quote them (`skipped "pkg:npm/x" ("forbidden")`).
-            for s in &skipped {
-                eprintln!(
-                    "  skipped {} ({})",
-                    s["purl"].as_str().unwrap_or_default(),
-                    s["reason"].as_str().unwrap_or_default()
-                );
+            // would JSON-quote them.
+            let skipped_pairs: Vec<(String, String)> = skipped
+                .iter()
+                .map(|s| {
+                    (
+                        s["purl"].as_str().unwrap_or_default().to_string(),
+                        s["reason"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            // Granted, but nothing in the project pins it (no lock entry,
+            // unreadable lock, ...): listed so it never vanishes silently.
+            // (A skipped uuid — e.g. unavailable wheel metadata — is already
+            // listed with its reason.)
+            let unconfirmed: Vec<String> = candidates
+                .iter()
+                .filter(|c| {
+                    !confirmed
+                        .iter()
+                        .any(|(cp, cu)| *cp == c.purl && *cu == c.dep.patch_uuid)
+                })
+                .filter(|c| {
+                    !skipped
+                        .iter()
+                        .any(|s| s["uuid"].as_str() == Some(c.dep.patch_uuid.as_str()))
+                })
+                .map(|c| c.purl.clone())
+                .collect();
+            for line in format_unredirected(
+                &skipped_pairs,
+                &unconfirmed,
+                confirmed.is_empty(),
+                // Only the lockfile rewriters' own warnings explain a
+                // missing lock entry; unrelated guidance (pnpm trust, VEX,
+                // stale installs) is not what the hint points at.
+                rewrite.warnings.len(),
+            ) {
+                eprintln!("{line}");
             }
-            // Same warning set as the JSON envelope, same order: the
-            // rewriter's own warnings first (e.g. `no package-lock.json`),
-            // then the record and package-manager warnings.
-            for w in &rewrite.warnings {
-                eprintln!("  warning: {}", w.detail);
-            }
-            for w in &record_warnings {
-                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
-            }
-            for w in &rush_warnings {
-                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
-            }
-            for w in &pnpm_warnings {
-                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
-            }
-            for w in gem_stale.warnings.iter().chain(&python_stale.warnings) {
-                // Code included: the stale-install hazard is a silent-CVE
-                // state, so the stderr line must be greppable by its stable
-                // code in CI logs, same as the JSON envelope.
-                eprintln!(
-                    "  warning ({}): {}",
-                    w["code"].as_str().unwrap_or_default(),
-                    w["detail"].as_str().unwrap_or_default()
-                );
-            }
-            for w in &takeover_pre_warnings {
-                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
-            }
-            for w in &takeover_warnings {
-                eprintln!("  warning: {}", w["detail"].as_str().unwrap_or_default());
+            for (code, detail) in &human_warnings {
+                let detail = if *code == "redirect_pnpm_trust_lockfile" && pnpm_rerun_only {
+                    pnpm_trust_rerun_reminder()
+                } else {
+                    detail
+                };
+                eprintln!("{}", format_warning(code, detail, width));
             }
             if let Some(statements) = vex_statements {
                 eprintln!(
-                    "Wrote OpenVEX document with {} statement(s) to {} (redirected patches are \
-                     attested from the ledger, not hash-verified — their bytes are fetched at \
-                     install time; run `socket-patch vex` after installing to verify against \
-                     the installed tree).",
-                    statements,
+                    "Wrote OpenVEX document with {} to {} (redirected patches are attested \
+                     from the ledger, not hash-verified — their bytes are fetched at install \
+                     time; run `socket-patch vex` after installing to verify against the \
+                     installed tree).",
+                    crate::ui::plural(statements, "statement", "statements"),
                     vex.vex
                         .as_ref()
                         .expect("vex_statements is Some only when --vex was given")
                         .display(),
                 );
             } else if vex.vex.is_some() && common.dry_run {
-                eprintln!("Skipping VEX generation (--dry-run).");
+                eprintln!("Skipping VEX generation (--dry-run: nothing was redirected).");
+            }
+            if !common.dry_run {
+                for line in
+                    format_next_steps(&human_files, ledger_written, !takeover_migrated.is_empty())
+                {
+                    println!("{line}");
+                }
             }
         }
         // Errors print even under --silent ("errors only", never
@@ -2431,6 +2558,319 @@ pub(crate) async fn run_redirect_selected(
         }
     }
     vex_code
+}
+
+// ── Human-output formatting ────────────────────────────────────────────────
+//
+// Pure `String` builders for everything the hosted flow prints in human
+// mode, so the exact text is unit-testable (see the tests module). JSON
+// output never goes through these: its `detail`/`reason` strings are the
+// stable, machine-facing spellings.
+
+/// Warning codes that report a SUCCESSFUL vendored→hosted migration. They
+/// stay in the JSON `warnings[]` (additive contract), but a human run
+/// prints them as plain progress lines ([`format_takeover_line`]), not as
+/// warnings.
+const TAKEOVER_INFO_CODES: &[&str] = &[
+    "redirect_takeover_reverted_vendored",
+    "redirect_would_revert_vendored",
+];
+
+/// Lowercase tool names that must keep their spelling at the start of a
+/// sentence (`pnpm >=11 rejects…` must not become `Pnpm`).
+const LOWERCASE_TOOLS: &[&str] = &[
+    "npm", "pnpm", "yarn", "bun", "cargo", "pip", "pipenv", "uv", "poetry", "pdm", "hatch", "go",
+    "gem", "bundler", "bundle", "composer", "mvn", "gradle", "dotnet", "deno", "rush",
+];
+
+/// Capitalize the first letter of a message for an `Error:`/`Warning:`
+/// line, leaving it alone when the first word is an identifier rather than
+/// an English word: a file name (`pnpm-lock.yaml`), a purl, a flag, a path,
+/// or a lowercase tool name.
+fn sentence_case(msg: &str) -> String {
+    let first_word = msg.split_whitespace().next().unwrap_or("");
+    let is_word = !first_word.is_empty()
+        && first_word
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == ',' || c == ';')
+        && !LOWERCASE_TOOLS.contains(&first_word.trim_end_matches([',', ';']));
+    if !is_word {
+        return msg.to_string();
+    }
+    let mut chars = msg.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// `Error: <Message>` for a hosted-flow failure.
+fn format_error_line(msg: &str) -> String {
+    format!("Error: {}", sentence_case(msg))
+}
+
+/// Split `text` into wrap tokens at whitespace, except that a
+/// backtick-delimited code span (`` `pnpm install --trust-lockfile` ``)
+/// stays one token so a command the user copies is never broken across
+/// lines. An unclosed span falls back to plain whitespace splitting.
+fn wrap_tokens(text: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut span: Vec<&str> = Vec::new();
+    for word in text.split_whitespace() {
+        span.push(word);
+        let open = span.iter().map(|w| w.matches('`').count()).sum::<usize>() % 2 == 1;
+        if !open {
+            tokens.push(span.join(" "));
+            span.clear();
+        }
+    }
+    tokens.extend(span.into_iter().map(str::to_string));
+    tokens
+}
+
+/// Greedy word wrap to `width` columns (characters, not bytes). The first
+/// line starts with `first_prefix`, later lines with `indent`. A word
+/// longer than the line (a URL) gets a line of its own, never split; a
+/// backtick code span counts as one word (see [`wrap_tokens`]).
+fn wrap_words(text: &str, width: usize, first_prefix: &str, indent: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut line = first_prefix.to_string();
+    let mut line_len = first_prefix.chars().count();
+    let mut empty = true;
+    for word in wrap_tokens(text) {
+        let word = word.as_str();
+        let wlen = word.chars().count();
+        if !empty && line_len + 1 + wlen > width {
+            lines.push(std::mem::replace(&mut line, indent.to_string()));
+            line_len = indent.chars().count();
+            empty = true;
+        }
+        if !empty {
+            line.push(' ');
+            line_len += 1;
+        }
+        line.push_str(word);
+        line_len += wlen;
+        empty = false;
+    }
+    lines.push(line);
+    lines
+}
+
+/// Split a long guidance paragraph into its sentences, at every period
+/// followed by a space (host names and versions such as `patch.socket.dev`
+/// or `5.4` never contain one). Each sentence keeps its own period; the
+/// last one is returned as written.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text.trim();
+    while let Some(i) = rest.find(". ") {
+        out.push(rest[..=i].to_string());
+        rest = rest[i + 2..].trim_start();
+    }
+    if !rest.is_empty() {
+        out.push(rest.to_string());
+    }
+    out
+}
+
+/// One human warning: `Warning (<code>): <detail>`. The pnpm trustLockfile
+/// guidance is a paragraph of separate instructions, so it renders as a
+/// headline plus one `  - ` bullet per sentence. With `width` (stderr is a
+/// terminal) every line is word-wrapped; without it (a pipe or a CI log)
+/// each sentence stays on one line so the text remains greppable.
+fn format_warning(code: &str, detail: &str, width: Option<usize>) -> String {
+    let prefix = format!("Warning ({code}): ");
+    let detail = sentence_case(detail.trim());
+    let (headline, bullets) = if code == "redirect_pnpm_trust_lockfile" {
+        let mut sentences = split_sentences(&detail).into_iter();
+        let head = sentences.next().unwrap_or_default();
+        (head, sentences.collect::<Vec<_>>())
+    } else {
+        (detail, Vec::new())
+    };
+    let mut lines: Vec<String> = Vec::new();
+    match width {
+        Some(w) => {
+            lines.extend(wrap_words(&headline, w, &prefix, "  "));
+            for b in &bullets {
+                lines.extend(wrap_words(b, w, "  - ", "    "));
+            }
+        }
+        None => {
+            lines.push(format!("{prefix}{headline}"));
+            lines.extend(bullets.iter().map(|b| format!("  - {b}")));
+        }
+    }
+    lines.join("\n")
+}
+
+/// The one-line re-run reminder that replaces the full pnpm trustLockfile
+/// guidance in human mode when this run changed nothing pnpm-related (the
+/// lock was redirected and trust configured by an earlier run, whose
+/// output carried the full text; `--json` still carries it every time).
+fn pnpm_trust_rerun_reminder() -> &'static str {
+    "pnpm-lock.yaml is already redirected and pnpm-workspace.yaml already sets \
+     `trustLockfile: true`; keep both committed, and never rebuild the lockfile \
+     (`pnpm clean --lockfile`), which discards the redirect"
+}
+
+/// The stdout summary line.
+///
+/// - wet: `Redirected 1 package; rewrote 1 file.`
+/// - dry run: `Would redirect 1 package and rewrite 1 file (--dry-run: nothing was changed).`
+/// - every redirected package was already in place (nothing to rewrite):
+///   `1 package is already redirected; nothing to rewrite.`
+fn format_redirect_summary(redirected: usize, files: usize, dry_run: bool) -> String {
+    use crate::ui::plural;
+    if redirected > 0 && files == 0 {
+        return format!(
+            "{} already redirected; nothing to rewrite.",
+            plural(redirected, "package is", "packages are")
+        );
+    }
+    let pkgs = plural(redirected, "package", "packages");
+    let files = plural(files, "file", "files");
+    if dry_run {
+        format!("Would redirect {pkgs} and rewrite {files} (--dry-run: nothing was changed).")
+    } else {
+        format!("Redirected {pkgs}; rewrote {files}.")
+    }
+}
+
+/// Readable text for a `skipped[].reason` code (the JSON keeps the code).
+/// Unknown server statuses fall through verbatim.
+fn describe_skip_reason(reason: &str) -> String {
+    match reason {
+        "not_found" => "the hosted patch server has no artifact for this patch".into(),
+        "forbidden" => "not entitled to this patch (paid plan or no org access)".into(),
+        "pending" | "pending_build" => {
+            "the hosted artifact is still being built; re-run later".into()
+        }
+        "build_failed" => "the hosted artifact failed to build".into(),
+        "withdrawn" => "the patch was withdrawn".into(),
+        "bad_purl" => "the server returned an unparseable package URL".into(),
+        "no_url" => "the server returned no artifact URL".into(),
+        "vendored_revert_failed" => {
+            "its vendored state could not be reverted (see the warning)".into()
+        }
+        "python_metadata_unavailable" => "the hosted wheel's metadata could not be fetched".into(),
+        "redirect_bun_lock_unsupported" | "redirect_bun_lockb_invalid" => {
+            "the Bun lockfile blocks the vendored-to-hosted migration (see the warning)".into()
+        }
+        other => format!("server status `{other}`"),
+    }
+}
+
+/// The per-package "not redirected" lines, `skipped` (with a reason code)
+/// first, then `unconfirmed` (granted, but nothing in the project's files
+/// pins it). When nothing at all was redirected they sit under a
+/// `No patches could be redirected:` headline; otherwise each line stands
+/// alone (it prints on stderr, apart from the stdout summary).
+fn format_unredirected(
+    skipped: &[(String, String)],
+    unconfirmed: &[String],
+    nothing_redirected: bool,
+    lock_warnings: usize,
+) -> Vec<String> {
+    if skipped.is_empty() && unconfirmed.is_empty() {
+        return Vec::new();
+    }
+    let see = match lock_warnings {
+        0 => "",
+        1 => " (see the warning below)",
+        _ => " (see the warnings below)",
+    };
+    let indent = if nothing_redirected { "  " } else { "" };
+    let mut lines = Vec::new();
+    if nothing_redirected {
+        lines.push("No patches could be redirected:".to_string());
+    }
+    for (purl, reason) in skipped {
+        lines.push(format!(
+            "{indent}Skipped {purl}: {}",
+            describe_skip_reason(reason)
+        ));
+    }
+    for purl in unconfirmed {
+        lines.push(format!(
+            "{indent}Not redirected {purl}: no lockfile entry pinning it could be redirected{see}"
+        ));
+    }
+    lines
+}
+
+/// The human line for a successful (or, on `--dry-run`, planned)
+/// vendored→hosted migration.
+fn format_takeover_line(purl: &str, dry_run: bool) -> String {
+    if dry_run {
+        format!(
+            "Would migrate {purl} from vendored to hosted (its vendored wiring, ledger entry, \
+             and committed artifact would be reverted first)."
+        )
+    } else {
+        format!(
+            "Migrated {purl} from vendored to hosted (reverted its vendored wiring, ledger \
+             entry, and committed artifact)."
+        )
+    }
+}
+
+/// `a`, `a and b`, `a, b, and c`; past `max` names, `a, b, and 3 more`.
+fn join_names(names: &[String], max: usize) -> String {
+    let shown: Vec<&str> = names.iter().take(max).map(String::as_str).collect();
+    let more = names.len().saturating_sub(max);
+    let mut parts: Vec<String> = shown.iter().map(|s| s.to_string()).collect();
+    if more > 0 {
+        parts.push(format!("{more} more"));
+    }
+    match parts.len() {
+        0 => String::new(),
+        1 => parts.remove(0),
+        2 => format!("{} and {}", parts[0], parts[1]),
+        n => format!("{}, and {}", parts[..n - 1].join(", "), parts[n - 1]),
+    }
+}
+
+/// Next steps after a wet run that rewrote files (stdout, after the
+/// summary — the same place vendored mode prints its own): commit the
+/// ledger and the rewritten files, reinstall so the installed tree picks
+/// up the patched artifacts, then verify with `vex`. After a
+/// vendored→hosted takeover (`vendored_removed`) the commit also has to
+/// carry the deleted vendored ledger entries and artifacts, so the whole
+/// `.socket/vendor/` directory is named instead of the redirect ledger.
+fn format_next_steps(
+    files: &[String],
+    ledger_written: bool,
+    vendored_removed: bool,
+) -> Vec<String> {
+    if files.is_empty() && !vendored_removed {
+        return Vec::new();
+    }
+    let mut commit: Vec<String> = Vec::new();
+    if vendored_removed {
+        commit.push(if ledger_written {
+            ".socket/vendor/ (the redirect ledger, plus the removed vendored ledger entries and \
+             artifacts)"
+                .to_string()
+        } else {
+            ".socket/vendor/ (the removed vendored ledger entries and artifacts)".to_string()
+        });
+    } else if ledger_written {
+        commit.push(".socket/vendor/redirect-state.json".to_string());
+    }
+    commit.extend(files.iter().cloned());
+    let npm = files
+        .iter()
+        .any(|f| f == "package-lock.json" || f == "npm-shrinkwrap.json");
+    let hint = if npm { " (e.g. `npm ci`)" } else { "" };
+    vec![
+        format!("Commit {} to keep the redirect.", join_names(&commit, 6)),
+        format!(
+            "Reinstall from the updated lockfile{hint} so the installed packages pick up the \
+             patched artifacts, then run `socket-patch vex` to verify them."
+        ),
+    ]
 }
 
 /// Transient-frame boxed constructor for [`run_redirect_selected`] — the
@@ -2464,6 +2904,12 @@ mod tests {
         pnpm_lock_version_major, pnpm_trust_configured_detail, pnpm_trust_legacy_detail,
         pnpm_trust_manual_guidance, pnpm_trust_workspace_unreadable_detail, prune_ignored_warning,
         read_workspace_for_trust, redirect_json_block, TrustPlan, REDIRECT_CANDIDATE_FILES,
+    };
+    use super::{
+        describe_skip_reason, format_error_line, format_next_steps, format_redirect_summary,
+        format_takeover_line, format_unredirected, format_warning, join_names,
+        pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder, sentence_case, split_sentences,
+        wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
     };
     use socket_patch_core::constants::npm_family;
     use socket_patch_core::patch::redirect::DepOverride;
@@ -2592,7 +3038,16 @@ mod tests {
             assert!(!configured.contains("would be"), "{configured}");
             let dry = pnpm_trust_configured_detail(server, created, true);
             assert!(dry.contains("would be"), "{dry}");
-            assert!(dry.contains("--dry-run"), "{dry}");
+            // The summary line already says it is a dry run; a marker
+            // inside the noun phrase ("a new (--dry-run) pnpm-workspace")
+            // read as garbled.
+            assert!(!dry.contains("--dry-run"), "{dry}");
+            let want = if created {
+                "so `trustLockfile: true` would be written to a new pnpm-workspace.yaml — commit"
+            } else {
+                "so `trustLockfile: true` would be merged into the existing pnpm-workspace.yaml — commit"
+            };
+            assert!(dry.contains(want), "{dry}");
             for text in [&configured, &dry] {
                 assert!(text.contains("ALL lockfile entries"), "{text}");
                 assert!(text.contains("minimumReleaseAge"), "{text}");
@@ -3610,5 +4065,369 @@ mod tests {
                  npm_family table) but appears in REDIRECT_CANDIDATE_FILES"
             );
         }
+    }
+    // ── Human-output formatting ────────────────────────────────────────────
+
+    #[test]
+    fn redirect_summary_singular_plural_and_dry_run() {
+        assert_eq!(
+            format_redirect_summary(1, 1, false),
+            "Redirected 1 package; rewrote 1 file."
+        );
+        assert_eq!(
+            format_redirect_summary(2, 3, false),
+            "Redirected 2 packages; rewrote 3 files."
+        );
+        assert_eq!(
+            format_redirect_summary(0, 0, false),
+            "Redirected 0 packages; rewrote 0 files."
+        );
+        assert_eq!(
+            format_redirect_summary(1, 1, true),
+            "Would redirect 1 package and rewrite 1 file (--dry-run: nothing was changed)."
+        );
+        assert_eq!(
+            format_redirect_summary(0, 0, true),
+            "Would redirect 0 packages and rewrite 0 files (--dry-run: nothing was changed)."
+        );
+        assert_eq!(
+            format_redirect_summary(2, 5, true),
+            "Would redirect 2 packages and rewrite 5 files (--dry-run: nothing was changed)."
+        );
+    }
+
+    #[test]
+    fn redirect_summary_already_redirected_is_not_redirected_n() {
+        // Confirmed but nothing to write: an idempotent re-run, never
+        // "Redirected 1 package(s); rewrote 0 file(s)".
+        for dry in [false, true] {
+            assert_eq!(
+                format_redirect_summary(1, 0, dry),
+                "1 package is already redirected; nothing to rewrite."
+            );
+            assert_eq!(
+                format_redirect_summary(3, 0, dry),
+                "3 packages are already redirected; nothing to rewrite."
+            );
+        }
+    }
+
+    #[test]
+    fn skip_reasons_are_readable_and_unknown_codes_pass_through() {
+        assert_eq!(
+            describe_skip_reason("forbidden"),
+            "not entitled to this patch (paid plan or no org access)"
+        );
+        assert_eq!(
+            describe_skip_reason("pending"),
+            "the hosted artifact is still being built; re-run later"
+        );
+        assert_eq!(
+            describe_skip_reason("not_found"),
+            "the hosted patch server has no artifact for this patch"
+        );
+        assert_eq!(
+            describe_skip_reason("vendored_revert_failed"),
+            "its vendored state could not be reverted (see the warning)"
+        );
+        assert_eq!(
+            describe_skip_reason("redirect_bun_lockb_invalid"),
+            describe_skip_reason("redirect_bun_lock_unsupported")
+        );
+        assert_eq!(describe_skip_reason("mystery"), "server status `mystery`");
+        for code in [
+            "not_found",
+            "forbidden",
+            "pending",
+            "pending_build",
+            "build_failed",
+            "withdrawn",
+            "bad_purl",
+            "no_url",
+            "python_metadata_unavailable",
+        ] {
+            let text = describe_skip_reason(code);
+            assert!(!text.contains('_'), "{code} → {text}");
+        }
+    }
+
+    #[test]
+    fn unredirected_lines_empty_partial_and_nothing_redirected() {
+        assert!(format_unredirected(&[], &[], true, 1).is_empty());
+        let skipped = vec![(
+            "pkg:npm/lodash@4.17.20".to_string(),
+            "forbidden".to_string(),
+        )];
+        let unconfirmed = vec!["pkg:npm/minimist@1.2.5".to_string()];
+        assert_eq!(
+            format_unredirected(&skipped, &unconfirmed, false, 1),
+            vec![
+                "Skipped pkg:npm/lodash@4.17.20: not entitled to this patch (paid plan or no \
+                 org access)"
+                    .to_string(),
+                "Not redirected pkg:npm/minimist@1.2.5: no lockfile entry pinning it could be \
+                 redirected (see the warning below)"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            format_unredirected(&[], &unconfirmed, false, 2),
+            vec![
+                "Not redirected pkg:npm/minimist@1.2.5: no lockfile entry pinning it could be \
+                 redirected (see the warnings below)"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            format_unredirected(&[], &unconfirmed, true, 0),
+            vec![
+                "No patches could be redirected:".to_string(),
+                "  Not redirected pkg:npm/minimist@1.2.5: no lockfile entry pinning it could \
+                 be redirected"
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn takeover_lines_wet_and_dry() {
+        assert_eq!(
+            format_takeover_line("pkg:npm/lodash@4.17.20", false),
+            "Migrated pkg:npm/lodash@4.17.20 from vendored to hosted (reverted its vendored \
+             wiring, ledger entry, and committed artifact)."
+        );
+        assert_eq!(
+            format_takeover_line("pkg:npm/lodash@4.17.20", true),
+            "Would migrate pkg:npm/lodash@4.17.20 from vendored to hosted (its vendored \
+             wiring, ledger entry, and committed artifact would be reverted first)."
+        );
+        assert!(TAKEOVER_INFO_CODES.contains(&"redirect_takeover_reverted_vendored"));
+        assert!(TAKEOVER_INFO_CODES.contains(&"redirect_would_revert_vendored"));
+        assert!(!TAKEOVER_INFO_CODES.contains(&"redirect_vendored_revert_failed"));
+    }
+
+    #[test]
+    fn sentence_case_skips_identifiers_and_tool_names() {
+        assert_eq!(
+            sentence_case("failed to write x: y"),
+            "Failed to write x: y"
+        );
+        assert_eq!(
+            sentence_case("the redirect ledger ./a is malformed"),
+            "The redirect ledger ./a is malformed"
+        );
+        assert_eq!(sentence_case("pnpm >=11 rejects"), "pnpm >=11 rejects");
+        assert_eq!(
+            sentence_case("pnpm-lock.yaml was repointed"),
+            "pnpm-lock.yaml was repointed"
+        );
+        assert_eq!(
+            sentence_case("pkg:npm/x@1 redirected"),
+            "pkg:npm/x@1 redirected"
+        );
+        assert_eq!(sentence_case("`vendor` refused"), "`vendor` refused");
+        assert_eq!(sentence_case("Already upper"), "Already upper");
+        assert_eq!(sentence_case(""), "");
+        assert_eq!(sentence_case("é accent"), "é accent");
+        assert_eq!(
+            format_error_line("failed to resolve patch references: boom"),
+            "Error: Failed to resolve patch references: boom"
+        );
+    }
+
+    #[test]
+    fn wrap_words_respects_width_prefix_and_long_words() {
+        assert_eq!(
+            wrap_words("alpha beta gamma delta", 16, "W: ", "  "),
+            vec!["W: alpha beta", "  gamma delta"]
+        );
+        // A word wider than the line sits alone, unsplit.
+        let url = "https://patch.socket.dev/very/long/path/that/does/not/fit";
+        assert_eq!(
+            wrap_words(&format!("see {url} now"), 20, "", "  "),
+            vec!["see".to_string(), format!("  {url}"), "  now".to_string()]
+        );
+        assert_eq!(wrap_words("", 10, "W: ", "  "), vec!["W: "]);
+        // Counts characters, not bytes.
+        let lines = wrap_words("ééé ééé ééé", 8, "", "");
+        assert_eq!(lines, vec!["ééé ééé", "ééé"]);
+        for line in wrap_words(&"word ".repeat(50), 30, "Warning (x): ", "  ") {
+            assert!(line.chars().count() <= 30, "{line}");
+        }
+    }
+
+    #[test]
+    fn wrap_words_keeps_code_spans_whole() {
+        // The span crosses the wrap column: it moves to the next line whole.
+        assert_eq!(
+            wrap_words(
+                "never rebuild it (`pnpm clean --lockfile`), ever",
+                30,
+                "",
+                "  "
+            ),
+            vec!["never rebuild it", "  (`pnpm clean --lockfile`),", "  ever"]
+        );
+        // A span wider than the line gets a line of its own, unsplit.
+        assert_eq!(
+            wrap_words(
+                "use `pnpm install --frozen-lockfile --store-dir <dir>` now",
+                20,
+                "",
+                "  "
+            ),
+            vec![
+                "use",
+                "  `pnpm install --frozen-lockfile --store-dir <dir>`",
+                "  now"
+            ]
+        );
+        // Two spans in one word, and a word with a closed span, split normally.
+        assert_eq!(
+            wrap_tokens("a `b` c `d e`f g"),
+            vec!["a", "`b`", "c", "`d e`f", "g"]
+        );
+        // An unclosed span never swallows the rest of the text.
+        assert_eq!(wrap_tokens("a `b c d"), vec!["a", "`b", "c", "d"]);
+    }
+
+    #[test]
+    fn split_sentences_keeps_hosts_and_versions_whole() {
+        assert_eq!(
+            split_sentences("Repointed at patch.socket.dev. Keep lock 5.4 committed. done"),
+            vec![
+                "Repointed at patch.socket.dev.",
+                "Keep lock 5.4 committed.",
+                "done"
+            ]
+        );
+        assert_eq!(split_sentences("one"), vec!["one"]);
+        assert!(split_sentences("  ").is_empty());
+    }
+
+    #[test]
+    fn warning_line_one_line_in_pipes_and_wrapped_on_terminals() {
+        assert_eq!(
+            format_warning(
+                "redirect_npm_no_lockfile",
+                "no package-lock.json present",
+                None
+            ),
+            "Warning (redirect_npm_no_lockfile): No package-lock.json present"
+        );
+        let long = "word ".repeat(40);
+        let wrapped = format_warning("c", &long, Some(40));
+        assert!(wrapped.lines().count() > 1, "{wrapped}");
+        assert!(
+            wrapped.lines().all(|l| l.chars().count() <= 40),
+            "{wrapped}"
+        );
+        assert!(wrapped.starts_with("Warning (c): Word word"), "{wrapped}");
+        assert!(
+            wrapped.lines().skip(1).all(|l| l.starts_with("  ")),
+            "{wrapped}"
+        );
+    }
+
+    #[test]
+    fn pnpm_warning_renders_headline_plus_bullets() {
+        let detail = "pnpm-lock.yaml was repointed at the server; so it goes. Note: a tradeoff. \
+                      Do NOT rebuild the lockfile. Run `socket-patch vex` after installation.";
+        assert_eq!(
+            format_warning("redirect_pnpm_trust_lockfile", detail, None),
+            "Warning (redirect_pnpm_trust_lockfile): pnpm-lock.yaml was repointed at the \
+             server; so it goes.\n  - Note: a tradeoff.\n  - Do NOT rebuild the lockfile.\n  \
+             - Run `socket-patch vex` after installation."
+        );
+        let wrapped = format_warning("redirect_pnpm_trust_lockfile", detail, Some(60));
+        for line in wrapped.lines() {
+            assert!(line.chars().count() <= 60, "{line:?}");
+        }
+        assert_eq!(
+            wrapped,
+            "Warning (redirect_pnpm_trust_lockfile): pnpm-lock.yaml was\n  \
+             repointed at the server; so it goes.\n  - Note: a tradeoff.\n  - Do NOT \
+             rebuild the lockfile.\n  - Run `socket-patch vex` after installation."
+        );
+        // Continuation lines of a long bullet are indented under its text.
+        let bullet = "Head. Do NOT follow the advice to rebuild the lockfile, which discards it.";
+        assert_eq!(
+            format_warning("redirect_pnpm_trust_lockfile", bullet, Some(40)),
+            "Warning (redirect_pnpm_trust_lockfile): Head.\n  - Do NOT follow the advice to \
+             rebuild\n    the lockfile, which discards it."
+        );
+    }
+
+    #[test]
+    fn pnpm_rerun_reminder_keeps_the_rebuild_caution() {
+        let r = pnpm_trust_rerun_reminder();
+        assert!(r.contains("trustLockfile: true"), "{r}");
+        assert!(r.contains("pnpm clean --lockfile"), "{r}");
+        assert!(r.chars().count() < 240, "a reminder, not the wall: {r}");
+    }
+
+    #[test]
+    fn store_flag_note_only_for_pnpm_one_to_four_locks() {
+        assert!(pnpm_lock_may_need_store_flag("shrinkwrapVersion: 3\n"));
+        assert!(pnpm_lock_may_need_store_flag("lockfileVersion: 5.1\n"));
+        assert!(pnpm_lock_may_need_store_flag("lockfileVersion: '5.2'\n"));
+        assert!(!pnpm_lock_may_need_store_flag("lockfileVersion: 5.3\n"));
+        assert!(!pnpm_lock_may_need_store_flag("lockfileVersion: 5.4\n"));
+        assert!(!pnpm_lock_may_need_store_flag("lockfileVersion: '6.0'\n"));
+        assert!(!pnpm_lock_may_need_store_flag("lockfileVersion: '9.0'\n"));
+        assert!(!pnpm_lock_may_need_store_flag("packages: {}\n"));
+    }
+
+    #[test]
+    fn join_names_lists_and_caps() {
+        let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(join_names(&n(&[]), 6), "");
+        assert_eq!(join_names(&n(&["a"]), 6), "a");
+        assert_eq!(join_names(&n(&["a", "b"]), 6), "a and b");
+        assert_eq!(join_names(&n(&["a", "b", "c"]), 6), "a, b, and c");
+        assert_eq!(join_names(&n(&["a", "b", "c", "d"]), 2), "a, b, and 2 more");
+    }
+
+    #[test]
+    fn next_steps_name_the_ledger_files_and_reinstall() {
+        assert!(format_next_steps(&[], true, false).is_empty());
+        assert_eq!(
+            format_next_steps(&["package-lock.json".to_string()], true, false),
+            vec![
+                "Commit .socket/vendor/redirect-state.json and package-lock.json to keep the \
+                 redirect."
+                    .to_string(),
+                "Reinstall from the updated lockfile (e.g. `npm ci`) so the installed packages \
+                 pick up the patched artifacts, then run `socket-patch vex` to verify them."
+                    .to_string(),
+            ]
+        );
+        let steps = format_next_steps(
+            &[
+                "pnpm-lock.yaml".to_string(),
+                "pnpm-workspace.yaml".to_string(),
+            ],
+            false,
+            false,
+        );
+        assert_eq!(
+            steps[0],
+            "Commit pnpm-lock.yaml and pnpm-workspace.yaml to keep the redirect."
+        );
+        assert!(!steps[1].contains("npm ci"), "{}", steps[1]);
+    }
+
+    #[test]
+    fn next_steps_after_a_takeover_name_the_removed_vendored_state() {
+        assert_eq!(
+            format_next_steps(&["package-lock.json".to_string()], true, true)[0],
+            "Commit .socket/vendor/ (the redirect ledger, plus the removed vendored ledger \
+             entries and artifacts) and package-lock.json to keep the redirect."
+        );
+        assert_eq!(
+            format_next_steps(&["pnpm-lock.yaml".to_string()], false, true)[0],
+            "Commit .socket/vendor/ (the removed vendored ledger entries and artifacts) and \
+             pnpm-lock.yaml to keep the redirect."
+        );
     }
 }

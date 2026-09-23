@@ -3,7 +3,7 @@
 //!
 //!   - the non-quiet offline "no local source" report: the count header,
 //!     the 5-PURL cap, the "... and N more" continuation, and the
-//!     `repair` hint (`report_offline_missing`);
+//!     re-run-online hint (`report_offline_missing`);
 //!   - the non-quiet online staging progress: the download announcement
 //!     and the diff→per-file-blob fallback messages;
 //!   - the vendor mem-stager's per-file failure arms for malformed patch
@@ -132,7 +132,7 @@ fn apply_offline_nonquiet_lists_capped_missing_purls_and_repair_hint() {
         "offline + 7 sourceless patches must fail; stderr={stderr}"
     );
     assert!(
-        stderr.contains("Error: 7 patch(es) have no local source and --offline is set:"),
+        stderr.contains("Error: 7 patches have no local source and --offline is set:"),
         "the header must carry the TOTAL count, not the listed count; stderr={stderr}"
     );
     let listed: Vec<&str> = stderr
@@ -149,8 +149,8 @@ fn apply_offline_nonquiet_lists_capped_missing_purls_and_repair_hint() {
         "the 2 unlisted patches are summarized; stderr={stderr}"
     );
     assert!(
-        stderr.contains("Run \"socket-patch repair\" to download missing artifacts."),
-        "the repair hint closes the report; stderr={stderr}"
+        stderr.contains("Run `socket-patch repair` to download missing artifacts."),
+        "apply's repair remedy closes the report; stderr={stderr}"
     );
 }
 
@@ -161,8 +161,9 @@ fn apply_offline_nonquiet_lists_capped_missing_purls_and_repair_hint() {
 /// A human-mode (no `--json`/`--silent`) online apply in the default
 /// `diff` download mode, where the server has no diff archive but serves
 /// the per-file blob: the run announces the primary download (with the
-/// mode tag), reports the diff failure, announces the per-file blob
-/// fallback, reports its success — and applies. `.socket/` stays
+/// mode tag), announces the per-file blob fallback in place of the
+/// unavailable diff archive (whose 404 is not reported: the blobs cover
+/// it), reports its success — and applies. `.socket/` stays
 /// untouched (downloads land in the overlay tempdir).
 #[tokio::test]
 async fn apply_online_nonquiet_prints_download_progress_and_diff_fallback() {
@@ -235,23 +236,28 @@ async fn apply_online_nonquiet_prints_download_progress_and_diff_fallback() {
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
 
-    // The four progress lines of the staging flow, in the shapes users see.
+    // The progress lines of the staging flow, in the shapes users see —
+    // on stderr (stdout is for results).
     assert!(
-        stdout.contains("Downloading missing patch artifacts (mode: diff)..."),
-        "the primary download is announced with its mode tag; stdout={stdout}"
+        stderr.contains("Downloading missing patch artifacts (mode: diff)..."),
+        "the primary download is announced with its mode tag; stderr={stderr}"
     );
     assert!(
-        stdout.contains("Failed to download 1 blob(s)")
-            && stdout.contains("Diff archive not found on server"),
-        "the diff fetch failure is reported before the fallback; stdout={stdout}"
+        !stderr.contains("Failed to download") && !stderr.contains("Diff archive not found"),
+        "a missing diff archive the blob fallback covers is not reported as a failure; \
+         stderr={stderr}"
     );
     assert!(
-        stdout.contains("Falling back to per-file blob downloads for 1 blob(s)..."),
-        "the per-file blob fallback is announced with the gap size; stdout={stdout}"
+        stderr.contains("1 diff archive unavailable; fetching 1 per-file blob instead..."),
+        "the per-file blob fallback is announced with the gap size; stderr={stderr}"
     );
     assert!(
-        stdout.contains("Downloaded 1 blob(s)"),
-        "the fallback's own result line is printed; stdout={stdout}"
+        stderr.contains("Downloaded 1 blob"),
+        "the fallback's own result line is printed; stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("Downloading") && !stdout.contains("Downloaded"),
+        "no progress on stdout; stdout={stdout}"
     );
 
     // The fallback actually applied the patch…
@@ -340,7 +346,7 @@ fn run_vendor_human(root: &Path, mock_uri: &str) -> (i32, String, String) {
 }
 
 /// Shared postconditions for every malformed-view variant: exit 1, the
-/// fetch was really attempted (announcement on stdout), the non-quiet
+/// fetch was really attempted (announcement on stderr), the non-quiet
 /// summary block names the failed purl on stderr, and the fail-closed run
 /// wrote nothing (no blobs — mem staging is disk-free — and no vendor
 /// tree).
@@ -350,11 +356,11 @@ fn assert_failed_closed(root: &Path, code: i32, stdout: &str, stderr: &str) {
         "a malformed view response must fail the run; stdout={stdout}\nstderr={stderr}"
     );
     assert!(
-        stdout.contains("Fetching 1 patch(es)' content (kept in memory)..."),
-        "the run must have reached the view fetch (not bailed earlier); stdout={stdout}"
+        stderr.contains("Fetching content for 1 patch..."),
+        "the run must have reached the view fetch (not bailed earlier); stderr={stderr}"
     );
     assert!(
-        stderr.contains("Error: could not fetch patch content for 1 patch(es):"),
+        stderr.contains("Error: Could not fetch patch content for 1 patch:"),
         "the summary block carries the failed count; stderr={stderr}"
     );
     assert!(

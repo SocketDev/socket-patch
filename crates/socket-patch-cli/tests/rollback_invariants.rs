@@ -385,7 +385,7 @@ fn rollback_offline_missing_blob_human_names_package_and_remedy() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("blob(s) are missing") && stderr.contains("--offline"),
+        stderr.contains("missing and --offline is set"),
         "stderr must explain the offline gate; stderr=\n{stderr}"
     );
     assert!(
@@ -394,7 +394,7 @@ fn rollback_offline_missing_blob_human_names_package_and_remedy() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("Failed to rollback:")
+        stdout.contains("Failed to roll back:")
             && stdout.contains("pkg:npm/__rollback_test__@1.0.0"),
         "the human summary must name the failed package; stdout=\n{stdout}"
     );
@@ -462,12 +462,28 @@ fn rollback_undownloadable_blob_envelope_names_blob_and_remedy() {
 
     // The env is scrubbed (no SOCKET_API_TOKEN) and socket-cli config is
     // vetoed by the workspace-pinned SOCKET_NO_CONFIG=1, so every client
-    // build prints the no-token notice — it must appear exactly once per
-    // invocation, not once per internal phase.
-    let notes = stderr.matches("No SOCKET_API_TOKEN set").count();
+    // build wants the no-token notice. Under --json it is muted entirely;
+    // in human mode it must appear exactly once per invocation, not once
+    // per internal phase.
+    assert!(
+        !stderr.contains("No SOCKET_API_TOKEN set"),
+        "--json must mute the no-token notice; stderr=\n{stderr}"
+    );
+    let human = rollback_cmd(tmp.path())
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .args([
+            "--api-url",
+            "http://127.0.0.1:1/",
+            "--proxy-url",
+            "http://127.0.0.1:1/",
+        ])
+        .output()
+        .expect("run socket-patch");
+    let human_stderr = String::from_utf8_lossy(&human.stderr).to_string();
+    let notes = human_stderr.matches("No SOCKET_API_TOKEN set").count();
     assert_eq!(
         notes, 1,
-        "the no-token notice must print exactly once per run; stderr=\n{stderr}"
+        "the no-token notice must print exactly once per run; stderr=\n{human_stderr}"
     );
 }
 

@@ -1,6 +1,6 @@
 use clap::Args;
 use socket_patch_core::api::client::get_api_client_with_overrides;
-use socket_patch_core::manifest::cleanup_blobs::format_cleanup_result;
+use socket_patch_core::manifest::cleanup_blobs::format_bytes;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::redirect::{
@@ -16,14 +16,13 @@ use std::time::Duration;
 
 use super::get::short_uuid;
 use super::rollback::{
-    all_files_already_original, pin_before_hash_blobs, revert_vendor_entry, rollback_patches_inner,
-    run_hosted_leg, sweep_failure, sweep_unused_artifacts, HostedLegOutcome, InnerSelection,
-    VendorRevertStep,
+    pin_before_hash_blobs, revert_vendor_entry, rollback_patches_inner, run_hosted_leg,
+    sweep_failure, sweep_unused_artifacts, HostedLegOutcome, InnerSelection, VendorRevertStep,
 };
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
-use crate::output::confirm;
+use crate::ui::plural;
 
 /// Vendor-ledger entries matching a remove identifier (by ledger key,
 /// base purl or uuid — `VendorEntry::matches_identifier`), sorted by key
@@ -94,7 +93,7 @@ async fn emit_not_found(
         env.error = Some(EnvelopeError::new("not_found", msg));
         println!("{}", env.to_pretty_json());
     } else {
-        eprintln!("{msg}");
+        eprintln!("Error: {msg}");
     }
 }
 
@@ -108,8 +107,157 @@ fn emit_error_envelope(json: bool, dry_run: bool, code: &str, message: String) {
         env.mark_error(EnvelopeError::new(code, message));
         println!("{}", env.to_pretty_json());
     } else {
-        eprintln!("Error: {message}");
+        eprintln!("Error: {}", super::rollback::capitalize_first(&message));
     }
+}
+
+/// The listing header above the patches a `remove` targets.
+fn format_remove_header(
+    identifier: &str,
+    count: usize,
+    variants: bool,
+    dry_run: bool,
+    preserve_state: bool,
+    skip_rollback: bool,
+) -> String {
+    let will = if dry_run { "would be" } else { "will be" };
+    let action = if preserve_state {
+        format!("{will} rolled back (patch records preserved)")
+    } else if skip_rollback {
+        format!("{will} removed from the manifest (files are not rolled back)")
+    } else {
+        format!("{will} removed")
+    };
+    if variants {
+        format!("{identifier} matches {count} release variants — all {action}:")
+    } else {
+        format!(
+            "The following {} {action}:",
+            if count == 1 { "patch" } else { "patches" }
+        )
+    }
+}
+
+/// The confirmation prompt, naming every leg the removal touches.
+fn remove_prompt(
+    count: usize,
+    preserve_state: bool,
+    skip_rollback: bool,
+    vendored: usize,
+    hosted: usize,
+) -> String {
+    let patches = plural(count, "patch", "patches");
+    let its = if count == 1 { "its" } else { "their" };
+    let mut clauses: Vec<String> = if preserve_state {
+        vec![format!("roll back files for {patches}")]
+    } else if skip_rollback {
+        vec![format!(
+            "remove {patches} from the manifest without rolling back {its} files"
+        )]
+    } else {
+        vec![
+            format!("remove {patches}"),
+            format!("roll back {its} files"),
+        ]
+    };
+    if vendored > 0 {
+        let artifacts = plural(vendored, "vendored artifact", "vendored artifacts");
+        clauses.push(if preserve_state {
+            format!("unwire {artifacts}")
+        } else {
+            format!("revert {artifacts}")
+        });
+    }
+    if hosted > 0 {
+        clauses.push(format!(
+            "unwind {}",
+            plural(hosted, "hosted redirect", "hosted redirects")
+        ));
+    }
+    let question = super::rollback::as_question(&super::rollback::join_clauses(&clauses));
+    if preserve_state {
+        format!("{question} (patch records will be preserved)")
+    } else {
+        question
+    }
+}
+
+/// The nested rollback's result lines (not-installed entries are reported
+/// separately, by [`format_not_installed_warning`]).
+fn format_rollback_counts(dry_run: bool, rolled_back: usize, already: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if rolled_back > 0 {
+        let packages = plural(rolled_back, "package", "packages");
+        lines.push(if dry_run {
+            format!("Would roll back {packages}")
+        } else {
+            format!("Rolled back {packages}")
+        });
+    }
+    if already > 0 {
+        lines.push(format!(
+            "{} already in original state",
+            plural(already, "package", "packages")
+        ));
+    }
+    lines
+}
+
+/// The crawler-miss warning for removed entries whose rollback was
+/// skipped. Kept revert data is claimed only for entries whose beforeHash
+/// blobs actually exist in `.socket/blobs` (`with_blobs`).
+fn format_not_installed_warning(with_blobs: &[&str], without_blobs: &[&str]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut group = |purls: &[&str], tail: &dyn Fn(bool) -> &'static str| {
+        if purls.is_empty() {
+            return;
+        }
+        let one = purls.len() == 1;
+        let tail = tail(one);
+        lines.push(String::new());
+        lines.push(format!(
+            "Warning: {} no matching installed package, so {} rollback was skipped (a \
+             crawler miss would look the same); {tail}:",
+            plural(purls.len(), "removed patch had", "removed patches had"),
+            if one { "its" } else { "their" },
+        ));
+        lines.extend(purls.iter().map(|p| format!("  - {p}")));
+    };
+    group(with_blobs, &|_| {
+        "the revert data (beforeHash blobs) was kept in .socket/blobs"
+    });
+    group(without_blobs, &|one| {
+        if one {
+            "no local revert data exists, so reinstall the package to restore its original files"
+        } else {
+            "no local revert data exists, so reinstall the packages to restore their original \
+             files"
+        }
+    });
+    lines
+}
+
+/// The blob-sweep result line (plus the swept list on a dry run).
+fn format_blob_sweep(
+    removed: usize,
+    bytes: u64,
+    removed_blobs: &[String],
+    dry_run: bool,
+) -> String {
+    let mut out = format!(
+        "{} {} ({} {})",
+        if dry_run { "Would remove" } else { "Removed" },
+        plural(removed, "unused blob", "unused blobs"),
+        format_bytes(bytes),
+        if dry_run { "would be freed" } else { "freed" }
+    );
+    if dry_run && !removed_blobs.is_empty() {
+        out.push_str("\nUnused blobs:");
+        for blob in removed_blobs {
+            out.push_str(&format!("\n  - {blob}"));
+        }
+    }
+    out
 }
 
 #[derive(Args)]
@@ -120,13 +268,12 @@ pub struct RemoveArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
 
-    /// Skip rolling back files before removing (only update manifest).
-    ///
-    /// `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
-    /// clap's default bool parser accepts only the literal strings
-    /// `true`/`false` from the env binding, so `SOCKET_SKIP_ROLLBACK=1` (or
-    /// an exported-but-empty `SOCKET_SKIP_ROLLBACK=`) aborted every
-    /// `remove` invocation.
+    // `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
+    // clap's default bool parser accepts only the literal strings
+    // `true`/`false` from the env binding, so `SOCKET_SKIP_ROLLBACK=1` (or
+    // an exported-but-empty `SOCKET_SKIP_ROLLBACK=`) aborted every
+    // `remove` invocation.
+    /// Skip rolling back files before removing (only update the manifest).
     #[arg(
         long = "skip-rollback",
         env = "SOCKET_SKIP_ROLLBACK",
@@ -160,7 +307,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // they select the do-nothing quadrant.
     if args.preserve_state && args.skip_rollback {
         eprintln!(
-            "error: --preserve-state cannot be used with --skip-rollback: the \
+            "Error: --preserve-state cannot be used with --skip-rollback: the \
              combination would be a no-op (nothing would change)"
         );
         return 2;
@@ -254,12 +401,14 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
     };
 
-    // Find matching patches to show what will be removed.
-    let matching: Vec<_> = manifest
+    // Find matching patches to show what will be removed (sorted: the
+    // manifest is a HashMap, and the listing must be deterministic).
+    let mut matching: Vec<_> = manifest
         .patches
         .iter()
         .filter(|(purl, patch)| patch_matches(purl, &patch.uuid, &args.identifier))
         .collect();
+    matching.sort_by(|a, b| a.0.cmp(b.0));
 
     // The vendor ledger, loaded ONCE under the lock: it scopes the nested
     // rollback (vendor-owned purls are not restored in place) and drives
@@ -322,24 +471,26 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // blast radius explicit so the user understands why a single
     // `remove pkg:pypi/foo@1.0` is removing several variants.
     if loud {
-        if args.identifier.starts_with("pkg:")
+        let variants = args.identifier.starts_with("pkg:")
             && !args.identifier.contains('?')
-            && matching.len() > 1
-        {
-            eprintln!(
-                "{} matches {} release variant(s) — all will be removed:",
-                args.identifier,
-                matching.len()
-            );
-        } else {
-            eprintln!("The following patch(es) will be removed:");
-        }
+            && matching.len() > 1;
+        eprintln!(
+            "{}",
+            format_remove_header(
+                &args.identifier,
+                matching.len(),
+                variants,
+                args.common.dry_run,
+                args.preserve_state,
+                args.skip_rollback,
+            )
+        );
         for (purl, patch) in &matching {
             eprintln!(
-                "  - {} (UUID: {}, {} file(s))",
+                "  - {} (UUID: {}, {})",
                 purl,
                 short_uuid(&patch.uuid),
-                patch.files.len()
+                plural(patch.files.len(), "file", "files")
             );
         }
         eprintln!();
@@ -347,20 +498,38 @@ pub async fn run(args: RemoveArgs) -> i32 {
 
     // `--dry-run` previews without mutating, so there is nothing to
     // confirm — skip the prompt (matching the global contract row:
-    // "Preview, no mutations").
-    let prompt = if args.preserve_state {
-        format!(
-            "Rollback files for {} patch(es)? (patch records will be preserved)",
-            matching.len()
-        )
-    } else {
-        format!("Remove {} patch(es) and rollback files?", matching.len())
-    };
-    if !args.common.dry_run && !confirm(&prompt, true, args.common.yes, args.common.json) {
-        if loud {
-            println!("Removal cancelled.");
+    // "Preview, no mutations"). The prompt names every leg the removal
+    // will touch: the redirect ledger is probed read-only here (the legs
+    // below re-load it and decide for real).
+    if !args.common.dry_run {
+        let (vendored, hosted) = if args.skip_rollback {
+            (0, 0)
+        } else {
+            let vendored = vendor_state_result
+                .as_ref()
+                .map(|st| vendor_entries_matching(st, &args.identifier).len())
+                .unwrap_or(0);
+            let hosted = load_redirect_state(cwd)
+                .await
+                .ok()
+                .flatten()
+                .map(|st| hosted_records_matching(&st, &args.identifier).len())
+                .unwrap_or(0);
+            (vendored, hosted)
+        };
+        let prompt = remove_prompt(
+            matching.len(),
+            args.preserve_state,
+            args.skip_rollback,
+            vendored,
+            hosted,
+        );
+        if !crate::ui::confirm(&prompt, true, &args.common) {
+            if loud {
+                println!("Removal cancelled.");
+            }
+            return 0;
         }
-        return 0;
     }
 
     // ── nested in-place rollback ────────────────────────────────────────
@@ -382,10 +551,14 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // warning event rides the envelope. Empty under `--skip-rollback`
     // (no rollback ran, so nothing is known — semantics unchanged).
     let mut rollback_not_installed: Vec<String> = Vec::new();
+    // Whether something was printed after the header listing, so the
+    // manifest result below gets a separating blank line (and only then).
+    let mut printed_progress = false;
     if !args.skip_rollback {
-        if loud {
-            println!("Rolling back patch before removal...");
-        }
+        // No outer status line: the engine prints its own progress (the
+        // blob-download status) and diagnostics, which an outer line
+        // would collide with on a TTY.
+        //
         // The delegation runs muted under --json/--silent (the envelope,
         // or the silence, is ours) and unscoped by --ecosystems (the
         // identifier IS the scope).
@@ -413,6 +586,19 @@ pub async fn run(args: RemoveArgs) -> i32 {
                         org_slug.as_deref(),
                     )
                     .await;
+                    // The nested rollback reports per-package failures
+                    // inline only under --silent; say why here otherwise.
+                    if loud {
+                        for r in outcome.results.iter().filter(|r| !r.success) {
+                            eprintln!(
+                                "{}",
+                                super::rollback::format_rollback_failure(
+                                    &r.package_key,
+                                    r.error.as_deref().unwrap_or("unknown error")
+                                )
+                            );
+                        }
+                    }
                     emit_error_envelope(
                         args.common.json,
                         args.common.dry_run,
@@ -422,46 +608,56 @@ pub async fn run(args: RemoveArgs) -> i32 {
                     return 1;
                 }
 
+                // Counted per package (two installed copies of one purl
+                // are one package), the same way rollback and apply count
+                // (`tally_rollback_results` reuses rollback's canonical
+                // `all_files_already_original` predicate, whose non-empty
+                // guard keeps a zero-file or not-installed result from
+                // counting as "already in original state").
+                // `rollback_count` stays per copy: it feeds the JSON
+                // envelope's `rolledBack`, which is unchanged.
+                let tally = super::rollback::tally_rollback_results(&outcome.results);
                 rollback_count = outcome
                     .results
                     .iter()
                     .filter(|r| r.success && !r.files_rolled_back.is_empty())
                     .count();
-                // Reuse rollback's canonical predicate rather than
-                // re-deriving it: the `!files_verified.is_empty()` guard
-                // inside `all_files_already_original` is essential —
-                // `Iterator::all` over an empty slice is vacuously `true`,
-                // so a zero-file (or not-installed) result would otherwise
-                // be miscounted as "already in original state".
-                let already_original = outcome
-                    .results
-                    .iter()
-                    .filter(|r| r.success && all_files_already_original(r))
-                    .count();
 
                 if loud {
-                    if rollback_count > 0 {
-                        println!("Rolled back {rollback_count} package(s)");
-                    }
-                    if already_original > 0 {
-                        println!("{already_original} package(s) already in original state");
-                    }
                     // Vendor-owned targets say nothing here: the vendored
                     // leg below reports each key's own disposition.
-                    if !rollback_not_installed.is_empty() {
-                        println!("No packages found to rollback (not installed)");
+                    // Not-installed entries are reported by the crawler-
+                    // miss warning after the manifest result below. A dry
+                    // run restores nothing (`files_rolled_back` stays
+                    // empty), so it counts what WOULD be rolled back.
+                    for line in format_rollback_counts(
+                        args.common.dry_run,
+                        if args.common.dry_run {
+                            tally.can_roll_back
+                        } else {
+                            tally.rolled_back
+                        },
+                        tally.already,
+                    ) {
+                        println!("{line}");
+                        printed_progress = true;
                     }
-                    println!();
                 }
             }
             Err(e) => {
                 track_patch_remove_failed(&e, api_token.as_deref(), org_slug.as_deref()).await;
-                emit_error_envelope(
-                    args.common.json,
-                    args.common.dry_run,
-                    "rollback_failed",
-                    format!("Error during rollback: {e}. Use --skip-rollback to remove from manifest without restoring files."),
-                );
+                let remedy = "Use --skip-rollback to remove from manifest without restoring files.";
+                if args.common.json {
+                    // The pinned envelope message keeps its historical prefix.
+                    emit_error_envelope(
+                        true,
+                        args.common.dry_run,
+                        "rollback_failed",
+                        format!("Error during rollback: {e}. {remedy}"),
+                    );
+                } else {
+                    eprintln!("Error: Rollback failed: {e}. {remedy}");
+                }
                 return 1;
             }
         }
@@ -526,6 +722,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 Ok(leg) => leg,
                 Err(code) => return code,
             };
+            printed_progress |= loud && vendor_leg.printed;
         }
     }
 
@@ -576,6 +773,8 @@ pub async fn run(args: RemoveArgs) -> i32 {
                              their ledger records were dropped with the unwound wiring."
                         );
                     }
+                    // `run_hosted_leg` printed one line per unwound purl.
+                    printed_progress |= loud && !leg.reverted.is_empty();
                     let hosted_action = if args.common.dry_run {
                         PatchAction::Verified
                     } else {
@@ -660,16 +859,24 @@ pub async fn run(args: RemoveArgs) -> i32 {
     }
 
     if loud {
+        if printed_progress {
+            println!();
+        }
         if args.preserve_state {
             println!(
-                "Manifest entries and vendored artifacts preserved \
-                 (--preserve-state); re-apply with `socket-patch apply` or \
-                 `socket-patch vendor`."
+                "{}",
+                super::rollback::format_preserved_note(matching.len(), vendor_leg.preserved)
             );
         } else if args.common.dry_run {
-            println!("Would remove {} patch(es) from manifest:", removed.len());
+            println!(
+                "Would remove {} from manifest:",
+                plural(removed.len(), "patch", "patches")
+            );
         } else {
-            println!("Removed {} patch(es) from manifest:", removed.len());
+            println!(
+                "Removed {} from manifest:",
+                plural(removed.len(), "patch", "patches")
+            );
         }
         for purl in &removed {
             println!("  - {purl}");
@@ -695,14 +902,24 @@ pub async fn run(args: RemoveArgs) -> i32 {
         .filter(|p| removed.iter().any(|r| r == p))
         .collect();
     if loud && !retained_not_installed.is_empty() {
-        eprintln!(
-            "\nWarning: {} removed patch(es) had no matching installed package, so \
-             their rollback was skipped (a crawler miss would look the same); their \
-             revert data (beforeHash blobs) was kept in .socket/blobs:",
-            retained_not_installed.len()
-        );
+        // Claim kept revert data only where it exists on disk.
+        let blobs_dir = socket_dir.join("blobs");
+        let mut with_blobs: Vec<&str> = Vec::new();
+        let mut without_blobs: Vec<&str> = Vec::new();
         for purl in &retained_not_installed {
-            eprintln!("  - {purl}");
+            let has_local = manifest.patches.get(*purl).is_some_and(|record| {
+                record.files.values().any(|info| {
+                    !info.before_hash.is_empty() && blobs_dir.join(&info.before_hash).is_file()
+                })
+            });
+            if has_local {
+                with_blobs.push(purl);
+            } else {
+                without_blobs.push(purl);
+            }
+        }
+        for line in format_not_installed_warning(&with_blobs, &without_blobs) {
+            eprintln!("{line}");
         }
     }
 
@@ -736,7 +953,15 @@ pub async fn run(args: RemoveArgs) -> i32 {
         if let Ok(r) = sweep.blobs {
             blobs_removed = r.blobs_removed;
             if loud && r.blobs_removed > 0 {
-                println!("\n{}", format_cleanup_result(&r, args.common.dry_run));
+                println!(
+                    "\n{}",
+                    format_blob_sweep(
+                        r.blobs_removed,
+                        r.bytes_freed,
+                        &r.removed_blobs,
+                        args.common.dry_run
+                    )
+                );
             }
         }
         // Diff/package archives use the same manifest-uuid keep rule
@@ -890,6 +1115,11 @@ struct RemoveVendorLeg {
     kept: Vec<String>,
     /// Entries actually reverted and dropped from the ledger (wet runs).
     reverted_count: usize,
+    /// Entries unwired with their artifact and ledger entry kept
+    /// (`--preserve-state`, wet runs).
+    preserved: usize,
+    /// A human progress line reached stdout.
+    printed: bool,
 }
 
 /// The vendored-revert loop shared by the manifest-backed and ledger-only
@@ -966,7 +1196,9 @@ async fn revert_vendored_matches(
                     )
                 };
                 if loud {
-                    eprintln!("Kept vendored state for {key}: lockfile wiring drifted{note}");
+                    eprintln!(
+                        "Warning: Kept vendored state for {key}: lockfile wiring drifted{note}"
+                    );
                 }
                 leg.kept.push(key.clone());
                 leg.skipped.push(
@@ -981,6 +1213,7 @@ async fn revert_vendored_matches(
                     } else {
                         println!("Would revert vendoring for {key}");
                     }
+                    leg.printed = true;
                 }
                 // Dry-run flips the would-be Removed to a Verified preview,
                 // same convention as apply/vendor/repair.
@@ -992,8 +1225,10 @@ async fn revert_vendored_matches(
                 );
             }
             VendorRevertStep::Preserved => {
+                leg.preserved += 1;
                 if loud {
                     println!("Unwired vendoring for {key} (artifact preserved)");
+                    leg.printed = true;
                 }
                 leg.skipped.push(
                     PatchEvent::new(PatchAction::Skipped, key.clone()).with_reason(
@@ -1006,6 +1241,7 @@ async fn revert_vendored_matches(
             VendorRevertStep::Reverted => {
                 if loud {
                     println!("Reverted vendoring for {key}");
+                    leg.printed = true;
                 }
                 leg.reverted_count += 1;
                 leg.reverted.push(
@@ -1123,7 +1359,7 @@ async fn remove_hosted_only(
             args.common.dry_run,
             "hosted_state_retained",
             format!(
-                "{} matches only hosted redirect record(s); removing one means unwinding \
+                "{} matches only hosted redirect records; removing one means unwinding \
                  its lockfile redirect, which --skip-rollback prevents",
                 args.identifier
             ),
@@ -1132,7 +1368,19 @@ async fn remove_hosted_only(
     }
 
     if loud {
-        eprintln!("The following hosted redirect(s) will be unwound and removed:");
+        eprintln!(
+            "The following {} {} unwound and removed:",
+            if hosted_matches.len() == 1 {
+                "hosted redirect"
+            } else {
+                "hosted redirects"
+            },
+            if args.common.dry_run {
+                "would be"
+            } else {
+                "will be"
+            }
+        );
         for purl in &hosted_matches {
             eprintln!("  - {purl}");
         }
@@ -1140,10 +1388,15 @@ async fn remove_hosted_only(
     }
     // `--dry-run` previews without mutating — nothing to confirm.
     let prompt = format!(
-        "Remove {} hosted redirect(s) and unwind their lockfile wiring?",
-        hosted_matches.len()
+        "Remove {} and unwind {} lockfile wiring?",
+        plural(hosted_matches.len(), "hosted redirect", "hosted redirects"),
+        if hosted_matches.len() == 1 {
+            "its"
+        } else {
+            "their"
+        }
     );
-    if !args.common.dry_run && !confirm(&prompt, true, args.common.yes, args.common.json) {
+    if !args.common.dry_run && !crate::ui::confirm(&prompt, true, &args.common) {
         if loud {
             println!("Removal cancelled.");
         }
@@ -1221,7 +1474,7 @@ async fn remove_ledger_only(
             args.common.dry_run,
             "vendor_state_retained",
             format!(
-                "{} matches only vendored patch(es) with no manifest record; removing one \
+                "{} matches only vendored patches with no manifest record; removing one \
                  means reverting its vendoring, which --skip-rollback prevents",
                 args.identifier
             ),
@@ -1230,13 +1483,19 @@ async fn remove_ledger_only(
     }
 
     if loud {
+        let subject = match (matches.len() == 1, args.common.dry_run) {
+            (true, false) => "patch will be",
+            (true, true) => "patch would be",
+            (false, false) => "patches will be",
+            (false, true) => "patches would be",
+        };
         if args.preserve_state {
             eprintln!(
-                "The following vendored patch(es) will be unwired (artifacts and ledger \
-                 entries preserved):"
+                "The following vendored {subject} unwired (artifacts and ledger entries \
+                 preserved):"
             );
         } else {
-            eprintln!("The following vendored patch(es) will be reverted and removed:");
+            eprintln!("The following vendored {subject} reverted and removed:");
         }
         for (key, entry) in &matches {
             eprintln!("  - {key} (UUID: {})", short_uuid(&entry.uuid));
@@ -1244,19 +1503,25 @@ async fn remove_ledger_only(
         eprintln!();
     }
     // `--dry-run` previews without mutating — nothing to confirm.
+    let one = matches.len() == 1;
     let prompt = if args.preserve_state {
         format!(
-            "Unwire vendoring for {} vendored patch(es)? (artifacts and ledger entries will \
-             be preserved)",
-            matches.len()
+            "Unwire vendoring for {}? ({} will be preserved)",
+            plural(matches.len(), "vendored patch", "vendored patches"),
+            if one {
+                "its artifact and ledger entry"
+            } else {
+                "their artifacts and ledger entries"
+            }
         )
     } else {
         format!(
-            "Remove {} vendored patch(es) and revert their vendoring?",
-            matches.len()
+            "Remove {} and revert {} vendoring?",
+            plural(matches.len(), "vendored patch", "vendored patches"),
+            if one { "its" } else { "their" }
         )
     };
-    if !args.common.dry_run && !confirm(&prompt, true, args.common.yes, args.common.json) {
+    if !args.common.dry_run && !crate::ui::confirm(&prompt, true, &args.common) {
         if loud {
             println!("Removal cancelled.");
         }
@@ -1493,5 +1758,114 @@ mod tests {
             .contains_key("pkg:pypi/six@1.16.0?artifact_id=sdist"));
         assert!(manifest.patches.contains_key("pkg:npm/foo@1.0"));
         assert_eq!(manifest.patches.len(), 2);
+    }
+
+    // ── human output formatters ──────────────────────────────────────────
+
+    #[test]
+    fn remove_header_by_mode_and_count() {
+        let h = |n, dry, pres, skip| format_remove_header("pkg:npm/a@1", n, false, dry, pres, skip);
+        assert_eq!(
+            h(1, false, false, false),
+            "The following patch will be removed:"
+        );
+        assert_eq!(
+            h(2, true, false, false),
+            "The following patches would be removed:"
+        );
+        assert_eq!(
+            h(1, false, true, false),
+            "The following patch will be rolled back (patch records preserved):"
+        );
+        assert_eq!(
+            h(1, false, false, true),
+            "The following patch will be removed from the manifest (files are not rolled back):"
+        );
+        assert_eq!(
+            format_remove_header("pkg:pypi/six@1.17.0", 3, true, false, false, false),
+            "pkg:pypi/six@1.17.0 matches 3 release variants — all will be removed:"
+        );
+    }
+
+    #[test]
+    fn remove_prompt_names_every_leg() {
+        assert_eq!(
+            remove_prompt(1, false, false, 0, 0),
+            "Remove 1 patch and roll back its files?"
+        );
+        assert_eq!(
+            remove_prompt(2, false, false, 0, 0),
+            "Remove 2 patches and roll back their files?"
+        );
+        assert_eq!(
+            remove_prompt(1, false, false, 0, 1),
+            "Remove 1 patch, roll back its files, and unwind 1 hosted redirect?"
+        );
+        assert_eq!(
+            remove_prompt(1, false, false, 2, 1),
+            "Remove 1 patch, roll back its files, revert 2 vendored artifacts, and unwind 1 \
+             hosted redirect?"
+        );
+        assert_eq!(
+            remove_prompt(1, true, false, 1, 0),
+            "Roll back files for 1 patch and unwire 1 vendored artifact? (patch records will \
+             be preserved)"
+        );
+        assert_eq!(
+            remove_prompt(3, false, true, 0, 0),
+            "Remove 3 patches from the manifest without rolling back their files?"
+        );
+    }
+
+    #[test]
+    fn rollback_counts_lines() {
+        assert_eq!(
+            format_rollback_counts(false, 1, 0),
+            vec!["Rolled back 1 package"]
+        );
+        assert_eq!(
+            format_rollback_counts(true, 2, 1),
+            vec![
+                "Would roll back 2 packages",
+                "1 package already in original state"
+            ]
+        );
+        assert!(format_rollback_counts(false, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn not_installed_warning_claims_kept_blobs_only_when_present() {
+        let with = format_not_installed_warning(&["pkg:npm/a@1"], &[]);
+        assert_eq!(
+            with,
+            vec![
+                "",
+                "Warning: 1 removed patch had no matching installed package, so its rollback \
+                 was skipped (a crawler miss would look the same); the revert data \
+                 (beforeHash blobs) was kept in .socket/blobs:",
+                "  - pkg:npm/a@1",
+            ]
+        );
+        let without = format_not_installed_warning(&[], &["pkg:npm/b@1", "pkg:npm/c@1"]);
+        assert_eq!(without.len(), 4);
+        assert!(without[1].starts_with("Warning: 2 removed patches had no matching installed"));
+        assert!(without[1].contains("their rollback was skipped"));
+        assert!(without[1].contains("reinstall the packages to restore their original files"));
+        let one = format_not_installed_warning(&[], &["pkg:npm/b@1"]);
+        assert!(one[1].contains("reinstall the package to restore its original files"));
+        assert!(!without[1].contains("was kept in .socket/blobs"));
+        assert!(format_not_installed_warning(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn blob_sweep_line() {
+        assert_eq!(
+            format_blob_sweep(1, 2048, &[], false),
+            "Removed 1 unused blob (2.00 KB freed)"
+        );
+        assert_eq!(
+            format_blob_sweep(2, 10, &["h1".to_string(), "h2".to_string()], true),
+            "Would remove 2 unused blobs (10 B would be freed)\nUnused blobs:\n  - h1\n  - h2"
+        );
     }
 }

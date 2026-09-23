@@ -296,8 +296,8 @@ async fn scan_silent_apply_flow_produces_no_output_but_still_applies() {
         "non-silent scan must print the pre-apply listing; got {loud_stdout:?}"
     );
     assert!(
-        loud_stderr.contains("Found 1 packages"),
-        "non-silent scan must print the crawl summary on stderr; got {loud_stderr:?}"
+        loud_stderr.contains("Found 1 package ("),
+        "non-silent scan must print the singular crawl summary on stderr; got {loud_stderr:?}"
     );
 }
 
@@ -633,7 +633,7 @@ async fn scan_silent_keeps_error_output() {
         "--silent must NOT suppress error output; got {stderr:?}"
     );
     assert!(
-        !stderr.contains("Found 1 packages"),
+        !stderr.contains("Found 1 package"),
         "--silent must suppress the informational crawl summary even on \
          the error path; got {stderr:?}"
     );

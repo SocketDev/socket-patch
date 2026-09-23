@@ -18,7 +18,9 @@ pub mod swap;
 
 use std::path::{Path, PathBuf};
 
-pub use channel::{channel_label, detect_channel, upgrade_hint, ChannelEnv, InstallChannel};
+pub use channel::{
+    channel_label, detect_channel, upgrade_hint, upgrade_hint_for, ChannelEnv, InstallChannel,
+};
 pub use release::{
     asset_name_for_target, current_version, fetch_latest_version, is_newer, parse_release_tag,
     UpdateEndpoints, UpdateTimeouts,
@@ -37,6 +39,12 @@ pub enum UpdateError {
 
     #[error("network error: {0}")]
     Network(String),
+
+    /// The release has no `SHA256SUMS`, so no download can be verified.
+    /// Raised while installing (after the check succeeded), hence its own
+    /// wording; it keeps the `check_failed` envelope code it always had.
+    #[error("could not verify release v{version}: it publishes no SHA256SUMS ({url} is 404)")]
+    SumsMissing { version: String, url: String },
 
     #[error("release v{version} has no prebuilt binary {asset} for this platform")]
     AssetNotFound { asset: String, version: String },
@@ -64,7 +72,7 @@ impl UpdateError {
     /// Stable machine-routing tag for the JSON envelope.
     pub fn error_code(&self) -> &'static str {
         match self {
-            UpdateError::CheckFailed(_) => "check_failed",
+            UpdateError::CheckFailed(_) | UpdateError::SumsMissing { .. } => "check_failed",
             UpdateError::Network(_) => "download_failed",
             UpdateError::AssetNotFound { .. } => "asset_not_found",
             UpdateError::DownloadFailed(_) => "download_failed",
@@ -164,8 +172,15 @@ mod tests {
     /// callers already handle for download failures.
     #[test]
     fn error_code_table_matches_cli_contract() {
-        let table: [(UpdateError, &str); 9] = [
+        let table: [(UpdateError, &str); 10] = [
             (UpdateError::CheckFailed("x".into()), "check_failed"),
+            (
+                UpdateError::SumsMissing {
+                    version: "1.0.0".into(),
+                    url: "u".into(),
+                },
+                "check_failed",
+            ),
             (UpdateError::Network("x".into()), "download_failed"),
             (
                 UpdateError::AssetNotFound {

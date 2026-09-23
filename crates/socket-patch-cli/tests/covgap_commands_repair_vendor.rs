@@ -1688,7 +1688,7 @@ async fn repair_human_output_lines() {
     let (code, stdout, stderr) = run_cli_human(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(
-        stdout.contains("Rebuilding 1 broken vendored artifact(s)"),
+        stdout.contains("Rebuilding 1 broken vendored artifact..."),
         "the rebuild header is printed: {stdout}"
     );
     assert!(
@@ -1704,7 +1704,7 @@ async fn repair_human_output_lines() {
     let (code, stdout, stderr) = run_cli_human(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
     assert!(
-        stderr.contains(&format!("Cannot repair vendored artifact for {PURL}")),
+        stderr.contains(&format!("Error: Cannot repair vendored artifact for {PURL}")),
         "the failure line is printed to stderr: {stderr}"
     );
 }

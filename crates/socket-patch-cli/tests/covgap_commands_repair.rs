@@ -4,17 +4,16 @@
 //!
 //! Ranges pinned (audited at d5e1815, file unchanged since):
 //!   * the loud `manifest_not_found` / `repair_failed` stderr prints,
-//!   * the loud "All {mode} artifacts are present locally." summary,
+//!   * the loud "All {artifacts} are present locally." summary,
 //!   * the `... and N more` truncation of the offline warning (>5 missing)
 //!     and the dry-run preview (>10 missing),
-//!   * the loud orphan-archive removal print, including the
-//!     `.replace("blob(s)", "{label} archive(s)")` coupling to
-//!     `format_cleanup_result`'s exact wording,
+//!   * the loud orphan-archive removal print, each directory's summary
+//!     naming its own artifact kind,
 //!   * the archive-cleanup failure arm (stderr warning + `cleanup_failed`
 //!     skip event, exit stays 0, loop continues to the packages pass),
 //!   * an unremovable `apply.lock` (read-only `.socket`) stays non-fatal
 //!     and silent (exit stays 0),
-//!   * the loud "Rebuilt N vendored artifact(s)." summary after the
+//!   * the loud "Rebuilt N vendored artifacts." summary after the
 //!     vendored-repair phase.
 //!
 //! Everything runs offline or against a wiremock server — no real hosts.
@@ -222,7 +221,7 @@ fn repair_failed_human_mode_prints_error_to_stderr() {
 // Human-mode summaries
 // ---------------------------------------------------------------------------
 
-/// The loud "All {mode} artifacts are present locally." summary. Every
+/// The loud "All {artifacts} are present locally." summary. Every
 /// existing loud run used the default diff mode with no `<uuid>.tar.gz`
 /// present (always "missing"), and every all-present run was `--json` —
 /// so the print never executed. `--download-mode file` with the referenced
@@ -245,8 +244,8 @@ fn repair_all_present_human_mode_prints_summary() {
         "expected exit 0; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("All file artifacts are present locally."),
-        "the all-present summary must name the requested mode; stdout=\n{stdout}"
+        stdout.contains("All blobs are present locally."),
+        "the all-present summary must name the requested artifact kind; stdout=\n{stdout}"
     );
     assert!(
         stdout.contains("Repair complete."),
@@ -271,17 +270,22 @@ fn repair_offline_warning_truncates_missing_list_after_five() {
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // The warning (and its list) is diagnostic output: stderr.
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),
         Some(0),
         "offline missing artifacts are a warning, not a failure; stdout=\n{stdout}"
     );
     assert!(
-        stdout
-            .contains("Warning: 12 file artifact(s) are missing (offline mode - not downloading)"),
-        "the warning header must carry the full missing count; stdout=\n{stdout}"
+        stderr.contains("Warning: 12 blobs are missing (offline mode - not downloading):"),
+        "the warning header must carry the full missing count; stderr=\n{stderr}"
     );
-    let items = item_lines(&stdout);
+    assert!(
+        !stdout.contains("Warning"),
+        "the warning must not pollute stdout; stdout=\n{stdout}"
+    );
+    let items = item_lines(&stderr);
     assert_eq!(
         items.len(),
         5,
@@ -296,8 +300,8 @@ fn repair_offline_warning_truncates_missing_list_after_five() {
         );
     }
     assert!(
-        stdout.contains("  ... and 7 more"),
-        "the overflow line must report the remaining 12 - 5 = 7 ids; stdout=\n{stdout}"
+        stderr.contains("  ... and 7 more"),
+        "the overflow line must report the remaining 12 - 5 = 7 ids; stderr=\n{stderr}"
     );
 }
 
@@ -324,7 +328,7 @@ fn repair_dry_run_preview_truncates_missing_list_after_ten() {
         "dry-run preview must succeed; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("Found 12 missing file artifact(s)"),
+        stdout.contains("Found 12 missing blobs"),
         "the online header must carry the full missing count; stdout=\n{stdout}"
     );
     assert!(
@@ -348,10 +352,8 @@ fn repair_dry_run_preview_truncates_missing_list_after_ten() {
     );
 }
 
-/// The loud orphan-archive removal print — including the
-/// `.replace("blob(s)", "{label} archive(s)")` rewrite of
-/// `format_cleanup_result`'s wording, a cross-crate string coupling only a
-/// test can pin. One orphan in `diffs/` and one in `packages/`, each next
+/// The loud orphan-archive removal print — each directory's summary names
+/// its own artifact kind (`format_cleanup_result_for` takes the noun). One orphan in `diffs/` and one in `packages/`, each next
 /// to the referenced `<uuid>.tar.gz` that must survive.
 #[test]
 fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
@@ -378,25 +380,24 @@ fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
         Some(0),
         "expected exit 0; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    // The relabeled summaries: `format_cleanup_result` says
-    // "Removed 1 unused blob(s) (...)"; the archive arms must rewrite the
-    // noun per directory.
+    // Each directory's summary names its own artifact kind (the formatter
+    // takes the noun; no string rewriting of the blob wording).
     assert!(
-        stdout.contains("Removed 1 unused diff archive(s)"),
-        "the diffs sweep must print the relabeled summary; stdout=\n{stdout}"
+        stdout.contains("Removed 1 unused diff archive (17 B freed)"),
+        "the diffs sweep must print its own summary; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("Removed 1 unused package archive(s)"),
-        "the packages sweep must print the relabeled summary; stdout=\n{stdout}"
+        stdout.contains("Removed 1 unused package archive (16 B freed)"),
+        "the packages sweep must print its own summary; stdout=\n{stdout}"
     );
     assert!(
-        !stdout.contains("unused blob(s)"),
-        "no archive line may leak the unrelabeled 'blob(s)' wording; stdout=\n{stdout}"
+        !stdout.contains("blob"),
+        "no archive line may use the blob wording; stdout=\n{stdout}"
     );
     // Bonus pin: with the referenced diff archive present, the default diff
     // mode takes the all-present branch too.
     assert!(
-        stdout.contains("All diff artifacts are present locally."),
+        stdout.contains("All diff archives are present locally."),
         "diff mode with the referenced archive present is all-present; stdout=\n{stdout}"
     );
     // Disk effects: orphans gone, referenced archives intact.
@@ -519,7 +520,7 @@ fn repair_archive_cleanup_failure_warns_and_continues() {
 
 /// True when the loud stdout carries the packages sweep summary.
 fn stdout_reports_package_sweep(stdout: &str) -> bool {
-    stdout.contains("Removed 1 unused package archive(s)")
+    stdout.contains("Removed 1 unused package archive (")
 }
 
 // ---------------------------------------------------------------------------
@@ -582,7 +583,7 @@ fn repair_exits_zero_and_stays_quiet_when_lock_file_unremovable() {
 }
 
 // ---------------------------------------------------------------------------
-// Loud vendored-repair summary — "Rebuilt N vendored artifact(s)."
+// Loud vendored-repair summary — "Rebuilt N vendored artifacts."
 // ---------------------------------------------------------------------------
 
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -728,7 +729,7 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str], json: bool) -> (i32, Stri
     )
 }
 
-/// The loud "Rebuilt N vendored artifact(s)." summary after the
+/// The loud "Rebuilt N vendored artifacts." summary after the
 /// vendored-repair phase — uncovered only because the sibling e2e suite
 /// drives every repair through `--json`. Reuses the hermetic
 /// offline-rebuild fixture (installed copy + seeded after-blob), so the
@@ -766,7 +767,7 @@ async fn repair_offline_rebuild_human_mode_prints_rebuilt_summary() {
     let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"], false);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(
-        stdout.contains("Rebuilt 1 vendored artifact(s)."),
+        stdout.contains("Rebuilt 1 vendored artifact."),
         "the loud run must print the vendored-rebuild summary; stdout=\n{stdout}"
     );
     assert!(tgz.is_file(), "the tarball was rebuilt offline");
