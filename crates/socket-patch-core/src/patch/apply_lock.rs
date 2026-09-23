@@ -50,10 +50,11 @@
 //! name in the meantime fails with `ERROR_ACCESS_DENIED` (5),
 //! `ERROR_SHARING_VIOLATION` (32) or `ERROR_DELETE_PENDING` (303). Two
 //! measures keep that window short and harmless: a waiter never holds
-//! the file open across its backoff sleep, and those three codes get a
-//! short fixed grace (5 ms × 40 per streak, independent of the caller's
-//! timeout; a live holder observed in between resets it) before they
-//! surface as `Io`. std's default share mode already
+//! the file open across its backoff sleep, and those three codes are
+//! retried — the lock is free, only the name is momentarily unusable —
+//! until BOTH a fixed grace floor and the caller's own `timeout` are
+//! spent (a live holder observed in between resets the streak) before
+//! they surface as `Io`. std's default share mode already
 //! includes `FILE_SHARE_DELETE`, so a holder can unlink the file while
 //! waiters have it open.
 //!
@@ -95,11 +96,21 @@ const VANISHED_LIMIT: u32 = 256;
 #[cfg(unix)]
 const EINVAL: i32 = 22;
 
-/// Windows delete-pending grace: `attempts × sleep` per delete-pending
-/// streak, independent of `timeout` (a zero-timeout try-once still waits
-/// it out, because the name is free, just not reusable yet). Like
+/// Windows delete-pending grace. The lock itself is FREE here — only the
+/// name is briefly unusable while the OS finishes a releaser's unlink —
+/// so this is a transient condition like contention, not a fault, and a
+/// caller that asked to wait must not be failed out of its budget by it.
+/// We therefore give up only once BOTH this fixed floor and the caller's
+/// `timeout` are spent: a zero-timeout try-once still rides out a
+/// delete-pending window (the floor alone), a `--lock-timeout` run waits
+/// its whole budget, and an unbounded wait never gives up. Like
 /// `VANISHED_LIMIT`, a `Contended` outcome resets the streak.
-const DELETE_PENDING_ATTEMPTS: u32 = 40;
+///
+/// The floor is generous because the window is bounded by how long the
+/// releaser's last handle stays open, which on a loaded CI runner can be
+/// far longer than the syscalls involved suggest: two processes cycling
+/// the lock back-to-back produced streaks past 200 ms on `windows-latest`.
+const DELETE_PENDING_GRACE: Duration = Duration::from_secs(2);
 const DELETE_PENDING_SLEEP: Duration = Duration::from_millis(5);
 
 /// Errors surfaced when acquiring the apply lock.
@@ -225,7 +236,9 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
     // responsive and `ZERO` keeps its non-blocking try-once semantics.
     let deadline = Instant::now().checked_add(timeout);
     let mut vanished: u32 = 0;
-    let mut delete_pending: u32 = 0;
+    // `Some(instant)` once a delete-pending streak starts: the end of its
+    // grace floor. Cleared whenever the streak ends (see `Contended`).
+    let mut delete_pending: Option<Instant> = None;
     loop {
         // One mkdir → open → lock → identity-check attempt, in its own
         // function so the file handle is closed before any sleep below:
@@ -238,7 +251,7 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
                 // delete-pending streak preceded it has ended: the bounds
                 // are per streak, never cumulative over the whole wait.
                 vanished = 0;
-                delete_pending = 0;
+                delete_pending = None;
                 let now = Instant::now();
                 // A `None` deadline (timeout overflowed `Instant`) never
                 // elapses; otherwise give up once the budget is spent.
@@ -271,8 +284,12 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
                 std::thread::yield_now();
             }
             Attempt::DeletePending(source) => {
-                delete_pending += 1;
-                if delete_pending > DELETE_PENDING_ATTEMPTS {
+                let now = Instant::now();
+                let grace_end = *delete_pending.get_or_insert(now + DELETE_PENDING_GRACE);
+                // Give up only when the fixed floor AND the caller's budget
+                // are both spent; a `None` deadline (an overflowing timeout)
+                // waits indefinitely, exactly as it does for contention.
+                if now >= grace_end && deadline.is_some_and(|d| now >= d) {
                     return Err(fail(socket_dir, path, source));
                 }
                 std::thread::sleep(DELETE_PENDING_SLEEP);
