@@ -1292,6 +1292,74 @@ mod tests {
         assert!(lock.contains(&fx.actual_integrity().await));
     }
 
+    /// F7: a patched member edited AND the ledger sha forged to match fails
+    /// the afterHash check; the tampered bytes are never pinned.
+    #[tokio::test]
+    async fn bun_forged_ledger_over_edited_patched_member_is_not_reused() {
+        use sha2::Sha256;
+        let (fx, server, _, _) = bun_service_vendored().await;
+        let evil = {
+            let mut b = tar::Builder::new(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            ));
+            for (n, data) in [
+                (
+                    "package/package.json",
+                    br#"{"name":"left-pad","version":"1.3.0"}"#.to_vec(),
+                ),
+                ("package/index.js", b"module.exports = 'evil';\n".to_vec()),
+            ] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, n, data.as_slice()).unwrap();
+            }
+            b.into_inner().unwrap().finish().unwrap()
+        };
+        tokio::fs::write(fx.root().join(fx.rel_tgz()), &evil)
+            .await
+            .unwrap();
+        let mut state = crate::vendor::state::load_state(fx.root()).await.unwrap();
+        let e = state.entries.get_mut("pkg:npm/left-pad@1.3.0").unwrap();
+        e.artifact.sha256 = hex::encode(Sha256::digest(&evil));
+        e.artifact.size = Some(evil.len() as u64);
+        crate::vendor::state::save_state(fx.root(), &state)
+            .await
+            .unwrap();
+        let (r, e, _) = bun_outage_rerun(&fx, &server).await;
+        assert!(r.success, "{:?}", r.error);
+        assert!(e.is_some(), "not reused: rebuilt and re-pinned");
+        let lock = fx.read_lock().await;
+        assert!(!lock.contains(&crate::vendor::test_support::sri(&evil)));
+        assert!(lock.contains(&fx.actual_integrity().await));
+    }
+
+    /// F9: a new record uuid acquires under the new uuid dir; the old
+    /// uuid's committed artifact is left alone.
+    #[tokio::test]
+    async fn bun_new_record_uuid_acquires_under_the_new_uuid_dir() {
+        const NEXT: &str = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d";
+        let (mut fx, server, alt, _) = bun_service_vendored().await;
+        fx.record.uuid = NEXT.to_string();
+        let (r, e, _) = bun_outage_rerun(&fx, &server).await;
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(
+            e.expect("a new uuid re-wires").artifact.path,
+            format!(".socket/vendor/npm/{NEXT}/left-pad-1.3.0.tgz")
+        );
+        assert_eq!(
+            tokio::fs::read(
+                fx.root()
+                    .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"))
+            )
+            .await
+            .unwrap(),
+            alt
+        );
+    }
+
     /// F8: no ledger, no anchor — today's re-pin (the documented residual).
     #[tokio::test]
     async fn bun_missing_ledger_keeps_todays_repin() {
