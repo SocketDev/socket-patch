@@ -421,14 +421,20 @@ async fn embed_vex_human(
 /// `selection_required`. `Err` carries the exit code AND the message: the
 /// JSON callers must fold it into their envelope (every `--json`
 /// invocation emits exactly one JSON object — see CLI_CONTRACT.md), so
-/// the stderr line alone is not enough.
+/// the stderr line alone is not enough. `show_progress` / `warn` are the
+/// human-only output knobs of [`fetch_patch_details`] (the JSON callers pass
+/// `false, false`; the hosted human arm passes the same values as the agent
+/// human arm, so the two print the same progress counter and per-package
+/// warnings).
 async fn discover_selected(
     api_client: &socket_patch_core::api::client::ApiClient,
     packages: &[BatchPackagePatches],
     can_access_paid_patches: bool,
+    show_progress: bool,
+    warn: bool,
 ) -> Result<Vec<PatchSearchResult>, (i32, String)> {
     let (all_search_results, error_count, last_error) =
-        fetch_patch_details(api_client, packages, false, false).await;
+        fetch_patch_details(api_client, packages, show_progress, warn).await;
     if error_count > 0 && error_count == packages.len() {
         let err = last_error.unwrap_or_else(|| "all patch-detail queries failed".to_string());
         let message = format!("all {error_count} patch-detail queries failed: {err}");
@@ -481,6 +487,19 @@ async fn fetch_patch_details(
         eprintln!();
     }
     (results, error_count, last_error)
+}
+
+/// The human hosted arm's stand-in for the lenient loader's advisory: a
+/// malformed redirect ledger the engine would report as a hard error, on a
+/// run that returned BEFORE the engine (empty discovery, nothing
+/// downloadable, a detail-fetch failure, a declined confirm). Read-only —
+/// the file is never moved; `--silent` mutes it like every advisory.
+fn warn_unreported_corrupt_ledger(common: &crate::args::GlobalArgs, corrupt: Option<&str>) {
+    if let Some(corrupt) = corrupt {
+        if !common.silent {
+            eprintln!("Warning: {corrupt}");
+        }
+    }
 }
 
 /// Fold a [`discover_selected`] failure into a JSON caller's `result` and
@@ -2088,15 +2107,27 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // warned about here (and muted by --silent — the warning is advisory)
     // — this is a read-only consult; a malformed vendor ledger contributes
     // nothing (the supplement above already recovered its purls from the
-    // committed artifacts). A HOSTED run mutes the warning outright: its
-    // engine loads the same ledger strictly, under the apply lock, and
-    // reports the corruption ONCE as the hard error it is (quarantine
-    // included), so the advisory here would only duplicate that message.
-    let redirect_state = crate::commands::load_redirect_state_lenient(
-        &args.common.cwd,
-        args.common.silent || hosted,
-    )
-    .await;
+    // committed artifacts). A HOSTED run does not warn here: its engine
+    // loads the same ledger strictly, under the apply lock when it holds
+    // one, and reports the corruption ONCE as the hard error it is, so the
+    // advisory here would only duplicate that message. But the human hosted
+    // arm has returns BEFORE the engine (empty discovery, nothing
+    // downloadable, a detail-fetch failure, a declined confirm) where nobody
+    // would report it — so the corruption text is kept and printed at those
+    // returns (`warn_unreported_corrupt_ledger`), never quarantined (a
+    // read-only consult; quarantine is the engine's under-lock job).
+    let (redirect_state, hosted_corrupt_ledger) = if hosted {
+        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
+            Ok(state) => (state, None),
+            Err(corrupt) => (None, Some(corrupt.to_string())),
+        }
+    } else {
+        (
+            crate::commands::load_redirect_state_lenient(&args.common.cwd, args.common.silent)
+                .await,
+            None,
+        )
+    };
     let update_manifest = merge_ledger_records_for_updates(
         existing_manifest.as_ref(),
         redirect_state.as_ref(),
@@ -2215,6 +2246,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 &api_client,
                 &all_packages_with_patches,
                 can_access_paid_patches,
+                false,
+                false,
             )
             .await
             {
@@ -2397,6 +2430,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         if !args.common.silent {
             println!("\nNo patches available for installed packages.");
         }
+        warn_unreported_corrupt_ledger(&args.common, hosted_corrupt_ledger.as_deref());
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
@@ -2555,17 +2589,44 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // (the `--json` arm, which returned above with the redirect result
     // NESTED in its envelope) and the same engine entry as `get --mode
     // hosted`.
+    // Count downloadable patches. Shared by the hosted arm below and the
+    // agent/vendored arms: a free-tier org whose every offer is paid-tier has
+    // nothing any mode could select, so every human arm stops here with the
+    // same paid-subscription line instead of entering its engine for a
+    // no-op (hosted would otherwise print `Redirected 0 package(s)`).
+    let downloadable_count = if can_access_paid_patches {
+        all_packages_with_patches.len()
+    } else {
+        all_packages_with_patches
+            .iter()
+            .filter(|pkg| pkg.patches.iter().any(|p| p.tier == "free"))
+            .count()
+    };
+
+    if downloadable_count == 0 {
+        if !args.common.silent {
+            println!("\nNo downloadable patches (paid subscription required).");
+        }
+        warn_unreported_corrupt_ledger(&args.common, hosted_corrupt_ledger.as_deref());
+        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
+    }
+
     if hosted {
         let selected = match discover_selected(
             &api_client,
             &all_packages_with_patches,
             can_access_paid_patches,
+            show_progress,
+            !args.common.silent,
         )
         .await
         {
             Ok(s) => s,
             // `discover_selected` already printed the failure to stderr.
-            Err((code, _)) => return code,
+            Err((code, _)) => {
+                warn_unreported_corrupt_ledger(&args.common, hosted_corrupt_ledger.as_deref());
+                return code;
+            }
         };
         // The engine honors `--dry-run` itself (a preview mutates nothing),
         // so only a wet run with work confirms. `--mode hosted` is explicit
@@ -2580,6 +2641,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 if !args.common.silent {
                     print_get_hint(true);
                 }
+                warn_unreported_corrupt_ledger(&args.common, hosted_corrupt_ledger.as_deref());
                 return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
             }
         }
@@ -2596,23 +2658,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             None,
         )
         .await;
-    }
-
-    // Count downloadable patches
-    let downloadable_count = if can_access_paid_patches {
-        all_packages_with_patches.len()
-    } else {
-        all_packages_with_patches
-            .iter()
-            .filter(|pkg| pkg.patches.iter().any(|p| p.tier == "free"))
-            .count()
-    };
-
-    if downloadable_count == 0 {
-        if !args.common.silent {
-            println!("\nNo downloadable patches (paid subscription required).");
-        }
-        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
     // Fetch the full per-package patch lists — the same loop the JSON arms

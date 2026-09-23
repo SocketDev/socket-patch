@@ -453,6 +453,8 @@ async fn run_vendor_json_path(
         api_client,
         all_packages_with_patches,
         can_access_paid_patches,
+        false,
+        false,
     )
     .await
     {

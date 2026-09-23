@@ -85,11 +85,17 @@ into the new version's section — see docs/releasing.md.
   Human `scan --mode hosted` now prints the results table and update
   detection like the other modes and confirms once ("Redirect N package(s)
   to the hosted patch server?" — the same prompt as `get --mode hosted` —
-  default yes, skipped by `--yes`/`--json`; on a non-TTY stdin without
-  `--yes` it prints `Non-interactive mode detected, proceeding with default.`
-  and proceeds), and an empty hosted discovery prints
-  `No patches available for installed packages.` and exits 0 without
-  entering the redirect engine (was `Redirected 0 package(s)`).
+  default yes, skipped by `--yes`/`--json`/`--dry-run`; on a non-TTY stdin
+  without `--yes` it prints `Non-interactive mode detected, proceeding with
+  default.` and proceeds), fetches patch details with the agent arm's
+  progress counter and per-package warnings, and an empty hosted discovery
+  prints `No patches available for installed packages.` and exits 0 without
+  entering the redirect engine (was `Redirected 0 package(s)`); a discovery
+  whose every offer is paid-tier for an org without paid access stops the
+  same way with `No downloadable patches (paid subscription required).`. A
+  malformed redirect ledger on a human hosted run that stops before the
+  engine is reported as the read-only `Warning: the redirect ledger … is
+  malformed` advisory instead of nowhere.
 - **`apply.lock` never outlives a command, and hosted mode takes it.** Lock
   acquisition creates `.socket/` when missing; the lock file is unlinked
   (while still held) and an otherwise-empty `.socket/` removed when the
@@ -103,7 +109,14 @@ into the new version's section — see docs/releasing.md.
   JSON shape; a read-only project root or a file squatting on `.socket/` is
   refused at the lock, before the redirect ledger is touched, and a
   vendored→hosted takeover over a symlinked wiring file is refused with
-  `redirect_symlinked_file_unsupported` before any revert). Agent-mode `get`
+  `redirect_symlinked_file_unsupported` before any revert). A zero-grant wet
+  run — which holds no lock — no longer moves a malformed
+  `redirect-state.json` aside: like a dry run it reports the hard error and
+  leaves the file in place; only the lock holder quarantines. The lock guard
+  unlinks only the file it holds (a replacement planted by a non-cooperating
+  `rm` + `touch` is left for the next acquire), and a long `--lock-timeout`
+  wait behind a hot loop of short commands can no longer accumulate its
+  vanished-file retries into a spurious `lock_io`. Agent-mode `get`
   and `scan --apply`/`--sync` hold one lock window across download →
   manifest write → nested apply (the nested apply no longer re-acquires and
   now inherits `--lock-timeout`/`--verbose`); `setup` takes the lock while

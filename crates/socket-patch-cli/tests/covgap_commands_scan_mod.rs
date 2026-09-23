@@ -1762,9 +1762,9 @@ async fn scan_human_vendored_dry_run_names_would_refuse_records() {
         stdout.contains("lockfileVersion-1 lock") && stdout.contains("--mode hosted"),
         "the engine's detail rides along; got {stdout:?}"
     );
-    // Nothing written: no manifest, no blobs, no vendor ledger. (The human
-    // preview does fetch the patch view for its baseline-hash check — the
-    // same as every human dry run — so the request log is not the oracle.)
+    // Nothing written: no manifest, no blobs, no vendor ledger. (The dry-run
+    // return precedes the human arm's baseline pre-verify, so this preview
+    // fetches no patch view either; the on-disk state is the oracle here.)
     assert!(
         !tmp.path().join(".socket").exists(),
         "a dry run writes nothing"

@@ -847,6 +847,8 @@ pub(super) async fn run_redirect(
         api_client,
         all_packages_with_patches,
         can_access_paid_patches,
+        false,
+        false,
     )
     .await
     {
@@ -894,8 +896,10 @@ pub(super) async fn run_redirect(
 /// prompt (`scan/mod.rs`) — and by `get --mode hosted` (which pins the
 /// advisory-resolved uuid), so all produce identical on-disk results for
 /// the same selection. The redirect ledger is loaded HERE, under the apply
-/// lock (never handed in pre-loaded: a copy read before the lock could
-/// merge over a concurrent writer's edits).
+/// lock whenever this run holds one (never handed in pre-loaded: a copy
+/// read before the lock could merge over a concurrent writer's edits); a
+/// dry run or a zero-grant run reads it strictly but writes nothing,
+/// quarantine included.
 ///
 /// `scan_result` must be `Some` exactly when `common.json` is set (the
 /// human/JSON split keys on `common.json`; a `--json` caller passing `None`
@@ -1077,8 +1081,9 @@ pub(crate) async fn run_redirect_selected(
     // concurrent wet run, or fail on a read-only checkout). Acquired BEFORE
     // the ledger load so load → merge → persist is one critical section
     // (rollback's rule: a ledger a run will persist is loaded under the
-    // lock) and held to the end of the function.
-    let _lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() {
+    // lock) and held to the end of the function. Read below: it also gates
+    // the corrupt-ledger quarantine, the one write the load itself can make.
+    let lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() {
         match acquire_hosted_lock(common, &mut scan_result) {
             Ok(guard) => Some(guard),
             Err(code) => return code,
@@ -1094,7 +1099,11 @@ pub(crate) async fn run_redirect_selected(
     // ledger" and the merge below would have started fresh, silently
     // overwriting that revert data. The malformed file is moved aside to
     // redirect-state.json.corrupt (never clobbered) so recovery stays
-    // possible; a dry-run reports the same hard error but moves nothing.
+    // possible. Only a run holding the apply lock moves it: a dry run or a
+    // zero-grant run — neither holds the lock, neither would have written
+    // anything — reports the same hard error but moves nothing (the message
+    // then names the repair-or-move-aside remedy instead of the `.corrupt`
+    // path), so no `.socket/vendor/` mutation ever happens lock-free.
     //
     // Held as the ONE in-memory ledger for the whole run: the write below
     // merges into it in place, the stale-install probes read its records
@@ -1107,7 +1116,7 @@ pub(crate) async fn run_redirect_selected(
         match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await {
             Ok(state) => state.unwrap_or_else(RedirectState::new),
             Err(mut corrupt) => {
-                if !common.dry_run {
+                if lock.is_some() {
                     corrupt.quarantine().await;
                 }
                 let message = corrupt.to_string();
