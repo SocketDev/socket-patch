@@ -61,11 +61,28 @@ impl RubyCrawler {
         app_config_env: Option<&OsStr>,
         home_env: Option<&OsStr>,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
+        Ok(
+            Self::gem_paths_and_discovery(options, bundle_path_env, app_config_env, home_env)
+                .await
+                .0,
+        )
+    }
+
+    /// The gem paths plus the local-mode bundle-store discovery they came
+    /// from (`None` in global / `--global-prefix` mode, which never probes
+    /// the Bundler roots), so a caller that needs the discovery's advisories
+    /// (`skipped_config_path`) does not probe the roots a second time.
+    async fn gem_paths_and_discovery(
+        options: &CrawlerOptions,
+        bundle_path_env: Option<&OsStr>,
+        app_config_env: Option<&OsStr>,
+        home_env: Option<&OsStr>,
+    ) -> (Vec<PathBuf>, Option<BundleStoreDiscovery>) {
         if options.global || options.global_prefix.is_some() {
             if let Some(ref custom) = options.global_prefix {
-                return Ok(vec![custom.clone()]);
+                return (vec![custom.clone()], None);
             }
-            return Ok(Self::get_global_gem_paths().await);
+            return (Self::get_global_gem_paths().await, None);
         }
 
         // Local mode: probe the Bundler install roots first.
@@ -76,6 +93,7 @@ impl RubyCrawler {
             home_env,
         )
         .await;
+        let mut paths = discovery.stores.clone();
 
         // Historic early-return, kept ONLY for the implicit project-local
         // `vendor/bundle` probe: a deployment-style install is the
@@ -86,20 +104,15 @@ impl RubyCrawler {
         // env-`BUNDLE_PATH` project still needs the `gem env` homes to see
         // them (the explicit-roots feature briefly suppressed that
         // pre-existing fallback).
-        if discovery.default_root_has_stores {
-            return Ok(discovery.stores);
-        }
-
-        let mut paths = discovery.stores;
-
-        // Only consult the installed gem homes if this looks like a Ruby
-        // project. A non-deployment `bundle install` puts the project's gems
-        // in the ambient gem homes, so every home `gem env` reports counts —
-        // not just `gemdir`: bundler resolves from all of `Gem.path`, and a
-        // gem the project loads routinely lives in a non-`gemdir` home (rvm
-        // keeps shared gems in the `@global` gemset; `--user-install` puts
-        // them under `~/.gem`/`$XDG_DATA_HOME`).
-        if Self::has_bundler_manifest(&options.cwd).await {
+        //
+        // Otherwise only consult the installed gem homes if this looks like
+        // a Ruby project. A non-deployment `bundle install` puts the
+        // project's gems in the ambient gem homes, so every home `gem env`
+        // reports counts — not just `gemdir`: bundler resolves from all of
+        // `Gem.path`, and a gem the project loads routinely lives in a
+        // non-`gemdir` home (rvm keeps shared gems in the `@global` gemset;
+        // `--user-install` puts them under `~/.gem`/`$XDG_DATA_HOME`).
+        if !discovery.default_root_has_stores && Self::has_bundler_manifest(&options.cwd).await {
             let mut seen: HashSet<PathBuf> = paths.iter().cloned().collect();
             for gems_dir in Self::gem_env_gems_dirs().await {
                 if seen.insert(gems_dir.clone()) {
@@ -108,22 +121,39 @@ impl RubyCrawler {
             }
         }
 
-        Ok(paths)
+        (paths, Some(discovery))
     }
 
     /// Crawl all discovered gem paths and return every package found.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
+        self.crawl_all_with_discovery(options).await.0
+    }
+
+    /// [`Self::crawl_all`] plus the bundle-store discovery the local-mode
+    /// crawl consulted (`None` in global / `--global-prefix` mode), so the
+    /// CLI can surface its `skipped_config_path` advisory without probing
+    /// the Bundler roots again.
+    pub async fn crawl_all_with_discovery(
+        &self,
+        options: &CrawlerOptions,
+    ) -> (Vec<CrawledPackage>, Option<BundleStoreDiscovery>) {
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
 
-        let gem_paths = self.get_gem_paths(options).await.unwrap_or_default();
+        let (gem_paths, discovery) = Self::gem_paths_and_discovery(
+            options,
+            std::env::var_os("BUNDLE_PATH").as_deref(),
+            std::env::var_os("BUNDLE_APP_CONFIG").as_deref(),
+            ambient_home().as_deref(),
+        )
+        .await;
 
         for gem_path in &gem_paths {
             let found = self.scan_gem_dir(gem_path, &mut seen).await;
             packages.extend(found);
         }
 
-        packages
+        (packages, discovery)
     }
 
     /// Find specific packages by PURL inside a single gem directory.

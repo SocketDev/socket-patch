@@ -655,11 +655,12 @@ async fn gem_stale_install_warnings(
     global: bool,
     global_prefix: Option<std::path::PathBuf>,
     confirmed: &[(String, String)],
+    // This run's fetched records MERGED with the ledger's persisted ones
+    // (the caller hands the post-merge ledger map): the persisted half is
+    // the fallback judgment source when this run's /patches/view fetch
+    // failed transiently, so the warning keeps firing until the stale
+    // materialization is gone.
     records: &std::collections::BTreeMap<String, socket_patch_core::manifest::schema::PatchRecord>,
-    ledger_records: &std::collections::BTreeMap<
-        String,
-        socket_patch_core::manifest::schema::PatchRecord,
-    >,
     gem_artifact_shas: &std::collections::BTreeMap<(String, String), String>,
 ) -> StaleInstallOutcome {
     use socket_patch_core::crawlers::types::CrawlerOptions;
@@ -669,12 +670,7 @@ async fn gem_stale_install_warnings(
     use socket_patch_core::vex::verify::verify_patch_record;
 
     let mut out = StaleInstallOutcome::default();
-    let find_record = |uuid: &str| -> Option<&PatchRecord> {
-        records
-            .values()
-            .chain(ledger_records.values())
-            .find(|r| r.uuid == uuid)
-    };
+    let find_record = |uuid: &str| -> Option<&PatchRecord> { records.values().find(|r| r.uuid == uuid) };
     // Record availability folds into the candidate filter (a zero-file map
     // included: nothing to hash means no judgment either way) so the no-op
     // cases return here, before the crawler is built. On `--dry-run` the
@@ -894,9 +890,14 @@ pub(super) async fn run_redirect(
 /// first) → candidate-file read → rewrite → pnpm trust config →
 /// confirmation probe → ledger merge-then-persist → file writes → gem stale
 /// probe → warnings → optional VEX. Shared VERBATIM by `scan --mode hosted`
-/// (whose `run_redirect` wrapper selects via `discover_selected`) and
-/// `get --mode hosted` (which pins the advisory-resolved uuid), so both
-/// produce identical on-disk results for the same selection.
+/// — its `--json` arm through the `run_redirect` wrapper (which selects via
+/// `discover_selected`), its human arm through
+/// [`boxed_run_redirect_selected`] directly, after its own table + confirm
+/// prompt (`scan/mod.rs`) — and by `get --mode hosted` (which pins the
+/// advisory-resolved uuid), so all produce identical on-disk results for
+/// the same selection. The redirect ledger is loaded HERE, under the apply
+/// lock (never handed in pre-loaded: a copy read before the lock could
+/// merge over a concurrent writer's edits).
 ///
 /// `scan_result` must be `Some` exactly when `common.json` is set (the
 /// human/JSON split keys on `common.json`; a `--json` caller passing `None`
@@ -1100,11 +1101,12 @@ pub(crate) async fn run_redirect_selected(
     // possible; a dry-run reports the same hard error but moves nothing.
     //
     // Held as the ONE in-memory ledger for the whole run: the write below
-    // merges into it in place, and the stale-install probes read its
-    // records (persisted ones included — their fallback judgment source
-    // when this run's /patches/view fetch fails transiently: the warning
-    // must keep firing until the stale materialization is gone, not until
-    // the first flaky fetch).
+    // merges into it in place, the stale-install probes read its records
+    // (persisted ones included — their fallback judgment source when this
+    // run's /patches/view fetch fails transiently: the warning must keep
+    // firing until the stale materialization is gone, not until the first
+    // flaky fetch), and the takeover classification at the end reads the
+    // merged state.
     let mut ledger =
         match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await {
             Ok(state) => state.unwrap_or_else(RedirectState::new),
@@ -1120,6 +1122,14 @@ pub(crate) async fn run_redirect_selected(
                 return 1;
             }
         };
+    // The vendored ledger, loaded ONCE per run (under the same lock, so no
+    // other writer can move the on-disk file under it): the takeover below
+    // mutates it in place per reverted purl (saving after each), and the
+    // post-write overlap classification reads that post-takeover state —
+    // never a pre-takeover snapshot, which would flag every migrated purl
+    // as still vendored. `Err` (unreadable / malformed) is "no vendored
+    // ownership known" for both consumers.
+    let mut vendor_state = socket_patch_core::vendor::load_state(&common.cwd).await;
 
     // Cross-mode takeover: a purl this run is about to redirect may still be
     // VENDORED — for cargo a committed `[patch.crates-io]` path entry, a
@@ -1153,10 +1163,6 @@ pub(crate) async fn run_redirect_selected(
         // No takeover-capable candidates — nothing to reconcile.
     } else {
         use socket_patch_core::utils::purl::{canonical_purl as canon, strip_purl_qualifiers};
-        // Loaded ONCE and mutated in place per reverted purl (the wet loop
-        // saves after each revert): this run holds the apply lock, so no
-        // other writer can move the on-disk ledger under it.
-        let mut vendor_state = socket_patch_core::vendor::load_state(&common.cwd).await;
         // Each takeover-capable candidate with its vendored ledger entry, if
         // any (cloned out so the loop can mutate the state).
         let takeover: Vec<(&Candidate, Option<socket_patch_core::vendor::VendorEntry>)> =
@@ -2129,7 +2135,7 @@ pub(crate) async fn run_redirect_selected(
                     ledger.edits.push(edit.clone());
                 }
             }
-            ledger.records.extend(records.clone());
+            ledger.records.extend(records);
             // The ledger is the only revert path and the VEX record store —
             // a swallowed write failure would let the lockfile writes below
             // proceed with no revert data persisted while reporting success.
@@ -2203,7 +2209,6 @@ pub(crate) async fn run_redirect_selected(
             common.global,
             common.global_prefix.clone(),
             &confirmed,
-            &records,
             &ledger.records,
             &gem_artifact_shas,
         )
@@ -2216,7 +2221,6 @@ pub(crate) async fn run_redirect_selected(
             common,
             &confirmed,
             &rewrite.confirmed_pipenv_uuids,
-            &records,
             &ledger.records,
         )
         .await
@@ -2231,9 +2235,17 @@ pub(crate) async fn run_redirect_selected(
     // points at the vendored files stays silent instead of pointing cleanup at
     // the live vendored ledger. Warn (JSON `warnings[]` and stderr) WITHOUT
     // deleting the other mode's ledger; reconciliation is deferred (see PR Scope).
-    // Read after the ledger write above so a non-dry-run reflects this run.
+    // Classified over this run's in-memory ledgers — the redirect ledger as
+    // merged and persisted above, the vendored ledger as the takeover left
+    // it — so a non-dry-run reflects this run without re-reading either file.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
-    let superseded = super::classify_overlap_takeover(&common.cwd).await.redirect;
+    let superseded = super::classify_overlap_takeover_with(
+        &common.cwd,
+        Some(&ledger),
+        vendor_state.as_ref().ok(),
+    )
+    .await
+    .redirect;
     if !superseded.is_empty() {
         takeover_warnings.push(serde_json::json!({
             "code": super::REDIRECT_SUPERSEDES_VENDORED,
@@ -2994,8 +3006,9 @@ mod tests {
     }
 
     /// Probe invocation with the default surface (project-local discovery,
-    /// no ledger fallback, no artifact shas) — tests override the knobs
-    /// they exercise.
+    /// no artifact shas) — tests override the knobs they exercise.
+    /// `records` is the merged map production hands over (this run's
+    /// fetched records plus the ledger's persisted ones).
     async fn probe(
         cwd: &std::path::Path,
         confirmed: &[(String, String)],
@@ -3007,7 +3020,6 @@ mod tests {
             None,
             confirmed,
             records,
-            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
         )
         .await
@@ -3256,25 +3268,21 @@ mod tests {
         );
     }
 
-    /// RE-FIRE guarantee: when this run's record fetch failed (fresh records
-    /// empty) the probe falls back to the redirect ledger's persisted
-    /// records, so a transient /patches/view failure cannot silently retire
-    /// the warning while the stale materialization is still there.
+    /// RE-FIRE guarantee: when this run's record fetch failed (no fresh
+    /// records), the merged map the caller hands over still carries the
+    /// redirect ledger's PERSISTED record under whatever purl key the
+    /// ledger used — and the probe's uuid lookup judges from it, so a
+    /// transient /patches/view failure cannot silently retire the warning
+    /// while the stale materialization is still there.
     #[tokio::test]
-    async fn gem_stale_probe_falls_back_to_ledger_records() {
+    async fn gem_stale_probe_judges_from_persisted_ledger_records() {
         let stale = tempfile::tempdir().unwrap();
         materialize_gem(stale.path(), GEM_UPSTREAM);
-        let fresh = std::collections::BTreeMap::new();
-        let out = gem_stale_install_warnings(
-            stale.path(),
-            false,
-            None,
-            &one_confirmed(),
-            &fresh,
-            &one_record(), // the ledger snapshot
-            &std::collections::BTreeMap::new(),
-        )
-        .await;
+        // Persisted under the API's qualified spelling, not the confirmed
+        // purl: only the uuid links them.
+        let mut ledger_only = std::collections::BTreeMap::new();
+        ledger_only.insert(format!("{GEM_PURL}?platform=ruby"), gem_record());
+        let out = probe(stale.path(), &one_confirmed(), &ledger_only).await;
         assert_eq!(
             out.warnings.len(),
             1,
@@ -3301,7 +3309,6 @@ mod tests {
             Some(store.clone()),
             &one_confirmed(),
             &one_record(),
-            &std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
         )
         .await;
@@ -3376,7 +3383,6 @@ mod tests {
             None,
             &one_confirmed(),
             &one_record(),
-            &std::collections::BTreeMap::new(),
             &shas,
         )
         .await;
@@ -3416,7 +3422,6 @@ mod tests {
             None,
             &one_confirmed(),
             &one_record(),
-            &std::collections::BTreeMap::new(),
             &shas,
         )
         .await;
@@ -3441,7 +3446,6 @@ mod tests {
             None,
             &one_confirmed(),
             &one_record(),
-            &std::collections::BTreeMap::new(),
             &patched_shas,
         )
         .await;
@@ -3464,7 +3468,6 @@ mod tests {
             None,
             &one_confirmed(),
             &one_record(),
-            &std::collections::BTreeMap::new(),
             &shas,
         )
         .await;
@@ -3548,7 +3551,6 @@ mod tests {
             None,
             &one_confirmed(),
             &one_record(),
-            &std::collections::BTreeMap::new(),
             &shas,
         )
         .await;

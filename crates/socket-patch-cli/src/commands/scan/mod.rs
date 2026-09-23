@@ -8,15 +8,16 @@
 
 use clap::Args;
 use socket_patch_core::api::client::{
-    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate,
+    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate, ApiClient,
 };
 use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
 use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
-use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem, RubyCrawler};
+use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::vendor::VendorState;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -24,10 +25,11 @@ use std::path::Path;
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::crawl_all_ecosystems;
-use crate::output::{color, confirm, format_severity};
+use crate::output::{color, confirm, format_severity, print_json};
 
 use super::get::{
-    download_and_apply_patches, select_patches, truncate_with_ellipsis, DownloadParams,
+    download_and_apply_patches_with, select_patches, truncate_with_ellipsis, DownloadParams,
+    DownloadRun,
 };
 
 mod discovery;
@@ -38,7 +40,7 @@ mod vendor_flow;
 use self::discovery::{
     collect_vuln_ids, detect_updates, lockfile_only_contains, lockfile_supplement,
     merge_ledger_records_for_updates, preverify_vendor_baselines, severity_order,
-    vendored_ledger_supplement, vendored_purl_keys, LockfileSupplement,
+    vendored_ledger_supplement, LockfileSupplement,
 };
 // Shared with `get --mode hosted|vendored` (commands::get): the advisory-
 // pinned entry into the hosted engine, the vendor step + its dry-run
@@ -498,11 +500,7 @@ async fn fetch_patch_details(
 fn emit_discovery_error_json(result: &mut serde_json::Value, message: &str) {
     result["status"] = serde_json::json!("error");
     result["error"] = serde_json::json!(message);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(result)
-            .expect("serializing an in-memory JSON value cannot fail")
-    );
+    print_json(result);
 }
 
 /// The report-only / declined-prompt hint: how to consume one patch
@@ -597,6 +595,18 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
     }
 }
 
+/// The run-level context the agent engine borrows from scan: the client
+/// `run` already built (proxy fallback included) and the flags the nested
+/// apply inherits — so `scan --apply` honors `--lock-timeout` and never
+/// rebuilds the client.
+fn download_run<'a>(args: &ScanArgs, api_client: &'a ApiClient) -> DownloadRun<'a> {
+    DownloadRun {
+        api_client,
+        lock_timeout: args.common.lock_timeout,
+        verbose: args.common.verbose,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cross-mode ledger takeover detection (hosted ⇄ vendored)
 // ---------------------------------------------------------------------------
@@ -654,16 +664,35 @@ pub(super) const REDIRECT_PRUNE_IGNORED_DETAIL: &str =
 /// one way). Empty when either ledger is missing/empty/unreadable, or when the
 /// two ledgers describe disjoint packages (a legitimate split: some redirected,
 /// others vendored) — so there are no false positives.
+///
+/// Production classifies through [`classify_overlap_takeover_with`] over
+/// ledgers it already holds; this load-then-derive form is the unit tests'
+/// entry point.
+#[cfg(test)]
 pub(super) async fn overlapping_ledger_purls(cwd: &Path) -> Vec<String> {
     // A malformed redirect ledger classifies like a missing one here — this
     // path only feeds takeover WARNINGS, and the corruption itself is already
     // a hard error on every path that would write (`run_redirect`) or attest
     // (`vex`) from the ledger.
-    let Ok(Some(redirect)) = socket_patch_core::patch::redirect::load_redirect_state(cwd).await
-    else {
+    let redirect = socket_patch_core::patch::redirect::load_redirect_state(cwd)
+        .await
+        .ok()
+        .flatten();
+    let Ok(vendor) = socket_patch_core::vendor::load_state(cwd).await else {
         return Vec::new();
     };
-    let Ok(vendor) = socket_patch_core::vendor::load_state(cwd).await else {
+    overlap_from_states(redirect.as_ref(), &vendor)
+}
+
+/// [`overlapping_ledger_purls`] over ALREADY-LOADED ledgers — loads nothing,
+/// so a flow holding both in memory (the hosted engine, post-merge) shares
+/// its copies instead of re-reading them. `None` / an empty vendor ledger
+/// yield the empty overlap, exactly like the missing-file cases above.
+fn overlap_from_states(
+    redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
+    vendor: &VendorState,
+) -> Vec<String> {
+    let Some(redirect) = redirect else {
         return Vec::new();
     };
     if vendor.entries.is_empty() {
@@ -757,17 +786,39 @@ pub(super) struct OverlapTakeover {
 }
 
 pub(super) async fn classify_overlap_takeover(cwd: &Path) -> OverlapTakeover {
-    let overlap = overlapping_ledger_purls(cwd).await;
+    // Both ledgers loaded ONCE here. A malformed ledger classifies like a
+    // missing one, matching `overlapping_ledger_purls` (this path only
+    // feeds takeover warnings; corruption is a hard error on the
+    // write/attest paths).
+    let redirect = socket_patch_core::patch::redirect::load_redirect_state(cwd)
+        .await
+        .ok()
+        .flatten();
+    let vendor = socket_patch_core::vendor::load_state(cwd).await.ok();
+    classify_overlap_takeover_with(cwd, redirect.as_ref(), vendor.as_ref()).await
+}
+
+/// [`classify_overlap_takeover`] over ALREADY-LOADED ledgers: loads neither
+/// (the hosted engine holds both in memory — its post-merge redirect ledger
+/// and the post-takeover vendor ledger — and must classify against those,
+/// never a pre-takeover snapshot) but still inventories the LIVE lockfiles
+/// in `cwd`, the truth source for direction. `None` for either ledger
+/// yields no overlap.
+pub(super) async fn classify_overlap_takeover_with(
+    cwd: &Path,
+    redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
+    vendor: Option<&VendorState>,
+) -> OverlapTakeover {
     let mut out = OverlapTakeover::default();
+    let Some(vendor) = vendor else {
+        return out;
+    };
+    let overlap = overlap_from_states(redirect, vendor);
     if overlap.is_empty() {
         return out;
     }
-    // Re-load the vendored ledger to recover each overlapping entry's uuid +
-    // the lockfiles it wired (revert reads the same set); `overlapping_ledger_purls`
-    // already proved it loads and is non-empty.
-    let Ok(vendor) = socket_patch_core::vendor::load_state(cwd).await else {
-        return out;
-    };
+    // Each overlapping vendored entry's uuid + the lockfiles it wired
+    // (revert reads the same set).
     let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
     let mut vendor_by_purl: std::collections::HashMap<
         String,
@@ -781,19 +832,12 @@ pub(super) async fn classify_overlap_takeover(cwd: &Path) -> OverlapTakeover {
     }
     // The hosted proof needs the redirect ledger too: each record's patch
     // uuid (embedded in every hosted artifact URL, whatever the host) and
-    // the lockfiles the redirect actually edited. A malformed ledger
-    // classifies like a missing one, matching `overlapping_ledger_purls`
-    // (this path only feeds takeover warnings; corruption is a hard error
-    // on the write/attest paths) — and that guard already returned empty
-    // overlap for the corrupt case, so this consult never runs then.
-    let redirect_state = socket_patch_core::patch::redirect::load_redirect_state(cwd)
-        .await
-        .ok()
-        .flatten();
+    // the lockfiles the redirect actually edited. A non-empty overlap
+    // proves the ledger is `Some`.
     let mut redirect_uuid_by_purl: std::collections::HashMap<String, &str> =
         std::collections::HashMap::new();
     let mut redirect_files: Vec<&str> = Vec::new();
-    if let Some(redirect) = &redirect_state {
+    if let Some(redirect) = redirect {
         for (key, record) in &redirect.records {
             redirect_uuid_by_purl
                 .entry(canon(key))
@@ -1512,11 +1556,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 "updates": [],
                 "paths": path_scope.raw(),
             });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&result)
-                    .expect("serializing an in-memory JSON value cannot fail")
-            );
+            print_json(&result);
         } else {
             eprintln!("Error: {err}");
         }
@@ -1594,7 +1634,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     }
 
     // Crawl packages
-    let (mut all_crawled, mut eco_counts) = crawl_all_ecosystems(&crawler_options).await;
+    let (mut all_crawled, mut eco_counts, skipped_bundle_config_path) =
+        crawl_all_ecosystems(&crawler_options).await;
 
     // Lockfile supplement: dependencies the project's lockfile resolves
     // that have NO installed copy (fresh clone, partial install). They join
@@ -1610,23 +1651,17 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // guard (a committed `.bundle/config` whose BUNDLE_PATH resolves
     // outside the project — untrusted input that would otherwise become a
     // scan/apply WRITE-target root). The crawl above consulted and
-    // silently skipped it; surface the skip on the SAME run-level channel
-    // as the layout refusals (JSON `warnings[]` on both the zero-package
-    // and ≥1-package envelopes; a gated stderr line on the human path).
-    // Scoped like the crawl that hit it: local mode, with gem not filtered
-    // out by `--ecosystems`. Cheap re-probe: filesystem only, no `gem env`
-    // shell-out.
-    if !crawler_options.global
-        && crawler_options.global_prefix.is_none()
-        && args
+    // silently skipped it, handing the skip back (local mode only); surface
+    // it on the SAME run-level channel as the layout refusals (JSON
+    // `warnings[]` on both the zero-package and ≥1-package envelopes; a
+    // gated stderr line on the human path) unless `--ecosystems` filtered
+    // gem out of this run.
+    if let Some(value) = skipped_bundle_config_path {
+        if args
             .common
             .ecosystems
             .as_ref()
             .is_none_or(|list| list.iter().any(|e| e == Ecosystem::Gem.cli_name()))
-    {
-        if let Some(value) = RubyCrawler::discover_bundle_stores(&args.common.cwd)
-            .await
-            .skipped_config_path
         {
             let (code, detail) = config_path_ignored_warning(&value);
             layout_refusals.push((code.to_string(), detail));
@@ -1679,8 +1714,13 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // Vendor-ledger purl keys (from the single load above), shared by the
     // prune exemption (a vendored package is consumed from the committed
     // artifact, so "absent from the crawl" is its normal state, not
-    // grounds for pruning) and the vendored-skip in the apply path.
-    let vendored_purls = vendored_purl_keys(&vendor_state);
+    // grounds for pruning) and the vendored-skip in the apply path. A
+    // corrupt ledger degrades to the EMPTY set — fail-open by the key set's
+    // documented contract (the supplement above is the fail-closed half).
+    let vendored_purls: HashSet<String> = vendor_state
+        .as_ref()
+        .map(VendorState::purl_keys)
+        .unwrap_or_default();
 
     // Filter by --ecosystems if provided
     let filtered_crawled: Vec<_> = if let Some(ref allowed) = args.common.ecosystems {
@@ -1719,10 +1759,11 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 ),
             ));
         }
+        let scope = path_scope.bind(&args.common.cwd);
         let in_scope: HashSet<String> = filtered_crawled
             .iter()
             .filter(|pkg| !supplement_purls.contains(&pkg.purl))
-            .filter(|pkg| path_scope.matches(&args.common.cwd, &pkg.path))
+            .filter(|pkg| scope.matches(&pkg.path))
             .map(|pkg| pkg.purl.clone())
             .collect();
         filtered_crawled
@@ -1794,19 +1835,15 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             if hosted {
                 let mut warnings: Vec<serde_json::Value> = Vec::new();
                 if prune {
-                    warnings.push(serde_json::json!({
-                        "code": REDIRECT_PRUNE_IGNORED,
-                        "detail": REDIRECT_PRUNE_IGNORED_DETAIL,
-                    }));
+                    warnings.push(hosted::prune_ignored_warning());
                 }
-                result["redirect"] = serde_json::json!({
-                    "mode": "hosted",
-                    "redirected": 0,
-                    "rewrittenFiles": [],
-                    "skipped": [],
-                    "warnings": warnings,
-                    "dryRun": args.common.dry_run,
-                });
+                result["redirect"] = hosted::redirect_json_block(
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                    warnings,
+                    args.common.dry_run,
+                );
             } else if !vendor {
                 // The `redirectState` block rides the empty-discovery
                 // envelope too (same rule as the ≥1-package path below:
@@ -1832,11 +1869,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             }
             let code =
                 embed_vex_into_json(&args.common, &args.vex, &manifest_path, 0, &mut result).await;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&result)
-                    .expect("serializing an in-memory JSON value cannot fail")
-            );
+            print_json(&result);
             return code;
         } else if args.common.silent {
             // Errors only: the empty-scan hint is informational.
@@ -2000,11 +2033,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 "updates": [],
                 "paths": path_scope.raw(),
             });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&result)
-                    .expect("serializing an in-memory JSON value cannot fail")
-            );
+            print_json(&result);
         } else {
             eprintln!("Error: all {total_batches} API batch queries failed: {err}");
         }
@@ -2073,11 +2102,17 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // structurally empty and a superseding patch is never reported. The
     // envelope schema is unchanged. A malformed redirect ledger is only
     // warned about here (and muted by --silent — the warning is advisory)
-    // — this is a read-only consult, and the hosted write path hard-errors
-    // on it; a malformed vendor ledger contributes nothing (the supplement
-    // above already recovered its purls from the committed artifacts).
-    let redirect_state =
-        crate::commands::load_redirect_state_lenient(&args.common.cwd, args.common.silent).await;
+    // — this is a read-only consult; a malformed vendor ledger contributes
+    // nothing (the supplement above already recovered its purls from the
+    // committed artifacts). A HOSTED run mutes the warning outright: its
+    // engine loads the same ledger strictly, under the apply lock, and
+    // reports the corruption ONCE as the hard error it is (quarantine
+    // included), so the advisory here would only duplicate that message.
+    let redirect_state = crate::commands::load_redirect_state_lenient(
+        &args.common.cwd,
+        args.common.silent || hosted,
+    )
+    .await;
     let update_manifest = merge_ledger_records_for_updates(
         existing_manifest.as_ref(),
         redirect_state.as_ref(),
@@ -2277,7 +2312,9 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 let params = download_params(
                     &args, /*save_only=*/ false, /*json=*/ true, /*silent=*/ true,
                 );
-                let (code, apply_json) = download_and_apply_patches(&selected, &params).await;
+                let (code, apply_json) =
+                    download_and_apply_patches_with(&selected, &params, &download_run(&args, &api_client))
+                        .await;
                 apply_code = code;
                 let mut apply_obj = apply_json;
                 fold_vendored_skips_into_apply(&mut apply_obj, &vendored_records);
@@ -2361,11 +2398,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             &mut result,
         )
         .await;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result)
-                .expect("serializing an in-memory JSON value cannot fail")
-        );
+        print_json(&result);
         return final_code;
     }
 
@@ -2834,7 +2867,9 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         )
         .await
     } else {
-        let (code, _) = download_and_apply_patches(&selected, &params).await;
+        let (code, _) =
+            download_and_apply_patches_with(&selected, &params, &download_run(&args, &api_client))
+                .await;
         code
     };
 
@@ -2863,8 +2898,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // Post-apply GC: only runs when the user opted in via `--prune` or
     // `--sync`. Default `scan --yes` no longer touches the manifest
     // beyond what `--apply` added — users wanting to clean up should
-    // run `socket-patch gc` (or `repair`) explicitly. (Vendor mode
-    // already ran its GC before the vendor step.)
+    // run `socket-patch gc` (or `repair`) explicitly. (Vendor mode runs
+    // its own GC after the vendor step, inside `vendor_flow`.)
     if prune && !vendor {
         let gc = run_apply_gc(
             &args.common,

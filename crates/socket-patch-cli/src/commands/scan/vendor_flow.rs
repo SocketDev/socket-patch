@@ -38,6 +38,7 @@ use crate::commands::vendor::{
     note_classic_migration_risk, track_outcomes_for_vendor, vendor_records,
 };
 use crate::json_envelope::{Command as EnvelopeCommand, Envelope, RunWarning};
+use crate::output::print_json;
 
 use super::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
 use super::{
@@ -61,15 +62,6 @@ type VendorStepError = (&'static str, String, Option<Box<Envelope>>);
 /// `(has_errors, envelope)` from a step that reached the engine, else a
 /// [`VendorStepError`].
 type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
-
-/// Pretty-print one JSON document to stdout — every `--json` consumer
-/// parses stdout as exactly one document.
-fn print_json(v: &serde_json::Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(v).expect("serializing an in-memory JSON value cannot fail")
-    );
-}
 
 /// Dry-run preview for `scan --vendor` (and `get … --mode vendored
 /// --dry-run`): classify each selected patch against the vendor ledger

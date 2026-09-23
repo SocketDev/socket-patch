@@ -23,7 +23,7 @@
 //! flavor strings they have no backend for. Both keep an old binary safe
 //! against a newer project checkout.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::utils::fs::{atomic_write_bytes, read_regular_to_bytes};
+use crate::utils::purl::strip_purl_qualifiers;
 use crate::utils::serde::serialize_sorted;
 use crate::utils::socket_dir::{prune_empty_dirs, remove_file_and_prune, write_json_ledger};
 
@@ -282,6 +283,25 @@ impl VendorState {
             version: VENDOR_STATE_VERSION,
             entries: HashMap::new(),
         }
+    }
+
+    /// Every purl spelling under which this ledger's entries are
+    /// addressable: each entry's map key (the manifest purl, possibly
+    /// qualified), its resolved base purl, and the qualifier-stripped key.
+    /// The one derivation behind every whole-set vendor-ownership match
+    /// (apply / rollback / remove / scan prune); [`super::vendored_purl_keys`]
+    /// is its load-then-derive convenience.
+    pub fn purl_keys(&self) -> HashSet<String> {
+        self.entries
+            .iter()
+            .flat_map(|(key, entry)| {
+                [
+                    key.clone(),
+                    entry.base_purl.clone(),
+                    strip_purl_qualifiers(key).to_string(),
+                ]
+            })
+            .collect()
     }
 }
 
@@ -618,6 +638,29 @@ mod tests {
             pdm: None,
             pipenv: None,
         }
+    }
+
+    /// Every spelling `purl_keys` promises: the (possibly qualified,
+    /// percent-encoded) map key, the entry's base purl and the
+    /// qualifier-stripped key; an empty ledger yields the empty set.
+    #[test]
+    fn purl_keys_carry_every_spelling() {
+        let mut state = VendorState::new();
+        let mut entry = sample_entry();
+        entry.base_purl = "pkg:npm/@scope/pkg@1.0.0".into();
+        state
+            .entries
+            .insert("pkg:npm/%40scope/pkg@1.0.0?artifact_id=x".into(), entry);
+        let keys = state.purl_keys();
+        for spelling in [
+            "pkg:npm/%40scope/pkg@1.0.0?artifact_id=x",
+            "pkg:npm/%40scope/pkg@1.0.0",
+            "pkg:npm/@scope/pkg@1.0.0",
+        ] {
+            assert!(keys.contains(spelling), "missing {spelling}: {keys:?}");
+        }
+        assert_eq!(keys.len(), 3);
+        assert!(VendorState::new().purl_keys().is_empty());
     }
 
     #[tokio::test]

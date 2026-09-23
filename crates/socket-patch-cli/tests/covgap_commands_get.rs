@@ -17,13 +17,31 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serial_test::serial;
-use socket_patch_cli::commands::get::{download_and_apply_patches, run, DownloadParams, GetArgs};
+use socket_patch_cli::commands::get::{
+    download_and_apply_patches_with, run, DownloadParams, DownloadRun, GetArgs,
+};
 use socket_patch_cli::commands::scan::ScanMode;
-use socket_patch_core::api::client::ApiClientEnvOverrides;
+use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClientEnvOverrides};
 use socket_patch_core::api::types::PatchSearchResult;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// The agent engine driven from `params` alone: builds the run's client
+/// from the params' API overrides (what scan/get do once per run) with the
+/// default try-once lock, then runs [`download_and_apply_patches_with`].
+async fn download_and_apply_patches(
+    selected: &[PatchSearchResult],
+    params: &DownloadParams,
+) -> (i32, serde_json::Value) {
+    let (api_client, _) = get_api_client_with_overrides(params.api_overrides.clone()).await;
+    let run = DownloadRun {
+        api_client: &api_client,
+        lock_timeout: None,
+        verbose: false,
+    };
+    download_and_apply_patches_with(selected, params, &run).await
+}
 
 #[path = "common/mod.rs"]
 mod common;

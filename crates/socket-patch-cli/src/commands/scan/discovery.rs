@@ -149,30 +149,6 @@ fn crawled_from_purl(
     })
 }
 
-/// The vendor ledger's purl keys in every spelling the CLI matches on — the
-/// ledger map key, its qualifier-stripped form, and the entry's base purl
-/// (the same three `socket_patch_core::vendor::vendored_purl_keys` derives,
-/// minus the load: `run` loads the ledger ONCE and shares it). Feeds the
-/// prune exemption and the agent-path vendored skip. A corrupt ledger
-/// degrades to the EMPTY set — fail-open by that helper's documented
-/// contract (the supplement below is the fail-closed half).
-pub(super) fn vendored_purl_keys(state: &std::io::Result<VendorState>) -> HashSet<String> {
-    let Ok(state) = state else {
-        return HashSet::new();
-    };
-    state
-        .entries
-        .iter()
-        .flat_map(|(key, entry)| {
-            [
-                key.clone(),
-                entry.base_purl.clone(),
-                strip_purl_qualifiers(key).to_string(),
-            ]
-        })
-        .collect()
-}
-
 /// Vendored-ledger packages with no crawled counterpart: on a fresh clone
 /// the committed artifact IS the dependency, so these stay discoverable
 /// (updates[] detection, the table, and `scan --vendor` re-vendor/in-sync
@@ -195,7 +171,7 @@ pub(super) async fn vendored_ledger_supplement(
             .collect(),
         // Corrupt/unreadable ledger (a MISSING file is Ok(empty) above).
         // Returning empty here silently dropped every vendored purl from
-        // `scanned_purls` — and since the `vendored_purl_keys` prune
+        // `scanned_purls` — and since the purl-keys prune
         // exemption degrades to empty on the same Err (fail-open by its
         // documented contract), `scan --prune` then deleted still-vendored
         // packages' manifest entries and blobs while their committed
@@ -1037,7 +1013,7 @@ mod tests {
     // The prune-safety chain for vendored packages: their purls enter
     // `scanned_purls` via this supplement, which shields their manifest
     // entries (and blobs) from `scan --prune`'s GC even when the
-    // `vendored_purl_keys` exemption degrades to empty (fail-open by its
+    // `VendorState::purl_keys` exemption degrades to empty (fail-open by its
     // documented contract). A corrupt `.socket/vendor/state.json`
     // (`load_state` → Err; a MISSING file is Ok(empty)) must therefore fall
     // back to the committed ground truth — manifest entries whose patch uuid
@@ -1088,27 +1064,6 @@ mod tests {
         };
         let state = socket_patch_core::vendor::load_state(root).await;
         vendored_ledger_supplement(&args, crawled, &state).await
-    }
-
-    /// The shared-load key set: every spelling the prune exemption and the
-    /// agent-path vendored skip match on, and EMPTY (fail-open) on a corrupt
-    /// ledger — the supplement's artifact fallback is the fail-closed half.
-    #[tokio::test]
-    async fn vendored_purl_keys_carry_every_spelling_and_degrade_to_empty() {
-        let state = vendor_ledger_with(&[("pkg:npm/%40scope/pkg@1.0.0?artifact_id=x", "u", true)]);
-        let keys = vendored_purl_keys(&Ok(state));
-        for spelling in [
-            "pkg:npm/%40scope/pkg@1.0.0?artifact_id=x",
-            "pkg:npm/%40scope/pkg@1.0.0",
-        ] {
-            assert!(keys.contains(spelling), "missing {spelling}: {keys:?}");
-        }
-        assert!(vendored_purl_keys(&Ok(VendorState::new())).is_empty());
-        let tmp = tempfile::tempdir().unwrap();
-        seed_corrupt_ledger(tmp.path());
-        let corrupt = socket_patch_core::vendor::load_state(tmp.path()).await;
-        assert!(corrupt.is_err(), "the fixture must be unreadable");
-        assert!(vendored_purl_keys(&corrupt).is_empty());
     }
 
     #[tokio::test]

@@ -17,8 +17,9 @@ pub(super) async fn stale_install_warnings(
     common: &crate::args::GlobalArgs,
     confirmed: &[(String, String)],
     pipenv_uuids: &BTreeSet<String>,
+    // This run's fetched records MERGED with the ledger's persisted ones
+    // (the caller hands the post-merge ledger map), looked up by uuid.
     records: &BTreeMap<String, PatchRecord>,
-    ledger_records: &BTreeMap<String, PatchRecord>,
 ) -> StaleInstallOutcome {
     let mut out = StaleInstallOutcome::default();
     let candidates: Vec<_> = confirmed
@@ -27,7 +28,6 @@ pub(super) async fn stale_install_warnings(
         .filter_map(|(purl, uuid)| {
             records
                 .values()
-                .chain(ledger_records.values())
                 .find(|record| &record.uuid == uuid)
                 .filter(|record| !record.files.is_empty())
                 .map(|record| (purl, record))
@@ -190,7 +190,7 @@ mod tests {
             ("one".into(), record("first-uuid", "first.py", b"patched")),
             ("two".into(), record("second-uuid", "second.py", b"patched")),
         ]);
-        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &BTreeMap::new(), &ledger).await;
+        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &ledger).await;
         assert_eq!(out.stale_purls, BTreeSet::from([first.to_string()]));
         assert_eq!(out.warnings.len(), 1);
         assert!(out.warnings[0]["detail"]
@@ -205,7 +205,7 @@ mod tests {
             "variant".into(),
         ));
         ledger.insert("three".into(), record("variant", "first.py", b"upstream"));
-        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &BTreeMap::new(), &ledger).await;
+        let out = stale_install_warnings(&common, &confirmed, &BTreeSet::new(), &ledger).await;
         assert!(out.stale_purls.is_empty());
         assert!(out.warnings.is_empty());
     }

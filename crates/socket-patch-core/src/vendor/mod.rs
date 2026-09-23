@@ -712,28 +712,16 @@ pub fn is_vendorable(purl: &str) -> bool {
     ecosystem_dir_for_purl(purl).is_some()
 }
 
-/// Every purl spelling under which the ledger's entries are addressable:
-/// each entry's map key (the manifest purl, possibly qualified), its
-/// resolved base purl, and the qualifier-stripped key. Loaded once for
-/// callers that match whole purl sets against vendor ownership (apply /
-/// rollback / scan prune). An unreadable ledger degrades to the empty set
-/// (fail-open); mutating callers that need fail-closed semantics use
-/// [`load_state`] directly.
+/// [`VendorState::purl_keys`] over the ledger in `project_root`, loaded
+/// once for callers that match whole purl sets against vendor ownership
+/// (apply / rollback / scan prune). An unreadable ledger degrades to the
+/// empty set (fail-open); mutating callers that need fail-closed semantics
+/// use [`load_state`] directly.
 pub async fn vendored_purl_keys(project_root: &Path) -> HashSet<String> {
-    match load_state(project_root).await {
-        Ok(state) => state
-            .entries
-            .iter()
-            .flat_map(|(key, entry)| {
-                [
-                    key.clone(),
-                    entry.base_purl.clone(),
-                    strip_purl_qualifiers(key).to_string(),
-                ]
-            })
-            .collect(),
-        Err(_) => HashSet::new(),
-    }
+    load_state(project_root)
+        .await
+        .map(|state| state.purl_keys())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

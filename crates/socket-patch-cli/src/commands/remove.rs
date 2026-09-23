@@ -18,8 +18,8 @@ use std::time::Duration;
 use super::get::short_uuid;
 use super::rollback::{
     all_files_already_original, pin_before_hash_blobs, revert_vendor_entry,
-    rollback_patches_inner, run_hosted_leg, sweep_unused_artifacts, vendored_purl_keys_of,
-    HostedLegOutcome, InnerSelection, VendorRevertStep,
+    rollback_patches_inner, run_hosted_leg, sweep_unused_artifacts, HostedLegOutcome,
+    InnerSelection, VendorRevertStep,
 };
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::lock_cli::acquire_or_emit;
@@ -399,7 +399,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // "nothing vendored" here and fails closed at that leg.
     let vendored_keys: HashSet<String> = vendor_state_result
         .as_ref()
-        .map(vendored_purl_keys_of)
+        .map(socket_patch_core::vendor::VendorState::purl_keys)
         .unwrap_or_default();
     let mut rollback_count = 0;
     // In-scope manifest entries the nested rollback SKIPPED because the

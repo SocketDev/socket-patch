@@ -486,10 +486,14 @@ pub async fn find_manifest_package_paths(
     find_packages_for_rollback(&partitioned, &crawler_options, quiet).await
 }
 
-/// Crawl all ecosystems and return all packages plus per-ecosystem counts.
+/// Crawl all ecosystems and return all packages, per-ecosystem counts and
+/// the gem crawl's refused config-sourced `BUNDLE_PATH`
+/// (`BundleStoreDiscovery::skipped_config_path`, local mode only) —
+/// recovered from the crawl that hit it, so callers surfacing the advisory
+/// never probe the Bundler roots a second time.
 pub async fn crawl_all_ecosystems(
     options: &CrawlerOptions,
-) -> (Vec<CrawledPackage>, HashMap<Ecosystem, usize>) {
+) -> (Vec<CrawledPackage>, HashMap<Ecosystem, usize>, Option<String>) {
     let mut all_packages = Vec::new();
     let mut counts: HashMap<Ecosystem, usize> = HashMap::new();
 
@@ -504,14 +508,17 @@ pub async fn crawl_all_ecosystems(
     crawl!(Ecosystem::Npm, NpmCrawler);
     crawl!(Ecosystem::Pypi, PythonCrawler);
     crawl!(Ecosystem::Cargo, CargoCrawler);
-    crawl!(Ecosystem::Gem, RubyCrawler);
+    let (gems, gem_discovery) = RubyCrawler.crawl_all_with_discovery(options).await;
+    counts.insert(Ecosystem::Gem, gems.len());
+    all_packages.extend(gems);
     crawl!(Ecosystem::Golang, GoCrawler);
     crawl!(Ecosystem::Maven, MavenCrawler);
     crawl!(Ecosystem::Composer, ComposerCrawler);
     crawl!(Ecosystem::Nuget, NuGetCrawler);
     crawl!(Ecosystem::Deno, DenoCrawler);
 
-    (all_packages, counts)
+    let skipped_config_path = gem_discovery.and_then(|d| d.skipped_config_path);
+    (all_packages, counts, skipped_config_path)
 }
 
 #[cfg(test)]
@@ -1259,7 +1266,7 @@ mod tests {
     #[tokio::test]
     async fn crawl_all_includes_every_ecosystem_unconditionally() {
         let tmp = tempfile::tempdir().unwrap();
-        let (_, counts) = crawl_all_ecosystems(&local_options(tmp.path().to_path_buf())).await;
+        let (_, counts, _) = crawl_all_ecosystems(&local_options(tmp.path().to_path_buf())).await;
         for eco in [
             Ecosystem::Npm,
             Ecosystem::Pypi,

@@ -5,6 +5,16 @@ pub(crate) fn stdin_is_tty() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// Print one JSON document, pretty-printed, to stdout — the one writer
+/// behind every `--json` envelope, so each consumer parses stdout as
+/// exactly one document.
+pub(crate) fn print_json(v: &serde_json::Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(v).expect("serializing an in-memory JSON value cannot fail")
+    );
+}
+
 /// The update notifier's TTY gate reads *stderr*, not stdin: the notice
 /// prints there, and stdout may be legitimately piped (`list | jq`) in a
 /// perfectly interactive session.

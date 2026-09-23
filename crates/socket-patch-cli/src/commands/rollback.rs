@@ -938,7 +938,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // leg (its own containment is the `vendor_state_unreadable` exit below).
     let vendored_keys: HashSet<String> = vendor_state_result
         .as_ref()
-        .map(vendored_purl_keys_of)
+        .map(VendorState::purl_keys)
         .unwrap_or_default();
 
     // ── scope resolution ────────────────────────────────────────────────
@@ -1479,12 +1479,13 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 ));
             }
             if !path_scope.is_empty() {
+                let scope = path_scope.bind(&cwd);
                 let out_of_scope: Vec<&str> = results
                     .iter()
                     .filter(|r| {
                         r.success
                             && !r.files_rolled_back.is_empty()
-                            && !path_scope.matches(&cwd, Path::new(&r.package_path))
+                            && !scope.matches(Path::new(&r.package_path))
                     })
                     .map(|r| r.package_key.as_str())
                     .collect();
@@ -1812,27 +1813,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
     }
 }
 
-/// Every purl spelling under which `state`'s entries are addressable —
-/// each entry's ledger key, its base purl and the qualifier-stripped key
-/// (the same triple as core's `vendored_purl_keys`, computed from an
-/// already-loaded ledger instead of re-reading it).
-pub(crate) fn vendored_purl_keys_of(state: &VendorState) -> HashSet<String> {
-    state
-        .entries
-        .iter()
-        .flat_map(|(key, entry)| {
-            [
-                key.clone(),
-                entry.base_purl.clone(),
-                strip_purl_qualifiers(key).to_string(),
-            ]
-        })
-        .collect()
-}
-
 /// The in-place (agent) rollback engine over an already-loaded `manifest`.
 /// `vendored_keys` is the ledger's ownership set (see
-/// [`vendored_purl_keys_of`]): vendor-owned purls are excluded from the
+/// [`VendorState::purl_keys`]): vendor-owned purls are excluded from the
 /// in-place restore. Both `run()` and `remove`'s delegation load each
 /// store once under the lock and thread it in here.
 pub(crate) async fn rollback_patches_inner(

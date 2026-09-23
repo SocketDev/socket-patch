@@ -34,7 +34,7 @@ use crate::commands::lock_cli::lock_failure;
 use crate::ecosystem_dispatch::{
     crawl_all_ecosystems, find_packages_for_rollback, partition_purls,
 };
-use crate::output::{confirm, select_one, SelectError};
+use crate::output::{confirm, print_json, select_one, SelectError};
 
 /// Best-effort ecosystem extractor for a `pkg:<eco>/...` PURL. Used as
 /// the telemetry `ecosystem` field. Returns an empty string when the
@@ -184,14 +184,6 @@ fn merge_metadata(record: &mut serde_json::Value, meta: serde_json::Value) {
             record_obj.insert(k, v);
         }
     }
-}
-
-/// Print a `serde_json::Value` as pretty JSON to stdout.
-fn print_json(v: &serde_json::Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(v).expect("serializing an in-memory JSON value cannot fail")
-    );
 }
 
 /// Truncate `s` to at most `limit` displayed characters, appending an
@@ -688,16 +680,12 @@ pub(crate) fn select_patches(
                             })
                         })
                         .collect();
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "status": "selection_required",
-                            "error": format!("Multiple patches available for {purl}. Re-run with the chosen UUID as the identifier (`socket-patch get <uuid>`) to select one."),
-                            "purl": purl,
-                            "options": options_json,
-                        }))
-                        .expect("serializing an in-memory JSON value cannot fail")
-                    );
+                    print_json(&serde_json::json!({
+                        "status": "selection_required",
+                        "error": format!("Multiple patches available for {purl}. Re-run with the chosen UUID as the identifier (`socket-patch get <uuid>`) to select one."),
+                        "purl": purl,
+                        "options": options_json,
+                    }));
                     return Err(1);
                 }
                 Err(SelectError::Cancelled) => {
@@ -1252,7 +1240,9 @@ fn resolved_api_overrides(
 }
 
 /// Build the API client for a download run driven without a run-level
-/// client (the plain `download_*` wrappers other commands call).
+/// client — the shape the retired 2-arg `download_*` wrappers had; kept
+/// for the in-file engine unit tests below, which drive `params` alone.
+#[cfg(test)]
 async fn api_client_for(params: &DownloadParams) -> ApiClient {
     get_api_client_with_overrides(resolved_api_overrides(params))
         .await
@@ -1777,24 +1767,10 @@ async fn run_nested_apply(common: GlobalArgs, quiet: bool) -> bool {
 
 /// Download the selected patches into `.socket/` (manifest records +
 /// blobs) and, unless `save_only`, apply them in place — the agent-mode
-/// engine behind `get` and `scan --apply/--sync`. Returns `(exit_code,
-/// json)`. Builds its own client from `params` and takes the manifest lock
-/// non-blocking; callers holding the run's client (and `--lock-timeout`)
-/// use [`download_and_apply_patches_with`].
-pub async fn download_and_apply_patches(
-    selected: &[PatchSearchResult],
-    params: &DownloadParams,
-) -> (i32, serde_json::Value) {
-    let api_client = api_client_for(params).await;
-    let run = DownloadRun {
-        api_client: &api_client,
-        lock_timeout: None,
-        verbose: false,
-    };
-    download_and_apply_patches_with(selected, params, &run).await
-}
-
-/// [`download_and_apply_patches`] over the caller's run-level context.
+/// engine behind `get` and `scan --apply/--sync`, over the caller's
+/// run-level context (`run`: the client the run already built, plus the
+/// `--lock-timeout` / `--verbose` the manifest lock and the nested apply
+/// honor). Returns `(exit_code, json)`.
 pub async fn download_and_apply_patches_with(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
@@ -2222,7 +2198,7 @@ pub async fn run(args: GetArgs) -> i32 {
             if !quiet {
                 println!("Enumerating packages...");
             }
-            let (all_packages, _) = crawl_all_ecosystems(&crawler_options_for(&args.common)).await;
+            let (all_packages, _, _) = crawl_all_ecosystems(&crawler_options_for(&args.common)).await;
 
             if all_packages.is_empty() {
                 if args.common.json {
@@ -2516,11 +2492,7 @@ pub async fn run(args: GetArgs) -> i32 {
     fold_narrowing_into_result(&mut result_json, &narrow_skips, &narrow_warnings);
 
     if args.common.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result_json)
-                .expect("serializing an in-memory JSON value cannot fail")
-        );
+        print_json(&result_json);
     }
 
     code
