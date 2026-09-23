@@ -594,6 +594,25 @@ fn rewrite_one_npm_lock(
         }
     }
     if changed {
+        // npm <= 6 (the only writer of lockfileVersion 1) installs a registry
+        // dependency from the CONFIGURED registry and ignores the entry's
+        // `resolved` — verified against real npm 6.14.18, while npm 7 / 11
+        // fetch the rewritten url from the same v1 lock. Under npm 6 the
+        // redirected lock therefore fails EINTEGRITY against the patched
+        // sha512 pin (fail-closed: the unpatched bytes never install). Say
+        // so instead of letting an npm 6 CI discover it.
+        if lock.get("lockfileVersion").and_then(Value::as_u64) == Some(1) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_npm_legacy_client".into(),
+                detail: format!(
+                    "{lockfile} is lockfileVersion 1 (written by npm <= 6). npm <= 6 installs \
+                     registry dependencies from the configured registry and ignores the \
+                     redirected `resolved` url, so its installs fail EINTEGRITY against the \
+                     patched sha512 pin (the unpatched bytes are never installed); install \
+                     with npm >= 7, which fetches the hosted patch (and upgrades the lock)"
+                ),
+            });
+        }
         result.files.insert(lockfile.into(), serialize_json(&lock));
     }
 }
@@ -826,13 +845,13 @@ fn rewrite_cargo(
         // resolution through the managed registry, which serves the patched
         // checksum.
         enum LockCommit {
-            Write(String, Box<FileEdit>),
+            Write(String, Vec<FileEdit>),
             InPlace,
             Absent,
         }
         let lock_commit = if let Some(lock_text) = cargo_lock.as_ref() {
             match plan_cargo_lock(lock_text, &dep.name, &dep.version, index_url, &cksum) {
-                CargoLockPlan::Rewritten { content, edit } => LockCommit::Write(content, edit),
+                CargoLockPlan::Rewritten { content, edits } => LockCommit::Write(content, edits),
                 CargoLockPlan::AlreadyRedirected => LockCommit::InPlace,
                 CargoLockPlan::NotFound => {
                     result.warnings.push(RewriteWarning {
@@ -880,9 +899,9 @@ fn rewrite_cargo(
             toml_changed = true;
         }
         match lock_commit {
-            LockCommit::Write(content, edit) => {
+            LockCommit::Write(content, edits) => {
                 cargo_lock = Some(content);
-                result.edits.push(*edit);
+                result.edits.extend(edits);
                 lock_changed = true;
             }
             LockCommit::InPlace | LockCommit::Absent => {}
@@ -1496,15 +1515,34 @@ fn plan_cargo_toml(
 }
 
 static CARGO_LOCK_SOURCE_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)^source = "[^"]*"$"#).expect("static lock source-line regex is valid")
+    Regex::new(r#"(?m)^source = "([^"]*)"$"#).expect("static lock source-line regex is valid")
 });
 static CARGO_LOCK_CHECKSUM_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?m)^checksum = "[^"]*"$"#).expect("static lock checksum-line regex is valid")
 });
+// `$` (not `\n`) so it also anchors a source line that ENDS the block: the
+// trailing newline sits outside the block region.
 static CARGO_LOCK_AFTER_SOURCE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)^(source = "[^"]*"\n)"#).expect("static source-line anchor regex is valid")
+    Regex::new(r#"(?m)^(source = "[^"]*")$"#).expect("static source-line anchor regex is valid")
 });
 
+/// Repoint the crate's `[[package]]` at the hosted index with the patched
+/// `.crate`'s checksum, in whichever Cargo.lock format the file is:
+///
+/// * v2–v4: `source` + an inline `checksum` in the entry;
+/// * v1 (cargo < 1.41, still read by every cargo): the entry carries only
+///   `source`; the checksum lives in the trailing `[metadata]` table under
+///   `"checksum <name> <version> (<source>)"`, and every dependent names the
+///   crate by its FULL package id `"<name> <version> (<source>)"`. Both are
+///   keyed by the source, so both must follow it — a v1 lock with only the
+///   entry repointed names a package that no longer exists (cargo discards
+///   the lock and re-resolves; `--locked` fails) and pins nothing.
+///
+/// Full-id references are rewritten in any format (v2+ spells them that way
+/// when a name + version is ambiguous). Each changed fragment is its own
+/// `redirect_cargo_lock_entry` edit (unique text, so the fragment revert is
+/// unambiguous): the entry, the `[metadata]` line, and each dependent's
+/// whole `[[package]]` block.
 fn plan_cargo_lock(
     content: &str,
     crate_name: &str,
@@ -1513,22 +1551,9 @@ fn plan_cargo_lock(
     cksum: &str,
 ) -> CargoLockPlan {
     // Rust's regex has NO lookahead, so bound the [[package]] block by string
-    // search: from its header to the next `\n[[package]]` (or EOF), so the
-    // trailing bytes after the block (incl. the final newline) are preserved.
-    // Trailing newline(s) are excluded from the block region so the recorded
-    // original/new strings stop after the last content byte (mirrors the TS
-    // rewriter's `(?=\n*$)` lookahead), while the file keeps its trailing
-    // newline (it stays outside the replaced region).
-    let block_end_after = |body_start: usize| -> usize {
-        let mut block_end = match content[body_start..].find("\n[[package]]") {
-            Some(rel) => body_start + rel,
-            None => content.len(),
-        };
-        while block_end > body_start && content.as_bytes()[block_end - 1] == b'\n' {
-            block_end -= 1;
-        }
-        block_end
-    };
+    // search (see [`lock_block_end`]): from its header to the next block or
+    // trailing table (or EOF), so the bytes after the block (incl. the final
+    // newline) are preserved.
     let head = format!("[[package]]\nname = \"{crate_name}\"\nversion = \"{version}\"\n");
     // Every line-anchored header for this name@version. A Cargo.lock may
     // legitimately hold TWO blocks for one name@version from different
@@ -1550,7 +1575,7 @@ fn plan_cargo_lock(
             let target_source = format!("source = \"{index_url}\"");
             let mut ours = twins.iter().copied().filter(|&at| {
                 let body_start = at + head.len();
-                content[body_start..block_end_after(body_start)]
+                content[body_start..lock_block_end(content, body_start)]
                     .lines()
                     .any(|line| line == target_source)
             });
@@ -1561,43 +1586,129 @@ fn plan_cargo_lock(
         }
     };
     let body_start = block_start + head.len();
-    let block_end = block_end_after(body_start);
+    let block_end = lock_block_end(content, body_start);
     let original = content[block_start..block_end].to_string();
     let mut body = content[body_start..block_end].to_string();
-    if CARGO_LOCK_SOURCE_LINE_RE.is_match(&body) {
+    let old_source = CARGO_LOCK_SOURCE_LINE_RE
+        .captures(&body)
+        .map(|c| c[1].to_string());
+    if old_source.is_some() {
         body = CARGO_LOCK_SOURCE_LINE_RE
             .replace(&body, format!("source = \"{index_url}\"").as_str())
             .to_string();
     } else {
         body = format!("source = \"{index_url}\"\n{body}");
     }
-    if CARGO_LOCK_CHECKSUM_LINE_RE.is_match(&body) {
-        body = CARGO_LOCK_CHECKSUM_LINE_RE
-            .replace(&body, format!("checksum = \"{cksum}\"").as_str())
-            .to_string();
-    } else {
-        body = CARGO_LOCK_AFTER_SOURCE_RE
-            .replace(&body, format!("${{1}}checksum = \"{cksum}\"\n").as_str())
-            .to_string();
+    // A v1 lock keeps the checksum in `[metadata]`, keyed by the package id
+    // — the chosen block's OWN source when it has one, so a multi-source
+    // twin's line is never taken for ours.
+    let metadata_source = old_source
+        .as_deref()
+        .map_or_else(|| r#"[^)"]*"#.to_string(), regex::escape);
+    let metadata_re = Regex::new(&format!(
+        r#"(?m)^"checksum {} {} \({metadata_source}\)" = "[^"]*"$"#,
+        regex::escape(crate_name),
+        regex::escape(version)
+    ))
+    .expect("escaped lock metadata-line regex is valid");
+    let metadata_line = metadata_re.find(content).map(|m| m.as_str().to_string());
+    if metadata_line.is_none() {
+        if CARGO_LOCK_CHECKSUM_LINE_RE.is_match(&body) {
+            body = CARGO_LOCK_CHECKSUM_LINE_RE
+                .replace(&body, format!("checksum = \"{cksum}\"").as_str())
+                .to_string();
+        } else {
+            body = CARGO_LOCK_AFTER_SOURCE_RE
+                .replace(&body, format!("${{1}}\nchecksum = \"{cksum}\"").as_str())
+                .to_string();
+        }
     }
     let rebuilt = format!("{head}{body}");
-    // Already redirected (re-run): the block is at the target values; a
+    let key = format!("{crate_name}@{version}");
+    let edit = |original: &str, new: &str| FileEdit {
+        path: "Cargo.lock".into(),
+        kind: "redirect_cargo_lock_entry".into(),
+        action: "rewritten".into(),
+        key: Some(key.clone()),
+        original: Some(Value::String(original.to_string())),
+        new: Some(Value::String(new.to_string())),
+    };
+    let mut edits = Vec::new();
+    let mut new_content = content.to_string();
+    if rebuilt != original {
+        new_content.replace_range(block_start..block_end, &rebuilt);
+        edits.push(edit(&original, &rebuilt));
+    }
+    if let Some(line) = metadata_line {
+        let pinned = format!("\"checksum {crate_name} {version} ({index_url})\" = \"{cksum}\"");
+        if line != pinned {
+            new_content = new_content.replacen(&line, &pinned, 1);
+            edits.push(edit(&line, &pinned));
+        }
+    }
+    // Dependents' full-id references to the OLD source.
+    if let Some(old) = old_source.filter(|old| old != index_url) {
+        let from = format!("\"{crate_name} {version} ({old})\"");
+        let to = format!("\"{crate_name} {version} ({index_url})\"");
+        let mut cursor = 0;
+        while let Some((start, end)) = next_lock_block(&new_content, cursor) {
+            let block = new_content[start..end].to_string();
+            if block.contains(&from) {
+                let repointed = block.replace(&from, &to);
+                new_content.replace_range(start..end, &repointed);
+                edits.push(edit(&block, &repointed));
+                cursor = start + repointed.len();
+            } else {
+                cursor = end;
+            }
+        }
+    }
+    // Already redirected (re-run): every fragment is at the target values; a
     // recorded edit would have original == new and grow the ledger forever.
-    if rebuilt == original {
+    if edits.is_empty() {
         return CargoLockPlan::AlreadyRedirected;
     }
-    let new_content = content.replacen(&original, &rebuilt, 1);
     CargoLockPlan::Rewritten {
         content: new_content,
-        edit: Box::new(FileEdit {
-            path: "Cargo.lock".into(),
-            kind: "redirect_cargo_lock_entry".into(),
-            action: "rewritten".into(),
-            key: Some(format!("{crate_name}@{version}")),
-            original: Some(Value::String(original)),
-            new: Some(Value::String(rebuilt)),
-        }),
+        edits,
     }
+}
+
+/// The next `[[package]]` block starting at or after `from`, as
+/// [`lock_block_end`] bounds it.
+fn next_lock_block(content: &str, from: usize) -> Option<(usize, usize)> {
+    let rel = content.get(from..)?.find("[[package]]\n")?;
+    let start = from + rel;
+    if start != 0 && content.as_bytes()[start - 1] != b'\n' {
+        return next_lock_block(content, start + 1);
+    }
+    Some((
+        start,
+        lock_block_end(content, start + "[[package]]\n".len()),
+    ))
+}
+
+/// End of the `[[package]]` block whose body starts at `body_start`,
+/// excluding the newline(s) before the next block / trailing table / EOF (so
+/// a recorded original/new stops after the block's last content byte — the
+/// TS rewriter's `(?=\n*$)` lookahead — while the file keeps its newlines).
+fn lock_block_end(content: &str, body_start: usize) -> usize {
+    // The next block, or the `[metadata]` / `[[patch.unused]]` tables that
+    // trail the packages.
+    let mut end = [
+        "\n[[package]]",
+        "\n[metadata]",
+        "\n[[patch.unused]]",
+        "\n[patch",
+    ]
+    .iter()
+    .filter_map(|marker| content[body_start..].find(marker))
+    .min()
+    .map_or(content.len(), |rel| body_start + rel);
+    while end > body_start && content.as_bytes()[end - 1] == b'\n' {
+        end -= 1;
+    }
+    end
 }
 
 /// Outcome of the Cargo.lock `[[package]]` plan — distinguishes a re-run
@@ -1606,7 +1717,7 @@ fn plan_cargo_lock(
 enum CargoLockPlan {
     Rewritten {
         content: String,
-        edit: Box<FileEdit>,
+        edits: Vec<FileEdit>,
     },
     AlreadyRedirected,
     NotFound,
@@ -2251,7 +2362,14 @@ fn rewrite_yarn_berry(
     let mut changed = false;
     for dep in &npm {
         let fname = full_name(dep);
-        let Some(checksum) = dep.integrity.yarn_berry10c0.clone() else {
+        // The API hands the prefixed `10c0/<hex>`; a yarn 4.0.x lock spells
+        // its checksums bare, and `--immutable` rejects a respelled one.
+        let Some(checksum) = dep
+            .integrity
+            .yarn_berry10c0
+            .as_deref()
+            .map(|c| crate::vendor::yarn_berry_lock::checksum_in_lock_spelling(content, c))
+        else {
             result.warnings.push(RewriteWarning {
                 code: "redirect_yarn_berry_missing_checksum".into(),
                 detail: format!(
@@ -3114,6 +3232,22 @@ static COMPOSER_DIST_SHASUM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"("shasum": ")[^"]*(")"#).expect("static dist shasum regex is valid")
 });
 
+/// Byte offset of the entry's `"source": {` key when that object is the
+/// dist block's IMMEDIATE predecessor (only `,` + whitespace between them) —
+/// the layout composer itself always writes (`source` then `dist`).
+/// `None` when the entry has no source object there.
+fn composer_source_before_dist(
+    content: &str,
+    entry_start: usize,
+    dist_start: usize,
+) -> Option<usize> {
+    const SOURCE_KEY: &str = "\"source\": {";
+    let source_start = entry_start + content[entry_start..dist_start].rfind(SOURCE_KEY)?;
+    let source_end = json_object_end_from(content, source_start + SOURCE_KEY.len())?;
+    (source_end < dist_start && content[source_end + 1..dist_start].trim() == ",")
+        .then_some(source_start)
+}
+
 fn rewrite_composer_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -3226,10 +3360,38 @@ fn rewrite_composer_lock(
         } else {
             append_composer_shasum(&rewritten, &sha1)
         };
-        if rewritten != block {
+        // Drop the entry's `source` (the vendored backend does the same):
+        // when the dist download fails — checksum mismatch, an expired grant
+        // token, a patch-server outage — composer 1 and composer 2 before its
+        // source-fallback cutoff (2.2 LTS included) print "Now trying to
+        // download from source" and silently install the PRISTINE upstream
+        // commit from git, and `--prefer-source` / `preferred-install:
+        // source` always does. With the source gone the hosted archive is
+        // the only way to install the package, so a failed fetch fails the
+        // install instead of shipping the vulnerable code. The edit then
+        // spans `"source": {…},\n<indent>"dist": {…}`, so the ledger's
+        // fragment revert puts both blocks back byte-for-byte.
+        let (edit_start, original) =
+            match composer_source_before_dist(&content, entry_start, dist_start) {
+                Some(source_start) => (source_start, content[source_start..=dist_end].to_string()),
+                None => {
+                    if content[entry_start..=entry_end].contains("\"source\": {") {
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_composer_source_kept".into(),
+                            detail: format!(
+                                "{composer_name}'s source block does not directly precede its \
+                                 dist and was left in place; a failed hosted download may fall \
+                                 back to it"
+                            ),
+                        });
+                    }
+                    (dist_start, block.clone())
+                }
+            };
+        if rewritten != original {
             content = format!(
                 "{}{}{}",
-                &content[..dist_start],
+                &content[..edit_start],
                 rewritten,
                 &content[dist_end + 1..]
             );
@@ -3239,7 +3401,7 @@ fn rewrite_composer_lock(
                 kind: "redirect_composer_dist".into(),
                 action: "rewritten".into(),
                 key: Some(composer_name),
-                original: Some(Value::String(block)),
+                original: Some(Value::String(original)),
                 new: Some(Value::String(rewritten)),
             });
         }
@@ -3763,10 +3925,11 @@ fn gem_lock_dependency_name(entry: &str) -> &str {
     entry.trim_end_matches('!')
 }
 
-/// One parsed `GEM` section of a Gemfile.lock: its `remote:` lines (index +
-/// URL) and the exclusive end index — the start of the next column-0 header
-/// (trailing blank separator included) or EOF.
+/// One parsed `GEM` section of a Gemfile.lock: its header line index, its
+/// `remote:` lines (index + URL) and the exclusive end index — the start of
+/// the next column-0 header (trailing blank separator included) or EOF.
 struct GemLockSection {
+    start: usize,
     remotes: Vec<(usize, String)>,
     end: usize,
 }
@@ -3834,7 +3997,11 @@ fn converge_gem_lock_source(
             j += 1;
         }
         if header_is_gem {
-            sections.push(GemLockSection { remotes, end: j });
+            sections.push(GemLockSection {
+                start,
+                remotes,
+                end: j,
+            });
         } else if c == "DEPENDENCIES" {
             deps_range = Some((start + 1, j));
         }
@@ -3933,7 +4100,19 @@ fn converge_gem_lock_source(
         }
     } else {
         // Move the spec (+ sublines) into a patch-registry section of its
-        // own, inserted where the section it leaves ends.
+        // own, inserted where bundler itself writes it: bundler emits the
+        // rubygems `GEM` sections sorted by source identifier
+        // (`SourceList#lock_rubygems_sources`: `sort_by(&:identifier)`, i.e.
+        // by the section's remote URLs), so the new section goes before the
+        // first `GEM` section whose remotes sort after the index URL, else
+        // after the last one. A frozen install re-renders the lock, and
+        // since bundler 4.0.19 (rubygems#9750, "fail instead of warning when
+        // frozen mode can't update the lockfile") any difference is fatal:
+        // "Your lockfile needs to be updated, but it can't be because frozen
+        // mode is set". Appending after `https://rubygems.org/` when the
+        // patch registry (`https://patch.socket.dev/…`) sorts first broke
+        // every converged hosted pair under `BUNDLE_FROZEN` / deployment
+        // mode (verified: 4.0.15 installs it, 4.0.21 refuses it).
         let mut last = spec_idx;
         while last + 1 < lines.len()
             && gem_lock_line_content(&lines[last + 1]).starts_with("      ")
@@ -3941,7 +4120,29 @@ fn converge_gem_lock_source(
             last += 1;
         }
         let moved: Vec<String> = lines.drain(spec_idx..=last).collect();
-        let insert_at = sections[sec_idx].end - moved.len();
+        let n = moved.len();
+        // Section bounds after the drain (every drained line sat inside
+        // section `sec_idx`, which keeps its start).
+        let bounds = |k: usize| -> (usize, usize) {
+            let s = &sections[k];
+            match k.cmp(&sec_idx) {
+                std::cmp::Ordering::Less => (s.start, s.end),
+                std::cmp::Ordering::Equal => (s.start, s.end - n),
+                std::cmp::Ordering::Greater => (s.start - n, s.end - n),
+            }
+        };
+        let identifier = |k: usize| -> String {
+            sections[k]
+                .remotes
+                .iter()
+                .map(|(_, url)| url.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let insert_at = (0..sections.len())
+            .find(|&k| identifier(k).as_str() > index_url)
+            .map(|k| bounds(k).0)
+            .unwrap_or_else(|| bounds(sections.len() - 1).1);
         let mut block: Vec<String> = Vec::with_capacity(moved.len() + 4);
         block.push(format!("GEM{eol}"));
         block.push(format!("  remote: {index_url}{eol}"));
@@ -6252,6 +6453,37 @@ mod tests {
              checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n",
             "3".repeat(128)
         )
+    }
+
+    /// REGRESSION (yarn 4.0.x): a lock that spells its `10c0` checksums
+    /// bare (yarn 4.0.0–4.0.2) gets the hosted entry's checksum spelled bare
+    /// — the API's prefixed `yarnBerry10c0` made `yarn install --immutable`
+    /// reject the rewritten lock (YN0028). A 4.1+ (prefixed) lock keeps it.
+    #[test]
+    fn yarn_berry_checksum_follows_the_lock_spelling() {
+        let hex = "7".repeat(128);
+        let ovr = berry_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            &format!("10c0/{hex}"),
+        );
+        for (lock, want) in [
+            (
+                berry_lock("10c0").replace("checksum: 10c0/", "checksum: "),
+                format!("\n  checksum: {hex}\n"),
+            ),
+            (berry_lock("10c0"), format!("\n  checksum: 10c0/{hex}\n")),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("yarn.lock".to_string(), lock.clone());
+            let mut r = RewriteResult::default();
+            rewrite_yarn_berry(&files, std::slice::from_ref(&ovr), &mut r);
+            let out = &r.files["yarn.lock"];
+            assert!(out.contains("::__archiveUrl="), "{out}");
+            assert!(out.contains(&want), "want {want:?} in:\n{out}");
+            assert_eq!(out.matches("checksum:").count(), 1, "{out}");
+        }
     }
 
     #[test]
@@ -8931,8 +9163,8 @@ mod tests {
         );
         let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
         let expected = format!(
-            "GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
-             GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)\n\n\
+            "GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)\n\n\
+             GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
              PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n\n\
              CHECKSUMS\n  rails (7.0.0) sha256={}\n\nBUNDLED WITH\n   2.6.2\n",
             "f".repeat(64)
@@ -8974,6 +9206,96 @@ mod tests {
             "a converged pair is frozen-install-ready — the caveat would be a lie: {:?}",
             r.warnings
         );
+    }
+
+    /// REGRESSION (bundler 4.0.19+): the patch-registry `GEM` section must
+    /// land where bundler itself renders it — rubygems sections sorted by
+    /// remote (`SourceList#lock_rubygems_sources`) — because a frozen install
+    /// re-renders the lock and, since rubygems#9750, FAILS on any difference.
+    /// Appending after the upstream section produced a lock bundler 4.0.21
+    /// refuses under `BUNDLE_FROZEN=true` whenever the patch registry sorts
+    /// first (`https://patch.socket.dev/` < `https://rubygems.org/`), i.e. on
+    /// every production pair. Pinned both ways, with a third section present.
+    #[test]
+    fn gem_converged_section_is_inserted_in_bundler_source_order() {
+        for (upstream, other, want) in [
+            // Patch registry sorts before both: first.
+            (
+                "https://rubygems.org/",
+                "https://zz.example/",
+                ["patch", "up", "other"],
+            ),
+            // Between the two.
+            (
+                "https://rubygems.org/",
+                "https://aa.example/",
+                ["other", "patch", "up"],
+            ),
+            // After both: appended after the last GEM section.
+            (
+                "https://aa.example/",
+                "https://ab.example/",
+                ["up", "other", "patch"],
+            ),
+        ] {
+            let (first, second) = if upstream < other {
+                (upstream, other)
+            } else {
+                (other, upstream)
+            };
+            let section = |url: &str| {
+                if url == upstream {
+                    format!("GEM\n  remote: {url}\n  specs:\n    rails (7.0.0)\n\n")
+                } else {
+                    format!("GEM\n  remote: {url}\n  specs:\n    puma (6.0.0)\n\n")
+                }
+            };
+            let lock = format!(
+                "{}{}PLATFORMS\n  ruby\n\nDEPENDENCIES\n  puma\n  rails (= 7.0.0)\n\n\
+                 CHECKSUMS\n  puma (6.0.0) sha256={}\n  rails (7.0.0) sha256={}\n\n\
+                 BUNDLED WITH\n   4.0.21\n",
+                section(first),
+                section(second),
+                "1".repeat(64),
+                "2".repeat(64)
+            );
+            let mut files = BTreeMap::new();
+            files.insert(
+                "Gemfile".to_string(),
+                format!(
+                    "source \"{upstream}\"\n\ngem \"rails\", \"7.0.0\"\n\
+                     source \"{other}\" do\n  gem \"puma\"\nend\n"
+                ),
+            );
+            files.insert("Gemfile.lock".to_string(), lock);
+            let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
+            let out = r.files.get("Gemfile.lock").expect("lock rewritten");
+            let remotes: Vec<&str> = out
+                .lines()
+                .filter_map(|l| l.strip_prefix("  remote: "))
+                .map(|url| match url {
+                    u if u == upstream => "up",
+                    u if u == other => "other",
+                    u if u.starts_with("https://patch.test/") => "patch",
+                    u => panic!("unexpected remote {u}"),
+                })
+                .collect();
+            assert_eq!(remotes, want, "{upstream} / {other}:\n{out}");
+            let urls: Vec<&str> = out
+                .lines()
+                .filter_map(|l| l.strip_prefix("  remote: "))
+                .collect();
+            let mut sorted = urls.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                urls, sorted,
+                "bundler's sort_by(&:identifier) order:\n{out}"
+            );
+            assert!(
+                out.contains("GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)\n\n"),
+                "{out}"
+            );
+        }
     }
 
     /// Feeding the converged pair back must be a true no-op (the ledger would
@@ -9093,8 +9415,8 @@ mod tests {
         );
         let r = rewrite_registry_redirect(&files, &[gem_override("rails", "7.0.0")]);
         let expected = format!(
-            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.0.0)\n\n\
-             GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)\n      rack (>= 2)\n\n\
+            "GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)\n      rack (>= 2)\n\n\
+             GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (3.0.0)\n\n\
              PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rack (= 3.0.0)\n  rails (= 7.0.0)!\n\n\
              CHECKSUMS\n  rack (3.0.0) sha256={}\n  rails (7.0.0) sha256={}\n\nBUNDLED WITH\n   2.6.2\n",
             "4".repeat(64),
@@ -9538,8 +9860,8 @@ mod tests {
             r.warnings
         );
         let expected = format!(
-            "GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
-             GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)\n\n\
+            "GEM\n  remote: https://patch.test/gem/tok/uuid/\n  specs:\n    rails (7.0.0)\n\n\
+             GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
              PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n\n\
              CHECKSUMS\n  rails (7.0.0) sha256={}\n\nBUNDLED WITH\n   2.6.2\n",
             "f".repeat(64)
@@ -9603,6 +9925,64 @@ mod tests {
             "CRLF re-run must be a no-op: files={:?} edits={:?}",
             second.files.keys(),
             second.edits
+        );
+    }
+
+    /// REGRESSION (npm 6): a lockfileVersion 1 lock is only ever written by
+    /// npm <= 6, which ignores `resolved` for registry deps (verified against
+    /// real npm 6.14.18) — so its installs of the redirected lock fail
+    /// EINTEGRITY. The rewrite still happens (npm >= 7 installs it), but the
+    /// run must say so; a v2/v3 lock (npm >= 7) gets no such caveat.
+    #[test]
+    fn npm_v1_lock_redirect_warns_about_npm_6_clients() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let v1 = r#"{
+  "name": "app",
+  "version": "0.0.0",
+  "lockfileVersion": 1,
+  "requires": true,
+  "dependencies": {
+    "left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+      "integrity": "sha512-UPSTREAM=="
+    }
+  }
+}
+"#;
+        let mut files = BTreeMap::new();
+        files.insert("package-lock.json".to_string(), v1.to_string());
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        let out = r.files.get("package-lock.json").expect("v1 lock rewritten");
+        assert!(
+            out.contains("http://patch.test/left-pad-1.3.0.tgz"),
+            "{out}"
+        );
+        let w = r
+            .warnings
+            .iter()
+            .find(|w| w.code == "redirect_npm_legacy_client")
+            .unwrap_or_else(|| panic!("missing legacy-client caveat: {:?}", r.warnings));
+        assert!(
+            w.detail.contains("npm <= 6") && w.detail.contains("EINTEGRITY"),
+            "{}",
+            w.detail
+        );
+
+        let v3 = v1.replace("\"lockfileVersion\": 1", "\"lockfileVersion\": 3");
+        let mut files = BTreeMap::new();
+        files.insert("package-lock.json".to_string(), v3);
+        let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(r.files.contains_key("package-lock.json"));
+        assert!(
+            !warning_codes(&r).contains(&"redirect_npm_legacy_client"),
+            "{:?}",
+            r.warnings
         );
     }
 
@@ -10343,6 +10723,123 @@ snapshots:
             r.files.keys(),
             r.edits,
             r.warnings
+        );
+    }
+
+    /// composer writes `source` right before `dist`, and composer 1 / 2.2
+    /// LTS fall back to it ("Now trying to download from source") whenever
+    /// the hosted dist fails its checksum or cannot be fetched — silently
+    /// installing the pristine upstream commit. The redirect must drop the
+    /// target's source (only the target's), record ONE fragment edit
+    /// spanning both blocks, and that fragment's inverse must restore the
+    /// original lock byte-for-byte. A re-run over the output is a no-op.
+    #[test]
+    fn composer_redirect_drops_the_target_source_fallback_and_reverts_it() {
+        let target_source = "
+            \"source\": {
+                \"type\": \"git\",
+                \"url\": \"https://github.com/acme/target.git\",
+                \"reference\": \"cafe\"
+            },";
+        let lock = composer_lock_with(&format!(
+            "{target_source}
+            \"dist\": {{
+                \"type\": \"zip\",
+                \"url\": \"https://api.github.com/repos/acme/target/zipball/cafe\",
+                \"reference\": \"cafe\",
+                \"shasum\": \"\"
+            }}"
+        ))
+        .replace(
+            "\"version\": \"2.0.0\",\n            \"dist\": {",
+            "\"version\": \"2.0.0\",\n            \"source\": {\n                \"type\": \"git\",\n                \"url\": \"https://github.com/innocent/bystander.git\",\n                \"reference\": \"beef\"\n            },\n            \"dist\": {",
+        );
+        let r = composer_result(&lock, "1.0.0");
+        assert!(r.warnings.is_empty(), "no warnings: {:?}", r.warnings);
+        let out = r
+            .files
+            .get("composer.lock")
+            .expect("the dist is redirected");
+        let doc: Value = serde_json::from_str(out).expect("valid JSON");
+        let target = &doc["packages"][0];
+        assert_eq!(target["name"], "acme/target");
+        assert!(
+            target.get("source").is_none(),
+            "the target's git source must be dropped so a failed hosted download cannot \
+             fall back to the pristine upstream: {target}"
+        );
+        assert_eq!(target["dist"]["url"], COMPOSER_ARTIFACT_URL);
+        assert_eq!(target["dist"]["shasum"], COMPOSER_SHA1);
+        assert_eq!(
+            doc["packages"][1]["source"]["url"], "https://github.com/innocent/bystander.git",
+            "a bystander's source is untouched"
+        );
+
+        // One edit whose fragments invert the whole change (the ledger's
+        // ReplaceFragment revert: `new` → `original`).
+        assert_eq!(r.edits.len(), 1, "{:?}", r.edits);
+        let edit = &r.edits[0];
+        assert_eq!(edit.kind, "redirect_composer_dist");
+        let original = edit.original.as_ref().and_then(Value::as_str).unwrap();
+        let new = edit.new.as_ref().and_then(Value::as_str).unwrap();
+        assert!(original.starts_with("\"source\": {") && original.contains("acme/target.git"));
+        assert!(new.starts_with("\"dist\": {") && !new.contains("\"source\""));
+        assert_eq!(out.matches(new).count(), 1, "the fragment is unambiguous");
+        assert_eq!(
+            out.replacen(new, original, 1),
+            lock,
+            "revert restores the lock"
+        );
+
+        // Re-run over the redirected lock: nothing left to change.
+        let mut again = BTreeMap::new();
+        again.insert("composer.lock".to_string(), out.clone());
+        let second = rewrite_registry_redirect(&again, &[composer_override("1.0.0")]);
+        assert!(
+            second.files.is_empty() && second.edits.is_empty() && second.warnings.is_empty(),
+            "re-run must be a no-op: {:?} {:?}",
+            second.edits,
+            second.warnings
+        );
+    }
+
+    /// A hand-ordered entry whose `source` does NOT directly precede its
+    /// `dist` keeps the source (the fragment edit cannot span it losslessly)
+    /// and says so; the dist is still redirected and pinned.
+    #[test]
+    fn composer_non_adjacent_source_is_kept_with_a_warning() {
+        let lock = composer_lock_with(
+            "
+            \"dist\": {
+                \"type\": \"zip\",
+                \"url\": \"https://api.github.com/repos/acme/target/zipball/cafe\",
+                \"reference\": \"cafe\",
+                \"shasum\": \"\"
+            },
+            \"source\": {
+                \"type\": \"git\",
+                \"url\": \"https://github.com/acme/target.git\",
+                \"reference\": \"cafe\"
+            }",
+        );
+        let r = composer_result(&lock, "1.0.0");
+        assert_eq!(warning_codes(&r), vec!["redirect_composer_source_kept"]);
+        let out = r
+            .files
+            .get("composer.lock")
+            .expect("the dist is redirected");
+        let doc: Value = serde_json::from_str(out).expect("valid JSON");
+        assert_eq!(doc["packages"][0]["dist"]["url"], COMPOSER_ARTIFACT_URL);
+        assert!(doc["packages"][0].get("source").is_some());
+        let edit = &r.edits[0];
+        let (original, new) = (
+            edit.original.as_ref().and_then(Value::as_str).unwrap(),
+            edit.new.as_ref().and_then(Value::as_str).unwrap(),
+        );
+        assert_eq!(
+            out.replacen(new, original, 1),
+            lock,
+            "revert restores the lock"
         );
     }
 
@@ -12419,6 +12916,116 @@ packages:
     /// git-sourced entry) or missing BOTH `source` and `checksum` are rebuilt
     /// with the lines inserted in canonical order, and the neighbor blocks
     /// stay byte-identical.
+    /// Cargo.lock v1 (cargo < 1.41; every cargo still reads it and, under
+    /// `--locked`, never rewrites it): the checksum lives in `[metadata]`
+    /// keyed by the source, and dependents reference the crate by its full
+    /// `"name version (source)"` id. REGRESSION: only the entry's `source`
+    /// was repointed — the dependent's reference then named a package no
+    /// longer in the lock (real cargo discards the lock and re-resolves;
+    /// `cargo fetch --locked` fails) and nothing pinned the patched
+    /// `.crate` (the v1 entry has no inline checksum, and the insert after a
+    /// block-final `source` line never matched). Every fragment now follows
+    /// the source, each as its own revertible edit.
+    #[test]
+    fn cargo_lock_v1_repoints_metadata_checksum_and_full_id_references() {
+        const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = \"1.0.190\"\nlog = \"0.4\"\n";
+        let cksum = "e".repeat(64);
+        let lock = format!(
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"log 0.4.20 ({CRATES_IO})\",\n \"serde 1.0.190 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\
+             dependencies = [\n \"serde 1.0.190 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{CRATES_IO}\"\n\n\
+             [metadata]\n\"checksum log 0.4.20 ({CRATES_IO})\" = \"{a}\"\n\
+             \"checksum serde 1.0.190 ({CRATES_IO})\" = \"{b}\"\n",
+            a = "a".repeat(64),
+            b = "b".repeat(64),
+        );
+        let mut files = BTreeMap::new();
+        files.insert("Cargo.toml".to_string(), manifest.to_string());
+        files.insert("Cargo.lock".to_string(), lock.clone());
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let out = r.files.get("Cargo.lock").expect("lock rewritten");
+        let idx = cargo_index_url();
+        let want = format!(
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"log 0.4.20 ({CRATES_IO})\",\n \"serde 1.0.190 ({idx})\",\n]\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\
+             dependencies = [\n \"serde 1.0.190 ({idx})\",\n]\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{idx}\"\n\n\
+             [metadata]\n\"checksum log 0.4.20 ({CRATES_IO})\" = \"{a}\"\n\
+             \"checksum serde 1.0.190 ({idx})\" = \"{cksum}\"\n",
+            a = "a".repeat(64),
+        );
+        assert_eq!(out, &want, "v1 lock stays v1, fully repointed");
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+
+        // Four fragment edits (entry, metadata line, two dependents), each
+        // unique in the rewritten file, and reverting them newest-first (the
+        // replay order) restores the original byte-for-byte.
+        let edits: Vec<&FileEdit> = r
+            .edits
+            .iter()
+            .filter(|e| e.kind == "redirect_cargo_lock_entry")
+            .collect();
+        assert_eq!(edits.len(), 4, "{edits:#?}");
+        let mut reverted = out.clone();
+        for e in edits.iter().rev() {
+            assert_eq!(e.key.as_deref(), Some("serde@1.0.190"));
+            let new = e.new.as_ref().and_then(Value::as_str).unwrap();
+            let orig = e.original.as_ref().and_then(Value::as_str).unwrap();
+            assert_eq!(reverted.matches(new).count(), 1, "unique fragment: {new}");
+            reverted = reverted.replacen(new, orig, 1);
+        }
+        assert_eq!(reverted, lock);
+
+        // Re-run over the redirected lock: nothing to do, no new edits.
+        files.insert("Cargo.lock".to_string(), out.clone());
+        files.insert(
+            "Cargo.toml".to_string(),
+            r.files.get("Cargo.toml").expect("manifest pinned").clone(),
+        );
+        files.insert(
+            ".cargo/config.toml".to_string(),
+            r.files.get(".cargo/config.toml").expect("config").clone(),
+        );
+        let again = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            !again
+                .edits
+                .iter()
+                .any(|e| e.kind == "redirect_cargo_lock_entry"),
+            "{:?}",
+            again.edits
+        );
+    }
+
+    /// A checksum-less entry whose `source` line ends the block (the
+    /// trailing newline sits outside the block region) still gets its pin.
+    #[test]
+    fn cargo_lock_checksum_is_inserted_after_a_block_final_source_line() {
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = \"1.0.190\"\n";
+        let cksum = "e".repeat(64);
+        let lock = "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.190\"\n\
+                    source = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
+        let mut files = BTreeMap::new();
+        files.insert("Cargo.toml".to_string(), manifest.to_string());
+        files.insert("Cargo.lock".to_string(), lock.to_string());
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let out = r.files.get("Cargo.lock").expect("lock rewritten");
+        assert_eq!(
+            out,
+            &format!(
+                "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.190\"\n\
+                 source = \"{}\"\nchecksum = \"{cksum}\"\n",
+                cargo_index_url()
+            )
+        );
+    }
+
     #[test]
     fn cargo_lock_blocks_without_source_or_checksum_lines_are_rebuilt() {
         let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\

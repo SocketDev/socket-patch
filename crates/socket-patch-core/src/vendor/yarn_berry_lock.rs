@@ -345,7 +345,7 @@ pub async fn vendor_yarn_berry(
     // tamper guard on the tarball itself (spike B3, flips on any byte edit).
     let hash6 = &tgz_sha512[..6];
     let checksum = match berry_cache_checksum_10c0(&tgz_bytes, name) {
-        Ok(c) => c,
+        Ok(c) => checksum_in_lock_spelling(&lock_text, &c),
         Err(e) => {
             return done_failure_unstage(
                 purl,
@@ -997,8 +997,42 @@ fn carried_sections(lines: &[String]) -> Vec<String> {
     out
 }
 
+/// Whether `lock_text` spells its entries' `checksum:` values as BARE hex.
+///
+/// yarn 4.0.x writes the bare sha512 hex even at cacheKey `10c0`; yarn 4.1+
+/// prefixes the cache key (`10c0/<hex>`). Both are the digest of the same
+/// cache zip, but a `--immutable` install treats a respelled checksum as a
+/// lockfile modification (YN0028: "The lockfile would have been modified by
+/// this install") — so an entry Socket writes (the vendored `file:` entry,
+/// the hosted `__archiveUrl` rewrite) must follow the lock's own spelling or
+/// every CI install of a yarn 4.0.x project fails. A lock with no checksum
+/// at all keeps the prefixed form (every yarn since 4.1).
+pub(crate) fn lock_spells_bare_checksums(lock_text: &str) -> bool {
+    let mut saw_bare = false;
+    for line in lock_text.lines() {
+        let Some(value) = line.strip_prefix("  checksum:") else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"');
+        if value.contains('/') {
+            return false;
+        }
+        saw_bare |= !value.is_empty();
+    }
+    saw_bare
+}
+
+/// `checksum` (the recipe's `10c0/<hex>`) spelled the way `lock_text`
+/// spells its checksums (see [`lock_spells_bare_checksums`]).
+pub(crate) fn checksum_in_lock_spelling(lock_text: &str, checksum: &str) -> String {
+    match checksum.split_once('/') {
+        Some((_, hex)) if lock_spells_bare_checksums(lock_text) => hex.to_string(),
+        _ => checksum.to_string(),
+    }
+}
+
 /// Read a berry scalar field (`<name>: <value>`, value possibly quoted).
-pub(super) fn berry_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
+pub(crate) fn berry_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
     for line in lines.iter().skip(1) {
         let Some(rest) = body_field_line(line) else {
             continue;
@@ -3155,5 +3189,64 @@ __metadata:
                 "package.json untouched"
             );
         }
+    }
+
+    /// REGRESSION (yarn 4.0.x): a lock whose checksums are spelled bare
+    /// (yarn 4.0.0–4.0.2 at cacheKey `10c0`) gets the vendored entry's
+    /// checksum spelled bare too — byte-exact against the spike after-lock
+    /// with every checksum de-prefixed. The prefixed spelling made the
+    /// fresh-checkout `yarn install --immutable` fail with YN0028.
+    #[tokio::test]
+    async fn yarn40_bare_checksum_lock_gets_a_bare_vendored_checksum() {
+        let bare_before = B3_BEFORE_LOCK.replace("checksum: 10c0/", "checksum: ");
+        let fx = fixture_with(B3_BEFORE_PKG, &bare_before).await;
+        let (result, _entry, _warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let (hash6, checksum) = fx.packed_berry_facts().await;
+        let written = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        assert_eq!(
+            written,
+            spike_after_lock(&hash6, &checksum).replace("checksum: 10c0/", "checksum: ")
+        );
+        // Idempotent: the re-run sees its own (bare) entry as in sync.
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "in-sync re-run writes nothing");
+        assert_eq!(
+            tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+            written
+        );
+    }
+
+    /// yarn 4.0.x spells `10c0` checksums bare, 4.1+ prefixed: a written
+    /// entry follows the lock (an `--immutable` install rejects a respelled
+    /// checksum with YN0028). A lock with no checksum keeps the prefix.
+    #[test]
+    fn checksum_spelling_follows_the_lock() {
+        let prefixed = "10c0/abcdef";
+        let entry = |c: &str| format!("\"x@npm:1.0.0\":\n  version: 1.0.0\n  checksum: {c}\n");
+        let bare_lock = format!(
+            "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n{}",
+            entry("0123")
+        );
+        let prefixed_lock = bare_lock.replace("checksum: 0123", "checksum: 10c0/0123");
+        assert!(lock_spells_bare_checksums(&bare_lock));
+        assert!(lock_spells_bare_checksums(&bare_lock.replace('\n', "\r\n")));
+        assert_eq!(checksum_in_lock_spelling(&bare_lock, prefixed), "abcdef");
+        assert!(!lock_spells_bare_checksums(&prefixed_lock));
+        assert_eq!(
+            checksum_in_lock_spelling(&prefixed_lock, prefixed),
+            prefixed
+        );
+        // Any prefixed entry means a 4.1+ lock.
+        let mixed = format!("{bare_lock}\n{}", entry("10c0/9999"));
+        assert!(!lock_spells_bare_checksums(&mixed));
+        // No checksum at all: the modern prefixed form.
+        let none = "__metadata:\n  version: 8\n  cacheKey: 10c0\n";
+        assert_eq!(checksum_in_lock_spelling(none, prefixed), prefixed);
+        // Deeper-indented `checksum:` text (a dependency named `checksum`)
+        // is not an entry field.
+        let nested = format!("{none}\n\"x@npm:1.0.0\":\n  dependencies:\n    checksum: 1.0.0\n");
+        assert!(!lock_spells_bare_checksums(&nested));
     }
 }

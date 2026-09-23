@@ -393,8 +393,9 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
         // The remaining flavors wire resolutions into the lock itself
         // (resolved URLs / file: ranges / package tuples), so a textual
         // probe for the uuid dir is exact: the path appears iff some
-        // resolution still points at the artifact. shrinkwrap wins over
-        // package-lock, mirroring the vendor/revert lockfile selection.
+        // resolution still points at the artifact. Both npm locks are
+        // probed: npm <= 11 installs from the shrinkwrap, npm 12 from the
+        // package-lock beside it.
         None | Some("package-lock") => {
             lock_text_mentions_uuid(
                 project_root,
@@ -431,21 +432,32 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
     }
 }
 
-/// First readable lockfile from `names`, probed for the uuid artifact dir.
-/// Shared with the textual backends' unwired-revert guard
+/// Every readable lockfile from `names`, probed for the uuid artifact dir:
+/// `Some(true)` when ANY of them mentions it, `Some(false)` when at least one
+/// was readable and none does, `None` when none was readable. Shared with
+/// the textual backends' unwired-revert guard
 /// ([`super::npm_lock::guard_unwired_textual_revert`]).
+///
+/// It used to stop at the FIRST readable name (npm <= 11's shrinkwrap-wins
+/// rule), but npm 12 installs from package-lock.json beside a committed
+/// npm-shrinkwrap.json, so a mention in either lock can be the one an
+/// install resolves through.
 pub(super) async fn lock_text_mentions_uuid(
     project_root: &Path,
     names: &[&str],
     uuid: &str,
 ) -> Option<bool> {
     let needle = format!(".socket/vendor/npm/{uuid}/");
+    let mut any_readable = false;
     for name in names {
         if let Ok(text) = read_regular_to_string(&project_root.join(name)).await {
-            return Some(text.contains(&needle));
+            if text.contains(&needle) {
+                return Some(true);
+            }
+            any_readable = true;
         }
     }
-    None
+    any_readable.then_some(false)
 }
 
 /// Revert one recorded npm vendor entry through the flavor that wired it.

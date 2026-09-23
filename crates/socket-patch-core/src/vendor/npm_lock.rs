@@ -100,7 +100,7 @@ pub async fn vendor_npm(
     let base_purl = coords.base_purl;
 
     // ── 2. Lockfile selection ───────────────────────────────────────────
-    let (lock_name, lock_bytes) = match select_lockfile(project_root).await {
+    let (lock_name, lock_bytes, sibling_locks) = match select_lockfile(project_root).await {
         Ok(Some(found)) => found,
         Ok(None) => {
             return refused(
@@ -196,6 +196,31 @@ pub async fn vendor_npm(
         );
     }
 
+    // ── 3b. Sibling lock (npm 12) ───────────────────────────────────────
+    // npm 12 removed `npm shrinkwrap`, auto-creates a package-lock.json
+    // beside a committed npm-shrinkwrap.json on first install and then
+    // reifies FROM package-lock.json (verified against real npm 12.0.0 /
+    // 12.1.0; npm <= 11 installs from the shrinkwrap). Wiring only the
+    // shrinkwrap in that dual-lock state was a silent false success under
+    // npm 12 — the unpatched registry bytes kept installing. Every other
+    // present npm lock is therefore rewired identically (the hosted
+    // rewriter's rule), and one that cannot be is SAID.
+    let mut siblings: Vec<SiblingLock> = Vec::new();
+    for (sib_name, sib_bytes) in sibling_locks {
+        match sibling_lock_target(sib_name, sib_bytes, name, version, &mut warnings) {
+            Ok(sib) => siblings.push(sib),
+            Err(why) => warnings.push(VendorWarning::new(
+                "vendor_npm_sibling_lock_unwired",
+                format!(
+                    "{sib_name} beside {lock_name} was NOT rewired for {name}@{version} \
+                     ({why}) — npm >= 12 installs from {sib_name} when both exist, so those \
+                     installs stay UNPATCHED; regenerate it from {lock_name} (or delete it) \
+                     and re-run vendor"
+                ),
+            )),
+        }
+    }
+
     // ── 4–7. Stage → patch → pack (shared flavor-agnostic pipeline:
     //         tempdir stage outside the project, nested node_modules prune,
     //         bundled-deps refusal, hardened apply, deterministic pack) ────
@@ -240,71 +265,62 @@ pub async fn vendor_npm(
     let mut wiring: Vec<WiringRecord> = Vec::new();
     let mut changed = false;
     let mut recomputed_deps = false;
-    {
-        let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) else {
-            return done_failure_unstage(
-                purl,
-                "lock `packages` object vanished mid-rewrite".to_string(),
-                project_root,
-                &uuid_dir_rel,
-                uuid_dir_preexisted,
-            )
+    let rewire = LockRewire {
+        name,
+        version,
+        resolved: &resolved,
+        integrity: &packed.integrity,
+        staged_pkg_json: staged_pkg_json.as_ref(),
+    };
+    if let Err(e) = rewire.apply(
+        &mut lock,
+        lock_version,
+        &matches,
+        &lock_name,
+        &mut wiring,
+        &mut changed,
+        &mut recomputed_deps,
+        &mut warnings,
+    ) {
+        return done_failure_unstage(purl, e, project_root, &uuid_dir_rel, uuid_dir_preexisted)
             .await;
-        };
-        for m in &matches {
-            let Some(live) = packages.get_mut(&m.key).and_then(Value::as_object_mut) else {
-                continue;
-            };
-            // Idempotency: an instance already carrying our exact spec needs
-            // no edit and no wiring record.
-            if entry_in_sync(live, &resolved, &packed.integrity) {
-                continue;
-            }
-            // Never record one of our own (stale) edits as the "original" —
-            // revert must restore the pre-vendor registry fragment, not a
-            // dangling `.socket/vendor/` pointer from an earlier uuid.
-            let was_vendored = entry_points_into_vendor(live);
-            live.insert("resolved".to_string(), Value::String(resolved.clone()));
-            live.insert(
-                "integrity".to_string(),
-                Value::String(packed.integrity.clone()),
-            );
-            if let Some(pkg) = &staged_pkg_json {
-                recompute_dep_fields(live, pkg);
-                recomputed_deps = true;
-            }
-            wiring.push(WiringRecord {
-                file: lock_name.clone(),
-                kind: KIND_LOCK_ENTRY.to_string(),
-                action: WiringAction::Rewritten,
-                key: Some(m.key.clone()),
-                original: if was_vendored {
-                    None
-                } else {
-                    Some(m.original.clone())
-                },
-                new: Some(Value::Object(live.clone())),
-            });
-            changed = true;
-        }
     }
-    // lockfileVersion 2 keeps a legacy `dependencies` mirror (read by npm 6);
-    // leaving the registry resolved/integrity there would let an old client
-    // silently install unpatched bytes.
-    if lock_version == Some(2) {
-        if let Some(deps) = lock.get_mut("dependencies").and_then(Value::as_object_mut) {
-            rewrite_legacy_tree(
-                deps,
-                "/dependencies",
-                name,
-                version,
-                &resolved,
-                &packed.integrity,
-                &lock_name,
-                &mut wiring,
-                &mut changed,
-                &mut warnings,
-            );
+    let primary_changed = changed;
+    // Sibling locks get the identical rewrite; their wiring records name
+    // their own file, so revert (which walks records per file) restores
+    // each.
+    let mut sibling_writes: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
+    for sib in &mut siblings {
+        let mut sib_changed = false;
+        if let Err(e) = rewire.apply(
+            &mut sib.lock,
+            sib.lock_version,
+            &sib.matches,
+            &sib.name,
+            &mut wiring,
+            &mut sib_changed,
+            &mut recomputed_deps,
+            &mut warnings,
+        ) {
+            return done_failure_unstage(purl, e, project_root, &uuid_dir_rel, uuid_dir_preexisted)
+                .await;
+        }
+        if sib_changed {
+            changed = true;
+            let indent = detect_indent(&String::from_utf8_lossy(&sib.bytes));
+            match serialize_json(&sib.lock, &indent) {
+                Ok(out) => sibling_writes.push((sib.name.clone(), sib.bytes.clone(), out)),
+                Err(e) => {
+                    return done_failure_unstage(
+                        purl,
+                        format!("cannot serialize {}: {e}", sib.name),
+                        project_root,
+                        &uuid_dir_rel,
+                        uuid_dir_preexisted,
+                    )
+                    .await
+                }
+            }
         }
     }
     if recomputed_deps {
@@ -346,15 +362,34 @@ pub async fn vendor_npm(
             .await
         }
     };
-    if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(&lock_name), &out).await {
-        return done_failure_unstage(
-            purl,
-            format!("cannot write {lock_name}: {e}"),
-            project_root,
-            &uuid_dir_rel,
-            uuid_dir_preexisted,
-        )
-        .await;
+    // Siblings first, the primary lock last (still the final mutation); a
+    // failed write restores every sibling already written, so no lock is
+    // left resolving through an artifact the unstage removes.
+    let mut written: Vec<(&str, &[u8])> = Vec::new();
+    let mut write_err: Option<String> = None;
+    for (sib_name, original, out) in &sibling_writes {
+        if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(sib_name), out).await
+        {
+            write_err = Some(format!("cannot write {sib_name}: {e}"));
+            break;
+        }
+        written.push((sib_name, original));
+    }
+    if write_err.is_none() && primary_changed {
+        if let Err(e) =
+            atomic_write_bytes_preserving_mode(&project_root.join(&lock_name), &out).await
+        {
+            write_err = Some(format!("cannot write {lock_name}: {e}"));
+        }
+    }
+    if let Some(e) = write_err {
+        for (sib_name, original) in written {
+            // Best effort: the original bytes were read moments ago.
+            let _ =
+                atomic_write_bytes_preserving_mode(&project_root.join(sib_name), original).await;
+        }
+        return done_failure_unstage(purl, e, project_root, &uuid_dir_rel, uuid_dir_preexisted)
+            .await;
     }
 
     // ── 9. Marker + ledger entry ─────────────────────────────────────────
@@ -967,15 +1002,166 @@ fn revert_one_record(
 // ───────────────────────────── small helpers ─────────────────────────────
 // (the flavor-agnostic coordinate/staging helpers live in `npm_common`)
 
-async fn select_lockfile(project_root: &Path) -> std::io::Result<Option<(String, Vec<u8>)>> {
+/// The primary lock (`npm-shrinkwrap.json` wins, like npm <= 11 installs)
+/// plus every OTHER present npm lock (npm 12's dual-lock state: the
+/// package-lock.json npm 12 reifies from). A sibling that exists but cannot
+/// be read is returned as `Err` inside the list so the caller can say so.
+/// Reads go through the guarded `read_regular_to_bytes` (flavor detection is
+/// existence-only for the npm locks, so this read is the FIRST open — a FIFO
+/// planted as a lockfile must fail fast, never wedge vendor or revert).
+#[allow(clippy::type_complexity)]
+async fn select_lockfile(
+    project_root: &Path,
+) -> std::io::Result<
+    Option<(
+        String,
+        Vec<u8>,
+        Vec<(&'static str, std::io::Result<Vec<u8>>)>,
+    )>,
+> {
+    let mut primary: Option<(String, Vec<u8>)> = None;
+    let mut siblings = Vec::new();
     for lock_name in [SHRINKWRAP, PACKAGE_LOCK] {
         match read_regular_to_bytes(&project_root.join(lock_name)).await {
-            Ok(bytes) => return Ok(Some((lock_name.to_string(), bytes))),
+            Ok(bytes) if primary.is_none() => primary = Some((lock_name.to_string(), bytes)),
+            Ok(bytes) => siblings.push((lock_name, Ok(bytes))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
+            Err(e) if primary.is_none() => return Err(e),
+            Err(e) => siblings.push((lock_name, Err(e))),
         }
     }
-    Ok(None)
+    Ok(primary.map(|(name, bytes)| (name, bytes, siblings)))
+}
+
+/// A present npm lock beside the primary one, parsed and scanned.
+struct SiblingLock {
+    name: String,
+    bytes: Vec<u8>,
+    lock: Value,
+    lock_version: Option<u64>,
+    matches: Vec<LockMatch>,
+}
+
+/// Parse + validate + scan a sibling lock with the primary's rules; `Err`
+/// is the human reason it cannot be rewired.
+fn sibling_lock_target(
+    sib_name: &str,
+    sib_bytes: std::io::Result<Vec<u8>>,
+    name: &str,
+    version: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<SiblingLock, String> {
+    let bytes = sib_bytes.map_err(|e| format!("it cannot be read: {e}"))?;
+    let lock: Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("it is not parseable JSON: {e}"))?;
+    let lock_version = lock.get("lockfileVersion").and_then(Value::as_u64);
+    if !matches!(lock_version, Some(2) | Some(3))
+        || !lock.get("packages").is_some_and(Value::is_object)
+    {
+        return Err(format!(
+            "lockfileVersion {lock_version:?}; only v2/v3 locks are supported"
+        ));
+    }
+    match scan_lock_matches(&lock, name, version, warnings) {
+        LockScan::Matches(matches) if !matches.is_empty() => Ok(SiblingLock {
+            name: sib_name.to_string(),
+            bytes,
+            lock,
+            lock_version,
+            matches,
+        }),
+        LockScan::Matches(_) => Err("it has no rewritable entry for the package".to_string()),
+        LockScan::WorkspaceMember { key } => Err(format!("`{key}` is a workspace member there")),
+    }
+}
+
+/// The per-lock rewrite of step 8: every matched `packages` instance (and,
+/// for v2, the legacy `dependencies` mirror) is pointed at the vendored
+/// tarball, recording one wiring record per edit under `lock_name`.
+struct LockRewire<'a> {
+    name: &'a str,
+    version: &'a str,
+    resolved: &'a str,
+    integrity: &'a str,
+    staged_pkg_json: Option<&'a Value>,
+}
+
+impl LockRewire<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn apply(
+        &self,
+        lock: &mut Value,
+        lock_version: Option<u64>,
+        matches: &[LockMatch],
+        lock_name: &str,
+        wiring: &mut Vec<WiringRecord>,
+        changed: &mut bool,
+        recomputed_deps: &mut bool,
+        warnings: &mut Vec<VendorWarning>,
+    ) -> Result<(), String> {
+        let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) else {
+            return Err("lock `packages` object vanished mid-rewrite".to_string());
+        };
+        for m in matches {
+            let Some(live) = packages.get_mut(&m.key).and_then(Value::as_object_mut) else {
+                continue;
+            };
+            // Idempotency: an instance already carrying our exact spec needs
+            // no edit and no wiring record.
+            if entry_in_sync(live, self.resolved, self.integrity) {
+                continue;
+            }
+            // Never record one of our own (stale) edits as the "original" —
+            // revert must restore the pre-vendor registry fragment, not a
+            // dangling `.socket/vendor/` pointer from an earlier uuid.
+            let was_vendored = entry_points_into_vendor(live);
+            live.insert(
+                "resolved".to_string(),
+                Value::String(self.resolved.to_string()),
+            );
+            live.insert(
+                "integrity".to_string(),
+                Value::String(self.integrity.to_string()),
+            );
+            if let Some(pkg) = self.staged_pkg_json {
+                recompute_dep_fields(live, pkg);
+                *recomputed_deps = true;
+            }
+            wiring.push(WiringRecord {
+                file: lock_name.to_string(),
+                kind: KIND_LOCK_ENTRY.to_string(),
+                action: WiringAction::Rewritten,
+                key: Some(m.key.clone()),
+                original: if was_vendored {
+                    None
+                } else {
+                    Some(m.original.clone())
+                },
+                new: Some(Value::Object(live.clone())),
+            });
+            *changed = true;
+        }
+        // lockfileVersion 2 keeps a legacy `dependencies` mirror (read by
+        // npm 6); leaving the registry resolved/integrity there would let an
+        // old client silently install unpatched bytes.
+        if lock_version == Some(2) {
+            if let Some(deps) = lock.get_mut("dependencies").and_then(Value::as_object_mut) {
+                rewrite_legacy_tree(
+                    deps,
+                    "/dependencies",
+                    self.name,
+                    self.version,
+                    self.resolved,
+                    self.integrity,
+                    lock_name,
+                    wiring,
+                    changed,
+                    warnings,
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1982,9 +2168,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shrinkwrap_wins_over_package_lock() {
+    async fn shrinkwrap_only_project_rewires_the_shrinkwrap() {
         let fx = fixture().await;
-        // Same content as the package-lock, but under the shrinkwrap name.
+        // npm <= 11's `npm shrinkwrap` RENAMES the lock: shrinkwrap only.
+        tokio::fs::rename(fx.lock_path(), fx.root().join(SHRINKWRAP))
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+        assert!(entry.wiring.iter().all(|r| r.file == SHRINKWRAP));
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "vendor_npm_sibling_lock_unwired"),
+            "{warnings:?}"
+        );
+        assert!(!fx.lock_path().exists(), "no package-lock.json is invented");
+        let shrink: Value =
+            serde_json::from_slice(&tokio::fs::read(fx.root().join(SHRINKWRAP)).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            shrink["packages"]["node_modules/left-pad"]["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz()))
+        );
+    }
+
+    /// REGRESSION (npm 12): npm 12 auto-creates package-lock.json beside a
+    /// committed npm-shrinkwrap.json and installs FROM package-lock.json
+    /// (verified against real npm 12.0.0 / 12.1.0), so wiring only the
+    /// shrinkwrap was a silent false success there. BOTH locks are rewired
+    /// identically, each wiring record names its own file, a re-run is a
+    /// byte-stable no-op, and revert restores both byte-for-byte.
+    #[tokio::test]
+    async fn dual_npm_locks_are_both_rewired_and_both_reverted() {
+        let fx = fixture().await;
         tokio::fs::write(fx.root().join(SHRINKWRAP), &fx.lock_bytes)
             .await
             .unwrap();
@@ -1992,19 +2211,77 @@ mod tests {
         let (result, entry, _) = expect_done(fx.vendor(false).await);
         assert!(result.success);
         let entry = entry.unwrap();
-        assert!(entry.wiring.iter().all(|r| r.file == SHRINKWRAP));
+        for lock in [SHRINKWRAP, PACKAGE_LOCK] {
+            assert!(
+                entry.wiring.iter().any(|r| r.file == lock),
+                "{lock} wiring recorded: {:?}",
+                entry.wiring
+            );
+            let v: Value =
+                serde_json::from_slice(&tokio::fs::read(fx.root().join(lock)).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                v["packages"]["node_modules/left-pad"]["resolved"],
+                json!(format!("file:{}", fx.expected_rel_tgz())),
+                "{lock} rewired"
+            );
+        }
+        let wired_shrink = tokio::fs::read(fx.root().join(SHRINKWRAP)).await.unwrap();
+        let wired_lock = tokio::fs::read(fx.lock_path()).await.unwrap();
+        assert_eq!(wired_shrink, wired_lock, "identical rewrite in both locks");
 
-        // package-lock.json byte-untouched; shrinkwrap rewritten.
+        // Re-run: in sync everywhere, nothing rewritten.
+        let (result, again, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success);
+        assert!(again.is_none(), "in-sync re-run records nothing");
+        assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), wired_lock);
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        for lock in [SHRINKWRAP, PACKAGE_LOCK] {
+            assert_eq!(
+                tokio::fs::read(fx.root().join(lock)).await.unwrap(),
+                fx.lock_bytes,
+                "{lock} restored byte-for-byte"
+            );
+        }
+        assert!(!fx.root().join(".socket/vendor/npm").join(UUID).exists());
+    }
+
+    /// Only the shrinkwrap (primary) is rewired when a stale sibling
+    /// package-lock.json lacks the package: vendor still succeeds, but LOUDLY
+    /// names the lock npm 12 would install from unpatched.
+    #[tokio::test]
+    async fn unrewirable_sibling_lock_is_named_not_silently_skipped() {
+        let fx = fixture().await;
+        tokio::fs::write(fx.root().join(SHRINKWRAP), &fx.lock_bytes)
+            .await
+            .unwrap();
+        let stale = json!({
+            "name": "fixture", "version": "1.0.0", "lockfileVersion": 3,
+            "packages": { "": { "name": "fixture", "version": "1.0.0" } }
+        });
+        let stale_bytes = serde_json::to_vec_pretty(&stale).unwrap();
+        tokio::fs::write(fx.lock_path(), &stale_bytes)
+            .await
+            .unwrap();
+
+        let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success);
+        assert!(entry.unwrap().wiring.iter().all(|r| r.file == SHRINKWRAP));
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "vendor_npm_sibling_lock_unwired")
+            .unwrap_or_else(|| panic!("sibling warning missing: {warnings:?}"));
+        assert!(
+            w.detail.contains(PACKAGE_LOCK) && w.detail.contains("npm >= 12"),
+            "{}",
+            w.detail
+        );
         assert_eq!(
             tokio::fs::read(fx.lock_path()).await.unwrap(),
-            fx.lock_bytes
-        );
-        let shrink: Value =
-            serde_json::from_slice(&tokio::fs::read(fx.root().join(SHRINKWRAP)).await.unwrap())
-                .unwrap();
-        assert_eq!(
-            shrink["packages"]["node_modules/left-pad"]["resolved"],
-            json!(format!("file:{}", fx.expected_rel_tgz()))
+            stale_bytes,
+            "the stale sibling is left byte-untouched"
         );
     }
 
@@ -2952,17 +3229,14 @@ mod tests {
     /// The flip side: when the lock provably no longer resolves through the
     /// artifact (re-locked away from it), the empty-wiring revert keeps its
     /// pre-guard behavior and removes the genuinely orphaned artifact —
-    /// replaying nothing. A shrinkwrap wins the probe like it wins installs:
-    /// an uuid mention left behind in package-lock.json does not block.
+    /// replaying nothing.
     #[tokio::test]
     async fn empty_wiring_revert_removes_a_genuinely_orphaned_artifact() {
         let (fx, entry) = reconstructed_fixture().await;
-        // npm installs from the shrinkwrap when both exist; the pre-vendor
-        // one carries no uuid reference while package-lock.json still does.
-        tokio::fs::write(fx.root().join(SHRINKWRAP), &fx.lock_bytes)
+        // Re-locked away from the artifact: the pre-vendor lock is back.
+        tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
             .await
             .unwrap();
-        let lock_vendored = tokio::fs::read(fx.lock_path()).await.unwrap();
 
         let outcome = revert_npm(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
@@ -2974,8 +3248,38 @@ mod tests {
         );
         assert_eq!(
             tokio::fs::read(fx.lock_path()).await.unwrap(),
-            lock_vendored,
+            fx.lock_bytes,
             "empty wiring replays nothing"
+        );
+    }
+
+    /// REGRESSION (npm 12): a clean shrinkwrap no longer "wins" the probe.
+    /// npm 12 installs from package-lock.json beside a committed
+    /// npm-shrinkwrap.json, so a package-lock.json still resolving through
+    /// the artifact must block its deletion — it used to be removed, and
+    /// every later npm 12 install failed ENOENT on the missing tarball.
+    #[tokio::test]
+    async fn empty_wiring_revert_refuses_while_the_sibling_package_lock_is_wired() {
+        let (fx, entry) = reconstructed_fixture().await;
+        tokio::fs::write(fx.root().join(SHRINKWRAP), &fx.lock_bytes)
+            .await
+            .unwrap();
+        let lock_vendored = tokio::fs::read(fx.lock_path()).await.unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(!outcome.success, "must refuse: package-lock.json is wired");
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_wiring_unknown_revert_blocked"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(fx.root().join(fx.expected_rel_tgz()).exists());
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            lock_vendored
         );
     }
 
