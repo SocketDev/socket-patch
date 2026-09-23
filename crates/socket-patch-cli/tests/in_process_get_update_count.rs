@@ -1,5 +1,6 @@
 //! In-process tests for the `updated` accounting in
-//! `get::download_and_apply_patches`.
+//! `get::download_and_apply_patches_with` (driven through this file's
+//! `download_and_apply_patches` shim, which supplies the run's client).
 //!
 //! Regression guard: the manifest-update count used to be tallied from a
 //! pre-fetch scan of the manifest (`existing.uuid != search_result.uuid`),
