@@ -681,6 +681,15 @@ into the new version's section — see docs/releasing.md.
   `service` promises that only the patch service's artifact is used. They now
   refuse with `vendor_prebuilt_required` before doing any work, the same way
   `--offline` is already refused.
+- **Rebuilding a missing cargo vendored copy now honours
+  `--vendor-source`.** When a wired project's committed crate copy was
+  missing or stale, `vendor` always rebuilt it locally from the installed
+  source. Under `--vendor-source=service` it did so even with `--offline`
+  or without an API client, and reported success. The rebuild now uses the
+  patch service's prebuilt crate like a fresh vendor does, so `service`
+  mode refuses (`vendor_service_offline_conflict` / `vendor_prebuilt_required`)
+  when the service cannot be used, and `auto` still builds locally when it
+  has no prebuilt crate.
 
 ### Changed
 
