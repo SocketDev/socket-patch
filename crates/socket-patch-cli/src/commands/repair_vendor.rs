@@ -52,6 +52,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
+use socket_patch_core::constants::SOCKET_DIR;
 use socket_patch_core::crawlers::CrawlerOptions;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::copy_tree::remove_tree;
@@ -422,12 +423,17 @@ fn warn_wiring_unknown(env: &mut Envelope, common: &GlobalArgs, detail: String) 
     });
 }
 
-/// Best-effort removal of a vendored uuid dir — ahead of a rebuild (corrupt
-/// bytes must never blend into one) or after a failed post-verify (never
-/// leave unverifiable bytes behind).
+/// Best-effort removal of a vendored uuid dir after a failed post-verify
+/// (never leave unverifiable bytes behind). Prunes the emptied
+/// `.socket/vendor/<eco>/` (and `vendor/`) husks like every other artifact
+/// removal, stopping at `.socket/`; a sibling unit or the ledger keeps them.
 async fn remove_vendor_dir(cwd: &Path, eco: &str, uuid: &str) {
     if let Some(rel) = vendor::path::vendor_uuid_dir_rel(eco, uuid) {
-        let _ = remove_tree(&cwd.join(rel)).await;
+        let _ = socket_patch_core::utils::socket_dir::remove_tree_and_prune(
+            &cwd.join(rel),
+            &cwd.join(SOCKET_DIR),
+        )
+        .await;
     }
 }
 
@@ -1995,6 +2001,14 @@ mod tests {
         assert!(dir.is_dir(), "a non-canonical uuid must remove nothing");
         remove_vendor_dir(tmp.path(), "npm", uuid).await;
         assert!(!dir.exists(), "the canonical pair removes its uuid dir");
+        assert!(
+            !tmp.path().join(".socket/vendor").exists(),
+            "the emptied <eco>/ and vendor/ husks are pruned"
+        );
+        assert!(
+            tmp.path().join(".socket").is_dir(),
+            ".socket/ is never removed"
+        );
     }
 
     /// The empty-component rejects: a purl with no name or no version can

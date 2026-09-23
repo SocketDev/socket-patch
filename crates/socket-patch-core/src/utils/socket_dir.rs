@@ -81,16 +81,46 @@ pub async fn remove_tree_and_prune(dir: &Path, stop_dir: &Path) -> std::io::Resu
 /// reads through the FIFO-safe opener; any read error (absent, unreadable,
 /// not a regular file) simply falls through to the write, so failure paths
 /// are exactly those of a plain write.
+///
+/// A failed write leaves no husk: when this call had to create the parent
+/// (`.socket/vendor/` on a fresh project) and the write then fails
+/// (ENOSPC, a squatter, …), the directories it created are pruned again up
+/// to the nearest `.socket/` ancestor before the ORIGINAL error propagates.
+/// Unlike [`remove_file_and_prune`], nothing was written here, so pruning
+/// on the error path is the right asymmetry. A parent that already existed
+/// (the user's, or another run's) is never removed.
 pub(crate) async fn write_json_ledger<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
     bytes.push(b'\n');
     if matches!(read_regular_to_bytes(path).await, Ok(existing) if existing == bytes) {
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    let Some(parent) = path.parent() else {
+        return atomic_write_bytes(path, &bytes).await;
+    };
+    let created_parent = tokio::fs::metadata(parent).await.is_err();
+    tokio::fs::create_dir_all(parent).await?;
+    match atomic_write_bytes(path, &bytes).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if created_parent {
+                if let Some(stop) = nearest_socket_dir(path) {
+                    prune_empty_dirs(parent, stop).await;
+                }
+            }
+            Err(e)
+        }
     }
-    atomic_write_bytes(path, &bytes).await
+}
+
+/// The nearest ancestor of `path` literally named `.socket` — the fence for
+/// an error-path prune. `None` (a ledger that does not live under a
+/// `.socket/`) means: never climb.
+fn nearest_socket_dir(path: &Path) -> Option<&Path> {
+    path.ancestors().skip(1).find(|a| {
+        a.file_name()
+            .is_some_and(|n| n == crate::constants::SOCKET_DIR)
+    })
 }
 
 #[cfg(test)]
@@ -270,5 +300,62 @@ mod tests {
             let name = entry.unwrap().file_name().to_string_lossy().into_owned();
             assert!(!name.starts_with(".socket-stage-"), "litter: {name}");
         }
+    }
+
+    /// A failed write on a fresh project prunes the `.socket/vendor/` this
+    /// call created, keeps `.socket/` (the fence), and propagates the write
+    /// error unchanged. The failure is forced by a stem long enough that the
+    /// `.socket-stage-<stem>-<uuid>` staging name exceeds NAME_MAX.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_json_ledger_failed_write_prunes_the_parent_it_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join(".socket");
+        tokio::fs::create_dir_all(&socket).await.unwrap();
+        let stem = "x".repeat(250);
+        let path = socket.join("vendor").join(format!("{stem}.json"));
+        let ledger = Ledger {
+            version: 1,
+            entries: vec![],
+        };
+
+        let err = write_json_ledger(&path, &ledger).await.unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        assert!(
+            !socket.join("vendor").exists(),
+            "the vendor/ husk this call created is pruned on the error path"
+        );
+        assert!(socket.exists(), "the .socket/ fence is never removed");
+    }
+
+    /// A parent that already existed is NOT removed on a failed write, even
+    /// when empty: only directories this call created are its husks.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_json_ledger_failed_write_keeps_a_preexisting_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let vendor = tmp.path().join(".socket/vendor");
+        tokio::fs::create_dir_all(&vendor).await.unwrap();
+        std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::File::create(vendor.join("probe")).is_ok() {
+            let _ = std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o755));
+            eprintln!("skipping: running as root, 0555 does not block writes");
+            return;
+        }
+        let ledger = Ledger {
+            version: 1,
+            entries: vec!["a".into()],
+        };
+
+        let err = write_json_ledger(&vendor.join("state.json"), &ledger)
+            .await
+            .unwrap_err();
+        std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            vendor.exists(),
+            "a pre-existing parent survives a failed write"
+        );
     }
 }

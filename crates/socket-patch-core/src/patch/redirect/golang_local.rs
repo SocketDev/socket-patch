@@ -36,8 +36,10 @@ use crate::vendor::common::{
     already_patched_result, copy_matches_after_hashes, synthesized_result,
 };
 
-use crate::patch::copy_tree::{fresh_copy, remove_tree};
+use crate::constants::SOCKET_DIR;
+use crate::patch::copy_tree::fresh_copy;
 use crate::patch::path_safety;
+use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::vendor::go_mod_edit::{
     self, read_replace_entries, read_required_versions, replace_target_path, ReplaceOwner,
     GO_PATCHES_DIR,
@@ -340,7 +342,11 @@ pub async fn remove_go_redirect(
 
     if !dry_run {
         let copy_dir = copy_dir_for(project_root, base_rel, module, version);
-        let _ = remove_tree(&copy_dir).await; // ignore NotFound
+        // Ignore NotFound. Prunes the emptied `<host>/<org>/` levels and
+        // `go-patches/` itself when this was its last module, stopping at
+        // `.socket/` — module paths carry slashes, so a bare tree removal
+        // would leave `.socket/go-patches/github.com/foo/` husks behind.
+        let _ = remove_tree_and_prune(&copy_dir, &project_root.join(SOCKET_DIR)).await;
     }
     Ok(())
 }
@@ -417,7 +423,7 @@ pub async fn reconcile_go_redirects(
                 }
             }
             if !dry_run {
-                let _ = remove_tree(&dir).await;
+                let _ = remove_tree_and_prune(&dir, &project_root.join(SOCKET_DIR)).await;
             }
             if !removed.contains(&purl) {
                 removed.push(purl);
@@ -588,7 +594,7 @@ async fn teardown_failed_redirect(
     version: &str,
     base_rel: &str,
 ) {
-    let _ = remove_tree(copy_dir).await;
+    let _ = remove_tree_and_prune(copy_dir, &project_root.join(SOCKET_DIR)).await;
     if let Some(owner) = go_mod_edit::detect_owner(&replace_target_path(base_rel, module, version))
     {
         let _ = go_mod_edit::drop_replace_entry(project_root, module, owner, false).await;
@@ -680,6 +686,7 @@ async fn collect_copy_modules(go_patches_root: &Path) -> Vec<(String, PathBuf)> 
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+    use crate::patch::copy_tree::remove_tree;
     use std::collections::HashMap;
 
     const PRISTINE: &[u8] = b"package bar\n\nfunc Hello() string { return \"hi\" }\n";
@@ -1301,7 +1308,52 @@ mod tests {
         assert!(!root
             .join(".socket/go-patches/github.com/foo/bar@v1.4.2")
             .exists());
+        // The last module's removal also prunes the `github.com/foo/`
+        // levels and `go-patches/` itself — no empty husks under `.socket/`.
+        assert!(
+            !root.join(GO_PATCHES_DIR).exists(),
+            "emptied .socket/go-patches/ husk must be pruned"
+        );
+        assert!(root.join(".socket").is_dir(), ".socket/ is the prune fence");
         assert!(read_replace_entries(root).await.is_empty());
+    }
+
+    /// A sibling module under the same host/org stops the prune climb: only
+    /// the removed module's own directory goes.
+    #[tokio::test]
+    async fn test_remove_go_redirect_keeps_a_sibling_modules_copy() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        apply_go_redirect(
+            PURL,
+            MODULE,
+            VERSION,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        let sibling = root.join(".socket/go-patches/github.com/foo/baz@v0.1.0");
+        tokio::fs::create_dir_all(&sibling).await.unwrap();
+        tokio::fs::write(sibling.join("go.mod"), b"module github.com/foo/baz\n")
+            .await
+            .unwrap();
+
+        remove_go_redirect(PURL, root, GO_PATCHES_DIR, ReplaceOwner::GoPatches, false)
+            .await
+            .unwrap();
+
+        assert!(!root
+            .join(".socket/go-patches/github.com/foo/bar@v1.4.2")
+            .exists());
+        assert!(sibling.join("go.mod").is_file(), "sibling copy untouched");
+        assert!(root.join(".socket/go-patches/github.com/foo").is_dir());
     }
 
     #[tokio::test]
@@ -2177,7 +2229,10 @@ mod tests {
 
         // Parity: the real run removes exactly what the dry run reported.
         let removed_wet = reconcile_go_redirects(root, &HashSet::new(), false).await;
-        assert_eq!(removed_wet, removed, "dry-run report must match the real run");
+        assert_eq!(
+            removed_wet, removed,
+            "dry-run report must match the real run"
+        );
         assert!(!copy_dir.exists(), "real run prunes the copy");
         assert!(read_replace_entries(root).await.is_empty());
     }

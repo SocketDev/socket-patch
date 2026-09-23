@@ -3075,10 +3075,15 @@ mod tests {
             .await
             .unwrap()
             .contains("require github.com/foo/bar v1.4.2"));
-        // ...and the patched copy is removed.
+        // ...and the patched copy is removed, together with the emptied
+        // `.socket/go-patches/<host>/<org>/` levels (no husk residue).
         assert!(
             !copy_dir.exists(),
             "patched copy under .socket/go-patches must be removed"
+        );
+        assert!(
+            !root.join(".socket/go-patches").exists(),
+            "emptied .socket/go-patches/ husk must be pruned after the last module"
         );
     }
 
