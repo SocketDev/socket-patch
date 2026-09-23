@@ -43,9 +43,9 @@ use crate::utils::purl::{build_composer_purl, parse_composer_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
-    already_patched_result, copy_matches_after_hashes, done, prune_empty_vendor_levels, refused,
-    serialize_json, service_offline_conflict, stage_dir_for, swap_stage_into_place,
-    synthesized_result,
+    already_patched_result, any_live_file_references, copy_matches_after_hashes, done,
+    prune_empty_vendor_levels, refused, serialize_json, service_offline_conflict, stage_dir_for,
+    swap_stage_into_place, synthesized_result,
 };
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::extract_zip;
@@ -359,6 +359,14 @@ pub async fn vendor_composer(
 /// update`, a hand edit, or a newer vendor run — is left alone with a
 /// `vendor_lock_entry_drifted` warning.
 ///
+/// Drift-keep: when a record was left alone and the live composer.lock STILL
+/// names the uuid dir (reachable only past the stranded refusal below, i.e.
+/// under `keep_artifact`, or through a reference the refusal's structural
+/// scan does not see), the artifact is kept and `kept_artifact` tells the
+/// caller to keep the ledger entry too. A lock that no longer references
+/// the dir has converged: the drift is warned about and the artifact
+/// removed — nothing wired consumes it any more.
+///
 /// Refused fail-closed when composer.lock still wires a package to our uuid
 /// dir that NO wiring record can restore (a `repair`-reconstructed entry
 /// carries no pre-vendor fragment): the registry `dist` the surgery replaced
@@ -456,25 +464,35 @@ pub async fn revert_composer_opts(
         }
     }
 
-    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
-    // (and the caller keeps the ledger entry), so only the deletion is
-    // skipped.
-    if !dry_run && !keep_artifact {
-        // The last composer entry leaves `.socket/vendor/composer/` (and
-        // `.socket/vendor/`) empty: the shared helper prunes them so a
-        // reverted project carries no vendor residue (non-recursive:
-        // siblings keep them).
-        if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
-            return RevertOutcome {
-                kept_artifact: false,
-                success: false,
-                warnings,
-                error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
-            };
+    let mut outcome = RevertOutcome {
+        kept_artifact: false,
+        success: true,
+        warnings,
+        error: None,
+    };
+    if !dry_run {
+        if outcome.drift_skipped()
+            && any_live_file_references(project_root, &[COMPOSER_LOCK], &uuid_dir_rel).await
+        {
+            // Drift-keep (see the fn doc): never delete a uuid dir the live
+            // lock still routes composer at.
+            outcome.keep_artifact(&uuid_dir_rel);
+        } else if !keep_artifact {
+            // `--preserve-state` (`keep_artifact`) skips only this deletion:
+            // the artifact dir stays behind and the caller keeps the ledger
+            // entry. The last composer entry leaves `.socket/vendor/composer/`
+            // (and `.socket/vendor/`) empty: the shared helper prunes them so
+            // a reverted project carries no vendor residue (non-recursive:
+            // siblings keep them).
+            if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
+                outcome.success = false;
+                outcome.error = Some(format!("failed to remove {}: {e}", uuid_dir.display()));
+                return outcome;
+            }
         }
     }
 
-    warnings.push(VendorWarning::new(
+    outcome.warnings.push(VendorWarning::new(
         "vendor_installed_copy_stale",
         format!(
             "the installed vendor/{} copy keeps the patched bytes until the next `composer install`",
@@ -486,13 +504,7 @@ pub async fn revert_composer_opts(
                 .unwrap_or("<package>")
         ),
     ));
-
-    RevertOutcome {
-        kept_artifact: false,
-        success: true,
-        warnings,
-        error: None,
-    }
+    outcome
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -1629,11 +1641,12 @@ mod tests {
             drifted_bytes,
             "drifted lock left alone"
         );
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
         assert!(
             !root
                 .join(format!(".socket/vendor/composer/{UUID}"))
                 .exists(),
-            "uuid dir still removed"
+            "a lock rewired to the registry names nothing under .socket/vendor: the uuid dir is removed"
         );
     }
 
@@ -3010,6 +3023,11 @@ mod tests {
             "unknown wiring left alone"
         );
         assert!(root.join(copy_rel()).exists(), "artifact kept");
+        assert!(
+            outcome.kept_artifact,
+            "the still-wired lock drift-keeps the artifact: {:?}",
+            outcome.warnings
+        );
     }
 
     /// Malformed wiring records — no key, a colon-less key, an unknown
@@ -3068,13 +3086,18 @@ mod tests {
                 "{label}: lock untouched"
             );
             assert!(root.join(copy_rel()).exists(), "{label}: artifact kept");
+            assert!(
+                outcome.kept_artifact,
+                "{label}: the still-wired lock drift-keeps the artifact: {:?}",
+                outcome.warnings
+            );
         }
     }
 
     /// Drift shapes beyond the covered registry-dist rewrite: the whole lock
     /// section vanished, or the package entry was dropped from the lock. Both
-    /// warn and still remove the artifact (composer's documented
-    /// delete-on-drift behavior — nothing wired consumes it any more).
+    /// warn and still remove the artifact: nothing in the lock names the uuid
+    /// dir any more, so there is nothing a drift-keep would protect.
     #[tokio::test]
     async fn test_revert_drift_section_or_entry_gone_still_removes_artifact() {
         for strip_section in [true, false] {
@@ -3119,6 +3142,11 @@ mod tests {
                 tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
                 drifted_bytes,
                 "strip_section={strip_section}: drifted lock left alone"
+            );
+            assert!(
+                !outcome.kept_artifact,
+                "strip_section={strip_section}: {:?}",
+                outcome.warnings
             );
             assert!(
                 !root

@@ -376,6 +376,36 @@ pub(crate) async fn prune_empty_vendor_levels(uuid_dir: &Path) {
     crate::utils::socket_dir::prune_empty_dirs(uuid_dir, socket_dir).await;
 }
 
+/// True when any of `files` (root-relative wiring files a backend authored)
+/// still names `uuid_dir_rel`: the package manager can still be routed at
+/// the vendored artifact even though no wiring record could restore the
+/// fragment. This is the drift-keep gate of the whole-file backends
+/// (composer / maven / nuget). Unlike the lock backends, their drift
+/// classification is not liveness-aware — a converged file (our block
+/// already gone, a regenerated pom) reads as `vendor_lock_entry_drifted`
+/// too — so gating the keep on the drift warning alone would keep the
+/// artifact and ledger entry forever (the LIVENESS CONTRACT on
+/// [`RevertOutcome::drift_skipped`]). A live reference is the one thing a
+/// converged file never carries, so keeping exactly while one exists is
+/// both safe (nothing a file still routes at is deleted) and live (the
+/// user can always undo the drift). A file that cannot be read (absent,
+/// unreadable, not a regular file) references nothing.
+pub(crate) async fn any_live_file_references(
+    root: &Path,
+    files: &[&str],
+    uuid_dir_rel: &str,
+) -> bool {
+    for file in files {
+        if read_regular_to_string(&root.join(file))
+            .await
+            .is_ok_and(|live| live.contains(uuid_dir_rel))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 // ── pre-write guards shared by the pypi lock flavors ────────────────────────
 
 /// Refuse (with the flavor's stable `code`) when any of `files` (root-relative)

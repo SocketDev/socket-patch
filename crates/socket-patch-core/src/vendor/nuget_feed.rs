@@ -63,8 +63,9 @@ use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
-    already_patched_result, done, failed_result, prune_empty_vendor_levels, read_zip_artifact,
-    rebuild_zip, refused, synthesized_result, zip_bytes_match_after_hashes,
+    already_patched_result, any_live_file_references, done, failed_result,
+    prune_empty_vendor_levels, read_zip_artifact, rebuild_zip, refused, synthesized_result,
+    zip_bytes_match_after_hashes,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
@@ -549,6 +550,15 @@ pub async fn vendor_nuget(
 /// longer looks like what vendor wrote — a hand edit, a `dotnet restore`
 /// re-resolution, a newer vendor run — is left alone with a
 /// `vendor_lock_entry_drifted` warning.
+///
+/// Drift-keep: when a record was left alone and a live wiring file (the
+/// config) STILL names the uuid dir — tooling re-serialized `nuget.config`
+/// so neither authored element matches verbatim, a truncated record over a
+/// wired config — the artifact is kept and `kept_artifact` tells the caller
+/// to keep the ledger entry too: under the exclusive `packageSourceMapping`
+/// a source pointing at a gone dir bricks every cold restore. A config that
+/// no longer references the dir has converged: the drift is warned about
+/// and the artifact removed.
 pub async fn revert_nuget(
     entry: &VendorEntry,
     project_root: &Path,
@@ -622,30 +632,47 @@ pub async fn revert_nuget_opts(
         }
     }
 
-    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
-    // (and the caller keeps the ledger entry), so only the deletion is
-    // skipped.
-    if !dry_run && !keep_artifact {
-        // The last nuget entry leaves `.socket/vendor/nuget/` (and
-        // `.socket/vendor/`) empty: the shared helper prunes them so a
-        // reverted project carries no vendor residue (non-recursive:
-        // siblings keep them).
-        if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
-            return RevertOutcome {
-                kept_artifact: false,
-                success: false,
-                warnings,
-                error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
-            };
-        }
-    }
-
-    RevertOutcome {
+    let mut outcome = RevertOutcome {
         kept_artifact: false,
         success: true,
         warnings,
         error: None,
+    };
+    if dry_run {
+        return outcome;
     }
+    // Drift-keep (see the fn doc): never delete a uuid dir a live wiring
+    // file still routes NuGet at. Only the root-level basenames vendor
+    // records are probed (a tampered `../` path is never read).
+    let mut wired_files: Vec<&str> = entry
+        .wiring
+        .iter()
+        .map(|w| w.file.as_str())
+        .filter(|f| is_safe_single_segment(f))
+        .collect();
+    wired_files.sort_unstable();
+    wired_files.dedup();
+    if outcome.drift_skipped()
+        && any_live_file_references(project_root, &wired_files, &uuid_dir_rel).await
+    {
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
+    // (and the caller keeps the ledger entry), so only the deletion is
+    // skipped.
+    if keep_artifact {
+        return outcome;
+    }
+    // The last nuget entry leaves `.socket/vendor/nuget/` (and
+    // `.socket/vendor/`) empty: the shared helper prunes them so a
+    // reverted project carries no vendor residue (non-recursive:
+    // siblings keep them).
+    if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
+        outcome.success = false;
+        outcome.error = Some(format!("failed to remove {}: {e}", uuid_dir.display()));
+    }
+    outcome
 }
 
 // ── materialisation (service download / local rebuild) ─────────────────────────
@@ -2225,6 +2252,11 @@ mod tests {
             regenerated,
             "the user's regenerated config is left alone"
         );
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            !root.join(format!(".socket/vendor/nuget/{UUID}")).exists(),
+            "a regenerated config names nothing under .socket/vendor: the uuid dir is removed"
+        );
     }
 
     #[test]
@@ -3653,6 +3685,78 @@ mod tests {
                 .unwrap(),
             cfg,
             "a key-less record must not touch the live config"
+        );
+        assert!(
+            !outcome.kept_artifact,
+            "a config that names no uuid dir keeps nothing: {:?}",
+            outcome.warnings
+        );
+    }
+
+    /// A drift-skipped config record whose live `nuget.config` STILL routes
+    /// the package at the uuid dir — re-serialized by tooling, so neither
+    /// authored element matches verbatim — keeps the artifact (and, through
+    /// `kept_artifact`, the ledger entry): deleting it would point the
+    /// exclusive `packageSourceMapping` at a gone dir and brick every cold
+    /// restore. Parity with the lock backends' drift-keep.
+    #[tokio::test]
+    async fn revert_drift_keeps_the_artifact_while_the_config_still_routes_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let uuid_dir = root.join(format!(".socket/vendor/nuget/{UUID}"));
+        tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
+        tokio::fs::write(uuid_dir.join("x.nupkg"), b"zip")
+            .await
+            .unwrap();
+        // Same routing as vendor wrote, different spelling (`/>` without the
+        // space, no mapping block): case (c) of the config restore.
+        let cfg = format!(
+            "<configuration>\n  <packageSources>\n    <add key=\"socket-patch-{UUID}\" \
+             value=\".socket/vendor/nuget/{UUID}\"/>\n  </packageSources>\n</configuration>\n"
+        );
+        tokio::fs::write(root.join("nuget.config"), &cfg)
+            .await
+            .unwrap();
+        let entry = entry_with_wiring(
+            UUID,
+            vec![WiringRecord {
+                file: "nuget.config".to_string(),
+                kind: CONFIG_SOURCE_WIRING_KIND.to_string(),
+                action: WiringAction::Rewritten,
+                key: Some(format!("socket-patch-{UUID}")),
+                original: None,
+                new: None,
+            }],
+        );
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep is surfaced: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            uuid_dir.join("x.nupkg").is_file(),
+            "the artifact the live config still routes at is kept"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("nuget.config"))
+                .await
+                .unwrap(),
+            cfg,
+            "the drifted config is left alone"
         );
     }
 

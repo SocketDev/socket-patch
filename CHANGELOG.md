@@ -472,7 +472,12 @@ into the new version's section — see docs/releasing.md.
 - **Vendor backend parity.** Gem reverts follow every other backend's
   drift-keep rule (genuine drift keeps artifact + ledger entry; converged files
   are silent; a missing `Gemfile`/`Gemfile.lock` warns `vendor_lockfile_missing`
-  and still removes the artifact); the golang service leg stages its download
+  and still removes the artifact); composer, maven and nuget reverts keep the
+  artifact + ledger entry (`kept_artifact`, the `vendor_revert_kept` skip)
+  while the live `composer.lock` / `pom.xml` / `nuget.config` still names the
+  drift-skipped entry's uuid dir — previously the dir was deleted under a
+  `<repository>` / `<add>` that still routed at it — and remove it once
+  nothing references it; the golang service leg stages its download
   and, when a re-download of a wired present copy fails, keeps the copy and
   directive instead of tearing them down; poetry/pipenv/requirements refuse
   symlinked targets (`pypi_{poetry,pipenv,requirements}_symlink_unsupported`)

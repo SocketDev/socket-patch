@@ -76,8 +76,9 @@ use crate::utils::purl::{build_maven_purl, parse_maven_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
-    already_patched_result, done, failed_result, prune_empty_vendor_levels, read_zip_artifact,
-    rebuild_zip, refused, synthesized_result, zip_bytes_match_after_hashes,
+    already_patched_result, any_live_file_references, done, failed_result,
+    prune_empty_vendor_levels, read_zip_artifact, rebuild_zip, refused, synthesized_result,
+    zip_bytes_match_after_hashes,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
@@ -432,6 +433,13 @@ pub async fn vendor_maven(
 /// edits survive) and remove the validated uuid dir. A drifted live pom.xml —
 /// our block already gone, a re-generated pom — is left alone with a
 /// `vendor_lock_entry_drifted` warning.
+///
+/// Drift-keep: when a record was left alone and the live pom.xml STILL names
+/// the uuid dir (an unrecognized or truncated record over a wired pom, a
+/// hand-edited `<repository>`), the artifact is kept and `kept_artifact`
+/// tells the caller to keep the ledger entry too — deleting it would strand
+/// the `<repository>` at a gone path. A pom that no longer references the
+/// dir has converged: the drift is warned about and the artifact removed.
 pub async fn revert_maven(
     entry: &VendorEntry,
     project_root: &Path,
@@ -499,30 +507,38 @@ pub async fn revert_maven_opts(
         }
     }
 
-    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
-    // (and the caller keeps the ledger entry), so only the deletion is
-    // skipped.
-    if !dry_run && !keep_artifact {
-        // The last maven entry leaves `.socket/vendor/maven/` (and
-        // `.socket/vendor/`) empty: the shared helper prunes them so a
-        // reverted project carries no vendor residue (non-recursive:
-        // siblings keep them).
-        if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
-            return RevertOutcome {
-                kept_artifact: false,
-                success: false,
-                warnings,
-                error: Some(format!("failed to remove {}: {e}", uuid_dir.display())),
-            };
-        }
-    }
-
-    RevertOutcome {
+    let mut outcome = RevertOutcome {
         kept_artifact: false,
         success: true,
         warnings,
         error: None,
+    };
+    if dry_run {
+        return outcome;
     }
+    // Drift-keep (see the fn doc): never delete a uuid dir the live pom
+    // still routes Maven at.
+    if outcome.drift_skipped()
+        && any_live_file_references(project_root, &[PROJECT_POM], &uuid_dir_rel).await
+    {
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+    // `--preserve-state` (`keep_artifact`): the artifact dir stays behind
+    // (and the caller keeps the ledger entry), so only the deletion is
+    // skipped.
+    if keep_artifact {
+        return outcome;
+    }
+    // The last maven entry leaves `.socket/vendor/maven/` (and
+    // `.socket/vendor/`) empty: the shared helper prunes them so a
+    // reverted project carries no vendor residue (non-recursive:
+    // siblings keep them).
+    if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
+        outcome.success = false;
+        outcome.error = Some(format!("failed to remove {}: {e}", uuid_dir.display()));
+    }
+    outcome
 }
 
 // ── materialisation (service download / local rebuild) ──────────────────────────
@@ -1770,9 +1786,10 @@ mod tests {
             drifted,
             "drifted pom.xml left alone"
         );
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
         assert!(
             !root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
-            "uuid dir still removed"
+            "a converged pom names nothing under .socket/vendor: the uuid dir is removed"
         );
     }
 
@@ -1919,6 +1936,11 @@ mod tests {
                 .unwrap(),
             regenerated,
             "the user's regenerated pom is left alone"
+        );
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            !root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
+            "a regenerated pom names nothing under .socket/vendor: the uuid dir is removed"
         );
     }
 
@@ -2796,9 +2818,11 @@ mod tests {
     }
 
     /// An unrecognized wiring kind (forward-compat / tampered state.json) is
-    /// warned about and left alone while the artifact is still removed.
+    /// warned about and left alone; the live pom still names the uuid dir,
+    /// so the artifact is drift-kept (deleting it would strand the
+    /// `<repository>` at a gone path).
     #[tokio::test]
-    async fn revert_unrecognized_wiring_kind_warns_but_removes_artifact() {
+    async fn revert_unrecognized_wiring_kind_warns_and_keeps_the_referenced_artifact() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
         let (result, entry, _w) =
@@ -2824,14 +2848,24 @@ mod tests {
             wired,
             "the unrecognized wiring is left in place"
         );
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
         assert!(
-            !root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
-            "the artifact is still removed"
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep is surfaced: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
+            "the artifact the live pom still names is kept"
         );
     }
 
     /// A wiring record missing its `key` (tampered/truncated state.json) is
-    /// tolerated as drift — `<unknown>` in the warning, pom.xml untouched.
+    /// tolerated as drift — `<unknown>` in the warning, pom.xml untouched;
+    /// the still-wired pom keeps the artifact.
     #[tokio::test]
     async fn revert_tolerates_wiring_key_missing() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
@@ -2858,14 +2892,23 @@ mod tests {
             wired,
             "pom.xml untouched when the record is unusable"
         );
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
         assert!(
-            !root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
-            "the artifact is still removed"
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep is surfaced: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
+            "the artifact the live pom still names is kept"
         );
     }
 
     /// A wiring record whose `original` is not a string is tolerated as drift;
-    /// pom.xml is untouched.
+    /// pom.xml is untouched and, still wired, keeps the artifact.
     #[tokio::test]
     async fn revert_tolerates_wiring_original_missing() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
@@ -2891,6 +2934,19 @@ mod tests {
             tokio::fs::read(root.join(PROJECT_POM)).await.unwrap(),
             wired,
             "pom.xml untouched when the record is unusable"
+        );
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"),
+            "the keep is surfaced: {:?}",
+            outcome.warnings
+        );
+        assert!(
+            root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
+            "the artifact the live pom still names is kept"
         );
     }
 

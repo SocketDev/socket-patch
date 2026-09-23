@@ -667,7 +667,11 @@ worse, lets a warm cache silently serve unpatched bytes):
 * `vendor --revert` restores the originals (fragments that no longer match — a user re-resolved —
   are left alone with a `vendor_lock_entry_drifted` warning; the drift-kept artifact and entry stay,
   every backend alike — gem included as of v5.0, where a MISSING `Gemfile`/`Gemfile.lock` instead
-  warns `vendor_lockfile_missing` and still removes the artifact), removes the artifacts, prunes the
+  warns `vendor_lockfile_missing` and still removes the artifact; composer / maven / nuget, whose
+  whole-file wiring cannot tell a converged fragment from a drifted one, keep the artifact exactly
+  while the live `composer.lock` / `pom.xml` / `nuget.config` still names its
+  `.socket/vendor/<eco>/<uuid>` dir — a file that no longer references it is warned about and the
+  artifact removed), removes the artifacts, prunes the
   ledger, sweeps orphan uuid dirs, and (v5.0) prunes the now-empty `.socket/vendor/<eco>/` and
   `.socket/vendor/` levels — `.socket/` itself is removed by the lock guard when nothing else is
   left. It works without a manifest: with no manifest and no ledger it is a clean exit-0 no-op.
