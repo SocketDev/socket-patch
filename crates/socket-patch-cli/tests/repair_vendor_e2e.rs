@@ -562,6 +562,23 @@ async fn repair_rebuilds_detached_entry_without_manifest() {
     let v = parse_env(&stdout);
     assert_eq!(v["summary"]["rebuilt"], 1, "envelope={v}");
     assert!(tgz.is_file());
+    assert_socket_dir_lean(tmp.path());
+}
+
+/// G6 for a manifest-free vendored project: after the run, `.socket/` holds
+/// exactly `vendor/` — no `apply.lock` outlives it, no blobs/diffs/packages
+/// are conjured by a repair that rebuilds from the ledger's embedded record.
+fn assert_socket_dir_lean(root: &Path) {
+    let mut names: Vec<String> = std::fs::read_dir(root.join(".socket"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["vendor".to_string()],
+        "a vendored project's .socket/ holds only vendor/"
+    );
 }
 
 /// 7. The whole `.socket/vendor` tree (state.json included) deleted: repair
@@ -628,6 +645,7 @@ async fn repair_reconstructs_ledger_from_lockfile_references() {
         sha256_hex(&std::fs::read(&tgz).unwrap()),
         "recomputed fingerprint matches the rebuilt artifact: {state}"
     );
+    assert_socket_dir_lean(tmp.path());
 
     // Revert fails CLOSED: there are no recorded originals to replay and
     // the rewired lock still resolves through the artifact — removing it

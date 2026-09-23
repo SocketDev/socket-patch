@@ -440,6 +440,35 @@ async fn scan_vendor_dry_run_prune_previews_gc_without_mutating() {
         manifest_before,
         "a dry-run prune must not GC the manifest"
     );
+    // Residue-free: no lock file left behind, no vendor tree conjured (the
+    // fixture seeds `.socket/manifest.json`, so a leak would hide inside the
+    // pre-existing directory).
+    assert!(
+        !tmp.path().join(".socket/apply.lock").exists(),
+        "a dry-run prune leaves no lock file"
+    );
+    assert!(
+        !tmp.path().join(".socket/vendor").exists(),
+        "a dry-run prune conjures no .socket/vendor"
+    );
+
+    // And it TAKES no lock: under an externally held apply.lock the preview
+    // still lists (a lock-taking run would report lock_held instead).
+    let _held = take_external_lock(&tmp.path().join(".socket"));
+    let (code, stdout, stderr) =
+        run_scan_vendor(tmp.path(), &mock.uri(), &["--dry-run", "--prune"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["vendor"]["dryRun"], true, "envelope={v}");
+    assert_eq!(
+        v["gc"]["prunableManifestEntries"],
+        serde_json::json!([STALE_PURL]),
+        "the lock-free preview lists under a held lock: {v}"
+    );
+    assert!(
+        v.get("error").is_none(),
+        "no lock_held under a held lock: {v}"
+    );
 }
 
 /// An externally-held `.socket/apply.lock` fails the vendor step (after
