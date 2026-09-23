@@ -590,7 +590,8 @@ async fn run_vendor(
     // Reconcile first (mirrors apply's placement): entries vendored by a
     // previous run whose patches were dropped from the manifest are reverted
     // even when zero in-scope patches remain. Its post-reconcile ledger
-    // feeds the staging harvest below (one load, not two).
+    // feeds the staging harvest below and then the engine (one load, not
+    // three).
     let (mut has_errors, ledger) = reconcile_dropped(&manifest, common, env).await;
 
     let socket_dir = crate::args::socket_dir_of(manifest_path, &common.cwd);
@@ -628,6 +629,7 @@ async fn run_vendor(
         args.force,
         env,
         Some(service),
+        ledger,
     )
     .await;
 
@@ -798,8 +800,15 @@ pub(crate) async fn fetch_pristine_package(
 /// vendored modes never write one; only this command's `detached: false`
 /// entries are manifest-tracked.
 ///
-/// Does NOT lock, read the manifest, or print the envelope — callers own all
-/// three. Returns whether any non-benign failure occurred.
+/// Does NOT lock, read the manifest, load the ledger or print the envelope —
+/// callers own all four. `ledger` is the vendor ledger the caller loaded
+/// once under its apply lock (the same load that fed its staging harvest),
+/// handed over for this run's persists; an unreadable one is reported here
+/// as `vendor_state_unreadable`. Returns whether any non-benign failure
+/// occurred.
+// The eighth parameter is the caller's one ledger load; bundling it with the
+// run flags would only move the same arguments into a struct.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn vendor_records(
     common: &GlobalArgs,
     records: &HashMap<String, PatchRecord>,
@@ -810,6 +819,7 @@ pub(crate) async fn vendor_records(
     // Vendoring-service config (`None` = build-only). Both the `vendor`
     // command and `scan --vendor` pass `Some(_)`, honoring `--vendor-source`.
     service: Option<&VendorServiceConfig>,
+    ledger: std::io::Result<VendorState>,
 ) -> bool {
     let mut has_errors = false;
     // Lockfile flavors the backends wired THIS run (from the returned ledger
@@ -855,14 +865,15 @@ pub(crate) async fn vendor_records(
         })
         .collect();
 
-    // The vendor ledger, loaded ONCE for the whole run: the artifact-staging
+    // The vendor ledger, loaded ONCE per run by the caller (under its lock,
+    // for its staging harvest) and handed over here: the artifact-staging
     // path below, the Bun preflight and every per-package persist read or
     // mutate this copy. An unreadable ledger is the hard error it is —
     // failing here, before the crawler walk and any registry traffic, is
     // what keeps a corrupt state.json from running the whole fetch ladder
     // first (and pushing its warnings into the envelope) only to fail the
     // run afterwards.
-    let mut state = match load_state(&common.cwd).await {
+    let mut state = match ledger {
         Ok(s) => s,
         Err(e) => {
             env.mark_error(EnvelopeError::new("vendor_state_unreadable", e.to_string()));
@@ -2350,7 +2361,17 @@ mod variant_probe_tests {
             );
 
             let mut env = Envelope::new(Command::Vendor);
-            vendor_records(&common, &records, &sources, false, false, &mut env, None).await;
+            vendor_records(
+                &common,
+                &records,
+                &sources,
+                false,
+                false,
+                &mut env,
+                None,
+                load_state(&common.cwd).await,
+            )
+            .await;
 
             assert!(
                 !env.events.iter().any(|e| e.purl.as_deref() == Some(SDIST)),
@@ -2410,7 +2431,17 @@ mod variant_probe_tests {
             record(&[("brand_new_file.py", "", &after)]),
         );
         let mut env = Envelope::new(Command::Vendor);
-        vendor_records(&common, &records, &sources, false, false, &mut env, None).await;
+        vendor_records(
+            &common,
+            &records,
+            &sources,
+            false,
+            false,
+            &mut env,
+            None,
+            load_state(&common.cwd).await,
+        )
+        .await;
 
         assert!(
             env.events.iter().any(|e| e.purl.as_deref() == Some(WHEEL)),

@@ -243,7 +243,8 @@ async fn stage_and_vendor(
     use_public_proxy: bool,
     env: &mut Envelope,
 ) -> Result<bool, (&'static str, String)> {
-    // Loaded under the lock for the staging harvest; an unreadable ledger
+    // Loaded ONCE under the lock: the staging harvest reads it here, then
+    // the engine takes it over for its persists. An unreadable ledger
     // harvests nothing and is the engine's report.
     let ledger = load_state(&common.cwd).await;
     let staged = match stage_vendor_sources_in_memory(
@@ -273,7 +274,15 @@ async fn stage_and_vendor(
     // service-download under `auto`) instead of scan silently building
     // locally.
     let service = common.vendor_service_config(Some(client), use_public_proxy);
-    Ok(boxed_vendor_records(common, &manifest.patches, &sources, Some(&service), env).await)
+    Ok(boxed_vendor_records(
+        common,
+        &manifest.patches,
+        &sources,
+        Some(&service),
+        ledger,
+        env,
+    )
+    .await)
 }
 
 /// The ledger key addressable as `purl`: the exact key, else the entry
@@ -850,14 +859,16 @@ fn boxed_vendor_records<'a>(
     records: &'a HashMap<String, PatchRecord>,
     sources: &'a socket_patch_core::patch::apply::PatchSources<'a>,
     service: Option<&'a socket_patch_core::vendor::VendorServiceConfig>,
+    ledger: std::io::Result<VendorState>,
     env: &'a mut Envelope,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'a>> {
     // `scan --vendor` threads the SAME service config the `vendor` command
     // builds (honoring `--vendor-source`), so both entry points vendor the
     // same bytes by default. See `run_scan_vendor_step`. Always detached:
-    // vendored mode is manifest-free.
+    // vendored mode is manifest-free. The ledger is the one the harvest
+    // just read, handed over so the engine does not reload it.
     Box::pin(vendor_records(
-        common, records, sources, /*detached=*/ true, false, env, service,
+        common, records, sources, /*detached=*/ true, false, env, service, ledger,
     ))
 }
 
