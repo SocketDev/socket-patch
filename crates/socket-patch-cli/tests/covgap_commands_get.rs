@@ -2371,9 +2371,22 @@ async fn vendored_lock_held_vendor_step_errors_without_vendor_envelope() {
             ],
         );
         assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
-        assert!(
-            stderr.contains("Error (lock_held):"),
-            "human mode must print the coded vendor-step error; stderr={stderr}"
+        // The shared vendor-step formatter: capitalized, period-terminated,
+        // plus the same wait hint every other lock error carries.
+        let line = stderr
+            .lines()
+            .position(|l| l.starts_with("Error (lock_held): "))
+            .unwrap_or_else(|| panic!("no coded vendor-step error; stderr={stderr}"));
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(
+            lines[line],
+            "Error (lock_held): Another socket-patch process is operating in this directory.",
+            "stderr={stderr}"
+        );
+        assert_eq!(
+            lines.get(line + 1).copied(),
+            Some("  Wait for it to finish, or retry with --lock-timeout <secs> to wait for the lock."),
+            "stderr={stderr}"
         );
     }
 }

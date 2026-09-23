@@ -3562,7 +3562,10 @@ async fn run_get_vendored(
                     }],
                 }));
             } else {
-                eprintln!("Error ({code}): {detail}");
+                eprintln!(
+                    "{}",
+                    crate::commands::scan::vendor_flow::format_vendor_step_error(code, detail)
+                );
             }
             return 1;
         }
@@ -3661,7 +3664,10 @@ async fn run_get_vendored(
                 result["error"] = serde_json::json!({ "code": code, "message": message });
                 print_json(&result);
             } else {
-                eprintln!("Error ({code}): {message}");
+                eprintln!(
+                    "{}",
+                    crate::commands::scan::vendor_flow::format_vendor_step_error(code, &message)
+                );
             }
             1
         }

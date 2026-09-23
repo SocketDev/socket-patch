@@ -33,7 +33,7 @@ mod discovery;
 mod gc;
 mod hosted;
 mod render;
-mod vendor_flow;
+pub(crate) mod vendor_flow;
 
 use self::discovery::{
     collect_vuln_ids, detect_updates, lockfile_only_contains, lockfile_supplement,
