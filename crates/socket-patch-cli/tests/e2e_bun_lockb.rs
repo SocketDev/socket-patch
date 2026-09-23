@@ -623,6 +623,25 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     assert_eq!(repeat["summary"]["applied"], 0, "vendor rerun: {repeat}");
     assert_eq!(repeat["summary"]["skipped"], 1, "vendor rerun: {repeat}");
     assert_eq!(fixture.lock(), vendor_lock);
+    // The same rerun during a vendoring-service outage (closed port): the
+    // committed archive is reused, so bun.lockb stays byte-identical.
+    let outage = cli(
+        project,
+        &[
+            "vendor",
+            "--api-url",
+            &server.uri(),
+            "--vendor-url",
+            "http://127.0.0.1:9",
+            "--api-token",
+            "fake",
+            "--org",
+            ORG,
+        ],
+    );
+    assert_eq!(outage["summary"]["applied"], 0, "outage rerun: {outage}");
+    assert_eq!(outage["summary"]["skipped"], 1, "outage rerun: {outage}");
+    assert_eq!(fixture.lock(), vendor_lock);
 
     // Rebuild a deleted artifact from the manifest, preserve binary wiring.
     std::fs::remove_dir_all(project.join(".socket/vendor/npm")).unwrap();

@@ -368,8 +368,9 @@ enum AdvisoryTier {
 
 fn advisory_tier(code: &str) -> AdvisoryTier {
     match code {
-        // Every successful service vendor emits this, one per package.
-        "vendor_prebuilt_downloaded" => AdvisoryTier::Verbose,
+        // Every successful service vendor emits this, one per package; a
+        // relock re-scan that re-wires the committed wheel emits the other.
+        "vendor_prebuilt_downloaded" | "vendor_artifact_reused" => AdvisoryTier::Verbose,
         // The run did what was asked; these explain how.
         "vendor_fetched_missing"
         | "vendor_would_revert_redirect"
@@ -4190,6 +4191,11 @@ mod ui_format_tests {
                 true
             ),
             Some("Note: vendored x from the service".to_string())
+        );
+        assert_eq!(format_advisory("vendor_artifact_reused", "r", false), None);
+        assert_eq!(
+            format_advisory("vendor_artifact_reused", "re-wired x", true),
+            Some("Note: re-wired x".to_string())
         );
         assert_eq!(
             format_advisory("vendor_fetched_missing", "fetched", false),

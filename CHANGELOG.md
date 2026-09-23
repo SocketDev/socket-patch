@@ -345,6 +345,23 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **A vendoring-service outage no longer re-vendors packages.** An npm
+  re-run (every lock flavor, `bun.lockb` included) re-acquired its tarball
+  from whichever source answered — the service's prebuilt, or a local pack
+  with different bytes — so an outage or its recovery rewrote the lock's
+  integrity and the committed tarball and reported `applied`. A re-run now
+  keeps the committed artifact whenever the vendor ledger vouches for it
+  (uuid-bound path, no symlink, sha256 + size equal to the ledger, every
+  patched file verified from the same bytes) and is `already_vendored`
+  with no service request, in every `--vendor-source` mode (including
+  `service` + `--offline`, as cargo and composer already did; golang now
+  matches). A pypi re-scan after a relock re-wires the committed wheel
+  instead of pinning a new sha, the PDM partial-relock guard holds
+  whichever source built the wheel, a wiring failure no longer deletes a
+  committed wheel, and a missing prebuilt wheel during an outage now says
+  to wait for the service. Transient service failures (network, 429,
+  5xx) are retried with backoff, and after two consecutive exhausted
+  fetches the run stops calling the service.
 - **Terminal output is clean on every command.** Progress lines no longer
   leave stale text behind (`scan` printed e.g. `Found 7 patches for 1
   packagesatch 7/7)`) or run into warnings printed while they are active.

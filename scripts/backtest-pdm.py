@@ -1139,6 +1139,15 @@ def main():
             rollback_note = {"exit": rb1.rc, "status": erb1.get("status"), "failed": failures[:3], "lockEqualsRelocked": (project / lockname).read_bytes() == relocked}
             if target_kept:
                 check("rescanAfterRelockApplies", rs.ok() and marker in rescanned, info["rescanAfterRelock"])
+                if mode == "vendored":
+                    # The re-scan re-wires the COMMITTED wheel (no service
+                    # call, no rebuild): the patched sha the first scan
+                    # wired is the one wired again.
+                    sha_re = rb"sha256:([a-f0-9]{64})"
+                    patched_shas = set(re.findall(sha_re, lock_after)) - set(re.findall(sha_re, pristine_lock))
+                    reused = bool(patched_shas) and patched_shas <= set(re.findall(sha_re, rescanned))
+                    info["rescanAfterRelock"]["reusesWheel"] = reused
+                    check("rescanReusesWheel", reused, info["rescanAfterRelock"])
                 check("rollbackAfterRelockPristine", rb1.ok() and rollback_note["lockEqualsRelocked"], rollback_note)
             else:
                 # The relock resolved urllib3 away from 1.26.18 (PDM < 2.0

@@ -1358,3 +1358,433 @@ fn human_classic_migration_risk_prints_stderr_warning() {
         "the run-level advisory prints for humans: {stderr}"
     );
 }
+
+// ─────────────── service outage / source-flip idempotence ───────────────
+//
+// A re-run whose committed artifact the ledger vouches for is
+// `already_vendored` whichever source built it and whatever the service
+// answers now: exit 0, the lock byte-identical, no service request.
+
+const PACKAGE_PATH: &str = "/v0/orgs/acme/patches/package";
+
+/// `vendor --json` against the mock service at `uri` (authenticated, org
+/// `acme`, `--vendor-url` pointed at the mock too).
+fn vendor_via_service(root: &Path, uri: &str) -> (i32, Value, String) {
+    let args = [
+        "vendor",
+        "--json",
+        "--cwd",
+        root.to_str().unwrap(),
+        "--api-url",
+        uri,
+        "--vendor-url",
+        uri,
+        "--api-token",
+        "sktsec_placeholder_value_for_tests_api",
+        "--org",
+        "acme",
+        "--lock-timeout",
+        "5",
+    ];
+    let (code, stdout, stderr) = run_cli(root, &args, &[]);
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("vendor --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    (code, env, stderr)
+}
+
+fn regzip(tgz: &[u8]) -> Vec<u8> {
+    use std::io::{Read as _, Write as _};
+    let mut raw = Vec::new();
+    flate2::read::GzDecoder::new(tgz)
+        .read_to_end(&mut raw)
+        .unwrap();
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(&raw).unwrap();
+    let out = enc.finish().unwrap();
+    assert_ne!(out, tgz);
+    out
+}
+
+async fn mount_granted_artifact(server: &MockServer, leaf: &str, bytes: &[u8]) {
+    let serve = format!("/serve/{UUID}/{leaf}");
+    let url = format!("{}{serve}", server.uri());
+    Mock::given(method("POST"))
+        .and(path(PACKAGE_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "results": { UUID: { "status": "granted", "url": url,
+                "artifacts": [{ "kind": "tarball", "url": url,
+                                "integrity": { "sha512": sri_of(bytes) } }] } }
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(serve))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+        .mount(server)
+        .await;
+}
+
+async fn mount_outage(server: &MockServer) {
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path(PACKAGE_PATH))
+        .respond_with(ResponseTemplate::new(503).set_body_string("upstream unavailable"))
+        .mount(server)
+        .await;
+}
+
+async fn package_posts(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == PACKAGE_PATH)
+        .count()
+}
+
+/// The run-2 contract: exit 0, applied 0, skipped 1, exactly one
+/// `already_vendored` event, no outage advisory.
+fn assert_already_vendored(code: i32, env: &Value, stderr: &str) {
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert_eq!(env["summary"]["applied"], 0, "{env:#}");
+    assert_eq!(env["summary"]["skipped"], 1, "{env:#}");
+    let in_sync = events(env)
+        .iter()
+        .filter(|e| e["errorCode"] == "already_vendored")
+        .count();
+    assert_eq!(in_sync, 1, "{env:#}");
+    assert!(
+        events(env)
+            .iter()
+            .all(|e| e["errorCode"] != "vendor_prebuilt_unavailable"),
+        "{env:#}"
+    );
+}
+
+/// Swap an npm fixture's package-lock for a bun.lock project.
+fn to_bun(fx: &NpmFixture) {
+    std::fs::remove_file(fx.lock_path()).unwrap();
+    std::fs::write(
+        fx.root().join("package.json"),
+        "{\n  \"name\": \"bn3-lockonly\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"left-pad\": \"1.3.0\"\n  }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fx.root().join("bun.lock"),
+        r#"{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "bn3-lockonly",
+      "dependencies": {
+        "left-pad": "1.3.0",
+      },
+    },
+  },
+  "packages": {
+    "left-pad": ["left-pad@1.3.0", "", {}, "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],
+  }
+}
+"#,
+    )
+    .unwrap();
+}
+
+/// `(fixture, lock file name)` for a flavor.
+fn flavor_fixture(bun: bool) -> (NpmFixture, &'static str) {
+    let fx = npm_fixture();
+    if bun {
+        to_bun(&fx);
+        (fx, "bun.lock")
+    } else {
+        (fx, "package-lock.json")
+    }
+}
+
+/// The service's prebuilt artifact: the local build's members, re-encoded.
+fn prebuilt_for(bun: bool) -> Vec<u8> {
+    let (probe, _) = flavor_fixture(bun);
+    let (code, stdout, stderr) = run_cli(
+        probe.root(),
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            probe.root().to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    regzip(&std::fs::read(probe.tgz_path()).unwrap())
+}
+
+async fn service_then_outage(bun: bool) {
+    let alt = prebuilt_for(bun);
+    let (fx, lock) = flavor_fixture(bun);
+    let server = MockServer::start().await;
+    mount_granted_artifact(&server, "left-pad-1.3.0.tgz", &alt).await;
+    let (code, env, stderr) = vendor_via_service(fx.root(), &server.uri());
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
+    assert_eq!(
+        std::fs::read(fx.tgz_path()).unwrap(),
+        alt,
+        "run 1 used the service"
+    );
+    let lock1 = std::fs::read(fx.root().join(lock)).unwrap();
+
+    mount_outage(&server).await;
+    let (code, env, stderr) = vendor_via_service(fx.root(), &server.uri());
+    assert_already_vendored(code, &env, &stderr);
+    assert_eq!(
+        std::fs::read(fx.root().join(lock)).unwrap(),
+        lock1,
+        "{lock} unchanged"
+    );
+    assert_eq!(std::fs::read(fx.tgz_path()).unwrap(), alt);
+    assert_eq!(
+        package_posts(&server).await,
+        0,
+        "no service request on the re-run"
+    );
+}
+
+async fn outage_then_service(bun: bool) {
+    let alt = prebuilt_for(bun);
+    let (fx, lock) = flavor_fixture(bun);
+    let server = MockServer::start().await;
+    mount_outage(&server).await;
+    let (code, env, stderr) = vendor_via_service(fx.root(), &server.uri());
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
+    assert!(
+        events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_prebuilt_unavailable"),
+        "run 1 fell back to a local build: {env:#}"
+    );
+    let lock1 = std::fs::read(fx.root().join(lock)).unwrap();
+    let tgz1 = std::fs::read(fx.tgz_path()).unwrap();
+
+    server.reset().await;
+    mount_granted_artifact(&server, "left-pad-1.3.0.tgz", &alt).await;
+    let (code, env, stderr) = vendor_via_service(fx.root(), &server.uri());
+    assert_already_vendored(code, &env, &stderr);
+    assert_eq!(
+        std::fs::read(fx.root().join(lock)).unwrap(),
+        lock1,
+        "{lock} unchanged"
+    );
+    assert_eq!(std::fs::read(fx.tgz_path()).unwrap(), tgz1);
+    assert_eq!(package_posts(&server).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn npm_service_then_outage_rerun_is_already_vendored() {
+    service_then_outage(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn npm_outage_then_service_rerun_is_already_vendored() {
+    outage_then_service(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_lock_service_then_outage_rerun_is_already_vendored() {
+    service_then_outage(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bun_lock_outage_then_service_rerun_is_already_vendored() {
+    outage_then_service(true).await;
+}
+
+const PDM_REGISTRY_LOCK: &str = r#"# This file is @generated by PDM.
+# It is not intended for manual editing.
+
+[metadata]
+groups = ["default"]
+strategy = ["inherit_metadata"]
+lock_version = "4.5.0"
+content_hash = "sha256:d49d286986c5de41ec9879b6d710389b0be11cd096d883c069123b489ac6e6ea"
+
+[[metadata.targets]]
+requires_python = "==3.14.*"
+
+[[package]]
+name = "six"
+version = "1.16.0"
+requires_python = ">=2.7, !=3.0.*, !=3.1.*, !=3.2.*"
+summary = "Python 2 and 3 compatibility utilities"
+groups = ["default"]
+files = [
+    {file = "six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254"},
+    {file = "six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926"},
+]
+"#;
+const SIX_WHEEL: &str = "six-1.16.0-py2.py3-none-any.whl";
+
+/// A PDM project: pdm.lock pinning registry six, six installed in a
+/// project `.venv`, and the manifest + blob for a patch to `six.py`.
+fn pdm_fixture() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    const ORIG: &[u8] = b"# six, original\n";
+    const PATCHED: &[u8] = b"# six, patched\n";
+    std::fs::write(root.join("pdm.lock"), PDM_REGISTRY_LOCK).unwrap();
+    let sp = if cfg!(windows) {
+        root.join(".venv/Lib/site-packages")
+    } else {
+        root.join(".venv/lib/python3.12/site-packages")
+    };
+    let di = sp.join("six-1.16.0.dist-info");
+    std::fs::create_dir_all(&di).unwrap();
+    std::fs::write(sp.join("six.py"), ORIG).unwrap();
+    std::fs::write(
+        di.join("METADATA"),
+        "Metadata-Version: 2.1\nName: six\nVersion: 1.16.0\n\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(
+        di.join("WHEEL"),
+        "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py2-none-any\nTag: py3-none-any\n",
+    )
+    .unwrap();
+    std::fs::write(
+        di.join("RECORD"),
+        "six.py,sha256=AAAA,20\nsix-1.16.0.dist-info/METADATA,,\nsix-1.16.0.dist-info/WHEEL,,\nsix-1.16.0.dist-info/RECORD,,\n",
+    )
+    .unwrap();
+    let before = compute_git_sha256_from_bytes(ORIG);
+    let after = compute_git_sha256_from_bytes(PATCHED);
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(socket.join("blobs").join(&after), PATCHED).unwrap();
+    let manifest = json!({ "patches": { "pkg:pypi/six@1.16.0": {
+        "uuid": UUID,
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": { "six.py": { "beforeHash": before, "afterHash": after } },
+        "vulnerabilities": {},
+        "description": "synthetic pdm outage test patch",
+        "license": "MIT",
+        "tier": "free"
+    } } });
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    tmp
+}
+
+fn wheel_path(root: &Path) -> PathBuf {
+    root.join(format!(".socket/vendor/pypi/{UUID}/{SIX_WHEEL}"))
+}
+
+/// The same wheel members, re-encoded (stored): the service's prebuilt.
+fn rezip(whl: &[u8]) -> Vec<u8> {
+    use std::io::{Read as _, Write as _};
+    let mut src = zip::ZipArchive::new(std::io::Cursor::new(whl)).unwrap();
+    let mut out = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for i in 0..src.len() {
+        let mut entry = src.by_index(i).unwrap();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        out.start_file(entry.name().to_string(), opts).unwrap();
+        out.write_all(&bytes).unwrap();
+    }
+    let alt = out.finish().unwrap().into_inner();
+    assert_ne!(alt, whl);
+    alt
+}
+
+/// PDM relock twin (P1 end to end): vendor from the service, `pdm lock`
+/// restores the registry unit, re-vendor during an outage — the committed
+/// wheel is re-wired (the service sha, no request), and `rollback` then
+/// restores the relocked bytes exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn pdm_relock_rescan_under_outage_rewires_the_committed_wheel() {
+    use sha2::{Digest as _, Sha256};
+    let probe = pdm_fixture();
+    let (code, stdout, stderr) = run_cli(
+        probe.path(),
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            probe.path().to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    let alt = rezip(&std::fs::read(wheel_path(probe.path())).unwrap());
+    let alt_sha = hex::encode(Sha256::digest(&alt));
+
+    let tmp = pdm_fixture();
+    let root = tmp.path();
+    let server = MockServer::start().await;
+    mount_granted_artifact(&server, SIX_WHEEL, &alt).await;
+    let (code, env, stderr) = vendor_via_service(root, &server.uri());
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert_eq!(env["summary"]["applied"], 1, "{env:#}");
+    let wired = std::fs::read_to_string(root.join("pdm.lock")).unwrap();
+    assert!(
+        wired.contains(&alt_sha),
+        "run 1 pins the service wheel: {wired}"
+    );
+
+    // `pdm lock` re-resolves the registry unit.
+    std::fs::write(root.join("pdm.lock"), PDM_REGISTRY_LOCK).unwrap();
+    mount_outage(&server).await;
+    let (code, env, stderr) = vendor_via_service(root, &server.uri());
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    assert_eq!(
+        env["summary"]["applied"], 1,
+        "the relock is re-wired: {env:#}"
+    );
+    assert!(
+        events(&env)
+            .iter()
+            .any(|e| e["errorCode"] == "vendor_artifact_reused"),
+        "{env:#}"
+    );
+    assert!(
+        events(&env)
+            .iter()
+            .all(|e| e["errorCode"] != "vendor_prebuilt_unavailable"),
+        "{env:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("pdm.lock")).unwrap(),
+        wired,
+        "the same service sha is pinned again"
+    );
+    assert_eq!(std::fs::read(wheel_path(root)).unwrap(), alt);
+    assert_eq!(package_posts(&server).await, 0);
+
+    let (code, stdout, stderr) = run_cli(
+        root,
+        &[
+            "rollback",
+            "--json",
+            "--offline",
+            "--yes",
+            "--cwd",
+            root.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("pdm.lock")).unwrap(),
+        PDM_REGISTRY_LOCK,
+        "rollback restores the relocked bytes"
+    );
+}
