@@ -881,6 +881,34 @@ async fn scan_human_preview_renders_vulnerability_details() {
     );
 }
 
+/// `scan --dry-run --vex`: the embedded VEX is skipped with the same note
+/// apply, vendor and hosted scan print, and no document is written.
+#[tokio::test]
+async fn scan_human_dry_run_vex_prints_the_shared_skip_line() {
+    let mock = MockServer::start().await;
+    let purl = "pkg:npm/minimist@1.2.2";
+    mount_batch_one(&mock, purl, UUID, "free", &[], false).await;
+    mount_by_package(&mock, purl, UUID, serde_json::json!({})).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
+
+    let (code, stdout, stderr) = run_scan_human(
+        tmp.path(),
+        &mock.uri(),
+        &["--dry-run", "--yes", "--vex", "out.vex.json"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout
+            .lines()
+            .any(|l| l == "Skipping VEX generation (--dry-run: nothing was applied)."),
+        "got {stdout:?}"
+    );
+    assert!(!tmp.path().join("out.vex.json").exists());
+}
+
 // ---------------------------------------------------------------------------
 // Human post-apply GC line (`--sync`) — both pluralization arms — and the
 // hosted_wiring_retained warning after an in-place apply

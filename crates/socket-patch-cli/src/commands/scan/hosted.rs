@@ -2550,7 +2550,10 @@ pub(crate) async fn run_redirect_selected(
                         .display(),
                 );
             } else if vex.vex.is_some() && common.dry_run {
-                eprintln!("Skipping VEX generation (--dry-run: nothing was redirected).");
+                eprintln!(
+                    "{}",
+                    crate::commands::vex::format_vex_dry_run_skip("redirected")
+                );
             }
             if !common.dry_run {
                 for line in

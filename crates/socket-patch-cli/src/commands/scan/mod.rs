@@ -373,7 +373,7 @@ async fn embed_vex_human(
     // Dry-run twin of the JSON guard above: no generation, no file write.
     if common.dry_run {
         if !common.silent {
-            println!("[dry-run] VEX generation skipped. No attestation written.");
+            println!("{}", crate::commands::vex::format_vex_dry_run_skip("applied"));
         }
         return base_code;
     }

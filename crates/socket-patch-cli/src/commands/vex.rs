@@ -355,6 +355,13 @@ pub(crate) fn format_vex_written(statements: usize, path: &Path) -> String {
     )
 }
 
+/// The note an embedded `--vex` prints under `--dry-run`, where no
+/// document is built: `done` is what the dry run did not do ("applied",
+/// "redirected", "vendored").
+pub(crate) fn format_vex_dry_run_skip(done: &str) -> String {
+    format!("Skipping VEX generation (--dry-run: nothing was {done}).")
+}
+
 /// The `--dry-run` twin of [`format_vex_written`]: nothing was written.
 pub(crate) fn format_vex_dry_run(statements: usize, path: &Path) -> String {
     format!(
@@ -1402,6 +1409,10 @@ mod tests {
         assert_eq!(
             format_vex_written(1, p),
             "Wrote OpenVEX document with 1 statement to out.json"
+        );
+        assert_eq!(
+            format_vex_dry_run_skip("applied"),
+            "Skipping VEX generation (--dry-run: nothing was applied)."
         );
         assert_eq!(
             format_vex_written(0, p),

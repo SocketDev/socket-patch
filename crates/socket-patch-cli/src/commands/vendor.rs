@@ -691,7 +691,10 @@ pub async fn run(args: VendorArgs) -> i32 {
         if let Some(vex_path) = args.vex.vex.as_ref() {
             if args.common.dry_run {
                 if !args.common.json && !args.common.silent {
-                    println!("Skipping VEX generation (--dry-run: nothing was vendored).");
+                    println!(
+                        "{}",
+                        crate::commands::vex::format_vex_dry_run_skip("vendored")
+                    );
                 }
             } else {
                 let params = args.vex.to_build_params();

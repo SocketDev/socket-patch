@@ -1102,7 +1102,10 @@ pub(crate) async fn run_locked(
                             && args.common.dry_run
                             && args.vex.vex.is_some()
                         {
-                            println!("Skipping VEX generation (--dry-run: nothing was applied).");
+                            println!(
+                                "{}",
+                                crate::commands::vex::format_vex_dry_run_skip("applied")
+                            );
                         }
                     }
                 }
