@@ -59,9 +59,11 @@ pub enum Commands {
     /// vulnerabilities mitigated by the applied patches.
     Vex(commands::vex::VexArgs),
 
-    /// Eject patched dependencies into committable `.socket/vendor/`
-    /// and rewire lockfiles so fresh checkouts build with the patches
-    /// (no socket-patch or Socket API needed). `--revert` undoes it.
+    /// Eject patched dependencies into committable `.socket/vendor/` and
+    /// rewire lockfiles to use them (`--revert` undoes it)
+    ///
+    /// Fresh checkouts then build with the patches, with no socket-patch or
+    /// Socket API needed.
     Vendor(commands::vendor::VendorArgs),
 
     /// Wire install hooks (npm, Python, Bundler, Composer) that re-apply
@@ -81,13 +83,12 @@ pub enum Commands {
     /// Remove a patch from the manifest by PURL or UUID (rolls back files first)
     Remove(commands::remove::RemoveArgs),
 
-    /// Download missing blobs and clean up unused blobs.
+    /// Download missing patch artifacts and clean up unused ones
     ///
-    /// `repair` (alias `gc`) is a first-class command for cleaning up
-    /// the `.socket/` directory without running a scan. For the
-    /// combined workflow (discover + apply + GC), use
-    /// `scan --sync --json --yes`. `repair`/`gc` remain useful on
-    /// their own when the user wants to clean up without an apply pass.
+    /// Restores missing blobs and diff/package archives, rebuilds missing
+    /// or corrupt vendored artifacts, then deletes the artifacts nothing
+    /// references. It needs no scan; for the combined workflow (discover,
+    /// apply, clean up) use `scan --sync --json --yes`.
     #[command(visible_alias = "gc")]
     Repair(commands::repair::RepairArgs),
 

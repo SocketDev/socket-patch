@@ -51,14 +51,21 @@ fn long_help(path: &[&str]) -> String {
 }
 
 #[test]
-fn owned_help_pages_have_no_developer_notes() {
-    // `self-update` is covered by `self_update_help_shows_the_public_spelling`
-    // (its [VERSION] arg help lives in commands/update.rs).
-    for path in [&[][..], &["vex"], &["setup"]] {
-        let text = long_help(path);
+fn every_help_page_has_no_developer_notes() {
+    let mut cmd = Cli::command();
+    cmd.build();
+    let mut names: Vec<String> = vec![String::new()];
+    names.extend(cmd.get_subcommands().map(|s| s.get_name().to_string()));
+    let mut failures = Vec::new();
+    for name in &names {
+        let path: Vec<&str> = if name.is_empty() { vec![] } else { vec![name.as_str()] };
+        let text = long_help(&path);
         let found = leaks(&text);
-        assert!(found.is_empty(), "{path:?} --help leaks {found:?}:\n{text}");
+        if !found.is_empty() {
+            failures.push(format!("{path:?} --help leaks {found:?}:\n{text}"));
+        }
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
 #[test]
@@ -144,5 +151,31 @@ fn root_command_list_uses_the_verb_form() {
     assert!(
         text.contains("Wire install hooks (npm, Python, Bundler, Composer)"),
         "{text}"
+    );
+}
+
+#[test]
+fn vendor_and_repair_summaries_read_as_one_line() {
+    let text = long_help(&[]);
+    assert!(
+        text.lines().any(|l| l
+            == "  vendor    Eject patched dependencies into committable `.socket/vendor/` and rewire lockfiles to use them (`--revert` undoes it)"),
+        "{text}"
+    );
+    assert!(
+        text.lines().any(|l| l
+            == "  repair    Download missing patch artifacts and clean up unused ones [aliases: gc]"),
+        "{text}"
+    );
+    let repair = long_help(&["repair"]);
+    assert!(
+        repair.starts_with(
+            "Download missing patch artifacts and clean up unused ones\n\n\
+             Restores missing blobs and diff/package archives, rebuilds missing or corrupt \
+             vendored artifacts, then deletes the artifacts nothing references. It needs no \
+             scan; for the combined workflow (discover, apply, clean up) use \
+             `scan --sync --json --yes`.\n"
+        ),
+        "{repair}"
     );
 }
