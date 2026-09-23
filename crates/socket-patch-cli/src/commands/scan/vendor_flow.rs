@@ -694,13 +694,11 @@ async fn run_vendor_interactive_path(
             vendored_purls,
         )
         .await;
-        if !args.common.silent && !gc.pruned.is_empty() {
-            println!(
-                "GC: pruned {}.",
-                plural(gc.pruned.len(), "manifest entry", "manifest entries")
-            );
-        }
         if !args.common.silent {
+            // The agent arm's GC line: pruned entries AND swept files.
+            if let Some(line) = super::gc::format_gc_line(&gc, false) {
+                println!("{line}");
+            }
             print_gc_vendored_line(&gc);
         }
     }

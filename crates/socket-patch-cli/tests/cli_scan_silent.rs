@@ -362,7 +362,7 @@ fn seed_manifest_with_gone_entry(root: &Path) {
 /// The vendored-mode GC line must honor `--silent` like the apply-mode one
 /// does: `scan --vendor --prune --silent --yes` prints nothing when it
 /// succeeds. Regression guard: `run_vendor_interactive_path` printed
-/// "GC: pruned N manifest entries." (and the vendored-revert GC line)
+/// "GC: pruned N manifest entries and removed …" (and the vendored-revert GC line)
 /// unconditionally.
 #[tokio::test]
 async fn scan_vendor_silent_gc_prints_nothing() {
@@ -467,7 +467,9 @@ async fn scan_vendor_silent_gc_prints_nothing() {
         "control run must succeed; stderr={loud_stderr:?}"
     );
     assert!(
-        loud_stdout.contains("GC: pruned 1 manifest entry."),
+        loud_stdout
+            .lines()
+            .any(|l| l == "GC: pruned 1 manifest entry and removed 0 orphan files (0 B)."),
         "non-silent vendor scan must print the GC line; got {loud_stdout:?}"
     );
 }
