@@ -1091,7 +1091,45 @@ async fn preserved_ledger_does_not_bypass_bun_refusal_after_rollback() {
         std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
         state
     );
-    assert_eq!(std::fs::read(artifact_path).unwrap(), artifact);
+    assert_eq!(std::fs::read(&artifact_path).unwrap(), artifact);
+
+    // The WET scan/search path: the preserved ledger still names this exact
+    // uuid (detached, record embedded — the idempotency skip's shape), but
+    // the refusal must win over the skip: `download.patches[0]` is `failed`
+    // with the workspace code, nothing is fetched, nothing changes on disk.
+    // (Contract: "UUID equality in the ledger alone never exempts a purl".)
+    let views_before = view_requests_for(&mock, UUID).await;
+    let (exit, stdout, stderr) = scan_vendored(root, &mock.uri(), &["--json"]);
+    assert_eq!(exit, 1, "{stdout}\n{stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["status"], "partial_failure", "{v}");
+    assert_eq!(v["download"]["downloaded"], 0, "{v}");
+    assert_eq!(
+        v["download"]["skipped"], 0,
+        "a preserved uuid is not a skip: {v}"
+    );
+    assert_eq!(v["download"]["failed"], 1, "{v}");
+    assert_refused_record(&v["download"]["patches"][0], WS_CODE, &v);
+    assert_eq!(
+        view_requests_for(&mock, UUID).await,
+        views_before,
+        "a refused purl never fetches its view"
+    );
+    assert_eq!(String::from_utf8(lock_bytes(root)).unwrap(), lock);
+    assert_eq!(
+        std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+        state
+    );
+    assert_eq!(std::fs::read(&artifact_path).unwrap(), artifact);
+    let (_exit, _stdout, stderr) = scan_vendored(root, &mock.uri(), &[]);
+    assert!(
+        stderr.contains(&format!("[error] {PURL} ({WS_CODE})")),
+        "the human line carries the code; stderr=\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(&format!("[skip] {PURL} (already vendored)")),
+        "a preserved uuid must not read as already vendored; stderr=\n{stderr}"
+    );
 }
 
 /// The download phase must NOT refuse a purl the ledger already wires at
@@ -1175,6 +1213,10 @@ async fn superseding_uuid_on_already_vendored_v1_workspace_is_revendored_not_ref
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "{v}");
     assert_eq!(v["patches"][0]["action"], "downloaded", "{v}");
+    assert_eq!(
+        v["patches"][0]["oldUuid"], UUID,
+        "the superseded ledger uuid must ride the downloaded record: {v}"
+    );
     assert!(v["patches"][0].get("errorCode").is_none(), "{v}");
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),

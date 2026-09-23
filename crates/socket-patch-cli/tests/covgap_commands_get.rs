@@ -27,14 +27,21 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// The agent engine driven from `params` alone: builds the run's client
-/// from the params' API overrides (what scan/get do once per run) with the
+/// The agent engine driven from `params` plus the mock server's URI: builds
+/// the run's client against it (what scan/get do once per run) with the
 /// default try-once lock, then runs [`download_and_apply_patches_with`].
 async fn download_and_apply_patches(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
+    server_uri: &str,
 ) -> (i32, serde_json::Value) {
-    let (api_client, _) = get_api_client_with_overrides(params.api_overrides.clone()).await;
+    let (api_client, _) = get_api_client_with_overrides(ApiClientEnvOverrides {
+        api_url: Some(server_uri.to_string()),
+        api_token: Some("fake".to_string()),
+        org_slug: Some(ORG.to_string()),
+        proxy_url: None,
+    })
+    .await;
     let run = DownloadRun {
         api_client: &api_client,
         lock_timeout: None,
@@ -193,6 +200,18 @@ fn assert_vendored_detached(cwd: &Path, purl: &str, uuid: &str) {
         !cwd.join(".socket/blobs").exists(),
         "the vendored download phase must not persist blobs"
     );
+    // G6: vendored writes ONLY `.socket/vendor/**` — no `apply.lock` outlives
+    // the run, no `diffs/`/`packages/`, nothing else.
+    let mut names: Vec<String> = std::fs::read_dir(cwd.join(".socket"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["vendor".to_string()],
+        "a vendored get's footprint is .socket/vendor/** only"
+    );
 }
 
 /// Pre-stage an `apply.lock` so the lock can be acquired inside a directory
@@ -263,23 +282,16 @@ fn search_result(uuid: &str, purl: &str) -> PatchSearchResult {
 }
 
 /// Engine params (mirrors `in_process_get_update_count::params`).
-fn engine_params(root: &Path, server_uri: String) -> DownloadParams {
+fn engine_params(root: &Path) -> DownloadParams {
     DownloadParams {
         cwd: root.to_path_buf(),
         manifest_path: root.join(".socket/manifest.json"),
-        org: Some(ORG.to_string()),
         save_only: true,
         global: false,
         global_prefix: None,
         json: true,
         silent: true,
         download_mode: "diff".to_string(),
-        api_overrides: ApiClientEnvOverrides {
-            api_url: Some(server_uri),
-            api_token: Some("fake".to_string()),
-            org_slug: Some(ORG.to_string()),
-            proxy_url: None,
-        },
         strict: false,
         ecosystems: None,
         persist_blobs: true,
@@ -856,7 +868,7 @@ async fn engine_no_applicable_files_is_failed_and_unrecorded() {
     let tmp = tempfile::tempdir().unwrap();
     let selected = vec![search_result(UUID, PURL)];
     let (code, json) =
-        download_and_apply_patches(&selected, &engine_params(tmp.path(), server.uri())).await;
+        download_and_apply_patches(&selected, &engine_params(tmp.path()), &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "partial_failure", "json={json}");
@@ -898,7 +910,7 @@ async fn engine_invalid_blob_hash_is_failed_and_unrecorded() {
     let tmp = tempfile::tempdir().unwrap();
     let selected = vec![search_result(UUID, PURL)];
     let (code, json) =
-        download_and_apply_patches(&selected, &engine_params(tmp.path(), server.uri())).await;
+        download_and_apply_patches(&selected, &engine_params(tmp.path()), &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["failed"], 1, "json={json}");
@@ -923,7 +935,7 @@ async fn engine_view_404_is_could_not_fetch_details() {
     let tmp = tempfile::tempdir().unwrap();
     let selected = vec![search_result(UUID, PURL)];
     let (code, json) =
-        download_and_apply_patches(&selected, &engine_params(tmp.path(), server.uri())).await;
+        download_and_apply_patches(&selected, &engine_params(tmp.path()), &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["failed"], 1, "json={json}");
@@ -949,7 +961,7 @@ async fn engine_socket_path_occupied_fails_before_any_fetch() {
 
     let selected = vec![search_result(UUID, PURL)];
     let (code, json) =
-        download_and_apply_patches(&selected, &engine_params(tmp.path(), server.uri())).await;
+        download_and_apply_patches(&selected, &engine_params(tmp.path()), &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "error", "json={json}");
@@ -996,7 +1008,7 @@ async fn engine_readonly_socket_fails_closed_before_any_fetch() {
 
     let selected = vec![search_result(UUID, PURL)];
     let (code, json) =
-        download_and_apply_patches(&selected, &engine_params(tmp.path(), server.uri())).await;
+        download_and_apply_patches(&selected, &engine_params(tmp.path()), &server.uri()).await;
 
     // A refused acquire prunes the EMPTY `.socket/` it could not lock (no
     // residue), so there is normally nothing left to restore.
@@ -1044,9 +1056,9 @@ async fn engine_readonly_socket_fails_manifest_write() {
     }
 
     let selected = vec![search_result(UUID, PURL)];
-    let mut params = engine_params(tmp.path(), server.uri());
+    let mut params = engine_params(tmp.path());
     params.persist_blobs = false;
-    let (code, json) = download_and_apply_patches(&selected, &params).await;
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -1065,6 +1077,65 @@ async fn engine_readonly_socket_fails_manifest_write() {
     );
 }
 
+/// The blobs an agent-mode run wrote before its manifest write failed have
+/// no record pointing at them: the engine unwinds exactly those (a
+/// pre-existing blob — some other record's revert data — survives) and
+/// prunes what it can. The read-only `.socket/` keeps `blobs/` itself from
+/// being removed (rmdir needs write on the parent), but it must be EMPTY of
+/// this run's blobs.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn engine_manifest_write_failure_unwinds_the_blobs_it_wrote() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start().await;
+    mount_view_files(&server, UUID, PURL, good_files()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join(".socket");
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).unwrap();
+    // A blob some other record owns: never this run's to remove.
+    let foreign = blobs.join("f".repeat(64));
+    std::fs::write(&foreign, b"someone else's revert data").unwrap();
+    prestage_lock_file(&socket);
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if !readonly_dir_enforced(&socket) {
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let selected = vec![search_result(UUID, PURL)];
+    let params = engine_params(tmp.path());
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
+
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(code, 1, "json={json}");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("writing manifest"),
+        "json={json}"
+    );
+    let mut left: Vec<String> = std::fs::read_dir(&blobs)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        vec!["f".repeat(64)],
+        "only the pre-existing blob survives; this run's blobs are unwound"
+    );
+    assert_eq!(
+        std::fs::read(&foreign).unwrap(),
+        b"someone else's revert data",
+        "a blob this run did not create is never touched"
+    );
+}
+
 /// Release-narrowing warnings must ride the agent envelope: two qualified
 /// PyPI variants of an UNINSTALLED base are both kept (the keep-all
 /// fallback) and the `warnings` key explains why.
@@ -1078,9 +1149,9 @@ async fn engine_uninstalled_variant_base_keeps_all_with_warning() {
         search_result(UUID, &format!("{base}?artifact_id=wheel")),
         search_result(UUID_B, &format!("{base}?artifact_id=sdist")),
     ];
-    let mut params = engine_params(tmp.path(), server.uri());
+    let mut params = engine_params(tmp.path());
     params.all_releases = false;
-    let (code, json) = download_and_apply_patches(&selected, &params).await;
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["found"], 2, "both variants must be kept; json={json}");
@@ -1111,10 +1182,10 @@ async fn engine_human_mode_skip_and_failed_summary() {
     seed_manifest_with(tmp.path(), PURL, UUID);
 
     let selected = vec![search_result(UUID, PURL), search_result(UUID_V2, PURL_V2)];
-    let mut params = engine_params(tmp.path(), server.uri());
+    let mut params = engine_params(tmp.path());
     params.json = false;
     params.silent = false;
-    let (code, json) = download_and_apply_patches(&selected, &params).await;
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "partial_failure", "json={json}");
@@ -1196,11 +1267,11 @@ async fn engine_variant_no_hash_match_keeps_all_variants_with_note() {
         search_result(UUID, &purl_wheel),
         search_result(UUID_B, &purl_sdist),
     ];
-    let mut params = engine_params(tmp.path(), server.uri());
+    let mut params = engine_params(tmp.path());
     params.all_releases = false;
     params.json = false;
     params.silent = false;
-    let (code, json) = download_and_apply_patches(&selected, &params).await;
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
     assert_eq!(
         code, 0,
@@ -1266,9 +1337,9 @@ async fn engine_variant_view_fetch_error_keeps_errored_variant() {
         search_result(UUID, &purl_erroring),
         search_result(UUID_B, &purl_mismatch),
     ];
-    let mut params = engine_params(tmp.path(), server.uri());
+    let mut params = engine_params(tmp.path());
     params.all_releases = false;
-    let (code, json) = download_and_apply_patches(&selected, &params).await;
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
     assert_eq!(
         code, 1,
@@ -1953,10 +2024,10 @@ async fn engine_human_silent_no_applicable_files_still_fails() {
 
     let tmp = tempfile::tempdir().unwrap();
     let selected = vec![search_result(UUID, PURL)];
-    let mut params = engine_params(tmp.path(), server.uri());
+    let mut params = engine_params(tmp.path());
     params.json = false;
     params.silent = true;
-    let (code, json) = download_and_apply_patches(&selected, &params).await;
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
     assert_eq!(code, 1, "json={json}");
     assert_eq!(json["status"], "partial_failure", "json={json}");
@@ -1986,11 +2057,11 @@ async fn engine_human_readonly_socket_manifest_write_failure_still_errors() {
     }
 
     let selected = vec![search_result(UUID, PURL)];
-    let mut params = engine_params(tmp.path(), server.uri());
+    let mut params = engine_params(tmp.path());
     params.persist_blobs = false;
     params.json = false;
     params.silent = true;
-    let (code, json) = download_and_apply_patches(&selected, &params).await;
+    let (code, json) = download_and_apply_patches(&selected, &params, &server.uri()).await;
 
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
 

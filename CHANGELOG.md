@@ -435,7 +435,9 @@ into the new version's section — see docs/releasing.md.
   tree); `rollback` deletes patch-added files in every pnpm store copy and
   heals a patched twin of an already-original primary.
 - **Human chrome.** The global-mode `Using <X> at: <path>` banner moves to
-  stderr so piped stdout stays clean; `vendor --revert` and the no-manifest
+  stderr so piped stdout stays clean; the empty-crawl hint of `scan` and
+  `get` reads `Run your package manager's install first.` instead of a fixed
+  npm/yarn/pnpm/pip/cargo/go/mvn/composer list; `vendor --revert` and the no-manifest
   no-ops of `vendor` and `apply` (and `apply --check`) build no API client,
   so the `SOCKET_API_TOKEN` advisories no longer print on hooked
   manifest-less runs, and `repair` prints its token notice once.

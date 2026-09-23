@@ -255,6 +255,15 @@ async fn vendored_purls_from_artifacts(common: &GlobalArgs) -> Vec<String> {
 /// time. Only `Ok(Some)` views are cached — an errored or 404'd fetch is
 /// left for the download phase to retry and report per patch.
 ///
+/// `vendor` is the run's ledger (`None` when unreadable — fail-open, the
+/// preflight reports the corruption): a purl the ledger already holds
+/// detached at the selected uuid with an embedded record — exactly the
+/// entries the download phase reuses without a view fetch — is compared
+/// against that record's file hashes instead of fetching the view, so an
+/// idempotent re-run performs zero view fetches in the human arm too
+/// (contract: "same-uuid re-runs reuse the embedded record, skip the
+/// patch-view fetch"). Nothing is inserted into `views` for them.
+///
 /// Best-effort and read-only: a detail-fetch failure or an unresolvable
 /// installed path just skips the annotation — it never blocks the flow and
 /// writes nothing.
@@ -263,10 +272,12 @@ pub(super) async fn preverify_vendor_baselines(
     selected: &[PatchSearchResult],
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     lockfile_only: &HashSet<String>,
+    vendor: Option<&HashMap<String, socket_patch_core::vendor::VendorEntry>>,
 ) -> (HashSet<String>, HashMap<String, PatchResponse>) {
     use socket_patch_core::manifest::schema::PatchFileInfo;
     use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
     use socket_patch_core::utils::purl::purl_eq;
+    use socket_patch_core::vendor::lookup_entry;
 
     let mut mismatched: HashSet<String> = HashSet::new();
     let mut views: HashMap<String, PatchResponse> = HashMap::new();
@@ -282,24 +293,48 @@ pub(super) async fn preverify_vendor_baselines(
         let Some(pkg) = crawled.iter().find(|c| purl_eq(&c.purl, base)) else {
             continue;
         };
-        let Ok(Some(detail)) = api_client.fetch_patch(&patch.uuid).await else {
-            continue;
+        // The same predicate as the download phase's ledger idempotency
+        // skip: its no-fetch set and this one must be the same set.
+        let embedded = vendor
+            .and_then(|entries| lookup_entry(entries, &patch.purl))
+            .filter(|e| e.detached && e.uuid == patch.uuid)
+            .and_then(|e| e.record.as_ref());
+        let files: Vec<(String, PatchFileInfo)> = match embedded {
+            Some(record) => record
+                .files
+                .iter()
+                .map(|(file, info)| (file.clone(), info.clone()))
+                .collect(),
+            None => {
+                let Ok(Some(detail)) = api_client.fetch_patch(&patch.uuid).await else {
+                    continue;
+                };
+                let files = detail
+                    .files
+                    .iter()
+                    .map(|(file, info)| {
+                        (
+                            file.clone(),
+                            PatchFileInfo {
+                                before_hash: info.before_hash.clone().unwrap_or_default(),
+                                after_hash: info.after_hash.clone().unwrap_or_default(),
+                            },
+                        )
+                    })
+                    .collect();
+                views.insert(patch.uuid.clone(), detail);
+                files
+            }
         };
-        for (file, info) in &detail.files {
-            let info = PatchFileInfo {
-                before_hash: info.before_hash.clone().unwrap_or_default(),
-                after_hash: info.after_hash.clone().unwrap_or_default(),
-            };
+        for (file, info) in &files {
             if info.before_hash.is_empty() {
                 continue; // a new file has no baseline to compare
             }
-            if verify_file_patch(&pkg.path, file, &info).await.status == VerifyStatus::HashMismatch
-            {
+            if verify_file_patch(&pkg.path, file, info).await.status == VerifyStatus::HashMismatch {
                 mismatched.insert(patch.uuid.clone());
                 break;
             }
         }
-        views.insert(patch.uuid.clone(), detail);
     }
     (mismatched, views)
 }
@@ -1474,7 +1509,7 @@ mod tests {
             std::iter::once("pkg:npm/@scope/lockonly@1.0.0".to_string()).collect();
 
         let (mismatched, views) =
-            preverify_vendor_baselines(&client, &selected, &crawled, &lockfile_only).await;
+            preverify_vendor_baselines(&client, &selected, &crawled, &lockfile_only, None).await;
         assert!(mismatched.is_empty());
         assert!(
             mock.received_requests().await.unwrap().is_empty(),
@@ -1529,7 +1564,7 @@ mod tests {
         let selected = vec![search_result("u3", "pkg:npm/newfile@1.0.0")];
 
         let (mismatched, views) =
-            preverify_vendor_baselines(&client, &selected, &crawled, &HashSet::new()).await;
+            preverify_vendor_baselines(&client, &selected, &crawled, &HashSet::new(), None).await;
         assert!(
             mismatched.is_empty(),
             "a new-file-only patch never annotates a baseline mismatch"
@@ -1558,7 +1593,7 @@ mod tests {
         let selected = vec![search_result("u404", "pkg:npm/newfile@1.0.0")];
 
         let (mismatched, views) =
-            preverify_vendor_baselines(&client, &selected, &crawled, &HashSet::new()).await;
+            preverify_vendor_baselines(&client, &selected, &crawled, &HashSet::new(), None).await;
         assert!(mismatched.is_empty());
         assert_eq!(
             mock.received_requests().await.unwrap().len(),
@@ -1598,13 +1633,121 @@ mod tests {
         let selected = vec![search_result("u4", "pkg:npm/newfile@1.0.0")];
 
         let (mismatched, views) =
-            preverify_vendor_baselines(&client, &selected, &crawled, &HashSet::new()).await;
+            preverify_vendor_baselines(&client, &selected, &crawled, &HashSet::new(), None).await;
         assert_eq!(
             mismatched,
             std::iter::once("u4".to_string()).collect::<HashSet<_>>(),
             "the new-file skip must not swallow a sibling file's mismatch"
         );
         assert!(views.contains_key("u4"), "a mismatched view is cached too");
+    }
+
+    /// A purl the ledger already holds DETACHED at the selected uuid with an
+    /// embedded record is judged from that record — no view fetch, nothing
+    /// cached (the download phase reuses the record itself) — while a
+    /// stale-uuid or legacy non-detached entry still fetches like an unknown
+    /// purl. The no-fetch set is exactly the download phase's
+    /// `already vendored` skip set.
+    #[tokio::test]
+    async fn preverify_reads_an_in_sync_detached_entrys_embedded_record_without_fetching() {
+        use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord};
+        use socket_patch_core::vendor::state::VendorArtifact;
+        use socket_patch_core::vendor::VendorEntry;
+
+        let mock = wiremock::MockServer::start().await; // trap: no mounts
+        let client = api_client_for(&mock.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_dir = tmp.path().join("node_modules/insync");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        // Installed bytes hash to neither hash the record carries.
+        std::fs::write(pkg_dir.join("index.js"), b"installed bytes\n").unwrap();
+        let crawled = vec![crawled_pkg("insync", "pkg:npm/insync@1.0.0", pkg_dir)];
+        let selected = vec![search_result("u5", "pkg:npm/insync@1.0.0")];
+
+        let record = PatchRecord {
+            uuid: "u5".into(),
+            exported_at: "2026-01-01T00:00:00Z".into(),
+            files: HashMap::from([(
+                "index.js".to_string(),
+                PatchFileInfo {
+                    before_hash: "b".repeat(64),
+                    after_hash: "c".repeat(64),
+                },
+            )]),
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: "MIT".into(),
+            tier: "free".into(),
+        };
+        let entry = |uuid: &str, detached: bool| VendorEntry {
+            ecosystem: "npm".into(),
+            base_purl: "pkg:npm/insync@1.0.0".into(),
+            uuid: uuid.into(),
+            artifact: VendorArtifact {
+                path: format!(".socket/vendor/npm/{uuid}/insync-1.0.0.tgz"),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached,
+            record: Some(record.clone()),
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        };
+
+        // In sync: judged from the record, zero fetches, nothing cached.
+        let ledger = HashMap::from([("pkg:npm/insync@1.0.0".to_string(), entry("u5", true))]);
+        let (mismatched, views) = preverify_vendor_baselines(
+            &client,
+            &selected,
+            &crawled,
+            &HashSet::new(),
+            Some(&ledger),
+        )
+        .await;
+        assert_eq!(
+            mismatched,
+            std::iter::once("u5".to_string()).collect::<HashSet<_>>(),
+            "the embedded record still drives the mismatch annotation"
+        );
+        assert!(
+            mock.received_requests().await.unwrap().is_empty(),
+            "an in-sync detached entry never fetches its view"
+        );
+        assert!(
+            views.is_empty(),
+            "the download phase reuses the record, not a view"
+        );
+
+        // Stale uuid, or a legacy non-detached entry: fetch like an unknown
+        // purl — here against a trap server, so the patch is skipped and the
+        // attempt is visible in the request log.
+        for stale in [entry("u-old", true), entry("u5", false)] {
+            let ledger = HashMap::from([("pkg:npm/insync@1.0.0".to_string(), stale)]);
+            let before = mock.received_requests().await.unwrap().len();
+            let (mismatched, _) = preverify_vendor_baselines(
+                &client,
+                &selected,
+                &crawled,
+                &HashSet::new(),
+                Some(&ledger),
+            )
+            .await;
+            assert!(mismatched.is_empty());
+            assert_eq!(
+                mock.received_requests().await.unwrap().len(),
+                before + 1,
+                "a stale or legacy entry still fetches"
+            );
+        }
     }
 
     #[test]

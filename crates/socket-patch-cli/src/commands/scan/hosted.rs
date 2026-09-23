@@ -476,12 +476,9 @@ fn acquire_hosted_lock(
     common: &crate::args::GlobalArgs,
     scan_result: &mut Option<serde_json::Value>,
 ) -> Result<LockGuard, i32> {
-    let manifest_path = common.resolved_manifest_path();
-    let socket_dir = manifest_path
-        .parent()
-        .expect("manifest path names a file, so it has a parent");
+    let socket_dir = common.socket_dir();
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    match acquire(socket_dir, timeout) {
+    match acquire(&socket_dir, timeout) {
         Ok(guard) => Ok(guard),
         Err(err) => {
             let (code, message) = crate::commands::lock_cli::lock_failure(&err, timeout);

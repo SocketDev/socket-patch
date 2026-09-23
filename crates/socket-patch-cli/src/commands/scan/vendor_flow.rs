@@ -170,8 +170,6 @@ pub(crate) fn print_dry_run_refusals(preview: &serde_json::Value) {
 /// envelope carries no events.
 async fn run_scan_vendor_step(
     common: &GlobalArgs,
-    manifest_path: &Path,
-    socket_dir: &Path,
     records: HashMap<String, PatchRecord>,
     seed: HashMap<String, Vec<u8>>,
     client: ApiClient,
@@ -182,12 +180,15 @@ async fn run_scan_vendor_step(
     if records.is_empty() {
         return Ok((false, env));
     }
+    // The one socket-dir / manifest-path derivation every caller shares.
+    let manifest_path = common.resolved_manifest_path();
+    let socket_dir = common.socket_dir();
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
     // `acquire` creates `.socket/` itself and reports a file squatting on
     // it as `LockError::Io` (→ `lock_io`). The guard lives to the end of
     // the step so the ledger migration and the redirect-ledger reconcile
     // inside `note_vendor_supersedes_redirect` run under the lock too.
-    let _guard = apply_lock::acquire(socket_dir, timeout).map_err(|e| {
+    let _guard = apply_lock::acquire(&socket_dir, timeout).map_err(|e| {
         let (code, message) = lock_failure(&e, timeout);
         (code, message, None)
     })?;
@@ -200,7 +201,7 @@ async fn run_scan_vendor_step(
     };
     let has_errors = match stage_and_vendor(
         common,
-        socket_dir,
+        &socket_dir,
         &manifest,
         seed,
         client,
@@ -218,7 +219,7 @@ async fn run_scan_vendor_step(
             return Err((code, message, Some(Box::new(env))));
         }
     };
-    migrate_legacy_manifest_records(common, manifest_path, &manifest.patches, &mut env).await;
+    migrate_legacy_manifest_records(common, &manifest_path, &manifest.patches, &mut env).await;
     if has_errors {
         env.mark_partial_failure();
     }
@@ -288,18 +289,26 @@ fn ledger_key_for(state: &VendorState, purl: &str) -> Option<String> {
 }
 
 /// Migrate a project vendored by an older, manifest-mode CLI: the ledger
-/// is now the single owner of vendored state, so (1) a legacy entry the
-/// engine just found in sync at a record's uuid (an `already_vendored`
-/// skip persists nothing) is upgraded in place — `detached: true` plus the
-/// embedded record, the verification source every manifest-free reader
-/// needs — and (2) every `.socket/manifest.json` record keyed by (or
-/// sharing a qualifier-stripped base with) a ledger-owned entry is
-/// dropped. An emptied manifest is left as `{"patches":{}}` (never
-/// deleted: `list`/`apply`/`repair` distinguish empty from missing).
-/// Idempotent, so it also heals records stranded by earlier detached
-/// runs; a project with no manifest is untouched (no file is created).
-/// Best-effort: failures are reported as run-level warnings, never as
-/// run errors — the vendoring itself already committed.
+/// is now the single owner of vendored state, so for the purls THIS run
+/// vendored (`records` — the selection, in-sync `already_vendored` skips
+/// included): (1) a legacy entry the engine just found in sync at a
+/// record's uuid (an `already_vendored` skip persists nothing) is upgraded
+/// in place — `detached: true` plus the embedded record, the verification
+/// source every manifest-free reader needs — and (2) every
+/// `.socket/manifest.json` record keyed by (or sharing a qualifier-stripped
+/// base with) the purl's ledger entry is dropped, provided the ledger now
+/// owns it: the entry is detached with an embedded record AT the record's
+/// uuid. An emptied manifest is left as `{"patches":{}}` (never deleted:
+/// `list`/`apply`/`repair` distinguish empty from missing). Scoped to the
+/// selection on purpose (D2: "when a vendored run vendors a purl that ALSO
+/// has a manifest record, drop that manifest record"): an agent-mode `get X`
+/// may legitimately record X at a NEWER uuid than the ledger's while the
+/// user is told to run `vendor` to refresh the artifact — a vendored run for
+/// some other purl must not destroy that pending signal. Idempotent for the
+/// selected purls, so it also heals their records stranded by earlier
+/// detached runs; a project with no manifest is untouched (no file is
+/// created). Best-effort: failures are reported as run-level warnings,
+/// never as run errors — the vendoring itself already committed.
 ///
 /// Caller holds the apply lock (both files are rewritten).
 async fn migrate_legacy_manifest_records(
@@ -358,18 +367,24 @@ async fn migrate_legacy_manifest_records(
         }
     }
 
-    // (2) Drop the manifest records the ledger now owns.
+    // (2) Drop the manifest records the ledger now owns — for this run's
+    // purls only, and only when the ledger holds the purl at the record's
+    // uuid (a purl whose vendoring FAILED this run keeps its manifest record
+    // and the standalone `vendor` remedy it drives).
     let mut dropped: Vec<String> = Vec::new();
-    for (purl, entry) in state
-        .entries
-        .iter()
-        .filter(|(_, e)| e.detached && e.record.is_some())
-    {
+    for (purl, record) in records {
+        let Some(key) = ledger_key_for(&state, purl) else {
+            continue;
+        };
+        let entry = &state.entries[&key];
+        if !(entry.detached && entry.record.is_some() && entry.uuid == record.uuid) {
+            continue;
+        }
         let base = strip_purl_qualifiers(&entry.base_purl);
         let keys: Vec<String> = manifest
             .patches
             .keys()
-            .filter(|k| *k == purl || strip_purl_qualifiers(k) == base)
+            .filter(|k| *k == &key || *k == purl || strip_purl_qualifiers(k) == base)
             .cloned()
             .collect();
         for k in keys {
@@ -381,6 +396,7 @@ async fn migrate_legacy_manifest_records(
         return;
     }
     dropped.sort();
+    dropped.dedup();
     match write_manifest(manifest_path, &manifest).await {
         Ok(()) => push_run_warning(
             env,
@@ -495,8 +511,6 @@ async fn run_vendor_json_path(
     //    that creates nothing when there is nothing to vendor).
     let vendor_code = match boxed_scan_vendor_step(
         &args.common,
-        manifest_path,
-        socket_dir,
         records,
         blobs,
         api_client.clone(),
@@ -597,8 +611,6 @@ async fn run_vendor_interactive_path(
     let mut has_errors = dl_code != 0;
     let code = match boxed_scan_vendor_step(
         &args.common,
-        manifest_path,
-        socket_dir,
         records,
         blobs,
         api_client.clone(),
@@ -692,7 +704,7 @@ pub(super) fn partition_skipped_selected(
 }
 
 /// Fold the pre-download vendored skips into the apply report returned by
-/// `download_and_apply_patches`: they were "found" by discovery and
+/// `download_and_apply_patches_with`: they were "found" by discovery and
 /// skipped here, never downloaded. Also strips the inner `status` (scan
 /// recomputes its own). Plain fn for the same poll-frame reason as
 /// [`partition_skipped_selected`].
@@ -799,11 +811,8 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
 /// (same rationale as [`boxed_vendor_json_path`], one level down). Moving
 /// the records and seed maps and the client into the future is
 /// stack-neutral (a few words each).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn boxed_scan_vendor_step<'a>(
     common: &'a GlobalArgs,
-    manifest_path: &'a Path,
-    socket_dir: &'a Path,
     records: HashMap<String, PatchRecord>,
     seed: HashMap<String, Vec<u8>>,
     client: ApiClient,
@@ -811,8 +820,6 @@ pub(crate) fn boxed_scan_vendor_step<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = VendorStepResult> + 'a>> {
     Box::pin(run_scan_vendor_step(
         common,
-        manifest_path,
-        socket_dir,
         records,
         seed,
         client,
@@ -974,20 +981,20 @@ mod migration_tests {
         assert!(env.warnings[0].detail.contains(PURL), "{:?}", env.warnings);
     }
 
-    /// Every record the ledger already owns is dropped — exact key and
-    /// qualified variants sharing the base purl — whichever run vendored
-    /// them, and an emptied manifest stays on disk as `{"patches":{}}`.
+    /// Every record for a purl THIS run vendored that the ledger now owns is
+    /// dropped — exact key and qualified variants sharing the base purl —
+    /// and an emptied manifest stays on disk as `{"patches":{}}`.
     #[tokio::test]
-    async fn drops_every_ledger_owned_record_and_leaves_an_emptied_manifest() {
+    async fn drops_this_runs_ledger_owned_records_and_leaves_an_emptied_manifest() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         seed_ledger(root, entry(OTHER_UUID, true, Some(record(OTHER_UUID)))).await;
         seed_manifest(root, &[(PURL, UUID), (QUALIFIED, UUID)]);
         let manifest_path = root.join(".socket/manifest.json");
+        let records: HashMap<String, PatchRecord> = [(PURL.to_string(), record(OTHER_UUID))].into();
         let mut env = Envelope::new(EnvelopeCommand::Vendor);
 
-        migrate_legacy_manifest_records(&common(root), &manifest_path, &HashMap::new(), &mut env)
-            .await;
+        migrate_legacy_manifest_records(&common(root), &manifest_path, &records, &mut env).await;
 
         assert_eq!(
             std::fs::read_to_string(&manifest_path).unwrap().trim(),
@@ -1000,6 +1007,34 @@ mod migration_tests {
             detail.contains(PURL) && detail.contains(QUALIFIED),
             "{detail}"
         );
+    }
+
+    /// A ledger-owned entry this run did NOT vendor keeps its manifest
+    /// record: agent-mode `get X` may have recorded X at a newer uuid than
+    /// the ledger's (the user was told a `vendor` run refreshes the
+    /// artifact), and a vendored run for some OTHER purl must not destroy
+    /// that pending signal. Manifest and ledger stay byte-identical, no
+    /// warning claims a migration that did not happen.
+    #[tokio::test]
+    async fn leaves_records_of_purls_this_run_did_not_vendor_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        seed_ledger(root, entry(UUID, true, Some(record(UUID)))).await;
+        seed_manifest(root, &[(PURL, OTHER_UUID)]);
+        let manifest_path = root.join(".socket/manifest.json");
+        let before = std::fs::read(&manifest_path).unwrap();
+        let ledger_before = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
+        let records: HashMap<String, PatchRecord> = [(OTHER.to_string(), record(UUID))].into();
+        let mut env = Envelope::new(EnvelopeCommand::Vendor);
+
+        migrate_legacy_manifest_records(&common(root), &manifest_path, &records, &mut env).await;
+
+        assert_eq!(std::fs::read(&manifest_path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+            ledger_before
+        );
+        assert!(env.warnings.is_empty(), "{:?}", env.warnings);
     }
 
     /// A record for a purl whose ledger entry is NOT ledger-owned (a

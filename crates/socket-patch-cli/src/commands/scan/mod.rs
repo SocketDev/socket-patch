@@ -155,8 +155,8 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
     if !args.paths.is_empty()
         && matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
     {
-        // Hosted/vendored consume root lockfiles (and, for vendored, the
-        // WHOLE manifest) — path scoping cannot mean anything coherent
+        // Hosted/vendored rewire the project's root lockfiles — whole-project
+        // by construction — so path scoping cannot mean anything coherent
         // there. Same phrasing family as the conflicts above.
         return Err(format!(
             "path targeting cannot be used with --mode {}: it applies to \
@@ -590,14 +590,12 @@ fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -
     DownloadParams {
         cwd: args.common.cwd.clone(),
         manifest_path: args.common.resolved_manifest_path(),
-        org: args.common.org.clone(),
         save_only,
         global: args.common.global,
         global_prefix: args.common.global_prefix.clone(),
         json,
         silent,
         download_mode: args.common.download_mode.clone(),
-        api_overrides: args.common.api_client_overrides(),
         all_releases: args.all_releases,
         strict: args.common.strict,
         ecosystems: args.common.ecosystems.clone(),
@@ -667,37 +665,15 @@ pub(super) const REDIRECT_PRUNE_IGNORED_DETAIL: &str =
 
 /// The PURLs claimed by BOTH the hosted redirect ledger
 /// (`.socket/vendor/redirect-state.json`) and the vendored state ledger
-/// (`.socket/vendor/state.json`) in `cwd`, sorted. A non-empty result means
-/// one mode has taken the lockfile over from the other for these package(s)
-/// while the displaced mode's ledger stayed on disk — exactly one of the two
-/// ledgers is stale for each PURL (a package's lockfile entry can point only
-/// one way). Empty when either ledger is missing/empty/unreadable, or when the
-/// two ledgers describe disjoint packages (a legitimate split: some redirected,
-/// others vendored) — so there are no false positives.
-///
-/// Production classifies through [`classify_overlap_takeover_with`] over
-/// ledgers it already holds; this load-then-derive form is the unit tests'
-/// entry point.
-#[cfg(test)]
-pub(super) async fn overlapping_ledger_purls(cwd: &Path) -> Vec<String> {
-    // A malformed redirect ledger classifies like a missing one here — this
-    // path only feeds takeover WARNINGS, and the corruption itself is already
-    // a hard error on every path that would write (`run_redirect`) or attest
-    // (`vex`) from the ledger.
-    let redirect = socket_patch_core::patch::redirect::load_redirect_state(cwd)
-        .await
-        .ok()
-        .flatten();
-    let Ok(vendor) = socket_patch_core::vendor::load_state(cwd).await else {
-        return Vec::new();
-    };
-    overlap_from_states(redirect.as_ref(), &vendor)
-}
-
-/// [`overlapping_ledger_purls`] over ALREADY-LOADED ledgers — loads nothing,
-/// so a flow holding both in memory (the hosted engine, post-merge) shares
-/// its copies instead of re-reading them. `None` / an empty vendor ledger
-/// yield the empty overlap, exactly like the missing-file cases above.
+/// (`.socket/vendor/state.json`), sorted, over ALREADY-LOADED ledgers —
+/// loads nothing, so a flow holding both in memory (the hosted engine,
+/// post-merge) shares its copies instead of re-reading them. A non-empty
+/// result means one mode has taken the lockfile over from the other for
+/// these package(s) while the displaced mode's ledger stayed on disk —
+/// exactly one of the two ledgers is stale for each PURL (a package's
+/// lockfile entry can point only one way). `None` / an empty vendor ledger
+/// yield the empty overlap; disjoint ledgers (a legitimate split: some
+/// redirected, others vendored) too — so there are no false positives.
 fn overlap_from_states(
     redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
     vendor: &VendorState,
@@ -797,7 +773,7 @@ pub(super) struct OverlapTakeover {
 
 pub(super) async fn classify_overlap_takeover(cwd: &Path) -> OverlapTakeover {
     // Both ledgers loaded ONCE here. A malformed ledger classifies like a
-    // missing one, matching `overlapping_ledger_purls` (this path only
+    // missing one, matching `overlap_from_states` (this path only
     // feeds takeover warnings; corruption is a hard error on the
     // write/attest paths).
     let redirect = socket_patch_core::patch::redirect::load_redirect_state(cwd)
@@ -1071,7 +1047,7 @@ async fn vendored_wiring_live(cwd: &Path, entry: &socket_patch_core::vendor::Ven
 /// not converge:
 ///
 /// * The vendored direction names the package's `edits` entry alongside its
-///   `records` entry. `overlapping_ledger_purls` falls back to matching edit
+///   `records` entry. `overlap_from_states` falls back to matching edit
 ///   KEYS once `records` is empty (the degraded-ledger blind spot), so a
 ///   records-only cleanup that happened to delete the last record left the
 ///   package still matching and this warning firing on every later run —
@@ -1620,10 +1596,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // `--vex` side-effect reads the manifest at several terminal returns,
     // including the early "no packages" exit before the GC block.
     let manifest_path = args.common.resolved_manifest_path();
-    let socket_dir = manifest_path
-        .parent()
-        .expect("manifest path names a file, so it has a parent")
-        .to_path_buf();
+    let socket_dir = args.common.socket_dir();
 
     let overrides = args.common.api_client_overrides();
     let (mut api_client, mut use_public_proxy) =
@@ -2859,6 +2832,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             &selected,
             &filtered_crawled,
             &lockfile_only.purls,
+            vendor_state.as_ref().ok().map(|s| &s.entries),
         )
         .await;
         for patch in selected.iter().filter(|p| mismatched.contains(&p.uuid)) {
@@ -2972,6 +2946,23 @@ pub async fn run(mut args: ScanArgs) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The load-then-derive form of [`overlap_from_states`]: the unit
+    /// tests' entry point (production classifies over ledgers it already
+    /// holds via `classify_overlap_takeover_with`). A malformed redirect
+    /// ledger classifies like a missing one — this path only feeds takeover
+    /// WARNINGS; the corruption itself is a hard error on every path that
+    /// would write or attest from the ledger.
+    async fn overlapping_ledger_purls(cwd: &Path) -> Vec<String> {
+        let redirect = socket_patch_core::patch::redirect::load_redirect_state(cwd)
+            .await
+            .ok()
+            .flatten();
+        let Ok(vendor) = socket_patch_core::vendor::load_state(cwd).await else {
+            return Vec::new();
+        };
+        overlap_from_states(redirect.as_ref(), &vendor)
+    }
     use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
     use std::collections::HashMap;
 

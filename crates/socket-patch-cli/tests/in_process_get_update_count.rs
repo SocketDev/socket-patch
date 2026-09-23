@@ -20,14 +20,21 @@ use std::collections::HashMap;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// The agent engine driven from `params` alone: builds the run's client
-/// from the params' API overrides (what scan/get do once per run) with the
-/// default try-once lock, then runs [`download_and_apply_patches_with`].
+/// The agent engine driven from `params` plus the mock server: builds the
+/// run's client against it (what scan/get do once per run) with the default
+/// try-once lock, then runs [`download_and_apply_patches_with`].
 async fn download_and_apply_patches(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
+    server: &MockServer,
 ) -> (i32, serde_json::Value) {
-    let (api_client, _) = get_api_client_with_overrides(params.api_overrides.clone()).await;
+    let (api_client, _) = get_api_client_with_overrides(ApiClientEnvOverrides {
+        api_url: Some(server.uri()),
+        api_token: Some("fake".to_string()),
+        org_slug: Some(ORG.to_string()),
+        proxy_url: None,
+    })
+    .await;
     let run = DownloadRun {
         api_client: &api_client,
         lock_timeout: None,
@@ -72,11 +79,10 @@ fn search_result(uuid: &str, purl: &str) -> PatchSearchResult {
     }
 }
 
-fn params(root: &Path, server: &MockServer) -> DownloadParams {
+fn params(root: &Path) -> DownloadParams {
     DownloadParams {
         cwd: root.to_path_buf(),
         manifest_path: root.join(".socket/manifest.json"),
-        org: Some(ORG.to_string()),
         // save_only isolates download bookkeeping from the apply step.
         save_only: true,
         global: false,
@@ -84,12 +90,6 @@ fn params(root: &Path, server: &MockServer) -> DownloadParams {
         json: true,
         silent: true,
         download_mode: "diff".to_string(),
-        api_overrides: ApiClientEnvOverrides {
-            api_url: Some(server.uri()),
-            api_token: Some("fake".to_string()),
-            org_slug: Some(ORG.to_string()),
-            proxy_url: None,
-        },
         strict: false,
         ecosystems: None,
         persist_blobs: true,
@@ -118,7 +118,7 @@ async fn failed_update_fetch_is_not_counted_as_updated() {
     seed_manifest_with(tmp.path(), PURL, OLD_UUID);
 
     let selected = vec![search_result(NEW_UUID, PURL)];
-    let (code, json) = download_and_apply_patches(&selected, &params(tmp.path(), &server)).await;
+    let (code, json) = download_and_apply_patches(&selected, &params(tmp.path()), &server).await;
 
     assert_eq!(code, 1, "a failed detail fetch must exit 1; json={json}");
     assert_eq!(json["status"], "partial_failure", "json={json}");
@@ -171,7 +171,7 @@ async fn successful_update_is_counted_once() {
     seed_manifest_with(tmp.path(), PURL, OLD_UUID);
 
     let selected = vec![search_result(NEW_UUID, PURL)];
-    let (code, json) = download_and_apply_patches(&selected, &params(tmp.path(), &server)).await;
+    let (code, json) = download_and_apply_patches(&selected, &params(tmp.path()), &server).await;
 
     // save_only => no apply step => clean success.
     assert_eq!(code, 0, "save-only update should succeed; json={json}");
@@ -238,7 +238,7 @@ async fn corrupt_manifest_is_a_hard_error_not_silently_clobbered() {
     std::fs::write(socket.join("manifest.json"), corrupt).unwrap();
 
     let selected = vec![search_result(NEW_UUID, PURL)];
-    let (code, json) = download_and_apply_patches(&selected, &params(tmp.path(), &server)).await;
+    let (code, json) = download_and_apply_patches(&selected, &params(tmp.path()), &server).await;
 
     assert_eq!(
         code, 1,
