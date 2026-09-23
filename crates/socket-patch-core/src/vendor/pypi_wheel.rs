@@ -202,7 +202,7 @@ fn escape_wheel_component(s: &str) -> String {
 /// version (`packaging.utils.parse_wheel_filename` raises on
 /// `torch-2.0.0_cu118-…` but parses `torch-2.0.0+cu118-…`), so escaping
 /// those two would make the rebuilt wheel uninstallable.
-fn escape_wheel_version(s: &str) -> String {
+pub(crate) fn escape_wheel_version(s: &str) -> String {
     escape_wheel_chars(s, true)
 }
 

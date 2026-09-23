@@ -34,7 +34,8 @@ use super::pypi_uv::{
     check_target_guards, load_uv_project, revert_uv, wire_uv, UvProject, UvTarget,
 };
 use super::pypi_wheel::{
-    build_patched_wheel, locate_installed_dist, wheel_file_name, WheelArtifact,
+    build_patched_wheel, escape_wheel_version, locate_installed_dist, wheel_file_name,
+    WheelArtifact,
 };
 use super::reuse;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
@@ -790,11 +791,42 @@ pub async fn vendor_pypi_with_pipenv_version(
     // vouches for is intact — re-wire those exact bytes instead of acquiring
     // anew, so the re-scan pins the first run's sha whichever source is
     // reachable now (no service call, no local build).
-    let reused_wheel = if !in_sync && !dry_run {
-        fresh_reuse_wheel(base, project_root, &uuid_dir_rel, record, prior.as_ref()).await
+    //
+    // The probe is read-only and offline, so a dry run runs it too: its
+    // preview must agree with the real run, which re-wires without the
+    // service, the installed dist or the blobs (and so is never refused by
+    // `service` + `--offline`).
+    let reused_wheel = if !in_sync {
+        fresh_reuse_wheel(
+            base,
+            project_root,
+            &uuid_dir_rel,
+            record,
+            prior.as_ref(),
+            &canon_name,
+            version,
+        )
+        .await
     } else {
         None
     };
+    if dry_run {
+        if let Some(acquired) = &reused_wheel {
+            warnings.push(VendorWarning::new(
+                "vendor_artifact_reused",
+                format!(
+                    "would re-wire the committed wheel {} for {base} (no rebuild, no service \
+                     download)",
+                    acquired.rel_wheel
+                ),
+            ));
+            return done(
+                reuse_preview_result(base, &project_root.join(&acquired.rel_wheel), record),
+                None,
+                warnings,
+            );
+        }
+    }
     let reused = reused_wheel.is_some();
     if let Some(acquired) = &reused_wheel {
         warnings.push(VendorWarning::new(
@@ -1394,18 +1426,37 @@ pub async fn revert_pypi_opts(
 /// The patched wheel plus the facts the wiring + ledger need, however it was
 /// acquired (service download or local build).
 /// The committed wheel for a Fresh-plan re-run, when the ledger anchors it
-/// and it verifies (see [`reuse`]): directly under `uuid_dir_rel`, a `.whl`,
-/// and not platform-locked (a platform-specific wheel committed on another
-/// OS keeps today's acquire-and-pin behavior). `None` acquires as usual.
+/// and it verifies (see [`reuse`]): directly under `uuid_dir_rel`, a
+/// well-formed wheel filename for THIS distribution and version (the leaf
+/// comes from the committed ledger, and the wirings splice it verbatim into
+/// requirements.txt / uv.lock / poetry.lock — see [`reusable_wheel_leaf`]),
+/// and not platform-locked by either the ledger flag or the filename's own
+/// tags (a platform-specific wheel committed on another OS keeps today's
+/// acquire-and-pin behavior). `None` acquires as usual.
 async fn fresh_reuse_wheel(
     base: &str,
     project_root: &Path,
     uuid_dir_rel: &str,
     record: &PatchRecord,
     prior: Option<&VendorEntry>,
+    canon_name: &str,
+    version: &str,
 ) -> Option<AcquiredWheel> {
     let prior = prior?;
-    if prior.artifact.platform_locked == Some(true) {
+    let rel = prior.artifact.path.replace('\\', "/");
+    let leaf = match rel
+        .strip_prefix(uuid_dir_rel)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|leaf| reusable_wheel_leaf(leaf, canon_name, version))
+    {
+        Some(leaf) => leaf.to_string(),
+        None => {
+            reuse::log_miss(base, &reuse::ReuseMiss::PathUnsafe);
+            return None;
+        }
+    };
+    let (locked, platform_tags_display) = wheel_platform_from_filename(&leaf);
+    if locked || prior.artifact.platform_locked == Some(true) {
         reuse::log_miss(base, &reuse::ReuseMiss::PlatformLocked);
         return None;
     }
@@ -1416,12 +1467,6 @@ async fn fresh_reuse_wheel(
             return None;
         }
     };
-    let leaf = art
-        .rel_path
-        .strip_prefix(uuid_dir_rel)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .filter(|leaf| !leaf.contains('/') && leaf.ends_with(".whl"))?
-        .to_string();
     let abs = project_root.join(&art.rel_path);
     Some(AcquiredWheel {
         rel_wheel: art.rel_path.clone(),
@@ -1431,10 +1476,53 @@ async fn fresh_reuse_wheel(
             sha256_hex: art.entry.artifact.sha256.to_ascii_lowercase(),
             size: art.bytes.len() as u64,
         }),
-        platform_tags_display: wheel_platform_from_filename(&leaf).1,
+        platform_tags_display,
         wheel_name: leaf,
         platform_locked: false,
     })
+}
+
+/// A ledger-supplied wheel leaf is reusable only as a well-formed PEP 427
+/// filename (`name-version(-build)?-py-abi-plat.whl`) in the wheel-filename
+/// charset — no whitespace, control, `#`, `;` or `/`, which a wiring would
+/// splice verbatim into a requirements line or lock path — whose name is
+/// THIS distribution (PEP 503-normalized) and whose version is THIS version
+/// (as [`escape_wheel_version`] spells it, ASCII case-insensitively).
+fn reusable_wheel_leaf(leaf: &str, canon_name: &str, version: &str) -> bool {
+    let Some(stem) = leaf.strip_suffix(".whl") else {
+        return false;
+    };
+    if !stem
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'!' | b'-'))
+    {
+        return false;
+    }
+    let parts: Vec<&str> = stem.split('-').collect();
+    if !(parts.len() == 5 || parts.len() == 6) || parts.iter().any(|p| p.is_empty()) {
+        return false;
+    }
+    canonicalize_pypi_name(parts[0]) == canonicalize_pypi_name(canon_name)
+        && parts[1].eq_ignore_ascii_case(&escape_wheel_version(version))
+}
+
+/// The dry-run preview of a Fresh-path reuse: the shape a dry-run local
+/// build reports (every patched file verified, ready to wire) — the CLI
+/// renders it as a verified preview, as it would the build.
+fn reuse_preview_result(base: &str, abs: &Path, record: &PatchRecord) -> ApplyResult {
+    let files_verified = record
+        .files
+        .keys()
+        .map(|f| crate::patch::apply::VerifyResult {
+            file: f.clone(),
+            status: crate::patch::apply::VerifyStatus::Ready,
+            message: None,
+            current_hash: None,
+            expected_hash: None,
+            target_hash: None,
+        })
+        .collect();
+    super::common::synthesized_result(base, abs, files_verified, true, None)
 }
 
 struct AcquiredWheel {
@@ -6409,6 +6497,159 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
             assert!(ts::has_warning(&w, "vendor_prebuilt_unavailable"), "{w:?}");
             assert_ne!(e.unwrap().artifact.sha256, first.artifact.sha256);
             assert_eq!(requests, 1, "acquisition ran (the 503 POST)");
+        }
+
+        /// Dry run of the relock re-scan: the preview agrees with the real
+        /// run (which re-wires offline, see above) — success, a verified
+        /// preview, the reuse note, nothing written, no request — instead
+        /// of the `service` + `--offline` refusal the acquisition preview
+        /// raised.
+        #[tokio::test]
+        async fn relock_rescan_dry_run_previews_the_reuse_under_service_offline() {
+            let alt = rezip(&local_wheel().await);
+            let fx = flavor_fixture(&[("pdm.lock", PDM_LOCK_REGISTRY)]).await;
+            let registry = snap(&fx).await;
+            let _ = first_run(&fx, Some(&alt)).await;
+            restore(&fx, &registry).await;
+            let server = wiremock::MockServer::start().await;
+            ts::mount_503(&server).await;
+            let cfg = ts::service_cfg(&server.uri(), VendorSource::Service, true);
+            let outcome = vendor_pypi(
+                KEY,
+                &fx.site_packages,
+                &fx.root,
+                &fx.record,
+                &PatchSources::blobs_only(&fx.blobs),
+                "2026-06-09T00:00:00Z",
+                true,
+                false,
+                Some(&cfg),
+            )
+            .await;
+            let (r, e, w) = ts::expect_done(outcome);
+            assert!(r.success, "{:?}", r.error);
+            assert!(e.is_none(), "a dry run records nothing");
+            assert!(ts::has_warning(&w, "vendor_artifact_reused"), "{w:?}");
+            assert!(
+                r.files_verified
+                    .iter()
+                    .all(|f| f.status == crate::patch::apply::VerifyStatus::Ready),
+                "a verified preview, as the dry-run build reports"
+            );
+            assert_eq!(snap(&fx).await, registry, "nothing wired");
+            assert_eq!(tokio::fs::read(wheel(&fx)).await.unwrap(), alt);
+            assert_eq!(ts::request_count(&server).await, 0);
+        }
+
+        /// Rename the committed wheel to `leaf` and point every ledger
+        /// entry at it (a forged, committed state.json), then relock.
+        async fn forge_leaf(fx: &E2eFixture, registry: &Snap, leaf: &str) {
+            tokio::fs::rename(wheel(fx), uuid_dir_of(fx).join(leaf))
+                .await
+                .unwrap();
+            let state_p = fx.root.join(".socket/vendor/state.json");
+            let mut state: crate::vendor::state::VendorState =
+                serde_json::from_slice(&tokio::fs::read(&state_p).await.unwrap()).unwrap();
+            for e in state.entries.values_mut() {
+                let dir = e.artifact.path.rsplit_once('/').unwrap().0.to_string();
+                e.artifact.path = format!("{dir}/{leaf}");
+            }
+            tokio::fs::write(&state_p, serde_json::to_vec_pretty(&state).unwrap())
+                .await
+                .unwrap();
+            restore(fx, registry).await;
+        }
+
+        /// The reused leaf comes from the committed ledger and is spliced
+        /// verbatim into the wiring: a leaf carrying a newline must never
+        /// inject a requirements.txt option line, and a leaf naming another
+        /// distribution must never be wired for this one.
+        #[tokio::test]
+        async fn forged_ledger_leaf_is_never_reused() {
+            for leaf in [
+                "six-1.16.0-py3-none-any.whl\n--trusted-host evil.example\n#.whl",
+                "evil-9.9-py3-none-any.whl",
+                "six-6.6.6-py3-none-any.whl",
+            ] {
+                let fx = flavor_fixture(&[]).await;
+                let registry = snap(&fx).await;
+                let _ = first_run(&fx, None).await;
+                forge_leaf(&fx, &registry, leaf).await;
+                let (outcome, _) = run(&fx, None, VendorSource::Auto, false).await;
+                let (r, _, w) = ts::expect_done(outcome);
+                assert!(
+                    !ts::has_warning(&w, "vendor_artifact_reused"),
+                    "{leaf:?}: {w:?}"
+                );
+                let req = tokio::fs::read_to_string(fx.root.join("requirements.txt"))
+                    .await
+                    .unwrap();
+                assert!(
+                    !req.lines()
+                        .any(|l| l.trim_start().starts_with("--trusted-host")),
+                    "{leaf:?}: injected\n{req}"
+                );
+                assert!(!req.contains("evil"), "{leaf:?}\n{req}");
+                assert!(r.success, "{leaf:?}: acquisition re-vendors: {:?}", r.error);
+            }
+        }
+
+        /// A platform-specific wheel (by its own filename tags) is not
+        /// reused even when the ledger lacks the `platform_locked` flag.
+        #[tokio::test]
+        async fn platform_tagged_leaf_without_ledger_flag_is_not_reused() {
+            let fx = flavor_fixture(&[("pdm.lock", PDM_LOCK_REGISTRY)]).await;
+            let registry = snap(&fx).await;
+            let mut first = first_run(&fx, None).await;
+            first.artifact.platform_locked = None;
+            ts::persist(&fx.root, KEY, first).await;
+            forge_leaf(
+                &fx,
+                &registry,
+                "six-1.16.0-cp311-cp311-manylinux_2_17_x86_64.whl",
+            )
+            .await;
+            let (outcome, requests) = run(&fx, None, VendorSource::Auto, false).await;
+            let (_, _, w) = ts::expect_done(outcome);
+            assert!(!ts::has_warning(&w, "vendor_artifact_reused"), "{w:?}");
+            assert_eq!(requests, 1, "acquisition ran (the 503 POST)");
+        }
+
+        #[test]
+        fn reusable_wheel_leaf_accepts_only_this_dist_and_version() {
+            assert!(reusable_wheel_leaf(
+                "six-1.16.0-py2.py3-none-any.whl",
+                "six",
+                "1.16.0"
+            ));
+            assert!(reusable_wheel_leaf(
+                "Six-1.16.0-1-py3-none-any.whl",
+                "six",
+                "1.16.0"
+            ));
+            assert!(reusable_wheel_leaf(
+                "zope_interface-5.0-py3-none-any.whl",
+                "zope-interface",
+                "5.0"
+            ));
+            assert!(reusable_wheel_leaf(
+                "torch-2.0.0+cu118-cp311-cp311-linux_x86_64.whl",
+                "torch",
+                "2.0.0+cu118"
+            ));
+            for bad in [
+                "six-1.16.0-py3-none-any.whl\n--x\n#.whl",
+                "six-1.16.0-py3-none-any .whl",
+                "six-1.16.0-py3-none-any.whl#x.whl",
+                "evil-1.16.0-py3-none-any.whl",
+                "six-1.17.0-py3-none-any.whl",
+                "six-1.16.0-any.whl",
+                "six-1.16.0-a-b-py3-none-any.whl",
+                "six-1.16.0-py3-none-any.tar.gz",
+                "six--1.16.0-py3-none-any.whl",
+            ] {
+                assert!(!reusable_wheel_leaf(bad, "six", "1.16.0"), "{bad:?}");
+            }
         }
 
         /// P7: the in-sync path is unchanged — `service` mode + 503 on an
