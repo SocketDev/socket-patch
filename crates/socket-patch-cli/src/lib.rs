@@ -2,7 +2,7 @@
 //!
 //! Exposes the clap parser types so integration tests can verify the public
 //! CLI contract without invoking the binary. The `main.rs` binary entry point
-//! is a thin wrapper that delegates to [`parse_with_uuid_fallback`] and the
+//! is a thin wrapper that delegates to [`parse_argv_with_shortcuts`] and the
 //! `run` function on each command's `Args`.
 
 pub mod args;
@@ -36,7 +36,7 @@ pub struct Cli {
     /// upgrade command.
     //
     // This root flag is the public surface; parsing-wise it is rewritten
-    // to the hidden `self-update` subcommand by `parse_with_uuid_fallback`
+    // to the hidden `self-update` subcommand by `parse_argv_with_shortcuts`
     // (`command` stays required, so `--update` alone never parses `Ok`
     // here). The field itself exists for `--help` discoverability and to
     // reject the contradictory `socket-patch --update <subcommand>` form
@@ -91,7 +91,7 @@ pub enum Commands {
     Repair(commands::repair::RepairArgs),
 
     /// Internal parse target of the root `--update` flag (see the rewrite
-    /// in [`parse_with_uuid_fallback`]). Hidden: the public contract
+    /// in [`parse_argv_with_shortcuts`]). Hidden: the public contract
     /// surface is `socket-patch --update`, and this name carries no
     /// stability guarantee (documented as internal in CLI_CONTRACT.md).
     #[command(hide = true, name = "self-update")]
@@ -121,7 +121,7 @@ impl Commands {
 
 /// Check whether `s` looks like a UUID (8-4-4-4-12 hex pattern).
 ///
-/// Used by [`parse_with_uuid_fallback`] to detect the convenience form
+/// Used by [`parse_argv_with_shortcuts`] to detect the convenience form
 /// `socket-patch <UUID>` and rewrite it to `socket-patch get <UUID>`, and
 /// by rollback's target resolver to decide whether a no-match identifier
 /// error should hint at the path-glob spelling.
@@ -143,7 +143,7 @@ pub(crate) fn looks_like_uuid(s: &str) -> bool {
 /// no rewrite applies or the applicable rewrite also genuinely fails.
 ///
 /// Pulled out of `main.rs` so the fallback paths are unit-testable.
-pub fn parse_with_uuid_fallback(argv: Vec<String>) -> Result<Cli, clap::Error> {
+pub fn parse_argv_with_shortcuts(argv: Vec<String>) -> Result<Cli, clap::Error> {
     match Cli::try_parse_from(&argv) {
         Ok(cli) => Ok(cli),
         Err(err) => {
@@ -317,7 +317,7 @@ mod tests {
         assert!(!looks_like_uuid("8063068 -4da6-45f9-bba8-b888e0ffd58c"));
     }
 
-    // ---------- parse_with_uuid_fallback ----------
+    // ---------- parse_argv_with_shortcuts ----------
 
     const UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
 
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn fallback_rewrites_bare_uuid_to_get() {
-        let cli = parse_with_uuid_fallback(argv(&["socket-patch", UUID])).unwrap();
+        let cli = parse_argv_with_shortcuts(argv(&["socket-patch", UUID])).unwrap();
         match cli.command {
             Commands::Get(args) => assert_eq!(args.identifier, UUID),
             _ => panic!("expected Commands::Get"),
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn fallback_preserves_trailing_flags() {
         // Flags after the UUID must be forwarded to the synthesized `get`.
-        let cli = parse_with_uuid_fallback(argv(&["socket-patch", UUID, "--json"])).unwrap();
+        let cli = parse_argv_with_shortcuts(argv(&["socket-patch", UUID, "--json"])).unwrap();
         match cli.command {
             Commands::Get(args) => {
                 assert_eq!(args.identifier, UUID);
@@ -352,7 +352,7 @@ mod tests {
         // No rewrite should happen; the original clap error must surface.
         // `Cli` doesn't derive `Debug`, so `unwrap_err()` doesn't compile —
         // pull the error out via `match` instead.
-        let err = match parse_with_uuid_fallback(argv(&["socket-patch", "not-a-uuid"])) {
+        let err = match parse_argv_with_shortcuts(argv(&["socket-patch", "not-a-uuid"])) {
             Ok(_) => panic!("expected parse to fail"),
             Err(e) => e,
         };
@@ -362,14 +362,14 @@ mod tests {
     #[test]
     fn fallback_is_skipped_when_normal_parse_succeeds() {
         // `list` parses normally — fallback should not engage.
-        let cli = parse_with_uuid_fallback(argv(&["socket-patch", "list"])).unwrap();
+        let cli = parse_argv_with_shortcuts(argv(&["socket-patch", "list"])).unwrap();
         assert!(matches!(cli.command, Commands::List(_)));
     }
 
     #[test]
     fn fallback_does_not_double_rewrite_explicit_get() {
         // `socket-patch get <UUID>` already parses; fallback never runs.
-        let cli = parse_with_uuid_fallback(argv(&["socket-patch", "get", UUID])).unwrap();
+        let cli = parse_argv_with_shortcuts(argv(&["socket-patch", "get", UUID])).unwrap();
         match cli.command {
             Commands::Get(args) => assert_eq!(args.identifier, UUID),
             _ => panic!("expected Commands::Get"),
@@ -382,7 +382,7 @@ mod tests {
         // after the synthesized `get`, preserving order, so multiple flags
         // all reach the rewritten command.
         let cli =
-            parse_with_uuid_fallback(argv(&["socket-patch", UUID, "--id", "--json"])).unwrap();
+            parse_argv_with_shortcuts(argv(&["socket-patch", UUID, "--id", "--json"])).unwrap();
         match cli.command {
             Commands::Get(args) => {
                 assert_eq!(args.identifier, UUID);
@@ -402,7 +402,7 @@ mod tests {
         // shift it onto the wrong token. Passing the flag explicitly wins over
         // its `SOCKET_MANIFEST_PATH` env fallback, so this holds regardless of
         // ambient env.
-        let cli = parse_with_uuid_fallback(argv(&[
+        let cli = parse_argv_with_shortcuts(argv(&[
             "socket-patch",
             UUID,
             "--manifest-path",
@@ -426,7 +426,7 @@ mod tests {
         // Only the program name is present (argv.len() == 1). The
         // `argv.len() >= 2` guard must short-circuit before indexing argv[1],
         // so this returns the original clap error rather than panicking.
-        let err = match parse_with_uuid_fallback(argv(&["socket-patch"])) {
+        let err = match parse_argv_with_shortcuts(argv(&["socket-patch"])) {
             Ok(_) => panic!("expected parse to fail without a subcommand"),
             Err(e) => e,
         };
@@ -442,7 +442,7 @@ mod tests {
         // The shape check accepts uppercase; confirm the full fallback path
         // (not just `looks_like_uuid`) rewrites an uppercase bare UUID to get.
         const UPPER: &str = "80630680-4DA6-45F9-BBA8-B888E0FFD58C";
-        let cli = parse_with_uuid_fallback(argv(&["socket-patch", UPPER])).unwrap();
+        let cli = parse_argv_with_shortcuts(argv(&["socket-patch", UPPER])).unwrap();
         match cli.command {
             Commands::Get(args) => assert_eq!(args.identifier, UPPER),
             _ => panic!("expected Commands::Get"),
@@ -455,7 +455,7 @@ mod tests {
         // accept this flag — the rewrite parse fails and we must return the
         // ORIGINAL error (the one from the un-rewritten parse), not the
         // rewrite's error.
-        let err = match parse_with_uuid_fallback(argv(&[
+        let err = match parse_argv_with_shortcuts(argv(&[
             "socket-patch",
             UUID,
             "--invalid-flag-that-get-does-not-accept",
@@ -477,7 +477,7 @@ mod tests {
         // "invalid subcommand" error. clap models `--help` as an `Err`, but it
         // is a display request (exit 0), so the fallback must surface THAT
         // error, not the original InvalidSubcommand (which would exit 2).
-        let err = match parse_with_uuid_fallback(argv(&["socket-patch", UUID, "--help"])) {
+        let err = match parse_argv_with_shortcuts(argv(&["socket-patch", UUID, "--help"])) {
             Ok(_) => panic!("clap surfaces --help as an Err"),
             Err(e) => e,
         };
@@ -498,7 +498,7 @@ mod tests {
     fn fallback_forwards_version_to_rewritten_get() {
         // `--version` is likewise a display request that propagates to
         // subcommands (propagate_version = true); it must not be swallowed.
-        let err = match parse_with_uuid_fallback(argv(&["socket-patch", UUID, "--version"])) {
+        let err = match parse_argv_with_shortcuts(argv(&["socket-patch", UUID, "--version"])) {
             Ok(_) => panic!("clap surfaces --version as an Err"),
             Err(e) => e,
         };
@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn update_flag_alone_rewrites_to_self_update() {
-        let cli = parse_with_uuid_fallback(argv(&["socket-patch", "--update"])).unwrap();
+        let cli = parse_argv_with_shortcuts(argv(&["socket-patch", "--update"])).unwrap();
         match cli.command {
             Commands::SelfUpdate(args) => {
                 assert_eq!(args.pin_version, None);
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn update_flag_takes_a_version_pin() {
-        let cli = parse_with_uuid_fallback(argv(&["socket-patch", "--update", "3.4.0"])).unwrap();
+        let cli = parse_argv_with_shortcuts(argv(&["socket-patch", "--update", "3.4.0"])).unwrap();
         match cli.command {
             Commands::SelfUpdate(args) => assert_eq!(args.pin_version.as_deref(), Some("3.4.0")),
             _ => panic!("expected Commands::SelfUpdate"),
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn update_version_pin_normalizes_v_prefix() {
-        let cli = parse_with_uuid_fallback(argv(&["socket-patch", "--update", "v3.4.0"])).unwrap();
+        let cli = parse_argv_with_shortcuts(argv(&["socket-patch", "--update", "v3.4.0"])).unwrap();
         match cli.command {
             Commands::SelfUpdate(args) => assert_eq!(args.pin_version.as_deref(), Some("3.4.0")),
             _ => panic!("expected Commands::SelfUpdate"),
@@ -543,13 +543,13 @@ mod tests {
     fn update_flag_is_position_independent() {
         // The flag needn't come first: every other arg is preserved in
         // order around the dropped `--update` token.
-        let cli = parse_with_uuid_fallback(argv(&["socket-patch", "--json", "--update"])).unwrap();
+        let cli = parse_argv_with_shortcuts(argv(&["socket-patch", "--json", "--update"])).unwrap();
         match cli.command {
             Commands::SelfUpdate(args) => assert!(args.common.json),
             _ => panic!("expected Commands::SelfUpdate"),
         }
         let cli =
-            parse_with_uuid_fallback(argv(&["socket-patch", "--update", "--force", "--silent"]))
+            parse_argv_with_shortcuts(argv(&["socket-patch", "--update", "--force", "--silent"]))
                 .unwrap();
         match cli.command {
             Commands::SelfUpdate(args) => {
@@ -562,7 +562,7 @@ mod tests {
 
     #[test]
     fn update_with_garbage_version_is_a_usage_error() {
-        let err = match parse_with_uuid_fallback(argv(&["socket-patch", "--update", "latest"])) {
+        let err = match parse_argv_with_shortcuts(argv(&["socket-patch", "--update", "latest"])) {
             Ok(_) => panic!("expected parse to fail"),
             Err(e) => e,
         };
@@ -578,7 +578,7 @@ mod tests {
         // `socket-patch --update scan` parses Ok at the clap layer (root
         // flag + subcommand); main.rs rejects the combination with exit 2.
         // Pinned here so the rewrite never fires for it.
-        let cli = parse_with_uuid_fallback(argv(&["socket-patch", "--update", "scan"]));
+        let cli = parse_argv_with_shortcuts(argv(&["socket-patch", "--update", "scan"]));
         // "scan" is not valid semver, so if the rewrite HAD fired this
         // would be an error — instead the plain parse wins.
         let cli = cli.unwrap();
@@ -592,7 +592,7 @@ mod tests {
         // rewrite (`self-update scan`) also fails on the VERSION value. The
         // flag was not argv[1], so the ORIGINAL unknown-argument error must
         // surface — pointing at scan, not at self-update.
-        let err = match parse_with_uuid_fallback(argv(&["socket-patch", "scan", "--update"])) {
+        let err = match parse_argv_with_shortcuts(argv(&["socket-patch", "scan", "--update"])) {
             Ok(_) => panic!("expected parse to fail"),
             Err(e) => e,
         };
@@ -601,7 +601,7 @@ mod tests {
 
     #[test]
     fn update_help_shows_self_update_help() {
-        let err = match parse_with_uuid_fallback(argv(&["socket-patch", "--update", "--help"])) {
+        let err = match parse_argv_with_shortcuts(argv(&["socket-patch", "--update", "--help"])) {
             Ok(_) => panic!("clap surfaces --help as an Err"),
             Err(e) => e,
         };
@@ -620,7 +620,7 @@ mod tests {
         // were expected", i.e. "this flag takes no value at all". The VERSION
         // only exists on the synthesized subcommand, so the rewrite has to
         // recognize `--update=<VERSION>` itself.
-        let cli = parse_with_uuid_fallback(argv(&["socket-patch", "--update=3.4.0"])).unwrap();
+        let cli = parse_argv_with_shortcuts(argv(&["socket-patch", "--update=3.4.0"])).unwrap();
         match cli.command {
             Commands::SelfUpdate(args) => assert_eq!(args.pin_version.as_deref(), Some("3.4.0")),
             _ => panic!("expected Commands::SelfUpdate"),
@@ -632,7 +632,7 @@ mod tests {
         // Same leading-`v` normalization as the space form, and the inline
         // value is spliced in where the flag token was, so the args on either
         // side keep both their order and their meaning.
-        let cli = parse_with_uuid_fallback(argv(&[
+        let cli = parse_argv_with_shortcuts(argv(&[
             "socket-patch",
             "--json",
             "--update=v3.4.0",
@@ -654,7 +654,7 @@ mod tests {
         // The inline form validates its VERSION exactly like the space form:
         // a usage error naming the bad value (exit 2), never a silent
         // fall-through to a latest-release install.
-        let err = match parse_with_uuid_fallback(argv(&["socket-patch", "--update=latest"])) {
+        let err = match parse_argv_with_shortcuts(argv(&["socket-patch", "--update=latest"])) {
             Ok(_) => panic!("expected parse to fail"),
             Err(e) => e,
         };
@@ -671,7 +671,7 @@ mod tests {
         // self-update. (`socket-patch list -- --update` already errors, only
         // because the rewrite happens to fail there; the root form has to
         // fail for the right reason.)
-        let err = match parse_with_uuid_fallback(argv(&["socket-patch", "--", "--update"])) {
+        let err = match parse_argv_with_shortcuts(argv(&["socket-patch", "--", "--update"])) {
             Ok(_) => panic!("`--update` after `--` is an operand, not the flag"),
             Err(e) => e,
         };
@@ -684,7 +684,7 @@ mod tests {
         // Counter-guard for the test above: only a `--` that PRECEDES the
         // flag ends the option list, so `--update -- 3.4.0` still pins.
         let cli =
-            parse_with_uuid_fallback(argv(&["socket-patch", "--update", "--", "3.4.0"])).unwrap();
+            parse_argv_with_shortcuts(argv(&["socket-patch", "--update", "--", "3.4.0"])).unwrap();
         match cli.command {
             Commands::SelfUpdate(args) => assert_eq!(args.pin_version.as_deref(), Some("3.4.0")),
             _ => panic!("expected Commands::SelfUpdate"),
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn root_help_documents_the_update_flag() {
-        let err = match parse_with_uuid_fallback(argv(&["socket-patch", "--help"])) {
+        let err = match parse_argv_with_shortcuts(argv(&["socket-patch", "--help"])) {
             Ok(_) => panic!("clap surfaces --help as an Err"),
             Err(e) => e,
         };
@@ -716,7 +716,7 @@ mod tests {
         // help/version carve-out doesn't accidentally swallow legitimate
         // failures. An unknown flag makes the rewrite fail with UnknownArgument
         // (use_stderr == true), so the original InvalidSubcommand wins.
-        let err = match parse_with_uuid_fallback(argv(&[
+        let err = match parse_argv_with_shortcuts(argv(&[
             "socket-patch",
             UUID,
             "--definitely-not-a-real-flag",

@@ -8,10 +8,10 @@
 //! Each subcommand name and alias here is part of the CLI contract
 //! defined in `crates/socket-patch-cli/CLI_CONTRACT.md`.
 
-use socket_patch_cli::{parse_with_uuid_fallback, Cli, Commands};
+use socket_patch_cli::{parse_argv_with_shortcuts, Cli, Commands};
 
 /// Parse through the **production** entry point. `main.rs` does not call
-/// `Cli::try_parse_from` directly — it calls `parse_with_uuid_fallback`, which
+/// `Cli::try_parse_from` directly — it calls `parse_argv_with_shortcuts`, which
 /// wraps clap with the bare-`<UUID>` → `get <UUID>` rewrite. Driving these
 /// tests through the raw clap parser would leave that wrapper entirely
 /// uncovered: a regression that swallows clap errors, mis-routes argv, or
@@ -19,7 +19,7 @@ use socket_patch_cli::{parse_with_uuid_fallback, Cli, Commands};
 /// the real CLI. Routing through the wrapper means each name/alias/error-kind
 /// assertion below also exercises the code path users actually hit.
 fn parse(argv: &[&str]) -> Result<Cli, clap::Error> {
-    parse_with_uuid_fallback(argv.iter().map(|s| s.to_string()).collect())
+    parse_argv_with_shortcuts(argv.iter().map(|s| s.to_string()).collect())
 }
 
 /// Pull the error out of a parse result. `Cli` doesn't derive `Debug`,
