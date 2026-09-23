@@ -4664,4 +4664,107 @@ mod tests {
             "the drifted live config is untouched after the failed write"
         );
     }
+
+    // ── source-flip regression: the hot path decides "in sync" from the
+    //    COMMITTED copy before any service call, so a service ↔ local flip
+    //    between runs is a byte-identical no-op with no request. ──
+
+    async fn flip_granted_nupkg() -> (wiremock::MockServer, Vec<u8>) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let served = make_nupkg(PATCHED);
+        let sri = crate::vendor::test_support::sri(&served);
+        let serve_path =
+            "/patch/nuget/newtonsoft.json/13.0.3/tok/uuid/newtonsoft.json.13.0.3.nupkg";
+        let serve_url = format!("{}{serve_path}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: {
+                    "status": "granted", "url": serve_url,
+                    "artifacts": [{ "kind": "tarball", "url": serve_url,
+                                    "integrity": { "sha512": sri } }]
+                }}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(serve_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(served.clone()))
+            .mount(&server)
+            .await;
+        (server, served)
+    }
+
+    async fn flip_run(
+        root: &Path,
+        blobs: &Path,
+        installed: &Path,
+        record: &PatchRecord,
+        s: &wiremock::MockServer,
+    ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
+        let cfg = crate::vendor::test_support::service_cfg(
+            &s.uri(),
+            crate::vendor::VendorSource::Auto,
+            false,
+        );
+        let sources = PatchSources::blobs_only(blobs);
+        unwrap_done(
+            vendor_nuget(
+                PURL,
+                installed,
+                root,
+                record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                Some(&cfg),
+            )
+            .await,
+        )
+    }
+
+    #[tokio::test]
+    async fn flip_local_then_service_is_noop() {
+        use crate::vendor::test_support as ts;
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let down = wiremock::MockServer::start().await;
+        ts::mount_503(&down).await;
+        let (r1, e1, _) = flip_run(root, &blobs, &installed, &record, &down).await;
+        assert!(r1.success && e1.is_some());
+        let local = tokio::fs::read(root.join(copy_rel())).await.unwrap();
+        let before = ts::tree_snapshot(root);
+        let (up, served) = flip_granted_nupkg().await;
+        assert_ne!(local, served);
+        let (r2, e2, _) = flip_run(root, &blobs, &installed, &record, &up).await;
+        assert!(r2.success);
+        assert!(e2.is_none());
+        assert_eq!(before, ts::tree_snapshot(root));
+        assert_eq!(ts::request_count(&up).await, 0);
+    }
+
+    #[tokio::test]
+    async fn flip_service_then_local_is_noop() {
+        use crate::vendor::test_support as ts;
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let (up, served) = flip_granted_nupkg().await;
+        let (r1, e1, _) = flip_run(root, &blobs, &installed, &record, &up).await;
+        assert!(r1.success && e1.is_some());
+        assert_eq!(
+            tokio::fs::read(root.join(copy_rel())).await.unwrap(),
+            served
+        );
+        let before = ts::tree_snapshot(root);
+        let down = wiremock::MockServer::start().await;
+        ts::mount_503(&down).await;
+        let (r2, e2, _) = flip_run(root, &blobs, &installed, &record, &down).await;
+        assert!(r2.success);
+        assert!(e2.is_none());
+        assert_eq!(before, ts::tree_snapshot(root));
+        assert_eq!(ts::request_count(&down).await, 0);
+    }
 }

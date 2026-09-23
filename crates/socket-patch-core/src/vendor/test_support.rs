@@ -339,3 +339,24 @@ macro_rules! npm_flip_suite {
     };
 }
 pub(crate) use npm_flip_suite;
+
+/// Every regular file under `root` (relative path → bytes), for the
+/// whole-tree byte-identity oracle of the directory-shaped backends.
+pub(crate) fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(base: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                walk(base, &p, out);
+            } else {
+                out.insert(
+                    p.strip_prefix(base).unwrap().to_string_lossy().into_owned(),
+                    std::fs::read(&p).unwrap(),
+                );
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}

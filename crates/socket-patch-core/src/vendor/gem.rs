@@ -8068,4 +8068,89 @@ mod tests {
             "the freshly-built uuid dir is unwound"
         );
     }
+
+    // ── source-flip regression: the hot path decides "in sync" from the
+    //    COMMITTED copy before any service call, so a service ↔ local flip
+    //    between runs is a byte-identical no-op with no request. ──
+
+    async fn flip_run(
+        root: &Path,
+        installed: &Path,
+        blobs: &Path,
+        record: &PatchRecord,
+        server: &wiremock::MockServer,
+    ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
+        let sources = PatchSources::blobs_only(blobs);
+        unwrap_done(
+            vendor_gem(
+                PURL,
+                installed,
+                root,
+                record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                Some(&gem_service_cfg(&server.uri(), VendorSource::Auto, false)),
+            )
+            .await,
+        )
+    }
+
+    async fn flip_granted() -> wiremock::MockServer {
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let sri = sri_sha512(&gem);
+        let stub_sri = sri_sha512(SERVICE_STUB);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(&server, &gem, &sri, Some((SERVICE_STUB, &stub_sri))).await;
+        server
+    }
+
+    #[tokio::test]
+    async fn flip_local_then_service_is_noop() {
+        use crate::vendor::test_support as ts;
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let down = wiremock::MockServer::start().await;
+        ts::mount_503(&down).await;
+        let (r1, e1, w1) = flip_run(&root, &installed, &blobs, &record, &down).await;
+        assert!(r1.success && e1.is_some());
+        assert!(ts::has_warning(&w1, "vendor_prebuilt_unavailable"));
+        let before = ts::tree_snapshot(&root);
+        let up = flip_granted().await;
+        let (r2, e2, _) = flip_run(&root, &installed, &blobs, &record, &up).await;
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(
+            e2.is_none(),
+            "re-run must be the in-sync no-op (entry None)"
+        );
+        assert!(r2
+            .files_verified
+            .iter()
+            .all(|f| f.status == VerifyStatus::AlreadyPatched));
+        assert_eq!(before, ts::tree_snapshot(&root), "tree byte-identical");
+        assert_eq!(ts::request_count(&up).await, 0);
+    }
+
+    #[tokio::test]
+    async fn flip_service_then_local_is_noop() {
+        use crate::vendor::test_support as ts;
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let up = flip_granted().await;
+        let (r1, e1, w1) = flip_run(&root, &installed, &blobs, &record, &up).await;
+        assert!(r1.success && e1.is_some());
+        assert!(ts::has_warning(&w1, "vendor_prebuilt_downloaded"));
+        assert_eq!(
+            tokio::fs::read(copy_gemspec(&root)).await.unwrap(),
+            SERVICE_STUB
+        );
+        let before = ts::tree_snapshot(&root);
+        let down = wiremock::MockServer::start().await;
+        ts::mount_503(&down).await;
+        let (r2, e2, w2) = flip_run(&root, &installed, &blobs, &record, &down).await;
+        assert!(r2.success);
+        assert!(e2.is_none());
+        assert!(w2.is_empty(), "{w2:?}");
+        assert_eq!(before, ts::tree_snapshot(&root));
+        assert_eq!(ts::request_count(&down).await, 0);
+    }
 }

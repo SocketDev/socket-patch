@@ -3148,4 +3148,86 @@ mod tests {
         assert!(!backup_dir_for(&copy).exists(), "no parked backup");
         assert!(stage.exists(), "the stage is left for the caller's cleanup");
     }
+
+    // ── source-flip regression: the hot path decides "in sync" from the
+    //    COMMITTED copy before any service call, so a service ↔ local flip
+    //    between runs is a byte-identical no-op with no request. ──
+
+    async fn flip_run(
+        root: &Path,
+        blobs: &Path,
+        pristine: &Path,
+        record: &PatchRecord,
+        uri: &str,
+    ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
+        let sources = PatchSources::blobs_only(blobs);
+        expect_done(
+            vendor_cargo_crate(
+                PURL,
+                pristine,
+                root,
+                record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                Some(&cargo_service_cfg(uri, VendorSource::Auto, false)),
+            )
+            .await,
+        )
+    }
+
+    /// A service crate that differs from the local build in NON-patched bytes.
+    fn flip_service_crate() -> Vec<u8> {
+        make_crate_tgz(
+            "cfg-if-1.0.4",
+            &[
+                ("src/lib.rs", PATCHED),
+                (
+                    "Cargo.toml",
+                    b"[package]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n# service\n",
+                ),
+                ("README.service.md", b"built by the service\n"),
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn flip_local_then_service_is_noop() {
+        use crate::vendor::test_support as ts;
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let down = wiremock::MockServer::start().await;
+        ts::mount_503(&down).await;
+        let (r1, e1, _) = flip_run(root, &blobs, &pristine, &record, &down.uri()).await;
+        assert!(r1.success && e1.is_some());
+        let before = ts::tree_snapshot(root);
+        let up = wiremock::MockServer::start().await;
+        let tgz = flip_service_crate();
+        mount_cargo_granted(&up, &sri_sha512(&tgz), &tgz).await;
+        let (r2, e2, w2) = flip_run(root, &blobs, &pristine, &record, &up.uri()).await;
+        assert!(r2.success && e2.is_none() && r2.files_patched.is_empty() && w2.is_empty());
+        assert_eq!(ts::tree_snapshot(root), before, "tree byte-identical");
+        assert_eq!(ts::request_count(&up).await, 0);
+    }
+
+    #[tokio::test]
+    async fn flip_service_then_local_is_noop() {
+        use crate::vendor::test_support as ts;
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let up = wiremock::MockServer::start().await;
+        let tgz = flip_service_crate();
+        mount_cargo_granted(&up, &sri_sha512(&tgz), &tgz).await;
+        let (r1, e1, w1) = flip_run(root, &blobs, &pristine, &record, &up.uri()).await;
+        assert!(r1.success && e1.is_some());
+        assert!(ts::has_warning(&w1, "vendor_prebuilt_downloaded"));
+        let before = ts::tree_snapshot(root);
+        let down = wiremock::MockServer::start().await;
+        ts::mount_503(&down).await;
+        let (r2, e2, w2) = flip_run(root, &blobs, &pristine, &record, &down.uri()).await;
+        assert!(r2.success && e2.is_none() && w2.is_empty());
+        assert_eq!(ts::tree_snapshot(root), before);
+        assert_eq!(ts::request_count(&down).await, 0);
+    }
 }

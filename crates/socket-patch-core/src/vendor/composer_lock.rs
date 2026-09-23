@@ -3480,4 +3480,114 @@ mod tests {
             "lock untouched"
         );
     }
+
+    // ── source-flip regression: the hot path decides "in sync" from the
+    //    COMMITTED copy before any service call, so a service ↔ local flip
+    //    between runs is a byte-identical no-op with no request. ──
+
+    fn flip_service_zip() -> Vec<u8> {
+        make_dist_zip(
+            "php-fig-log-f16e1d5",
+            &[
+                (
+                    "composer.json",
+                    b"{\"name\": \"psr/log\", \"_service\": true}\n",
+                ),
+                ("src/LoggerInterface.php", PATCHED),
+                ("SERVICE_ONLY.md", b"x\n"),
+            ],
+        )
+    }
+
+    async fn flip(
+        root: &Path,
+        blobs: &Path,
+        installed: &Path,
+        record: &PatchRecord,
+        uri: &str,
+        source: VendorSource,
+    ) -> VendorOutcome {
+        vendor_with_service(
+            root,
+            blobs,
+            installed,
+            record,
+            &composer_service_cfg(uri, source, false),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn flip_local_then_service_is_noop() {
+        use crate::vendor::test_support as ts;
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let down = wiremock::MockServer::start().await;
+        ts::mount_503(&down).await;
+        let (r1, e1, _) = unwrap_done(
+            flip(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &down.uri(),
+                VendorSource::Auto,
+            )
+            .await,
+        );
+        assert!(r1.success && e1.is_some());
+        let before = ts::tree_snapshot(root);
+        let up = wiremock::MockServer::start().await;
+        let z = flip_service_zip();
+        mount_composer_granted(&up, &sri_sha512(&z), &z).await;
+        let (r2, e2, w2) = unwrap_done(
+            flip(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &up.uri(),
+                VendorSource::Auto,
+            )
+            .await,
+        );
+        assert!(r2.success && e2.is_none() && w2.is_empty());
+        assert_eq!(ts::tree_snapshot(root), before);
+        assert_eq!(ts::request_count(&up).await, 0);
+    }
+
+    #[tokio::test]
+    async fn flip_service_then_local_is_noop() {
+        use crate::vendor::test_support as ts;
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let up = wiremock::MockServer::start().await;
+        let z = flip_service_zip();
+        mount_composer_granted(&up, &sri_sha512(&z), &z).await;
+        let (r1, e1, w1) = unwrap_done(
+            flip(
+                root,
+                &blobs,
+                &installed,
+                &record,
+                &up.uri(),
+                VendorSource::Auto,
+            )
+            .await,
+        );
+        assert!(r1.success && e1.is_some());
+        assert!(ts::has_warning(&w1, "vendor_prebuilt_downloaded"));
+        let before = ts::tree_snapshot(root);
+        let down = wiremock::MockServer::start().await;
+        ts::mount_503(&down).await;
+        for source in [VendorSource::Auto, VendorSource::Service] {
+            let (r2, e2, w2) =
+                unwrap_done(flip(root, &blobs, &installed, &record, &down.uri(), source).await);
+            assert!(r2.success && e2.is_none() && w2.is_empty(), "{source:?}");
+            assert_eq!(ts::tree_snapshot(root), before, "{source:?}");
+        }
+        assert_eq!(ts::request_count(&down).await, 0);
+    }
 }
