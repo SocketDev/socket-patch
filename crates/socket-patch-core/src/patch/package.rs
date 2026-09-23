@@ -86,10 +86,21 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
             format!("archive {} is not a regular file", archive_path.display()),
         )));
     }
+    read_tgz_to_map(file)
+}
+
+/// [`read_archive_to_map`] over in-memory `.tar.gz` bytes (a downloaded
+/// artifact not yet written anywhere), with the same path-safety and
+/// decompression-bomb caps.
+pub fn read_archive_bytes_to_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
+    read_tgz_to_map(bytes)
+}
+
+fn read_tgz_to_map<R: Read>(reader: R) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
     // Hard-cap decompressed bytes to defuse gzip / tar bombs. Reads
     // beyond the limit yield EOF, which the tar parser surfaces as a
     // truncated-archive error.
-    let bounded = GzDecoder::new(file).take(MAX_TOTAL_DECOMPRESSED_BYTES);
+    let bounded = GzDecoder::new(reader).take(MAX_TOTAL_DECOMPRESSED_BYTES);
     let mut tar = Archive::new(bounded);
 
     let mut out: HashMap<String, Vec<u8>> = HashMap::new();

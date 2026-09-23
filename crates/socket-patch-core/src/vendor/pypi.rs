@@ -22,6 +22,7 @@ use crate::utils::toml_edit_ext::has_table;
 
 use super::common::{
     already_patched_result, done, prune_empty_vendor_levels, refused, service_offline_conflict,
+    zip_bytes_match_after_hashes,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::pypi_pdm::{PdmProject, PdmTarget};
@@ -1482,6 +1483,20 @@ async fn try_pypi_service_wheel(
                         .to_string(),
                 );
             };
+            // The SRI proves only that the transfer is intact. A wheel's
+            // members are site-packages-relative (the `record.files` keys),
+            // so require each patched file to carry its afterHash before
+            // reporting the package patched and pinning the lockfile to it.
+            if !zip_bytes_match_after_hashes(&archive.bytes, &record.files) {
+                return miss(
+                    warnings,
+                    "vendor_prebuilt_layout_mismatch",
+                    format!(
+                        "prebuilt wheel for {base} does not carry the patched files at \
+                         their recorded paths"
+                    ),
+                );
+            }
             let rel_wheel = format!("{uuid_dir_rel}/{wheel_name}");
             let sha256_hex = hex::encode(Sha256::digest(&archive.bytes));
             // In-sync rebuild: the lockfile still pins the first vendor's
@@ -2469,6 +2484,24 @@ wheels = [
 
     const WHEEL_NAME: &str = "six-1.16.0-py2.py3-none-any.whl";
 
+    /// A wheel zip whose `six.py` member is `six_py`, plus a `tag` member so
+    /// callers can make the bytes differ from any other wheel.
+    fn wheel_with(six_py: &[u8], tag: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default();
+        zip.start_file("six.py", opts).unwrap();
+        zip.write_all(six_py).unwrap();
+        zip.start_file("socket-test-tag.txt", opts).unwrap();
+        zip.write_all(tag).unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// A served wheel that carries the patched `six.py`.
+    fn served_wheel(tag: &[u8]) -> Vec<u8> {
+        wheel_with(PATCHED, tag)
+    }
+
     fn sri_sha512(bytes: &[u8]) -> String {
         use base64::Engine as _;
         format!(
@@ -2536,7 +2569,7 @@ wheels = [
     async fn service_success_requirements_writes_wheel_and_wires_sha256() {
         let fx = e2e_fixture().await;
         let sources = PatchSources::blobs_only(&fx.blobs);
-        let bytes = b"prebuilt wheel bytes from the service";
+        let bytes: &[u8] = &served_wheel(b"prebuilt wheel bytes from the service");
         let sri = sri_sha512(bytes);
         let server = wiremock::MockServer::start().await;
         mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
@@ -2591,6 +2624,67 @@ wheels = [
                 .unwrap(),
             ORIG
         );
+    }
+
+    /// A served wheel with an intact SRI whose `six.py` is still the ORIGINAL
+    /// bytes is not the patched package: `service` refuses and writes no
+    /// wheel; `auto` warns and builds locally (which carries the patch).
+    #[tokio::test]
+    async fn service_wheel_failing_after_hashes_is_rejected() {
+        for source in [VendorSource::Service, VendorSource::Auto] {
+            let fx = e2e_fixture().await;
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let bytes = wheel_with(ORIG, b"unpatched");
+            let server = wiremock::MockServer::start().await;
+            mount_pypi_granted(&server, WHEEL_NAME, &sri_sha512(&bytes), &bytes).await;
+            let outcome = vendor_pypi(
+                "pkg:pypi/six@1.16.0",
+                &fx.site_packages,
+                &fx.root,
+                &fx.record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                Some(&pypi_service_cfg(&server.uri(), source, false)),
+            )
+            .await;
+            let wheel = fx
+                .root
+                .join(format!(".socket/vendor/pypi/{UUID}/{WHEEL_NAME}"));
+            match source {
+                VendorSource::Service => {
+                    let VendorOutcome::Refused { code, .. } = &outcome else {
+                        panic!("service must refuse an unpatched wheel, got {outcome:?}");
+                    };
+                    assert_eq!(*code, "vendor_prebuilt_required");
+                    assert!(!wheel.exists(), "no unpatched wheel written");
+                }
+                _ => {
+                    let VendorOutcome::Done {
+                        result, warnings, ..
+                    } = &outcome
+                    else {
+                        panic!("auto must fall back, got {outcome:?}");
+                    };
+                    assert!(result.success, "{:?}", result.error);
+                    assert!(
+                        warnings
+                            .iter()
+                            .any(|w| w.code == "vendor_prebuilt_layout_mismatch"),
+                        "{warnings:?}"
+                    );
+                    assert!(
+                        !warnings
+                            .iter()
+                            .any(|w| w.code == "vendor_prebuilt_downloaded"),
+                        "{warnings:?}"
+                    );
+                    let on_disk = tokio::fs::read(&wheel).await.unwrap();
+                    assert_ne!(on_disk, bytes, "the served wheel was not used");
+                }
+            }
+        }
     }
 
     /// An sdist service artifact (not a `.whl`) falls back to the local wheel
@@ -2750,7 +2844,8 @@ wheels = [
             .unwrap();
 
         // The service offers a wheel whose bytes do NOT match the wired pin.
-        let bytes = b"service-built wheel bytes that differ from the local build";
+        let bytes: &[u8] =
+            &served_wheel(b"service-built wheel bytes that differ from the local build");
         let sri = sri_sha512(bytes);
         let server = wiremock::MockServer::start().await;
         mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
@@ -2834,7 +2929,8 @@ wheels = [
             .await
             .unwrap();
 
-        let bytes = b"service-built wheel bytes that differ from the local build";
+        let bytes: &[u8] =
+            &served_wheel(b"service-built wheel bytes that differ from the local build");
         let sri = sri_sha512(bytes);
         let server = wiremock::MockServer::start().await;
         mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
@@ -2874,7 +2970,7 @@ wheels = [
     async fn in_sync_local_rebuild_pin_mismatch_fails_loudly() {
         let fx = e2e_fixture().await;
         let sources = PatchSources::blobs_only(&fx.blobs);
-        let bytes = b"prebuilt wheel bytes from the service";
+        let bytes: &[u8] = &served_wheel(b"prebuilt wheel bytes from the service");
         let sri = sri_sha512(bytes);
         let server = wiremock::MockServer::start().await;
         mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
@@ -2974,7 +3070,8 @@ wheels = [
             .await
             .unwrap();
 
-        let bytes = b"service-built wheel bytes that differ from the local build";
+        let bytes: &[u8] =
+            &served_wheel(b"service-built wheel bytes that differ from the local build");
         let sri = sri_sha512(bytes);
         let server = wiremock::MockServer::start().await;
         mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
@@ -3032,7 +3129,7 @@ wheels = [
     async fn in_sync_ledgerless_local_rebuild_pin_mismatch_fails_loudly() {
         let fx = e2e_fixture().await;
         let sources = PatchSources::blobs_only(&fx.blobs);
-        let bytes = b"prebuilt wheel bytes from the service";
+        let bytes: &[u8] = &served_wheel(b"prebuilt wheel bytes from the service");
         let sri = sri_sha512(bytes);
         let server = wiremock::MockServer::start().await;
         mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
@@ -5352,7 +5449,7 @@ wheels = [
     async fn service_uuid_dir_create_failure_hard_fails() {
         let fx = e2e_fixture().await;
         let sources = PatchSources::blobs_only(&fx.blobs);
-        let bytes = b"prebuilt wheel bytes from the service";
+        let bytes: &[u8] = &served_wheel(b"prebuilt wheel bytes from the service");
         let sri = sri_sha512(bytes);
         let server = wiremock::MockServer::start().await;
         mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
@@ -5391,7 +5488,7 @@ wheels = [
     async fn service_wheel_write_failure_hard_fails_even_under_auto() {
         let fx = e2e_fixture().await;
         let sources = PatchSources::blobs_only(&fx.blobs);
-        let bytes = b"prebuilt wheel bytes from the service";
+        let bytes: &[u8] = &served_wheel(b"prebuilt wheel bytes from the service");
         let sri = sri_sha512(bytes);
         let server = wiremock::MockServer::start().await;
         mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;
@@ -5723,7 +5820,8 @@ wheels = [
         tokio::fs::remove_dir_all(uuid_dir_of(&fx)).await.unwrap();
 
         // The service offers a wheel whose bytes do NOT match the wired pin.
-        let bytes = b"service-built wheel bytes that differ from the local build";
+        let bytes: &[u8] =
+            &served_wheel(b"service-built wheel bytes that differ from the local build");
         let sri = sri_sha512(bytes);
         let server = wiremock::MockServer::start().await;
         mount_pypi_granted(&server, WHEEL_NAME, &sri, bytes).await;

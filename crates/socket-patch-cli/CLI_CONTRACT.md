@@ -473,7 +473,7 @@ per service outcome:
 |---|---|---|
 | granted/reused, integrity ok | **use service** | **use service** |
 | integrity mismatch (including the gem stub gemspec) | **refuse** (`vendor_prebuilt_integrity_mismatch`; npm: the package fails with the integrity detail). Tampered bytes never fall back to a local build | refuse (same) |
-| integrity ok, but the archive does not carry the patched files (a member at a recorded path fails its `afterHash`; checked for cargo/golang/composer/gem after extraction, and for maven/nuget before the archive is written) | local build + `vendor_prebuilt_layout_mismatch` | refuse (`vendor_prebuilt_required`) |
+| integrity ok, but the archive does not carry the patched files (a member at a recorded path fails its `afterHash`; checked for cargo/golang/composer/gem after extraction, and for maven/nuget/pypi/npm before the archive is written; npm under `service` fails the package with the detail) | local build + `vendor_prebuilt_layout_mismatch` | refuse (`vendor_prebuilt_required`) |
 | still building (`pending_build` / serve 408) | local build + `vendor_prebuilt_pending` | refuse |
 | not built / withdrawn / not found / no usable artifact | local build (quiet) | refuse |
 | gem stub gemspec missing / invalid | local build + `vendor_prebuilt_stub_missing` / `vendor_prebuilt_stub_invalid` (invalid + gem not installed: refuse `vendor_prebuilt_stub_invalid` — no stub source exists) | refuse (`vendor_prebuilt_required` / `vendor_prebuilt_stub_invalid`) |

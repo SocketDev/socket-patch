@@ -347,6 +347,27 @@ async fn try_service_pack(
     let hard_fail =
         |detail: String| ServicePackDecision::HardFail(Box::new(done_failure(purl, detail)));
     match fetch_verified_archive(cfg, &record.uuid).await {
+        // The SRI proves only that the transfer is intact: require the
+        // tarball to carry every patched file at its afterHash before
+        // reporting the package patched and wiring the lock to it.
+        ServiceArtifact::Ready(archive)
+            if !tgz_bytes_match_after_hashes(&archive.bytes, record) =>
+        {
+            let reason = format!(
+                "prebuilt tarball for {}@{} does not carry the patched files at their \
+                 recorded paths",
+                coords.name, coords.version
+            );
+            if cfg.source.requires_service() {
+                hard_fail(reason)
+            } else {
+                warnings.push(VendorWarning::new(
+                    "vendor_prebuilt_layout_mismatch",
+                    format!("{reason}; building locally instead"),
+                ));
+                ServicePackDecision::FallBack
+            }
+        }
         ServiceArtifact::Ready(archive) => {
             match staged_pack_from_service_bytes(
                 purl,
@@ -367,8 +388,8 @@ async fn try_service_pack(
                         ),
                     ));
                     // No local apply to verify — every patched file reads as
-                    // `AlreadyPatched` (trust is the service-verified
-                    // integrity).
+                    // `AlreadyPatched` (the tarball's members were checked
+                    // against their afterHashes above).
                     let result = already_patched_result(
                         purl,
                         &project_root.join(&staged.rel_tgz),
@@ -498,6 +519,19 @@ async fn staged_pack_from_service_bytes(
         packed,
         staged_pkg_json,
         uuid_dir_preexisted,
+    })
+}
+
+/// True when the downloaded npm tarball (`package/`-rooted, like the
+/// `record.files` keys) has every patched file hashing to its `afterHash`.
+fn tgz_bytes_match_after_hashes(bytes: &[u8], record: &PatchRecord) -> bool {
+    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+    let Ok(map) = crate::patch::package::read_archive_bytes_to_map(bytes) else {
+        return false;
+    };
+    record.files.iter().all(|(file_name, info)| {
+        map.get(normalize_file_path(file_name))
+            .is_some_and(|content| compute_git_sha256_from_bytes(content) == info.after_hash)
     })
 }
 
@@ -1216,7 +1250,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         mount_granted(&server, &served_sri, &tgz).await;
 
-        let record = record_with_uuid(UUID);
+        let record = patched_index_record();
         for source in [VendorSource::Service, VendorSource::Auto] {
             let tmp = tempfile::tempdir().unwrap();
             let cfg = service_cfg(&server.uri(), source);
@@ -1231,6 +1265,79 @@ mod tests {
                 "the string guard fires before any write"
             );
         }
+    }
+
+    /// A record patching `package/index.js` to `PATCHED_INDEX` (real hashes,
+    /// so a served tarball carrying the patch passes the afterHash check).
+    fn patched_index_record() -> PatchRecord {
+        use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+        let mut record = record_with_uuid(UUID);
+        record.files.clear();
+        record.files.insert(
+            "package/index.js".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(ORIG_INDEX),
+                after_hash: compute_git_sha256_from_bytes(PATCHED_INDEX),
+            },
+        );
+        record
+    }
+
+    /// A served tarball with an intact SRI whose `index.js` is still the
+    /// ORIGINAL bytes is not the patched package: `service` fails the package
+    /// and writes nothing; `auto` warns and builds locally instead.
+    #[tokio::test]
+    async fn service_tarball_failing_after_hashes_is_rejected() {
+        let tgz = build_tgz(&[("index.js", ORIG_INDEX)]).await;
+        let sri = PackedTarball::from_bytes(&tgz).integrity;
+        let server = wiremock::MockServer::start().await;
+        mount_granted(&server, &sri, &tgz).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = service_cfg(&server.uri(), VendorSource::Service);
+        let err = expect_err(run_pipeline(tmp.path(), &patched_index_record(), Some(&cfg)).await);
+        expect_done_failure(err, "does not carry the patched files");
+        assert!(
+            !tmp.path().join(".socket/vendor").exists(),
+            "an unpatched service tarball is never written"
+        );
+
+        let (tmp, record) = local_fixture(b"{\"name\":\"left-pad\",\"version\":\"1.3.0\"}").await;
+        let root = tmp.path();
+        let blobs = root.join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        let mut warnings = Vec::new();
+        let cfg = service_cfg(&server.uri(), VendorSource::Auto);
+        let Ok((Some(staged), result)) = stage_patch_pack(
+            LP_PURL,
+            &root.join("node_modules/left-pad"),
+            root,
+            &record,
+            &sources,
+            false,
+            false,
+            &mut warnings,
+            Some(&cfg),
+        )
+        .await
+        else {
+            panic!("auto must fall back to the local build");
+        };
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_layout_mismatch"),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
+        let written = tokio::fs::read(root.join(&staged.rel_tgz)).await.unwrap();
+        assert_ne!(written, tgz, "the served tarball was not used");
     }
 
     // ──────────── staged_pack_from_service_bytes unit matrix ────────────
