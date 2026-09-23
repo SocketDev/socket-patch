@@ -24,7 +24,14 @@
 //!    ONCE into memory — every later check runs on that one buffer;
 //! 5. `sha256(bytes)` == the ledger sha256 (and the ledger size, when
 //!    recorded) — the tamper anchor for unpatched members and re-encodings;
-//! 6. every `record.files` afterHash verifies inside the decoded members.
+//! 6. the archive is CANONICAL (strict decode: every tarball entry under
+//!    `package/`, only regular/directory entries, no exact or case-folded
+//!    duplicate names; the same name rules for wheels) — so the decoded
+//!    members are exactly what an installer extracts, and the afterHash
+//!    check below cannot be satisfied by one entry while a sibling the
+//!    installer prefers (another top-level dir, a type-`7` twin, a
+//!    case-variant name) carries different bytes;
+//! 7. every `record.files` afterHash verifies inside the decoded members.
 //!
 //! The lockfile is deliberately NOT an input: the flavor's own in-sync code
 //! runs afterwards against the reused bytes' facts, so a lock that already
@@ -48,7 +55,7 @@ use crate::utils::env_compat::is_debug_enabled;
 
 use super::state::{load_state, VendorEntry};
 use super::verify::{
-    checked_artifact_path, read_zip_bytes_to_map, verify_member_map, MAX_HEALTH_HASH_BYTES,
+    checked_artifact_path, read_zip_bytes_to_map_strict, verify_member_map, MAX_HEALTH_HASH_BYTES,
 };
 
 /// A committed artifact that passed every reuse check.
@@ -81,6 +88,7 @@ pub(crate) enum ReuseMiss {
     Sha256Mismatch,
     SizeMismatch,
     Unreadable,
+    NonCanonical,
     MemberMismatch(String),
     PlatformLocked,
 }
@@ -221,15 +229,24 @@ pub(crate) async fn verify_committed_artifact(
     }
     let (bytes, members) = tokio::task::spawn_blocking(move || {
         let members = if is_tarball {
-            crate::patch::package::read_archive_bytes_to_map(&bytes).map_err(|_| ())
+            crate::patch::package::read_archive_bytes_to_map_strict(&bytes).map_err(|e| match e {
+                crate::patch::package::ArchiveError::NonCanonical(_) => ReuseMiss::NonCanonical,
+                _ => ReuseMiss::Unreadable,
+            })
         } else {
-            read_zip_bytes_to_map(&bytes).map_err(|_| ())
+            read_zip_bytes_to_map_strict(&bytes).map_err(|e| {
+                if e == "vendor_artifact_non_canonical" {
+                    ReuseMiss::NonCanonical
+                } else {
+                    ReuseMiss::Unreadable
+                }
+            })
         };
         (bytes, members)
     })
     .await
     .map_err(|_| ReuseMiss::Unreadable)?;
-    let members = members.map_err(|()| ReuseMiss::Unreadable)?;
+    let members = members?;
     verify_member_map(&members, record).map_err(ReuseMiss::MemberMismatch)?;
 
     Ok(CommittedArtifact {
@@ -695,5 +712,194 @@ mod tests {
             reuse(tmp.path(), &record(UUID)).await.unwrap_err(),
             ReuseMiss::TooLarge
         );
+    }
+
+    // ── Canonical-archive gate: an archive whose decoded members differ
+    //    from what an installer extracts is never reused, even with the
+    //    ledger sha recomputed (a plain sha256 anyone committing
+    //    state.json can forge).
+
+    const EVIL: &[u8] = b"module.exports = 'UNPATCHED';\n";
+    const PKG_JSON: &[u8] = b"{\"name\":\"left-pad\",\"version\":\"1.3.0\"}";
+
+    fn tgz_typed(members: &[(&str, &[u8], tar::EntryType)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for (name, data, ty) in members {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(*ty);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *data).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    async fn forged_reuse(bytes: &[u8]) -> Result<CommittedArtifact, ReuseMiss> {
+        let (tmp, _) = project(bytes).await;
+        reuse(tmp.path(), &record(UUID)).await
+    }
+
+    /// npm/pnpm/yarn/bun strip the FIRST segment whatever it is: a second
+    /// top-level dir shadows the verified `package/index.js` at install.
+    #[tokio::test]
+    async fn second_top_level_dir_is_not_canonical() {
+        use tar::EntryType::Regular;
+        let bytes = tgz_typed(&[
+            ("package/index.js", PATCHED, Regular),
+            ("package/package.json", PKG_JSON, Regular),
+            ("zzz/index.js", EVIL, Regular),
+        ]);
+        assert_eq!(
+            forged_reuse(&bytes).await.unwrap_err(),
+            ReuseMiss::NonCanonical
+        );
+    }
+
+    /// node-tar extracts a type-'7' (contiguous) entry as a file; the
+    /// lenient decoder skips it.
+    #[tokio::test]
+    async fn contiguous_twin_entry_is_not_canonical() {
+        use tar::EntryType::{Continuous, Regular};
+        let bytes = tgz_typed(&[
+            ("package/index.js", PATCHED, Regular),
+            ("package/package.json", PKG_JSON, Regular),
+            ("package/index.js", EVIL, Continuous),
+        ]);
+        assert_eq!(
+            forged_reuse(&bytes).await.unwrap_err(),
+            ReuseMiss::NonCanonical
+        );
+        // A symlink / hardlink entry is refused the same way.
+        let bytes = tgz_typed(&[
+            ("package/index.js", PATCHED, Regular),
+            ("package/evil.js", b"", tar::EntryType::Symlink),
+        ]);
+        assert_eq!(
+            forged_reuse(&bytes).await.unwrap_err(),
+            ReuseMiss::NonCanonical
+        );
+    }
+
+    /// A case-insensitive filesystem keeps one of `index.js` / `INDEX.js`
+    /// (the later write) — and an exact duplicate lets the LAST one win in
+    /// both the decoder and the installer, but whichever wins is not ours
+    /// to guess.
+    #[tokio::test]
+    async fn case_folded_or_exact_duplicate_is_not_canonical() {
+        use tar::EntryType::Regular;
+        let bytes = tgz_typed(&[
+            ("package/index.js", PATCHED, Regular),
+            ("package/INDEX.js", EVIL, Regular),
+        ]);
+        assert_eq!(
+            forged_reuse(&bytes).await.unwrap_err(),
+            ReuseMiss::NonCanonical
+        );
+        let bytes = tgz_typed(&[
+            ("package/index.js", EVIL, Regular),
+            ("package/index.js", PATCHED, Regular),
+        ]);
+        assert_eq!(
+            forged_reuse(&bytes).await.unwrap_err(),
+            ReuseMiss::NonCanonical
+        );
+        // `./` aliases collapse onto the same key.
+        let bytes = tgz_typed(&[
+            ("package/index.js", PATCHED, Regular),
+            ("package/./Index.js", EVIL, Regular),
+        ]);
+        assert_eq!(
+            forged_reuse(&bytes).await.unwrap_err(),
+            ReuseMiss::NonCanonical
+        );
+    }
+
+    /// Honest shapes stay reusable: directory entries, a `package/` root
+    /// dir entry, and a pax/GNU long-name member.
+    #[tokio::test]
+    async fn canonical_archive_with_dirs_and_long_names_is_reused() {
+        let long = format!("package/{}/deep.js", "d".repeat(120));
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for dir in ["package/", "package/lib/"] {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Directory);
+            h.set_size(0);
+            h.set_mode(0o755);
+            h.set_cksum();
+            builder.append_data(&mut h, dir, std::io::empty()).unwrap();
+        }
+        for (name, data) in [
+            ("package/index.js", PATCHED),
+            ("package/lib/a.js", b"a" as &[u8]),
+            (long.as_str(), b"deep"),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            builder.append_data(&mut h, name, data).unwrap();
+        }
+        let bytes = builder.into_inner().unwrap().finish().unwrap();
+        let art = forged_reuse(&bytes).await.unwrap();
+        assert!(art.members.contains_key("lib/a.js"));
+        assert!(art.members.keys().any(|k| k.ends_with("/deep.js")));
+    }
+
+    async fn wheel_reuse(whl: &[u8]) -> Result<CommittedArtifact, ReuseMiss> {
+        let tmp = tempfile::tempdir().unwrap();
+        let rel = format!(".socket/vendor/pypi/{UUID}/six-1.0-py3-none-any.whl");
+        let abs = tmp.path().join(&rel);
+        tokio::fs::create_dir_all(abs.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&abs, whl).await.unwrap();
+        let mut entry = entry_for(UUID, &rel, whl);
+        entry.ecosystem = "pypi".into();
+        verify_committed_artifact(tmp.path(), &entry, &record(UUID)).await
+    }
+
+    fn zip_of(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in members {
+            zip.start_file::<_, ()>(*name, Default::default()).unwrap();
+            zip.write_all(data).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    /// Wheel twin of the case-fold shape, plus an exact duplicate name
+    /// (made by renaming a same-length sibling in place: the name is not
+    /// covered by the CRC).
+    #[tokio::test]
+    async fn case_folded_or_exact_duplicate_wheel_member_is_not_reused() {
+        let whl = zip_of(&[("index.js", PATCHED), ("INDEX.js", EVIL)]);
+        assert_eq!(
+            wheel_reuse(&whl).await.unwrap_err(),
+            ReuseMiss::NonCanonical
+        );
+
+        let whl = zip_of(&[("index.js", PATCHED), ("indeX.js", EVIL)]);
+        let mut dup = whl.clone();
+        let (from, to) = (b"indeX.js", b"index.js");
+        let mut i = 0;
+        while i + from.len() <= dup.len() {
+            if &dup[i..i + from.len()] == from {
+                dup[i..i + from.len()].copy_from_slice(to);
+            }
+            i += 1;
+        }
+        assert!(
+            wheel_reuse(&dup).await.is_err(),
+            "an exact duplicate must never be reused"
+        );
+        // The canonical wheel is still reused.
+        assert!(wheel_reuse(&zip_of(&[("index.js", PATCHED)])).await.is_ok());
     }
 }

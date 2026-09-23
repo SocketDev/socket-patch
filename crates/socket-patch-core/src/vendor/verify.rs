@@ -147,31 +147,65 @@ fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
     // reader streams from it.
     let (file, _metadata) = crate::utils::fs::open_regular_file_sync(whl)
         .map_err(|_| "vendor_artifact_unreadable".to_string())?;
-    read_zip_to_map(file)
+    read_zip_to_map(file, false)
 }
 
 /// [`read_wheel_to_map`] over in-memory zip bytes — the same entry and
 /// decompressed-size caps — for callers that hash and decode the SAME
 /// buffer (a committed wheel read exactly once).
+#[cfg(test)]
 pub(crate) fn read_zip_bytes_to_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, String> {
-    read_zip_to_map(std::io::Cursor::new(bytes))
+    read_zip_to_map(std::io::Cursor::new(bytes), false)
+}
+
+/// [`read_zip_bytes_to_map`] that also refuses a wheel an installer could
+/// extract differently from how it decodes: a symlink entry, a name outside
+/// [`canonical_member_key`]'s shape (non-ASCII, backslash, `..`, absolute),
+/// or two entries that collide exactly or after ASCII case-folding (a
+/// case-insensitive filesystem keeps only one of `six.py` / `SIX.py`, and
+/// which one is the installer's choice, not ours). Fails with
+/// `vendor_artifact_non_canonical`. For re-verifying a COMMITTED wheel
+/// before it is reused unchanged.
+///
+/// [`canonical_member_key`]: crate::patch::package::canonical_member_key
+pub(crate) fn read_zip_bytes_to_map_strict(
+    bytes: &[u8],
+) -> Result<HashMap<String, Vec<u8>>, String> {
+    read_zip_to_map(std::io::Cursor::new(bytes), true)
 }
 
 /// The shared bounded zip decoder behind [`read_wheel_to_map`] and
-/// [`read_zip_bytes_to_map`].
-fn read_zip_to_map<R: Read + std::io::Seek>(reader: R) -> Result<HashMap<String, Vec<u8>>, String> {
+/// [`read_zip_bytes_to_map`] (plus the canonical-shape gate when `strict`).
+fn read_zip_to_map<R: Read + std::io::Seek>(
+    reader: R,
+    strict: bool,
+) -> Result<HashMap<String, Vec<u8>>, String> {
     let mut zip =
         zip::ZipArchive::new(reader).map_err(|_| "vendor_artifact_unreadable".to_string())?;
     if zip.len() > MAX_WHEEL_ENTRIES {
         return Err("vendor_artifact_unreadable".to_string());
     }
     let mut out = HashMap::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut declared: u64 = 0;
     let mut actual: u64 = 0;
     for i in 0..zip.len() {
         let mut entry = zip
             .by_index(i)
             .map_err(|_| "vendor_artifact_unreadable".to_string())?;
+        if strict {
+            let non_canonical = || "vendor_artifact_non_canonical".to_string();
+            if entry.is_symlink() || entry.name().starts_with('/') {
+                return Err(non_canonical());
+            }
+            let key = crate::patch::package::canonical_member_key(entry.name())
+                .ok_or_else(non_canonical)?;
+            // Directories share the key space: a dir `six.py/` next to a
+            // file `SIX.py` collides on disk too.
+            if !seen.insert(key) {
+                return Err(non_canonical());
+            }
+        }
         if !entry.is_file() {
             continue;
         }

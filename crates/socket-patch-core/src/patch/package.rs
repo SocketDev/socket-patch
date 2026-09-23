@@ -46,6 +46,35 @@ pub enum ArchiveError {
     EntryTooLarge { path: String, size: u64, max: u64 },
     #[error("archive contains more than {0} entries")]
     TooManyEntries(usize),
+    /// Strict decoding only: the archive is not in the canonical shape an
+    /// installer extracts exactly as decoded (see
+    /// [`read_archive_bytes_to_map_strict`]).
+    #[error("entry {0:?} is not canonical")]
+    NonCanonical(String),
+}
+
+/// The key two archive member names collide under on a case-insensitive
+/// filesystem, or `None` when the name is outside the strict shape: ASCII
+/// only (no Unicode case-folding / normalization aliases), no backslash,
+/// no empty/`.`/`..` segment smuggled past a string compare. Used by the
+/// strict tarball and wheel decoders so every member an installer would
+/// write has exactly one decoded twin.
+pub(crate) fn canonical_member_key(name: &str) -> Option<String> {
+    if !name.is_ascii() || name.contains('\\') || name.bytes().any(|b| b.is_ascii_control()) {
+        return None;
+    }
+    let mut segs = Vec::new();
+    for seg in name.split('/') {
+        match seg {
+            "" | "." => continue,
+            ".." => return None,
+            s => segs.push(s.to_ascii_lowercase()),
+        }
+    }
+    if segs.is_empty() {
+        return None;
+    }
+    Some(segs.join("/"))
 }
 
 /// Read a `.tar.gz` archive into a map of `normalized_path -> bytes`.
@@ -86,7 +115,7 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
             format!("archive {} is not a regular file", archive_path.display()),
         )));
     }
-    read_archive_from_reader(file)
+    read_archive_from_reader(file, false)
 }
 
 /// [`read_archive_to_map`] over an in-memory `.tar.gz` — the same bomb caps,
@@ -94,13 +123,40 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
 /// decode the SAME bytes (a committed artifact read once, so no swap between
 /// the whole-file hash and the member check can go unnoticed).
 pub fn read_archive_bytes_to_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
-    read_archive_from_reader(bytes)
+    read_archive_from_reader(bytes, false)
+}
+
+/// [`read_archive_bytes_to_map`] that additionally refuses any archive an
+/// npm-family installer (npm, pnpm, yarn, bun) would extract DIFFERENTLY
+/// from how it decodes, so a member check over the decoded map is a check
+/// over what gets installed. Those installers strip the first path segment
+/// whatever it is, extract more entry types than `Regular` as files, and
+/// let case-variant names overwrite each other on a case-insensitive
+/// filesystem; the lenient decoder strips only a literal `package/`, keeps
+/// `Regular` entries, and lets the last duplicate win. Strict mode fails
+/// ([`ArchiveError::NonCanonical`]) when:
+///
+/// - an entry's path does not start with `package/`;
+/// - an entry is anything but `Regular` or `Directory` (pax / GNU long-name
+///   metadata headers are consumed or skipped);
+/// - an entry name is not in [`canonical_member_key`]'s shape, or two
+///   entries share a key (exact or ASCII-case-folded duplicates).
+///
+/// For re-verifying a COMMITTED artifact before it is reused unchanged.
+pub fn read_archive_bytes_to_map_strict(
+    bytes: &[u8],
+) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
+    read_archive_from_reader(bytes, true)
 }
 
 /// The shared decoder behind [`read_archive_to_map`] and
 /// [`read_archive_bytes_to_map`]: gunzip → tar walk with every cap and the
-/// post-normalization path-safety gate.
-fn read_archive_from_reader<R: Read>(reader: R) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
+/// post-normalization path-safety gate (plus the canonical-shape gate when
+/// `strict`).
+fn read_archive_from_reader<R: Read>(
+    reader: R,
+    strict: bool,
+) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
     // Hard-cap decompressed bytes to defuse gzip / tar bombs. Reads
     // beyond the limit yield EOF, which the tar parser surfaces as a
     // truncated-archive error.
@@ -108,6 +164,9 @@ fn read_archive_from_reader<R: Read>(reader: R) -> Result<HashMap<String, Vec<u8
     let mut tar = Archive::new(bounded);
 
     let mut out: HashMap<String, Vec<u8>> = HashMap::new();
+    // Strict mode: canonical keys of every file / directory seen.
+    let mut file_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dir_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut entry_count: usize = 0;
     for entry in tar.entries()? {
         let mut entry = entry?;
@@ -117,8 +176,52 @@ fn read_archive_from_reader<R: Read>(reader: R) -> Result<HashMap<String, Vec<u8
             return Err(ArchiveError::TooManyEntries(MAX_ENTRIES));
         }
 
+        let entry_type = entry.header().entry_type();
+        if strict {
+            use tar::EntryType;
+            let is_meta = matches!(
+                entry_type,
+                EntryType::XGlobalHeader
+                    | EntryType::XHeader
+                    | EntryType::GNULongName
+                    | EntryType::GNULongLink
+            );
+            if !is_meta {
+                let raw = entry.path()?.to_string_lossy().to_string();
+                let is_dir = entry_type == EntryType::Directory;
+                if !(entry_type == EntryType::Regular || is_dir) {
+                    return Err(ArchiveError::NonCanonical(raw));
+                }
+                // The installers strip the FIRST segment whatever it is;
+                // only `package/` maps onto the decoded key space.
+                let stripped = if is_dir && raw.trim_end_matches('/') == "package" {
+                    None
+                } else if let Some(rest) = raw.strip_prefix("package/") {
+                    Some(rest)
+                } else {
+                    return Err(ArchiveError::NonCanonical(raw));
+                };
+                if let Some(rest) = stripped {
+                    let Some(key) = canonical_member_key(rest) else {
+                        return Err(ArchiveError::NonCanonical(raw));
+                    };
+                    let collides = if is_dir {
+                        file_keys.contains(&key)
+                    } else {
+                        dir_keys.contains(&key) || !file_keys.insert(key.clone())
+                    };
+                    if collides {
+                        return Err(ArchiveError::NonCanonical(raw));
+                    }
+                    if is_dir {
+                        dir_keys.insert(key);
+                    }
+                }
+            }
+        }
+
         // Only regular files. Skip directories, symlinks, hardlinks, etc.
-        if entry.header().entry_type() != tar::EntryType::Regular {
+        if entry_type != tar::EntryType::Regular {
             continue;
         }
 
