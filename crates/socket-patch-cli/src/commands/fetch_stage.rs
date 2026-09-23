@@ -453,7 +453,7 @@ pub(crate) async fn stage_vendor_sources_in_memory(
         let (client, _) = get_api_client_with_overrides(common.api_client_overrides()).await;
         let mut failed: Vec<&str> = Vec::new();
         for (purl, uuid) in &to_fetch {
-            match client.fetch_patch(common.org.as_deref(), uuid).await {
+            match client.fetch_patch(uuid).await {
                 Ok(Some(patch)) => {
                     let mut complete = true;
                     for (file, info) in &patch.files {

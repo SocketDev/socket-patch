@@ -424,12 +424,11 @@ async fn embed_vex_human(
 /// the stderr line alone is not enough.
 async fn discover_selected(
     api_client: &socket_patch_core::api::client::ApiClient,
-    org_slug: Option<&str>,
     packages: &[BatchPackagePatches],
     can_access_paid_patches: bool,
 ) -> Result<Vec<PatchSearchResult>, (i32, String)> {
     let (all_search_results, error_count, last_error) =
-        fetch_patch_details(api_client, org_slug, packages, false, false).await;
+        fetch_patch_details(api_client, packages, false, false).await;
     if error_count > 0 && error_count == packages.len() {
         let err = last_error.unwrap_or_else(|| "all patch-detail queries failed".to_string());
         let message = format!("all {error_count} patch-detail queries failed: {err}");
@@ -453,7 +452,6 @@ async fn discover_selected(
 /// `\r`-overwriting counter on stderr, `warn` the per-package failure line.
 async fn fetch_patch_details(
     api_client: &socket_patch_core::api::client::ApiClient,
-    org_slug: Option<&str>,
     packages: &[BatchPackagePatches],
     show_progress: bool,
     warn: bool,
@@ -472,10 +470,7 @@ async fn fetch_patch_details(
                 packages.len()
             );
         }
-        match api_client
-            .search_patches_by_package(org_slug, &pkg.purl)
-            .await
-        {
+        match api_client.search_patches_by_package(&pkg.purl).await {
             Ok(response) => results.extend(response.patches),
             Err(e) => {
                 if warn {
@@ -1608,9 +1603,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // how often stale-token fallbacks fire in the wild.
     let mut fallback_to_proxy = false;
 
-    // org slug is already stored in the client
-    let effective_org_slug: Option<&str> = None;
-
     let crawler_options = CrawlerOptions {
         cwd: args.common.cwd.clone(),
         global: args.common.global,
@@ -1946,9 +1938,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             );
         }
 
-        let mut result = api_client
-            .search_patches_batch(effective_org_slug, chunk)
-            .await;
+        let mut result = api_client.search_patches_batch(chunk).await;
 
         // Fallback: a 401/403 against the authenticated endpoint can
         // mean a stale/revoked token. Retry against the public proxy
@@ -1966,9 +1956,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                     api_client = build_proxy_fallback_client(&overrides);
                     use_public_proxy = true;
                     fallback_to_proxy = true;
-                    result = api_client
-                        .search_patches_batch(effective_org_slug, chunk)
-                        .await;
+                    result = api_client.search_patches_batch(chunk).await;
                 }
             }
         }
@@ -2181,7 +2169,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             return run_redirect(
                 &args,
                 &api_client,
-                effective_org_slug,
                 &all_packages_with_patches,
                 can_access_paid_patches,
                 Some(result),
@@ -2230,7 +2217,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         if apply {
             let selected = match discover_selected(
                 &api_client,
-                effective_org_slug,
                 &all_packages_with_patches,
                 can_access_paid_patches,
             )
@@ -2362,7 +2348,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 &args,
                 &api_client,
                 use_public_proxy,
-                effective_org_slug,
                 &all_packages_with_patches,
                 can_access_paid_patches,
                 &mut result,
@@ -2574,7 +2559,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     if hosted {
         let selected = match discover_selected(
             &api_client,
-            effective_org_slug,
             &all_packages_with_patches,
             can_access_paid_patches,
         )
@@ -2609,7 +2593,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             &args.vex,
             prune,
             &api_client,
-            effective_org_slug,
             &pairs,
             None,
         )
@@ -2639,7 +2622,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // merged set is a fetch failure.
     let (all_search_results, _, _) = fetch_patch_details(
         &api_client,
-        effective_org_slug,
         &all_packages_with_patches,
         show_progress,
         !args.common.silent,
@@ -2814,7 +2796,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     let prefetched = if vendor && !args.common.silent {
         let (mismatched, views) = preverify_vendor_baselines(
             &api_client,
-            effective_org_slug,
             &selected,
             &filtered_crawled,
             &lockfile_only.purls,

@@ -260,7 +260,6 @@ async fn vendored_purls_from_artifacts(common: &GlobalArgs) -> Vec<String> {
 /// writes nothing.
 pub(super) async fn preverify_vendor_baselines(
     api_client: &socket_patch_core::api::client::ApiClient,
-    org_slug: Option<&str>,
     selected: &[PatchSearchResult],
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     lockfile_only: &HashSet<String>,
@@ -283,7 +282,7 @@ pub(super) async fn preverify_vendor_baselines(
         let Some(pkg) = crawled.iter().find(|c| purl_eq(&c.purl, base)) else {
             continue;
         };
-        let Ok(Some(detail)) = api_client.fetch_patch(org_slug, &patch.uuid).await else {
+        let Ok(Some(detail)) = api_client.fetch_patch(&patch.uuid).await else {
             continue;
         };
         for (file, info) in &detail.files {
@@ -1470,7 +1469,7 @@ mod tests {
             std::iter::once("pkg:npm/@scope/lockonly@1.0.0".to_string()).collect();
 
         let (mismatched, views) =
-            preverify_vendor_baselines(&client, None, &selected, &crawled, &lockfile_only).await;
+            preverify_vendor_baselines(&client, &selected, &crawled, &lockfile_only).await;
         assert!(mismatched.is_empty());
         assert!(
             mock.received_requests().await.unwrap().is_empty(),
@@ -1525,7 +1524,7 @@ mod tests {
         let selected = vec![search_result("u3", "pkg:npm/newfile@1.0.0")];
 
         let (mismatched, views) =
-            preverify_vendor_baselines(&client, None, &selected, &crawled, &HashSet::new()).await;
+            preverify_vendor_baselines(&client, &selected, &crawled, &HashSet::new()).await;
         assert!(
             mismatched.is_empty(),
             "a new-file-only patch never annotates a baseline mismatch"
@@ -1554,7 +1553,7 @@ mod tests {
         let selected = vec![search_result("u404", "pkg:npm/newfile@1.0.0")];
 
         let (mismatched, views) =
-            preverify_vendor_baselines(&client, None, &selected, &crawled, &HashSet::new()).await;
+            preverify_vendor_baselines(&client, &selected, &crawled, &HashSet::new()).await;
         assert!(mismatched.is_empty());
         assert_eq!(mock.received_requests().await.unwrap().len(), 1, "it did try");
         assert!(views.is_empty(), "a 404'd view must not be cached");
@@ -1590,7 +1589,7 @@ mod tests {
         let selected = vec![search_result("u4", "pkg:npm/newfile@1.0.0")];
 
         let (mismatched, views) =
-            preverify_vendor_baselines(&client, None, &selected, &crawled, &HashSet::new()).await;
+            preverify_vendor_baselines(&client, &selected, &crawled, &HashSet::new()).await;
         assert_eq!(
             mismatched,
             std::iter::once("u4".to_string()).collect::<HashSet<_>>(),

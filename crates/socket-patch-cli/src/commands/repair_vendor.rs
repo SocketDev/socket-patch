@@ -1646,10 +1646,7 @@ async fn fetch_record_by_uuid(
     let client = client_cache
         .as_ref()
         .expect("client_cache was just initialized above");
-    let patch = client
-        .fetch_patch(common.org.as_deref(), uuid)
-        .await
-        .ok()??;
+    let patch = client.fetch_patch(uuid).await.ok()??;
     Some(crate::commands::get::record_from_patch_response(&patch))
 }
 

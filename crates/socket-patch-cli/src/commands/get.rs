@@ -903,8 +903,7 @@ async fn filter_to_installed_releases(
         // kept for the download loop — it is the same GET it would issue.
         let mut candidates: Vec<(String, HashMap<String, PatchFileInfo>)> = Vec::new();
         for s in &variants {
-            // org slug is already stored in the client.
-            match api_client.fetch_patch(None, &s.uuid).await {
+            match api_client.fetch_patch(&s.uuid).await {
                 Ok(Some(patch)) => {
                     candidates.push((s.purl.clone(), files_with_both_hashes(&patch)));
                     views.insert(s.uuid.clone(), patch);
@@ -1392,11 +1391,10 @@ async fn fetch_selected_patches(
         }
 
         // The view: from memory when the narrowing (or the uuid path's own
-        // identifier fetch) already fetched it, else the network. org slug
-        // is already stored in the client.
+        // identifier fetch) already fetched it, else the network.
         let view = match prefetched.remove(uuid) {
             Some(patch) => Ok(Some(patch)),
-            None => api_client.fetch_patch(None, uuid).await,
+            None => api_client.fetch_patch(uuid).await,
         };
         let patch = match view {
             Ok(Some(patch)) => patch,
@@ -2028,8 +2026,7 @@ pub async fn run(args: GetArgs) -> i32 {
         if !quiet {
             println!("Fetching patch by UUID: {}", args.identifier);
         }
-        // org slug is already stored in the client.
-        let mut fetch_result = api_client.fetch_patch(None, &args.identifier).await;
+        let mut fetch_result = api_client.fetch_patch(&args.identifier).await;
         // 401/403 from the auth endpoint → swap to the public proxy
         // and retry once. Free patches still surface; paid patches
         // come back as the existing "paid_required" branch below.
@@ -2043,7 +2040,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     api_client = build_proxy_fallback_client(&overrides);
                     use_public_proxy = true;
                     fallback_to_proxy = true;
-                    fetch_result = api_client.fetch_patch(None, &args.identifier).await;
+                    fetch_result = api_client.fetch_patch(&args.identifier).await;
                 }
             }
         }
@@ -2163,22 +2160,11 @@ pub async fn run(args: GetArgs) -> i32 {
             if !quiet {
                 println!("Searching patches for {id_type}: {}", args.identifier);
             }
-            // org slug is already stored in the client.
             let result = match id_type {
-                IdentifierType::Cve => {
-                    api_client
-                        .search_patches_by_cve(None, &args.identifier)
-                        .await
-                }
-                IdentifierType::Ghsa => {
-                    api_client
-                        .search_patches_by_ghsa(None, &args.identifier)
-                        .await
-                }
+                IdentifierType::Cve => api_client.search_patches_by_cve(&args.identifier).await,
+                IdentifierType::Ghsa => api_client.search_patches_by_ghsa(&args.identifier).await,
                 IdentifierType::Purl => {
-                    api_client
-                        .search_patches_by_package(None, &args.identifier)
-                        .await
+                    api_client.search_patches_by_package(&args.identifier).await
                 }
                 _ => unreachable!(),
             };
@@ -2240,13 +2226,9 @@ pub async fn run(args: GetArgs) -> i32 {
                 );
             }
 
-            // Search for patches for the best match (org slug is already
-            // stored in the client).
+            // Search for patches for the best match.
             let best_match = &matches[0];
-            match api_client
-                .search_patches_by_package(None, &best_match.purl)
-                .await
-            {
+            match api_client.search_patches_by_package(&best_match.purl).await {
                 Ok(r) => r,
                 Err(e) => {
                     return report_fetch_failure(
@@ -2843,13 +2825,11 @@ async fn run_get_hosted(
     // default-off VexEmbedArgs — deliberately NOT env-bound here, so an
     // ambient SOCKET_VEX only affects commands that declare the flag.
     let vex = crate::commands::vex::VexEmbedArgs::default();
-    // org slug is already stored in the client.
     super::scan::boxed_run_redirect_selected(
         &args.common,
         &vex,
         /*prune_requested=*/ false,
         api_client,
-        None,
         &pairs,
         scan_result,
     )

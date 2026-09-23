@@ -85,7 +85,7 @@ async fn proxy_batch_posts_components_and_skips_per_package_gets() {
 
     let client = proxy_client(&server.uri());
     let resp = client
-        .search_patches_batch(None, &[PURL.to_string()])
+        .search_patches_batch(&[PURL.to_string()])
         .await
         .expect("proxy batch POST must succeed");
 
@@ -112,7 +112,7 @@ async fn proxy_batch_degrades_to_per_package_gets_on_legacy_catch_all_400() {
 
     let client = proxy_client(&server.uri());
     let resp = client
-        .search_patches_batch(None, &[PURL.to_string()])
+        .search_patches_batch(&[PURL.to_string()])
         .await
         .expect("legacy proxy must degrade to per-package GETs, not error");
 
@@ -137,7 +137,7 @@ async fn proxy_batch_degrades_when_patch_api_unconfigured_503() {
 
     let client = proxy_client(&server.uri());
     client
-        .search_patches_batch(None, &[PURL.to_string()])
+        .search_patches_batch(&[PURL.to_string()])
         .await
         .expect("unconfigured patch API must degrade to the GET path");
 }
@@ -165,7 +165,7 @@ async fn proxy_batch_validation_400_degrades_to_per_package_gets() {
 
     let client = proxy_client(&server.uri());
     let resp = client
-        .search_patches_batch(None, &[PURL.to_string()])
+        .search_patches_batch(&[PURL.to_string()])
         .await
         .expect("validation 400 must degrade to per-package GETs, not error");
 
@@ -206,7 +206,7 @@ async fn proxy_batch_validation_400_with_failing_gets_yields_empty_ok() {
 
     let client = proxy_client(&server.uri());
     let resp = client
-        .search_patches_batch(None, &["pkg:jsr/@std/path@0.220.0".to_string()])
+        .search_patches_batch(&["pkg:jsr/@std/path@0.220.0".to_string()])
         .await
         .expect("per-purl failures are swallowed; the batch call must not error");
 
@@ -234,7 +234,7 @@ async fn proxy_batch_over_capacity_503_surfaces_without_fallback() {
 
     let client = proxy_client(&server.uri());
     let err = client
-        .search_patches_batch(None, &[PURL.to_string()])
+        .search_patches_batch(&[PURL.to_string()])
         .await
         .expect_err("over-capacity 503 must surface");
     assert!(
@@ -256,7 +256,7 @@ async fn proxy_batch_429_surfaces_as_rate_limited_without_fallback() {
 
     let client = proxy_client(&server.uri());
     let err = client
-        .search_patches_batch(None, &[PURL.to_string()])
+        .search_patches_batch(&[PURL.to_string()])
         .await
         .expect_err("429 must surface");
     assert!(
@@ -307,7 +307,7 @@ async fn proxy_batch_fallback_preserves_requested_purl_order() {
 
     let client = proxy_client(&server.uri());
     let resp = client
-        .search_patches_batch(None, &[first.to_string(), second.to_string()])
+        .search_patches_batch(&[first.to_string(), second.to_string()])
         .await
         .expect("legacy proxy must degrade to per-package GETs");
 

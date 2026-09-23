@@ -217,12 +217,8 @@ impl ApiClient {
     /// Fetch a patch by UUID (full details with blob content).
     ///
     /// Returns `Ok(None)` when the patch is not found (404).
-    pub async fn fetch_patch(
-        &self,
-        org_slug: Option<&str>,
-        uuid: &str,
-    ) -> Result<Option<PatchResponse>, ApiError> {
-        let path = self.patches_path(org_slug, &format!("view/{uuid}"));
+    pub async fn fetch_patch(&self, uuid: &str) -> Result<Option<PatchResponse>, ApiError> {
+        let path = self.patches_path(None, &format!("view/{uuid}"));
         self.get_json(&path).await
     }
 
@@ -231,12 +227,11 @@ impl ApiClient {
     /// is identical across the three endpoints.
     async fn search_patches_by_route(
         &self,
-        org_slug: Option<&str>,
         route: &str,
         identifier: &str,
     ) -> Result<SearchResponse, ApiError> {
         let encoded = urlencoding_encode(identifier);
-        let path = self.patches_path(org_slug, &format!("{route}/{encoded}"));
+        let path = self.patches_path(None, &format!("{route}/{encoded}"));
         let mut result = self
             .get_json::<SearchResponse>(&path)
             .await?
@@ -249,36 +244,21 @@ impl ApiClient {
     }
 
     /// Search patches by CVE ID.
-    pub async fn search_patches_by_cve(
-        &self,
-        org_slug: Option<&str>,
-        cve_id: &str,
-    ) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route(org_slug, "by-cve", cve_id)
-            .await
+    pub async fn search_patches_by_cve(&self, cve_id: &str) -> Result<SearchResponse, ApiError> {
+        self.search_patches_by_route("by-cve", cve_id).await
     }
 
     /// Search patches by GHSA ID.
-    pub async fn search_patches_by_ghsa(
-        &self,
-        org_slug: Option<&str>,
-        ghsa_id: &str,
-    ) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route(org_slug, "by-ghsa", ghsa_id)
-            .await
+    pub async fn search_patches_by_ghsa(&self, ghsa_id: &str) -> Result<SearchResponse, ApiError> {
+        self.search_patches_by_route("by-ghsa", ghsa_id).await
     }
 
     /// Search patches by package PURL.
     ///
     /// The PURL must be a valid Package URL starting with `pkg:`.
     /// Examples: `pkg:npm/lodash@4.17.21`, `pkg:pypi/django@3.2.0`
-    pub async fn search_patches_by_package(
-        &self,
-        org_slug: Option<&str>,
-        purl: &str,
-    ) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route(org_slug, "by-package", purl)
-            .await
+    pub async fn search_patches_by_package(&self, purl: &str) -> Result<SearchResponse, ApiError> {
+        self.search_patches_by_route("by-package", purl).await
     }
 
     /// Search patches for multiple packages (batch).
@@ -295,12 +275,11 @@ impl ApiClient {
     /// callers may rely on each package's `patches` being best-first.
     pub async fn search_patches_batch(
         &self,
-        org_slug: Option<&str>,
         purls: &[String],
     ) -> Result<BatchSearchResponse, ApiError> {
         if !self.use_public_proxy {
-            let slug = self.org_slug_or_default(org_slug);
-            let path = self.patches_path(org_slug, "batch");
+            let slug = self.org_slug_or_default(None);
+            let path = self.patches_path(None, "batch");
             let body = BatchSearchBody::new(purls);
             let result = self
                 .post_json::<BatchSearchResponse, _>(&path, &body)
@@ -351,9 +330,10 @@ impl ApiClient {
         self.fetch_registry_references_for_org(None, uuids).await
     }
 
-    /// [`Self::fetch_registry_references`] with the same per-call `org_slug`
-    /// override the other JSON routes (`fetch_patch`, `search_patches_*`)
-    /// accept: `Some(slug)` wins over the client's configured slug.
+    /// [`Self::fetch_registry_references`] with a per-call `org_slug`
+    /// override: `Some(slug)` wins over the client's configured slug. The
+    /// only patches route that takes one — `fetch_patch` / `search_patches_*`
+    /// always use the client's configured slug.
     pub async fn fetch_registry_references_for_org(
         &self,
         org_slug: Option<&str>,
@@ -476,7 +456,7 @@ impl ApiClient {
                 let purl = purl.clone();
                 let client = self.clone();
                 join_set.spawn(async move {
-                    let resp = client.search_patches_by_package(None, &purl).await;
+                    let resp = client.search_patches_by_package(&purl).await;
                     match resp {
                         Ok(r) => (purl, Some(r)),
                         Err(e) => {
@@ -3249,9 +3229,9 @@ mod vendor_package_tests {
         assert_eq!(map[UUID].status, "granted");
     }
 
-    /// The package-reference route honors the same per-call org override as
-    /// `fetch_patch`/`search_patches_*`: `Some(slug)` beats the client's
-    /// configured `acme`, and the one-arg wrapper keeps using `acme`.
+    /// The package-reference route honors a per-call org override:
+    /// `Some(slug)` beats the client's configured `acme`, and the one-arg
+    /// wrapper keeps using `acme`.
     #[tokio::test]
     async fn fetch_registry_references_for_org_overrides_client_slug() {
         let server = MockServer::start().await;
@@ -3607,7 +3587,7 @@ mod authenticated_batch_tests {
             .await;
 
         let err = auth_client(server.uri(), "typo-slug")
-            .search_patches_batch(None, &["pkg:npm/lodash@4.17.21".to_string()])
+            .search_patches_batch(&["pkg:npm/lodash@4.17.21".to_string()])
             .await
             .expect_err("a 404 on the authenticated batch route must not become an empty success");
         let msg = err.to_string();
@@ -3639,7 +3619,7 @@ mod authenticated_batch_tests {
             .await;
 
         let result = auth_client(server.uri(), "acme")
-            .search_patches_batch(None, &["pkg:npm/lodash@4.17.21".to_string()])
+            .search_patches_batch(&["pkg:npm/lodash@4.17.21".to_string()])
             .await
             .expect("200 with empty packages is the legitimate no-patches shape");
         assert!(result.packages.is_empty());

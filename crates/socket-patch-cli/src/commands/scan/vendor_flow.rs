@@ -435,7 +435,6 @@ async fn run_vendor_json_path(
     args: &ScanArgs,
     api_client: &ApiClient,
     use_public_proxy: bool,
-    effective_org_slug: Option<&str>,
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
     result: &mut serde_json::Value,
@@ -452,7 +451,6 @@ async fn run_vendor_json_path(
     // land on the backend's `already_vendored` skip).
     let selected = match discover_selected(
         api_client,
-        effective_org_slug,
         all_packages_with_patches,
         can_access_paid_patches,
     )
@@ -742,7 +740,6 @@ pub(super) fn boxed_vendor_json_path<'a>(
     args: &'a ScanArgs,
     api_client: &'a ApiClient,
     use_public_proxy: bool,
-    effective_org_slug: Option<&'a str>,
     all_packages_with_patches: &'a [BatchPackagePatches],
     can_access_paid_patches: bool,
     result: &'a mut serde_json::Value,
@@ -758,7 +755,6 @@ pub(super) fn boxed_vendor_json_path<'a>(
         args,
         api_client,
         use_public_proxy,
-        effective_org_slug,
         all_packages_with_patches,
         can_access_paid_patches,
         result,

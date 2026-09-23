@@ -833,7 +833,6 @@ fn gem_sha_key(purl: &str) -> (String, String) {
 pub(super) async fn run_redirect(
     args: &ScanArgs,
     api_client: &socket_patch_core::api::client::ApiClient,
-    effective_org_slug: Option<&str>,
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
     // The classic scan object `run` builds for the `--json` path (`Some` in
@@ -845,7 +844,6 @@ pub(super) async fn run_redirect(
     // Same discovery/selection as `--apply`/`--vendor`.
     let selected = match discover_selected(
         api_client,
-        effective_org_slug,
         all_packages_with_patches,
         can_access_paid_patches,
     )
@@ -877,7 +875,6 @@ pub(super) async fn run_redirect(
         &args.vex,
         args.prune || args.sync,
         api_client,
-        effective_org_slug,
         &pairs,
         scan_result,
     )
@@ -903,13 +900,11 @@ pub(super) async fn run_redirect(
 /// human/JSON split keys on `common.json`; a `--json` caller passing `None`
 /// would get a minimal envelope that drops its own keys). `prune_requested`
 /// only feeds the `redirect_prune_ignored` warning — `get` passes `false`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_redirect_selected(
     common: &crate::args::GlobalArgs,
     vex: &crate::commands::vex::VexEmbedArgs,
     prune_requested: bool,
     api_client: &socket_patch_core::api::client::ApiClient,
-    effective_org_slug: Option<&str>,
     selected: &[(String, String)],
     mut scan_result: Option<serde_json::Value>,
 ) -> i32 {
@@ -2012,7 +2007,7 @@ pub(crate) async fn run_redirect_selected(
 
     if !common.dry_run {
         for (purl, uuid) in &confirmed {
-            match api_client.fetch_patch(effective_org_slug, uuid).await {
+            match api_client.fetch_patch(uuid).await {
                 Ok(Some(resp)) => {
                     let (rec_purl, record) =
                         crate::commands::get::record_from_patch_response(&resp);
@@ -2432,13 +2427,11 @@ pub(crate) async fn run_redirect_selected(
 /// future embeds the whole hosted engine, and callers outside scan (`get
 /// --mode hosted`) must not materialize it in their own poll frame (Windows
 /// 1 MiB main-thread stack; same rationale as scan's `boxed_*` family).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn boxed_run_redirect_selected<'a>(
     common: &'a crate::args::GlobalArgs,
     vex: &'a crate::commands::vex::VexEmbedArgs,
     prune_requested: bool,
     api_client: &'a socket_patch_core::api::client::ApiClient,
-    effective_org_slug: Option<&'a str>,
     selected: &'a [(String, String)],
     scan_result: Option<serde_json::Value>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
@@ -2447,7 +2440,6 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
         vex,
         prune_requested,
         api_client,
-        effective_org_slug,
         selected,
         scan_result,
     ))
