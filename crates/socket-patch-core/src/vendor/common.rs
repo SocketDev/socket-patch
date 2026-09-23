@@ -17,7 +17,7 @@ use crate::patch::apply::{
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::file_hash::compute_file_git_sha256;
 use crate::utils::fs::{
-    atomic_write_bytes_preserving_mode, first_symlink, read_regular_to_bytes,
+    atomic_write_bytes_preserving_mode, first_symlink, open_regular_file_sync,
     read_regular_to_string,
 };
 
@@ -220,22 +220,42 @@ pub(crate) fn rebuild_zip(stage: &Path, skip_entry: Option<&str>) -> Result<Vec<
 }
 
 /// Bound on a committed `.jar` / `.nupkg` the in-sync probe is willing to
-/// read into memory (the same cap the blob harvest in `vendor/mod.rs`
-/// applies to committed artifacts).
-const MAX_ZIP_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+/// read into memory: the whole-file cap `verify.rs` applies to the same
+/// artifacts (`MAX_HEALTH_HASH_BYTES`), which also covers everything the
+/// rebuild path can produce (`extract_zip` bounds the decompressed payload
+/// at 512 MiB and a deflated archive is never larger than its payload) — so
+/// a valid committed artifact can never read as stale because of the cap.
+const MAX_ZIP_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The committed archive's bytes, or `None` when it is missing, not a regular
-/// file, or over the cap. Guarded read (`read_regular_to_bytes`: O_NONBLOCK +
+/// file, or over the cap. Guarded open (`open_regular_file`: O_NONBLOCK +
 /// regular-file check): a FIFO planted at the archive path must read as
 /// out-of-sync, not wedge the probe forever in an `open(2)` waiting for a
-/// writer. The archive is committed and tamper-able: cap it like the blob
-/// harvest does (an oversized file reads as out-of-sync instead of being
-/// slurped into memory). Backends that need the bytes for more than the
-/// member check (a sidecar / content hash) read once through this and hand
-/// them to [`zip_bytes_match_after_hashes`].
+/// writer. The archive is committed and tamper-able: the size gate runs on
+/// the open handle's metadata BEFORE anything is read, like the blob harvest
+/// in `vendor/mod.rs`, so an oversized file is never slurped into memory.
+/// Backends that need the bytes for more than the member check (a sidecar /
+/// content hash) read once through this and hand them to
+/// [`zip_bytes_match_after_hashes`].
 pub(crate) async fn read_zip_artifact(archive_path: &Path) -> Option<Vec<u8>> {
-    let bytes = read_regular_to_bytes(archive_path).await.ok()?;
-    (bytes.len() as u64 <= MAX_ZIP_ARTIFACT_BYTES).then_some(bytes)
+    read_zip_artifact_capped(archive_path, MAX_ZIP_ARTIFACT_BYTES).await
+}
+
+async fn read_zip_artifact_capped(archive_path: &Path, cap: u64) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let path = archive_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let (mut file, metadata) = open_regular_file_sync(&path).ok()?;
+        if metadata.len() > cap {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.read_to_end(&mut bytes).ok()?;
+        Some(bytes)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// True when the committed archive (a plain zip: `.jar` / `.nupkg`) — its
@@ -389,9 +409,12 @@ pub(crate) async fn refuse_symlinked(
 /// leave the tree byte-untouched) and only write after the wheel build — a
 /// `poetry lock` / `pdm lock` / editor save landing in between would
 /// otherwise be silently overwritten with stale snapshot-derived text and
-/// recorded as the entry's `original`. A file that cannot be re-read is NOT
-/// refused here: the write that follows surfaces that failure with the
-/// flavor's own write-failed code.
+/// recorded as the entry's `original`. A file that has been REMOVED since
+/// the snapshot is refused the same way: the stage-and-rename write would
+/// otherwise recreate it from snapshot-derived text and record it as wired.
+/// Any other re-read failure is left to the write that follows — a
+/// directory squatting on the path fails the rename with the flavor's own
+/// write-failed code.
 pub(crate) async fn ensure_unchanged(
     root: &Path,
     file: &str,
@@ -402,6 +425,12 @@ pub(crate) async fn ensure_unchanged(
         Ok(live) if live != snapshot => Err((
             code,
             format!("{file} changed during vendoring; re-run to vendor against the new contents"),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err((
+            code,
+            format!(
+                "{file} changed during vendoring (it no longer exists); re-run to vendor against the new contents"
+            ),
         )),
         _ => Ok(()),
     }
@@ -678,6 +707,45 @@ mod tests {
     use super::*;
 
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+    /// An archive over the size cap reads as out-of-sync (`None`) without
+    /// being read, and one within it is returned whole.
+    #[tokio::test]
+    async fn read_zip_artifact_gates_on_size_before_reading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pkg.jar");
+        tokio::fs::write(&path, b"0123456789").await.unwrap();
+        assert!(read_zip_artifact_capped(&path, 9).await.is_none());
+        assert_eq!(
+            read_zip_artifact_capped(&path, 10).await.as_deref(),
+            Some(&b"0123456789"[..])
+        );
+        assert!(
+            read_zip_artifact_capped(&tmp.path().join("missing.jar"), 10)
+                .await
+                .is_none()
+        );
+    }
+
+    /// A lock removed between the pre-flight snapshot and the write is a
+    /// change too: refused before the write would recreate it.
+    #[tokio::test]
+    async fn ensure_unchanged_refuses_a_removed_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = ensure_unchanged(tmp.path(), "poetry.lock", "snapshot", "x_changed")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "x_changed");
+        assert!(err.1.contains("changed during vendoring"), "{}", err.1);
+        assert!(!tmp.path().join("poetry.lock").exists());
+
+        tokio::fs::write(tmp.path().join("poetry.lock"), "snapshot")
+            .await
+            .unwrap();
+        ensure_unchanged(tmp.path(), "poetry.lock", "snapshot", "x_changed")
+            .await
+            .unwrap();
+    }
 
     /// The path-taking shape the maven / nuget probes compose out of
     /// [`read_zip_artifact`] + [`zip_bytes_match_after_hashes`]: one guarded,

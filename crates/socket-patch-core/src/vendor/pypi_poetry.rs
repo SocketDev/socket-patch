@@ -1878,4 +1878,38 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
             "the live lock is left alone"
         );
     }
+
+    /// The lock was REMOVED between the pre-flight snapshot and the write
+    /// (`rm poetry.lock && poetry lock` mid-build): refused like any other
+    /// change, and the stage-and-rename write must not recreate it from the
+    /// stale snapshot and record it as wired.
+    #[tokio::test]
+    async fn lock_removed_during_vendoring_is_refused_and_not_recreated() {
+        let tmp = write_project(LOCK21_DIRECT_REGISTRY, PYPROJECT_DIRECT).await;
+        let p = load_poetry_project(tmp.path()).await.unwrap();
+        tokio::fs::remove_file(tmp.path().join(LOCK_FILE))
+            .await
+            .unwrap();
+
+        let err = wire_poetry(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_poetry_changed");
+        assert!(err.1.contains("changed during vendoring"), "{}", err.1);
+        assert!(
+            tokio::fs::metadata(tmp.path().join(LOCK_FILE))
+                .await
+                .is_err(),
+            "the removed lock must not be recreated from the snapshot"
+        );
+    }
 }
