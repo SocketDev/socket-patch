@@ -473,6 +473,7 @@ per service outcome:
 |---|---|---|
 | granted/reused, integrity ok | **use service** | **use service** |
 | integrity mismatch | cargo/maven/nuget: **refuse** (`vendor_prebuilt_integrity_mismatch`) — tampered bytes never fall back; other ecosystems (to be aligned): local build + `vendor_prebuilt_integrity_mismatch` | refuse (cargo/maven/nuget: `vendor_prebuilt_integrity_mismatch`; others: `vendor_prebuilt_required`) |
+| integrity ok, but the archive does not carry the patched files (a member at a recorded path fails its `afterHash`; checked for cargo/golang/composer/gem after extraction, and for maven/nuget before the archive is written) | local build + `vendor_prebuilt_layout_mismatch` | refuse (`vendor_prebuilt_required`) |
 | still building (`pending_build` / serve 408) | local build + `vendor_prebuilt_pending` | refuse |
 | not built / withdrawn / not found / no usable artifact | local build (quiet) | refuse |
 | gem stub gemspec missing / invalid | local build + `vendor_prebuilt_stub_missing` / `vendor_prebuilt_stub_invalid` (invalid + gem not installed: refuse `vendor_prebuilt_stub_invalid` — no stub source exists) | refuse (`vendor_prebuilt_required` / `vendor_prebuilt_stub_invalid`) |

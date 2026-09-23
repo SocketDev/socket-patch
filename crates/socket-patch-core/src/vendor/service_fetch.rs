@@ -9,11 +9,12 @@
 //! extract it into the vendor directory) and the build-vs-service policy.
 
 use crate::api::client::{SecondaryArtifact, VendorServiceOutcome};
+use crate::manifest::schema::PatchRecord;
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::registry_fetch::{artifact_matches_integrity, verify_go_h1};
 use crate::vendor::VendorServiceConfig;
 use crate::vendor::{
-    common::{refused, service_offline_conflict},
+    common::{refused, service_offline_conflict, zip_bytes_match_after_hashes},
     VendorOutcome, VendorWarning,
 };
 
@@ -129,7 +130,7 @@ pub(crate) enum ServiceCopy {
 /// policy. `noun` is the artifact kind used in messages (".jar" / ".nupkg").
 pub(crate) async fn service_archive_copy(
     service: Option<&VendorServiceConfig>,
-    uuid: &str,
+    record: &PatchRecord,
     name: &str,
     noun: &str,
     warnings: &mut Vec<VendorWarning>,
@@ -160,7 +161,24 @@ pub(crate) async fn service_archive_copy(
             ServiceCopy::FallBack
         }
     };
-    match fetch_verified_archive(cfg, uuid).await {
+    match fetch_verified_archive(cfg, &record.uuid).await {
+        // The SRI proves the download is intact, not that it carries the
+        // patch: the bytes are written verbatim and reported AlreadyPatched,
+        // so every patched member must hash to its afterHash first (the
+        // Tier-B backends' extracted-tree check). Fail closed → `auto`
+        // falls back to the local rebuild.
+        ServiceArtifact::Ready(archive)
+            if !zip_bytes_match_after_hashes(&archive.bytes, &record.files) =>
+        {
+            miss(
+                warnings,
+                "vendor_prebuilt_layout_mismatch",
+                format!(
+                    "prebuilt {noun} for {name} does not carry the patched files at their \
+                     recorded paths"
+                ),
+            )
+        }
         ServiceArtifact::Ready(archive) => {
             warnings.push(VendorWarning::new(
                 "vendor_prebuilt_downloaded",
@@ -265,6 +283,29 @@ mod tests {
 
     const UUID: &str = "22222222-2222-2222-2222-222222222222";
     const SERVE_PATH: &str = "/patch/npm/x/1.0.0/tok/uuid/x-1.0.0.tgz";
+
+    /// A files-less record for [`UUID`]: the Tier-A afterHash gate then only
+    /// requires the served bytes to be a readable zip.
+    fn record() -> PatchRecord {
+        PatchRecord {
+            uuid: UUID.to_string(),
+            exported_at: String::new(),
+            files: std::collections::HashMap::new(),
+            vulnerabilities: std::collections::HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        }
+    }
+
+    /// An empty (member-less) zip — passes the afterHash gate of a
+    /// files-less [`record`].
+    fn empty_zip() -> Vec<u8> {
+        zip::ZipWriter::new(std::io::Cursor::new(Vec::new()))
+            .finish()
+            .unwrap()
+            .into_inner()
+    }
 
     fn cfg_for(server: &MockServer) -> VendorServiceConfig {
         VendorServiceConfig {
@@ -373,7 +414,7 @@ mod tests {
         let mut cfg = cfg_for(&server);
         cfg.source = VendorSource::Auto;
         let mut warnings = Vec::new();
-        match service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await {
+        match service_archive_copy(Some(&cfg), &record(), "x", ".jar", &mut warnings).await {
             ServiceCopy::HardFail(outcome) => match *outcome {
                 VendorOutcome::Refused { code, .. } => {
                     assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
@@ -397,7 +438,7 @@ mod tests {
         let mut cfg = cfg_for(&server);
         cfg.offline = true;
         let mut warnings = Vec::new();
-        match service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await {
+        match service_archive_copy(Some(&cfg), &record(), "x", ".jar", &mut warnings).await {
             ServiceCopy::HardFail(outcome) => match *outcome {
                 VendorOutcome::Refused { code, .. } => {
                     assert_eq!(code, "vendor_service_offline_conflict");
@@ -420,7 +461,7 @@ mod tests {
         cfg.offline = true;
         let mut warnings = Vec::new();
         assert!(matches!(
-            service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await,
+            service_archive_copy(Some(&cfg), &record(), "x", ".jar", &mut warnings).await,
             ServiceCopy::FallBack
         ));
         assert!(warnings.is_empty(), "quiet fallback, no warning");
@@ -486,11 +527,18 @@ mod tests {
     #[tokio::test]
     async fn service_copy_ready_returns_used_bytes_with_downloaded_note() {
         let server = MockServer::start().await;
-        let body = b"prebuilt jar bytes";
+        let body = &empty_zip()[..];
         let sri = PackedTarball::from_bytes(body).integrity;
         mount_granted(&server, &sri, body).await;
         let mut warnings = Vec::new();
-        match service_archive_copy(Some(&cfg_for(&server)), UUID, "x", ".jar", &mut warnings).await
+        match service_archive_copy(
+            Some(&cfg_for(&server)),
+            &record(),
+            "x",
+            ".jar",
+            &mut warnings,
+        )
+        .await
         {
             ServiceCopy::Used(bytes) => assert_eq!(bytes, body),
             ServiceCopy::HardFail(outcome) => panic!("expected Used, got HardFail({outcome:?})"),
@@ -522,7 +570,7 @@ mod tests {
         cfg.source = VendorSource::Auto;
         let mut warnings = Vec::new();
         assert!(matches!(
-            service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await,
+            service_archive_copy(Some(&cfg), &record(), "x", ".jar", &mut warnings).await,
             ServiceCopy::FallBack
         ));
         assert_eq!(warnings.len(), 1);
@@ -540,7 +588,14 @@ mod tests {
         let server = MockServer::start().await;
         mount_status(&server, "pending_build").await;
         let mut warnings = Vec::new();
-        match service_archive_copy(Some(&cfg_for(&server)), UUID, "x", ".jar", &mut warnings).await
+        match service_archive_copy(
+            Some(&cfg_for(&server)),
+            &record(),
+            "x",
+            ".jar",
+            &mut warnings,
+        )
+        .await
         {
             ServiceCopy::HardFail(outcome) => match *outcome {
                 VendorOutcome::Refused { code, detail } => {
@@ -564,7 +619,14 @@ mod tests {
         let server = MockServer::start().await;
         mount_status(&server, "not_found").await;
         let mut warnings = Vec::new();
-        match service_archive_copy(Some(&cfg_for(&server)), UUID, "x", ".jar", &mut warnings).await
+        match service_archive_copy(
+            Some(&cfg_for(&server)),
+            &record(),
+            "x",
+            ".jar",
+            &mut warnings,
+        )
+        .await
         {
             ServiceCopy::HardFail(outcome) => match *outcome {
                 VendorOutcome::Refused { code, detail } => {
@@ -592,7 +654,7 @@ mod tests {
         cfg.source = VendorSource::Auto;
         let mut warnings = Vec::new();
         assert!(matches!(
-            service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await,
+            service_archive_copy(Some(&cfg), &record(), "x", ".jar", &mut warnings).await,
             ServiceCopy::FallBack
         ));
         assert!(
@@ -616,7 +678,7 @@ mod tests {
         cfg.source = VendorSource::Auto;
         let mut warnings = Vec::new();
         assert!(matches!(
-            service_archive_copy(Some(&cfg), UUID, "x", ".jar", &mut warnings).await,
+            service_archive_copy(Some(&cfg), &record(), "x", ".jar", &mut warnings).await,
             ServiceCopy::FallBack
         ));
         assert_eq!(warnings.len(), 1);
@@ -646,7 +708,14 @@ mod tests {
             .mount(&server)
             .await;
         let mut warnings = Vec::new();
-        match service_archive_copy(Some(&cfg_for(&server)), UUID, "x", ".jar", &mut warnings).await
+        match service_archive_copy(
+            Some(&cfg_for(&server)),
+            &record(),
+            "x",
+            ".jar",
+            &mut warnings,
+        )
+        .await
         {
             ServiceCopy::HardFail(outcome) => match *outcome {
                 VendorOutcome::Refused { code, detail } => {
@@ -697,6 +766,67 @@ mod tests {
             SecondaryArtifactResult::IntegrityMismatch(m) => {
                 panic!("expected Failed, got IntegrityMismatch({m})")
             }
+        }
+    }
+
+    /// A served archive that passes its SRI but does not carry the
+    /// record's patched bytes is never `Used`: `service` refuses, `auto`
+    /// falls back loudly — and neither pushes the `vendor_prebuilt_downloaded`
+    /// advisory for bytes it rejected.
+    #[tokio::test]
+    async fn service_copy_ready_failing_after_hashes_is_rejected() {
+        use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+        use crate::manifest::schema::PatchFileInfo;
+        let body = {
+            use std::io::Write as _;
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            zw.start_file("lib/x.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(b"unpatched").unwrap();
+            zw.finish().unwrap().into_inner()
+        };
+        let mut rec = record();
+        rec.files.insert(
+            "lib/x.txt".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"unpatched"),
+                after_hash: compute_git_sha256_from_bytes(b"patched"),
+            },
+        );
+        for source in [VendorSource::Service, VendorSource::Auto] {
+            let server = MockServer::start().await;
+            let sri = PackedTarball::from_bytes(&body).integrity;
+            mount_granted(&server, &sri, &body).await;
+            let mut cfg = cfg_for(&server);
+            cfg.source = source;
+            let mut warnings = Vec::new();
+            let copy = service_archive_copy(Some(&cfg), &rec, "x", ".jar", &mut warnings).await;
+            match (source, copy) {
+                (VendorSource::Service, ServiceCopy::HardFail(outcome)) => match *outcome {
+                    VendorOutcome::Refused { code, detail } => {
+                        assert_eq!(code, "vendor_prebuilt_required");
+                        assert!(
+                            detail.contains("does not carry the patched files"),
+                            "{detail}"
+                        );
+                    }
+                    other => panic!("expected Refused, got {other:?}"),
+                },
+                (VendorSource::Auto, ServiceCopy::FallBack) => {
+                    assert_eq!(warnings.len(), 1, "{warnings:?}");
+                    assert_eq!(warnings[0].code, "vendor_prebuilt_layout_mismatch");
+                }
+                (source, ServiceCopy::Used(_)) => {
+                    panic!("{source:?}: unpatched service bytes were accepted")
+                }
+                (source, _) => panic!("{source:?}: unexpected outcome"),
+            }
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_prebuilt_downloaded"),
+                "{warnings:?}"
+            );
         }
     }
 }

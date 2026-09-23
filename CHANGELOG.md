@@ -654,6 +654,15 @@ into the new version's section — see docs/releasing.md.
   so revert still restores the pre-vendor files. If `state.json` has no
   entry for the package, the rebuild still runs but no entry is added,
   because the run has no pre-vendor originals to record.
+- **A prebuilt maven `.jar` or nuget `.nupkg` from the patch service must now
+  contain the patched files.** Checking its integrity hash only showed that
+  the download was intact, not that the archive carried the patch. The
+  archive was still written as-is and every file was reported as already
+  patched, so an unpatched archive could be committed and then rebuilt on
+  every run. Each patched file inside the archive is now checked against the
+  patch's expected hash before the archive is used. On a mismatch, `auto`
+  builds the archive locally and warns `vendor_prebuilt_layout_mismatch`,
+  and `--vendor-source=service` refuses with `vendor_prebuilt_required`.
 
 ### Changed
 

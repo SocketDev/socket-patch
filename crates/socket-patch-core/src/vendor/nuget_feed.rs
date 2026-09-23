@@ -740,7 +740,7 @@ async fn materialise_patched_nupkg(
     config_wired: bool,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(Vec<u8>, ApplyResult), Box<VendorOutcome>> {
-    match service_archive_copy(service, &record.uuid, name, ".nupkg", warnings).await {
+    match service_archive_copy(service, record, name, ".nupkg", warnings).await {
         ServiceCopy::Used(bytes) => {
             if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &bytes).await {
                 if !config_wired {
@@ -4864,5 +4864,22 @@ mod tests {
             !root.join("nuget.config").exists(),
             "created config removed"
         );
+    }
+
+    /// A served nupkg that passes the SRI floor but whose patched
+    /// member does NOT carry the afterHash is refused under `service`.
+    #[tokio::test]
+    async fn service_nupkg_failing_after_hashes_refused_under_service() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let server = mount_granted_nupkg(&make_nupkg(PRISTINE)).await;
+        let cfg = integrity_cfg(Some(&server), crate::vendor::VendorSource::Service);
+        let outcome = run_vendor_cfg(root, &blobs, &installed, &record, Some(&cfg)).await;
+        let VendorOutcome::Refused { code, .. } = outcome else {
+            panic!("an unpatched service nupkg was accepted: {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(".socket").exists(), "nothing written");
+        assert!(!root.join("nuget.config").exists());
     }
 }

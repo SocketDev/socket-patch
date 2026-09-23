@@ -600,7 +600,7 @@ async fn materialise_and_write(
     // The patched jar first (service Tier A, else local rebuild). A non-fatal
     // failure returns an un-successful ApplyResult with nothing written.
     let (jar_bytes, result) =
-        match service_archive_copy(service, &record.uuid, artifact_id, ".jar", warnings).await {
+        match service_archive_copy(service, record, artifact_id, ".jar", warnings).await {
             ServiceCopy::Used(bytes) => {
                 (bytes, already_patched_result(purl, jar_path, &record.files))
             }
@@ -3743,6 +3743,70 @@ mod tests {
                 .await
                 .unwrap(),
             project_pom()
+        );
+    }
+
+    /// A served jar that passes the SRI floor but whose patched
+    /// member does NOT carry the record's afterHash must never be accepted.
+    /// Under `service` it is a refusal with nothing written.
+    #[tokio::test]
+    async fn service_jar_failing_after_hashes_refused_under_service() {
+        let server = mount_granted_jar(&make_jar(PRISTINE)).await;
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let cfg = service_cfg(
+            Some(&server.uri()),
+            crate::vendor::VendorSource::Service,
+            false,
+        );
+        let outcome = run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await;
+        let VendorOutcome::Refused { code, .. } = outcome else {
+            panic!("an unpatched service jar was accepted: {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(".socket").exists(), "nothing written");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PROJECT_POM))
+                .await
+                .unwrap(),
+            project_pom()
+        );
+    }
+
+    /// Under `auto`: the bad served jar falls back (loudly) to the
+    /// local rebuild, so the committed jar really carries the patch and a
+    /// re-run is in sync (no perpetual rebuild).
+    #[tokio::test]
+    async fn service_jar_failing_after_hashes_falls_back_under_auto() {
+        let server = mount_granted_jar(&make_jar(PRISTINE)).await;
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let cfg = service_cfg(
+            Some(&server.uri()),
+            crate::vendor::VendorSource::Auto,
+            false,
+        );
+        let (r1, e1, w1) =
+            unwrap_done(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(
+            w1.iter()
+                .any(|w| w.code == "vendor_prebuilt_layout_mismatch"),
+            "the rejected service jar is surfaced: {w1:?}"
+        );
+        let e1 = e1.expect("entry");
+        assert_eq!(
+            crate::vendor::check_vendored_artifact(root, &e1, &record).await,
+            crate::vendor::ArtifactHealth::Healthy,
+            "the committed jar must carry the afterHash"
+        );
+        let (r2, e2, w2) =
+            unwrap_done(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
+        assert!(r2.success);
+        assert!(e2.is_none(), "re-run is in sync");
+        assert!(
+            !w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{w2:?}"
         );
     }
 }
