@@ -169,7 +169,7 @@ fn parse_env(stdout: &str) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("apply must emit JSON: {e}; stdout={stdout}"))
 }
 
-fn find_skip_event<'a>(env: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+fn find_skip_event(env: &serde_json::Value) -> Option<&serde_json::Value> {
     env["events"].as_array().and_then(|events| {
         events.iter().find(|e| {
             e["action"] == "skipped"

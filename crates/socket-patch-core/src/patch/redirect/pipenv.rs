@@ -869,7 +869,7 @@ mod compatibility_tests {
             ),
             ("requirements.txt".into(), "urllib3==1.26.18\n".into()),
         ]);
-        let result = super::super::rewrite_registry_redirect(&files, &[dep.clone()]);
+        let result = super::super::rewrite_registry_redirect(&files, std::slice::from_ref(&dep));
         assert!(result.files.is_empty());
         assert!(result.edits.is_empty());
         assert!(result.refused_pipenv_uuids.contains("patch-one"));
