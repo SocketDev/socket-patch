@@ -173,11 +173,15 @@ pub(super) async fn stage_patch_pack(
     // recovery would re-vendor every package. `--vendor-source` governs
     // acquisition, not reuse; checked before `service_offline_conflict` so
     // an in-sync `service` + `--offline` re-run succeeds (as cargo and
-    // composer already do). A dry run keeps previewing the local build.
-    if !dry_run {
-        if let Some(pair) = reuse_committed_pack(purl, project_root, &coords, record).await {
+    // composer already do). The probe is read-only and offline, so a dry
+    // run runs it too: on a hit it skips the offline refusal (the real run
+    // would not raise it) and keeps previewing the local build.
+    let mut reusable = false;
+    if let Some(pair) = reuse_committed_pack(purl, project_root, &coords, record).await {
+        if !dry_run {
             return Ok(pair);
         }
+        reusable = true;
     }
 
     // ── Service-download fast path (Tier A: write the prebuilt tarball) ──
@@ -186,7 +190,7 @@ pub(super) async fn stage_patch_pack(
     // locally. A dry run previews the local build (no network). Per the
     // `auto`/`service` policy a non-fatal miss falls back to the local build
     // below; under `service` it fails closed.
-    if let Some(refusal) = service_offline_conflict(service) {
+    if let Some(refusal) = service_offline_conflict(service).filter(|_| !reusable) {
         return Err(Box::new(refusal));
     }
     if let Some(cfg) = service {

@@ -3906,30 +3906,32 @@ mod tests {
         assert_eq!(ts::request_count(&server).await, 0);
     }
 
-    /// F12: a patch that rewrites package.json — the reused pack's parsed
-    /// manifest equals the fresh one, so the dependency mirror (and the
-    /// whole lock) stays byte-identical across a flip.
-    #[tokio::test]
-    async fn package_json_patch_reuse_keeps_the_dependency_mirror() {
-        async fn pkg_fixture() -> Fixture {
-            let mut fx = fixture().await;
-            let before = installed_pkg_json("left-pad", "1.3.0");
-            let after: &[u8] =
-                br#"{"name":"left-pad","version":"1.3.0","dependencies":{"wow":"^1.0.0"}}"#;
-            let after_hash = compute_git_sha256_from_bytes(after);
-            tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
-                .await
-                .unwrap();
-            fx.record.files.insert(
-                "package/package.json".to_string(),
-                PatchFileInfo {
-                    before_hash: compute_git_sha256_from_bytes(&before),
-                    after_hash,
-                },
-            );
-            fx
-        }
-        let probe = pkg_fixture().await;
+    /// A fixture whose patch also rewrites `package/package.json` (adds a
+    /// `wow` dependency).
+    async fn pkg_json_patch_fixture() -> Fixture {
+        let mut fx = fixture().await;
+        let before = installed_pkg_json("left-pad", "1.3.0");
+        let after: &[u8] =
+            br#"{"name":"left-pad","version":"1.3.0","dependencies":{"wow":"^1.0.0"}}"#;
+        let after_hash = compute_git_sha256_from_bytes(after);
+        tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
+            .await
+            .unwrap();
+        fx.record.files.insert(
+            "package/package.json".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(&before),
+                after_hash,
+            },
+        );
+        fx
+    }
+
+    /// Run 1 of [`pkg_json_patch_fixture`] from the service (a re-encoding
+    /// of the local build), persisted; the server then answers 503.
+    /// Returns (fixture, server, run-1 lock bytes).
+    async fn pkg_json_patch_service_vendored() -> (Fixture, wiremock::MockServer, Vec<u8>) {
+        let probe = pkg_json_patch_fixture().await;
         let _ = expect_done(flip_run(&probe, None).await);
         let local = tokio::fs::read(probe.root().join(probe.expected_rel_tgz()))
             .await
@@ -3937,7 +3939,7 @@ mod tests {
         let alt = ts::regzip(&local);
         let server = wiremock::MockServer::start().await;
         ts::mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &alt).await;
-        let fx = pkg_fixture().await;
+        let fx = pkg_json_patch_fixture().await;
         let cfg = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
         let (r, e, _) = expect_done(flip_run(&fx, Some(&cfg)).await);
         assert!(r.success, "{:?}", r.error);
@@ -3949,6 +3951,125 @@ mod tests {
         );
         server.reset().await;
         ts::mount_503(&server).await;
+        (fx, server, lock1)
+    }
+
+    /// F10 + F12: a relock (registry dependency map) re-pinned from the
+    /// reused bytes recomputes the dependency mirror from THEIR patched
+    /// package.json — not the registry's map — with no request.
+    #[tokio::test]
+    async fn relock_with_pkg_json_patch_recomputes_deps_from_reused_bytes() {
+        let (fx, server, lock1) = pkg_json_patch_service_vendored().await;
+        tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
+            .await
+            .unwrap();
+        let cfg = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
+        let (r, e, w) = expect_done(flip_run(&fx, Some(&cfg)).await);
+        assert!(r.success, "{:?}", r.error);
+        assert!(e.is_some(), "the relocked lock is re-wired");
+        assert!(!ts::has_warning(&w, "vendor_prebuilt_unavailable"), "{w:?}");
+        assert_eq!(
+            fx.read_lock().await["packages"]["node_modules/left-pad"]["dependencies"],
+            json!({ "wow": "^1.0.0" })
+        );
+        assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), lock1);
+        assert_eq!(ts::request_count(&server).await, 0);
+    }
+
+    /// A wiring failure after a reuse (the relocked lock's staged write
+    /// fails) must never unstage the uuid dir: it holds the committed
+    /// tarball the live ledger entry still names.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wiring_failure_after_reuse_keeps_the_committed_tarball() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores the read-only dir
+        }
+        let (fx, server, alt) = service_vendored().await;
+        tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
+            .await
+            .unwrap();
+        std::fs::set_permissions(fx.root(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let cfg = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
+        let outcome = flip_run(&fx, Some(&cfg)).await;
+        std::fs::set_permissions(fx.root(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (r, e, _) = expect_done(outcome);
+        assert!(!r.success, "the lock write must fail");
+        assert!(e.is_none());
+        assert_eq!(
+            tokio::fs::read(fx.root().join(fx.expected_rel_tgz()))
+                .await
+                .unwrap(),
+            alt,
+            "the committed tarball the ledger names survives"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "lock untouched"
+        );
+    }
+
+    /// Dry run and real run agree for an in-sync package under
+    /// `service` + `--offline`: the real run reuses (already_vendored), so
+    /// the dry run must not predict the offline refusal.
+    #[tokio::test]
+    async fn dry_run_agrees_with_real_run_under_service_offline_in_sync() {
+        let (fx, server, alt) = service_vendored().await;
+        let before = ts::snapshot(&fx).await;
+        let cfg = ts::service_cfg(&server.uri(), VendorSource::Service, true);
+        let blobs = fx.root().join(".socket/blobs");
+        let sources = PatchSources::blobs_only(&blobs);
+        for dry_run in [true, false] {
+            let outcome = vendor_npm(
+                &fx.purl(),
+                &fx.installed(),
+                fx.root(),
+                &fx.record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                dry_run,
+                false,
+                Some(&cfg),
+            )
+            .await;
+            let (r, e, _) = expect_done(outcome);
+            assert!(r.success, "dry_run={dry_run}: {:?}", r.error);
+            assert!(e.is_none(), "dry_run={dry_run}");
+            assert_eq!(ts::snapshot(&fx).await, before, "dry_run={dry_run}");
+        }
+        assert_eq!(before[0].1.as_deref(), Some(alt.as_slice()));
+        assert_eq!(ts::request_count(&server).await, 0);
+        // A reuse miss (tarball gone) keeps the refusal in the dry run.
+        tokio::fs::remove_file(fx.root().join(fx.expected_rel_tgz()))
+            .await
+            .unwrap();
+        let outcome = vendor_npm(
+            &fx.purl(),
+            &fx.installed(),
+            fx.root(),
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            true,
+            false,
+            Some(&cfg),
+        )
+        .await;
+        assert!(
+            matches!(outcome, VendorOutcome::Refused { code, .. } if code == "vendor_service_offline_conflict"),
+            "{outcome:?}"
+        );
+    }
+
+    /// F12: a patch that rewrites package.json — the reused pack's parsed
+    /// manifest equals the fresh one, so the dependency mirror (and the
+    /// whole lock) stays byte-identical across a flip.
+    #[tokio::test]
+    async fn package_json_patch_reuse_keeps_the_dependency_mirror() {
+        let (fx, server, lock1) = pkg_json_patch_service_vendored().await;
+        let cfg = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
         let (r, e, _) = expect_done(flip_run(&fx, Some(&cfg)).await);
         assert!(r.success, "{:?}", r.error);
         assert!(e.is_none());
