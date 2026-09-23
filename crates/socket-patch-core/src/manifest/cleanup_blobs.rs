@@ -11,6 +11,11 @@ pub struct CleanupResult {
     pub blobs_removed: usize,
     pub bytes_freed: u64,
     pub removed_blobs: Vec<String>,
+    /// Orphans the wet sweep could not unlink, as `<file name>: <error>`.
+    /// The pass keeps going past each failure, so the counts above are
+    /// what was actually reclaimed; a non-empty list is the caller's cue
+    /// to warn (`cleanup_failed`) without discarding them.
+    pub failed: Vec<String>,
 }
 
 /// Shared core for `cleanup_unused_blobs` / `cleanup_unused_archives`.
@@ -25,8 +30,9 @@ pub struct CleanupResult {
 /// `packages/` husk behind.
 ///
 /// Per-file unlink failures do not abort the sweep: every other orphan is
-/// still attempted, only files actually removed are counted, and the first
-/// failure is returned once the pass is complete.
+/// still attempted, only files actually removed are counted, and each
+/// failure is recorded in [`CleanupResult::failed`] so the partial counts
+/// survive alongside it.
 async fn cleanup_dir<F: Fn(&str) -> bool>(
     dir: &Path,
     dry_run: bool,
@@ -48,7 +54,6 @@ async fn cleanup_dir<F: Fn(&str) -> bool>(
     drop(read_dir);
 
     let mut result = CleanupResult::default();
-    let mut first_error = None;
 
     for entry in &entries {
         let file_name_str = entry.file_name().to_string_lossy().to_string();
@@ -78,7 +83,7 @@ async fn cleanup_dir<F: Fn(&str) -> bool>(
         }
         if !dry_run {
             if let Err(e) = tokio::fs::remove_file(&path).await {
-                first_error.get_or_insert(e);
+                result.failed.push(format!("{file_name_str}: {e}"));
                 continue;
             }
         }
@@ -87,10 +92,9 @@ async fn cleanup_dir<F: Fn(&str) -> bool>(
         result.removed_blobs.push(file_name_str);
     }
 
-    if let Some(e) = first_error {
-        return Err(e);
-    }
     if !dry_run {
+        // Best-effort: a directory still holding kept files, hidden files,
+        // subdirectories or the orphans that failed to unlink stays.
         let _ = tokio::fs::remove_dir(dir).await;
     }
     Ok(result)
@@ -403,12 +407,13 @@ mod tests {
     }
 
     /// A per-file unlink failure must not abort the sweep: the remaining
-    /// orphans are still attempted, and the error is returned only after the
-    /// pass. Pinned on Unix by a read-only store dir — every unlink fails,
-    /// so the error propagates and nothing is counted as removed.
+    /// orphans are still attempted, and every failure is recorded in
+    /// `failed` beside the counts of what WAS reclaimed (the pass is `Ok`).
+    /// Pinned on Unix by a read-only store dir — every unlink fails, so
+    /// both orphans land in `failed` and nothing is counted as removed.
     #[cfg(unix)]
     #[tokio::test]
-    async fn test_cleanup_unlink_failure_propagates_after_the_pass() {
+    async fn test_cleanup_unlink_failures_are_recorded_after_the_pass() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let blobs_dir = dir.path().join("blobs");
@@ -429,11 +434,26 @@ mod tests {
         let result = cleanup_unused_blobs(&create_test_manifest(), &blobs_dir, false).await;
         std::fs::set_permissions(&blobs_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert_eq!(
-            result.unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied,
-            "a failed unlink is still reported as the sweep's error"
-        );
+        let result = result.expect("unlink failures do not fail the pass");
+        assert_eq!(result.blobs_checked, 2, "both orphans were considered");
+        assert_eq!(result.blobs_removed, 0, "a failed unlink is not counted as removed");
+        assert_eq!(result.bytes_freed, 0);
+        assert!(result.removed_blobs.is_empty());
+        let mut failed = result.failed.clone();
+        failed.sort();
+        assert_eq!(failed.len(), 2, "every failed unlink is recorded: {failed:?}");
+        let mut expected = [ORPHAN_HASH, BEFORE_HASH_1];
+        expected.sort();
+        for (entry, name) in failed.iter().zip(expected) {
+            assert!(
+                entry.starts_with(&format!("{name}: ")),
+                "each failure names its file: {entry}"
+            );
+            assert!(
+                entry.to_lowercase().contains("permission denied"),
+                "each failure carries the OS error: {entry}"
+            );
+        }
         assert!(blobs_dir.join(ORPHAN_HASH).exists());
         assert!(blobs_dir.join(BEFORE_HASH_1).exists());
         assert!(blobs_dir.is_dir(), "a non-empty store dir is never removed");
@@ -475,6 +495,7 @@ mod tests {
             blobs_removed: 0,
             bytes_freed: 0,
             removed_blobs: vec![],
+            ..Default::default()
         };
         assert_eq!(
             format_cleanup_result(&result, false),
@@ -489,6 +510,7 @@ mod tests {
             blobs_removed: 0,
             bytes_freed: 0,
             removed_blobs: vec![],
+            ..Default::default()
         };
         assert_eq!(
             format_cleanup_result(&result, false),
@@ -503,6 +525,7 @@ mod tests {
             blobs_removed: 2,
             bytes_freed: 2048,
             removed_blobs: vec!["aaa".to_string(), "bbb".to_string()],
+            ..Default::default()
         };
         assert_eq!(
             format_cleanup_result(&result, false),
@@ -838,6 +861,7 @@ mod tests {
             blobs_removed: 2,
             bytes_freed: 2048,
             removed_blobs: vec!["aaa".to_string(), "bbb".to_string()],
+            ..Default::default()
         };
         let formatted = format_cleanup_result(&result, true);
         assert!(formatted.starts_with("Would remove 2 unused blob(s)"));

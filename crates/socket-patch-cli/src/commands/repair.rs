@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::lock_cli::{acquire_or_emit, error_envelope};
-use crate::commands::rollback::sweep_unused_artifacts;
+use crate::commands::rollback::{sweep_failure, sweep_unused_artifacts};
 use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent, Status};
 
 #[derive(Args)]
@@ -138,9 +138,9 @@ pub async fn run(args: RepairArgs) -> i32 {
     // otherwise-empty `.socket/` — on every exit path, dry-run included.
     // A live holder makes repair refuse with `lock_held`; it never steals
     // the lock.
-    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let socket_dir = crate::args::socket_dir_of(&manifest_path, &args.common.cwd);
     let _lock = match acquire_or_emit(
-        socket_dir,
+        &socket_dir,
         Command::Repair,
         args.common.json,
         args.common.dry_run,
@@ -236,9 +236,7 @@ async fn repair_inner(
         .await
         .map_err(|e| e.to_string())?;
 
-    let socket_dir = manifest_path
-        .parent()
-        .expect("manifest path names a file, so it has a parent");
+    let socket_dir = crate::args::socket_dir_of(manifest_path, &args.common.cwd);
     let blobs_path = socket_dir.join("blobs");
     let diffs_path = socket_dir.join("diffs");
     let packages_path = socket_dir.join("packages");
@@ -419,7 +417,7 @@ async fn repair_inner(
     let vendor_rebuilt = crate::commands::repair_vendor::repair_vendored_artifacts_with_references(
         &args.common,
         manifest.as_ref(),
-        socket_dir,
+        &socket_dir,
         &mut env,
         &vendor_references,
         ledger,
@@ -434,7 +432,7 @@ async fn repair_inner(
         if !quiet {
             println!();
         }
-        let sweep = sweep_unused_artifacts(manifest, socket_dir, args.common.dry_run).await;
+        let sweep = sweep_unused_artifacts(manifest, &socket_dir, args.common.dry_run).await;
         // The blob pass prints its status unconditionally ("all are in
         // use" included — the core helper owns that wording); the archive
         // passes print only when they removed something, relabeled.
@@ -444,40 +442,38 @@ async fn repair_inner(
             ("package", Some("package archive(s)"), sweep.packages),
         ];
         for (label, relabel, result) in passes {
-            match result {
-                Ok(cleanup_result) => {
-                    blobs_checked += cleanup_result.blobs_checked;
-                    blobs_cleaned += cleanup_result.blobs_removed;
-                    bytes_freed += cleanup_result.bytes_freed;
-                    if quiet {
-                        continue;
-                    }
-                    let text = format_cleanup_result(&cleanup_result, args.common.dry_run);
-                    match relabel {
-                        None => println!("{text}"),
-                        Some(relabel) if cleanup_result.blobs_removed > 0 => {
-                            println!("{}", text.replace("blob(s)", relabel));
-                        }
-                        Some(_) => {}
-                    }
+            // A failed cleanup — the pass aborted, or it could not unlink
+            // every orphan — is error output: `--silent` (suppress
+            // NON-error output) must not mute it, and the JSON envelope
+            // must carry it — a bare `status: success` with no events is
+            // indistinguishable from "nothing to clean". Recorded as an
+            // informational skip (not `Failed`) to preserve the human
+            // path's warn-and-continue contract: status stays success,
+            // exit stays 0, and the loop goes on to the next directory.
+            if let Some(detail) = sweep_failure(label, &result) {
+                if !args.common.json {
+                    eprintln!("Warning: {detail}");
                 }
-                Err(e) => {
-                    // A failed cleanup is error output: `--silent` (suppress
-                    // NON-error output) must not mute it, and the JSON
-                    // envelope must carry it — a bare `status: success` with
-                    // no events is indistinguishable from "nothing to
-                    // clean". Recorded as an informational skip (not
-                    // `Failed`) to preserve the human path's
-                    // warn-and-continue contract: status stays success, exit
-                    // stays 0, and the loop goes on to the next directory.
-                    if !args.common.json {
-                        eprintln!("Warning: {label} cleanup failed: {e}");
-                    }
-                    env.record(
-                        PatchEvent::artifact(PatchAction::Skipped)
-                            .with_reason("cleanup_failed", format!("{label} cleanup failed: {e}")),
-                    );
+                env.record(
+                    PatchEvent::artifact(PatchAction::Skipped).with_reason("cleanup_failed", detail),
+                );
+            }
+            let Ok(cleanup_result) = result else {
+                continue;
+            };
+            blobs_checked += cleanup_result.blobs_checked;
+            blobs_cleaned += cleanup_result.blobs_removed;
+            bytes_freed += cleanup_result.bytes_freed;
+            if quiet {
+                continue;
+            }
+            let text = format_cleanup_result(&cleanup_result, args.common.dry_run);
+            match relabel {
+                None => println!("{text}"),
+                Some(relabel) if cleanup_result.blobs_removed > 0 => {
+                    println!("{}", text.replace("blob(s)", relabel));
                 }
+                Some(_) => {}
             }
         }
     }

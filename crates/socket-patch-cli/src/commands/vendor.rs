@@ -376,10 +376,7 @@ pub async fn run(args: VendorArgs) -> i32 {
     apply_env_toggles(&args.common);
 
     let manifest_path = args.common.resolved_manifest_path();
-    let socket_dir = manifest_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
+    let socket_dir = crate::args::socket_dir_of(&manifest_path, &args.common.cwd);
 
     // `--revert` derives everything from state.json + the vendor tree; it
     // must work after the manifest was deleted. Plain vendor needs the
@@ -597,7 +594,7 @@ async fn run_vendor(
     // feeds the staging harvest below (one load, not two).
     let (mut has_errors, ledger) = reconcile_dropped(&manifest, common, env).await;
 
-    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let socket_dir = crate::args::socket_dir_of(manifest_path, &common.cwd);
     // Vendor stages patch content IN MEMORY: existing .socket artifacts are
     // read in place, missing content is fetched per patch — vendoring never
     // writes blobs or temp files (the committed artifact is the patch). No
@@ -605,7 +602,7 @@ async fn run_vendor(
     let staged = match stage_vendor_sources_in_memory(
         common,
         &manifest,
-        socket_dir,
+        &socket_dir,
         &common.cwd,
         ledger.as_ref().map(|s| &s.entries),
         HashMap::new(),

@@ -2,9 +2,7 @@
 //! orphan blob/diff/package-archive sweeps, in both mutating (apply) and
 //! read-only (preview) forms.
 
-use socket_patch_core::manifest::cleanup_blobs::{
-    cleanup_unused_archives, cleanup_unused_blobs, CleanupResult,
-};
+use socket_patch_core::manifest::cleanup_blobs::CleanupResult;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::apply_lock;
@@ -16,6 +14,7 @@ use std::time::Duration;
 
 use crate::args::GlobalArgs;
 use crate::commands::lock_cli::lock_failure;
+use crate::commands::rollback::{sweep_failure, sweep_unused_artifacts};
 use crate::commands::vendor::{run_vendor_gc, run_vendor_gc_locked, VendorGcSummary};
 
 /// Aggregated outcome of a GC pass (or preview). Serialized into the
@@ -58,9 +57,12 @@ pub(super) struct GcSummary {
     /// (the preview is lock-free and read-only).
     skipped: Option<(&'static str, String)>,
     /// Post-revert/prune rewrites that failed (`vendor_state_write_failed`
-    /// / `manifest_write_failed` + detail): the reverts or prunes already
-    /// happened on disk, so the stale record is reported, not the pass
-    /// failed. Serialized as additive `warnings[]` on the apply shape only.
+    /// / `manifest_write_failed` + detail) and orphan sweeps that could not
+    /// finish (`cleanup_failed`: the pass aborted, or left orphans it could
+    /// not unlink — the removed counts above are what it did reclaim). The
+    /// mutations already happened on disk, so the stale record is reported,
+    /// not the pass failed. Serialized as additive `warnings[]` on the
+    /// apply shape only.
     warnings: Vec<(&'static str, String)>,
 }
 
@@ -139,30 +141,36 @@ impl GcSummary {
     }
 }
 
-/// Compute GC actions without performing them. `dry_run = true` for the
-/// preview path; `dry_run = false` for the apply path. The cleanup helpers
-/// from `socket_patch_core::manifest::cleanup_blobs` natively support dry-run,
-/// so the same function works for both.
+/// The orphan blob/diff/package sweep against the (post-prune) manifest.
+/// `dry_run = true` for the preview path; `dry_run = false` for the apply
+/// path — the shared `sweep_unused_artifacts` natively supports dry-run, so
+/// the same function works for both. A pass that failed outright counts
+/// as empty; that failure (or a wet pass's unremovable orphans) rides
+/// `warnings` as `cleanup_failed` so the output never reads as a clean
+/// all-zero sweep.
 async fn run_gc(
     manifest: &PatchManifest,
     pruned: Vec<String>,
     socket_dir: &Path,
     dry_run: bool,
 ) -> GcSummary {
-    let blobs = cleanup_unused_blobs(manifest, &socket_dir.join("blobs"), dry_run)
-        .await
-        .unwrap_or_default();
-    let diffs = cleanup_unused_archives(manifest, &socket_dir.join("diffs"), dry_run)
-        .await
-        .unwrap_or_default();
-    let packages = cleanup_unused_archives(manifest, &socket_dir.join("packages"), dry_run)
-        .await
-        .unwrap_or_default();
+    let sweep = sweep_unused_artifacts(manifest, socket_dir, dry_run).await;
+    let mut warnings = Vec::new();
+    let mut take = |label: &str, pass: std::io::Result<CleanupResult>| {
+        if let Some(detail) = sweep_failure(label, &pass) {
+            warnings.push(("cleanup_failed", detail));
+        }
+        pass.unwrap_or_default()
+    };
+    let blobs = take("blob", sweep.blobs);
+    let diffs = take("diffs", sweep.diffs);
+    let packages = take("packages", sweep.packages);
     GcSummary {
         pruned,
         blobs,
         diffs,
         packages,
+        warnings,
         ..Default::default()
     }
 }

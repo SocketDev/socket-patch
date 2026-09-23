@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::utils::fs::{atomic_write_bytes, read_regular_to_bytes};
-use crate::utils::purl::strip_purl_qualifiers;
+use crate::utils::purl::{patch_matches, strip_purl_qualifiers};
 use crate::utils::serde::serialize_sorted;
 use crate::utils::socket_dir::{prune_empty_dirs, remove_file_and_prune, write_json_ledger};
 
@@ -267,6 +267,26 @@ pub struct VendorEntry {
     /// uuid cross-checks before any disk access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<PatchRecord>,
+}
+
+impl VendorEntry {
+    /// Does this entry, stored under ledger `key`, match a remove/rollback
+    /// identifier? By its ledger key or by its base purl (mirroring the
+    /// manifest matching of [`patch_matches`]; a golang key is case-encoded
+    /// while `base_purl` holds the decoded spelling users type), or by uuid.
+    pub fn matches_identifier(&self, key: &str, identifier: &str) -> bool {
+        patch_matches(key, &self.uuid, identifier)
+            || patch_matches(&self.base_purl, &self.uuid, identifier)
+    }
+
+    /// Does this entry, stored under ledger `key`, own the manifest purl
+    /// `purl`? The ledger-key / qualifier-stripped-key / base-purl triple —
+    /// the per-entry form of the set [`VendorState::purl_keys`] flattens.
+    pub fn covers_purl(&self, key: &str, purl: &str) -> bool {
+        key == purl
+            || strip_purl_qualifiers(key) == strip_purl_qualifiers(purl)
+            || self.base_purl == strip_purl_qualifiers(purl)
+    }
 }
 
 /// The ledger.
@@ -661,6 +681,49 @@ mod tests {
         }
         assert_eq!(keys.len(), 3);
         assert!(VendorState::new().purl_keys().is_empty());
+    }
+
+    /// `matches_identifier`: ledger key, base purl (the decoded spelling a
+    /// golang user types) and uuid all address the entry; a foreign purl or
+    /// uuid does not.
+    #[test]
+    fn entry_matches_identifier_by_key_base_purl_or_uuid() {
+        let mut entry = sample_entry();
+        entry.ecosystem = "golang".into();
+        entry.base_purl = "pkg:golang/github.com/BurntSushi/toml@1.0.0".into();
+        let key = "pkg:golang/github.com/!burnt!sushi/toml@1.0.0";
+        assert!(entry.matches_identifier(key, key));
+        assert!(entry.matches_identifier(key, "pkg:golang/github.com/BurntSushi/toml@1.0.0"));
+        assert!(entry.matches_identifier(key, UUID));
+        assert!(!entry.matches_identifier(key, "pkg:golang/github.com/BurntSushi/toml@2.0.0"));
+        assert!(!entry.matches_identifier(key, "00000000-0000-4000-8000-000000000000"));
+
+        // A qualified pypi key: the base identifier covers it, another
+        // variant's qualifier does not.
+        let mut entry = sample_entry();
+        entry.base_purl = "pkg:pypi/requests@2.28.0".into();
+        let key = "pkg:pypi/requests@2.28.0?artifact_id=abc";
+        assert!(entry.matches_identifier(key, "pkg:pypi/requests@2.28.0"));
+        assert!(entry.matches_identifier(key, key));
+        assert!(!entry.matches_identifier(key, "pkg:pypi/requests@2.28.0?artifact_id=zzz"));
+    }
+
+    /// `covers_purl`: the exact key, a qualifier-stripped twin of the key
+    /// and the base purl all belong to the entry; a different package does
+    /// not, and the match is by spelling (no percent-decoding — the set
+    /// form `purl_keys` carries the same three spellings).
+    #[test]
+    fn entry_covers_purl_by_key_stripped_key_or_base_purl() {
+        let mut entry = sample_entry();
+        entry.base_purl = "pkg:npm/@scope/pkg@1.0.0".into();
+        let key = "pkg:npm/%40scope/pkg@1.0.0?artifact_id=x";
+        assert!(entry.covers_purl(key, key));
+        assert!(entry.covers_purl(key, "pkg:npm/%40scope/pkg@1.0.0"));
+        assert!(entry.covers_purl(key, "pkg:npm/%40scope/pkg@1.0.0?artifact_id=other"));
+        assert!(entry.covers_purl(key, "pkg:npm/@scope/pkg@1.0.0"));
+        assert!(entry.covers_purl(key, "pkg:npm/@scope/pkg@1.0.0?artifact_id=y"));
+        assert!(!entry.covers_purl(key, "pkg:npm/@scope/pkg@1.0.1"));
+        assert!(!entry.covers_purl(key, "pkg:npm/other@1.0.0"));
     }
 
     #[tokio::test]

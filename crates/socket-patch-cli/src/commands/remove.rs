@@ -7,62 +7,32 @@ use socket_patch_core::patch::redirect::{
     load_redirect_state, persist_redirect_state, RedirectState, REDIRECT_STATE_REL,
 };
 use socket_patch_core::telemetry::{track_patch_remove_failed, track_patch_removed};
-use socket_patch_core::utils::purl::{purl_matches_identifier, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::patch_matches;
 use socket_patch_core::vendor::{
     load_state, RevertOpts, VendorEntry, VendorState, VENDOR_STATE_REL,
 };
 use std::collections::HashSet;
-use std::path::Path;
 use std::time::Duration;
 
 use super::get::short_uuid;
 use super::rollback::{
     all_files_already_original, pin_before_hash_blobs, revert_vendor_entry,
-    rollback_patches_inner, run_hosted_leg, sweep_unused_artifacts, HostedLegOutcome,
-    InnerSelection, VendorRevertStep,
+    rollback_patches_inner, run_hosted_leg, sweep_failure, sweep_unused_artifacts,
+    HostedLegOutcome, InnerSelection, VendorRevertStep,
 };
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, Status};
 use crate::output::confirm;
 
-/// A remove/rollback identifier matches a patch by PURL for `pkg:`
-/// identifiers (a base PURL matches every release variant of that
-/// package@version; a qualified PURL targets a single patch), or by patch
-/// uuid otherwise.
-pub(crate) fn patch_matches(purl: &str, uuid: &str, identifier: &str) -> bool {
-    if identifier.starts_with("pkg:") {
-        purl_matches_identifier(purl, identifier)
-    } else {
-        uuid == identifier
-    }
-}
-
-/// A vendor-ledger entry matches a remove/rollback identifier by its
-/// ledger key or by its base purl (mirroring the manifest matching; a
-/// golang key is case-encoded while `base_purl` holds the decoded spelling
-/// users type).
-pub(crate) fn vendor_entry_matches(key: &str, entry: &VendorEntry, identifier: &str) -> bool {
-    patch_matches(key, &entry.uuid, identifier)
-        || patch_matches(&entry.base_purl, &entry.uuid, identifier)
-}
-
-/// Does the ledger entry under `key` own the manifest purl `purl`? The
-/// ledger-key / qualifier-stripped-key / base-purl triple — the per-entry
-/// form of the set core's `vendored_purl_keys` flattens.
-pub(crate) fn vendor_entry_covers_purl(key: &str, entry: &VendorEntry, purl: &str) -> bool {
-    key == purl
-        || strip_purl_qualifiers(key) == strip_purl_qualifiers(purl)
-        || entry.base_purl == strip_purl_qualifiers(purl)
-}
-
-/// Vendor-ledger entries matching a remove identifier, sorted by key for
-/// deterministic event order.
+/// Vendor-ledger entries matching a remove identifier (by ledger key,
+/// base purl or uuid — `VendorEntry::matches_identifier`), sorted by key
+/// for deterministic event order.
 fn vendor_entries_matching(state: &VendorState, identifier: &str) -> Vec<(String, VendorEntry)> {
     let mut matches: Vec<(String, VendorEntry)> = state
         .entries
         .iter()
-        .filter(|(key, entry)| vendor_entry_matches(key, entry, identifier))
+        .filter(|(key, entry)| entry.matches_identifier(key, identifier))
         .map(|(k, e)| (k.clone(), e.clone()))
         .collect();
     matches.sort_by(|a, b| a.0.cmp(&b.0));
@@ -238,9 +208,9 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // the rollback, the ledger reverts and the manifest mutation, and its
     // drop removes `apply.lock` (and an emptied `.socket/`) on every exit
     // path.
-    let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let socket_dir = crate::args::socket_dir_of(&manifest_path, &args.common.cwd);
     let _lock = match acquire_or_emit(
-        socket_dir,
+        &socket_dir,
         Command::Remove,
         args.common.json,
         args.common.dry_run,
@@ -426,7 +396,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         };
         match rollback_patches_inner(
             &delegated,
-            socket_dir,
+            &socket_dir,
             &manifest,
             &vendored_keys,
             InnerSelection::Identifier(Some(&args.identifier)),
@@ -632,7 +602,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 vendored_matches
                     .iter()
                     .find(|(k, _)| k == key)
-                    .is_some_and(|(k, e)| vendor_entry_covers_purl(k, e, purl))
+                    .is_some_and(|(k, e)| e.covers_purl(k, purl))
             })
         })
         .collect();
@@ -748,31 +718,32 @@ pub async fn run(args: RemoveArgs) -> i32 {
     let mut blobs_removed = 0;
     let mut archives_removed = 0;
     if !args.preserve_state {
-        let sweep = sweep_unused_artifacts(&cleanup_reference, socket_dir, args.common.dry_run).await;
-        match sweep.blobs {
-            Ok(r) => {
-                blobs_removed = r.blobs_removed;
-                if loud && r.blobs_removed > 0 {
-                    println!("\n{}", format_cleanup_result(&r, args.common.dry_run));
-                }
+        let sweep =
+            sweep_unused_artifacts(&cleanup_reference, &socket_dir, args.common.dry_run).await;
+        // repair's posture: a failed pass (or a pass that could not unlink
+        // every orphan) warns and continues, never fatal; its partial
+        // counts still stand.
+        if let Some(detail) = sweep_failure("blob", &sweep.blobs) {
+            if loud {
+                eprintln!("Warning: {detail}");
             }
-            Err(e) => {
-                // repair's posture: warn and continue, never fatal.
-                if loud {
-                    eprintln!("Warning: blob cleanup failed: {e}");
-                }
+        }
+        if let Ok(r) = sweep.blobs {
+            blobs_removed = r.blobs_removed;
+            if loud && r.blobs_removed > 0 {
+                println!("\n{}", format_cleanup_result(&r, args.common.dry_run));
             }
         }
         // Diff/package archives use the same manifest-uuid keep rule
         // (parity with repair and scan --prune).
         for (dir, result) in [("diffs", sweep.diffs), ("packages", sweep.packages)] {
-            match result {
-                Ok(r) => archives_removed += r.blobs_removed,
-                Err(e) => {
-                    if loud {
-                        eprintln!("Warning: {dir} cleanup failed: {e}");
-                    }
+            if let Some(detail) = sweep_failure(dir, &result) {
+                if loud {
+                    eprintln!("Warning: {detail}");
                 }
+            }
+            if let Ok(r) = result {
+                archives_removed += r.blobs_removed;
             }
         }
     }

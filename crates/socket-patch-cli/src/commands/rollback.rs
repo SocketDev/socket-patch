@@ -15,7 +15,7 @@ use socket_patch_core::patch::rollback::{
     VerifyRollbackResult, VerifyRollbackStatus,
 };
 use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl::{patch_matches, strip_purl_qualifiers};
 use socket_patch_core::vendor::{save_state, RevertOpts, VendorState, VendorWarning};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -24,7 +24,6 @@ use std::time::Duration;
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::apply::is_local_go;
 use crate::commands::lock_cli::acquire_or_emit;
-use crate::commands::remove::{patch_matches, vendor_entry_covers_purl, vendor_entry_matches};
 use crate::commands::vendor::dispatch_revert_one_opts;
 use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls};
 use crate::json_envelope::Command as EnvelopeCommand;
@@ -629,6 +628,21 @@ pub(crate) async fn sweep_unused_artifacts(
     }
 }
 
+/// The `cleanup_failed` detail for one sweep pass labelled `label`: the
+/// directory-level error that stopped the pass, or — after a pass that
+/// kept sweeping past unlink failures — the files it could not remove
+/// (their counts of what WAS reclaimed still stand). `None` for a clean
+/// pass. Every consumer renders it as `<label> cleanup failed: …`.
+pub(crate) fn sweep_failure(label: &str, pass: &std::io::Result<CleanupResult>) -> Option<String> {
+    match pass {
+        Err(e) => Some(format!("{label} cleanup failed: {e}")),
+        Ok(r) if !r.failed.is_empty() => {
+            Some(format!("{label} cleanup failed: {}", r.failed.join("; ")))
+        }
+        Ok(_) => None,
+    }
+}
+
 /// Unwire the in-scope vendored entries. `preserve` keeps artifacts and
 /// ledger entries (only the lockfile wiring is restored); otherwise a
 /// clean revert drops the entry and saves the ledger per purl.
@@ -911,10 +925,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // Serialize against concurrent socket-patch runs targeting the
     // same `.socket/` directory. See
     // `socket_patch_core::patch::apply_lock`.
-    let socket_dir = manifest_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
+    let socket_dir = crate::args::socket_dir_of(&manifest_path, &cwd);
     let _lock = match acquire_or_emit(
         &socket_dir,
         EnvelopeCommand::Rollback,
@@ -1009,7 +1020,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
         }
         for (key, entry) in &vendor_entries {
-            if vendor_entry_matches(key, entry, id) {
+            if entry.matches_identifier(key, id) {
                 vendor_scope.insert(key.clone());
                 matched = true;
             }
@@ -1349,7 +1360,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     vendor_entries
                         .iter()
                         .find(|(k, _)| k == key)
-                        .is_some_and(|(k, e)| vendor_entry_covers_purl(k, e, purl))
+                        .is_some_and(|(k, e)| e.covers_purl(k, purl))
                 })
             };
             let succeeded_purls: HashSet<String> = results
@@ -1438,15 +1449,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     ("diffs", sweep.diffs),
                     ("packages", sweep.packages),
                 ]) {
-                    match result {
-                        Ok(r) => {
-                            *slot = r.blobs_removed;
-                            gc_bytes_freed += r.bytes_freed;
-                        }
-                        Err(e) => run_warnings.push((
-                            "cleanup_failed".into(),
-                            format!("{label} cleanup failed: {e}"),
-                        )),
+                    if let Some(detail) = sweep_failure(label, &result) {
+                        run_warnings.push(("cleanup_failed".into(), detail));
+                    }
+                    if let Ok(r) = result {
+                        *slot = r.blobs_removed;
+                        gc_bytes_freed += r.bytes_freed;
                     }
                 }
                 gc_json = serde_json::json!({
@@ -1930,9 +1938,10 @@ pub(crate) async fn rollback_patches_inner(
     // Partition PURLs by ecosystem up front. The before-blob gate and the
     // download below must only consider patches this run can actually roll
     // back — the `--ecosystems` filter. An out-of-scope patch with an
-    // absent before-blob must not abort
-    // (or trigger fetches for) a run that will never restore it. Mirrors
-    // apply's `scoped_manifest`.
+    // absent before-blob must not abort (or trigger fetches for) a run that
+    // will never restore it, so `scoped_manifest` below narrows the
+    // reference set to the in-scope purls (apply narrows its manifest the
+    // same way, in place, in `apply_patches_inner`).
     let rollback_purls: Vec<String> = patches_to_rollback.iter().map(|p| p.purl.clone()).collect();
     let partitioned = partition_purls(&rollback_purls, common.ecosystems.as_deref());
     let in_scope: HashSet<String> = partitioned
@@ -2410,82 +2419,79 @@ pub(crate) async fn rollback_patches_inner(
     })
 }
 
-// The legacy path-taking delegation shape, kept for the unit tests below
-// (`remove` now threads its already-loaded manifest and ledger straight
-// into `rollback_patches_inner`; this wrapper reads them from disk). The
-// third tuple element lists vendor-owned purls that were excluded from
-// in-place rollback (benign); the fourth is `RollbackOutcome::not_installed`
-// — in-scope manifest entries the crawler found no installed package for.
-//
-// The returned `bool` is `RollbackOutcome::success` — per-package semantics
-// only. Manifest entries whose package is not installed are NOT failures
-// here (there is nothing on disk to restore), so `remove` proceeds to drop
-// them from the manifest; the CLI `rollback` boundary's apply-mirroring
-// "none matched → exit 1" rule deliberately does NOT apply to this
-// delegation (it would wedge `remove` for packages long uninstalled).
-//
-// The `not_installed` element exists because that drop is IRREVERSIBLE in a
-// way a genuine rollback is not: "not installed" can also mean "installed
-// but missed by the crawler" (layout gaps are a documented reality), in
-// which case the patched bytes are still on disk. `remove` uses the list to
-// warn and to keep those entries' beforeHash blobs out of its cleanup
-// sweep, so the revert data survives a crawler miss.
-//
-// Takes the caller's `GlobalArgs` as the base (only the per-call fields are
-// overridden): the nested missing-blob download builds its API client from
-// `api_client_overrides()`, so flag-passed `--api-url` / `--api-token` /
-// `--org` / `--proxy-url` must flow through. A from-scratch
-// `GlobalArgs::default()` here silently dropped them — with credentials
-// passed as flags the nested client was unauthenticated and pointed at the
-// public proxy, so the download failed and the whole `remove` aborted with
-// `rollback_failed` (see tests/remove_rollback_api_overrides.rs).
-#[cfg(test)]
-pub(crate) async fn rollback_patches(
-    common: &crate::args::GlobalArgs,
-    manifest_path: &Path,
-    identifier: Option<&str>,
-    dry_run: bool,
-    silent: bool,
-    ecosystems: Option<Vec<String>>,
-) -> Result<(bool, Vec<RollbackResult>, Vec<String>, Vec<String>), String> {
-    // The Identifier selection keeps the legacy hard requirement: a
-    // missing manifest is the (historical) "Invalid manifest" error.
-    let manifest = read_manifest(manifest_path)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Invalid manifest".to_string())?;
-    let socket_dir = manifest_path
-        .parent()
-        .expect("manifest path names a file, so it has a parent");
-    let vendored_keys = socket_patch_core::vendor::vendored_purl_keys(&common.cwd).await;
-    let delegated_common = crate::args::GlobalArgs {
-        ecosystems,
-        silent,
-        dry_run,
-        ..common.clone()
-    };
-    let outcome = rollback_patches_inner(
-        &delegated_common,
-        socket_dir,
-        &manifest,
-        &vendored_keys,
-        InnerSelection::Identifier(identifier),
-        None,
-    )
-    .await?;
-    Ok((
-        outcome.success,
-        outcome.results,
-        outcome.vendored_skipped,
-        outcome.not_installed,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
     use std::collections::HashMap;
+
+    // The legacy path-taking delegation shape, kept for the unit tests below
+    // (`remove` now threads its already-loaded manifest and ledger straight
+    // into `rollback_patches_inner`; this wrapper reads them from disk). The
+    // third tuple element lists vendor-owned purls that were excluded from
+    // in-place rollback (benign); the fourth is `RollbackOutcome::not_installed`
+    // — in-scope manifest entries the crawler found no installed package for.
+    //
+    // The returned `bool` is `RollbackOutcome::success` — per-package semantics
+    // only. Manifest entries whose package is not installed are NOT failures
+    // here (there is nothing on disk to restore), so `remove` proceeds to drop
+    // them from the manifest; the CLI `rollback` boundary's apply-mirroring
+    // "none matched → exit 1" rule deliberately does NOT apply to this
+    // delegation (it would wedge `remove` for packages long uninstalled).
+    //
+    // The `not_installed` element exists because that drop is IRREVERSIBLE in a
+    // way a genuine rollback is not: "not installed" can also mean "installed
+    // but missed by the crawler" (layout gaps are a documented reality), in
+    // which case the patched bytes are still on disk. `remove` uses the list to
+    // warn and to keep those entries' beforeHash blobs out of its cleanup
+    // sweep, so the revert data survives a crawler miss.
+    //
+    // Takes the caller's `GlobalArgs` as the base (only the per-call fields are
+    // overridden): the nested missing-blob download builds its API client from
+    // `api_client_overrides()`, so flag-passed `--api-url` / `--api-token` /
+    // `--org` / `--proxy-url` must flow through. A from-scratch
+    // `GlobalArgs::default()` here silently dropped them — with credentials
+    // passed as flags the nested client was unauthenticated and pointed at the
+    // public proxy, so the download failed and the whole `remove` aborted with
+    // `rollback_failed` (see tests/remove_rollback_api_overrides.rs).
+    async fn rollback_patches(
+        common: &crate::args::GlobalArgs,
+        manifest_path: &Path,
+        identifier: Option<&str>,
+        dry_run: bool,
+        silent: bool,
+        ecosystems: Option<Vec<String>>,
+    ) -> Result<(bool, Vec<RollbackResult>, Vec<String>, Vec<String>), String> {
+        // The Identifier selection keeps the legacy hard requirement: a
+        // missing manifest is the (historical) "Invalid manifest" error.
+        let manifest = read_manifest(manifest_path)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Invalid manifest".to_string())?;
+        let socket_dir = crate::args::socket_dir_of(manifest_path, &common.cwd);
+        let vendored_keys = socket_patch_core::vendor::vendored_purl_keys(&common.cwd).await;
+        let delegated_common = crate::args::GlobalArgs {
+            ecosystems,
+            silent,
+            dry_run,
+            ..common.clone()
+        };
+        let outcome = rollback_patches_inner(
+            &delegated_common,
+            &socket_dir,
+            &manifest,
+            &vendored_keys,
+            InnerSelection::Identifier(identifier),
+            None,
+        )
+        .await?;
+        Ok((
+            outcome.success,
+            outcome.results,
+            outcome.vendored_skipped,
+            outcome.not_installed,
+        ))
+    }
 
     fn make_record(uuid: &str) -> PatchRecord {
         PatchRecord {

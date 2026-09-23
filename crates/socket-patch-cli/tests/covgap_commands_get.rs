@@ -2288,6 +2288,111 @@ async fn vendored_lock_held_vendor_step_errors_without_vendor_envelope() {
     }
 }
 
+/// The hosted reference endpoint granting `uuid` for `purl` at `url` (the
+/// `covgap_commands_scan_hosted` fixture shape).
+async fn mount_granted_reference(server: &MockServer, uuid: &str, purl: &str, url: &str) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                uuid: {
+                    "status": "granted",
+                    "url": url,
+                    "purl": purl,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": url,
+                        "integrity": { "sha512": "sha512-PATCHEDpatchedPATCHEDpatched0123456789==" }
+                    }],
+                    "registryOverride": null
+                }
+            }
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Hosted twin of `vendored_lock_held_vendor_step_errors_without_vendor_envelope`
+/// (and of `covgap_commands_scan_hosted::hosted_lock_held_refuses_before_any_write`):
+/// `get <uuid> --mode hosted` folds its result into the HOSTED error
+/// envelope, so a held apply lock surfaces as the top-level `errorCode`
+/// with a string `error` — NOT the vendored `error: {code, message}`
+/// object — exit 1, `redirect.mode` retained, nothing written; the human
+/// arm prints `Error (lock_held):` plus the `--lock-timeout` hint. A
+/// `--dry-run` never contends: it previews the redirect under the held
+/// lock and exits 0.
+#[tokio::test]
+async fn hosted_lock_held_get_errors_with_top_level_error_code() {
+    use std::time::Duration;
+
+    const HOSTED_URL: &str = "http://patch.test/patch/npm/covgap-pkg/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/covgap-pkg-1.0.0.tgz";
+    const HELD: &str = "another socket-patch process is operating in this directory";
+
+    let server = MockServer::start().await;
+    mount_view_files(&server, UUID, PURL, good_files()).await;
+    mount_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let lock_before = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    let _lock = socket_patch_core::patch::apply_lock::acquire(&socket, Duration::ZERO).unwrap();
+
+    // Wet --json: get's envelope fold keeps the hosted shape.
+    let (code, stdout, stderr) =
+        run_get_bin(tmp.path(), &server.uri(), &[UUID, "--mode", "hosted", "--json"]);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["status"], "error", "stdout={stdout}");
+    assert_eq!(v["errorCode"], "lock_held", "stdout={stdout}");
+    assert_eq!(
+        v["error"], HELD,
+        "the hosted envelope carries a string `error`, not the vendored object; stdout={stdout}"
+    );
+    assert!(
+        v["error"].get("code").is_none(),
+        "no nested `error.code` on the hosted shape; stdout={stdout}"
+    );
+    assert_eq!(
+        v["redirect"]["mode"], "hosted",
+        "the hosted error envelope keeps its redirect block; stdout={stdout}"
+    );
+
+    // Wet human: the coded line and the wait hint.
+    let (code, stdout, stderr) =
+        run_get_bin(tmp.path(), &server.uri(), &[UUID, "--mode", "hosted"]);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stderr.contains(&format!("Error (lock_held): {HELD}")),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("--lock-timeout"),
+        "the wait hint must accompany a live holder; stderr={stderr}"
+    );
+
+    // --dry-run under the held lock: a preview never locks, so it previews
+    // the redirect instead of contending.
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[UUID, "--mode", "hosted", "--json", "--dry-run"],
+    );
+    assert_eq!(code, 0, "a dry run never contends; stdout={stdout}\nstderr={stderr}");
+    let v = parse_single_json_doc(&stdout);
+    assert_eq!(v["status"], "success", "stdout={stdout}");
+    assert_eq!(v["redirect"]["dryRun"], true, "stdout={stdout}");
+    assert_eq!(v["redirect"]["redirected"], 1, "stdout={stdout}");
+
+    assert_eq!(
+        std::fs::read(tmp.path().join("package-lock.json")).unwrap(),
+        lock_before,
+        "none of the runs may touch the lockfile"
+    );
+    assert!(!tmp.path().join(".socket/vendor/redirect-state.json").exists());
+    assert_no_manifest(tmp.path());
+}
+
 /// Human vendored-uuid over a purl the ledger already vendors at a
 /// DIFFERENT uuid: the engine's `[fetch] … (replacing …)` line names the
 /// superseded short uuid (ledger-derived — there is no manifest), then a

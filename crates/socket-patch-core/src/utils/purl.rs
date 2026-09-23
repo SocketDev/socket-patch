@@ -337,9 +337,46 @@ pub fn purl_matches_identifier(manifest_key: &str, identifier: &str) -> bool {
     }
 }
 
+/// Does a patch (its manifest/ledger `purl` key and `uuid`) match a
+/// user-supplied remove/rollback identifier? A `pkg:` identifier matches
+/// by PURL with [`purl_matches_identifier`]'s variant rules (a base PURL
+/// covers every release variant of that `package@version`; a qualified one
+/// targets a single patch); anything else is compared to the patch uuid.
+pub fn patch_matches(purl: &str, uuid: &str, identifier: &str) -> bool {
+    if is_purl(identifier) {
+        purl_matches_identifier(purl, identifier)
+    } else {
+        uuid == identifier
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pkg:` identifiers match by PURL (base covers every variant, a
+    /// qualified one only its exact key); anything else is a uuid match.
+    #[test]
+    fn test_patch_matches_routes_purl_vs_uuid() {
+        const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+        let key = "pkg:pypi/requests@2.28.0?artifact_id=abc";
+        assert!(patch_matches(key, UUID, "pkg:pypi/requests@2.28.0"));
+        assert!(patch_matches(key, UUID, key));
+        assert!(!patch_matches(key, UUID, "pkg:pypi/requests@2.28.0?artifact_id=zzz"));
+        assert!(!patch_matches(key, UUID, "pkg:pypi/requests@2.29.0"));
+        assert!(patch_matches(key, UUID, UUID));
+        assert!(!patch_matches(key, UUID, "not-the-uuid"));
+        // A uuid identifier never matches by PURL text, and a PURL
+        // identifier is only ever compared against the purl field — a
+        // uuid field that happens to equal the identifier does not match.
+        assert!(!patch_matches(
+            "pkg:npm/other@1.0.0",
+            "pkg:pypi/requests@2.28.0",
+            "pkg:pypi/requests@2.28.0"
+        ));
+        assert!(!patch_matches(UUID, "other-uuid", UUID));
+        assert!(!patch_matches("pkg:npm/a@1", UUID, "pkg:npm/b@1"));
+    }
 
     #[test]
     fn test_strip_qualifiers() {
