@@ -1784,12 +1784,19 @@ pub(crate) async fn vendor_records(
                     // An artifact-only rebuild hands back a refreshed
                     // fingerprint with no wiring of its own: it relies on
                     // the ledger entry it replaces for the pre-vendor
-                    // originals. With no such entry, recording it would give
-                    // `--revert` an entry that deletes the artifact yet
-                    // cannot unwire the project — leave the ledger as is.
-                    let entry = entry.filter(|_| {
-                        state.entries.contains_key(candidate.as_str())
-                            || !warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt")
+                    // originals, and `carry_forward_wiring` re-attaches them
+                    // only from a SAME-uuid predecessor. With no such entry
+                    // (none at all, or one from another patch generation),
+                    // recording it would give `--revert` an entry that
+                    // deletes the artifact yet cannot unwire the project —
+                    // leave the ledger as is.
+                    let rebuilt = warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt");
+                    let entry = entry.filter(|e| {
+                        !rebuilt
+                            || state
+                                .entries
+                                .get(candidate.as_str())
+                                .is_some_and(|prev| prev.uuid == e.uuid)
                     });
                     if let Some(entry) = entry {
                         if let Some(flavor) = entry.flavor.as_deref() {

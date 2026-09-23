@@ -652,8 +652,9 @@ into the new version's section — see docs/releasing.md.
   also reported as `already_vendored` instead of `applied`. The rebuild now
   records the new fingerprint and keeps the entry's original wiring records,
   so revert still restores the pre-vendor files. If `state.json` has no
-  entry for the package, the rebuild still runs but no entry is added,
-  because the run has no pre-vendor originals to record.
+  entry for the package, or only an entry from another patch uuid, the
+  rebuild still runs but the ledger is left as it is, because the run has no
+  pre-vendor originals to record.
 - **A prebuilt maven `.jar`, nuget `.nupkg`, pypi wheel or npm tarball from
   the patch service must now contain the patched files.** Checking its integrity hash only showed that
   the download was intact, not that the archive carried the patch. The

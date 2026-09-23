@@ -2314,6 +2314,49 @@ async fn scan_vendor_gem_artifact_rebuild_without_ledger_entry_records_none() {
     assert!(!recorded, "no wiring-less ledger entry invented: {env2:#}");
 }
 
+/// The same rebuild when the ledger entry belongs to ANOTHER patch
+/// generation (the run that wired this uuid never saved its entry): the
+/// refreshed entry cannot inherit that entry's wiring, so recording it would
+/// leave `vendor --revert` unable to unwire the Gemfile. The ledger keeps
+/// the other-uuid entry, wiring intact.
+#[tokio::test]
+async fn scan_vendor_gem_artifact_rebuild_over_other_uuid_entry_keeps_ledger() {
+    let mock = wiremock::MockServer::start().await;
+    mount_gem_patch_api(&mock, GEM_PURL).await;
+    let fx = gem_fixture();
+    let (code, env) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "first vendor: {env:#}");
+
+    let mut state: Value =
+        serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    let other = "99999999-9999-4999-8999-999999999999";
+    state["entries"][GEM_PURL]["uuid"] = Value::String(other.to_string());
+    let wiring = state["entries"][GEM_PURL]["wiring"].clone();
+    assert!(
+        wiring.as_array().is_some_and(|w| !w.is_empty()),
+        "fixture entry is wired: {state:#}"
+    );
+    std::fs::write(fx.state_path(), serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    std::fs::remove_file(fx.vendored_lib()).unwrap();
+
+    let (code, env2) = run_scan_vendor(fx.root(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "rebuild run: {env2:#}");
+    assert_eq!(
+        std::fs::read(fx.vendored_lib()).unwrap(),
+        GEM_PATCHED,
+        "the copy is still rebuilt"
+    );
+    let after: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
+    assert_eq!(
+        after["entries"][GEM_PURL]["uuid"], other,
+        "the other-uuid entry is not replaced: {env2:#}"
+    );
+    assert_eq!(
+        after["entries"][GEM_PURL]["wiring"], wiring,
+        "its wiring survives: {env2:#}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // hosted → vendored mode conversion (takeover reconciliation, pnpm v9)
 // ─────────────────────────────────────────────────────────────────────
