@@ -667,23 +667,30 @@ async fn npm_get_uuid_vendored_fresh_checkout_npm_ci() {
     );
     assert_eq!(env["vendor"]["summary"]["failed"], 0, "no failures: {env}");
 
-    // Committed state: manifest record + artifact + ledger, NO blobs.
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(proj.join(".socket/manifest.json")).unwrap())
-            .unwrap();
-    assert_eq!(
-        manifest["patches"][purl.as_str()]["uuid"],
-        UUID,
-        "the manifest must record the vendored patch: {manifest}"
+    // Committed state: artifact + ledger (a detached entry carrying the
+    // record), NO manifest, NO blobs — vendored mode is manifest-free.
+    assert!(
+        !proj.join(".socket/manifest.json").exists(),
+        "get --mode vendored must NOT write the manifest (the ledger is the record)"
     );
     let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
     assert!(
         proj.join(&tgz_rel).is_file(),
         "vendored tarball missing at {tgz_rel}"
     );
-    assert!(
-        proj.join(".socket/vendor/state.json").is_file(),
-        "vendor ledger missing"
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(proj.join(".socket/vendor/state.json")).expect("vendor ledger missing"),
+    )
+    .unwrap();
+    assert_eq!(
+        state["entries"][purl.as_str()]["uuid"],
+        UUID,
+        "the ledger must record the vendored patch: {state}"
+    );
+    assert_eq!(
+        state["entries"][purl.as_str()]["detached"],
+        true,
+        "a get --mode vendored entry is detached: {state}"
     );
     assert!(
         !proj.join(".socket/blobs").exists(),

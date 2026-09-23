@@ -368,9 +368,11 @@ async fn get_uuid_hosted_dry_run_writes_nothing() {
 // ---------------------------------------------------------------------------
 
 /// `get <uuid> --mode vendored` must produce scan's vendored result: the
-/// manifest record, the committed artifact under `.socket/vendor/npm/<uuid>/`,
-/// the vendor ledger, the lock rewired to the `file:` artifact — and NO
-/// `.socket/blobs` (the download phase holds content in memory).
+/// committed artifact under `.socket/vendor/npm/<uuid>/`, the vendor ledger
+/// carrying the record as a detached entry, the lock rewired to the `file:`
+/// artifact — and NO `.socket/manifest.json` and NO `.socket/blobs`
+/// (vendored mode is manifest-free; the download phase holds content in
+/// memory and the ledger is the only record).
 #[tokio::test]
 #[serial]
 async fn get_uuid_vendored_commits_artifact_and_wires_lock() {
@@ -385,10 +387,13 @@ async fn get_uuid_vendored_commits_artifact_and_wires_lock() {
     let code = socket_patch_cli::commands::get::run(args).await;
     assert_eq!(code, 0, "get --mode vendored should succeed");
 
-    assert_eq!(
-        read_manifest_purls(tmp.path()),
-        vec![PURL1.to_string()],
-        "the manifest must record the vendored patch"
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "vendored mode must NOT write the manifest (the ledger is the record)"
+    );
+    assert!(
+        read_manifest_purls(tmp.path()).is_empty(),
+        "no manifest record may exist for the vendored patch"
     );
     let artifact = tmp
         .path()
@@ -400,9 +405,20 @@ async fn get_uuid_vendored_commits_artifact_and_wires_lock() {
         "the patched artifact must be committed at {}",
         artifact.display()
     );
-    assert!(
-        tmp.path().join(".socket/vendor/state.json").is_file(),
-        "the vendor ledger must be written"
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json"))
+            .expect("the vendor ledger must be written"),
+    )
+    .unwrap();
+    let entry = &state["entries"][PURL1];
+    assert_eq!(entry["uuid"], UUID1, "ledger entry: {state}");
+    assert_eq!(
+        entry["detached"], true,
+        "every get --mode vendored entry is detached: {state}"
+    );
+    assert_eq!(
+        entry["record"]["uuid"], UUID1,
+        "the embedded record is the verification source: {state}"
     );
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert!(
@@ -415,9 +431,10 @@ async fn get_uuid_vendored_commits_artifact_and_wires_lock() {
     );
 }
 
-/// Re-running the same vendored get is an idempotent no-op: the manifest
-/// insert is gated on `changed` and the vendor engine lands on its benign
-/// `already_vendored` skip. The artifact survives.
+/// Re-running the same vendored get is an idempotent no-op: the download
+/// phase reuses the ledger's detached record (`skipped`, no fetch) and the
+/// vendor engine lands on its benign `already_vendored` skip. The artifact
+/// survives and no manifest appears.
 #[tokio::test]
 #[serial]
 async fn get_uuid_vendored_rerun_is_idempotent() {
@@ -450,6 +467,10 @@ async fn get_uuid_vendored_rerun_is_idempotent() {
     assert_eq!(
         lock_after_first, lock_after_second,
         "the re-run must leave the lock byte-identical"
+    );
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "an idempotent vendored re-run still writes no manifest"
     );
 }
 

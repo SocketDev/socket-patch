@@ -1,7 +1,7 @@
 use clap::Args;
 use regex::Regex;
 use socket_patch_core::api::client::{
-    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate,
+    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate, ApiClient,
 };
 use socket_patch_core::api::ranking::{cmp_search_results, severity_order};
 use socket_patch_core::api::types::{
@@ -13,17 +13,24 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
+// Re-exported for `fetch_stage`, which imports the blob-hash guard from here.
+pub(crate) use socket_patch_core::patch::apply::is_valid_blob_hash;
 use socket_patch_core::patch::apply::select_installed_variants;
+use socket_patch_core::patch::apply_lock::{self, LockError};
 use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use socket_patch_core::utils::purl::{is_purl, normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::vendor::{load_state, lookup_entry, VendorEntry};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::bun_preflight::{
     bun_vendor_preflight, bun_vendor_preflight_with_ledger, BunVendorRefusal,
 };
+use crate::commands::lock_cli::lock_failure;
 use crate::ecosystem_dispatch::{
     crawl_all_ecosystems, find_packages_for_rollback, partition_purls,
 };
@@ -252,17 +259,35 @@ fn report_error(json: bool, message: impl std::fmt::Display) {
     }
 }
 
-/// A blob hash must be a SHA-256 hex string — the same shape `fetch_blob`
-/// enforces before splicing a hash into a URL. Enforced here because the
-/// hash comes from an untrusted API response and is used as a filesystem
-/// path component: anything else (`../../x`, an absolute path) would
-/// escape the blobs directory via `Path::join`.
-pub(crate) fn is_valid_blob_hash(hash: &str) -> bool {
-    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
+/// Report a failed apply-lock acquire in get's legacy error shape — the
+/// `{status: "error", error: "<message>"}` envelope every other hard error
+/// here uses, plus the stable `errorCode` (`lock_held` / `lock_io`) the
+/// other lock sites emit — and return the envelope for the caller's
+/// early-return guard. The message/code mapping is
+/// [`crate::commands::lock_cli::lock_failure`]'s, so the waited clause and
+/// the I/O rendering cannot drift from `apply`'s.
+fn report_lock_failure(json: bool, err: &LockError, timeout: Duration) -> serde_json::Value {
+    let (code, message) = lock_failure(err, timeout);
+    let envelope = serde_json::json!({
+        "status": "error",
+        "errorCode": code,
+        "error": message,
+    });
+    if json {
+        print_json(&envelope);
+    } else {
+        eprintln!("Error: {message}");
+    }
+    envelope
 }
 
 /// Decode a base64 string and write it to `blobs_dir/hash`. Returns a
 /// formatted error string referencing `file_path` and `label` on failure.
+///
+/// `blobs_dir` is created here, lazily — only once a blob is actually
+/// about to be persisted — so a run that records nothing (every fetch
+/// failed, every patch skipped, undecodable content) leaves no empty
+/// `.socket/blobs/` behind.
 async fn write_blob_entry(
     blobs_dir: &Path,
     b64: &str,
@@ -277,6 +302,9 @@ async fn write_blob_entry(
     }
     let decoded =
         base64_decode(b64).map_err(|e| format!("Failed to decode {label} for {file_path}: {e}"))?;
+    tokio::fs::create_dir_all(blobs_dir)
+        .await
+        .map_err(|e| format!("Failed to create blobs directory: {e}"))?;
     tokio::fs::write(blobs_dir.join(hash), &decoded)
         .await
         .map_err(|e| format!("Failed to write {label} for {file_path}: {e}"))
@@ -485,11 +513,12 @@ pub struct GetArgs {
     /// `agent` (default; record in `.socket/manifest.json` + blobs and
     /// apply in place), `hosted` (rewrite lockfiles so the patched deps
     /// resolve to Socket's hosted patch server; no manifest, no blobs —
-    /// state lives in the redirect ledger), or `vendored` (record in the
-    /// manifest, then commit patched artifacts under `.socket/vendor/` and
-    /// rewire the lockfile). Hosted/vendored runs produce the same on-disk
-    /// result as `scan --mode hosted|vendored` selecting the same patch.
-    /// No env binding, matching `scan --mode`.
+    /// state lives in the redirect ledger), or `vendored` (commit patched
+    /// artifacts under `.socket/vendor/` and rewire the lockfile; no
+    /// manifest, no blobs — the vendor ledger carries the records).
+    /// Hosted/vendored runs produce the same on-disk result as
+    /// `scan --mode hosted|vendored` selecting the same patch. No env
+    /// binding, matching `scan --mode`.
     #[arg(long = "mode", value_enum)]
     pub mode: Option<super::scan::ScanMode>,
 }
@@ -515,18 +544,22 @@ impl fmt::Display for IdentifierType {
     }
 }
 
-fn detect_identifier_type(identifier: &str) -> Option<IdentifierType> {
-    let uuid_re = Regex::new(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-        .expect("hardcoded UUID regex must compile");
-    let cve_re = Regex::new(r"(?i)^CVE-\d{4}-\d+$").expect("hardcoded CVE regex must compile");
-    let ghsa_re = Regex::new(r"(?i)^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$")
-        .expect("hardcoded GHSA regex must compile");
+/// Case-insensitive advisory-id shapes, compiled once. The UUID shape is
+/// [`crate::looks_like_uuid`] (the same 8-4-4-4-12 hex check the argv
+/// rewrite uses), so the two detectors cannot drift.
+static CVE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^CVE-\d{4}-\d+$").expect("hardcoded CVE regex must compile"));
+static GHSA_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$")
+        .expect("hardcoded GHSA regex must compile")
+});
 
-    if uuid_re.is_match(identifier) {
+fn detect_identifier_type(identifier: &str) -> Option<IdentifierType> {
+    if crate::looks_like_uuid(identifier) {
         Some(IdentifierType::Uuid)
-    } else if cve_re.is_match(identifier) {
+    } else if CVE_RE.is_match(identifier) {
         Some(IdentifierType::Cve)
-    } else if ghsa_re.is_match(identifier) {
+    } else if GHSA_RE.is_match(identifier) {
         Some(IdentifierType::Ghsa)
     } else if is_purl(identifier) {
         Some(IdentifierType::Purl)
@@ -723,6 +756,52 @@ pub struct DownloadParams {
     pub persist_blobs: bool,
 }
 
+impl DownloadParams {
+    /// `--silent` is "errors only" and `--json` owns stdout: every
+    /// informational print in the engines is gated on this.
+    fn quiet(&self) -> bool {
+        self.json || self.silent
+    }
+
+    /// The `.socket/` directory the manifest lives in (lock + blobs root).
+    fn socket_dir(&self) -> PathBuf {
+        self.manifest_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
+    }
+
+    fn crawler_options(&self) -> CrawlerOptions {
+        CrawlerOptions {
+            cwd: self.cwd.clone(),
+            global: self.global,
+            global_prefix: self.global_prefix.clone(),
+        }
+    }
+}
+
+/// Run-level context the download engines need but `DownloadParams`
+/// cannot carry (it is built as a full struct literal by scan and by the
+/// integration tests): the run's API client — built once, proxy fallback
+/// included, so the engines never rebuild it from flags and repeat the org
+/// auto-resolve round-trip — and the flags the nested apply must inherit.
+pub struct DownloadRun<'a> {
+    pub api_client: &'a ApiClient,
+    /// `--lock-timeout`: the wait budget for the manifest-write lock here
+    /// and for the nested apply's own acquire.
+    pub lock_timeout: Option<u64>,
+    /// `--verbose`, forwarded to the nested apply.
+    pub verbose: bool,
+}
+
+fn crawler_options_for(common: &GlobalArgs) -> CrawlerOptions {
+    CrawlerOptions {
+        cwd: common.cwd.clone(),
+        global: common.global,
+        global_prefix: common.global_prefix.clone(),
+    }
+}
+
 /// Narrow a selection of patches down to the release variant(s) present
 /// in each locally-installed distribution.
 ///
@@ -744,16 +823,27 @@ pub struct DownloadParams {
 ///
 /// Both fallbacks push a human-readable warning.
 ///
-/// Returns the kept patches plus any warnings to surface to the caller
-/// (also printed to stderr here, in human mode). With `--all-releases`
-/// set this is a verbatim pass-through.
+/// Returns the kept patches, any warnings to surface to the caller (also
+/// printed to stderr here unless `quiet`), and the patch views fetched to
+/// hash-match the KEPT variants (uuid-keyed) — the download loop serves
+/// those from memory instead of fetching every view a second time. Only
+/// successful fetches are cached: a variant whose view errored or 404'd is
+/// re-fetched by the loop so the failure surfaces per patch as before.
+/// With `--all-releases` set this is a verbatim pass-through.
 async fn filter_to_installed_releases(
     selected: &[PatchSearchResult],
-    params: &DownloadParams,
-    api_client: &socket_patch_core::api::client::ApiClient,
-) -> (Vec<PatchSearchResult>, Vec<String>) {
-    if params.all_releases {
-        return (selected.to_vec(), Vec::new());
+    all_releases: bool,
+    crawler_options: &CrawlerOptions,
+    quiet: bool,
+    api_client: &ApiClient,
+) -> (
+    Vec<PatchSearchResult>,
+    Vec<String>,
+    HashMap<String, PatchResponse>,
+) {
+    let mut views: HashMap<String, PatchResponse> = HashMap::new();
+    if all_releases {
+        return (selected.to_vec(), Vec::new(), views);
     }
 
     // Group release-variant ecosystem selections (PyPI / RubyGems / Maven)
@@ -787,7 +877,7 @@ async fn filter_to_installed_releases(
     }
 
     if multi.is_empty() {
-        return (kept, warnings);
+        return (kept, warnings, views);
     }
 
     // Discover the on-disk path for each multi-variant base. The crawler
@@ -801,12 +891,7 @@ async fn filter_to_installed_releases(
         .collect();
     // All collected PURLs are PyPI; no ecosystem filter needed.
     let partitioned = partition_purls(&all_qualified, None);
-    let crawler_options = CrawlerOptions {
-        cwd: params.cwd.clone(),
-        global: params.global,
-        global_prefix: params.global_prefix.clone(),
-    };
-    let paths = find_packages_for_rollback(&partitioned, &crawler_options, true).await;
+    let paths = find_packages_for_rollback(&partitioned, crawler_options, true).await;
 
     for (base, variants) in multi {
         // Any variant's resolved path works — they all map to the same
@@ -824,13 +909,15 @@ async fn filter_to_installed_releases(
         };
 
         // Fetch each variant's file hashes (the view carries them) so we
-        // can hash-match against the installed distribution.
+        // can hash-match against the installed distribution. The view is
+        // kept for the download loop — it is the same GET it would issue.
         let mut candidates: Vec<(String, HashMap<String, PatchFileInfo>)> = Vec::new();
         for s in &variants {
             // org slug is already stored in the client.
             match api_client.fetch_patch(None, &s.uuid).await {
                 Ok(Some(patch)) => {
                     candidates.push((s.purl.clone(), files_with_both_hashes(&patch)));
+                    views.insert(s.uuid.clone(), patch);
                 }
                 // On a fetch error/miss, keep the variant so the main
                 // download loop can record the failure as it would today.
@@ -863,12 +950,17 @@ async fn filter_to_installed_releases(
         }
     }
 
-    if !params.json && !params.silent {
+    if !quiet {
         for w in &warnings {
             eprintln!("  [note] {w}");
         }
     }
-    (kept, warnings)
+    // Narrowed-out variants are never downloaded: drop their views (each
+    // carries every file's base64 content) so only the kept ones ride on.
+    let kept_uuids: std::collections::HashSet<&str> =
+        kept.iter().map(|s| s.uuid.as_str()).collect();
+    views.retain(|uuid, _| kept_uuids.contains(uuid.as_str()));
+    (kept, warnings, views)
 }
 
 /// Does this purl carry an exact version (`pkg:type/name@version`)? An
@@ -994,12 +1086,7 @@ async fn filter_to_installed_purls(
             .collect()
     };
     let partitioned = partition_purls(&bases, None);
-    let crawler_options = CrawlerOptions {
-        cwd: common.cwd.clone(),
-        global: common.global,
-        global_prefix: common.global_prefix.clone(),
-    };
-    let found = find_packages_for_rollback(&partitioned, &crawler_options, true).await;
+    let found = find_packages_for_rollback(&partitioned, &crawler_options_for(common), true).await;
     let mut present: HashSet<String> = found.keys().map(|k| canon(k)).collect();
 
     // Manifest membership counts as presence (read-only probe: a corrupt
@@ -1151,9 +1238,9 @@ fn fold_narrowing_into_result(
 /// The API-client overrides for a download run: the caller's CLI flags with
 /// the override org slug defaulted to `--org` when none was given.
 ///
-/// Shared by the client built here AND by the nested `apply` step, which
-/// constructs its own client and must resolve to the same endpoint/token —
-/// see [`run_nested_apply`].
+/// Shared by the client the plain engine wrappers build AND by the nested
+/// `apply` step, which constructs its own client and must resolve to the
+/// same endpoint/token — see [`nested_apply_args_from_params`].
 fn resolved_api_overrides(
     params: &DownloadParams,
 ) -> socket_patch_core::api::client::ApiClientEnvOverrides {
@@ -1164,230 +1251,387 @@ fn resolved_api_overrides(
     overrides
 }
 
-/// Build the API client for a download run.
-async fn api_client_for(params: &DownloadParams) -> socket_patch_core::api::client::ApiClient {
+/// Build the API client for a download run driven without a run-level
+/// client (the plain `download_*` wrappers other commands call).
+async fn api_client_for(params: &DownloadParams) -> ApiClient {
     get_api_client_with_overrides(resolved_api_overrides(params))
         .await
         .0
 }
 
-/// Download and apply a set of selected patches.
-///
-/// Used by both `get` and `scan` commands. Returns (exit_code, json_result).
-/// Download patches and their blobs WITHOUT touching the manifest, and
-/// return the fetched records keyed by purl — the `scan --vendor
-/// --detached` download phase, where the vendor ledger (not the manifest)
-/// carries the records. Honors the same installed-release narrowing as
-/// [`download_and_apply_patches`]. A purl already vendored DETACHED at the
+/// Which state store the shared fetch loop classifies each selected patch
+/// against — the one non-presentational difference between the vendored
+/// and agent download engines.
+#[derive(Clone, Copy)]
+enum RecordStore<'a> {
+    /// The vendor ledger (`scan` / `get --mode vendored`, the detached
+    /// posture): a detached entry already at the selected uuid is reused
+    /// without a fetch (`skipped`); a fetched patch is `downloaded`, with
+    /// `oldUuid` when the ledger wires the purl at another uuid.
+    Ledger(&'a HashMap<String, VendorEntry>),
+    /// `.socket/manifest.json` (agent mode): the fetched view is classified
+    /// by [`decide_patch_action`] — `added` / `updated` (+ `oldUuid`) /
+    /// `skipped` (the same uuid is already recorded).
+    Manifest(&'a PatchManifest),
+}
+
+/// A fetched patch the shared loop accepted — recordable files, blobs
+/// persisted when asked — handed to the engine wrapper to record.
+struct FetchedPatch {
+    patch: PatchResponse,
+    files: HashMap<String, PatchFileInfo>,
+    action: PatchAction,
+}
+
+/// What the shared fetch loop produced over one selection.
+struct FetchBatch {
+    /// Selection size after installed-release narrowing.
+    found: usize,
+    skipped: usize,
+    failed: usize,
+    /// Fetched, recordable patches in selection order.
+    fetched: Vec<FetchedPatch>,
+    /// Ledger store only: `(purl, record)` reused from a detached entry
+    /// already at the selected uuid (no fetch).
+    reused: Vec<(String, PatchRecord)>,
+    /// Per-patch JSON records in selection order (the contract vocabulary).
+    patches_json: Vec<serde_json::Value>,
+    /// Release-narrowing fallbacks (uninstalled base, no matching variant).
+    warnings: Vec<String>,
+}
+
+impl FetchBatch {
+    /// Record a per-patch failure. `line` is the stderr text — an error, so
+    /// exempt from `--silent`; JSON runs carry the detail in the envelope
+    /// instead — or `None` when the failure already printed its own detail.
+    fn fail(
+        &mut self,
+        json: bool,
+        line: Option<String>,
+        purl: &str,
+        uuid: &str,
+        error: &str,
+        error_code: Option<&str>,
+    ) {
+        if let (false, Some(line)) = (json, line) {
+            eprintln!("  {line}");
+        }
+        let mut record = serde_json::json!({
+            "purl": purl,
+            "uuid": uuid,
+            "action": "failed",
+        });
+        if let Some(code) = error_code {
+            record["errorCode"] = serde_json::json!(code);
+        }
+        record["error"] = serde_json::json!(error);
+        self.patches_json.push(record);
+        self.failed += 1;
+    }
+}
+
+/// The fetch loop both download engines share: installed-release
+/// narrowing, the caller's Bun refusal, the per-store skip decision, the
+/// view fetch (served from `prefetched` when the narrowing or the caller
+/// already holds the view), the no-applicable-files guardrail, optional
+/// blob persistence, and every per-patch failure record. Every pinned
+/// stderr line and JSON action lives here once.
+async fn fetch_selected_patches(
+    selected: &[PatchSearchResult],
+    params: &DownloadParams,
+    api_client: &ApiClient,
+    store: RecordStore<'_>,
+    blobs_dir: Option<&Path>,
+    bun_refusal: Option<&BunVendorRefusal>,
+    mut prefetched: HashMap<String, PatchResponse>,
+) -> FetchBatch {
+    let quiet = params.quiet();
+    // Narrow multi-release selections to the installed distribution unless
+    // --all-releases was passed (a no-op for non-variant ecosystems and
+    // single-variant packages). The views it fetched serve the loop below.
+    let (selected, warnings, views) = filter_to_installed_releases(
+        selected,
+        params.all_releases,
+        &params.crawler_options(),
+        quiet,
+        api_client,
+    )
+    .await;
+    prefetched.extend(views);
+    if matches!(store, RecordStore::Manifest(_)) && !quiet {
+        eprintln!("\nDownloading {} patch(es)...", selected.len());
+    }
+
+    let mut batch = FetchBatch {
+        found: selected.len(),
+        skipped: 0,
+        failed: 0,
+        fetched: Vec::new(),
+        reused: Vec::new(),
+        patches_json: Vec::new(),
+        warnings,
+    };
+
+    for search_result in &selected {
+        let (purl, uuid) = (search_result.purl.as_str(), search_result.uuid.as_str());
+
+        // Idempotency (ledger store): a detached entry already at this uuid
+        // carries its own record — no view fetch needed.
+        if let RecordStore::Ledger(entries) = store {
+            if let Some(record) = lookup_entry(entries, purl)
+                .filter(|e| e.detached && e.uuid == uuid)
+                .and_then(|e| e.record.clone())
+            {
+                if !quiet {
+                    eprintln!("  [skip] {purl} (already vendored)");
+                }
+                batch.patches_json.push(serde_json::json!({
+                    "purl": purl,
+                    "uuid": uuid,
+                    "action": "skipped",
+                }));
+                batch.reused.push((purl.to_string(), record));
+                batch.skipped += 1;
+                continue;
+            }
+        }
+
+        // Code-tagged so a `--silent` operator can grep the stable code.
+        if let Some(refusal) = bun_refusal.filter(|r| r.applies_to(purl)) {
+            batch.fail(
+                params.json,
+                Some(format!(
+                    "[error] {purl} ({}): {}",
+                    refusal.code, refusal.detail
+                )),
+                purl,
+                uuid,
+                &refusal.detail,
+                Some(refusal.code),
+            );
+            continue;
+        }
+
+        // The view: from memory when the narrowing (or the uuid path's own
+        // identifier fetch) already fetched it, else the network. org slug
+        // is already stored in the client.
+        let view = match prefetched.remove(uuid) {
+            Some(patch) => Ok(Some(patch)),
+            None => api_client.fetch_patch(None, uuid).await,
+        };
+        let patch = match view {
+            Ok(Some(patch)) => patch,
+            Ok(None) => {
+                batch.fail(
+                    params.json,
+                    Some(format!("[fail] {purl} (could not fetch details)")),
+                    purl,
+                    uuid,
+                    "could not fetch details",
+                    None,
+                );
+                continue;
+            }
+            Err(e) => {
+                batch.fail(
+                    params.json,
+                    Some(format!("[fail] {purl} ({e})")),
+                    purl,
+                    uuid,
+                    &e.to_string(),
+                    None,
+                );
+                continue;
+            }
+        };
+
+        // Classify against the store BEFORE anything is written. `Skipped`
+        // early-continues; `Updated` is preserved so the per-patch record
+        // can carry `oldUuid`.
+        let action = match store {
+            RecordStore::Manifest(manifest) => {
+                decide_patch_action(manifest, &patch.purl, &patch.uuid)
+            }
+            RecordStore::Ledger(entries) => match lookup_entry(entries, &patch.purl) {
+                Some(entry) if entry.uuid != patch.uuid => PatchAction::Updated {
+                    old_uuid: entry.uuid.clone(),
+                },
+                _ => PatchAction::Added,
+            },
+        };
+        if action == PatchAction::Skipped {
+            if !quiet {
+                eprintln!(
+                    "  [skip] {} (already in manifest)",
+                    normalize_purl(&patch.purl)
+                );
+            }
+            batch.patches_json.push(serde_json::json!({
+                "purl": patch.purl,
+                "uuid": patch.uuid,
+                "action": "skipped",
+            }));
+            batch.skipped += 1;
+            continue;
+        }
+
+        // Record every file the patch touches, added files included
+        // (empty-beforeHash sentinel); see `files_for_manifest`.
+        let files = files_for_manifest(&patch);
+        // GUARDRAIL: a patch that yields NO recordable files cannot be
+        // applied or vendored — recording an empty `files` map and then
+        // reporting it protected would claim protection while writing
+        // nothing. Count it as a failure so the status/exit code degrade.
+        if files.is_empty() {
+            batch.fail(
+                params.json,
+                Some(format!(
+                    "[fail] {} (patch has no applicable files)",
+                    patch.purl
+                )),
+                &patch.purl,
+                &patch.uuid,
+                "patch has no applicable files",
+                None,
+            );
+            continue;
+        }
+        // Blob failures are errors: only JSON mode suppresses the per-file
+        // detail line (the envelope carries the error). Vendor flows pass no
+        // blobs dir — their content stays in memory for the vendor step.
+        if let Some(blobs_dir) = blobs_dir {
+            if write_all_patch_blobs(blobs_dir, &patch, params.json)
+                .await
+                .is_err()
+            {
+                batch.fail(
+                    params.json,
+                    None,
+                    &patch.purl,
+                    &patch.uuid,
+                    "Blob decode or write failed",
+                    None,
+                );
+                continue;
+            }
+        }
+
+        let (label, tag) = match (store, &action) {
+            (RecordStore::Ledger(_), _) => ("downloaded", "fetch"),
+            (RecordStore::Manifest(_), PatchAction::Updated { .. }) => ("updated", "update"),
+            (RecordStore::Manifest(_), _) => ("added", "add"),
+        };
+        let mut record = serde_json::json!({
+            "purl": patch.purl,
+            "uuid": patch.uuid,
+            "action": label,
+        });
+        if let PatchAction::Updated { old_uuid } = &action {
+            if !quiet {
+                // Defensive: a malformed/short UUID in the store must not
+                // panic the loop — `short_uuid` never does.
+                eprintln!(
+                    "  [{tag}] {} (replacing {})",
+                    patch.purl,
+                    short_uuid(old_uuid)
+                );
+            }
+            record["oldUuid"] = serde_json::json!(old_uuid);
+        } else if !quiet {
+            eprintln!("  [{tag}] {}", patch.purl);
+        }
+        // Splice description / severity / vulnerability IDs into the record
+        // so PR-comment bots, dashboards, and CLI consumers can render the
+        // patch without a second round-trip to the API.
+        merge_metadata(&mut record, patch_event_metadata(&patch));
+        batch.patches_json.push(record);
+        batch.fetched.push(FetchedPatch {
+            patch,
+            files,
+            action,
+        });
+    }
+    batch
+}
+
+/// Download patches WITHOUT touching the manifest and return the fetched
+/// records keyed by purl — the download phase of every vendored run
+/// (`scan` / `get --mode vendored`), where the vendor ledger carries the
+/// records (`detached`). Honors the same installed-release narrowing as
+/// [`download_and_apply_patches`]. A purl already vendored detached at the
 /// selected uuid skips the network fetch and reuses the ledger's embedded
-/// record, so idempotent re-runs stay cheap (mirrors what
-/// `decide_patch_action` does for the manifest-tracked flow).
+/// record, so idempotent re-runs stay cheap. Builds its own client from
+/// `params`; callers holding the run's client use
+/// [`download_patch_records_with`].
 pub(crate) async fn download_patch_records(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
 ) -> (i32, serde_json::Value, HashMap<String, PatchRecord>) {
     let api_client = api_client_for(params).await;
+    download_patch_records_with(selected, params, &api_client, HashMap::new()).await
+}
 
-    let socket_dir = params
-        .manifest_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
-    let blobs_dir = socket_dir.join("blobs");
-    if params.persist_blobs {
-        if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
-            let err = format!("Failed to create blobs directory: {}", e);
-            report_error(params.json, &err);
-            return (
-                1,
-                serde_json::json!({"status": "error", "error": err}),
-                HashMap::new(),
-            );
-        }
-    }
-
-    let (selected, narrow_warnings) =
-        filter_to_installed_releases(selected, params, &api_client).await;
-
+/// [`download_patch_records`] over the caller's client. `prefetched` maps
+/// uuid → an already-fetched view: the `get <uuid>` path resolved its
+/// identifier by fetching the view and must not fetch it again (a fresh
+/// client could re-hit the 401 the proxy fallback just recovered from).
+pub(crate) async fn download_patch_records_with(
+    selected: &[PatchSearchResult],
+    params: &DownloadParams,
+    api_client: &ApiClient,
+    prefetched: HashMap<String, PatchResponse>,
+) -> (i32, serde_json::Value, HashMap<String, PatchRecord>) {
     // The ledger load outcome is handed to the preflight AS a result: an
     // unreadable ledger must surface as `vendor_state_unreadable` from the
     // one refusal this phase emits (fail closed, nothing exempt), not be
     // flattened into an empty ledger that then reports a Bun lock remedy.
-    // For the idempotency lookup below it degrades to empty (no detached
-    // entry to reuse — the vendor step reports the corruption itself).
-    let vendor_state = socket_patch_core::vendor::load_state(&params.cwd).await;
-
-    // The same Bun preflight the manifest-tracked download runs (see
-    // `download_and_apply_patches`): a detached run feeds the same vendor
-    // engine, so it must refuse the same projects BEFORE fetching. Without
-    // it the patch view was downloaded for nothing and — for a package
-    // installed under an alias directory, resolvable only through the
-    // unreadable bun.lockb inventory — the vendor step then misreported
-    // `package_not_installed` instead of the real `vendor_bun_*` code.
-    // `persist_blobs` is never set on this (vendor-only) path; the gate
-    // mirrors the manifest-tracked download's posture defensively.
-    let bun_refusal = if params.persist_blobs {
-        None
-    } else {
-        bun_vendor_preflight_with_ledger(
-            &params.cwd,
-            &selected,
-            vendor_state.as_ref().map(|s| &s.entries),
-        )
-        .await
-    };
+    // For the classification below it degrades to empty (no detached entry
+    // to reuse — the vendor step reports the corruption itself).
+    let vendor_state = load_state(&params.cwd).await;
+    // Bun preflight (see `BunVendorRefusal`): this phase feeds the vendor
+    // engine, so it must refuse the same projects BEFORE fetching —
+    // otherwise the view was downloaded for nothing and a package
+    // resolvable only through the unreadable bun.lockb inventory
+    // misreported `package_not_installed` instead of the real
+    // `vendor_bun_*` code. npm-only, so release narrowing (PyPI / RubyGems /
+    // Maven variants) cannot change its verdict.
+    let bun_refusal = bun_vendor_preflight_with_ledger(
+        &params.cwd,
+        selected,
+        vendor_state.as_ref().map(|s| &s.entries),
+    )
+    .await;
     let vendor_state = vendor_state.unwrap_or_default();
 
-    let mut records: HashMap<String, PatchRecord> = HashMap::new();
-    let mut downloaded = 0usize;
-    let mut skipped = 0usize;
-    let mut failed = 0usize;
-    let mut patch_records_json: Vec<serde_json::Value> = Vec::new();
+    let blobs_dir = params.socket_dir().join("blobs");
+    let batch = fetch_selected_patches(
+        selected,
+        params,
+        api_client,
+        RecordStore::Ledger(&vendor_state.entries),
+        params.persist_blobs.then_some(blobs_dir.as_path()),
+        bun_refusal.as_ref(),
+        prefetched,
+    )
+    .await;
 
-    for search_result in &selected {
-        // Idempotency: a detached entry already at this uuid carries its
-        // own record — no view fetch needed.
-        let existing =
-            socket_patch_core::vendor::lookup_entry(&vendor_state.entries, &search_result.purl)
-                .filter(|e| e.detached && e.uuid == search_result.uuid);
-        if let Some(record) = existing.and_then(|e| e.record.clone()) {
-            if !params.json && !params.silent {
-                eprintln!("  [skip] {} (already vendored)", search_result.purl);
-            }
-            patch_records_json.push(serde_json::json!({
-                "purl": search_result.purl,
-                "uuid": search_result.uuid,
-                "action": "skipped",
-            }));
-            records.insert(search_result.purl.clone(), record);
-            skipped += 1;
-            continue;
-        }
-
-        if let Some(refusal) = bun_refusal
-            .as_ref()
-            .filter(|r| r.applies_to(&search_result.purl))
-        {
-            // Errors are exempt from --silent ("errors only"); JSON runs
-            // carry the code + detail in the envelope instead.
-            if !params.json {
-                eprintln!(
-                    "  [error] {} ({}): {}",
-                    search_result.purl, refusal.code, refusal.detail
-                );
-            }
-            failed += 1;
-            patch_records_json.push(serde_json::json!({
-                "purl": search_result.purl,
-                "uuid": search_result.uuid,
-                "action": "failed",
-                "errorCode": refusal.code,
-                "error": refusal.detail,
-            }));
-            continue;
-        }
-
-        // org slug is already stored in the client.
-        match api_client.fetch_patch(None, &search_result.uuid).await {
-            Ok(Some(patch)) => {
-                // Record every file the patch touches, added files
-                // included (empty-beforeHash sentinel); see
-                // `files_for_manifest`.
-                let files = files_for_manifest(&patch);
-                // GUARDRAIL: a patch that yields NO recordable files
-                // cannot be vendored — recording an empty `files` map and
-                // reporting the purl as vendored would claim protection
-                // while writing nothing. Fail loudly instead.
-                if files.is_empty() {
-                    // Errors are exempt from --silent ("errors only");
-                    // JSON runs carry them in the envelope instead.
-                    if !params.json {
-                        eprintln!(
-                            "  [fail] {} (patch has no applicable files)",
-                            search_result.purl
-                        );
-                    }
-                    failed += 1;
-                    patch_records_json.push(serde_json::json!({
-                        "purl": patch.purl,
-                        "uuid": patch.uuid,
-                        "action": "failed",
-                        "error": "patch has no applicable files",
-                    }));
-                    continue;
-                }
-                // Blob failures are errors: only JSON mode suppresses the
-                // per-file detail line (the envelope carries the error).
-                let quiet = params.json;
-                // Vendor flows keep blob content in memory (the vendor
-                // step re-fetches what it needs); persisting blobs here
-                // would litter .socket/blobs for no consumer.
-                if params.persist_blobs
-                    && write_all_patch_blobs(&blobs_dir, &patch, quiet)
-                        .await
-                        .is_err()
-                {
-                    failed += 1;
-                    patch_records_json.push(serde_json::json!({
-                        "purl": patch.purl,
-                        "uuid": patch.uuid,
-                        "action": "failed",
-                        "error": "Blob decode or write failed",
-                    }));
-                    continue;
-                }
-                if !params.json && !params.silent {
-                    eprintln!("  [fetch] {}", patch.purl);
-                }
-                let mut record_json = serde_json::json!({
-                    "purl": patch.purl,
-                    "uuid": patch.uuid,
-                    "action": "downloaded",
-                });
-                merge_metadata(&mut record_json, patch_event_metadata(&patch));
-                patch_records_json.push(record_json);
-                records.insert(patch.purl.clone(), build_patch_record(&patch, files));
-                downloaded += 1;
-            }
-            Ok(None) => {
-                if !params.json {
-                    eprintln!("  [fail] {} (could not fetch details)", search_result.purl);
-                }
-                failed += 1;
-                patch_records_json.push(serde_json::json!({
-                    "purl": search_result.purl,
-                    "uuid": search_result.uuid,
-                    "action": "failed",
-                    "error": "could not fetch details",
-                }));
-            }
-            Err(e) => {
-                if !params.json {
-                    eprintln!("  [fail] {} ({e})", search_result.purl);
-                }
-                failed += 1;
-                patch_records_json.push(serde_json::json!({
-                    "purl": search_result.purl,
-                    "uuid": search_result.uuid,
-                    "action": "failed",
-                    "error": e.to_string(),
-                }));
-            }
-        }
+    let downloaded = batch.fetched.len();
+    let mut records: HashMap<String, PatchRecord> = batch.reused.into_iter().collect();
+    for FetchedPatch { patch, files, .. } in batch.fetched {
+        records.insert(patch.purl.clone(), build_patch_record(&patch, files));
     }
-
     let mut result_json = serde_json::json!({
-        "found": selected.len(),
+        "found": batch.found,
         "downloaded": downloaded,
-        "skipped": skipped,
-        "failed": failed,
+        "skipped": batch.skipped,
+        "failed": batch.failed,
         "detached": true,
-        "patches": patch_records_json,
+        "patches": batch.patches_json,
     });
-    if !narrow_warnings.is_empty() {
-        result_json["warnings"] = serde_json::json!(narrow_warnings);
+    if !batch.warnings.is_empty() {
+        result_json["warnings"] = serde_json::json!(batch.warnings);
     }
-    (i32::from(failed > 0), result_json, records)
+    (i32::from(batch.failed > 0), result_json, records)
 }
 
 /// Emit a warning (stderr `[note]` + `warnings[]`) for every added/updated
@@ -1404,7 +1648,7 @@ async fn warn_on_vendored_uuid_drift(
     downloaded_patches: &[serde_json::Value],
     warnings: &mut Vec<String>,
 ) {
-    let Ok(vendor_state) = socket_patch_core::vendor::load_state(cwd).await else {
+    let Ok(vendor_state) = load_state(cwd).await else {
         return;
     };
     if vendor_state.entries.is_empty() {
@@ -1417,7 +1661,7 @@ async fn warn_on_vendored_uuid_drift(
         if !matches!(rec["action"].as_str(), Some("added" | "updated")) {
             continue;
         }
-        let entry = socket_patch_core::vendor::lookup_entry(&vendor_state.entries, purl);
+        let entry = lookup_entry(&vendor_state.entries, purl);
         if let Some(entry) = entry.filter(|e| e.uuid != uuid) {
             let w = format!(
                 "{purl} is vendored at patch {} but the manifest now records {uuid}; \
@@ -1432,63 +1676,70 @@ async fn warn_on_vendored_uuid_drift(
     }
 }
 
-/// Run the nested `apply` step over the manifest under `cwd`. Returns
-/// whether apply exited 0. Callers print their own "Applying patches..."
-/// line (they differ on stdout vs stderr). `get` drives apply internally:
-/// the read-only cargo-redirect verifier stays off and embedded VEX is
-/// opt-in on the top-level command only, never on this internal
-/// invocation.
-///
-/// `api` carries the caller's API-client flags and is NOT optional: apply
-/// builds its own clients from the `GlobalArgs` handed to it (its telemetry
-/// client, and `fetch_stage`'s artifact fetcher), and those only ever see
-/// this struct. Leaving the fields at their `GlobalArgs::default()` `None`
-/// dropped `--api-url` / `--api-token` / `--org` / `--proxy-url` on the
-/// floor, so a token supplied purely as a CLI flag fell through to env →
-/// socket-cli config → the token-less public proxy. That breaks the flow
-/// for real: a patch view that omits `blobContent` for a file (`Option` on
-/// the wire, which is why `--download-mode diff` exists) leaves `get` with
-/// no blob to write, and the nested apply must download it — with the wrong
-/// client, against the wrong host.
-#[allow(clippy::too_many_arguments)]
-async fn run_nested_apply(
-    cwd: &Path,
-    manifest_path: &Path,
-    global: bool,
-    global_prefix: Option<PathBuf>,
-    quiet: bool,
-    download_mode: String,
-    strict: bool,
-    api: socket_patch_core::api::client::ApiClientEnvOverrides,
-    ecosystems: Option<Vec<String>>,
-) -> bool {
-    // Apply re-resolves a relative manifest path against ITS `--cwd`
-    // (`resolved_manifest_path`), but ours is already cwd-resolved —
-    // passing it through relative double-joins the cwd (`proj/proj/...`),
-    // and apply then no-ops on the missing manifest while reporting
-    // success. Absolutize so it passes through verbatim.
+/// The `GlobalArgs` a nested apply runs with: the caller's flags verbatim
+/// (`--lock-timeout`, `--verbose`, `--strict`, the API flags, `--ecosystems`
+/// … all flow through — apply builds its own clients from these, so a token
+/// supplied purely as a flag must reach it), with the fields `get` owns
+/// overridden: the already-resolved manifest path (apply re-resolves a
+/// relative path against ITS `--cwd`, which double-joins ours — absolutize
+/// so it passes through verbatim), `silent` = quiet and `json: false` (the
+/// nested apply must never print a second JSON document), and `dry_run:
+/// false` — agent-mode `get` ignores `--dry-run` by contract, and the
+/// manifest + blobs it just wrote for real must be applied for real too.
+fn nested_apply_args(common: &GlobalArgs, manifest_path: &Path, quiet: bool) -> GlobalArgs {
     let manifest_path =
         std::path::absolute(manifest_path).unwrap_or_else(|_| manifest_path.to_path_buf());
+    GlobalArgs {
+        manifest_path: manifest_path.display().to_string(),
+        silent: quiet,
+        json: false,
+        dry_run: false,
+        ..common.clone()
+    }
+}
+
+/// The caller flags a `DownloadParams` + [`DownloadRun`] pair reconstructs
+/// for the nested apply (the engine never sees a `GlobalArgs`). The API
+/// fields come from [`resolved_api_overrides`] so the nested apply resolves
+/// to the same endpoint/token as the download.
+fn nested_apply_args_from_params(
+    params: &DownloadParams,
+    run: &DownloadRun<'_>,
+    manifest_path: &Path,
+) -> GlobalArgs {
+    let api = resolved_api_overrides(params);
+    let common = GlobalArgs {
+        cwd: params.cwd.clone(),
+        global: params.global,
+        global_prefix: params.global_prefix.clone(),
+        download_mode: params.download_mode.clone(),
+        strict: params.strict,
+        api_url: api.api_url,
+        api_token: api.api_token,
+        org: api.org_slug,
+        proxy_url: api.proxy_url,
+        // Scope the nested apply like the caller was scoped: leaving this
+        // at the default `None` made `scan --ecosystems gem --sync` apply
+        // the WHOLE manifest, mutating other ecosystems' packages the user
+        // filtered out.
+        ecosystems: params.ecosystems.clone(),
+        lock_timeout: run.lock_timeout,
+        verbose: run.verbose,
+        ..GlobalArgs::default()
+    };
+    nested_apply_args(&common, manifest_path, params.quiet())
+}
+
+/// Run the nested `apply` step with `common` (see [`nested_apply_args`]).
+/// Returns whether apply exited 0. Callers print their own "Applying
+/// patches..." line (they differ on stdout vs stderr). The read-only
+/// cargo-redirect verifier stays off and embedded VEX is opt-in on the
+/// top-level command only, never on this internal invocation. The caller
+/// must have released its own apply lock first: apply acquires its own,
+/// and a same-process re-acquire contends.
+async fn run_nested_apply(common: GlobalArgs, quiet: bool) -> bool {
     let apply_args = super::apply::ApplyArgs {
-        common: crate::args::GlobalArgs {
-            manifest_path: manifest_path.display().to_string(),
-            cwd: cwd.to_path_buf(),
-            global,
-            global_prefix,
-            silent: quiet,
-            download_mode,
-            strict,
-            api_url: api.api_url,
-            api_token: api.api_token,
-            org: api.org_slug,
-            proxy_url: api.proxy_url,
-            // Scope the nested apply like the caller was scoped: leaving
-            // this at the default `None` made `scan --ecosystems gem --sync`
-            // apply the WHOLE manifest, mutating other ecosystems' packages
-            // the user filtered out.
-            ecosystems,
-            ..crate::args::GlobalArgs::default()
-        },
+        common,
         force: false,
         check: false,
         vex: Default::default(),
@@ -1500,38 +1751,55 @@ async fn run_nested_apply(
     code == 0
 }
 
+/// Download the selected patches into `.socket/` (manifest records +
+/// blobs) and, unless `save_only`, apply them in place — the agent-mode
+/// engine behind `get` and `scan --apply/--sync`. Returns `(exit_code,
+/// json)`. Builds its own client from `params` and takes the manifest lock
+/// non-blocking; callers holding the run's client (and `--lock-timeout`)
+/// use [`download_and_apply_patches_with`].
 pub async fn download_and_apply_patches(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
 ) -> (i32, serde_json::Value) {
     let api_client = api_client_for(params).await;
+    let run = DownloadRun {
+        api_client: &api_client,
+        lock_timeout: None,
+        verbose: false,
+    };
+    download_and_apply_patches_with(selected, params, &run).await
+}
 
+/// [`download_and_apply_patches`] over the caller's run-level context.
+pub async fn download_and_apply_patches_with(
+    selected: &[PatchSearchResult],
+    params: &DownloadParams,
+    run: &DownloadRun<'_>,
+) -> (i32, serde_json::Value) {
+    let quiet = params.quiet();
     let manifest_path = params.manifest_path.clone();
-    let socket_dir = manifest_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
-    let blobs_dir = socket_dir.join("blobs");
+    let socket_dir = params.socket_dir();
+    let lock_timeout = Duration::from_secs(run.lock_timeout.unwrap_or(0));
 
-    if let Err(e) = tokio::fs::create_dir_all(&socket_dir).await {
-        let err = format!("Failed to create .socket directory: {}", e);
-        report_error(params.json, &err);
-        return (1, serde_json::json!({"status": "error", "error": err}));
-    }
-    if params.persist_blobs {
-        if let Err(e) = tokio::fs::create_dir_all(&blobs_dir).await {
-            let err = format!("Failed to create blobs directory: {}", e);
-            report_error(params.json, &err);
-            return (1, serde_json::json!({"status": "error", "error": err}));
-        }
-    }
+    // The manifest read-modify-write — and the blob writes it records —
+    // runs under the apply lock: `remove`/`rollback` RMW the same file under
+    // it, and an unlocked writer here lost their update or had its own
+    // record clobbered. `acquire` creates `.socket/` itself; the guard's
+    // drop removes `apply.lock` and prunes an otherwise-empty `.socket/`, so
+    // a run that records nothing leaves no residue. Released BEFORE the
+    // nested apply, which takes its own lock (a same-process re-acquire
+    // would contend).
+    let guard = match apply_lock::acquire(&socket_dir, lock_timeout) {
+        Ok(guard) => guard,
+        Err(e) => return (1, report_lock_failure(params.json, &e, lock_timeout)),
+    };
 
     let mut manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,
         Ok(None) => PatchManifest::new(),
         // Fail closed on a manifest that exists but can't be read/parsed:
-        // treating it as empty would let the unconditional write below
-        // replace the file and destroy every tracked patch record.
+        // treating it as empty would let the write below replace the file
+        // and destroy every tracked patch record.
         Err(e) => {
             let err = format!("Failed to read manifest: {e}");
             report_error(params.json, &err);
@@ -1539,218 +1807,66 @@ pub async fn download_and_apply_patches(
         }
     };
 
-    // Narrow multi-release selections to the installed distribution
-    // unless --all-releases was passed. `filter_to_installed_releases`
-    // is a no-op for non-variant ecosystems and single-variant packages.
-    let (selected, mut narrow_warnings) =
-        filter_to_installed_releases(selected, params, &api_client).await;
-
-    if !params.json && !params.silent {
-        eprintln!("\nDownloading {} patch(es)...", selected.len());
-    }
-
-    // `patches_added` and `patches_updated` are DISJOINT — one patch lands in
-    // exactly one of them, matching the per-patch `action` vocabulary
-    // (CLI_CONTRACT.md: `added` | `updated` | ...) and the single-UUID flow's
-    // summary in `save_and_apply_patch`. `patches_downloaded` is their sum:
-    // the JSON `downloaded` / `applied` counts cover both (a replacement was
-    // fetched and applied just like a new record), and it gates the apply
-    // step. Counting an update in `patches_added` too made the human summary
-    // print `Added: 1` AND `Updated: 1` for the one entry it had swapped.
-    let mut patches_added = 0;
-    let mut patches_skipped = 0;
-    let mut patches_failed = 0;
-    let mut patches_updated = 0;
-    let mut patches_downloaded = 0;
-    let mut downloaded_patches: Vec<serde_json::Value> = Vec::new();
-
-    // Vendored downloads must not claim a patch in the manifest when Bun
-    // cannot consume its artifact (see `BunVendorRefusal`). Agent/save-only
-    // flows (`persist_blobs`) retain their record-only intent: the preflight
-    // is scoped to the `save_only && !persist_blobs` posture the vendored
-    // flows use, never the agent download.
+    // Bun preflight for the one non-agent caller left: scan's manifest-mode
+    // vendored download (`save_only && !persist_blobs`), which feeds the
+    // vendor engine and must refuse the same projects before fetching.
+    // Agent/save-only flows keep their record-only intent (no preflight).
+    // Retire together with that caller once scan's vendored path is
+    // detached-only.
     let bun_refusal = if params.save_only && !params.persist_blobs {
-        bun_vendor_preflight(&params.cwd, &selected).await
+        bun_vendor_preflight(&params.cwd, selected).await
     } else {
         None
     };
-    for search_result in &selected {
-        if let Some(refusal) = bun_refusal
-            .as_ref()
-            .filter(|r| r.applies_to(&search_result.purl))
-        {
-            patches_failed += 1;
-            downloaded_patches.push(serde_json::json!({
-                "purl": search_result.purl,
-                "uuid": search_result.uuid,
-                "action": "failed",
-                "errorCode": refusal.code,
-                "error": refusal.detail,
-            }));
-            // Errors are exempt from --silent ("errors only", like the
-            // `[fail]` lines below); JSON runs carry the code + detail in
-            // the envelope instead. Code-tagged so a `--silent` operator
-            // can grep the stable code, not just the prose.
-            if !params.json {
-                eprintln!(
-                    "  [error] {} ({}): {}",
-                    search_result.purl, refusal.code, refusal.detail
-                );
-            }
-            continue;
+
+    let blobs_dir = socket_dir.join("blobs");
+    let batch = fetch_selected_patches(
+        selected,
+        params,
+        run.api_client,
+        RecordStore::Manifest(&manifest),
+        params.persist_blobs.then_some(blobs_dir.as_path()),
+        bun_refusal.as_ref(),
+        HashMap::new(),
+    )
+    .await;
+
+    // `added` and `updated` are DISJOINT — one patch lands in exactly one,
+    // matching the per-patch `action` vocabulary (CLI_CONTRACT.md) and the
+    // single-uuid flow's summary in `save_and_apply_patch`; `downloaded` is
+    // their sum (a replacement was fetched and applied just like a new
+    // record) and gates the apply step.
+    let downloaded = batch.fetched.len();
+    let mut updated = 0usize;
+    for FetchedPatch {
+        patch,
+        files,
+        action,
+    } in batch.fetched
+    {
+        if matches!(action, PatchAction::Updated { .. }) {
+            updated += 1;
         }
-        // org slug is already stored in the client.
-        match api_client.fetch_patch(None, &search_result.uuid).await {
-            Ok(Some(patch)) => {
-                // Classify against the manifest state BEFORE we touch it.
-                // `Skipped` early-returns; `Updated` is preserved so the
-                // per-patch JSON record below can include `oldUuid`.
-                let action = decide_patch_action(&manifest, &patch.purl, &patch.uuid);
-                if let PatchAction::Skipped = action {
-                    if !params.json && !params.silent {
-                        eprintln!(
-                            "  [skip] {} (already in manifest)",
-                            normalize_purl(&patch.purl)
-                        );
-                    }
-                    downloaded_patches.push(serde_json::json!({
-                        "purl": patch.purl,
-                        "uuid": patch.uuid,
-                        "action": "skipped",
-                    }));
-                    patches_skipped += 1;
-                    continue;
-                }
-
-                // Build the manifest `files` map. Retains patch-added new
-                // files (empty-beforeHash sentinel) so scan/apply/vendor
-                // record and write them; see `files_for_manifest`.
-                let files = files_for_manifest(&patch);
-
-                // GUARDRAIL: a patch that yields NO recordable files
-                // cannot be applied — recording an empty `files` map and
-                // then reporting `applied` would tell the user we protected
-                // them while writing nothing. Count it as a failure so the
-                // status/exit code degrade and it is never auto-applied.
-                if files.is_empty() {
-                    // Errors are exempt from --silent ("errors only");
-                    // JSON runs carry them in the envelope instead.
-                    if !params.json {
-                        eprintln!("  [fail] {} (patch has no applicable files)", patch.purl);
-                    }
-                    downloaded_patches.push(serde_json::json!({
-                        "purl": patch.purl,
-                        "uuid": patch.uuid,
-                        "action": "failed",
-                        "error": "patch has no applicable files",
-                    }));
-                    patches_failed += 1;
-                    continue;
-                }
-
-                // Blob failures are errors: only JSON mode suppresses the
-                // per-file detail line (the envelope carries the error).
-                let quiet = params.json;
-                // Vendor flows keep blob content in memory (the vendor
-                // step re-fetches what it needs); persisting blobs here
-                // would litter .socket/blobs for no consumer.
-                if params.persist_blobs
-                    && write_all_patch_blobs(&blobs_dir, &patch, quiet)
-                        .await
-                        .is_err()
-                {
-                    patches_failed += 1;
-                    downloaded_patches.push(serde_json::json!({
-                        "purl": patch.purl,
-                        "uuid": patch.uuid,
-                        "action": "failed",
-                        "error": "Blob decode or write failed",
-                    }));
-                    continue;
-                }
-
-                manifest
-                    .patches
-                    .insert(patch.purl.clone(), build_patch_record(&patch, files));
-
-                let mut action_record = match &action {
-                    PatchAction::Updated { old_uuid } => {
-                        patches_updated += 1;
-                        if !params.json && !params.silent {
-                            // Defensive: a malformed/short UUID in the manifest
-                            // must not panic the download loop. `&uuid[..8]`
-                            // would; `short_uuid` falls back to the whole string.
-                            eprintln!(
-                                "  [update] {} (replacing {})",
-                                patch.purl,
-                                short_uuid(old_uuid)
-                            );
-                        }
-                        serde_json::json!({
-                            "purl": patch.purl,
-                            "uuid": patch.uuid,
-                            "action": "updated",
-                            "oldUuid": old_uuid,
-                        })
-                    }
-                    _ => {
-                        patches_added += 1;
-                        if !params.json && !params.silent {
-                            eprintln!("  [add] {}", patch.purl);
-                        }
-                        serde_json::json!({
-                            "purl": patch.purl,
-                            "uuid": patch.uuid,
-                            "action": "added",
-                        })
-                    }
-                };
-                // Splice description / severity / vulnerability IDs into
-                // the per-patch record so PR-comment bots, dashboards, and
-                // CLI consumers can render the patch without a second
-                // round-trip to the API.
-                merge_metadata(&mut action_record, patch_event_metadata(&patch));
-                downloaded_patches.push(action_record);
-                patches_downloaded += 1;
+        manifest
+            .patches
+            .insert(patch.purl.clone(), build_patch_record(&patch, files));
+    }
+    let added = downloaded - updated;
+    // Write only when a record changed: an all-skipped or all-failed run
+    // leaves the manifest bytes (and a fresh project's tree) untouched.
+    if downloaded > 0 {
+        if let Err(e) = write_manifest(&manifest_path, &manifest).await {
+            let msg = format!("Error writing manifest: {e}");
+            let err_json = serde_json::json!({ "status": "error", "error": &msg });
+            if params.json {
+                print_json(&err_json);
+            } else {
+                eprintln!("{msg}");
             }
-            Ok(None) => {
-                if !params.json {
-                    eprintln!("  [fail] {} (could not fetch details)", search_result.purl);
-                }
-                downloaded_patches.push(serde_json::json!({
-                    "purl": search_result.purl,
-                    "uuid": search_result.uuid,
-                    "action": "failed",
-                    "error": "could not fetch details",
-                }));
-                patches_failed += 1;
-            }
-            Err(e) => {
-                if !params.json {
-                    eprintln!("  [fail] {} ({e})", search_result.purl);
-                }
-                downloaded_patches.push(serde_json::json!({
-                    "purl": search_result.purl,
-                    "uuid": search_result.uuid,
-                    "action": "failed",
-                    "error": e.to_string(),
-                }));
-                patches_failed += 1;
-            }
+            return (1, err_json);
         }
     }
-
-    // Write manifest
-    if let Err(e) = write_manifest(&manifest_path, &manifest).await {
-        let msg = format!("Error writing manifest: {e}");
-        let err_json = serde_json::json!({ "status": "error", "error": &msg });
-        if params.json {
-            print_json(&err_json);
-        } else {
-            eprintln!("{msg}");
-        }
-        return (1, err_json);
-    }
+    drop(guard);
 
     // Vendored-uuid drift: an explicit `get` is allowed to move the
     // manifest past the patch uuid the vendor ledger still wires (the user
@@ -1759,44 +1875,32 @@ pub async fn download_and_apply_patches(
     // uuid — tell the operator now instead of letting VEX surprise them
     // later. (`scan` never hits this: it filters vendored purls before
     // download.) The nested apply below skips the vendored purl either way.
-    warn_on_vendored_uuid_drift(
-        &params.cwd,
-        params.json || params.silent,
-        &downloaded_patches,
-        &mut narrow_warnings,
-    )
-    .await;
+    let mut warnings = batch.warnings;
+    warn_on_vendored_uuid_drift(&params.cwd, quiet, &batch.patches_json, &mut warnings).await;
 
-    if !params.json && !params.silent {
+    if !quiet {
         eprintln!("\nPatches saved to {}", manifest_path.display());
-        eprintln!("  Added: {patches_added}");
-        if patches_skipped > 0 {
-            eprintln!("  Skipped: {patches_skipped}");
+        eprintln!("  Added: {added}");
+        if batch.skipped > 0 {
+            eprintln!("  Skipped: {}", batch.skipped);
         }
-        if patches_failed > 0 {
-            eprintln!("  Failed: {patches_failed}");
+        if batch.failed > 0 {
+            eprintln!("  Failed: {}", batch.failed);
         }
-        if patches_updated > 0 {
-            eprintln!("  Updated: {patches_updated}");
+        if updated > 0 {
+            eprintln!("  Updated: {updated}");
         }
     }
 
     // Auto-apply unless --save-only
     let mut apply_succeeded = false;
-    if !params.save_only && patches_downloaded > 0 {
-        if !params.json && !params.silent {
+    if !params.save_only && downloaded > 0 {
+        if !quiet {
             eprintln!("\nApplying patches...");
         }
         apply_succeeded = run_nested_apply(
-            &params.cwd,
-            &manifest_path,
-            params.global,
-            params.global_prefix.clone(),
-            params.json || params.silent,
-            params.download_mode.clone(),
-            params.strict,
-            resolved_api_overrides(params),
-            params.ecosystems.clone(),
+            nested_apply_args_from_params(params, run, &manifest_path),
+            quiet,
         )
         .await;
     }
@@ -1807,23 +1911,23 @@ pub async fn download_and_apply_patches(
     // alongside a non-zero exit code misleads JSON consumers (the scan
     // wrapper recomputes status from the exit code for exactly this
     // reason, but `get` surfaces this envelope directly).
-    let apply_failed = !apply_succeeded && patches_downloaded > 0 && !params.save_only;
-    let (status, exit_code) = run_outcome(patches_failed > 0, apply_failed);
+    let apply_failed = !apply_succeeded && downloaded > 0 && !params.save_only;
+    let (status, exit_code) = run_outcome(batch.failed > 0, apply_failed);
     let mut result_json = serde_json::json!({
         "status": status,
-        "found": selected.len(),
-        "downloaded": patches_downloaded,
-        "skipped": patches_skipped,
-        "failed": patches_failed,
-        "applied": if apply_succeeded { patches_downloaded } else { 0 },
-        "updated": patches_updated,
-        "patches": downloaded_patches,
+        "found": batch.found,
+        "downloaded": downloaded,
+        "skipped": batch.skipped,
+        "failed": batch.failed,
+        "applied": if apply_succeeded { downloaded } else { 0 },
+        "updated": updated,
+        "patches": batch.patches_json,
     });
     // Surface release-narrowing fallbacks (uninstalled package / no
     // matching variant) so JSON consumers can see why all variants were
     // kept. Omitted entirely when narrowing was clean.
-    if !narrow_warnings.is_empty() {
-        result_json["warnings"] = serde_json::json!(narrow_warnings);
+    if !warnings.is_empty() {
+        result_json["warnings"] = serde_json::json!(warnings);
     }
 
     (exit_code, result_json)
@@ -1906,9 +2010,6 @@ pub async fn run(args: GetArgs) -> i32 {
     // incidence of stale-token fallbacks.
     let mut fallback_to_proxy = false;
 
-    // org slug is already stored in the client
-    let effective_org_slug: Option<&str> = None;
-
     // Determine identifier type
     let id_type = if args.id {
         IdentifierType::Uuid
@@ -1935,9 +2036,8 @@ pub async fn run(args: GetArgs) -> i32 {
         if !quiet {
             println!("Fetching patch by UUID: {}", args.identifier);
         }
-        let mut fetch_result = api_client
-            .fetch_patch(effective_org_slug, &args.identifier)
-            .await;
+        // org slug is already stored in the client.
+        let mut fetch_result = api_client.fetch_patch(None, &args.identifier).await;
         // 401/403 from the auth endpoint → swap to the public proxy
         // and retry once. Free patches still surface; paid patches
         // come back as the existing "paid_required" branch below.
@@ -1951,9 +2051,7 @@ pub async fn run(args: GetArgs) -> i32 {
                     api_client = build_proxy_fallback_client(&overrides);
                     use_public_proxy = true;
                     fallback_to_proxy = true;
-                    fetch_result = api_client
-                        .fetch_patch(effective_org_slug, &args.identifier)
-                        .await;
+                    fetch_result = api_client.fetch_patch(None, &args.identifier).await;
                 }
             }
         }
@@ -2014,13 +2112,17 @@ pub async fn run(args: GetArgs) -> i32 {
                     super::scan::ScanMode::Agent => save_and_apply_patch(&args, &patch).await,
                     super::scan::ScanMode::Hosted => {
                         let selected = vec![search_result_from_response(&patch)];
-                        run_get_hosted(&args, &api_client, effective_org_slug, &selected, &[], &[])
-                            .await
+                        run_get_hosted(&args, &api_client, &selected, &[], &[]).await
                     }
                     super::scan::ScanMode::Vendored => {
-                        run_get_vendored_uuid(
+                        let selected = vec![search_result_from_response(&patch)];
+                        run_get_vendored(
                             &args,
-                            &patch,
+                            &api_client,
+                            &selected,
+                            Some(&patch),
+                            &[],
+                            &[],
                             telemetry_token.as_deref(),
                             telemetry_org.as_deref(),
                         )
@@ -2064,28 +2166,23 @@ pub async fn run(args: GetArgs) -> i32 {
     let search_response: SearchResponse = match id_type {
         IdentifierType::Cve | IdentifierType::Ghsa | IdentifierType::Purl => {
             if !quiet {
-                let label = match id_type {
-                    IdentifierType::Cve => "CVE",
-                    IdentifierType::Ghsa => "GHSA",
-                    IdentifierType::Purl => "PURL",
-                    _ => unreachable!(),
-                };
-                println!("Searching patches for {label}: {}", args.identifier);
+                println!("Searching patches for {id_type}: {}", args.identifier);
             }
+            // org slug is already stored in the client.
             let result = match id_type {
                 IdentifierType::Cve => {
                     api_client
-                        .search_patches_by_cve(effective_org_slug, &args.identifier)
+                        .search_patches_by_cve(None, &args.identifier)
                         .await
                 }
                 IdentifierType::Ghsa => {
                     api_client
-                        .search_patches_by_ghsa(effective_org_slug, &args.identifier)
+                        .search_patches_by_ghsa(None, &args.identifier)
                         .await
                 }
                 IdentifierType::Purl => {
                     api_client
-                        .search_patches_by_package(effective_org_slug, &args.identifier)
+                        .search_patches_by_package(None, &args.identifier)
                         .await
                 }
                 _ => unreachable!(),
@@ -2109,12 +2206,7 @@ pub async fn run(args: GetArgs) -> i32 {
             if !quiet {
                 println!("Enumerating packages...");
             }
-            let crawler_options = CrawlerOptions {
-                cwd: args.common.cwd.clone(),
-                global: args.common.global,
-                global_prefix: args.common.global_prefix.clone(),
-            };
-            let (all_packages, _) = crawl_all_ecosystems(&crawler_options).await;
+            let (all_packages, _) = crawl_all_ecosystems(&crawler_options_for(&args.common)).await;
 
             if all_packages.is_empty() {
                 if args.common.json {
@@ -2123,13 +2215,9 @@ pub async fn run(args: GetArgs) -> i32 {
                     if args.common.global {
                         println!("No global packages found.");
                     } else {
-                        #[allow(unused_mut)]
-                        let mut install_cmds = String::from("npm/yarn/pnpm/pip");
-                        install_cmds.push_str("/cargo");
-                        install_cmds.push_str("/go");
-                        install_cmds.push_str("/mvn");
-                        install_cmds.push_str("/composer");
-                        println!("No packages found. Run {install_cmds} install first.");
+                        println!(
+                            "No packages found. Run npm/yarn/pnpm/pip/cargo/go/mvn/composer install first."
+                        );
                     }
                 }
                 return 0;
@@ -2157,10 +2245,11 @@ pub async fn run(args: GetArgs) -> i32 {
                 );
             }
 
-            // Search for patches for the best match
+            // Search for patches for the best match (org slug is already
+            // stored in the client).
             let best_match = &matches[0];
             match api_client
-                .search_patches_by_package(effective_org_slug, &best_match.purl)
+                .search_patches_by_package(None, &best_match.purl)
                 .await
             {
                 Ok(r) => r,
@@ -2306,7 +2395,9 @@ pub async fn run(args: GetArgs) -> i32 {
         return 0;
     }
 
-    // Smart patch selection: pick one patch per PURL
+    // Smart patch selection: pick one patch per PURL. `accessible` is
+    // non-empty here and every entry passes the selector's tier filter, so
+    // the selection is never empty (one patch per purl group, or `Err`).
     let selected = match select_patches(
         &accessible,
         search_response.can_access_paid_patches,
@@ -2315,13 +2406,6 @@ pub async fn run(args: GetArgs) -> i32 {
         Ok(s) => s,
         Err(code) => return code,
     };
-
-    if selected.is_empty() {
-        if !quiet {
-            println!("No patches selected.");
-        }
-        return 0;
-    }
 
     // Confirm before acting (default YES), with mode-appropriate wording.
     // Hosted/vendored dry-runs skip the prompt — nothing mutates (scan's
@@ -2354,25 +2438,16 @@ pub async fn run(args: GetArgs) -> i32 {
             // granted and rewritten, not just the installed distribution.
             // Same fallbacks as everywhere else: uninstalled/unmatched
             // bases keep all variants with a warning; --all-releases
-            // passes through.
-            let filter_params = DownloadParams {
-                cwd: args.common.cwd.clone(),
-                manifest_path: args.common.resolved_manifest_path(),
-                org: args.common.org.clone(),
-                save_only: true,
-                global: args.common.global,
-                global_prefix: args.common.global_prefix.clone(),
-                json: args.common.json,
-                silent: args.common.silent,
-                download_mode: args.common.download_mode.clone(),
-                api_overrides: args.common.api_client_overrides(),
-                all_releases: args.all_releases,
-                strict: args.common.strict,
-                ecosystems: args.common.ecosystems.clone(),
-                persist_blobs: false,
-            };
-            let (selected, variant_warnings) =
-                filter_to_installed_releases(&selected, &filter_params, &api_client).await;
+            // passes through. (The views it fetched are not needed here:
+            // hosted never downloads.)
+            let (selected, variant_warnings, _views) = filter_to_installed_releases(
+                &selected,
+                args.all_releases,
+                &crawler_options_for(&args.common),
+                quiet,
+                &api_client,
+            )
+            .await;
             let mut narrow_warnings = narrow_warnings;
             narrow_warnings.extend(
                 variant_warnings
@@ -2382,7 +2457,6 @@ pub async fn run(args: GetArgs) -> i32 {
             return run_get_hosted(
                 &args,
                 &api_client,
-                effective_org_slug,
                 &selected,
                 &narrow_skips,
                 &narrow_warnings,
@@ -2390,9 +2464,11 @@ pub async fn run(args: GetArgs) -> i32 {
             .await;
         }
         super::scan::ScanMode::Vendored => {
-            return run_get_vendored_search(
+            return run_get_vendored(
                 &args,
+                &api_client,
                 &selected,
+                None,
                 &narrow_skips,
                 &narrow_warnings,
                 telemetry_token.as_deref(),
@@ -2403,30 +2479,18 @@ pub async fn run(args: GetArgs) -> i32 {
         super::scan::ScanMode::Agent => {}
     }
 
-    // Download and apply (agent mode)
-    let params = DownloadParams {
-        cwd: args.common.cwd.clone(),
-        manifest_path: args.common.resolved_manifest_path(),
-        org: args.common.org.clone(),
-        save_only: args.save_only,
-        global: args.common.global,
-        global_prefix: args.common.global_prefix.clone(),
-        json: args.common.json,
-        silent: args.common.silent,
-        download_mode: args.common.download_mode.clone(),
-        api_overrides: args.common.api_client_overrides(),
-        all_releases: args.all_releases,
-        strict: args.common.strict,
-        ecosystems: args.common.ecosystems.clone(),
-        persist_blobs: true,
+    // Download and apply (agent mode), with the run's client and flags.
+    let params = get_download_params(&args, args.save_only, /*persist_blobs=*/ true);
+    let run = DownloadRun {
+        api_client: &api_client,
+        lock_timeout: args.common.lock_timeout,
+        verbose: args.common.verbose,
     };
-
-    let (code, mut result_json) = download_and_apply_patches(&selected, &params).await;
-    // A download-phase HARD error (unreadable manifest, unwritable
-    // .socket, failed manifest write) is an `error`-status envelope the
-    // engine has ALREADY printed — printing below would put a second JSON
-    // document on stdout (get's `--json` contract is exactly one per
-    // run; `run_get_vendored_search` has the same guard). Per-patch
+    let (code, mut result_json) = download_and_apply_patches_with(&selected, &params, &run).await;
+    // A download-phase HARD error (lock refused, unreadable manifest,
+    // failed manifest write) is an `error`-status envelope the engine has
+    // ALREADY printed — printing below would put a second JSON document on
+    // stdout (get's `--json` contract is exactly one per run). Per-patch
     // failures are NOT this case: they ride a success-shaped
     // (`partial_failure`) envelope the engine leaves for us to print.
     if result_json["status"] == "error" {
@@ -2495,55 +2559,31 @@ fn display_search_results(patches: &[PatchSearchResult], can_access_paid: bool) 
     }
 }
 
-/// Save an already-fetched patch to the manifest and (unless
-/// `--save-only`) apply it. Takes the `PatchResponse` the caller fetched
-/// rather than re-fetching by UUID: the caller's client may have fallen
-/// back to the public proxy after a 401/403, and a fresh client built
-/// here would hit the same auth failure again, breaking the fallback
-/// end to end.
-/// The manifest-record half of the single-uuid save — blobs dir + blob
-/// writes (when `persist_blobs`), fail-closed manifest read, the
-/// no-applicable-files guardrail, action classification, and the manifest
-/// write — WITHOUT the nested apply, drift warning, or terminal JSON
-/// envelope. Shared by the agent-mode [`save_and_apply_patch`] terminal
-/// (`persist_blobs: true`, `insert_when_skipped: true` — today's exact
-/// behavior, a same-uuid re-get still rewrites the record bytes) and the
-/// `--mode vendored` uuid path (`false`/`false`: the vendor step stages
-/// patch content in memory so nothing lands in `.socket/blobs`, and an
-/// idempotent re-get leaves the manifest bytes untouched, matching the
-/// multi-patch download loop's Skipped `continue`).
+/// The manifest-record half of the agent single-uuid save, under the apply
+/// lock: fail-closed manifest read, the no-applicable-files guardrail,
+/// action classification against the manifest, and — unless the same uuid
+/// is already recorded — the blob writes and the manifest write. Takes the
+/// `PatchResponse` the caller fetched rather than re-fetching by UUID: the
+/// caller's client may have fallen back to the public proxy after a
+/// 401/403, and a fresh client would hit the same auth failure again. A
+/// same-uuid re-get writes nothing (matching the multi-patch engine's
+/// `skipped`); the lock is released on return, before the nested apply
+/// takes its own.
 ///
-/// Errors are reported here exactly as before the extraction and surface
-/// as `Err(exit_code)`.
-async fn save_patch_record(
-    args: &GetArgs,
-    patch: &PatchResponse,
-    persist_blobs: bool,
-    insert_when_skipped: bool,
-) -> Result<PatchAction, i32> {
+/// Errors are reported here and surface as `Err(exit_code)`.
+async fn save_patch_record(args: &GetArgs, patch: &PatchResponse) -> Result<PatchAction, i32> {
     let manifest_path = args.common.resolved_manifest_path();
     let socket_dir = manifest_path
         .parent()
         .unwrap_or(Path::new("."))
         .to_path_buf();
-
-    if persist_blobs {
-        if let Err(e) = tokio::fs::create_dir_all(socket_dir.join("blobs")).await {
-            report_error(
-                args.common.json,
-                format!("Failed to create blobs directory: {e}"),
-            );
-            return Err(1);
-        }
-    } else if let Err(e) = tokio::fs::create_dir_all(&socket_dir).await {
-        // No blobs dir in vendored mode, but the manifest write below (and
-        // the vendor step's apply lock) still need `.socket/` itself.
-        report_error(
-            args.common.json,
-            format!("Failed to create .socket directory: {e}"),
-        );
-        return Err(1);
-    }
+    let lock_timeout = Duration::from_secs(args.common.lock_timeout.unwrap_or(0));
+    // See `download_and_apply_patches_with`: the RMW runs under the lock,
+    // which also creates `.socket/` and prunes it again when nothing lands.
+    let _guard = apply_lock::acquire(&socket_dir, lock_timeout).map_err(|e| {
+        report_lock_failure(args.common.json, &e, lock_timeout);
+        1
+    })?;
 
     let mut manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,
@@ -2577,10 +2617,18 @@ async fn save_patch_record(
         return Err(1);
     }
 
-    if persist_blobs
-        && write_all_patch_blobs(&socket_dir.join("blobs"), patch, args.common.json)
-            .await
-            .is_err()
+    // Classify against the manifest state BEFORE the insert, with the same
+    // vocabulary `download_and_apply_patches` emits (CLI_CONTRACT.md): a
+    // different uuid already recorded at this purl is `updated` (+`oldUuid`),
+    // not `added` — consumers diff manifest replacements on that action.
+    let action = decide_patch_action(&manifest, &patch.purl, &patch.uuid);
+    if action == PatchAction::Skipped {
+        return Ok(action);
+    }
+
+    if write_all_patch_blobs(&socket_dir.join("blobs"), patch, args.common.json)
+        .await
+        .is_err()
     {
         if args.common.json {
             print_json(&serde_json::json!({
@@ -2605,21 +2653,12 @@ async fn save_patch_record(
         return Err(1);
     }
 
-    // Classify against the manifest state BEFORE the insert, with the same
-    // vocabulary `download_and_apply_patches` emits (CLI_CONTRACT.md): a
-    // different uuid already recorded at this purl is `updated` (+`oldUuid`),
-    // not `added` — consumers diff manifest replacements on that action.
-    let action = decide_patch_action(&manifest, &patch.purl, &patch.uuid);
-
-    if insert_when_skipped || action != PatchAction::Skipped {
-        manifest
-            .patches
-            .insert(patch.purl.clone(), build_patch_record(patch, files));
-
-        if let Err(e) = write_manifest(&manifest_path, &manifest).await {
-            report_error(args.common.json, format!("Error writing manifest: {e}"));
-            return Err(1);
-        }
+    manifest
+        .patches
+        .insert(patch.purl.clone(), build_patch_record(patch, files));
+    if let Err(e) = write_manifest(&manifest_path, &manifest).await {
+        report_error(args.common.json, format!("Error writing manifest: {e}"));
+        return Err(1);
     }
     Ok(action)
 }
@@ -2630,7 +2669,7 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
     let quiet = args.common.json || args.common.silent;
     let manifest_path = args.common.resolved_manifest_path();
 
-    let action = match save_patch_record(args, patch, true, true).await {
+    let action = match save_patch_record(args, patch).await {
         Ok(action) => action,
         Err(code) => return code,
     };
@@ -2677,15 +2716,8 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
             println!("\nApplying patches...");
         }
         apply_succeeded = run_nested_apply(
-            &args.common.cwd,
-            &manifest_path,
-            args.common.global,
-            args.common.global_prefix.clone(),
+            nested_apply_args(&args.common, &manifest_path, quiet),
             quiet,
-            args.common.download_mode.clone(),
-            args.common.strict,
-            args.common.api_client_overrides(),
-            args.common.ecosystems.clone(),
         )
         .await;
     }
@@ -2724,11 +2756,7 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
         if !warnings.is_empty() {
             result_json["warnings"] = serde_json::json!(warnings);
         }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result_json)
-                .expect("serializing an in-memory JSON value cannot fail")
-        );
+        print_json(&result_json);
     }
 
     exit_code
@@ -2748,46 +2776,26 @@ fn search_result_from_response(patch: &PatchResponse) -> PatchSearchResult {
     }
 }
 
-/// Transient-frame boxed constructor for the vendored-mode download phase —
-/// `download_and_apply_patches`' future embeds the in-process apply engine,
-/// and `run_get_vendored_search`'s poll frame must not carry it inline
-/// (Windows 1 MiB main-thread stack; scan's vendor flow boxes the same call).
-fn boxed_download_and_apply<'a>(
-    selected: &'a [PatchSearchResult],
-    params: &'a DownloadParams,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = (i32, serde_json::Value)> + 'a>> {
-    Box::pin(download_and_apply_patches(selected, params))
-}
-
-/// Print the whole-manifest blast-radius note for `--mode vendored`: the
-/// vendor step is scan's — it reconciles and (re)vendors EVERY manifest
-/// record, not just the one(s) this get selected.
-async fn note_vendored_whole_manifest_scope(
-    manifest_path: &Path,
-    selected_purls: &[&str],
-    quiet: bool,
-) {
-    if quiet {
-        return;
-    }
-    let Ok(Some(manifest)) = read_manifest(manifest_path).await else {
-        return;
-    };
-    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-    let selected_canon: std::collections::HashSet<String> =
-        selected_purls.iter().map(|p| canon(p)).collect();
-    let others = manifest
-        .patches
-        .keys()
-        .filter(|k| !selected_canon.contains(&canon(k)))
-        .count();
-    if others > 0 {
-        eprintln!(
-            "  [note] --mode vendored runs the vendor engine over the whole manifest: \
-             {others} existing record(s) will also be verified/re-vendored, and records \
-             whose packages left the manifest may have their vendored state reverted \
-             (same behavior as `scan --mode vendored`)."
-        );
+/// The `DownloadParams` a `get` run hands its download engine. Only the
+/// posture differs per mode: agent persists blobs and applies unless
+/// `--save-only`; vendored holds content in memory (`save_only`, no blobs)
+/// because the vendor step is the persistence.
+fn get_download_params(args: &GetArgs, save_only: bool, persist_blobs: bool) -> DownloadParams {
+    DownloadParams {
+        cwd: args.common.cwd.clone(),
+        manifest_path: args.common.resolved_manifest_path(),
+        org: args.common.org.clone(),
+        save_only,
+        global: args.common.global,
+        global_prefix: args.common.global_prefix.clone(),
+        json: args.common.json,
+        silent: args.common.silent,
+        download_mode: args.common.download_mode.clone(),
+        api_overrides: args.common.api_client_overrides(),
+        all_releases: args.all_releases,
+        strict: args.common.strict,
+        ecosystems: args.common.ecosystems.clone(),
+        persist_blobs,
     }
 }
 
@@ -2799,8 +2807,7 @@ async fn note_vendored_whole_manifest_scope(
 /// `redirect` block into the get base envelope passed as `scan_result`.
 async fn run_get_hosted(
     args: &GetArgs,
-    api_client: &socket_patch_core::api::client::ApiClient,
-    effective_org_slug: Option<&str>,
+    api_client: &ApiClient,
     selected: &[PatchSearchResult],
     narrow_skips: &[serde_json::Value],
     narrow_warnings: &[(String, String)],
@@ -2825,31 +2832,45 @@ async fn run_get_hosted(
     // default-off VexEmbedArgs — deliberately NOT env-bound here, so an
     // ambient SOCKET_VEX only affects commands that declare the flag.
     let vex = crate::commands::vex::VexEmbedArgs::default();
+    // org slug is already stored in the client.
     super::scan::boxed_run_redirect_selected(
         &args.common,
         &vex,
         /*prune_requested=*/ false,
         api_client,
-        effective_org_slug,
+        None,
         &pairs,
         scan_result,
     )
     .await
 }
 
-/// `get … --mode vendored` (search path): scan's vendored posture end to
-/// end — download phase writing ONLY the manifest (blobs in memory), then
-/// scan's whole-manifest vendor step, telemetry included — so the result
-/// matches `scan --mode vendored` selecting the same patches.
-async fn run_get_vendored_search(
+/// `get … --mode vendored`, both identifier paths: scan's vendored posture
+/// end to end — the detached download phase ([`download_patch_records_with`]:
+/// records fetched into memory, no manifest, no blobs) feeding scan's
+/// detached vendor step (apply lock, in-memory staging, the vendor engine;
+/// the ledger carries every record `detached: true`), telemetry included —
+/// so the result matches `scan --mode vendored` selecting the same patches.
+/// `.socket/manifest.json` is never read or written here.
+///
+/// `prefetched` is the `get <uuid>` path's already-fetched view: it resolved
+/// the identifier by fetching it (with the possibly-proxy-fallback client)
+/// and the engine serves the record from it instead of fetching again. That
+/// path also refuses a Bun project BEFORE the engine, with the contract's
+/// exact pre-record envelope, so a refused run writes nothing at all; the
+/// search path lets the engine record the refusal per patch and still runs
+/// the vendor step (scan parity).
+#[allow(clippy::too_many_arguments)]
+async fn run_get_vendored(
     args: &GetArgs,
+    api_client: &ApiClient,
     selected: &[PatchSearchResult],
+    prefetched: Option<&PatchResponse>,
     narrow_skips: &[serde_json::Value],
     narrow_warnings: &[(String, String)],
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
 ) -> i32 {
-    let quiet = args.common.json || args.common.silent;
     let manifest_path = args.common.resolved_manifest_path();
     let socket_dir = manifest_path
         .parent()
@@ -2879,52 +2900,94 @@ async fn run_get_vendored_search(
         return 0;
     }
 
-    let selected_purls: Vec<&str> = selected.iter().map(|s| s.purl.as_str()).collect();
-    note_vendored_whole_manifest_scope(&manifest_path, &selected_purls, quiet).await;
-
-    // Download phase — scan's vendored posture: manifest-only writes, blobs
-    // held in memory, the nested apply never runs (save_only).
-    let params = DownloadParams {
-        cwd: args.common.cwd.clone(),
-        manifest_path: manifest_path.clone(),
-        org: args.common.org.clone(),
-        save_only: true,
-        global: args.common.global,
-        global_prefix: args.common.global_prefix.clone(),
-        json: args.common.json,
-        silent: args.common.silent,
-        download_mode: args.common.download_mode.clone(),
-        api_overrides: args.common.api_client_overrides(),
-        all_releases: args.all_releases,
-        strict: args.common.strict,
-        ecosystems: args.common.ecosystems.clone(),
-        persist_blobs: false,
-    };
-    let (dl_code, mut result) = boxed_download_and_apply(selected, &params).await;
-    // A download-phase HARD error (unreadable manifest, unwritable
-    // .socket, failed manifest write — an `error`-status envelope the
-    // engine has ALREADY printed) aborts before the vendor step: get's
-    // `--json` contract is exactly one JSON document per run, and the
-    // vendor step would only re-fail on the same broken state and print a
-    // second, different document. Per-patch failures are NOT this case —
-    // they ride a success-shaped envelope and the vendor step still runs
-    // (scan parity: previously-recorded patches still (re)vendor).
-    if result["status"] == "error" {
-        return dl_code;
+    if let Some(patch) = prefetched {
+        // Bun preflight (see `BunVendorRefusal`): refuse BEFORE the engine
+        // and the vendor step, so the tree stays exactly as it was (no
+        // `.socket/` is created on a fresh project). The already-fetched
+        // patch is the only network traffic of a refused run.
+        //
+        // JSON shape (contract: `get <uuid> --mode vendored` pre-record
+        // refusal; the record carries BOTH `errorCode` and `error` like the
+        // search path's failed records, and the envelope carries `skipped`
+        // like this path's success shape):
+        //
+        // {
+        //   "status": "error",
+        //   "found": 1, "downloaded": 0, "skipped": 0, "failed": 1,
+        //   "error": { "code": "<vendor code>", "message": "<detail>" },
+        //   "patches": [{ "purl": "…", "uuid": "…", "action": "failed",
+        //                 "errorCode": "<vendor code>", "error": "<detail>" }]
+        // }
+        //
+        // Human: `Error (<code>): <detail>` on stderr — an error, so it is
+        // exempt from `--silent` like every other `Error (…)` line here.
+        if let Some(refusal) = bun_vendor_preflight(&args.common.cwd, selected)
+            .await
+            .filter(|r| r.applies_to(&patch.purl))
+        {
+            let BunVendorRefusal { code, detail, .. } = refusal;
+            // Same failure telemetry as the vendor-step Err arm below: this
+            // run exits 1 without vendoring anything.
+            socket_patch_core::telemetry::track_patch_vendor_failed(
+                &detail,
+                args.common.dry_run,
+                telemetry_token,
+                telemetry_org,
+            )
+            .await;
+            if args.common.json {
+                print_json(&serde_json::json!({
+                    "status": "error",
+                    "found": 1,
+                    "downloaded": 0,
+                    "skipped": 0,
+                    "failed": 1,
+                    "error": { "code": code, "message": detail },
+                    "patches": [{
+                        "purl": patch.purl,
+                        "uuid": patch.uuid,
+                        "action": "failed",
+                        "errorCode": code,
+                        "error": detail,
+                    }],
+                }));
+            } else {
+                eprintln!("Error ({code}): {detail}");
+            }
+            return 1;
+        }
     }
+
+    // Download phase — records in memory, blobs never persisted, the nested
+    // apply structurally never runs (save_only): the vendor step IS the
+    // persistence. Boxed: the future embeds the narrowing + fetch loop, and
+    // `run`'s poll frame must fit Windows' 1 MiB main-thread stack.
+    let params = get_download_params(
+        args, /*save_only=*/ true, /*persist_blobs=*/ false,
+    );
+    let prefetched_views: HashMap<String, PatchResponse> = prefetched
+        .map(|p| HashMap::from([(p.uuid.clone(), p.clone())]))
+        .unwrap_or_default();
+    let (dl_code, mut result, records) = Box::pin(download_patch_records_with(
+        selected,
+        &params,
+        api_client,
+        prefetched_views,
+    ))
+    .await;
     let mut has_errors = dl_code != 0;
     fold_narrowing_into_result(&mut result, narrow_skips, narrow_warnings);
-    if let Some(obj) = result.as_object_mut() {
-        // save_only: the nested apply structurally never ran, so `applied`
-        // would misleadingly report 0 — drop it (scan's vendored download
-        // sub-object gets the same surgery).
-        obj.remove("applied");
-    }
 
-    // The vendor step (scan's, verbatim): apply lock, whole-manifest
-    // reconcile + staging + engine. A per-patch download failure does not
-    // skip it — previously-recorded patches still (re)vendor, like scan.
-    match super::scan::boxed_scan_vendor_step(&args.common, &manifest_path, &socket_dir, None).await
+    // The vendor step (scan's, verbatim): apply lock, in-memory staging, the
+    // engine over exactly the records fetched above. A per-patch download
+    // failure does not skip it (scan parity).
+    match super::scan::boxed_scan_vendor_step(
+        &args.common,
+        &manifest_path,
+        &socket_dir,
+        Some(&records),
+    )
+    .await
     {
         Ok((vendor_errors, venv)) => {
             has_errors |= vendor_errors;
@@ -2960,9 +3023,9 @@ async fn run_get_vendored_search(
             )
             .await;
             if args.common.json {
-                // A pre-failure reconcile already mutated the vendor ledger
-                // on disk; its envelope (events included) must reach the
-                // JSON consumer even though the run aborts here.
+                // A vendor envelope built before the failure (events
+                // included) must reach the JSON consumer even though the
+                // run aborts here.
                 if let Some(venv) = venv {
                     result["vendor"] =
                         serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
@@ -2978,193 +3041,13 @@ async fn run_get_vendored_search(
     }
 }
 
-/// `get <uuid> --mode vendored`: record the ALREADY-FETCHED patch in the
-/// manifest (no blobs, no nested apply — the vendor step stages content in
-/// memory), then run scan's whole-manifest vendor step. Reuses the fetched
-/// `PatchResponse` so the uuid path's proxy-fallback survives the record
-/// save; the vendor step builds its own client from the flags, exactly as
-/// scan's does.
-async fn run_get_vendored_uuid(
-    args: &GetArgs,
-    patch: &PatchResponse,
-    telemetry_token: Option<&str>,
-    telemetry_org: Option<&str>,
-) -> i32 {
-    let quiet = args.common.json || args.common.silent;
-    let manifest_path = args.common.resolved_manifest_path();
-    let socket_dir = manifest_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
-
-    if args.common.dry_run {
-        let selected = vec![search_result_from_response(patch)];
-        let preview = super::scan::preview_vendor_json(&args.common.cwd, &selected).await;
-        if args.common.json {
-            let mut result = serde_json::json!({
-                "status": "success",
-                "found": 1,
-                "patches": [],
-            });
-            result["vendor"] = preview;
-            print_json(&result);
-        } else if !args.common.silent {
-            println!("[dry-run] Would download and vendor 1 patch.");
-            super::scan::print_dry_run_refusals(&preview);
-        }
-        return 0;
-    }
-
-    // Bun preflight (see `BunVendorRefusal`): refuse BEFORE the manifest
-    // record is saved and before the vendor step, so the tree stays exactly
-    // as it was (no `.socket/` is created on a fresh project). The
-    // already-fetched patch is the only network traffic of a refused run.
-    //
-    // JSON shape (contract: `get <uuid> --mode vendored` pre-record refusal;
-    // the record carries BOTH `errorCode` and `error` like the search path's
-    // failed records, and the envelope carries `skipped` like this path's
-    // success shape):
-    //
-    // {
-    //   "status": "error",
-    //   "found": 1, "downloaded": 0, "skipped": 0, "failed": 1,
-    //   "error": { "code": "<vendor code>", "message": "<detail>" },
-    //   "patches": [{ "purl": "…", "uuid": "…", "action": "failed",
-    //                 "errorCode": "<vendor code>", "error": "<detail>" }]
-    // }
-    //
-    // Human: `Error (<code>): <detail>` on stderr — an error, so it is
-    // exempt from `--silent` like every other `Error (…)` line here.
-    let selected = vec![search_result_from_response(patch)];
-    if let Some(refusal) = bun_vendor_preflight(&args.common.cwd, &selected)
-        .await
-        .filter(|r| r.applies_to(&patch.purl))
-    {
-        let BunVendorRefusal { code, detail, .. } = refusal;
-        // Same failure telemetry as the vendor-step Err arm below: this run
-        // exits 1 without vendoring anything.
-        socket_patch_core::telemetry::track_patch_vendor_failed(
-            &detail,
-            args.common.dry_run,
-            telemetry_token,
-            telemetry_org,
-        )
-        .await;
-        if args.common.json {
-            print_json(&serde_json::json!({
-                "status": "error",
-                "found": 1,
-                "downloaded": 0,
-                "skipped": 0,
-                "failed": 1,
-                "error": { "code": code, "message": detail },
-                "patches": [{
-                    "purl": patch.purl,
-                    "uuid": patch.uuid,
-                    "action": "failed",
-                    "errorCode": code,
-                    "error": detail,
-                }],
-            }));
-        } else {
-            eprintln!("Error ({code}): {detail}");
-        }
-        return 1;
-    }
-
-    note_vendored_whole_manifest_scope(&manifest_path, &[patch.purl.as_str()], quiet).await;
-
-    let action = match save_patch_record(args, patch, false, false).await {
-        Ok(action) => action,
-        Err(code) => return code,
-    };
-    let changed = action != PatchAction::Skipped;
-    let action_label = match &action {
-        PatchAction::Added => "added",
-        PatchAction::Updated { .. } => "updated",
-        PatchAction::Skipped => "skipped",
-    };
-    if !quiet {
-        println!("\nPatch record saved to {}", manifest_path.display());
-        match &action {
-            PatchAction::Added => println!("  Added: 1"),
-            PatchAction::Updated { old_uuid } => {
-                println!("  Updated: 1 (replacing {})", short_uuid(old_uuid));
-            }
-            PatchAction::Skipped => println!("  Skipped: 1 (already exists)"),
-        }
-    }
-
-    let mut result = if args.common.json {
-        let mut patch_record = serde_json::json!({
-            "purl": patch.purl,
-            "uuid": patch.uuid,
-            "action": action_label,
-        });
-        if let PatchAction::Updated { old_uuid } = &action {
-            patch_record["oldUuid"] = serde_json::json!(old_uuid);
-        }
-        if changed {
-            merge_metadata(&mut patch_record, patch_event_metadata(patch));
-        }
-        serde_json::json!({
-            "status": "success",
-            "found": 1,
-            "downloaded": if changed { 1 } else { 0 },
-            "skipped": if changed { 0 } else { 1 },
-            "patches": [patch_record],
-        })
-    } else {
-        serde_json::Value::Null
-    };
-
-    match super::scan::boxed_scan_vendor_step(&args.common, &manifest_path, &socket_dir, None).await
-    {
-        Ok((vendor_errors, venv)) => {
-            crate::commands::vendor::track_outcomes_for_vendor(
-                vendor_errors,
-                &venv,
-                args.common.dry_run,
-                telemetry_token,
-                telemetry_org,
-            )
-            .await;
-            if args.common.json {
-                result["status"] = serde_json::json!(if vendor_errors {
-                    "partial_failure"
-                } else {
-                    "success"
-                });
-                result["vendor"] =
-                    serde_json::to_value(&venv).unwrap_or_else(|_| serde_json::json!({}));
-                print_json(&result);
-            }
-            i32::from(vendor_errors)
-        }
-        Err((code, message, venv)) => {
-            socket_patch_core::telemetry::track_patch_vendor_failed(
-                &message,
-                args.common.dry_run,
-                telemetry_token,
-                telemetry_org,
-            )
-            .await;
-            if args.common.json {
-                if let Some(venv) = venv {
-                    result["vendor"] =
-                        serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
-                }
-                result["status"] = serde_json::json!("error");
-                result["error"] = serde_json::json!({ "code": code, "message": message });
-                print_json(&result);
-            } else {
-                eprintln!("Error ({code}): {message}");
-            }
-            1
-        }
-    }
-}
-
+/// Decode a patch view's `blobContent` (canonical, padded base64 as the API
+/// produces it). Hand-rolled only because `base64` is a dev-dependency of
+/// this crate today — once it is a plain dependency (it already is one of
+/// `socket-patch-core`, pinned workspace-wide), this body should become
+/// `base64::engine::general_purpose::STANDARD.decode(input)` with
+/// `DecodeError::InvalidByte(_, b)` mapped to the
+/// `Invalid base64 character: <b>` message below (pinned by a unit test).
 pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut table = [255u8; 256];
@@ -4903,46 +4786,51 @@ mod tests {
         );
     }
 
-    /// `download_patch_records` with `persist_blobs`: an uncreatable blobs
-    /// dir (`.socket` squatted by a regular file) is a hard `error` envelope
-    /// BEFORE any fetch, with no records handed to the caller.
+    /// `download_patch_records` with `persist_blobs` on a tree whose
+    /// `.socket` path is squatted by a regular file: the blobs dir is created
+    /// lazily, at the first blob actually persisted, so the failure surfaces
+    /// as the per-patch `Blob decode or write failed` after the view fetch —
+    /// no record handed to the caller, the squatting file left untouched.
     #[tokio::test]
     #[serial_test::serial]
-    async fn download_patch_records_blobs_dir_create_failure_errors_before_any_fetch() {
-        use wiremock::MockServer;
+    async fn download_patch_records_persist_blobs_unwritable_blobs_dir_is_failed_and_unrecorded() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
         let server = MockServer::start().await;
+        let uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let purl = "pkg:npm/covgap-blobfail@1.0.0";
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/v0/orgs/test-org/patches/view/{uuid}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": uuid, "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": { "package/index.js": {
+                    "beforeHash": "0".repeat(64), "afterHash": "1".repeat(64),
+                    "blobContent": "cGF0Y2hlZAo=",
+                }},
+                "vulnerabilities": {}, "description": "d", "license": "MIT", "tier": "free",
+            })))
+            .mount(&server)
+            .await;
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join(".socket"), b"not a dir").unwrap();
 
-        let selected = vec![mk_patch(
-            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            "pkg:npm/covgap-blobfail@1.0.0",
-            "free",
-            "2024-01-01",
-        )];
+        let selected = vec![mk_patch(uuid, purl, "free", "2024-01-01")];
         let mut params = detached_params(tmp.path(), server.uri());
         params.persist_blobs = true;
         let (code, json, records) = download_patch_records(&selected, &params).await;
 
         assert_eq!(code, 1, "json={json}");
-        assert_eq!(json["status"], "error", "json={json}");
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("blobs directory"),
-            "the error must name the blobs dir; json={json}"
+        assert_eq!(json["failed"], 1, "json={json}");
+        assert_eq!(
+            json["patches"][0]["error"], "Blob decode or write failed",
+            "json={json}"
         );
-        assert!(records.is_empty());
         assert!(
-            server
-                .received_requests()
-                .await
-                .unwrap_or_default()
-                .is_empty(),
-            "the failure must precede any fetch"
+            records.is_empty(),
+            "a blob failure must not hand back a record"
         );
         assert_eq!(
             std::fs::read(tmp.path().join(".socket")).unwrap(),
@@ -4997,12 +4885,10 @@ mod tests {
             records.is_empty(),
             "a blob failure must not hand back a record"
         );
-        let blobs = tmp.path().join(".socket/blobs");
-        assert!(blobs.is_dir(), "the blobs dir itself was created");
-        assert_eq!(
-            std::fs::read_dir(&blobs).unwrap().count(),
-            0,
-            "no blob may materialize from undecodable content"
+        assert!(
+            !tmp.path().join(".socket").exists(),
+            "the blobs dir is created only once a blob decodes, so undecodable \
+             content must leave no `.socket/` behind at all"
         );
     }
 
@@ -5467,6 +5353,198 @@ mod tests {
         assert!(
             warnings[0].contains(purl) && warnings[0].contains("is vendored at patch"),
             "warnings={warnings:?}"
+        );
+    }
+
+    /// The nested apply inherits the caller's flags verbatim (`--lock-timeout`
+    /// and `--verbose` were dropped when its args were rebuilt from Default),
+    /// with `json`/`dry_run` forced off — one JSON document per run, and
+    /// agent-mode `get` ignores `--dry-run` — `silent` following the caller's
+    /// quiet gate, and the manifest path absolutized so apply does not
+    /// re-resolve it against its own `--cwd`.
+    #[test]
+    fn nested_apply_args_flow_caller_flags_and_force_a_real_quiet_apply() {
+        let common = GlobalArgs {
+            lock_timeout: Some(30),
+            verbose: true,
+            strict: true,
+            json: true,
+            dry_run: true,
+            api_token: Some("flag-token".into()),
+            ..GlobalArgs::default()
+        };
+        let nested = nested_apply_args(&common, Path::new("proj/.socket/manifest.json"), true);
+        assert_eq!(
+            nested.lock_timeout,
+            Some(30),
+            "--lock-timeout must reach the nested apply"
+        );
+        assert!(
+            nested.verbose && nested.strict,
+            "--verbose / --strict must flow through"
+        );
+        assert_eq!(nested.api_token.as_deref(), Some("flag-token"));
+        assert!(
+            !nested.json && !nested.dry_run,
+            "the nested apply is always a real, non-JSON run"
+        );
+        assert!(nested.silent, "silent follows the caller's quiet gate");
+        assert!(
+            Path::new(&nested.manifest_path).is_absolute(),
+            "got {}",
+            nested.manifest_path
+        );
+    }
+
+    /// The engine's variant rebuilds the same shape from `DownloadParams` +
+    /// `DownloadRun`: the API flags via `resolved_api_overrides` (so `--org`
+    /// fills a missing override org), the run's lock/verbosity flags, and
+    /// quiet = json || silent.
+    #[test]
+    fn nested_apply_args_from_params_carry_run_flags_and_resolved_api_overrides() {
+        let client = ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
+            api_url: "http://127.0.0.1:1".into(),
+            api_token: None,
+            use_public_proxy: false,
+            org_slug: None,
+        });
+        let run = DownloadRun {
+            api_client: &client,
+            lock_timeout: Some(7),
+            verbose: true,
+        };
+        let params = dl_params_for_org(Some("from-org".into()), None);
+        let nested =
+            nested_apply_args_from_params(&params, &run, Path::new(".socket/manifest.json"));
+        assert_eq!(nested.lock_timeout, Some(7));
+        assert!(nested.verbose);
+        assert_eq!(
+            nested.org.as_deref(),
+            Some("from-org"),
+            "a missing override org must fall back to --org"
+        );
+        assert_eq!(nested.download_mode, "diff");
+        assert!(nested.silent, "json || silent params run a quiet apply");
+        assert!(!nested.json && !nested.dry_run);
+    }
+
+    /// The uuid path hands the engine the view it already fetched: the
+    /// record is served from `prefetched` with ZERO network traffic (a
+    /// fresh fetch could re-hit the 401 the proxy fallback recovered from),
+    /// and the ledger-free classification reports it `downloaded`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_patch_records_with_prefetched_view_never_fetches() {
+        use wiremock::MockServer;
+
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let server = MockServer::start().await; // trap: no mounts
+        let tmp = tempfile::tempdir().unwrap();
+        let mut patch = patch_with_files(HashMap::from([(
+            "package/index.js".to_string(),
+            file_resp(Some(&"0".repeat(64)), Some(&"1".repeat(64))),
+        )]));
+        patch.uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into();
+        patch.purl = "pkg:npm/covgap-prefetched@1.0.0".into();
+        let selected = vec![mk_patch(&patch.uuid, &patch.purl, "free", "2024-01-01")];
+        let params = detached_params(tmp.path(), server.uri());
+        let client = api_client_for(&params).await;
+        let prefetched = HashMap::from([(patch.uuid.clone(), patch.clone())]);
+
+        let (code, json, records) =
+            download_patch_records_with(&selected, &params, &client, prefetched).await;
+
+        assert_eq!(code, 0, "json={json}");
+        assert_eq!(json["downloaded"], 1, "json={json}");
+        assert_eq!(json["detached"], true, "json={json}");
+        assert_eq!(json["patches"][0]["action"], "downloaded", "json={json}");
+        assert!(
+            json["patches"][0].get("oldUuid").is_none(),
+            "no ledger entry, no oldUuid; json={json}"
+        );
+        assert_eq!(
+            records.get(&patch.purl).map(|r| r.uuid.as_str()),
+            Some(patch.uuid.as_str()),
+            "the record must be built from the prefetched view"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "a prefetched view must never be fetched again"
+        );
+        assert!(
+            !tmp.path().join(".socket").exists(),
+            "the detached download phase writes nothing"
+        );
+    }
+
+    /// A ledger entry at an OLDER uuid: the fetched record is `downloaded`
+    /// and carries `oldUuid` — the re-vendor the vendor step will perform —
+    /// derived from the ledger, since the vendored flows have no manifest.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_patch_records_superseding_uuid_carries_old_uuid_from_ledger() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let server = MockServer::start().await;
+        let purl = "pkg:npm/covgap-supersede@1.0.0";
+        let old_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let new_uuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        Mock::given(method("GET"))
+            .and(wm_path(format!(
+                "/v0/orgs/test-org/patches/view/{new_uuid}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uuid": new_uuid, "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": { "package/index.js": {
+                    "beforeHash": "0".repeat(64), "afterHash": "1".repeat(64),
+                    "blobContent": "cGF0Y2hlZAo=",
+                }},
+                "vulnerabilities": {}, "description": "d", "license": "MIT", "tier": "free",
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vendor = tmp.path().join(".socket/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(
+            vendor.join("state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "entries": { purl: {
+                    "ecosystem": "npm",
+                    "basePurl": purl,
+                    "uuid": old_uuid,
+                    "artifact": {
+                        "path": format!(".socket/vendor/npm/{old_uuid}/covgap-supersede-1.0.0.tgz"),
+                    },
+                    "wiring": []
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let selected = vec![mk_patch(new_uuid, purl, "free", "2024-01-01")];
+        let (code, json, records) =
+            download_patch_records(&selected, &detached_params(tmp.path(), server.uri())).await;
+
+        assert_eq!(code, 0, "json={json}");
+        assert_eq!(json["downloaded"], 1, "json={json}");
+        assert_eq!(json["skipped"], 0, "json={json}");
+        assert_eq!(json["patches"][0]["action"], "downloaded", "json={json}");
+        assert_eq!(json["patches"][0]["oldUuid"], old_uuid, "json={json}");
+        assert_eq!(
+            records.get(purl).map(|r| r.uuid.as_str()),
+            Some(new_uuid),
+            "the superseding record is what the vendor step receives"
         );
     }
 

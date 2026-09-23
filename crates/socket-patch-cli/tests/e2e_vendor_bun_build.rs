@@ -1318,14 +1318,24 @@ async fn bun_get_uuid_vendored_fresh_checkout_frozen_install() {
         "the view endpoint must have served the patch record"
     );
 
-    // Manifest yes, blobs no (scan-vendored parity: content stays in memory).
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(proj.join(".socket").join("manifest.json")).unwrap(),
+    // Ledger yes (a detached entry carrying the record), manifest no, blobs
+    // no — vendored mode is manifest-free (scan-vendored parity).
+    assert!(
+        !proj.join(".socket").join("manifest.json").exists(),
+        "get --mode vendored must NOT write the manifest (the ledger is the record)"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".socket").join("vendor").join("state.json"))
+            .expect("vendor ledger missing"),
     )
     .unwrap();
     assert_eq!(
-        manifest["patches"][purl]["uuid"], UUID,
-        "the manifest must record the vendored patch: {manifest}"
+        state["entries"][purl]["uuid"], UUID,
+        "the ledger must record the vendored patch: {state}"
+    );
+    assert_eq!(
+        state["entries"][purl]["detached"], true,
+        "a get --mode vendored entry is detached: {state}"
     );
     assert!(
         !proj.join(".socket").join("blobs").exists(),

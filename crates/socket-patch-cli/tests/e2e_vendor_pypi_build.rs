@@ -656,14 +656,23 @@ async fn uv_get_uuid_vendored_fresh_checkout_frozen_offline() {
     );
     assert_vendored_applied(&env["vendor"]);
 
-    // get wrote the manifest itself, keyed by the suite's bare pypi purl —
-    // and persisted NO blobs.
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(proj.join(".socket/manifest.json")).unwrap())
-            .unwrap();
+    // get wrote NO manifest and NO blobs: the ledger's detached entry, keyed
+    // by the suite's bare pypi purl, is the record.
+    assert!(
+        !proj.join(".socket/manifest.json").exists(),
+        "get --mode vendored must NOT write the manifest (the ledger is the record)"
+    );
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(proj.join(".socket/vendor/state.json")).expect("vendor ledger missing"),
+    )
+    .unwrap();
     assert_eq!(
-        manifest["patches"][PURL]["uuid"], UUID,
-        "manifest must record the vendored patch under the bare purl: {manifest}"
+        state["entries"][PURL]["uuid"], UUID,
+        "the ledger must record the vendored patch under the bare purl: {state}"
+    );
+    assert_eq!(
+        state["entries"][PURL]["detached"], true,
+        "a get --mode vendored entry is detached: {state}"
     );
     assert!(
         !proj.join(".socket/blobs").exists(),

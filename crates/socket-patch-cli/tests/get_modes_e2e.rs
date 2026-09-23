@@ -283,9 +283,11 @@ async fn get_uuid_hosted_json_envelope_nests_redirect() {
 // ---------------------------------------------------------------------------
 
 /// `get <uuid> --mode vendored --json` (local `--vendor-source build`, so no
-/// vendoring-service mocks): get's record envelope with `applied` DROPPED
-/// (save-only posture — the nested apply structurally never ran) and scan's
-/// full vendor `Envelope` nested under `vendor` (camelCase keys/statuses).
+/// vendoring-service mocks): the detached download envelope — the same
+/// vocabulary scan's `download` block uses (`downloaded`, `patches[].action:
+/// "downloaded"`, `detached: true`), no `applied` (nothing is applied in
+/// place) — with scan's full vendor `Envelope` nested under `vendor`
+/// (camelCase keys/statuses).
 #[tokio::test]
 async fn get_uuid_vendored_json_envelope_nests_vendor() {
     let server = MockServer::start().await;
@@ -315,13 +317,21 @@ async fn get_uuid_vendored_json_envelope_nests_vendor() {
     assert_eq!(v["status"], "success", "envelope={v}");
     assert_eq!(v["found"], 1, "envelope={v}");
     assert_eq!(v["downloaded"], 1, "envelope={v}");
+    assert_eq!(v["skipped"], 0, "envelope={v}");
+    assert_eq!(v["failed"], 0, "envelope={v}");
+    assert_eq!(
+        v["detached"], true,
+        "vendored get is the detached download phase; got {v}"
+    );
     assert_eq!(v["patches"][0]["purl"], PURL1, "envelope={v}");
     assert_eq!(v["patches"][0]["uuid"], UUID1, "envelope={v}");
-    assert_eq!(v["patches"][0]["action"], "added", "envelope={v}");
+    assert_eq!(
+        v["patches"][0]["action"], "downloaded",
+        "the detached vocabulary: the record was fetched into memory, not added to a manifest; got {v}"
+    );
     assert!(
         v.get("applied").is_none(),
-        "vendored mode must DROP the top-level `applied` key (the nested \
-         apply never runs under the save-only download posture); got {v}"
+        "vendored mode has no top-level `applied` key (nothing is applied in place); got {v}"
     );
 
     // The nested vendor Envelope: the unified `--json` shape the standalone
@@ -348,8 +358,8 @@ async fn get_uuid_vendored_json_envelope_nests_vendor() {
     );
 
     // Anti-vacuity: the envelope reflects the real vendored result —
-    // committed artifact + rewired lock, and NO blobs (scan parity:
-    // patch content stays in memory).
+    // committed artifact + rewired lock, NO blobs and NO manifest (vendored
+    // mode is manifest-free: the ledger's detached entry is the record).
     let artifact = tmp
         .path()
         .join(".socket/vendor/npm")
@@ -359,6 +369,10 @@ async fn get_uuid_vendored_json_envelope_nests_vendor() {
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert!(lock.contains(".socket/vendor/npm/"), "lock:\n{lock}");
     assert!(!tmp.path().join(".socket/blobs").exists());
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "get --mode vendored must not write .socket/manifest.json"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +706,10 @@ async fn get_vendored_then_hosted_takes_over_cleanly() {
     assert!(
         lock.contains(".socket/vendor/npm/"),
         "precondition: lock vendored-wired; got:\n{lock}"
+    );
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "precondition: vendored get wrote no manifest — the takeover unwinds a detached entry"
     );
 
     // Step 2: hosted via get — the takeover.

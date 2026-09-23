@@ -670,15 +670,25 @@ async fn composer_get_uuid_vendored_fresh_checkout_install() {
         "expected an applied vendor event for {purl}: {env}"
     );
 
-    // get wrote the manifest itself, keyed by the bare composer purl — and
-    // persisted NO blobs.
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(proj.join(".socket/manifest.json")).unwrap())
-            .unwrap();
+    // get wrote NO manifest and NO blobs: the ledger's detached entry, keyed
+    // by the bare composer purl, is the record.
+    assert!(
+        !proj.join(".socket/manifest.json").exists(),
+        "get --mode vendored must NOT write the manifest (the ledger is the record)"
+    );
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(proj.join(".socket/vendor/state.json")).expect("vendor ledger missing"),
+    )
+    .unwrap();
     assert_eq!(
-        manifest["patches"][purl.as_str()]["uuid"],
+        state["entries"][purl.as_str()]["uuid"],
         UUID,
-        "manifest must record the vendored patch under the bare purl: {manifest}"
+        "the ledger must record the vendored patch under the bare purl: {state}"
+    );
+    assert_eq!(
+        state["entries"][purl.as_str()]["detached"],
+        true,
+        "a get --mode vendored entry is detached: {state}"
     );
     assert!(
         !proj.join(".socket/blobs").exists(),

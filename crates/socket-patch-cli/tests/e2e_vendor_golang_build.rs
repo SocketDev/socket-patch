@@ -589,16 +589,25 @@ async fn go_get_uuid_vendored_fresh_checkout_offline_build() {
         "the patch record must be fetched via the API"
     );
 
-    // Download-phase persistence: the manifest records the patch, but NO
-    // blobs are written (scan --mode vendored parity: content in memory).
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(consumer.join(".socket/manifest.json"))
-            .expect("the manifest must be written"),
+    // Persistence: the ledger's detached entry records the patch; NO
+    // manifest and NO blobs are written (scan --mode vendored parity:
+    // content in memory, vendored mode is manifest-free).
+    assert!(
+        !consumer.join(".socket/manifest.json").exists(),
+        "get --mode vendored must NOT write the manifest (the ledger is the record)"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(consumer.join(".socket/vendor/state.json"))
+            .expect("vendor ledger missing"),
     )
     .unwrap();
     assert_eq!(
-        manifest["patches"][UPURL]["uuid"], UUID,
-        "manifest must record the vendored patch: {manifest}"
+        state["entries"][UPURL]["uuid"], UUID,
+        "the ledger must record the vendored patch: {state}"
+    );
+    assert_eq!(
+        state["entries"][UPURL]["detached"], true,
+        "a get --mode vendored entry is detached: {state}"
     );
     assert!(
         !consumer.join(".socket/blobs").exists(),

@@ -1064,16 +1064,27 @@ async fn gem_get_uuid_vendored_fresh_checkout_bundle_install() {
         "clean vendor event: {applied}"
     );
 
-    // Persistence: the manifest records the patch; NO blobs land on disk
-    // (the committed artifact IS the patch — parity with scan --mode
-    // vendored).
-    let manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(proj.join(".socket/manifest.json")).unwrap())
-            .unwrap();
+    // Persistence: the ledger's detached entry records the patch; NO
+    // manifest and NO blobs land on disk (the committed artifact IS the
+    // patch — parity with scan --mode vendored).
+    assert!(
+        !proj.join(".socket/manifest.json").exists(),
+        "get --mode vendored must NOT write the manifest (the ledger is the record)"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".socket/vendor/state.json"))
+            .expect("vendor ledger missing"),
+    )
+    .unwrap();
     assert_eq!(
-        manifest["patches"][purl.as_str()]["uuid"],
+        state["entries"][purl.as_str()]["uuid"],
         UUID,
-        "manifest must record the vendored patch: {manifest}"
+        "the ledger must record the vendored patch: {state}"
+    );
+    assert_eq!(
+        state["entries"][purl.as_str()]["detached"],
+        true,
+        "a get --mode vendored entry is detached: {state}"
     );
     assert!(
         !proj.join(".socket/blobs").exists(),
