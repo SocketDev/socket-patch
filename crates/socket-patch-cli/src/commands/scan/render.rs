@@ -176,7 +176,7 @@ pub(super) fn lockfile_only_note(n: usize) -> String {
 /// What an empty crawl says, naming the filter that emptied it when there
 /// was one (`--ecosystems`, PATH scoping) instead of a generic
 /// "install first" hint.
-pub(super) fn no_packages_message(
+pub(crate) fn no_packages_message(
     global: bool,
     ecosystems: Option<&[String]>,
     paths: &[String],

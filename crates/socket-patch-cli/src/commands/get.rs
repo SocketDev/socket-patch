@@ -935,13 +935,10 @@ fn format_dry_run(action: &str, n: usize) -> String {
     )
 }
 
-/// What a package-name search says when the crawl found nothing.
-fn no_packages_message(global: bool) -> &'static str {
-    if global {
-        "No global packages found."
-    } else {
-        "No packages found. Run your package manager's install first."
-    }
+/// What a package-name search says when the crawl found nothing: scan's
+/// empty-crawl line (get has no ecosystem or path filter to name).
+fn no_packages_message(global: bool) -> String {
+    crate::commands::scan::render::no_packages_message(global, None, &[])
 }
 
 /// The human result for a patch the caller's plan cannot download.
