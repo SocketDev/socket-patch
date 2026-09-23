@@ -9,6 +9,7 @@ use std::time::Duration;
 use socket_patch_core::api::types::BatchPackagePatches;
 use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::redirect::DepOverride;
+use socket_patch_core::utils::purl::purl_parts;
 
 use crate::commands::vex::generate_vex_from_manifest_path;
 
@@ -82,25 +83,6 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     // redirect rewriter edits its integrity entries today — recording the
     // decision here so the omission reads as deliberate, not forgotten.
 ];
-
-/// `pkg:<type>/<coordinate>@<version>` → `(type, coordinate, version)`. The
-/// coordinate keeps its full slash-bearing form (npm `@scope/name`, composer
-/// `vendor/pkg`, golang module path) — the rewriters treat that as the `name`
-/// (their `full_name()` is `name` when `namespace` is `None`).
-fn parse_purl_simple(purl: &str) -> Option<(String, String, String)> {
-    let stripped = socket_patch_core::utils::purl::strip_purl_qualifiers(purl);
-    let rest = stripped.strip_prefix("pkg:")?;
-    let (typ, after) = rest.split_once('/')?;
-    let (coord, version) = after.rsplit_once('@')?;
-    let name = socket_patch_core::utils::purl::percent_decode_purl_component(coord).into_owned();
-    // The API serves canonical percent-encoded purls, so the version needs
-    // decoding just like the coordinate — npm build metadata arrives as
-    // `1.2.3%2Bbuild` while lockfiles store `1.2.3+build`; an undecoded
-    // version would silently match no lock entry.
-    let version =
-        socket_patch_core::utils::purl::percent_decode_purl_component(version).into_owned();
-    Some((typ.to_string(), name, version))
-}
 
 /// `scheme://[user[:pass]@]host[:port]/…` → `host[:port]`, NEVER userinfo.
 /// For user-facing messages that name where a lockfile now points — the
@@ -960,7 +942,7 @@ async fn gem_stale_install_warnings(
         let Some(want_sha) = gem_artifact_shas.get(&gem_sha_key(purl)) else {
             continue;
         };
-        let Some((_, name, version)) = parse_purl_simple(purl) else {
+        let Some((_, name, version)) = purl_parts(purl) else {
             continue;
         };
         let cache_path = cwd
@@ -988,7 +970,7 @@ async fn gem_stale_install_warnings(
 /// the purl so overrides (which carry no purl) and confirmed purls meet on
 /// neutral ground.
 fn gem_sha_key(purl: &str) -> (String, String) {
-    parse_purl_simple(purl)
+    purl_parts(purl)
         .map(|(_, name, version)| (name, version))
         .unwrap_or_default()
 }
@@ -1142,7 +1124,7 @@ pub(crate) async fn run_redirect_selected(
                 continue;
             }
             let purl = reference.purl.as_deref().unwrap_or(sel_purl);
-            let Some((ecosystem, name, version)) = parse_purl_simple(purl) else {
+            let Some((ecosystem, name, version)) = purl_parts(purl) else {
                 skipped.push(
                     serde_json::json!({ "purl": purl, "uuid": sel_uuid, "reason": "bad_purl" }),
                 );
@@ -1574,7 +1556,7 @@ pub(crate) async fn run_redirect_selected(
                 // own per-flavor diagnostics.)
                 let name = purl
                     .starts_with("pkg:cargo/")
-                    .then(|| parse_purl_simple(purl).map(|(_, name, _)| name))
+                    .then(|| purl_parts(purl).map(|(_, name, _)| name))
                     .flatten();
                 let wired = name
                     .as_deref()
@@ -1669,9 +1651,8 @@ pub(crate) async fn run_redirect_selected(
 
         if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(&common.cwd) {
             for path in paths {
-                if let Some(script_path) = path
-                    .strip_suffix(".py.lock")
-                    .map(|prefix| format!("{prefix}.py"))
+                if let Some(script_path) =
+                    socket_patch_core::utils::python_lock::script_of_lock(&path).map(str::to_string)
                 {
                     if let Ok(content) =
                         read_regular_to_string(&common.cwd.join(&script_path)).await
@@ -1737,7 +1718,10 @@ pub(crate) async fn run_redirect_selected(
         }
         let native_target = files
             .iter()
-            .filter(|(path, _)| *path == "uv.lock" || path.ends_with(".py.lock"))
+            .filter(|(path, _)| {
+                *path == "uv.lock"
+                    || socket_patch_core::utils::python_lock::is_script_lock_name(path)
+            })
             .any(|(_, text)| {
                 socket_patch_core::utils::python_lock::rewrite_python_lock(
                     text,
@@ -2652,6 +2636,7 @@ pub(crate) async fn run_redirect_selected(
     // it — so a non-dry-run reflects this run without re-reading either file.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
     let superseded = super::classify_overlap_takeover_with(
+        common,
         &common.cwd,
         Some(&ledger),
         vendor_state.as_ref().ok(),
@@ -2683,14 +2668,16 @@ pub(crate) async fn run_redirect_selected(
     // manifest patches (previously applied / vendored — and any stale ledger
     // records this run did not confirm) still verify normally. A post-install
     // `socket-patch vex` hash-verifies the redirected patches against the
-    // installed tree (it reads the records back from the redirect ledger via
-    // augment_with_redirect). Requested-but-failed VEX (including "nothing to
-    // attest") flips the exit code, matching `scan --vex`.
+    // installed tree (it reads the records back from the redirect ledger and
+    // re-proves their lockfile wiring — see `commands::vex_sources`), or,
+    // with no install yet, attests from the pinned hosted wiring it finds in
+    // the lockfile. Requested-but-failed VEX (including "nothing to attest")
+    // flips the exit code, matching `scan --vex`.
     let mut vex_statements: Option<usize> = None;
     // VEX run-level advisories: `note_warning` keeps them off stderr under
     // --json, so the envelope's `vex.warnings` is their only channel there.
     let mut vex_warnings: Vec<crate::json_envelope::RunWarning> = Vec::new();
-    let mut vex_error: Option<(&'static str, String)> = None;
+    let mut vex_error: Option<crate::commands::vex::VexGenError> = None;
     let mut vex_code = 0;
     if vex.vex.is_some() && !common.dry_run {
         let mut params = vex.to_build_params();
@@ -2720,7 +2707,8 @@ pub(crate) async fn run_redirect_selected(
             }
             Err(e) => {
                 vex_code = 1;
-                vex_error = Some((e.code, e.message));
+                vex_warnings = e.embedded_warnings();
+                vex_error = Some(e);
             }
         }
     }
@@ -2775,9 +2763,10 @@ pub(crate) async fn run_redirect_selected(
                 result["vex"]["warnings"] = serde_json::to_value(&vex_warnings)
                     .expect("RunWarning is a plain string struct: serialization cannot fail");
             }
-        } else if let Some((code, message)) = &vex_error {
+        } else if let Some(e) = &vex_error {
             result["status"] = serde_json::json!("error");
-            result["error"] = serde_json::json!({ "code": code, "message": message });
+            result["error"] = serde_json::json!({ "code": e.code, "message": e.message });
+            super::append_vex_error_warnings(&mut result, &vex_warnings);
         }
         println!(
             "{}",
@@ -2898,8 +2887,8 @@ pub(crate) async fn run_redirect_selected(
         }
         // Errors print even under --silent ("errors only", never
         // "nothing"): exit 1 with no message would be undiagnosable.
-        if let Some((_, message)) = &vex_error {
-            eprintln!("Error: VEX generation failed: {message}");
+        if let Some(e) = &vex_error {
+            e.print_embedded(common);
         }
     }
     vex_code
@@ -3254,7 +3243,7 @@ mod tests {
         npm_allow_remote_already_detail, npm_allow_remote_configured_detail,
         npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
         npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
-        npm_allow_remote_user_set_detail, parse_purl_simple, plan_workspace_trust, pnpm_heal_root,
+        npm_allow_remote_user_set_detail, plan_workspace_trust, pnpm_heal_root,
         pnpm_lock_carries_hosted_redirect, pnpm_lock_version_major, pnpm_trust_configured_detail,
         pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
         pnpm_trust_workspace_unreadable_detail, prune_ignored_warning, read_npmrc_for_allow_remote,
@@ -3632,39 +3621,6 @@ mod tests {
 
         // No root lock at all (e.g. Rush): nothing to heal.
         assert!(pnpm_heal_root(false, None, &overrides).is_none());
-    }
-
-    #[test]
-    fn parse_purl_simple_percent_decodes_name_and_version() {
-        // The API serves canonical percent-encoded purls: npm build metadata
-        // `1.2.3+build` arrives as `1.2.3%2Bbuild`. Lock entries store the
-        // decoded form, so an undecoded version silently matches nothing.
-        assert_eq!(
-            parse_purl_simple("pkg:npm/foo@1.2.3%2Bbuild"),
-            Some((
-                "npm".to_string(),
-                "foo".to_string(),
-                "1.2.3+build".to_string()
-            ))
-        );
-        // The coordinate keeps decoding too (scoped npm name).
-        assert_eq!(
-            parse_purl_simple("pkg:npm/%40scope/name@1.0.0"),
-            Some((
-                "npm".to_string(),
-                "@scope/name".to_string(),
-                "1.0.0".to_string()
-            ))
-        );
-        // Plain versions pass through unchanged.
-        assert_eq!(
-            parse_purl_simple("pkg:npm/left-pad@1.3.0"),
-            Some((
-                "npm".to_string(),
-                "left-pad".to_string(),
-                "1.3.0".to_string()
-            ))
-        );
     }
 
     /// The classic scan object `run` builds for the `--json` path with ≥1

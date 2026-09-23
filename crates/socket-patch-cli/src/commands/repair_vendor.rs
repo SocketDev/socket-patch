@@ -155,9 +155,8 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
         .collect();
     if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(project_root) {
         for path in paths {
-            if let Some(script) = path
-                .strip_suffix(".py.lock")
-                .map(|prefix| format!("{prefix}.py"))
+            if let Some(script) =
+                socket_patch_core::utils::python_lock::script_of_lock(&path).map(str::to_string)
             {
                 files.push(script);
             }
@@ -606,9 +605,16 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
         if !ecosystem_in_scope(common, &entry.ecosystem) {
             continue;
         }
-        let record = match (&entry.record, manifest) {
-            (Some(r), _) => r.clone(),
-            (None, Some(m)) => {
+        // `detached` is the "no manifest owner" flag. The manifest-driven
+        // standalone `vendor` embeds the record too, so an embedded record
+        // does not imply detached: a manifest-owned entry keeps taking the
+        // manifest's record (a manifest that moved on to a newer patch uuid
+        // must still surface as vendor_uuid_mismatch below, never repair the
+        // stale artifact from the embedded copy), and the embedded copy
+        // stands in only when there is no manifest at all.
+        let record = match (entry.detached, &entry.record, manifest) {
+            (true, Some(r), _) => r.clone(),
+            (_, _, Some(m)) => {
                 match m
                     .patches
                     .get(purl)
@@ -621,9 +627,11 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                     None => continue,
                 }
             }
-            // Non-detached entry with no manifest at all: recover the
-            // record from the API below, like a reconstruction.
-            (None, None) => {
+            // No manifest at all: the embedded copy, else (a ledger written
+            // before standalone `vendor` embedded records) recover the record
+            // from the API below, like a reconstruction.
+            (_, Some(r), None) => r.clone(),
+            (_, None, None) => {
                 match fetch_record_by_uuid(common, &mut api_client, &entry.uuid).await {
                     Some((_, r)) => r,
                     None => {

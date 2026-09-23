@@ -1,7 +1,7 @@
 use socket_patch_core::crawlers::{
     CrawledPackage, CrawlerOptions, Ecosystem, NpmCrawler, PythonCrawler, RubyCrawler,
 };
-use socket_patch_core::utils::purl::strip_purl_qualifiers;
+use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -395,7 +395,7 @@ async fn dispatch_find(
 /// `setup`, `get`, `repair vendor`) use the collapsing wrappers below and
 /// keep the old `HashMap<String, PathBuf>` contract unchanged. `apply` and
 /// `rollback` — which must touch EVERY copy — use the `_all` variants.
-fn collapse_to_first(multi: HashMap<String, Vec<PathBuf>>) -> HashMap<String, PathBuf> {
+pub(crate) fn collapse_to_first(multi: HashMap<String, Vec<PathBuf>>) -> HashMap<String, PathBuf> {
     multi
         .into_iter()
         .filter_map(|(purl, paths)| paths.into_iter().next().map(|p| (purl, p)))
@@ -448,6 +448,40 @@ pub async fn find_packages_for_rollback(
     collapse_to_first(find_all_packages_for_rollback(partitioned, options, silent).await)
 }
 
+/// The installed copy of each npm purl in `purls`, found by its
+/// `package.json` identity (a full npm crawl) instead of its install path.
+/// An npm ALIAS dependency (`"lp": "npm:left-pad@1.3.0"`) is installed under
+/// its dependency key (`node_modules/lp`), which the name-keyed resolvers
+/// above never probe; callers use this as the last lookup before calling a
+/// package missing (`vendor`, and `vex` for a purl nothing else found).
+/// The crawl dedups by name@version, so this yields ONE copy per purl — the
+/// first the crawl reaches — never every alias beside a normal install
+/// (`vex`'s per-dir alias walk, `vex_consumed::npm_alias_copies`, finds
+/// those). Keyed by the caller's spelling; a purl with no copy has no
+/// entry. No crawl runs when `purls` is empty.
+pub(crate) async fn npm_paths_by_identity(
+    options: &CrawlerOptions,
+    purls: &[&String],
+) -> HashMap<String, Vec<PathBuf>> {
+    let mut out = HashMap::new();
+    if purls.is_empty() {
+        return out;
+    }
+    let installed = NpmCrawler::new().crawl_all(options).await;
+    for purl in purls {
+        let want = canonical_purl(purl);
+        let paths: Vec<PathBuf> = installed
+            .iter()
+            .filter(|pkg| normalize_purl(&pkg.purl) == want)
+            .map(|pkg| pkg.path.clone())
+            .collect();
+        if !paths.is_empty() {
+            out.insert((*purl).clone(), paths);
+        }
+    }
+    out
+}
+
 /// Resolve manifest PURLs to their installed on-disk paths (partition,
 /// build crawler options from the global args, dispatch). Uses the
 /// rollback (qualified-aware) resolver, never a base-keyed collapse of
@@ -465,13 +499,26 @@ pub async fn find_manifest_package_paths(
     common: &GlobalArgs,
     quiet: bool,
 ) -> HashMap<String, PathBuf> {
+    collapse_to_first(find_manifest_package_copies(purls, common, quiet).await)
+}
+
+/// [`find_manifest_package_paths`] keeping EVERY installed copy of each
+/// purl (crawl order): one lookup a caller can take both the first-copy
+/// view and the every-copy view from (`vex` hashes the first copy of a
+/// manifest purl and every copy of a hosted one), so the tree is crawled —
+/// and a `--global` run's "Using … at:" banner printed — once.
+pub async fn find_manifest_package_copies(
+    purls: &[String],
+    common: &GlobalArgs,
+    quiet: bool,
+) -> HashMap<String, Vec<PathBuf>> {
     let partitioned = partition_purls(purls, common.ecosystems.as_deref());
     let crawler_options = CrawlerOptions {
         cwd: common.cwd.clone(),
         global: common.global,
         global_prefix: common.global_prefix.clone(),
     };
-    find_packages_for_rollback(&partitioned, &crawler_options, quiet).await
+    find_all_packages_for_rollback(&partitioned, &crawler_options, quiet).await
 }
 
 /// Crawl all ecosystems and return all packages, per-ecosystem counts and

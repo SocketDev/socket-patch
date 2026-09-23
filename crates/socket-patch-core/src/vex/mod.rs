@@ -8,7 +8,8 @@
 //! * [`discover`] — manifest-less input: Socket-patched dependency
 //!   references (hosted + vendored) recovered from the project's lockfiles.
 //! * [`product`] — auto-detect the top-level product PURL from the
-//!   filesystem (package.json / pyproject.toml / Cargo.toml).
+//!   filesystem (package.json / pyproject.toml / Cargo.toml / go.mod /
+//!   composer.json / pom.xml / *.csproj / *.gemspec).
 //! * [`verify`] — partition manifest entries by on-disk hash check.
 //! * [`time`] — minimal RFC 3339 timestamp formatter (no chrono).
 //!
@@ -34,7 +35,8 @@ pub use schema::{
     OPENVEX_CONTEXT_V0_2_0,
 };
 pub use verify::{
-    applied_patches, applied_patches_with_vendor, FailedPatch, VendorContext, VerifyOutcome,
+    applied_patches, applied_patches_with_vendor, FailedPatch, HostedCopies, VendorContext,
+    VerifyOutcome,
 };
 
 #[cfg(test)]

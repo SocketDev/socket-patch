@@ -70,6 +70,40 @@ pub struct VendorContext {
     /// their paths live outside `.socket/vendor/`) and count as `applied`
     /// but not `vendored`.
     pub go_patches: HashMap<String, PathBuf>,
+    /// Hosted-wiring evidence: PURL → the installed copies the BUILD
+    /// consumes through its hosted (Socket patch server) wiring, resolved by
+    /// the caller per package manager. When present for a PURL it REPLACES
+    /// the crawler's `package_paths` entry — see [`HostedCopies`].
+    pub hosted: HashMap<String, HostedCopies>,
+}
+
+/// The installed copies a hosted-wired PURL's build consumes — the CLI
+/// resolves them per package manager, because a crawler's "first copy of
+/// `name@version`" is not always one the build reads:
+///
+/// * a DISTINCT-STORE ecosystem keeps the hosted artifact apart from the
+///   registry's copy of the same `name@version` — Go's replacement module
+///   `patch.socket.dev/gopatch/<uuid>@<sver>`, cargo's per-registry
+///   `registry/src/<host>-<hash>/`, maven's `<base>-socket.<hex8>` version
+///   dir — so the registry copy (e.g. cached before the redirect) is a
+///   PRISTINE SIBLING the build never reads: it is left out, never reported
+///   as "unpatched";
+/// * a SHARED-LOCATION ecosystem installs hosted and registry bytes at one
+///   path (`node_modules`, site-packages, gem homes), so a pristine copy
+///   there IS what runs — and when the crawler finds several, each may be
+///   the one some consumer loads, so every one is listed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostedCopies {
+    /// Every consumed copy found. EMPTY means none is installed yet: the
+    /// PURL is `package_not_found` (which the not-installed lockfile basis
+    /// may excuse) — never judged against a pristine sibling. Non-empty:
+    /// EVERY copy must verify, the first failure's tag wins.
+    pub paths: Vec<PathBuf>,
+    /// Maven's suffixed version renames the artifact files: the record's
+    /// `<artifactId>-<base>…` file names are found as
+    /// `<artifactId>-<base>-socket.<hex8>…` in the consumed dir. `(from, to)`
+    /// file-name prefix rewrite, applied to the record's keys.
+    pub rename: Option<(String, String)>,
 }
 
 /// Walk the manifest and bucket each PURL into `applied` / `failed`.
@@ -99,7 +133,10 @@ pub async fn applied_patches(
 ///    dir-hash check (`applied` only, not `vendored`); again no fallback —
 ///    an active redirect makes the copy dir the consumed bytes, while the
 ///    module cache stays pristine by design.
-/// 3. Otherwise the installed-tree behavior of [`applied_patches`], verbatim.
+/// 3. A `hosted` entry verifies exactly the copies the hosted build consumes
+///    ([`HostedCopies`]) — no fallback to `package_paths` either, whose
+///    representative may be the pristine sibling the build never reads.
+/// 4. Otherwise the installed-tree behavior of [`applied_patches`], verbatim.
 pub async fn applied_patches_with_vendor(
     manifest: &PatchManifest,
     package_paths: &HashMap<String, PathBuf>,
@@ -114,6 +151,8 @@ pub async fn applied_patches_with_vendor(
             verify_vendored_patch_record(&ctx.project_root, entry, record).await
         } else if let Some(copy_dir) = vendor.and_then(|ctx| ctx.go_patches.get(purl)) {
             verify_patch_record(copy_dir, record).await
+        } else if let Some(copies) = vendor.and_then(|ctx| ctx.hosted.get(purl)) {
+            verify_hosted_copies(copies, record).await
         } else if let Some(pkg_path) = package_paths.get(purl) {
             verify_patch_record(pkg_path, record).await
         } else {
@@ -132,7 +171,16 @@ pub async fn applied_patches_with_vendor(
                     // warn about — it never changes the verdict, because
                     // there is deliberately no installed-tree fallback in
                     // either direction (see the precedence note above).
-                    if let Some(pkg_path) = package_paths.get(purl) {
+                    //
+                    // Go is exempt: a directory `replace` makes the
+                    // committed copy the only bytes any build of this
+                    // module reads, and the module-cache `M@v` the crawler
+                    // finds is immutable, go.sum-verified and therefore
+                    // pristine BY CONSTRUCTION — its "drift" is no
+                    // bypassing build, and "re-run your install to resync
+                    // it" is advice no `go` command can follow.
+                    let go_cache_copy = purl.starts_with("pkg:golang/");
+                    if let Some(pkg_path) = package_paths.get(purl).filter(|_| !go_cache_copy) {
                         if verify_patch_record(pkg_path, record).await.is_err() {
                             out.vendored_out_of_sync.push(purl.clone());
                         }
@@ -178,6 +226,53 @@ pub async fn verify_patch_record(pkg_path: &Path, record: &PatchRecord) -> Resul
         }
     }
     Ok(())
+}
+
+/// [`HostedCopies`] verdict: no consumed copy is `package_not_found`; every
+/// listed copy must pass [`verify_patch_record`] (under the maven file
+/// rename, when set), the first failure's tag wins.
+async fn verify_hosted_copies(copies: &HostedCopies, record: &PatchRecord) -> Result<(), String> {
+    if copies.paths.is_empty() {
+        return Err("package_not_found".to_string());
+    }
+    let renamed;
+    let record = match &copies.rename {
+        Some((from, to)) => {
+            renamed = rename_record_files(record, from, to);
+            &renamed
+        }
+        None => record,
+    };
+    for path in &copies.paths {
+        verify_patch_record(path, record).await?;
+    }
+    Ok(())
+}
+
+/// `record` with every file key whose name starts with the whole component
+/// `from` — followed by `-` (a classifier) or by a `.` that opens an
+/// extension, not a version continuation (`lib-1.0` + `.jar`, never
+/// `lib-1.0` + `.1.jar`) — re-prefixed `to`; other keys are kept as they
+/// are (and so still verify as-is).
+fn rename_record_files(record: &PatchRecord, from: &str, to: &str) -> PatchRecord {
+    let whole_component = |rest: &str| {
+        rest.starts_with('-')
+            || rest.strip_prefix('.').is_some_and(|ext| {
+                !ext.is_empty() && !ext.starts_with(|c: char| c.is_ascii_digit())
+            })
+    };
+    let mut renamed = record.clone();
+    renamed.files = record
+        .files
+        .iter()
+        .map(
+            |(key, info)| match key.strip_prefix(from).filter(|rest| whole_component(rest)) {
+                Some(rest) => (format!("{to}{rest}"), info.clone()),
+                None => (key.clone(), info.clone()),
+            },
+        )
+        .collect();
+    renamed
 }
 
 #[cfg(test)]
@@ -1020,6 +1115,7 @@ mod tests {
             project_root: root.path().to_path_buf(),
             entries,
             go_patches: HashMap::new(),
+            hosted: HashMap::new(),
         };
 
         let paths: HashMap<String, PathBuf> = HashMap::new(); // no installed tree
@@ -1064,6 +1160,7 @@ mod tests {
             project_root: root.path().to_path_buf(),
             entries,
             go_patches: HashMap::new(),
+            hosted: HashMap::new(),
         };
 
         let out = applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
@@ -1124,6 +1221,7 @@ mod tests {
             project_root: root.path().to_path_buf(),
             entries,
             go_patches: HashMap::new(),
+            hosted: HashMap::new(),
         };
         let mut paths = HashMap::new();
         paths.insert(purl.to_string(), installed);
@@ -1140,6 +1238,52 @@ mod tests {
         // attestation stands (committed artifact is the product) but the
         // drift must be reported so the CLI can advise a re-install.
         assert_eq!(out.vendored_out_of_sync, vec![purl.to_string()]);
+    }
+
+    /// Go vendored: the crawler's module-cache `M@v` is pristine by
+    /// construction (immutable, go.sum-verified; the directory `replace`
+    /// builds the committed copy), so it is never reported out of sync —
+    /// every developer machine that ran `vendor` has it.
+    #[tokio::test]
+    async fn golang_pristine_module_cache_copy_is_not_out_of_sync() {
+        let root = tempfile::tempdir().unwrap();
+        let purl = "pkg:golang/github.com/foo/bar@v1.4.2";
+        let rel = format!(".socket/vendor/golang/{VUUID}/github.com/foo/bar@v1.4.2");
+        let patched = b"package bar // patched\n";
+        let vdir = root.path().join(&rel);
+        tokio::fs::create_dir_all(&vdir).await.unwrap();
+        tokio::fs::write(vdir.join("index.js"), patched)
+            .await
+            .unwrap();
+        let cache = root.path().join("gomodcache/github.com/foo/bar@v1.4.2");
+        tokio::fs::create_dir_all(&cache).await.unwrap();
+        tokio::fs::write(cache.join("index.js"), b"package bar // pristine\n")
+            .await
+            .unwrap();
+
+        let mut rec = record_with_one_file(&compute_git_sha256_from_bytes(patched));
+        rec.uuid = VUUID.to_string();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(purl.to_string(), rec);
+        let mut entries = HashMap::new();
+        entries.insert(purl.to_string(), vendor_entry(purl, &rel));
+        let ctx = VendorContext {
+            project_root: root.path().to_path_buf(),
+            entries,
+            go_patches: HashMap::new(),
+            hosted: HashMap::new(),
+        };
+        let mut paths = HashMap::new();
+        paths.insert(purl.to_string(), cache);
+
+        let out = applied_patches_with_vendor(&manifest, &paths, Some(&ctx)).await;
+        assert_eq!(out.applied, vec![purl.to_string()]);
+        assert_eq!(out.vendored, vec![purl.to_string()]);
+        assert!(
+            out.vendored_out_of_sync.is_empty(),
+            "the pristine module cache is not drift: {:?}",
+            out.vendored_out_of_sync
+        );
     }
 
     /// Disclosure probe, tampered direction: the vendor artifact is healthy
@@ -1180,6 +1324,7 @@ mod tests {
             project_root: root.path().to_path_buf(),
             entries,
             go_patches: HashMap::new(),
+            hosted: HashMap::new(),
         };
         let mut paths = HashMap::new();
         paths.insert(purl.to_string(), installed);
@@ -1231,6 +1376,7 @@ mod tests {
             project_root: root.path().to_path_buf(),
             entries,
             go_patches: HashMap::new(),
+            hosted: HashMap::new(),
         };
         let mut paths = HashMap::new();
         paths.insert(purl.to_string(), installed);
@@ -1273,6 +1419,7 @@ mod tests {
             project_root: root.path().to_path_buf(),
             entries: HashMap::new(),
             go_patches,
+            hosted: HashMap::new(),
         };
 
         // No installed tree (module cache absent) — the redirect copy is
@@ -1294,5 +1441,145 @@ mod tests {
         assert!(out.applied.is_empty());
         assert_eq!(out.failed.len(), 1);
         assert_eq!(out.failed[0].reason, "hash_mismatch");
+    }
+
+    /// A package dir holding `index.js` with `bytes`.
+    async fn package_dir(root: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
+        let dir = root.join(rel);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("index.js"), bytes).await.unwrap();
+        dir
+    }
+
+    fn hosted_ctx(purl: &str, copies: HostedCopies) -> VendorContext {
+        VendorContext {
+            hosted: [(purl.to_string(), copies)].into_iter().collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A hosted entry REPLACES the crawler's representative: a pristine
+    /// sibling in `package_paths` (the original Go module beside its
+    /// replacement) is never judged — an empty copy list is
+    /// `package_not_found` (the lockfile basis's to excuse), a consumed copy
+    /// that verifies attests.
+    #[tokio::test]
+    async fn hosted_copies_replace_the_pristine_sibling() {
+        let root = tempfile::tempdir().unwrap();
+        let purl = "pkg:golang/github.com/foo/bar@v1.4.2";
+        let patched = b"patched";
+        let pristine =
+            package_dir(root.path(), "modcache/github.com/foo/bar@v1.4.2", b"orig").await;
+        let replacement = package_dir(
+            root.path(),
+            "modcache/patch.socket.dev/gopatch/u@v1.4.2-socketpatch.1",
+            patched,
+        )
+        .await;
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            purl.to_string(),
+            record_with_one_file(&compute_git_sha256_from_bytes(patched)),
+        );
+        let paths: HashMap<String, PathBuf> = [(purl.to_string(), pristine)].into_iter().collect();
+
+        // Without the hosted entry the pristine original fails the patch.
+        let out = applied_patches_with_vendor(&manifest, &paths, None).await;
+        assert_eq!(out.failed[0].reason, "hash_mismatch");
+
+        let none = hosted_ctx(purl, HostedCopies::default());
+        let out = applied_patches_with_vendor(&manifest, &paths, Some(&none)).await;
+        assert!(out.applied.is_empty());
+        assert_eq!(out.failed[0].reason, "package_not_found");
+
+        let consumed = hosted_ctx(
+            purl,
+            HostedCopies {
+                paths: vec![replacement],
+                rename: None,
+            },
+        );
+        let out = applied_patches_with_vendor(&manifest, &paths, Some(&consumed)).await;
+        assert_eq!(out.applied, vec![purl.to_string()]);
+        assert!(out.vendored.is_empty() && out.failed.is_empty());
+    }
+
+    /// Shared-location copies: EVERY listed copy must verify — a patched
+    /// root `node_modules` copy must not attest a pristine nested one some
+    /// dependent still loads.
+    #[tokio::test]
+    async fn every_hosted_copy_must_verify() {
+        let root = tempfile::tempdir().unwrap();
+        let purl = "pkg:npm/x@1.0.0";
+        let patched = b"patched";
+        let top = package_dir(root.path(), "node_modules/x", patched).await;
+        let nested = package_dir(root.path(), "node_modules/y/node_modules/x", b"orig").await;
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            purl.to_string(),
+            record_with_one_file(&compute_git_sha256_from_bytes(patched)),
+        );
+        let ctx = hosted_ctx(
+            purl,
+            HostedCopies {
+                paths: vec![top.clone(), nested.clone()],
+                rename: None,
+            },
+        );
+        let out = applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        assert!(out.applied.is_empty());
+        assert_eq!(out.failed[0].reason, "hash_mismatch");
+
+        tokio::fs::write(nested.join("index.js"), patched)
+            .await
+            .unwrap();
+        let out = applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        assert_eq!(out.applied, vec![purl.to_string()]);
+    }
+
+    /// Maven's suffixed hosted version renames the artifact files: the
+    /// record's `<a>-<base>…` keys are verified as `<a>-<suffixed>…` —
+    /// whole components only (`lib-1.0` never re-prefixes `lib-1.0.1.jar`).
+    #[tokio::test]
+    async fn hosted_copies_verify_renamed_maven_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let purl = "pkg:maven/org.example/lib@1.0";
+        let patched = b"patched-jar";
+        let dir = root.path().join("lib/1.0-socket.abcdef12");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("lib-1.0-socket.abcdef12.jar"), patched)
+            .await
+            .unwrap();
+        let mut record = record_with_one_file(&compute_git_sha256_from_bytes(patched));
+        record.files = [(
+            "lib-1.0.jar".to_string(),
+            record.files.remove("index.js").unwrap(),
+        )]
+        .into_iter()
+        .collect();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(purl.to_string(), record.clone());
+        let ctx = hosted_ctx(
+            purl,
+            HostedCopies {
+                paths: vec![dir.clone()],
+                rename: Some(("lib-1.0".into(), "lib-1.0-socket.abcdef12".into())),
+            },
+        );
+        let out = applied_patches_with_vendor(&manifest, &HashMap::new(), Some(&ctx)).await;
+        assert_eq!(out.applied, vec![purl.to_string()], "{:?}", out.failed);
+
+        let renamed = rename_record_files(&record, "lib-1.0", "lib-1.0-socket.abcdef12");
+        assert!(renamed.files.contains_key("lib-1.0-socket.abcdef12.jar"));
+        let mut odd = record.clone();
+        odd.files.insert(
+            "lib-1.0.1.jar".to_string(),
+            odd.files["lib-1.0.jar"].clone(),
+        );
+        let renamed = rename_record_files(&odd, "lib-1.0", "lib-1.0-socket.abcdef12");
+        assert!(
+            renamed.files.contains_key("lib-1.0.1.jar"),
+            "not a whole component"
+        );
     }
 }

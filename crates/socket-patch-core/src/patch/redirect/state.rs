@@ -6,9 +6,11 @@
 //! (for a future `--revert`) plus, per redirected PURL, the manifest
 //! [`PatchRecord`] (file hashes + vulnerability metadata) so a post-install
 //! `socket-patch vex` can attest the redirected patches against the installed
-//! tree exactly as it does for `apply` / `vendor`. `augment_with_redirect`
-//! folds `records` straight into a `PatchManifest` (keyed by PURL, the same
-//! key the manifest and VEX use).
+//! tree exactly as it does for `apply` / `vendor`. VEX folds `records`
+//! into its record view (keyed by PURL, the same key the manifest uses) —
+//! but only while the lockfile still wires each record's patch (the
+//! CLI's `commands::vex_sources` liveness gate): a stale ledger alone never
+//! attests.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -248,7 +250,7 @@ pub async fn save_redirect_state(
 ///
 /// * its `new` content references THIS purl's hosted artifact — every hosted
 ///   artifact URL embeds the patch uuid (on ANY patch-server host; the same
-///   invariant the takeover classifier's `hosted_wiring_live` proof rests
+///   invariant the takeover classifier's `redirect_record_live` proof rests
 ///   on), and a uuid is hex-and-dashes so it spells identically raw,
 ///   `\/`-escaped (old composer) and percent-encoded (yarn-berry
 ///   `::__archiveUrl=`). The uuid(s) come from this purl's own `records`
