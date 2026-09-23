@@ -428,7 +428,7 @@ And `setup --remove` reverts the install hooks that `setup` added.
 | [`vex`](#vex) | Generate an OpenVEX attestation for the applied patches |
 | [`vendor`](#vendor) | Eject patched dependencies into committable `.socket/vendor/` |
 | [`setup`](#setup) | Wire install hooks so patches re-apply automatically |
-| [`rollback`](#rollback) | Restore original files (keeps the manifest) |
+| [`rollback`](#rollback) | Fully unpatch everything (or the given targets) in every mode and drop the rolled-back manifest entries (`--preserve-state` keeps them) |
 | [`get`](#get) | Fetch and apply a patch by UUID / CVE / GHSA / PURL / name (alias: `download`) |
 | [`list`](#list) | List recorded patches: manifest entries plus vendor-ledger and redirect-ledger records |
 | [`remove`](#remove) | Remove a patch: roll back files + delete the manifest entry |
@@ -980,7 +980,7 @@ socket-patch get CVE-2024-12345 --json -y
 ### `list`
 
 List all patches recorded locally: the manifest's entries plus the vendor ledger's
-(marked `(vendored)`) and the hosted redirect ledger's records, so it works on
+(labeled `Mode: vendored`) and the hosted redirect ledger's records, so it works on
 manifest-less vendored or hosted projects too.
 
 **Usage:**

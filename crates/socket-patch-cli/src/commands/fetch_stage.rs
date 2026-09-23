@@ -371,7 +371,11 @@ pub(crate) enum MemStageOutcome {
 /// nothing). `seed` pre-populates the in-memory blob set — the vendored
 /// download phase already holds every fetched view's `blobContent`, so a
 /// fresh `scan`/`get --mode vendored` never fetches a view a second time
-/// here; manifest-driven callers pass an empty map.
+/// here; manifest-driven callers pass an empty map. `client` is the run's
+/// one API client (every CLI caller has one — building another here
+/// repeated its token advisory and org-slug round-trip, under the apply
+/// lock in `vendor`'s case); `None` builds one on demand, only once a fetch
+/// is actually needed (the unit tests' offline arms never get that far).
 pub(crate) async fn stage_vendor_sources_in_memory(
     common: &GlobalArgs,
     manifest: &PatchManifest,
@@ -379,6 +383,7 @@ pub(crate) async fn stage_vendor_sources_in_memory(
     project_root: &Path,
     ledger: LedgerLoad<'_>,
     seed: HashMap<String, Vec<u8>>,
+    client: Option<&ApiClient>,
 ) -> MemStageOutcome {
     let quiet = common.silent || common.json;
     let blobs = socket_dir.join("blobs");
@@ -448,7 +453,16 @@ pub(crate) async fn stage_vendor_sources_in_memory(
             );
         }
 
-        let (client, _) = get_api_client_with_overrides(common.api_client_overrides()).await;
+        let built;
+        let client = match client {
+            Some(client) => client,
+            None => {
+                built = get_api_client_with_overrides(common.api_client_overrides())
+                    .await
+                    .0;
+                &built
+            }
+        };
         let mut failed: Vec<&str> = Vec::new();
         for (purl, uuid) in &to_fetch {
             match client.fetch_patch(uuid).await {
@@ -676,6 +690,7 @@ mod tests {
             &project_root,
             Ok(&HashMap::new()),
             HashMap::new(),
+            None,
         )
         .await;
         assert!(
@@ -703,6 +718,7 @@ mod tests {
             &project_root,
             Ok(&HashMap::new()),
             seed,
+            None,
         )
         .await;
         let MemStageOutcome::Ready(staged) = outcome else {
@@ -750,6 +766,7 @@ mod tests {
             &project_root,
             Ok(&HashMap::new()),
             seed,
+            None,
         )
         .await;
         assert!(
@@ -775,6 +792,7 @@ mod tests {
             &project_root,
             Err(&err),
             HashMap::new(),
+            None,
         )
         .await;
         assert!(matches!(outcome, MemStageOutcome::Unavailable));

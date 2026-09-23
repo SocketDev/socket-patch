@@ -605,6 +605,7 @@ async fn run_vendor(
         &common.cwd,
         ledger.as_ref().map(|s| &s.entries),
         HashMap::new(),
+        service.client.as_ref(),
     )
     .await
     {

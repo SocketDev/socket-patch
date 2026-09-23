@@ -521,7 +521,10 @@ async fn restore_orphaned_pre_rebuild_dirs(common: &GlobalArgs) {
 /// ones the reconstruction below rewires), so neither is re-read here. An
 /// unreadable ledger fails this phase loudly (`vendor_state_unreadable`);
 /// the caller's own degrade-to-empty policy for its download scoping is
-/// its own.
+/// its own. `run_client` is the run's API client when the caller already
+/// built one (repair.rs's `telemetry_client`): the uuid lookups and the
+/// staging fetch reuse it instead of constructing a second (or third) one
+/// and re-printing its token advisory; `None` builds lazily on first need.
 pub(crate) async fn repair_vendored_artifacts_with_references(
     common: &GlobalArgs,
     manifest: Option<&PatchManifest>,
@@ -529,6 +532,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
     env: &mut Envelope,
     references: &[(String, String, String)],
     ledger: std::io::Result<VendorState>,
+    run_client: Option<&ApiClient>,
 ) -> usize {
     let quiet = common.json || common.silent;
     let mut rebuilt = 0usize;
@@ -551,8 +555,9 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
 
     // ── Pass 1: ledger-driven health check ───────────────────────────────
     // Shared across both passes so the API client (and its one-time
-    // token-shape stderr advisory) is constructed at most once per run.
-    let mut api_client: Option<ApiClient> = None;
+    // token-shape stderr advisory) is constructed at most once per run —
+    // seeded from the run's client when the caller has one.
+    let mut api_client: Option<ApiClient> = run_client.cloned();
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut ledger_purls: Vec<String> = state.entries.keys().cloned().collect();
     ledger_purls.sort();
@@ -1063,6 +1068,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
         &common.cwd,
         Ok(&state.entries),
         HashMap::new(),
+        api_client.as_ref(),
     )
     .await
     {

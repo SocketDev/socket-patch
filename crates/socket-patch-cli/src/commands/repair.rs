@@ -422,6 +422,7 @@ async fn repair_inner(
         &mut env,
         &vendor_references,
         ledger,
+        api_client,
     )
     .await;
     if !quiet && vendor_rebuilt > 0 {

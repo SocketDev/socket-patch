@@ -253,6 +253,7 @@ async fn stage_and_vendor(
         &common.cwd,
         ledger.as_ref().map(|s| &s.entries),
         seed,
+        Some(&client),
     )
     .await
     {
