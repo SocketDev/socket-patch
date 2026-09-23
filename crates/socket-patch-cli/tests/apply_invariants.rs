@@ -501,7 +501,7 @@ fn apply_with_no_socket_dir_silent_emits_nothing() {
     assert_eq!(loud.status.code(), Some(0));
     let loud_stdout = String::from_utf8_lossy(&loud.stdout);
     assert!(
-        loud_stdout.contains("No .socket folder found"),
+        loud_stdout.contains("No patch manifest found; nothing to apply."),
         "non-silent no-manifest run must print the skip message; got {loud_stdout:?}"
     );
 }

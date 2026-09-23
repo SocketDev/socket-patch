@@ -589,9 +589,11 @@ fn apply_in_pty_with_no_manifest_prints_friendly_message() {
     let (code, output) = run_in_pty(&["apply"], tmp.path(), "", Duration::from_secs(15));
     assert_eq!(code, 0);
     // Assert the full message, not either half of it. The `||` previously
-    // let a truncated/garbled message ("...skipping...") pass.
+    // let a truncated/garbled message ("...nothing to apply...") pass.
+    // v5.0 wording names the missing manifest, not the `.socket/` folder
+    // (hosted/vendored projects have one with nothing for `apply` to do).
     assert!(
-        output.contains("No .socket folder found, skipping patch application."),
+        output.contains("No patch manifest found; nothing to apply."),
         "PTY apply no-manifest must print the friendly message; got: {output}"
     );
 }
