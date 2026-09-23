@@ -20,6 +20,14 @@
 //!   6. Same-run `--vex`: the stale purl is excluded from the ledger-based
 //!      attestation — the envelope must never attest a CVE its own warning
 //!      says is live.
+//!   7. Manifest-less standalone `vex` over the same committed state follows
+//!      the installed tree: stale → `not_applied` (ledger kept) / nothing
+//!      discoverable (ledgers deleted, lock not yet converged); after the
+//!      prescribed re-install (the lock bundler then writes — separate
+//!      patch-registry `GEM` section on bundler >= 2.2, the merged
+//!      multi-remote section on <= 2.1) it attests from the lock + patch API
+//!      with no ledger; offline → `record_unavailable`; tampered →
+//!      `hash_mismatch`; reverted pair → `redirect_unwired`.
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +37,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
 const ORG: &str = "test-org";
 const DEP: &str = "stale-probe-gem";
@@ -518,4 +528,118 @@ async fn gem_hosted_stale_purl_is_not_vex_attested_in_the_same_run() {
         "an all-stale --vex run must fail, not attest.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert_eq!(env["status"], "error", "envelope: {env}");
+}
+
+/// 7. Manifest-less VEX (no `.socket/manifest.json` — hosted never writes
+/// one) over the stale-install scenario, before and after the prescribed
+/// fix. The two post-install lock shapes are the ones REAL bundler writes
+/// (captured in e2e_redirect_gem_build's version matrix).
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_manifest_less_vex_follows_the_installed_tree() {
+    use vex_e2e_common::{
+        assert_absent, assert_attested, assert_not_attested, run_vex, strip_ledgers,
+        strip_manifest, Marker, VexRun,
+    };
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let bin = vex_e2e_common::binary();
+    let vulns: &[(&str, &[&str])] = &[(GHSA, &["CVE-2026-4444"])];
+    let base = VexRun {
+        api_url: Some(server.uri()),
+        api_token: Some("fake".into()),
+        org: Some(ORG.into()),
+        // The fixture's hosted URLs are on the mock origin, not the Socket
+        // patch host discovery allowlists by default.
+        patch_server_url: Some(server.uri()),
+        product: Some("pkg:gem/app@1.0.0".into()),
+        ..VexRun::default()
+    };
+    let requests = || async {
+        server
+            .received_requests()
+            .await
+            .map(|r| r.len())
+            .unwrap_or(0)
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    let pristine_gemfile = std::fs::read(proj.join("Gemfile")).unwrap();
+    let pristine_lock = std::fs::read(proj.join("Gemfile.lock")).unwrap();
+    let (gem_dir, _, _) = materialize_installed_gem(&proj, "3.3.0", UPSTREAM_LIB);
+    let (code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
+    assert_eq!(code, 0, "hosted scan:\n{stdout}\n{stderr}");
+    assert_eq!(
+        stale_warnings(&common::parse_json_envelope(&stdout)).len(),
+        1
+    );
+    strip_manifest(&proj);
+    let ledger = std::fs::read(proj.join(".socket/vendor/redirect-state.json")).unwrap();
+
+    // Stale, ledger kept: the Gemfile block keeps the claim live, the
+    // pristine installed tree decides.
+    let out = run_vex(&bin, &proj, &base);
+    assert_eq!(out.code, Some(1), "stale install: {out}");
+    assert_not_attested(&out.envelope, PURL, "not_applied");
+
+    // Stale, no ledgers: the lock is not converged yet (bundler < 2.6 mixed
+    // pair) and the Gemfile is not a discovery input — nothing to attest.
+    strip_ledgers(&proj);
+    let out = run_vex(&bin, &proj, &base);
+    assert_eq!(out.code, Some(2), "nothing discoverable: {out}");
+    assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
+    assert_absent(out.doc.as_ref(), PURL);
+
+    // The prescribed re-install: patched tree + the lock bundler writes.
+    let index_url = format!("{}/patch-registry/gem/{TOKEN}/{UUID}/", server.uri());
+    let separate = format!(
+        "GEM\n  remote: {index_url}\n  specs:\n    {DEP} ({DEP_VERSION})\n\n\
+         GEM\n  remote: https://rubygems.org/\n  specs:\n\n\
+         PLATFORMS\n  ruby\n\nDEPENDENCIES\n  {DEP} (= {DEP_VERSION})!\n\n\
+         BUNDLED WITH\n   2.6.9\n"
+    );
+    let merged = format!(
+        "GEM\n  remote: https://rubygems.org/\n  remote: {index_url}\n  specs:\n    \
+         {DEP} ({DEP_VERSION})\n\nPLATFORMS\n  ruby\n\n\
+         DEPENDENCIES\n  {DEP} (= {DEP_VERSION})!\n\nBUNDLED WITH\n   1.17.3\n"
+    );
+    std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), PATCHED_LIB).unwrap();
+    for (shape, lock) in [
+        ("bundler >= 2.2", &separate),
+        ("bundler <= 2.1 merged", &merged),
+    ] {
+        std::fs::write(proj.join("Gemfile.lock"), lock).unwrap();
+        let out = run_vex(&bin, &proj, &base);
+        assert_eq!(out.code, Some(0), "{shape}, ledger-less: {out}");
+        assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+
+        let before = requests().await;
+        let mut offline = base.clone();
+        offline.offline = true;
+        let out = run_vex(&bin, &proj, &offline);
+        assert_eq!(out.code, Some(1), "{shape}, offline: {out}");
+        assert_not_attested(&out.envelope, PURL, "record_unavailable");
+        assert_eq!(requests().await, before, "{shape}: --offline made requests");
+    }
+
+    // Tampered installed tree: installed evidence wins over the wiring.
+    std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), "tampered\n").unwrap();
+    let out = run_vex(&bin, &proj, &base);
+    assert_eq!(out.code, Some(1), "tampered: {out}");
+    assert_not_attested(&out.envelope, PURL, "hash_mismatch");
+    std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), PATCHED_LIB).unwrap();
+
+    // Reverted pair, ledger (and the patched install) kept.
+    std::fs::write(proj.join(".socket/vendor/redirect-state.json"), &ledger).unwrap();
+    std::fs::write(proj.join("Gemfile"), &pristine_gemfile).unwrap();
+    std::fs::write(proj.join("Gemfile.lock"), &pristine_lock).unwrap();
+    for no_verify in [false, true] {
+        let mut run = base.clone();
+        run.no_verify = no_verify;
+        let out = run_vex(&bin, &proj, &run);
+        assert_eq!(out.code, Some(1), "reverted no_verify={no_verify}: {out}");
+        assert_not_attested(&out.envelope, PURL, "redirect_unwired");
+    }
 }

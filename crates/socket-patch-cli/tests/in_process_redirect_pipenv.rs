@@ -14,8 +14,20 @@
 //!   the sibling `requirements.txt` redirect (Bugbot HIGH on #242);
 //! * a venv still holding the UPSTREAM release is reported stale and kept
 //!   out of the same-run attestation.
+//!
+//! Every flow ends with the manifest-less VEX steps (`vex_pipenv_pip_steps`)
+//! over a copy of the committed state it produced: manifest deleted,
+//! ledgers deleted too, `--offline` (`record_unavailable`, zero requests),
+//! the lock reverted to the registry (`redirect_unwired`, `--no-verify`
+//! too) and `apply --vex` — and, for the warm venv, `not_applied` whatever
+//! the lock says.
 
 use std::path::Path;
+
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+#[path = "vex_pipenv_pip_steps/mod.rs"]
+mod vex_pipenv_pip_steps;
 
 use serial_test::serial;
 use socket_patch_cli::args::GlobalArgs;
@@ -25,6 +37,9 @@ use socket_patch_cli::commands::vex::VexEmbedArgs;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use vex_e2e_common::Marker;
+use vex_pipenv_pip_steps::{run_manifestless_steps, Records, Steps};
 
 const ORG: &str = "test-org";
 /// Discovery names the base purl (the lockfile supplement's spelling)…
@@ -136,28 +151,57 @@ async fn mock_api(server: &MockServer) {
         .await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID,
-            "purl": RECORD_PURL,
-            "publishedAt": "2026-07-29T20:20:47Z",
-            "files": {
-                "urllib3/response.py": {
-                    "beforeHash": compute_git_sha256_from_bytes(UPSTREAM),
-                    "afterHash": compute_git_sha256_from_bytes(PATCHED),
-                }
-            },
-            "vulnerabilities": {
-                GHSA: {
-                    "cves": ["CVE-2025-66418"],
-                    "summary": "pipenv redirect vex fixture",
-                    "severity": "HIGH",
-                    "description": "d"
-                }
-            },
-            "description": "x", "license": "MIT", "tier": "free"
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view_body()))
         .mount(server)
         .await;
+}
+
+/// The patch view (`GET …/view/<uuid>`) — also what the manifest-less VEX
+/// steps' patch API serves on the public-proxy route.
+fn view_body() -> serde_json::Value {
+    serde_json::json!({
+        "uuid": UUID,
+        "purl": RECORD_PURL,
+        "publishedAt": "2026-07-29T20:20:47Z",
+        "files": {
+            "urllib3/response.py": {
+                "beforeHash": compute_git_sha256_from_bytes(UPSTREAM),
+                "afterHash": compute_git_sha256_from_bytes(PATCHED),
+            }
+        },
+        "vulnerabilities": {
+            GHSA: {
+                "cves": ["CVE-2025-66418"],
+                "summary": "pipenv redirect vex fixture",
+                "severity": "HIGH",
+                "description": "d"
+            }
+        },
+        "description": "x", "license": "MIT", "tier": "free"
+    })
+}
+
+const VEX_PRODUCT: &str = "pkg:pypi/pipenv-fixture@0.1.0";
+
+/// The manifest-less VEX steps over the committed state `project` holds
+/// (nothing installed: the lock's integrity pin is the evidence), with
+/// `revert` putting the wiring back on the registry.
+fn manifestless_vex(project: &Path, what: &str, revert: &(dyn Fn(&Path) + Sync)) {
+    run_manifestless_steps(&Steps {
+        what: what.to_string(),
+        project,
+        purl: PURL,
+        uuid: UUID,
+        marker: Marker::Redirected,
+        vulns: Some(&[(GHSA, &["CVE-2025-66418"])]),
+        records: Records::Mock(vec![(UUID.to_string(), view_body())]),
+        patch_server_url: None,
+        product: VEX_PRODUCT,
+        revert,
+        envs: Vec::new(),
+        on_step: None,
+        expect_verified: true,
+    });
 }
 
 fn site_packages(root: &Path) -> std::path::PathBuf {
@@ -308,6 +352,11 @@ async fn lock_only_pipenv_project_redirects_attests_rescans_and_rolls_back() {
             .unwrap();
     assert_eq!(ledger["edits"].as_array().map(Vec::len), Some(1), "one edit, not two");
 
+    // Manifest-less VEX over the committed state (the depscan / CI shape).
+    manifestless_vex(tmp.path(), "pipenv lock-only", &|p: &Path| {
+        std::fs::write(p.join("Pipfile.lock"), LOCK).unwrap();
+    });
+
     // 3. rollback unwinds the redirect and drops the record.
     roll_back(tmp.path(), server.uri()).await;
     assert_eq!(read(&lock_path), LOCK, "rollback must restore the pristine lock byte for byte");
@@ -345,6 +394,11 @@ async fn legacy_installer_major_selects_path_references() {
     assert!(entry.get("file").is_none(), "{entry}");
     assert_eq!(entry["hashes"], serde_json::json!([format!("sha256:{}", sha256())]));
 
+    // The legacy `path` reference is discovered just like `file`.
+    manifestless_vex(tmp.path(), "pipenv legacy path", &|p: &Path| {
+        std::fs::write(p.join("Pipfile.lock"), LOCK).unwrap();
+    });
+
     roll_back(tmp.path(), server.uri()).await;
     assert_eq!(read(&lock_path), LOCK);
 }
@@ -370,10 +424,23 @@ async fn stale_pipfile_lock_does_not_veto_the_requirements_redirect() {
         requirements.contains(HOSTED_URL),
         "requirements.txt must be redirected past a stale Pipfile.lock: {requirements}"
     );
-    assert_eq!(read(&tmp.path().join("Pipfile.lock")), stale, "the stale lock is left alone");
+    assert_eq!(
+        read(&tmp.path().join("Pipfile.lock")),
+        stale,
+        "the stale lock is left alone"
+    );
+
+    // The requirements wiring attests manifest-less; the stale lock beside
+    // it neither vetoes nor contributes.
+    manifestless_vex(tmp.path(), "requirements past a stale lock", &|p: &Path| {
+        std::fs::write(p.join("requirements.txt"), "urllib3==1.26.18\n").unwrap();
+    });
 
     roll_back(tmp.path(), server.uri()).await;
-    assert_eq!(read(&tmp.path().join("requirements.txt")), "urllib3==1.26.18\n");
+    assert_eq!(
+        read(&tmp.path().join("requirements.txt")),
+        "urllib3==1.26.18\n"
+    );
     assert_eq!(read(&tmp.path().join("Pipfile.lock")), stale);
 }
 
@@ -407,6 +474,38 @@ async fn warm_venv_with_the_upstream_release_is_not_attested() {
         UPSTREAM,
         "the probe is read-only"
     );
+
+    // Manifest-less: the installed UPSTREAM copy is the evidence, whatever
+    // the lock and the ledger say — `not_applied`, with or without the
+    // ledger, online.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let api = vex_e2e_common::PatchApi::start(vec![(UUID.to_string(), view_body())]);
+                for strip_ledgers in [false, true] {
+                    let scratch = tempfile::tempdir().unwrap();
+                    let p = scratch.path().join("proj");
+                    vex_pipenv_pip_steps::copy_tree(tmp.path(), &p);
+                    vex_e2e_common::strip_manifest(&p);
+                    if strip_ledgers {
+                        vex_e2e_common::strip_ledgers(&p);
+                    }
+                    let out = vex_e2e_common::run_vex(
+                        &vex_e2e_common::binary(),
+                        &p,
+                        &vex_e2e_common::VexRun {
+                            product: Some(VEX_PRODUCT.into()),
+                            ..vex_e2e_common::VexRun::online(&api)
+                        },
+                    );
+                    assert_eq!(out.code, Some(1), "ledgers stripped={strip_ledgers}: {out}");
+                    vex_e2e_common::assert_absent(out.doc.as_ref(), PURL);
+                    vex_e2e_common::assert_not_attested(&out.envelope, PURL, "not_applied");
+                }
+            })
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e));
+    });
 
     roll_back(tmp.path(), server.uri()).await;
     assert_eq!(read(&lock_path), LOCK);

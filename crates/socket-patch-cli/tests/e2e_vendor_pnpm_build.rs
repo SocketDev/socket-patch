@@ -45,6 +45,21 @@
 //! proof (pnpm <= 8 absolutizes file: override specifiers, so frozen
 //! installs are path-bound — the moved-checkout frozen FAILURE is asserted
 //! as the documented limitation).
+//!
+//! `pnpm_pinned_matrix_vendored_lifecycle_and_manifestless_vex` is the
+//! required pnpm-compatibility.yml leg (one exact pnpm per job, pnpm 1-12):
+//! the 9.0 capstone (both drivers) on pnpm >= 9, the legacy lifecycle on
+//! 7 / 8, and the byte-untouched refusal on 1-6. Measured spelling quirks
+//! it pins: pnpm 7.0-7.17 keep a `file:` override specifier relative and
+//! 9.0.0-9.0.4 absolutize it, so `--frozen-lockfile` refuses the wiring on
+//! exactly those releases (a plain install still lands the vendored bytes).
+//!
+//! MANIFEST-LESS VEX: every positive capstone ends in
+//! `assert_manifestless_vendored_vex` over its real fresh install — the
+//! ledger record, the lockfile alone + the patch API record, `--offline`
+//! (`record_unavailable`), embedded `vendor --vex` / `apply --vex`, the
+//! wiring reverted with ledger + tarball kept (`vendor_unwired`,
+//! `--no-verify` too), and a lock-only revert that pnpm itself re-wires.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -55,6 +70,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+use vex_e2e_common::{
+    assert_absent, assert_attested, assert_not_attested, patch_view, run_vex, strip_ledgers,
+    strip_manifest, Marker, PatchApi, VexRun, VexVia,
+};
 
 const ORG: &str = "test-org";
 const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
@@ -70,28 +91,100 @@ const PNPM_TERTIARY: &str = "pnpm@11";
 
 // ── self-contained helpers ────────────────────────────────────────────
 
+/// The binary under test; the pinned-matrix workflow runs a prebuilt copy
+/// (`SOCKET_PATCH_PNPM_E2E_SOCKET_BIN`, shared with the hosted suite).
 fn binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
+    std::env::var_os("SOCKET_PATCH_PNPM_E2E_SOCKET_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_socket-patch")))
+}
+
+/// Set by the pinned-matrix workflow: a missing toolchain or a failed
+/// fixture install is then a failure, never a skip.
+fn pnpm_required() -> bool {
+    std::env::var_os("SOCKET_PATCH_PNPM_E2E_REQUIRED").is_some()
+}
+
+/// `corepack <pm>`, or — in the pinned matrix — the provisioned pnpm
+/// executable (`SOCKET_PATCH_PNPM_E2E_BIN`, the hosted suite's contract).
+fn pnpm_command(pm: &str) -> Command {
+    if let Some(bin) = std::env::var_os("SOCKET_PATCH_PNPM_E2E_BIN") {
+        Command::new(bin)
+    } else {
+        let mut cmd = Command::new("corepack");
+        cmd.arg(pm);
+        cmd
+    }
+}
+
+fn pnpm_major(pm: &str) -> Option<u32> {
+    pm.strip_prefix("pnpm@")?.split('.').next()?.parse().ok()
+}
+
+/// pnpm 7.0.0-7.17.x keep a `file:` override's importer specifier relative
+/// (measured 2026-09-22: 7.17.1 refuses the absolutized spelling under
+/// `--frozen-lockfile`, 7.18.0 writes and accepts it).
+fn keeps_relative_file_overrides(pm: &str) -> bool {
+    let Some(v) = pm.strip_prefix("pnpm@") else {
+        return false;
+    };
+    let parts: Vec<u32> = v.split('.').filter_map(|p| p.parse().ok()).collect();
+    matches!(parts.as_slice(), [7, minor, _] if *minor <= 17)
+}
+
+/// pnpm 9.0.0-9.0.4: the last releases that absolutize a `file:` override's
+/// importer specifier (measured 2026-09-22: 9.0.4 refuses the relative
+/// spelling under `--frozen-lockfile`, 9.0.5 accepts it).
+fn absolutizes_file_overrides(pm: &str) -> bool {
+    let Some(v) = pm.strip_prefix("pnpm@") else {
+        return false;
+    };
+    let parts: Vec<u32> = v.split('.').filter_map(|p| p.parse().ok()).collect();
+    matches!(parts.as_slice(), [9, 0, patch] if *patch <= 4)
 }
 
 fn has_corepack_pm(pm: &str) -> bool {
     // Isolated too: this probe is what actually downloads the package manager
     // the first time, and corepack stores it under `COREPACK_HOME`.
-    let mut cmd = Command::new("corepack");
-    cmd.args([pm, "--version"])
+    let probe = tempfile::tempdir().unwrap();
+    let mut cmd = pnpm_command(pm);
+    cmd.arg("--version")
+        .current_dir(probe.path())
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     cache_env::isolate(&mut cmd);
-    cmd.stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let out = cmd.stdin(Stdio::null()).output();
+    let ok = out.as_ref().is_ok_and(|o| o.status.success());
+    if pnpm_required() {
+        assert!(ok, "required pnpm toolchain unavailable: {out:?}");
+        if let (Ok(out), Some(want)) = (&out, pm.strip_prefix("pnpm@")) {
+            if want.contains('.') {
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout).trim(),
+                    want,
+                    "the matrix must run the pinned version"
+                );
+            }
+        }
+    }
+    ok
 }
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str]) -> Output {
-    let mut cmd = Command::new("corepack");
-    cmd.arg(pm)
-        .args(args)
+    // pnpm <= 4 spells the store option `--store`; 1-3 silently ignore
+    // `--store-dir` (a warm store would then fake cold-install coverage).
+    let legacy_store = pnpm_major(pm).is_some_and(|m| m <= 4);
+    let args: Vec<&str> = args
+        .iter()
+        .map(|a| {
+            if legacy_store && *a == "--store-dir" {
+                "--store"
+            } else {
+                *a
+            }
+        })
+        .collect();
+    let mut cmd = pnpm_command(pm);
+    cmd.args(&args)
         .current_dir(cwd)
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     scrub_socket_env(&mut cmd);
@@ -332,6 +425,10 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
         &["install", "--store-dir", store.to_str().unwrap()],
     );
     if !install.status.success() {
+        assert!(
+            !pnpm_required(),
+            "required {pm} fixture install failed: {install:?}"
+        );
         println!(
             "SKIP e2e_vendor_pnpm_build ({pm}): fixture `pnpm install` failed (registry \
              unreachable?):\n{}",
@@ -590,7 +687,7 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
     copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_store = tmp.path().join("fresh-pnpm-store");
-    let ci = corepack(
+    let mut ci = corepack(
         &fresh,
         pm,
         &[
@@ -601,6 +698,28 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
             fresh_store.to_str().unwrap(),
         ],
     );
+    if absolutizes_file_overrides(pm) {
+        // pnpm 9.0.0-9.0.4 still absolutize a `file:` override's
+        // specifier, like pnpm <= 8, so the frozen check refuses the
+        // relative spelling the 9.0 backend writes (fixed in 9.0.5). The
+        // committable set still installs the vendored bytes without it.
+        assert!(
+            !ci.status.success()
+                && String::from_utf8_lossy(&ci.stdout).contains("ERR_PNPM_OUTDATED_LOCKFILE"),
+            "{pm} was expected to refuse the relative override specifier: {ci:?}"
+        );
+        ci = corepack(
+            &fresh,
+            pm,
+            &[
+                "install",
+                "--offline",
+                "--no-frozen-lockfile",
+                "--store-dir",
+                fresh_store.to_str().unwrap(),
+            ],
+        );
+    }
     assert!(
         ci.status.success(),
         "fresh-checkout `pnpm install --frozen-lockfile --offline` must succeed from the \
@@ -620,6 +739,22 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
         "fresh install must be byte-identical to the patched content"
     );
     eprintln!("FRESH INSTALL OK ({pm}, {driver:?})");
+
+    // Manifest-less VEX over the real fresh install (kept ledger, deleted
+    // ledgers, offline, embedded vendor/apply --vex, reverted lock).
+    // The fixture had no pnpm-workspace.yaml: vendoring created it.
+    assert_manifestless_vendored_vex(
+        &fresh,
+        pm,
+        &purl,
+        &patched,
+        &[
+            ("pnpm-lock.yaml", Some(lock_before.clone())),
+            ("package.json", Some(pkg_before.clone())),
+            ("pnpm-workspace.yaml", None),
+        ],
+        &format!("{pm} {driver:?}"),
+    );
 
     if driver == VendorDriver::GetUuid {
         // The lifecycle's latter half (idempotent re-vendor + revert) is the
@@ -703,6 +838,336 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
         "revert must delete the pnpm-workspace.yaml vendoring created"
     );
     eprintln!("REVERT OK ({pm})");
+}
+
+// ── manifest-less VEX (lockfile discovery) ─────────────────────────────
+
+/// The vulnerability set every vendored fixture's record carries.
+const VENDOR_VULNS: &[(&str, &[&str])] = &[("GHSA-vend-pnpm-real", &["CVE-2024-88888"])];
+
+/// Run `f` on a scoped OS thread outside any tokio runtime: [`PatchApi`]
+/// owns its own runtime, which can be neither started nor dropped from
+/// inside an async context. A panic in `f` fails the test unchanged.
+fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        s.spawn(f)
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
+}
+
+/// Manifest-less VEX over `fresh`, a checkout the REAL pnpm installed from
+/// the vendored wiring (committed `pnpm-lock.yaml` + `.socket/vendor/`).
+/// Proves, in order:
+///
+/// 1. `.socket/manifest.json` deleted: the vendor ledger's embedded record
+///    + the hash-verified committed tarball attest `(vendored)`;
+/// 2. the ledgers deleted too: the lockfile reference alone, with the
+///    record fetched from the patch API, still attests;
+/// 3. `--offline` with no ledgers: `record_unavailable`, zero API traffic;
+/// 4. embedded `vendor --vex` and `apply --vex` over the manifest- and
+///    ledger-less checkout attest too (`status: noManifest`), touching no
+///    wiring;
+/// 5. the wiring reverted to the registry resolution (`pristine`: every
+///    file vendoring edited, with its pre-vendor bytes — `None` = the file
+///    did not exist) while the ledger AND the tarball stay: NOT attested
+///    (`vendor_unwired`), `--no-verify` too;
+/// 6. ONLY the lock reverted, the `overrides` (package.json /
+///    pnpm-workspace.yaml) kept: still attested. That is what pnpm does
+///    with such a checkout — `--frozen-lockfile` refuses it
+///    (ERR_PNPM_LOCKFILE_CONFIG_MISMATCH: the overrides no longer match
+///    the lock) and a plain install re-applies the overrides and installs
+///    the vendored tarball, so no build consumes the registry copy — both
+///    halves are re-proven against the real `pm` here. Liveness for a uuid
+///    the reverted lock no longer names falls back to the ledger's recorded
+///    wiring files, overrides included.
+fn assert_manifestless_vendored_vex(
+    fresh: &Path,
+    pm: &str,
+    purl: &str,
+    patched: &[u8],
+    pristine: &[(&str, Option<Vec<u8>>)],
+    tag: &str,
+) {
+    off_runtime(|| {
+        let bin = binary();
+        let api = PatchApi::start(vec![(
+            UUID.to_string(),
+            patch_view(
+                UUID,
+                purl,
+                &[("package/index.js", &git_sha256(patched))],
+                VENDOR_VULNS,
+            ),
+        )]);
+        let lock = fresh.join("pnpm-lock.yaml");
+        let state = fresh.join(".socket/vendor/state.json");
+        let lock_wired = std::fs::read(&lock).expect("fresh checkout lock");
+        let pkg_wired = std::fs::read(fresh.join("package.json")).unwrap();
+        assert!(
+            fresh
+                .join(format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz"))
+                .is_file(),
+            "[{tag}] the committed tarball must travel with the checkout"
+        );
+
+        // 1. Manifest deleted: the ledger's embedded record.
+        strip_manifest(fresh);
+        let out = run_vex(&bin, fresh, &VexRun::online(&api));
+        assert_eq!(out.code, Some(0), "[{tag}] manifest-less vex: {out}");
+        assert_attested(out.doc(), purl, UUID, Marker::Vendored, VENDOR_VULNS);
+        eprintln!("VEX-CELL vendored [{tag}] manifest-deleted: attested");
+
+        // 2. Ledgers deleted: lockfile discovery + the API record.
+        let state_bytes = std::fs::read(&state).expect("vendor ledger");
+        strip_ledgers(fresh);
+        let views = api.view_requests(UUID);
+        let out = run_vex(&bin, fresh, &VexRun::online(&api));
+        assert_eq!(out.code, Some(0), "[{tag}] ledger-less vex: {out}");
+        assert_attested(out.doc(), purl, UUID, Marker::Vendored, VENDOR_VULNS);
+        assert!(
+            api.view_requests(UUID) > views,
+            "[{tag}] the record must come from the patch API: {:?}",
+            api.requests()
+        );
+        eprintln!("VEX-CELL vendored [{tag}] ledgers-deleted: attested");
+
+        // 3. Offline, no ledgers: the record is unavailable, zero network.
+        let seen = api.request_count();
+        let out = run_vex(&bin, fresh, &VexRun::offline());
+        assert_eq!(out.code, Some(1), "[{tag}] offline ledger-less vex: {out}");
+        assert_not_attested(&out.envelope, purl, "record_unavailable");
+        assert_absent(out.doc.as_ref(), purl);
+        assert_eq!(api.request_count(), seen, "[{tag}] --offline hit the API");
+        eprintln!("VEX-CELL vendored [{tag}] offline: record_unavailable");
+
+        // 4. Embedded, manifest- and ledger-less.
+        for via in [VexVia::Vendor, VexVia::Apply] {
+            let out = run_vex(&bin, fresh, &VexRun::online(&api).via(via));
+            assert_eq!(out.code, Some(0), "[{tag}] {via:?} --vex: {out}");
+            assert_eq!(
+                out.envelope["status"], "noManifest",
+                "[{tag}] {via:?}: {out}"
+            );
+            assert_attested(out.doc(), purl, UUID, Marker::Vendored, VENDOR_VULNS);
+            assert_eq!(std::fs::read(&lock).unwrap(), lock_wired, "[{tag}] {via:?}");
+            assert_eq!(
+                std::fs::read(fresh.join("package.json")).unwrap(),
+                pkg_wired,
+                "[{tag}] {via:?} must not touch the wiring"
+            );
+            assert!(!state.exists(), "[{tag}] {via:?} must not write a ledger");
+            eprintln!("VEX-CELL vendored [{tag}] embedded-{via:?}: attested");
+        }
+
+        // 5. Wiring reverted to the registry resolution; ledger + tarball
+        //    kept.
+        std::fs::write(&state, &state_bytes).unwrap();
+        let wired: Vec<(PathBuf, Option<Vec<u8>>)> = pristine
+            .iter()
+            .map(|(rel, _)| (fresh.join(rel), std::fs::read(fresh.join(rel)).ok()))
+            .collect();
+        let put = |path: &Path, bytes: &Option<Vec<u8>>| match bytes {
+            Some(b) => std::fs::write(path, b).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        };
+        for (rel, bytes) in pristine {
+            put(&fresh.join(rel), bytes);
+        }
+        for no_verify in [false, true] {
+            let out = run_vex(
+                &bin,
+                fresh,
+                &VexRun {
+                    no_verify,
+                    ..VexRun::online(&api)
+                },
+            );
+            assert_ne!(
+                out.code,
+                Some(0),
+                "[{tag}] reverted lock (no_verify={no_verify}): {out}"
+            );
+            assert_absent(out.doc.as_ref(), purl);
+            assert_not_attested(&out.envelope, purl, "vendor_unwired");
+            eprintln!("VEX-CELL vendored [{tag}] reverted(no_verify={no_verify}): not attested");
+        }
+        for (path, bytes) in &wired {
+            put(path, bytes);
+        }
+
+        // 6. Only the lock reverted; the overrides still wire the tarball.
+        let lock_pristine = pristine
+            .iter()
+            .find(|(rel, _)| *rel == "pnpm-lock.yaml")
+            .and_then(|(_, b)| b.clone())
+            .expect("the pristine lock");
+        std::fs::write(&lock, &lock_pristine).unwrap();
+        let out = run_vex(&bin, fresh, &VexRun::online(&api));
+        assert_eq!(out.code, Some(0), "[{tag}] lock-only revert: {out}");
+        assert_attested(out.doc(), purl, UUID, Marker::Vendored, VENDOR_VULNS);
+        let store = fresh.with_file_name("store-lock-only-revert");
+        let store = store.to_str().unwrap();
+        // A new store under an existing node_modules makes pnpm prompt to
+        // purge it (which fails without a TTY): install into a clean tree.
+        std::fs::remove_dir_all(fresh.join("node_modules")).unwrap();
+        let frozen = corepack(
+            fresh,
+            pm,
+            &[
+                "install",
+                "--frozen-lockfile",
+                "--offline",
+                "--store-dir",
+                store,
+            ],
+        );
+        assert!(
+            !frozen.status.success(),
+            "[{tag}] a frozen install must refuse a lock the overrides disagree with: {frozen:?}"
+        );
+        let plain = corepack(
+            fresh,
+            pm,
+            &[
+                "install",
+                "--offline",
+                "--no-frozen-lockfile",
+                "--store-dir",
+                store,
+            ],
+        );
+        assert!(plain.status.success(), "[{tag}] plain install: {plain:?}");
+        assert_eq!(
+            std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+            patched,
+            "[{tag}] a plain install must re-apply the overrides (vendored bytes)"
+        );
+        eprintln!("VEX-CELL vendored [{tag}] lock-only-revert(overrides kept): attested");
+        std::fs::write(&lock, &lock_wired).unwrap();
+    });
+    eprintln!("MANIFEST-LESS VENDORED VEX OK ({tag})");
+}
+
+// ── pinned-version matrix (pnpm-compatibility.yml) ────────────────────
+
+/// Required CI matrix twin of `e2e_redirect_pnpm_build`'s
+/// `pnpm_pinned_matrix_install_verify_revert_and_tamper`: the workflow
+/// provisions one exact pnpm (`SOCKET_PATCH_PNPM_E2E_VERSION` +
+/// `SOCKET_PATCH_PNPM_E2E_BIN`, with a compatible Node on PATH) and a
+/// missing toolchain or failed fixture install is a failure. Per lock era:
+///
+/// * pnpm >= 9 (lockfileVersion 9.0): the full `vendor` AND `get <uuid>
+///   --mode vendored` capstones;
+/// * pnpm 7 / 8 (5.4 / 6.0): the legacy lifecycle;
+/// * pnpm 1-6 (shrinkwrap 3, lockfile 5.0-5.3): vendored mode refuses the
+///   lock byte-untouched, and a manifest-less VEX attests nothing.
+///
+/// Every positive era ends in the manifest-less VEX cells.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the pinned pnpm matrix toolchain"]
+async fn pnpm_pinned_matrix_vendored_lifecycle_and_manifestless_vex() {
+    let version = std::env::var("SOCKET_PATCH_PNPM_E2E_VERSION")
+        .expect("set SOCKET_PATCH_PNPM_E2E_VERSION to the exact pnpm version");
+    let pm = format!("pnpm@{version}");
+    assert!(has_corepack_pm(&pm), "pnpm {version} unavailable");
+    match pnpm_major(&pm).expect("numeric pnpm major") {
+        9.. => {
+            run_pnpm_capstone(&pm, VendorDriver::VendorCli).await;
+            run_pnpm_capstone(&pm, VendorDriver::GetUuid).await;
+        }
+        7 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: 5.4")),
+        8 => off_runtime(|| run_legacy_capstone(&pm, "lockfileVersion: '6.0'")),
+        _ => off_runtime(|| run_unsupported_lock_refusal(&pm)),
+    }
+}
+
+/// pnpm 1-6: vendored mode supports lockfileVersion 5.4 / 6.0 / 9.0 only,
+/// so `vendor` over a real older lock must refuse without touching the
+/// lock or package.json, leave no artifact, and a manifest-less VEX — in
+/// either front door — must find nothing to attest and stay offline.
+fn run_unsupported_lock_refusal(pm: &str) {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let pkg_doc = serde_json::json!({
+        "name": "pnpm-refusal-capstone",
+        "version": "0.0.0",
+        "private": true,
+        "dependencies": { DEP: DEP_VERSION },
+    });
+    std::fs::write(
+        proj.join("package.json"),
+        format!("{}\n", serde_json::to_string_pretty(&pkg_doc).unwrap()),
+    )
+    .unwrap();
+    let store = tmp.path().join("pnpm-store");
+    let install = corepack(
+        &proj,
+        pm,
+        &["install", "--store-dir", store.to_str().unwrap()],
+    );
+    assert!(
+        install.status.success(),
+        "required {pm} fixture install failed: {install:?}"
+    );
+    let lock_name = if proj.join("pnpm-lock.yaml").exists() {
+        "pnpm-lock.yaml"
+    } else {
+        "shrinkwrap.yaml"
+    };
+    let lock_path = proj.join(lock_name);
+    let lock_before = std::fs::read(&lock_path).expect("the fixture install wrote a lock");
+    let pkg_before = std::fs::read(proj.join("package.json")).unwrap();
+    let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js"))
+        .expect("installed index.js");
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(
+        env["summary"]["applied"], 0,
+        "{pm}: an unsupported lock must not vendor (exit {code}).\n{env}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("vendor_lockfile_version_unsupported")
+            || stdout.contains("vendor_lockfile_missing"),
+        "{pm}: the refusal must name the lockfile: {env}"
+    );
+    assert_eq!(std::fs::read(&lock_path).unwrap(), lock_before, "{pm} lock");
+    assert_eq!(
+        std::fs::read(proj.join("package.json")).unwrap(),
+        pkg_before,
+        "{pm} package.json"
+    );
+    assert!(
+        !proj.join(format!(".socket/vendor/npm/{UUID}")).exists(),
+        "{pm}: a refused vendor must leave no artifact"
+    );
+    eprintln!("VENDOR REFUSED ({pm}, {lock_name})");
+
+    let api = PatchApi::empty();
+    strip_manifest(&proj);
+    let out = run_vex(&binary(), &proj, &VexRun::online(&api));
+    assert_ne!(out.code, Some(0), "{pm}: nothing is wired: {out}");
+    assert_absent(out.doc.as_ref(), &purl);
+    let out = run_vex(&binary(), &proj, &VexRun::online(&api).via(VexVia::Vendor));
+    assert_absent(out.doc.as_ref(), &purl);
+    api.assert_no_requests();
+    eprintln!("VEX-CELL vendored [{pm}] refused: not attested");
 }
 
 // ── pre-9.0 LEGACY lock legs (hermetic splice-shape + gated real-pnpm) ────
@@ -1066,6 +1531,10 @@ fn run_legacy_capstone(pm: &str, lock_head: &str) {
         &["install", "--store-dir", store.to_str().unwrap()],
     );
     if !install.status.success() {
+        assert!(
+            !pnpm_required(),
+            "required {pm} fixture install failed: {install:?}"
+        );
         println!(
             "SKIP legacy capstone ({pm}): fixture `pnpm install` failed (registry \
              unreachable?):\n{}",
@@ -1132,7 +1601,7 @@ fn run_legacy_capstone(pm: &str, lock_head: &str) {
     //    spike-proven strictest invocation.
     std::fs::remove_dir_all(proj.join("node_modules")).unwrap();
     let same_store = tmp.path().join("store-same");
-    let ci = corepack(
+    let mut ci = corepack(
         &proj,
         pm,
         &[
@@ -1143,6 +1612,29 @@ fn run_legacy_capstone(pm: &str, lock_head: &str) {
             same_store.to_str().unwrap(),
         ],
     );
+    let relative_spec = keeps_relative_file_overrides(pm);
+    if relative_spec {
+        // pnpm 7.0-7.17 keep a `file:` override's specifier RELATIVE, so
+        // their frozen check refuses the absolutized spelling the legacy
+        // backend writes (pnpm >= 7.18 absolutizes). The committable set
+        // still installs the vendored bytes without the frozen flag.
+        assert!(
+            !ci.status.success()
+                && String::from_utf8_lossy(&ci.stdout).contains("ERR_PNPM_OUTDATED_LOCKFILE"),
+            "{pm} was expected to refuse the absolutized override specifier: {ci:?}"
+        );
+        ci = corepack(
+            &proj,
+            pm,
+            &[
+                "install",
+                "--offline",
+                "--no-frozen-lockfile",
+                "--store-dir",
+                same_store.to_str().unwrap(),
+            ],
+        );
+    }
     assert!(
         ci.status.success(),
         "same-path `install --frozen-lockfile --offline` must succeed from the vendored \
@@ -1157,7 +1649,11 @@ fn run_legacy_capstone(pm: &str, lock_head: &str) {
     );
     eprintln!("SAME-PATH FROZEN INSTALL OK ({pm})");
 
-    // The lock must be byte-stable under pnpm's own re-serialization.
+    // The lock must be byte-stable under pnpm's own re-serialization (the
+    // relative-spelling releases re-spell the specifier: restore ours).
+    if relative_spec {
+        std::fs::write(&lock_path, &lock_after).unwrap();
+    }
     assert_eq!(
         std::fs::read_to_string(&lock_path).unwrap(),
         lock_after,
@@ -1222,6 +1718,17 @@ fn run_legacy_capstone(pm: &str, lock_head: &str) {
         "moved-checkout install must land the patched bytes ({pm})"
     );
     eprintln!("MOVED-CHECKOUT OFFLINE INSTALL OK ({pm})");
+    assert_manifestless_vendored_vex(
+        &fresh,
+        pm,
+        &purl,
+        &patched,
+        &[
+            ("pnpm-lock.yaml", Some(lock_before.clone())),
+            ("package.json", Some(pkg_before.clone())),
+        ],
+        pm,
+    );
 
     // 5. Idempotency in the original project.
     let (code, stdout, stderr) = run_socket(

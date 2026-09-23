@@ -18,7 +18,9 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
 };
-use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState};
+use socket_patch_core::vendor::state::{
+    VendorArtifact, VendorEntry, VendorState, WiringAction, WiringRecord,
+};
 
 /// Canonical-grammar patch UUID (the vendored-artifact verifier validates
 /// the uuid path level, so fixtures must use the real shape).
@@ -236,7 +238,7 @@ fn corrupt_manifest_json_envelope_carries_code_and_removes_stale_doc() {
 // The module doc promises a HARD error for a present-but-malformed
 // `.socket/vendor/redirect-state.json`: attesting with its records
 // silently dropped would produce a false document. No manifest is laid
-// down — `augment_with_redirect` must error BEFORE the empty-manifest /
+// down — the ledger load must error BEFORE the empty-manifest /
 // manifest_not_found check, which is itself an ordering assertion.
 // ──────────────────────────────────────────────────────────────────────
 
@@ -337,18 +339,20 @@ fn corrupt_redirect_ledger_json_envelope_carries_code_and_preserves_ledger() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// corrupt vendor ledger → warn + fail-closed degrade (732, 829-836)
+// corrupt vendor ledger → `vendor_ledger_corrupt`, exit 2
 //
-// Unlike the redirect ledger, a present-but-corrupt
-// `.socket/vendor/state.json` DEGRADES: `load_vendor_context` warns on
-// stderr and proceeds with no vendor entries, so vendored purls fall
-// through to the installed tree, fail verification there, and are omitted
-// — fail-closed, never falsely attested. The same run drives
-// `augment_with_detached`'s Err-skip (its `if let Ok(state)` guard).
+// DELIBERATE CHANGE (manifest-less VEX): a present-but-corrupt
+// `.socket/vendor/state.json` used to DEGRADE (stderr warning, vendored
+// purls fell through to the installed tree and were omitted). It is now a
+// hard error mirroring `redirect_ledger_corrupt`: the vendor ledger is an
+// attestation input in its own right — it carries embedded records and
+// the entries whose wiring liveness gates them — so a run that cannot read
+// it cannot tell which vendored patches it is dropping, and attesting from
+// the remainder would publish a silently partial document.
 // ──────────────────────────────────────────────────────────────────────
 
 #[test]
-fn corrupt_vendor_ledger_warns_and_fails_closed_in_human_mode() {
+fn corrupt_vendor_ledger_is_a_hard_error_in_human_mode() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     let purl = "pkg:npm/leftpad@1.0.0";
@@ -368,40 +372,31 @@ fn corrupt_vendor_ledger_warns_and_fails_closed_in_human_mode() {
         ])
         .output()
         .expect("invoke vex");
-    // The sole patch fails verification against the (absent) installed tree
-    // → soft "nothing to attest", exit 1 — NOT a false attestation and NOT
-    // a hard ledger error (the vendor ledger, unlike the redirect ledger,
-    // is a degrade).
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "corrupt vendor ledger must degrade to no_applicable_patches. stderr:\n{}",
+        Some(2),
+        "a corrupt vendor ledger is a hard error, never a degrade. stderr:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(out.stdout.is_empty(), "no document when nothing attests");
+    assert!(out.stdout.is_empty(), "no document on a hard error");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("Warning: Unreadable vendor state"),
-        "the degrade must be disclosed on stderr. got: {stderr}"
+        stderr.contains("vendor ledger") && stderr.contains("state.json"),
+        "the error must name the unreadable ledger. got: {stderr}"
     );
     assert!(
         stderr.contains("corrupt"),
-        "the warning must carry load_state's detail (corrupt <path>). got: {stderr}"
+        "the error must carry load_state's detail (corrupt <path>). got: {stderr}"
     );
-    // Fail-closed surfacing: the omitted patch is named with its reason.
+    // Nothing was verified, so no per-patch omission is reported.
     assert!(
-        stderr.contains(purl) && stderr.contains("package_not_found"),
-        "the un-verifiable patch must be reported omitted. got: {stderr}"
-    );
-    assert!(
-        stderr.contains("No applied patches"),
-        "the generic nothing-to-attest message applies (the omission was \
-         verification, not the setup filter). got: {stderr}"
+        !stderr.contains("package_not_found") && !stderr.contains("omitting"),
+        "the ledger error fires before verification. got: {stderr}"
     );
 }
 
 #[test]
-fn corrupt_vendor_ledger_json_mode_pins_channel_behavior() {
+fn corrupt_vendor_ledger_json_envelope_carries_code_and_preserves_ledger() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     let purl = "pkg:npm/leftpad@1.0.0";
@@ -426,39 +421,32 @@ fn corrupt_vendor_ledger_json_mode_pins_channel_behavior() {
         .expect("invoke vex");
     assert_eq!(
         out.status.code(),
-        Some(1),
-        "same fail-closed degrade under --json. stdout:\n{}",
+        Some(2),
+        "vendor_ledger_corrupt is a hard error in --json mode too. stdout:\n{}",
         String::from_utf8_lossy(&out.stdout)
     );
     let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
     assert_eq!(env["status"], "error", "{env}");
-    assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
-    // The un-verifiable patch surfaces as a machine-readable skipped event.
-    let events = env["events"].as_array().unwrap();
-    let skipped = events
-        .iter()
-        .find(|e| e["action"] == "skipped" && e["purl"] == purl)
-        .unwrap_or_else(|| panic!("expected a skipped event for the ghost purl: {env}"));
-    assert_eq!(skipped["errorCode"], "package_not_found", "{skipped}");
-    assert!(!vex_path.exists(), "no document when nothing attests");
-
-    // Channel pin: like every other vex advisory, the unreadable-vendor-
-    // state warning rides the envelope's warnings[] under --json (the error
-    // envelope included) and stays off stderr.
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(env["error"]["code"], "vendor_ledger_corrupt", "{env}");
     assert!(
-        !stderr.contains("nreadable vendor state"),
-        "--json keeps the advisory off stderr. got: {stderr}"
+        env["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("corrupt"),
+        "the envelope must carry the load_state detail: {env}"
     );
-    let warnings = env["warnings"].as_array().unwrap_or_else(|| panic!("{env}"));
-    let w = warnings
-        .iter()
-        .find(|w| w["code"] == "vendor_state_unreadable")
-        .unwrap_or_else(|| panic!("vendor_state_unreadable warning expected: {env}"));
     assert!(
-        w["detail"].as_str().unwrap().contains("corrupt"),
-        "the detail carries load_state's cause: {w}"
+        env["events"].as_array().is_none_or(|e| e.is_empty()),
+        "no per-patch events on a pre-verification hard error: {env}"
     );
+    // vex is a READ-ONLY ledger consumer: the file may hold the only revert
+    // data for the committed vendoring, so it stays exactly where it was.
+    assert_eq!(
+        std::fs::read_to_string(dir.join("state.json")).unwrap(),
+        "not json",
+        "vex must not touch the corrupt vendor ledger"
+    );
+    assert!(!vex_path.exists(), "no document on a hard error");
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -623,7 +611,7 @@ fn auto_detect_multi_manifest_warning_suppressed_by_silent() {
 // so hand-written lines reach every guard:
 //   (a) version-less directory replace          → skipped (875)
 //   (b) go-patches replace with no manifest purl → skipped (879)
-//   (c) explicit vendor entry takes precedence   → skipped (884)
+//   (c) explicit (LIVE) vendor entry takes precedence → skipped (884)
 //   (d) SECURITY: unsafe module coordinates      → skipped (891) — the
 //       only end-to-end proof that a tampered go.mod cannot key an
 //       out-of-tree path into VEX verification (the inline unit test only
@@ -634,7 +622,11 @@ const GOOD_UUID: &str = "22222222-2222-4222-8222-222222222222";
 const EVIL_UUID: &str = "33333333-3333-4333-8333-333333333333";
 
 /// Non-detached golang vendor-ledger entry (the manifest record is the
-/// verification oracle) whose dir-shaped artifact lives at `rel_path`.
+/// verification oracle) whose dir-shaped artifact lives at `rel_path`,
+/// recording its `go.mod` replace wiring — vex only honors a vendor entry
+/// whose artifact some lockfile/config still references, and the ledger's
+/// recorded wiring files are that proof for formats lockfile discovery does
+/// not read.
 fn write_golang_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
     let mut state = VendorState::new();
     state.entries.insert(
@@ -650,7 +642,14 @@ fn write_golang_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
+            wiring: vec![WiringRecord {
+                file: "go.mod".to_string(),
+                kind: "go_replace".to_string(),
+                action: WiringAction::Added,
+                key: None,
+                original: None,
+                new: None,
+            }],
             lock: None,
             took_over_go_patches: false,
             detached: false,
@@ -743,11 +742,16 @@ fn go_patches_synthesis_skips_tampered_and_stale_replaces() {
 
     // Hand-append the tampered/stale replace lines exactly as an attacker
     // (or a stale tool) could commit them; the `.socket/go-patches/` target
-    // prefix classifies every one of them as socket-owned.
+    // prefix classifies every one of them as socket-owned. (c) also keeps
+    // its LIVE vendor wiring — the vendor-over-go-patches takeover shape
+    // with the stale go-patches line left behind: without it the vendor
+    // entry wires nothing, and vex now omits such a leftover entry as
+    // `vendor_unwired` instead of letting it route verification at all.
     let mut go_mod = std::fs::read_to_string(cwd.join("go.mod")).unwrap();
     go_mod.push_str(&format!(
         "\nreplace github.com/noversion => ./.socket/go-patches/x\n\
          replace github.com/stale v1.0.0 => ./.socket/go-patches/github.com/stale@v1.0.0\n\
+         replace {vend_module} {vend_version} => ./{vend_rel}\n\
          replace {vend_module} {vend_version} => ./.socket/go-patches/{vend_module}@{vend_version}\n\
          replace {evil_module} {evil_version} => ./.socket/go-patches/{evil_module}@{evil_version}\n"
     ));
@@ -882,15 +886,16 @@ fn go_patches_synthesis_skips_tampered_and_stale_replaces() {
 
 // ──────────────────────────────────────────────────────────────────────
 // Corrupt vendor ledger on a MANIFEST-FREE project (the D2 vendored
-// posture): the ledger was the only possible source of records, so the
-// run still fails `manifest_not_found` (exit 2, read-only degrade posture
-// kept) — but the unreadable ledger is disclosed first, on stderr and in
-// the error's message, instead of only telling the operator a manifest
-// they never had is missing. `--silent` mutes the advisory, never the error.
+// posture): the ledger was the only possible source of records, and it
+// gates what attests — so the run fails `vendor_ledger_corrupt` (exit 2,
+// the same hard error as with a manifest, see above) naming the unreadable
+// ledger, instead of telling the operator a manifest they never had is
+// missing. A read-only consumer never moves or rewrites the ledger, and
+// `--silent` never mutes the error.
 // ──────────────────────────────────────────────────────────────────────
 
 #[test]
-fn corrupt_vendor_ledger_without_manifest_is_disclosed_before_manifest_not_found() {
+fn corrupt_vendor_ledger_without_manifest_fails_naming_the_ledger() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     let dir = cwd.join(".socket/vendor");
@@ -911,13 +916,16 @@ fn corrupt_vendor_ledger_without_manifest_is_disclosed_before_manifest_not_found
     assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
     assert!(out.stdout.is_empty(), "no document");
     assert!(
-        stderr.contains("Warning: Unreadable vendor state") && stderr.contains("corrupt"),
-        "the unreadable ledger must be disclosed: {stderr}"
+        stderr.contains("vendor ledger") && stderr.contains("state.json"),
+        "the error must name the unreadable ledger: {stderr}"
     );
     assert!(
-        stderr.contains("Manifest not found")
-            && stderr.contains("vendor ledger is also unreadable"),
-        "the error names both missing stores: {stderr}"
+        stderr.contains("corrupt"),
+        "the error carries load_state's detail: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Manifest not found"),
+        "a missing manifest is not the problem here: {stderr}"
     );
     assert_eq!(
         std::fs::read(dir.join("state.json")).unwrap(),
@@ -925,6 +933,25 @@ fn corrupt_vendor_ledger_without_manifest_is_disclosed_before_manifest_not_found
         "a read-only consumer never moves or rewrites the ledger"
     );
     assert!(!dir.join("state.json.corrupt").exists());
+
+    let vex_path = cwd.join("out.vex.json");
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--json",
+            "--output",
+            vex_path.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+        ])
+        .output()
+        .expect("invoke vex --json");
+    assert_eq!(out.status.code(), Some(2));
+    let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
+    assert_eq!(env["error"]["code"], "vendor_ledger_corrupt", "{env}");
+    assert!(!vex_path.exists(), "no document on a hard error");
 
     let out = cli()
         .args([
@@ -940,11 +967,7 @@ fn corrupt_vendor_ledger_without_manifest_is_disclosed_before_manifest_not_found
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
     assert!(
-        !stderr.contains("Unreadable vendor state"),
-        "--silent mutes the advisory: {stderr}"
-    );
-    assert!(
-        stderr.contains("Manifest not found"),
+        stderr.contains("vendor ledger"),
         "--silent never mutes the error: {stderr}"
     );
 }

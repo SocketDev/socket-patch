@@ -70,9 +70,30 @@
 //! real binary: byte-idempotent under the same grant, in-place URL refresh
 //! (Gemfile source block + converged-lock remote) under a rotated one.
 //!
-//! Skips (with a println) when `ruby`/`gem`/`bundle` are missing or the host
-//! bundler predates 2.6 (the CHECKSUMS-aware floor); everything after that is
-//! hard — no live network is involved at all.
+//! MANIFEST-LESS VEX (every installing arm, `manifestless_vex_matrix`): on
+//! the fresh checkout the real bundler installed — hosted never writes a
+//! `.socket/manifest.json` — `vex` attests `(redirected)` from the lock +
+//! ledger; with both ledgers deleted it still attests from the lockfile
+//! wiring + the patch API (and so does the embedded `apply --vex`);
+//! `--offline` without ledgers is `record_unavailable` with zero requests;
+//! the pair reverted to its registry version is `redirect_unwired` even
+//! under `--no-verify`. The main arm also proves the lock-only revert
+//! (Gemfile block kept) re-converges on the next unfrozen install.
+//!
+//! VERSION MATRIX: the arms run on bundler 1.17 → 4.x (the CHECKSUMS arm
+//! from 2.6, the CHECKSUMS-era floor; every other arm from 1.17). Pick the
+//! bundler with `PATH` (CI: `ruby/setup-ruby`'s `bundler:` input) and name
+//! it in `SOCKET_PATCH_BUNDLER_E2E_VERSION` (asserted) plus
+//! `SOCKET_PATCH_BUNDLER_E2E_REQUIRED=1` (missing toolchain = failure) —
+//! see `common/bundler_e2e.rs`. Lock shapes per era: bundler 1.17–2.1
+//! writes ONE merged `GEM` section listing both remotes (attributed through
+//! the Gemfile source pin), 2.2 on a separate patch-registry section; before
+//! 2.2 there is no API-mismatch check (the deps red-arm's signature differs).
+//!
+//! Skips (with a println) when `ruby`/`gem`/`bundle` are missing (a hard
+//! failure under `SOCKET_PATCH_BUNDLER_E2E_REQUIRED=1`) or the bundler is
+//! below the arm's floor; everything after that is hard — no live network is
+//! involved at all.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -83,8 +104,12 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "common/bundler_e2e.rs"]
+mod bundler_e2e;
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
 const ORG: &str = "test-org";
 const DEP: &str = "vuln-gem";
@@ -124,34 +149,6 @@ const TINY_LIB: &str = "module TinyDep\n  VALUE = \"tiny-ok\"\nend\n";
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
-
-fn has_command(cmd: &str) -> bool {
-    let mut probe = Command::new(cmd);
-    probe.arg("--version");
-    cache_env::isolate(&mut probe);
-    probe
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok()
-}
-
-/// `bundle --version` → `(major, minor)`; `None` = no usable bundler.
-fn bundler_version() -> Option<(u32, u32)> {
-    let mut probe = Command::new("bundle");
-    probe.arg("--version");
-    cache_env::isolate(&mut probe);
-    let out = probe.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let ver = text.split_whitespace().last()?.to_string();
-    let mut it = ver.split('.');
-    let major = it.next()?.parse().ok()?;
-    let minor = it.next()?.parse().ok()?;
-    Some((major, minor))
 }
 
 /// Run the socket-patch binary with the ambient `SOCKET_*` surface scrubbed
@@ -287,6 +284,18 @@ fn build_gem(
     std::fs::read(dir.join(format!("{name}-{version}.gem"))).expect("built .gem present")
 }
 
+/// A compact-index response carrying the quoted-md5 `ETag` rubygems.org
+/// serves: bundler <= 2.1 validates every `/versions` / `/info` body against
+/// it and, on a mismatch (or no ETag at all), abandons the compact index for
+/// the dependency API / full index — which neither index here serves, so
+/// those bundlers would fail for a reason no production registry exhibits.
+fn compact_index_body(body: String) -> ResponseTemplate {
+    let etag = format!("\"{}\"", md5_hex(body.as_bytes()));
+    ResponseTemplate::new(200)
+        .insert_header("ETag", etag.as_str())
+        .set_body_raw(body, "text/plain")
+}
+
 /// One gem a compact index serves: coordinates, runtime deps (compact-index
 /// `name:constraint` tokens), and the `.gem` bytes the download route returns.
 struct IndexGem {
@@ -319,7 +328,7 @@ async fn mount_compact_index(server: &MockServer, base: &str, gems: &[IndexGem])
         names_body.push_str(&format!("{}\n", g.name));
         Mock::given(method("GET"))
             .and(path(format!("{base}/info/{}", g.name)))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(info_body, "text/plain"))
+            .respond_with(compact_index_body(info_body))
             .mount(server)
             .await;
         Mock::given(method("GET"))
@@ -332,12 +341,12 @@ async fn mount_compact_index(server: &MockServer, base: &str, gems: &[IndexGem])
     }
     Mock::given(method("GET"))
         .and(path(format!("{base}/versions")))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(versions_body, "text/plain"))
+        .respond_with(compact_index_body(versions_body))
         .mount(server)
         .await;
     Mock::given(method("GET"))
         .and(path(format!("{base}/names")))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(names_body, "text/plain"))
+        .respond_with(compact_index_body(names_body))
         .mount(server)
         .await;
 }
@@ -351,6 +360,10 @@ struct RedirectFixture {
     gemfile_name: &'static str,
     lock_name: &'static str,
     patched: Vec<u8>,
+    /// The manifest pair as it stood BEFORE the redirect (registry wiring).
+    pristine_gemfile: Vec<u8>,
+    pristine_lock: Vec<u8>,
+    bundler: bundler_e2e::Bundler,
     _server: MockServer,
 }
 
@@ -485,26 +498,15 @@ async fn redirect_scanned_project(
     rotated_token: Option<&str>,
     driver: Driver,
 ) -> Option<RedirectFixture> {
-    for cmd in ["ruby", "gem", "bundle"] {
-        if !has_command(cmd) {
-            println!("SKIP e2e_redirect_gem_build ({tag}): `{cmd}` not installed");
-            return None;
-        }
-    }
-    let Some((major, minor)) = bundler_version() else {
-        println!("SKIP e2e_redirect_gem_build ({tag}): `bundle --version` unparseable");
-        return None;
-    };
-    // 2.6 floor: the suite exercises CHECKSUMS-aware behavior (lock pins,
-    // `bundle lock --add-checksums`, `lockfile_checksums` config) that
-    // predates nothing older.
-    if major < 2 || (major == 2 && minor < 6) {
-        println!(
-            "SKIP e2e_redirect_gem_build ({tag}): host bundler {major}.{minor} predates the \
-             CHECKSUMS-aware 2.6 floor"
-        );
-        return None;
-    }
+    // Floors: the CHECKSUMS arm needs `bundle lock --add-checksums` (2.6+);
+    // every other arm drives a CHECKSUMS-less lock, which every bundler from
+    // the last 1.x (1.17) on writes. `SOCKET_PATCH_BUNDLER_E2E_{VERSION,
+    // REQUIRED}` turn this into a checked version-matrix leg (see
+    // `common/bundler_e2e.rs`).
+    let floor = if checksums_lock { (2, 6) } else { (1, 17) };
+    let bundler = bundler_e2e::gate("e2e_redirect_gem_build", tag, floor, &|c| {
+        cache_env::isolate(c);
+    })?;
 
     let tmp = tempfile::tempdir().unwrap();
     let (gemfile_name, lock_name) = spelling.pair();
@@ -666,18 +668,18 @@ async fn redirect_scanned_project(
         format!("source \"{}/upstream\"\n\ngem \"{DEP}\"\n", server.uri()),
     )
     .unwrap();
-    let config = bundle(
-        &proj,
-        &["config", "set", "--local", "path", "vendor/bundle"],
-    );
+    let config_args = bundler.config_local_args("path", "vendor/bundle");
+    let config_args: Vec<&str> = config_args.iter().map(String::as_str).collect();
+    let config = bundle(&proj, &config_args);
     assert!(
         config.status.success(),
         "bundle config set --local path failed:\n{}",
         String::from_utf8_lossy(&config.stderr)
     );
-    if !checksums_lock {
+    if !checksums_lock && bundler.at_least(2, 6) {
         // Pin the bundler-2.x/3.x lock shape (no CHECKSUMS section) even on a
-        // bundler >= 4 host, which writes CHECKSUMS into fresh locks by default.
+        // bundler >= 4 host, which writes CHECKSUMS into fresh locks by default
+        // (older bundlers have no such setting and never write the section).
         let cfg = bundle(
             &proj,
             &["config", "set", "--local", "lockfile_checksums", "false"],
@@ -728,6 +730,17 @@ async fn redirect_scanned_project(
         orig,
         "fixture install must extract the authored pristine bytes"
     );
+    // The pre-redirect (registry) pair — what reverting the patch commit
+    // restores; the manifest-less VEX legs revert to it.
+    let pristine_gemfile = std::fs::read(proj.join(gemfile_name)).unwrap();
+    let pristine_lock = lock_before.clone().into_bytes();
+    // Drop the pristine materialization before redirecting: bundler never
+    // refetches an already-installed gem, so with it in place the scan
+    // (correctly) raises `redirect_gem_stale_install` and its same-run VEX
+    // refuses to attest the purl (e2e_redirect_gem_stale_install pins that
+    // contract) — the in-run attestation leg below needs the remedy that
+    // warning prescribes applied first.
+    std::fs::remove_dir_all(proj.join("vendor")).expect("remove the stale materialization");
 
     // 4. The driving command. ScanVex: scan --mode hosted --vex — the
     //    Gemfile rewrite + the in-run (unverified) attestation. GetUuid:
@@ -778,6 +791,10 @@ async fn redirect_scanned_project(
         0,
         "{} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
         driver.label()
+    );
+    assert!(
+        !stdout.contains("redirect_gem_stale_install"),
+        "the stale materialization was removed before the redirect:\n{stdout}"
     );
     let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!(
@@ -892,6 +909,9 @@ async fn redirect_scanned_project(
         gemfile_name,
         lock_name,
         patched,
+        pristine_gemfile,
+        pristine_lock,
+        bundler,
         _server: server,
     })
 }
@@ -993,13 +1013,203 @@ fn assert_patched_install(fx: &RedirectFixture, fresh: &Path) {
     );
 }
 
+// ── manifest-less VEX over the real install ───────────────────────────
+
+/// The patch-API view's vulnerability set (see the `/view` mock).
+const VULNS: &[(&str, &[&str])] = &[(GHSA, &["CVE-2026-3333"])];
+
+/// A standalone `vex` run against the fixture's mock: the org-scoped view
+/// route (the one the mock mounts), and `--patch-server-url` = the mock's
+/// origin — the hosted URLs this hermetic fixture writes are on loopback,
+/// not `patch.socket.dev`, and discovery only reads a Socket host or the
+/// configured override.
+fn vex_run(fx: &RedirectFixture) -> vex_e2e_common::VexRun {
+    let uri = fx._server.uri();
+    vex_e2e_common::VexRun {
+        api_url: Some(uri.clone()),
+        api_token: Some("fake".into()),
+        org: Some(ORG.into()),
+        patch_server_url: Some(uri),
+        product: Some(PRODUCT.into()),
+        ..vex_e2e_common::VexRun::default()
+    }
+}
+
+async fn request_count(fx: &RedirectFixture) -> usize {
+    fx._server
+        .received_requests()
+        .await
+        .map(|r| r.len())
+        .unwrap_or(0)
+}
+
+async fn view_requests(fx: &RedirectFixture) -> usize {
+    let want = format!("/v0/orgs/{ORG}/patches/view/{UUID}");
+    fx._server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path() == want)
+        .count()
+}
+
+/// Manifest-less VEX over a fresh checkout the REAL bundler just installed
+/// the patched gem into (`fresh`, whose ledger came along with the commit):
+///
+///   1. no `.socket/manifest.json` (hosted never writes one): `vex` attests
+///      `(redirected)` from the lockfile wiring + the ledger record, hash-
+///      verified against the installed tree;
+///   2. both ledgers deleted too: still attested — discovery reads the
+///      converged lock's patch-registry `GEM` remote and the record comes
+///      from the patch API; the embedded `apply --vex` agrees;
+///   3. `--offline` with no ledgers: `record_unavailable`, ZERO requests;
+///   4. the manifest pair reverted to its registry version (ledgers and the
+///      installed patched tree kept): `redirect_unwired`, with and without
+///      `--no-verify`, online and offline.
+async fn manifestless_vex_matrix(fx: &RedirectFixture, fresh: &Path) {
+    use vex_e2e_common::{
+        assert_absent, assert_attested, assert_not_attested, run_vex, strip_ledgers,
+        strip_manifest, Marker, VexVia,
+    };
+    let bin = binary();
+    let lock = std::fs::read_to_string(fresh.join(fx.lock_name)).unwrap();
+    assert!(
+        lock.contains(&format!("remote: {}", fx.index_url)),
+        "the installed checkout's {} must name the patch registry (bundler {}):\n{lock}",
+        fx.lock_name,
+        fx.bundler.version
+    );
+    let ledgers = fresh.join(".socket/vendor");
+    let saved = fx.tmp.path().join(format!(
+        "ledgers-{}",
+        fresh.file_name().unwrap().to_string_lossy()
+    ));
+    copy_dir_recursive(&ledgers, &saved);
+
+    // 1. manifest-less (the ledger rides along).
+    strip_manifest(fresh);
+    let out = run_vex(&bin, fresh, &vex_run(fx));
+    assert_eq!(
+        out.code,
+        Some(0),
+        "manifest-less vex: {out}\n--- {}\n{lock}",
+        fx.lock_name
+    );
+    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
+    assert_eq!(out.envelope["summary"]["verified"], 1, "{out}");
+
+    // 2. no ledgers: lockfile discovery + the patch API.
+    strip_ledgers(fresh);
+    let views = view_requests(fx).await;
+    let out = run_vex(&bin, fresh, &vex_run(fx));
+    assert_eq!(
+        out.code,
+        Some(0),
+        "ledger-less vex: {out}\n--- {}\n{lock}",
+        fx.lock_name
+    );
+    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
+    assert!(
+        view_requests(fx).await > views,
+        "the record must come from the patch API"
+    );
+    let out = run_vex(&bin, fresh, &vex_run(fx).via(VexVia::Apply));
+    assert_eq!(out.code, Some(0), "ledger-less apply --vex: {out}");
+    assert_eq!(out.envelope["status"], "noManifest", "{out}");
+    assert_eq!(out.envelope["vex"]["statements"], 1, "{out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
+    assert!(
+        !fresh.join(".socket/manifest.json").exists(),
+        "vex / apply --vex must never write the manifest"
+    );
+
+    // 3. offline, no ledgers: nothing to build a statement from, no network.
+    let before = request_count(fx).await;
+    let mut offline = vex_run(fx);
+    offline.offline = true;
+    let out = run_vex(&bin, fresh, &offline);
+    assert_eq!(out.code, Some(1), "offline ledger-less vex: {out}");
+    assert_not_attested(&out.envelope, PURL, "record_unavailable");
+    assert_eq!(request_count(fx).await, before, "--offline made requests");
+
+    // 4. reverted to the registry pair; ledgers (and the patched install)
+    //    kept.
+    copy_dir_recursive(&saved, &ledgers);
+    std::fs::write(fresh.join(fx.gemfile_name), &fx.pristine_gemfile).unwrap();
+    std::fs::write(fresh.join(fx.lock_name), &fx.pristine_lock).unwrap();
+    for (offline, no_verify) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut run = vex_run(fx);
+        run.offline = offline;
+        run.no_verify = no_verify;
+        let out = run_vex(&bin, fresh, &run);
+        let cell = format!("reverted offline={offline} no_verify={no_verify}");
+        assert_eq!(out.code, Some(1), "{cell}: {out}");
+        assert_not_attested(&out.envelope, PURL, "redirect_unwired");
+        assert_absent(out.doc.as_ref(), PURL);
+    }
+}
+
+/// The mixed pair the bundler < 2.6 rewriter leaves (and a lock-only
+/// `git checkout`): the Gemfile still carries the patch-registry source
+/// block, the lock resolves the gem from upstream. Bundler re-resolves from
+/// the Gemfile — proven here with the REAL bundler — so the ledger keeps the
+/// patch live (vex_sources `redirect_record_live` step 0), while a
+/// ledger-less checkout has nothing discovery reads until that install
+/// re-converges the lock, after which it attests from the lock alone.
+async fn lock_only_revert_reconverges(fx: &RedirectFixture) {
+    use vex_e2e_common::{assert_attested, run_vex, strip_ledgers, Marker};
+    let bin = binary();
+    let dir = stage_fresh_checkout(fx, "fresh-lock-only-revert");
+    let install = bundle(&dir, &["install"]);
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    std::fs::write(dir.join(fx.lock_name), &fx.pristine_lock).unwrap();
+    let out = run_vex(&bin, &dir, &vex_run(fx));
+    assert_eq!(
+        out.code,
+        Some(0),
+        "Gemfile-wired, lock reverted, ledger kept: {out}"
+    );
+    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
+
+    strip_ledgers(&dir);
+    let out = run_vex(&bin, &dir, &vex_run(fx));
+    assert_eq!(
+        out.code,
+        Some(2),
+        "no ledger and no lockfile reference: nothing to attest: {out}"
+    );
+    assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
+
+    let install = bundle(&dir, &["install"]);
+    assert!(
+        install.status.success(),
+        "unfrozen install over the mixed pair (bundler {}):\n{}",
+        fx.bundler.version,
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let lock = std::fs::read_to_string(dir.join(fx.lock_name)).unwrap();
+    assert!(
+        lock.contains(&format!("remote: {}", fx.index_url)),
+        "bundler must re-resolve the gem from the Gemfile's patch-registry block:\n{lock}"
+    );
+    assert_patched_install(fx, &dir);
+    let out = run_vex(&bin, &dir, &vex_run(fx));
+    assert_eq!(out.code, Some(0), "re-converged, ledger-less: {out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
+}
+
 // ── the capstones ─────────────────────────────────────────────────────
 
 // multi_thread: the CLI/gem/bundle subprocesses block a worker thread while
 // wiremock keeps serving the API + both compact indexes on the others.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
-            job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex_verifies() {
     let Some(fx) = redirect_scanned_project(
         "main",
@@ -1072,6 +1282,9 @@ async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex
         format!("Patched via Socket patch {UUID} (redirected)"),
         "the post-install (hash-verified) attestation must carry the (redirected) marker"
     );
+
+    manifestless_vex_matrix(&fx, &fresh).await;
+    lock_only_revert_reconverges(&fx).await;
 }
 
 /// GET-DRIVEN TWIN of the main capstone: `get <uuid> --mode hosted` (v3.6,
@@ -1081,8 +1294,8 @@ async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex
 /// fresh checkout of only the committable files resolves the PATCHED gem
 /// (bytes + runtime dep + require probe) from the mock patch registry.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
-            job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_get_uuid_hosted_fresh_checkout_bundle_install() {
     let Some(fx) = redirect_scanned_project(
         "get-uuid",
@@ -1132,6 +1345,7 @@ async fn gem_get_uuid_hosted_fresh_checkout_bundle_install() {
         lock.contains(&format!("{DEP} (= {DEP_VERSION})!")),
         "post-install lock must carry bundler's source-pinned dependency:\n{lock}"
     );
+    manifestless_vex_matrix(&fx, &fresh).await;
 }
 
 /// Bundler's modern `gems.rb`/`gems.locked` spelling, end to end: the
@@ -1139,8 +1353,8 @@ async fn gem_get_uuid_hosted_fresh_checkout_bundle_install() {
 /// and the real bundler must install the patched gem from the redirected
 /// gems.rb. Fails without the gems.rb support in either layer.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
-            job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
     let Some(fx) = redirect_scanned_project(
         "gems.rb",
@@ -1172,6 +1386,7 @@ async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
         lock.contains(&format!("remote: {}", fx.index_url)),
         "gems.locked must converge on the patch-registry source:\n{lock}"
     );
+    manifestless_vex_matrix(&fx, &fresh).await;
 }
 
 /// The compact-index DEPENDENCY contract, pinned from the red side: a patch
@@ -1181,8 +1396,8 @@ async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
 /// prescribed install with bundler's `APIResponseMismatchError`. If the CLI
 /// or fixture ever starts tolerating that silently, this turns red.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
-            job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_registry_info_without_deps_breaks_install_like_production() {
     let Some(fx) = redirect_scanned_project(
         "nodeps",
@@ -1210,11 +1425,25 @@ async fn gem_hosted_registry_info_without_deps_breaks_install_like_production() 
         String::from_utf8_lossy(&install.stdout),
         String::from_utf8_lossy(&install.stderr)
     );
+    // Bundler < 4 prints the same check's message without the exception
+    // class name (`Downloading vuln-gem-1.0.0 revealed dependencies not in
+    // the API or the lockfile`); bundler 4 prefixes `APIResponseMismatchError`.
+    // Bundler < 2.2 has no such check: its resolver trusts the index's (empty)
+    // dependency list and the install dies on the dropped dep instead
+    // (`Could not find tiny-dep-1.0.0 in any of the sources`).
+    let signature = if fx.bundler.at_least(2, 2) {
+        chatter.contains("dependencies not in the API")
+            && (!fx.bundler.at_least(4, 0) || chatter.contains("APIResponseMismatchError"))
+    } else {
+        chatter.contains(&format!(
+            "Could not find {TRANSITIVE}-1.0.0 in any of the sources"
+        ))
+    };
     assert!(
-        chatter.contains("APIResponseMismatchError")
-            && chatter.contains("dependencies not in the API"),
+        signature,
         "the failure must be bundler's API-mismatch check (the live production signature), \
-         not something incidental:\n{chatter}"
+         not something incidental (bundler {}):\n{chatter}",
+        fx.bundler.version
     );
     // Anti-vacuity: the .gem itself declares the dep, so the mismatch can
     // only come from the registry's deps-less /info.
@@ -1236,8 +1465,8 @@ async fn gem_hosted_registry_info_without_deps_breaks_install_like_production() 
 /// `BUNDLE_FROZEN=true` with the lock byte-untouched (no two-step), and
 /// unfrozen (no exit 37).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
-            job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() {
     let Some(fx) = redirect_scanned_project(
         "checksums",
@@ -1314,6 +1543,9 @@ async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() 
         "a frozen install must leave the lock byte-identical"
     );
     assert_patched_install(&fx, &frozen);
+    // The converged lock is the Socket-written one here (no install-time
+    // rewrite): discovery reads it AND its CHECKSUMS pin.
+    manifestless_vex_matrix(&fx, &frozen).await;
 
     // UNFROZEN fresh checkout: the previously-pinned exit 37 "mismatched
     // checksums" refusal is gone too.
@@ -1340,8 +1572,8 @@ async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() 
 /// (+1 nesting per re-scan), kept the stale token URL live, and still
 /// reported success.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real ruby/gem/bundler >= 2.6; the unpinned `test` \
-            job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
     const TOKEN_B: &str = "55555555-5555-4555-8555-555555555555";
     let Some(fx) = redirect_scanned_project(
@@ -1442,4 +1674,10 @@ async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
         String::from_utf8_lossy(&install.stderr),
     );
     assert_patched_install(&fx, &fresh);
+    // The rotated grant's URL (token B) is what the lock names now.
+    let rotated = RedirectFixture {
+        index_url: format!("{api}/patch-registry/gem/{TOKEN_B}/{UUID}/"),
+        ..fx
+    };
+    manifestless_vex_matrix(&rotated, &fresh).await;
 }

@@ -21,12 +21,32 @@
 //!   6. **Revert proof**: `vendor --revert` restores yarn.lock byte-for-byte
 //!      to the pre-vendor snapshot and removes `.socket/vendor/` entirely.
 //!
+//!   7. **Manifest-less VEX** on the fresh checkout (`ManifestlessVex`):
+//!      with `.socket/manifest.json` deleted, then the vendor ledger too, the
+//!      patch is still attested `(vendored)` from the `yarn.lock` wiring +
+//!      committed tarball (record from the patch API); `--offline` is
+//!      `record_unavailable` with zero API requests; a lock reverted to the
+//!      registry (and really re-installed) is NOT attested even though the
+//!      ledger and tarball remain — plus embedded `apply --vex` /
+//!      `vendor --vex`.
+//!
+//! The detached twin (`yarn_classic_detached_scan_vendored_…`) produces the
+//! state with `scan --mode vendored --detached` against a wiremock Socket
+//! API instead — the vendored shape that never has a manifest — and runs the
+//! same fresh-checkout install + manifest-less VEX matrix (plus the embedded
+//! re-scan).
+//!
+//! The yarn release is `yarn@1.22.22` unless
+//! `SOCKET_PATCH_YARN_CLASSIC_E2E_VERSION` names another 1.x (see
+//! `common/yarn_classic_vex.rs`).
+//!
 //! LOCAL capstone (not behind docker-e2e): skips with a `println` + return
 //! when `corepack` (yarn classic) is unavailable or the fixture install
-//! cannot reach the registry; every assertion after that is HARD.
+//! cannot reach the registry — unless `SOCKET_PATCH_YARN_E2E_REQUIRED=1`;
+//! every assertion after that is HARD.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
@@ -37,32 +57,34 @@ const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const DEP: &str = "left-pad";
 const DEP_VERSION: &str = "1.3.0";
-/// Pinned yarn classic via corepack (matches the spike).
-const YARN_CLASSIC: &str = "yarn@1.22.22";
+const GHSA: &str = "GHSA-vend-yarn-real";
+const CVE: &str = "CVE-2024-88888";
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+#[path = "common/yarn_classic_vex.rs"]
+mod yarn_classic_vex;
+
+use yarn_classic_vex::{
+    require_yarn_classic, via_apply, via_vendor, yarn_classic, ManifestlessVex, Wiring,
+};
+
+/// Print a SKIP line — or, under `SOCKET_PATCH_YARN_E2E_REQUIRED=1` (a leg
+/// that provisioned corepack yarn on purpose), FAIL: a required leg must
+/// never report green on an unexercised toolchain or an unreachable fixture
+/// registry.
+macro_rules! skip {
+    ($($arg:tt)*) => {{
+        yarn_classic_vex::skip("e2e_vendor_yarn_classic_build", &format!($($arg)*));
+    }};
+}
 
 // ── self-contained helpers ────────────────────────────────────────────
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
-
-/// `corepack <pm> --version` succeeds — the only liveness probe that
-/// distinguishes "corepack present" from "this yarn flavor is fetchable".
-fn has_corepack_pm(pm: &str) -> bool {
-    // Isolated too: this probe is what actually downloads the package manager
-    // the first time, and corepack stores it under `COREPACK_HOME`.
-    let mut cmd = Command::new("corepack");
-    cmd.args([pm, "--version"])
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
-    cache_env::isolate(&mut cmd);
-    cmd.stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 /// Run `corepack <pm> <args>` in `cwd` with the given extra env, the download
@@ -130,8 +152,8 @@ fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[
                 "beforeHash": git_sha256(before),
                 "afterHash": git_sha256(after),
             }},
-            "vulnerabilities": { "GHSA-vend-yarn-real": {
-                "cves": ["CVE-2024-88888"],
+            "vulnerabilities": { GHSA: {
+                "cves": [CVE],
                 "summary": "capstone vex vuln",
                 "severity": "high",
                 "description": "d",
@@ -171,11 +193,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
 
 #[test]
 fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
-    if !has_corepack_pm(YARN_CLASSIC) {
-        println!(
-            "SKIP e2e_vendor_yarn_classic_build: `corepack {YARN_CLASSIC}` unavailable \
-             (corepack not installed or yarn classic not fetchable)"
-        );
+    if !require_yarn_classic("e2e_vendor_yarn_classic_build", |c| {
+        cache_env::isolate(c);
+    }) {
         return;
     }
 
@@ -197,14 +217,13 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
     let cache = tmp.path().join("yarn-cache");
     let install = corepack(
         &proj,
-        YARN_CLASSIC,
+        &yarn_classic(),
         &["install", "--no-progress"],
         &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
     );
     if !install.status.success() {
-        println!(
-            "SKIP e2e_vendor_yarn_classic_build: fixture `yarn install` failed (registry \
-             unreachable?):\n{}",
+        skip!(
+            "fixture `yarn install` failed (registry unreachable?):\n{}",
             String::from_utf8_lossy(&install.stderr)
         );
         return;
@@ -389,7 +408,7 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
     let fresh_cache = tmp.path().join("fresh-yarn-cache");
     let ci = corepack(
         &fresh,
-        YARN_CLASSIC,
+        &yarn_classic(),
         &["install", "--frozen-lockfile", "--offline", "--no-progress"],
         &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
     );
@@ -400,27 +419,99 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
         String::from_utf8_lossy(&ci.stdout),
         String::from_utf8_lossy(&ci.stderr),
     );
+    let tarball_capable =
+        yarn_classic_vex::installs_file_tarballs(&yarn_classic_vex::yarn_classic_version());
+    if !tarball_capable {
+        // KNOWN yarn < 1.7 LIMITATION (see `installs_file_tarballs`): the
+        // install "succeeds" having installed nothing for the vendored
+        // entry. Pin the shape so a behavior change is noticed; the
+        // manifest-less VEX below still runs (it verifies the committed
+        // artifact, not the installed tree).
+        assert!(
+            !fresh.join("node_modules").join(DEP).exists(),
+            "yarn {} unexpectedly installed a `file:` tarball entry — the \
+             installs_file_tarballs boundary moved",
+            yarn_classic()
+        );
+        println!(
+            "KNOWN LIMITATION {}: a vendored `file:` tarball lock entry installs nothing",
+            yarn_classic()
+        );
+    }
     // Same guard for the fresh install: yarn unpacks even `file:` tarballs
     // through its cache, so an untouched fresh_cache means the GLOBAL cache
     // served the install and the offline-from-vendored-tarball proof is
     // vacuous.
-    assert!(
-        fresh_cache.is_dir() && std::fs::read_dir(&fresh_cache).unwrap().next().is_some(),
-        "fresh install did not populate the private YARN_CACHE_FOLDER at {}",
-        fresh_cache.display()
-    );
-    let fresh_installed =
-        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
-    assert!(
-        fresh_installed.starts_with(MARKER.as_bytes()),
-        "yarn must install the PATCHED bytes from the vendored tarball; got:\n{}",
-        String::from_utf8_lossy(&fresh_installed[..fresh_installed.len().min(120)])
-    );
-    assert_eq!(
-        fresh_installed, patched,
-        "fresh install must be byte-identical to the patched content"
-    );
-    eprintln!("FRESH INSTALL OK");
+    if tarball_capable {
+        assert!(
+            fresh_cache.is_dir() && std::fs::read_dir(&fresh_cache).unwrap().next().is_some(),
+            "fresh install did not populate the private YARN_CACHE_FOLDER at {}",
+            fresh_cache.display()
+        );
+        let fresh_installed =
+            std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+        assert!(
+            fresh_installed.starts_with(MARKER.as_bytes()),
+            "yarn must install the PATCHED bytes from the vendored tarball; got:\n{}",
+            String::from_utf8_lossy(&fresh_installed[..fresh_installed.len().min(120)])
+        );
+        assert_eq!(
+            fresh_installed, patched,
+            "fresh install must be byte-identical to the patched content"
+        );
+        eprintln!("FRESH INSTALL OK");
+    }
+
+    // 7. MANIFEST-LESS VEX over the really-installed fresh checkout (a copy,
+    //    so the idempotency/revert legs below still see the vendored proj).
+    let vex_dir = tmp.path().join("fresh-vex");
+    copy_dir_recursive(&fresh, &vex_dir);
+    let api = vex_e2e_common::PatchApi::start(vec![(
+        UUID.to_string(),
+        vex_e2e_common::patch_view(
+            UUID,
+            &purl,
+            &[("package/index.js", &vex_e2e_common::git_sha256(&patched))],
+            &[(GHSA, &[CVE])],
+        ),
+    )]);
+    let reverted_cache = tmp.path().join("reverted-yarn-cache");
+    ManifestlessVex {
+        leg: "vendor-build",
+        wiring: Wiring::Vendored,
+        purl: &purl,
+        uuid: UUID,
+        vulns: &[(GHSA, &[CVE])],
+        api: &api,
+        proxy_override: None,
+        patch_server_url: None,
+        registry_lock: lock_before.clone(),
+        // A real `yarn install --frozen-lockfile` of the reverted lock (from
+        // the registry): pristine bytes, the committed tarball unused.
+        reinstall: Some(Box::new(|dir: &Path| {
+            // (Absent on yarn < 1.7, which installed nothing above.)
+            let _ = std::fs::remove_dir_all(dir.join("node_modules"));
+            let out = corepack(
+                dir,
+                &yarn_classic(),
+                &["install", "--frozen-lockfile", "--no-progress"],
+                &[("YARN_CACHE_FOLDER", reverted_cache.to_str().unwrap())],
+            );
+            assert!(
+                out.status.success(),
+                "reverted-lock `yarn install --frozen-lockfile` failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                std::fs::read(dir.join("node_modules").join(DEP).join("index.js")).unwrap(),
+                orig,
+                "the reverted lock installs pristine bytes"
+            );
+        })),
+        embedded: vec![("apply --vex", via_apply()), ("vendor --vex", via_vendor())],
+    }
+    .run(&vex_dir);
+    eprintln!("MANIFEST-LESS VEX OK");
 
     // 5. Idempotency: a re-run exits 0 and leaves the lock byte-stable.
     let lock_wired = std::fs::read(&lock_path).unwrap();
@@ -526,4 +617,240 @@ fn sha512_sri_b64(bytes: &[u8]) -> String {
     use sha2::Sha512;
     let digest = Sha512::digest(bytes);
     base64::engine::general_purpose::STANDARD.encode(digest)
+}
+
+// ── detached vendoring from the patch API (the manifest-less shape) ────
+
+/// `scan --mode vendored --detached` against a wiremock Socket API: the
+/// vendored posture that NEVER has a `.socket/manifest.json` (the vendor
+/// ledger embeds the record) — the shape a depscan-opened PR commits. The
+/// scan discovers the dep (batch search), the record (with `blobContent`)
+/// comes from the mocked `view/<uuid>` and the tarball is built locally
+/// (`--vendor-source build`). A fresh checkout of
+/// only the committable files installs the patched bytes with the real yarn
+/// (`--frozen-lockfile --offline`, empty cache), then the manifest-less VEX
+/// matrix runs over it.
+#[test]
+fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
+    const LEG: &str = "vendor-detached-scan";
+    if !require_yarn_classic(LEG, |c| {
+        cache_env::isolate(c);
+    }) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"yarn-classic-detached","version":"0.0.0","private":true,"dependencies":{{"{DEP}":"{DEP_VERSION}"}}}}"#
+        ),
+    )
+    .unwrap();
+    let cache = tmp.path().join("yarn-cache");
+    let install = corepack(
+        &proj,
+        &yarn_classic(),
+        &["install", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+    );
+    if !install.status.success() {
+        skip!(
+            "{LEG}: fixture `yarn install` failed (registry unreachable?):\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        return;
+    }
+    let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js")).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    let lock_before = std::fs::read(proj.join("yarn.lock")).unwrap();
+
+    let mut view = vex_e2e_common::patch_view(
+        UUID,
+        &purl,
+        &[("package/index.js", &git_sha256(&patched))],
+        &[(GHSA, &[CVE])],
+    );
+    view["files"]["package/index.js"]["beforeHash"] = git_sha256(&orig).into();
+    view["files"]["package/index.js"]["blobContent"] = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(&patched)
+            .into()
+    };
+    // The Socket API the scan drives: discovery + the patch view.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let server = rt.block_on(async {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let summary = serde_json::json!({
+            "uuid": UUID, "purl": purl, "tier": "free", "cveIds": [CVE],
+            "ghsaIds": [GHSA], "severity": "high", "title": "detached capstone",
+        });
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/test-org/patches/batch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "packages": [{ "purl": purl, "patches": [summary] }],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/v0/orgs/test-org/patches/by-package/.+$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "patches": [{
+                    "uuid": UUID, "purl": purl, "publishedAt": "2026-01-01T00:00:00Z",
+                    "description": "x", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {}
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/test-org/patches/view/{UUID}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(view.clone()))
+            .mount(&server)
+            .await;
+        server
+    });
+    // The record source for VEX once the ledger is gone (counted apart).
+    let api = vex_e2e_common::PatchApi::start(vec![(UUID.to_string(), view)]);
+
+    let api_url = server.uri();
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "scan",
+            "--mode",
+            "vendored",
+            "--detached",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &api_url,
+            "--api-token",
+            "fake",
+            "--org",
+            "test-org",
+            "--vendor-source",
+            "build",
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "scan --mode vendored --detached failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(
+        env["vendor"]["summary"]["applied"], 1,
+        "one package vendored: {env}"
+    );
+    assert!(
+        !proj.join(".socket/manifest.json").exists(),
+        "--detached must never write the manifest"
+    );
+    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
+    assert!(proj.join(&tgz_rel).is_file(), "vendored tarball missing");
+    let lock = std::fs::read_to_string(proj.join("yarn.lock")).unwrap();
+    assert!(
+        lock.contains(&format!("  resolved \"file:./{tgz_rel}#")),
+        "yarn.lock must be wired to the vendored tarball:\n{lock}"
+    );
+
+    // Fresh checkout: only the committable files, empty cache, offline.
+    let fresh = tmp.path().join("fresh");
+    std::fs::create_dir_all(&fresh).unwrap();
+    std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
+    std::fs::copy(proj.join("yarn.lock"), fresh.join("yarn.lock")).unwrap();
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    let fresh_cache = tmp.path().join("fresh-yarn-cache");
+    let ci = corepack(
+        &fresh,
+        &yarn_classic(),
+        &["install", "--frozen-lockfile", "--offline", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
+    );
+    assert!(
+        ci.status.success(),
+        "fresh-checkout install failed:\n{}",
+        String::from_utf8_lossy(&ci.stderr)
+    );
+    let installed = fresh.join("node_modules").join(DEP).join("index.js");
+    if yarn_classic_vex::installs_file_tarballs(&yarn_classic_vex::yarn_classic_version()) {
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            patched,
+            "the fresh install must deliver the patched bytes"
+        );
+    } else {
+        assert!(!installed.exists(), "yarn < 1.7 installs no `file:` entry");
+    }
+
+    let reverted_cache = tmp.path().join("reverted-yarn-cache");
+    ManifestlessVex {
+        leg: LEG,
+        wiring: Wiring::Vendored,
+        purl: &purl,
+        uuid: UUID,
+        vulns: &[(GHSA, &[CVE])],
+        api: &api,
+        proxy_override: None,
+        patch_server_url: None,
+        registry_lock: lock_before,
+        reinstall: Some(Box::new(|dir: &Path| {
+            let _ = std::fs::remove_dir_all(dir.join("node_modules"));
+            let out = corepack(
+                dir,
+                &yarn_classic(),
+                &["install", "--frozen-lockfile", "--no-progress"],
+                &[("YARN_CACHE_FOLDER", reverted_cache.to_str().unwrap())],
+            );
+            assert!(
+                out.status.success(),
+                "reverted-lock install failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                std::fs::read(dir.join("node_modules").join(DEP).join("index.js")).unwrap(),
+                orig,
+                "the reverted lock installs pristine bytes"
+            );
+        })),
+        embedded: vec![
+            ("apply --vex", via_apply()),
+            ("vendor --vex", via_vendor()),
+            // The command that produced the state, re-run manifest-less.
+            (
+                "scan --mode vendored --detached --vex",
+                Box::new(|run: vex_e2e_common::VexRun| {
+                    let mut run = run
+                        .via(vex_e2e_common::VexVia::Scan)
+                        .arg("--mode")
+                        .arg("vendored")
+                        .arg("--detached")
+                        .arg("--vendor-source")
+                        .arg("build")
+                        .arg("--yes");
+                    run.proxy_url = None;
+                    run.api_url = Some(api_url.clone());
+                    run.api_token = Some("fake".to_string());
+                    run.org = Some("test-org".to_string());
+                    run
+                }),
+            ),
+        ],
+    }
+    .run(&fresh);
+    drop(server);
 }

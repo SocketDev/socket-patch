@@ -81,6 +81,8 @@ use sha2::{Digest, Sha256, Sha512};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "vex_e2e_common/bun.rs"]
+mod bun_vex;
 #[path = "common/cache_env.rs"]
 mod cache_env;
 
@@ -93,6 +95,10 @@ const TAMPER_MARKER: &str = "/* SOCKET-TAMPERED */\n";
 const DEP: &str = "left-pad";
 const DEP_VERSION: &str = "1.3.0";
 const ORG: &str = "test-org";
+/// The vulnerability the patch record carries (staged manifest and the
+/// `view/{uuid}` mock alike) — what manifest-less VEX must attest.
+const GHSA: &str = "GHSA-vendor-bun-real";
+const CVE: &str = "CVE-2026-2222";
 
 /// The scoped, dependency-bearing target of the meta-preserving leg. It
 /// exists only in the wiremock registry this suite runs; bun fetches it
@@ -707,7 +713,10 @@ fn stage_patch(fx: &BunProject) {
                 "beforeHash": git_sha256(&fx.orig),
                 "afterHash": git_sha256(&fx.patched),
             }},
-            "vulnerabilities": {},
+            "vulnerabilities": { GHSA: {
+                "cves": [CVE], "summary": "vendor bun capstone vuln",
+                "severity": "high", "description": "d"
+            }},
             "description": "capstone marker patch",
             "license": "MIT",
             "tier": "free",
@@ -925,6 +934,47 @@ fn fresh_checkout_install_proof(fx: &BunProject, name: &str) {
         assert_scoped_meta_honored(&fresh);
     }
     eprintln!("PLAIN INSTALL LOCK-STABLE ({name})");
+    manifestless_vex(fx, name, &fx.lock_before);
+}
+
+/// The manifest-less VEX step ([`bun_vex::run_bun_vex_matrix`]) on a fresh
+/// checkout of the vendored project with `.socket/manifest.json` deleted
+/// and a real frozen install: attested `(vendored)` from the ledger and,
+/// with both ledgers deleted, from the lock's `.socket/vendor/` wiring +
+/// the patch API; `record_unavailable` offline with zero requests; NOT
+/// attested once the lock is back to `registry_lock` (ledger + committed
+/// artifact + patched install left behind).
+fn manifestless_vex(fx: &BunProject, tag: &str, registry_lock: &[u8]) {
+    let case = bun_vex::BunVexCase {
+        tag,
+        mode: bun_vex::BunMode::Vendored,
+        purl: fx.target.purl(),
+        uuid: UUID,
+        files: vec![("package/index.js".to_string(), git_sha256(&fx.patched))],
+        vulns: &[(GHSA, &[CVE])],
+        lock: "bun.lock",
+        registry_lock: registry_lock.to_vec(),
+        patch_server_url: None,
+    };
+    bun_vex::run_bun_vex_matrix(&fx.proj, fx.tmp.path(), &case, |checkout| {
+        let cache = fx.tmp.path().join(format!("vex-{tag}-bun-cache"));
+        let ci = bun(
+            checkout,
+            &["install", "--frozen-lockfile", "--ignore-scripts"],
+            &cache,
+        );
+        assert!(
+            ci.status.success(),
+            "vex checkout frozen install.\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&ci.stdout),
+            String::from_utf8_lossy(&ci.stderr)
+        );
+        assert_eq!(
+            std::fs::read(fx.target.installed_dir(checkout).join("index.js")).unwrap(),
+            fx.patched,
+            "the vex checkout must hold the patched install"
+        );
+    });
 }
 
 /// The tampered twin's shared tail: bun.lock pins OUR sha512 while the
@@ -1208,6 +1258,40 @@ fn bun_vendor_tampered_tarball_digest_boundary() {
     std::fs::write(&tgz_path, &tampered_tgz).unwrap();
 
     assert_tamper_outcome(&fx, &tampered);
+
+    // The committed artifact is the vendored evidence: manifest-less VEX
+    // over the tampered tarball must omit the patch — from the ledger, and
+    // with the ledgers deleted (discovery + patch API) alike.
+    let checkout = bun_vex::manifestless_checkout(&fx.proj, &fx.tmp.path().join("vex-tampered"));
+    let patched = git_sha256(&fx.patched);
+    bun_vex::outside_runtime(|| {
+        let api = bun_vex::PatchApi::start(vec![(
+            UUID.to_string(),
+            bun_vex::patch_view(
+                UUID,
+                fx.target.purl(),
+                &[("package/index.js", &patched)],
+                &[(GHSA, &[CVE])],
+            ),
+        )]);
+        for strip in [false, true] {
+            if strip {
+                bun_vex::strip_ledgers(&checkout);
+            }
+            let out = bun_vex::run_vex(
+                &bun_vex::binary(),
+                &checkout,
+                &bun_vex::VexRun::online(&api),
+            );
+            assert_eq!(
+                out.code,
+                Some(1),
+                "tampered artifact (strip={strip}): {out}"
+            );
+            bun_vex::assert_skipped(&out.envelope, fx.target.purl(), "vendor_hash_mismatch");
+        }
+    });
+    eprintln!("BUN-VEX tampered vendored vendor-hash-mismatch ok");
 }
 
 // ── the get-driven twin (v3.6) ────────────────────────────────────────
@@ -1230,7 +1314,10 @@ async fn mock_view(server: &MockServer, purl: &str, before: &[u8], after: &[u8])
                     "blobContent": b64(after),
                 }
             },
-            "vulnerabilities": {},
+            "vulnerabilities": { GHSA: {
+                "cves": [CVE], "summary": "vendor bun capstone vuln",
+                "severity": "high", "description": "d"
+            }},
             "description": "capstone marker patch",
             "license": "MIT",
             "tier": "free",
@@ -1465,8 +1552,16 @@ fn bun_vendor_survives_a_digest_dropping_lock_resave() {
 
     // 1. Grow → re-save; assert the era's spelling.
     let tgz_a = grow_project_with_local_dep(&fx, 1);
-    assert_resave_shape(&fx, &wired_line);
+    let live_line = assert_resave_shape(&fx, &wired_line);
     eprintln!("RESAVE OK (bun {})", fx.bun_raw);
+    // Manifest-less VEX over the lock bun re-saved (digest-less 2-tuple
+    // below 1.3.10): the committed artifact is still wired and is the
+    // evidence. Reverted = the grown lock with the registry line back.
+    let resaved = std::fs::read_to_string(&lock_path).unwrap();
+    let lock_before = String::from_utf8(fx.lock_before.clone()).unwrap();
+    let grown_registry = resaved.replace(&live_line, &packages_line(&lock_before, DEP));
+    assert_ne!(grown_registry, resaved);
+    manifestless_vex(&fx, "resaved", grown_registry.as_bytes());
 
     // 2. Re-run `vendor`: exit 0, nothing failed, in sync, digest healed.
     let (code, stdout, stderr) = run_vendor(&fx, &[]);

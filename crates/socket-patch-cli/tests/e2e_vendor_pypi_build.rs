@@ -14,6 +14,12 @@
 //!   (both tools resolve bare paths against the CWD — spike claim 3), and
 //!   the same wheel installs via `uv pip install --no-index -r`.
 //!
+//! The requirements flavor also ends with the manifest-less VEX steps
+//! (`vex_pipenv_pip_steps`) over the installed fresh checkout: manifest
+//! deleted, ledgers deleted, `--offline` (`record_unavailable`, zero
+//! requests), the pin reverted to the registry (`vendor_unwired`,
+//! `--no-verify` too) and `apply --vex`.
+//!
 //! Both flavors finish with the revert proof: pyproject/uv.lock/
 //! requirements.txt byte-identical to the pre-vendor snapshots and
 //! `.socket/vendor/` gone.
@@ -31,6 +37,22 @@
 //! Skips (println) when python3/uv are missing or the fixture install cannot
 //! reach PyPI; all assertions after that are hard. uv discovery tries PATH
 //! then `~/.local/bin/uv`.
+//!
+//! Manifest-less VEX: both uv capstones end in the shared matrix
+//! (`vex_e2e_common/uv.rs` [`uv_vex::manifestless_matrix`]) over their fresh
+//! checkout — `.socket/manifest.json` deleted, `vex` attests `(vendored)`
+//! with and without the ledgers, `record_unavailable` offline with zero
+//! requests, embedded `apply --vex` / `vendor --vex`, and NOT attested once
+//! the pair is reverted with the ledger + wheel left behind. The `#[ignore]`d
+//! `vendored_uv_*` lanes drive every other uv lock shape (constraints,
+//! transitive override, script lock, pylock via `uv export` / `uv pip
+//! compile` / `pip lock`) end to end with the uv under test.
+//!
+//! uv release for the uv tests: `SOCKET_PATCH_UV_E2E_BIN` / `_VERSION` /
+//! `_PYTHON` / `_REQUIRED` (`scripts/uv-vex-matrix.sh` runs every uv 0.N
+//! line); the two capstones need `uv lock --check` and report `n/a` on
+//! older releases, whose lanes run in the `vendored_uv_*` tests. The pip
+//! capstones below keep their own `uv` discovery.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -41,6 +63,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "vex_e2e_common/uv.rs"]
+mod uv_vex;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+#[path = "vex_pipenv_pip_steps/mod.rs"]
+mod vex_pipenv_pip_steps;
 
 const UUID: &str = "4d5e6f70-8192-4a1b-8c2d-0123456789ab";
 const PURL: &str = "pkg:pypi/six@1.16.0";
@@ -48,6 +76,33 @@ const PURL: &str = "pkg:pypi/six@1.16.0";
 const ORG: &str = "test-org";
 /// Appended to the installed `six.py` by the synthetic patch.
 const PATCH_SUFFIX: &str = "\n# SOCKET-PATCHED\nSOCKET_PATCHED = 1\n";
+/// The staged record's advisory (what the manifest-less VEX must attest).
+const VEX_VULNS: &[(&str, &[&str])] = &[("GHSA-vend-pypi-real", &["CVE-2024-88888"])];
+
+/// The manifest-less VEX steps over the installed fresh checkout `fresh`
+/// of the vendored requirements project (records served by a mock patch
+/// API: the staged patch's `six.py` afterHash + advisory), `original`
+/// being the registry requirements the revert step restores.
+fn manifestless_vex(fresh: &Path, what: &str, patched: &[u8], original: &[u8]) {
+    let view =
+        vex_e2e_common::patch_view(UUID, PURL, &[("six.py", &git_sha256(patched))], VEX_VULNS);
+    vex_pipenv_pip_steps::run_manifestless_steps(&vex_pipenv_pip_steps::Steps {
+        what: what.to_string(),
+        project: fresh,
+        purl: PURL,
+        uuid: UUID,
+        marker: vex_e2e_common::Marker::Vendored,
+        vulns: Some(VEX_VULNS),
+        records: vex_pipenv_pip_steps::Records::Mock(vec![(UUID.to_string(), view)]),
+        patch_server_url: None,
+        product: "pkg:pypi/app@0.1.0",
+        revert: &|p: &Path| std::fs::write(p.join("requirements.txt"), original).unwrap(),
+        envs: Vec::new(),
+        on_step: None,
+        expect_verified: true,
+    });
+}
+
 /// Oracle: prints `1` iff the patched module is the one imported.
 const ORACLE: &str = "import six; print(six.SOCKET_PATCHED)";
 
@@ -94,6 +149,32 @@ fn find_python() -> Option<&'static str> {
         }
     }
     None
+}
+
+/// The uv under test for the two uv capstones (`SOCKET_PATCH_UV_E2E_*`,
+/// else PATH / `~/.local/bin/uv`), plus the `UV_PYTHON` pin to pass it.
+/// `None` after printing why (a skip, or `n/a` for a release without `uv
+/// lock --check`); panics under `SOCKET_PATCH_UV_E2E_REQUIRED` when uv is
+/// missing.
+fn capstone_uv(tag: &str) -> Option<(PathBuf, Option<String>)> {
+    let uv = match uv_vex::uv_under_test() {
+        Ok(uv) => uv,
+        Err(why) => {
+            uv_vex::skip(&format!("e2e_vendor_pypi_build({tag})"), &why);
+            return None;
+        }
+    };
+    if !uv.help_has(&["lock"], "--check") {
+        println!(
+            "UV-VEX uv={} mode=vendored lane=project({}) step=all result=n/a (no `uv lock \
+             --check`; the vendored_uv_project lane covers this release)",
+            uv.version,
+            if tag == "uv" { "vendor" } else { "get-uuid" }
+        );
+        return None;
+    }
+    let python = uv.python.as_ref().map(|p| p.display().to_string());
+    Some((uv.exe, python))
 }
 
 /// Resolve `uv`: PATH first, then `~/.local/bin/uv` (the standalone
@@ -353,7 +434,13 @@ fn setup_uv_six_project(uv: &Path, proj: &Path, cache_env: &[(&str, &str)], tag:
 /// new dir; with an EMPTY UV_CACHE_DIR, `uv sync --frozen --offline` must
 /// install the PATCHED six and leave uv.lock byte-identical to `lock_wired`
 /// (spike claim 3).
-fn assert_fresh_checkout_frozen_offline(uv: &Path, tmp: &Path, proj: &Path, lock_wired: &[u8]) {
+fn assert_fresh_checkout_frozen_offline(
+    uv: &Path,
+    tmp: &Path,
+    proj: &Path,
+    lock_wired: &[u8],
+    python: Option<&str>,
+) {
     let fresh = tmp.join("fresh");
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("pyproject.toml"), fresh.join("pyproject.toml")).unwrap();
@@ -361,7 +448,10 @@ fn assert_fresh_checkout_frozen_offline(uv: &Path, tmp: &Path, proj: &Path, lock
     copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_cache = tmp.join("fresh-uv-cache");
-    let fresh_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", fresh_cache.to_str().unwrap())];
+    let mut fresh_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", fresh_cache.to_str().unwrap())];
+    if let Some(py) = python {
+        fresh_env.push(("UV_PYTHON", py));
+    }
     let frozen = tool(
         uv,
         &fresh,
@@ -445,13 +535,138 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
     }
 }
 
+/// The shared manifest-less VEX matrix (`uv_vex::manifestless_matrix`) over
+/// `<tmp>/fresh`, the fresh checkout [`assert_fresh_checkout_frozen_offline`]
+/// just installed PATCHED: manifest deleted → attested `(vendored)`; ledgers
+/// deleted → attested from the lock + the API record; `--offline` →
+/// `record_unavailable`, zero requests; `apply --vex` / `vendor --vex`
+/// manifest-less → attested; the pair reverted to `registry` (ledger + wheel
+/// kept) and reinstalled pristine by uv → `vendor_unwired`, `--no-verify` too.
+fn manifestless_vex_tail(
+    uv: &Path,
+    tmp: &Path,
+    patched: &[u8],
+    registry: &[(&str, &[u8])],
+    python: Option<&str>,
+    tag: &str,
+) {
+    use vex_e2e_common::{git_sha256, patch_view, strip_manifest, PatchApi, VexRun, VexVia};
+    let fresh = tmp.join("fresh");
+    strip_manifest(&fresh);
+    let vulns: &[(&str, &[&str])] = &[("GHSA-vend-pypi-real", &["CVE-2024-88888"])];
+    let api = PatchApi::start(vec![(
+        UUID.to_string(),
+        patch_view(UUID, PURL, &[("six.py", &git_sha256(patched))], vulns),
+    )]);
+    let registry: Vec<(String, Vec<u8>)> = registry
+        .iter()
+        .map(|(f, b)| (f.to_string(), b.to_vec()))
+        .collect();
+    let reinstall_cache = tmp.join("reinstall-uv-cache");
+    let version = String::from_utf8_lossy(&tool(uv, tmp, &["--version"], &[]).stdout)
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("?")
+        .to_string();
+    uv_vex::manifestless_matrix(
+        &uv_vex::Matrix {
+            fresh: &fresh,
+            purl: PURL,
+            uuid: UUID,
+            mode: uv_vex::Mode::Vendored,
+            vulns,
+            api: &api,
+            patch_server: None,
+            embedded: vec![
+                ("apply --vex", VexRun::offline().via(VexVia::Apply)),
+                ("vendor --vex", VexRun::offline().via(VexVia::Vendor)),
+            ],
+            registry: &registry,
+            reinstall_registry: &|dir: &Path| {
+                let _ = std::fs::remove_dir_all(dir.join(".venv"));
+                let mut env: Vec<(&str, &str)> =
+                    vec![("UV_CACHE_DIR", reinstall_cache.to_str().unwrap())];
+                if let Some(py) = python {
+                    env.push(("UV_PYTHON", py));
+                }
+                let out = tool(uv, dir, &["sync", "--frozen", "-q"], &env);
+                assert_tool_ok(&out, "registry reinstall of the reverted pair");
+                let probe = tool(
+                    &dir.join(".venv/bin/python"),
+                    dir,
+                    &["-c", "import six; print(getattr(six, 'SOCKET_PATCHED', 0))"],
+                    &[],
+                );
+                assert_tool_ok(&probe, "pristine oracle");
+                String::from_utf8_lossy(&probe.stdout).trim().to_string()
+            },
+        },
+        &|step, result| {
+            println!(
+                "UV-VEX uv={version} mode=vendored lane=project({tag}) step={step} result={result}"
+            )
+        },
+    );
+}
+
+// ── the uv lanes (every lock shape, uv under test) ─────────────────────
+
+fn vendored_lane(lane: uv_vex::Lane) {
+    const SUITE: &str = "e2e_vendor_pypi_build";
+    match uv_vex::uv_under_test() {
+        Ok(uv) => uv_vex::run_lane(SUITE, &uv, uv_vex::Mode::Vendored, lane),
+        Err(why) => uv_vex::skip(SUITE, &why),
+    }
+}
+
+#[test]
+#[ignore = "real uv + PyPI; run with --ignored"]
+fn vendored_uv_project_manifestless_vex() {
+    vendored_lane(uv_vex::Lane::Project);
+}
+
+#[test]
+#[ignore = "real uv + PyPI; run with --ignored"]
+fn vendored_uv_constraints_manifestless_vex() {
+    vendored_lane(uv_vex::Lane::Constraints);
+}
+
+#[test]
+#[ignore = "real uv + PyPI; run with --ignored"]
+fn vendored_uv_transitive_override_manifestless_vex() {
+    vendored_lane(uv_vex::Lane::Transitive);
+}
+
+#[test]
+#[ignore = "real uv + PyPI; run with --ignored"]
+fn vendored_uv_script_lock_manifestless_vex() {
+    vendored_lane(uv_vex::Lane::Script);
+}
+
+#[test]
+#[ignore = "real uv + PyPI; run with --ignored"]
+fn vendored_uv_export_pylock_manifestless_vex() {
+    vendored_lane(uv_vex::Lane::ExportPylock);
+}
+
+#[test]
+#[ignore = "real uv + PyPI; run with --ignored"]
+fn vendored_uv_pip_compile_pylock_manifestless_vex() {
+    vendored_lane(uv_vex::Lane::CompilePylock);
+}
+
+#[test]
+#[ignore = "real uv + pip + PyPI; run with --ignored"]
+fn vendored_pip_lock_pylock_manifestless_vex() {
+    vendored_lane(uv_vex::Lane::PipLock);
+}
+
 // ── capstone 1: uv project flavor ─────────────────────────────────────
 
 #[test]
 #[serial_test::serial]
 fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
-    let Some(uv) = find_uv() else {
-        println!("SKIP e2e_vendor_pypi_build(uv): `uv` not on PATH or at ~/.local/bin/uv");
+    let Some((uv, python)) = capstone_uv("uv") else {
         return;
     };
     bake_leak_guards();
@@ -459,7 +674,10 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     let cache = tmp.path().join("uv-cache");
-    let cache_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", cache.to_str().unwrap())];
+    let mut cache_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", cache.to_str().unwrap())];
+    if let Some(py) = python.as_deref() {
+        cache_env.push(("UV_PYTHON", py));
+    }
 
     // REAL fixture: pyproject + uv lock + uv sync (network allowed here).
     if !setup_uv_six_project(&uv, &proj, &cache_env, "uv") {
@@ -468,7 +686,7 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
 
     let venv = proj.join(".venv");
     let installed_six = site_packages(&venv).join("six.py");
-    let _patched = stage_patch(&proj, &installed_six);
+    let patched = stage_patch(&proj, &installed_six);
 
     let pyproject_before = std::fs::read(proj.join("pyproject.toml")).unwrap();
     let uvlock_before = std::fs::read(proj.join("uv.lock")).unwrap();
@@ -553,7 +771,21 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
 
     // FRESH-CHECKOUT PROOF: pyproject + uv.lock + .socket only, EMPTY cache,
     // `uv sync --frozen --offline` (spike claim 3).
-    assert_fresh_checkout_frozen_offline(&uv, tmp.path(), &proj, &lock_wired);
+    assert_fresh_checkout_frozen_offline(&uv, tmp.path(), &proj, &lock_wired, python.as_deref());
+
+    // Manifest-less VEX over that fresh checkout (a `vendor --detached` /
+    // depscan checkout's shape once the manifest is gone).
+    manifestless_vex_tail(
+        &uv,
+        tmp.path(),
+        &patched,
+        &[
+            ("pyproject.toml", &pyproject_before),
+            ("uv.lock", &uvlock_before),
+        ],
+        python.as_deref(),
+        "vendor",
+    );
 
     // REVERT PROOF: both halves of the pair restored byte-for-byte.
     let (code, stdout, stderr) = run_socket(
@@ -603,8 +835,7 @@ fn uv_vendor_fresh_checkout_frozen_offline_and_revert() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn uv_get_uuid_vendored_fresh_checkout_frozen_offline() {
-    let Some(uv) = find_uv() else {
-        println!("SKIP e2e_vendor_pypi_build(uv-get): `uv` not on PATH or at ~/.local/bin/uv");
+    let Some((uv, python)) = capstone_uv("uv-get") else {
         return;
     };
     bake_leak_guards();
@@ -612,7 +843,10 @@ async fn uv_get_uuid_vendored_fresh_checkout_frozen_offline() {
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     let cache = tmp.path().join("uv-cache");
-    let cache_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", cache.to_str().unwrap())];
+    let mut cache_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", cache.to_str().unwrap())];
+    if let Some(py) = python.as_deref() {
+        cache_env.push(("UV_PYTHON", py));
+    }
 
     // REAL fixture: pyproject + uv lock + uv sync (network allowed here).
     if !setup_uv_six_project(&uv, &proj, &cache_env, "uv-get") {
@@ -627,6 +861,8 @@ async fn uv_get_uuid_vendored_fresh_checkout_frozen_offline() {
         "pristine install must not carry the marker"
     );
     let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    let pyproject_before = std::fs::read(proj.join("pyproject.toml")).unwrap();
+    let uvlock_before = std::fs::read(proj.join("uv.lock")).unwrap();
 
     // The API serves the record: view/{uuid} with REAL git-blob hashes over
     // the ACTUAL installed bytes + inline blob content.
@@ -710,7 +946,29 @@ async fn uv_get_uuid_vendored_fresh_checkout_frozen_offline() {
     let check = tool(&uv, &proj, &["lock", "--check"], &cache_env);
     assert_tool_ok(&check, "`uv lock --check` on the wired pair");
     let lock_wired = std::fs::read(proj.join("uv.lock")).unwrap();
-    assert_fresh_checkout_frozen_offline(&uv, tmp.path(), &proj, &lock_wired);
+    assert_fresh_checkout_frozen_offline(&uv, tmp.path(), &proj, &lock_wired, python.as_deref());
+
+    // Manifest-less VEX over the fresh checkout: get wrote the manifest, the
+    // checkout deletes it; the vendor ledger (+ wheel) and the pair remain.
+    // Off the async runtime: the matrix's patch API owns its own runtime.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                manifestless_vex_tail(
+                    &uv,
+                    tmp.path(),
+                    &patched,
+                    &[
+                        ("pyproject.toml", &pyproject_before),
+                        ("uv.lock", &uvlock_before),
+                    ],
+                    python.as_deref(),
+                    "get-uuid",
+                )
+            })
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e))
+    });
 }
 
 // ── capstone 2: requirements.txt flavor (pip + `uv pip`) ──────────────
@@ -756,7 +1014,7 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
     }
 
     let installed_six = site_packages(&venv).join("six.py");
-    let _patched = stage_patch(&proj, &installed_six);
+    let patched = stage_patch(&proj, &installed_six);
     let requirements_before = std::fs::read(proj.join("requirements.txt")).unwrap();
 
     // Vendor (offline; blob staged locally).
@@ -872,6 +1130,14 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
         );
     }
 
+    // MANIFEST-LESS VEX over the installed fresh checkout.
+    manifestless_vex(
+        &fresh,
+        "pip vendored fresh checkout",
+        &patched,
+        &requirements_before,
+    );
+
     // REVERT PROOF.
     let (code, stdout, stderr) = run_socket(
         &proj,
@@ -926,7 +1192,7 @@ fn pip_vendored_requirements_evaluate_environment_markers() {
             ),
             "install upstream six",
         );
-        stage_patch(&project, &site_packages(&venv).join("six.py"));
+        let patched = stage_patch(&project, &site_packages(&venv).join("six.py"));
         let original = format!("six==1.16.0 ; {marker}\n");
         std::fs::write(project.join("requirements.txt"), &original).unwrap();
         let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &project);
@@ -978,6 +1244,13 @@ fn pip_vendored_requirements_evaluate_environment_markers() {
         );
         if installed {
             assert_eq!(python_oracle(&fresh_venv, &fresh), "1");
+            // The marker-carrying vendored line attests manifest-less too.
+            manifestless_vex(
+                &fresh,
+                &format!("pip vendored marker {label}"),
+                &patched,
+                original.as_bytes(),
+            );
         }
         let (code, stdout, stderr) =
             run_socket(&project, &["vendor", "--revert", "--offline", "--json"]);

@@ -9,6 +9,14 @@
 //! the ledger onto the relocked bytes — adopting the fresh `original` — for
 //! `rollback` to still land on the relocked lock. The rewriter bytes themselves
 //! are pinned by the core `utils::pdm_lock` tests; this covers the CLI wiring.
+//!
+//! Every flow ends with the MANIFEST-LESS VEX step ([`assert_manifestless_vex`],
+//! the shared `vex_e2e_common` helper): a fresh copy of the committed state
+//! (pyproject + lock + `.socket/`, never a manifest in hosted mode) attests the
+//! redirect from the ledger offline, from the lock + patch API with the ledger
+//! gone (`--patch-server-url` admits the fixture's non-Socket host), omits it
+//! `record_unavailable` offline with no ledger (zero requests), and omits it
+//! `redirect_unwired` once the lock is reverted — `--no-verify` included.
 
 use std::path::Path;
 
@@ -20,6 +28,13 @@ use socket_patch_cli::commands::vex::VexEmbedArgs;
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+use vex_e2e_common::{
+    assert_attested, assert_not_attested, binary, git_sha256, patch_view, run_vex, strip_ledgers,
+    strip_manifest, Marker, PatchApi, VexRun,
+};
 
 const ORG: &str = "test-org";
 /// Discovery names the base purl (the lock inventory's spelling)…
@@ -172,6 +187,121 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap()
 }
 
+/// Origin of [`HOSTED_URL`]: not on the Socket host allowlist, so discovery
+/// only counts it as a hosted reference when named by `--patch-server-url`.
+const PATCH_SERVER: &str = "http://patch.test";
+
+/// The manifest-less VEX step every flow ends with. `root` holds the
+/// committed state the flow produced (pyproject + lock + `.socket/`);
+/// `pristine_lock` is the registry lock a revert restores. Runs on its own
+/// thread: the patch-API stand-in owns a runtime, which cannot be driven
+/// from inside this test's.
+fn assert_manifestless_vex(root: &Path, pristine_lock: &str) {
+    let root = root.to_path_buf();
+    let pristine_lock = pristine_lock.to_string();
+    std::thread::spawn(move || manifestless_vex_steps(&root, &pristine_lock))
+        .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e));
+}
+
+fn manifestless_vex_steps(root: &Path, pristine_lock: &str) {
+    let vulns: &[(&str, &[&str])] = &[(GHSA, &["CVE-2025-66418"])];
+    let api = PatchApi::start(vec![(
+        UUID.to_string(),
+        patch_view(
+            UUID,
+            RECORD_PURL,
+            &[("urllib3/response.py", &git_sha256(PATCHED))],
+            vulns,
+        ),
+    )]);
+    let online = || VexRun {
+        patch_server_url: Some(PATCH_SERVER.to_string()),
+        ..VexRun::online(&api)
+    };
+    // A fresh checkout of the committed state: the files, no installed
+    // package (an EMPTY in-project venv keeps the crawl hermetic).
+    let tmp = tempfile::tempdir().unwrap();
+    let copy = tmp.path();
+    write_project(copy, &read(&root.join("pdm.lock")));
+    std::fs::copy(root.join("pyproject.toml"), copy.join("pyproject.toml")).unwrap();
+    copy_dir(&root.join(".socket"), &copy.join(".socket"));
+    strip_manifest(copy);
+
+    // (1) ledger kept: attested offline from the ledger record (zero
+    // network), and online. Nothing is installed, so the basis is the
+    // lock's sha256 pin — which counts only once `--patch-server-url` makes
+    // the lock's url a discovered hosted reference.
+    let offline_ledger = VexRun {
+        offline: true,
+        patch_server_url: Some(PATCH_SERVER.to_string()),
+        ..VexRun::default()
+    };
+    for (i, run) in [offline_ledger, online()].into_iter().enumerate() {
+        let out = run_vex(&binary(), copy, &run);
+        assert_eq!(out.code, Some(0), "{out}");
+        assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+        if i == 0 {
+            api.assert_no_requests();
+        }
+    }
+
+    // (2) ledgers gone: the lock alone, the record from the patch API.
+    strip_ledgers(copy);
+    let out = run_vex(&binary(), copy, &online());
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+    assert!(api.view_requests(UUID) >= 1, "{:?}", api.requests());
+    // …and without `--patch-server-url` the non-Socket host is no reference.
+    let out = run_vex(&binary(), copy, &VexRun::online(&api));
+    assert_eq!(out.code, Some(2), "{out}");
+    assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
+
+    // (3) offline with no ledger: nothing local to attest from, no network.
+    let quiet = PatchApi::empty();
+    let offline = VexRun {
+        offline: true,
+        patch_server_url: Some(PATCH_SERVER.to_string()),
+        ..VexRun::online(&quiet)
+    };
+    let out = run_vex(&binary(), copy, &offline);
+    assert_eq!(out.code, Some(1), "{out}");
+    assert_not_attested(&out.envelope, PURL, "record_unavailable");
+    quiet.assert_no_requests();
+
+    // (4) lock reverted to the registry, ledger kept: dead claim.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let reverted = tmp2.path();
+    write_project(reverted, pristine_lock);
+    std::fs::copy(root.join("pyproject.toml"), reverted.join("pyproject.toml")).unwrap();
+    copy_dir(&root.join(".socket"), &reverted.join(".socket"));
+    strip_manifest(reverted);
+    for no_verify in [false, true] {
+        let out = run_vex(
+            &binary(),
+            reverted,
+            &VexRun {
+                no_verify,
+                ..online()
+            },
+        );
+        assert_eq!(out.code, Some(1), "no_verify={no_verify}: {out}");
+        assert_not_attested(&out.envelope, PURL, "redirect_unwired");
+    }
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 /// Lock-only hosted redirect regression: before the `pdm.lock` inventory
 /// reader, a fresh checkout with nothing installed surfaced no package to the
 /// batch API, so `redirected` was 0 and nothing was attested.
@@ -235,7 +365,10 @@ async fn lock_only_pdm_project_redirects_attests_rescans_and_rolls_back() {
     assert_eq!(code, 0);
     assert_eq!(read(&lock_path), redirected, "re-scan must not touch the lock");
 
-    // 3. rollback unwinds the redirect and drops the record.
+    // 3. The committed state, manifest-less, attests (and only while wired).
+    assert_manifestless_vex(tmp.path(), LOCK);
+
+    // 4. rollback unwinds the redirect and drops the record.
     let code = rollback::run(RollbackArgs {
         targets: Vec::new(),
         common: global(tmp.path(), server.uri()),
@@ -300,6 +433,7 @@ async fn hatchling_build_backend_does_not_veto_the_pdm_lock_redirect() {
         Some("redirect_pdm_lock_package"),
         "{ledger}"
     );
+    assert_manifestless_vex(tmp.path(), LOCK);
 
     let code = rollback::run(RollbackArgs {
         targets: Vec::new(),
@@ -334,6 +468,7 @@ async fn legacy_metadata_files_lock_redirects_both_fragments_and_warns() {
         2,
         "package unit + [metadata.files] entry: {ledger}"
     );
+    assert_manifestless_vex(tmp.path(), LOCK_LEGACY);
 
     // rollback restores both fragments byte for byte.
     let code = rollback::run(RollbackArgs {
@@ -401,6 +536,9 @@ async fn assert_relock_roundtrip(lock: &str, relocked: &str) {
             "new fragments describe the current lock: {after}"
         );
     }
+    // The rebased ledger + re-redirected (relocked) lock attest; reverting
+    // to the relocked registry lock unwires it.
+    assert_manifestless_vex(tmp.path(), relocked);
 
     // rollback lands on the relocked (LF, registry) lock — the user's `pdm
     // lock` is preserved, only the Socket patch is unwound.

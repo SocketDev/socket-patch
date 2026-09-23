@@ -26,6 +26,8 @@ use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "vex_e2e_common/bun.rs"]
+mod bun_vex;
 #[path = "common/mod.rs"]
 mod common;
 
@@ -518,6 +520,42 @@ async fn repair_rebuilds_deleted_yarn_berry_tarball() {
 async fn repair_rebuilds_deleted_bun_tarball() {
     for shape in BunLock::MATRIX {
         deleted_tarball_rebuilds(Flavor::Bun(shape)).await;
+    }
+}
+
+/// Manifest-less VEX over every REPAIRED bun shape (lockfileVersion
+/// {0, 1, 2} × {plain, workspace}): the rebuilt committed artifact is the
+/// vendored evidence, so a lockfile-only checkout with the manifest deleted
+/// is attested `(vendored)` from the ledger and — ledgers deleted — from
+/// the lock + patch API; offline → `record_unavailable`; the pristine lock
+/// back → NOT attested ([`bun_vex::run_bun_vex_matrix`]).
+#[tokio::test]
+async fn repaired_bun_tarball_attests_without_a_manifest() {
+    for shape in BunLock::MATRIX {
+        let flavor = Flavor::Bun(shape);
+        let mock = MockServer::start().await;
+        mount_patch_api(&mock).await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), flavor);
+        let pristine = std::fs::read(tmp.path().join(flavor.lock_name())).unwrap();
+        let tgz = vendor_project(tmp.path(), &mock.uri(), flavor);
+        std::fs::remove_file(&tgz).unwrap();
+        let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair"]);
+        assert_eq!(code, 0, "{}: stdout={stdout} stderr={stderr}", flavor.tag());
+        let scratch = tempfile::tempdir().unwrap();
+        let tag = flavor.tag();
+        let case = bun_vex::BunVexCase {
+            tag: &tag,
+            mode: bun_vex::BunMode::Vendored,
+            purl: PURL,
+            uuid: UUID,
+            files: vec![("package/index.js".to_string(), common::git_sha256(AFTER))],
+            vulns: &[("GHSA-aaaa-bbbb-cccc", &["CVE-2026-0001"])],
+            lock: flavor.lock_name(),
+            registry_lock: pristine,
+            patch_server_url: None,
+        };
+        bun_vex::run_bun_vex_matrix(tmp.path(), scratch.path(), &case, |_| {});
     }
 }
 

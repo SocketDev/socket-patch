@@ -30,6 +30,16 @@
 //!
 //! Skips (with a println) when `corepack yarn@4.12.0` is unavailable or the
 //! fixture install cannot reach the registry; every assertion after is hard.
+//!
+//! Every capstone ends with the manifest-less VEX matrix
+//! (`yarn_berry_common::run_manifestless_vex_matrix`): fresh checkouts of the
+//! wired state without the manifest, without the ledgers, `--offline`,
+//! tampered, reverted to the registry and installed under PnP — each
+//! installed by the REAL yarn and attested (or refused) by standalone and
+//! embedded VEX against a mock patch API. The yarn 4 release is
+//! `SOCKET_PATCH_YARN_BERRY_VERSION` (default 4.12.0; loop:
+//! `scripts/yarn-berry-vex-matrix.sh`); `SOCKET_PATCH_YARN_E2E_REQUIRED=1`
+//! turns every soft-skip into a failure.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -50,7 +60,27 @@ const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const GHSA: &str = "GHSA-redirect-berry-real";
 const PRODUCT: &str = "pkg:npm/app@1.0.0";
-const YARN_BERRY: &str = "yarn@4.12.0";
+// The yarn 4 release under test is `yarn_berry()` (`yarn@4.12.0` unless
+// `SOCKET_PATCH_YARN_BERRY_VERSION` pins another 4.x — see yarn_berry_common).
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+#[path = "yarn_berry_common/mod.rs"]
+mod yarn_berry_common;
+use yarn_berry_common::{yarn_berry, yarn_e2e_required};
+
+/// Print a SKIP line — or, under `SOCKET_PATCH_YARN_E2E_REQUIRED=1` (a leg
+/// that provisioned corepack yarn on purpose), FAIL: a required leg must
+/// never report green on an unexercised toolchain or an unreachable fixture
+/// registry.
+macro_rules! skip {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        if yarn_e2e_required() {
+            panic!("{msg} (SOCKET_PATCH_YARN_E2E_REQUIRED=1 forbids skipping)");
+        }
+        println!("{msg}");
+    }};
+}
 
 // ── self-contained helpers ────────────────────────────────────────────
 
@@ -200,25 +230,29 @@ fn bootstrap_berry_checksum(tmp: &Path, patched_tgz: &Path) -> Option<String> {
     let global = tmp.join("berry-bootstrap-global");
     let out = corepack(
         &boot,
-        YARN_BERRY,
+        yarn_berry(),
         &["install"],
         &[("YARN_GLOBAL_FOLDER", global.to_str().unwrap())],
     );
     if !out.status.success() {
-        println!(
+        skip!(
             "SKIP e2e_redirect_yarn_berry_build: bootstrap yarn install failed:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
         return None;
     }
     let lock = std::fs::read_to_string(boot.join("yarn.lock")).ok()?;
-    let checksum = lock
-        .lines()
-        .map(str::trim)
-        .find(|l| l.starts_with("checksum: 10c0/"))?
-        .trim_start_matches("checksum: ")
-        .to_string();
-    Some(checksum)
+    // yarn 4.0.x writes the bare hex, 4.1+ `10c0/<hex>`: the API form is the
+    // prefixed one. A lock with neither is a harness failure, never a
+    // silent pass (the old `?` here returned before any assertion ran).
+    let checksum = yarn_berry_common::yarn_written_checksum(&lock);
+    if checksum.is_none() {
+        skip!(
+            "SKIP: bootstrap `{} install` wrote no 10c0 cache checksum:\n{lock}",
+            yarn_berry()
+        );
+    }
+    checksum
 }
 
 /// Everything the fresh-checkout leg needs. `tmp` owns the tree; `_server`
@@ -226,8 +260,11 @@ fn bootstrap_berry_checksum(tmp: &Path, patched_tgz: &Path) -> Option<String> {
 struct BerryRedirectFixture {
     tmp: tempfile::TempDir,
     proj: PathBuf,
+    orig: Vec<u8>,
     patched: Vec<u8>,
     host: String,
+    /// `yarn.lock` as the real yarn wrote it, BEFORE the hosted rewrite.
+    registry_lock: Vec<u8>,
     _server: MockServer,
 }
 
@@ -254,12 +291,15 @@ async fn berry_hosted_project(
     tamper_served_tarball: bool,
     driver: HostedDriver,
 ) -> Option<BerryRedirectFixture> {
-    if !has_corepack_pm(YARN_BERRY) {
-        println!("SKIP e2e_redirect_yarn_berry_build ({tag}): `corepack {YARN_BERRY}` unavailable");
+    if !has_corepack_pm(yarn_berry()) {
+        skip!(
+            "SKIP e2e_redirect_yarn_berry_build ({tag}): `corepack {}` unavailable",
+            yarn_berry()
+        );
         return None;
     }
     if !has_command("tar") {
-        println!("SKIP e2e_redirect_yarn_berry_build ({tag}): `tar` not installed");
+        skip!("SKIP e2e_redirect_yarn_berry_build ({tag}): `tar` not installed");
         return None;
     }
 
@@ -283,12 +323,12 @@ async fn berry_hosted_project(
     let global = tmp.path().join("yarn-global");
     let install = corepack(
         &proj,
-        YARN_BERRY,
+        yarn_berry(),
         &["install"],
         &[("YARN_GLOBAL_FOLDER", global.to_str().unwrap())],
     );
     if !install.status.success() {
-        println!(
+        skip!(
             "SKIP e2e_redirect_yarn_berry_build ({tag}): fixture `yarn install` failed \
              (registry unreachable?):\n{}",
             String::from_utf8_lossy(&install.stderr)
@@ -297,6 +337,7 @@ async fn berry_hosted_project(
     }
     let installed_dir = proj.join("node_modules").join(DEP);
     let orig = std::fs::read(installed_dir.join("index.js")).expect("installed index.js");
+    let registry_lock = std::fs::read(proj.join("yarn.lock")).expect("registry yarn.lock");
     assert!(
         !orig.starts_with(MARKER.as_bytes()),
         "pristine install must not carry the marker"
@@ -506,9 +547,14 @@ async fn berry_hosted_project(
         lock.contains("::__archiveUrl=") && lock.contains(&encoded),
         "yarn.lock must carry the encoded __archiveUrl; got:\n{lock}"
     );
+    let checksum_line = yarn_berry_common::expected_checksum_line(
+        &String::from_utf8_lossy(&registry_lock),
+        &checksum,
+    );
     assert!(
-        lock.contains(&checksum),
-        "yarn.lock must carry the 10c0 checksum ({checksum}); got:\n{lock}"
+        lock.lines().any(|l| l == checksum_line),
+        "yarn.lock must carry the cache checksum in yarn's own spelling \
+         ({checksum_line:?}); got:\n{lock}"
     );
 
     let ledger = std::fs::read_to_string(proj.join(".socket/vendor/redirect-state.json")).unwrap();
@@ -520,10 +566,25 @@ async fn berry_hosted_project(
     Some(BerryRedirectFixture {
         tmp,
         proj,
+        orig,
         patched,
         host,
+        registry_lock,
         _server: server,
     })
+}
+
+/// The `.yarnrc.yml` of a fresh checkout: node-modules linker, no global
+/// cache, the wiremock host whitelisted for plain http (yarn refuses http
+/// otherwise) and the registry poisoned (the install must come from the
+/// hosted tarball alone).
+fn fresh_yarnrc(fx: &BerryRedirectFixture) -> String {
+    format!(
+        "nodeLinker: node-modules\nenableGlobalCache: false\n\
+         unsafeHttpWhitelist:\n  - \"{}\"\n\
+         npmRegistryServer: \"http://127.0.0.1:1\"\n",
+        fx.host.split(':').next().unwrap_or("127.0.0.1")
+    )
 }
 
 /// Fresh dir with only the committable files, then `yarn install --immutable
@@ -536,21 +597,12 @@ fn fresh_checkout_yarn_install(fx: &BerryRedirectFixture) -> (PathBuf, Output) {
     std::fs::copy(fx.proj.join("yarn.lock"), fresh.join("yarn.lock")).unwrap();
     // A fresh .yarnrc.yml: node-modules linker, no global cache, and the
     // wiremock host whitelisted for plain http (yarn refuses http otherwise).
-    std::fs::write(
-        fresh.join(".yarnrc.yml"),
-        format!(
-            "nodeLinker: node-modules\nenableGlobalCache: false\n\
-             unsafeHttpWhitelist:\n  - \"{}\"\n\
-             npmRegistryServer: \"http://127.0.0.1:1\"\n",
-            fx.host.split(':').next().unwrap_or("127.0.0.1")
-        ),
-    )
-    .unwrap();
+    std::fs::write(fresh.join(".yarnrc.yml"), fresh_yarnrc(fx)).unwrap();
     copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
     let fresh_global = fx.tmp.path().join("fresh-yarn-global");
     let ci = corepack(
         &fresh,
-        YARN_BERRY,
+        yarn_berry(),
         &["install", "--immutable", "--check-cache"],
         &[
             ("YARN_GLOBAL_FOLDER", fresh_global.to_str().unwrap()),
@@ -558,6 +610,50 @@ fn fresh_checkout_yarn_install(fx: &BerryRedirectFixture) -> (PathBuf, Output) {
         ],
     );
     (fresh, ci)
+}
+
+/// The manifest-less VEX matrix over the hosted rewrite `driver` produced
+/// (see `yarn_berry_common`): fresh checkouts without the manifest, without
+/// the ledgers, offline, tampered, reverted to the registry and installed
+/// under PnP — each installed by the REAL yarn and attested (or refused) by
+/// the REAL binary against a mock patch API.
+fn hosted_manifestless_vex_matrix(fx: &BerryRedirectFixture, driver: HostedDriver) {
+    let yarnrc = fresh_yarnrc(fx);
+    let registry_state = [("yarn.lock", fx.registry_lock.clone())];
+    let yarn =
+        |cwd: &Path, args: &[&str], env: &[(&str, &str)]| corepack(cwd, yarn_berry(), args, env);
+    let api_url = fx._server.uri();
+    let flow = yarn_berry_common::BerryVexFlow {
+        yarn_spec: yarn_berry(),
+        flow: match driver {
+            HostedDriver::Scan => "node-modules(scan)",
+            HostedDriver::GetUuid => "node-modules(get)",
+        },
+        wiring: yarn_berry_common::BerryWiring::Hosted {
+            patch_server: api_url.clone(),
+        },
+        proj: &fx.proj,
+        scratch: fx.tmp.path(),
+        committable: &["package.json", "yarn.lock"],
+        yarnrc: &yarnrc,
+        registry_state: &registry_state,
+        purl: PURL,
+        uuid: UUID,
+        vulns: &[(GHSA, &["CVE-2026-1111"])],
+        patched: &fx.patched,
+        pristine: &fx.orig,
+        installed: "node_modules/left-pad/index.js",
+        registry_cache: fx.proj.join(".yarn/cache"),
+        yarn: &yarn,
+        // Re-run the flow's own `scan --mode hosted --vex` manifest-less
+        // (the get driver has no `--vex` by contract).
+        flow_api: (driver == HostedDriver::Scan).then(|| yarn_berry_common::FlowApi {
+            api_url,
+            org: ORG.to_string(),
+        }),
+        pnp_cell: true,
+    };
+    yarn_berry_common::off_runtime(|| yarn_berry_common::run_manifestless_vex_matrix(&flow));
 }
 
 // ── the capstone ──────────────────────────────────────────────────────
@@ -590,6 +686,8 @@ async fn berry_redirect_fresh_checkout_installs_patched_bytes() {
         installed, fx.patched,
         "fresh install must be byte-identical to the patched content"
     );
+
+    hosted_manifestless_vex_matrix(&fx, HostedDriver::Scan);
 }
 
 /// get-driven hosted twin (v3.6): `get <uuid> --mode hosted --json --yes`
@@ -626,6 +724,8 @@ async fn berry_get_uuid_hosted_fresh_checkout_installs() {
         installed, fx.patched,
         "fresh install must be byte-identical to the patched content (get-driven)"
     );
+
+    hosted_manifestless_vex_matrix(&fx, HostedDriver::GetUuid);
 }
 
 /// Negative twin: the archiveUrl serves a DIFFERENT tarball while the lock

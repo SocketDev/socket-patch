@@ -32,6 +32,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+use vex_e2e_common::{
+    assert_absent, assert_attested, assert_not_attested, git_sha256, patch_view, run_vex,
+    strip_ledgers, strip_manifest, Marker, PatchApi, VexRun,
+};
 
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
@@ -41,6 +47,8 @@ const UUID: &str = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d";
 const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const RUSH_VERSION: &str = "5.100.0";
+const GHSA: &str = "GHSA-rush-hosted";
+const VULNS: &[(&str, &[&str])] = &[(GHSA, &["CVE-2026-5151"])];
 
 // ── self-contained helpers ────────────────────────────────────────────
 
@@ -188,7 +196,13 @@ fn write_rush_fixture(root: &Path, with_repo_state: bool) {
 /// Mount discovery + reference + view + the hosted tarball route. `served` is
 /// what the tarball endpoint returns (tampered legs pass different bytes than
 /// the pinned sha512).
-async fn mount_hosted(server: &MockServer, hosted_url: &str, sri: &str, served: Vec<u8>) {
+async fn mount_hosted(
+    server: &MockServer,
+    hosted_url: &str,
+    sri: &str,
+    served: Vec<u8>,
+    patched: &[u8],
+) {
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -238,16 +252,16 @@ async fn mount_hosted(server: &MockServer, hosted_url: &str, sri: &str, served: 
         })))
         .mount(server)
         .await;
+    // The record the ledger embeds: the patched bytes' real hash, so a
+    // post-install VEX verifies what the install landed.
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": UUID, "purl": PURL, "publishedAt": "2026-01-01T00:00:00Z",
-            "files": { "package/index.js": {
-                "beforeHash": "a".repeat(64), "afterHash": "b".repeat(64)
-            }},
-            "vulnerabilities": {},
-            "description": "x", "license": "MIT", "tier": "free"
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(patch_view(
+            UUID,
+            PURL,
+            &[("package/index.js", &git_sha256(patched))],
+            VULNS,
+        )))
         .mount(server)
         .await;
     // The hosted tarball route pnpm hits at install time.
@@ -318,6 +332,75 @@ fn simulate_rush_install(root: &Path, store: &Path) -> Output {
     )
 }
 
+/// Manifest-less VEX over the Rush repo root after an install landed the
+/// patched bytes. Discovery reads `common/config/rush/pnpm-lock.yaml` (the
+/// rewritten source of truth); the hosted URLs sit on `patch_server` (the
+/// wiremock), named via `--patch-server-url`. Cells: ledger kept (the
+/// ledger record); ledgers deleted (the lock + the patch API record);
+/// `--offline` with no ledgers (`record_unavailable`, zero requests); the
+/// common lock reverted with the ledger restored (`redirect_unwired`,
+/// `--no-verify` too).
+fn assert_rush_manifestless_vex(root: &Path, patch_server: &str, patched: &[u8], pristine: &[u8]) {
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let bin = binary();
+            let api = PatchApi::start(vec![(
+                UUID.to_string(),
+                patch_view(
+                    UUID,
+                    PURL,
+                    &[("package/index.js", &git_sha256(patched))],
+                    VULNS,
+                ),
+            )]);
+            let online = |no_verify| VexRun {
+                patch_server_url: Some(patch_server.to_string()),
+                no_verify,
+                ..VexRun::online(&api)
+            };
+            let lock = root.join("common/config/rush/pnpm-lock.yaml");
+            let wired = std::fs::read(&lock).unwrap();
+            strip_manifest(root);
+            let out = run_vex(&bin, root, &online(false));
+            assert_eq!(out.code, Some(0), "rush, ledger kept: {out}");
+            assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
+
+            let ledger = root.join(".socket/vendor/redirect-state.json");
+            let ledger_bytes = std::fs::read(&ledger).unwrap();
+            strip_ledgers(root);
+            let out = run_vex(&bin, root, &online(false));
+            assert_eq!(out.code, Some(0), "rush, ledgers deleted: {out}");
+            assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
+            assert!(api.view_requests(UUID) >= 1, "{:?}", api.requests());
+
+            let seen = api.request_count();
+            let out = run_vex(
+                &bin,
+                root,
+                &VexRun {
+                    patch_server_url: Some(patch_server.to_string()),
+                    ..VexRun::offline()
+                },
+            );
+            assert_eq!(out.code, Some(1), "rush, offline: {out}");
+            assert_not_attested(&out.envelope, PURL, "record_unavailable");
+            assert_eq!(api.request_count(), seen, "--offline hit the API");
+
+            std::fs::write(&ledger, &ledger_bytes).unwrap();
+            std::fs::write(&lock, pristine).unwrap();
+            for no_verify in [false, true] {
+                let out = run_vex(&bin, root, &online(no_verify));
+                assert_ne!(out.code, Some(0), "rush, reverted: {out}");
+                assert_not_attested(&out.envelope, PURL, "redirect_unwired");
+                assert_absent(out.doc.as_ref(), PURL);
+            }
+            std::fs::write(&lock, &wired).unwrap();
+        })
+        .join()
+        .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    });
+}
+
 // ── Tier 1: default-runnable pnpm simulation ───────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -343,7 +426,7 @@ async fn rush_hosted_scan_then_simulated_pnpm_install_lands_patched_bytes() {
         "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz",
         server.uri()
     );
-    mount_hosted(&server, &hosted_url, &sri, tgz.clone()).await;
+    mount_hosted(&server, &hosted_url, &sri, tgz.clone(), &patched).await;
 
     let out = scan_hosted(root, &server.uri());
     assert!(
@@ -380,6 +463,7 @@ async fn rush_hosted_scan_then_simulated_pnpm_install_lands_patched_bytes() {
         "the simulated rush install must land the PATCHED bytes; got:\n{}",
         String::from_utf8_lossy(&installed[..installed.len().min(120)])
     );
+    assert_rush_manifestless_vex(root, &server.uri(), &patched, rush_common_lock().as_bytes());
 }
 
 /// Tamper twin: the hosted route serves DIFFERENT bytes than the pinned
@@ -410,7 +494,7 @@ async fn rush_hosted_tampered_tarball_fails_simulated_install() {
         "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz",
         server.uri()
     );
-    mount_hosted(&server, &hosted_url, &sri, tampered).await;
+    mount_hosted(&server, &hosted_url, &sri, tampered, &patched).await;
 
     let out = scan_hosted(root, &server.uri());
     assert!(out.status.success(), "scan --mode hosted should succeed");
@@ -503,7 +587,7 @@ async fn rush_hosted_real_rush_update_install() {
         "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz",
         server.uri()
     );
-    mount_hosted(&server, &hosted_url, &sri, tgz.clone()).await;
+    mount_hosted(&server, &hosted_url, &sri, tgz.clone(), &patched).await;
 
     // rush update generates common/config/rush/pnpm-lock.yaml + common/temp.
     // Rush REJECTS any unrecognized `RUSH_`-prefixed env var (including our own
@@ -532,6 +616,7 @@ async fn rush_hosted_real_rush_update_install() {
         );
         return;
     }
+    let lock_generated = std::fs::read(common.join("pnpm-lock.yaml")).expect("rush update lock");
     // scan --mode hosted rewrites the generated common lock.
     let out = scan_hosted(root, &server.uri());
     assert!(
@@ -558,6 +643,7 @@ async fn rush_hosted_real_rush_update_install() {
         installed.starts_with(MARKER.as_bytes()),
         "real rush install must land the PATCHED bytes"
     );
+    assert_rush_manifestless_vex(root, &server.uri(), &patched, &lock_generated);
 
     // Flip preventManualShrinkwrapChanges=true: rush install must now refuse
     // the out-of-band lock edit, and a `rush update` recovers.

@@ -2250,7 +2250,9 @@ fn engine_stdout(stdout: &str) -> String {
 /// Wet run, then an idempotent re-run: the first prints the singular
 /// summary plus next steps on stdout; the second says the package is
 /// already redirected instead of "Redirected 1 package(s); rewrote 0
-/// file(s)", and prints no next steps.
+/// file(s)", and prints no next steps. The first run's files include the
+/// project `.npmrc` the npm 12 `allow-remote=all` auto-config creates, so
+/// the commit line names it beside the lock.
 #[tokio::test]
 async fn human_rerun_says_already_redirected_and_first_run_prints_next_steps() {
     let server = MockServer::start().await;
@@ -2265,9 +2267,9 @@ async fn human_rerun_says_already_redirected_and_first_run_prints_next_steps() {
     assert_eq!(code, 0, "stderr=\n{stderr}");
     assert_eq!(
         engine_stdout(&stdout),
-        "Redirected 1 package; rewrote 1 file.\n\
-         Commit .socket/vendor/redirect-state.json and package-lock.json to keep the \
-         redirect.\n\
+        "Redirected 1 package; rewrote 2 files.\n\
+         Commit .socket/vendor/redirect-state.json, .npmrc, and package-lock.json to keep \
+         the redirect.\n\
          Reinstall from the updated lockfile (e.g. `npm ci`) so the installed packages pick \
          up the patched artifacts, then run `socket-patch vex` to verify them.\n",
         "stderr=\n{stderr}"

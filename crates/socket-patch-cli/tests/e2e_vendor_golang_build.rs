@@ -16,6 +16,14 @@
 //! same committed shape out of the CLI's advisory-selector path, with the
 //! patch record served by a wiremock `view/{uuid}` instead of a local
 //! manifest+blobs seed.
+//!
+//! Every flow ends in the manifest-less VEX tail
+//! ([`golang_e2e_matrix::manifestless_vex`]) over its committed state: a
+//! fresh checkout built fully offline (`GOPROXY=off`, empty module cache)
+//! attests the patch `(vendored)` from the go.mod replace + committed
+//! artifact alone — with and without `state.json`, never offline without a
+//! record, never with a tampered artifact member or a reverted go.mod. The
+//! Go release is whatever `go` is on `PATH` (see `golang_e2e_matrix`).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -26,6 +34,13 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "golang_e2e_matrix/mod.rs"]
+mod golang_e2e_matrix;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+
+use golang_e2e_matrix::{manifestless_vex, ManifestlessGo};
+use vex_e2e_common::{patch_view, Marker, VexVia};
 
 const ORG: &str = "test-org";
 const UUID: &str = "3c4d5e6f-7081-4a1b-8c2d-0123456789ab";
@@ -39,17 +54,6 @@ const PATCHED_LIB: &str = "package upstream\n\nfunc Greeting() string { return \
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
-
-fn has_command(cmd: &str) -> bool {
-    let mut probe = Command::new(cmd);
-    probe.arg("--version");
-    cache_env::isolate(&mut probe);
-    probe
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
 }
 
 /// Run socket-patch with `SOCKET_*` scrubbed + the fixture GOMODCACHE (the
@@ -261,12 +265,100 @@ fn chmod_writable(dir: &Path) {
     }
 }
 
+/// The manifest-less VEX tail over a vendored project's committed state.
+/// Each fresh checkout builds FULLY offline (`GOPROXY=off`, empty module
+/// cache — a directory replace needs neither) and must link PATCHED, then
+/// VEX sees `dev_modcache` (the pristine `M@v` `vendor` built from); the
+/// revert restores the pre-vendor go.mod (artifact + `state.json` kept) and
+/// must link PRISTINE from the proxy again.
+#[allow(clippy::too_many_arguments)]
+fn vendored_vex_tail(
+    tmp: &Path,
+    consumer: &Path,
+    dev_modcache: &Path,
+    gomod_before: &[u8],
+    proxy: &str,
+    label: &str,
+    vulns: &[(&str, &[&str])],
+    embedded: &[VexVia],
+) {
+    let n = std::cell::Cell::new(0);
+    let modcache = |what: &str| {
+        n.set(n.get() + 1);
+        let dir = tmp.join(format!(
+            "vex-mc-{}-{what}-{}",
+            label.replace('/', "-"),
+            n.get()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    };
+    let install = |dir: &Path| {
+        let mc = modcache("install");
+        let build = go(
+            dir,
+            &["build", "-o", "app", "."],
+            &go_env(mc.to_str().unwrap(), "off"),
+        );
+        assert!(
+            build.status.success(),
+            "[{label}] fresh-checkout offline build failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let app = Command::new(dir.join("app")).output().expect("run app");
+        assert!(
+            String::from_utf8_lossy(&app.stdout).contains("OUT: PATCHED"),
+            "[{label}] fresh checkout must link PATCHED: {}",
+            String::from_utf8_lossy(&app.stdout)
+        );
+        // VEX then runs on the developer's machine, whose module cache
+        // holds the PRISTINE `M@v` (`vendor` built from it): the verdict
+        // must come from the committed copy, with no drift disclosure.
+        dev_modcache.to_path_buf()
+    };
+    let revert = |dir: &Path| {
+        std::fs::write(dir.join("go.mod"), gomod_before).unwrap();
+        let mc = modcache("revert");
+        let out = go(dir, &["run", "."], &go_env(mc.to_str().unwrap(), proxy));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("OUT: PRISTINE"),
+            "[{label}] reverted checkout must link PRISTINE: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        mc
+    };
+    let art = format!(".socket/vendor/golang/{UUID}/{UMOD}@{UVER}/lib.go");
+    manifestless_vex(&ManifestlessGo {
+        label,
+        committed: consumer,
+        scratch: tmp,
+        purl: UPURL,
+        uuid: UUID,
+        marker: Marker::Vendored,
+        vulns,
+        view: patch_view(
+            UUID,
+            UPURL,
+            &[("lib.go", &git_sha256(PATCHED_LIB.as_bytes()))],
+            vulns,
+        ),
+        install: &install,
+        revert: &revert,
+        tamper: &|dir, _modcache| {
+            golang_e2e_matrix::overwrite(&dir.join(&art), b"package upstream // tampered\n")
+        },
+        tamper_reason: "vendor_hash_mismatch",
+        unwired_reason: "vendor_unwired",
+        embedded,
+    });
+}
+
 // ── capstone 1: vendor → build → fresh checkout → revert ─────────────
 
 #[test]
 fn go_vendor_fresh_checkout_offline_build_and_revert() {
-    if !has_command("go") || !has_command("zip") {
-        println!("SKIP e2e_vendor_golang_build: `go`/`zip` not installed");
+    if !golang_e2e_matrix::toolchain_ready("e2e_vendor_golang_build") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -434,6 +526,19 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
         "directory-replaced modules must write NOTHING to the module cache"
     );
 
+    // Manifest-less VEX over the committed state (before the revert below
+    // removes it).
+    vendored_vex_tail(
+        tmp.path(),
+        &consumer,
+        &modcache,
+        &gomod_before,
+        &proxy,
+        "vendored/vendor",
+        &[("GHSA-vend-golang-real", &["CVE-2024-88888"])],
+        &[VexVia::Vendor, VexVia::Apply],
+    );
+
     // REVERT PROOF.
     let (code, stdout, stderr) = run_socket(
         &consumer,
@@ -488,8 +593,7 @@ fn go_vendor_fresh_checkout_offline_build_and_revert() {
 // keeps serving the view route on the others.
 #[tokio::test(flavor = "multi_thread")]
 async fn go_get_uuid_vendored_fresh_checkout_offline_build() {
-    if !has_command("go") || !has_command("zip") {
-        println!("SKIP e2e_vendor_golang_build: `go`/`zip` not installed");
+    if !golang_e2e_matrix::toolchain_ready("e2e_vendor_golang_build") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -505,6 +609,7 @@ async fn go_get_uuid_vendored_fresh_checkout_offline_build() {
         String::from_utf8_lossy(&base.stderr)
     );
     assert!(String::from_utf8_lossy(&base.stdout).contains("OUT: PRISTINE"));
+    let gomod_before = std::fs::read(consumer.join("go.mod")).unwrap();
 
     // The suite's patch record served over the wire: REAL git-blob hashes +
     // inline blobContent, so the vendor step's in-memory staging hash-gates
@@ -681,6 +786,26 @@ async fn go_get_uuid_vendored_fresh_checkout_offline_build() {
         "directory-replaced modules must write NOTHING to the module cache"
     );
 
+    // Manifest-less VEX over the committed state. The API stand-in owns its
+    // own runtime, so the tail runs off this test's async runtime.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                vendored_vex_tail(
+                    tmp.path(),
+                    &consumer,
+                    &modcache,
+                    &gomod_before,
+                    &proxy,
+                    "vendored/get",
+                    &[("GHSA-vend-golang-get1", &["CVE-2026-77777"])],
+                    &[VexVia::Vendor, VexVia::Apply],
+                )
+            })
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e))
+    });
+
     chmod_writable(tmp.path());
 }
 
@@ -690,14 +815,14 @@ async fn go_get_uuid_vendored_fresh_checkout_offline_build() {
 /// documented revert handoff (`takeover_not_restored` → re-run `apply`).
 #[test]
 fn go_apply_vendor_interplay_takeover_and_yield() {
-    if !has_command("go") || !has_command("zip") {
-        println!("SKIP e2e_vendor_golang_build: `go`/`zip` not installed");
+    if !golang_e2e_matrix::toolchain_ready("e2e_vendor_golang_build") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let (consumer, modcache, proxy) = stage(tmp.path());
     let goenv = go_env(modcache.to_str().unwrap(), &proxy);
     let cs = consumer.to_str().unwrap();
+    let gomod_before = std::fs::read(consumer.join("go.mod")).unwrap();
     write_patch(&consumer);
 
     // 1. `apply` first: the project-local go-patches redirect.
@@ -816,6 +941,20 @@ fn go_apply_vendor_interplay_takeover_and_yield() {
         "apply must not re-create the go-patches redirect for a vendored module"
     );
 
+    // Manifest-less VEX over the taken-over state: the vendor copy (not the
+    // deleted go-patches one) is what attests, standalone and through both
+    // commands this flow runs.
+    vendored_vex_tail(
+        tmp.path(),
+        &consumer,
+        &modcache,
+        &gomod_before,
+        &proxy,
+        "vendored/takeover",
+        &[("GHSA-vend-golang-real", &["CVE-2024-88888"])],
+        &[VexVia::Apply, VexVia::Vendor],
+    );
+
     // 4. Revert: the taken-over redirect is NOT restored — surfaced via
     //    `takeover_not_restored` — and a fresh `apply` restores it.
     let (code, stdout, stderr) = run_socket(
@@ -869,12 +1008,12 @@ fn go_apply_vendor_interplay_takeover_and_yield() {
 /// misroutes results whose package_path is the `.socket/vendor/` copy dir).
 #[test]
 fn go_vendor_reports_applied_event() {
-    if !has_command("go") || !has_command("zip") {
-        println!("SKIP: `go`/`zip` not installed");
+    if !golang_e2e_matrix::toolchain_ready("e2e_vendor_golang_build") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let (consumer, modcache, _proxy) = stage(tmp.path());
+    let (consumer, modcache, proxy) = stage(tmp.path());
+    let gomod_before = std::fs::read(consumer.join("go.mod")).unwrap();
     write_patch(&consumer);
 
     let (code, stdout, stderr) = run_socket(
@@ -906,6 +1045,17 @@ fn go_vendor_reports_applied_event() {
     assert_eq!(
         event["action"], "applied",
         "vendor success must be an `applied` event, not skipped/`vendored`: {event}"
+    );
+
+    vendored_vex_tail(
+        tmp.path(),
+        &consumer,
+        &modcache,
+        &gomod_before,
+        &proxy,
+        "vendored/applied-event",
+        &[("GHSA-vend-golang-real", &["CVE-2024-88888"])],
+        &[],
     );
 
     chmod_writable(tmp.path());
