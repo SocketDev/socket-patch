@@ -2428,7 +2428,7 @@ pub(crate) async fn rollback_patches_inner(
     //     installed) don't gate either: there is nothing on disk to
     //     restore, so no before-blob is ever read for them. They used to
     //     be gated "fail-closed", which hard-failed the run (exit 1,
-    //     `Cannot rollback: ... Before blob not found`, `path: ""`) over
+    //     `Cannot roll back: ... Before blob not found`, `path: ""`) over
     //     an entry that had nothing to roll back — the same entry apply
     //     reports as a benign `package_not_installed` skip. They surface
     //     via `not_installed` below instead.
@@ -3180,7 +3180,7 @@ mod tests {
         assert!(r.files_rolled_back.is_empty());
         assert_eq!(
             r.error.as_deref(),
-            Some("Cannot rollback: a.js - gone: missing_a"),
+            Some("Cannot roll back: a.js - gone: missing_a"),
             "error mirrors the engine's first-blocking-file shape"
         );
         assert_eq!(r.files_verified.len(), 1);
@@ -3887,7 +3887,7 @@ mod tests {
     /// Regression (rollback ordering): a manifest entry whose package is
     /// NOT installed must never enter the before-blob plan. Before the gate
     /// reorder, its missing before-blob hard-failed the whole offline run
-    /// (exit 1, `Cannot rollback: ... Before blob not found`, `path: ""`)
+    /// (exit 1, `Cannot roll back: ... Before blob not found`, `path: ""`)
     /// even though there was nothing on disk to roll back. Through the
     /// `remove`-facing delegation this is a benign no-op: success with zero
     /// results, exactly as when the blob IS present — so `remove` can drop

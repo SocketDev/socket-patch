@@ -157,7 +157,7 @@ pub async fn verify_file_rollback(
             file: file_name.to_string(),
             status: VerifyRollbackStatus::HashMismatch,
             message: Some(
-                "File has been modified after patching. Cannot safely rollback.".to_string(),
+                "File has been modified after patching. Cannot safely roll back.".to_string(),
             ),
             current_hash: Some(current_hash),
             expected_hash: Some(file_info.after_hash.clone()),
@@ -296,7 +296,7 @@ pub async fn verify_file_rollback(
             file: file_name.to_string(),
             status: VerifyRollbackStatus::HashMismatch,
             message: Some(
-                "File has been modified after patching. Cannot safely rollback.".to_string(),
+                "File has been modified after patching. Cannot safely roll back.".to_string(),
             ),
             current_hash: Some(current_hash),
             expected_hash: Some(file_info.after_hash.clone()),
@@ -320,7 +320,7 @@ pub async fn verify_file_rollback(
 /// before this engine runs) emits byte-identical errors — the string
 /// reaches users through both stderr and the `--json` envelope.
 pub fn cannot_rollback_error(file: &str, why: &str) -> String {
-    format!("Cannot rollback: {file} - {why}")
+    format!("Cannot roll back: {file} - {why}")
 }
 
 /// Verify and rollback patches for a single package.

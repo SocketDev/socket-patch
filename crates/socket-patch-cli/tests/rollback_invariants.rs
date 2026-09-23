@@ -574,7 +574,7 @@ fn rollback_with_no_installed_packages_succeeds_quietly() {
 /// the before-blob MISSING must produce the identical envelope — the entry
 /// has no installed package, so its blob is never planned, probed, or
 /// fetched. Before the gate reorder this run hard-failed with exit 1,
-/// `failed: 1`, and a synthesized `Cannot rollback: ... Before blob not
+/// `failed: 1`, and a synthesized `Cannot roll back: ... Before blob not
 /// found` result carrying `path: ""` — a blob error for a package with
 /// nothing on disk to roll back.
 #[test]
@@ -703,7 +703,7 @@ fn rollback_mixed_installed_gated_and_not_installed_entries() {
     // package: engine vocabulary + repair remedy.
     let err = entry["error"].as_str().expect("error message string");
     assert!(
-        err.contains("Cannot rollback") && err.contains("socket-patch repair"),
+        err.contains("Cannot roll back: ") && err.contains("socket-patch repair"),
         "pinned abort error shape; got: {err}"
     );
     let verified = entry["filesVerified"]

@@ -110,7 +110,7 @@ async fn verify_new_file_rollback_hash_mismatch_when_user_modified() {
     // containing "modified".
     assert_eq!(
         result.message.as_deref(),
-        Some("File has been modified after patching. Cannot safely rollback.")
+        Some("File has been modified after patching. Cannot safely roll back.")
     );
     // The reported current hash must be the production hash of the *mutated*
     // on-disk bytes (proving it re-hashed disk, not echoed the manifest), and
