@@ -31,7 +31,7 @@
 use std::path::Path;
 
 use serde_json::Value;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
@@ -310,19 +310,36 @@ pub async fn vendor_yarn_berry(
     let dest = project_root.join(&rel_tgz);
 
     // ── 8. Berry identity facts of the packed tarball ─────────────────────
-    let tgz_bytes = match tokio::fs::read(&dest).await {
-        Ok(b) => b,
-        Err(e) => {
-            return done_failure_unstage(
-                purl,
-                format!("cannot re-read the packed tarball: {e}"),
-                project_root,
-                &uuid_dir_rel,
-                uuid_dir_preexisted,
-            )
-            .await
-        }
+    // A reuse hands over the exact bytes it verified; a fresh pack is
+    // re-read and must still be the bytes the pack hashed (the lock's
+    // checksum and `hash=` are derived from these, so a file swapped after
+    // verification must fail, never be pinned).
+    let tgz_bytes = match staged.verified_bytes {
+        Some(bytes) => bytes,
+        None => match tokio::fs::read(&dest).await {
+            Ok(b) => b,
+            Err(e) => {
+                return done_failure_unstage(
+                    purl,
+                    format!("cannot re-read the packed tarball: {e}"),
+                    project_root,
+                    &uuid_dir_rel,
+                    uuid_dir_preexisted,
+                )
+                .await
+            }
+        },
     };
+    if hex::encode(Sha256::digest(&tgz_bytes)) != packed.sha256_hex {
+        return done_failure_unstage(
+            purl,
+            format!("the packed tarball {rel_tgz} changed on disk after it was verified"),
+            project_root,
+            &uuid_dir_rel,
+            uuid_dir_preexisted,
+        )
+        .await;
+    }
     let tgz_sha512 = hex::encode(Sha512::digest(&tgz_bytes));
     // `hash=` — the first 6 hex chars of sha512(tgz): the lock-committed
     // tamper guard on the tarball itself (spike B3, flips on any byte edit).

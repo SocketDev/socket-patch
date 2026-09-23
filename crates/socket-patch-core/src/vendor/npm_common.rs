@@ -128,6 +128,12 @@ pub(super) struct NpmStagedPack {
     /// (a same-uuid re-vendor's dir may still be referenced by live wiring);
     /// backends feed this to [`done_failure_unstage`].
     pub uuid_dir_preexisted: bool,
+    /// The exact bytes a committed-artifact reuse hashed and verified
+    /// (`None` for a fresh pack / download, which this run just wrote).
+    /// A consumer that needs the tarball's bytes (yarn berry's checksum)
+    /// uses these instead of re-reading the file, so nothing swapped in
+    /// after verification can reach the lock.
+    pub verified_bytes: Option<Vec<u8>>,
 }
 
 /// Stage → patch → pack one installed npm package.
@@ -337,6 +343,7 @@ pub(super) async fn stage_patch_pack(
             packed,
             staged_pkg_json,
             uuid_dir_preexisted,
+            verified_bytes: None,
         }),
         result,
     ))
@@ -397,6 +404,7 @@ async fn reuse_committed_pack(
             packed: PackedTarball::from_bytes(&art.bytes),
             staged_pkg_json,
             uuid_dir_preexisted: true,
+            verified_bytes: Some(art.bytes),
         }),
         result,
     ))
@@ -590,6 +598,7 @@ async fn staged_pack_from_service_bytes(
         packed,
         staged_pkg_json,
         uuid_dir_preexisted,
+        verified_bytes: None,
     })
 }
 
@@ -1422,6 +1431,58 @@ mod tests {
         let err = expect_err(service_bytes(tmp.path(), &record, &tgz, &sri).await);
         expect_done_failure(err, "vendored package.json is not parseable JSON");
         assert!(!tmp.path().join(".socket/vendor").exists());
+    }
+
+    /// A reuse hands the flavor the EXACT bytes it verified (yarn berry
+    /// derives its checksum from them rather than re-reading a file that
+    /// may have been swapped since); a fresh download carries none.
+    #[tokio::test]
+    async fn reused_pack_carries_the_verified_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut record = record_with_uuid(UUID);
+        record.files.get_mut("package/index.js").unwrap().after_hash =
+            crate::hash::git_sha256::compute_git_sha256_from_bytes(PATCHED_INDEX);
+        let tgz = build_tgz(&[
+            ("index.js", PATCHED_INDEX),
+            ("package.json", br#"{"name":"left-pad","version":"1.3.0"}"#),
+        ])
+        .await;
+        let sri = PackedTarball::from_bytes(&tgz).integrity;
+        let fresh = service_bytes(tmp.path(), &record, &tgz, &sri)
+            .await
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(fresh.verified_bytes.is_none());
+        let entry = crate::vendor::state::VendorEntry {
+            ecosystem: "npm".into(),
+            base_purl: LP_PURL.into(),
+            uuid: record.uuid.clone(),
+            artifact: crate::vendor::state::VendorArtifact {
+                path: fresh.rel_tgz.clone(),
+                sha256: fresh.packed.sha256_hex.clone(),
+                size: Some(fresh.packed.size),
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            flavor: Some("yarn-berry".into()),
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+            detached: false,
+            record: None,
+        };
+        crate::vendor::test_support::persist(tmp.path(), LP_PURL, entry).await;
+        let coords = guard_coordinates(LP_PURL, &record).unwrap();
+        let (staged, _) = reuse_committed_pack(LP_PURL, tmp.path(), &coords, &record)
+            .await
+            .expect("the committed tarball is reused");
+        let staged = staged.unwrap();
+        assert_eq!(staged.verified_bytes.as_deref(), Some(tgz.as_slice()));
+        assert!(staged.uuid_dir_preexisted);
     }
 
     /// Full service-bytes success: the tarball lands verbatim at the same
