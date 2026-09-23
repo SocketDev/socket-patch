@@ -10,7 +10,9 @@
 //! * every error constructor of `run_scan_vendor_step` — `lock_held`,
 //!   `lock_io` (a directory squatting on `apply.lock`; a file squatting on
 //!   `.socket` itself) and `no_local_source` — through the JSON error fold
-//!   (which must NOT emit a `vendor` key: nothing mutates before staging)
+//!   (a lock failure precedes the step and carries NO `vendor` key; a
+//!   staging failure carries the step's envelope demoted to
+//!   `partialFailure`, events-less because nothing mutates before staging)
 //!   and the interactive `Error (code): message` line;
 //! * a corrupt legacy manifest, which vendored mode reports and steps
 //!   around (the manifest is not its record source).
@@ -291,10 +293,11 @@ fn seed_stale_manifest(root: &Path) {
 }
 
 /// Shared assertions for the vendor-step error fold: exit 1, a JSON
-/// envelope with `status: "error"`, the given `error.code`, a `download`
+/// envelope with `status: "error"`, the given `error.code` and a `download`
 /// sub-object (proof the run got PAST the download phase and died inside
-/// the vendor step) and NO `vendor` key (nothing mutates before staging,
-/// so no vendor sub-object may be fabricated for the aborted step).
+/// the vendor step). Whether a `vendor` sub-object rides along depends on
+/// WHERE the step died — see [`assert_no_vendor_envelope`] (lock failures)
+/// and [`assert_demoted_empty_vendor_envelope`] (staging failures).
 fn assert_vendor_step_error(
     code: i32,
     stdout: &str,
@@ -310,11 +313,34 @@ fn assert_vendor_step_error(
         v["download"].is_object(),
         "the run must reach the vendor step (download phase completed); envelope={v}"
     );
+    v
+}
+
+/// A lock failure happens BEFORE the step builds its envelope: no `vendor`
+/// sub-object may be fabricated for it (get's fold pins the same in
+/// `covgap_commands_get::vendored_lock_held_vendor_step_errors_without_vendor_envelope`).
+fn assert_no_vendor_envelope(v: &serde_json::Value) {
     assert!(
         !v.as_object().unwrap().contains_key("vendor"),
-        "a None-envelope error must not fabricate a vendor sub-object; envelope={v}"
+        "a pre-lock failure has no vendor envelope to carry; envelope={v}"
     );
-    v
+}
+
+/// A staging failure happens AFTER the lock, inside the step: the fold
+/// carries the step's envelope demoted to `partialFailure` (a consumer
+/// reading `.vendor.status` inside a `"status":"error"` result must not
+/// see the fresh-envelope default `success`) and events-less — nothing
+/// mutates before staging, so there is no work to report.
+fn assert_demoted_empty_vendor_envelope(v: &serde_json::Value) {
+    assert_eq!(
+        v["vendor"]["status"], "partialFailure",
+        "the carried envelope's status must be demoted; envelope={v}"
+    );
+    assert_eq!(
+        v["vendor"]["events"],
+        serde_json::json!([]),
+        "nothing mutates before staging, so the aborted step reports no events; envelope={v}"
+    );
 }
 
 /// Dry-run preview, same-uuid case: an entry already vendored at the
@@ -427,6 +453,7 @@ async fn scan_vendor_lock_held_reports_json_error() {
 
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     let v = assert_vendor_step_error(code, &stdout, &stderr, "lock_held");
+    assert_no_vendor_envelope(&v);
     assert_eq!(
         v["error"]["message"],
         "another socket-patch process is operating in this directory",
@@ -450,6 +477,7 @@ async fn scan_vendor_lock_io_reports_json_error() {
 
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     let v = assert_vendor_step_error(code, &stdout, &stderr, "lock_io");
+    assert_no_vendor_envelope(&v);
     assert!(
         v["error"]["message"]
             .as_str()
@@ -510,7 +538,8 @@ async fn scan_vendor_socket_dir_file_reports_lock_io() {
     std::fs::write(tmp.path().join(".socket"), b"not a dir").unwrap();
 
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
-    assert_vendor_step_error(code, &stdout, &stderr, "lock_io");
+    let v = assert_vendor_step_error(code, &stdout, &stderr, "lock_io");
+    assert_no_vendor_envelope(&v);
     assert_eq!(
         std::fs::read(tmp.path().join(".socket")).unwrap(),
         b"not a dir",
@@ -521,8 +550,12 @@ async fn scan_vendor_socket_dir_file_reports_lock_io() {
 /// The JSON vendor-step error fold for a staging failure: the download
 /// phase recorded the patch (hashes only), but the view serves no blob
 /// content, so the vendor step cannot stage it and the run aborts
-/// `no_local_source` with a `download` object and NO `vendor` key —
-/// nothing mutated before staging — and creates nothing under `.socket/`.
+/// `no_local_source` with a `download` object and the step's own `vendor`
+/// envelope carried through the fold — demoted to `partialFailure`, with
+/// no events (nothing mutated before staging) — and creates nothing under
+/// `.socket/`. Contract: the `vendor` sub-object is present whenever the
+/// step ran; `get --mode vendored` shares the fold
+/// (`covgap_commands_get::get_uuid_vendored_vendor_step_error_leaves_legacy_state_alone`).
 #[tokio::test]
 async fn scan_vendor_staging_error_reports_json_error() {
     let mock = MockServer::start().await;
@@ -533,6 +566,7 @@ async fn scan_vendor_staging_error_reports_json_error() {
 
     let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
     let v = assert_vendor_step_error(code, &stdout, &stderr, "no_local_source");
+    assert_demoted_empty_vendor_envelope(&v);
     assert_eq!(
         v["error"]["message"],
         "patch artifacts unavailable (offline or download failure)",

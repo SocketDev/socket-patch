@@ -32,7 +32,7 @@ use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutco
 use crate::commands::get::{download_patch_records, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
-    note_classic_migration_risk, reconcile_dropped, track_outcomes_for_vendor, vendor_records,
+    note_classic_migration_risk, track_outcomes_for_vendor, vendor_records,
 };
 use crate::json_envelope::{Command as EnvelopeCommand, Envelope, RunWarning};
 
@@ -49,6 +49,15 @@ const VENDOR_MANIFEST_RECORD_MIGRATED: &str = "vendor_manifest_record_migrated";
 /// Run-level warning: the migration above could not read or rewrite the
 /// manifest (or the ledger); the legacy records were left in place.
 const VENDOR_MANIFEST_MIGRATION_FAILED: &str = "vendor_manifest_migration_failed";
+
+/// The vendor step's error: the contract code, its message and — when the
+/// step had already taken the lock and died at staging — the vendor
+/// Envelope it was building, demoted to `partialFailure`, for the caller's
+/// JSON fold. Lock failures precede the step and carry `None`.
+type VendorStepError = (&'static str, String, Option<Box<Envelope>>);
+/// `(has_errors, envelope)` from a step that reached the engine, else a
+/// [`VendorStepError`].
+type VendorStepResult = Result<(bool, Envelope), VendorStepError>;
 
 /// Pretty-print one JSON document to stdout — every `--json` consumer
 /// parses stdout as exactly one document.
@@ -178,16 +187,22 @@ fn scan_vendor_service_config(
 /// nothing to vendor.
 ///
 /// `Ok((has_errors, envelope))` on a run that reached the engine;
-/// `Err((code, message))` for the lock/stage failures the caller folds
-/// into its own output shape (scan's ad-hoc JSON can't use
-/// `acquire_or_emit`, which prints an Envelope). Nothing mutates the
-/// project before staging, so an error carries no partial envelope.
+/// `Err((code, message, envelope))` for the lock/stage failures the caller
+/// folds into its own output shape (scan's ad-hoc JSON can't use
+/// `acquire_or_emit`, which prints an Envelope). A lock failure precedes
+/// the step, so it carries no envelope (`None`); a staging failure
+/// (`no_local_source`) hands back the step's envelope demoted to
+/// `partialFailure` — the contract's `vendor` sub-object is present
+/// whenever the step ran, and a consumer reading `.vendor.status` inside a
+/// `"status":"error"` result must never see the fresh-envelope default of
+/// `success`. Nothing mutates the project before staging, so that
+/// envelope carries no events.
 async fn run_scan_vendor_step(
     common: &GlobalArgs,
     manifest_path: &Path,
     socket_dir: &Path,
     records: HashMap<String, PatchRecord>,
-) -> Result<(bool, Envelope), (&'static str, String)> {
+) -> VendorStepResult {
     let mut env = Envelope::new(EnvelopeCommand::Vendor);
     env.dry_run = common.dry_run;
     if records.is_empty() {
@@ -198,7 +213,10 @@ async fn run_scan_vendor_step(
     // it as `LockError::Io` (→ `lock_io`). The guard lives to the end of
     // the step so the ledger migration and the redirect-ledger reconcile
     // inside `note_vendor_supersedes_redirect` run under the lock too.
-    let _guard = apply_lock::acquire(socket_dir, timeout).map_err(|e| lock_failure(&e, timeout))?;
+    let _guard = apply_lock::acquire(socket_dir, timeout).map_err(|e| {
+        let (code, message) = lock_failure(&e, timeout);
+        (code, message, None)
+    })?;
 
     // Staging probes blobs by the records' hashes; a manifest VIEW over the
     // in-memory records (a move, not a clone) is all it needs.
@@ -206,8 +224,16 @@ async fn run_scan_vendor_step(
         patches: records,
         setup: None,
     };
-    let has_errors =
-        stage_and_vendor(common, socket_dir, &manifest, /*detached=*/ true, &mut env).await?;
+    let has_errors = match stage_and_vendor(common, socket_dir, &manifest, &mut env).await {
+        Ok(has_errors) => has_errors,
+        Err((code, message)) => {
+            // The step ran and is aborting: hand its envelope (demoted) to
+            // the caller's fold instead of letting the `vendor` sub-object
+            // vanish from a run that entered the step.
+            env.mark_partial_failure();
+            return Err((code, message, Some(Box::new(env))));
+        }
+    };
     migrate_legacy_manifest_records(common, manifest_path, &manifest.patches, &mut env).await;
     if has_errors {
         env.mark_partial_failure();
@@ -218,14 +244,13 @@ async fn run_scan_vendor_step(
 }
 
 /// Stage `manifest`'s patch sources in memory and drive the vendor engine
-/// over them. The caller holds the apply lock. `Err` is the
-/// `no_local_source` fold (staging could not obtain the patch content —
-/// offline, or the view fetch failed).
+/// over them (detached: every entry embeds its record). The caller holds
+/// the apply lock. `Err` is the `no_local_source` fold (staging could not
+/// obtain the patch content — offline, or the view fetch failed).
 async fn stage_and_vendor(
     common: &GlobalArgs,
     socket_dir: &Path,
     manifest: &PatchManifest,
-    detached: bool,
     env: &mut Envelope,
 ) -> Result<bool, (&'static str, String)> {
     let staged = match stage_vendor_sources_in_memory(common, manifest, socket_dir, &common.cwd)
@@ -250,15 +275,7 @@ async fn stage_and_vendor(
     let (client, use_public_proxy) =
         get_api_client_with_overrides(common.api_client_overrides()).await;
     let service = scan_vendor_service_config(common, Some(client), use_public_proxy);
-    Ok(boxed_vendor_records(
-        common,
-        &manifest.patches,
-        &sources,
-        detached,
-        Some(&service),
-        env,
-    )
-    .await)
+    Ok(boxed_vendor_records(common, &manifest.patches, &sources, Some(&service), env).await)
 }
 
 /// Record a run-level advisory: stderr `Warning (code): detail` in human
@@ -407,52 +424,6 @@ async fn migrate_legacy_manifest_records(
     }
 }
 
-/// COMPATIBILITY SHIM for `get --mode vendored`'s two manifest-mode callers
-/// (`boxed_scan_vendor_step(.., None)`): the pre-D2 vendor step — read the
-/// manifest as the work list (`invalid_manifest` on a corrupt one, a clean
-/// no-op on none), reconcile dropped entries like the `vendor` command,
-/// stage, vendor NON-detached. The `Some(envelope)` error payload exists
-/// only because that reconcile mutates the ledger before staging can
-/// fail. Deleted by the integration pass once `get` passes its records.
-async fn legacy_manifest_vendor_step(
-    common: &GlobalArgs,
-    manifest_path: &Path,
-    socket_dir: &Path,
-) -> Result<(bool, Envelope), (&'static str, String, Option<Box<Envelope>>)> {
-    let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    let _guard = apply_lock::acquire(socket_dir, timeout).map_err(|e| {
-        let (code, message) = lock_failure(&e, timeout);
-        (code, message, None)
-    })?;
-    let mut env = Envelope::new(EnvelopeCommand::Vendor);
-    env.dry_run = common.dry_run;
-    let manifest = match read_manifest(manifest_path).await {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            note_classic_migration_risk(&mut env, &common.cwd, common);
-            note_vendor_supersedes_redirect(&mut env, &common.cwd, common).await;
-            return Ok((false, env));
-        }
-        Err(e) => return Err(("invalid_manifest", e.to_string(), None)),
-    };
-    let mut has_errors = reconcile_dropped(&manifest, common, &mut env).await;
-    match stage_and_vendor(common, socket_dir, &manifest, /*detached=*/ false, &mut env).await {
-        Ok(engine_errors) => has_errors |= engine_errors,
-        Err((code, message)) => {
-            // The reconcile may already have reverted entries on disk —
-            // hand its envelope (demoted: this run is aborting) to the fold.
-            env.mark_partial_failure();
-            return Err((code, message, Some(Box::new(env))));
-        }
-    }
-    if has_errors {
-        env.mark_partial_failure();
-    }
-    note_classic_migration_risk(&mut env, &common.cwd, common);
-    note_vendor_supersedes_redirect(&mut env, &common.cwd, common).await;
-    Ok((has_errors, env))
-}
-
 /// The `scan --vendor` JSON path: discovery → (dry-run preview | download
 /// → vendor engine → GC → embedded VEX) → print `result` → exit code.
 /// The dry-run arm skips the VEX embed (emitting a `vex.skipped` marker
@@ -537,7 +508,7 @@ async fn run_vendor_json_path(
 
     // 2) The vendor engine, under the same lock as apply/vendor (a no-op
     //    that creates nothing when there is nothing to vendor).
-    let vendor_code = match boxed_vendor_step(&args.common, manifest_path, socket_dir, records)
+    let vendor_code = match boxed_scan_vendor_step(&args.common, manifest_path, socket_dir, records)
         .await
     {
         Ok((vendor_errors, venv)) => {
@@ -557,7 +528,7 @@ async fn run_vendor_json_path(
                 serde_json::to_value(&venv).unwrap_or_else(|_| serde_json::json!({}));
             i32::from(has_errors)
         }
-        Err((code, message)) => {
+        Err((code, message, venv)) => {
             track_patch_vendor_failed(
                 &message,
                 args.common.dry_run,
@@ -565,6 +536,13 @@ async fn run_vendor_json_path(
                 telemetry_org,
             )
             .await;
+            // A step that ran (and died at staging) hands back its demoted
+            // envelope; it must reach the JSON consumer even though the run
+            // aborts here. A lock failure carries none — no `vendor` key.
+            if let Some(venv) = venv {
+                result["vendor"] =
+                    serde_json::to_value(&*venv).unwrap_or_else(|_| serde_json::json!({}));
+            }
             result["status"] = serde_json::json!("error");
             result["error"] = serde_json::json!({
                 "code": code,
@@ -618,7 +596,8 @@ async fn run_vendor_interactive_path(
 ) -> i32 {
     let (dl_code, _, records) = boxed_download_patch_records(selected, params).await;
     let mut has_errors = dl_code != 0;
-    let code = match boxed_vendor_step(&args.common, manifest_path, socket_dir, records).await {
+    let code = match boxed_scan_vendor_step(&args.common, manifest_path, socket_dir, records).await
+    {
         Ok((vendor_errors, venv)) => {
             has_errors |= vendor_errors;
             // Run-outcome telemetry, same as the JSON arm above.
@@ -632,7 +611,7 @@ async fn run_vendor_interactive_path(
             .await;
             i32::from(has_errors)
         }
-        Err((code, message)) => {
+        Err((code, message, _envelope)) => {
             track_patch_vendor_failed(
                 &message,
                 args.common.dry_run,
@@ -800,54 +779,23 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
 }
 
 /// Transient-frame boxed constructor for [`run_scan_vendor_step`] — the
-/// future embeds the entire vendor engine, and the vendor-path frames it
-/// would otherwise ride must themselves fit Windows' 1 MiB main-thread
-/// stack (same rationale as [`boxed_vendor_json_path`], one level down).
-/// Moving the records map into the future is stack-neutral (three words).
-#[allow(clippy::type_complexity)]
-fn boxed_vendor_step<'a>(
+/// one entry for scan's two arms and for `get --mode vendored`. The future
+/// embeds the entire vendor engine, and the vendor-path frames it would
+/// otherwise ride must themselves fit Windows' 1 MiB main-thread stack
+/// (same rationale as [`boxed_vendor_json_path`], one level down). Moving
+/// the records map into the future is stack-neutral (three words).
+pub(crate) fn boxed_scan_vendor_step<'a>(
     common: &'a GlobalArgs,
     manifest_path: &'a Path,
     socket_dir: &'a Path,
     records: HashMap<String, PatchRecord>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(bool, Envelope), (&'static str, String)>> + 'a>,
-> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = VendorStepResult> + 'a>> {
     Box::pin(run_scan_vendor_step(
         common,
         manifest_path,
         socket_dir,
         records,
     ))
-}
-
-/// `get --mode vendored`'s entry into the vendor step (both its arms call
-/// this). `Some(records)` runs the manifest-free step over a copy of the
-/// records; `None` is the pre-D2 manifest-mode step
-/// ([`legacy_manifest_vendor_step`]) kept only until `get` passes its
-/// records — the integration pass collapses this onto
-/// [`boxed_vendor_step`]. Same transient-frame rationale as above.
-#[allow(clippy::type_complexity)]
-pub(crate) fn boxed_scan_vendor_step<'a>(
-    common: &'a GlobalArgs,
-    manifest_path: &'a Path,
-    socket_dir: &'a Path,
-    detached_records: Option<&'a HashMap<String, PatchRecord>>,
-) -> std::pin::Pin<
-    Box<
-        dyn std::future::Future<
-                Output = Result<(bool, Envelope), (&'static str, String, Option<Box<Envelope>>)>,
-            > + 'a,
-    >,
-> {
-    Box::pin(async move {
-        match detached_records {
-            Some(records) => run_scan_vendor_step(common, manifest_path, socket_dir, records.clone())
-                .await
-                .map_err(|(code, message)| (code, message, None)),
-            None => legacy_manifest_vendor_step(common, manifest_path, socket_dir).await,
-        }
-    })
 }
 
 /// Transient-frame boxed constructor for the download-phase future used
@@ -873,15 +821,15 @@ fn boxed_vendor_records<'a>(
     common: &'a GlobalArgs,
     records: &'a HashMap<String, PatchRecord>,
     sources: &'a socket_patch_core::patch::apply::PatchSources<'a>,
-    detached: bool,
     service: Option<&'a VendorServiceConfig>,
     env: &'a mut Envelope,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'a>> {
     // `scan --vendor` threads the SAME service config the `vendor` command
     // builds (honoring `--vendor-source`), so both entry points vendor the
-    // same bytes by default. See `run_scan_vendor_step`.
+    // same bytes by default. See `run_scan_vendor_step`. Always detached:
+    // vendored mode is manifest-free.
     Box::pin(vendor_records(
-        common, records, sources, detached, false, env, service,
+        common, records, sources, /*detached=*/ true, false, env, service,
     ))
 }
 

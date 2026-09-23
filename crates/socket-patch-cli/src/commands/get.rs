@@ -2979,15 +2979,11 @@ async fn run_get_vendored(
     fold_narrowing_into_result(&mut result, narrow_skips, narrow_warnings);
 
     // The vendor step (scan's, verbatim): apply lock, in-memory staging, the
-    // engine over exactly the records fetched above. A per-patch download
-    // failure does not skip it (scan parity).
-    match super::scan::boxed_scan_vendor_step(
-        &args.common,
-        &manifest_path,
-        &socket_dir,
-        Some(&records),
-    )
-    .await
+    // engine over exactly the records fetched above (moved in — nothing
+    // here needs them afterwards). A per-patch download failure does not
+    // skip it (scan parity).
+    match super::scan::boxed_scan_vendor_step(&args.common, &manifest_path, &socket_dir, records)
+        .await
     {
         Ok((vendor_errors, venv)) => {
             has_errors |= vendor_errors;
