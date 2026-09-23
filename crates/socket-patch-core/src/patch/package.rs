@@ -86,10 +86,25 @@ pub fn read_archive_to_map(archive_path: &Path) -> Result<HashMap<String, Vec<u8
             format!("archive {} is not a regular file", archive_path.display()),
         )));
     }
+    read_archive_from_reader(file)
+}
+
+/// [`read_archive_to_map`] over an in-memory `.tar.gz` — the same bomb caps,
+/// entry-count cap and path-safety gate. For callers that must hash and
+/// decode the SAME bytes (a committed artifact read once, so no swap between
+/// the whole-file hash and the member check can go unnoticed).
+pub fn read_archive_bytes_to_map(bytes: &[u8]) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
+    read_archive_from_reader(bytes)
+}
+
+/// The shared decoder behind [`read_archive_to_map`] and
+/// [`read_archive_bytes_to_map`]: gunzip → tar walk with every cap and the
+/// post-normalization path-safety gate.
+fn read_archive_from_reader<R: Read>(reader: R) -> Result<HashMap<String, Vec<u8>>, ArchiveError> {
     // Hard-cap decompressed bytes to defuse gzip / tar bombs. Reads
     // beyond the limit yield EOF, which the tar parser surfaces as a
     // truncated-archive error.
-    let bounded = GzDecoder::new(file).take(MAX_TOTAL_DECOMPRESSED_BYTES);
+    let bounded = GzDecoder::new(reader).take(MAX_TOTAL_DECOMPRESSED_BYTES);
     let mut tar = Archive::new(bounded);
 
     let mut out: HashMap<String, Vec<u8>> = HashMap::new();
@@ -276,6 +291,32 @@ mod tests {
     /// defense-in-depth check inside [`read_archive_to_map`].
     fn write_raw_archive(path: &Path, name: &[u8], data: &[u8]) {
         write_raw_tar_gz(path, &[raw_entry(name, data.len() as u64, data)]);
+    }
+
+    /// The in-memory reader decodes exactly what the path reader decodes and
+    /// keeps the same path-safety gate (it is the same core).
+    #[test]
+    fn test_read_archive_bytes_matches_path_reader_and_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("arc.tar.gz");
+        write_archive(
+            &archive,
+            &[("package/index.js", b"hello"), ("package/lib/a.js", b"a")],
+        );
+        let bytes = std::fs::read(&archive).unwrap();
+        assert_eq!(
+            read_archive_bytes_to_map(&bytes).unwrap(),
+            read_archive_to_map(&archive).unwrap()
+        );
+
+        let bad = dir.path().join("bad.tar.gz");
+        write_raw_archive(&bad, b"/etc/passwd", b"evil");
+        let bytes = std::fs::read(&bad).unwrap();
+        assert!(matches!(
+            read_archive_bytes_to_map(&bytes),
+            Err(ArchiveError::UnsafePath(_))
+        ));
+        assert!(read_archive_bytes_to_map(b"not a gzip").is_err());
     }
 
     #[test]
