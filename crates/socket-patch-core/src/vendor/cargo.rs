@@ -2094,12 +2094,15 @@ mod tests {
     fn cargo_service_cfg(uri: &str, source: VendorSource, offline: bool) -> VendorServiceConfig {
         VendorServiceConfig {
             source,
-            client: Some(ApiClient::new(ApiClientOptions {
-                api_url: uri.to_string(),
-                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
-                use_public_proxy: false,
-                org_slug: Some("acme".into()),
-            })),
+            client: Some(
+                ApiClient::new(ApiClientOptions {
+                    api_url: uri.to_string(),
+                    api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                    use_public_proxy: false,
+                    org_slug: Some("acme".into()),
+                })
+                .with_vendor_retry(crate::api::client::VendorRetryPolicy::none()),
+            ),
             use_public_proxy: false,
             vendor_url: None,
             patch_server_url: None,

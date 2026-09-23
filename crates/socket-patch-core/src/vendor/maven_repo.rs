@@ -2464,6 +2464,7 @@ mod tests {
                     use_public_proxy: false,
                     org_slug: Some("acme".into()),
                 })
+                .with_vendor_retry(crate::api::client::VendorRetryPolicy::none())
             }),
             use_public_proxy: false,
             vendor_url: None,
