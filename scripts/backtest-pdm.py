@@ -12,7 +12,13 @@ patch) in a number of project shapes, then for each mode:
   agent     pdm sync -> scan --mode agent    -> installed bytes == patch
 
 and checks idempotent re-scans, unchanged pyproject, lock byte-stability
-across `pdm sync` / `pdm install`, `pdm lock --check`, tampered-hash
+across `pdm sync` / `pdm install`, `pdm lock --check`, MANIFEST-LESS VEX
+(a fresh copy of the committed state — pyproject, lock, `.socket/` minus
+the manifest — is `pdm sync`ed into its own venv and `socket-patch vex`
+must attest the patch with the ledger, with the ledgers deleted too, omit
+it `record_unavailable` under `--offline` with no ledger, and omit it
+`redirect_unwired` / `vendor_unwired` once the lock is reverted, also
+under `--no-verify`), tampered-hash
 rejection, what PDM's own relock does to the patch source (and whether a
 re-scan + rollback still restores the relocked bytes), `pdm export`, and
 `rollback` restoring every byte.  Lock formats the CLI does not support
@@ -190,6 +196,12 @@ def pins_for(version):
         pins += ["pip==22.0.4", "requests==2.31.0"]
     else:
         pins += ["pip==24.0"]
+        # 2.21 - 2.26.0 declare an unbounded `hishel>=0.0.32` but import
+        # `hishel._serializers`, which hishel 1.0 removed (2.26.1 bounds it,
+        # 2.26.9+ require 1.x): without the pin every command dies with
+        # ModuleNotFoundError before locking.
+        if (2, 21) <= v < (2, 26, 1):
+            pins.append("hishel<1")
     return pins
 
 
@@ -803,6 +815,98 @@ def main():
             and re.search(r"Install (?!" + name + r")\S+ [^\n]*failed", text) is None
         )
 
+    def manifestless_vex(check, info, version, case, project, lockname, pristine_lock, mode, uuid, hashes, sync_groups):
+        """The manifest-less VEX step. A fresh copy of what a hosted /
+        vendored checkout commits (pyproject, lock, `.socket/` WITHOUT
+        `manifest.json`) is installed by `pdm sync` into its own venv, then
+        standalone `vex` (public patch API, no token) must:
+
+          vexManifestDeleted  attest PURL_BASE via `uuid` with the mode's
+                              `(redirected)` / `(vendored)` marker (ledgers kept)
+          vexLedgersDeleted   still attest with both ledgers deleted (lockfile
+                              discovery + the patch API record)
+          vexOfflineUnavailable  `--offline`, no ledger: exit 1, omitted
+                              `record_unavailable`
+          vexRevertedUnwired  lock restored to the registry, ledgers +
+                              artifacts kept: exit 1, omitted
+                              `redirect_unwired` / `vendor_unwired`, with and
+                              without `--no-verify`
+          vexApplyEmbedded    `apply --vex` on the manifest-less checkout
+                              attests too
+
+        (Refused lock formats get `vexRefusedAttestsNothing` instead.)
+        """
+        marker = "(redirected)" if mode == "hosted" else "(vendored)"
+        unwired = "redirect_unwired" if mode == "hosted" else "vendor_unwired"
+        vdir = case / "vex-checkout"
+        shutil.rmtree(vdir, ignore_errors=True)
+        vdir.mkdir()
+        for name in ("pyproject.toml", lockname):
+            shutil.copyfile(project / name, vdir / name)
+        shutil.copytree(project / ".socket", vdir / ".socket")
+        (vdir / ".socket/manifest.json").unlink(missing_ok=True)
+        ledgers = [vdir / ".socket/vendor/state.json", vdir / ".socket/vendor/redirect-state.json"]
+        saved = {p: p.read_bytes() for p in ledgers if p.exists()}
+        vhome, vcache = case / "vex-home", case / "vex-cache"
+        write_configs(version, vdir, vhome, vcache, pep582=False)
+        vvenv = vdir / ".venv"
+        make_venv(version, vvenv, vdir, case / "vex-venv.log")
+        venv_env = pdm_env(version, vdir, vhome, vcache, vvenv)
+        rs = Run(install_cmd(version, "sync", sync_groups, None), vdir, venv_env, case / "vex-install.log", timeout=900, retry=True)
+        res = oracle(version, vdir, venv_env, hashes, case / "vex-oracle.log")
+        info["vexCheckoutInstall"] = {"exit": rs.rc, "patched": patched(res, hashes)}
+        check("vexCheckoutInstallsPatched", (rs.ok() or self_install_only(rs.out)) and patched(res, hashes), info["vexCheckoutInstall"])
+        cenv_v = cli_env(version, vhome)
+
+        def vex(log, *flags, via="vex"):
+            out = vdir / "out.vex.json"
+            out.unlink(missing_ok=True)
+            if via == "vex":
+                cmd = [cli, "vex", "--cwd", vdir, "--json", "--output", out, "--product", "pkg:pypi/pdm-patch-backtest@0.0.0", *flags]
+            else:
+                cmd = [cli, via, "--cwd", vdir, "--json", "--vex", out, "--vex-product", "pkg:pypi/pdm-patch-backtest@0.0.0", *flags]
+            r = Run(cmd, vdir, cenv_v, case / log, timeout=600, retry=True)
+            doc = json.loads(out.read_text(encoding="utf-8")) if out.exists() else None
+            return r, r.json_or_empty(), doc
+
+        def attested(doc):
+            for st in (doc or {}).get("statements", []):
+                ids = [sc.get("@id", "") for p in st.get("products", []) for sc in p.get("subcomponents", [])]
+                if any(i == PURL_BASE or i.startswith(PURL_BASE + "?") for i in ids) and uuid in st.get("impact_statement", "") and marker in st.get("impact_statement", ""):
+                    return True
+            return False
+
+        def omitted(env, reason):
+            return any(e.get("action") == "skipped" and (e.get("purl") or "").startswith(PURL_BASE) and e.get("errorCode") == reason for e in env.get("events", []))
+
+        notes = info.setdefault("vex", {})
+        r, env_, doc = vex("vex-manifest-deleted.log")
+        notes["manifestDeleted"] = {"exit": r.rc, "status": env_.get("status"), "error": (env_.get("error") or {}).get("code")}
+        check("vexManifestDeleted", r.ok() and attested(doc), notes["manifestDeleted"])
+        for p in ledgers:
+            p.unlink(missing_ok=True)
+        r, env_, doc = vex("vex-ledgers-deleted.log")
+        notes["ledgersDeleted"] = {"exit": r.rc, "status": env_.get("status"), "error": (env_.get("error") or {}).get("code")}
+        check("vexLedgersDeleted", r.ok() and attested(doc) and not (vdir / ".socket/manifest.json").exists(), notes["ledgersDeleted"])
+        r, env_, doc = vex("vex-apply-embedded.log", via="apply")
+        notes["applyEmbedded"] = {"exit": r.rc, "vex": env_.get("vex")}
+        check("vexApplyEmbedded", r.ok() and attested(doc), notes["applyEmbedded"])
+        r, env_, doc = vex("vex-offline.log", "--offline")
+        notes["offlineNoLedger"] = {"exit": r.rc, "error": (env_.get("error") or {}).get("code")}
+        check("vexOfflineUnavailable", r.rc == 1 and doc is None and omitted(env_, "record_unavailable"), notes["offlineNoLedger"])
+        for p, data in saved.items():
+            p.write_bytes(data)
+        (vdir / lockname).write_bytes(pristine_lock)
+        reverted = {}
+        for flags in ((), ("--no-verify",), ("--offline", "--no-verify")):
+            r, env_, doc = vex("vex-reverted%s.log" % "".join(flags).replace("--", "-"), *flags)
+            reverted[" ".join(flags) or "default"] = {"exit": r.rc, "omitted": omitted(env_, unwired), "attested": attested(doc)}
+        notes["reverted"] = reverted
+        check("vexRevertedUnwired", bool(saved) and all(v["exit"] == 1 and v["omitted"] and not v["attested"] for v in reverted.values()), reverted)
+        if not args.keep_environments:
+            for path in (vvenv, vhome, vcache):
+                shutil.rmtree(path, ignore_errors=True)
+
     def prune(case, project):
         if args.keep_environments:
             return
@@ -997,6 +1101,17 @@ def main():
                 # Not refused after all: run the full flow and say so.
                 row["unexpected"] = "the CLI rewrote a lock the harness expected it to refuse"
             else:
+                # Manifest-less VEX over the refused project (the registry
+                # lock, plus whatever `.socket/` the refusal left behind —
+                # never a manifest: hosted and vendored mode are both
+                # manifest-free): nothing was wired, so nothing may be
+                # attested for the package.
+                vout = case / "refused.vex.json"
+                rv = Run([cli, "vex", "--cwd", project, "--json", "--output", vout, "--product", "pkg:pypi/pdm-patch-backtest@0.0.0"], project, cenv, case / "vex-refused.log", timeout=600, retry=True)
+                vdoc = json.loads(vout.read_text(encoding="utf-8")) if vout.exists() else {}
+                named = [st for st in vdoc.get("statements", []) if any(sc.get("@id", "").startswith(PURL_BASE) for p in st.get("products", []) for sc in p.get("subcomponents", []))]
+                info["vexRefused"] = {"exit": rv.rc, "error": (rv.json_or_empty().get("error") or {}).get("code"), "statements": len(named)}
+                check("vexRefusedAttestsNothing", rv.rc != 0 and not named, info["vexRefused"])
                 return finish("REFUSED-EXPECTED" if all(checks.values()) else "FAIL")
 
         if mode == "agent":
@@ -1078,6 +1193,8 @@ def main():
         else:
             check("installedBytesPatched", patched(res, after), res)
         check("lockUnchangedByInstall", (project / lockname).read_bytes() == lock_after)
+        if not excluded:
+            manifestless_vex(check, info, version, case, project, lockname, pristine_lock, mode, uuid, after, groups)
         # ordinary `pdm install`
         ri = Run(install, project, penv, case / "ordinary-install.log", timeout=900, retry=True)
         ordinary_stable = (project / lockname).read_bytes() == lock_after

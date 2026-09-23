@@ -50,6 +50,17 @@ Boundaries the oracle encodes (measured against real releases):
                             enforced on every text-lock release)
   0.8.1 / 1.0.0             peers not installed, overrides ignored (upstream)
 
+Manifest-less VEX (every supported cell, after the installs): a fresh checkout
+of the committed state with .socket/manifest.json deleted and a real frozen
+`bun install` must be attested by standalone `vex` against the public patch
+API — the patched purl under the ledger record's uuid with the `(redirected)` /
+`(vendored)` marker and exactly the record's vulnerability ids (+ CVE aliases),
+also through the embedded `apply --vex`; with both ledgers deleted too
+(lockfile discovery + the API); `--offline` with no ledgers must omit it as
+`record_unavailable` (exit 1); and with the lock put back to the registry
+version (ledgers, artifacts and the patched install kept) it must NOT be
+attested, also under `--no-verify` (`redirect_unwired` / `vendor_unwired`).
+
 Every cell records the CLI exit codes (main, repeat, rollback, conversion),
 the exact refusal-code set, the repeat-run envelope semantics, digest
 enforcement, and after rollback the lockfile presence rules and byte identity.
@@ -596,6 +607,64 @@ def tamper_digests(lock, marker):
         if marker in line else line for line in lock.splitlines(keepends=True))
 
 
+VEX_PRODUCT = 'pkg:npm/bun-patch-backtest@1.0.0'
+VEX_OUTPUT = 'out.vex.json'
+LEDGERS = ('.socket/vendor/state.json', '.socket/vendor/redirect-state.json')
+
+
+def manifestless_checkout(project, dest):
+    """Copy the committable state of `project` into `dest`: everything but
+    node_modules, the manifest, the apply lock and earlier VEX output."""
+    skip = {'.socket/manifest.json', '.socket/apply.lock', VEX_OUTPUT}
+    if dest.exists():
+        shutil.rmtree(dest)
+    for source in project.rglob('*'):
+        rel = source.relative_to(project)
+        if 'node_modules' in rel.parts or rel.as_posix() in skip or not source.is_file():
+            continue
+        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, dest / rel)
+    dest.mkdir(parents=True, exist_ok=True)
+    return dest
+
+
+def vex_statements(doc, purl):
+    """The OpenVEX statements whose subcomponent is `purl` (or `purl?…`)."""
+    def about(statement):
+        return any(sub.get('@id') == purl or str(sub.get('@id', '')).split('?')[0] == purl
+                   for product in statement.get('products', [])
+                   for sub in product.get('subcomponents', []))
+    return [st for st in (doc or {}).get('statements', []) if about(st)]
+
+
+def vex_attested(doc, purl, uuid, marker, vulns):
+    """True when `doc` attests `purl` for EXACTLY the vulnerability ids of
+    `vulns` ({id: [cve aliases]}), each not_affected, carrying every alias
+    and the `Patched via Socket patch <uuid> (<marker>)` impact part."""
+    statements = vex_statements(doc, purl)
+    if not vulns or sorted(st['vulnerability']['name'] for st in statements) != sorted(vulns):
+        return False
+    part = f'Patched via Socket patch {uuid} ({marker})'
+    for st in statements:
+        aliases = set(st['vulnerability'].get('aliases', []))
+        if (st.get('status') != 'not_affected'
+                or not set(vulns[st['vulnerability']['name']]) <= aliases
+                or part not in str(st.get('impact_statement', '')).split('; ')):
+            return False
+    return True
+
+
+def vex_skip_reason(envelope, purl):
+    """The `errorCode` of the standalone vex envelope's skipped event for
+    `purl` (None when it was verified or never mentioned)."""
+    canonical = purl.replace('%40', '@')
+    events = [e for e in (envelope or {}).get('events', [])
+              if str(e.get('purl', '')).split('?')[0] in (purl, canonical)]
+    if any(e.get('action') == 'verified' for e in events):
+        return None
+    return next((e.get('errorCode') for e in events if e.get('action') == 'skipped'), None)
+
+
 def remove_node_modules(project):
     for modules in sorted(project.rglob('node_modules'), key=lambda p: len(p.parts)):
         if modules.exists() and not modules.is_symlink():
@@ -951,6 +1020,57 @@ def main():
                         patched_lock = installed_lock
                     else:
                         checks[label + 'StableLock'] = installed_lock == patched_lock
+                # Manifest-less VEX on a fresh checkout of the committed state.
+                checkout = manifestless_checkout(project, case / 'vex-checkout')
+                vex_flags = ['--frozen-lockfile', *(['--production'] if shape == 'production' else [])]
+                code, _ = run([bun, 'install', '--ignore-scripts', *vex_flags], checkout,
+                              env_for(bun, 'cache-vex'), case / 'vex-install.log', False)
+                checks['vexCheckoutPatchedBytes'] = code == 0 and oracle(checkout, record, 'after')[0]
+                marker = 'redirected' if main_mode == 'hosted' else 'vendored'
+                vulns = {vid: list(v.get('cves', []))
+                         for vid, v in (record.get('vulnerabilities') or {}).items()}
+                checks['vexRecordHasVulnerabilities'] = bool(vulns)
+                row['vex'] = vex_row = {}
+
+                def vex(label, *extra, via='vex'):
+                    out = checkout / VEX_OUTPUT
+                    out.unlink(missing_ok=True)
+                    if via == 'vex':
+                        argv = [cli, 'vex', '--output', out, '--product', VEX_PRODUCT]
+                    else:
+                        argv = [cli, via, '--vex', out, '--vex-product', VEX_PRODUCT]
+                    code, output = run([*argv, '--cwd', checkout, '--json', '--no-telemetry', *extra],
+                                       checkout, env, case / f'vex-{label}.log', False)
+                    envelope = parse_envelope(output)
+                    doc = load_json(out)
+                    vex_row[label] = dict(exit=code, skip=vex_skip_reason(envelope, PURL),
+                                          attested=vex_attested(doc, PURL, record['uuid'], marker, vulns))
+                    return code, envelope, doc
+
+                code, _, doc = vex('manifestDeleted')
+                checks['vexManifestDeleted'] = code == 0 and vex_attested(doc, PURL, record['uuid'], marker, vulns)
+                code, envelope, doc = vex('applyEmbedded', via='apply')
+                checks['vexApplyEmbedded'] = (code == 0 and envelope.get('status') == 'noManifest'
+                                              and vex_attested(doc, PURL, record['uuid'], marker, vulns))
+                saved_ledgers = {rel: (checkout / rel).read_bytes() for rel in LEDGERS if (checkout / rel).is_file()}
+                checks['vexLedgerPresent'] = bool(saved_ledgers)
+                for rel in saved_ledgers:
+                    (checkout / rel).unlink()
+                code, _, doc = vex('ledgersDeleted')
+                checks['vexLedgersDeleted'] = code == 0 and vex_attested(doc, PURL, record['uuid'], marker, vulns)
+                code, envelope, doc = vex('offline', '--offline')
+                checks['vexOffline'] = (code == 1 and vex_skip_reason(envelope, PURL) == 'record_unavailable'
+                                        and not vex_statements(doc, PURL))
+                for rel, data in saved_ledgers.items():
+                    (checkout / rel).write_bytes(data)
+                (checkout / lock.name).write_bytes(original[lock.name])
+                unwired = 'redirect_unwired' if main_mode == 'hosted' else 'vendor_unwired'
+                for label, extra in (('reverted', []), ('revertedNoVerify', ['--no-verify'])):
+                    code, envelope, doc = vex(label, *extra)
+                    checks['vex' + label[0].upper() + label[1:]] = (
+                        code == 1 and vex_skip_reason(envelope, PURL) == unwired
+                        and not vex_statements(doc, PURL))
+                shutil.rmtree(checkout, ignore_errors=True)
                 code, repeat = run(command, project, env, case / 'repeat.log', False)
                 exit_codes['repeat'] = code
                 row['repeat'] = parse_envelope(repeat)
