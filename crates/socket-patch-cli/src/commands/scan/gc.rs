@@ -790,7 +790,11 @@ mod tests {
         );
         let json = gc.to_apply_json();
         assert_eq!(json["skipped"]["code"], "lock_held", "{json}");
-        assert_eq!(json["prunedManifestEntries"], serde_json::json!([]), "{json}");
+        assert_eq!(
+            json["prunedManifestEntries"],
+            serde_json::json!([]),
+            "{json}"
+        );
     }
 
     /// `--lock-timeout` reaches the GC acquire: the pass waits (and says
@@ -1164,8 +1168,7 @@ mod tests {
         socket_patch_core::vendor::save_state(tmp.path(), &state)
             .await
             .unwrap();
-        let state_before =
-            std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
+        let state_before = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
 
         let vendored: HashSet<String> = [PURL.to_string()].into_iter().collect();
         let gc = preview_apply_gc(
@@ -1359,7 +1362,8 @@ mod tests {
     /// rewrites become `warnings` — never mislabelled as `lock_held`.
     #[test]
     fn gc_json_shapes_carry_drift_keeps_only_on_apply() {
-        const LOCK_MARKER: &str = "vendor GC skipped: another socket-patch run holds the apply lock";
+        const LOCK_MARKER: &str =
+            "vendor GC skipped: another socket-patch run holds the apply lock";
         let mut gc = GcSummary::default();
         gc.absorb_vendor_gc(VendorGcSummary {
             kept: vec!["pkg:npm/b@1.0.0".into(), "pkg:npm/a@1.0.0".into()],
@@ -1448,7 +1452,10 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(io.skipped.as_ref().map(|(c, _)| *c), Some("lock_io"));
-        assert_eq!(io.to_apply_json()["warnings"][0]["code"], "manifest_write_failed");
+        assert_eq!(
+            io.to_apply_json()["warnings"][0]["code"],
+            "manifest_write_failed"
+        );
         assert!(io.vendored_failed.is_empty());
     }
 }

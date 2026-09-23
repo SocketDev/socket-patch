@@ -370,8 +370,8 @@ mod tests {
         assert!(path_is_socket_owned(&vendor_path("cfg-if", "1.0.4")));
         assert!(path_is_socket_owned("./.socket/vendor/cargo/u/x-1.0.0")); // "." segment normalised
         assert!(path_is_socket_owned(r".socket\vendor\cargo\u\x-1.0.0")); // backslash normalised
-        // The retired redirect backend's `.socket/cargo-patches/` never
-        // shipped in a tagged release: an entry there is a user path.
+                                                                          // The retired redirect backend's `.socket/cargo-patches/` never
+                                                                          // shipped in a tagged release: an entry there is a user path.
         assert!(!path_is_socket_owned(".socket/cargo-patches/cfg-if-1.0.0"));
         assert!(!path_is_socket_owned("./.socket/cargo-patches/x-1.0.0"));
         // User paths are not.

@@ -542,10 +542,7 @@ pub(crate) async fn revert_lock_fragment_splice(
     kind: &str,
     flavor: &str,
 ) -> RevertOutcome {
-    revert_lock_fragment_splice_inner(
-        entry, root, dry_run, lock_file, kind, flavor, false,
-    )
-    .await
+    revert_lock_fragment_splice_inner(entry, root, dry_run, lock_file, kind, flavor, false).await
 }
 
 /// [`revert_lock_fragment_splice`] for backends whose records are COUPLED
@@ -563,10 +560,7 @@ pub(crate) async fn revert_lock_fragment_splice_atomic(
     kind: &str,
     flavor: &str,
 ) -> RevertOutcome {
-    revert_lock_fragment_splice_inner(
-        entry, root, dry_run, lock_file, kind, flavor, true,
-    )
-    .await
+    revert_lock_fragment_splice_inner(entry, root, dry_run, lock_file, kind, flavor, true).await
 }
 
 async fn revert_lock_fragment_splice_inner(
@@ -704,8 +698,9 @@ mod tests {
     fn in_sync_jar_fixture(
         dir: &Path,
     ) -> (std::path::PathBuf, HashMap<String, PatchFileInfo>, Vec<u8>) {
-        let zip_bytes = write_zip_entries(&[("lib/a.js".to_string(), b"patched\n".to_vec(), 0o644)])
-            .expect("fixture zip");
+        let zip_bytes =
+            write_zip_entries(&[("lib/a.js".to_string(), b"patched\n".to_vec(), 0o644)])
+                .expect("fixture zip");
         let jar = dir.join("pkg.jar");
         std::fs::write(&jar, &zip_bytes).unwrap();
         let files = HashMap::from([(

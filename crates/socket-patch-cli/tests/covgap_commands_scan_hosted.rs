@@ -652,7 +652,10 @@ async fn takeover_refuses_symlinked_wiring_file_before_reverting() {
             state_before,
             "the vendored ledger must be byte-identical: {doc:#}"
         );
-        assert!(artifact.is_file(), "the committed artifact must survive: {doc:#}");
+        assert!(
+            artifact.is_file(),
+            "the committed artifact must survive: {doc:#}"
+        );
         assert!(
             !root.join(".socket/vendor/redirect-state.json").exists(),
             "no redirect ledger may be written: {doc:#}"
@@ -666,7 +669,10 @@ async fn takeover_refuses_symlinked_wiring_file_before_reverting() {
     for dry_run in [false, true] {
         let extra: &[&str] = if dry_run { &["--dry-run"] } else { &[] };
         let (code, doc) = scan_hosted_json(root, &server.uri(), extra, &[]);
-        assert_eq!(code, 1, "dry_run={dry_run}: a symlinked revert target fails the run: {doc:#}");
+        assert_eq!(
+            code, 1,
+            "dry_run={dry_run}: a symlinked revert target fails the run: {doc:#}"
+        );
         assert_eq!(doc["status"], "error", "dry_run={dry_run}: {doc:#}");
         assert_eq!(doc["errorCode"], CODE, "dry_run={dry_run}: {doc:#}");
         let error = doc["error"].as_str().unwrap_or_default();
@@ -682,7 +688,9 @@ async fn takeover_refuses_symlinked_wiring_file_before_reverting() {
     let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
     assert_eq!(code, 1, "stderr=\n{stderr}");
     assert!(
-        stderr.contains(&format!("Error ({CODE}): package-lock.json is a symbolic link")),
+        stderr.contains(&format!(
+            "Error ({CODE}): package-lock.json is a symbolic link"
+        )),
         "the human refusal must carry the stable code; stderr=\n{stderr}"
     );
     assert_untouched(&json!(null));
@@ -726,7 +734,10 @@ async fn hosted_lock_held_refuses_before_any_write() {
     assert_eq!(code, 1, "a held lock refuses the wet run: {doc:#}");
     assert_eq!(doc["status"], "error", "{doc:#}");
     assert_eq!(doc["errorCode"], "lock_held", "{doc:#}");
-    assert_eq!(doc["error"], HELD, "no --lock-timeout: no waited clause; {doc:#}");
+    assert_eq!(
+        doc["error"], HELD,
+        "no --lock-timeout: no waited clause; {doc:#}"
+    );
     assert_eq!(
         doc["redirect"]["mode"], "hosted",
         "the hosted error envelope keeps its redirect block: {doc:#}"

@@ -11,6 +11,7 @@ use socket_patch_core::package_json::update::{
     remove_package_json, update_package_json, RemoveResult, RemoveStatus, UpdateResult,
     UpdateStatus,
 };
+use socket_patch_core::patch::apply_lock::acquire;
 use socket_patch_core::setup::composer::{self, ComposerSetupStatus};
 use socket_patch_core::setup::gem::{self, GemSetupStatus};
 use socket_patch_core::setup::pypi::detect::{
@@ -20,7 +21,6 @@ use socket_patch_core::setup::pypi::edit::{
     add_hook_dependency, pyproject_contains_hook, remove_hook_dependency, ManifestKind,
     PthEditResult, PthStatus,
 };
-use socket_patch_core::patch::apply_lock::acquire;
 use socket_patch_core::telemetry::track_patch_setup;
 use socket_patch_core::vex::applied_patches_with_vendor;
 use std::io::{self, Write};
@@ -1660,7 +1660,10 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     // Gem + Composer projects are discovered ONCE and bundler probed ONCE:
     // the preview and the real edit below share both.
     let gem = discover_gem_target(common).await;
-    let gem_add = || gem.as_ref().map(|(project, probe)| (project, GemEdit::Add(probe)));
+    let gem_add = || {
+        gem.as_ref()
+            .map(|(project, probe)| (project, GemEdit::Add(probe)))
+    };
     let composer_json = discover_composer_json(common).await;
     // Gem + Composer previews (dry-run); `.present` also tells us each project exists.
     let gem_preview = build_gem_outcome(common, gem_add(), true).await;

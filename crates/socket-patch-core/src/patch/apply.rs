@@ -2778,7 +2778,9 @@ mod tests {
         assert!(result.success, "expected success: {:?}", result.error);
         assert_eq!(result.files_patched, vec!["new.js".to_string()]);
         assert_eq!(result.applied_via.get("new.js"), Some(&AppliedVia::Blob));
-        let written = tokio::fs::read(pkg_dir.path().join("new.js")).await.unwrap();
+        let written = tokio::fs::read(pkg_dir.path().join("new.js"))
+            .await
+            .unwrap();
         assert_eq!(written, fresh, "divergent existing content is overwritten");
     }
 
@@ -2826,7 +2828,9 @@ mod tests {
 
         assert!(result.success, "strict still overwrites at a new-file path");
         assert_eq!(result.files_patched, vec!["new.js".to_string()]);
-        let written = tokio::fs::read(pkg_dir.path().join("new.js")).await.unwrap();
+        let written = tokio::fs::read(pkg_dir.path().join("new.js"))
+            .await
+            .unwrap();
         assert_eq!(written, fresh);
     }
 
@@ -2976,7 +2980,9 @@ mod tests {
         let evil = b"pwned";
         let evil_hash = compute_git_sha256_from_bytes(evil);
 
-        tokio::fs::write(pkg.join("index.js"), original).await.unwrap();
+        tokio::fs::write(pkg.join("index.js"), original)
+            .await
+            .unwrap();
         tokio::fs::write(blobs_dir.path().join(&after_hash), patched)
             .await
             .unwrap();
@@ -3020,7 +3026,10 @@ mod tests {
         assert!(result.files_patched.is_empty());
         // The safe file was never written — the whole apply aborted
         // before the write phase.
-        assert_eq!(tokio::fs::read(pkg.join("index.js")).await.unwrap(), original);
+        assert_eq!(
+            tokio::fs::read(pkg.join("index.js")).await.unwrap(),
+            original
+        );
         assert!(!root.path().join("escape.js").exists());
     }
 

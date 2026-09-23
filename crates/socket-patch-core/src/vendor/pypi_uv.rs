@@ -752,7 +752,8 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
     let lock_path = root.join("uv.lock");
     // A symlinked half would be replaced by the rename-over write: keep the
     // artifact (the wiring still routes through it) and fail the revert.
-    if let Err((code, detail)) = refuse_symlinked(root, &UV_PAIR, "pypi_uv_symlink_unsupported").await
+    if let Err((code, detail)) =
+        refuse_symlinked(root, &UV_PAIR, "pypi_uv_symlink_unsupported").await
     {
         return RevertOutcome {
             kept_artifact: true,
@@ -2619,7 +2620,11 @@ wheels = [
             };
             assert!(!outcome.success, "FIFO {what} must fail the revert");
             assert!(
-                outcome.error.as_deref().unwrap_or("").contains("cannot read"),
+                outcome
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("cannot read"),
                 "{:?}",
                 outcome.error
             );
@@ -3175,7 +3180,11 @@ wheels = [
         let kinds: Vec<&str> = wiring.iter().map(|w| w.kind.as_str()).collect();
         assert_eq!(
             kinds,
-            vec!["uv_sources_entry", "uv_lock_package", "uv_lock_requires_dev"]
+            vec![
+                "uv_sources_entry",
+                "uv_lock_package",
+                "uv_lock_requires_dev"
+            ]
         );
 
         let entry = entry_for(wiring, meta);
@@ -3311,7 +3320,10 @@ wheels = [
 
         let (py, lock) = read_pair(tmp.path()).await;
         assert_eq!(py, pyproject, "refusal must precede any pyproject write");
-        assert_eq!(lock, DIRECT_REGISTRY_LOCK, "refusal must precede any lock write");
+        assert_eq!(
+            lock, DIRECT_REGISTRY_LOCK,
+            "refusal must precede any lock write"
+        );
     }
 
     /// Two real single-project lock shapes that must load clean: a
@@ -3986,7 +3998,9 @@ wheels = [
         assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
         assert_eq!(outcome.warnings[0].code, "vendor_lock_entry_drifted");
         assert!(
-            outcome.warnings[0].detail.contains("unknown uv wiring kind")
+            outcome.warnings[0]
+                .detail
+                .contains("unknown uv wiring kind")
                 && outcome.warnings[0].detail.contains("uv_future_kind"),
             "{}",
             outcome.warnings[0].detail
@@ -4140,7 +4154,10 @@ wheels = [
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
         let (py, lock) = read_pair(tmp.path()).await;
         assert_eq!(py, DIRECT_REGISTRY_PYPROJECT);
-        assert_eq!(lock, sdist_only_lock, "revert must byte-restore the sdist-only lock");
+        assert_eq!(
+            lock, sdist_only_lock,
+            "revert must byte-restore the sdist-only lock"
+        );
     }
 
     /// An sdist-only unit FOLLOWED by a `[package.*]` sub-table: the wheels
@@ -4150,13 +4167,7 @@ wheels = [
     fn sdist_only_unit_splices_wheels_before_a_package_subtable() {
         let lock_text = "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.15.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://e/six-1.15.0.tar.gz\", hash = \"sha256:aa\", size = 1 }\n\n[package.optional-dependencies]\nsocks = [\n    { name = \"pysocks\" },\n]\n";
         let (old_unit, new_unit) = rewrite_target_package_unit(
-            lock_text,
-            "six",
-            "1.16.0",
-            REL_WHEEL,
-            WHEEL_NAME,
-            WHEEL_SHA,
-            None,
+            lock_text, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, None,
         )
         .unwrap();
         assert!(lock_text.contains(&old_unit));
@@ -4360,7 +4371,11 @@ wheels = [
     fn wired_pin_rejects_a_malformed_wheel_hash() {
         let short = DIRECT_PATH_LOCK.replace(WHEEL_SHA, "deadbeef");
         let p = project_from(DIRECT_PATH_PYPROJECT, &short);
-        assert_eq!(wired_pin(&p, "six", UUID), None, "a short hash pins nothing");
+        assert_eq!(
+            wired_pin(&p, "six", UUID),
+            None,
+            "a short hash pins nothing"
+        );
 
         let non_hex = DIRECT_PATH_LOCK.replace(WHEEL_SHA, &"z".repeat(64));
         let p = project_from(DIRECT_PATH_PYPROJECT, &non_hex);
@@ -4392,7 +4407,10 @@ wheels = [
         assert_eq!(err.0, "pypi_uv_lock_parse_failed");
         assert!(err.1.contains("cannot build override value"), "{}", err.1);
         let (py, lock) = read_pair(tmp.path()).await;
-        assert_eq!(py, TRANSITIVE_REGISTRY_PYPROJECT, "refusal leaves the tree untouched");
+        assert_eq!(
+            py, TRANSITIVE_REGISTRY_PYPROJECT,
+            "refusal leaves the tree untouched"
+        );
         assert_eq!(lock, TRANSITIVE_REGISTRY_LOCK);
     }
 
@@ -4472,7 +4490,10 @@ wheels = [
         assert_eq!(err.0, "pypi_uv_lock_parse_failed");
         assert!(err.1.contains("cannot build sources value"), "{}", err.1);
         let (py, lock) = read_pair(tmp.path()).await;
-        assert_eq!(py, DIRECT_REGISTRY_PYPROJECT, "refusal leaves the tree untouched");
+        assert_eq!(
+            py, DIRECT_REGISTRY_PYPROJECT,
+            "refusal leaves the tree untouched"
+        );
         assert_eq!(lock, DIRECT_REGISTRY_LOCK);
     }
 
@@ -4505,7 +4526,10 @@ wheels = [
         assert_eq!(err.0, "pypi_uv_lock_package_missing");
         assert!(err.1.contains("six"), "{}", err.1);
         let (py, on_disk) = read_pair(tmp.path()).await;
-        assert_eq!(py, DIRECT_REGISTRY_PYPROJECT, "refusal leaves the tree untouched");
+        assert_eq!(
+            py, DIRECT_REGISTRY_PYPROJECT,
+            "refusal leaves the tree untouched"
+        );
         assert_eq!(on_disk, lock);
     }
 
@@ -4570,10 +4594,7 @@ wheels = [
         )
         .await
         .unwrap();
-        let pkg_rec = wiring
-            .iter()
-            .find(|w| w.kind == "uv_lock_package")
-            .unwrap();
+        let pkg_rec = wiring.iter().find(|w| w.kind == "uv_lock_package").unwrap();
         let pkg_new = pkg_rec
             .new
             .as_ref()
@@ -4593,7 +4614,10 @@ wheels = [
             &format!("path = \"{REL_WHEEL}\" }}, {{ name = \"extra\", path = \"e.whl\" }}]"),
             1,
         );
-        assert_ne!(tampered, wired_lock, "the tamper must hit the overrides line");
+        assert_ne!(
+            tampered, wired_lock,
+            "the tamper must hit the overrides line"
+        );
         tokio::fs::write(tmp.path().join("uv.lock"), &tampered)
             .await
             .unwrap();
@@ -4641,9 +4665,12 @@ wheels = [
         .await
         .unwrap();
         // Hand-restore BOTH files to their pre-vendor bytes.
-        tokio::fs::write(tmp.path().join("pyproject.toml"), TRANSITIVE_REGISTRY_PYPROJECT)
-            .await
-            .unwrap();
+        tokio::fs::write(
+            tmp.path().join("pyproject.toml"),
+            TRANSITIVE_REGISTRY_PYPROJECT,
+        )
+        .await
+        .unwrap();
         tokio::fs::write(tmp.path().join("uv.lock"), &input_lock)
             .await
             .unwrap();
@@ -4787,7 +4814,10 @@ wheels = [
         );
         let (py, lock) = read_pair(tmp.path()).await;
         assert_eq!(py, DIRECT_REGISTRY_PYPROJECT);
-        assert_eq!(lock, DIRECT_REGISTRY_LOCK, "the preceding lock write succeeded");
+        assert_eq!(
+            lock, DIRECT_REGISTRY_LOCK,
+            "the preceding lock write succeeded"
+        );
     }
 
     /// A SINGLE-LINE `wheels = […]` array (uv emits one for one-wheel
@@ -4797,13 +4827,7 @@ wheels = [
     fn single_line_wheels_array_is_rewritten_in_place() {
         let lock = "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.15.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://example.invalid/six.tar.gz\", hash = \"sha256:aa\", size = 1 }\nwheels = [{ url = \"https://example.invalid/six.whl\", hash = \"sha256:bb\" }]\n";
         let (old_unit, new_unit) = rewrite_target_package_unit(
-            lock,
-            "six",
-            "1.16.0",
-            REL_WHEEL,
-            WHEEL_NAME,
-            WHEEL_SHA,
-            None,
+            lock, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, None,
         )
         .unwrap();
         assert!(old_unit.contains("wheels = [{ url"), "{old_unit}");
@@ -4839,7 +4863,11 @@ wheels = [
             panic!("an unbalanced requires-dist array must refuse");
         };
         assert_eq!(err.0, "pypi_uv_lock_parse_failed");
-        assert!(err.1.contains("requires-dist array is unbalanced"), "{}", err.1);
+        assert!(
+            err.1.contains("requires-dist array is unbalanced"),
+            "{}",
+            err.1
+        );
     }
 
     /// Same for a truncated `[package.metadata.requires-dev]` group array.
@@ -4867,7 +4895,11 @@ wheels = [
             "{ROOT_UNIT_HDR}requires-dist = [{{ name = \"six\", specifier = \"==1.16.0\" }}]\n\n[package.metadata.requires-dev]\nlint = [\n    {{ name = \"black\", specifier = \"==24.4.2\" }},\n]\n"
         );
         let edits = rewrite_root_metadata_entries(&lock, "six", REL_WHEEL).unwrap();
-        assert_eq!(edits.len(), 1, "the black-only dev group contributes no edit");
+        assert_eq!(
+            edits.len(),
+            1,
+            "the black-only dev group contributes no edit"
+        );
         assert_eq!(edits[0].kind, "uv_lock_requires_dist");
         assert!(edits[0].old_entry.contains("name = \"six\""));
     }
@@ -4889,8 +4921,8 @@ wheels = [
     /// created section no insertion anchor: a parse-failure refusal.
     #[test]
     fn manifest_override_requires_a_package_entry() {
-        let err = add_manifest_override("version = 1\nrevision = 3\n", "six", REL_WHEEL)
-            .unwrap_err();
+        let err =
+            add_manifest_override("version = 1\nrevision = 3\n", "six", REL_WHEEL).unwrap_err();
         assert_eq!(err.0, "pypi_uv_lock_parse_failed");
         assert!(err.1.contains("no [[package]] entries"), "{}", err.1);
     }
@@ -4967,7 +4999,11 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
         let kinds: Vec<&str> = wiring.iter().map(|w| w.kind.as_str()).collect();
         assert_eq!(
             kinds,
-            vec!["uv_sources_entry", "uv_lock_package", "uv_lock_requires_dev"],
+            vec![
+                "uv_sources_entry",
+                "uv_lock_package",
+                "uv_lock_requires_dev"
+            ],
             "a requires-dev repoint and NO override record"
         );
         assert_eq!(meta.dep_class, "direct");
@@ -5213,11 +5249,13 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
     #[tokio::test]
     async fn constraint_dependencies_manifest_entries_repointed_and_reverted() {
         let manifest = "[manifest]\nconstraints = [{ name = \"six\", specifier = \"==1.16.0\" }]\nbuild-constraints = [{ name = \"six\", specifier = \">=1.16\" }]\n\n";
-        let registry_lock = DIRECT_REGISTRY_LOCK.replacen("[[package]]", &format!("{manifest}[[package]]"), 1);
+        let registry_lock =
+            DIRECT_REGISTRY_LOCK.replacen("[[package]]", &format!("{manifest}[[package]]"), 1);
         let path_manifest = format!(
             "[manifest]\nconstraints = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]\nbuild-constraints = [{{ name = \"six\", path = \"{REL_WHEEL}\" }}]\n\n"
         );
-        let path_lock = DIRECT_PATH_LOCK.replacen("[[package]]", &format!("{path_manifest}[[package]]"), 1);
+        let path_lock =
+            DIRECT_PATH_LOCK.replacen("[[package]]", &format!("{path_manifest}[[package]]"), 1);
 
         let tmp = write_pair(CONSTRAINTS_REGISTRY_PYPROJECT, &registry_lock).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
@@ -5238,7 +5276,11 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
         // `--locked` (matrix: 0.2.37–0.5.0 fail, 0.5.16+ pass), so it advises.
         let codes: Vec<&str> = advisories.iter().map(|w| w.code).collect();
         assert_eq!(codes, vec!["pypi_uv_constraints_require_uv_0_5_6"]);
-        assert!(advisories[0].detail.contains("0.5.6"), "{}", advisories[0].detail);
+        assert!(
+            advisories[0].detail.contains("0.5.6"),
+            "{}",
+            advisories[0].detail
+        );
 
         let (pyproject, lock) = read_pair(tmp.path()).await;
         assert_eq!(pyproject, CONSTRAINTS_PATH_PYPROJECT);
@@ -5262,13 +5304,19 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             .filter(|w| w.kind == "uv_lock_manifest_constraints")
             .collect();
         assert_eq!(
-            constraint_records[0].original.as_ref().and_then(|v| v.as_str()),
+            constraint_records[0]
+                .original
+                .as_ref()
+                .and_then(|v| v.as_str()),
             Some("constraints = [{ name = \"six\", specifier = \"==1.16.0\" }]"),
             "the fragment spans the whole key line so revert cannot confuse it \
              with an identical requires-dist element"
         );
         assert_eq!(
-            constraint_records[1].original.as_ref().and_then(|v| v.as_str()),
+            constraint_records[1]
+                .original
+                .as_ref()
+                .and_then(|v| v.as_str()),
             Some("build-constraints = [{ name = \"six\", specifier = \">=1.16\" }]")
         );
 
@@ -5319,7 +5367,11 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
                 &existing_override_pyproject,
                 &existing_override_lock,
             ),
-            ("dev-group", DEV_GROUP_REGISTRY_PYPROJECT, DEV_GROUP_REGISTRY_LOCK),
+            (
+                "dev-group",
+                DEV_GROUP_REGISTRY_PYPROJECT,
+                DEV_GROUP_REGISTRY_LOCK,
+            ),
         ];
         for (label, pyproject_lf, lock_lf) in cases {
             let pyproject_crlf = pyproject_lf.replace('\n', "\r\n");
@@ -5428,7 +5480,11 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             "fixture must lack the bare header"
         );
         let edits = rewrite_root_metadata_entries(&lock, "six", REL_WHEEL).unwrap();
-        assert_eq!(edits.len(), 1, "the requires-dev group entry must be repointed");
+        assert_eq!(
+            edits.len(),
+            1,
+            "the requires-dev group entry must be repointed"
+        );
         assert_eq!(edits[0].kind, "uv_lock_requires_dev");
         assert_eq!(
             edits[0].new_entry,
@@ -5519,7 +5575,10 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             let meta = tokio::fs::symlink_metadata(tmp.path().join(linked))
                 .await
                 .unwrap();
-            assert!(meta.file_type().is_symlink(), "{linked}: link replaced by revert");
+            assert!(
+                meta.file_type().is_symlink(),
+                "{linked}: link replaced by revert"
+            );
             assert_eq!(tokio::fs::read(&target).await.unwrap(), target_before);
         }
     }
@@ -5550,9 +5609,16 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
         .await
         .unwrap_err();
         assert_eq!(err.0, "pypi_uv_changed");
-        assert!(err.1.contains("uv.lock changed during vendoring"), "{}", err.1);
+        assert!(
+            err.1.contains("uv.lock changed during vendoring"),
+            "{}",
+            err.1
+        );
         let (pyproject, lock) = read_pair(tmp.path()).await;
-        assert_eq!(pyproject, DIRECT_REGISTRY_PYPROJECT, "pyproject never written");
+        assert_eq!(
+            pyproject, DIRECT_REGISTRY_PYPROJECT,
+            "pyproject never written"
+        );
         assert_eq!(lock, relocked, "the live lock is left alone");
     }
 }

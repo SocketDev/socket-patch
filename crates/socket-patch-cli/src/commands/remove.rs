@@ -16,9 +16,9 @@ use std::time::Duration;
 
 use super::get::short_uuid;
 use super::rollback::{
-    all_files_already_original, pin_before_hash_blobs, revert_vendor_entry,
-    rollback_patches_inner, run_hosted_leg, sweep_failure, sweep_unused_artifacts,
-    HostedLegOutcome, InnerSelection, VendorRevertStep,
+    all_files_already_original, pin_before_hash_blobs, revert_vendor_entry, rollback_patches_inner,
+    run_hosted_leg, sweep_failure, sweep_unused_artifacts, HostedLegOutcome, InnerSelection,
+    VendorRevertStep,
 };
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::lock_cli::acquire_or_emit;
@@ -561,7 +561,12 @@ pub async fn run(args: RemoveArgs) -> i32 {
                             Ok(leg) => leg,
                             Err(err) => {
                                 let (code, msg) = hosted_unwind_error(err, true);
-                                emit_error_envelope(args.common.json, args.common.dry_run, code, msg);
+                                emit_error_envelope(
+                                    args.common.json,
+                                    args.common.dry_run,
+                                    code,
+                                    msg,
+                                );
                                 return 1;
                             }
                         };
@@ -828,14 +833,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // Consumers read the blob/rollback totals from `details`, never
         // from `summary.removed`.
         if blobs_removed > 0 || rollback_count > 0 || archives_removed > 0 {
-            env.events
-                .push(PatchEvent::artifact(removal_action).with_details(
-                    serde_json::json!({
-                        "blobsRemoved": blobs_removed,
-                        "rolledBack": rollback_count,
-                        "archivesRemoved": archives_removed,
-                    }),
-                ));
+            env.events.push(
+                PatchEvent::artifact(removal_action).with_details(serde_json::json!({
+                    "blobsRemoved": blobs_removed,
+                    "rolledBack": rollback_count,
+                    "archivesRemoved": archives_removed,
+                })),
+            );
         }
         // Any drift-kept entry means part of the requested removal did
         // NOT happen: the run is a partialFailure (exit 1) even when
@@ -860,7 +864,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
                  record retained); re-run `scan --mode vendored` to normalize, then \
                  remove again",
                 vendor_leg.kept.len(),
-                if vendor_leg.kept.len() == 1 { "y was" } else { "ies were" }
+                if vendor_leg.kept.len() == 1 {
+                    "y was"
+                } else {
+                    "ies were"
+                }
             );
         }
         1
@@ -1174,12 +1182,10 @@ async fn remove_hosted_only(
     };
     // Human per-purl lines already printed inside `run_hosted_leg`.
     for purl in &leg.reverted {
-        env.record(
-            PatchEvent::new(action, purl.clone()).with_reason(
-                "hosted_reverted",
-                "hosted lockfile redirect unwound on remove",
-            ),
-        );
+        env.record(PatchEvent::new(action, purl.clone()).with_reason(
+            "hosted_reverted",
+            "hosted lockfile redirect unwound on remove",
+        ));
     }
     if args.common.json {
         println!("{}", env.to_pretty_json());
@@ -1258,12 +1264,11 @@ async fn remove_ledger_only(
     }
 
     let keys: Vec<String> = matches.iter().map(|(k, _)| k.clone()).collect();
-    let leg = match revert_vendored_matches(args, &keys, &mut state, api_token, org_slug, false)
-        .await
-    {
-        Ok(leg) => leg,
-        Err(code) => return code,
-    };
+    let leg =
+        match revert_vendored_matches(args, &keys, &mut state, api_token, org_slug, false).await {
+            Ok(leg) => leg,
+            Err(code) => return code,
+        };
 
     let mut env = Envelope::new(Command::Remove);
     env.dry_run = args.common.dry_run;
@@ -1307,7 +1312,11 @@ async fn remove_ledger_only(
                 "Error: {} matching entr{} drift-kept (vendored state and ledger record \
                  retained); re-run `scan --mode vendored` to normalize, then remove again",
                 leg.kept.len(),
-                if leg.kept.len() == 1 { "y was" } else { "ies were" }
+                if leg.kept.len() == 1 {
+                    "y was"
+                } else {
+                    "ies were"
+                }
             );
         }
         1
@@ -1364,7 +1373,10 @@ mod tests {
         // All three release variants removed (sorted); the npm package untouched.
         assert_eq!(removed.len(), 3);
         assert!(removed.iter().all(|p| p.contains("six@1.16.0")));
-        assert!(removed.windows(2).all(|w| w[0] < w[1]), "sorted: {removed:?}");
+        assert!(
+            removed.windows(2).all(|w| w[0] < w[1]),
+            "sorted: {removed:?}"
+        );
         assert_eq!(manifest.patches.len(), 1);
         assert!(manifest.patches.contains_key("pkg:npm/foo@1.0"));
     }
@@ -1471,7 +1483,11 @@ mod tests {
 
         let removed = remove_matching(&mut manifest, "pkg:pypi/six@1.16.0", &exclusions);
 
-        assert_eq!(removed.len(), 2, "the two wheels go, the excluded sdist stays");
+        assert_eq!(
+            removed.len(),
+            2,
+            "the two wheels go, the excluded sdist stays"
+        );
         assert!(manifest
             .patches
             .contains_key("pkg:pypi/six@1.16.0?artifact_id=sdist"));

@@ -464,11 +464,7 @@ async fn fetch_patch_details(
     }
     for (i, pkg) in packages.iter().enumerate() {
         if show_progress {
-            eprint!(
-                "\rFetching patch details... ({}/{})",
-                i + 1,
-                packages.len()
-            );
+            eprint!("\rFetching patch details... ({}/{})", i + 1, packages.len());
         }
         match api_client.search_patches_by_package(&pkg.purl).await {
             Ok(response) => results.extend(response.patches),
@@ -2298,9 +2294,12 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 let params = download_params(
                     &args, /*save_only=*/ false, /*json=*/ true, /*silent=*/ true,
                 );
-                let (code, apply_json) =
-                    download_and_apply_patches_with(&selected, &params, &download_run(&args, &api_client))
-                        .await;
+                let (code, apply_json) = download_and_apply_patches_with(
+                    &selected,
+                    &params,
+                    &download_run(&args, &api_client),
+                )
+                .await;
                 apply_code = code;
                 let mut apply_obj = apply_json;
                 fold_vendored_skips_into_apply(&mut apply_obj, &vendored_records);
@@ -2777,10 +2776,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // prompt) still proceeds unattended, and a TTY always prompts.
     let verb = if vendor { "vendor" } else { "apply" };
     let prompt = format!("Download and {verb} {} patch(es)?", selected.len());
-    let report_only = args.mode.is_none()
-        && !args.prune
-        && !args.common.yes
-        && !crate::output::stdin_is_tty();
+    let report_only =
+        args.mode.is_none() && !args.prune && !args.common.yes && !crate::output::stdin_is_tty();
     if report_only {
         if !args.common.silent {
             print_get_hint(false);
@@ -3199,9 +3196,13 @@ mod tests {
         // …but the agent flow's direct probe sees it for scanned purls.
         let scanned: HashSet<String> = [purl.to_string()].into_iter().collect();
         let ledger = load_ledger(root).await;
-        let retained =
-            hosted_wiring_retained_purls(root, ledger.as_ref(), &scanned, &inventory_of(root).await)
-                .await;
+        let retained = hosted_wiring_retained_purls(
+            root,
+            ledger.as_ref(),
+            &scanned,
+            &inventory_of(root).await,
+        )
+        .await;
         assert_eq!(retained, vec![purl.to_string()]);
     }
 
@@ -4365,7 +4366,12 @@ mod tests {
         let mut env = vendor_env();
         note_vendor_supersedes_redirect(&mut env, root, &takeover_common()).await;
 
-        assert_eq!(env.warnings.len(), 1, "exactly one warning: {:?}", env.warnings);
+        assert_eq!(
+            env.warnings.len(),
+            1,
+            "exactly one warning: {:?}",
+            env.warnings
+        );
         assert_eq!(env.warnings[0].code, VENDOR_SUPERSEDES_REDIRECT);
         assert!(
             env.warnings[0].detail.contains("reconciled automatically"),
@@ -4424,7 +4430,10 @@ mod tests {
             env.warnings[0].detail
         );
         let after = tokio::fs::read(&ledger_path).await.unwrap();
-        assert_eq!(before, after, "a dry run must leave the ledger byte-identical");
+        assert_eq!(
+            before, after,
+            "a dry run must leave the ledger byte-identical"
+        );
     }
 
     #[tokio::test]
@@ -4479,8 +4488,7 @@ mod tests {
         // Root ignores mode bits; skip there (CI containers sometimes run as root).
         if std::fs::File::create(vendor_dir.join("probe")).is_ok() {
             let _ = std::fs::remove_file(vendor_dir.join("probe"));
-            let _ =
-                std::fs::set_permissions(&vendor_dir, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::set_permissions(&vendor_dir, std::fs::Permissions::from_mode(0o755));
             eprintln!("skipping: running as root, 0555 does not block writes");
             return;
         }
@@ -4495,19 +4503,25 @@ mod tests {
         assert_eq!(env.warnings.len(), 1, "{:?}", env.warnings);
         assert_eq!(env.warnings[0].code, VENDOR_SUPERSEDES_REDIRECT);
         assert!(
-            env.warnings[0].detail.contains("Automatic reconciliation failed"),
+            env.warnings[0]
+                .detail
+                .contains("Automatic reconciliation failed"),
             "the persist failure must be surfaced inside the warning: {}",
             env.warnings[0].detail
         );
         assert!(
-            env.warnings[0]
-                .detail
-                .starts_with(&mode_takeover_detail(&[NPM_TAKEOVER_PURL.to_string()], false)),
+            env.warnings[0].detail.starts_with(&mode_takeover_detail(
+                &[NPM_TAKEOVER_PURL.to_string()],
+                false
+            )),
             "the failure text must ride on the full manual remediation: {}",
             env.warnings[0].detail
         );
         // Fail closed: the atomic writer left the ledger fully pre-drop.
         let after = tokio::fs::read(&ledger_path).await.unwrap();
-        assert_eq!(before, after, "a failed persist must leave the ledger untouched");
+        assert_eq!(
+            before, after,
+            "a failed persist must leave the ledger untouched"
+        );
     }
 }

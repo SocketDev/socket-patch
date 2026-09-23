@@ -470,8 +470,15 @@ async fn go_service_redirect(
             let stage = stage_dir_for(copy_dir);
             let _ = remove_tree(&stage).await; // a crashed earlier run's litter
             if let Err(e) = tokio::fs::create_dir_all(&stage).await {
-                cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired)
-                    .await;
+                cleanup_failed_service_stage(
+                    &stage,
+                    project_root,
+                    base_rel,
+                    copy_dir,
+                    module,
+                    wired,
+                )
+                .await;
                 return hard(
                     "vendor_prebuilt_write_failed",
                     format!("cannot create {}: {e}", stage.display()),
@@ -479,8 +486,15 @@ async fn go_service_redirect(
             }
             let prefix = format!("{module}@{version}/");
             if let Err(e) = extract_zip_with_prefix(&archive.bytes, &stage, &prefix) {
-                cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired)
-                    .await;
+                cleanup_failed_service_stage(
+                    &stage,
+                    project_root,
+                    base_rel,
+                    copy_dir,
+                    module,
+                    wired,
+                )
+                .await;
                 return hard(
                     "vendor_prebuilt_extract_failed",
                     format!("cannot extract the prebuilt module zip: {e}"),
@@ -489,8 +503,15 @@ async fn go_service_redirect(
             // A `replace` target needs a go.mod declaring the module path;
             // pre-modules zips may lack one — synthesize the minimal form.
             if let Err(e) = ensure_module_go_mod(&stage, module).await {
-                cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired)
-                    .await;
+                cleanup_failed_service_stage(
+                    &stage,
+                    project_root,
+                    base_rel,
+                    copy_dir,
+                    module,
+                    wired,
+                )
+                .await;
                 return hard(
                     "vendor_prebuilt_write_failed",
                     format!("cannot synthesize go.mod for the copy: {e}"),
@@ -505,8 +526,15 @@ async fn go_service_redirect(
             // wrong. Fail closed → `auto` falls back to the local build;
             // nothing points at the bad stage. (Mirrors composer_lock.rs.)
             if !copy_matches_after_hashes(&stage, &record.files).await {
-                cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired)
-                    .await;
+                cleanup_failed_service_stage(
+                    &stage,
+                    project_root,
+                    base_rel,
+                    copy_dir,
+                    module,
+                    wired,
+                )
+                .await;
                 return miss(
                     warnings,
                     "vendor_prebuilt_layout_mismatch",
@@ -518,8 +546,15 @@ async fn go_service_redirect(
                 );
             }
             if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
-                cleanup_failed_service_stage(&stage, project_root, base_rel, copy_dir, module, wired)
-                    .await;
+                cleanup_failed_service_stage(
+                    &stage,
+                    project_root,
+                    base_rel,
+                    copy_dir,
+                    module,
+                    wired,
+                )
+                .await;
                 return hard(
                     "vendor_prebuilt_write_failed",
                     format!("cannot move the extracted module into place: {e}"),
@@ -681,9 +716,9 @@ pub async fn revert_go_vendor_opts(
     if !dry_run && !keep_artifact {
         let uuid_dir = project_root.join(&base_rel);
         let _ = remove_tree(&uuid_dir).await; // ignore NotFound
-        // Best-effort: prune the now-empty `.socket/vendor/golang/` and
-        // `.socket/vendor/` levels so a fully-reverted project carries no
-        // vendor residue. `remove_dir` fails on non-empty.
+                                              // Best-effort: prune the now-empty `.socket/vendor/golang/` and
+                                              // `.socket/vendor/` levels so a fully-reverted project carries no
+                                              // vendor residue. `remove_dir` fails on non-empty.
         prune_empty_vendor_levels(&uuid_dir).await;
     }
 

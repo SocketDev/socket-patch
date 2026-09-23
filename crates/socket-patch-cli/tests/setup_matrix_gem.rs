@@ -515,9 +515,7 @@ mod host_guard {
             .find_map(|f| f.get("error").and_then(|e| e.as_str()))
             .unwrap_or_else(|| panic!("no gemfile error entry in files[]:\n{v}"));
         assert!(
-            gem_err.contains("1.17.3")
-                && gem_err.contains("2.2")
-                && gem_err.contains("--remove"),
+            gem_err.contains("1.17.3") && gem_err.contains("2.2") && gem_err.contains("--remove"),
             "the check error must name the detected bundler, the floor, and \
              the `setup --remove` recovery:\n{gem_err}"
         );
@@ -780,7 +778,16 @@ cat check.json
 echo 'ALL-DONE'
 "#;
         let out = Command::new("docker")
-            .args(["run", "--rm", "--network", "none", &image, "bash", "-c", script])
+            .args([
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                &image,
+                "bash",
+                "-c",
+                script,
+            ])
             .output()
             .expect("docker run");
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();

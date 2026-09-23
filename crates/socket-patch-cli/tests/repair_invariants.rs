@@ -642,7 +642,8 @@ fn repair_dry_run_also_removes_leftover_lock_file() {
         "a dry run leaves no apply.lock behind either"
     );
     assert!(
-        socket.join("manifest.json").exists() && socket.join("blobs").join(REFERENCED_HASH).exists(),
+        socket.join("manifest.json").exists()
+            && socket.join("blobs").join(REFERENCED_HASH).exists(),
         "project state is untouched by the dry run"
     );
 }

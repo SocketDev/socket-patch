@@ -1183,11 +1183,8 @@ mod tests {
         // runtime waits for on shutdown; connect a writer to release it so
         // the test can FAIL instead of hanging the whole suite.
         let deadline = std::time::Duration::from_secs(5);
-        let Ok(results) = tokio::time::timeout(
-            deadline,
-            remove_plugin_directive_at(&project, None, false),
-        )
-        .await
+        let Ok(results) =
+            tokio::time::timeout(deadline, remove_plugin_directive_at(&project, None, false)).await
         else {
             let _ = std::fs::OpenOptions::new().write(true).open(&index);
             panic!("remove must complete promptly with a FIFO index");

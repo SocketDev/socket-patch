@@ -806,7 +806,9 @@ async fn get_ghsa_pnpm_pnp_keeps_only_in_hosted_mode() {
         // the fan-out's 2.0.0 must still be skipped even under PnP.
         std::fs::write(
             root.join("pnpm-lock.yaml"),
-            format!("lockfileVersion: '9.0'\n\npackages:\n\n  {NAME}@1.0.0:\n    resolution: {{}}\n"),
+            format!(
+                "lockfileVersion: '9.0'\n\npackages:\n\n  {NAME}@1.0.0:\n    resolution: {{}}\n"
+            ),
         )
         .unwrap();
         std::fs::write(root.join(".pnp.cjs"), "/* pnpm node-linker=pnp loader */").unwrap();
@@ -860,7 +862,10 @@ async fn get_ghsa_pnpm_pnp_keeps_only_in_hosted_mode() {
         let mut args = get_args(GHSA, tmp.path(), server.uri());
         args.mode = mode;
         let code = socket_patch_cli::commands::get::run(args).await;
-        assert_eq!(code, 0, "pnpm PnP outside hosted is a calm skip (mode {mode:?})");
+        assert_eq!(
+            code, 0,
+            "pnpm PnP outside hosted is a calm skip (mode {mode:?})"
+        );
         assert!(!tmp.path().join(".socket").exists(), "mode {mode:?}");
         assert_eq!(requests_containing(&server, "/patches/view/").await, 0);
     }

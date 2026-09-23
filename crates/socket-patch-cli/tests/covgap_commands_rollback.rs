@@ -74,7 +74,13 @@ fn write_socket_manifest(root: &Path, entries: &[String]) -> PathBuf {
 
 /// Install a fake npm package at `<root>/<nm_rel>/<name>` with the given
 /// `index.js` bytes and version.
-fn install_npm_pkg(root: &Path, nm_rel: &str, name: &str, version: &str, index_js: &[u8]) -> PathBuf {
+fn install_npm_pkg(
+    root: &Path,
+    nm_rel: &str,
+    name: &str,
+    version: &str,
+    index_js: &[u8],
+) -> PathBuf {
     let pkg_dir = root.join(nm_rel).join(name);
     std::fs::create_dir_all(&pkg_dir).expect("create package dir");
     std::fs::write(
@@ -125,7 +131,9 @@ fn warning_codes(envelope: &Value) -> Vec<String> {
 
 fn parse_envelope(stdout: &str, stderr: &str) -> Value {
     serde_json::from_str(stdout).unwrap_or_else(|e| {
-        panic!("rollback --json must emit a JSON envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+        panic!(
+            "rollback --json must emit a JSON envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )
     })
 }
 
@@ -375,7 +383,13 @@ fn human_verbose_hash_mismatch_details() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
-    let pkg_dir = install_npm_pkg(tmp.path(), "node_modules", "covgap-drifted", "1.0.0", drifted);
+    let pkg_dir = install_npm_pkg(
+        tmp.path(),
+        "node_modules",
+        "covgap-drifted",
+        "1.0.0",
+        drifted,
+    );
     let socket = write_socket_manifest(
         tmp.path(),
         &[manifest_entry(
@@ -389,10 +403,7 @@ fn human_verbose_hash_mismatch_details() {
     // under test is the engine's hash-mismatch verification.
     stage_blob(&socket, &before_hash, before);
 
-    let (code, stdout, stderr) = run(
-        tmp.path(),
-        &["rollback", "--offline", "--yes", "--verbose"],
-    );
+    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "--yes", "--verbose"]);
     assert_eq!(
         code, 1,
         "a hash mismatch must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
@@ -734,7 +745,11 @@ fn lock_contention_exits_with_lock_held_envelope() {
         Some("lock_held"),
         "expected errorCode=lock_held; stdout=\n{stdout}"
     );
-    assert_eq!(json_string(&v, "status"), Some("error"), "stdout=\n{stdout}");
+    assert_eq!(
+        json_string(&v, "status"),
+        Some("error"),
+        "stdout=\n{stdout}"
+    );
     assert_eq!(
         json_string(&v, "command"),
         Some("rollback"),
@@ -853,7 +868,14 @@ fn vendor_fixture() -> VendorFixture {
 fn vendor(fx: &VendorFixture) {
     let (code, stdout, stderr) = run(
         fx.root(),
-        &["vendor", "--json", "--silent", "--offline", "--lock-timeout", "5"],
+        &[
+            "vendor",
+            "--json",
+            "--silent",
+            "--offline",
+            "--lock-timeout",
+            "5",
+        ],
     );
     assert_eq!(
         code, 0,
@@ -935,7 +957,11 @@ fn vendored_dry_run_previews_in_human_mode() {
         stdout.contains(&format!("Would revert vendoring for {V_PURL}")),
         "the default preview line must print; stdout=\n{stdout}"
     );
-    assert_eq!(fx.lock_bytes(), wired_lock, "dry run must not touch the lock");
+    assert_eq!(
+        fx.lock_bytes(),
+        wired_lock,
+        "dry run must not touch the lock"
+    );
     assert_eq!(
         std::fs::read(fx.state_path()).unwrap(),
         state_before,
@@ -1010,7 +1036,14 @@ fn ecosystems_filter_narrows_vendored_scope() {
 
     let (code, stdout, stderr) = run(
         fx.root(),
-        &["rollback", "--json", "--offline", "--yes", "--ecosystems", "pypi"],
+        &[
+            "rollback",
+            "--json",
+            "--offline",
+            "--yes",
+            "--ecosystems",
+            "pypi",
+        ],
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
@@ -1025,7 +1058,14 @@ fn ecosystems_filter_narrows_vendored_scope() {
 
     let (code, stdout, stderr) = run(
         fx.root(),
-        &["rollback", "--json", "--offline", "--yes", "--ecosystems", "npm"],
+        &[
+            "rollback",
+            "--json",
+            "--offline",
+            "--yes",
+            "--ecosystems",
+            "npm",
+        ],
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
@@ -1104,7 +1144,13 @@ fn path_glob_selects_vendored_entry() {
 
     let (code, stdout, stderr) = run(
         fx.root(),
-        &["rollback", "--json", "--offline", "--yes", "node_modules/left-pad"],
+        &[
+            "rollback",
+            "--json",
+            "--offline",
+            "--yes",
+            "node_modules/left-pad",
+        ],
     );
     assert_eq!(
         code, 0,
@@ -1267,10 +1313,7 @@ fn qualified_manifest_purl_removed_after_vendored_revert() {
     // Re-key the manifest entry with a qualifier the ledger key lacks.
     let mut manifest = fx.manifest_json();
     let record = manifest["patches"][V_PURL].take();
-    manifest["patches"]
-        .as_object_mut()
-        .unwrap()
-        .remove(V_PURL);
+    manifest["patches"].as_object_mut().unwrap().remove(V_PURL);
     manifest["patches"][QUALIFIED] = record;
     std::fs::write(
         fx.root().join(".socket/manifest.json"),
@@ -1760,7 +1803,14 @@ fn ecosystems_filter_narrows_hosted_scope() {
 
     let (code, stdout, stderr) = run(
         tmp.path(),
-        &["rollback", "--json", "--offline", "--yes", "--ecosystems", "pypi"],
+        &[
+            "rollback",
+            "--json",
+            "--offline",
+            "--yes",
+            "--ecosystems",
+            "pypi",
+        ],
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
@@ -1782,7 +1832,14 @@ fn ecosystems_filter_narrows_hosted_scope() {
 
     let (code, stdout, stderr) = run(
         tmp.path(),
-        &["rollback", "--json", "--offline", "--yes", "--ecosystems", "npm"],
+        &[
+            "rollback",
+            "--json",
+            "--offline",
+            "--yes",
+            "--ecosystems",
+            "npm",
+        ],
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout, &stderr);
@@ -1818,7 +1875,13 @@ fn path_glob_selects_hosted_record() {
 
     let (code, stdout, stderr) = run(
         tmp.path(),
-        &["rollback", "--json", "--offline", "--yes", "node_modules/left-pad"],
+        &[
+            "rollback",
+            "--json",
+            "--offline",
+            "--yes",
+            "node_modules/left-pad",
+        ],
     );
     assert_eq!(
         code, 0,
@@ -2050,7 +2113,10 @@ fn manifest_write_failure_warns_and_exits_one() {
     let manifest_before = std::fs::read(&manifest_path).expect("read manifest bytes");
     let guard = ChflagsGuard::set(&manifest_path);
 
-    let (code, stdout, stderr) = run(fx.root.path(), &["rollback", "--json", "--offline", "--yes"]);
+    let (code, stdout, stderr) = run(
+        fx.root.path(),
+        &["rollback", "--json", "--offline", "--yes"],
+    );
     guard.release();
 
     assert_eq!(
@@ -2200,9 +2266,7 @@ mod interactive {
         );
         assert_eq!(code, 0, "declining must exit 0; got: {output}");
         assert!(
-            output.contains(
-                "Roll back 1 patch(es) and remove them from the local manifest? [Y/n]"
-            ),
+            output.contains("Roll back 1 patch(es) and remove them from the local manifest? [Y/n]"),
             "the composed confirm prompt must render verbatim; got: {output}"
         );
         assert!(
@@ -2250,7 +2314,11 @@ fn vendored_dry_run_json_previews_without_human_print() {
         !stdout.contains("Would revert vendoring"),
         "--json must mute the human preview line; stdout=\n{stdout}"
     );
-    assert_eq!(fx.lock_bytes(), wired_lock, "dry run must not touch the lock");
+    assert_eq!(
+        fx.lock_bytes(),
+        wired_lock,
+        "dry run must not touch the lock"
+    );
     assert_eq!(
         std::fs::read(fx.state_path()).unwrap(),
         state_before,
@@ -2392,7 +2460,14 @@ fn manifest_deleted_under_held_lock_fails_with_invalid_manifest() {
 
         let child = spawn_scrubbed(
             tmp.path(),
-            &["rollback", "--json", "--offline", "--yes", "--lock-timeout", "30"],
+            &[
+                "rollback",
+                "--json",
+                "--offline",
+                "--yes",
+                "--lock-timeout",
+                "30",
+            ],
         );
         // Grace for the child to pass its (fast) pre-lock probe and block
         // on the lock; escalates across retries.
@@ -2536,9 +2611,21 @@ fn human_dry_run_summary_reports_already_original_and_failed() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
     // Installed at the BEFORE bytes: verification says already-original.
-    install_npm_pkg(tmp.path(), "node_modules", "covgap-dry-noop", "1.0.0", noop_before);
+    install_npm_pkg(
+        tmp.path(),
+        "node_modules",
+        "covgap-dry-noop",
+        "1.0.0",
+        noop_before,
+    );
     // Installed at DRIFTED bytes: verification says hash-mismatch.
-    let drift_dir = install_npm_pkg(tmp.path(), "node_modules", "covgap-dry-drift", "1.0.0", drifted);
+    let drift_dir = install_npm_pkg(
+        tmp.path(),
+        "node_modules",
+        "covgap-dry-drift",
+        "1.0.0",
+        drifted,
+    );
     let socket = write_socket_manifest(
         tmp.path(),
         &[
@@ -2695,7 +2782,15 @@ fn identifier_scope_leaves_unrelated_vendored_entry_untouched() {
 
     let (code, stdout, stderr) = run(
         fx.root(),
-        &["rollback", "--json", "--yes", "--offline", "--lock-timeout", "5", IO_PURL],
+        &[
+            "rollback",
+            "--json",
+            "--yes",
+            "--offline",
+            "--lock-timeout",
+            "5",
+            IO_PURL,
+        ],
     );
     assert_eq!(
         code, 0,
@@ -2708,7 +2803,12 @@ fn identifier_scope_leaves_unrelated_vendored_entry_untouched() {
         json!(IO_PURL),
         "only the named patch may be acted on; stdout=\n{stdout}"
     );
-    for leg in ["vendoredReverted", "vendoredPreserved", "vendoredKept", "vendoredFailed"] {
+    for leg in [
+        "vendoredReverted",
+        "vendoredPreserved",
+        "vendoredKept",
+        "vendoredFailed",
+    ] {
         assert_eq!(
             v[leg],
             json!([]),
@@ -2726,13 +2826,20 @@ fn identifier_scope_leaves_unrelated_vendored_entry_untouched() {
         "the named patch must be restored in place"
     );
     // Every vendored surface survives byte-identically.
-    assert_eq!(fx.lock_bytes(), wired_lock, "the vendored lock wiring must survive");
+    assert_eq!(
+        fx.lock_bytes(),
+        wired_lock,
+        "the vendored lock wiring must survive"
+    );
     assert_eq!(
         std::fs::read(fx.state_path()).expect("vendor ledger still present"),
         state_before,
         "the vendor ledger must be byte-identical"
     );
-    assert!(fx.tgz_path().is_file(), "the vendored artifact must survive");
+    assert!(
+        fx.tgz_path().is_file(),
+        "the vendored artifact must survive"
+    );
     let m = fx.manifest_json();
     assert!(
         m["patches"].get(V_PURL).is_some(),
@@ -2755,7 +2862,8 @@ fn two_vendored_entries_each_cleanup_via_their_own_revert() {
     const RP_PURL: &str = "pkg:npm/right-pad@1.0.1";
     const RP_UUID: &str = "5b8c0d2e-3f4a-4b5c-8d6e-9f0a1b2c3d4e";
     let rp_orig: &[u8] = b"module.exports = (s, n) => s + ' '.repeat(n); // orig\n";
-    let rp_patched: &[u8] = b"module.exports = (s, n) => s + ' '.repeat(n < 0 ? 0 : n); // patched\n";
+    let rp_patched: &[u8] =
+        b"module.exports = (s, n) => s + ' '.repeat(n < 0 ? 0 : n); // patched\n";
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
@@ -2827,7 +2935,14 @@ fn two_vendored_entries_each_cleanup_via_their_own_revert() {
 
     let (code, stdout, stderr) = run(
         root,
-        &["vendor", "--json", "--silent", "--offline", "--lock-timeout", "5"],
+        &[
+            "vendor",
+            "--json",
+            "--silent",
+            "--offline",
+            "--lock-timeout",
+            "5",
+        ],
     );
     assert_eq!(
         code, 0,
@@ -2835,11 +2950,21 @@ fn two_vendored_entries_each_cleanup_via_their_own_revert() {
     );
     let lp_tgz = root.join(format!(".socket/vendor/npm/{V_UUID}/left-pad-1.3.0.tgz"));
     let rp_tgz = root.join(format!(".socket/vendor/npm/{RP_UUID}/right-pad-1.0.1.tgz"));
-    assert!(lp_tgz.is_file() && rp_tgz.is_file(), "sanity: both artifacts written");
+    assert!(
+        lp_tgz.is_file() && rp_tgz.is_file(),
+        "sanity: both artifacts written"
+    );
 
     let (code, stdout, stderr) = run(
         root,
-        &["rollback", "--json", "--yes", "--offline", "--lock-timeout", "5"],
+        &[
+            "rollback",
+            "--json",
+            "--yes",
+            "--offline",
+            "--lock-timeout",
+            "5",
+        ],
     );
     assert_eq!(
         code, 0,
@@ -2885,10 +3010,9 @@ fn two_vendored_entries_each_cleanup_via_their_own_revert() {
     );
     let state_path = root.join(".socket/vendor/state.json");
     if state_path.exists() {
-        let state: Value = serde_json::from_slice(
-            &std::fs::read(&state_path).expect("read vendor ledger"),
-        )
-        .expect("ledger is JSON");
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(&state_path).expect("read vendor ledger"))
+                .expect("ledger is JSON");
         assert_eq!(
             state["entries"],
             json!({}),
@@ -2972,7 +3096,14 @@ fn pypi_variant_group_with_no_installed_match_attempts_every_variant() {
 
     let (code, stdout, stderr) = common::run_with_env(
         root,
-        &["rollback", "--json", "--yes", "--offline", "--lock-timeout", "5"],
+        &[
+            "rollback",
+            "--json",
+            "--yes",
+            "--offline",
+            "--lock-timeout",
+            "5",
+        ],
         &[("VIRTUAL_ENV", venv.to_str().expect("utf8 venv path"))],
     );
     assert_eq!(
@@ -3048,11 +3179,19 @@ fn discovered_local_go_redirect_drops_wiring_not_cache_copy() {
     )
     .expect("write go.mod");
     assert!(
-        rt.block_on(ensure_replace_entry(root, MODULE, VERSION, GO_PATCHES_DIR, false))
-            .expect("install replace directive"),
+        rt.block_on(ensure_replace_entry(
+            root,
+            MODULE,
+            VERSION,
+            GO_PATCHES_DIR,
+            false
+        ))
+        .expect("install replace directive"),
         "fixture must install the socket-owned replace"
     );
-    let copy_dir = root.join(GO_PATCHES_DIR).join(format!("{MODULE}@{VERSION}"));
+    let copy_dir = root
+        .join(GO_PATCHES_DIR)
+        .join(format!("{MODULE}@{VERSION}"));
     std::fs::create_dir_all(&copy_dir).expect("create go-patches copy");
     std::fs::write(copy_dir.join("discovered.go"), patched).expect("write patched copy");
 
@@ -3083,8 +3222,18 @@ fn discovered_local_go_redirect_drops_wiring_not_cache_copy() {
 
     let (code, stdout, stderr) = common::run_with_env(
         root,
-        &["rollback", "--json", "--yes", "--offline", "--lock-timeout", "5"],
-        &[("GOMODCACHE", cache.path().to_str().expect("utf8 cache path"))],
+        &[
+            "rollback",
+            "--json",
+            "--yes",
+            "--offline",
+            "--lock-timeout",
+            "5",
+        ],
+        &[(
+            "GOMODCACHE",
+            cache.path().to_str().expect("utf8 cache path"),
+        )],
     );
     assert_eq!(
         code, 0,

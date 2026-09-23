@@ -11,7 +11,9 @@
 use std::path::Path;
 
 use serial_test::serial;
-use socket_patch_cli::commands::get::{download_and_apply_patches_with, DownloadParams, DownloadRun};
+use socket_patch_cli::commands::get::{
+    download_and_apply_patches_with, DownloadParams, DownloadRun,
+};
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClientEnvOverrides};
 use socket_patch_core::api::types::PatchSearchResult;
 use std::collections::HashMap;

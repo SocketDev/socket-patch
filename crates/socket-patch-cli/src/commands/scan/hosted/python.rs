@@ -54,7 +54,8 @@ pub(super) async fn stale_install_warnings(
             .await
             .unwrap_or_default()
     } else {
-        socket_patch_core::crawlers::python_crawler::find_local_venv_site_packages(&common.cwd).await
+        socket_patch_core::crawlers::python_crawler::find_local_venv_site_packages(&common.cwd)
+            .await
     };
 
     #[derive(Default)]

@@ -834,10 +834,7 @@ mod tests {
         // below); if the team decides such values should degrade to
         // WorkspaceType::None (npm semantics), update detect_workspaces and
         // flip these assertions together.
-        for spelling in [
-            r#"{"workspaces": "packages/*"}"#,
-            r#"{"workspaces": null}"#,
-        ] {
+        for spelling in [r#"{"workspaces": "packages/*"}"#, r#"{"workspaces": null}"#] {
             let dir = tempfile::tempdir().unwrap();
             let pkg = dir.path().join("package.json");
             fs::write(&pkg, spelling).await.unwrap();

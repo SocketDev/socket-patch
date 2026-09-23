@@ -931,10 +931,7 @@ async fn scan_vendored_v2_workspace_lock_vendors() {
     assert_eq!(v["status"], "success", "{v}");
     assert_eq!(v["download"]["downloaded"], 1, "{v}");
     assert_eq!(v["download"]["detached"], true, "{v}");
-    assert_eq!(
-        v["download"]["patches"][0]["action"], "downloaded",
-        "{v}"
-    );
+    assert_eq!(v["download"]["patches"][0]["action"], "downloaded", "{v}");
     assert_eq!(v["vendor"]["summary"]["applied"], 1, "{v}");
     assert_eq!(
         manifest_value(tmp.path()),
@@ -1522,10 +1519,7 @@ async fn scan_vendored_from_workspace_member_cwd_fetches_then_engine_refuses_loc
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "partial_failure", "{v}");
     assert_eq!(v["download"]["downloaded"], 1, "{v}");
-    assert_eq!(
-        v["download"]["patches"][0]["action"], "downloaded",
-        "{v}"
-    );
+    assert_eq!(v["download"]["patches"][0]["action"], "downloaded", "{v}");
     let events = v["vendor"]["events"].as_array().unwrap();
     assert!(
         events

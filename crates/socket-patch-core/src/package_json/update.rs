@@ -786,7 +786,9 @@ mod tests {
         );
         assert!(result.new_script.is_none());
         assert!(
-            result.old_dependencies_script.contains("socket-patch apply"),
+            result
+                .old_dependencies_script
+                .contains("socket-patch apply"),
             "old_dependencies_script must reflect the configured script, got {:?}",
             result.old_dependencies_script
         );

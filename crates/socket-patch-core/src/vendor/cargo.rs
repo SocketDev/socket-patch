@@ -865,9 +865,9 @@ pub async fn revert_cargo_vendor_opts(
     if !dry_run && !keep_artifact {
         let uuid_dir = project_root.join(&base_rel);
         let _ = remove_tree(&uuid_dir).await; // ignore NotFound
-        // Best-effort: prune the now-empty `.socket/vendor/cargo/` and
-        // `.socket/vendor/` levels so a fully-reverted project carries no
-        // vendor residue. `remove_dir` fails on non-empty.
+                                              // Best-effort: prune the now-empty `.socket/vendor/cargo/` and
+                                              // `.socket/vendor/` levels so a fully-reverted project carries no
+                                              // vendor residue. `remove_dir` fails on non-empty.
         prune_empty_vendor_levels(&uuid_dir).await;
     }
 
@@ -1819,7 +1819,8 @@ mod tests {
         tokio::fs::create_dir_all(root.join(".cargo"))
             .await
             .unwrap();
-        let config = "[patch.crates-io]\ncfg-if = { path = \".socket/cargo-patches/cfg-if-1.0.4\" }\n";
+        let config =
+            "[patch.crates-io]\ncfg-if = { path = \".socket/cargo-patches/cfg-if-1.0.4\" }\n";
         tokio::fs::write(root.join(".cargo/config.toml"), config)
             .await
             .unwrap();
@@ -2922,9 +2923,9 @@ mod tests {
     async fn marker_write_failure_warns_but_vendor_succeeds() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
-        tokio::fs::create_dir_all(root.join(format!(
-            ".socket/vendor/cargo/{UUID}/{VENDOR_MARKER_FILE}"
-        )))
+        tokio::fs::create_dir_all(
+            root.join(format!(".socket/vendor/cargo/{UUID}/{VENDOR_MARKER_FILE}")),
+        )
         .await
         .unwrap();
 
@@ -2933,7 +2934,9 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "the wired vendor still emits its entry");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "the failed marker write is surfaced: {warnings:?}"
         );
         // The vendor is otherwise fully wired.
@@ -2964,7 +2967,10 @@ mod tests {
         let out = revert_cargo_vendor(&entry, root, false).await;
         assert!(!out.success);
         assert!(
-            out.error.as_deref().unwrap_or("").contains("not a cargo purl"),
+            out.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not a cargo purl"),
             "{:?}",
             out.error
         );

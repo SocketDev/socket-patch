@@ -710,7 +710,10 @@ async fn pypi_requirements_hosted_round_trip() {
     );
 
     let code = rollback_in_process(tmp.path(), Vec::new(), false).await;
-    assert_eq!(code, 0, "bare rollback over the pypi redirect should exit 0");
+    assert_eq!(
+        code, 0,
+        "bare rollback over the pypi redirect should exit 0"
+    );
 
     let restored = std::fs::read_to_string(tmp.path().join("requirements.txt")).unwrap();
     assert_eq!(
@@ -852,7 +855,10 @@ async fn hosted_only_project_without_manifest() {
     // Truly empty: all three stores absent keeps the legacy error.
     let empty = tempfile::tempdir().unwrap();
     let (code, envelope) = run_rollback_subprocess(empty.path(), &[]);
-    assert_eq!(code, 1, "a truly-empty project must keep exit 1: {envelope}");
+    assert_eq!(
+        code, 1,
+        "a truly-empty project must keep exit 1: {envelope}"
+    );
     assert_eq!(envelope["status"], "error", "{envelope}");
     assert!(
         envelope["error"]
@@ -878,7 +884,10 @@ async fn preserve_state_still_unwinds_hosted() {
     write_single_npm_fixture(tmp.path()).await;
 
     let (code, envelope) = run_rollback_subprocess(tmp.path(), &["--preserve-state"]);
-    assert_eq!(code, 0, "preserve-state hosted rollback exits 0: {envelope}");
+    assert_eq!(
+        code, 0,
+        "preserve-state hosted rollback exits 0: {envelope}"
+    );
     assert_eq!(envelope["status"], "success", "{envelope}");
     assert_eq!(
         envelope["hosted"]["reverted"],

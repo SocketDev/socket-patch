@@ -409,7 +409,11 @@ async fn scan_vendor_dry_run_prune_previews_gc_without_mutating() {
 
     // The vendor dry-run preview ran (empty discovery ⇒ empty preview).
     assert_eq!(v["vendor"]["dryRun"], true, "envelope={v}");
-    assert_eq!(v["vendor"]["patches"], serde_json::json!([]), "envelope={v}");
+    assert_eq!(
+        v["vendor"]["patches"],
+        serde_json::json!([]),
+        "envelope={v}"
+    );
 
     // The GC preview: the stale entry is PRUNABLE (preview vocabulary),
     // not "pruned" (the mutating pass's vocabulary).
@@ -455,8 +459,7 @@ async fn scan_vendor_lock_held_reports_json_error() {
     let v = assert_vendor_step_error(code, &stdout, &stderr, "lock_held");
     assert_no_vendor_envelope(&v);
     assert_eq!(
-        v["error"]["message"],
-        "another socket-patch process is operating in this directory",
+        v["error"]["message"], "another socket-patch process is operating in this directory",
         "the contention message is contract; envelope={v}"
     );
     assert_eq!(v["download"]["downloaded"], 1, "envelope={v}");
@@ -508,10 +511,12 @@ async fn scan_vendor_corrupt_manifest_is_reported_and_stepped_around() {
     assert_eq!(v["status"], "success", "envelope={v}");
     assert_eq!(v["vendor"]["summary"]["applied"], 1, "envelope={v}");
     assert!(
-        v["vendor"]["warnings"].as_array().is_some_and(|ws| ws.iter().any(|w| {
-            w["code"] == "vendor_manifest_migration_failed"
-                && w["detail"].as_str().unwrap_or("").contains("manifest.json")
-        })),
+        v["vendor"]["warnings"]
+            .as_array()
+            .is_some_and(|ws| ws.iter().any(|w| {
+                w["code"] == "vendor_manifest_migration_failed"
+                    && w["detail"].as_str().unwrap_or("").contains("manifest.json")
+            })),
         "the unreadable manifest must be reported; envelope={v}"
     );
     assert_eq!(
@@ -568,8 +573,7 @@ async fn scan_vendor_staging_error_reports_json_error() {
     let v = assert_vendor_step_error(code, &stdout, &stderr, "no_local_source");
     assert_demoted_empty_vendor_envelope(&v);
     assert_eq!(
-        v["error"]["message"],
-        "patch artifacts unavailable (offline or download failure)",
+        v["error"]["message"], "patch artifacts unavailable (offline or download failure)",
         "envelope={v}"
     );
     assert_eq!(v["download"]["downloaded"], 1, "envelope={v}");

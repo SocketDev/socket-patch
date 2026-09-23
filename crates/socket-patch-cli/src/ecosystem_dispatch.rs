@@ -479,7 +479,11 @@ pub async fn find_manifest_package_paths(
 /// never probe the Bundler roots a second time.
 pub async fn crawl_all_ecosystems(
     options: &CrawlerOptions,
-) -> (Vec<CrawledPackage>, HashMap<Ecosystem, usize>, Option<String>) {
+) -> (
+    Vec<CrawledPackage>,
+    HashMap<Ecosystem, usize>,
+    Option<String>,
+) {
     let mut all_packages = Vec::new();
     let mut counts: HashMap<Ecosystem, usize> = HashMap::new();
 

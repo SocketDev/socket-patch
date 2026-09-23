@@ -3447,7 +3447,12 @@ wheels = [
                 !outcome.success,
                 "{flavor}: revert under an unlistable root must refuse: {outcome:?}"
             );
-            assert_eq!(outcome.warnings.len(), 1, "{flavor}: {:?}", outcome.warnings);
+            assert_eq!(
+                outcome.warnings.len(),
+                1,
+                "{flavor}: {:?}",
+                outcome.warnings
+            );
             assert_eq!(
                 outcome.warnings[0].code,
                 "vendor_wiring_unknown_revert_blocked"
@@ -3522,8 +3527,7 @@ wheels = [
                 "vendor_wiring_unknown_revert_blocked"
             );
             assert!(
-                outcome
-                    .warnings[0]
+                outcome.warnings[0]
                     .detail
                     .contains(&format!("{lock_name} exists but could not be read")),
                 "{lock_name}: {}",
@@ -3639,7 +3643,9 @@ wheels = [
         tokio::fs::write(root.join("requirements.txt"), "-r requirements/base.txt\n")
             .await
             .unwrap();
-        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        tokio::fs::create_dir(root.join("requirements"))
+            .await
+            .unwrap();
         let include = format!(
             "./{rel_wheel} --hash=sha256:{}  # socket-patch vendor: six==1.16.0\n",
             "0".repeat(64)
@@ -3718,9 +3724,10 @@ wheels = [
             .unwrap();
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
         let p = load_pipenv_project(root).await.unwrap();
-        let (wiring, _meta) = wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
-            .await
-            .unwrap();
+        let (wiring, _meta) =
+            wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
+                .await
+                .unwrap();
         let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
@@ -3773,7 +3780,9 @@ wheels = [
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
         let (wiring2, _meta2) = wire_pipenv(
-            &load_pipenv_project(root).await.unwrap_or_else(|e| panic!("{e:?}")),
+            &load_pipenv_project(root)
+                .await
+                .unwrap_or_else(|e| panic!("{e:?}")),
             root,
             "six",
             "1.16.0",
@@ -3798,15 +3807,25 @@ wheels = [
         let entry = revert_entry("pipenv", &rel_wheel, wiring2);
         let outcome = revert_pypi(&entry, root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(!outcome.drift_skipped() && !outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            !outcome.drift_skipped() && !outcome.kept_artifact,
+            "{:?}",
+            outcome.warnings
+        );
         let restored: serde_json::Value = serde_json::from_str(
             &tokio::fs::read_to_string(root.join("Pipfile.lock"))
                 .await
                 .unwrap(),
         )
         .unwrap();
-        assert!(restored["default"]["six"].get("file").is_none(), "{restored}");
-        assert_eq!(restored["default"]["six"]["version"], serde_json::json!("==1.16.0"));
+        assert!(
+            restored["default"]["six"].get("file").is_none(),
+            "{restored}"
+        );
+        assert_eq!(
+            restored["default"]["six"]["version"],
+            serde_json::json!("==1.16.0")
+        );
 
         // Foreign file reference → still drift, still kept.
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
@@ -3821,7 +3840,11 @@ wheels = [
         let entry = revert_entry("pipenv", &rel_wheel, wiring);
         let outcome = revert_pypi(&entry, root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
-        assert!(outcome.drift_skipped() && outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome.drift_skipped() && outcome.kept_artifact,
+            "{:?}",
+            outcome.warnings
+        );
         assert!(wheel.is_file());
     }
 
@@ -3841,9 +3864,10 @@ wheels = [
             .unwrap();
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
         let p = load_pipenv_project(root).await.unwrap();
-        let (wiring, _meta) = wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
-            .await
-            .unwrap();
+        let (wiring, _meta) =
+            wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
+                .await
+                .unwrap();
         let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         let wheel = uuid_dir.join("six-1.16.0-py2.py3-none-any.whl");
@@ -3975,9 +3999,10 @@ wheels = [
             .unwrap();
         let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
         let p = load_pipenv_project(root).await.unwrap();
-        let (wiring, _meta) = wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
-            .await
-            .unwrap();
+        let (wiring, _meta) =
+            wire_pipenv(&p, root, "six", "1.16.0", &rel_wheel, &"0".repeat(64), UUID)
+                .await
+                .unwrap();
         let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         tokio::fs::write(uuid_dir.join("six-1.16.0-py2.py3-none-any.whl"), b"wheel")
@@ -4796,7 +4821,9 @@ wheels = [
             "{warnings:?}"
         );
         assert!(
-            !warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            !warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "rewriting the surviving marker file must succeed: {warnings:?}"
         );
         assert!(wheel.is_file(), "wheel rebuilt at the recorded path");
@@ -4837,7 +4864,9 @@ wheels = [
         assert!(result.success, "{:?}", result.error);
         let entry = entry.expect("a fully-wired vendor still emits its entry");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "the failed marker write is surfaced: {warnings:?}"
         );
         assert!(
@@ -4890,7 +4919,9 @@ wheels = [
             "{warnings:?}"
         );
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "{warnings:?}"
         );
         assert!(fx.root.join(&entry.artifact.path).is_file());
@@ -5951,9 +5982,25 @@ mod hatch_routing_tests {
     async fn hatchling_with_requirements_preserves_pip_routing() {
         let dir = tempfile::tempdir().unwrap();
         tokio::fs::write(dir.path().join("pyproject.toml"), "[build-system]\nbuild-backend=\"hatchling.build\"\n[project]\ndependencies=[\"urllib3==1.26.18\"]\n").await.unwrap();
-        tokio::fs::write(dir.path().join("requirements.txt"), "urllib3==1.26.18\n").await.unwrap();
-        assert_eq!(detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18"))).await.unwrap().0, PypiFlavor::Requirements);
-        tokio::fs::remove_file(dir.path().join("requirements.txt")).await.unwrap();
-        assert_eq!(detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18"))).await.unwrap().0, PypiFlavor::Hatch);
+        tokio::fs::write(dir.path().join("requirements.txt"), "urllib3==1.26.18\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18")))
+                .await
+                .unwrap()
+                .0,
+            PypiFlavor::Requirements
+        );
+        tokio::fs::remove_file(dir.path().join("requirements.txt"))
+            .await
+            .unwrap();
+        assert_eq!(
+            detect_pypi_flavor(dir.path(), Some(("urllib3", "1.26.18")))
+                .await
+                .unwrap()
+                .0,
+            PypiFlavor::Hatch
+        );
     }
 }

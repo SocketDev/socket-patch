@@ -1255,10 +1255,8 @@ mod tests {
             (
                 detect_npm_lock_flavor(pnpm_dir.path()).await,
                 detect_npm_lock_flavor(yarn_dir.path()).await,
-                vendored_entry_in_use(&probe_entry(Some("package-lock")), in_use_dir.path())
-                    .await,
-                vendored_entry_in_use(&probe_entry(Some("yarn-classic")), in_use_dir.path())
-                    .await,
+                vendored_entry_in_use(&probe_entry(Some("package-lock")), in_use_dir.path()).await,
+                vendored_entry_in_use(&probe_entry(Some("yarn-classic")), in_use_dir.path()).await,
                 vendored_entry_in_use(&probe_entry(Some("bun")), in_use_dir.path()).await,
             )
         };

@@ -2005,7 +2005,9 @@ __metadata:
         tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
             .await
             .unwrap();
-        tokio::fs::write(fx.pkg_path(), &fx.pkg_bytes).await.unwrap();
+        tokio::fs::write(fx.pkg_path(), &fx.pkg_bytes)
+            .await
+            .unwrap();
         let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(!fx.tgz_path().exists(), "orphaned artifact removed");
@@ -2022,7 +2024,9 @@ __metadata:
         let mut entry = entry.unwrap();
         entry.wiring.clear();
         tokio::fs::remove_file(fx.lock_path()).await.unwrap();
-        tokio::fs::write(fx.pkg_path(), &fx.pkg_bytes).await.unwrap();
+        tokio::fs::write(fx.pkg_path(), &fx.pkg_bytes)
+            .await
+            .unwrap();
         let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(!fx.tgz_path().exists(), "no lock, no reference");
@@ -2313,16 +2317,24 @@ __metadata:
         let lock = B3_BEFORE_LOCK.replace("__metadata:\n  version: 8\n  cacheKey: 10c0\n\n", "");
         assert_ne!(lock, B3_BEFORE_LOCK, "the fixture edit must hit");
         let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
-        let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_version_unsupported");
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
         assert!(detail.contains("__metadata"), "{detail}");
         fx.assert_untouched().await;
 
         // No root `<name>@workspace:.` entry: the locator cannot be built.
-        let lock = B3_BEFORE_LOCK
-            .replace("vendor-spike@workspace:.", "vendor-spike@workspace:packages/a");
+        let lock = B3_BEFORE_LOCK.replace(
+            "vendor-spike@workspace:.",
+            "vendor-spike@workspace:packages/a",
+        );
         assert_ne!(lock, B3_BEFORE_LOCK, "the fixture edit must hit");
         let fx = fixture_with(B3_BEFORE_PKG, &lock).await;
-        let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_version_unsupported");
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
         assert!(detail.contains("@workspace:."), "{detail}");
         fx.assert_untouched().await;
 
@@ -2480,7 +2492,10 @@ __metadata:
             .iter()
             .find(|w| w.code == "vendor_lockfile_missing")
             .unwrap_or_else(|| {
-                panic!("expected the missing-manifest warning: {:?}", outcome.warnings)
+                panic!(
+                    "expected the missing-manifest warning: {:?}",
+                    outcome.warnings
+                )
             });
         assert!(warning.detail.contains(PACKAGE_JSON), "{}", warning.detail);
         assert_eq!(
@@ -2640,7 +2655,9 @@ __metadata:
             outcome.warnings
         );
         assert!(
-            !fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
             "the re-run converges and removes the uuid dir"
         );
     }
@@ -2737,13 +2754,17 @@ __metadata:
         let fx = fixture_with(&pkg_before, B3_BEFORE_LOCK).await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let entry = entry.unwrap();
-        tokio::fs::write(fx.pkg_path(), B3_BEFORE_PKG).await.unwrap();
+        tokio::fs::write(fx.pkg_path(), B3_BEFORE_PKG)
+            .await
+            .unwrap();
         let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.iter().any(
-                |w| w.code == "vendor_lock_entry_drifted" && w.detail.contains("no longer exists")
-            ),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("no longer exists")),
             "{:?}",
             outcome.warnings
         );
@@ -2774,9 +2795,11 @@ __metadata:
         let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.iter().any(
-                |w| w.code == "vendor_lock_entry_drifted" && w.detail.contains("no longer exists")
-            ),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("no longer exists")),
             "{:?}",
             outcome.warnings
         );
@@ -3034,9 +3057,7 @@ __metadata:
         let mut entry = entry.unwrap();
         entry.wiring.clear();
         let lock_vendored = tokio::fs::read(fx.lock_path()).await.unwrap();
-        let pkg_vendored = tokio::fs::read(fx.root().join(PACKAGE_JSON))
-            .await
-            .unwrap();
+        let pkg_vendored = tokio::fs::read(fx.root().join(PACKAGE_JSON)).await.unwrap();
 
         for dry_run in [true, false] {
             let outcome = revert_yarn_berry_opts(
@@ -3063,9 +3084,7 @@ __metadata:
                 "empty wiring replays nothing"
             );
             assert_eq!(
-                tokio::fs::read(fx.root().join(PACKAGE_JSON))
-                    .await
-                    .unwrap(),
+                tokio::fs::read(fx.root().join(PACKAGE_JSON)).await.unwrap(),
                 pkg_vendored,
                 "package.json untouched"
             );

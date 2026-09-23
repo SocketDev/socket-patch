@@ -4929,7 +4929,9 @@ snapshots:
 
         let healed = fx.read(PNPM_LOCK).await;
         assert!(
-            healed.contains("    peerDependencies:\n      deprecated: ^1.0.0\n      version: '>=1'\n"),
+            healed.contains(
+                "    peerDependencies:\n      deprecated: ^1.0.0\n      version: '>=1'\n"
+            ),
             "peer deps named like dropped fields must survive verbatim:\n{healed}"
         );
         assert!(
@@ -4964,7 +4966,9 @@ snapshots:
         let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_missing");
         assert!(detail.contains(PNPM_WORKSPACE), "{detail}");
         assert_eq!(
-            tokio::fs::read(fx.root().join(PNPM_WORKSPACE)).await.unwrap(),
+            tokio::fs::read(fx.root().join(PNPM_WORKSPACE))
+                .await
+                .unwrap(),
             junk,
             "the unreadable workspace file must survive byte-identical"
         );
@@ -4986,7 +4990,11 @@ snapshots:
         let detail = expect_refused(fx.vendor(false).await, "vendor_lockfile_crlf_unsupported");
         assert!(detail.contains(PNPM_WORKSPACE), "{detail}");
         assert!(detail.contains("CRLF"), "{detail}");
-        assert_eq!(fx.read(PNPM_WORKSPACE).await, crlf_ws, "workspace untouched");
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            crlf_ws,
+            "workspace untouched"
+        );
         assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "lock untouched");
         assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "pkg untouched");
     }
@@ -5026,7 +5034,11 @@ snapshots:
                 .exists(),
             "artifact dir survives the drift-keep"
         );
-        assert_eq!(fx.read(PNPM_WORKSPACE).await, crlf_ws, "CRLF file left alone");
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            crlf_ws,
+            "CRLF file left alone"
+        );
     }
 
     /// A CRLF lock breaks the packages/snapshots section probes, so the
@@ -5352,7 +5364,11 @@ snapshots:
             "pnpm-workspace.yaml overrides section is gone; `left-pad@1.3.0` not removed",
         );
         assert!(outcome.kept_artifact);
-        assert_eq!(fx.read(PNPM_WORKSPACE).await, gutted, "gutted file left alone");
+        assert_eq!(
+            fx.read(PNPM_WORKSPACE).await,
+            gutted,
+            "gutted file left alone"
+        );
     }
 
     /// Our override line hand-removed from the ws section: a takeover
@@ -5419,7 +5435,10 @@ snapshots:
             "packages:\n  - '.'\noverrides:\n# user note\n",
             "user's edited file kept; only our key removed (header residue stays)"
         );
-        assert!(!uuid_dir(&fx).exists(), "silent removal still prunes the artifact");
+        assert!(
+            !uuid_dir(&fx).exists(),
+            "silent removal still prunes the artifact"
+        );
     }
 
     /// Vendor-time: the ws file carries OUR key with a foreign value —
@@ -5473,10 +5492,10 @@ snapshots:
             pkg["pnpm"]["overrides"]["left-pad@1.3.0"],
             Value::String(format!("file:{}", fx.rel_tgz()))
         );
-        assert!(fx
-            .read(PNPM_LOCK)
-            .await
-            .contains(&format!("overrides:\n  left-pad@1.3.0: file:{}", fx.rel_tgz())));
+        assert!(fx.read(PNPM_LOCK).await.contains(&format!(
+            "overrides:\n  left-pad@1.3.0: file:{}",
+            fx.rel_tgz()
+        )));
     }
 
     /// Records stripped of their `key` fail closed on every surface.
@@ -6089,7 +6108,10 @@ snapshots:
         let pkg = "{\n  \"name\": \"x\",\n  \"pnpm\": {\n    \"overrides\": []\n  }\n}\n";
         let fx = fixture_with(pkg, P1_BEFORE_LOCK).await;
         let detail = expect_refused(fx.vendor(false).await, "vendor_override_conflict");
-        assert!(detail.contains("pnpm.overrides is not an object"), "{detail}");
+        assert!(
+            detail.contains("pnpm.overrides is not an object"),
+            "{detail}"
+        );
         assert!(!fx.root().join(".socket/vendor").exists());
     }
 
@@ -6138,7 +6160,10 @@ snapshots:
         assert_ne!(lock, P1_BEFORE_LOCK);
         let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
         let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_unsupported");
-        assert!(detail.contains("a peer-suffixed snapshot reference"), "{detail}");
+        assert!(
+            detail.contains("a peer-suffixed snapshot reference"),
+            "{detail}"
+        );
         assert!(detail.contains("1.3.0(react@18.0.0)"), "{detail}");
         assert!(!fx.root().join(".socket/vendor").exists());
 
@@ -6150,7 +6175,10 @@ snapshots:
         assert_ne!(lock, P1_BEFORE_LOCK);
         let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
         let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_unsupported");
-        assert!(detail.contains("a peer-suffixed importer version"), "{detail}");
+        assert!(
+            detail.contains("a peer-suffixed importer version"),
+            "{detail}"
+        );
         assert!(!fx.root().join(".socket/vendor").exists());
     }
 
@@ -6165,12 +6193,14 @@ snapshots:
         assert_ne!(lock, P1_BEFORE_LOCK);
         let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
         let (result, entry, _) = expect_done(fx.vendor(false).await);
-        assert!(!result.success, "resolution-less entry must fail, not half-wire");
         assert!(
-            result
-                .error
-                .as_deref()
-                .is_some_and(|e| e.contains("has no resolution line") && e.contains("surgery failed")),
+            !result.success,
+            "resolution-less entry must fail, not half-wire"
+        );
+        assert!(
+            result.error.as_deref().is_some_and(
+                |e| e.contains("has no resolution line") && e.contains("surgery failed")
+            ),
             "{:?}",
             result.error
         );
@@ -6246,7 +6276,10 @@ catalogs:
         assert!(result.success, "{:?}", result.error);
         let entry = entry.unwrap();
         assert!(
-            !entry.wiring.iter().any(|r| r.kind == KIND_LOCK_IMPORTER_DEP),
+            !entry
+                .wiring
+                .iter()
+                .any(|r| r.kind == KIND_LOCK_IMPORTER_DEP),
             "the half-shaped importer entry is silently skipped: {:?}",
             entry.wiring
         );
@@ -6372,8 +6405,16 @@ snapshots:
         let outcome = revert_pnpm(&entry, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
-        assert_eq!(fx.read(PNPM_LOCK).await, MULTI_BEFORE_LOCK, "lock byte-restored");
-        assert_eq!(fx.read(PACKAGE_JSON).await, P7_BEFORE_PKG, "pkg byte-restored");
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            MULTI_BEFORE_LOCK,
+            "lock byte-restored"
+        );
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            P7_BEFORE_PKG,
+            "pkg byte-restored"
+        );
         assert!(!uuid_dir(&fx).exists());
     }
 
@@ -6399,7 +6440,11 @@ snapshots:
             "pnpm-lock.yaml is missing; lock fragments cannot be restored",
         );
         assert!(!outcome.kept_artifact, "a missing lock is not a drift-keep");
-        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG, "pkg still restored");
+        assert_eq!(
+            fx.read(PACKAGE_JSON).await,
+            P1_BEFORE_PKG,
+            "pkg still restored"
+        );
         assert!(!fx.root().join(PNPM_LOCK).exists());
         assert!(!ws_exists(&fx).await, "created ws still deleted");
         assert!(!uuid_dir(&fx).exists(), "artifact removed");
@@ -6499,7 +6544,9 @@ snapshots:
         tokio::fs::write(root.join(PACKAGE_JSON), P1_BEFORE_PKG)
             .await
             .unwrap();
-        tokio::fs::create_dir(root.join(PNPM_WORKSPACE)).await.unwrap();
+        tokio::fs::create_dir(root.join(PNPM_WORKSPACE))
+            .await
+            .unwrap();
 
         let err = commit_surfaces(
             root,
@@ -6512,7 +6559,10 @@ snapshots:
         )
         .await
         .unwrap_err();
-        assert!(err.contains(&format!("cannot write {PNPM_WORKSPACE}")), "{err}");
+        assert!(
+            err.contains(&format!("cannot write {PNPM_WORKSPACE}")),
+            "{err}"
+        );
         assert!(err.contains("restored"), "{err}");
         assert_eq!(
             tokio::fs::read_to_string(root.join(PACKAGE_JSON))
@@ -7063,11 +7113,15 @@ snapshots:
             integrity: SPIKE_INTEGRITY,
             override_key: "left-pad@1.3.0",
         };
-        let mut lines = split_lines("lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n");
+        let mut lines =
+            split_lines("lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n");
         let before = lines.clone();
         let mut wiring = Vec::new();
         assert_eq!(edit_importers(&mut lines, &ctx, &mut wiring), Ok(false));
-        assert_eq!(edit_snapshot_rekey(&mut lines, &ctx, &mut wiring), Ok(false));
+        assert_eq!(
+            edit_snapshot_rekey(&mut lines, &ctx, &mut wiring),
+            Ok(false)
+        );
         assert_eq!(edit_snapshot_refs(&mut lines, &ctx, &mut wiring), Ok(false));
         assert_eq!(lines, before, "no-ops leave every byte alone");
         assert!(wiring.is_empty(), "{wiring:?}");
@@ -7075,7 +7129,10 @@ snapshots:
         // A snapshots section with only foreign entries: scanned, untouched.
         let mut lines = split_lines("lockfileVersion: '9.0'\n\nsnapshots:\n\n  other@1.0.0: {}\n");
         let before = lines.clone();
-        assert_eq!(edit_snapshot_rekey(&mut lines, &ctx, &mut wiring), Ok(false));
+        assert_eq!(
+            edit_snapshot_rekey(&mut lines, &ctx, &mut wiring),
+            Ok(false)
+        );
         assert_eq!(lines, before);
         assert!(wiring.is_empty(), "{wiring:?}");
 
@@ -7105,7 +7162,14 @@ snapshots:
         };
         let mut dirty = false;
         let mut warnings = Vec::new();
-        revert_importer_dep(&mut lines, &rec, ".|left-pad", UUID, &mut dirty, &mut warnings);
+        revert_importer_dep(
+            &mut lines,
+            &rec,
+            ".|left-pad",
+            UUID,
+            &mut dirty,
+            &mut warnings,
+        );
         assert!(!dirty);
         assert_warning(&warnings, "vendor_lock_entry_drifted", "no longer exists");
     }
@@ -7131,10 +7195,21 @@ snapshots:
         };
         let mut dirty = false;
         let mut warnings = Vec::new();
-        revert_importer_dep(&mut lines, &rec, ".|left-pad", UUID, &mut dirty, &mut warnings);
+        revert_importer_dep(
+            &mut lines,
+            &rec,
+            ".|left-pad",
+            UUID,
+            &mut dirty,
+            &mut warnings,
+        );
         assert!(!dirty);
         assert_eq!(lines, before, "left alone");
-        assert_warning(&warnings, "vendor_lock_entry_drifted", "original is malformed");
+        assert_warning(
+            &warnings,
+            "vendor_lock_entry_drifted",
+            "original is malformed",
+        );
     }
 
     /// A rekeyed block that vanished, where the recorded original ALSO
@@ -7142,9 +7217,8 @@ snapshots:
     /// silent return applies only when the original block is live verbatim.
     #[test]
     fn packages_block_revert_with_no_live_or_original_match_warns_vanished() {
-        let mut lines = split_lines(
-            "packages:\n\n  other@1.0.0:\n    resolution: {integrity: sha512-o}\n",
-        );
+        let mut lines =
+            split_lines("packages:\n\n  other@1.0.0:\n    resolution: {integrity: sha512-o}\n");
         let rec = WiringRecord {
             file: PNPM_LOCK.to_string(),
             kind: KIND_LOCK_PACKAGE.to_string(),
@@ -7210,8 +7284,15 @@ snapshots:
             .await
             .unwrap();
 
-        unwind_override_surfaces(root, None, b"never written", true, Some(b"original ws\n"), false)
-            .await;
+        unwind_override_surfaces(
+            root,
+            None,
+            b"never written",
+            true,
+            Some(b"original ws\n"),
+            false,
+        )
+        .await;
         assert_eq!(
             tokio::fs::read_to_string(root.join(PACKAGE_JSON))
                 .await

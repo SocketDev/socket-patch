@@ -14,13 +14,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{json, Value};
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 use socket_patch_cli::args::GlobalArgs;
 use socket_patch_cli::commands::vendor::{run as vendor_run, VendorArgs};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::vendor::state::VendorArtifact;
 use socket_patch_core::vendor::{save_state, VendorEntry, VendorState};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Canonical-grammar patch UUID (the vendor path layer validates it).
 const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";

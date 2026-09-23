@@ -8,8 +8,8 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
 use super::common::{
-    ensure_unchanged, item_get, lock_units_named, pep621_declared_names, record,
-    refuse_symlinked, revert_lock_fragment_splice_atomic, unit_has_canon_name,
+    ensure_unchanged, item_get, lock_units_named, pep621_declared_names, record, refuse_symlinked,
+    revert_lock_fragment_splice_atomic, unit_has_canon_name,
 };
 use super::path::parse_vendor_path;
 use super::state::{PoetryMeta, VendorEntry, WiringAction, WiringRecord};
@@ -942,14 +942,19 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
             Some("x".into()),
             "y".into(),
         ));
-        let outcome = revert_poetry(&entry_for(wiring.clone(), meta.clone()), tmp.path(), false).await;
+        let outcome =
+            revert_poetry(&entry_for(wiring.clone(), meta.clone()), tmp.path(), false).await;
         assert!(outcome.success);
         assert_eq!(outcome.warnings.len(), 2, "{:?}", outcome.warnings);
         assert!(outcome
             .warnings
             .iter()
             .all(|w| w.code == "vendor_lock_entry_drifted"));
-        assert_eq!(read_lock(tmp.path()).await, native, "known fragments restored");
+        assert_eq!(
+            read_lock(tmp.path()).await,
+            native,
+            "known fragments restored"
+        );
 
         // Re-wire, then drift one fragment: now the atomic write must hold.
         let project = load_poetry_project(tmp.path()).await.unwrap();
@@ -1804,14 +1809,7 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
 
         let p = load_poetry_project(&root).await.unwrap();
         let err = wire_poetry(
-            &p,
-            &root,
-            "six",
-            "1.16.0",
-            REL_WHEEL,
-            WHEEL_NAME,
-            WHEEL_SHA,
-            UUID,
+            &p, &root, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID,
         )
         .await
         .unwrap_err();

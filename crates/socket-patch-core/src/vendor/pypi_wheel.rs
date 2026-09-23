@@ -1239,7 +1239,10 @@ mod tests {
             record: vec![],
             wheel_tags: vec!["py3-none-any".into()],
         };
-        assert_eq!(wheel_file_name(&dist).unwrap(), "pkg-1!2.0-py3-none-any.whl");
+        assert_eq!(
+            wheel_file_name(&dist).unwrap(),
+            "pkg-1!2.0-py3-none-any.whl"
+        );
     }
 
     /// `mkfifo(2)` directly instead of shelling out to the binary — the

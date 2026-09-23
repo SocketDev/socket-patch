@@ -2964,7 +2964,11 @@ packages:
             fx.root().join(fx.rel_tgz()).exists(),
             "the CRLF lock still resolves through the tarball; deleting it bricks installs"
         );
-        assert_eq!(fx.read(PNPM_LOCK).await, crlf, "the drifted lock is left alone");
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            crlf,
+            "the drifted lock is left alone"
+        );
     }
 
     /// LIVENESS CONTRACT ([`RevertOutcome::drift_skipped`]): a pair already
@@ -3334,7 +3338,9 @@ packages:
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "the wiring itself succeeds");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_dep_manifest_stale"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_dep_manifest_stale"),
             "{warnings:?}"
         );
     }
@@ -3598,7 +3604,10 @@ packages:
             let entry = entry.unwrap();
             let after = fx.read(PNPM_LOCK).await;
 
-            assert!(after.contains(untouched), "{tag}: root dep untouched:\n{after}");
+            assert!(
+                after.contains(untouched),
+                "{tag}: root dep untouched:\n{after}"
+            );
             assert!(
                 !after.contains(&fx.canon_root_str()),
                 "{tag}: no machine path may be written:\n{after}"
@@ -3710,7 +3719,8 @@ packages:
         let ours_block = format!(
             "  file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz:\n    resolution: {{integrity: {SPIKE_INTEGRITY}, tarball: file:.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz}}\n    name: left-pad\n    version: 1.3.0\n    dev: false\n\n"
         );
-        let both = T7_BEFORE_LOCK.replace("  file:consumer:", &format!("{ours_block}  file:consumer:"));
+        let both =
+            T7_BEFORE_LOCK.replace("  file:consumer:", &format!("{ours_block}  file:consumer:"));
         assert_ne!(both, T7_BEFORE_LOCK);
         // (b) the registry entry has no resolution: line.
         let no_resolution = T7_BEFORE_LOCK.replace(
@@ -3802,7 +3812,11 @@ packages:
             outcome.warnings
         );
         assert!(!outcome.kept_artifact);
-        assert_eq!(fx.read(PNPM_LOCK).await, T7_BEFORE_LOCK, "lock byte-restored");
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            T7_BEFORE_LOCK,
+            "lock byte-restored"
+        );
         assert_eq!(fx.read(PACKAGE_JSON).await, T_BEFORE_PKG);
         assert!(
             !fx.root()
@@ -3837,7 +3851,11 @@ packages:
             "foreign ours values are not drift: {:?}",
             outcome.warnings
         );
-        assert_eq!(fx.read(PNPM_LOCK).await, T8_BEFORE_LOCK, "lock byte-restored");
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            T8_BEFORE_LOCK,
+            "lock byte-restored"
+        );
         assert_eq!(fx.read(PACKAGE_JSON).await, T_BEFORE_PKG);
     }
 
@@ -3879,7 +3897,13 @@ packages:
         tokio::fs::write(fx.root().join(PNPM_LOCK), &tampered)
             .await
             .unwrap();
-        assert_drift_keep(&fx, &entry, "specifiers entry `left-pad` no longer exists", 1).await;
+        assert_drift_keep(
+            &fx,
+            &entry,
+            "specifiers entry `left-pad` no longer exists",
+            1,
+        )
+        .await;
         rewire(&fx, &wired_pkg, &wired).await;
 
         // (c) the consumer's dep ref re-resolved.
@@ -4129,13 +4153,19 @@ packages:
         let outcome = revert_pnpm_legacy(&misflavored, fx.root(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(
-            outcome.warnings.iter().any(|w| w.code == "vendor_lock_entry_drifted"
-                && w.detail.contains("non-allowlisted")
-                && w.detail.contains("pnpm-workspace.yaml")),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"
+                    && w.detail.contains("non-allowlisted")
+                    && w.detail.contains("pnpm-workspace.yaml")),
             "{:?}",
             outcome.warnings
         );
-        assert!(outcome.kept_artifact, "an allowlist skip keeps the artifact");
+        assert!(
+            outcome.kept_artifact,
+            "an allowlist skip keeps the artifact"
+        );
         assert!(
             !fx.root().join("pnpm-workspace.yaml").exists(),
             "the non-allowlisted file is never written"
@@ -4202,11 +4232,10 @@ packages:
             T7_BEFORE_LOCK,
             "the lock is still restored"
         );
-        assert!(
-            !fx.root()
-                .join(format!(".socket/vendor/npm/{UUID}"))
-                .exists()
-        );
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
 
         // (c) non-object package.json: hard failure, nothing written.
         let (fx, entry) = vendored(T7_BEFORE_LOCK).await;
@@ -4215,7 +4244,10 @@ packages:
             .await
             .unwrap();
         let outcome = revert_pnpm_legacy(&entry, fx.root(), false).await;
-        assert!(!outcome.success, "a broken package.json must fail the revert");
+        assert!(
+            !outcome.success,
+            "a broken package.json must fail the revert"
+        );
         assert!(
             outcome
                 .error
@@ -4472,7 +4504,9 @@ packages:
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "the wiring itself succeeded");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "{warnings:?}"
         );
         assert_eq!(fx.read(PACKAGE_JSON).await, T_AFTER_PKG);
@@ -4674,8 +4708,7 @@ packages:
         assert!(err.contains("vanished mid-rewrite"), "{err}");
         assert!(wiring.is_empty(), "a failed edit records no wiring");
 
-        let mut lines =
-            split_lines("lockfileVersion: 5.4\n\ndependencies:\n  left-pad: 1.3.0\n");
+        let mut lines = split_lines("lockfileVersion: 5.4\n\ndependencies:\n  left-pad: 1.3.0\n");
         assert_eq!(edit_pkg_dep_refs(&mut lines, &ctx, &mut wiring), Ok(false));
         assert!(wiring.is_empty());
     }

@@ -1,7 +1,7 @@
 //! The Bun vendored-mode preflight shared by EVERY path that feeds the
-//! vendor engine: `scan --mode vendored` (the manifest-tracked AND the
-//! `--detached` download phases), `get … --mode vendored` (search and uuid
-//! paths), their `--dry-run` previews, and the `vendor` command's engine
+//! vendor engine: `scan --mode vendored` (its in-memory download phase;
+//! the hidden `--detached` flag is a no-op), `get … --mode vendored`
+//! (search and uuid paths), their `--dry-run` previews, and the `vendor` command's engine
 //! loop itself ([`crate::commands::vendor::vendor_records`], where it runs
 //! BEFORE the hosted→vendored takeover reverts anything).
 //!

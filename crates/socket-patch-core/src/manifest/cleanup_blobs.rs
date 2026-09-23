@@ -436,12 +436,19 @@ mod tests {
 
         let result = result.expect("unlink failures do not fail the pass");
         assert_eq!(result.blobs_checked, 2, "both orphans were considered");
-        assert_eq!(result.blobs_removed, 0, "a failed unlink is not counted as removed");
+        assert_eq!(
+            result.blobs_removed, 0,
+            "a failed unlink is not counted as removed"
+        );
         assert_eq!(result.bytes_freed, 0);
         assert!(result.removed_blobs.is_empty());
         let mut failed = result.failed.clone();
         failed.sort();
-        assert_eq!(failed.len(), 2, "every failed unlink is recorded: {failed:?}");
+        assert_eq!(
+            failed.len(),
+            2,
+            "every failed unlink is recorded: {failed:?}"
+        );
         let mut expected = [ORPHAN_HASH, BEFORE_HASH_1];
         expected.sort();
         for (entry, name) in failed.iter().zip(expected) {

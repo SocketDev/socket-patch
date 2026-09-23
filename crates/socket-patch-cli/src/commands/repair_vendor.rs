@@ -168,8 +168,7 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
     // would delete the include-referenced wheel). An unreadable include
     // tree degrades to the root file, matching the per-file tolerance
     // below.
-    if let Ok(includes) =
-        socket_patch_core::vendor::requirements_include_names(project_root).await
+    if let Ok(includes) = socket_patch_core::vendor::requirements_include_names(project_root).await
     {
         files.extend(includes);
     }
@@ -282,9 +281,7 @@ async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> 
     }
     let needle = format!(".socket/vendor/npm/{uuid}/");
     let read = |name: &'static str| async move {
-        read_regular_to_string(&project_root.join(name))
-            .await
-            .ok()
+        read_regular_to_string(&project_root.join(name)).await.ok()
     };
     if read("bun.lock").await.is_some_and(|t| t.contains(&needle)) {
         return Some("bun".to_string());
@@ -1778,7 +1775,11 @@ mod tests {
         let fifos = ["tool.py", "bun.lock"];
         for name in fifos {
             let c = std::ffi::CString::new(root.join(name).to_str().unwrap()).unwrap();
-            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0, "mkfifo {name}");
+            assert_eq!(
+                unsafe { libc::mkfifo(c.as_ptr(), 0o644) },
+                0,
+                "mkfifo {name}"
+            );
         }
         // Release valve: if a read DID wedge in open(2), connecting a
         // writer lets the blocking thread finish so the runtime can shut
@@ -1828,7 +1829,9 @@ mod tests {
         tokio::fs::write(root.join("requirements.txt"), "-r requirements/base.txt\n")
             .await
             .unwrap();
-        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        tokio::fs::create_dir(root.join("requirements"))
+            .await
+            .unwrap();
         tokio::fs::write(
             root.join("requirements/base.txt"),
             format!(

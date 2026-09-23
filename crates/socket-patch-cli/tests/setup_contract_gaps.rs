@@ -376,11 +376,13 @@ fn setup_check_flags_tampered_detached_vendored_artifact_without_manifest() {
     );
     assert_eq!(v["status"], "needs_configuration", "stdout=\n{stdout}");
     assert!(
-        v["files"].as_array().is_some_and(|files| files.iter().any(|f| {
-            f["kind"] == "patch"
-                && f["path"] == "pkg:npm/vendpkg@1.0.0"
-                && f["status"] == "needs_configuration"
-        })),
+        v["files"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|f| {
+                f["kind"] == "patch"
+                    && f["path"] == "pkg:npm/vendpkg@1.0.0"
+                    && f["status"] == "needs_configuration"
+            })),
         "the drifted vendored purl must be named as a `patch` entry; stdout=\n{stdout}"
     );
 }

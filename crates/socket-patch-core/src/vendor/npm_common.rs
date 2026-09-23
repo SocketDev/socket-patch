@@ -791,9 +791,8 @@ mod tests {
     /// pruned.
     #[test]
     fn declares_bundled_deps_matches_npm_value_shapes() {
-        let with = |key: &str, v: serde_json::Value| {
-            declares_bundled_deps(&serde_json::json!({ key: v }))
-        };
+        let with =
+            |key: &str, v: serde_json::Value| declares_bundled_deps(&serde_json::json!({ key: v }));
         for key in ["bundleDependencies", "bundledDependencies"] {
             assert!(with(key, serde_json::json!(true)), "{key}: true = all deps");
             assert!(!with(key, serde_json::json!(false)), "{key}: false");
@@ -1274,7 +1273,8 @@ mod tests {
     async fn service_bytes_integrity_string_guard_fires_before_any_write() {
         let tmp = tempfile::tempdir().unwrap();
         let record = record_with_uuid(UUID);
-        let err = expect_err(service_bytes(tmp.path(), &record, b"tarball bytes", "sha512-AAAA").await);
+        let err =
+            expect_err(service_bytes(tmp.path(), &record, b"tarball bytes", "sha512-AAAA").await);
         let error = expect_done_failure(err, "disagrees with the service integrity sha512-AAAA");
         assert!(error.contains("recomputed integrity"), "{error}");
         assert!(
@@ -1455,8 +1455,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome =
-            done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
+        let outcome = done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
         expect_done_error(outcome, "boom");
         assert!(!failed_dir.exists(), "the failed artifact dir is removed");
         assert!(
@@ -1480,8 +1479,7 @@ mod tests {
             .await
             .unwrap();
 
-        let outcome =
-            done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
+        let outcome = done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, false).await;
         expect_done_error(outcome, "boom");
         assert!(
             !root.join(".socket/vendor").exists(),
@@ -1510,7 +1508,9 @@ mod tests {
         let outcome = done_failure_unstage(LP_PURL, "boom".to_string(), root, &rel, true).await;
         expect_done_error(outcome, "boom");
         assert_eq!(
-            tokio::fs::read(dir.join("left-pad-1.3.0.tgz")).await.unwrap(),
+            tokio::fs::read(dir.join("left-pad-1.3.0.tgz"))
+                .await
+                .unwrap(),
             b"live artifact",
             "a pre-existing (possibly live) artifact dir survives untouched"
         );

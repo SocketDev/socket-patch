@@ -92,8 +92,8 @@ pub async fn run(args: RepairArgs) -> i32 {
             .join(socket_patch_core::vendor::VENDOR_STATE_REL);
         let mut has_vendor_traces = tokio::fs::metadata(&state_file).await.is_ok();
         if !has_vendor_traces {
-            let refs = crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd)
-                .await;
+            let refs =
+                crate::commands::repair_vendor::scan_vendor_references(&args.common.cwd).await;
             has_vendor_traces = !refs.is_empty();
             vendor_references = Some(refs);
         }
@@ -371,9 +371,10 @@ async fn repair_inner(
             let client = match api_client {
                 Some(c) => c,
                 None => {
-                    built_client = get_api_client_with_overrides(args.common.api_client_overrides())
-                        .await
-                        .0;
+                    built_client =
+                        get_api_client_with_overrides(args.common.api_client_overrides())
+                            .await
+                            .0;
                     &built_client
                 }
             };
@@ -455,7 +456,8 @@ async fn repair_inner(
                     eprintln!("Warning: {detail}");
                 }
                 env.record(
-                    PatchEvent::artifact(PatchAction::Skipped).with_reason("cleanup_failed", detail),
+                    PatchEvent::artifact(PatchAction::Skipped)
+                        .with_reason("cleanup_failed", detail),
                 );
             }
             let Ok(cleanup_result) = result else {

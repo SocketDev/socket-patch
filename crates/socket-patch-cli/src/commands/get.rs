@@ -2187,7 +2187,8 @@ pub async fn run(args: GetArgs) -> i32 {
             if !quiet {
                 println!("Enumerating packages...");
             }
-            let (all_packages, _, _) = crawl_all_ecosystems(&crawler_options_for(&args.common)).await;
+            let (all_packages, _, _) =
+                crawl_all_ecosystems(&crawler_options_for(&args.common)).await;
 
             if all_packages.is_empty() {
                 if args.common.json {

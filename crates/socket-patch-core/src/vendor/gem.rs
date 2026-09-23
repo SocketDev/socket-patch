@@ -329,8 +329,7 @@ pub async fn vendor_gem(
             // stub) instead of the silent `already_vendored` no-op. The stub
             // read runs second so a hash mismatch short-circuits it.
             let copy_ok = copy_matches_after_hashes(&copy_dir, &record.files).await
-                && match read_regular_to_string(&copy_dir.join(format!("{name}.gemspec"))).await
-                {
+                && match read_regular_to_string(&copy_dir.join(format!("{name}.gemspec"))).await {
                     Ok(text) => gemspec_missing_required_attrs(&text).is_empty(),
                     Err(_) => false,
                 };
@@ -1083,8 +1082,7 @@ async fn materialise_patched_copy(
             }
             // The stage is freshly created and not yet referenced by
             // anything, so a plain write suffices for the gemspec.
-            if let Err(e) =
-                tokio::fs::write(stage.join(format!("{name}.gemspec")), spec_text).await
+            if let Err(e) = tokio::fs::write(stage.join(format!("{name}.gemspec")), spec_text).await
             {
                 cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
                 return Ok(synthesized_result(
@@ -1111,8 +1109,7 @@ async fn materialise_patched_copy(
             if let Err(e) = swap_stage_into_place(&stage, copy_dir).await {
                 cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
                 result.success = false;
-                result.error =
-                    Some(format!("failed to move the rebuilt copy into place: {e}"));
+                result.error = Some(format!("failed to move the rebuilt copy into place: {e}"));
                 return Ok(result);
             }
             Ok(result)
@@ -2257,9 +2254,7 @@ async fn revert_gemfile_record(
 ) -> Result<RecordRevert, String> {
     let text = match read_regular_to_string(gemfile_path).await {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(RecordRevert::FileMissing)
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RecordRevert::FileMissing),
         Err(e) => return Err(format!("unreadable Gemfile: {e}")),
     };
     let Some(written) = w.new.as_ref().and_then(Value::as_str) else {
@@ -2319,20 +2314,20 @@ async fn revert_lock_record(
     };
     let text = match read_regular_to_string(lock_path).await {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(RecordRevert::FileMissing)
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RecordRevert::FileMissing),
         Err(e) => return Err(format!("unreadable Gemfile.lock: {e}")),
     };
     let Some(restored) = revert_lock_text(&text, &original_lines, &new_lines) else {
         // ALREADY CONVERGED: our PATH section is gone and every pre-vendor
         // spec line is back in GEM/specs (a `bundle update` regeneration or
         // an earlier partial revert) — not drift, nothing to write.
-        return Ok(if lock_record_converged(&text, &original_lines, &new_lines) {
-            RecordRevert::Done
-        } else {
-            RecordRevert::Drifted
-        });
+        return Ok(
+            if lock_record_converged(&text, &original_lines, &new_lines) {
+                RecordRevert::Done
+            } else {
+                RecordRevert::Drifted
+            },
+        );
     };
     if !dry_run {
         atomic_write_bytes_preserving_mode(lock_path, restored.as_bytes())
@@ -2395,9 +2390,7 @@ async fn revert_lock_checksum_record(
     };
     let text = match read_regular_to_string(lock_path).await {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(RecordRevert::FileMissing)
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RecordRevert::FileMissing),
         Err(e) => return Err(format!("unreadable Gemfile.lock: {e}")),
     };
     let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
@@ -2688,10 +2681,10 @@ fn gemspec_missing_required_attrs(spec_text: &str) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vendor::common::{backup_dir_for, swap_sibling_for};
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::VerifyStatus;
+    use crate::vendor::common::{backup_dir_for, swap_sibling_for};
     use crate::vendor::state::VENDOR_MARKER_FILE;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -5266,8 +5259,7 @@ mod tests {
 
         let empty = root.join(".socket/empty-blobs");
         tokio::fs::create_dir_all(&empty).await.unwrap();
-        let (r2, e2, _) =
-            unwrap_done(run_vendor(&root, &empty, &installed, &record, false).await);
+        let (r2, e2, _) = unwrap_done(run_vendor(&root, &empty, &installed, &record, false).await);
         assert!(!r2.success, "rebuild must fail without patch content");
         assert!(e2.is_none());
 
@@ -6030,7 +6022,10 @@ mod tests {
         assert_eq!(code, "unsafe_coordinates");
         assert!(detail.contains("unsafe gem coordinates"), "{detail}");
 
-        assert!(!root.join(".socket").exists(), "refusals must write nothing");
+        assert!(
+            !root.join(".socket").exists(),
+            "refusals must write nothing"
+        );
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
             GEMFILE_DIRECT
@@ -6316,7 +6311,9 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "a marker failure must not drop the entry");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "{warnings:?}"
         );
         // The pair edit went through normally.
@@ -6476,8 +6473,7 @@ mod tests {
             gem_service_cfg("http://127.0.0.1:1", VendorSource::Build, false),
             gem_service_cfg("http://127.0.0.1:1", VendorSource::Auto, true),
         ] {
-            let (_tmp, root, installed, blobs, record) =
-                fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+            let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
             let (result, entry, warnings) =
                 unwrap_done(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
             assert!(result.success, "{:?}: {:?}", cfg.source, result.error);
@@ -6693,10 +6689,7 @@ mod tests {
         let (code, detail) =
             unwrap_refused(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
         assert_eq!(code, "vendor_prebuilt_write_failed");
-        assert!(
-            detail.contains("cannot write the stub gemspec"),
-            "{detail}"
-        );
+        assert!(detail.contains("cannot write the stub gemspec"), "{detail}");
         assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
         assert_eq!(
             tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
@@ -7045,9 +7038,18 @@ mod tests {
         }
         let cases: [(&str, fn(&mut VendorEntry)); 5] = [
             ("gemfile record without `new`", t_gemfile_new_none),
-            ("rewritten gemfile record without `original`", t_gemfile_original_none),
-            ("lock record with non-array `original`", t_lock_original_not_array),
-            ("lock record whose `new` lost its remote line", t_lock_new_remote_tampered),
+            (
+                "rewritten gemfile record without `original`",
+                t_gemfile_original_none,
+            ),
+            (
+                "lock record with non-array `original`",
+                t_lock_original_not_array,
+            ),
+            (
+                "lock record whose `new` lost its remote line",
+                t_lock_new_remote_tampered,
+            ),
             ("checksum record without `new`", t_checksum_new_none),
         ];
         for (label, tamper) in cases {
@@ -7502,8 +7504,13 @@ mod tests {
             Some("gem \"rack\", \"3.2.6\"")
         );
         assert_eq!(
-            devendored_gem_line(&format!("{with_path}, require: false"), "rack", "3.2.6", &rel)
-                .as_deref(),
+            devendored_gem_line(
+                &format!("{with_path}, require: false"),
+                "rack",
+                "3.2.6",
+                &rel
+            )
+            .as_deref(),
             Some("gem \"rack\", \"3.2.6\", require: false")
         );
         assert_eq!(
@@ -7512,7 +7519,12 @@ mod tests {
             "trailing `, ` (empty opts) is fail-closed"
         );
         assert_eq!(
-            devendored_gem_line(&format!("{with_path}, source: \"x\""), "rack", "3.2.6", &rel),
+            devendored_gem_line(
+                &format!("{with_path}, source: \"x\""),
+                "rack",
+                "3.2.6",
+                &rel
+            ),
             None,
             "a source-selecting trailing option is fail-closed"
         );

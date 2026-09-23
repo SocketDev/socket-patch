@@ -419,9 +419,10 @@ pub async fn harvest_artifact_blobs_from(
             // off the async thread like `verify` does, so a large committed
             // artifact never stalls the runtime.
             let tgz = artifact.clone();
-            let read =
-                tokio::task::spawn_blocking(move || crate::patch::package::read_archive_to_map(&tgz))
-                    .await;
+            let read = tokio::task::spawn_blocking(move || {
+                crate::patch::package::read_archive_to_map(&tgz)
+            })
+            .await;
             if let Ok(Ok(map)) = read {
                 for bytes in map.into_values() {
                     let h = compute_git_sha256_from_bytes(&bytes);
@@ -1372,7 +1373,9 @@ mod harvest_tests {
         let (k, r) = record(purl, UUID, "lib/__init__.py", PATCHED);
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "a corrupt zip-shaped artifact contributes nothing"
         );
     }
@@ -1414,7 +1417,9 @@ mod harvest_tests {
         let (k, r) = record("pkg:npm/left-pad@1.3.0", UUID, "package/index.js", PATCHED);
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "an un-vendored record must not harvest another package's artifact"
         );
     }
@@ -1433,7 +1438,9 @@ mod harvest_tests {
         let (k, r) = record(purl, UUID, "package/index.js", PATCHED);
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "an unreadable ledger contributes nothing"
         );
     }
@@ -1452,7 +1459,9 @@ mod harvest_tests {
         r.files.get_mut("package/index.js").unwrap().after_hash = String::new();
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "a deletion-only record needs no blobs, even with a readable artifact"
         );
     }
@@ -1503,16 +1512,14 @@ mod harvest_tests {
         std::fs::create_dir_all(tmp.path().join(&rel)).unwrap();
         write_ledger(tmp.path(), purl, UUID, &rel);
         // <artifact>/../../outside.rs resolves here:
-        std::fs::write(
-            tmp.path().join(".socket/vendor/cargo/outside.rs"),
-            PATCHED,
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join(".socket/vendor/cargo/outside.rs"), PATCHED).unwrap();
 
         let (k, r) = record(purl, UUID, "../../outside.rs", PATCHED);
         let patches = HashMap::from([(k, r)]);
         assert!(
-            harvest_artifact_blobs(tmp.path(), &patches).await.is_empty(),
+            harvest_artifact_blobs(tmp.path(), &patches)
+                .await
+                .is_empty(),
             "an escaping record key must never be resolved against the artifact dir"
         );
     }
@@ -1681,10 +1688,7 @@ mod berry_migration_risk_tests {
     /// `open(2)` forever — and the probe runs unconditionally at
     /// envelope-finalize time on EVERY vendor / scan --vendor run.
     #[cfg(unix)]
-    fn probe_with_timeout(
-        root: &Path,
-        fifo: &Path,
-    ) -> Option<VendorWarning> {
+    fn probe_with_timeout(root: &Path, fifo: &Path) -> Option<VendorWarning> {
         let root = root.to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {

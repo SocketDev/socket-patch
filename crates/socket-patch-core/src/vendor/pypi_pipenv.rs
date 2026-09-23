@@ -176,12 +176,18 @@ pub(super) fn check_target_guards(
                 Some(parts) if parts.eco == "pypi" && parts.uuid == record_uuid => {
                     let filename = file_ref.rsplit('/').next().unwrap_or("");
                     let mut fields = filename.split('-');
-                    let matches_identity = fields.next().is_some_and(|name| canonicalize_pypi_name(name) == canon_name) && fields.next() == Some(version);
-                    let conflicting_source = NON_REGISTRY_KEYS.iter().filter(|key| **key != "path").any(|key| obj.contains_key(*key))
+                    let matches_identity = fields
+                        .next()
+                        .is_some_and(|name| canonicalize_pypi_name(name) == canon_name)
+                        && fields.next() == Some(version);
+                    let conflicting_source = NON_REGISTRY_KEYS
+                        .iter()
+                        .filter(|key| **key != "path")
+                        .any(|key| obj.contains_key(*key))
                         || (obj.contains_key("file") && obj.contains_key("path"))
-                        || obj.contains_key("version") || obj.contains_key("index");
-                    if matches_identity && !conflicting_source
-                    {
+                        || obj.contains_key("version")
+                        || obj.contains_key("index");
+                    if matches_identity && !conflicting_source {
                         continue;
                     }
                     return Err((
@@ -1222,8 +1228,7 @@ mod tests {
         mkfifo(&fifo);
 
         // Load must refuse fast.
-        let Ok(res) = tokio::time::timeout(deadline, load_pipenv_project(tmp.path())).await
-        else {
+        let Ok(res) = tokio::time::timeout(deadline, load_pipenv_project(tmp.path())).await else {
             let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
             panic!("load_pipenv_project must complete promptly with a FIFO Pipfile.lock");
         };
@@ -1253,7 +1258,11 @@ mod tests {
         };
         assert!(!outcome.success, "FIFO lock must fail the revert");
         assert!(
-            outcome.error.as_deref().unwrap_or("").contains("cannot read"),
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot read"),
             "{:?}",
             outcome.error
         );

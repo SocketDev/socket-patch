@@ -954,7 +954,8 @@ mod tests {
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-manifest")]);
         let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-ledger")]);
         let vendor = vendor_ledger_with(&[("pkg:npm/foo@1.0", "uuid-vendor", true)]);
-        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor));
+        let merged =
+            merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor));
         let pkgs = vec![batch_with("pkg:npm/foo@1.0", &["uuid-new"])];
         let updates = detect_updates(merged.as_deref(), &pkgs);
         assert_eq!(updates.len(), 1);
@@ -973,7 +974,8 @@ mod tests {
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-f1")]);
         let ledger = ledger_with(&[("pkg:npm/bar@2.0", "uuid-b1")]);
         let vendor = vendor_ledger_with(&[("pkg:npm/baz@3.0", "uuid-z1", true)]);
-        let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor));
+        let merged =
+            merge_ledger_records_for_updates(Some(&manifest), Some(&ledger), Some(&vendor));
         let pkgs = vec![
             batch_with("pkg:npm/foo@1.0", &["uuid-f2"]),
             batch_with("pkg:npm/bar@2.0", &["uuid-b2"]),
@@ -992,7 +994,9 @@ mod tests {
         assert!(merge_ledger_records_for_updates(None, None, None).is_none());
         let empty = socket_patch_core::patch::redirect::RedirectState::new();
         let empty_vendor = VendorState::new();
-        assert!(merge_ledger_records_for_updates(None, Some(&empty), Some(&empty_vendor)).is_none());
+        assert!(
+            merge_ledger_records_for_updates(None, Some(&empty), Some(&empty_vendor)).is_none()
+        );
         let manifest =
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-a")]);
         let merged = merge_ledger_records_for_updates(Some(&manifest), Some(&empty), None)
@@ -1196,7 +1200,8 @@ mod tests {
         std::fs::write(uuid_dir.join("left-pad-1.3.0.tgz"), b"tgz").unwrap();
         std::fs::create_dir_all(tmp.path().join(".socket/vendor/npm/not-a-uuid")).unwrap();
         std::fs::write(
-            tmp.path().join(".socket/vendor/npm/not-a-uuid/ghost-9.9.9.tgz"),
+            tmp.path()
+                .join(".socket/vendor/npm/not-a-uuid/ghost-9.9.9.tgz"),
             b"tgz",
         )
         .unwrap();
@@ -1484,8 +1489,8 @@ mod tests {
         use wiremock::matchers::{method, path as wm_path};
         wiremock::Mock::given(method("GET"))
             .and(wm_path(format!("/patch/view/{uuid}")))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "uuid": uuid,
                     "purl": "pkg:npm/newfile@1.0.0",
                     "publishedAt": "2026-01-01T00:00:00Z",
@@ -1494,8 +1499,8 @@ mod tests {
                     "description": "",
                     "license": "MIT",
                     "tier": "free",
-                }),
-            ))
+                })),
+            )
             .mount(mock)
             .await;
     }
@@ -1555,7 +1560,11 @@ mod tests {
         let (mismatched, views) =
             preverify_vendor_baselines(&client, &selected, &crawled, &HashSet::new()).await;
         assert!(mismatched.is_empty());
-        assert_eq!(mock.received_requests().await.unwrap().len(), 1, "it did try");
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            1,
+            "it did try"
+        );
         assert!(views.is_empty(), "a 404'd view must not be cached");
     }
 

@@ -869,7 +869,10 @@ mod tests {
         let cfg = common_with_source("service").vendor_service_config(None, true);
         assert_eq!(cfg.source, VendorSource::Service);
         assert!(cfg.source.requires_service());
-        assert!(cfg.use_public_proxy, "the proxy-fallback state threads through");
+        assert!(
+            cfg.use_public_proxy,
+            "the proxy-fallback state threads through"
+        );
 
         let cfg = common_with_source("build").vendor_service_config(None, false);
         assert_eq!(cfg.source, VendorSource::Build);

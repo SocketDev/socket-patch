@@ -2809,7 +2809,10 @@ mod gc_tests {
             .unwrap();
 
         let out = run_vendor_gc(&common, &manifest_path, false).await;
-        let (code, message) = out.skipped.as_ref().expect("the I/O fault is the skip reason");
+        let (code, message) = out
+            .skipped
+            .as_ref()
+            .expect("the I/O fault is the skip reason");
         assert_eq!(*code, "lock_io", "{out:?}");
         assert!(
             message.contains("apply.lock"),
@@ -3192,7 +3195,9 @@ mod gc_tests {
         tokio::fs::write(root.join("requirements.txt"), "-r requirements/base.txt\n")
             .await
             .unwrap();
-        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        tokio::fs::create_dir(root.join("requirements"))
+            .await
+            .unwrap();
         tokio::fs::write(
             root.join("requirements/base.txt"),
             format!(
@@ -3320,7 +3325,11 @@ mod gc_tests {
         // reclaims normally.
         let locked = run_vendor_gc_locked(&common, &manifest_path, false).await;
         assert!(locked.skipped.is_none(), "{locked:?}");
-        assert_eq!(locked.dropped_reverted, vec![PURL.to_string()], "{locked:?}");
+        assert_eq!(
+            locked.dropped_reverted,
+            vec![PURL.to_string()],
+            "{locked:?}"
+        );
         assert!(
             !load_state(tmp.path())
                 .await

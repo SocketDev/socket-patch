@@ -911,7 +911,9 @@ mod tests {
     async fn requirements_include_names_walks_in_root_includes() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        tokio::fs::create_dir(root.join("requirements")).await.unwrap();
+        tokio::fs::create_dir(root.join("requirements"))
+            .await
+            .unwrap();
         tokio::fs::write(
             root.join("requirements.txt"),
             "-r requirements/base.txt\n-c constraints.txt\n-r ../shared.txt\n",
@@ -956,10 +958,8 @@ mod tests {
             tokio::fs::remove_file(root.join("requirements/dev.txt"))
                 .await
                 .unwrap();
-            let fifo = std::ffi::CString::new(
-                root.join("requirements/dev.txt").to_str().unwrap(),
-            )
-            .unwrap();
+            let fifo = std::ffi::CString::new(root.join("requirements/dev.txt").to_str().unwrap())
+                .unwrap();
             assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
             let err = requirements_include_names(root)
                 .await
@@ -1544,7 +1544,10 @@ mod tests {
             WiringAction::Rewritten,
             "the BOM'd pin must be rewritten in place, not duplicated"
         );
-        assert_eq!(read_root(tmp.path()).await, format!("{}\n", expected_line()));
+        assert_eq!(
+            read_root(tmp.path()).await,
+            format!("{}\n", expected_line())
+        );
 
         // The BOM travels inside the replaced physical line's record, so
         // the revert is byte-identical.
@@ -1668,7 +1671,11 @@ mod tests {
         };
         assert!(!outcome.success, "FIFO requirements must fail the revert");
         assert!(
-            outcome.error.as_deref().unwrap_or("").contains("cannot read"),
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot read"),
             "{:?}",
             outcome.error
         );
@@ -2172,10 +2179,16 @@ mod tests {
             "{:?}",
             outcome.error
         );
-        assert!(std::fs::symlink_metadata(tmp.path().join("requirements.txt"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(read_root(tmp.path()).await, wired, "the link target is untouched");
+        assert!(
+            std::fs::symlink_metadata(tmp.path().join("requirements.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            read_root(tmp.path()).await,
+            wired,
+            "the link target is untouched"
+        );
     }
 }

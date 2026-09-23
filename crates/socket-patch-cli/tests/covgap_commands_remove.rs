@@ -254,7 +254,8 @@ fn remove_lock_held_returned_then_proceeds_after_release() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_lock__@1.0.0";
-    let socket = write_manifest_files_empty(tmp.path(), purl, "11111111-1111-4111-8111-111111111111");
+    let socket =
+        write_manifest_files_empty(tmp.path(), purl, "11111111-1111-4111-8111-111111111111");
     let manifest_before = read_bytes(&socket.join("manifest.json"));
 
     // Take an exclusive flock on the binary's lock path (the
@@ -271,8 +272,11 @@ fn remove_lock_held_returned_then_proceeds_after_release() {
         .try_lock_exclusive()
         .expect("test could not take initial lock");
 
-    let (code, stdout, stderr) =
-        run_remove(tmp.path(), &[purl, "--json", "--yes", "--skip-rollback"], &[]);
+    let (code, stdout, stderr) = run_remove(
+        tmp.path(),
+        &[purl, "--json", "--yes", "--skip-rollback"],
+        &[],
+    );
     assert_eq!(
         code, 1,
         "remove under contention must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
@@ -282,8 +286,7 @@ fn remove_lock_held_returned_then_proceeds_after_release() {
     assert_eq!(v["status"], "error");
     assert_eq!(v["error"]["code"], "lock_held", "envelope={v}");
     assert_eq!(
-        v["error"]["message"],
-        "another socket-patch process is operating in this directory",
+        v["error"]["message"], "another socket-patch process is operating in this directory",
         "lock_held message must be the stable contention string; envelope={v}"
     );
     assert_eq!(
@@ -299,8 +302,11 @@ fn remove_lock_held_returned_then_proceeds_after_release() {
 
     // Release and re-run: the removal must now proceed.
     drop(lock_file);
-    let (code2, stdout2, stderr2) =
-        run_remove(tmp.path(), &[purl, "--json", "--yes", "--skip-rollback"], &[]);
+    let (code2, stdout2, stderr2) = run_remove(
+        tmp.path(),
+        &[purl, "--json", "--yes", "--skip-rollback"],
+        &[],
+    );
     assert_eq!(code2, 0, "stdout=\n{stdout2}\nstderr=\n{stderr2}");
     let v2 = parse_envelope(&stdout2);
     assert_eq!(v2["status"], "success");
@@ -323,7 +329,8 @@ fn remove_lock_held_returned_then_proceeds_after_release() {
 fn remove_corrupt_vendor_ledger_fails_closed_json() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_vsl__@1.0.0";
-    let socket = write_manifest_files_empty(tmp.path(), purl, "22222222-2222-4222-8222-222222222222");
+    let socket =
+        write_manifest_files_empty(tmp.path(), purl, "22222222-2222-4222-8222-222222222222");
     let manifest_before = read_bytes(&socket.join("manifest.json"));
     let vendor = socket.join("vendor");
     std::fs::create_dir_all(&vendor).unwrap();
@@ -337,7 +344,10 @@ fn remove_corrupt_vendor_ledger_fails_closed_json() {
     );
     let v = parse_envelope(&stdout);
     assert_eq!(v["status"], "error");
-    assert_eq!(v["error"]["code"], "vendor_state_unreadable", "envelope={v}");
+    assert_eq!(
+        v["error"]["code"], "vendor_state_unreadable",
+        "envelope={v}"
+    );
     let msg = v["error"]["message"].as_str().expect("message string");
     assert!(
         msg.contains("cannot read .socket/vendor/state.json"),
@@ -357,7 +367,8 @@ fn remove_corrupt_vendor_ledger_fails_closed_json() {
 fn remove_corrupt_vendor_ledger_fails_closed_human() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_vsl__@1.0.0";
-    let socket = write_manifest_files_empty(tmp.path(), purl, "22222222-2222-4222-8222-222222222222");
+    let socket =
+        write_manifest_files_empty(tmp.path(), purl, "22222222-2222-4222-8222-222222222222");
     let manifest_before = read_bytes(&socket.join("manifest.json"));
     let vendor = socket.join("vendor");
     std::fs::create_dir_all(&vendor).unwrap();
@@ -552,7 +563,10 @@ fn remove_vendor_state_write_failure_aborts_before_manifest_mutation() {
     );
     let v = parse_envelope(&stdout);
     assert_eq!(v["status"], "error");
-    assert_eq!(v["error"]["code"], "vendor_state_write_failed", "envelope={v}");
+    assert_eq!(
+        v["error"]["code"], "vendor_state_write_failed",
+        "envelope={v}"
+    );
     assert_eq!(v["summary"]["removed"], 0);
     // The manifest mutation runs after the vendor leg: it must not have
     // happened.
@@ -570,7 +584,14 @@ fn remove_detached_vendor_state_write_failure_fails_with_code() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_detvsw__@1.0.0";
     let uuid = "66666666-6666-4666-8666-666666666666";
-    write_vendor_ledger_entry(tmp.path(), purl, purl, uuid, "[]", "\"detached\": true,\n      ");
+    write_vendor_ledger_entry(
+        tmp.path(),
+        purl,
+        purl,
+        uuid,
+        "[]",
+        "\"detached\": true,\n      ",
+    );
     let vendor = tmp.path().join(".socket/vendor");
 
     chmod(&vendor, 0o555);
@@ -584,7 +605,10 @@ fn remove_detached_vendor_state_write_failure_fails_with_code() {
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
     let v = parse_envelope(&stdout);
     assert_eq!(v["status"], "error");
-    assert_eq!(v["error"]["code"], "vendor_state_write_failed", "envelope={v}");
+    assert_eq!(
+        v["error"]["code"], "vendor_state_write_failed",
+        "envelope={v}"
+    );
     // The ledger file could not be rewritten, so it must still exist.
     assert!(
         vendor.join("state.json").exists(),
@@ -638,7 +662,11 @@ fn remove_hosted_dry_run_leaves_lock_and_ledger_untouched() {
 
     // Nothing on disk moved.
     assert_eq!(read_bytes(&lock_path), lock_before, "lock byte-identical");
-    assert_eq!(read_bytes(&ledger_path), ledger_before, "ledger byte-identical");
+    assert_eq!(
+        read_bytes(&ledger_path),
+        ledger_before,
+        "ledger byte-identical"
+    );
     assert_eq!(
         read_bytes(&socket.join("manifest.json")),
         manifest_before,
@@ -678,7 +706,11 @@ fn remove_hosted_only_dry_run_previews_without_mutation() {
         "expected a verified/hosted_reverted preview event: {events:?}"
     );
     assert_eq!(read_bytes(&lock_path), lock_before, "lock byte-identical");
-    assert_eq!(read_bytes(&ledger_path), ledger_before, "ledger byte-identical");
+    assert_eq!(
+        read_bytes(&ledger_path),
+        ledger_before,
+        "ledger byte-identical"
+    );
     assert!(
         !tmp.path().join(".socket/manifest.json").exists(),
         "no manifest may be materialized as a side effect"
@@ -724,7 +756,10 @@ fn remove_hosted_preserve_state_notes_no_preservable_state() {
         expected_reverted_lock_text(),
         "the lock must hold exactly the pre-redirect entry"
     );
-    assert!(!ledger_path.exists(), "the emptied redirect ledger must be deleted");
+    assert!(
+        !ledger_path.exists(),
+        "the emptied redirect ledger must be deleted"
+    );
     // The state half was preserved: manifest byte-identical.
     assert_eq!(
         read_bytes(&socket.join("manifest.json")),
@@ -745,7 +780,8 @@ fn remove_hosted_preserve_state_notes_no_preservable_state() {
 fn remove_corrupt_hosted_ledger_warns_and_continues_human() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_hcorrupt__@1.0.0";
-    let socket = write_manifest_files_empty(tmp.path(), purl, "77777777-7777-4777-8777-777777777777");
+    let socket =
+        write_manifest_files_empty(tmp.path(), purl, "77777777-7777-4777-8777-777777777777");
     let ledger_path = write_redirect_ledger_text(tmp.path(), "{nope");
     let ledger_before = read_bytes(&ledger_path);
 
@@ -845,8 +881,7 @@ fn remove_hosted_only_human_lists_redirects_and_unwinds() {
     std::fs::write(&lock_path, redirected_lock_text()).unwrap();
     let ledger_path = write_redirect_ledger_text(tmp.path(), &npm_redirect_ledger_text());
 
-    let (code, stdout, stderr) =
-        run_remove(tmp.path(), &[NPM_PURL, "--yes", "--offline"], &[]);
+    let (code, stdout, stderr) = run_remove(tmp.path(), &[NPM_PURL, "--yes", "--offline"], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
         stderr.contains("The following hosted redirect(s) will be unwound and removed:"),
@@ -862,7 +897,10 @@ fn remove_hosted_only_human_lists_redirects_and_unwinds() {
         expected_reverted_lock_text(),
         "the lock must hold exactly the pre-redirect entry"
     );
-    assert!(!ledger_path.exists(), "the emptied redirect ledger must be deleted");
+    assert!(
+        !ledger_path.exists(),
+        "the emptied redirect ledger must be deleted"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -931,7 +969,11 @@ fn remove_hosted_only_revert_failure_fails_closed() {
         "the error must name the purl; got: {msg}"
     );
     assert_eq!(read_bytes(&ledger_path), ledger_before, "ledger untouched");
-    assert_eq!(read_bytes(&lock_path), lock_before, "corrupt lock untouched");
+    assert_eq!(
+        read_bytes(&lock_path),
+        lock_before,
+        "corrupt lock untouched"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,7 +1061,11 @@ fn remove_hosted_only_ledger_persist_failure_fails_closed() {
         msg.contains("failed to persist the hosted redirect ledger"),
         "the error must name the persist failure; got: {msg}"
     );
-    assert_eq!(read_bytes(&ledger_path), ledger_before, "ledger keeps its old bytes");
+    assert_eq!(
+        read_bytes(&ledger_path),
+        ledger_before,
+        "ledger keeps its old bytes"
+    );
     assert_eq!(
         std::fs::read_to_string(&lock_path).unwrap(),
         expected_reverted_lock_text(),
@@ -1070,8 +1116,11 @@ fn remove_mixed_drift_keep_is_partial_failure_json() {
     let ledger_path = tmp.path().join(".socket/vendor/state.json");
     let ledger_before = read_bytes(&ledger_path);
 
-    let (code, stdout, stderr) =
-        run_remove(tmp.path(), &[MIXED_UUID, "--json", "--yes", "--offline"], &[]);
+    let (code, stdout, stderr) = run_remove(
+        tmp.path(),
+        &[MIXED_UUID, "--json", "--yes", "--offline"],
+        &[],
+    );
     assert_eq!(
         code, 1,
         "a partially drift-kept remove must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
@@ -1128,8 +1177,7 @@ fn remove_mixed_drift_keep_is_partial_failure_human() {
     let tmp = tempfile::tempdir().expect("tempdir");
     make_mixed_drift_fixture(tmp.path());
 
-    let (code, stdout, stderr) =
-        run_remove(tmp.path(), &[MIXED_UUID, "--yes", "--offline"], &[]);
+    let (code, stdout, stderr) = run_remove(tmp.path(), &[MIXED_UUID, "--yes", "--offline"], &[]);
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
         stderr.contains("1 matching entry was drift-kept"),
@@ -1195,7 +1243,11 @@ fn remove_drift_keep_excludes_sibling_variants_by_stripped_key() {
         manifest_before,
         "BOTH variants' manifest entries must survive the drift-keep"
     );
-    assert_eq!(read_bytes(&ledger_path), ledger_before, "ledger byte-identical");
+    assert_eq!(
+        read_bytes(&ledger_path),
+        ledger_before,
+        "ledger byte-identical"
+    );
 }
 
 /// Base-purl exclusion arm (remove.rs:742-745, and the base_purl match arm
@@ -1237,7 +1289,11 @@ fn remove_drift_keep_excludes_manifest_entry_by_base_purl() {
         manifest_before,
         "the base-purl-matched manifest entry must survive"
     );
-    assert_eq!(read_bytes(&ledger_path), ledger_before, "ledger byte-identical");
+    assert_eq!(
+        read_bytes(&ledger_path),
+        ledger_before,
+        "ledger byte-identical"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1327,8 +1383,14 @@ fn remove_detached_skip_rollback_refused() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_detskip__@1.0.0";
     let uuid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
-    let artifact_dir =
-        write_vendor_ledger_entry(tmp.path(), purl, purl, uuid, "[]", "\"detached\": true,\n      ");
+    let artifact_dir = write_vendor_ledger_entry(
+        tmp.path(),
+        purl,
+        purl,
+        uuid,
+        "[]",
+        "\"detached\": true,\n      ",
+    );
     let ledger_path = tmp.path().join(".socket/vendor/state.json");
     let ledger_before = read_bytes(&ledger_path);
 
@@ -1347,7 +1409,10 @@ fn remove_detached_skip_rollback_refused() {
         "the refusal must name the purl and the flag; got: {msg}"
     );
     assert_eq!(read_bytes(&ledger_path), ledger_before, "ledger untouched");
-    assert!(artifact_dir.join("package.tgz").exists(), "artifact untouched");
+    assert!(
+        artifact_dir.join("package.tgz").exists(),
+        "artifact untouched"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,7 +1439,9 @@ fn remove_multi_variant_blast_radius_prints_expansion() {
     let (code, stdout, stderr) = run_remove(tmp.path(), &[base, "--yes", "--offline"], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr.contains(&format!("{base} matches 2 release variant(s) — all will be removed:")),
+        stderr.contains(&format!(
+            "{base} matches 2 release variant(s) — all will be removed:"
+        )),
         "the blast-radius line must reach stderr; got:\n{stderr}"
     );
     assert!(
@@ -1479,7 +1546,9 @@ fn remove_preserve_state_vendored_human_wet_surfaces() {
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains(&format!("Unwired vendoring for {purl} (artifact preserved)")),
+        stdout.contains(&format!(
+            "Unwired vendoring for {purl} (artifact preserved)"
+        )),
         "the per-key preserve line must print; got:\n{stdout}"
     );
     assert!(
@@ -1512,7 +1581,9 @@ fn remove_preserve_state_vendored_human_dry_run_previews() {
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains(&format!("Would unwire vendoring for {purl} (artifact preserved)")),
+        stdout.contains(&format!(
+            "Would unwire vendoring for {purl} (artifact preserved)"
+        )),
         "the dry-run preserve preview must print; got:\n{stdout}"
     );
     assert_eq!(read_bytes(&socket.join("manifest.json")), manifest_before);
@@ -1533,13 +1604,13 @@ fn remove_preserve_state_vendored_human_dry_run_previews() {
 fn remove_cleanup_failures_warn_not_fatal() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_cleanup__@1.0.0";
-    let socket = write_manifest_files_empty(tmp.path(), purl, "13131313-1313-4131-8131-131313131313");
+    let socket =
+        write_manifest_files_empty(tmp.path(), purl, "13131313-1313-4131-8131-131313131313");
     for name in ["blobs", "diffs", "packages"] {
         std::fs::write(socket.join(name), b"not a directory").unwrap();
     }
 
-    let (code, stdout, stderr) =
-        run_remove(tmp.path(), &[purl, "--yes", "--skip-rollback"], &[]);
+    let (code, stdout, stderr) = run_remove(tmp.path(), &[purl, "--yes", "--skip-rollback"], &[]);
     assert_eq!(
         code, 0,
         "cleanup failures must never fail the remove; stdout=\n{stdout}\nstderr=\n{stderr}"
@@ -1728,7 +1799,10 @@ mod pty {
         let status = child.wait().expect("child.wait");
         drop(pair.master);
         let output = reader_handle.join().expect("reader thread join");
-        (status.exit_code() as i32, String::from_utf8_lossy(&output).to_string())
+        (
+            status.exit_code() as i32,
+            String::from_utf8_lossy(&output).to_string(),
+        )
     }
 
     /// Declining the hosted-only confirm prompt must cancel cleanly (exit
@@ -1748,7 +1822,10 @@ mod pty {
             "n\n",
             Duration::from_secs(15),
         );
-        assert_eq!(code, 0, "declined hosted remove must exit cleanly; got: {output}");
+        assert_eq!(
+            code, 0,
+            "declined hosted remove must exit cleanly; got: {output}"
+        );
         // Vacuity guard: the hosted-only confirm prompt MUST have run.
         assert!(
             output.contains("Remove 1 hosted redirect(s) and unwind their lockfile wiring?"),
@@ -1786,8 +1863,14 @@ fn remove_detached_preserve_state_keeps_artifact_and_ledger_entry() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let purl = "pkg:npm/__covgap_detpreserve__@1.0.0";
     let uuid = "77777777-7777-4777-8777-777777777777";
-    let artifact_dir =
-        write_vendor_ledger_entry(tmp.path(), purl, purl, uuid, "[]", "\"detached\": true,\n      ");
+    let artifact_dir = write_vendor_ledger_entry(
+        tmp.path(),
+        purl,
+        purl,
+        uuid,
+        "[]",
+        "\"detached\": true,\n      ",
+    );
     let ledger_path = tmp.path().join(".socket/vendor/state.json");
     let ledger_before = read_bytes(&ledger_path);
 
@@ -1824,8 +1907,14 @@ fn remove_detached_preserve_state_keeps_artifact_and_ledger_entry() {
     // Dry-run twin: the listing and the preview line say what --preserve-state
     // will do, and nothing moves.
     let tmp2 = tempfile::tempdir().expect("tempdir");
-    let artifact_dir2 =
-        write_vendor_ledger_entry(tmp2.path(), purl, purl, uuid, "[]", "\"detached\": true,\n      ");
+    let artifact_dir2 = write_vendor_ledger_entry(
+        tmp2.path(),
+        purl,
+        purl,
+        uuid,
+        "[]",
+        "\"detached\": true,\n      ",
+    );
     let ledger_path2 = tmp2.path().join(".socket/vendor/state.json");
     let ledger_before2 = read_bytes(&ledger_path2);
     let (code, stdout, stderr) = run_remove(
@@ -1835,15 +1924,24 @@ fn remove_detached_preserve_state_keeps_artifact_and_ledger_entry() {
     );
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains(&format!("Would unwire vendoring for {purl} (artifact preserved)")),
+        stdout.contains(&format!(
+            "Would unwire vendoring for {purl} (artifact preserved)"
+        )),
         "the preserve preview line must print; stdout=\n{stdout}"
     );
     assert!(
         stderr.contains("will be unwired (artifacts and ledger entries preserved)"),
         "the listing must be honest about --preserve-state; stderr=\n{stderr}"
     );
-    assert_eq!(read_bytes(&ledger_path2), ledger_before2, "dry run: ledger untouched");
-    assert!(artifact_dir2.join("package.tgz").exists(), "dry run: artifact untouched");
+    assert_eq!(
+        read_bytes(&ledger_path2),
+        ledger_before2,
+        "dry run: ledger untouched"
+    );
+    assert!(
+        artifact_dir2.join("package.tgz").exists(),
+        "dry run: artifact untouched"
+    );
 }
 
 /// A drifted lock on a ledger-only entry: the backend DRIFT-KEEPS
@@ -1917,11 +2015,15 @@ fn remove_detached_drift_keep_holds_ledger_entry_and_exits_one() {
     let (code, stdout, stderr) = run_remove(tmp2.path(), &[purl, "--yes", "--offline"], &[]);
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr.contains(&format!("Kept vendored state for {purl}: lockfile wiring drifted")),
+        stderr.contains(&format!(
+            "Kept vendored state for {purl}: lockfile wiring drifted"
+        )),
         "the per-key keep line must print; stderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("1 matching entry was drift-kept (vendored state and ledger record retained)"),
+        stderr.contains(
+            "1 matching entry was drift-kept (vendored state and ledger record retained)"
+        ),
         "the summary error line must print; stderr=\n{stderr}"
     );
     assert!(

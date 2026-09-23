@@ -2339,8 +2339,11 @@ async fn hosted_lock_held_get_errors_with_top_level_error_code() {
     let _lock = socket_patch_core::patch::apply_lock::acquire(&socket, Duration::ZERO).unwrap();
 
     // Wet --json: get's envelope fold keeps the hosted shape.
-    let (code, stdout, stderr) =
-        run_get_bin(tmp.path(), &server.uri(), &[UUID, "--mode", "hosted", "--json"]);
+    let (code, stdout, stderr) = run_get_bin(
+        tmp.path(),
+        &server.uri(),
+        &[UUID, "--mode", "hosted", "--json"],
+    );
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "error", "stdout={stdout}");
@@ -2378,7 +2381,10 @@ async fn hosted_lock_held_get_errors_with_top_level_error_code() {
         &server.uri(),
         &[UUID, "--mode", "hosted", "--json", "--dry-run"],
     );
-    assert_eq!(code, 0, "a dry run never contends; stdout={stdout}\nstderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "a dry run never contends; stdout={stdout}\nstderr={stderr}"
+    );
     let v = parse_single_json_doc(&stdout);
     assert_eq!(v["status"], "success", "stdout={stdout}");
     assert_eq!(v["redirect"]["dryRun"], true, "stdout={stdout}");
@@ -2389,7 +2395,10 @@ async fn hosted_lock_held_get_errors_with_top_level_error_code() {
         lock_before,
         "none of the runs may touch the lockfile"
     );
-    assert!(!tmp.path().join(".socket/vendor/redirect-state.json").exists());
+    assert!(!tmp
+        .path()
+        .join(".socket/vendor/redirect-state.json")
+        .exists());
     assert_no_manifest(tmp.path());
 }
 

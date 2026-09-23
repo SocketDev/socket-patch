@@ -56,8 +56,8 @@ use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::fs::{
-    atomic_write_bytes, atomic_write_bytes_preserving_mode, list_dir_entries, read_regular_to_bytes,
-    read_regular_to_string,
+    atomic_write_bytes, atomic_write_bytes_preserving_mode, list_dir_entries,
+    read_regular_to_bytes, read_regular_to_string,
 };
 use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
@@ -3829,7 +3829,9 @@ mod tests {
         let root = dir.path();
         let parent = root.join(".socket/vendor/nuget");
         tokio::fs::create_dir_all(&parent).await.unwrap();
-        tokio::fs::write(parent.join(UUID), b"squatter").await.unwrap();
+        tokio::fs::write(parent.join(UUID), b"squatter")
+            .await
+            .unwrap();
 
         let (result, entry, _w) =
             unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
@@ -4092,17 +4094,11 @@ mod tests {
         // original missing → drift, and the file is never touched.
         let w = lock_wiring(None, Some("OURS=="));
         assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
-        assert_eq!(
-            tokio::fs::read_to_string(&lock_path).await.unwrap(),
-            text
-        );
+        assert_eq!(tokio::fs::read_to_string(&lock_path).await.unwrap(), text);
         // new missing → same drift.
         let w = lock_wiring(Some("OLD=="), None);
         assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
-        assert_eq!(
-            tokio::fs::read_to_string(&lock_path).await.unwrap(),
-            text
-        );
+        assert_eq!(tokio::fs::read_to_string(&lock_path).await.unwrap(), text);
     }
 
     #[tokio::test]
@@ -4433,7 +4429,9 @@ mod tests {
         let root = dir.path();
         let parent = root.join(".socket/vendor/nuget");
         tokio::fs::create_dir_all(&parent).await.unwrap();
-        tokio::fs::write(parent.join(UUID), b"squatter").await.unwrap();
+        tokio::fs::write(parent.join(UUID), b"squatter")
+            .await
+            .unwrap();
 
         let server = MockServer::start().await;
         let served = make_nupkg(PATCHED);

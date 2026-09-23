@@ -576,11 +576,7 @@ mod tests {
             .records
             .insert("pkg:npm/aaa-hosted@1.0.0".to_string(), hosted_record);
 
-        let env = build_list_envelope(&combined_entries(
-            Some(&manifest),
-            Some(&redirect),
-            None,
-        ));
+        let env = build_list_envelope(&combined_entries(Some(&manifest), Some(&redirect), None));
         let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
         assert_eq!(v["summary"]["discovered"], 3);
         let events = v["events"].as_array().unwrap();

@@ -583,8 +583,8 @@ async fn reconcile_drops_stale_entries() {
 // 8b. reconcile: detached entries are exempt
 // ─────────────────────────────────────────────────────────────────────
 
-/// A detached entry (`scan --vendor --detached`) is never manifest-tracked,
-/// so "absent from the manifest" is its normal state — reconcile must leave
+/// A detached entry (the shape every `scan --mode vendored` run writes) is
+/// never manifest-tracked, so "absent from the manifest" is its normal state — reconcile must leave
 /// it alone. Only `vendor --revert` or `remove` may undo it.
 #[tokio::test]
 async fn reconcile_leaves_detached_entries_alone() {
@@ -592,7 +592,7 @@ async fn reconcile_leaves_detached_entries_alone() {
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
     let wired_lock = fx.lock_bytes();
 
-    // Mark the entry detached (the shape `scan --vendor --detached` writes)
+    // Mark the entry detached (the shape `scan --mode vendored` writes)
     // and drop the patch from the manifest.
     let mut state: Value = serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap())
         .expect("state.json is JSON");
@@ -1131,7 +1131,7 @@ async fn remove_detached_only_purl_reverts() {
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0);
 
     // Detach the entry and drop the manifest record (the state a
-    // `scan --vendor --detached` run leaves behind).
+    // `scan --mode vendored` run leaves behind).
     let mut state: Value =
         serde_json::from_slice(&std::fs::read(fx.state_path()).unwrap()).unwrap();
     state["entries"][PURL]["detached"] = json!(true);

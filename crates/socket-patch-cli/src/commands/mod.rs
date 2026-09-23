@@ -96,7 +96,9 @@ pub(crate) fn fold_detached_records(
         if !entry.detached {
             continue;
         }
-        let Some(record) = &entry.record else { continue };
+        let Some(record) = &entry.record else {
+            continue;
+        };
         if !manifest.patches.contains_key(key) {
             manifest.patches.insert(key.clone(), record.clone());
         }

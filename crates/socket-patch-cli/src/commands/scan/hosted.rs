@@ -670,7 +670,8 @@ async fn gem_stale_install_warnings(
     use socket_patch_core::vex::verify::verify_patch_record;
 
     let mut out = StaleInstallOutcome::default();
-    let find_record = |uuid: &str| -> Option<&PatchRecord> { records.values().find(|r| r.uuid == uuid) };
+    let find_record =
+        |uuid: &str| -> Option<&PatchRecord> { records.values().find(|r| r.uuid == uuid) };
     // Record availability folds into the candidate filter (a zero-file map
     // included: nothing to hash means no judgment either way) so the no-op
     // cases return here, before the crawler is built. On `--dry-run` the
@@ -1218,9 +1219,8 @@ pub(crate) async fn run_redirect_selected(
         };
         // A bun-refused npm purl is never dispatched (see the loop), so its
         // wiring is not a write target here.
-        let bun_refused = |c: &Candidate| {
-            bun_takeover_refusal.is_some() && c.purl.starts_with("pkg:npm/")
-        };
+        let bun_refused =
+            |c: &Candidate| bun_takeover_refusal.is_some() && c.purl.starts_with("pkg:npm/");
         // SYMLINK PRE-CHECK for the takeover reverts — the same rule as the
         // SYMLINK GUARD below, applied to the files the reverts rewrite
         // (each ledger entry's recorded wiring): the revert backends stage
@@ -1473,8 +1473,7 @@ pub(crate) async fn run_redirect_selected(
                         continue;
                     };
                     let key = format!("common/config/subspaces/{name}/pnpm-lock.yaml");
-                    if let Ok(content) = read_regular_to_string(&dir.join("pnpm-lock.yaml")).await
-                    {
+                    if let Ok(content) = read_regular_to_string(&dir.join("pnpm-lock.yaml")).await {
                         files.insert(key.clone(), content);
                         rush_lock_keys.push(key);
                     }
@@ -1864,8 +1863,8 @@ pub(crate) async fn run_redirect_selected(
     // persist a ledger record. When pdm DOES drive, pypi confirmation keys off
     // `confirmed_pdm_uuids` and never consults this probe, so dropping the file
     // here is always safe; `pdm.lock` only ever carries pypi URLs.
-    let pdm_inactive = files.contains_key("pdm.lock")
-        && !socket_patch_core::patch::redirect::pdm_drives(&files);
+    let pdm_inactive =
+        files.contains_key("pdm.lock") && !socket_patch_core::patch::redirect::pdm_drives(&files);
     let final_texts: Vec<&String> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
@@ -2327,8 +2326,13 @@ pub(crate) async fn run_redirect_selected(
         // scan envelopes — same top-level scan keys (scannedPackages,
         // totalPatches, canAccessPaidPatches) plus the `packages` enumeration —
         // instead of the bare `{status, redirect}` it used to emit.
-        let redirect =
-            redirect_json_block(confirmed.len(), rewritten, skipped, warnings, common.dry_run);
+        let redirect = redirect_json_block(
+            confirmed.len(),
+            rewritten,
+            skipped,
+            warnings,
+            common.dry_run,
+        );
         let mut result = build_redirect_json_envelope(scan_result.take(), redirect);
         if let Some(statements) = vex_statements {
             result["vex"] = serde_json::json!({
@@ -2452,9 +2456,8 @@ mod tests {
         gem_stale_install_warnings, installed_stale_positive_evidence, parse_purl_simple,
         plan_workspace_trust, pnpm_heal_root, pnpm_lock_carries_hosted_redirect,
         pnpm_lock_version_major, pnpm_trust_configured_detail, pnpm_trust_legacy_detail,
-        pnpm_trust_manual_guidance, pnpm_trust_workspace_unreadable_detail,
-        prune_ignored_warning, read_workspace_for_trust, redirect_json_block, TrustPlan,
-        REDIRECT_CANDIDATE_FILES,
+        pnpm_trust_manual_guidance, pnpm_trust_workspace_unreadable_detail, prune_ignored_warning,
+        read_workspace_for_trust, redirect_json_block, TrustPlan, REDIRECT_CANDIDATE_FILES,
     };
     use socket_patch_core::constants::npm_family;
     use socket_patch_core::patch::redirect::DepOverride;

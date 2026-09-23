@@ -1437,9 +1437,11 @@ distribution = false
         std::os::unix::fs::symlink(&real, root.join("pdm.lock")).unwrap();
 
         let p = load_pdm_project(&root).await.unwrap();
-        let err = wire_pdm(&p, &root, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID)
-            .await
-            .unwrap_err();
+        let err = wire_pdm(
+            &p, &root, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, "pypi_pdm_symlink_unsupported");
         // The link is intact and its target is byte-unchanged.
         assert!(std::fs::symlink_metadata(root.join("pdm.lock"))

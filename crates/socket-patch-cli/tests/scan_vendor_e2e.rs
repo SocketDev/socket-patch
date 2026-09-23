@@ -248,7 +248,11 @@ async fn scan_vendor_end_to_end_is_manifest_free() {
     );
     // One view fetch per patch for the whole run: the download phase's
     // blob content seeds the vendor stager, which never re-fetches it.
-    assert_eq!(view_fetches(&mock).await, 1, "the view is fetched exactly once");
+    assert_eq!(
+        view_fetches(&mock).await,
+        1,
+        "the view is fetched exactly once"
+    );
 
     // Vendor phase: a full vendor Envelope with one applied event.
     let venv = v["vendor"].as_object().expect("vendor sub-object");
@@ -455,10 +459,12 @@ async fn scan_vendor_migrates_legacy_manifest_mode_project() {
         "{v}"
     );
     assert!(
-        v["vendor"]["warnings"].as_array().is_some_and(|ws| ws.iter().any(|w| {
-            w["code"] == "vendor_manifest_record_migrated"
-                && w["detail"].as_str().unwrap_or("").contains(PURL)
-        })),
+        v["vendor"]["warnings"]
+            .as_array()
+            .is_some_and(|ws| ws.iter().any(|w| {
+                w["code"] == "vendor_manifest_record_migrated"
+                    && w["detail"].as_str().unwrap_or("").contains(PURL)
+            })),
         "the migration must be announced: {v}"
     );
     let state: serde_json::Value =
@@ -1205,7 +1211,11 @@ async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
     // The pre-verify fetched the view; the download phase served the
     // record from that view and the stager from its blob content — one
     // fetch for the whole interactive run, not three.
-    assert_eq!(view_fetches(&mock).await, 1, "the view is fetched exactly once");
+    assert_eq!(
+        view_fetches(&mock).await,
+        1,
+        "the view is fetched exactly once"
+    );
 }
 
 // ───────────── lockfile auto-fetch + scan lockfile supplement ─────────────

@@ -1450,8 +1450,14 @@ left-pad@^1.3.0:
         for lock in [wrong_version_dup, both_candidates_dup] {
             let fx = fixture_with_lock(lock).await;
             let detail = expect_refused(fx.vendor(false).await, "vendor_lock_entry_ambiguous");
-            assert!(detail.contains("left-pad@^1.3.0"), "names the key: {detail}");
-            assert!(detail.contains("yarn install"), "actionable detail: {detail}");
+            assert!(
+                detail.contains("left-pad@^1.3.0"),
+                "names the key: {detail}"
+            );
+            assert!(
+                detail.contains("yarn install"),
+                "actionable detail: {detail}"
+            );
             assert_eq!(
                 tokio::fs::read(fx.lock_path()).await.unwrap(),
                 fx.lock_bytes,
@@ -2052,7 +2058,9 @@ left-pad@^1.3.0:
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
         assert!(
-            !warnings.iter().any(|w| w.code == "vendor_link_entry_skipped"),
+            !warnings
+                .iter()
+                .any(|w| w.code == "vendor_link_entry_skipped"),
             "a file: TARBALL range is rewritable, not a link-skip: {warnings:?}"
         );
         let entry = entry.expect("success carries a ledger entry");
@@ -2236,7 +2244,11 @@ left-pad@^1.3.0:
         // (c) Recorded key gone AND the original block not live anywhere:
         // deleted-since-vendoring drift.
         let absent = vec!["absent@^9:".to_string(), "  version \"9.0.0\"".to_string()];
-        let rec = wrec(Some("absent@^9"), KIND_LOCK_BLOCK, Some(lines_to_json(&absent)));
+        let rec = wrec(
+            Some("absent@^9"),
+            KIND_LOCK_BLOCK,
+            Some(lines_to_json(&absent)),
+        );
         let (changed, text, warnings) = run(Y2_AFTER, &rec);
         assert!(!changed);
         assert_eq!(text, Y2_AFTER);
@@ -2410,16 +2422,18 @@ left-pad@^1.3.0:
         // A DIRECTORY squatting on the marker path: the tarball pack into
         // the (pre-existing) uuid dir succeeds, the marker's atomic rename
         // onto a directory fails.
-        let marker_path = fx
-            .root()
-            .join(format!(".socket/vendor/npm/{UUID}/socket-patch.vendor.json"));
+        let marker_path = fx.root().join(format!(
+            ".socket/vendor/npm/{UUID}/socket-patch.vendor.json"
+        ));
         tokio::fs::create_dir_all(&marker_path).await.unwrap();
 
         let (result, entry, warnings) = expect_done(fx.vendor(false).await);
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "the vendor itself succeeded");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "{warnings:?}"
         );
         assert!(fx.tgz_path().exists(), "tarball packed");
@@ -2528,7 +2542,9 @@ left-pad@^1.3.0:
             outcome.warnings
         );
         assert!(
-            !fx.root().join(format!(".socket/vendor/npm/{UUID}")).exists(),
+            !fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
             "artifact removed on the re-run"
         );
         assert_eq!(

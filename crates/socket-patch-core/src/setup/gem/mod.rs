@@ -2063,7 +2063,8 @@ mod tests {
         let root = dir.path();
         let plugin_root = root.join(".bundle/plugin");
         let index = plugin_root.join("index");
-        let body = "---\ncommands:\nhooks:\n  after-install:\n  - \"other\"\n  - \"socket-patch\"\n\
+        let body =
+            "---\ncommands:\nhooks:\n  after-install:\n  - \"other\"\n  - \"socket-patch\"\n\
              load_paths:\n  other:\n  - \"/x/other/.\"\n  socket-patch:\n  - \"/proj/p/.\"\n\
              plugin_paths:\n  other: \"/x/other\"\n  socket-patch: \"/proj/p\"\nsources:\n";
         write(&index, body).await;
@@ -2136,7 +2137,11 @@ mod tests {
         .await;
 
         let r = add_plugin_files(root, false).await;
-        assert_eq!(r.status, GemSetupStatus::Updated, "stale plugins.rb resynced");
+        assert_eq!(
+            r.status,
+            GemSetupStatus::Updated,
+            "stale plugins.rb resynced"
+        );
         assert_eq!(
             fs::read_to_string(plugins_rb_path(root)).await.unwrap(),
             PLUGINS_RB

@@ -1363,8 +1363,7 @@ fn write_vendor_ledger(root: &Path, entries: &[(&str, Option<PatchRecord>)]) {
     std::fs::create_dir_all(&vendor_dir).unwrap();
     std::fs::write(
         vendor_dir.join("state.json"),
-        serde_json::to_string_pretty(&serde_json::json!({ "version": 1, "entries": map }))
-            .unwrap(),
+        serde_json::to_string_pretty(&serde_json::json!({ "version": 1, "entries": map })).unwrap(),
     )
     .unwrap();
 }
@@ -1496,7 +1495,11 @@ fn record_less_vendor_entry_without_manifest_still_manifest_not_found_via_binary
     let out = run_list_binary(tmp.path(), &["--json"]);
     let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
         .expect("stdout must be valid JSON");
-    assert_eq!(out.status.code(), Some(1), "no records anywhere must exit 1");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "no records anywhere must exit 1"
+    );
     assert_eq!(v["error"]["code"], "manifest_not_found", "envelope={v}");
 }
 
@@ -1536,7 +1539,10 @@ fn manifest_path_scopes_vendor_ledger_to_target_project_via_binary() {
     let cwd = tempfile::tempdir().unwrap();
     write_vendor_ledger(
         cwd.path(),
-        &[("pkg:npm/local-decoy@0.0.1", Some(hosted_record(VENDORED_UUID)))],
+        &[(
+            "pkg:npm/local-decoy@0.0.1",
+            Some(hosted_record(VENDORED_UUID)),
+        )],
     );
     let target = tempfile::tempdir().unwrap();
     write_manifest_in(target.path(), &populated_manifest());

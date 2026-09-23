@@ -362,7 +362,11 @@ mod tests {
         let key = "pkg:pypi/requests@2.28.0?artifact_id=abc";
         assert!(patch_matches(key, UUID, "pkg:pypi/requests@2.28.0"));
         assert!(patch_matches(key, UUID, key));
-        assert!(!patch_matches(key, UUID, "pkg:pypi/requests@2.28.0?artifact_id=zzz"));
+        assert!(!patch_matches(
+            key,
+            UUID,
+            "pkg:pypi/requests@2.28.0?artifact_id=zzz"
+        ));
         assert!(!patch_matches(key, UUID, "pkg:pypi/requests@2.29.0"));
         assert!(patch_matches(key, UUID, UUID));
         assert!(!patch_matches(key, UUID, "not-the-uuid"));

@@ -2568,8 +2568,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (r2, e2, _w2) =
-            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let (r2, e2, _w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(!r2.success, "a blob-less rebuild cannot succeed");
         assert!(r2.error.is_some(), "the failure carries a detail");
         assert!(e2.is_none(), "a failed rebuild must not re-record");
@@ -2747,7 +2746,9 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some(), "the vendor is recorded despite the marker");
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_marker_write_failed"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_marker_write_failed"),
             "the marker failure is surfaced as a warning: {warnings:?}"
         );
         let pom_xml = tokio::fs::read_to_string(root.join(PROJECT_POM))
@@ -2942,7 +2943,9 @@ mod tests {
             unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(result.success);
         let entry = entry.unwrap();
-        tokio::fs::remove_file(root.join(PROJECT_POM)).await.unwrap();
+        tokio::fs::remove_file(root.join(PROJECT_POM))
+            .await
+            .unwrap();
 
         let outcome = revert_maven(&entry, root, false).await;
         assert!(outcome.success, "{:?}", outcome.error);
@@ -3062,7 +3065,9 @@ mod tests {
             unwrap_done(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
         assert!(result.success, "{:?}", result.error);
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_prebuilt_downloaded"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_downloaded"),
             "the service download is surfaced: {warnings:?}"
         );
         assert_eq!(
@@ -3092,10 +3097,13 @@ mod tests {
     async fn service_mode_offline_refuses_before_any_write() {
         let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
         let root = dir.path();
-        let cfg = service_cfg(None, crate::vendor::VendorSource::Service, /*offline=*/ true);
-        let (code, _d) = unwrap_refused(
-            run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await,
+        let cfg = service_cfg(
+            None,
+            crate::vendor::VendorSource::Service,
+            /*offline=*/ true,
         );
+        let (code, _d) =
+            unwrap_refused(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
         assert_eq!(code, "vendor_service_offline_conflict");
         assert!(!root.join(".socket").exists(), "refusal writes nothing");
         let pom_xml = tokio::fs::read_to_string(root.join(PROJECT_POM))
@@ -3113,7 +3121,9 @@ mod tests {
         let uuid_dir = root.join(format!(".socket/vendor/maven/{UUID}"));
         tokio::fs::create_dir_all(&uuid_dir).await.unwrap();
         // create_dir_all of <uuid>/org/... fails on the planted regular file.
-        tokio::fs::write(uuid_dir.join("org"), b"squatter").await.unwrap();
+        tokio::fs::write(uuid_dir.join("org"), b"squatter")
+            .await
+            .unwrap();
 
         let (result, entry, _w) =
             unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
@@ -3197,13 +3207,19 @@ mod tests {
         let (dir, blobs, installed, record) =
             fixture(Some(project_pom()), true, /*with_local_pom=*/ false).await;
         let root = dir.path();
-        let cfg = service_cfg(Some(&server.uri()), crate::vendor::VendorSource::Auto, false);
+        let cfg = service_cfg(
+            Some(&server.uri()),
+            crate::vendor::VendorSource::Auto,
+            false,
+        );
         let (result, entry, warnings) =
             unwrap_done(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_some());
         assert!(
-            warnings.iter().any(|w| w.code == "vendor_maven_pom_downloaded"),
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_maven_pom_downloaded"),
             "the pom download is surfaced: {warnings:?}"
         );
         let vendored_pom = root.join(format!("{}/commons-text-1.10.0.pom", leaf_rel()));
@@ -3212,10 +3228,9 @@ mod tests {
             UPSTREAM_POM,
             "the downloaded pom is vendored verbatim"
         );
-        let pom_sha1 = tokio::fs::read_to_string(root.join(format!(
-            "{}/commons-text-1.10.0.pom.sha1",
-            leaf_rel()
-        )))
+        let pom_sha1 = tokio::fs::read_to_string(
+            root.join(format!("{}/commons-text-1.10.0.pom.sha1", leaf_rel())),
+        )
         .await
         .unwrap();
         assert_eq!(pom_sha1.trim(), sha1_hex(UPSTREAM_POM));
@@ -3241,10 +3256,13 @@ mod tests {
         let (dir, blobs, installed, record) =
             fixture(Some(project_pom()), true, /*with_local_pom=*/ false).await;
         let root = dir.path();
-        let cfg = service_cfg(Some(&server.uri()), crate::vendor::VendorSource::Auto, false);
-        let (code, detail) = unwrap_refused(
-            run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await,
+        let cfg = service_cfg(
+            Some(&server.uri()),
+            crate::vendor::VendorSource::Auto,
+            false,
         );
+        let (code, detail) =
+            unwrap_refused(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
         assert_eq!(code, "vendor_maven_pom_unavailable");
         assert!(
             detail.contains("registry fetch failed"),
@@ -3286,9 +3304,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(pom_route))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_bytes(vec![0u8; MAX_POM_BYTES + 1]),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; MAX_POM_BYTES + 1]))
             .mount(&server)
             .await;
         let err = fetch_pom_bytes(&format!("{}{pom_route}", server.uri()))
@@ -3377,8 +3393,10 @@ mod tests {
     #[test]
     fn profiles_masking_edge_branches() {
         // Decoy: <profilesX> is not <profiles> — the real section is wireable.
-        let decoy = "<project><profilesX>x</profilesX>\n  <repositories>\n  </repositories>\n</project>\n";
-        let out = build_repo_edit(decoy, "socket-patch-vendor-x", ".socket/vendor/maven/x").unwrap();
+        let decoy =
+            "<project><profilesX>x</profilesX>\n  <repositories>\n  </repositories>\n</project>\n";
+        let out =
+            build_repo_edit(decoy, "socket-patch-vendor-x", ".socket/vendor/maven/x").unwrap();
         assert!(out.contains("<id>socket-patch-vendor-x</id>"));
         assert_eq!(
             out.matches("</repositories>").count(),
@@ -3479,7 +3497,9 @@ mod tests {
             "  <properties>\n  </properties>\n</project>",
             1,
         );
-        tokio::fs::write(root.join(PROJECT_POM), &edited).await.unwrap();
+        tokio::fs::write(root.join(PROJECT_POM), &edited)
+            .await
+            .unwrap();
 
         let outcome = revert_maven(&entry, root, /*dry_run=*/ true).await;
         assert!(outcome.success, "{:?}", outcome.error);

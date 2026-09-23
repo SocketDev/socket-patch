@@ -2149,12 +2149,9 @@ mod tests {
             .await
             .unwrap();
         // Blob whose CONTENT does not match its name — verifies Ready.
-        tokio::fs::write(
-            blobs_dir.path().join(&before_hash),
-            b"corrupted blob bytes",
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(blobs_dir.path().join(&before_hash), b"corrupted blob bytes")
+            .await
+            .unwrap();
 
         let mut files = HashMap::new();
         files.insert(
@@ -2308,11 +2305,19 @@ mod tests {
             },
         );
 
-        let result =
-            rollback_package_patch("pkg:npm/foo@1.0.0", &primary, &files, blobs_dir.path(), false)
-                .await;
+        let result = rollback_package_patch(
+            "pkg:npm/foo@1.0.0",
+            &primary,
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
         assert!(result.success, "expected success: {:?}", result.error);
-        assert_eq!(result.files_rolled_back, vec!["package/added.js".to_string()]);
+        assert_eq!(
+            result.files_rolled_back,
+            vec!["package/added.js".to_string()]
+        );
         for entry_nm in &variants {
             assert!(
                 tokio::fs::symlink_metadata(entry_nm.join("foo").join("added.js"))
@@ -2327,9 +2332,14 @@ mod tests {
         tokio::fs::write(variants[1].join("foo").join("added.js"), added)
             .await
             .unwrap();
-        let result =
-            rollback_package_patch("pkg:npm/foo@1.0.0", &primary, &files, blobs_dir.path(), false)
-                .await;
+        let result = rollback_package_patch(
+            "pkg:npm/foo@1.0.0",
+            &primary,
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
         assert!(result.success, "expected success: {:?}", result.error);
         assert!(
             tokio::fs::symlink_metadata(variants[1].join("foo").join("added.js"))

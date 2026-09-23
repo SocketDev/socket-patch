@@ -375,7 +375,10 @@ fn remove_silent_suppresses_vendor_revert_warnings() {
     // a partialFailure — nothing was removed. The error line still prints
     // under --silent ("errors only, never nothing"); the backend WARNING
     // chatter stays suppressed, which is what this test pins.
-    assert_eq!(code, 1, "all-kept remove is a partialFailure; stderr={stderr:?}");
+    assert_eq!(
+        code, 1,
+        "all-kept remove is a partialFailure; stderr={stderr:?}"
+    );
     assert!(
         stderr.contains("drift-kept"),
         "the drift-kept error must print even under --silent; got {stderr:?}"

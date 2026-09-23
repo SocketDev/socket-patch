@@ -213,24 +213,15 @@ mod tests {
     fn directory_pattern_scopes_its_subtree() {
         // No `/**` needed: matching an ancestor is enough.
         let s = scope(&["packages/foo"]);
-        assert!(s.matches(
-            &cwd(),
-            Path::new("/proj/packages/foo/node_modules/lodash")
-        ));
-        assert!(!s.matches(
-            &cwd(),
-            Path::new("/proj/packages/bar/node_modules/lodash")
-        ));
+        assert!(s.matches(&cwd(), Path::new("/proj/packages/foo/node_modules/lodash")));
+        assert!(!s.matches(&cwd(), Path::new("/proj/packages/bar/node_modules/lodash")));
     }
 
     #[test]
     fn star_does_not_cross_separators() {
         let s = scope(&["packages/*"]);
         // `packages/*` matches the ancestor `packages/foo`, scoping its tree…
-        assert!(s.matches(
-            &cwd(),
-            Path::new("/proj/packages/foo/node_modules/lodash")
-        ));
+        assert!(s.matches(&cwd(), Path::new("/proj/packages/foo/node_modules/lodash")));
         // …but `nested/*` must not match a deeper path component-wise.
         let s2 = scope(&["*"]);
         assert!(s2.matches(&cwd(), Path::new("/proj/anything")));
@@ -241,10 +232,7 @@ mod tests {
     #[test]
     fn double_star_spans_directories() {
         let s = scope(&["packages/**/lodash"]);
-        assert!(s.matches(
-            &cwd(),
-            Path::new("/proj/packages/foo/node_modules/lodash")
-        ));
+        assert!(s.matches(&cwd(), Path::new("/proj/packages/foo/node_modules/lodash")));
         assert!(!s.matches(&cwd(), Path::new("/proj/apps/foo/node_modules/lodash")));
     }
 

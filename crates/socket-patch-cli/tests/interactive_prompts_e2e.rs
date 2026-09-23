@@ -534,7 +534,10 @@ fn remove_detached_interactive_n_cancel_message_respects_silent() {
         "n\n",
         Duration::from_secs(15),
     );
-    assert_eq!(code, 0, "declined detached remove must exit cleanly; got: {output}");
+    assert_eq!(
+        code, 0,
+        "declined detached remove must exit cleanly; got: {output}"
+    );
     // Vacuity guard: the detached confirm prompt MUST have run — otherwise
     // an early error (e.g. a broken ledger fixture) would pass the absence
     // assertion below without ever reaching the cancel branch.
@@ -567,7 +570,10 @@ fn remove_detached_interactive_n_cancel_message_respects_silent() {
         "n\n",
         Duration::from_secs(15),
     );
-    assert_eq!(loud_code, 0, "declined detached remove must exit cleanly; got: {loud_output}");
+    assert_eq!(
+        loud_code, 0,
+        "declined detached remove must exit cleanly; got: {loud_output}"
+    );
     assert!(
         loud_output.contains("Removal cancelled"),
         "non-silent declined detached remove must report cancellation; got: {loud_output}"

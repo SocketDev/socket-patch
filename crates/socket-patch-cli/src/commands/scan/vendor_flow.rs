@@ -1007,7 +1007,10 @@ mod migration_tests {
         );
         assert_eq!(warning_codes(&env), vec![VENDOR_MANIFEST_RECORD_MIGRATED]);
         let detail = &env.warnings[0].detail;
-        assert!(detail.contains(PURL) && detail.contains(QUALIFIED), "{detail}");
+        assert!(
+            detail.contains(PURL) && detail.contains(QUALIFIED),
+            "{detail}"
+        );
     }
 
     /// A record for a purl whose ledger entry is NOT ledger-owned (a
@@ -1023,8 +1026,7 @@ mod migration_tests {
         let manifest_path = root.join(".socket/manifest.json");
         let before = std::fs::read(&manifest_path).unwrap();
         let ledger_before = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
-        let records: HashMap<String, PatchRecord> =
-            [(PURL.to_string(), record(OTHER_UUID))].into();
+        let records: HashMap<String, PatchRecord> = [(PURL.to_string(), record(OTHER_UUID))].into();
         let mut env = Envelope::new(EnvelopeCommand::Vendor);
 
         migrate_legacy_manifest_records(&common(root), &manifest_path, &records, &mut env).await;

@@ -414,7 +414,10 @@ async fn fetch_missing_blobs_disk_write_failure_is_per_blob_failure() {
 
     let result = fetch_missing_blobs(&manifest, &blobs, &client, None).await;
     assert_eq!(result.total, 1);
-    assert_eq!(result.downloaded, 0, "an unwritable blob is not 'downloaded'");
+    assert_eq!(
+        result.downloaded, 0,
+        "an unwritable blob is not 'downloaded'"
+    );
     assert_eq!(result.failed, 1);
     assert_eq!(result.skipped, 0);
     let err = result.results[0].error.as_deref().unwrap();
@@ -426,7 +429,11 @@ async fn fetch_missing_blobs_disk_write_failure_is_per_blob_failure() {
     // run's presence check would trust it), and no staging turd either —
     // the stage was never created, which is the invariant callers need.
     assert!(!blobs.join(&hash).exists());
-    assert_eq!(dir_entry_count(&blobs), 0, "no partial file, no stage litter");
+    assert_eq!(
+        dir_entry_count(&blobs),
+        0,
+        "no partial file, no stage litter"
+    );
 
     // Restore so tempdir teardown can't mask a failure.
     std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -482,7 +489,11 @@ async fn fetch_missing_sources_diff_disk_write_failure_is_per_archive_failure() 
         "archive disk-write arm message expected: {err}"
     );
     assert!(!diffs.join(format!("{uuid}.tar.gz")).exists());
-    assert_eq!(dir_entry_count(&diffs), 0, "no partial file, no stage litter");
+    assert_eq!(
+        dir_entry_count(&diffs),
+        0,
+        "no partial file, no stage litter"
+    );
 
     std::fs::set_permissions(&diffs, std::fs::Permissions::from_mode(0o755)).unwrap();
 }

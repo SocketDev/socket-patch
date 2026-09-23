@@ -386,7 +386,10 @@ fn scan_offline_human_path_errors_on_stderr() {
 fn scan_hosted_prune_human_warns_prune_is_ignored() {
     let tmp = tempfile::tempdir().unwrap();
     let (code, _stdout, stderr) = run_scan(tmp.path(), &["--mode", "hosted", "--prune"]);
-    assert_eq!(code, 0, "hosted --prune stays accepted (never a usage error)");
+    assert_eq!(
+        code, 0,
+        "hosted --prune stays accepted (never a usage error)"
+    );
     assert!(
         stderr.contains("Warning (redirect_prune_ignored):"),
         "the ignored-prune warning must reach stderr; got {stderr:?}"
@@ -435,7 +438,10 @@ async fn scan_hosted_prune_zero_package_json_carries_the_warning() {
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(v["status"], "success");
-    assert_eq!(v["scannedPackages"], 0, "classic keys stay schema-consistent");
+    assert_eq!(
+        v["scannedPackages"], 0,
+        "classic keys stay schema-consistent"
+    );
     assert_eq!(v["redirect"]["mode"], "hosted");
     assert_eq!(v["redirect"]["redirected"], 0);
     let warnings = v["redirect"]["warnings"]
@@ -454,7 +460,10 @@ async fn scan_hosted_prune_zero_package_json_carries_the_warning() {
 
     // The empty crawl never queries the API.
     let reqs = recorded(&mock).await;
-    assert!(batch_bodies(&reqs).is_empty(), "empty project must not query");
+    assert!(
+        batch_bodies(&reqs).is_empty(),
+        "empty project must not query"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -528,7 +537,10 @@ async fn scan_paid_patch_with_access_counts_all_and_reports_detail_failure() {
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
 
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &[]);
-    assert_eq!(code, 1, "a failed detail fetch fails the scan; stdout={stdout}");
+    assert_eq!(
+        code, 1,
+        "a failed detail fetch fails the scan; stdout={stdout}"
+    );
     assert!(
         stdout.contains("Summary: 1 package(s) with 1 available patch(es)"),
         "the can-access summary counts all patches; got {stdout:?}"
@@ -691,7 +703,9 @@ async fn scan_human_skips_vendored_purls_without_downloading() {
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &["--yes"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
     assert!(
-        stdout.contains(&format!("[skip] {purl} (vendored — run scan --vendor to update)")),
+        stdout.contains(&format!(
+            "[skip] {purl} (vendored — run scan --vendor to update)"
+        )),
         "the vendored skip line must name the purl and the remedy; got {stdout:?}"
     );
     assert!(
@@ -833,7 +847,10 @@ async fn scan_sync_human_gc_line_singular_arms() {
         "the applied patch must be recorded: {v}"
     );
     assert!(
-        !tmp.path().join(".socket/blobs").join("c".repeat(64)).exists(),
+        !tmp.path()
+            .join(".socket/blobs")
+            .join("c".repeat(64))
+            .exists(),
         "the orphan blob must be swept"
     );
 }
@@ -845,7 +862,11 @@ async fn scan_sync_human_gc_line_plural_arms() {
         &mock,
         &[
             ("pkg:npm/gone@1.0.0", OLD_UUID, 'c'),
-            ("pkg:npm/also-gone@2.0.0", "88888888-8888-4888-8888-888888888888", 'd'),
+            (
+                "pkg:npm/also-gone@2.0.0",
+                "88888888-8888-4888-8888-888888888888",
+                'd',
+            ),
         ],
         &["--sync", "--yes"],
     )
@@ -1046,7 +1067,10 @@ async fn scan_human_pnp_refusal_prints_alongside_other_ecosystems() {
     .unwrap();
 
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &[]);
-    assert_eq!(code, 0, "refusals never flip the exit; stdout={stdout}; stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "refusals never flip the exit; stdout={stdout}; stderr={stderr}"
+    );
     assert!(
         stderr.contains("Found 1 packages"),
         "the gem must be discovered (non-empty path); got {stderr:?}"
@@ -1097,7 +1121,10 @@ async fn scan_bare_human_non_tty_is_report_only() {
     write_npm_package(tmp.path(), "minimist", "1.2.2", b"x\n");
 
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &[]);
-    assert_eq!(code, 0, "report-only is a success; stdout={stdout}; stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "report-only is a success; stdout={stdout}; stderr={stderr}"
+    );
     assert!(
         stdout.contains("Patches to apply:") && stdout.contains(purl),
         "the per-patch preview still prints; got {stdout:?}"
@@ -1120,7 +1147,11 @@ async fn scan_bare_human_non_tty_is_report_only() {
         "a report-only scan must not patch the installed file"
     );
     let reqs = recorded(&mock).await;
-    assert_eq!(view_gets(&reqs), 0, "a report-only scan must not download the patch");
+    assert_eq!(
+        view_gets(&reqs),
+        0,
+        "a report-only scan must not download the patch"
+    );
 }
 
 /// The same piped run with an explicit intent flag (each spelling that
@@ -1180,7 +1211,10 @@ async fn scan_human_non_tty_prune_counts_as_intent() {
         std::fs::read_to_string(tmp.path().join(".socket/manifest.json")).expect("manifest");
     let v: serde_json::Value = serde_json::from_str(&manifest).unwrap();
     assert!(v["patches"]["pkg:npm/gone@1.0.0"].is_null(), "{v}");
-    assert_eq!(v["patches"]["pkg:npm/silent-target@1.0.0"]["uuid"], UUID, "{v}");
+    assert_eq!(
+        v["patches"]["pkg:npm/silent-target@1.0.0"]["uuid"], UUID,
+        "{v}"
+    );
 }
 
 /// An empty discovery stops every human mode at "No patches available"
@@ -1247,9 +1281,7 @@ async fn mount_forbidden_reference(mock: &MockServer, purl: &str) {
 
 fn reference_posts(reqs: &[wiremock::Request]) -> usize {
     reqs.iter()
-        .filter(|r| {
-            format!("{}", r.method) == "POST" && r.url.path().ends_with("/patches/package")
-        })
+        .filter(|r| format!("{}", r.method) == "POST" && r.url.path().ends_with("/patches/package"))
         .count()
 }
 
@@ -1308,7 +1340,8 @@ async fn scan_hosted_human_prints_table_updates_and_confirms() {
         "the summary must print in hosted mode; got {stdout:?}"
     );
     assert!(
-        stdout.contains("[UPDATE]") && stdout.contains("1 package(s) have newer patches available."),
+        stdout.contains("[UPDATE]")
+            && stdout.contains("1 package(s) have newer patches available."),
         "update detection must run in hosted mode; got {stdout:?}"
     );
     // `--mode hosted` is explicit intent: the new prompt auto-accepts on a
@@ -1322,7 +1355,11 @@ async fn scan_hosted_human_prints_table_updates_and_confirms() {
         "the engine must run after the prompt; got {stdout:?}"
     );
     let reqs = recorded(&mock).await;
-    assert_eq!(reference_posts(&reqs), 1, "the engine resolved the reference");
+    assert_eq!(
+        reference_posts(&reqs),
+        1,
+        "the engine resolved the reference"
+    );
 
     // `--dry-run` previews without confirming (the engine honors it itself).
     let (code, _stdout, stderr) =

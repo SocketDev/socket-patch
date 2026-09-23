@@ -277,7 +277,8 @@ fn repair_offline_warning_truncates_missing_list_after_five() {
         "offline missing artifacts are a warning, not a failure; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("Warning: 12 file artifact(s) are missing (offline mode - not downloading)"),
+        stdout
+            .contains("Warning: 12 file artifact(s) are missing (offline mode - not downloading)"),
         "the warning header must carry the full missing count; stdout=\n{stdout}"
     );
     let items = item_lines(&stdout);
@@ -499,7 +500,10 @@ fn repair_archive_cleanup_failure_warns_and_continues() {
             panic!("json: envelope must record the failed archive cleanup; got events={events:?}")
         });
     assert!(
-        skip["reason"].as_str().unwrap_or("").contains("diff cleanup failed"),
+        skip["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("diff cleanup failed"),
         "the skip reason must name the failing archive pass; got {skip}"
     );
     // The packages pass still swept its orphan: one batched removal event.
@@ -707,7 +711,14 @@ fn run_cli(root: &Path, mock_uri: &str, argv: &[&str], json: bool) -> (i32, Stri
     if json {
         cmd.arg("--json");
     }
-    cmd.args(["--api-url", mock_uri, "--api-token", "fake-token", "--org", ORG_SLUG]);
+    cmd.args([
+        "--api-url",
+        mock_uri,
+        "--api-token",
+        "fake-token",
+        "--org",
+        ORG_SLUG,
+    ]);
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     let out = cmd.output().expect("run socket-patch");
     (
@@ -736,7 +747,10 @@ async fn repair_offline_rebuild_human_mode_prints_rebuilt_summary() {
         &["scan", "--vendor", "--yes"],
         true,
     );
-    assert_eq!(code, 0, "vendor setup failed: stdout={stdout} stderr={stderr}");
+    assert_eq!(
+        code, 0,
+        "vendor setup failed: stdout={stdout} stderr={stderr}"
+    );
     let tgz = tmp
         .path()
         .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"));

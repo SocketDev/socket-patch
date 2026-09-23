@@ -785,12 +785,16 @@ pub(crate) async fn run_hosted_leg(
             let files: Vec<&str> = refusal.files.iter().map(String::as_str).collect();
             let why = format!("{} ({})", refusal.reason, files.join(", "));
             if !common.json {
-                eprintln!("Cannot unwind hosted redirect edits ({}): {why}", refusal.group);
+                eprintln!(
+                    "Cannot unwind hosted redirect edits ({}): {why}",
+                    refusal.group
+                );
             }
             out.failed.push((format!("group:{}", refusal.group), why));
         }
         out.warnings.extend(replay.warnings.iter().cloned());
-        out.edited_files.extend(replay.reverted_files.iter().cloned());
+        out.edited_files
+            .extend(replay.reverted_files.iter().cloned());
         // Deferred purls succeeded iff the replay dropped their records.
         for purl in deferred_to_replay {
             if replay.dropped_records.iter().any(|p| p == &purl) {
@@ -885,11 +889,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let vendor_ledger_exists = tokio::fs::metadata(cwd.join(".socket/vendor/state.json"))
         .await
         .is_ok();
-    let redirect_ledger_exists = tokio::fs::metadata(
-        cwd.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL),
-    )
-    .await
-    .is_ok();
+    let redirect_ledger_exists =
+        tokio::fs::metadata(cwd.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL))
+            .await
+            .is_ok();
 
     if manifest_missing && !vendor_ledger_exists && !redirect_ledger_exists {
         // Ledger-less but still wired? (a deleted/uncommitted state.json
@@ -941,8 +944,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // each exactly once: the agent leg below receives the manifest and the
     // vendor-ownership key set instead of re-reading them.
     let vendor_state_result = socket_patch_core::vendor::load_state(&cwd).await;
-    let redirect_state_result =
-        socket_patch_core::patch::redirect::load_redirect_state(&cwd).await;
+    let redirect_state_result = socket_patch_core::patch::redirect::load_redirect_state(&cwd).await;
     let vendor_corrupt = vendor_state_result.is_err();
     let redirect_corrupt = redirect_state_result.is_err();
     // An unreadable ledger degrades to "nothing vendored" for the in-place
@@ -970,8 +972,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
             Err(e) => {
                 let msg = e.to_string();
-                track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref())
-                    .await;
+                track_patch_rollback_failed(&msg, api_token.as_deref(), org_slug.as_deref()).await;
                 emit_rollback_error(args.common.json, &msg);
                 return 1;
             }
@@ -1148,8 +1149,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 })
         });
         hosted_scope.retain(|purl| {
-            Ecosystem::from_purl(purl)
-                .is_some_and(|e| crate::commands::vendor::ecosystem_in_scope(&args.common, e.cli_name()))
+            Ecosystem::from_purl(purl).is_some_and(|e| {
+                crate::commands::vendor::ecosystem_in_scope(&args.common, e.cli_name())
+            })
         });
     }
 
@@ -1183,7 +1185,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
             format!(
                 "cannot read .socket/vendor/state.json: {} — the vendored leg, manifest \
                  cleanup, and GC were skipped",
-                vendor_state_result.as_ref().expect_err("checked corrupt above")
+                vendor_state_result
+                    .as_ref()
+                    .expect_err("checked corrupt above")
             ),
         ));
     }
@@ -1240,10 +1244,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
             ));
         }
         if !hosted_scope.is_empty() {
-            clauses.push(format!(
-                "unwind {} hosted redirect(s)",
-                hosted_scope.len()
-            ));
+            clauses.push(format!("unwind {} hosted redirect(s)", hosted_scope.len()));
         } else if hosted_leftover_edits > 0 {
             clauses.push(format!(
                 "replay {hosted_leftover_edits} leftover hosted redirect edit(s)"
@@ -1318,8 +1319,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     if !purls.is_empty() || (replay_eligible && !st.edits.is_empty()) {
                         hosted_leg =
                             run_hosted_leg(&args.common, &purls, &mut st, replay_eligible).await;
-                        let changed =
-                            (st.edits.len(), st.records.len()) != before;
+                        let changed = (st.edits.len(), st.records.len()) != before;
                         if !args.common.dry_run && changed {
                             if let Err(e) =
                                 socket_patch_core::patch::redirect::persist_redirect_state(
@@ -1504,7 +1504,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
                             "rollback restores every installed copy of a selected patch; \
                              {} restored cop{} outside the given paths",
                             out_of_scope.len(),
-                            if out_of_scope.len() == 1 { "y lives" } else { "ies live" }
+                            if out_of_scope.len() == 1 {
+                                "y lives"
+                            } else {
+                                "ies live"
+                            }
                         ),
                     ));
                 }
@@ -2355,14 +2359,8 @@ pub(crate) async fn rollback_patches_inner(
         let result = match try_rollback_local_go(purl, pkg_path, patch, common).await {
             Some(r) => r,
             None => {
-                rollback_package_patch(
-                    purl,
-                    pkg_path,
-                    &patch.files,
-                    &blobs_path,
-                    common.dry_run,
-                )
-                .await
+                rollback_package_patch(purl, pkg_path, &patch.files, &blobs_path, common.dry_run)
+                    .await
             }
         };
 
@@ -2390,8 +2388,7 @@ pub(crate) async fn rollback_patches_inner(
         let Some(patch) = scoped_manifest.patches.get(purl) else {
             continue;
         };
-        let Some(result) = try_rollback_local_go(purl, &common.cwd, patch, common).await
-        else {
+        let Some(result) = try_rollback_local_go(purl, &common.cwd, patch, common).await else {
             continue;
         };
         if !result.success {
@@ -2990,8 +2987,7 @@ mod tests {
             "pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1",
             &global
         ));
-        let global_attempted: HashSet<&str> =
-            ["pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1"].into();
+        let global_attempted: HashSet<&str> = ["pkg:golang/github.com%2Fpkg%2Ferrors@0.9.1"].into();
         assert!(
             before_blob_gate_manifest(&manifest, &global_attempted, &global)
                 .patches

@@ -75,8 +75,7 @@ pub(crate) enum StageOutcome {
 
 /// The disk stager's remedy: `repair` fills the persistent `.socket/`
 /// cache `apply` reads from.
-const APPLY_OFFLINE_REMEDY: &str =
-    "Run \"socket-patch repair\" to download missing artifacts.";
+const APPLY_OFFLINE_REMEDY: &str = "Run \"socket-patch repair\" to download missing artifacts.";
 
 /// The memory stager's remedy. Vendored content is fetched into memory and
 /// never lands under `.socket/`; sending a vendored project to `repair`
@@ -265,8 +264,7 @@ pub(crate) async fn stage_patch_sources(
     }
 
     let sources = staged.as_patch_sources();
-    let fetch_result =
-        fetch_missing_sources(manifest, &sources, download_mode, client, None).await;
+    let fetch_result = fetch_missing_sources(manifest, &sources, download_mode, client, None).await;
 
     if !quiet {
         println!("{}", format_fetch_result(&fetch_result));

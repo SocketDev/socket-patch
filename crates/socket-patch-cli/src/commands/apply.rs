@@ -789,8 +789,7 @@ pub(crate) async fn run_locked(
     // inode).
     match detect_npm_pkg_manager(&args.common.cwd) {
         NpmPkgManager::YarnBerryPnP => {
-            if eco_in_local_scope(&args.common, Ecosystem::Npm) && manifest_targets_npm(&manifest)
-            {
+            if eco_in_local_scope(&args.common, Ecosystem::Npm) && manifest_targets_npm(&manifest) {
                 return refuse_yarn_pnp(&args);
             }
         }
@@ -1276,8 +1275,8 @@ async fn apply_patches_inner(
         .patches
         .retain(|purl, _| target_manifest_purls.contains(purl));
 
-    let mut staged =
-        match stage_patch_sources(&args.common, &manifest, &socket_dir, client).await? {
+    let mut staged = match stage_patch_sources(&args.common, &manifest, &socket_dir, client).await?
+    {
         StageOutcome::Ready(s) => s,
         StageOutcome::Unavailable => {
             return Ok(ApplyOutcome {

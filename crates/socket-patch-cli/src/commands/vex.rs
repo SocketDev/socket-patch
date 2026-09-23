@@ -434,12 +434,16 @@ async fn generate_vex(
         let is_stale = |purl: &str| stale.contains(strip_purl_qualifiers(purl));
         outcome.applied.retain(|purl| !is_stale(purl));
         outcome.failed.retain(|failure| !is_stale(&failure.purl));
-        outcome.failed.extend(manifest.patches.keys().filter(|purl| is_stale(purl)).map(
-            |purl| FailedPatch {
-                purl: purl.clone(),
-                reason: "stale_install".to_string(),
-            },
-        ));
+        outcome.failed.extend(
+            manifest
+                .patches
+                .keys()
+                .filter(|purl| is_stale(purl))
+                .map(|purl| FailedPatch {
+                    purl: purl.clone(),
+                    reason: "stale_install".to_string(),
+                }),
+        );
     }
 
     // Vendored disclosure: the committed artifact verified (the attestation
