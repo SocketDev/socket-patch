@@ -467,11 +467,15 @@ async fn discover_selected(
 
 /// `common` with `json` off, for `select_patches`: scan has no "re-run
 /// with the chosen UUID" path, so it must never get `selection_required`.
-/// (A `--json` run still keeps the non-interactive note off stderr: the
-/// process-wide quiet switch mutes it.)
+/// A `--json` run also counts as `--yes`: it must never stop at the
+/// interactive patch menu (on a TTY that menu would block a machine
+/// consumer), so it takes the menu's default, the top-ranked patch.
+/// (It still keeps the non-interactive note off stderr: the process-wide
+/// quiet switch mutes it.)
 fn selection_args(common: &GlobalArgs) -> GlobalArgs {
     GlobalArgs {
         json: false,
+        yes: common.yes || common.json,
         ..common.clone()
     }
 }
@@ -3155,6 +3159,22 @@ mod tests {
         write_redirect_ledger(root, &["pkg:npm/minimist@1.2.2"]).await;
         write_vendor_ledger(root, &["pkg:npm/lodash@4.17.21"]).await;
         assert!(overlapping_ledger_purls(root).await.is_empty());
+    }
+
+    #[test]
+    fn selection_args_never_leaves_json_at_the_patch_menu() {
+        let json = selection_args(&GlobalArgs {
+            json: true,
+            ..GlobalArgs::default()
+        });
+        assert!(!json.json && json.yes, "--json selects like --yes");
+        let human = selection_args(&GlobalArgs::default());
+        assert!(!human.json && !human.yes, "a human run keeps its menu");
+        let yes = selection_args(&GlobalArgs {
+            yes: true,
+            ..GlobalArgs::default()
+        });
+        assert!(yes.yes);
     }
 
     #[test]
