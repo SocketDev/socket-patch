@@ -2198,6 +2198,56 @@ packages:
         }
     }
 
+    // ── source-flip / outage idempotence (vendor::test_support::npm_flip_suite) ──
+
+    impl crate::vendor::test_support::FlipFixture for Fixture {
+        fn flip_root(&self) -> &Path {
+            self.root()
+        }
+        fn flip_key(&self) -> String {
+            "pkg:npm/left-pad@1.3.0".to_string()
+        }
+        fn flip_uuid(&self) -> String {
+            self.record.uuid.clone()
+        }
+        fn flip_artifact_rel(&self) -> String {
+            self.rel_tgz()
+        }
+        fn flip_files(&self) -> Vec<String> {
+            vec![PACKAGE_JSON.to_string(), PNPM_LOCK.to_string()]
+        }
+    }
+
+    async fn flip_run(
+        fx: &Fixture,
+        cfg: Option<&crate::vendor::VendorServiceConfig>,
+    ) -> VendorOutcome {
+        let blobs = fx.root().join(".socket/blobs");
+        vendor_pnpm_legacy(
+            "pkg:npm/left-pad@1.3.0",
+            &fx.installed(),
+            fx.root(),
+            &fx.record,
+            &PatchSources::blobs_only(&blobs),
+            "2026-08-18T00:00:00Z",
+            false,
+            false,
+            cfg,
+        )
+        .await
+    }
+
+    async fn flip_fixture_v5() -> Fixture {
+        fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await
+    }
+
+    async fn flip_fixture_v6() -> Fixture {
+        fixture_with(T_BEFORE_PKG, T8_BEFORE_LOCK).await
+    }
+
+    crate::vendor::test_support::npm_flip_suite!(flip_suite_v5, Fixture, flip_fixture_v5, flip_run);
+    crate::vendor::test_support::npm_flip_suite!(flip_suite_v6, Fixture, flip_fixture_v6, flip_run);
+
     async fn fixture_with(pkg_json: &str, lock: &str) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();

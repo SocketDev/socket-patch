@@ -233,8 +233,10 @@ pub async fn vendor_yarn_classic(
 
     if wiring.is_empty() {
         // Every block already points at this uuid with the packed hashes:
-        // in sync. Touch nothing (the tarball re-pack above was
-        // byte-identical by determinism) and synthesize AlreadyPatched.
+        // in sync. `#sha1` and `integrity` were derived from the reused
+        // committed tarball (or, when reuse missed, from a fresh acquisition
+        // that reproduced them); touch nothing and synthesize
+        // AlreadyPatched.
         return VendorOutcome::Done {
             result: already_patched_result(purl, &dest, &record.files),
             entry: None,
@@ -1052,6 +1054,51 @@ left-pad@^1.3.0, left-pad@~1.3.0:
             .await
         }
     }
+
+    // ── source-flip / outage idempotence (vendor::test_support::npm_flip_suite) ──
+
+    impl crate::vendor::test_support::FlipFixture for Fixture {
+        fn flip_root(&self) -> &Path {
+            self.root()
+        }
+        fn flip_key(&self) -> String {
+            "pkg:npm/left-pad@1.3.0".to_string()
+        }
+        fn flip_uuid(&self) -> String {
+            self.record.uuid.clone()
+        }
+        fn flip_artifact_rel(&self) -> String {
+            format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")
+        }
+        fn flip_files(&self) -> Vec<String> {
+            vec![YARN_LOCK.to_string(), "package.json".to_string()]
+        }
+    }
+
+    async fn flip_run(
+        fx: &Fixture,
+        cfg: Option<&crate::vendor::VendorServiceConfig>,
+    ) -> VendorOutcome {
+        let blobs = fx.root().join(".socket/blobs");
+        vendor_yarn_classic(
+            "pkg:npm/left-pad@1.3.0",
+            &fx.installed(),
+            fx.root(),
+            &fx.record,
+            &PatchSources::blobs_only(&blobs),
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            cfg,
+        )
+        .await
+    }
+
+    async fn flip_fixture() -> Fixture {
+        fixture_with_lock(Y2_BEFORE).await
+    }
+
+    crate::vendor::test_support::npm_flip_suite!(flip_suite, Fixture, flip_fixture, flip_run);
 
     /// Build a project tempdir: installed left-pad, patched blob, the given
     /// yarn.lock bytes, and the PatchRecord.

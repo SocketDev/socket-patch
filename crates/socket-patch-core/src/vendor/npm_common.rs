@@ -29,6 +29,7 @@ use super::common::{
 };
 use super::npm_pack::{pack_deterministic, PackedTarball};
 use super::path::vendor_uuid_dir_rel;
+use super::reuse;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -161,6 +162,23 @@ pub(super) async fn stage_patch_pack(
     service: Option<&VendorServiceConfig>,
 ) -> Result<(Option<NpmStagedPack>, ApplyResult), Box<VendorOutcome>> {
     let coords = guard_coordinates(purl, record)?;
+
+    // ── Reuse the committed artifact (before any acquisition) ───────────
+    // A re-run whose tarball the ledger vouches for — sha256 anchored,
+    // every afterHash verified from the same bytes — keeps those bytes:
+    // no service call, no local pack, no write. Acquiring anew would make
+    // the lock's digests depend on which source answered THIS run (the
+    // service's prebuilt encoding and the local deterministic pack carry the
+    // same members but different bytes), so a service outage or its
+    // recovery would re-vendor every package. `--vendor-source` governs
+    // acquisition, not reuse; checked before `service_offline_conflict` so
+    // an in-sync `service` + `--offline` re-run succeeds (as cargo and
+    // composer already do). A dry run keeps previewing the local build.
+    if !dry_run {
+        if let Some(pair) = reuse_committed_pack(purl, project_root, &coords, record).await {
+            return Ok(pair);
+        }
+    }
 
     // ── Service-download fast path (Tier A: write the prebuilt tarball) ──
     // When the vendoring service is configured, try to download the already-
@@ -315,6 +333,66 @@ pub(super) async fn stage_patch_pack(
             packed,
             staged_pkg_json,
             uuid_dir_preexisted,
+        }),
+        result,
+    ))
+}
+
+/// The staged pack for a verified committed tarball (see
+/// [`super::reuse`]), or `None` to acquire as usual. Nothing is written, so
+/// the pack reports `uuid_dir_preexisted: true` — a later wiring failure's
+/// [`done_failure_unstage`] must never delete the committed artifact the
+/// live ledger entry still names.
+async fn reuse_committed_pack(
+    purl: &str,
+    project_root: &Path,
+    coords: &NpmCoords,
+    record: &PatchRecord,
+) -> Option<(Option<NpmStagedPack>, ApplyResult)> {
+    let rel_tgz = format!(
+        "{}/{}",
+        coords.uuid_dir_rel,
+        tgz_rel_leaf(&coords.name, &coords.version)
+    );
+    let art = match reuse::reusable_committed_artifact(project_root, "npm", record, Some(&rel_tgz))
+        .await
+    {
+        Ok(art) => art,
+        Err(miss) => {
+            reuse::log_miss(purl, &miss);
+            return None;
+        }
+    };
+    // A patched package.json feeds the flavor's dependency-mirror
+    // recompute; read it from the SAME verified bytes.
+    let staged_pkg_json = if record
+        .files
+        .keys()
+        .any(|k| normalize_file_path(k) == "package.json")
+    {
+        match art
+            .members
+            .get("package.json")
+            .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+        {
+            Some(pkg) => Some(pkg),
+            None => {
+                reuse::log_miss(purl, &reuse::ReuseMiss::Unreadable);
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    let result = already_patched_result(purl, &project_root.join(&rel_tgz), &record.files);
+    Some((
+        Some(NpmStagedPack {
+            name: coords.name.clone(),
+            version: coords.version.clone(),
+            rel_tgz,
+            packed: PackedTarball::from_bytes(&art.bytes),
+            staged_pkg_json,
+            uuid_dir_preexisted: true,
         }),
         result,
     ))

@@ -1195,6 +1195,55 @@ __metadata:
         }
     }
 
+    // ── source-flip / outage idempotence (vendor::test_support::npm_flip_suite) ──
+
+    impl crate::vendor::test_support::FlipFixture for Fixture {
+        fn flip_root(&self) -> &Path {
+            self.root()
+        }
+        fn flip_key(&self) -> String {
+            "pkg:npm/left-pad@1.3.0".to_string()
+        }
+        fn flip_uuid(&self) -> String {
+            self.record.uuid.clone()
+        }
+        fn flip_artifact_rel(&self) -> String {
+            format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")
+        }
+        fn flip_files(&self) -> Vec<String> {
+            vec![
+                PACKAGE_JSON.to_string(),
+                YARN_LOCK.to_string(),
+                YARNRC.to_string(),
+            ]
+        }
+    }
+
+    async fn flip_run(
+        fx: &Fixture,
+        cfg: Option<&crate::vendor::VendorServiceConfig>,
+    ) -> VendorOutcome {
+        let blobs = fx.root().join(".socket/blobs");
+        vendor_yarn_berry(
+            "pkg:npm/left-pad@1.3.0",
+            &fx.installed(),
+            fx.root(),
+            &fx.record,
+            &PatchSources::blobs_only(&blobs),
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            cfg,
+        )
+        .await
+    }
+
+    async fn flip_fixture() -> Fixture {
+        fixture().await
+    }
+
+    crate::vendor::test_support::npm_flip_suite!(flip_suite, Fixture, flip_fixture, flip_run);
+
     async fn fixture_with(pkg: &str, lock: &str) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
