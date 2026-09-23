@@ -81,7 +81,10 @@ mod pypi_requirements;
 mod pypi_uv;
 mod pypi_wheel;
 pub mod registry_fetch;
+pub(crate) mod reuse;
 pub(crate) mod service_fetch;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod toml_surgery;
 pub(crate) mod verify;
 pub(crate) mod yarn_berry_lock;
