@@ -7,7 +7,7 @@ use std::path::Path;
 use base64::Engine as _;
 use sha2::{Digest, Sha512};
 
-use crate::api::client::{ApiClient, ApiClientOptions};
+use crate::api::client::{ApiClient, ApiClientOptions, VendorRetryPolicy};
 use crate::patch::apply::ApplyResult;
 use crate::vendor::state::{load_state, save_state, VendorEntry};
 use crate::vendor::{VendorOutcome, VendorServiceConfig, VendorSource, VendorWarning};
@@ -41,7 +41,8 @@ pub(crate) fn sri(bytes: &[u8]) -> String {
     )
 }
 
-/// A service config against `server_uri` (org `acme`, authenticated).
+/// A service config against `server_uri` (org `acme`, authenticated), with
+/// retries disabled (tests about retry build their own client).
 pub(crate) fn service_cfg(
     server_uri: &str,
     source: VendorSource,
@@ -49,12 +50,15 @@ pub(crate) fn service_cfg(
 ) -> VendorServiceConfig {
     VendorServiceConfig {
         source,
-        client: Some(ApiClient::new(ApiClientOptions {
-            api_url: server_uri.to_string(),
-            api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
-            use_public_proxy: false,
-            org_slug: Some("acme".into()),
-        })),
+        client: Some(
+            ApiClient::new(ApiClientOptions {
+                api_url: server_uri.to_string(),
+                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                use_public_proxy: false,
+                org_slug: Some("acme".into()),
+            })
+            .with_vendor_retry(VendorRetryPolicy::none()),
+        ),
         use_public_proxy: false,
         vendor_url: None,
         patch_server_url: None,
