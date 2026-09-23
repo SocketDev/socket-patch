@@ -702,10 +702,15 @@ async fn composer_service_copy(
             ));
             ComposerServiceCopy::Used
         }
-        ServiceArtifact::IntegrityMismatch(reason) => miss(
-            warnings,
+        // Bytes that fail integrity verification are an active tamper signal:
+        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
+        // quiet local-build fallback (`ServiceArtifact`'s documented contract).
+        ServiceArtifact::IntegrityMismatch(reason) => hard(
             "vendor_prebuilt_integrity_mismatch",
-            format!("prebuilt dist zip failed integrity ({reason})"),
+            format!(
+                "prebuilt dist zip for {pkg} failed integrity verification ({reason}); \
+                 refusing to fall back to a local build on tampered bytes"
+            ),
         ),
         ServiceArtifact::Pending => miss(
             warnings,
@@ -1999,7 +2004,7 @@ mod tests {
             )
             .await,
         );
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
         assert!(!root
             .join(format!(".socket/vendor/composer/{UUID}"))
             .exists());
@@ -3479,5 +3484,33 @@ mod tests {
             before,
             "lock untouched"
         );
+    }
+
+    /// An integrity mismatch is a hard failure under `auto` too —
+    /// never a quiet local-build fallback (service_fetch's contract).
+    #[tokio::test]
+    async fn service_integrity_mismatch_auto_hard_fails() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let zip = make_dist_zip("x", &[("src/LoggerInterface.php", PATCHED)]);
+        let wrong = sri_sha512(b"different bytes");
+        let server = wiremock::MockServer::start().await;
+        mount_composer_granted(&server, &wrong, &zip).await;
+        let outcome = vendor_with_service(
+            root,
+            &blobs,
+            &installed,
+            &record,
+            &composer_service_cfg(&server.uri(), VendorSource::Auto, false),
+        )
+        .await;
+        let VendorOutcome::Refused { code, .. } = outcome else {
+            panic!("tampered bytes fell back to a local build: {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
+        assert!(!root
+            .join(format!(".socket/vendor/composer/{UUID}"))
+            .exists());
     }
 }

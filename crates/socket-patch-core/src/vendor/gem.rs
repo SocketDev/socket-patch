@@ -813,13 +813,16 @@ async fn gem_service_copy(
     // Step 1: the prebuilt `.gem` (sha512-verified against the reference).
     let archive = match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => archive,
+        // Bytes that fail integrity verification are an active tamper signal:
+        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
+        // quiet local-build fallback (`ServiceArtifact`'s documented contract).
         ServiceArtifact::IntegrityMismatch(reason) => {
-            return miss(
-                warnings,
+            return hard(
                 "vendor_prebuilt_integrity_mismatch",
-                ("vendor_prebuilt_required", ""),
-                format!("prebuilt .gem failed integrity ({reason})"),
-                false,
+                format!(
+                    "prebuilt .gem for {name} failed integrity verification ({reason}); \
+                     refusing to fall back to a local build on tampered bytes"
+                ),
             );
         }
         ServiceArtifact::Pending => {
@@ -866,12 +869,12 @@ async fn gem_service_copy(
             );
         }
         SecondaryArtifactResult::IntegrityMismatch(reason) => {
-            return miss(
-                warnings,
+            return hard(
                 "vendor_prebuilt_integrity_mismatch",
-                ("vendor_prebuilt_required", ""),
-                format!("prebuilt stub gemspec failed integrity ({reason})"),
-                false,
+                format!(
+                    "prebuilt stub gemspec for {name} failed integrity verification ({reason}); \
+                     refusing to fall back to a local build on tampered bytes"
+                ),
             );
         }
         SecondaryArtifactResult::Failed(reason) => {
@@ -4855,7 +4858,7 @@ mod tests {
         )
         .await;
         let (code, _) = unwrap_refused(outcome);
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
         assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
         // The lock is untouched.
         assert_eq!(
@@ -4894,7 +4897,7 @@ mod tests {
         )
         .await;
         let (code, _) = unwrap_refused(outcome);
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
         assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
     }
 
@@ -8185,5 +8188,38 @@ mod tests {
                 .unwrap(),
             LOCK_DIRECT
         );
+    }
+
+    /// A `.gem` or stub that fails integrity verification is a hard
+    /// failure under `auto` too — never a quiet local-build fallback.
+    #[tokio::test]
+    async fn integrity_mismatch_hard_fails_under_auto() {
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        for bad_stub in [false, true] {
+            let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+            let server = wiremock::MockServer::start().await;
+            let (gem_sri, stub_sri) = if bad_stub {
+                (sri_sha512(&gem), sri_sha512(b"not the stub"))
+            } else {
+                (sri_sha512(b"different bytes"), sri_sha512(SERVICE_STUB))
+            };
+            mount_gem_granted(&server, &gem, &gem_sri, Some((SERVICE_STUB, &stub_sri))).await;
+            let cfg = gem_service_cfg(&server.uri(), VendorSource::Auto, false);
+            let outcome = run_vendor_service(&root, &blobs, &installed, &record, &cfg).await;
+            let VendorOutcome::Refused { code, .. } = outcome else {
+                panic!("bad_stub={bad_stub}: tampered bytes fell back: {outcome:?}");
+            };
+            assert_eq!(
+                code, "vendor_prebuilt_integrity_mismatch",
+                "bad_stub={bad_stub}"
+            );
+            assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                    .await
+                    .unwrap(),
+                LOCK_DIRECT
+            );
+        }
     }
 }

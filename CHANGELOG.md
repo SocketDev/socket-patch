@@ -663,6 +663,17 @@ into the new version's section — see docs/releasing.md.
   patch's expected hash before the archive is used. On a mismatch, `auto`
   builds the archive locally and warns `vendor_prebuilt_layout_mismatch`,
   and `--vendor-source=service` refuses with `vendor_prebuilt_required`.
+- **A prebuilt artifact that fails its integrity check is always refused.**
+  Under the default `--vendor-source=auto`, npm, pypi, golang, composer and
+  gem (both the `.gem` and its stub gemspec) printed a warning and built the
+  package locally when the downloaded bytes did not match the integrity the
+  patch service reported. Bytes that fail verification may have been
+  tampered with, so these ecosystems now refuse the package in every mode,
+  as cargo, maven and nuget already did. The refusal code is
+  `vendor_prebuilt_integrity_mismatch` (npm fails the package with the
+  integrity detail). Under `--vendor-source=service`, golang, composer, gem
+  and pypi now report `vendor_prebuilt_integrity_mismatch` instead of
+  `vendor_prebuilt_required`.
 
 ### Changed
 

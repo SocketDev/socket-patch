@@ -1540,10 +1540,15 @@ async fn try_pypi_service_wheel(
                 platform_tags_display,
             }))
         }
-        ServiceArtifact::IntegrityMismatch(reason) => miss(
-            warnings,
+        // Bytes that fail integrity verification are an active tamper signal:
+        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
+        // quiet local-build fallback (`ServiceArtifact`'s documented contract).
+        ServiceArtifact::IntegrityMismatch(reason) => hard_fail(
             "vendor_prebuilt_integrity_mismatch",
-            format!("prebuilt wheel failed integrity ({reason})"),
+            format!(
+                "prebuilt wheel failed integrity verification ({reason}); \
+                 refusing to fall back to a local build on tampered bytes"
+            ),
         ),
         ServiceArtifact::Pending => miss(
             warnings,
@@ -5971,6 +5976,35 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
         assert!(warnings
             .iter()
             .any(|warning| warning.code == "pypi_unmatched_lockfiles"));
+    }
+
+    /// An integrity mismatch is a hard failure under `auto` too —
+    /// never a quiet local-build fallback (service_fetch's contract).
+    #[tokio::test]
+    async fn service_integrity_mismatch_auto_hard_fails() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let bytes = b"the real wheel bytes";
+        let wrong = sri_sha512(b"different bytes entirely");
+        let server = wiremock::MockServer::start().await;
+        mount_pypi_granted(&server, WHEEL_NAME, &wrong, bytes).await;
+        let outcome = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&pypi_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let VendorOutcome::Refused { code, .. } = outcome else {
+            panic!("tampered bytes fell back to a local build: {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
+        assert!(!fx.root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
     }
 }
 

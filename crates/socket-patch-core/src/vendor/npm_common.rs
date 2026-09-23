@@ -379,23 +379,13 @@ async fn try_service_pack(
                 Err(outcome) => ServicePackDecision::HardFail(outcome),
             }
         }
-        // An artifact that downloaded but failed integrity is NEVER silently
-        // used; under `auto` we fall back to a fresh local build (loudly).
-        ServiceArtifact::IntegrityMismatch(reason) => {
-            if cfg.source.requires_service() {
-                hard_fail(format!(
-                    "prebuilt artifact failed integrity verification: {reason}"
-                ))
-            } else {
-                warnings.push(VendorWarning::new(
-                    "vendor_prebuilt_integrity_mismatch",
-                    format!(
-                        "prebuilt artifact failed integrity ({reason}); building locally instead"
-                    ),
-                ));
-                ServicePackDecision::FallBack
-            }
-        }
+        // Bytes that fail integrity verification are an active tamper signal:
+        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
+        // quiet local-build fallback (`ServiceArtifact`'s documented contract).
+        ServiceArtifact::IntegrityMismatch(reason) => hard_fail(format!(
+            "prebuilt artifact failed integrity verification ({reason}); \
+             refusing to fall back to a local build on tampered bytes"
+        )),
         ServiceArtifact::Pending => {
             if cfg.source.requires_service() {
                 hard_fail("prebuilt artifact is still building".to_string())
