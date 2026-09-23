@@ -1142,11 +1142,19 @@ def main():
                 if mode == "vendored":
                     # The re-scan re-wires the COMMITTED wheel (no service
                     # call, no rebuild): the patched sha the first scan
-                    # wired is the one wired again.
+                    # wired is the one wired again. The sha alone also
+                    # holds whenever the source did not flip between the
+                    # scans, so when the relock dropped the vendored
+                    # reference (a re-wire, not an in-sync skip) the
+                    # re-scan must also report `vendor_artifact_reused` —
+                    # the proof the committed wheel, not a rebuild, was used.
                     sha_re = rb"sha256:([a-f0-9]{64})"
                     patched_shas = set(re.findall(sha_re, lock_after)) - set(re.findall(sha_re, pristine_lock))
-                    reused = bool(patched_shas) and patched_shas <= set(re.findall(sha_re, rescanned))
-                    info["rescanAfterRelock"]["reusesWheel"] = reused
+                    sha_kept = bool(patched_shas) and patched_shas <= set(re.findall(sha_re, rescanned))
+                    rewired = marker not in relocked
+                    reuse_event = "vendor_artifact_reused" in info["rescanAfterRelock"]["codes"]
+                    reused = sha_kept and (reuse_event or not rewired)
+                    info["rescanAfterRelock"].update({"shaKept": sha_kept, "rewired": rewired, "reuseEvent": reuse_event, "reusesWheel": reused})
                     check("rescanReusesWheel", reused, info["rescanAfterRelock"])
                 check("rollbackAfterRelockPristine", rb1.ok() and rollback_note["lockEqualsRelocked"], rollback_note)
             else:
