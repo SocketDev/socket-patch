@@ -276,15 +276,19 @@ async fn repair_inner(
     // packages` — repair must not re-litter them (or fail trying). The
     // cleanup phase below still uses the FULL manifest, so it never sweeps
     // sources an in-place apply may need for rollback.
-    let vendor_state = socket_patch_core::vendor::load_state(&args.common.cwd)
-        .await
-        .unwrap_or_default();
+    // Loaded ONCE under the lock; the vendored phase below takes the raw
+    // result (an unreadable ledger is ITS loud failure), while this scoping
+    // degrades to "nothing vendored" — a corrupt ledger must not hide the
+    // manifest's own missing sources.
+    let ledger = socket_patch_core::vendor::load_state(&args.common.cwd).await;
+    let no_entries = std::collections::HashMap::new();
+    let vendor_entries = ledger.as_ref().map(|s| &s.entries).unwrap_or(&no_entries);
     // Lockfile vendor references count as vendored even before the ledger
     // is reconstructed, so a no-ledger repair doesn't download sources for
     // entries the vendored phase is about to own.
     let referenced_uuids: std::collections::HashSet<String> = vendor_references
-        .into_iter()
-        .map(|(_, uuid, _)| uuid)
+        .iter()
+        .map(|(_, uuid, _)| uuid.clone())
         .collect();
     let scoped_manifest = manifest.as_ref().map(|m| {
         let patches = m
@@ -292,7 +296,7 @@ async fn repair_inner(
             .iter()
             .filter(|(purl, rec)| {
                 !referenced_uuids.contains(&rec.uuid)
-                    && socket_patch_core::vendor::lookup_entry(&vendor_state.entries, purl)
+                    && socket_patch_core::vendor::lookup_entry(vendor_entries, purl)
                         .is_none_or(|e| e.uuid != rec.uuid)
             })
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -410,12 +414,15 @@ async fn repair_inner(
     // Step 1.5: vendored artifacts — health-check the ledger (and any
     // lockfile vendor references with no ledger coverage) and rebuild
     // missing/corrupt artifacts. Runs under `--download-only` too:
-    // restoring artifacts IS repair's download half.
-    let vendor_rebuilt = crate::commands::repair_vendor::repair_vendored_artifacts(
+    // restoring artifacts IS repair's download half. The reference scan
+    // and ledger load above are handed over, not repeated.
+    let vendor_rebuilt = crate::commands::repair_vendor::repair_vendored_artifacts_with_references(
         &args.common,
         manifest.as_ref(),
         socket_dir,
         &mut env,
+        &vendor_references,
+        ledger,
     )
     .await;
     if !quiet && vendor_rebuilt > 0 {

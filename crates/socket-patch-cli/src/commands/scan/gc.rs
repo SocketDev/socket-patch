@@ -8,14 +8,15 @@ use socket_patch_core::manifest::cleanup_blobs::{
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::apply_lock;
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{canonical_purl, strip_purl_qualifiers};
+use socket_patch_core::vendor::load_state;
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::args::GlobalArgs;
 use crate::commands::lock_cli::lock_failure;
-use crate::commands::vendor::VendorGcSummary;
+use crate::commands::vendor::{run_vendor_gc, run_vendor_gc_locked, VendorGcSummary};
 
 /// Aggregated outcome of a GC pass (or preview). Serialized into the
 /// `scan --json` output's `gc` sub-object. See CLI_CONTRACT.md for the
@@ -49,12 +50,18 @@ pub(super) struct GcSummary {
     /// Orphan `.socket/vendor/<eco>/<uuid>` dirs swept (or sweepable).
     vendor_orphan_dirs: usize,
     /// Set when a wet pass could not take the apply lock and so skipped
-    /// its manifest prune + blob sweep: `lock_held` (another run holds it
-    /// — the contract's skip-not-fail posture) or `lock_io` (the lock file
-    /// could not be created or opened). `(code, message)` exactly as
+    /// its whole mutating half (vendored reverts, manifest prune, blob
+    /// sweep): `lock_held` (another run holds it — the contract's
+    /// skip-not-fail posture) or `lock_io` (the lock file could not be
+    /// created or opened). `(code, message)` exactly as
     /// `lock_cli::lock_failure` renders them. Never set in preview mode
     /// (the preview is lock-free and read-only).
     skipped: Option<(&'static str, String)>,
+    /// Post-revert/prune rewrites that failed (`vendor_state_write_failed`
+    /// / `manifest_write_failed` + detail): the reverts or prunes already
+    /// happened on disk, so the stale record is reported, not the pass
+    /// failed. Serialized as additive `warnings[]` on the apply shape only.
+    warnings: Vec<(&'static str, String)>,
 }
 
 impl GcSummary {
@@ -70,11 +77,10 @@ impl GcSummary {
         gc
     }
 
-    /// Fold a vendored-state GC pass into this summary. `failed` is
-    /// partitioned: ledger keys (every one a `pkg:` purl) are entries
-    /// whose revert failed; anything else is the pass-level lock-skip
-    /// marker `run_vendor_gc` records in place of a purl, which lands in
-    /// `skipped` unless this pass already recorded its own reason.
+    /// Fold a vendored-state GC pass into this summary: purl lists sorted,
+    /// the vendored half's lock skip becomes this pass's `skipped` unless
+    /// it already recorded its own reason, and its failed post-revert
+    /// rewrites join `warnings`.
     fn absorb_vendor_gc(&mut self, v: VendorGcSummary) {
         self.vendored_reverted = v
             .dropped_reverted
@@ -84,20 +90,16 @@ impl GcSummary {
         self.vendored_reverted.sort();
         self.vendored_kept = v.kept;
         self.vendored_kept.sort();
-        let (failed, markers): (Vec<String>, Vec<String>) =
-            v.failed.into_iter().partition(|f| f.starts_with("pkg:"));
-        self.vendored_failed = failed;
+        self.vendored_failed = v.failed;
         self.vendored_failed.sort();
-        if self.skipped.is_none() {
-            if let Some(marker) = markers.into_iter().next() {
-                self.skipped = Some(("lock_held", marker));
-            }
-        }
+        self.skipped = self.skipped.take().or(v.skipped);
+        self.warnings.extend(v.write_failures);
         self.vendor_orphan_dirs = v.orphan_dirs;
     }
 
-    /// Serialize for a *mutating* GC pass (post-apply). `skipped` is
-    /// additive: present only when the lock could not be taken.
+    /// Serialize for a *mutating* GC pass (post-apply). `skipped` and
+    /// `warnings` are additive: present only when the lock could not be
+    /// taken / a post-revert rewrite failed.
     fn to_apply_json(&self) -> serde_json::Value {
         let mut json = serde_json::json!({
             "prunedManifestEntries": self.pruned,
@@ -112,6 +114,13 @@ impl GcSummary {
         });
         if let Some((code, message)) = &self.skipped {
             json["skipped"] = serde_json::json!({ "code": code, "message": message });
+        }
+        if !self.warnings.is_empty() {
+            json["warnings"] = self
+                .warnings
+                .iter()
+                .map(|(code, detail)| serde_json::json!({ "code": code, "detail": detail }))
+                .collect();
         }
         json
     }
@@ -158,11 +167,16 @@ async fn run_gc(
     }
 }
 
-/// Apply-mode GC: run the vendored-state GC, then — when a manifest exists
-/// — prune manifest entries for PURLs not in `scanned_purls`, write the
-/// manifest back, and sweep orphan blob/diff/package files. Callers must
-/// gate on the `prune` flag — when GC isn't requested, simply don't call
-/// this function and don't emit a `gc` sub-object.
+/// Apply-mode GC, under ONE apply-lock window: the vendored-state GC
+/// (reverts manifest-dropped and lockfile-unused vendored entries, dropping
+/// the latter's manifest records), then — when a manifest exists — prune
+/// manifest entries for PURLs not in `scanned_purls`, write the manifest
+/// back, and sweep orphan blob/diff/package files, so the sweep reclaims
+/// the blobs the vendored half just orphaned in the same pass (the stale
+/// `vendored` exemption set is harmless: the entries it would exempt are
+/// already gone). Callers must gate on the `prune` flag — when GC isn't
+/// requested, simply don't call this function and don't emit a `gc`
+/// sub-object.
 pub(super) async fn run_apply_gc(
     common: &GlobalArgs,
     manifest_path: &Path,
@@ -170,49 +184,51 @@ pub(super) async fn run_apply_gc(
     scanned_purls: &HashSet<String>,
     vendored: &HashSet<String>,
 ) -> GcSummary {
-    // Vendored-state GC FIRST: it reverts manifest-dropped and
-    // lockfile-unused vendored entries, dropping the latter's manifest
-    // entries — so the manifest prune + blob sweep below reclaims their
-    // blobs in this same pass (and the stale `vendored` exemption set is
-    // harmless: the entries it would exempt are already gone). It takes
-    // the apply lock itself for its wet work and releases it on return.
-    let vendor_gc =
-        crate::commands::vendor::run_vendor_gc(common, manifest_path, /*dry_run=*/ false).await;
-
-    // No manifest ⇒ nothing to prune, and the blob sweep has no
-    // referenced-set to work from. Decided BEFORE the lock: `acquire`
-    // creates `.socket/` when it is missing, and a plain `scan --prune` on
-    // a project that has none (every manifest-free vendored project) must
-    // not conjure the directory just to find nothing to do.
-    if !tokio::fs::metadata(manifest_path)
+    // Existence gate BEFORE the lock: `acquire` creates `.socket/` when it
+    // is missing, and a plain `scan --prune` on a project with neither a
+    // manifest nor a ledger entry (a pristine checkout) must not conjure
+    // the directory just to find nothing to do. Either store alone is
+    // enough: the vendored half runs without a manifest, the manifest half
+    // without a ledger.
+    let has_manifest = tokio::fs::metadata(manifest_path)
         .await
-        .is_ok_and(|m| m.is_file())
-    {
-        return GcSummary::vendor_only(vendor_gc);
+        .is_ok_and(|m| m.is_file());
+    let has_ledger_entries = load_state(&common.cwd)
+        .await
+        .is_ok_and(|s| !s.entries.is_empty());
+    if !has_manifest && !has_ledger_entries {
+        return GcSummary::default();
     }
 
-    // The prune below is a manifest read-modify-write plus a blob/archive
-    // sweep — the writes the apply lock serializes everywhere else (apply,
-    // get, remove, repair, rollback, and the vendored half above). Run
-    // unlocked against a live holder mid-write, the stale read would
-    // clobber the holder's new manifest entry on write-back and the sweep
+    // Both halves are read-modify-writes the apply lock serializes
+    // everywhere else (apply, get, remove, repair, rollback, vendor). Run
+    // unlocked against a live holder mid-write, the stale manifest read
+    // would clobber the holder's new entry on write-back and the sweep
     // would delete its just-downloaded blobs. Contention skips the pass
     // without failing the scan; an I/O fault on the lock file skips it
-    // too — both are recorded so the output explains the untouched
-    // manifest instead of reading as a clean all-zero pass.
+    // too — both are recorded so the output explains the untouched state
+    // instead of reading as a clean all-zero pass. One acquire for both
+    // halves: flock is per open file description, so a nested acquire in
+    // the vendored half would read as a live holder and silently skip it.
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
     let _guard = match apply_lock::acquire(socket_dir, timeout) {
         Ok(g) => g,
         Err(e) => {
-            let mut gc = GcSummary::vendor_only(vendor_gc);
-            gc.skipped = Some(lock_failure(&e, timeout));
-            return gc;
+            return GcSummary {
+                skipped: Some(lock_failure(&e, timeout)),
+                ..Default::default()
+            };
         }
     };
 
+    // Vendored-state GC FIRST (see the fn doc), under this guard.
+    let vendor_gc = run_vendor_gc_locked(common, manifest_path, /*dry_run=*/ false).await;
+
     // Re-read the manifest under the lock (the apply step may have added
     // or updated entries we now want to consider for pruning; the probe
-    // above was only the cheap pre-lock gate).
+    // above was only the cheap pre-lock gate). Missing or unreadable ⇒
+    // nothing to prune, and the blob sweep has no referenced-set to work
+    // from.
     let mut manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
         _ => return GcSummary::vendor_only(vendor_gc),
@@ -221,13 +237,27 @@ pub(super) async fn run_apply_gc(
     for purl in &prunable {
         manifest.patches.remove(purl);
     }
+    let mut write_failure = None;
     if !prunable.is_empty() {
-        // If pruning failed mid-write the manifest may be stale, but the
-        // file-level cleanup below still operates on the in-memory copy.
-        let _ = write_manifest(manifest_path, &manifest).await;
+        // A failed write leaves the on-disk manifest stale (the entries
+        // are still listed as pruned — they are gone from the in-memory
+        // copy the sweep below works from), so it is reported, not
+        // swallowed.
+        if let Err(e) = write_manifest(manifest_path, &manifest).await {
+            write_failure = Some((
+                "manifest_write_failed",
+                format!(
+                    "pruned {} manifest entr{} but could not update {}: {e}",
+                    prunable.len(),
+                    if prunable.len() == 1 { "y" } else { "ies" },
+                    manifest_path.display()
+                ),
+            ));
+        }
     }
     let mut gc = run_gc(&manifest, prunable, socket_dir, /*dry_run=*/ false).await;
     gc.absorb_vendor_gc(vendor_gc);
+    gc.warnings.extend(write_failure);
     gc
 }
 
@@ -242,8 +272,7 @@ async fn preview_apply_gc(
     vendored: &HashSet<String>,
 ) -> GcSummary {
     // Read-only preview of the vendored-state GC (lists, never reverts).
-    let vendor_gc =
-        crate::commands::vendor::run_vendor_gc(common, manifest_path, /*dry_run=*/ true).await;
+    let vendor_gc = run_vendor_gc(common, manifest_path, /*dry_run=*/ true).await;
 
     let mut manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
@@ -298,11 +327,14 @@ pub(super) async fn gc_json(
 }
 
 /// Human-readable line(s) for the vendored-state half of a GC pass (and
-/// the lock-skip reason, when the manifest half could not run); prints
-/// nothing when there is nothing to report.
+/// the lock-skip reason / failed rewrites, when the pass could not run or
+/// persist in full); prints nothing when there is nothing to report.
 pub(super) fn print_gc_vendored_line(gc: &GcSummary) {
     if let Some((code, message)) = &gc.skipped {
         println!("GC: skipped ({code}): {message}.");
+    }
+    for (_, detail) in &gc.warnings {
+        println!("GC: {detail}.");
     }
     if !gc.vendored_reverted.is_empty() || gc.vendor_orphan_dirs > 0 {
         println!(
@@ -391,16 +423,12 @@ fn detect_prunable(
     scanned_purls: &HashSet<String>,
     vendored: &HashSet<String>,
 ) -> Vec<String> {
-    let scanned_bases: HashSet<String> = scanned_purls
-        .iter()
-        .map(|p| normalize_purl(strip_purl_qualifiers(p)).into_owned())
-        .collect();
+    let scanned_bases: HashSet<String> = scanned_purls.iter().map(|p| canonical_purl(p)).collect();
     manifest
         .patches
         .keys()
         .filter(|p| {
-            let base = normalize_purl(strip_purl_qualifiers(p));
-            !scanned_bases.contains(base.as_ref())
+            !scanned_bases.contains(&canonical_purl(p))
                 && !vendored.contains(p.as_str())
                 && !vendored.contains(strip_purl_qualifiers(p))
                 && crate::ecosystem_dispatch::crawl_covers_purl(p.as_str())
@@ -1313,23 +1341,27 @@ mod tests {
         assert!(uuid_dir.exists(), "kept artifacts must survive the sweep");
     }
 
-    /// The `keptVendoredEntries` / `failedVendoredEntries` / `skipped`
-    /// plumbing in isolation: absorbed sorted, serialized on the apply
-    /// shape, absent from the preview shape (a read-only preview cannot
-    /// detect drift, reverts nothing and takes no lock, so emitting a
-    /// constant `[]`/marker would claim a check that never ran). The
-    /// vendored half's `failed` is partitioned: purls are failed reverts,
-    /// the pass-level lock marker becomes the `skipped` reason.
+    /// The `keptVendoredEntries` / `failedVendoredEntries` / `skipped` /
+    /// `warnings` plumbing in isolation: absorbed sorted, serialized on the
+    /// apply shape, absent from the preview shape (a read-only preview
+    /// cannot detect drift, reverts nothing and takes no lock, so emitting
+    /// a constant `[]`/marker would claim a check that never ran). The
+    /// vendored half's typed fields land where they belong: `failed` holds
+    /// only purls, its lock skip becomes the `skipped` reason, its failed
+    /// rewrites become `warnings` — never mislabelled as `lock_held`.
     #[test]
     fn gc_json_shapes_carry_drift_keeps_only_on_apply() {
+        const LOCK_MARKER: &str = "vendor GC skipped: another socket-patch run holds the apply lock";
         let mut gc = GcSummary::default();
         gc.absorb_vendor_gc(VendorGcSummary {
             kept: vec!["pkg:npm/b@1.0.0".into(), "pkg:npm/a@1.0.0".into()],
-            failed: vec![
-                "pkg:npm/d@1.0.0".into(),
-                "vendor GC skipped: another socket-patch run holds the apply lock".into(),
-                "pkg:npm/c@1.0.0".into(),
-            ],
+            failed: vec!["pkg:npm/d@1.0.0".into(), "pkg:npm/c@1.0.0".into()],
+            skipped: Some(("lock_held", LOCK_MARKER.into())),
+            write_failures: vec![(
+                "vendor_state_write_failed",
+                "reverted vendored entries but could not update .socket/vendor/state.json: EROFS"
+                    .into(),
+            )],
             ..Default::default()
         });
         assert_eq!(
@@ -1340,15 +1372,12 @@ mod tests {
         assert_eq!(
             gc.vendored_failed,
             vec!["pkg:npm/c@1.0.0".to_string(), "pkg:npm/d@1.0.0".to_string()],
-            "failed reverts are absorbed sorted, the marker filtered out"
+            "failed reverts are absorbed sorted"
         );
         assert_eq!(
             gc.skipped,
-            Some((
-                "lock_held",
-                "vendor GC skipped: another socket-patch run holds the apply lock".to_string()
-            )),
-            "the vendored half's lock marker is the skip reason"
+            Some(("lock_held", LOCK_MARKER.to_string())),
+            "the vendored half's lock skip is the skip reason"
         );
         let apply = gc.to_apply_json();
         assert_eq!(
@@ -1361,32 +1390,57 @@ mod tests {
         );
         assert_eq!(apply["revertedVendoredEntries"], serde_json::json!([]));
         assert_eq!(apply["skipped"]["code"], "lock_held", "{apply}");
+        assert_eq!(
+            apply["warnings"],
+            serde_json::json!([{
+                "code": "vendor_state_write_failed",
+                "detail": "reverted vendored entries but could not update \
+                           .socket/vendor/state.json: EROFS",
+            }]),
+            "{apply}"
+        );
         let preview = gc.to_preview_json();
-        for key in ["keptVendoredEntries", "failedVendoredEntries", "skipped"] {
+        for key in [
+            "keptVendoredEntries",
+            "failedVendoredEntries",
+            "skipped",
+            "warnings",
+        ] {
             assert!(
                 preview.get(key).is_none(),
                 "preview must not claim a check it cannot run ({key}): {preview}"
             );
         }
 
-        // A pass that took its own lock fine reports NO skip, and the
-        // apply shape omits the key entirely (additive: absent, not null).
+        // A pass that took its own lock fine reports NO skip and NO
+        // warnings, and the apply shape omits both keys entirely (additive:
+        // absent, not null).
         let clean = GcSummary::vendor_only(VendorGcSummary::default());
         assert!(clean.skipped.is_none());
-        assert!(
-            clean.to_apply_json().get("skipped").is_none(),
-            "{}",
-            clean.to_apply_json()
-        );
-        // This pass's own reason wins over the vendored half's marker.
+        let clean_json = clean.to_apply_json();
+        assert!(clean_json.get("skipped").is_none(), "{clean_json}");
+        assert!(clean_json.get("warnings").is_none(), "{clean_json}");
+        // This pass's own reason wins over the vendored half's skip.
         let mut own = GcSummary {
             skipped: Some(("lock_io", "failed to open lock file".to_string())),
             ..Default::default()
         };
         own.absorb_vendor_gc(VendorGcSummary {
-            failed: vec!["vendor GC skipped: another socket-patch run holds the apply lock".into()],
+            skipped: Some(("lock_held", LOCK_MARKER.into())),
             ..Default::default()
         });
         assert_eq!(own.skipped.as_ref().map(|(c, _)| *c), Some("lock_io"));
+        // A `lock_io` fault or a failed rewrite in the vendored half is
+        // never reported as contention (the pre-fix `starts_with("pkg:")`
+        // partition labelled every non-purl marker `lock_held`).
+        let mut io = GcSummary::default();
+        io.absorb_vendor_gc(VendorGcSummary {
+            skipped: Some(("lock_io", "could not open apply.lock".into())),
+            write_failures: vec![("manifest_write_failed", "could not update manifest".into())],
+            ..Default::default()
+        });
+        assert_eq!(io.skipped.as_ref().map(|(c, _)| *c), Some("lock_io"));
+        assert_eq!(io.to_apply_json()["warnings"][0]["code"], "manifest_write_failed");
+        assert!(io.vendored_failed.is_empty());
     }
 }

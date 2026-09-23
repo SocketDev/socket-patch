@@ -361,16 +361,26 @@ pub async fn harvest_artifact_blobs(
     project_root: &Path,
     manifest_patches: &HashMap<String, PatchRecord>,
 ) -> HashMap<String, Vec<u8>> {
+    let Ok(state) = load_state(project_root).await else {
+        return HashMap::new();
+    };
+    harvest_artifact_blobs_from(project_root, &state.entries, manifest_patches).await
+}
+
+/// [`harvest_artifact_blobs`] over an already-loaded ledger (`entries`),
+/// for callers that hold the run's single `load_state` result.
+pub async fn harvest_artifact_blobs_from(
+    project_root: &Path,
+    entries: &HashMap<String, VendorEntry>,
+    manifest_patches: &HashMap<String, PatchRecord>,
+) -> HashMap<String, Vec<u8>> {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
 
     const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
     const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
     let mut out: HashMap<String, Vec<u8>> = HashMap::new();
-    let Ok(state) = load_state(project_root).await else {
-        return out;
-    };
-    if state.entries.is_empty() {
+    if entries.is_empty() {
         return out;
     }
 
@@ -384,9 +394,8 @@ pub async fn harvest_artifact_blobs(
         if needed.is_empty() {
             continue;
         }
-        let Some(entry) = state.entries.get(purl).or_else(|| {
-            state
-                .entries
+        let Some(entry) = entries.get(purl).or_else(|| {
+            entries
                 .values()
                 .find(|e| e.base_purl == strip_purl_qualifiers(purl))
         }) else {

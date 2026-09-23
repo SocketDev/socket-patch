@@ -26,12 +26,12 @@ use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::patch::apply_lock::{self, LockError};
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::{
     self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, registry_fetch,
     save_state, RevertOpts, RevertOutcome, VendorEntry, VendorOutcome, VendorServiceConfig,
-    VendorSource, VendorState, VendorWarning,
+    VendorState, VendorWarning,
 };
 use socket_patch_core::vex::time::now_rfc3339;
 use std::collections::{HashMap, HashSet};
@@ -43,6 +43,7 @@ use crate::commands::apply::{representative_file, result_to_event, variant_match
 use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
 use crate::commands::lock_cli::{acquire_or_emit, lock_failure};
+use crate::commands::rollback::VendorRevertStep;
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::json_envelope::{
@@ -421,14 +422,8 @@ pub async fn run(args: VendorArgs) -> i32 {
             get_api_client_with_overrides(args.common.api_client_overrides()).await;
         let telemetry_ids = (client.api_token().cloned(), client.org_slug().cloned());
         Some((
-            VendorServiceConfig {
-                source: VendorSource::parse(&args.common.vendor_source).unwrap_or_default(),
-                client: Some(client),
-                use_public_proxy,
-                vendor_url: args.common.vendor_url.clone(),
-                patch_server_url: args.common.patch_server_url.clone(),
-                offline: args.common.offline,
-            },
+            args.common
+                .vendor_service_config(Some(client), use_public_proxy),
             telemetry_ids,
         ))
     };
@@ -598,24 +593,34 @@ async fn run_vendor(
 
     // Reconcile first (mirrors apply's placement): entries vendored by a
     // previous run whose patches were dropped from the manifest are reverted
-    // even when zero in-scope patches remain.
-    let mut has_errors = reconcile_dropped(&manifest, common, env).await;
+    // even when zero in-scope patches remain. Its post-reconcile ledger
+    // feeds the staging harvest below (one load, not two).
+    let (mut has_errors, ledger) = reconcile_dropped(&manifest, common, env).await;
 
     let socket_dir = manifest_path.parent().unwrap_or(Path::new("."));
     // Vendor stages patch content IN MEMORY: existing .socket artifacts are
     // read in place, missing content is fetched per patch — vendoring never
-    // writes blobs or temp files (the committed artifact is the patch).
-    let staged =
-        match stage_vendor_sources_in_memory(common, &manifest, socket_dir, &common.cwd).await {
-            MemStageOutcome::Ready(s) => s,
-            MemStageOutcome::Unavailable => {
-                env.mark_error(EnvelopeError::new(
-                    "no_local_source",
-                    "patch artifacts unavailable (offline or download failure)",
-                ));
-                return 1;
-            }
-        };
+    // writes blobs or temp files (the committed artifact is the patch). No
+    // seed: this manifest-driven command has no download phase.
+    let staged = match stage_vendor_sources_in_memory(
+        common,
+        &manifest,
+        socket_dir,
+        &common.cwd,
+        ledger.as_ref().map(|s| &s.entries),
+        HashMap::new(),
+    )
+    .await
+    {
+        MemStageOutcome::Ready(s) => s,
+        MemStageOutcome::Unavailable => {
+            env.mark_error(EnvelopeError::new(
+                "no_local_source",
+                "patch artifacts unavailable (offline or download failure)",
+            ));
+            return 1;
+        }
+    };
     let sources = staged.as_patch_sources();
 
     has_errors |= vendor_records(
@@ -906,7 +911,7 @@ pub(crate) async fn vendor_records(
         let crawler = socket_patch_core::crawlers::npm_crawler::NpmCrawler::new();
         for package in crawler.crawl_all(&crawler_options).await {
             for purl in &missing_npm {
-                if normalize_purl(strip_purl_qualifiers(purl)) == normalize_purl(&package.purl) {
+                if canonical_purl(purl) == normalize_purl(&package.purl) {
                     all_packages
                         .entry(purl.clone())
                         .or_insert_with(|| package.path.clone());
@@ -1232,10 +1237,11 @@ pub(crate) async fn vendor_records(
                     }
                     continue;
                 }
-                let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
-                let claimed = redirect_ledger
-                    .as_ref()
-                    .is_some_and(|l| l.records.keys().any(|k| canon(k) == canon(candidate)));
+                let claimed = redirect_ledger.as_ref().is_some_and(|l| {
+                    l.records
+                        .keys()
+                        .any(|k| canonical_purl(k) == canonical_purl(candidate))
+                });
                 if claimed && common.dry_run {
                     // Probe the takeover exactly as the wet run would — the
                     // per-purl revert's dry run resolves every inverse and
@@ -1653,15 +1659,17 @@ fn manifest_dropped_purls(
 }
 
 /// Revert vendored entries whose patches were dropped from the manifest.
-/// Shared with `scan --vendor` (which runs the same engine in-process).
+/// Returns `(had_error, ledger)`: the post-reconcile ledger load, for the
+/// caller's staging harvest (an unreadable ledger is `Err` — reported by
+/// the engine, not here).
 pub(crate) async fn reconcile_dropped(
     manifest: &PatchManifest,
     common: &GlobalArgs,
     env: &mut Envelope,
-) -> bool {
+) -> (bool, std::io::Result<VendorState>) {
     let mut state = match load_state(&common.cwd).await {
         Ok(s) => s,
-        Err(_) => return false, // unreadable state is reported by the main path
+        Err(e) => return (false, Err(e)),
     };
     let stale = manifest_dropped_purls(&state, manifest, common);
     let mut had_error = false;
@@ -1715,7 +1723,7 @@ pub(crate) async fn reconcile_dropped(
             );
         }
     }
-    had_error
+    (had_error, Ok(state))
 }
 
 async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
@@ -1735,50 +1743,58 @@ async fn run_revert(args: &VendorArgs, env: &mut Envelope) -> i32 {
     let mut recorded: Vec<String> = state.entries.keys().cloned().collect();
     recorded.sort();
 
+    // The one vendored-revert primitive every reverting command shares
+    // (rollback's vendored leg, both of remove's paths): dispatch →
+    // drift-keep → per-entry ledger save. Only the event vocabulary and
+    // the human lines are this command's.
     for purl in &recorded {
-        let entry = state.entries.get(purl).cloned().expect("key listed above");
-        let outcome = dispatch_revert_one(&entry, &common.cwd, common.dry_run).await;
-        for w in &outcome.warnings {
+        let result = crate::commands::rollback::revert_vendor_entry(
+            &common.cwd,
+            purl,
+            &mut state,
+            RevertOpts::new(common.dry_run),
+        )
+        .await;
+        for w in &result.warnings {
             record_warning(env, purl, w, common);
         }
-        if outcome.success {
-            if outcome.kept_artifact {
-                // Drift-skip keep (residual #131): the backend left the
-                // drifted lock alone and kept the artifacts, so the ledger
-                // entry must survive too — and the genuine outcome is a
-                // COUNTED skip, not a removal. (`record_warning` above
-                // already surfaced the per-record details as uncounted
-                // advisory events.)
+        match result.step {
+            // Every key came from this ledger; `--revert` never preserves.
+            VendorRevertStep::Missing | VendorRevertStep::Preserved => {}
+            VendorRevertStep::Failed(why) => {
+                has_errors = true;
                 env.record(
-                    PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
-                        "vendor_revert_kept",
-                        "lock entries drifted since vendoring; artifacts and ledger entry kept \
-                         — undo the drift and re-run `vendor --revert` to finish",
-                    ),
+                    PatchEvent::new(PatchAction::Failed, purl.clone())
+                        .with_error("revert_failed", why),
                 );
-                continue;
-            }
-            env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
-            if !common.dry_run {
-                state.entries.remove(purl);
-                if let Err(e) = save_state(&common.cwd, &state).await {
-                    has_errors = true;
-                    env.record(
-                        PatchEvent::new(PatchAction::Failed, purl.clone())
-                            .with_error("vendor_state_write_failed", e.to_string()),
-                    );
+                if !common.silent && !common.json {
+                    eprintln!("Failed to revert {purl}");
                 }
             }
-        } else {
-            has_errors = true;
-            env.record(
-                PatchEvent::new(PatchAction::Failed, purl.clone()).with_error(
-                    "revert_failed",
-                    outcome.error.unwrap_or_else(|| "unknown error".into()),
+            // Drift-skip keep (residual #131): the backend left the
+            // drifted lock alone and kept the artifacts, so the ledger
+            // entry must survive too — and the genuine outcome is a
+            // COUNTED skip, not a removal. (`record_warning` above
+            // already surfaced the per-record details as uncounted
+            // advisory events.)
+            VendorRevertStep::Kept => env.record(
+                PatchEvent::new(PatchAction::Skipped, purl.clone()).with_reason(
+                    "vendor_revert_kept",
+                    "lock entries drifted since vendoring; artifacts and ledger entry kept \
+                     — undo the drift and re-run `vendor --revert` to finish",
                 ),
-            );
-            if !common.silent && !common.json {
-                eprintln!("Failed to revert {purl}");
+            ),
+            VendorRevertStep::WouldRevert | VendorRevertStep::Reverted => {
+                env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
+            }
+            // Reverted on disk; the record of it could not be persisted.
+            VendorRevertStep::LedgerWriteFailed(e) => {
+                env.record(PatchEvent::new(PatchAction::Removed, purl.clone()));
+                has_errors = true;
+                env.record(
+                    PatchEvent::new(PatchAction::Failed, purl.clone())
+                        .with_error("vendor_state_write_failed", e),
+                );
             }
         }
     }
@@ -1868,10 +1884,19 @@ pub(crate) struct VendorGcSummary {
     pub kept: Vec<String>,
     /// (c) orphan uuid dirs (no owning ledger entry) swept.
     pub orphan_dirs: usize,
-    /// Entries that could not be reverted (kept in the ledger), plus any
-    /// pass-level marker: the lock skip (`lock_held` contention or a
-    /// `lock_io` fault) and a failed post-revert ledger/manifest rewrite.
+    /// Entries (ledger keys) that could not be reverted — kept in the
+    /// ledger, nothing reclaimed. Only purls; the pass-level outcomes below
+    /// have their own fields.
     pub failed: Vec<String>,
+    /// Set when a wet pass skipped ALL its work because the apply lock
+    /// could not be taken: `("lock_held", <marker>)` for a live holder,
+    /// `lock_cli::lock_failure`'s `("lock_io", <message>)` for a lock file
+    /// that could not be created or opened. Never set on dry runs.
+    pub skipped: Option<(&'static str, String)>,
+    /// Post-revert rewrites that failed: `("vendor_state_write_failed" |
+    /// "manifest_write_failed", <detail>)`. The reverts themselves already
+    /// happened on disk; the stale record is what the caller must report.
+    pub write_failures: Vec<(&'static str, String)>,
 }
 
 /// The vendored-state GC behind `scan --prune`:
@@ -1904,13 +1929,65 @@ pub(crate) struct VendorGcSummary {
 ///
 /// Wet runs take the apply lock (lockfiles + the manifest are rewritten),
 /// honoring `--lock-timeout`; a live holder records the contention skip
-/// marker and returns — it never fails the scan — while a lock that cannot
-/// even be opened (`lock_io`) records a distinct marker and a human-mode
-/// warning. The ledger and manifest are rewritten only when a pass removed
-/// something; a failed rewrite is recorded as a pass-level marker (the
-/// reverts themselves already happened on disk). Dry runs are read-only,
-/// lock-free, and list-only.
+/// ([`VendorGcSummary::skipped`]) and returns — it never fails the scan —
+/// while a lock that cannot even be opened (`lock_io`) records the distinct
+/// reason plus a human-mode warning. The ledger and manifest are rewritten
+/// only when a pass removed something; a failed rewrite is recorded in
+/// [`VendorGcSummary::write_failures`] (the reverts themselves already
+/// happened on disk). Dry runs are read-only, lock-free, and list-only.
+///
+/// A caller already holding the apply lock (`scan --prune`'s manifest
+/// prune runs under the same guard) uses [`run_vendor_gc_locked`]: flock is
+/// per open file description, so a nested acquire here would read as a
+/// live holder and silently skip every revert.
 pub(crate) async fn run_vendor_gc(
+    common: &GlobalArgs,
+    manifest_path: &Path,
+    dry_run: bool,
+) -> VendorGcSummary {
+    if dry_run {
+        return run_vendor_gc_locked(common, manifest_path, true).await;
+    }
+    // Existence gate BEFORE the lock (`acquire` creates `.socket/`): a
+    // project with no ledger entries has nothing this pass could reclaim.
+    if !load_state(&common.cwd)
+        .await
+        .is_ok_and(|s| !s.entries.is_empty())
+    {
+        return VendorGcSummary::default();
+    }
+    let socket_dir = crate::args::socket_dir_of(manifest_path, &common.cwd);
+    let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
+    let _guard = match apply_lock::acquire(&socket_dir, timeout) {
+        Ok(g) => g,
+        Err(LockError::Held) => {
+            return VendorGcSummary {
+                skipped: Some((
+                    "lock_held",
+                    "vendor GC skipped: another socket-patch run holds the apply lock".to_string(),
+                )),
+                ..Default::default()
+            };
+        }
+        Err(e) => {
+            // Not contention: a file squatting on `.socket/`, a directory
+            // on `apply.lock`, a permissions problem. Mislabelling it as
+            // a live holder would hide a real fault behind a benign skip.
+            let (code, message) = lock_failure(&e, timeout);
+            gc_note(common, code, &format!("vendor GC skipped: {message}"));
+            return VendorGcSummary {
+                skipped: Some((code, message)),
+                ..Default::default()
+            };
+        }
+    };
+    run_vendor_gc_locked(common, manifest_path, false).await
+}
+
+/// [`run_vendor_gc`]'s body, lock-free: the caller holds the apply lock
+/// for a wet pass (or `dry_run` is set, which needs none). Re-reads the
+/// ledger itself — under the caller's lock it is the authoritative copy.
+pub(crate) async fn run_vendor_gc_locked(
     common: &GlobalArgs,
     manifest_path: &Path,
     dry_run: bool,
@@ -1921,35 +1998,6 @@ pub(crate) async fn run_vendor_gc(
         // No ledger (or unreadable): only the orphan sweep could apply, and
         // without a trustworthy ledger it must not delete anything.
         _ => return out,
-    };
-
-    let socket_dir = manifest_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| common.cwd.clone());
-    let _guard = if dry_run {
-        None
-    } else {
-        let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-        match apply_lock::acquire(&socket_dir, timeout) {
-            Ok(g) => Some(g),
-            Err(LockError::Held) => {
-                out.failed.push(
-                    "vendor GC skipped: another socket-patch run holds the apply lock".to_string(),
-                );
-                return out;
-            }
-            Err(e) => {
-                // Not contention: a file squatting on `.socket/`, a directory
-                // on `apply.lock`, a permissions problem. Mislabelling it as
-                // a live holder would hide a real fault behind a benign skip.
-                let (code, message) = lock_failure(&e, timeout);
-                gc_note(common, code, &format!("vendor GC skipped: {message}"));
-                out.failed
-                    .push(format!("vendor GC skipped ({code}): {message}"));
-                return out;
-            }
-        }
     };
 
     // (a) manifest-dropped entries. Everything (a) touches is excluded from
@@ -2053,7 +2101,8 @@ pub(crate) async fn run_vendor_gc(
                      .socket/vendor/state.json: {e}"
                 );
                 gc_note(common, "vendor_state_write_failed", &detail);
-                out.failed.push(format!("vendor GC: {detail}"));
+                out.write_failures
+                    .push(("vendor_state_write_failed", detail));
             }
         }
         if manifest_dirty {
@@ -2064,7 +2113,7 @@ pub(crate) async fn run_vendor_gc(
                         manifest_path.display()
                     );
                     gc_note(common, "manifest_write_failed", &detail);
-                    out.failed.push(format!("vendor GC: {detail}"));
+                    out.write_failures.push(("manifest_write_failed", detail));
                 }
             }
         }
@@ -2080,8 +2129,8 @@ pub(crate) async fn run_vendor_gc(
 }
 
 /// Human-mode stderr line for a pass-level GC problem (the GC has no
-/// envelope of its own; JSON consumers see the marker in
-/// [`VendorGcSummary::failed`]). Muted under `--json` and `--silent`.
+/// envelope of its own; JSON consumers see it as `scan --prune --json`'s
+/// `gc.skipped` / `gc.warnings`). Muted under `--json` and `--silent`.
 fn gc_note(common: &GlobalArgs, code: &str, detail: &str) {
     if !common.json && !common.silent {
         eprintln!("Warning ({code}): {detail}");
@@ -2117,14 +2166,12 @@ mod dispatch_tests {
             diffs_path: None,
             mem_blobs: None,
         };
-        let service = VendorServiceConfig {
-            source: VendorSource::Service,
-            client: None,
-            use_public_proxy: false,
-            vendor_url: None,
-            patch_server_url: None,
-            offline: false,
-        };
+        let service = GlobalArgs {
+            vendor_source: "service".to_string(),
+            ..Default::default()
+        }
+        .vendor_service_config(None, false);
+        assert_eq!(service.source, VendorSource::Service);
         let outcome = dispatch_vendor_one(
             "pkg:maven/org.apache.logging.log4j/log4j-core@2.17.0",
             tmp.path(),
@@ -2765,14 +2812,19 @@ mod gc_tests {
             .unwrap();
 
         let out = run_vendor_gc(&common, &manifest_path, false).await;
-        assert_eq!(out.failed.len(), 1, "{out:?}");
+        let (code, message) = out.skipped.as_ref().expect("the I/O fault is the skip reason");
+        assert_eq!(*code, "lock_io", "{out:?}");
         assert!(
-            out.failed[0].contains("lock_io") && out.failed[0].contains("apply.lock"),
+            message.contains("apply.lock"),
             "an I/O fault is reported as lock_io naming the path: {out:?}"
         );
         assert!(
-            !out.failed[0].contains("holds the apply lock"),
+            !message.contains("holds the apply lock"),
             "an I/O fault must not be mislabelled as contention: {out:?}"
+        );
+        assert!(
+            out.failed.is_empty(),
+            "a pass-level skip is not a per-purl failure: {out:?}"
         );
         assert!(out.dropped_reverted.is_empty(), "{out:?}");
         assert!(
@@ -3230,10 +3282,14 @@ mod gc_tests {
 
         let out = run_vendor_gc(&common, &manifest_path, false).await;
         assert_eq!(
-            out.failed,
-            vec!["vendor GC skipped: another socket-patch run holds the apply lock".to_string()],
+            out.skipped,
+            Some((
+                "lock_held",
+                "vendor GC skipped: another socket-patch run holds the apply lock".to_string()
+            )),
             "{out:?}"
         );
+        assert!(out.failed.is_empty(), "{out:?}");
         assert!(out.dropped_reverted.is_empty(), "{out:?}");
         assert!(out.unused_reverted.is_empty(), "{out:?}");
         assert_eq!(out.orphan_dirs, 0, "{out:?}");
@@ -3259,6 +3315,23 @@ mod gc_tests {
             "the lock-free dry preview still lists: {dry:?}"
         );
         assert!(dry.failed.is_empty(), "{dry:?}");
+        assert!(dry.skipped.is_none(), "a dry run takes no lock: {dry:?}");
+
+        // A caller that already HOLDS the lock runs the body directly: the
+        // same held lock is no obstacle (flock is per open description, so
+        // a nested `run_vendor_gc` would have skipped here) and the pass
+        // reclaims normally.
+        let locked = run_vendor_gc_locked(&common, &manifest_path, false).await;
+        assert!(locked.skipped.is_none(), "{locked:?}");
+        assert_eq!(locked.dropped_reverted, vec![PURL.to_string()], "{locked:?}");
+        assert!(
+            !load_state(tmp.path())
+                .await
+                .unwrap()
+                .entries
+                .contains_key(PURL),
+            "the locked body reverts under the caller's guard"
+        );
     }
 
     /// (a) revert FAILURE accounting: a ledger entry whose ecosystem has no

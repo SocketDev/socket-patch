@@ -17,7 +17,7 @@ use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::Path;
 
@@ -2324,6 +2324,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             return boxed_vendor_json_path(
                 &args,
                 &api_client,
+                use_public_proxy,
                 effective_org_slug,
                 &all_packages_with_patches,
                 can_access_paid_patches,
@@ -2657,22 +2658,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
     }
 
-    // Vendor mode: pre-verify baselines so a content mismatch surfaces
-    // BEFORE the confirm prompt (vendoring still proceeds for these —
-    // the stage force-applies the verified patched content).
-    let mismatched_baselines: HashSet<String> = if vendor && !args.common.silent {
-        preverify_vendor_baselines(
-            &api_client,
-            effective_org_slug,
-            &selected,
-            &filtered_crawled,
-            &lockfile_only.purls,
-        )
-        .await
-    } else {
-        HashSet::new()
-    };
-
     // Display detailed summary of selected patches before confirming
     // (presentational only — skipped wholesale under --silent).
     if !args.common.silent {
@@ -2715,11 +2700,6 @@ pub async fn run(mut args: ScanArgs) -> i32 {
                 patch.tier.to_uppercase(),
                 sev_colored,
             );
-            if mismatched_baselines.contains(&patch.uuid) {
-                println!(
-                    "    (installed content differs from patch baseline — will vendor patched content)"
-                );
-            }
             if !vuln_ids.is_empty() {
                 println!("    Fixes: {}", vuln_ids.join(", "));
             }
@@ -2786,7 +2766,39 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         && !args.prune
         && !args.common.yes
         && !crate::output::stdin_is_tty();
-    if report_only || !confirm(&prompt, true, args.common.yes, false) {
+    if report_only {
+        if !args.common.silent {
+            print_get_hint(false);
+        }
+        return embed_vex_human(&args.common, &args.vex, &manifest_path, 0).await;
+    }
+
+    // Vendor mode: pre-verify baselines so a content mismatch surfaces
+    // BEFORE the confirm prompt (vendoring still proceeds for these — the
+    // stage force-applies the verified patched content). Runs after the
+    // dry-run return above so a preview fetches no views; the views it
+    // does fetch seed the download phase, which never fetches them again.
+    let prefetched = if vendor && !args.common.silent {
+        let (mismatched, views) = preverify_vendor_baselines(
+            &api_client,
+            effective_org_slug,
+            &selected,
+            &filtered_crawled,
+            &lockfile_only.purls,
+        )
+        .await;
+        for patch in selected.iter().filter(|p| mismatched.contains(&p.uuid)) {
+            println!(
+                "  {}: installed content differs from patch baseline — will vendor patched content",
+                normalize_purl(&patch.purl)
+            );
+        }
+        views
+    } else {
+        HashMap::new()
+    };
+
+    if !confirm(&prompt, true, args.common.yes, false) {
         if !args.common.silent {
             print_get_hint(false);
         }
@@ -2807,8 +2819,11 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         // JSON path (see `run_vendor_json_path`).
         boxed_vendor_interactive_path(
             &args,
+            &api_client,
+            use_public_proxy,
             &selected,
             &params,
+            prefetched,
             &manifest_path,
             &socket_dir,
             &scanned_purls,

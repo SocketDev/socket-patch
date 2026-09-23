@@ -1152,8 +1152,7 @@ pub(crate) async fn run_redirect_selected(
     if !candidates.iter().any(|c| takeover_capable(&c.purl)) {
         // No takeover-capable candidates — nothing to reconcile.
     } else {
-        use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
-        let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
+        use socket_patch_core::utils::purl::{canonical_purl as canon, strip_purl_qualifiers};
         // Loaded ONCE and mutated in place per reverted purl (the wet loop
         // saves after each revert): this run holds the apply lock, so no
         // other writer can move the on-disk ledger under it.

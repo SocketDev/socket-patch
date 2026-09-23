@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
-use socket_patch_core::api::client::ApiClientEnvOverrides;
+use socket_patch_core::api::client::{ApiClient, ApiClientEnvOverrides};
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::Ecosystem;
-use socket_patch_core::vendor::VendorSource;
+use socket_patch_core::vendor::{VendorServiceConfig, VendorSource};
 
 /// clap value-parser for each `--ecosystems` / `SOCKET_ECOSYSTEMS` token.
 ///
@@ -361,6 +361,30 @@ impl GlobalArgs {
             api_token: self.api_token.clone().filter(|s| !s.is_empty()),
             org_slug: self.org.clone().filter(|s| !s.is_empty()),
             proxy_url: self.proxy_url.clone().filter(|s| !s.is_empty()),
+        }
+    }
+
+    /// The vendoring-service config every vendor entry point (`vendor`,
+    /// `scan`/`get --mode vendored`) builds from the same flags —
+    /// `--vendor-source` / `--vendor-url` / `--patch-server-url` /
+    /// `--offline` — so they commit byte-identical artifacts and lock
+    /// integrity for the same patch. `client` is the run-level API client
+    /// (moved in; the service reuses it for the package-reference request)
+    /// and `use_public_proxy` its proxy-fallback state. `vendor_source` was
+    /// validated by clap, so the parse cannot fail; the `auto` default is
+    /// the defensive fallback. A pure assembler (no async, no network).
+    pub(crate) fn vendor_service_config(
+        &self,
+        client: Option<ApiClient>,
+        use_public_proxy: bool,
+    ) -> VendorServiceConfig {
+        VendorServiceConfig {
+            source: VendorSource::parse(&self.vendor_source).unwrap_or_default(),
+            client,
+            use_public_proxy,
+            vendor_url: self.vendor_url.clone(),
+            patch_server_url: self.patch_server_url.clone(),
+            offline: self.offline,
         }
     }
 }
@@ -787,6 +811,73 @@ mod tests {
                 "an unknown vendor source must fail the parse",
             );
         });
+    }
+
+    // ---- vendor_service_config ------------------------------------------
+    // Moved from scan's vendored flow: the config every vendor entry point
+    // builds must be the same assembler, so `scan --mode vendored` and a
+    // plain `vendor` commit byte-identical artifacts for the same patch.
+
+    fn common_with_source(source: &str) -> GlobalArgs {
+        GlobalArgs {
+            vendor_source: source.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Regression: scan's vendored flow must build its service config FROM
+    /// `--vendor-source`, not hardcode build-only (the pre-fix `service =
+    /// None`). Under the default (`auto`), the config must permit the
+    /// vendoring service exactly as the `vendor` command's default does —
+    /// otherwise `scan --mode vendored` silently builds locally while a
+    /// plain `vendor` service-downloads, and the two commit different bytes /
+    /// lock integrity for the same patch (lock churn / merge conflicts).
+    #[test]
+    fn vendor_service_config_default_source_permits_service() {
+        let cfg = common_with_source("auto").vendor_service_config(None, false);
+        assert_eq!(cfg.source, VendorSource::Auto);
+        assert!(
+            cfg.source.may_use_service(),
+            "the default must be able to use the service (matching `vendor`)"
+        );
+        assert!(!cfg.source.requires_service());
+        assert!(cfg.client.is_none());
+        assert!(!cfg.use_public_proxy);
+    }
+
+    /// `--vendor-source service` reaches the fail-closed service path and
+    /// `--vendor-source build` never contacts the service.
+    #[test]
+    fn vendor_service_config_honors_service_and_build_sources() {
+        let cfg = common_with_source("service").vendor_service_config(None, true);
+        assert_eq!(cfg.source, VendorSource::Service);
+        assert!(cfg.source.requires_service());
+        assert!(cfg.use_public_proxy, "the proxy-fallback state threads through");
+
+        let cfg = common_with_source("build").vendor_service_config(None, false);
+        assert_eq!(cfg.source, VendorSource::Build);
+        assert!(!cfg.source.may_use_service());
+    }
+
+    /// The service overrides (`--vendor-url` / `--patch-server-url` /
+    /// `--offline`) thread through unchanged, so every entry point targets
+    /// the same hosts.
+    #[test]
+    fn vendor_service_config_threads_overrides_through() {
+        let common = GlobalArgs {
+            vendor_source: "service".to_string(),
+            vendor_url: Some("https://vendor.example".to_string()),
+            patch_server_url: Some("https://patch.example".to_string()),
+            offline: true,
+            ..Default::default()
+        };
+        let cfg = common.vendor_service_config(None, false);
+        assert_eq!(cfg.vendor_url.as_deref(), Some("https://vendor.example"));
+        assert_eq!(
+            cfg.patch_server_url.as_deref(),
+            Some("https://patch.example")
+        );
+        assert!(cfg.offline);
     }
 
     /// The new URL knobs flow through to the parsed args from CLI and env.

@@ -180,6 +180,16 @@ fn run_cli_env(root: &Path, argv: &[&str], extra_env: &[(&str, &str)]) -> (i32, 
     )
 }
 
+/// How many `/patches/view/…` requests the mock has served.
+async fn view_fetches(mock: &MockServer) -> usize {
+    mock.received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().contains("/patches/view/"))
+        .count()
+}
+
 fn run_scan_vendor(root: &Path, mock_uri: &str, extra: &[&str]) -> (i32, String, String) {
     let mut argv = vec![
         "scan",
@@ -236,6 +246,9 @@ async fn scan_vendor_end_to_end_is_manifest_free() {
         !tmp.path().join(".socket/manifest.json").exists(),
         "vendored mode never writes a manifest"
     );
+    // One view fetch per patch for the whole run: the download phase's
+    // blob content seeds the vendor stager, which never re-fetches it.
+    assert_eq!(view_fetches(&mock).await, 1, "the view is fetched exactly once");
 
     // Vendor phase: a full vendor Envelope with one applied event.
     let venv = v["vendor"].as_object().expect("vendor sub-object");
@@ -1177,6 +1190,10 @@ async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
         "pre-prompt annotation present; stdout={stdout}"
     );
     assert!(
+        stdout.contains(&format!("  {PURL}: installed content differs")),
+        "the annotation names the purl; stdout={stdout}"
+    );
+    assert!(
         stderr.contains("vendor_content_mismatch_overwritten"),
         "overwrite warning surfaced; stderr={stderr}"
     );
@@ -1185,6 +1202,10 @@ async fn scan_vendor_annotates_mismatched_baseline_and_vendors_anyway() {
         .path()
         .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"))
         .is_file());
+    // The pre-verify fetched the view; the download phase served the
+    // record from that view and the stager from its blob content — one
+    // fetch for the whole interactive run, not three.
+    assert_eq!(view_fetches(&mock).await, 1, "the view is fetched exactly once");
 }
 
 // ───────────── lockfile auto-fetch + scan lockfile supplement ─────────────

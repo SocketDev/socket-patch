@@ -13,12 +13,12 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
-// Re-exported for `fetch_stage`, which imports the blob-hash guard from here.
-pub(crate) use socket_patch_core::patch::apply::is_valid_blob_hash;
-use socket_patch_core::patch::apply::select_installed_variants;
+use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants};
 use socket_patch_core::patch::apply_lock::{self, LockError};
 use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
-use socket_patch_core::utils::purl::{is_purl, normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{
+    canonical_purl, is_purl, normalize_purl, strip_purl_qualifiers,
+};
 use socket_patch_core::vendor::{load_state, lookup_entry, VendorEntry};
 use std::collections::HashMap;
 use std::fmt;
@@ -1072,7 +1072,7 @@ async fn filter_to_installed_purls(
     use socket_patch_core::vendor::lock_inventory;
     use std::collections::HashSet;
 
-    let canon = |p: &str| normalize_purl(strip_purl_qualifiers(p)).into_owned();
+    let canon = canonical_purl;
 
     // Deduped base purls, probed against the installed tree. The resolver
     // keys its result by the purls we pass, so canonicalize the found keys
@@ -1554,33 +1554,43 @@ async fn fetch_selected_patches(
     batch
 }
 
+/// The vendored download phase's result: `(exit code, download JSON,
+/// records by purl, blob seed)` — the seed is every fetched view's decoded
+/// `blobContent` keyed by after-hash, for the vendor stager
+/// (`fetch_stage::stage_vendor_sources_in_memory`), so the step never
+/// fetches a view this phase already holds.
+pub(crate) type DetachedDownload = (
+    i32,
+    serde_json::Value,
+    HashMap<String, PatchRecord>,
+    HashMap<String, Vec<u8>>,
+);
+
 /// Download patches WITHOUT touching the manifest and return the fetched
 /// records keyed by purl — the download phase of every vendored run
 /// (`scan` / `get --mode vendored`), where the vendor ledger carries the
 /// records (`detached`). Honors the same installed-release narrowing as
 /// [`download_and_apply_patches`]. A purl already vendored detached at the
 /// selected uuid skips the network fetch and reuses the ledger's embedded
-/// record, so idempotent re-runs stay cheap. Builds its own client from
-/// `params`; callers holding the run's client use
-/// [`download_patch_records_with`].
-pub(crate) async fn download_patch_records(
-    selected: &[PatchSearchResult],
-    params: &DownloadParams,
-) -> (i32, serde_json::Value, HashMap<String, PatchRecord>) {
-    let api_client = api_client_for(params).await;
-    download_patch_records_with(selected, params, &api_client, HashMap::new()).await
-}
-
-/// [`download_patch_records`] over the caller's client. `prefetched` maps
-/// uuid → an already-fetched view: the `get <uuid>` path resolved its
-/// identifier by fetching the view and must not fetch it again (a fresh
-/// client could re-hit the 401 the proxy fallback just recovered from).
+/// record, so idempotent re-runs stay cheap.
+///
+/// `api_client` is the run's client (built once, proxy fallback included).
+/// `prefetched` maps uuid → an already-fetched view: the `get <uuid>` path
+/// resolved its identifier by fetching the view, and scan's interactive
+/// arm pre-verified baselines from the views — neither must fetch again (a
+/// fresh fetch could re-hit the 401 the proxy fallback just recovered
+/// from). The ledger idempotency check runs before the cache lookup, and a
+/// cache miss still fetches.
+///
+/// The blob seed is best-effort: an undecodable or missing `blobContent`
+/// contributes nothing and is NOT a failed record (the stager reports what
+/// it cannot source).
 pub(crate) async fn download_patch_records_with(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
     api_client: &ApiClient,
     prefetched: HashMap<String, PatchResponse>,
-) -> (i32, serde_json::Value, HashMap<String, PatchRecord>) {
+) -> DetachedDownload {
     // The ledger load outcome is handed to the preflight AS a result: an
     // unreadable ledger must surface as `vendor_state_unreadable` from the
     // one refusal this phase emits (fail closed, nothing exempt), not be
@@ -1617,7 +1627,21 @@ pub(crate) async fn download_patch_records_with(
 
     let downloaded = batch.fetched.len();
     let mut records: HashMap<String, PatchRecord> = batch.reused.into_iter().collect();
+    let mut blobs: HashMap<String, Vec<u8>> = HashMap::new();
     for FetchedPatch { patch, files, .. } in batch.fetched {
+        for info in patch.files.values() {
+            // Same key guard as the blob writers: the hash names the lookup
+            // key the apply pipeline gates writes on.
+            let (Some(b64), Some(hash)) = (&info.blob_content, &info.after_hash) else {
+                continue;
+            };
+            if !is_valid_blob_hash(hash) || blobs.contains_key(hash) {
+                continue;
+            }
+            if let Ok(bytes) = base64_decode(b64) {
+                blobs.insert(hash.clone(), bytes);
+            }
+        }
         records.insert(patch.purl.clone(), build_patch_record(&patch, files));
     }
     let mut result_json = serde_json::json!({
@@ -1631,7 +1655,7 @@ pub(crate) async fn download_patch_records_with(
     if !batch.warnings.is_empty() {
         result_json["warnings"] = serde_json::json!(batch.warnings);
     }
-    (i32::from(batch.failed > 0), result_json, records)
+    (i32::from(batch.failed > 0), result_json, records, blobs)
 }
 
 /// Emit a warning (stderr `[note]` + `warnings[]`) for every added/updated
@@ -1807,18 +1831,9 @@ pub async fn download_and_apply_patches_with(
         }
     };
 
-    // Bun preflight for the one non-agent caller left: scan's manifest-mode
-    // vendored download (`save_only && !persist_blobs`), which feeds the
-    // vendor engine and must refuse the same projects before fetching.
-    // Agent/save-only flows keep their record-only intent (no preflight).
-    // Retire together with that caller once scan's vendored path is
-    // detached-only.
-    let bun_refusal = if params.save_only && !params.persist_blobs {
-        bun_vendor_preflight(&params.cwd, selected).await
-    } else {
-        None
-    };
-
+    // No Bun preflight here: this is the agent (manifest) engine, and
+    // agent/save-only flows keep their record-only intent. The vendored
+    // download phase (`download_patch_records_with`) runs its own.
     let blobs_dir = socket_dir.join("blobs");
     let batch = fetch_selected_patches(
         selected,
@@ -1826,7 +1841,7 @@ pub async fn download_and_apply_patches_with(
         run.api_client,
         RecordStore::Manifest(&manifest),
         params.persist_blobs.then_some(blobs_dir.as_path()),
-        bun_refusal.as_ref(),
+        None,
         HashMap::new(),
     )
     .await;
@@ -2119,6 +2134,7 @@ pub async fn run(args: GetArgs) -> i32 {
                         run_get_vendored(
                             &args,
                             &api_client,
+                            use_public_proxy,
                             &selected,
                             Some(&patch),
                             &[],
@@ -2467,6 +2483,7 @@ pub async fn run(args: GetArgs) -> i32 {
             return run_get_vendored(
                 &args,
                 &api_client,
+                use_public_proxy,
                 &selected,
                 None,
                 &narrow_skips,
@@ -2848,9 +2865,10 @@ async fn run_get_hosted(
 /// `get … --mode vendored`, both identifier paths: scan's vendored posture
 /// end to end — the detached download phase ([`download_patch_records_with`]:
 /// records fetched into memory, no manifest, no blobs) feeding scan's
-/// detached vendor step (apply lock, in-memory staging, the vendor engine;
-/// the ledger carries every record `detached: true`), telemetry included —
-/// so the result matches `scan --mode vendored` selecting the same patches.
+/// detached vendor step (apply lock, in-memory staging seeded with the
+/// downloaded blobs, the vendor engine over the same run-level client; the
+/// ledger carries every record `detached: true`), telemetry included — so
+/// the result matches `scan --mode vendored` selecting the same patches.
 /// `.socket/manifest.json` is never read or written here.
 ///
 /// `prefetched` is the `get <uuid>` path's already-fetched view: it resolved
@@ -2864,6 +2882,7 @@ async fn run_get_hosted(
 async fn run_get_vendored(
     args: &GetArgs,
     api_client: &ApiClient,
+    use_public_proxy: bool,
     selected: &[PatchSearchResult],
     prefetched: Option<&PatchResponse>,
     narrow_skips: &[serde_json::Value],
@@ -2968,7 +2987,7 @@ async fn run_get_vendored(
     let prefetched_views: HashMap<String, PatchResponse> = prefetched
         .map(|p| HashMap::from([(p.uuid.clone(), p.clone())]))
         .unwrap_or_default();
-    let (dl_code, mut result, records) = Box::pin(download_patch_records_with(
+    let (dl_code, mut result, records, blobs) = Box::pin(download_patch_records_with(
         selected,
         &params,
         api_client,
@@ -2978,12 +2997,21 @@ async fn run_get_vendored(
     let mut has_errors = dl_code != 0;
     fold_narrowing_into_result(&mut result, narrow_skips, narrow_warnings);
 
-    // The vendor step (scan's, verbatim): apply lock, in-memory staging, the
-    // engine over exactly the records fetched above (moved in — nothing
-    // here needs them afterwards). A per-patch download failure does not
+    // The vendor step (scan's, verbatim): apply lock, in-memory staging
+    // seeded with the blobs fetched above, the engine over exactly the
+    // records fetched above (moved in — nothing here needs them afterwards)
+    // and over this run's client. A per-patch download failure does not
     // skip it (scan parity).
-    match super::scan::boxed_scan_vendor_step(&args.common, &manifest_path, &socket_dir, records)
-        .await
+    match super::scan::boxed_scan_vendor_step(
+        &args.common,
+        &manifest_path,
+        &socket_dir,
+        records,
+        blobs,
+        api_client.clone(),
+        use_public_proxy,
+    )
+    .await
     {
         Ok((vendor_errors, venv)) => {
             has_errors |= vendor_errors;
@@ -4429,6 +4457,19 @@ mod tests {
         }
     }
 
+    /// The 2-arg shape the vendored-download unit tests below drive: builds
+    /// the client from `params` the way the wrappers used to, and drops the
+    /// blob seed (the stager's concern, pinned by fetch_stage's tests).
+    async fn download_patch_records(
+        selected: &[PatchSearchResult],
+        params: &DownloadParams,
+    ) -> (i32, serde_json::Value, HashMap<String, PatchRecord>) {
+        let api_client = api_client_for(params).await;
+        let (code, json, records, _blobs) =
+            download_patch_records_with(selected, params, &api_client, HashMap::new()).await;
+        (code, json, records)
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn download_patch_records_no_applicable_files_is_failed_and_unrecorded() {
@@ -5436,10 +5477,17 @@ mod tests {
         let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
         let server = MockServer::start().await; // trap: no mounts
         let tmp = tempfile::tempdir().unwrap();
-        let mut patch = patch_with_files(HashMap::from([(
-            "package/index.js".to_string(),
-            file_resp(Some(&"0".repeat(64)), Some(&"1".repeat(64))),
-        )]));
+        // Two files: one with served `blobContent` (→ the blob seed), one
+        // without (→ contributes nothing, and is NOT a failure).
+        let mut seeded = file_resp(Some(&"0".repeat(64)), Some(&"1".repeat(64)));
+        seeded.blob_content = Some("cGF0Y2hlZA==".to_string()); // "patched"
+        let mut patch = patch_with_files(HashMap::from([
+            ("package/index.js".to_string(), seeded),
+            (
+                "package/other.js".to_string(),
+                file_resp(Some(&"2".repeat(64)), Some(&"3".repeat(64))),
+            ),
+        ]));
         patch.uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into();
         patch.purl = "pkg:npm/covgap-prefetched@1.0.0".into();
         let selected = vec![mk_patch(&patch.uuid, &patch.purl, "free", "2024-01-01")];
@@ -5447,11 +5495,19 @@ mod tests {
         let client = api_client_for(&params).await;
         let prefetched = HashMap::from([(patch.uuid.clone(), patch.clone())]);
 
-        let (code, json, records) =
+        let (code, json, records, blobs) =
             download_patch_records_with(&selected, &params, &client, prefetched).await;
 
         assert_eq!(code, 0, "json={json}");
         assert_eq!(json["downloaded"], 1, "json={json}");
+        // The blob seed carries every served `blobContent` by after-hash —
+        // decoded — and only those; the vendor stager starts from it.
+        assert_eq!(
+            blobs.get(&"1".repeat(64)).map(Vec::as_slice),
+            Some(&b"patched"[..]),
+            "the served blob is seeded under its after-hash"
+        );
+        assert_eq!(blobs.len(), 1, "a file with no blobContent seeds nothing");
         assert_eq!(json["detached"], true, "json={json}");
         assert_eq!(json["patches"][0]["action"], "downloaded", "json={json}");
         assert!(

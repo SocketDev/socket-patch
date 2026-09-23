@@ -106,11 +106,21 @@ async fn mount_view_files(server: &MockServer, uuid: &str, purl: &str, files: se
 /// `view/{uuid}` served exactly ONCE: the get's own fetch succeeds, and the
 /// vendor step's in-memory staging — which fetches the view again — then
 /// 404s, tripping the `no_local_source` staging refusal.
-async fn mount_view_once(server: &MockServer, uuid: &str, purl: &str) {
+/// A view whose files carry hashes but NO `blobContent`: the download
+/// phase records it fine (hashes only), but the vendor step has nothing to
+/// stage from — not in the download phase's blob seed, not on disk, and not
+/// from the view it re-fetches — so it dies `no_local_source`. (Serving a
+/// good view exactly once no longer produces that: the step stages from
+/// the seed and never fetches the view a second time.)
+async fn mount_contentless_view(server: &MockServer, uuid: &str, purl: &str) {
+    let mut files = good_files();
+    files["package/index.js"]
+        .as_object_mut()
+        .unwrap()
+        .remove("blobContent");
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(view_json(uuid, purl, good_files())))
-        .up_to_n_times(1)
+        .respond_with(ResponseTemplate::new(200).set_body_json(view_json(uuid, purl, files)))
         .mount(server)
         .await;
 }
@@ -1540,7 +1550,7 @@ fn assert_vendor_error_envelope(v: &serde_json::Value) {
 #[tokio::test]
 async fn get_uuid_vendored_vendor_step_error_leaves_legacy_state_alone() {
     let server = MockServer::start().await;
-    mount_view_once(&server, UUID, PURL).await;
+    mount_contentless_view(&server, UUID, PURL).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let (manifest_before, state_before) = seed_legacy_state(tmp.path());
@@ -1560,7 +1570,7 @@ async fn get_uuid_vendored_vendor_step_error_leaves_legacy_state_alone() {
 async fn get_search_vendored_vendor_step_error_leaves_legacy_state_alone() {
     let server = MockServer::start().await;
     mount_ghsa_single(&server).await;
-    mount_view_once(&server, UUID, PURL).await;
+    mount_contentless_view(&server, UUID, PURL).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let (manifest_before, state_before) = seed_legacy_state(tmp.path());
@@ -1591,7 +1601,7 @@ async fn get_search_vendored_vendor_step_error_leaves_legacy_state_alone() {
 #[tokio::test]
 async fn human_vendored_uuid_prints_fetch_and_vendor_error_without_manifest_note() {
     let server = MockServer::start().await;
-    mount_view_once(&server, UUID, PURL).await;
+    mount_contentless_view(&server, UUID, PURL).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let (manifest_before, state_before) = seed_legacy_state(tmp.path());

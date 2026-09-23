@@ -62,8 +62,8 @@ use socket_patch_core::utils::purl::{
 use socket_patch_core::vendor::state::{VendorArtifact, WiringRecord};
 use socket_patch_core::vendor::{
     self, artifact_is_file_shaped, check_vendored_artifact, compute_dir_inventory, file_sha256_hex,
-    load_state, lock_inventory, parse_vendor_path, registry_fetch, ArtifactHealth, VendorEntry,
-    VendorOutcome, VendorWarning,
+    lock_inventory, parse_vendor_path, registry_fetch, ArtifactHealth, VendorEntry, VendorOutcome,
+    VendorState, VendorWarning,
 };
 use socket_patch_core::vex::time::now_rfc3339;
 
@@ -511,32 +511,21 @@ async fn restore_orphaned_pre_rebuild_dirs(common: &GlobalArgs) {
 /// Returns the number of artifacts rebuilt (for the human summary line);
 /// failures are carried by `env` (`Failed` events + partial-failure status).
 ///
-/// Scans the wiring files for vendored references itself; a caller that
-/// already ran [`scan_vendor_references`] under the same lock (repair.rs
-/// does, for its `referenced_uuids`) should pass that result to
-/// [`repair_vendored_artifacts_with_references`] instead of paying for the
-/// ~20-file scan a second time.
-pub(crate) async fn repair_vendored_artifacts(
-    common: &GlobalArgs,
-    manifest: Option<&PatchManifest>,
-    socket_dir: &Path,
-    env: &mut Envelope,
-) -> usize {
-    let references = scan_vendor_references(&common.cwd).await;
-    repair_vendored_artifacts_with_references(common, manifest, socket_dir, env, &references).await
-}
-
-/// [`repair_vendored_artifacts`] with the wiring-file reference scan
-/// supplied by the caller: `references` is [`scan_vendor_references`]'s
-/// `(ecosystem, uuid, artifact relpath)` output for `common.cwd`, taken
-/// under the apply lock this phase runs under (the lockfiles it describes
-/// are the ones the reconstruction below rewires).
+/// `references` is [`scan_vendor_references`]'s `(ecosystem, uuid,
+/// artifact relpath)` output for `common.cwd` and `ledger` the caller's
+/// `load_state` outcome — both taken by repair.rs under the apply lock
+/// this phase runs under (the lockfiles and ledger they describe are the
+/// ones the reconstruction below rewires), so neither is re-read here. An
+/// unreadable ledger fails this phase loudly (`vendor_state_unreadable`);
+/// the caller's own degrade-to-empty policy for its download scoping is
+/// its own.
 pub(crate) async fn repair_vendored_artifacts_with_references(
     common: &GlobalArgs,
     manifest: Option<&PatchManifest>,
     socket_dir: &Path,
     env: &mut Envelope,
     references: &[(String, String, String)],
+    ledger: std::io::Result<VendorState>,
 ) -> usize {
     let quiet = common.json || common.silent;
     let mut rebuilt = 0usize;
@@ -545,7 +534,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
         restore_orphaned_pre_rebuild_dirs(common).await;
     }
 
-    let mut state = match load_state(&common.cwd).await {
+    let mut state = match ledger {
         Ok(s) => s,
         Err(e) => {
             env.record(
@@ -1062,7 +1051,17 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
         patches: records_map,
         setup: None,
     };
-    let staged = match stage_vendor_sources_in_memory(common, &synth, socket_dir, &common.cwd).await
+    // The ledger this pass already holds feeds the staging harvest; repair
+    // has no download phase, so no seed.
+    let staged = match stage_vendor_sources_in_memory(
+        common,
+        &synth,
+        socket_dir,
+        &common.cwd,
+        Ok(&state.entries),
+        HashMap::new(),
+    )
+    .await
     {
         MemStageOutcome::Ready(s) => s,
         MemStageOutcome::Unavailable => {

@@ -3,7 +3,9 @@
 //! baseline pre-verification, and the table's vuln-ID / severity helpers.
 
 use socket_patch_core::api::ranking::cmp_batch_infos;
-use socket_patch_core::api::types::{BatchPackagePatches, BatchPatchInfo, PatchSearchResult};
+use socket_patch_core::api::types::{
+    BatchPackagePatches, BatchPatchInfo, PatchResponse, PatchSearchResult,
+};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
@@ -272,21 +274,27 @@ async fn vendored_purls_from_artifacts(common: &GlobalArgs) -> Vec<String> {
 /// content; see `force_apply_staged`), but the user should learn it BEFORE
 /// the confirm prompt, not from a post-hoc warning event.
 ///
+/// Returns `(mismatched uuids, fetched views by uuid)`: the download phase
+/// serves its records from the views instead of fetching each one a second
+/// time. Only `Ok(Some)` views are cached — an errored or 404'd fetch is
+/// left for the download phase to retry and report per patch.
+///
 /// Best-effort and read-only: a detail-fetch failure or an unresolvable
 /// installed path just skips the annotation — it never blocks the flow and
-/// writes nothing (unlike `download_patch_records`, which stages blobs).
+/// writes nothing.
 pub(super) async fn preverify_vendor_baselines(
     api_client: &socket_patch_core::api::client::ApiClient,
     org_slug: Option<&str>,
     selected: &[PatchSearchResult],
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     lockfile_only: &HashSet<String>,
-) -> HashSet<String> {
+) -> (HashSet<String>, HashMap<String, PatchResponse>) {
     use socket_patch_core::manifest::schema::PatchFileInfo;
     use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
     use socket_patch_core::utils::purl::purl_eq;
 
     let mut mismatched: HashSet<String> = HashSet::new();
+    let mut views: HashMap<String, PatchResponse> = HashMap::new();
     for patch in selected {
         // API purls come percent-encoded, crawler purls literal — purl_eq
         // bridges the two spellings.
@@ -316,8 +324,9 @@ pub(super) async fn preverify_vendor_baselines(
                 break;
             }
         }
+        views.insert(patch.uuid.clone(), detail);
     }
-    mismatched
+    (mismatched, views)
 }
 
 /// Fold both ledgers' patch records into the manifest view update detection
@@ -1505,13 +1514,14 @@ mod tests {
         let lockfile_only: HashSet<String> =
             std::iter::once("pkg:npm/@scope/lockonly@1.0.0".to_string()).collect();
 
-        let mismatched =
+        let (mismatched, views) =
             preverify_vendor_baselines(&client, None, &selected, &crawled, &lockfile_only).await;
         assert!(mismatched.is_empty());
         assert!(
             mock.received_requests().await.unwrap().is_empty(),
             "both skip shapes must decide before any detail fetch"
         );
+        assert!(views.is_empty(), "nothing fetched, nothing cached");
     }
 
     /// Mount `GET /patch/view/<uuid>` (the public-proxy detail route) with
@@ -1559,14 +1569,40 @@ mod tests {
         let crawled = vec![crawled_pkg("newfile", "pkg:npm/newfile@1.0.0", pkg_dir)];
         let selected = vec![search_result("u3", "pkg:npm/newfile@1.0.0")];
 
-        let mismatched =
+        let (mismatched, views) =
             preverify_vendor_baselines(&client, None, &selected, &crawled, &HashSet::new()).await;
         assert!(
             mismatched.is_empty(),
             "a new-file-only patch never annotates a baseline mismatch"
         );
-        // Unlike the pre-fetch skips, this one DID fetch the detail.
+        // Unlike the pre-fetch skips, this one DID fetch the detail — and
+        // hands the view on so the download phase never fetches it again.
         assert_eq!(mock.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            views.keys().collect::<Vec<_>>(),
+            vec!["u3"],
+            "the fetched view is cached by uuid"
+        );
+        assert_eq!(views["u3"].purl, "pkg:npm/newfile@1.0.0");
+    }
+
+    /// A view the server does not serve (404 → `Ok(None)`) is NOT cached:
+    /// the download phase retries it and reports the miss per patch.
+    #[tokio::test]
+    async fn preverify_does_not_cache_a_missing_view() {
+        let mock = wiremock::MockServer::start().await;
+        let client = api_client_for(&mock.uri());
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg_dir = tmp.path().join("node_modules/newfile");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let crawled = vec![crawled_pkg("newfile", "pkg:npm/newfile@1.0.0", pkg_dir)];
+        let selected = vec![search_result("u404", "pkg:npm/newfile@1.0.0")];
+
+        let (mismatched, views) =
+            preverify_vendor_baselines(&client, None, &selected, &crawled, &HashSet::new()).await;
+        assert!(mismatched.is_empty());
+        assert_eq!(mock.received_requests().await.unwrap().len(), 1, "it did try");
+        assert!(views.is_empty(), "a 404'd view must not be cached");
     }
 
     #[tokio::test]
@@ -1598,13 +1634,14 @@ mod tests {
         let crawled = vec![crawled_pkg("newfile", "pkg:npm/newfile@1.0.0", pkg_dir)];
         let selected = vec![search_result("u4", "pkg:npm/newfile@1.0.0")];
 
-        let mismatched =
+        let (mismatched, views) =
             preverify_vendor_baselines(&client, None, &selected, &crawled, &HashSet::new()).await;
         assert_eq!(
             mismatched,
             std::iter::once("u4".to_string()).collect::<HashSet<_>>(),
             "the new-file skip must not swallow a sibling file's mismatch"
         );
+        assert!(views.contains_key("u4"), "a mismatched view is cached too");
     }
 
     #[test]

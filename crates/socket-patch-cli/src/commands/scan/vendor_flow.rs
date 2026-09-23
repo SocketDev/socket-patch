@@ -5,23 +5,26 @@
 //! out of `run`'s poll frame (Windows 1 MiB main-thread stack).
 //!
 //! Vendored mode is manifest-free: the download phase fetches the patch
-//! records in memory ([`download_patch_records`]), the vendor engine
+//! records in memory ([`download_patch_records_with`]), the vendor engine
 //! embeds each record in its ledger entry (`detached: true`), and
 //! `.socket/manifest.json` is never written — a project vendored by an
 //! older, manifest-mode CLI is migrated on its next vendored run (see
 //! [`migrate_legacy_manifest_records`]). `--detached` is accepted as a
 //! no-op for compatibility.
+//!
+//! One API client per run: `scan`/`get` build it once (proxy fallback
+//! included) and thread it through the download phase and into the vendor
+//! engine's service config; the views the download phase fetched seed the
+//! in-memory stager, so no view is fetched twice.
 
-use socket_patch_core::api::client::get_api_client_with_overrides;
-use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
+use socket_patch_core::api::client::ApiClient;
+use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSearchResult};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply_lock;
 use socket_patch_core::telemetry::track_patch_vendor_failed;
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
-use socket_patch_core::vendor::{
-    load_state, lookup_entry, save_state, VendorServiceConfig, VendorSource, VendorState,
-};
+use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
@@ -29,7 +32,7 @@ use std::time::Duration;
 use crate::args::GlobalArgs;
 use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
-use crate::commands::get::{download_patch_records, DownloadParams};
+use crate::commands::get::{download_patch_records_with, DetachedDownload, DownloadParams};
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
     note_classic_migration_risk, track_outcomes_for_vendor, vendor_records,
@@ -147,39 +150,15 @@ pub(crate) fn print_dry_run_refusals(preview: &serde_json::Value) {
     }
 }
 
-/// Build the vendoring-service config for scan's vendored flow — the SAME
-/// shape the standalone `vendor` command builds (see `vendor::run`), so both
-/// entry points honor `--vendor-source` / `--vendor-url` /
-/// `--patch-server-url` and commit byte-identical artifacts + lock integrity
-/// for the same patch. `vendor_source` was validated by clap, so the parse
-/// cannot fail; fall back to the `auto` default defensively — the SAME
-/// default as the `vendor` command (service download), not build-only.
-///
-/// `client` / `use_public_proxy` come from the run-level API client. A pure
-/// assembler (no async, no network) so the flow's byte-for-byte parity with
-/// the `vendor` command is unit-testable without a live client.
-fn scan_vendor_service_config(
-    common: &GlobalArgs,
-    client: Option<socket_patch_core::api::client::ApiClient>,
-    use_public_proxy: bool,
-) -> VendorServiceConfig {
-    VendorServiceConfig {
-        source: VendorSource::parse(&common.vendor_source).unwrap_or_default(),
-        client,
-        use_public_proxy,
-        vendor_url: common.vendor_url.clone(),
-        patch_server_url: common.patch_server_url.clone(),
-        offline: common.offline,
-    }
-}
-
 /// The vendor step shared by `scan --vendor`'s JSON and interactive arms
 /// (and, through [`boxed_scan_vendor_step`], `get --mode vendored`):
 /// acquire the apply lock, stage the in-memory `records` (from
-/// [`download_patch_records`]), drive [`vendor_records`] detached — every
-/// ledger entry embeds its record; `.socket/manifest.json` is never a
-/// record source — then migrate any legacy manifest records the ledger now
-/// owns and run the run-level advisories, all under the lock.
+/// [`download_patch_records_with`], whose blob `seed` spares the stager a
+/// second view fetch), drive [`vendor_records`] detached — every ledger
+/// entry embeds its record; `.socket/manifest.json` is never a record
+/// source — over the run's `client`, then migrate any legacy manifest
+/// records the ledger now owns and run the run-level advisories, all under
+/// the lock.
 ///
 /// An empty `records` map (nothing selected, or everything refused/failed
 /// in the download phase) is a no-op BEFORE the lock: nothing is staged,
@@ -202,6 +181,9 @@ async fn run_scan_vendor_step(
     manifest_path: &Path,
     socket_dir: &Path,
     records: HashMap<String, PatchRecord>,
+    seed: HashMap<String, Vec<u8>>,
+    client: ApiClient,
+    use_public_proxy: bool,
 ) -> VendorStepResult {
     let mut env = Envelope::new(EnvelopeCommand::Vendor);
     env.dry_run = common.dry_run;
@@ -224,7 +206,17 @@ async fn run_scan_vendor_step(
         patches: records,
         setup: None,
     };
-    let has_errors = match stage_and_vendor(common, socket_dir, &manifest, &mut env).await {
+    let has_errors = match stage_and_vendor(
+        common,
+        socket_dir,
+        &manifest,
+        seed,
+        client,
+        use_public_proxy,
+        &mut env,
+    )
+    .await
+    {
         Ok(has_errors) => has_errors,
         Err((code, message)) => {
             // The step ran and is aborting: hand its envelope (demoted) to
@@ -243,18 +235,33 @@ async fn run_scan_vendor_step(
     Ok((has_errors, env))
 }
 
-/// Stage `manifest`'s patch sources in memory and drive the vendor engine
-/// over them (detached: every entry embeds its record). The caller holds
-/// the apply lock. `Err` is the `no_local_source` fold (staging could not
-/// obtain the patch content — offline, or the view fetch failed).
+/// Stage `manifest`'s patch sources in memory (seeded with the download
+/// phase's blobs, harvesting the committed artifacts the ledger names for
+/// the rest) and drive the vendor engine over them (detached: every entry
+/// embeds its record). The caller holds the apply lock. `Err` is the
+/// `no_local_source` fold (staging could not obtain the patch content —
+/// offline, or the view fetch failed).
 async fn stage_and_vendor(
     common: &GlobalArgs,
     socket_dir: &Path,
     manifest: &PatchManifest,
+    seed: HashMap<String, Vec<u8>>,
+    client: ApiClient,
+    use_public_proxy: bool,
     env: &mut Envelope,
 ) -> Result<bool, (&'static str, String)> {
-    let staged = match stage_vendor_sources_in_memory(common, manifest, socket_dir, &common.cwd)
-        .await
+    // Loaded under the lock for the staging harvest; an unreadable ledger
+    // harvests nothing and is the engine's report.
+    let ledger = load_state(&common.cwd).await;
+    let staged = match stage_vendor_sources_in_memory(
+        common,
+        manifest,
+        socket_dir,
+        &common.cwd,
+        ledger.as_ref().map(|s| &s.entries),
+        seed,
+    )
+    .await
     {
         MemStageOutcome::Ready(s) => s,
         MemStageOutcome::Unavailable => {
@@ -266,15 +273,12 @@ async fn stage_and_vendor(
     };
     let sources = staged.as_patch_sources();
     // Honor `--vendor-source` (and `--vendor-url` / `--patch-server-url`)
-    // exactly as the `vendor` command does: build the SAME service config so
-    // `scan --mode vendored` and a plain `vendor` commit byte-identical
-    // artifacts by default (both service-download under `auto`) instead of
-    // scan silently building locally. Built here (once, from the run-level
-    // flags) on the already-boxed scan-vendored frame; dry runs never reach
-    // this step, so there is no wasted client build in preview mode.
-    let (client, use_public_proxy) =
-        get_api_client_with_overrides(common.api_client_overrides()).await;
-    let service = scan_vendor_service_config(common, Some(client), use_public_proxy);
+    // exactly as the `vendor` command does: the SAME service-config
+    // assembler, over the run's one client, so `scan --mode vendored` and a
+    // plain `vendor` commit byte-identical artifacts by default (both
+    // service-download under `auto`) instead of scan silently building
+    // locally.
+    let service = common.vendor_service_config(Some(client), use_public_proxy);
     Ok(boxed_vendor_records(common, &manifest.patches, &sources, Some(&service), env).await)
 }
 
@@ -437,7 +441,8 @@ async fn migrate_legacy_manifest_records(
 #[allow(clippy::too_many_arguments)]
 async fn run_vendor_json_path(
     args: &ScanArgs,
-    api_client: &socket_patch_core::api::client::ApiClient,
+    api_client: &ApiClient,
+    use_public_proxy: bool,
     effective_org_slug: Option<&str>,
     all_packages_with_patches: &[BatchPackagePatches],
     can_access_paid_patches: bool,
@@ -502,14 +507,23 @@ async fn run_vendor_json_path(
     let params = download_params(
         args, /*save_only=*/ true, /*json=*/ true, /*silent=*/ true,
     );
-    let (dl_code, dl_json, records) = boxed_download_patch_records(&selected, &params).await;
+    let (dl_code, dl_json, records, blobs) =
+        boxed_download_patch_records(&selected, &params, api_client, HashMap::new()).await;
     let mut has_errors = dl_code != 0;
     result["download"] = dl_json;
 
     // 2) The vendor engine, under the same lock as apply/vendor (a no-op
     //    that creates nothing when there is nothing to vendor).
-    let vendor_code = match boxed_scan_vendor_step(&args.common, manifest_path, socket_dir, records)
-        .await
+    let vendor_code = match boxed_scan_vendor_step(
+        &args.common,
+        manifest_path,
+        socket_dir,
+        records,
+        blobs,
+        api_client.clone(),
+        use_public_proxy,
+    )
+    .await
     {
         Ok((vendor_errors, venv)) => {
             has_errors |= vendor_errors;
@@ -579,13 +593,18 @@ async fn run_vendor_json_path(
 }
 
 /// The `scan --vendor` interactive arm: download → vendor engine → GC,
-/// with human-readable output. Extracted + boxed for the same
+/// with human-readable output. `prefetched` holds the views the pre-prompt
+/// baseline check already fetched (uuid-keyed), so the download phase
+/// serves those records from memory. Extracted + boxed for the same
 /// Windows-1-MiB-poll-frame reason as [`run_vendor_json_path`].
 #[allow(clippy::too_many_arguments)]
 async fn run_vendor_interactive_path(
     args: &ScanArgs,
+    api_client: &ApiClient,
+    use_public_proxy: bool,
     selected: &[PatchSearchResult],
     params: &DownloadParams,
+    prefetched: HashMap<String, PatchResponse>,
     manifest_path: &Path,
     socket_dir: &Path,
     scanned_purls: &HashSet<String>,
@@ -594,9 +613,19 @@ async fn run_vendor_interactive_path(
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
 ) -> i32 {
-    let (dl_code, _, records) = boxed_download_patch_records(selected, params).await;
+    let (dl_code, _, records, blobs) =
+        boxed_download_patch_records(selected, params, api_client, prefetched).await;
     let mut has_errors = dl_code != 0;
-    let code = match boxed_scan_vendor_step(&args.common, manifest_path, socket_dir, records).await
+    let code = match boxed_scan_vendor_step(
+        &args.common,
+        manifest_path,
+        socket_dir,
+        records,
+        blobs,
+        api_client.clone(),
+        use_public_proxy,
+    )
+    .await
     {
         Ok((vendor_errors, venv)) => {
             has_errors |= vendor_errors;
@@ -719,7 +748,8 @@ pub(super) fn fold_vendored_skips_into_apply(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn boxed_vendor_json_path<'a>(
     args: &'a ScanArgs,
-    api_client: &'a socket_patch_core::api::client::ApiClient,
+    api_client: &'a ApiClient,
+    use_public_proxy: bool,
     effective_org_slug: Option<&'a str>,
     all_packages_with_patches: &'a [BatchPackagePatches],
     can_access_paid_patches: bool,
@@ -735,6 +765,7 @@ pub(super) fn boxed_vendor_json_path<'a>(
     Box::pin(run_vendor_json_path(
         args,
         api_client,
+        use_public_proxy,
         effective_org_slug,
         all_packages_with_patches,
         can_access_paid_patches,
@@ -754,8 +785,11 @@ pub(super) fn boxed_vendor_json_path<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn boxed_vendor_interactive_path<'a>(
     args: &'a ScanArgs,
+    api_client: &'a ApiClient,
+    use_public_proxy: bool,
     selected: &'a [PatchSearchResult],
     params: &'a DownloadParams,
+    prefetched: HashMap<String, PatchResponse>,
     manifest_path: &'a Path,
     socket_dir: &'a Path,
     scanned_purls: &'a HashSet<String>,
@@ -766,8 +800,11 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_vendor_interactive_path(
         args,
+        api_client,
+        use_public_proxy,
         selected,
         params,
+        prefetched,
         manifest_path,
         socket_dir,
         scanned_purls,
@@ -783,35 +820,41 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
 /// embeds the entire vendor engine, and the vendor-path frames it would
 /// otherwise ride must themselves fit Windows' 1 MiB main-thread stack
 /// (same rationale as [`boxed_vendor_json_path`], one level down). Moving
-/// the records map into the future is stack-neutral (three words).
+/// the records and seed maps and the client into the future is
+/// stack-neutral (a few words each).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn boxed_scan_vendor_step<'a>(
     common: &'a GlobalArgs,
     manifest_path: &'a Path,
     socket_dir: &'a Path,
     records: HashMap<String, PatchRecord>,
+    seed: HashMap<String, Vec<u8>>,
+    client: ApiClient,
+    use_public_proxy: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = VendorStepResult> + 'a>> {
     Box::pin(run_scan_vendor_step(
         common,
         manifest_path,
         socket_dir,
         records,
+        seed,
+        client,
+        use_public_proxy,
     ))
 }
 
 /// Transient-frame boxed constructor for the download-phase future used
 /// inside the vendor paths, so the frame fits Windows' 1 MiB main-thread
 /// stack (same rationale as [`boxed_vendor_json_path`]).
-#[allow(clippy::type_complexity)]
 fn boxed_download_patch_records<'a>(
     selected: &'a [PatchSearchResult],
     params: &'a DownloadParams,
-) -> std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = (i32, serde_json::Value, HashMap<String, PatchRecord>)>
-            + 'a,
-    >,
-> {
-    Box::pin(download_patch_records(selected, params))
+    api_client: &'a ApiClient,
+    prefetched: HashMap<String, PatchResponse>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = DetachedDownload> + 'a>> {
+    Box::pin(download_patch_records_with(
+        selected, params, api_client, prefetched,
+    ))
 }
 
 /// Transient-frame boxed constructor for the vendor engine itself
@@ -821,7 +864,7 @@ fn boxed_vendor_records<'a>(
     common: &'a GlobalArgs,
     records: &'a HashMap<String, PatchRecord>,
     sources: &'a socket_patch_core::patch::apply::PatchSources<'a>,
-    service: Option<&'a VendorServiceConfig>,
+    service: Option<&'a socket_patch_core::vendor::VendorServiceConfig>,
     env: &'a mut Envelope,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'a>> {
     // `scan --vendor` threads the SAME service config the `vendor` command
@@ -1047,78 +1090,6 @@ mod migration_tests {
             "{:?}",
             env.warnings
         );
-    }
-}
-
-#[cfg(test)]
-mod service_config_tests {
-    use super::*;
-    use crate::args::GlobalArgs;
-
-    fn common_with_source(source: &str) -> GlobalArgs {
-        GlobalArgs {
-            vendor_source: source.to_string(),
-            ..Default::default()
-        }
-    }
-
-    /// Regression: scan's vendored flow must build its service config FROM
-    /// `--vendor-source`, not hardcode build-only (the pre-fix `service =
-    /// None`). Under the default (`auto`), the config must permit the
-    /// vendoring service exactly as the `vendor` command's default does —
-    /// otherwise `scan --mode vendored` silently builds locally while a
-    /// plain `vendor` service-downloads, and the two commit different bytes /
-    /// lock integrity for the same patch (lock churn / merge conflicts).
-    #[test]
-    fn default_source_permits_service_like_vendor_command() {
-        let common = common_with_source("auto");
-        let cfg = scan_vendor_service_config(&common, None, false);
-        assert_eq!(cfg.source, VendorSource::Auto);
-        assert!(
-            cfg.source.may_use_service(),
-            "default scan --vendor must be able to use the service (matching `vendor`)"
-        );
-        assert!(!cfg.source.requires_service());
-    }
-
-    /// `--vendor-source service` must reach the fail-closed service path,
-    /// exactly as the `vendor` command interprets the same flag.
-    #[test]
-    fn service_source_requires_service() {
-        let common = common_with_source("service");
-        let cfg = scan_vendor_service_config(&common, None, false);
-        assert_eq!(cfg.source, VendorSource::Service);
-        assert!(cfg.source.requires_service());
-    }
-
-    /// `--vendor-source build` stays build-only (never contacts the service).
-    #[test]
-    fn build_source_never_uses_service() {
-        let common = common_with_source("build");
-        let cfg = scan_vendor_service_config(&common, None, false);
-        assert_eq!(cfg.source, VendorSource::Build);
-        assert!(!cfg.source.may_use_service());
-    }
-
-    /// The service overrides (`--vendor-url` / `--patch-server-url` /
-    /// `--offline`) thread through unchanged, so scan and `vendor` target the
-    /// same hosts.
-    #[test]
-    fn overrides_thread_through() {
-        let common = GlobalArgs {
-            vendor_source: "service".to_string(),
-            vendor_url: Some("https://vendor.example".to_string()),
-            patch_server_url: Some("https://patch.example".to_string()),
-            offline: true,
-            ..Default::default()
-        };
-        let cfg = scan_vendor_service_config(&common, None, false);
-        assert_eq!(cfg.vendor_url.as_deref(), Some("https://vendor.example"));
-        assert_eq!(
-            cfg.patch_server_url.as_deref(),
-            Some("https://patch.example")
-        );
-        assert!(cfg.offline);
     }
 }
 

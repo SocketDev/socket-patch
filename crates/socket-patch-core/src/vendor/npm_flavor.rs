@@ -370,8 +370,8 @@ pub async fn vendor_npm_any(
 /// `overrides:` section is excluded by the flavor probe, and the other
 /// flavors carry no declaration inside the lock at all). `None`: cannot
 /// determine (missing lock, unknown flavor) — callers keep the entry,
-/// fail-safe. Detached entries are lockfile-invisible BY DESIGN and must
-/// never be routed here (the probe would always call them unused).
+/// fail-safe. Detached entries are wired into the lock exactly like
+/// manifest-tracked ones, so the probe applies to every entry.
 pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     match entry.flavor.as_deref() {
         Some("pnpm") => pnpm_lock::pnpm_entry_in_use(entry, project_root).await,
