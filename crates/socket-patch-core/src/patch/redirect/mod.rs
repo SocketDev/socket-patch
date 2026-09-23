@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::crawlers::composer_crawler::normalize_version;
+use crate::utils::digest::is_hex64_lower;
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 mod bun_binary;
@@ -31,7 +32,9 @@ pub mod golang_local;
 pub mod npmrc;
 mod pdm;
 mod pipenv;
-mod pnpm;
+// pub(crate): manifest-less VEX discovery (`vex::discover::npm`) reads
+// hosted pnpm locks with the SAME grammar this rewriter writes them in.
+pub(crate) mod pnpm;
 mod poetry;
 mod replay;
 mod requirements;
@@ -43,6 +46,9 @@ pub use state::{
     drop_superseded_purl, load_redirect_state, persist_redirect_state, save_redirect_state,
     CorruptRedirectState, RedirectState, REDIRECT_STATE_REL,
 };
+/// Hosted-artifact leaf ownership rule, shared with `vex`'s bun lockfile
+/// discovery (which recovers a URL tuple's version from that leaf).
+pub(crate) use takeover::hosted_url_version;
 pub use takeover::{
     redirect_revert_supported, revert_cargo_redirect_purl, revert_npm_redirect_purl,
     revert_redirect_purl, RedirectRevert,
@@ -430,7 +436,7 @@ fn rewrite_npm_lock(
     // install from — a silent FALSE SUCCESS. Rewrite EVERY present npm lock so
     // a fresh `npm install`/`npm ci` from EITHER is redirected (shrinkwrap-only
     // repos on npm <= 6 keep working: only that one file is present).
-    let present: Vec<&str> = ["npm-shrinkwrap.json", "package-lock.json"]
+    let present: Vec<&str> = crate::constants::npm_family::NPM_LOCKS
         .into_iter()
         .filter(|f| files.contains_key(*f))
         .collect();
@@ -948,22 +954,27 @@ fn is_valid_gem_index_url(url: &str) -> bool {
         && !url.chars().any(|c| c.is_control() || c == ' ')
 }
 
-/// The exact shape `hex::encode(sha256)` / the TS `Buffer.toString('hex')`
-/// produce: 64 lowercase hex chars. Anything else written as a Cargo.lock
-/// `checksum` breaks the next fetch.
-fn is_hex64_lower(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+/// The uuid of a Socket-owned registry / repository / source NAME in its
+/// EXACT grammar: `socket-patch-<canonical-uuid>`, or with `vendored`
+/// `socket-patch-vendor-<canonical-uuid>` (maven's vendored repository id).
+/// No trimming: the rewriter must never treat a user's padded pin as its
+/// own, while lockfile discovery trims at its call site
+/// (`vex::discover::socket_patch_name_uuid`).
+pub(crate) fn socket_patch_name_uuid_exact(name: &str, vendored: bool) -> Option<&str> {
+    let prefix = if vendored {
+        "socket-patch-vendor-"
+    } else {
+        "socket-patch-"
+    };
+    name.strip_prefix(prefix)
+        .filter(|uuid| crate::patch::path_safety::is_canonical_uuid(uuid))
 }
 
 /// A registry name THIS rewriter owns: `socket-patch-<canonical-uuid>`. An
 /// existing pin matching this grammar was written by a previous run and may be
 /// superseded in place; any other registry pin is the user's and is refused.
 fn is_socket_patch_registry_name(value: &str) -> bool {
-    value
-        .strip_prefix("socket-patch-")
-        .is_some_and(crate::patch::path_safety::is_canonical_uuid)
+    socket_patch_name_uuid_exact(value, false).is_some()
 }
 
 /// Split a TOML table-header path into dot segments, respecting quoted
@@ -2241,9 +2252,10 @@ fn rewrite_yarn_classic(
 const YARN_BERRY_SUPPORTED_CACHE_KEY: &str = "10c0";
 
 /// A yarn.lock is berry (v2+) when it carries the `__metadata:` header block;
-/// anything else is a classic v1 lock. Shared by both yarn rewriters so the
-/// ownership split cannot drift.
-fn is_berry_lock(content: &str) -> bool {
+/// anything else is a classic v1 lock. Shared by both yarn rewriters and
+/// lockfile discovery (`vex::discover::yarn`) so the grammar split cannot
+/// drift.
+pub(crate) fn is_berry_lock(content: &str) -> bool {
     content.lines().any(|line| line.starts_with("__metadata:"))
 }
 
@@ -2263,43 +2275,13 @@ fn berry_cache_key(content: &str) -> Option<String> {
     None
 }
 
-/// Split `name@npm:...` at the `@` past a leading `@scope/` marker.
-fn split_berry_descriptor(pattern: &str) -> Option<(&str, &str)> {
-    let from = usize::from(pattern.starts_with('@'));
-    let at = pattern[from..].find('@')? + from;
-    let (name, range) = (&pattern[..at], &pattern[at + 1..]);
-    if name.is_empty() || range.is_empty() {
-        return None;
-    }
-    Some((name, range))
-}
-
-/// Split a berry lock key into its comma-joined descriptor patterns. yarn
-/// wraps a multi-descriptor key in ONE outer quote pair (`"a@npm:^1,
-/// a@npm:^2"`), so strip a single wrapping pair first, THEN split on `, ` —
-/// that surfaces every descriptor (letting a genuinely mixed-name key be
-/// detected as ambiguous) while a single quoted descriptor stays intact.
-/// Twin of the TS `splitKeyPatterns`.
-fn split_berry_key_patterns(key: &str) -> Vec<String> {
-    let trimmed = key.trim();
-    let inner = if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
-    };
-    inner
-        .split(", ")
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 fn rewrite_yarn_berry(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
+    // Descriptors split with the classic grammar's `name@range` rule.
+    use crate::vendor::yarn_classic_lock::{split_berry_key_patterns, split_pattern};
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() || !files.contains_key("yarn.lock") {
         return;
@@ -2401,7 +2383,7 @@ fn rewrite_yarn_berry(
             }
             let patterns = split_berry_key_patterns(raw_key);
             let parsed: Vec<Option<(&str, &str)>> =
-                patterns.iter().map(|p| split_berry_descriptor(p)).collect();
+                patterns.iter().map(|p| split_pattern(p)).collect();
             // Every comma-joined pattern must parse as a descriptor.
             if parsed.iter().any(Option::is_none) {
                 continue;
@@ -2424,7 +2406,7 @@ fn rewrite_yarn_berry(
                         p.expect("every pattern parsed — None-bearing keys are skipped above")
                             .1
                             .strip_prefix("npm:")
-                            .and_then(split_berry_descriptor)
+                            .and_then(split_pattern)
                             .is_some_and(|(real, _)| real == fname)
                     })
                 {
@@ -2906,17 +2888,18 @@ fn plan_python_metadata(
     dep: &DepOverride,
     result: &RewriteResult,
 ) -> Result<(Option<PythonMetadataEdit>, Option<String>), RewriteWarning> {
-    use crate::utils::python_lock::{check_python_lock_source_scope, ArtifactSource};
+    use crate::utils::python_lock::{
+        check_python_lock_source_scope, is_script_lock_name, paired_metadata_rel, ArtifactSource,
+    };
     use crate::utils::python_script::{rewrite_project_metadata, rewrite_script_metadata};
 
-    let script = path.ends_with(".py.lock");
-    let metadata_path = if script {
-        path.strip_suffix(".lock")
-            .expect("script lock suffix")
-            .to_string()
-    } else if path == "uv.lock" && files.contains_key("pyproject.toml") {
-        "pyproject.toml".to_string()
-    } else {
+    // A script lock always needs its script; uv.lock is edited alone in a
+    // lock-only checkout.
+    let script = is_script_lock_name(path);
+    let Some(metadata_path) = paired_metadata_rel(path)
+        .filter(|metadata| script || files.contains_key(*metadata))
+        .map(str::to_string)
+    else {
         return Ok((None, None));
     };
     let Some(original) = result
@@ -3848,6 +3831,97 @@ pub fn grant_token_path_segment(url: &str, patch_uuid: &str) -> Option<String> {
     (!token.is_empty()).then(|| token.to_string())
 }
 
+/// Public host of Socket's patch server: the origin every production hosted
+/// artifact / registry URL is served from (`https://patch.socket.dev/patch/…`,
+/// `…/patch-registry/…`), and the root of the Go module namespace
+/// [`crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX`].
+pub const SOCKET_PATCH_SERVER_HOST: &str = "patch.socket.dev";
+
+/// The Socket patch uuid a lockfile-recorded HOSTED reference names, or
+/// `None` when `url` is not a Socket-hosted patch URL — the inverse of the
+/// rewriters, used by `vex`'s manifest-less lockfile discovery.
+///
+/// Recognition is deliberately strict, because the answer decides whether a
+/// committed (tamper-able) lockfile line becomes an attestation input:
+///
+/// * the ORIGIN must be Socket's patch server (`https://` +
+///   [`SOCKET_PATCH_SERVER_HOST`]) or one of `extra_origins` — the
+///   operator's `--patch-server-url` deployment, compared on scheme + host +
+///   port. A uuid inside any other host's URL is a user's own dependency
+///   source, never a patch reference;
+/// * no userinfo — a Socket-written URL never carries credentials;
+/// * the uuid is the LAST path segment passing the canonical-uuid grammar:
+///   hosted URLs carry the grant token in the level before the uuid
+///   (`…/patch/npm/<name>/<ver>/<token>/<uuid>/<leaf>`,
+///   `…/patch-registry/<eco>/<token>/<uuid>/…`), and grant tokens may
+///   themselves be uuid-shaped, so "the first uuid" would elect the token.
+///
+/// Every spelling the lock formats record the same URL in is accepted: a
+/// `#fragment` (yarn classic `#<sha1>`, pip `#sha256=`) and a `?query` are
+/// ignored; `\/`-escaped slashes (older composer locks) are unescaped; a
+/// wholly percent-encoded URL (yarn berry's `__archiveUrl=` binding) is
+/// decoded; a cargo source-kind prefix (`sparse+`, `registry+`) is dropped.
+/// Path segments are percent-decoded AFTER splitting, so an encoded `/`
+/// can never manufacture a segment.
+pub fn hosted_patch_uuid(url: &str, extra_origins: &[String]) -> Option<String> {
+    hosted_patch_url_uuids(url, extra_origins)?.pop()
+}
+
+/// EVERY canonical-uuid path segment of a Socket-HOSTED url, in path order
+/// (the grant token first when it is uuid-shaped, the patch uuid last), or
+/// `None` when `url` is not on an accepted origin — [`hosted_patch_uuid`]'s
+/// exact acceptance rules, without electing one segment. `vex` discovery
+/// uses it to RECOGNIZE every Socket identity a lockfile mentions, including
+/// the malformed or rejected shapes whose "last uuid" is not a patch.
+pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec<String>> {
+    use crate::patch::path_safety::is_canonical_uuid;
+    use crate::utils::purl::percent_decode_purl_component;
+
+    let unescaped = url.trim().replace("\\/", "/");
+    let lower = unescaped.to_ascii_lowercase();
+    let decoded = if lower.starts_with("https%3a%2f%2f") || lower.starts_with("http%3a%2f%2f") {
+        percent_decode_purl_component(&unescaped).into_owned()
+    } else {
+        unescaped
+    };
+    // `sparse+https://…` / `registry+https://…` (Cargo.lock `source`).
+    let (scheme, _) = decoded.split_once("://")?;
+    let text = match scheme.rsplit_once('+') {
+        Some((kind, _)) if !kind.is_empty() && kind.bytes().all(|b| b.is_ascii_alphabetic()) => {
+            &decoded[kind.len() + 1..]
+        }
+        _ => decoded.as_str(),
+    };
+    let parsed = reqwest::Url::parse(text).ok()?;
+    if !matches!(parsed.scheme(), "https" | "http")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    let socket_host = parsed.scheme() == "https"
+        && parsed.host_str() == Some(SOCKET_PATCH_SERVER_HOST)
+        && parsed.port_or_known_default() == Some(443);
+    let configured = extra_origins.iter().any(|origin| {
+        reqwest::Url::parse(origin.trim()).is_ok_and(|o| {
+            o.scheme() == parsed.scheme()
+                && o.host_str().is_some()
+                && o.host_str() == parsed.host_str()
+                && o.port_or_known_default() == parsed.port_or_known_default()
+        })
+    });
+    if !socket_host && !configured {
+        return None;
+    }
+    Some(
+        parsed
+            .path_segments()?
+            .map(|segment| percent_decode_purl_component(segment).into_owned())
+            .filter(|segment| is_canonical_uuid(segment))
+            .collect(),
+    )
+}
+
 /// A dep's Socket index URL as a regex source with the per-request rotating
 /// segments (grant token, patch uuid) wildcarded — an exact-URL pattern
 /// misses the URL a previous run wrote under an older grant. The grant token
@@ -4690,7 +4764,7 @@ const GRADLE_FILES: &[&str] = &[
 /// still resolves (only a MISMATCH fails); origin-unaware so one checksum
 /// matches the artifact from any repository.
 const MVN_CONFIG_ARGS: &[&str] = &[
-    "-Daether.artifactResolver.postProcessor.trustedChecksums=true",
+    TRUSTED_CHECKSUMS_ON,
     "-Daether.artifactResolver.postProcessor.trustedChecksums.checksumAlgorithms=SHA-256",
     "-Daether.artifactResolver.postProcessor.trustedChecksums.failIfMissing=false",
     "-Daether.trustedChecksumsSource.summaryFile=true",
@@ -4698,8 +4772,13 @@ const MVN_CONFIG_ARGS: &[&str] = &[
     "-Daether.trustedChecksumsSource.summaryFile.originAware=false",
 ];
 
-const MVN_CONFIG: &str = ".mvn/maven.config";
-const MVN_CHECKSUMS: &str = ".mvn/checksums/checksums.sha256";
+/// The resolver switch (the first [`MVN_CONFIG_ARGS`] line) that makes the
+/// checksums file an enforced pin; without it the file is inert.
+pub(crate) const TRUSTED_CHECKSUMS_ON: &str =
+    "-Daether.artifactResolver.postProcessor.trustedChecksums=true";
+
+pub(crate) const MVN_CONFIG: &str = ".mvn/maven.config";
+pub(crate) const MVN_CHECKSUMS: &str = ".mvn/checksums/checksums.sha256";
 
 /// Strip any `sha256-`/`sha256:` SRI-style prefix off a stored hash, leaving the
 /// bare lowercase hex Maven's trusted-checksums summary file expects (twin of
@@ -5264,7 +5343,12 @@ fn merge_checksums(existing: &str, entries: &[(String, String)]) -> String {
 
 /// The local-repository-relative artifact path Maven derives for a coordinate:
 /// `<groupId-with-slashes>/<artifactId>/<version>/<artifactId>-<version>.<ext>`.
-fn local_repo_artifact_path(group_id: &str, artifact_id: &str, version: &str, ext: &str) -> String {
+pub(crate) fn local_repo_artifact_path(
+    group_id: &str,
+    artifact_id: &str,
+    version: &str,
+    ext: &str,
+) -> String {
     format!(
         "{}/{artifact_id}/{version}/{artifact_id}-{version}.{ext}",
         group_id.replace('.', "/")
@@ -5303,17 +5387,6 @@ fn gradle_snippet(
 /// (`"foo v1.0.0 => evil.example/x v1\nreplace …"`). Fail-closed token guard.
 fn go_token_safe(s: &str) -> bool {
     !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control())
-}
-
-/// Strict `h1:` dirhash shape: exactly `h1:` + the 44-char standard-base64 of
-/// a sha256. Anything else (wrong algorithm, embedded whitespace, truncation)
-/// must not reach go.sum — a malformed line poisons the whole file.
-fn go_h1_shape(s: &str) -> bool {
-    s.strip_prefix("h1:").is_some_and(|b| {
-        b.len() == 44
-            && b.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
-    })
 }
 
 // The committable shape (validated empirically — `docs/design/golang-hosted.md`):
@@ -5428,7 +5501,7 @@ fn rewrite_golang(
             });
             continue;
         };
-        if !go_h1_shape(zip_h1) || !go_h1_shape(gomod_h1) {
+        if !go_sum_edit::is_h1_dirhash(zip_h1) || !go_sum_edit::is_h1_dirhash(gomod_h1) {
             result.warnings.push(RewriteWarning {
                 code: "redirect_golang_missing_integrity".into(),
                 detail: format!(
@@ -14732,6 +14805,111 @@ mod python_lock_warning_tests {
     }
 }
 
+/// Which metadata file `plan_python_metadata` pairs a native Python lock
+/// with, and what it does when that file is missing — pinned at the lib
+/// level (the `uv_hosted` integration suite is not part of the lib run).
+#[cfg(test)]
+mod python_metadata_pairing_tests {
+    use super::*;
+
+    fn dep() -> DepOverride {
+        DepOverride {
+            ecosystem: "pypi".into(),
+            name: "click".into(),
+            namespace: None,
+            version: "8.1.7".into(),
+            token: "11111111-1111-4111-8111-111111111111".into(),
+            patch_uuid: "22222222-2222-4222-8222-222222222222".into(),
+            artifact_url: "https://patch.socket.dev/click-8.1.7-py3-none-any.whl".into(),
+            berry_zip_url: None,
+            registry_override: None,
+            integrity: Integrity::default(),
+        }
+    }
+
+    const LOCK: &str = "version = 1\n";
+    const PYPROJECT: &str =
+        "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"click==8.1.7\"]\n";
+    const SCRIPT: &str = "# /// script\n# dependencies = [\"click==8.1.7\"]\n# ///\nimport click\n";
+
+    fn plan(
+        path: &str,
+        files: &[(&str, &str)],
+        planned: &[(&str, &str)],
+    ) -> Result<(Option<PythonMetadataEdit>, Option<String>), RewriteWarning> {
+        let files: BTreeMap<String, String> = files
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut result = RewriteResult::default();
+        for (k, v) in planned {
+            result.files.insert(k.to_string(), v.to_string());
+        }
+        plan_python_metadata(path, LOCK, &files, &dep(), &result)
+    }
+
+    #[test]
+    fn uv_lock_pairs_with_pyproject_only_when_present() {
+        let (edit, project) = plan("uv.lock", &[("pyproject.toml", PYPROJECT)], &[])
+            .unwrap_or_else(|w| panic!("{}: {}", w.code, w.detail));
+        let edit = edit.expect("pyproject rewritten");
+        assert_eq!(edit.path, "pyproject.toml");
+        assert!(!edit.script);
+        assert_eq!(edit.original, PYPROJECT);
+        assert_eq!(project.as_deref(), Some(edit.rewritten.as_str()));
+
+        // No pyproject: the lock is edited alone.
+        assert!(matches!(plan("uv.lock", &[], &[]), Ok((None, None))));
+        // Other native locks have no paired metadata at all.
+        for lock in ["pylock.toml", "pylock.dev.toml", "tool.lock", ".py.lockx"] {
+            assert!(
+                matches!(
+                    plan(lock, &[("pyproject.toml", PYPROJECT)], &[]),
+                    Ok((None, None))
+                ),
+                "{lock}"
+            );
+        }
+    }
+
+    #[test]
+    fn script_lock_pairs_with_its_script_and_requires_it() {
+        let (edit, project) = plan("tool.py.lock", &[("tool.py", SCRIPT)], &[])
+            .unwrap_or_else(|w| panic!("{}: {}", w.code, w.detail));
+        let edit = edit.expect("script rewritten");
+        assert_eq!(edit.path, "tool.py");
+        assert!(edit.script);
+        assert_eq!(project, None);
+
+        // An earlier dependency's planned rewrite of the script wins over the
+        // file on disk.
+        let (edit, _) = plan(
+            "tool.py.lock",
+            &[("tool.py", "not a script")],
+            &[("tool.py", SCRIPT)],
+        )
+        .unwrap_or_else(|w| panic!("{}: {}", w.code, w.detail));
+        assert_eq!(edit.expect("script rewritten").original, SCRIPT);
+
+        let Err(missing) = plan("tool.py.lock", &[("pyproject.toml", PYPROJECT)], &[]) else {
+            panic!("a script lock without its script must refuse");
+        };
+        assert_eq!(missing.code, "redirect_uv_script_missing");
+        assert_eq!(missing.detail, "tool.py.lock requires its paired tool.py");
+
+        let Err(bad) = plan("tool.py.lock", &[("tool.py", "print(1)\n")], &[]) else {
+            panic!("a script without PEP 723 metadata must refuse");
+        };
+        assert_eq!(bad.code, "redirect_uv_script_unsupported");
+        assert!(bad.detail.starts_with("tool.py: "), "{}", bad.detail);
+
+        let Err(bad) = plan("uv.lock", &[("pyproject.toml", "[tool]\n")], &[]) else {
+            panic!("a pyproject without [project] must refuse");
+        };
+        assert_eq!(bad.code, "redirect_uv_project_unsupported");
+    }
+}
+
 #[cfg(test)]
 mod hatch_tests {
     use super::*;
@@ -14849,5 +15027,128 @@ mod hatch_tests {
         let second = rewrite_registry_redirect(&result.files, &[patch()]);
         assert!(second.confirmed_hatch_uuids.contains("test-uuid"));
         assert!(second.files.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hosted_patch_uuid_tests {
+    //! `hosted_patch_uuid` is the trust gate between a committed lockfile
+    //! line and a VEX attestation input: pin the accepted spellings AND the
+    //! rejections (foreign hosts, credentials, non-canonical tokens).
+    use super::*;
+
+    const UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    /// A uuid-SHAPED grant token: the fixtures use them, and production
+    /// tokens are not guaranteed otherwise — the LAST uuid segment must win.
+    const TOKEN: &str = "11111111-2222-4333-8444-555555555555";
+
+    fn none() -> Vec<String> {
+        Vec::new()
+    }
+
+    #[test]
+    fn artifact_and_registry_shapes_yield_the_patch_uuid_not_the_token() {
+        for url in [
+            format!("https://patch.socket.dev/patch/npm/left-pad/1.3.0/{TOKEN}/{UUID}/left-pad-1.3.0.tgz"),
+            format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/left-pad-1.3.0.tgz"),
+            format!("https://patch.socket.dev/patch-registry/gem/{TOKEN}/{UUID}/"),
+            format!("https://patch.socket.dev/patch-registry/gem/{TOKEN}/{UUID}/gems/rack-2.2.3.gem"),
+            format!("https://patch.socket.dev/patch-registry/maven/{TOKEN}/{UUID}/maven2"),
+            format!("https://patch.socket.dev/patch-registry/nuget/{TOKEN}/{UUID}/index.json"),
+            format!("sparse+https://patch.socket.dev/patch-registry/cargo/{TOKEN}/{UUID}/index/"),
+            format!("registry+https://patch.socket.dev/patch-registry/cargo/{TOKEN}/{UUID}/index/"),
+        ] {
+            assert_eq!(
+                hosted_patch_uuid(&url, &none()).as_deref(),
+                Some(UUID),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn lock_format_spellings_are_normalized() {
+        let url = format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/left-pad-1.3.0.tgz");
+        // yarn classic `#<sha1>`, pip/hatch `#sha256=`, a stray query.
+        for spelled in [
+            format!("{url}#0123456789abcdef0123456789abcdef01234567"),
+            format!("{url}#sha256=abc"),
+            format!("{url}?x=1"),
+            // composer's `\/`-escaped slashes.
+            url.replace('/', "\\/"),
+            // yarn berry's percent-encoded `__archiveUrl=` binding value.
+            url.replace(':', "%3A").replace('/', "%2F"),
+            format!("  {url}  "),
+        ] {
+            assert_eq!(
+                hosted_patch_uuid(&spelled, &none()).as_deref(),
+                Some(UUID),
+                "{spelled}"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_hosts_credentials_and_plain_http_are_refused() {
+        for url in [
+            format!("https://registry.npmjs.org/{TOKEN}/{UUID}/x.tgz"),
+            format!("https://patch.socket.dev.evil.example/{TOKEN}/{UUID}/x.tgz"),
+            format!("https://evil.example/patch.socket.dev/{TOKEN}/{UUID}/x.tgz"),
+            format!("http://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/x.tgz"),
+            format!("https://patch.socket.dev:8443/patch/npm/{TOKEN}/{UUID}/x.tgz"),
+            format!("https://user:pw@patch.socket.dev/patch/npm/{TOKEN}/{UUID}/x.tgz"),
+            format!("git+ssh://patch.socket.dev/{UUID}"),
+            format!("file:.socket/vendor/npm/{UUID}/x.tgz"),
+            format!("patch.socket.dev/gopatch/{UUID}"),
+        ] {
+            assert_eq!(hosted_patch_uuid(&url, &none()), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn non_canonical_segments_are_not_patch_uuids() {
+        for url in [
+            // Placeholder tokens (fixtures use `uuid`, `tok`, `some-uuid`).
+            "https://patch.socket.dev/patch/npm/tok/uuid/x.tgz".to_string(),
+            // Uppercase is not the canonical grammar.
+            format!(
+                "https://patch.socket.dev/patch/npm/tok/{}/x.tgz",
+                UUID.to_ascii_uppercase()
+            ),
+            // A uuid only in the query / fragment is not a path level.
+            format!("https://patch.socket.dev/patch/npm/x.tgz?u={UUID}"),
+            format!("https://patch.socket.dev/patch/npm/x.tgz#{UUID}"),
+            // An encoded `/` cannot split a segment into a uuid.
+            format!("https://patch.socket.dev/patch/npm/tok%2F{UUID}/x.tgz"),
+        ] {
+            assert_eq!(hosted_patch_uuid(&url, &none()), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn configured_patch_server_origin_is_accepted_exactly() {
+        let origins = vec!["http://127.0.0.1:4545/some/base".to_string()];
+        let url = format!("http://127.0.0.1:4545/patch/npm/{TOKEN}/{UUID}/x.tgz");
+        assert_eq!(hosted_patch_uuid(&url, &origins).as_deref(), Some(UUID));
+        // Same host, other port / scheme: a different origin.
+        for other in [
+            format!("http://127.0.0.1:4546/patch/npm/{TOKEN}/{UUID}/x.tgz"),
+            format!("https://127.0.0.1:4545/patch/npm/{TOKEN}/{UUID}/x.tgz"),
+        ] {
+            assert_eq!(hosted_patch_uuid(&other, &origins), None, "{other}");
+        }
+        // The default host stays accepted alongside the override, and a
+        // malformed override is ignored rather than widening the allowlist.
+        let default = format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/x.tgz");
+        assert_eq!(hosted_patch_uuid(&default, &origins).as_deref(), Some(UUID));
+        assert_eq!(hosted_patch_uuid(&url, &["not a url".to_string()]), None);
+    }
+
+    /// The Go hosted namespace lives on the same host the URL allowlist
+    /// pins — the two spellings of "Socket's patch server" cannot drift.
+    #[test]
+    fn go_module_namespace_is_on_the_patch_server_host() {
+        assert!(crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX
+            .starts_with(&format!("{SOCKET_PATCH_SERVER_HOST}/")));
     }
 }

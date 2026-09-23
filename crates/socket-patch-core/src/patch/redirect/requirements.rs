@@ -138,20 +138,8 @@ enum RequirementVersion {
 fn archive_version(location: &str, name: &str) -> Option<String> {
     let url = reqwest::Url::parse(location).ok()?;
     let filename = percent_decode_purl_component(url.path().rsplit('/').next()?);
-    let (distribution, version) = if let Some(stem) = filename.strip_suffix(".whl") {
-        let mut parts = stem.splitn(3, '-');
-        let distribution = parts.next()?;
-        let version = parts.next()?;
-        parts.next()?;
-        (distribution, version)
-    } else {
-        let stem = [".tar.gz", ".zip", ".tar.bz2", ".tar.xz"]
-            .into_iter()
-            .find_map(|suffix| filename.strip_suffix(suffix))?;
-        stem.rsplit_once('-')?
-    };
-    (canonicalize_pypi_name(distribution) == name && !version.is_empty())
-        .then(|| version.to_string())
+    let (distribution, version) = crate::utils::requirements::archive_filename_coords(&filename)?;
+    (canonicalize_pypi_name(distribution) == name).then(|| version.to_string())
 }
 
 fn requirement_version(specifier: &str, name_re: &Regex, name: &str) -> RequirementVersion {

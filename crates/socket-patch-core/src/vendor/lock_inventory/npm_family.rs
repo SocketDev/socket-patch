@@ -4,15 +4,17 @@
 
 use std::path::Path;
 
-use crate::patch::path_safety;
-use crate::vendor::npm_common::is_safe_npm_name;
+use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_SHRINKWRAP_LEGACY};
+use crate::utils::purl::npm_purl;
 use crate::vendor::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};
 
-use super::bun::{inventory_bun, inventory_bun_binary};
+use super::bun::{bun_text_lock_present, inventory_bun, inventory_bun_binary};
 use super::npm::inventory_package_lock;
 use super::pnpm::{inventory_pnpm_lock, inventory_pnpm_lock_at, inventory_rush_pnpm_locks};
 use super::yarn::{inventory_yarn_berry, inventory_yarn_classic};
 use super::{dedup_prefer_integrity, LockfileEntry, UnsupportedNpmLayout};
+
+// ── registry view ──
 
 /// Inventory the project's npm-family lockfile. Routes by
 /// [`detect_npm_lock_flavor`]. `Ok(None)` means there is nothing to
@@ -30,6 +32,16 @@ use super::{dedup_prefer_integrity, LockfileEntry, UnsupportedNpmLayout};
 /// Any remaining probe failure falls back to Rush's common lock when
 /// `rush.json` is present.
 pub(crate) async fn inventory_npm_lock(
+    project_root: &Path,
+) -> Result<Option<(NpmLockFlavor, Vec<LockfileEntry>)>, UnsupportedNpmLayout> {
+    inventory_npm_lock_raw(project_root)
+        .await
+        .map(|found| found.map(|(flavor, raw)| (flavor, dedup_prefer_integrity(raw))))
+}
+
+/// [`inventory_npm_lock`] before its collapse: every
+/// guarded instance ([`super::inventory_project_every_lock`]).
+pub(super) async fn inventory_npm_lock_raw(
     project_root: &Path,
 ) -> Result<Option<(NpmLockFlavor, Vec<LockfileEntry>)>, UnsupportedNpmLayout> {
     let (flavor, _warnings) = match detect_npm_lock_flavor(project_root).await {
@@ -71,7 +83,7 @@ pub(crate) async fn inventory_npm_lock(
                 // lock the fallback may surface.
                 match inventory_live_sibling_lock(project_root).await {
                     Some((flavor, entries)) if !entries.is_empty() => {
-                        return Ok(Some((flavor, finalize_npm(entries))));
+                        return Ok(Some((flavor, guard_npm(entries))));
                     }
                     // A sibling lock FILE exists but yields no entries
                     // (dep-less project, or a grammar we cannot read): the
@@ -81,7 +93,7 @@ pub(crate) async fn inventory_npm_lock(
                     None => {
                         let pnpm = inventory_pnpm_lock(project_root).await.unwrap_or_default();
                         if !pnpm.is_empty() {
-                            return Ok(Some((NpmLockFlavor::Pnpm, finalize_npm(pnpm))));
+                            return Ok(Some((NpmLockFlavor::Pnpm, guard_npm(pnpm))));
                         }
                     }
                 }
@@ -99,11 +111,11 @@ pub(crate) async fn inventory_npm_lock(
             // long-ago migration whose dead resolutions must not pose as
             // the live dependency set.
             if code == "vendor_lockfile_missing" {
-                let legacy = inventory_pnpm_lock_at(&project_root.join("shrinkwrap.yaml"))
+                let legacy = inventory_pnpm_lock_at(&project_root.join(PNPM_SHRINKWRAP_LEGACY))
                     .await
                     .unwrap_or_default();
                 if !legacy.is_empty() {
-                    return Ok(Some((NpmLockFlavor::PnpmLegacy, finalize_npm(legacy))));
+                    return Ok(Some((NpmLockFlavor::PnpmLegacy, guard_npm(legacy))));
                 }
             }
             // Rush monorepos have no root package.json/lock pair; their
@@ -112,7 +124,7 @@ pub(crate) async fn inventory_npm_lock(
             // explicitly when the root lock is absent but rush.json is
             // present.
             let rush = inventory_rush_pnpm_locks(project_root).await;
-            return Ok((!rush.is_empty()).then(|| (NpmLockFlavor::Pnpm, finalize_npm(rush))));
+            return Ok((!rush.is_empty()).then(|| (NpmLockFlavor::Pnpm, guard_npm(rush))));
         }
     };
     let raw = match flavor {
@@ -124,17 +136,14 @@ pub(crate) async fn inventory_npm_lock(
         NpmLockFlavor::YarnClassic => inventory_yarn_classic(project_root).await,
         NpmLockFlavor::YarnBerry => inventory_yarn_berry(project_root).await,
         NpmLockFlavor::Bun => {
-            if tokio::fs::symlink_metadata(project_root.join("bun.lock"))
-                .await
-                .is_ok()
-            {
+            if bun_text_lock_present(project_root).await {
                 inventory_bun(project_root).await
             } else {
                 Some(inventory_bun_binary(project_root).await?)
             }
         }
     };
-    Ok(raw.map(|raw| (flavor, finalize_npm(raw))))
+    Ok(raw.map(|raw| (flavor, guard_npm(raw))))
 }
 
 /// The live sibling lock a version-refused root `pnpm-lock.yaml` may be
@@ -145,7 +154,7 @@ pub(crate) async fn inventory_npm_lock(
 /// then yarn, then npm — on file EXISTENCE, and returns the first present
 /// sibling's inventory (possibly empty: presence alone proves the pnpm lock
 /// is migration debris, so the caller must not fall back to it). Raw
-/// entries — the caller applies [`finalize_npm`].
+/// entries — the caller guards and collapses them.
 pub(super) async fn inventory_live_sibling_lock(
     root: &Path,
 ) -> Option<(NpmLockFlavor, Vec<LockfileEntry>)> {
@@ -157,13 +166,13 @@ pub(super) async fn inventory_live_sibling_lock(
     // when the version refusal fired no bun.lock can actually be present;
     // probed anyway to keep this a literal transcription of the router's
     // order. The binary lock shares the same routing precedence.
-    if exists("bun.lock").await {
+    if exists(BUN_LOCK).await {
         return Some((
             NpmLockFlavor::Bun,
             inventory_bun(root).await.unwrap_or_default(),
         ));
     }
-    if exists("bun.lockb").await {
+    if exists(BUN_LOCKB).await {
         return Some((
             NpmLockFlavor::Bun,
             inventory_bun_binary(root).await.unwrap_or_default(),
@@ -187,7 +196,7 @@ pub(super) async fn inventory_live_sibling_lock(
     }
     // npm — router step 5 (`inventory_package_lock` itself prefers the
     // shrinkwrap when both exist, mirroring npm).
-    if exists("npm-shrinkwrap.json").await || exists("package-lock.json").await {
+    if exists(NPM_LOCKS[0]).await || exists(NPM_LOCKS[1]).await {
         return Some((
             NpmLockFlavor::PackageLock,
             inventory_package_lock(root).await.unwrap_or_default(),
@@ -197,14 +206,16 @@ pub(super) async fn inventory_live_sibling_lock(
 }
 
 /// Guard + dedup the raw npm entries: unsafe names/versions are dropped
-/// fail-closed; duplicate (name, version) instances collapse to one,
-/// preferring the instance that carries a verifier.
+/// fail-closed ([`guard_npm`]); duplicate (name, version) instances collapse
+/// to one, preferring the instance that carries a verifier.
+#[cfg(test)]
 pub(super) fn finalize_npm(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
-    dedup_prefer_integrity(
-        raw.into_iter()
-            .filter(|e| {
-                is_safe_npm_name(&e.name) && path_safety::is_safe_single_segment(&e.version)
-            })
-            .collect(),
-    )
+    dedup_prefer_integrity(guard_npm(raw))
+}
+
+/// Drop raw npm entries whose name/version is unsafe, fail-closed.
+fn guard_npm(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
+    raw.into_iter()
+        .filter(|e| npm_purl(&e.name, &e.version).is_some())
+        .collect()
 }

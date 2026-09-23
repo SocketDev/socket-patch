@@ -5,6 +5,8 @@
 //!
 //! * [`schema`] — hand-rolled OpenVEX 0.2.0 serde structs.
 //! * [`build`] — manifest + applied-set → [`schema::Document`].
+//! * [`discover`] — manifest-less input: Socket-patched dependency
+//!   references (hosted + vendored) recovered from the project's lockfiles.
 //! * [`product`] — auto-detect the top-level product PURL from the
 //!   filesystem (package.json / pyproject.toml / Cargo.toml).
 //! * [`verify`] — partition manifest entries by on-disk hash check.
@@ -15,12 +17,17 @@
 //! struct in [`schema`].
 
 pub mod build;
+pub mod discover;
 pub mod product;
 pub mod schema;
 pub mod time;
 pub mod verify;
 
 pub use build::{build_document, BuildOptions};
+pub use discover::{
+    canonical_base_purl, discover_patched_refs, discover_patched_refs_with, Diag, DiscoverOptions,
+    Discovery, PatchedRef, Recognized, UnlockedPin, WiringMode,
+};
 pub use product::{detect_product, DetectResult};
 pub use schema::{
     Document, Justification, Product, Statement, Status, Subcomponent, Vulnerability,

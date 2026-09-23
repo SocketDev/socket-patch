@@ -3,12 +3,19 @@
 
 use std::path::Path;
 
-use toml_edit::{DocumentMut, Item, Value as TomlValue};
+use toml_edit::{DocumentMut, Item};
 
+use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK};
+use crate::utils::digest::is_sri_pin;
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
+use crate::utils::python_lock::{
+    lock_artifact, lock_package_collection, package_artifacts, uv_source_location,
+};
+use crate::vendor::bun_lockb::BunLockb;
 
-use super::recover::{inline_yaml_field, looks_like_sri};
-use super::{is_hex_of_len, LockIntegrity};
+use super::npm::npm_lock_nodes;
+use super::recover::inline_yaml_field;
+use super::LockIntegrity;
 
 /// The integrity the REWIRED npm-family lockfile records for a vendored
 /// artifact at `artifact_rel` (forward-slashed, no `./` prefix). This is
@@ -34,55 +41,34 @@ pub async fn wired_vendor_integrity(
             let Ok(document) = text.parse::<DocumentMut>() else {
                 continue;
             };
-            let collection = if document.contains_key("lock-version") {
-                "packages"
-            } else {
-                "package"
-            };
+            // The shared lock model: the package array, pylock `archive`
+            // paths, uv `source` locations and artifact tables.
+            let (collection, pep751) = lock_package_collection(&document);
             let Some(packages) = document.get(collection).and_then(Item::as_array_of_tables) else {
                 continue;
             };
             for package in packages.iter() {
-                let archive = package.get("archive").and_then(Item::as_table_like);
-                let source =
-                    archive.or_else(|| package.get("source").and_then(Item::as_table_like));
-                if source
-                    .and_then(|source| source.get("path"))
-                    .and_then(Item::as_str)
-                    .is_none_or(|path| path.trim_start_matches("./") != rel)
-                {
+                let archive = package
+                    .get("archive")
+                    .and_then(Item::as_table_like)
+                    .map(lock_artifact);
+                let location = match &archive {
+                    Some(archive) => archive.path,
+                    None if !pep751 => uv_source_location(package),
+                    None => None,
+                };
+                if location.is_none_or(|path| path.trim_start_matches("./") != rel) {
                     continue;
                 }
-                let sha = if let Some(archive) = archive {
-                    archive
-                        .get("hashes")
-                        .and_then(Item::as_table_like)
-                        .and_then(|hashes| hashes.get("sha256"))
-                        .and_then(Item::as_str)
-                } else {
-                    package
-                        .get("wheels")
-                        .and_then(Item::as_array)
-                        .and_then(|wheels| {
-                            wheels
-                                .iter()
-                                .filter_map(TomlValue::as_inline_table)
-                                .find_map(|wheel| {
-                                    if wheel.get("filename").and_then(TomlValue::as_str)
-                                        != rel.rsplit('/').next()
-                                    {
-                                        return None;
-                                    }
-                                    wheel
-                                        .get("hash")
-                                        .and_then(TomlValue::as_str)
-                                        .and_then(|value| value.strip_prefix("sha256:"))
-                                })
-                        })
+                let leaf = rel.rsplit('/').next();
+                let sha = match archive {
+                    Some(archive) => archive.sha256,
+                    None => package_artifacts(package, &["wheels", "wheel", "sdist"])
+                        .into_iter()
+                        .find(|wheel| wheel.filename.is_some() && wheel.filename == leaf)
+                        .and_then(|wheel| wheel.sha256),
                 };
-                let sha = sha
-                    .filter(|sha| is_hex_of_len(sha, 64))
-                    .map(str::to_ascii_lowercase)?;
+                let sha = sha?;
                 if pinned.as_ref().is_some_and(|previous| previous != &sha) {
                     return None;
                 }
@@ -94,56 +80,49 @@ pub async fn wired_vendor_integrity(
 
     // Read active binary resolution records, never the append-only string
     // pool: it can retain paths and digests from earlier patch generations.
-    if tokio::fs::symlink_metadata(project_root.join("bun.lock"))
-        .await
-        .is_err()
-    {
-        if let Ok(bytes) = read_regular_to_bytes(&project_root.join("bun.lockb")).await {
-            if let Ok(lock) = crate::vendor::bun_lockb::BunLockb::parse(&bytes) {
-                if let Ok(packages) = lock.packages() {
-                    let mut pinned: Option<String> = None;
-                    for package in packages {
-                        if package
-                            .resolution
-                            .trim_start_matches("file:")
-                            .trim_start_matches("./")
-                            != rel
-                        {
-                            continue;
-                        }
-                        let sri = package.integrity.filter(|sri| looks_like_sri(sri))?;
-                        if pinned.as_ref().is_some_and(|previous| previous != &sri) {
-                            return None;
-                        }
-                        pinned = Some(sri);
+    if !super::bun::bun_text_lock_present(project_root).await {
+        if let Ok(bytes) = read_regular_to_bytes(&project_root.join(BUN_LOCKB)).await {
+            if let Ok(packages) = BunLockb::parse_packages(&bytes) {
+                let mut pinned: Option<String> = None;
+                for package in packages {
+                    if package
+                        .resolution
+                        .trim_start_matches("file:")
+                        .trim_start_matches("./")
+                        != rel
+                    {
+                        continue;
                     }
-                    if let Some(sri) = pinned {
-                        return Some(LockIntegrity::Sri(sri));
+                    let sri = package.integrity.filter(|sri| is_sri_pin(sri))?;
+                    if pinned.as_ref().is_some_and(|previous| previous != &sri) {
+                        return None;
                     }
+                    pinned = Some(sri);
+                }
+                if let Some(sri) = pinned {
+                    return Some(LockIntegrity::Sri(sri));
                 }
             }
         }
     }
 
-    // JSON locks: resolved == "file:<rel>" (npm writes exactly this form).
-    for lock in ["npm-shrinkwrap.json", "package-lock.json"] {
+    // JSON locks: resolved == "file:<rel>" (npm writes exactly this form),
+    // read through the inventory's own entry walk (v1 `dependencies`
+    // included, which the legacy vendored backend rewires).
+    for lock in NPM_LOCKS {
         let Ok(bytes) = read_regular_to_bytes(&project_root.join(lock)).await else {
             continue;
         };
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             continue;
         };
-        if let Some(pkgs) = v.get("packages").and_then(serde_json::Value::as_object) {
-            for entry in pkgs.values() {
-                let resolved = entry.get("resolved").and_then(serde_json::Value::as_str);
-                if resolved.is_some_and(|r| r.trim_start_matches("file:") == rel) {
-                    if let Some(sri) = entry
-                        .get("integrity")
-                        .and_then(serde_json::Value::as_str)
-                        .filter(|s| looks_like_sri(s))
-                    {
-                        return Some(LockIntegrity::Sri(sri.to_string()));
-                    }
+        for node in npm_lock_nodes(&v) {
+            if node
+                .resolved
+                .is_some_and(|r| r.trim_start_matches("file:") == rel)
+            {
+                if let Some(sri) = node.integrity.filter(|s| is_sri_pin(s)) {
+                    return Some(LockIntegrity::Sri(sri.to_string()));
                 }
             }
         }
@@ -151,7 +130,7 @@ pub async fn wired_vendor_integrity(
 
     // Text locks: any line referencing the artifact path, integrity within
     // a short forward window (the same block).
-    for lock in ["pnpm-lock.yaml", "yarn.lock", "bun.lock"] {
+    for lock in [PNPM_LOCK, "yarn.lock", BUN_LOCK] {
         let Ok(text) = read_regular_to_string(&project_root.join(lock)).await else {
             continue;
         };
@@ -164,17 +143,17 @@ pub async fn wired_vendor_integrity(
                 // pnpm `resolution: {integrity: …}` / classic `integrity …`
                 // / bun tuple `"sha512-…"`.
                 if let Some(v) = inline_yaml_field(probe, "integrity:") {
-                    if looks_like_sri(&v) {
+                    if is_sri_pin(&v) {
                         return Some(LockIntegrity::Sri(v));
                     }
                 }
                 if let Some(rest) = probe.trim().strip_prefix("integrity ") {
                     let v = rest.trim().trim_matches('"');
-                    if looks_like_sri(v) {
+                    if is_sri_pin(v) {
                         return Some(LockIntegrity::Sri(v.to_string()));
                     }
                 }
-                if let Some(sri) = probe.split('"').rev().find(|tok| looks_like_sri(tok)) {
+                if let Some(sri) = probe.split('"').rev().find(|tok| is_sri_pin(tok)) {
                     return Some(LockIntegrity::Sri(sri.to_string()));
                 }
                 // yarn berry: `checksum: 10c0/…`.
@@ -189,4 +168,45 @@ pub async fn wired_vendor_integrity(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vendor::bun_lockb::BunLockb;
+    use crate::vex::discover::testing::{fixture_path, Project, UUID_A};
+
+    const SRI_A: &str = "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+    const SRI_B: &str = "sha512-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA==";
+
+    /// The `two-versions` bun.lockb with both `minimist` records pointed at
+    /// ONE vendored artifact path: agreeing pins are the anchor, disagreeing
+    /// ones (which record is the artifact?) are none.
+    #[tokio::test]
+    async fn bun_lockb_records_sharing_an_artifact_must_agree_on_its_pin() {
+        let fixture = std::fs::read(fixture_path("bun-lockb/two-versions/bun.lockb"))
+            .expect("two-versions fixture");
+        let artifact = format!(".socket/vendor/npm/{UUID_A}/minimist-1.2.2.tgz");
+        let minimist: Vec<usize> = BunLockb::parse_packages(&fixture)
+            .expect("fixture parses")
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.name == "minimist")
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(minimist.len(), 2, "the fixture's two minimist records");
+        for (second, want) in [
+            (SRI_A, Some(LockIntegrity::Sri(SRI_A.to_string()))),
+            (SRI_B, None),
+        ] {
+            let mut lock = BunLockb::parse(&fixture).expect("fixture parses");
+            lock.set_package(minimist[0], &artifact, SRI_A)
+                .expect("rewire the first record");
+            lock.set_package(minimist[1], &artifact, second)
+                .expect("rewire the second record");
+            let p = Project::new();
+            p.write("bun.lockb", lock.bytes());
+            assert_eq!(wired_vendor_integrity(p.root(), &artifact).await, want);
+        }
+    }
 }

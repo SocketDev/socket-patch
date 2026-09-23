@@ -6,11 +6,14 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::utils::digest::{is_hex, is_sri_pin, sha256_hex};
 use crate::utils::purl::percent_decode_purl_component;
 
-use super::gem::gem_remotes;
+use super::gem::{gem_download_url, gem_remotes};
 use super::pypi::python_lock_inventory;
-use super::{http_url, is_hex_of_len, LockIntegrity, LockfileEntry};
+use super::{http_url, LockIntegrity, LockfileEntry, SourceKind};
+
+// ──────────────── registry-fragment recovery from the ledger ────────────────
 
 /// Recover the PRE-VENDOR registry resolution of a vendored package from its
 /// ledger entry's wiring `original` fragments (and `entry.lock` for cargo),
@@ -20,7 +23,7 @@ use super::{http_url, is_hex_of_len, LockIntegrity, LockfileEntry};
 /// lockfile but missing on disk: the live lockfile no longer carries the
 /// registry resolution (it points at `.socket/vendor/...`), but `--revert`'s
 /// restore data does. golang is deliberately absent — go.sum is never
-/// rewired, so the standard [`inventory_project`]/[`lookup`] path covers it.
+/// rewired, so the standard [`super::inventory_project`]/[`super::lookup`] path covers it.
 ///
 /// SECURITY: state.json is committed and tamper-able. Recovered URLs go
 /// through the same http(s)-only gate as inventoried ones, recovered hashes
@@ -41,12 +44,15 @@ pub async fn recover_lock_entry(
                 .lock
                 .as_ref()
                 .and_then(|l| l.checksum.clone())
-                .filter(|c| is_hex_of_len(c, 64))
+                .filter(|c| is_hex(c, 64))
                 .ok_or_else(|| {
                     "the ledger records no pre-vendor Cargo.lock checksum".to_string()
                 })?;
+            // Vendoring only ever took over a crates.io entry: the recorded
+            // checksum is the crates.io `.crate`'s sha256.
             Ok(LockfileEntry {
                 ecosystem: "cargo",
+                source_kind: SourceKind::CratesIo,
                 purl: format!("pkg:cargo/{name}@{version}"),
                 name,
                 version,
@@ -68,13 +74,14 @@ pub async fn recover_lock_entry(
             let shasum = dist
                 .get("shasum")
                 .and_then(serde_json::Value::as_str)
-                .filter(|s| is_hex_of_len(s, 40))
+                .filter(|s| is_hex(s, 40))
                 .ok_or_else(|| {
                     "the pre-vendor dist records no shasum; refusing an unverifiable fetch"
                         .to_string()
                 })?;
             Ok(LockfileEntry {
                 ecosystem: "composer",
+                source_kind: SourceKind::Unspecified,
                 purl: format!("pkg:composer/{name}@{version}"),
                 name,
                 version,
@@ -96,7 +103,7 @@ pub async fn recover_lock_entry(
                         .take_while(|c| c.is_ascii_hexdigit())
                         .collect::<String>()
                 })
-                .filter(|s| is_hex_of_len(s, 64))
+                .filter(|s| is_hex(s, 64))
                 .ok_or_else(|| {
                     "the pre-vendor checksum line has no sha256; refusing an unverifiable fetch"
                         .to_string()
@@ -128,8 +135,9 @@ pub async fn recover_lock_entry(
             };
             Ok(LockfileEntry {
                 ecosystem: "gem",
+                source_kind: SourceKind::Unspecified,
                 purl: format!("pkg:gem/{name}@{version}"),
-                resolved: http_url(&format!("{base}/downloads/{name}-{version}.gem")),
+                resolved: gem_download_url(&base, &name, &version),
                 name,
                 version,
                 integrity: LockIntegrity::Sha256Hex(sha.to_ascii_lowercase()),
@@ -210,8 +218,7 @@ pub async fn recover_lock_entry(
                     .flatten()
                     .filter_map(serde_json::Value::as_str)
                     .filter_map(|h| h.strip_prefix("sha256:"))
-                    .filter(|h| is_hex_of_len(h, 64))
-                    .map(|h| h.to_ascii_lowercase())
+                    .filter_map(sha256_hex)
                     .collect();
                 if digests.is_empty() {
                     return Err(
@@ -222,6 +229,7 @@ pub async fn recover_lock_entry(
                 }
                 return Ok(LockfileEntry {
                     ecosystem: "pypi",
+                    source_kind: SourceKind::Unspecified,
                     purl: format!("pkg:pypi/{name}@{version}"),
                     name,
                     version,
@@ -233,6 +241,7 @@ pub async fn recover_lock_entry(
             let (url, sha) = pure_wheel_from_uv_unit(unit).ok_or_else(|| NO_URL.to_string())?;
             Ok(LockfileEntry {
                 ecosystem: "pypi",
+                source_kind: SourceKind::Unspecified,
                 purl: format!("pkg:pypi/{name}@{version}"),
                 name,
                 version,
@@ -289,6 +298,7 @@ fn recover_npm_fragment(
 ) -> Result<LockfileEntry, String> {
     let mk = |resolved: Option<String>, integrity: LockIntegrity| LockfileEntry {
         ecosystem: "npm",
+        source_kind: SourceKind::Unspecified,
         purl: format!("pkg:npm/{name}@{version}"),
         name: name.to_string(),
         version: version.to_string(),
@@ -305,7 +315,7 @@ fn recover_npm_fragment(
         if let Some(sri) = obj
             .get("integrity")
             .and_then(serde_json::Value::as_str)
-            .filter(|s| looks_like_sri(s))
+            .filter(|s| is_sri_pin(s))
         {
             return Ok(mk(resolved, LockIntegrity::Sri(sri.to_string())));
         }
@@ -323,7 +333,7 @@ fn recover_npm_fragment(
                 tarball = tarball.or(http_url(&v));
             }
         }
-        if let Some(sri) = sri.filter(|s| looks_like_sri(s)) {
+        if let Some(sri) = sri.filter(|s| is_sri_pin(s)) {
             return Ok(mk(tarball, LockIntegrity::Sri(sri)));
         }
     }
@@ -337,16 +347,16 @@ fn recover_npm_fragment(
             let t = line.trim();
             if let Some(rest) = t.strip_prefix("integrity ") {
                 let v = rest.trim().trim_matches('"');
-                if looks_like_sri(v) {
+                if is_sri_pin(v) {
                     sri = Some(v.to_string());
                 }
             }
             if let Some(rest) = t.strip_prefix("resolved ") {
                 let v = rest.trim().trim_matches('"');
-                let (u, frag) = v.split_once('#').unwrap_or((v, ""));
+                let (u, frag_sha1) = crate::vendor::yarn_classic_lock::split_resolved_sha1(v);
                 url = http_url(u);
-                if is_hex_of_len(frag, 40) {
-                    sha1 = Some(frag.to_ascii_lowercase());
+                if frag_sha1.is_some() {
+                    sha1 = frag_sha1;
                 }
             }
         }
@@ -387,7 +397,7 @@ fn recover_npm_fragment(
         if let Some(sri) = original
             .get("integrity")
             .and_then(Value::as_str)
-            .filter(|s| looks_like_sri(s))
+            .filter(|s| is_sri_pin(s))
         {
             let resolved = original
                 .get("resolution")
@@ -404,19 +414,13 @@ fn recover_npm_fragment(
         if let Some(sri) = line
             .split('"')
             .rev()
-            .find(|tok| looks_like_sri(tok))
+            .find(|tok| is_sri_pin(tok))
             .map(str::to_string)
         {
             return Ok(mk(None, LockIntegrity::Sri(sri)));
         }
     }
     Err("no pre-vendor npm registry fragment with a verifiable integrity recorded".to_string())
-}
-
-pub(super) fn looks_like_sri(s: &str) -> bool {
-    ["sha512-", "sha384-", "sha256-", "sha1-"]
-        .iter()
-        .any(|p| s.starts_with(p) && s.len() > p.len())
 }
 
 /// A wiring `original` recorded as an array of text lines.
@@ -453,7 +457,7 @@ pub(super) fn pure_wheel_from_uv_unit(unit: &str) -> Option<(String, String)> {
                 let hafter = &rest[hidx + 15..];
                 let hend = hafter.find('"')?;
                 let sha = &hafter[..hend];
-                if is_hex_of_len(sha, 64) {
+                if is_hex(sha, 64) {
                     if let Some(url) = http_url(url) {
                         return Some((url, sha.to_ascii_lowercase()));
                     }

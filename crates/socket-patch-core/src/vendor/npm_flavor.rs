@@ -66,7 +66,7 @@ impl NpmLockFlavor {
 
 /// Yarn berry Plug'n'Play loaders: packages live inside `.yarn/cache/` zips,
 /// so there is nothing on disk to stage and no lockfile entry to rewire.
-use crate::constants::npm_family::PNP_MARKERS;
+use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, PNP_MARKERS};
 
 /// How many head lines the yarn content sniff reads (the v1 header sits in
 /// the leading comment block; berry's `__metadata:` is the first top-level
@@ -79,14 +79,11 @@ const YARN_SNIFF_HEAD_LINES: usize = 30;
 const LOCKFILE_FAMILIES: [(NpmLockFlavor, &[&str]); 4] = [
     // npm itself ignores package-lock.json when npm-shrinkwrap.json exists,
     // so the npm family never warns about its own sibling.
-    (
-        NpmLockFlavor::PackageLock,
-        &["npm-shrinkwrap.json", "package-lock.json"],
-    ),
+    (NpmLockFlavor::PackageLock, &NPM_LOCKS),
     (NpmLockFlavor::YarnClassic, &["yarn.lock"]),
-    (NpmLockFlavor::Pnpm, &["pnpm-lock.yaml"]),
+    (NpmLockFlavor::Pnpm, &[PNPM_LOCK]),
     // Bun reads bun.lock when both text and binary lockfiles exist.
-    (NpmLockFlavor::Bun, &["bun.lock", "bun.lockb"]),
+    (NpmLockFlavor::Bun, &[BUN_LOCK, BUN_LOCKB]),
 ];
 
 /// Where a missing lockfile was looked for, for a refusal message:
@@ -171,15 +168,15 @@ pub(crate) async fn detect_npm_lock_flavor(
     let detected = 'flavor: {
         // 2. Bun's native backend accepts text and binary locks. Selection
         // inside the backend and inventory preserves bun.lock precedence.
-        if exists("bun.lock").await || exists("bun.lockb").await {
+        if exists(BUN_LOCK).await || exists(BUN_LOCKB).await {
             break 'flavor NpmLockFlavor::Bun;
         }
 
         // 3. pnpm: lockfileVersion 9.0 routes to the v9 backend, the legacy
         //    grammars 5.4 (pnpm 7) / 6.0 (pnpm 8) to the legacy backend;
         //    anything else refuses with the sniff's version-aware remedy.
-        if exists("pnpm-lock.yaml").await {
-            let text = read_lock(project_root, "pnpm-lock.yaml").await?;
+        if exists(PNPM_LOCK).await {
+            let text = read_lock(project_root, PNPM_LOCK).await?;
             match pnpm_lock_legacy::sniff_lock_grammar(&text) {
                 Ok(PnpmLockGrammar::V9) => break 'flavor NpmLockFlavor::Pnpm,
                 Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => {
@@ -197,7 +194,7 @@ pub(crate) async fn detect_npm_lock_flavor(
         }
 
         // 5. npm (npm_lock itself prefers the shrinkwrap when both exist).
-        if exists("npm-shrinkwrap.json").await || exists("package-lock.json").await {
+        if exists(NPM_LOCKS[0]).await || exists(NPM_LOCKS[1]).await {
             break 'flavor NpmLockFlavor::PackageLock;
         }
 
@@ -397,32 +394,23 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
         // probed: npm <= 11 installs from the shrinkwrap, npm 12 from the
         // package-lock beside it.
         None | Some("package-lock") => {
-            lock_text_mentions_uuid(
-                project_root,
-                &["npm-shrinkwrap.json", "package-lock.json"],
-                &entry.uuid,
-            )
-            .await
+            lock_text_mentions_uuid(project_root, &NPM_LOCKS, &entry.uuid).await
         }
         Some("yarn-classic") | Some("yarn-berry") => {
             lock_text_mentions_uuid(project_root, &["yarn.lock"], &entry.uuid).await
         }
         Some("bun") => {
-            if tokio::fs::symlink_metadata(project_root.join("bun.lock"))
-                .await
-                .is_ok()
-            {
-                return lock_text_mentions_uuid(project_root, &["bun.lock"], &entry.uuid).await;
+            if super::lock_inventory::bun::bun_text_lock_present(project_root).await {
+                return lock_text_mentions_uuid(project_root, &[BUN_LOCK], &entry.uuid).await;
             }
-            let bytes = read_regular_to_bytes(&project_root.join("bun.lockb"))
+            let bytes = read_regular_to_bytes(&project_root.join(BUN_LOCKB))
                 .await
                 .ok()?;
-            let lock = super::bun_lockb::BunLockb::parse(&bytes).ok()?;
             let needle = format!(".socket/vendor/npm/{}/", entry.uuid);
             // The string pool can retain superseded paths. Only active
             // package resolutions count, so stale bytes do not prevent GC.
             Some(
-                lock.packages()
+                super::bun_lockb::BunLockb::parse_packages(&bytes)
                     .ok()?
                     .iter()
                     .any(|package| package.resolution.contains(&needle)),

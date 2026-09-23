@@ -53,7 +53,7 @@ use super::state::{
 };
 use super::yarn_classic_lock::{
     body_field_line, lines_to_json, pattern_real_name, read_yarn_lock, replace_block,
-    revert_recorded_block, scan_blocks, split_key_patterns, split_pattern, LockBlock,
+    revert_recorded_block, scan_blocks, split_berry_key_patterns, split_pattern, LockBlock,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -104,7 +104,7 @@ pub async fn vendor_yarn_berry(
         Err(outcome) => return *outcome,
     };
     let blocks = scan_blocks(&lock_text);
-    let Some(meta) = blocks.iter().find(|b| b.key == "__metadata") else {
+    let Some(meta) = berry_metadata(&blocks) else {
         return refused(
             "vendor_lockfile_version_unsupported",
             "yarn.lock has no `__metadata:` entry — not a yarn berry lockfile".to_string(),
@@ -888,7 +888,7 @@ fn scan_berry_target(
         if block.key == "__metadata" {
             continue;
         }
-        let patterns = split_key_patterns(&block.key);
+        let patterns = split_berry_key_patterns(&block.key);
         let parsed: Vec<(&str, &str)> = patterns.iter().filter_map(|p| split_pattern(p)).collect();
         if parsed.len() != patterns.len() || parsed.is_empty() {
             continue; // not a descriptor key we understand; not ours to touch
@@ -1052,7 +1052,7 @@ pub(crate) fn berry_field<'a>(lines: &'a [String], field: &str) -> Option<&'a st
 /// entry (the key + resolution of our file: entry embed it).
 fn root_workspace_name(blocks: &[LockBlock]) -> Option<String> {
     for block in blocks {
-        if let [single] = split_key_patterns(&block.key).as_slice() {
+        if let [single] = split_berry_key_patterns(&block.key).as_slice() {
             if let Some(name) = single.strip_suffix("@workspace:.") {
                 if !name.is_empty() {
                     return Some(name.to_string());
@@ -1072,6 +1072,65 @@ pub(crate) fn yarnrc_compression_level(rc: &str) -> Option<&str> {
         let rest = line.strip_prefix("compressionLevel:")?;
         Some(rest.trim().trim_matches(['\'', '"']))
     })
+}
+
+/// The lock's exact `__metadata` block (its `version` / `cacheKey` header).
+pub(crate) fn berry_metadata(blocks: &[LockBlock]) -> Option<&LockBlock> {
+    blocks.iter().find(|b| b.key == "__metadata")
+}
+
+/// A berry `resolution:` locator `name@<reference>`, split at the first `@`
+/// past a leading `@scope/` marker ([`split_pattern`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BerryLocator<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) reference: &'a str,
+}
+
+impl<'a> BerryLocator<'a> {
+    /// `(version, bindings)` of a registry locator `npm:<version>[::<bindings>]`
+    /// (`bindings` is `""` without a `::`); `None` for any other protocol.
+    pub(crate) fn npm(&self) -> Option<(&'a str, &'a str)> {
+        let npm = self.reference.strip_prefix("npm:")?;
+        Some(npm.split_once("::").unwrap_or((npm, "")))
+    }
+
+    /// The `__archiveUrl=` binding of a registry locator (bindings are
+    /// `&`-joined), still percent-encoded — what the hosted redirect writes.
+    pub(crate) fn archive_url(&self) -> Option<&'a str> {
+        self.npm()?
+            .1
+            .split('&')
+            .find_map(|b| b.strip_prefix("__archiveUrl="))
+    }
+}
+
+/// Parse a berry `resolution:` value into its locator.
+pub(crate) fn parse_berry_locator(resolution: &str) -> Option<BerryLocator<'_>> {
+    split_pattern(resolution).map(|(name, reference)| BerryLocator { name, reference })
+}
+
+/// The package a berry `resolutions` selector overrides: its LAST
+/// descriptor's ident (`name`, `name@range`, `**/name`, `parent/name`,
+/// `@scope/name`, `parent/@scope/name@range`), or `None` when it has none.
+pub(crate) fn resolution_selector_target(selector: &str) -> Option<&str> {
+    let s = selector.trim();
+    // The last descriptor starts after the last `/` that is not a scope's
+    // own separator (the segment before it starts with `@`).
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    let mut seg_start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'/' {
+            if !s[seg_start..i].starts_with('@') {
+                start = i + 1;
+            }
+            seg_start = i + 1;
+        }
+    }
+    let last = &s[start..];
+    let name = split_pattern(last).map(|(n, _)| n).unwrap_or(last);
+    (!name.is_empty() && name != "**").then_some(name)
 }
 
 #[cfg(test)]
@@ -3109,6 +3168,50 @@ __metadata:
         );
     }
 
+    /// REGRESSION: the vendored backend splits berry keys with the ONE
+    /// berry splitter (`split_berry_key_patterns`, which the redirect and
+    /// the lock inventory's `berry_entries` use). The classic splitter read
+    /// berry's single outer quote pair as one pattern, so a multi-descriptor
+    /// key looked like a single `left-pad` / `a` descriptor: the mixed-name
+    /// refusal never fired, and an alias sharing the real package's block
+    /// was not seen.
+    #[test]
+    fn multi_descriptor_berry_keys_split_like_every_other_reader() {
+        let block = |key: &str, version: &str| {
+            format!(
+                "{key}:\n  version: {version}\n  resolution: \"left-pad@npm:{version}\"\n  \
+                 checksum: 10c0/abc\n  languageName: node\n  linkType: hard\n"
+            )
+        };
+        // Real name + alias in one block: mixed descriptors, refused.
+        let lock = block("\"left-pad@npm:1.3.0, lp@npm:left-pad@1.3.0\"", "1.3.0");
+        let err = scan_berry_target(&scan_blocks(&lock), "left-pad", "1.3.0")
+            .err()
+            .expect("mixed key refused");
+        assert_eq!(err.0, "vendor_override_conflict");
+        assert!(err.1.contains("mixes `left-pad`"), "{}", err.1);
+        let lock = block("\"a@npm:^1.0.0, b@npm:^1.0.0\"", "1.0.0");
+        assert!(scan_berry_target(&scan_blocks(&lock), "b", "1.0.0").is_err());
+        // Two ranges of one name in one quoted key: the single target.
+        let lock = block("\"left-pad@npm:^1.3.0, left-pad@npm:~1.3.0\"", "1.3.0");
+        let scan = scan_berry_target(&scan_blocks(&lock), "left-pad", "1.3.0").unwrap();
+        assert_eq!(scan.target, Some((0, false)));
+        assert!(scan.alias_keys.is_empty());
+        // The splitters agree with the entry model discovery reads.
+        let entries = crate::vendor::lock_inventory::yarn::berry_entries(&lock).entries;
+        assert_eq!(
+            entries[0].patterns,
+            split_berry_key_patterns(&scan_blocks(&lock)[0].key)
+        );
+        // A quoted single-pattern root workspace key still names the root.
+        let root = "\"app@workspace:.\":\n  version: 0.0.0-use.local\n  \
+                    resolution: \"app@workspace:.\"\n";
+        assert_eq!(
+            root_workspace_name(&scan_blocks(root)).as_deref(),
+            Some("app")
+        );
+    }
+
     /// An EMPTY workspace ident (`"@workspace:."` — a root package.json with
     /// no `name`) must never satisfy the root-workspace probe: the extracted
     /// name is embedded verbatim in the vendored `file:` locator, and an
@@ -3248,5 +3351,22 @@ __metadata:
         // is not an entry field.
         let nested = format!("{none}\n\"x@npm:1.0.0\":\n  dependencies:\n    checksum: 1.0.0\n");
         assert!(!lock_spells_bare_checksums(&nested));
+    }
+
+    #[test]
+    fn resolution_selector_targets() {
+        for (sel, want) in [
+            ("left-pad", Some("left-pad")),
+            ("left-pad@npm:1.3.0", Some("left-pad")),
+            ("**/left-pad", Some("left-pad")),
+            ("parent/left-pad", Some("left-pad")),
+            ("@scope/pkg", Some("@scope/pkg")),
+            ("@p/parent/@scope/pkg@^2", Some("@scope/pkg")),
+            ("@scope/parent/left-pad", Some("left-pad")),
+            ("**", None),
+            ("", None),
+        ] {
+            assert_eq!(resolution_selector_target(sel), want, "{sel}");
+        }
     }
 }

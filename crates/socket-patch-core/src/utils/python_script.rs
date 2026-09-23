@@ -4,6 +4,7 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::python_lock::ArtifactSource;
+use crate::vendor::common::{pep508_name, pyproject_dependency_specs};
 
 pub(crate) fn script_metadata(text: &str) -> Result<(Range<usize>, String), String> {
     let mut offset = 0;
@@ -55,14 +56,9 @@ pub(crate) fn replace_script_metadata(text: &str, metadata: &str) -> Result<Stri
     Ok(output)
 }
 
+/// The PEP 503 name a dependency specifier declares.
 fn dependency_name(specifier: &str) -> String {
-    canonicalize_pypi_name(
-        specifier
-            .trim()
-            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' && ch != '.')
-            .next()
-            .unwrap_or_default(),
-    )
+    canonicalize_pypi_name(pep508_name(specifier))
 }
 
 fn same_hosted_artifact(previous: &str, current: &str) -> bool {
@@ -241,32 +237,21 @@ pub fn rewrite_project_metadata(
         .parse()
         .map_err(|error| format!("invalid pyproject.toml: {error}"))?;
     let name = canonicalize_pypi_name(name);
-    let project = document
+    if document
         .get("project")
         .and_then(Item::as_table_like)
-        .ok_or("pyproject.toml has no project table")?;
+        .is_none()
+    {
+        return Err("pyproject.toml has no project table".to_string());
+    }
     let tool_uv = document
         .get("tool")
         .and_then(Item::as_table_like)
         .and_then(|tool| tool.get("uv"))
         .and_then(Item::as_table_like);
-    let direct = contains_dependency(project.get("dependencies"), &name)
-        || project
-            .get("optional-dependencies")
-            .and_then(Item::as_table_like)
-            .is_some_and(|groups| {
-                groups
-                    .iter()
-                    .any(|(_, group)| contains_dependency(Some(group), &name))
-            })
-        || document
-            .get("dependency-groups")
-            .and_then(Item::as_table_like)
-            .is_some_and(|groups| {
-                groups
-                    .iter()
-                    .any(|(_, group)| contains_dependency(Some(group), &name))
-            })
+    let direct = pyproject_dependency_specs(&document)
+        .into_iter()
+        .any(|(_, spec)| dependency_name(spec) == name)
         // The legacy `[tool.uv] dev-dependencies` array (still honoured by uv
         // with a deprecation warning) is a direct declaration too: uv records
         // it under `[package.metadata.requires-dev]`, so an override here
@@ -302,14 +287,7 @@ pub fn rewrite_script_metadata(
         .parse()
         .map_err(|error| format!("invalid script metadata: {error}"))?;
     let name = canonicalize_pypi_name(name);
-    let direct = document
-        .get("dependencies")
-        .and_then(Item::as_array)
-        .is_some_and(|deps| {
-            deps.iter()
-                .filter_map(Value::as_str)
-                .any(|spec| dependency_name(spec) == name)
-        });
+    let direct = contains_dependency(document.get("dependencies"), &name);
     rewrite_sources(
         &mut document,
         &name,
@@ -392,6 +370,43 @@ mod tests {
             ArtifactSource::Url(&different_host)
         )
         .is_err());
+    }
+
+    /// A package declared in ANY project table (dependencies, an extra, a
+    /// PEP 735 group, the legacy `[tool.uv] dev-dependencies`) is direct: its
+    /// source needs no override. Anything else gets one.
+    #[test]
+    fn project_metadata_classifies_every_declaration_table() {
+        let url = ArtifactSource::Url("https://example.test/patch.whl");
+        let overrides = |text: &str| {
+            let output = rewrite_project_metadata(text, "Urllib3", "1.26.18", url)
+                .unwrap()
+                .unwrap();
+            let document: DocumentMut = output.parse().unwrap();
+            assert_eq!(
+                document["tool"]["uv"]["sources"]["urllib3"]["url"].as_str(),
+                Some("https://example.test/patch.whl"),
+                "{text}"
+            );
+            document["tool"]["uv"]
+                .get("override-dependencies")
+                .is_some()
+        };
+        for direct in [
+            "[project]\nname='a'\ndependencies=[\" urllib3 >=1\"]\n",
+            "[project]\nname='a'\n[project.optional-dependencies]\nx=[\"idna\", \"URLLIB3[socks]\"]\n",
+            "[project]\nname='a'\n[dependency-groups]\nqa=[{include-group='x'}, \"urllib3\"]\n",
+            "[project]\nname='a'\n[tool.uv]\ndev-dependencies=[\"urllib3\"]\n",
+        ] {
+            assert!(!overrides(direct), "{direct}");
+        }
+        for transitive in [
+            "[project]\nname='a'\ndependencies=[\"requests\", 7]\n",
+            "[project]\nname='a'\n[project.optional-dependencies]\nx=\"urllib3\"\n",
+            "[project]\nname='a'\n[dependency-groups]\nqa=\"urllib3\"\n[tool.hatch.envs.x]\ndependencies=[\"urllib3\"]\n",
+        ] {
+            assert!(overrides(transitive), "{transitive}");
+        }
     }
 
     #[test]

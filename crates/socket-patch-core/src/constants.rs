@@ -179,4 +179,19 @@ pub mod npm_family {
     /// Rush monorepos keep the single pnpm source-of-truth lock here,
     /// relative to the repo root (no root package.json/lock pair).
     pub const RUSH_COMMON_LOCK_REL: &str = "common/config/rush/pnpm-lock.yaml";
+
+    /// The npm locks, in npm's own preference order (the shrinkwrap wins
+    /// for npm <= 11).
+    pub const NPM_LOCKS: [&str; 2] = ["npm-shrinkwrap.json", "package-lock.json"];
+    /// The root pnpm lock (pnpm >= 3, every `lockfileVersion`).
+    pub const PNPM_LOCK: &str = "pnpm-lock.yaml";
+    /// pnpm 1 / 2's lock (`shrinkwrapVersion: 3`), renamed by pnpm 3.
+    pub const PNPM_SHRINKWRAP_LEGACY: &str = "shrinkwrap.yaml";
+    /// Rush's per-subspace lock dir
+    /// (`common/config/subspaces/<name>/pnpm-lock.yaml`).
+    pub const RUSH_SUBSPACES_DIR: &str = "common/config/subspaces";
+    /// Bun's text lock (bun >= 1.1.39's default).
+    pub const BUN_LOCK: &str = "bun.lock";
+    /// Bun's binary lock.
+    pub const BUN_LOCKB: &str = "bun.lockb";
 }

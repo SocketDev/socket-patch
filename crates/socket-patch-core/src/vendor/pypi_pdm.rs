@@ -8,7 +8,7 @@ use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 
 use super::common::{
-    ensure_unchanged, item_get, lock_units_named, pep508_name, pep621_declared_names, record,
+    ensure_unchanged, item_get, lock_units_named, pep508_name, pyproject_dependency_specs, record,
     refuse_symlinked, revert_lock_fragment_splice,
 };
 use super::path::parse_vendor_path;
@@ -117,8 +117,10 @@ fn classify_dependency(p: &PdmProject, canon_name: &str) -> &'static str {
     let Ok(doc) = text.parse::<DocumentMut>() else {
         return "transitive";
     };
-    let mut declared: Vec<String> = Vec::new();
-    pep621_declared_names(&doc, &mut declared);
+    let mut declared: Vec<String> = pyproject_dependency_specs(&doc)
+        .into_iter()
+        .map(|(_, spec)| pep508_name(spec).to_string())
+        .collect();
     if let Some(pdm) = doc
         .get("tool")
         .and_then(|tool| item_get(tool, "pdm"))
@@ -138,14 +140,10 @@ fn classify_dependency(p: &PdmProject, canon_name: &str) -> &'static str {
         }
     }
 
-    for groups in [
-        doc.get("tool")
-            .and_then(|t| item_get(t, "pdm"))
-            .and_then(|p| item_get(p, "dev-dependencies")),
-        doc.get("dependency-groups"),
-    ]
-    .into_iter()
-    .flatten()
+    if let Some(groups) = doc
+        .get("tool")
+        .and_then(|t| item_get(t, "pdm"))
+        .and_then(|p| item_get(p, "dev-dependencies"))
     {
         if let Some(table) = groups.as_table_like() {
             for (_, item) in table.iter() {

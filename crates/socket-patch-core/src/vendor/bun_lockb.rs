@@ -187,6 +187,13 @@ impl BunLockb {
         (0..self.count).map(|id| self.package(id)).collect()
     }
 
+    /// Parse `input` and read every active package record — the one
+    /// combinator the readers share (lockfile discovery, the lock inventory,
+    /// the ledger-liveness probe), each mapping the error its own way.
+    pub(crate) fn parse_packages(input: &[u8]) -> Result<Vec<BinaryPackage>, String> {
+        Self::parse(input).and_then(|lock| lock.packages())
+    }
+
     /// Workspace roots are relative to the lockfile root. Callers validate
     /// filesystem confinement before creating per-workspace tarball mirrors.
     pub(crate) fn workspace_paths(&self) -> Result<Vec<String>, String> {

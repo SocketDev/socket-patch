@@ -77,8 +77,9 @@ impl std::fmt::Display for LockEditError {
     }
 }
 
-/// Read + parse `<root>/Cargo.lock`, mapping errors to [`LockEditError`].
-async fn read_lock(
+/// Read + parse `<root>/Cargo.lock`, mapping errors to [`LockEditError`]
+/// (the lock inventory reads the lock through it too).
+pub(crate) async fn read_lock(
     project_root: &Path,
 ) -> Result<(std::path::PathBuf, DocumentMut), LockEditError> {
     let path = project_root.join("Cargo.lock");
@@ -113,6 +114,96 @@ fn find_package_mut<'a>(
 /// The `[metadata]` key a v1 lock files `name`+`version`'s checksum under.
 fn metadata_checksum_key(name: &str, version: &str, source: &str) -> String {
     format!("checksum {name} {version} ({source})")
+}
+
+/// One `[[package]]` of a parsed `Cargo.lock`, as cargo resolves it — the
+/// read model every Cargo.lock reader shares (the lock inventory, the vendor
+/// probes below, lockfile discovery), so a v1 lock's `[metadata]` checksums
+/// and a missing `source` read the same everywhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LockedPackage {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    /// `None` for a workspace member, a path dependency, or a `[patch]` path
+    /// copy (the vendored "detached" shape).
+    pub(crate) source: Option<String>,
+    /// The inline `checksum` (v2+), else a v1 lock's `[metadata]`
+    /// `"checksum <name> <version> (<source>)"` entry — the same pin.
+    pub(crate) checksum: Option<String>,
+}
+
+/// Every `[[package]]` of `doc` (lock formats v1–v4), in lock order; an
+/// entry without a string `name` and `version` is skipped. A lock with no
+/// packages has no `package` key and yields nothing.
+pub(crate) fn locked_packages(doc: &DocumentMut) -> Vec<LockedPackage> {
+    let metadata = doc.get("metadata").and_then(Item::as_table_like);
+    let metadata_checksum = |name: &str, version: &str, source: Option<&str>| {
+        let key = metadata_checksum_key(name, version, source?);
+        metadata?.get(&key)?.as_str().map(str::to_string)
+    };
+    doc.get("package")
+        .and_then(Item::as_array_of_tables)
+        .map(|pkgs| {
+            pkgs.iter()
+                .filter_map(|t| {
+                    let name = t.get("name")?.as_str()?.to_string();
+                    let version = t.get("version")?.as_str()?.to_string();
+                    let source = t.get("source").and_then(Item::as_str).map(str::to_string);
+                    let checksum = t
+                        .get("checksum")
+                        .and_then(Item::as_str)
+                        .map(str::to_string)
+                        .or_else(|| metadata_checksum(&name, &version, source.as_deref()));
+                    Some(LockedPackage {
+                        name,
+                        version,
+                        source,
+                        checksum,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `(name, version)` of every `[[patch.unused]]` entry: a `[patch]` cargo
+/// resolved and then did NOT use in the crate graph — the lock's own record
+/// that a patch (e.g. a vendored copy) is not what builds.
+pub(crate) fn unused_patches(doc: &DocumentMut) -> Vec<(String, String)> {
+    doc.get("patch")
+        .and_then(|patch| patch.get("unused"))
+        .and_then(Item::as_array_of_tables)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|t| {
+                    Some((
+                        t.get("name")?.as_str()?.to_string(),
+                        t.get("version")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the lock BUILDS a `[patch]` path copy of `name`@`version`: it
+/// holds a SOURCELESS `[[package]]` for that name + version (the detached
+/// shape) and no `[[patch.unused]]` entry for it. A sourceless entry alone
+/// does not prove the copy builds — a path dependency on the user's own
+/// checkout of the crate is sourceless too, and cargo records the `[patch]`
+/// it resolved but left out of the graph as `[[patch.unused]]` (real cargo
+/// 1.97: `serde = { path = "my-serde" }` beside a stale `[patch]` locks a
+/// sourceless serde AND `[[patch.unused]] serde`).
+pub(crate) fn vendored_copy_consumed(
+    pkgs: &[LockedPackage],
+    unused: &[(String, String)],
+    name: &str,
+    version: &str,
+) -> bool {
+    pkgs.iter()
+        .any(|p| p.name == name && p.version == version && p.source.is_none())
+        && !unused.iter().any(|(n, v)| n == name && v == version)
 }
 
 /// A v1 lock: no top-level `version` key and a `[metadata]` table (kept,
@@ -276,14 +367,10 @@ pub async fn restore_lock_entry(
 /// versions. Reads only the project lockfile: no registry, no network.
 pub async fn read_locked_versions(project_root: &Path) -> Option<HashMap<String, HashSet<String>>> {
     let (_path, doc) = read_lock(project_root).await.ok()?;
-    let pkgs = doc.get("package")?.as_array_of_tables()?;
+    doc.get("package")?.as_array_of_tables()?;
     let mut map: HashMap<String, HashSet<String>> = HashMap::new();
-    for t in pkgs.iter() {
-        let name = t.get("name").and_then(Item::as_str);
-        let ver = t.get("version").and_then(Item::as_str);
-        if let (Some(n), Some(v)) = (name, ver) {
-            map.entry(n.to_string()).or_default().insert(v.to_string());
-        }
+    for pkg in locked_packages(&doc) {
+        map.entry(pkg.name).or_default().insert(pkg.version);
     }
     Some(map)
 }
@@ -309,15 +396,19 @@ pub enum LockEntryProbe {
 /// anything. Unreadable/unparseable locks read as [`LockEntryProbe::NoLockfile`]
 /// so callers stay fail-safe (cannot determine ⇒ keep / stay silent).
 pub async fn probe_lock_entry(project_root: &Path, name: &str, version: &str) -> LockEntryProbe {
-    let Ok((_path, mut doc)) = read_lock(project_root).await else {
+    let Ok((_path, doc)) = read_lock(project_root).await else {
         return LockEntryProbe::NoLockfile;
     };
-    let Some(table) = find_package_mut(&mut doc, name, version) else {
-        return LockEntryProbe::EntryMissing;
-    };
-    match table.get("source").and_then(Item::as_str) {
-        Some(s) => LockEntryProbe::Source(s.to_string()),
-        None => LockEntryProbe::Detached,
+    match locked_packages(&doc)
+        .into_iter()
+        .find(|p| p.name == name && p.version == version)
+    {
+        None => LockEntryProbe::EntryMissing,
+        Some(LockedPackage {
+            source: Some(source),
+            ..
+        }) => LockEntryProbe::Source(source),
+        Some(_) => LockEntryProbe::Detached,
     }
 }
 
@@ -332,14 +423,9 @@ pub async fn count_lock_entries(project_root: &Path, name: &str, version: &str) 
     let Ok((_path, doc)) = read_lock(project_root).await else {
         return 0;
     };
-    let Some(pkgs) = doc.get("package").and_then(Item::as_array_of_tables) else {
-        return 0;
-    };
-    pkgs.iter()
-        .filter(|t| {
-            t.get("name").and_then(Item::as_str) == Some(name)
-                && t.get("version").and_then(Item::as_str) == Some(version)
-        })
+    locked_packages(&doc)
+        .iter()
+        .filter(|p| p.name == name && p.version == version)
         .count()
 }
 

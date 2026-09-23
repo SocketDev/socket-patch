@@ -66,9 +66,9 @@ use super::state::{
     WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
+use crate::constants::npm_family::PNPM_LOCK;
 
 const PACKAGE_JSON: &str = "package.json";
-const PNPM_LOCK: &str = "pnpm-lock.yaml";
 const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
 
 /// The root-only workspace member list written into a freshly created

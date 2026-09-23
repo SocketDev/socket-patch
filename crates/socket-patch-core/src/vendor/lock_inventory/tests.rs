@@ -192,6 +192,36 @@ async fn pnpm_v9_keys_parse_with_peer_suffix_and_scoped_quoting() {
     );
 }
 
+/// A CRLF checkout of the same lock inventories identically: the
+/// hosted rewriter's pnpm grammar (the one reader) is CRLF-blind, where
+/// an exact `packages:` line match used to see no section at all.
+#[tokio::test]
+async fn pnpm_crlf_lock_inventories_like_its_lf_twin() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "pnpm-lock.yaml",
+        &PNPM_LOCK.replace('\n', "\r\n"),
+    )
+    .await;
+
+    let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    assert_eq!(flavor, NpmLockFlavor::Pnpm);
+    assert_eq!(
+        entry(&entries, "left-pad").integrity,
+        LockIntegrity::Sri("sha512-XI5MPz==".into()),
+        "no stray \\r rides into the verifier"
+    );
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![
+            ("@scope/pkg".into(), "2.0.0".into()),
+            ("left-pad".into(), "1.3.0".into()),
+            ("peer-user".into(), "4.0.0".into()),
+        ]
+    );
+}
+
 fn sorted_pairs(entries: &[LockfileEntry]) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = entries
         .iter()
@@ -1076,6 +1106,7 @@ async fn lookup_matches_cargo_and_golang_purls() {
     let entries = vec![
         LockfileEntry {
             ecosystem: "cargo",
+            source_kind: SourceKind::Unspecified,
             name: "serde".into(),
             version: "1.0.200".into(),
             purl: "pkg:cargo/serde@1.0.200".into(),
@@ -1084,6 +1115,7 @@ async fn lookup_matches_cargo_and_golang_purls() {
         },
         LockfileEntry {
             ecosystem: "golang",
+            source_kind: SourceKind::Unspecified,
             name: "github.com/x/y".into(),
             version: "v1.0.0".into(),
             purl: "pkg:golang/github.com/x/y@v1.0.0".into(),
@@ -1505,6 +1537,39 @@ async fn pipfile_lock_inventory_reads_every_category_with_its_digest_set() {
     assert_eq!(entry(&entries, "urllib3").integrity, LockIntegrity::None);
 }
 
+/// One hosted pypi url grammar (`hosted_artifact_url`, the one lockfile
+/// discovery reads): a hosted SDIST, an `http://` configured origin and a
+/// path-prefixed origin are Socket references too, so the package stays
+/// discoverable instead of vanishing from the inventory (the old
+/// `https://` + exactly-7-segments + `.whl` rule dropped them).
+#[tokio::test]
+async fn pipfile_lock_inventory_reads_hosted_refs_with_the_shared_url_grammar() {
+    let uuid = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    let tmp = tempfile::tempdir().unwrap();
+    let lock = serde_json::json!({
+        "_meta": {"pipfile-spec": 6, "sources": []},
+        "default": {
+            "six": {"file": format!("https://patch.socket.dev/patch/pypi/six/1.16.0/g/{uuid}/six-1.16.0.tar.gz")},
+            "idna": {"file": format!("http://127.0.0.1:4545/patch/pypi/idna/3.7/g/{uuid}/idna-3.7-py3-none-any.whl")},
+            "attrs": {"file": format!("https://patches.example/prefix/patch/pypi/attrs/23.1.0/g/{uuid}/attrs-23.1.0-py3-none-any.whl#sha256=00")},
+            "user": {"file": "https://example.org/wheels/user-1.0-py3-none-any.whl"},
+            "bad": {"file": format!("https://patch.socket.dev/patch/pypi/bad/1.0/g/{uuid}/other-2.0-py3-none-any.whl")},
+        }
+    });
+    write(tmp.path(), "Pipfile.lock", &lock.to_string()).await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![
+            ("attrs".into(), "23.1.0".into()),
+            ("idna".into(), "3.7".into()),
+            ("six".into(), "1.16.0".into()),
+        ],
+        "a user's own url and a url whose artifact disagrees with its coordinates are not ours"
+    );
+    assert!(entries.iter().all(|e| e.integrity == LockIntegrity::None));
+}
+
 /// Socket's own references in a Pipfile.lock (a hosted URL, a vendored
 /// path) keep the package discoverable on a lock-only re-scan; a lock
 /// whose sources are private indexes only never carries a fetchable
@@ -1569,6 +1634,20 @@ async fn pipfile_lock_inventory_keeps_socket_references_discoverable_and_respect
     assert_eq!(
         socket_reference_coords("https://example.org/patch/pypi/a/1/g/u/a-1-py3-none-any.whl"),
         Some(("a".into(), "1".into()))
+    );
+    assert_eq!(
+        socket_reference_coords("https://h/pre/patch/pypi/My.Pkg/1/g/u/my_pkg-1.tar.gz"),
+        Some(("my-pkg".into(), "1".into()))
+    );
+    assert_eq!(
+        socket_reference_coords("https://h/patch/pypi/a/1/g/u/b-1-py3-none-any.whl"),
+        None,
+        "coordinates disagreeing with the artifact"
+    );
+    assert_eq!(
+        socket_reference_coords("https://h/wheels/a-1-py3-none-any.whl"),
+        None,
+        "no patch-server tail"
     );
 }
 
@@ -2171,6 +2250,26 @@ async fn depless_poetry_lock_falls_through_to_requirements() {
     assert!(inventory_pypi_locks(tmp.path()).await.is_none());
 }
 
+/// requirements.txt pins read with the shared exact-pin rule
+/// (`utils::requirements::exact_pin`, the one lockfile discovery uses): a
+/// wildcard or arbitrary-equality pin is no exact version, so it is not
+/// inventoried as one (it used to emit `pkg:pypi/six@1.*`).
+#[tokio::test]
+async fn requirements_wildcard_pins_are_not_exact_versions() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "requirements.txt",
+        "six==1.*\nattrs===23.1.0\nidna==3.*  # wildcard\nrequests[socks]==2.31.0 ; python_version >= \"3.8\"\n",
+    )
+    .await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![("requests".into(), "2.31.0".into())]
+    );
+}
+
 /// `pure_wheel_from_uv_unit` rejection fall-throughs: a pure wheel whose
 /// hash is not 64-hex, one with no hash at all, and one whose URL is not
 /// http(s) all yield None — fail-closed, never a guessed pairing.
@@ -2226,4 +2325,32 @@ async fn wired_vendor_integrity_reads_rewired_yarn_classic_and_skips_bad_json_lo
         Some(LockIntegrity::Sri("sha512-ours==".into())),
         "the classic `integrity <sri>` line is the wired trust anchor"
     );
+}
+
+/// `PnpmPackage::resolution_tokens` exposes the raw `resolution:` value the
+/// grammar refused (a nested map, a duplicate key, a wrapped flow map), so
+/// lockfile discovery can still tell a Socket-shaped entry from anything
+/// else without locating resolution lines itself.
+#[test]
+fn pnpm_resolution_tokens_cover_maps_the_grammar_refuses() {
+    let url = "https://patch.socket.dev/patch/npm/x/1.0.0/g/u/x-1.0.0.tgz";
+    let lock = format!(
+        "lockfileVersion: '9.0'\n\npackages:\n\n  x@1.0.0:\n    resolution:\n      tarball: {url}\n      nested:\n        a: b\n\n  y@1.0.0:\n    resolution: {{integrity: sha512-a}}\n    resolution: {{tarball: '{url}'}}\n\n  z@1.0.0:\n    resolution: {{integrity: sha512-z,\n      tarball: \"{url}\"}}\n\n  ok@1.0.0:\n    resolution: {{integrity: sha512-ok}}\n"
+    );
+    let packages = super::pnpm::pnpm_packages(&lock);
+    let by_key = |key: &str| packages.iter().find(|p| p.key == key).unwrap();
+    for key in ["x@1.0.0", "y@1.0.0", "z@1.0.0"] {
+        let package = by_key(key);
+        assert!(
+            package.resolution.is_none(),
+            "{key}: the grammar refuses it"
+        );
+        assert!(
+            package.resolution_tokens().contains(&url),
+            "{key}: the resolution URL is not among the entry's resolution values"
+        );
+    }
+    let ok = by_key("ok@1.0.0");
+    assert!(ok.resolution.is_some());
+    assert_eq!(ok.resolution_tokens(), vec!["integrity:", "sha512-ok"]);
 }

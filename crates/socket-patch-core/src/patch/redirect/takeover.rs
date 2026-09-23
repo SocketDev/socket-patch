@@ -416,7 +416,7 @@ fn bun_spec_names(spec: &str, name: &str, version: &str) -> bool {
 /// to parse fails the match (closed). The exact-leaf comparison is the
 /// version discriminator: `pkg-1.3.0.tgz` never equals `pkg-11.3.0.tgz`
 /// or `pkg-1.3.0-rc1.tgz`.
-pub(super) fn hosted_url_names(url: &str, name: &str, version: &str) -> bool {
+pub(crate) fn hosted_url_names(url: &str, name: &str, version: &str) -> bool {
     if !url.starts_with("https://") && !url.starts_with("http://") {
         return false;
     }
@@ -430,6 +430,23 @@ pub(super) fn hosted_url_names(url: &str, name: &str, version: &str) -> bool {
     let leaf = url[path_start..].rsplit('/').next().unwrap_or_default();
     let bare = name.rsplit('/').next().unwrap_or(name);
     !leaf.is_empty() && leaf == format!("{bare}-{version}.tgz")
+}
+
+/// The version a hosted artifact `url` names for `name`: its last path
+/// segment is `<bare>-<version>.tgz` with a semver `<version>`, confirmed by
+/// [`hosted_url_names`]. How a hosted bun binary redirect's version is
+/// recovered (`bun_binary::names`) and how lockfile discovery reads a bun
+/// hosted ref's version.
+pub(crate) fn hosted_url_version<'u>(url: &'u str, name: &str) -> Option<&'u str> {
+    let bare = name.rsplit('/').next().unwrap_or(name);
+    let version = url
+        .rsplit('/')
+        .next()?
+        .strip_prefix(bare)?
+        .strip_prefix('-')?
+        .strip_suffix(".tgz")?;
+    (semver::Version::parse(version).is_ok() && hosted_url_names(url, name, version))
+        .then_some(version)
 }
 
 /// Revert every hosted-redirect edit the ledger records for `purl` (an npm

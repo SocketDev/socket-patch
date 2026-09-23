@@ -1,19 +1,168 @@
-//! pypi locks (uv / pylock, poetry, pdm, Pipfile, requirements): the
-//! registry views.
+//! pypi locks (uv / PEP 751 / PEP 723 script locks, poetry, pdm, Pipfile,
+//! requirements): the registry views, with the Pipfile.lock entry walk
+//! lockfile discovery shares ([`pipfile_lock_entries`]).
 
-use std::collections::HashMap;
 use std::path::Path;
 
-use toml_edit::{DocumentMut, Item, TableLike, Value as TomlValue};
+use serde_json::Value;
+use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::patch::path_safety;
 use crate::utils::fs::read_regular_to_string;
+use crate::utils::purl::{percent_decode_purl_component, pypi_purl};
+use crate::utils::python_lock::{lock_package_collection, package_artifacts, UvSource};
+use crate::utils::requirements::archive_filename_coords;
 
-use super::{dedup_prefer_integrity, http_url, is_hex_of_len, LockIntegrity, LockfileEntry};
+use crate::utils::digest::{sha256_hex, sha256_prefixed};
+
+use super::{dedup_prefer_integrity, http_url, LockIntegrity, LockfileEntry, SourceKind};
 
 // pypi purls and lock entries compare in PEP 503 normalized form
 // (`Foo._Bar` → `foo-bar`) — see `canonicalize_pypi_name`.
+
+// ── entry model ──
+
+/// One package entry of a parsed `Pipfile.lock` (see
+/// [`pipfile_lock_entries`]).
+pub(crate) struct PipfileLockEntry<'a> {
+    /// `default`, `develop`, or a custom Pipfile category.
+    pub(crate) category: &'a str,
+    /// The package name as the lock spells it.
+    pub(crate) name: &'a str,
+    pub(crate) entry: &'a serde_json::Map<String, Value>,
+}
+
+impl<'a> PipfileLockEntry<'a> {
+    /// The `file` / `path` references the entry carries, in that order
+    /// (Pipenv writes at most one; Pipenv 7.x–2017 spell the hosted one
+    /// `path`).
+    pub(crate) fn references(&self) -> Vec<&'a str> {
+        ["file", "path"]
+            .iter()
+            .filter_map(|key| self.entry.get(*key).and_then(Value::as_str))
+            .collect()
+    }
+
+    /// Whether the entry installs from a VCS checkout or an editable
+    /// source — nothing registry-shaped.
+    pub(crate) fn is_vcs(&self) -> bool {
+        ["git", "hg", "svn", "bzr", "editable"]
+            .iter()
+            .any(|key| self.entry.contains_key(*key))
+    }
+
+    /// The version of an exact `version: "==X"` pin (trimmed; possibly
+    /// empty), `None` for a range or no `version` at all.
+    pub(crate) fn exact_pin(&self) -> Option<&'a str> {
+        self.entry
+            .get("version")
+            .and_then(Value::as_str)
+            .and_then(|v| v.trim().strip_prefix("=="))
+            .map(str::trim)
+    }
+
+    /// The raw hex of every `hashes: ["sha256:<hex>", …]` digest
+    /// (unvalidated).
+    pub(crate) fn sha256_hashes(&self) -> Vec<&'a str> {
+        self.entry
+            .get("hashes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter_map(|h| h.strip_prefix("sha256:"))
+            .collect()
+    }
+}
+
+/// Parse a `Pipfile.lock`. Leading UTF-8 BOMs (Windows editors) are not
+/// JSON and are skipped — the one BOM policy of every Pipfile.lock reader
+/// (this inventory, the hosted Pipenv rewriter, lockfile discovery).
+pub(crate) fn parse_pipfile_lock(text: &str) -> serde_json::Result<Value> {
+    serde_json::from_str(text.trim_start_matches('\u{feff}'))
+}
+
+/// Every package entry of a parsed `Pipfile.lock` (pipfile-spec 6): each
+/// category other than `_meta` maps `name → {…}`; non-object categories
+/// and entries are skipped. `None` when the document is not a JSON object.
+/// The one walk the inventory and lockfile discovery
+/// (`vex::discover::pypi_other`) share.
+pub(crate) fn pipfile_lock_entries(doc: &Value) -> Option<Vec<PipfileLockEntry<'_>>> {
+    let mut out = Vec::new();
+    for (category, entries) in doc.as_object()? {
+        if category == "_meta" {
+            continue;
+        }
+        for (name, entry) in entries.as_object().into_iter().flatten() {
+            if let Some(entry) = entry.as_object() {
+                out.push(PipfileLockEntry {
+                    category,
+                    name,
+                    entry,
+                });
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The coordinates a hosted pypi artifact url names — the ONE hosted-url
+/// grammar the inventory ([`socket_reference_coords`]) and lockfile
+/// discovery (`vex::discover::pypi_other`) read.
+pub(crate) struct HostedArtifactUrl {
+    /// The url's `<name>` level, else the artifact's distribution (as
+    /// spelled; callers canonicalize).
+    pub(crate) name: String,
+    pub(crate) version: String,
+    /// The `<uuid>` level of a
+    /// `…/patch/pypi/<name>/<version>/<grant>/<uuid>/<artifact>` tail;
+    /// `None` when the path has no such tail.
+    pub(crate) uuid_level: Option<String>,
+}
+
+/// Read a hosted pypi artifact url: parsed as a url (any scheme), path
+/// segments percent-decoded, the artifact leaf a wheel or sdist
+/// ([`archive_filename_coords`]), and the patch-server tail matched from
+/// the END (a configured origin may carry a path prefix) — whose
+/// coordinates must agree with the artifact's. `Err` is the user-facing
+/// reason.
+pub(crate) fn hosted_artifact_url(url: &str) -> Result<HostedArtifactUrl, String> {
+    let parsed = reqwest::Url::parse(url.trim()).map_err(|e| format!("{url:?}: {e}"))?;
+    let segments: Vec<String> = parsed
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .map(|s| percent_decode_purl_component(s).into_owned())
+        .collect();
+    let leaf = segments.last().map(String::as_str).unwrap_or("");
+    let Some((dist, leaf_version)) = archive_filename_coords(leaf) else {
+        return Err(format!(
+            "{url:?} does not name a Python wheel or sdist artifact"
+        ));
+    };
+    let n = segments.len();
+    if n >= 7 && segments[n - 7] == "patch" && segments[n - 6] == "pypi" {
+        let (name, version) = (&segments[n - 5], &segments[n - 4]);
+        if canonicalize_pypi_name(name) != canonicalize_pypi_name(dist) || version != leaf_version {
+            return Err(format!(
+                "{url:?}: the url's coordinates {name}=={version} disagree with its artifact \
+                 {leaf:?}"
+            ));
+        }
+        return Ok(HostedArtifactUrl {
+            name: name.clone(),
+            version: version.clone(),
+            uuid_level: Some(segments[n - 2].clone()),
+        });
+    }
+    Ok(HostedArtifactUrl {
+        name: dist.to_string(),
+        version: leaf_version.to_string(),
+        uuid_level: None,
+    })
+}
+
+// ── registry view ──
 
 /// Inventory the pypi lock the project carries. Fetchable resolution
 /// (URL + sha256 of a pure `py3-none-any` wheel) comes from `uv.lock`;
@@ -23,6 +172,14 @@ use super::{dedup_prefer_integrity, http_url, is_hex_of_len, LockIntegrity, Lock
 /// entries. Pipfile.lock contributes entries whose integrity is its digest SET
 /// (see `inventory_pipfile_lock`).
 pub(super) async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+    inventory_pypi_locks_raw(project_root)
+        .await
+        .map(dedup_prefer_integrity)
+}
+
+/// [`inventory_pypi_locks`] before its collapse: every instance
+/// ([`super::inventory_project_every_lock`]).
+pub(super) async fn inventory_pypi_locks_raw(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let mut out = Vec::new();
     let mut found = false;
     let mut uv_lock = false;
@@ -75,74 +232,37 @@ pub(super) async fn inventory_pypi_locks(project_root: &Path) -> Option<Vec<Lock
             }
         }
     }
-    found.then(|| dedup_prefer_integrity(out))
+    found.then_some(out)
 }
 
-fn python_archive(archive: &dyn TableLike) -> Option<(String, String)> {
-    let url = archive.get("url")?.as_str()?;
-    if !url.split(['?', '#']).next()?.ends_with("-none-any.whl") {
-        return None;
-    }
-    let sha = archive
-        .get("hash")
-        .and_then(Item::as_str)
-        .and_then(|value| value.strip_prefix("sha256:"))
-        .or_else(|| {
-            archive
-                .get("hashes")?
-                .as_table_like()?
-                .get("sha256")?
-                .as_str()
-        })?;
-    if !is_hex_of_len(sha, 64) {
-        return None;
-    }
-    Some((http_url(url)?, sha.to_ascii_lowercase()))
-}
-
+/// The first fetchable pure-Python wheel of a lock package — `archive`,
+/// then `wheels[]` / `wheel` (read with the shared lock model,
+/// [`crate::utils::python_lock::package_artifacts`]): an http(s) url ending
+/// `-none-any.whl` with a sha256 pin, as `(url, sha256)`.
 fn python_package_archive(package: &dyn TableLike) -> Option<(String, String)> {
-    if let Some(archive) = package
-        .get("archive")
-        .and_then(Item::as_table_like)
-        .and_then(python_archive)
-    {
-        return Some(archive);
-    }
-    if let Some(wheels) = package.get("wheels").and_then(Item::as_array) {
-        for wheel in wheels.iter().filter_map(TomlValue::as_inline_table) {
-            if let Some(archive) = python_archive(wheel) {
-                return Some(archive);
+    package_artifacts(package, &["archive", "wheels", "wheel"])
+        .into_iter()
+        .find_map(|artifact| {
+            let url = artifact.url?;
+            if !url.split(['?', '#']).next()?.ends_with("-none-any.whl") {
+                return None;
             }
-        }
-    }
-    if let Some(wheels) = package.get("wheel").and_then(Item::as_array_of_tables) {
-        for wheel in wheels.iter() {
-            if let Some(archive) = python_archive(wheel) {
-                return Some(archive);
-            }
-        }
-    }
-    None
+            Some((http_url(url)?, artifact.sha256?))
+        })
 }
 
 pub(super) fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
     let document: DocumentMut = text.parse().ok()?;
-    let pep751 = document.get("lock-version").is_some();
-    let collection = if pep751 {
-        if document.get("lock-version").and_then(Item::as_str) != Some("1.0") {
-            return None;
-        }
-        "packages"
+    let (collection, pep751) = lock_package_collection(&document);
+    // Only the lock formats the fetch layer understands.
+    let supported = if pep751 {
+        document.get("lock-version").and_then(Item::as_str) == Some("1.0")
     } else {
-        if document.get("version").and_then(Item::as_integer) != Some(1) {
-            return None;
-        }
-        if document.contains_key("distribution") {
-            "distribution"
-        } else {
-            "package"
-        }
+        document.get("version").and_then(Item::as_integer) == Some(1)
     };
+    if !supported {
+        return None;
+    }
     let mut out = Vec::new();
     let packages = document.get(collection)?.as_array_of_tables()?;
     for package in packages.iter() {
@@ -156,11 +276,9 @@ pub(super) fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
         let Some(version) = package.get("version").and_then(Item::as_str) else {
             continue;
         };
-        if !path_safety::is_safe_single_segment(&name)
-            || !path_safety::is_safe_single_segment(version)
-        {
+        let Some(purl) = pypi_purl(&name, version) else {
             continue;
-        }
+        };
         let remote = if pep751 {
             !package.contains_key("vcs")
                 && !package.contains_key("directory")
@@ -169,13 +287,7 @@ pub(super) fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
                     .and_then(Item::as_table_like)
                     .is_some_and(|archive| archive.contains_key("path"))
         } else {
-            package.get("source").is_some_and(|source| {
-                source.as_str().is_some_and(|value| {
-                    value.starts_with("registry+") || value.starts_with("direct+")
-                }) || source.as_table_like().is_some_and(|table| {
-                    table.contains_key("registry") || table.contains_key("url")
-                })
-            })
+            UvSource::of(package).is_some_and(UvSource::is_remote)
         };
         if !remote {
             continue;
@@ -186,7 +298,8 @@ pub(super) fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
         };
         out.push(LockfileEntry {
             ecosystem: "pypi",
-            purl: format!("pkg:pypi/{name}@{version}"),
+            source_kind: SourceKind::Unspecified,
+            purl,
             name,
             version: version.to_string(),
             resolved,
@@ -196,110 +309,66 @@ pub(super) fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
     Some(out)
 }
 
-/// The sha256 of each package's pure-Python (`-none-any.whl`) wheel as the
-/// lock records it — `files = [...]` inside `[[package]]` (lock 2.x) or the
-/// `[metadata.files]` entry (lock 1.0/1.1). Poetry 0.12's `[metadata.hashes]`
-/// lists bare digests without filenames, so no wheel can be chosen there.
-/// Keyed by canonical name. An unparseable lock contributes nothing (the
-/// line-based name/version walk below still runs).
-fn poetry_pure_wheel_hashes(text: &str) -> HashMap<String, String> {
-    fn pure_wheel_sha(files: &Item) -> Option<String> {
-        let files = files.as_array()?;
-        files
-            .iter()
-            .filter_map(TomlValue::as_inline_table)
-            .find_map(|entry| {
-                let file = entry.get("file")?.as_str()?;
-                if !file.ends_with("-none-any.whl") {
-                    return None;
-                }
-                let sha = entry.get("hash")?.as_str()?.strip_prefix("sha256:")?;
-                is_hex_of_len(sha, 64).then(|| sha.to_ascii_lowercase())
-            })
-    }
-    let mut out = HashMap::new();
-    let Ok(document) = text.parse::<DocumentMut>() else {
-        return out;
-    };
-    if let Some(packages) = document.get("package").and_then(Item::as_array_of_tables) {
-        for package in packages.iter() {
-            let Some(name) = package.get("name").and_then(Item::as_str) else {
-                continue;
-            };
-            if let Some(sha) = package.get("files").and_then(pure_wheel_sha) {
-                out.entry(canonicalize_pypi_name(name)).or_insert(sha);
-            }
-        }
-    }
-    if let Some(files) = document
-        .get("metadata")
-        .and_then(|m| m.get("files"))
-        .and_then(Item::as_table_like)
-    {
-        for (name, entry) in files.iter() {
-            if let Some(sha) = pure_wheel_sha(entry) {
-                out.entry(canonicalize_pypi_name(name)).or_insert(sha);
-            }
-        }
-    }
-    out
-}
-
-/// poetry.lock: `[[package]]` blocks with `name`/`version`. The lock records
+/// poetry.lock: `[[package]]` tables with `name`/`version`. The lock records
 /// file hashes but no URLs and no platform choice, so an entry carries the
-/// pure-Python wheel's sha256 when the lock lists one (the pypi fetcher then
-/// resolves the matching file through PyPI's JSON API) and stays
-/// discovery-only otherwise.
+/// sha256 of the package's pure-Python (`-none-any.whl`) wheel when the lock
+/// lists one — its own `files = [...]` (lock 2.x) or its `[metadata.files]`
+/// entry (lock 1.0/1.1), read through the shared poetry lock helpers — and
+/// the pypi fetcher then resolves the matching file through PyPI's JSON
+/// API; it stays discovery-only otherwise (Poetry 0.12's
+/// `[metadata.hashes]` lists bare digests without filenames, so no wheel
+/// can be chosen there). A lock that is not TOML contributes nothing.
 async fn inventory_poetry_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = read_regular_to_string(&project_root.join("poetry.lock"))
         .await
         .ok()?;
-    let hashes = poetry_pure_wheel_hashes(&text);
-    let mut out = Vec::new();
-    let mut in_package = false;
-    let mut name: Option<String> = None;
-    for line in text.lines() {
-        let t = line.trim();
-        if t == "[[package]]" {
-            in_package = true;
-            name = None;
-            continue;
-        }
-        if t.starts_with('[') && t != "[[package]]" {
-            in_package = false;
-            continue;
-        }
-        if !in_package {
-            continue;
-        }
-        if let Some(v) = t.strip_prefix("name = ") {
-            name = Some(canonicalize_pypi_name(v.trim_matches('"')));
-        } else if let Some(v) = t.strip_prefix("version = ") {
-            if let Some(n) = name.take() {
-                let v = v.trim_matches('"').to_string();
-                if path_safety::is_safe_single_segment(&n)
-                    && path_safety::is_safe_single_segment(&v)
-                {
-                    let integrity = hashes
-                        .get(&n)
-                        .map(|sha| LockIntegrity::Sha256Hex(sha.clone()))
-                        .unwrap_or(LockIntegrity::None);
-                    out.push(LockfileEntry {
-                        ecosystem: "pypi",
-                        purl: format!("pkg:pypi/{n}@{v}"),
-                        name: n,
-                        version: v,
-                        resolved: None,
-                        integrity,
-                    });
-                }
+    let document: DocumentMut = text.parse().ok()?;
+    let pure_wheel_sha = |files: Vec<&dyn TableLike>| {
+        files.into_iter().find_map(|entry| {
+            let file = entry.get("file")?.as_str()?;
+            if !file.ends_with("-none-any.whl") {
+                return None;
             }
-        }
+            sha256_prefixed(entry.get("hash")?.as_str()?)
+        })
+    };
+    let mut out = Vec::new();
+    for (name, version, purl, package) in toml_package_coords(&document) {
+        let integrity = pure_wheel_sha(crate::utils::poetry_lock::package_files(package))
+            .or_else(|| pure_wheel_sha(crate::utils::poetry_lock::metadata_files(&document, &name)))
+            .map(LockIntegrity::Sha256Hex)
+            .unwrap_or(LockIntegrity::None);
+        out.push(LockfileEntry {
+            ecosystem: "pypi",
+            source_kind: SourceKind::Unspecified,
+            purl,
+            name,
+            version,
+            resolved: None,
+            integrity,
+        });
     }
     if out.is_empty() {
         return None;
     }
-    Some(dedup_prefer_integrity(out))
+    Some(out)
+}
+
+/// `(canonical name, version, purl, table)` of every path-safe `[[package]]`
+/// of a poetry.lock / pdm.lock document.
+fn toml_package_coords(document: &DocumentMut) -> Vec<(String, String, String, &toml_edit::Table)> {
+    let Some(packages) = document.get("package").and_then(Item::as_array_of_tables) else {
+        return Vec::new();
+    };
+    packages
+        .iter()
+        .filter_map(|package| {
+            let name = canonicalize_pypi_name(package.get("name")?.as_str()?);
+            let version = package.get("version")?.as_str()?.to_string();
+            let purl = pypi_purl(&name, &version)?;
+            Some((name, version, purl, package))
+        })
+        .collect()
 }
 
 /// `https://pypi.org/simple`, `https://pypi.python.org/simple`,
@@ -320,33 +389,30 @@ pub(super) fn is_public_pypi_url(url: &str) -> bool {
 }
 
 /// The `(canonical name, version)` a Socket-written Pipfile.lock reference
-/// stands for: a hosted URL
-/// `https://<host>/patch/pypi/<name>/<version>/<grant>/<uuid>/<wheel>[#…]`
-/// (coordinates from the path) or a vendored path
-/// `[./].socket/vendor/pypi/<uuid>/<name>-<version>-…whl` (coordinates from
-/// the wheel filename). `None` for a user's own file/path reference.
+/// stands for: a hosted url with the patch-server tail
+/// `…/patch/pypi/<name>/<version>/<grant>/<uuid>/<artifact>[#…]` (the shared
+/// [`hosted_artifact_url`] grammar — any scheme, a path-prefixed origin,
+/// a wheel or sdist leaf) or a root-anchored vendored path
+/// `[./].socket/vendor/pypi/<uuid>/<wheel>` (coordinates from the shared
+/// vendored-leaf table, [`crate::vendor::path::leaf_to_purl`]). `None` for
+/// a user's own file/path reference.
 pub(super) fn socket_reference_coords(reference: &str) -> Option<(String, String)> {
-    let reference = reference.split('#').next().unwrap_or(reference);
-    if let Some(rest) = reference.strip_prefix("https://") {
-        let path = rest.split_once('/')?.1;
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() == 7
-            && parts[0] == "patch"
-            && parts[1] == "pypi"
-            && parts[6].ends_with(".whl")
-        {
-            return Some((canonicalize_pypi_name(parts[2]), parts[3].to_string()));
-        }
+    if reference.contains("://") {
+        let url = hosted_artifact_url(reference).ok()?;
+        url.uuid_level.as_ref()?;
+        return Some((canonicalize_pypi_name(&url.name), url.version));
+    }
+    let rel = reference.split('#').next().unwrap_or(reference);
+    if !rel
+        .trim_start_matches("./")
+        .starts_with(".socket/vendor/pypi/")
+    {
         return None;
     }
-    let rel = reference.trim_start_matches("./");
-    let rest = rel.strip_prefix(".socket/vendor/pypi/")?;
-    let (_uuid, wheel) = rest.split_once('/')?;
-    let stem = wheel.strip_suffix(".whl")?;
-    let mut fields = stem.split('-');
-    let name = fields.next()?;
-    let version = fields.next()?;
-    if name.is_empty() || version.is_empty() || !version.starts_with(|c: char| c.is_ascii_digit()) {
+    let parts = crate::vendor::path::parse_vendor_path(rel)?;
+    let purl = crate::vendor::path::leaf_to_purl("pypi", &parts.leaf)?;
+    let (name, version) = purl.strip_prefix("pkg:pypi/")?.rsplit_once('@')?;
+    if !version.starts_with(|c: char| c.is_ascii_digit()) {
         return None;
     }
     Some((canonicalize_pypi_name(name), version.to_string()))
@@ -366,8 +432,7 @@ async fn inventory_pipfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
     let text = read_regular_to_string(&project_root.join("Pipfile.lock"))
         .await
         .ok()?;
-    let value: serde_json::Value =
-        serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    let value = parse_pipfile_lock(&text).ok()?;
     let root = value.as_object()?;
     // Digests are only fetchable through PyPI's JSON API when the lock
     // resolves from PyPI: a lock whose `_meta.sources` name only private
@@ -387,88 +452,57 @@ async fn inventory_pipfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry
                 })
         });
     let mut out = Vec::new();
-    for (section, entries) in root {
-        if section == "_meta" {
+    for pkg in pipfile_lock_entries(&value)? {
+        // Socket's own references (a hosted `file` URL, a vendored
+        // `./.socket/vendor/pypi/<uuid>/<wheel>` path) stay DISCOVERABLE
+        // as the package they replace, so a re-scan of an already
+        // redirected lock-only checkout still lists (and re-confirms /
+        // attests) it instead of reporting zero packages.
+        if let Some(reference) = pkg.references().first() {
+            if let Some((n, v)) = socket_reference_coords(reference) {
+                if let Some(purl) = pypi_purl(&n, &v) {
+                    out.push(LockfileEntry {
+                        ecosystem: "pypi",
+                        source_kind: SourceKind::Unspecified,
+                        purl,
+                        name: n,
+                        version: v,
+                        resolved: None,
+                        integrity: LockIntegrity::None,
+                    });
+                }
+            }
             continue;
         }
-        let Some(entries) = entries.as_object() else {
+        if pkg.is_vcs() {
+            continue;
+        }
+        let Some(version) = pkg.exact_pin().filter(|v| !v.is_empty()) else {
             continue;
         };
-        for (name, entry) in entries {
-            let Some(entry) = entry.as_object() else {
-                continue;
-            };
-            // Socket's own references (a hosted `file` URL, a vendored
-            // `./.socket/vendor/pypi/<uuid>/<wheel>` path) stay DISCOVERABLE
-            // as the package they replace, so a re-scan of an already
-            // redirected lock-only checkout still lists (and re-confirms /
-            // attests) it instead of reporting zero packages.
-            if let Some(reference) = entry
-                .get("file")
-                .or_else(|| entry.get("path"))
-                .and_then(serde_json::Value::as_str)
-            {
-                if let Some((n, v)) = socket_reference_coords(reference) {
-                    if path_safety::is_safe_single_segment(&n)
-                        && path_safety::is_safe_single_segment(&v)
-                    {
-                        out.push(LockfileEntry {
-                            ecosystem: "pypi",
-                            purl: format!("pkg:pypi/{n}@{v}"),
-                            name: n,
-                            version: v,
-                            resolved: None,
-                            integrity: LockIntegrity::None,
-                        });
-                    }
-                }
-                continue;
-            }
-            if ["git", "hg", "svn", "bzr", "editable"]
-                .iter()
-                .any(|key| entry.contains_key(*key))
-            {
-                continue;
-            }
-            let Some(version) = entry
-                .get("version")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|v| v.strip_prefix("=="))
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-            else {
-                continue;
-            };
-            let n = canonicalize_pypi_name(name);
-            if !path_safety::is_safe_single_segment(&n)
-                || !path_safety::is_safe_single_segment(version)
-            {
-                continue;
-            }
-            let hashes: Vec<String> = entry
-                .get("hashes")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(serde_json::Value::as_str)
-                .filter_map(|h| h.strip_prefix("sha256:"))
-                .filter(|h| is_hex_of_len(h, 64))
-                .map(|h| h.to_ascii_lowercase())
-                .collect();
-            let integrity = if hashes.is_empty() || !public_index {
-                LockIntegrity::None
-            } else {
-                LockIntegrity::Sha256AnyOf(hashes)
-            };
-            out.push(LockfileEntry {
-                ecosystem: "pypi",
-                purl: format!("pkg:pypi/{n}@{version}"),
-                name: n,
-                version: version.to_string(),
-                resolved: None,
-                integrity,
-            });
-        }
+        let n = canonicalize_pypi_name(pkg.name);
+        let Some(purl) = pypi_purl(&n, version) else {
+            continue;
+        };
+        let hashes: Vec<String> = pkg
+            .sha256_hashes()
+            .into_iter()
+            .filter_map(sha256_hex)
+            .collect();
+        let integrity = if hashes.is_empty() || !public_index {
+            LockIntegrity::None
+        } else {
+            LockIntegrity::Sha256AnyOf(hashes)
+        };
+        out.push(LockfileEntry {
+            ecosystem: "pypi",
+            source_kind: SourceKind::Unspecified,
+            purl,
+            name: n,
+            version: version.to_string(),
+            resolved: None,
+            integrity,
+        });
     }
     Some(out)
 }
@@ -485,78 +519,53 @@ async fn inventory_pdm_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = read_regular_to_string(&project_root.join("pdm.lock"))
         .await
         .ok()?;
-    let mut out = Vec::new();
-    let mut in_package = false;
-    let mut name: Option<String> = None;
-    for line in text.lines() {
-        let t = line.trim();
-        if t == "[[package]]" {
-            in_package = true;
-            name = None;
-            continue;
-        }
-        if t.starts_with('[') && t != "[[package]]" {
-            in_package = false;
-            continue;
-        }
-        if !in_package {
-            continue;
-        }
-        if let Some(v) = t.strip_prefix("name = ") {
-            name = Some(canonicalize_pypi_name(v.trim_matches('"')));
-        } else if let Some(v) = t.strip_prefix("version = ") {
-            if let Some(n) = name.take() {
-                let v = v.trim_matches('"').to_string();
-                if path_safety::is_safe_single_segment(&n)
-                    && path_safety::is_safe_single_segment(&v)
-                {
-                    out.push(LockfileEntry {
-                        ecosystem: "pypi",
-                        purl: format!("pkg:pypi/{n}@{v}"),
-                        name: n,
-                        version: v,
-                        resolved: None,
-                        integrity: LockIntegrity::None,
-                    });
-                }
-            }
-        }
-    }
+    let document: DocumentMut = text.parse().ok()?;
+    let out: Vec<LockfileEntry> = toml_package_coords(&document)
+        .into_iter()
+        .map(|(name, version, purl, _)| LockfileEntry {
+            ecosystem: "pypi",
+            source_kind: SourceKind::Unspecified,
+            purl,
+            name,
+            version,
+            resolved: None,
+            integrity: LockIntegrity::None,
+        })
+        .collect();
     if out.is_empty() {
         return None;
     }
-    Some(dedup_prefer_integrity(out))
+    Some(out)
 }
 
-/// requirements.txt with exact `==` pins — discovery only.
+/// requirements.txt with exact `==` pins — discovery only. Read as pip's
+/// logical lines with the shared requirements lexer
+/// ([`crate::utils::requirements`]: continuations joined, comments cut, one
+/// leading BOM dropped), the same one the planner and discovery use.
 async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = read_regular_to_string(&project_root.join("requirements.txt"))
         .await
         .ok()?;
     let mut out = Vec::new();
-    for line in text.lines() {
-        let t = line.trim();
-        if t.is_empty() || t.starts_with('#') || t.starts_with('-') {
+    for line in crate::utils::requirements::logical_lines(&text) {
+        let t = crate::utils::requirements::strip_comment(&line.text).trim();
+        if t.is_empty() || t.starts_with('-') {
             continue;
         }
-        // `name==version` (strip extras, env markers, hash continuations).
-        let spec = t.split(';').next().unwrap_or(t).trim();
-        let spec = spec.split_whitespace().next().unwrap_or(spec);
-        let Some((raw_name, version)) = spec.split_once("==") else {
+        // `name==version` (extras, env markers, hash options stripped) —
+        // the shared exact-pin rule discovery reads requirements with.
+        let Some((raw_name, version)) = crate::utils::requirements::exact_pin(t) else {
             continue;
         };
-        let name = canonicalize_pypi_name(raw_name.split('[').next().unwrap_or(raw_name).trim());
-        let version = version.trim().to_string();
-        if name.is_empty()
-            || !path_safety::is_safe_single_segment(&name)
-            || !path_safety::is_safe_single_segment(&version)
-            || !version.chars().next().is_some_and(|c| c.is_ascii_digit())
-        {
+        let name = canonicalize_pypi_name(raw_name);
+        let version = version.to_string();
+        let Some(purl) = pypi_purl(&name, &version) else {
             continue;
-        }
+        };
         out.push(LockfileEntry {
             ecosystem: "pypi",
-            purl: format!("pkg:pypi/{name}@{version}"),
+            source_kind: SourceKind::Unspecified,
+            purl,
             name,
             version,
             resolved: None,
@@ -566,5 +575,5 @@ async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileE
     if out.is_empty() {
         return None;
     }
-    Some(dedup_prefer_integrity(out))
+    Some(out)
 }

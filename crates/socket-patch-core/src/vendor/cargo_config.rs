@@ -35,6 +35,15 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_strin
 /// entry whose `path` is under this prefix is socket-owned.
 const CARGO_VENDOR_DIR: &str = ".socket/vendor/cargo";
 
+/// Cargo's legacy extensionless project config: when it exists cargo reads
+/// it INSTEAD of [`CONFIG_TOML`] (and warns that the `.toml` is ignored).
+pub(crate) const CONFIG_LEGACY: &str = ".cargo/config";
+/// The project config cargo reads when [`CONFIG_LEGACY`] does not exist.
+pub(crate) const CONFIG_TOML: &str = ".cargo/config.toml";
+/// The prefix every Socket-owned registry name carries
+/// (`socket-patch-<uuid>`, as the hosted rewriter defines and pins it).
+pub(crate) const SOCKET_REGISTRY_PREFIX: &str = "socket-patch-";
+
 /// Info about one `[patch.crates-io]` entry, for vendor pre-flight / verify.
 #[derive(Debug, Clone)]
 pub struct PatchEntryInfo {
@@ -95,46 +104,106 @@ pub async fn read_patch_entries(project_root: &Path) -> HashMap<String, PatchEnt
 /// depending on the index URL's host (test registries are localhost).
 pub async fn socket_registry_indexes(project_root: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for file in [".cargo/config", ".cargo/config.toml"] {
+    for file in [CONFIG_LEGACY, CONFIG_TOML] {
         let Ok(content) = read_regular_to_string(&project_root.join(file)).await else {
             continue;
         };
         let Ok(doc) = content.parse::<DocumentMut>() else {
             continue;
         };
-        let Some(registries) = doc.get("registries").and_then(Item::as_table_like) else {
-            continue;
-        };
-        for (name, item) in registries.iter() {
-            if !name.starts_with("socket-patch-") {
-                continue;
-            }
-            let index = item
-                .as_table_like()
-                .and_then(|t| t.get("index"))
-                .and_then(Item::as_str);
-            if let Some(index) = index {
-                out.push((name.to_string(), index.to_string()));
-            }
-        }
+        out.extend(registry_definitions(&doc));
     }
     out
 }
 
+// ── pure reader ──────────────────────────────────────────────────────────────
+// The read-only walks of a parsed manifest / config that the vendor side
+// above and lockfile discovery (`vex::discover::cargo`) share.
+
+/// The `[registries.socket-patch-*]` definitions of a parsed cargo config,
+/// as `(registry_name, index)` pairs in document order; a definition with
+/// no string `index` is skipped.
+pub(crate) fn registry_definitions(doc: &DocumentMut) -> Vec<(String, String)> {
+    let Some(registries) = doc.get("registries").and_then(Item::as_table_like) else {
+        return Vec::new();
+    };
+    registries
+        .iter()
+        .filter(|(name, _)| name.starts_with(SOCKET_REGISTRY_PREFIX))
+        .filter_map(|(name, item)| {
+            let index = item.as_table_like()?.get("index")?.as_str()?;
+            Some((name.to_string(), index.to_string()))
+        })
+        .collect()
+}
+
+/// One item of a `[patch.<source>]` table, as written.
+pub(crate) struct CargoPatchEntry<'d> {
+    /// The `<source>` key (`crates-io`, or a registry / git URL).
+    pub(crate) source: &'d str,
+    /// The item's own key.
+    pub(crate) key: &'d str,
+    /// The crate it patches: `package = "…"` when renamed, else the key.
+    pub(crate) name: &'d str,
+    /// The `path` / `registry` values (`None` too for a non-table item).
+    pub(crate) path: Option<&'d str>,
+    pub(crate) registry: Option<&'d str>,
+}
+
+/// Every item of every `[patch.<source>]` table of a manifest or config, in
+/// document order — header, dotted, and `[patch] crates-io = { … }` inline
+/// forms alike (cargo honors all). A `<source>` that is not a table
+/// contributes nothing.
+pub(crate) fn patch_entries(doc: &DocumentMut) -> Vec<CargoPatchEntry<'_>> {
+    let Some(patch) = doc.get("patch").and_then(Item::as_table_like) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for (source, table) in patch.iter() {
+        let Some(table) = table.as_table_like() else {
+            continue;
+        };
+        for (key, item) in table.iter() {
+            let field = move |k: &str| item.as_table_like()?.get(k)?.as_str();
+            entries.push(CargoPatchEntry {
+                source,
+                key,
+                name: field("package").unwrap_or(key),
+                path: field("path"),
+                registry: field("registry"),
+            });
+        }
+    }
+    entries
+}
+
 // ── config-file resolution + read-or-create write ────────────────────────────
 
-/// Resolve the config file under `<project_root>/.cargo/`. Prefers an existing
-/// legacy `config`: when both files exist cargo reads the one WITHOUT the
-/// extension (and warns) — writing into `config.toml` there would leave the
-/// `[patch]` entry silently inert. Falls back to an existing `config.toml`,
-/// else `config.toml` (created on first write).
-async fn config_path(project_root: &Path) -> PathBuf {
-    let dir = project_root.join(".cargo");
-    let legacy = dir.join("config");
-    if fs::metadata(&legacy).await.is_ok() {
-        return legacy;
+/// The project config cargo reads, root-relative: [`CONFIG_LEGACY`] when it
+/// exists — both files present means cargo reads the one WITHOUT the
+/// extension (and warns) — else [`CONFIG_TOML`] (which may not exist yet).
+/// `metadata`, not lstat: cargo's own existence probe follows symlinks.
+pub(crate) async fn effective_config_rel(project_root: &Path) -> &'static str {
+    if fs::metadata(project_root.join(".cargo").join("config"))
+        .await
+        .is_ok()
+    {
+        CONFIG_LEGACY
+    } else {
+        CONFIG_TOML
     }
-    dir.join("config.toml")
+}
+
+/// Resolve the config file under `<project_root>/.cargo/`
+/// ([`effective_config_rel`]): writing into `config.toml` while a legacy
+/// `config` exists would leave the `[patch]` entry silently inert. A missing
+/// `config.toml` is created on first write.
+async fn config_path(project_root: &Path) -> PathBuf {
+    let rel = effective_config_rel(project_root).await;
+    rel.split('/')
+        .fold(project_root.to_path_buf(), |path, segment| {
+            path.join(segment)
+        })
 }
 
 /// Apply a pure transform to the config file, writing only if it changed and
@@ -329,25 +398,20 @@ fn remove_patch_entry(content: &str, name: &str) -> Result<Option<String>, Strin
     Ok(Some(doc.to_string()))
 }
 
+/// Every `[patch.crates-io]` item keyed by its table key ([`patch_entries`]).
 fn parse_patch_entries(content: &str) -> HashMap<String, PatchEntryInfo> {
-    let mut out = HashMap::new();
-    let doc = match content.parse::<DocumentMut>() {
-        Ok(d) => d,
-        Err(_) => return out,
+    let Ok(doc) = content.parse::<DocumentMut>() else {
+        return HashMap::new();
     };
-    let crates_io = doc
-        .get("patch")
-        .and_then(Item::as_table_like)
-        .and_then(|t| t.get("crates-io"))
-        .and_then(Item::as_table_like);
-    if let Some(tbl) = crates_io {
-        for (name, item) in tbl.iter() {
-            let path = entry_path(item).map(str::to_string);
-            let socket_owned = path.as_deref().map(path_is_socket_owned).unwrap_or(false);
-            out.insert(name.to_string(), PatchEntryInfo { path, socket_owned });
-        }
-    }
-    out
+    patch_entries(&doc)
+        .into_iter()
+        .filter(|entry| entry.source == "crates-io")
+        .map(|entry| {
+            let path = entry.path.map(str::to_string);
+            let socket_owned = path.as_deref().is_some_and(path_is_socket_owned);
+            (entry.key.to_string(), PatchEntryInfo { path, socket_owned })
+        })
+        .collect()
 }
 
 #[cfg(test)]

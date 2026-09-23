@@ -265,18 +265,13 @@ pub async fn wired_instances_all_ours(
                         format!("cannot read bun.lockb: {error}"),
                     )
                 })?;
-            let lock = super::bun_lockb::BunLockb::parse(&bytes).map_err(|detail| {
-                (
-                    "vendor_bun_lockb_invalid",
-                    format!("cannot parse bun.lockb: {detail}"),
-                )
-            })?;
-            let packages = lock.packages().map_err(|detail| {
-                (
-                    "vendor_bun_lockb_invalid",
-                    format!("cannot parse bun.lockb: {detail}"),
-                )
-            })?;
+            let packages =
+                super::bun_lockb::BunLockb::parse_packages(&bytes).map_err(|detail| {
+                    (
+                        "vendor_bun_lockb_invalid",
+                        format!("cannot parse bun.lockb: {detail}"),
+                    )
+                })?;
             let leaf = tgz_rel_leaf(&name, &version);
             let mut matched = false;
             for package in packages.into_iter().filter(|package| package.name == name) {
@@ -316,9 +311,7 @@ pub async fn binary_vendor_paths(project_root: &Path) -> Result<Vec<String>, Str
     let bytes = crate::utils::fs::read_regular_to_bytes(&project_root.join("bun.lockb"))
         .await
         .map_err(|e| e.to_string())?;
-    let lock = super::bun_lockb::BunLockb::parse(&bytes)?;
-    Ok(lock
-        .packages()?
+    Ok(super::bun_lockb::BunLockb::parse_packages(&bytes)?
         .into_iter()
         .filter(|p| parse_vendor_path(&p.resolution).is_some_and(|v| v.eco == "npm"))
         .map(|p| p.resolution)
@@ -2328,6 +2321,45 @@ mod tests {
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
         assert_eq!(fx.read_lock().await, lock, "lock byte-restored");
+    }
+
+    /// The binary-lock readers of the per-purl gate and repair/GC: a lock
+    /// the codec rejects is `vendor_bun_lockb_invalid` / an error, and only
+    /// LIVE vendored resolutions are listed.
+    #[tokio::test]
+    async fn binary_lock_readers_refuse_corrupt_locks_and_list_vendor_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let lockb = root.path().join("bun.lockb");
+        tokio::fs::write(&lockb, b"binary").await.unwrap();
+        let (code, detail) = wired_instances_all_ours(root.path(), "pkg:npm/left-pad@1.3.0")
+            .await
+            .unwrap_err();
+        assert_eq!(code, "vendor_bun_lockb_invalid");
+        assert!(detail.starts_with("cannot parse bun.lockb: "), "{detail}");
+        assert!(binary_vendor_paths(root.path()).await.is_err());
+
+        let original = include_bytes!("../../tests/fixtures/bun-lockb/1.1.45/bun.lockb");
+        tokio::fs::write(&lockb, original).await.unwrap();
+        assert_eq!(
+            binary_vendor_paths(root.path()).await.unwrap(),
+            Vec::<String>::new()
+        );
+        let mut lock = super::super::bun_lockb::BunLockb::parse(original).unwrap();
+        let package = lock
+            .packages()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.version.is_some())
+            .unwrap();
+        let rel = format!(
+            ".socket/vendor/npm/11111111-1111-4111-8111-111111111111/{}-{}.tgz",
+            package.name,
+            package.version.as_deref().unwrap()
+        );
+        let integrity = format!("sha512-{}==", "A".repeat(86));
+        lock.set_package(package.id, &rel, &integrity).unwrap();
+        tokio::fs::write(&lockb, lock.bytes()).await.unwrap();
+        assert_eq!(binary_vendor_paths(root.path()).await.unwrap(), vec![rel]);
     }
 
     #[tokio::test]

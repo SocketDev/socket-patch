@@ -64,10 +64,10 @@ use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 
 use crate::constants::SOCKET_DIR;
+use crate::crawlers::maven_crawler::is_safe_maven_coordinate;
 use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
-use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::fs::{
     atomic_write_bytes, atomic_write_bytes_preserving_mode, read_regular_to_bytes,
     read_regular_to_string,
@@ -95,6 +95,13 @@ const PROJECT_POM: &str = "pom.xml";
 /// `pom.xml` snapshot (the authoritative revert record); its `key` is the
 /// repository id we added, which the revert ownership gate keys off.
 const REPO_WIRING_KIND: &str = "maven_pom_repository";
+
+/// The id prefix of the vendored `<repository>` (`socket-patch-vendor-<uuid>`).
+pub(crate) const VENDOR_REPO_ID_PREFIX: &str = "socket-patch-vendor-";
+
+/// The url prefix of the vendored `<repository>`: the project root, so the
+/// `.socket/vendor/maven/<uuid>` tree after it resolves on any checkout.
+pub(crate) const VENDOR_REPO_URL_PREFIX: &str = "file://${project.basedir}/";
 
 /// Bound on a pom download from the registry — a pom is dependency metadata
 /// (small XML); a multi-MB response is a mirror serving the wrong thing.
@@ -129,18 +136,9 @@ fn maven_registry_base() -> String {
 /// Convert a dotted Maven groupId to its maven2 path segment
 /// (`org.apache.commons` → `org/apache/commons`). Local twin of the private
 /// `maven_crawler::group_id_to_path`; the coordinate has already passed
-/// [`is_safe_group_id`] before this runs.
+/// [`is_safe_maven_coordinate`] before this runs.
 fn group_id_to_path(group_id: &str) -> String {
     group_id.replace('.', "/")
-}
-
-/// A groupId is safe to convert to a path and join onto the vendor root: each
-/// dot-delimited segment must be a safe path segment on its own (non-empty, no
-/// separator/backslash/colon/NUL), which also rejects the empty string and
-/// leading/trailing/double dots. Same delegation as the maven crawler's
-/// `is_safe_maven_coordinate` group half. Fails closed on tampered coordinates.
-fn is_safe_group_id(group_id: &str) -> bool {
-    group_id.split('.').all(is_safe_single_segment)
 }
 
 /// Vendor a Maven package: rebuild a patched `.jar` under a committed maven2
@@ -179,10 +177,10 @@ pub async fn vendor_maven(
             format!("non-canonical patch uuid {:?}", record.uuid),
         );
     };
-    if !is_safe_group_id(group_id)
-        || !is_safe_single_segment(artifact_id)
-        || !is_safe_single_segment(version)
-    {
+    // Each dot-delimited groupId segment must be a safe path segment on its
+    // own (which also rejects an empty groupId and leading/trailing/double
+    // dots), as must the artifactId and version.
+    if !is_safe_maven_coordinate(group_id, artifact_id, version) {
         return refused(
             "unsafe_coordinates",
             format!("unsafe maven coordinates `{group_id}:{artifact_id}` @ `{version}`"),
@@ -201,7 +199,7 @@ pub async fn vendor_maven(
     // while every other reported path keeps the rel's forward slashes —
     // `package_path` reports (and tests compare) this as a display string.
     let jar_path = project_root.join(&jar_copy_rel);
-    let repo_id = format!("socket-patch-vendor-{}", record.uuid);
+    let repo_id = format!("{VENDOR_REPO_ID_PREFIX}{}", record.uuid);
 
     // A patch with no files is meaningless to vendor: no-op success, no edits.
     if record.files.is_empty() {
@@ -939,6 +937,21 @@ fn sha1_hex(bytes: &[u8]) -> String {
     hex::encode(Sha1::digest(bytes))
 }
 
+/// Whether a `.sha1` sidecar's text names `jar`'s sha1 the way maven-resolver
+/// reads a checksum file: the first token of the first non-empty line,
+/// case-insensitive (`sha1sum`'s `<hex>  <file>` form included). Pure; the
+/// caller reads both files. (The vendor backend's own in-sync checks compare
+/// the trimmed text exactly, the shape it writes.)
+pub(crate) fn sha1_sidecar_matches(jar: &[u8], recorded: &str) -> bool {
+    let token = recorded
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or_default();
+    token.eq_ignore_ascii_case(&sha1_hex(jar))
+}
+
 // ── pom.xml editing ──────────────────────────────────────────────────────────────
 
 /// Build the wired `pom.xml` text: insert our `<repository>` into
@@ -949,8 +962,12 @@ fn sha1_hex(bytes: &[u8]) -> String {
 /// bare substring match: a `</repositories>` inside an XML comment or inside
 /// `<profiles>` would swallow the block where Maven never reads it, so the
 /// build would silently resolve the UNPATCHED jar while vendor reports
-/// success.
-fn build_repo_edit(original: &str, repo_id: &str, uuid_dir_rel: &str) -> Result<String, String> {
+/// success. `pub(crate)` so vex discovery's tests wire exactly this shape.
+pub(crate) fn build_repo_edit(
+    original: &str,
+    repo_id: &str,
+    uuid_dir_rel: &str,
+) -> Result<String, String> {
     let block = repository_block(repo_id, uuid_dir_rel);
     if let Some(at) = find_wireable_anchor(original, "</repositories>") {
         Ok(insert_block_at(original, at, &block))
@@ -1071,7 +1088,7 @@ fn repository_block(repo_id: &str, uuid_dir_rel: &str) -> String {
     format!(
         "    <repository>\n\
          \x20     <id>{repo_id}</id>\n\
-         \x20     <url>file://${{project.basedir}}/{uuid_dir_rel}</url>\n\
+         \x20     <url>{VENDOR_REPO_URL_PREFIX}{uuid_dir_rel}</url>\n\
          \x20     <releases>\n\
          \x20       <enabled>true</enabled>\n\
          \x20       <checksumPolicy>fail</checksumPolicy>\n\
@@ -2038,6 +2055,7 @@ mod tests {
     #[test]
     fn group_id_path_and_safety() {
         assert_eq!(group_id_to_path("org.apache.commons"), "org/apache/commons");
+        let is_safe_group_id = |g| is_safe_maven_coordinate(g, "a", "1");
         assert!(is_safe_group_id("org.apache.commons"));
         assert!(!is_safe_group_id(""));
         assert!(!is_safe_group_id(".org"));

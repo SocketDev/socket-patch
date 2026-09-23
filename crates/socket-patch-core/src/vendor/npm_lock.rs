@@ -38,12 +38,13 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 // suite exercises them through `use super::*` and stays unmodified.
 #[cfg(test)]
 use super::npm_common::{is_safe_npm_name, parse_npm_purl, tgz_rel_leaf};
+use crate::constants::npm_family::NPM_LOCKS;
 
 /// `npm-shrinkwrap.json` wins over `package-lock.json` when both exist —
 /// npm itself ignores the package-lock in that case, so editing it would be
 /// a silent no-op.
-const SHRINKWRAP: &str = "npm-shrinkwrap.json";
-const PACKAGE_LOCK: &str = "package-lock.json";
+const SHRINKWRAP: &str = NPM_LOCKS[0];
+const PACKAGE_LOCK: &str = NPM_LOCKS[1];
 
 const NODE_MODULES_SEG: &str = "node_modules/";
 

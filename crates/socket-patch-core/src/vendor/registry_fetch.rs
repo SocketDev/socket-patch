@@ -28,7 +28,7 @@ use crate::crawlers::go_crawler::encode_module_path;
 use crate::patch::apply::is_safe_relative_subpath;
 use crate::patch::path_safety::is_safe_single_segment;
 
-use super::lock_inventory::{LockIntegrity, LockfileEntry};
+use super::lock_inventory::{LockIntegrity, LockfileEntry, SourceKind};
 
 /// The default npm registry; override with `SOCKET_NPM_REGISTRY` (the
 /// enterprise-mirror / test escape hatch — `.npmrc` parsing is out of
@@ -899,6 +899,7 @@ pub async fn fetch_npm_unverified(
 ) -> Result<FetchedPackage, FetchError> {
     let entry = LockfileEntry {
         ecosystem: "npm",
+        source_kind: SourceKind::Unspecified,
         name: name.to_string(),
         version: version.to_string(),
         purl: format!("pkg:npm/{name}@{version}"),
@@ -1216,6 +1217,7 @@ mod tests {
     fn npm_entry(resolved: Option<String>, integrity: LockIntegrity) -> LockfileEntry {
         LockfileEntry {
             ecosystem: "npm",
+            source_kind: SourceKind::Unspecified,
             name: "left-pad".into(),
             version: "1.3.0".into(),
             purl: "pkg:npm/left-pad@1.3.0".into(),
@@ -1503,6 +1505,7 @@ mod tests {
 
         let entry = LockfileEntry {
             ecosystem: "cargo",
+            source_kind: SourceKind::Unspecified,
             name: "left-pad".into(),
             version: "1.3.0".into(),
             purl: "pkg:cargo/left-pad@1.3.0".into(),
@@ -1591,6 +1594,7 @@ mod tests {
 
         let entry = LockfileEntry {
             ecosystem: "golang",
+            source_kind: SourceKind::Unspecified,
             name: "github.com/x/y".into(),
             version: "v1.0.0".into(),
             purl: "pkg:golang/github.com/x/y@v1.0.0".into(),
@@ -1669,6 +1673,7 @@ mod tests {
 
         let entry = LockfileEntry {
             ecosystem: "composer",
+            source_kind: SourceKind::Unspecified,
             name: "monolog/monolog".into(),
             version: "3.5.0".into(),
             purl: "pkg:composer/monolog/monolog@3.5.0".into(),
@@ -1714,6 +1719,7 @@ mod tests {
 
         let entry = LockfileEntry {
             ecosystem: "composer",
+            source_kind: SourceKind::Unspecified,
             name: "acme/flat".into(),
             version: "1.0.0".into(),
             purl: "pkg:composer/acme/flat@1.0.0".into(),
@@ -1782,6 +1788,7 @@ mod tests {
 
         let entry = LockfileEntry {
             ecosystem: "gem",
+            source_kind: SourceKind::Unspecified,
             name: "rails".into(),
             version: "7.1.0".into(),
             purl: "pkg:gem/rails@7.1.0".into(),
@@ -1814,6 +1821,7 @@ mod tests {
         // contacted).
         let entry = LockfileEntry {
             ecosystem: "gem",
+            source_kind: SourceKind::Unspecified,
             name: "ra/ils".into(),
             version: "7.1.0".into(),
             purl: "pkg:gem/ra/ils@7.1.0".into(),
@@ -1848,6 +1856,7 @@ mod tests {
 
         let entry = LockfileEntry {
             ecosystem: "pypi",
+            source_kind: SourceKind::Unspecified,
             name: "requests".into(),
             version: "2.28.0".into(),
             purl: "pkg:pypi/requests@2.28.0".into(),
@@ -1904,6 +1913,7 @@ mod tests {
         };
         let entry = LockfileEntry {
             ecosystem: "pypi",
+            source_kind: SourceKind::Unspecified,
             name: "requests".into(),
             version: "2.28.0".into(),
             purl: "pkg:pypi/requests@2.28.0".into(),
@@ -1981,6 +1991,7 @@ mod tests {
         };
         let entry = LockfileEntry {
             ecosystem: "pypi",
+            source_kind: SourceKind::Unspecified,
             name: "requests".into(),
             version: "2.28.0".into(),
             purl: "pkg:pypi/requests@2.28.0".into(),
@@ -2207,6 +2218,7 @@ mod tests {
         // PyPI JSON API — `pypi_hash_only_entry_is_resolved_through_the_json_api`).
         let entry = LockfileEntry {
             ecosystem: "pypi",
+            source_kind: SourceKind::Unspecified,
             name: "requests".into(),
             version: "2.28.0".into(),
             purl: "pkg:pypi/requests@2.28.0".into(),
@@ -2318,6 +2330,7 @@ mod tests {
         // (the poison URL would hard-fail if contacted).
         let entry = LockfileEntry {
             ecosystem: "maven",
+            source_kind: SourceKind::Unspecified,
             name: "org.apache.commons:commons-lang3".into(),
             version: "3.14.0".into(),
             purl: "pkg:maven/org.apache.commons/commons-lang3@3.14.0".into(),
@@ -2342,6 +2355,7 @@ mod tests {
         // composer.lock entry with no dist URL.
         let entry = LockfileEntry {
             ecosystem: "composer",
+            source_kind: SourceKind::Unspecified,
             name: "monolog/monolog".into(),
             version: "3.5.0".into(),
             purl: "pkg:composer/monolog/monolog@3.5.0".into(),
@@ -2358,6 +2372,7 @@ mod tests {
         // Gem entry (safe coordinates) with no download URL.
         let entry = LockfileEntry {
             ecosystem: "gem",
+            source_kind: SourceKind::Unspecified,
             name: "rails".into(),
             version: "7.1.0".into(),
             purl: "pkg:gem/rails@7.1.0".into(),
@@ -2375,6 +2390,7 @@ mod tests {
         // integrity kind refuses before the URL is even built.
         let entry = LockfileEntry {
             ecosystem: "golang",
+            source_kind: SourceKind::Unspecified,
             name: "github.com/x/y".into(),
             version: "v1.0.0".into(),
             purl: "pkg:golang/github.com/x/y@v1.0.0".into(),
@@ -2404,6 +2420,7 @@ mod tests {
 
         let entry = LockfileEntry {
             ecosystem: "cargo",
+            source_kind: SourceKind::Unspecified,
             name: "left-pad".into(),
             version: "1.3.0".into(),
             purl: "pkg:cargo/left-pad@1.3.0".into(),
@@ -2431,6 +2448,7 @@ mod tests {
 
         let entry = LockfileEntry {
             ecosystem: "composer",
+            source_kind: SourceKind::Unspecified,
             name: "acme/pkg".into(),
             version: "1.0.0".into(),
             purl: "pkg:composer/acme/pkg@1.0.0".into(),
@@ -2485,6 +2503,7 @@ mod tests {
 
         let entry = LockfileEntry {
             ecosystem: "cargo",
+            source_kind: SourceKind::Unspecified,
             name: "left-pad".into(),
             version: "1.3.0".into(),
             purl: "pkg:cargo/left-pad@1.3.0".into(),
@@ -2529,6 +2548,7 @@ mod tests {
 
         let entry = LockfileEntry {
             ecosystem: "golang",
+            source_kind: SourceKind::Unspecified,
             name: "github.com/Azure/y".into(),
             version: "v1.0.0-RC1".into(),
             purl: "pkg:golang/github.com/Azure/y@v1.0.0-RC1".into(),

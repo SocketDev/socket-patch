@@ -2,10 +2,40 @@
 
 use std::path::Path;
 
+use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
-use crate::vendor::bun_lock_text;
+use crate::vendor::bun_lock_text::{self, BunEntry};
+use crate::vendor::bun_lockb::BunLockb;
 
 use super::{http_url, LockIntegrity, LockfileEntry, UnsupportedNpmLayout};
+
+/// Every `packages` entry of a text `bun.lock`, read with the ONE
+/// fail-closed line grammar the hosted and vendored backends splice with
+/// ([`bun_lock_text`]): the version head gated by
+/// [`bun_lock_text::check_lock_version`], then each single-line
+/// `"key": [tuple]` entry with its raw (JSON-encoded, trimmed) tuple
+/// elements. `Err` is the user-facing refusal detail (it names the file): a
+/// lock the backends refuse — a hand re-indented one included — is one
+/// neither the inventory nor lockfile discovery reads.
+pub(crate) fn bun_text_entries(text: &str) -> Result<Vec<BunEntry>, String> {
+    bun_lock_text::check_lock_version(text)?;
+    let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    bun_lock_text::parse_packages_section(&lines).map_err(|e| format!("{BUN_LOCK}: {e}"))
+}
+
+// ── file selection ──
+
+/// Whether the project root has a text `bun.lock` (lstat, so a dangling
+/// symlink counts): bun reads it whenever it exists, so the binary
+/// `bun.lockb` beside it is not the live lock. Lockfile discovery answers
+/// the same question with `DiscoverCtx::exists` (the same lstat).
+pub(crate) async fn bun_text_lock_present(root: &Path) -> bool {
+    tokio::fs::symlink_metadata(root.join(BUN_LOCK))
+        .await
+        .is_ok()
+}
+
+// ── registry view ──
 
 pub(super) async fn inventory_bun_binary(
     root: &Path,
@@ -14,11 +44,10 @@ pub(super) async fn inventory_bun_binary(
         code: "bun_lockb_invalid",
         detail: format!("cannot inventory bun.lockb: {detail}"),
     };
-    let bytes = read_regular_to_bytes(&root.join("bun.lockb"))
+    let bytes = read_regular_to_bytes(&root.join(BUN_LOCKB))
         .await
         .map_err(|error| invalid(error.to_string()))?;
-    let lock = crate::vendor::bun_lockb::BunLockb::parse(&bytes).map_err(invalid)?;
-    let packages = lock.packages().map_err(invalid)?;
+    let packages = BunLockb::parse_packages(&bytes).map_err(invalid)?;
     Ok(packages
         .into_iter()
         .filter_map(|package| {
@@ -43,10 +72,8 @@ pub(super) async fn inventory_bun_binary(
 }
 
 pub(super) async fn inventory_bun(root: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = read_regular_to_string(&root.join("bun.lock")).await.ok()?;
-    bun_lock_text::check_lock_version(&text).ok()?;
-    let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-    let entries = bun_lock_text::parse_packages_section(&lines).ok()?;
+    let text = read_regular_to_string(&root.join(BUN_LOCK)).await.ok()?;
+    let entries = bun_text_entries(&text).ok()?;
 
     let mut out = Vec::new();
     for entry in entries {

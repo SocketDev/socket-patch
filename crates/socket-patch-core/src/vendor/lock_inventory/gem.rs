@@ -1,13 +1,15 @@
 //! `Gemfile.lock`: the registry view and the GEM remote set ledger recovery
 //! reads.
 
-use std::collections::HashMap;
 use std::path::Path;
 
-use crate::patch::path_safety;
 use crate::utils::fs::read_regular_to_string;
+use crate::utils::purl::simple_purl;
+use crate::vendor::gemfile_lock::{self, Section};
 
-use super::{dedup_prefer_integrity, http_url, is_hex_of_len, LockIntegrity, LockfileEntry};
+use super::{dedup_prefer_integrity, http_url, LockIntegrity, LockfileEntry, SourceKind};
+
+// ── registry view ──
 
 /// Inventory `Gemfile.lock`: `GEM`-section `specs:` entries (4-space
 /// indent; deeper lines are dependency ranges) plus the bundler ≥ 2.6
@@ -25,109 +27,67 @@ use super::{dedup_prefer_integrity, http_url, is_hex_of_len, LockIntegrity, Lock
 /// per-spec origin is genuinely ambiguous: its specs stay discovery-only
 /// (no resolved URL — the fetch layer then refuses), fail-closed.
 pub(super) async fn inventory_gemfile_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
+    inventory_gemfile_lock_raw(project_root)
+        .await
+        .map(dedup_prefer_integrity)
+}
+
+/// [`inventory_gemfile_lock`] before its collapse: every instance
+/// ([`super::inventory_project_every_lock`]).
+pub(super) async fn inventory_gemfile_lock_raw(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = read_regular_to_string(&project_root.join("Gemfile.lock"))
         .await
         .ok()?;
-    let mut section_remotes: Vec<Vec<String>> = Vec::new();
-    let mut checksums: HashMap<(String, String), String> = HashMap::new();
-    let mut specs: Vec<(String, String, usize)> = Vec::new();
-
-    let mut section = "";
-    let mut in_specs = false;
-    for line in text.lines() {
-        if !line.starts_with(' ') {
-            section = line.trim();
-            in_specs = false;
-            if section == "GEM" {
-                section_remotes.push(Vec::new());
+    // The shared lock model (lockfile discovery reads it too); what bundler
+    // would refuse (`problems`) still inventories whatever parsed — this is
+    // read-only discovery.
+    let lock = gemfile_lock::parse(&text);
+    let gem_sections: Vec<&Section<'_>> = lock.gem_sections().collect();
+    let mut out = Vec::new();
+    for section in &gem_sections {
+        let remotes: Vec<&str> = section.remote_bases().collect();
+        for spec in section.specs.iter().filter_map(|line| line.parsed) {
+            // Platform-suffixed specs are unsupported for vendoring anyway.
+            if spec.platform.is_some() {
+                continue;
             }
-            continue;
-        }
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
-        match section {
-            "GEM" => {
-                if indent == 2 {
-                    if let Some(r) = trimmed.strip_prefix("remote:") {
-                        let r = r.trim().trim_end_matches('/');
-                        if !r.is_empty() {
-                            if let Some(remotes) = section_remotes.last_mut() {
-                                remotes.push(r.to_string());
-                            }
-                        }
-                    }
-                    in_specs = trimmed == "specs:";
-                } else if in_specs && indent == 4 {
-                    if let Some((name, version)) = parse_gem_spec_line(trimmed) {
-                        specs.push((name, version, section_remotes.len() - 1));
-                    }
+            let Some(purl) = simple_purl("gem", spec.name, spec.version) else {
+                continue;
+            };
+            let (name, version) = (spec.name, spec.version);
+            let integrity = lock.integrity(name, version).unwrap_or(LockIntegrity::None);
+            let resolved = match remotes.as_slice() {
+                [base] => gem_download_url(base, name, version),
+                // No remote (a missing `remote:` line defaults to rubygems.org
+                // ONLY when the whole lock has one remote-less GEM section —
+                // the pre-multisource shape) or several remotes: fail closed.
+                [] if gem_sections.len() == 1 => {
+                    gem_download_url("https://rubygems.org", name, version)
                 }
-            }
-            "CHECKSUMS" => {
-                // `  name (version) sha256=hex`
-                if let Some((spec_part, hash_part)) =
-                    trimmed.rsplit_once(" sha256=").map(|(s, h)| (s, h.trim()))
-                {
-                    if let Some((name, version)) = parse_gem_spec_line(spec_part) {
-                        if is_hex_of_len(hash_part, 64) {
-                            checksums.insert((name, version), hash_part.to_ascii_lowercase());
-                        }
-                    }
-                }
-            }
-            _ => {}
+                _ => None,
+            };
+            out.push(LockfileEntry {
+                ecosystem: "gem",
+                source_kind: SourceKind::Unspecified,
+                purl,
+                resolved,
+                name: name.to_string(),
+                version: version.to_string(),
+                integrity,
+            });
         }
     }
-    if specs.is_empty() {
+    if out.is_empty() {
         return None;
     }
-    let mut out = Vec::new();
-    for (name, version, sec) in specs {
-        if !path_safety::is_safe_single_segment(&name)
-            || !path_safety::is_safe_single_segment(&version)
-        {
-            continue;
-        }
-        let integrity = checksums
-            .get(&(name.clone(), version.clone()))
-            .map(|h| LockIntegrity::Sha256Hex(h.clone()))
-            .unwrap_or(LockIntegrity::None);
-        let resolved = match section_remotes.get(sec).map(Vec::as_slice) {
-            Some([base]) => http_url(&format!("{base}/downloads/{name}-{version}.gem")),
-            // No remote (a missing `remote:` line defaults to rubygems.org
-            // ONLY when the whole lock has one remote-less GEM section —
-            // the pre-multisource shape) or several remotes: fail closed.
-            Some([]) if section_remotes.len() == 1 => http_url(&format!(
-                "https://rubygems.org/downloads/{name}-{version}.gem"
-            )),
-            _ => None,
-        };
-        out.push(LockfileEntry {
-            ecosystem: "gem",
-            purl: format!("pkg:gem/{name}@{version}"),
-            resolved,
-            name,
-            version,
-            integrity,
-        });
-    }
-    Some(dedup_prefer_integrity(out))
+    Some(out)
 }
 
-/// `name (version)` → parts; platform-suffixed versions (`1.2.3-x86_64…`)
-/// and dependency lines (no parens / range operators) yield `None`.
-fn parse_gem_spec_line(line: &str) -> Option<(String, String)> {
-    let (name, rest) = line.split_once(" (")?;
-    let version = rest.strip_suffix(')')?;
-    if name.is_empty()
-        || version.is_empty()
-        || version.contains(' ')
-        || version.contains('-')
-        || !version.chars().next().is_some_and(|c| c.is_ascii_digit())
-    {
-        return None;
-    }
-    Some((name.to_string(), version.to_string()))
+/// Where a rubygems-compatible registry at `base` (no trailing `/`) serves
+/// `name`-`version`'s `.gem` — the inventory's resolved URL and ledger
+/// recovery's fetch URL. `None` for a non-http(s) base.
+pub(super) fn gem_download_url(base: &str, name: &str, version: &str) -> Option<String> {
+    http_url(&format!("{base}/downloads/{name}-{version}.gem"))
 }
 
 /// The DISTINCT `GEM remote:` bases across ALL GEM sections of the
@@ -145,24 +105,9 @@ pub(super) async fn gem_remotes(project_root: &Path) -> Vec<String> {
     let Ok(text) = read_regular_to_string(&project_root.join("Gemfile.lock")).await else {
         return Vec::new();
     };
-    let mut out: Vec<String> = Vec::new();
-    let mut in_gem = false;
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if !line.starts_with(' ') {
-            in_gem = line.trim_end() == "GEM";
-            continue;
-        }
-        if in_gem {
-            if let Some(rest) = line.trim().strip_prefix("remote:") {
-                let url = rest.trim().trim_end_matches('/').to_string();
-                if !url.is_empty() && !out.contains(&url) {
-                    out.push(url);
-                }
-            }
-        }
-    }
-    out
+    let lock = gemfile_lock::parse(&text);
+    lock.gem_remote_bases()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
