@@ -75,7 +75,7 @@ pub struct VendorContext {
 /// Walk the manifest and bucket each PURL into `applied` / `failed`.
 ///
 /// `package_paths` is the CLI-supplied `purl -> on-disk package dir`
-/// map (from `find_packages_for_purls`). A PURL absent from the map is
+/// map (the CLI's `find_manifest_package_paths`). A PURL absent from the map is
 /// recorded as `package_not_found` and ends up in `failed`.
 pub async fn applied_patches(
     manifest: &PatchManifest,

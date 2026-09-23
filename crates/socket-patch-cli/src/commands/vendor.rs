@@ -878,12 +878,12 @@ pub(crate) async fn vendor_records(
         global: common.global,
         global_prefix: common.global_prefix.clone(),
     };
-    // Resolve installed packages with the qualified-purl-aware resolver, NOT
-    // `find_packages_for_purls`: the manifest keys release-variant ecosystems
-    // (gem `?platform=`, pypi `?artifact_id=`, maven `?classifier=&ext=`) by
-    // *qualified* purls, but the crawler only knows the *base* purl.
-    // `find_packages_for_purls` keys the result map by the base purl, so the
-    // `missing`/`contains_key` check below would miss every installed
+    // Resolve installed packages with the qualified-purl-aware resolver, never
+    // a base-keyed one: the manifest keys release-variant ecosystems (gem
+    // `?platform=`, pypi `?artifact_id=`, maven `?classifier=&ext=`) by
+    // *qualified* purls, but the crawler only knows the *base* purl. A
+    // base-keyed result map would make the `missing`/`contains_key` check
+    // below miss every installed
     // qualified-purl package and falsely classify it "not installed" —
     // triggering a spurious `vendor_fetched_missing`, a redundant per-run
     // registry download, and (for gem) a HashMap-order platform coin-flip.

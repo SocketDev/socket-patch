@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
-use socket_patch_core::api::client::{ApiClient, ApiClientEnvOverrides};
+use socket_patch_core::api::client::{
+    resolve_ambient_credentials, ApiClient, ApiClientEnvOverrides,
+};
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::vendor::{VendorServiceConfig, VendorSource};
@@ -364,6 +366,20 @@ impl GlobalArgs {
         }
     }
 
+    /// The `(api_token, org_slug)` telemetry is attributed with, resolved
+    /// through the API client's own credential chain (flag → the
+    /// `SOCKET_NO_API_TOKEN` veto → env → `socket login` config) WITHOUT
+    /// building a client. For the purely local commands (`list`, `setup`,
+    /// `vex`): a client would add the org-slug auto-resolve round-trip and
+    /// the "No SOCKET_API_TOKEN set" advisory to a command that needs
+    /// neither, while anything less than the full chain reported a
+    /// `socket login`-only caller's events anonymously to the public proxy
+    /// — off the on-prem host every other command reports to.
+    pub(crate) fn telemetry_credentials(&self) -> (Option<String>, Option<String>) {
+        let overrides = self.api_client_overrides();
+        resolve_ambient_credentials(overrides.api_token, overrides.org_slug)
+    }
+
     /// The vendoring-service config every vendor entry point (`vendor`,
     /// `scan`/`get --mode vendored`) builds from the same flags —
     /// `--vendor-source` / `--vendor-url` / `--patch-server-url` /
@@ -606,11 +622,12 @@ mod tests {
     }
 
     /// Clear the extra env the core telemetry gate reads beyond the
-    /// `SOCKET_*` set (`is_telemetry_disabled` also consults the legacy
+    /// `SOCKET_*` set (`is_telemetry_disabled` also consults `VITEST` — the
+    /// kill-switch socket-cli's vitest suite relies on — and the legacy
     /// `SOCKET_PATCH_TELEMETRY_DISABLED` name), so the airgap tests below
     /// can't pass or fail vacuously. Restores afterwards.
     fn with_clean_telemetry_env(f: impl FnOnce()) {
-        with_env_cleared(&["SOCKET_PATCH_TELEMETRY_DISABLED"], f);
+        with_env_cleared(&["VITEST", "SOCKET_PATCH_TELEMETRY_DISABLED"], f);
     }
 
     /// `--offline` promises "never contact the network", but the telemetry
@@ -1082,6 +1099,37 @@ mod tests {
         );
         assert!(o.api_token.is_none());
         assert!(o.org_slug.is_none());
+    }
+
+    /// Telemetry attribution runs the client's credential chain over the
+    /// same overrides: explicit values — the flag, or the env var clap folds
+    /// into the same field — are used verbatim, and empty means "unset"
+    /// (`Some("")` would build a malformed `/v0/orgs//telemetry` URL and an
+    /// empty `Bearer ` header). The ambient layers below the flags are
+    /// pinned in core (`resolve_ambient_credentials_*`) and end-to-end by
+    /// `tests/cli_config_fallback.rs::list_telemetry_follows_socket_cli_login`.
+    #[test]
+    fn telemetry_credentials_prefer_explicit_values_and_treat_empty_as_unset() {
+        let explicit = GlobalArgs {
+            api_token: Some("sktsec_flag_api".to_string()),
+            org: Some("flag-org".to_string()),
+            ..GlobalArgs::default()
+        };
+        assert_eq!(
+            explicit.telemetry_credentials(),
+            (
+                Some("sktsec_flag_api".to_string()),
+                Some("flag-org".to_string())
+            )
+        );
+        let empty = GlobalArgs {
+            api_token: Some(String::new()),
+            org: Some(String::new()),
+            ..GlobalArgs::default()
+        };
+        let (api_token, org_slug) = empty.telemetry_credentials();
+        assert_ne!(api_token.as_deref(), Some(""));
+        assert_ne!(org_slug.as_deref(), Some(""));
     }
 
     /// Empty strings for url/token/org are filtered out, not forwarded as

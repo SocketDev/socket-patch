@@ -846,10 +846,11 @@ async fn repair_telemetry_attributed_to_env_credentials() {
     std::env::set_var("SOCKET_ORG_SLUG", ORG);
     // The telemetry kill-switch must not be ambiently on, or the oracle
     // below would fail for the wrong reason (`is_telemetry_disabled`
-    // reads these at runtime).
+    // reads these at runtime — `VITEST=true` included).
     std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
     std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
     std::env::remove_var("SOCKET_OFFLINE");
+    std::env::remove_var("VITEST");
     let code = repair_run(make_repair_args(tmp.path(), "file")).await;
     std::env::remove_var("SOCKET_API_URL");
     std::env::remove_var("SOCKET_API_TOKEN");

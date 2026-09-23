@@ -1112,9 +1112,9 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
     };
     // Ledger keys are the manifest spelling — QUALIFIED for release-variant
     // ecosystems (gem `?platform=`, pypi `?artifact_id=`, maven
-    // `?classifier=&ext=`) — while the crawler knows only base purls.
-    // `find_packages_for_purls` keys its result by the base purl, so the
-    // `contains_key(&c.purl)` checks below would miss every installed
+    // `?classifier=&ext=`) — while the crawler knows only base purls. A
+    // base-keyed result map would make the `contains_key(&c.purl)` checks
+    // below miss every installed
     // qualified-key package and fall through to a needless registry fetch
     // (or, offline, a spurious unrepairable / fingerprint-less restore).
     // The rollback variant fans each base path back out to every qualified

@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::ecosystem_dispatch::find_manifest_package_paths;
-use crate::output::stdin_is_tty;
+use crate::output::{read_yes_no, stdin_is_tty};
 
 /// Stringify the detected npm-family manager for telemetry.
 fn manager_name(pm: PackageManager) -> &'static str {
@@ -187,15 +187,8 @@ fn confirm_proceed(prompt: &str) -> bool {
     io::stdout()
         .flush()
         .expect("failed to write the confirmation prompt to stdout");
-    let mut answer = String::new();
-    if io::stdin().read_line(&mut answer).is_err() {
-        // Terminals can deliver non-UTF-8 bytes (e.g. a Latin-1 paste);
-        // `read_line` reports those as InvalidData. Treat any read
-        // failure like an unrecognized answer (abort), not a panic.
-        return false;
-    }
-    let answer = answer.trim().to_lowercase();
-    answer == "y" || answer == "yes"
+    // Only an explicit yes proceeds: empty and unreadable answers abort.
+    read_yes_no() == Some(true)
 }
 
 /// Whether an ecosystem is in scope for this run, honoring the global
@@ -642,22 +635,39 @@ async fn discover_gem_project(common: &GlobalArgs) -> Option<gem::BundlerProject
     gem::discover_bundler_project(&common.cwd).await
 }
 
+/// The gem project a setup run wires, paired with the run's ONE bundler
+/// probe (a `Gemfile.lock` read, or a `bundle --version` spawn bounded by
+/// its timeout): the preview and the real edit share both, so the probe
+/// runs at most once per run.
+async fn discover_gem_target(
+    common: &GlobalArgs,
+) -> Option<(gem::BundlerProject, gem::BundlerProbe)> {
+    let project = discover_gem_project(common).await?;
+    let probe = gem::probe_bundler(&project).await;
+    Some((project, probe))
+}
+
+/// What the gem branch does to a project.
+enum GemEdit<'a> {
+    /// Wire the plugin; `add_plugin_directive_with` refuses below the
+    /// bundler floor, judged from the run's probe.
+    Add(&'a gem::BundlerProbe),
+    /// Unwire. Deliberately ungated and never probes: it is the recovery
+    /// path for an already-wired bundler-1.x project.
+    Remove,
+}
+
 /// Build the gem branch's contribution to a setup/remove run: add (or remove)
 /// the managed `plugin "socket-patch"` block in the Gemfile + the generated
-/// `.socket/bundler-plugin/` plugin files. `project` comes from
-/// [`discover_gem_project`] and `probe` from ONE `gem::probe_bundler` per
-/// run, so the preview and the real edit spawn `bundle --version` at most
-/// once between them. `probe` is `None` on the remove path:
-/// `remove_plugin_directive` is deliberately ungated (it is the recovery
-/// path for an already-wired bundler-1.x project) and never probes.
+/// `.socket/bundler-plugin/` plugin files. `target` is the discovered project
+/// with the edit to make ([`discover_gem_target`] pairs the add path with the
+/// run's one probe); `None` when the project has no Gemfile.
 async fn build_gem_outcome(
     common: &GlobalArgs,
-    project: Option<&gem::BundlerProject>,
-    probe: Option<&gem::BundlerProbe>,
-    remove: bool,
+    target: Option<(&gem::BundlerProject, GemEdit<'_>)>,
     dry_run: bool,
 ) -> SetupOutcome {
-    let Some(project) = project else {
+    let Some((project, edit)) = target else {
         return SetupOutcome::default();
     };
 
@@ -666,10 +676,10 @@ async fn build_gem_outcome(
         ..Default::default()
     };
 
-    let results = match (remove, probe) {
-        (true, _) => gem::remove_plugin_directive(project, dry_run).await,
-        (false, Some(probe)) => gem::add_plugin_directive_with(project, probe, dry_run).await,
-        (false, None) => gem::add_plugin_directive(project, dry_run).await,
+    let remove = matches!(edit, GemEdit::Remove);
+    let results = match edit {
+        GemEdit::Add(probe) => gem::add_plugin_directive_with(project, probe, dry_run).await,
+        GemEdit::Remove => gem::remove_plugin_directive(project, dry_run).await,
     };
 
     let mut added_paths: Vec<String> = Vec::new();
@@ -1230,7 +1240,12 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     // removal below share them.
     let gem_project = discover_gem_project(common).await;
     let composer_json = discover_composer_json(common).await;
-    let gem_preview = build_gem_outcome(common, gem_project.as_ref(), None, true, true).await;
+    let gem_preview = build_gem_outcome(
+        common,
+        gem_project.as_ref().map(|p| (p, GemEdit::Remove)),
+        true,
+    )
+    .await;
     let composer_preview =
         build_composer_outcome(common, composer_json.as_deref(), true, true).await;
     if npm_files.is_empty()
@@ -1341,7 +1356,12 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     // Real gem + composer removal (gem Gemfile `plugin` block + generated plugin
     // dir; composer.json script-event command).
     let extra_results = merge_outcomes(
-        build_gem_outcome(common, gem_project.as_ref(), None, true, false).await,
+        build_gem_outcome(
+            common,
+            gem_project.as_ref().map(|p| (p, GemEdit::Remove)),
+            false,
+        )
+        .await,
         build_composer_outcome(common, composer_json.as_deref(), true, false).await,
     );
 
@@ -1637,18 +1657,13 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     let excludes = effective_excludes(manifest_view(&existing), &args.exclude);
     let npm_files = discover(args, &excludes).await;
     let py_plan = plan_python(common).await;
-    // Gem + Composer projects are discovered ONCE and bundler probed ONCE (a
-    // Gemfile.lock read, or a `bundle --version` spawn bounded by its
-    // timeout): the preview and the real edit below share both.
-    let gem_project = discover_gem_project(common).await;
-    let gem_probe = match &gem_project {
-        Some(project) => Some(gem::probe_bundler(project).await),
-        None => None,
-    };
+    // Gem + Composer projects are discovered ONCE and bundler probed ONCE:
+    // the preview and the real edit below share both.
+    let gem = discover_gem_target(common).await;
+    let gem_add = || gem.as_ref().map(|(project, probe)| (project, GemEdit::Add(probe)));
     let composer_json = discover_composer_json(common).await;
     // Gem + Composer previews (dry-run); `.present` also tells us each project exists.
-    let gem_preview =
-        build_gem_outcome(common, gem_project.as_ref(), gem_probe.as_ref(), false, true).await;
+    let gem_preview = build_gem_outcome(common, gem_add(), true).await;
     let composer_preview =
         build_composer_outcome(common, composer_json.as_deref(), false, true).await;
 
@@ -1818,7 +1833,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     // Real gem + composer edits (gem Gemfile `plugin` block + generated plugin
     // dir; composer.json script-event command).
     let extra_results = merge_outcomes(
-        build_gem_outcome(common, gem_project.as_ref(), gem_probe.as_ref(), false, false).await,
+        build_gem_outcome(common, gem_add(), false).await,
         build_composer_outcome(common, composer_json.as_deref(), false, false).await,
     );
 
@@ -1918,7 +1933,7 @@ async fn track_setup_success(
     npm_pm: PackageManager,
 ) {
     let manager = telemetry_manager_str(npm, py, gem, composer, npm_pm);
-    let (token, org) = crate::commands::list::telemetry_credentials(common);
+    let (token, org) = common.telemetry_credentials();
     track_patch_setup(&manager, token.as_deref(), org.as_deref()).await;
 }
 

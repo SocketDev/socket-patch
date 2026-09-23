@@ -1086,18 +1086,24 @@ pub async fn get_api_client_from_env(org_slug: Option<&str>) -> (ApiClient, bool
     .await
 }
 
-/// Like [`get_api_client_from_env`] but with explicit overrides for every
-/// env-driven knob. Each `Some(value)` in `overrides` wins over the
-/// corresponding env var. Used by CLI commands that expose `--api-url`,
-/// `--api-token`, `--org`, `--proxy-url` flags via [`crate::utils`] in the
-/// CLI crate.
-pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> (ApiClient, bool) {
-    // Per-key fallback chain: explicit override (CLI flag) → env var →
-    // socket-cli config file → built-in default. Empty strings mean
-    // "unset" at every layer. `SOCKET_NO_API_TOKEN` vetoes the *ambient*
-    // token sources (env + config) so unauthenticated behavior can be
-    // forced without unsetting anything; an explicit override still wins.
-    let api_token = overrides.api_token.filter(|t| !t.is_empty()).or_else(|| {
+/// The credential half of the client's fallback chain, on its own: the
+/// `(api_token, org_slug)` a run authenticates and attributes telemetry
+/// with. Per key: explicit override (CLI flag) → env var (`SOCKET_API_TOKEN`
+/// / `SOCKET_ORG_SLUG`) → socket-cli config file (`socket login`'s
+/// `apiToken` / `defaultOrg`). Empty strings mean "unset" at every layer.
+/// `SOCKET_NO_API_TOKEN` vetoes the *ambient* token sources (env + config)
+/// so unauthenticated behavior can be forced without unsetting anything; an
+/// explicit override still wins. Each config hit is echoed in `--debug`.
+///
+/// Shared by [`get_api_client_with_overrides`] and by the purely local
+/// commands (`list`) that report telemetry without building a client — the
+/// two must resolve identically, or a `socket login`-only caller's events
+/// land on the public proxy instead of their org.
+pub fn resolve_ambient_credentials(
+    api_token: Option<String>,
+    org_slug: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let api_token = api_token.filter(|t| !t.is_empty()).or_else(|| {
         if socket_cli_config::no_api_token_veto() {
             debug_log("api token: suppressed by SOCKET_NO_API_TOKEN");
             return None;
@@ -1113,8 +1119,7 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
                     })
             })
     });
-    let resolved_org_slug = overrides
-        .org_slug
+    let org_slug = org_slug
         .filter(|s| !s.is_empty())
         // Treat an empty slug as "not provided" (mirroring the api_token
         // handling above). Otherwise `SOCKET_ORG_SLUG=""` would be taken as
@@ -1132,6 +1137,17 @@ pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> 
                     debug_log(&format!("org slug: `{slug}` from socket-cli config"));
                 })
         });
+    (api_token, org_slug)
+}
+
+/// Like [`get_api_client_from_env`] but with explicit overrides for every
+/// env-driven knob. Each `Some(value)` in `overrides` wins over the
+/// corresponding env var. Used by CLI commands that expose `--api-url`,
+/// `--api-token`, `--org`, `--proxy-url` flags via [`crate::utils`] in the
+/// CLI crate.
+pub async fn get_api_client_with_overrides(overrides: ApiClientEnvOverrides) -> (ApiClient, bool) {
+    let (api_token, resolved_org_slug) =
+        resolve_ambient_credentials(overrides.api_token, overrides.org_slug);
 
     if api_token.is_none() {
         let proxy_url = overrides
@@ -1621,6 +1637,54 @@ mod tests {
         }
         assert!(use_public_proxy, "vetoed env token must select the proxy");
         assert!(client.api_token.is_none());
+    }
+
+    /// Explicit values — the flag, or the env var the CLI folds into the
+    /// same field — are used verbatim, never overridden by a lower layer.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_ambient_credentials_prefers_explicit_values() {
+        assert_eq!(
+            resolve_ambient_credentials(
+                Some("sktsec_flag_api".to_string()),
+                Some("flag-org".to_string())
+            ),
+            (
+                Some("sktsec_flag_api".to_string()),
+                Some("flag-org".to_string())
+            )
+        );
+    }
+
+    /// Empty means "unset" repo-wide, so an empty value must never be
+    /// forwarded: `Some("")` would build a malformed `/v0/orgs//telemetry`
+    /// URL and an empty `Bearer ` header.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_ambient_credentials_treats_empty_as_unset() {
+        let (api_token, org_slug) =
+            resolve_ambient_credentials(Some(String::new()), Some(String::new()));
+        assert_ne!(api_token.as_deref(), Some(""));
+        assert_ne!(org_slug.as_deref(), Some(""));
+    }
+
+    /// The veto suppresses the ambient token layers (env here) but leaves an
+    /// explicit token — and the org, which it never governs — alone.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_ambient_credentials_veto_drops_only_ambient_tokens() {
+        let saved_token = std::env::var("SOCKET_API_TOKEN").ok();
+        std::env::set_var("SOCKET_API_TOKEN", "sktsec_ambient_api");
+        std::env::set_var("SOCKET_NO_API_TOKEN", "1");
+        let vetoed = resolve_ambient_credentials(None, Some("org".to_string()));
+        let explicit = resolve_ambient_credentials(Some("sktsec_flag_api".to_string()), None);
+        std::env::remove_var("SOCKET_NO_API_TOKEN");
+        match saved_token {
+            Some(v) => std::env::set_var("SOCKET_API_TOKEN", v),
+            None => std::env::remove_var("SOCKET_API_TOKEN"),
+        }
+        assert_eq!(vetoed, (None, Some("org".to_string())));
+        assert_eq!(explicit.0.as_deref(), Some("sktsec_flag_api"));
     }
 
     /// An explicit override (the `--api-token` flag) survives the veto —

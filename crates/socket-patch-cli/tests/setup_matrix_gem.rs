@@ -395,6 +395,11 @@ mod host_guard {
             "socket-patch was the only registered plugin: the emptied index \
              must be deleted, not left as an all-empty husk"
         );
+        assert!(
+            !root.join(".socket").exists(),
+            "remove must prune the emptied .socket/ (nothing else lived there): \
+             --remove restores the pre-setup tree"
+        );
 
         // ── check (after remove): needs_configuration again, exit 1 ─────────
         let (code, out, _) = run(root, &["setup", "--check", "--cwd", root_s, "--json"]);

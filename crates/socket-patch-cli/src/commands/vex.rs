@@ -547,7 +547,7 @@ async fn generate_vex(
     ) {
         Some(doc) => doc,
         None => {
-            let (token, org) = crate::commands::list::telemetry_credentials(common);
+            let (token, org) = common.telemetry_credentials();
             track_vex_failed("no_applicable_patches", token.as_deref(), org.as_deref()).await;
             // When nothing attested and EVERY omission was the property-7
             // filter, say so: those patches ARE applied with vulnerability
@@ -613,7 +613,7 @@ async fn generate_vex(
         }
     };
 
-    let (token, org) = crate::commands::list::telemetry_credentials(common);
+    let (token, org) = common.telemetry_credentials();
     track_vex_generated(
         doc.statements.len(),
         "openvex-0.2.0",
@@ -788,7 +788,7 @@ async fn augment_with_redirect(
 /// `list`/`setup` (flag / env / socket-cli `config.json`), not the raw
 /// flags — a `socket login`-only user must not report anonymously.
 async fn fail(common: &GlobalArgs, code: &'static str, message: String) -> VexGenError {
-    let (token, org) = crate::commands::list::telemetry_credentials(common);
+    let (token, org) = common.telemetry_credentials();
     track_vex_failed(code, token.as_deref(), org.as_deref()).await;
     VexGenError {
         code,

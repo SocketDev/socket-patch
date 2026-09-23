@@ -1,13 +1,12 @@
 //! `get` must forward its API-client flags into the nested `apply` step.
 //!
-//! `get` drives `apply` in-process (`get.rs::run_nested_apply`). That step
-//! builds its OWN `ApiClient` from the `GlobalArgs` it is handed
-//! (`apply.rs` → `fetch_stage::stage_patch_sources` →
-//! `get_api_client_with_overrides(common.api_client_overrides())`), so any
-//! `--api-url` / `--api-token` / `--org` / `--proxy-url` the caller passed on
-//! the COMMAND LINE has to be threaded through. Regression guard: the nested
-//! `ApplyArgs` was built from `GlobalArgs::default()`, whose api fields are
-//! all `None` — the nested apply silently fell back to env-var / config /
+//! `get` drives `apply` in-process (`get.rs::run_nested_apply` →
+//! `apply::run_locked`) on the ONE `ApiClient` the `get` run built from its
+//! flags, so any `--api-url` / `--api-token` / `--org` / `--proxy-url` the
+//! caller passed on the COMMAND LINE must reach the nested apply's blob
+//! fetch through that client. Regression guard: the nested apply once built
+//! its own client from `ApplyArgs` made of `GlobalArgs::default()`, whose
+//! api fields are all `None` — it silently fell back to env-var / config /
 //! built-in-default resolution and never saw the user's flags.
 //!
 //! Reachable whenever the patch view does not embed `blobContent` for every

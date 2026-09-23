@@ -14,7 +14,7 @@ use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants};
-use socket_patch_core::patch::apply_lock::{self, LockError};
+use socket_patch_core::patch::apply_lock::{self, LockError, LockGuard};
 use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use socket_patch_core::utils::purl::{
     canonical_purl, is_purl, normalize_purl, strip_purl_qualifiers,
@@ -718,10 +718,11 @@ pub struct DownloadParams {
     pub silent: bool,
     /// `--download-mode` value forwarded to the apply step.
     pub download_mode: String,
-    /// API client overrides — propagates the caller's CLI flags
-    /// (`--api-url`, `--api-token`, `--proxy-url`) into the nested API
-    /// client constructed here. Without this, `download_and_apply_patches`
-    /// would only honor env vars and ignore the user's flags.
+    /// The API-client flags (`--api-url`, `--api-token`, `--org`,
+    /// `--proxy-url`) the run's client was built from. The engines consume
+    /// the caller's client ([`DownloadRun`]) — the nested apply included —
+    /// so this is read only by a `params`-alone driver (the in-file engine
+    /// tests) building that same client.
     pub api_overrides: socket_patch_core::api::client::ApiClientEnvOverrides,
     /// When `false` (the default — narrow), a PyPI package with multiple
     /// release variants (`?artifact_id=...`) is filtered down to the one
@@ -774,9 +775,10 @@ impl DownloadParams {
 /// included, so the engines never rebuild it from flags and repeat the org
 /// auto-resolve round-trip — and the flags the nested apply must inherit.
 pub struct DownloadRun<'a> {
+    /// The run's one API client; the nested apply runs on it too.
     pub api_client: &'a ApiClient,
-    /// `--lock-timeout`: the wait budget for the manifest-write lock here
-    /// and for the nested apply's own acquire.
+    /// `--lock-timeout`: the wait budget for the apply lock, taken once
+    /// around the manifest write and the nested apply.
     pub lock_timeout: Option<u64>,
     /// `--verbose`, forwarded to the nested apply.
     pub verbose: bool,
@@ -1223,30 +1225,17 @@ fn fold_narrowing_into_result(
     }
 }
 
-/// The API-client overrides for a download run: the caller's CLI flags with
-/// the override org slug defaulted to `--org` when none was given.
-///
-/// Shared by the client the plain engine wrappers build AND by the nested
-/// `apply` step, which constructs its own client and must resolve to the
-/// same endpoint/token — see [`nested_apply_args_from_params`].
-fn resolved_api_overrides(
-    params: &DownloadParams,
-) -> socket_patch_core::api::client::ApiClientEnvOverrides {
+/// Build the API client for a download run driven without a run-level
+/// client — the shape the retired 2-arg `download_*` wrappers had; kept
+/// for the in-file engine unit tests below, which drive `params` alone.
+/// `--org` fills a missing override org, as `get`'s own client build does.
+#[cfg(test)]
+async fn api_client_for(params: &DownloadParams) -> ApiClient {
     let mut overrides = params.api_overrides.clone();
     if overrides.org_slug.is_none() {
         overrides.org_slug = params.org.clone();
     }
-    overrides
-}
-
-/// Build the API client for a download run driven without a run-level
-/// client — the shape the retired 2-arg `download_*` wrappers had; kept
-/// for the in-file engine unit tests below, which drive `params` alone.
-#[cfg(test)]
-async fn api_client_for(params: &DownloadParams) -> ApiClient {
-    get_api_client_with_overrides(resolved_api_overrides(params))
-        .await
-        .0
+    get_api_client_with_overrides(overrides).await.0
 }
 
 /// Which state store the shared fetch loop classifies each selected patch
@@ -1691,10 +1680,10 @@ async fn warn_on_vendored_uuid_drift(
 }
 
 /// The `GlobalArgs` a nested apply runs with: the caller's flags verbatim
-/// (`--lock-timeout`, `--verbose`, `--strict`, the API flags, `--ecosystems`
-/// … all flow through — apply builds its own clients from these, so a token
-/// supplied purely as a flag must reach it), with the fields `get` owns
-/// overridden: the already-resolved manifest path (apply re-resolves a
+/// (`--verbose`, `--strict`, `--ecosystems`, `--download-mode` … all flow
+/// through; the API flags ride along but are inert — the nested apply runs
+/// on the caller's client), with the fields `get` owns overridden: the
+/// already-resolved manifest path (apply re-resolves a
 /// relative path against ITS `--cwd`, which double-joins ours — absolutize
 /// so it passes through verbatim), `silent` = quiet and `json: false` (the
 /// nested apply must never print a second JSON document), and `dry_run:
@@ -1713,25 +1702,20 @@ fn nested_apply_args(common: &GlobalArgs, manifest_path: &Path, quiet: bool) -> 
 }
 
 /// The caller flags a `DownloadParams` + [`DownloadRun`] pair reconstructs
-/// for the nested apply (the engine never sees a `GlobalArgs`). The API
-/// fields come from [`resolved_api_overrides`] so the nested apply resolves
-/// to the same endpoint/token as the download.
+/// for the nested apply (the engine never sees a `GlobalArgs`). No API
+/// fields: the nested apply runs on the run's client (`run.api_client`),
+/// which was built from the caller's flags.
 fn nested_apply_args_from_params(
     params: &DownloadParams,
     run: &DownloadRun<'_>,
     manifest_path: &Path,
 ) -> GlobalArgs {
-    let api = resolved_api_overrides(params);
     let common = GlobalArgs {
         cwd: params.cwd.clone(),
         global: params.global,
         global_prefix: params.global_prefix.clone(),
         download_mode: params.download_mode.clone(),
         strict: params.strict,
-        api_url: api.api_url,
-        api_token: api.api_token,
-        org: api.org_slug,
-        proxy_url: api.proxy_url,
         // Scope the nested apply like the caller was scoped: leaving this
         // at the default `None` made `scan --ecosystems gem --sync` apply
         // the WHOLE manifest, mutating other ecosystems' packages the user
@@ -1744,21 +1728,29 @@ fn nested_apply_args_from_params(
     nested_apply_args(&common, manifest_path, params.quiet())
 }
 
-/// Run the nested `apply` step with `common` (see [`nested_apply_args`]).
-/// Returns whether apply exited 0. Callers print their own "Applying
-/// patches..." line (they differ on stdout vs stderr). The read-only
-/// cargo-redirect verifier stays off and embedded VEX is opt-in on the
-/// top-level command only, never on this internal invocation. The caller
-/// must have released its own apply lock first: apply acquires its own,
-/// and a same-process re-acquire contends.
-async fn run_nested_apply(common: GlobalArgs, quiet: bool) -> bool {
+/// Run the nested `apply` step with `common` (see [`nested_apply_args`])
+/// on the caller's `client`, under the apply `lock` the caller took for
+/// its manifest write — one lock window for download → manifest write →
+/// apply (a same-process re-acquire would contend), released by apply once
+/// its last mutation is done. Returns whether apply exited 0. Callers print
+/// their own "Applying patches..." line (they differ on stdout vs stderr).
+/// The read-only cargo-redirect verifier stays off and embedded VEX is
+/// opt-in on the top-level command only, never on this internal
+/// invocation.
+async fn run_nested_apply(
+    common: GlobalArgs,
+    quiet: bool,
+    client: &ApiClient,
+    lock: LockGuard,
+) -> bool {
+    let manifest_path = common.resolved_manifest_path();
     let apply_args = super::apply::ApplyArgs {
         common,
         force: false,
         check: false,
         vex: Default::default(),
     };
-    let code = super::apply::run(apply_args).await;
+    let code = super::apply::run_locked(apply_args, manifest_path, client, lock).await;
     if code != 0 && !quiet {
         eprintln!("\nSome patches could not be applied.");
     }
@@ -1786,9 +1778,8 @@ pub async fn download_and_apply_patches_with(
     // it, and an unlocked writer here lost their update or had its own
     // record clobbered. `acquire` creates `.socket/` itself; the guard's
     // drop removes `apply.lock` and prunes an otherwise-empty `.socket/`, so
-    // a run that records nothing leaves no residue. Released BEFORE the
-    // nested apply, which takes its own lock (a same-process re-acquire
-    // would contend).
+    // a run that records nothing leaves no residue. The nested apply runs
+    // under this SAME guard (one lock window; see `run_nested_apply`).
     let guard = match apply_lock::acquire(&socket_dir, lock_timeout) {
         Ok(guard) => guard,
         Err(e) => return (1, report_lock_failure(params.json, &e, lock_timeout)),
@@ -1857,7 +1848,15 @@ pub async fn download_and_apply_patches_with(
             return (1, err_json);
         }
     }
-    drop(guard);
+    // The lock outlives the manifest write only when a nested apply follows
+    // (it is handed the guard and releases it after its last mutation);
+    // otherwise nothing more is written and it is released here.
+    let apply_lock = if !params.save_only && downloaded > 0 {
+        Some(guard)
+    } else {
+        drop(guard);
+        None
+    };
 
     // Vendored-uuid drift: an explicit `get` is allowed to move the
     // manifest past the patch uuid the vendor ledger still wires (the user
@@ -1883,15 +1882,17 @@ pub async fn download_and_apply_patches_with(
         }
     }
 
-    // Auto-apply unless --save-only
+    // Auto-apply unless --save-only (the lock decision above).
     let mut apply_succeeded = false;
-    if !params.save_only && downloaded > 0 {
+    if let Some(lock) = apply_lock {
         if !quiet {
             eprintln!("\nApplying patches...");
         }
         apply_succeeded = run_nested_apply(
             nested_apply_args_from_params(params, run, &manifest_path),
             quiet,
+            run.api_client,
+            lock,
         )
         .await;
     }
@@ -2093,14 +2094,16 @@ pub async fn run(args: GetArgs) -> i32 {
                     telemetry_org.as_deref(),
                 )
                 .await;
-                // Mode dispatch. All three reuse THIS fetched patch (and,
-                // for hosted, this possibly-proxy-fallback client) rather
-                // than re-fetching with a fresh client, which would re-hit
-                // the 401/403 the fallback just recovered from. An explicit
+                // Mode dispatch. All three reuse THIS fetched patch and
+                // this possibly-proxy-fallback client rather than
+                // re-fetching with a fresh one, which would re-hit the
+                // 401/403 the fallback just recovered from. An explicit
                 // UUID is exempt from installed narrowing (exact intent).
                 return match mode {
                     // Save to manifest and apply in place (today's flow).
-                    super::scan::ScanMode::Agent => save_and_apply_patch(&args, &patch).await,
+                    super::scan::ScanMode::Agent => {
+                        save_and_apply_patch(&args, &api_client, &patch).await
+                    }
                     super::scan::ScanMode::Hosted => {
                         let selected = vec![search_result_from_response(&patch)];
                         run_get_hosted(&args, &api_client, &selected, &[], &[]).await
@@ -2556,25 +2559,18 @@ fn display_search_results(patches: &[PatchSearchResult], can_access_paid: bool) 
 /// caller's client may have fallen back to the public proxy after a
 /// 401/403, and a fresh client would hit the same auth failure again. A
 /// same-uuid re-get writes nothing (matching the multi-patch engine's
-/// `skipped`); the lock is released on return, before the nested apply
-/// takes its own.
+/// `skipped`). Runs under the apply lock the caller (`save_and_apply_patch`)
+/// holds — the RMW must be serialized against `remove`/`rollback`, and the
+/// nested apply then runs under that same guard.
 ///
 /// Errors are reported here and surface as `Err(exit_code)`.
-async fn save_patch_record(args: &GetArgs, patch: &PatchResponse) -> Result<PatchAction, i32> {
-    let manifest_path = args.common.resolved_manifest_path();
-    let socket_dir = manifest_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
-    let lock_timeout = Duration::from_secs(args.common.lock_timeout.unwrap_or(0));
-    // See `download_and_apply_patches_with`: the RMW runs under the lock,
-    // which also creates `.socket/` and prunes it again when nothing lands.
-    let _guard = apply_lock::acquire(&socket_dir, lock_timeout).map_err(|e| {
-        report_lock_failure(args.common.json, &e, lock_timeout);
-        1
-    })?;
-
-    let mut manifest = match read_manifest(&manifest_path).await {
+async fn save_patch_record(
+    args: &GetArgs,
+    manifest_path: &Path,
+    socket_dir: &Path,
+    patch: &PatchResponse,
+) -> Result<PatchAction, i32> {
+    let mut manifest = match read_manifest(manifest_path).await {
         Ok(Some(m)) => m,
         Ok(None) => PatchManifest::new(),
         // Fail closed like the download flow: an unreadable manifest
@@ -2645,24 +2641,48 @@ async fn save_patch_record(args: &GetArgs, patch: &PatchResponse) -> Result<Patc
     manifest
         .patches
         .insert(patch.purl.clone(), build_patch_record(patch, files));
-    if let Err(e) = write_manifest(&manifest_path, &manifest).await {
+    if let Err(e) = write_manifest(manifest_path, &manifest).await {
         report_error(args.common.json, format!("Error writing manifest: {e}"));
         return Err(1);
     }
     Ok(action)
 }
 
-async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
+/// The uuid path's agent arm: record `patch` in the manifest and, unless
+/// `--save-only`, apply it — under ONE apply lock, on the `client` the
+/// fetch used (a fresh client could re-hit the 401/403 its proxy fallback
+/// just recovered from).
+async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchResponse) -> i32 {
     // Same "errors only" gate as `run` — informational prints respect
     // `--silent`; errors and the JSON envelope do not.
     let quiet = args.common.json || args.common.silent;
     let manifest_path = args.common.resolved_manifest_path();
+    let socket_dir = args.common.socket_dir();
+    let lock_timeout = Duration::from_secs(args.common.lock_timeout.unwrap_or(0));
+    // See `download_and_apply_patches_with`: the RMW runs under the lock,
+    // which also creates `.socket/` and prunes it again when nothing lands;
+    // an error return below drops the guard.
+    let guard = match apply_lock::acquire(&socket_dir, lock_timeout) {
+        Ok(guard) => guard,
+        Err(e) => {
+            report_lock_failure(args.common.json, &e, lock_timeout);
+            return 1;
+        }
+    };
 
-    let action = match save_patch_record(args, patch).await {
+    let action = match save_patch_record(args, &manifest_path, &socket_dir, patch).await {
         Ok(action) => action,
         Err(code) => return code,
     };
     let changed = action != PatchAction::Skipped;
+    // Carried into the nested apply when one follows (it releases the lock
+    // after its last mutation), released here otherwise.
+    let apply_lock = if !args.save_only && changed {
+        Some(guard)
+    } else {
+        drop(guard);
+        None
+    };
     let action_label = match &action {
         PatchAction::Added => "added",
         PatchAction::Updated { .. } => "updated",
@@ -2700,13 +2720,15 @@ async fn save_and_apply_patch(args: &GetArgs, patch: &PatchResponse) -> i32 {
     }
 
     let mut apply_succeeded = false;
-    if !args.save_only && changed {
+    if let Some(lock) = apply_lock {
         if !quiet {
             println!("\nApplying patches...");
         }
         apply_succeeded = run_nested_apply(
             nested_apply_args(&args.common, &manifest_path, quiet),
             quiet,
+            client,
+            lock,
         )
         .await;
     }
@@ -4273,10 +4295,8 @@ mod tests {
         );
     }
 
-    // --- resolved_api_overrides --------------------------------------------
-    // The org the nested client resolves to is behavior-bearing: an explicit
-    // override wins; otherwise `--org` (params.org) fills the gap.
-
+    /// Engine params with `--org` / an explicit override org, for the
+    /// nested-apply arg tests below.
     fn dl_params_for_org(org: Option<String>, org_slug: Option<String>) -> DownloadParams {
         DownloadParams {
             cwd: PathBuf::from("."),
@@ -4299,26 +4319,6 @@ mod tests {
             ecosystems: None,
             persist_blobs: false,
         }
-    }
-
-    #[test]
-    fn resolved_api_overrides_falls_back_to_params_org() {
-        let p = dl_params_for_org(Some("from-org".into()), None);
-        assert_eq!(
-            resolved_api_overrides(&p).org_slug.as_deref(),
-            Some("from-org"),
-            "a missing override org must fall back to --org"
-        );
-    }
-
-    #[test]
-    fn resolved_api_overrides_explicit_org_slug_wins() {
-        let p = dl_params_for_org(Some("from-org".into()), Some("explicit".into()));
-        assert_eq!(
-            resolved_api_overrides(&p).org_slug.as_deref(),
-            Some("explicit"),
-            "an explicit override org must not be clobbered by --org"
-        );
     }
 
     // --- format_patch_option: vulnerability summaries in the option lines --
@@ -5365,8 +5365,8 @@ mod tests {
         );
     }
 
-    /// The nested apply inherits the caller's flags verbatim (`--lock-timeout`
-    /// and `--verbose` were dropped when its args were rebuilt from Default),
+    /// The nested apply inherits the caller's flags verbatim (`--verbose`
+    /// and `--strict` were dropped when its args were rebuilt from Default),
     /// with `json`/`dry_run` forced off — one JSON document per run, and
     /// agent-mode `get` ignores `--dry-run` — `silent` following the caller's
     /// quiet gate, and the manifest path absolutized so apply does not
@@ -5374,25 +5374,17 @@ mod tests {
     #[test]
     fn nested_apply_args_flow_caller_flags_and_force_a_real_quiet_apply() {
         let common = GlobalArgs {
-            lock_timeout: Some(30),
             verbose: true,
             strict: true,
             json: true,
             dry_run: true,
-            api_token: Some("flag-token".into()),
             ..GlobalArgs::default()
         };
         let nested = nested_apply_args(&common, Path::new("proj/.socket/manifest.json"), true);
-        assert_eq!(
-            nested.lock_timeout,
-            Some(30),
-            "--lock-timeout must reach the nested apply"
-        );
         assert!(
             nested.verbose && nested.strict,
             "--verbose / --strict must flow through"
         );
-        assert_eq!(nested.api_token.as_deref(), Some("flag-token"));
         assert!(
             !nested.json && !nested.dry_run,
             "the nested apply is always a real, non-JSON run"
@@ -5406,11 +5398,11 @@ mod tests {
     }
 
     /// The engine's variant rebuilds the same shape from `DownloadParams` +
-    /// `DownloadRun`: the API flags via `resolved_api_overrides` (so `--org`
-    /// fills a missing override org), the run's lock/verbosity flags, and
-    /// quiet = json || silent.
+    /// `DownloadRun`: the run's verbosity flag, the caller's scope/mode
+    /// flags, and quiet = json || silent. No API fields: the nested apply
+    /// runs on the run's client, so `--org` need not be re-threaded.
     #[test]
-    fn nested_apply_args_from_params_carry_run_flags_and_resolved_api_overrides() {
+    fn nested_apply_args_from_params_carry_run_flags() {
         let client = ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
             api_url: "http://127.0.0.1:1".into(),
             api_token: None,
@@ -5425,12 +5417,10 @@ mod tests {
         let params = dl_params_for_org(Some("from-org".into()), None);
         let nested =
             nested_apply_args_from_params(&params, &run, Path::new(".socket/manifest.json"));
-        assert_eq!(nested.lock_timeout, Some(7));
         assert!(nested.verbose);
-        assert_eq!(
-            nested.org.as_deref(),
-            Some("from-org"),
-            "a missing override org must fall back to --org"
+        assert!(
+            nested.org.is_none() && nested.api_token.is_none(),
+            "API fields are not re-threaded: the nested apply runs on the run's client"
         );
         assert_eq!(nested.download_mode, "diff");
         assert!(nested.silent, "json || silent params run a quiet apply");

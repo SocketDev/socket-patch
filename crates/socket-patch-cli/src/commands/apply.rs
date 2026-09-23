@@ -10,6 +10,7 @@ use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRec
 use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, MismatchPolicy, PatchSources, VerifyStatus,
 };
+use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::redirect::golang_local::{
     apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
 };
@@ -722,13 +723,9 @@ pub async fn run(args: ApplyArgs) -> i32 {
     // lock, so none of that lengthens the lock hold. It serves the staging
     // fetch, the mismatch blob top-up and telemetry.
     let (client, _) = get_api_client_with_overrides(args.common.api_client_overrides()).await;
-    let api_token = client.api_token().cloned();
-    let org_slug = client.org_slug().cloned();
 
     // Serialize against concurrent socket-patch runs targeting the same
-    // `.socket/` directory. Released explicitly once every mutation is done
-    // (output and a possibly slow telemetry POST must not keep a sibling
-    // waiting), otherwise on return; see `socket_patch_core::patch::apply_lock`.
+    // `.socket/` directory; see `socket_patch_core::patch::apply_lock`.
     let lock = match acquire_or_emit(
         &args.common.socket_dir(),
         Command::Apply,
@@ -739,6 +736,28 @@ pub async fn run(args: ApplyArgs) -> i32 {
         Ok(guard) => guard,
         Err(code) => return code,
     };
+
+    run_locked(args, manifest_path, &client, lock).await
+}
+
+/// The locked half of `apply`: everything from the manifest read on — the
+/// package-manager layout gate, the apply loop, embedded VEX, output and
+/// telemetry — over a `lock` the caller already holds and the caller's
+/// `client`. [`run`] takes the lock itself; agent-mode `get` and
+/// `scan --apply/--sync` call this straight after their manifest write, so
+/// download → manifest write → apply is ONE lock window (a same-process
+/// re-acquire would contend) and the nested apply never builds a second
+/// client. `lock` is released explicitly once every mutation is done
+/// (output and a possibly slow telemetry POST must not keep a sibling
+/// waiting), otherwise on return.
+pub(crate) async fn run_locked(
+    args: ApplyArgs,
+    manifest_path: PathBuf,
+    client: &ApiClient,
+    lock: LockGuard,
+) -> i32 {
+    let api_token = client.api_token().cloned();
+    let org_slug = client.org_slug().cloned();
 
     // ONE parse of the manifest for the whole run — the PnP gate and the
     // apply loop (embedded VEX re-reads it by design, after the writes).
@@ -801,7 +820,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
         NpmPkgManager::Npm | NpmPkgManager::YarnClassic | NpmPkgManager::Unknown => {}
     }
 
-    match apply_patches_inner(&args, manifest, &client).await {
+    match apply_patches_inner(&args, manifest, client).await {
         Ok(ApplyOutcome {
             success,
             results,

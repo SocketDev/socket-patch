@@ -429,29 +429,15 @@ pub async fn find_all_packages_for_rollback(
     dispatch_find(partitioned, options, silent, merge_qualified).await
 }
 
-/// For each ecosystem in the partitioned map, create the crawler, discover
-/// source paths, and look up the given PURLs. Returns a unified
-/// `purl -> path` map (one representative copy per PURL).
-///
-/// No production caller since `repair` moved onto the qualified-aware
-/// [`find_packages_for_rollback`] (ledger keys are qualified for
-/// release-variant ecosystems, and this base-keyed map never matched them);
-/// kept for the in-file tests that pin that contrast. Integration pass:
-/// delete it or make it `#[cfg(test)]`.
-#[allow(dead_code)]
-pub async fn find_packages_for_purls(
-    partitioned: &HashMap<Ecosystem, Vec<String>>,
-    options: &CrawlerOptions,
-    silent: bool,
-) -> HashMap<String, PathBuf> {
-    collapse_to_first(find_all_packages_for_purls(partitioned, options, silent).await)
-}
-
-/// Variant of `find_packages_for_purls` for rollback and narrow-release
-/// resolution, which needs to remap qualified PURLs (PyPI
-/// `?artifact_id=`, RubyGems `?platform=`, Maven `?classifier=&ext=`) to
-/// the base PURL found by the crawler. Returns one representative copy per
-/// PURL.
+/// Qualified-aware PURL resolution for rollback, vendor, repair and
+/// narrow-release lookups: remaps qualified PURLs (PyPI `?artifact_id=`,
+/// RubyGems `?platform=`, Maven `?classifier=&ext=`) to the base PURL the
+/// crawler found, keyed back by the caller's qualified spelling. Returns one
+/// representative copy per PURL. (Its base-keyed twin,
+/// `collapse_to_first(find_all_packages_for_purls(..))`, has no production
+/// caller: manifest and ledger keys are qualified for the release-variant
+/// ecosystems, and a base-keyed map never matched them — the in-file tests
+/// pin that contrast.)
 pub async fn find_packages_for_rollback(
     partitioned: &HashMap<Ecosystem, Vec<String>>,
     options: &CrawlerOptions,
@@ -462,12 +448,12 @@ pub async fn find_packages_for_rollback(
 
 /// Resolve manifest PURLs to their installed on-disk paths (partition,
 /// build crawler options from the global args, dispatch). Uses the
-/// rollback (qualified-aware) resolver, NOT `find_packages_for_purls`:
-/// release-variant ecosystems (PyPI / RubyGems / Maven) key the manifest
-/// by *qualified* PURLs (`?artifact_id=`, `?platform=`,
-/// `?classifier=&ext=`), but the crawler only knows the *base* PURL.
-/// `find_packages_for_purls` would key the result map by the base PURL,
-/// so qualified manifest lookups would all miss and every PyPI/Gem/Maven
+/// rollback (qualified-aware) resolver, never a base-keyed collapse of
+/// [`find_all_packages_for_purls`]: release-variant ecosystems (PyPI /
+/// RubyGems / Maven) key the manifest by *qualified* PURLs
+/// (`?artifact_id=`, `?platform=`, `?classifier=&ext=`), but the crawler
+/// only knows the *base* PURL. A base-keyed result map would make every
+/// qualified manifest lookup miss, so every PyPI/Gem/Maven
 /// patch would silently resolve as `package_not_found`. The rollback
 /// variant fans each base path back out to every qualified manifest PURL
 /// — the same mapping the manifest was written with (`get` uses the same
@@ -1050,6 +1036,18 @@ mod tests {
         }
     }
 
+    /// The base-keyed PURL lookup (`find_all_packages_for_purls` collapsed
+    /// to one copy per PURL). No production caller — every resolver keys by
+    /// the caller's qualified spelling — kept here so the tests below can
+    /// pin the contrast with [`find_packages_for_rollback`].
+    async fn find_packages_for_purls(
+        partitioned: &HashMap<Ecosystem, Vec<String>>,
+        options: &CrawlerOptions,
+        silent: bool,
+    ) -> HashMap<String, PathBuf> {
+        collapse_to_first(find_all_packages_for_purls(partitioned, options, silent).await)
+    }
+
     #[tokio::test]
     async fn find_packages_for_purls_maps_npm_purl_to_install_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1228,13 +1226,14 @@ mod tests {
             "installed qualified gem must resolve under its qualified key"
         );
 
-        // The old resolver keyed by the BASE PURL only, so a `contains_key`
-        // on the qualified PURL missed — the exact false "not installed".
+        // A base-keyed collapse keys by the BASE PURL only, so a
+        // `contains_key` on the qualified PURL misses — the exact false
+        // "not installed" the retired resolver produced.
         let base_keyed = find_packages_for_purls(&partitioned, &options, true).await;
         assert!(
             !base_keyed.contains_key(&qualified),
-            "find_packages_for_purls must NOT be used by vendor: it keys by \
-             the base PURL, so the qualified lookup falsely misses"
+            "a base-keyed lookup must NOT serve vendor: it keys by the base \
+             PURL, so the qualified lookup falsely misses"
         );
     }
 
@@ -1375,9 +1374,9 @@ mod tests {
         }
     }
 
-    /// The PURL-lookup path (`find_packages_for_purls` — apply/vendor's
-    /// resolver) must resolve a maven package from a local repository with
-    /// no env opt-in of any kind.
+    /// The PURL-lookup path (`find_all_packages_for_purls`, the dispatch
+    /// behind every resolver) must resolve a maven package from a local
+    /// repository with no env opt-in of any kind.
     #[tokio::test]
     #[serial_test::serial(maven_repo_env)]
     async fn find_packages_resolves_maven_without_any_opt_in() {

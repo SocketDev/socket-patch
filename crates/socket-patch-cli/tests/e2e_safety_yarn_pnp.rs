@@ -1048,7 +1048,7 @@ fn apply_without_manifest_on_pnp_project_refuses_loudly() {
 }
 
 /// Human-mode twin of the no-manifest refusal: exit 1 with the stderr
-/// pointer, and the old calm "No .socket folder found" message must not be
+/// pointer, and the calm "No patch manifest found" no-op line must not be
 /// what the user sees instead.
 #[test]
 fn apply_without_manifest_on_pnp_project_refuses_in_human_mode() {
@@ -1061,7 +1061,7 @@ fn apply_without_manifest_on_pnp_project_refuses_in_human_mode() {
         "expected exit 1.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        !stdout.contains("No .socket folder found"),
+        !stdout.contains("No patch manifest found"),
         "the calm noManifest message must not mask the PnP refusal, got:\n{stdout}"
     );
     assert!(
