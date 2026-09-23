@@ -41,6 +41,37 @@ fn network_error_detail(e: &reqwest::Error) -> String {
     msg
 }
 
+/// The readable part of a non-2xx response body, for an error message: the
+/// `error.message` / `message` / `error` string of a JSON body (the API's
+/// error shape), otherwise the trimmed body text. Empty when there is
+/// nothing worth showing.
+fn error_body_detail(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let msg = v
+            .pointer("/error/message")
+            .and_then(|m| m.as_str())
+            .or_else(|| v.get("message").and_then(|m| m.as_str()))
+            .or_else(|| v.get("error").and_then(|m| m.as_str()))
+            .map(str::trim)
+            .filter(|m| !m.is_empty());
+        if let Some(m) = msg {
+            return m.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// `"<head> <code>"` plus `": <detail>"` when the body says something.
+fn status_error(head: &str, status: StatusCode, text: &str) -> String {
+    let detail = error_body_detail(text);
+    if detail.is_empty() {
+        format!("{head} {}", status.as_u16())
+    } else {
+        format!("{head} {}: {detail}", status.as_u16())
+    }
+}
+
 /// Log debug messages when debug mode is enabled.
 fn debug_log(message: &str) {
     if is_debug_enabled() {
@@ -210,10 +241,10 @@ impl ApiClient {
             return Err(err);
         }
         let text = resp.text().await.unwrap_or_default();
-        Err(ApiError::Other(format!(
-            "API request failed with status {}: {}",
-            status.as_u16(),
-            text
+        Err(ApiError::Other(status_error(
+            "API request failed with status",
+            status,
+            &text,
         )))
     }
 
@@ -453,10 +484,10 @@ impl ApiClient {
             ));
             return Ok(None);
         }
-        Err(ApiError::Other(format!(
-            "API request failed with status {}: {}",
-            status.as_u16(),
-            text
+        Err(ApiError::Other(status_error(
+            "API request failed with status",
+            status,
+            &text,
         )))
     }
 
@@ -634,7 +665,9 @@ impl ApiClient {
             let bytes = resp.bytes().await.map_err(|e| {
                 ApiError::Network(format!(
                     "Error reading {} body for {}: {}",
-                    kind, identifier, e
+                    kind,
+                    identifier,
+                    network_error_detail(&e)
                 ))
             })?;
             return Ok(Some(bytes.to_vec()));
@@ -653,12 +686,10 @@ impl ApiClient {
             return Err(err);
         }
         let text = resp.text().await.unwrap_or_default();
-        Err(ApiError::Other(format!(
-            "Failed to fetch {} {}: status {} - {}",
-            kind,
-            identifier,
-            status.as_u16(),
-            text,
+        Err(ApiError::Other(status_error(
+            &format!("Failed to fetch {kind} {identifier}: status"),
+            status,
+            &text,
         )))
     }
 
@@ -869,9 +900,10 @@ impl ApiClient {
             return Err(err);
         }
         let text = resp.text().await.unwrap_or_default();
-        Err(ApiError::Other(format!(
-            "package request failed with status {}: {text}",
-            status.as_u16(),
+        Err(ApiError::Other(status_error(
+            "package request failed with status",
+            status,
+            &text,
         )))
     }
 
@@ -2474,6 +2506,38 @@ mod tests {
         for (i, p) in parts.iter().enumerate() {
             assert!(!parts[i + 1..].contains(p), "{detail}");
         }
+    }
+
+    #[test]
+    fn status_error_surfaces_the_json_message_not_the_raw_body() {
+        let s500 = StatusCode::INTERNAL_SERVER_ERROR;
+        assert_eq!(
+            status_error(
+                "API request failed with status",
+                s500,
+                r#"{"error":{"message":"Patch store unavailable"}}"#
+            ),
+            "API request failed with status 500: Patch store unavailable"
+        );
+        assert_eq!(
+            status_error("x", StatusCode::BAD_REQUEST, r#"{"message":" bad purl "}"#),
+            "x 400: bad purl"
+        );
+        assert_eq!(
+            status_error("x", StatusCode::BAD_REQUEST, r#"{"error":"nope"}"#),
+            "x 400: nope"
+        );
+        // Not our shape: the body itself, trimmed.
+        assert_eq!(
+            status_error("x", s500, "  upstream timeout\n"),
+            "x 500: upstream timeout"
+        );
+        assert_eq!(
+            status_error("x", s500, r#"{"error":{"code":7}}"#),
+            r#"x 500: {"error":{"code":7}}"#
+        );
+        // Nothing to say: no dangling colon.
+        assert_eq!(status_error("x", StatusCode::BAD_GATEWAY, " \n"), "x 502");
     }
 
     #[test]
