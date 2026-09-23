@@ -19,8 +19,9 @@ into the new version's section — see docs/releasing.md.
 
 > **Semver note:** this entry changes `rollback`'s default behavior, narrows
 > the meaning of its existing `vendored: []` JSON key, makes vendored mode
-> manifest-free, and turns a plain non-TTY `scan` report-only — all MAJOR
-> per CLI_CONTRACT.md's semver policy — so it ships as the next major
+> manifest-free, turns a plain non-TTY `scan` report-only, and makes `vex`
+> refuse to attest stale ledger records and corrupt vendor ledgers — all
+> MAJOR per CLI_CONTRACT.md's semver policy — so it ships as the next major
 > release (v5.0).
 
 ### Changed (BREAKING)
@@ -129,9 +130,165 @@ into the new version's section — see docs/releasing.md.
   `[patch.crates-io]` entries now refuse as `user_authored_patch_entry`) and
   the `pypi_pipenv_invalid_wheel` refusal code (the Pipenv backend takes the
   resolved version instead of parsing the wheel filename).
+- **`vex` attests a ledger record only while a lockfile still wires it —
+  even under `--no-verify`.** A vendor-ledger entry whose artifact no
+  lockfile/config references any more is omitted as `vendor_unwired`, and a
+  redirect-ledger record whose hosted patch no lockfile references as
+  `redirect_unwired` (a manifest-owned purl falls back to agent-mode
+  verification instead). Previously a reverted lockfile plus a leftover
+  `.socket/vendor/state.json` / `redirect-state.json` kept attesting, and
+  `--no-verify` / `--vex-no-verify` attested every ledger record outright;
+  those flags now skip only the hashing, never the wiring, record-match and
+  conflict gates. A malformed or unreadable `.socket/vendor/state.json` is
+  now the hard error `vendor_ledger_corrupt` (exit 2 standalone, the host
+  command fails under `--vex`), mirroring `redirect_ledger_corrupt`, instead
+  of a warning after which vendored patches silently lost their
+  committed-artifact verification and detached records.
+  Lockfiles that wire one package to different patches attest none of them
+  (`wiring_conflict`), and when the lockfile wires a package to patch U, a
+  manifest or ledger record for it under another uuid is superseded.
 
 ### Added
 
+- **Hosted npm redirects configure npm 12's `allow-remote` for you.** npm 12
+  defaults to `allow-remote=none` and refuses (EALLOWREMOTE) a lock that
+  resolves patched packages from the Socket patch host. When `scan --mode
+  hosted` / `get --mode hosted` leaves a root `package-lock.json` /
+  `npm-shrinkwrap.json` redirected, it now writes `allow-remote=all` to the
+  project `.npmrc` — creating the file, or appending one line with the BOM,
+  CRLF and every other byte preserved — so a plain `npm ci` installs the
+  patched bytes on npm 12 (verified on npm 10.9.9, 11.20.0 and 12.1.0). The
+  edit is ledger-recorded (`redirect_npmrc_allow_remote`, `created` / `added`)
+  and `rollback`, `remove`, scoped unwinds and the hosted → vendored takeover
+  remove exactly what was added once no package-lock entry needs it (a
+  modified created file keeps its other lines:
+  `redirect_npmrc_allow_remote_modified`, reported by `rollback`, `remove`,
+  `vendor` and the vendored reconcile). An explicit user
+  `allow-remote=none` / `root` is respected — in the project `.npmrc`, in the
+  user / global / builtin npm config (a committed project line would
+  silently override that machine policy), or in an `npm_config_allow_remote`
+  environment variable (which beats every `.npmrc`) — and the warning names
+  where it was found. A symlinked, unreadable or bare-CR `.npmrc` is left
+  alone (and a symlinked one refuses an unwind before anything is written),
+  `--dry-run` writes nothing but previews the write — also for a vendored →
+  hosted takeover — and
+  `--no-npm-allow-remote-config` / `SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG` opts
+  out. `redirect_npm_allow_remote` now fires on EVERY hosted npm run —
+  including when `.npmrc` already allows it — and always states the
+  tradeoff: `allow-remote=all` admits any url-resolved dependency, not just
+  Socket's, while the sha512 integrity pins stay enforced. The `.npmrc`
+  sniff now follows npm 12's measured grammar: only the exact key
+  `allow-remote` counts (an `allow_remote` / `ALLOW-REMOTE` line, which npm
+  ignores, previously silenced the warning), lines split on a bare `\r` as
+  well as `\n`, a `[section]` header only counts on the untrimmed line (as
+  in npm's `ini`), section bodies are not top-level (a section-scoped copy of
+  the line never makes the unwind ambiguous), and the value is
+  case-sensitive. Mode-preserving atomic writes now create their stage file
+  with the destination's permission bits, so a 0600 token-bearing `.npmrc`
+  is never staged world-readable. Vendored mode is unaffected
+  (npm gates `file:` tarballs by `allow-file`, default `all`).
+
+- **Manifest-less VEX: `vex` attests hosted and vendored patches straight
+  from the lockfiles.** `socket-patch vex`, and `apply` / `scan` / `vendor
+  --vex`, no longer need `.socket/manifest.json`, or the `.socket/vendor`
+  ledgers, to attest hosted and vendored patches. That covers a
+  depscan-opened PR, a clone that never committed its ledgers, and a lock-only
+  CI checkout. New read-only discovery (`socket-patch-core` `vex::discover`)
+  reads every supported root lockfile and config:
+  - npm: package-lock / shrinkwrap;
+  - pnpm: every lock generation, plus Rush locks;
+  - yarn classic and berry;
+  - `bun.lock` / `bun.lockb`;
+  - cargo: `Cargo.lock` + `Cargo.toml` + cargo config;
+  - Go: `go.mod` / `go.work` + sums;
+  - Python: uv, PEP 723 script locks, `pylock.toml`, poetry, pdm,
+    `Pipfile.lock`, requirements (+ `-r` includes), Hatch / PEP 621 direct
+    references;
+  - `Gemfile.lock` / `gems.locked`;
+  - `composer.lock`;
+  - maven: `pom.xml`;
+  - nuget: `nuget.config` + `packages.lock.json`.
+
+  Each patch uuid is recovered from a Socket patch-host URL (or the
+  `--patch-server-url` origin) or a `.socket/vendor/<eco>/<uuid>/…` path,
+  validated fail-closed. A lock that resolves the same package elsewhere
+  contests the wiring and blocks it. Records come from the manifest, then
+  the ledgers, then (online only) the patch API by uuid; nothing is written
+  to the manifest. `--offline` or a failed fetch omits the patch as
+  `record_unavailable`, and a record naming another patch or package as
+  `record_mismatch`. Evidence: vendored patches hash the committed artifact.
+  Hosted patches hash the installed copy the build consumes (the Go
+  replacement module, never the pristine cache copy), or, before any
+  install, attest from the lockfile's integrity pin. Unreadable or
+  unparseable lockfiles and rejected references surface as run warnings
+  (`lockfile_unreadable`, `lockfile_unparseable`, `patched_ref_invalid`,
+  `patched_ref_unattributable`) and never abort the run. Why a patch was
+  gated rides `warnings[]` too, so `--json` keeps it: a failed record fetch
+  (`vex_record_fetch_failed`, `vex_record_not_found`,
+  `vex_record_offline`), a stale-credential fallback to the public proxy
+  (`api_auth_fallback`, `get` / `scan`'s warning), a wiring conflict
+  (`vex_wiring_conflict`), a superseded record (`vex_record_superseded`)
+  and a dead ledger claim (`vex_claim_unwired`); a failed embedded `--vex`
+  adds one `vex_omitted` per omitted patch to the host command's
+  `warnings[]`. `apply --vex` and
+  `vendor --vex` with no manifest now write the document instead of exiting
+  0 with none. A project with nothing wired anywhere keeps that calm exit,
+  and `apply --check` never generates. Manifest-less runs honor `vex
+  --dry-run` and `-O -` like every `vex` run, and show a transient
+  `Fetching patch records...` status line on a terminal. Per-PM support and
+  limitations: the README's "No manifest needed for hosted and vendored
+  patches" and CLI_CONTRACT.md's "Manifest-less VEX".
+- **One lockfile reader per format, and one ledger-liveness rule.**
+  Discovery and the lock inventory read each lockfile through one reader
+  (the package-lock, composer.lock and Pipfile.lock entry walks, the hosted
+  rewriter's `pnpm-lock.yaml` grammar with one key grammar for every lock
+  generation, the backends' fail-closed `bun.lock` line grammar — so a hand
+  re-indented `bun.lock` is diagnosed `lockfile_unparseable` instead of
+  attested — one berry key splitter, which the vendored berry backend now
+  uses too, a shared `Gemfile.lock` model, the vendor backend's
+  `Cargo.lock` model, the Python lock and requirements-file readers the
+  rewriters use, with one exact-pin rule and one hosted pypi url
+  grammar).
+  `scan`'s cross-mode takeover warnings (`redirect_supersedes_vendored`,
+  `vendor_supersedes_redirect`), `hosted_wiring_retained` and
+  `redirectState.wiringLive` now prove the live lock with the same
+  discovery and liveness rules `vex` gates attestations on, instead of a
+  looser text scan: a ledger record counts as live only while a lockfile
+  wires that package to the record's patch (a hosted url carrying its
+  uuid, or the exact vendored artifact the ledger names). That rule reads
+  EVERY lock's entry for the package (a PEP 723 script lock resolving it
+  from PyPI no longer vetoes the project lock's hosted entry) and a
+  recorded Gemfile with discovery's source-block grammar (a commented-out
+  `source … do` block no longer keeps a reverted record alive). The
+  shared readers
+  also change the lock inventory at the edges: a v1 `Cargo.lock`'s
+  `[metadata]` checksums now verify a crates.io fetch, `requirements.txt` is
+  read as pip's logical lines (continuations joined, comments cut, a BOM
+  dropped), a wildcard `requirements.txt` pin (`six==1.*`) is no exact
+  version, a Pipfile.lock hosted reference to an sdist, an `http://` origin
+  or a path-prefixed origin stays inventoried, a CRLF `pnpm-lock.yaml` is
+  inventoried (it used to read as having no packages), and a `poetry.lock` /
+  `pdm.lock` / `Cargo.lock` that is not valid TOML contributes nothing
+  instead of a best-effort line scan. The vendored berry backend splits a
+  multi-descriptor lock key the way yarn writes it, so a key mixing the
+  patched package with another descriptor (`"lp@npm:left-pad@1.3.0,
+  left-pad@npm:1.3.0"`) is refused `vendor_override_conflict` instead of
+  being read as one descriptor.
+- **Standalone `vendor` embeds the patch record in its ledger entries too.**
+  Vendored mode (`scan` / `get --mode vendored`) already writes every entry
+  `detached: true` with its embedded `record`; the manifest-driven `vendor`
+  command now also writes `record` into `.socket/vendor/state.json` (never
+  `detached` — the manifest record stays authoritative while the manifest
+  covers the package), so a project it wired whose manifest is gone still
+  verifies, lists and attests offline: `vex`, `list` and `setup --check` read
+  the embedded copy whenever no manifest entry covers the package, and
+  `repair` recovers the record without the API when there is no manifest at
+  all. Entries written by older releases keep working.
+- **VEX product auto-detection covers Go, Composer, Maven, NuGet and
+  RubyGems projects**, after the existing git / `package.json` /
+  `pyproject.toml` / `Cargo.toml` probes: `go.mod` `module`, `composer.json`
+  `name`, `pom.xml` coordinates, the root's single `*.csproj`, the root's
+  single `*.gemspec`. Ambiguous roots yield no product rather than a guess.
 - **Pipenv projects can use hosted patches, and vendored patches keep every
   category.** `scan --mode hosted` rewrites every `Pipfile.lock` category
   (`default`, `develop`, Pipenv 2022+ named categories) that pins the patched
@@ -452,8 +609,8 @@ into the new version's section — see docs/releasing.md.
   of being swallowed. `setup --check` reads the vendor ledger even without
   a manifest and, on a corrupt one, warns `unreadable vendor state` and
   reports a `vendor_ledger` error entry (verdict `error`, exit 1) — never
-  `configured`; `vex` discloses the same unreadable ledger before its
-  `manifest_not_found` / `no_patches` exit on a manifest-free project; `list`
+  `configured`; `vex` refuses the same unreadable ledger outright
+  (`vendor_ledger_corrupt`, see Changed); `list`
   degrades a corrupt vendor ledger to a `Warning: unreadable vendor ledger …`
   line (muted by `--silent`) rather than an error; `patch_setup` telemetry
   fires only for a successful, non-dry-run setup.
@@ -532,6 +689,30 @@ into the new version's section — see docs/releasing.md.
   "malformed"; a blob-cleanup pass keeps sweeping after one unremovable file
   and reports the first error afterwards; the ledgers skip byte-identical
   rewrites.
+- **Hosted composer redirects no longer fall back to the pristine git
+  source.** Composer 1 and 2.2 LTS silently install the upstream commit from
+  `source` when the hosted dist fails; the rewriter now drops the entry's
+  adjacent `source` block (one fragment edit, reverted byte-for-byte) and
+  warns `redirect_composer_source_kept` when a hand-ordered source cannot be
+  dropped.
+- **Hosted gem locks keep bundler's source order.** The patch-registry
+  `GEM` section is inserted where bundler sorts it, so `BUNDLE_FROZEN=true
+  bundle install` on bundler ≥ 4.0.19 no longer refuses the converged lock.
+- **v1 `Cargo.lock` files redirect and vendor correctly.** Hosted and
+  vendored rewrites now follow the `[metadata]` checksum table and rewrite
+  dependents' full-id references, so `cargo --locked` accepts the lock (and
+  the revert stays byte-identical).
+- **yarn 4.0.x checksums keep the lock's own spelling.** Vendored and hosted
+  berry rewrites write bare-hex `cacheKey: 10c0` checksums when the lock
+  does, so `yarn install --immutable` no longer fails with YN0028.
+- **npm 12 dual-lock projects vendor both locks.** `vendor` rewires a
+  `package-lock.json` npm 12 keeps beside a committed shrinkwrap (else warns
+  `vendor_npm_sibling_lock_unwired`), and hosted runs warn
+  `redirect_npm_allow_remote` (npm 12's `allow-remote=none` refuses
+  redirected tarballs unless `.npmrc` sets `allow-remote=all` — which hosted
+  mode now writes itself, see Added) and `redirect_npm_legacy_client` (npm 6
+  ignores a v1 lock's `resolved`).
+
 - **Bun refusal safety:** hosted compatibility is checked before removing
   an existing vendored patch, including during dry-run. Vendored preflight
   exemptions require live local lock tuples; a ledger retained by
