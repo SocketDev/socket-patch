@@ -647,7 +647,7 @@ async fn restore_file_permissions(
         if let Some((uid, gid)) = owner {
             if let Err(e) = chown_blocking(filepath.to_path_buf(), Some(uid), Some(gid)).await {
                 warning = Some(format!(
-                    "{}: patched, but ownership could not be restored to uid {uid} gid {gid}: {e}",
+                    "{}: patched, but {OWNERSHIP_NOT_RESTORED_MARKER} to uid {uid} gid {gid}: {e}",
                     filepath.display()
                 ));
             }
@@ -744,25 +744,47 @@ pub async fn apply_package_patch(
             let copy_result =
                 apply_package_patch_at(package_key, &copy, files, sources, uuid, dry_run, policy)
                     .await;
-            if !copy_result.success {
-                result.success = false;
-                let copy_err = copy_result
-                    .error
-                    .unwrap_or_else(|| "unknown error".to_string());
-                let note = format!(
-                    "pnpm store copy {} failed to patch: {}",
-                    copy.display(),
-                    copy_err
-                );
-                result.error = Some(match result.error.take() {
-                    Some(prev) => format!("{prev}; {note}"),
-                    None => note,
-                });
-            }
+            fold_copy_result(&mut result, &copy, copy_result);
         }
     }
     result
 }
+
+/// Merge one pnpm store copy's result into the primary's. A failed copy
+/// fails the whole result with a `pnpm store copy <path> failed to patch: …`
+/// note. A copy that patched fine but could not put file ownership back
+/// (`success: true, error: Some("<path>: patched, but ownership could not
+/// be restored…")`) keeps `success` and appends that advisory verbatim (it
+/// already names the copy's full file path), so the CLI's
+/// `ownership_not_restored` warning sees every copy. Only the ownership
+/// advisory is carried: the `--force` all-skipped note describes the copy
+/// alone and would mislead on a primary that actually patched.
+fn fold_copy_result(result: &mut ApplyResult, copy: &Path, copy_result: ApplyResult) {
+    let note = if copy_result.success {
+        match copy_result.error {
+            Some(advisory) if advisory.contains(OWNERSHIP_NOT_RESTORED_MARKER) => advisory,
+            _ => return,
+        }
+    } else {
+        result.success = false;
+        format!(
+            "pnpm store copy {} failed to patch: {}",
+            copy.display(),
+            copy_result
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        )
+    };
+    result.error = Some(match result.error.take() {
+        Some(prev) => format!("{prev}; {note}"),
+        None => note,
+    });
+}
+
+/// The substring every ownership advisory carries (see
+/// `restore_file_permissions`); the CLI's `ownership_not_restored` warning
+/// keys on the same text.
+pub const OWNERSHIP_NOT_RESTORED_MARKER: &str = "ownership could not be restored";
 
 /// The single-copy apply engine behind [`apply_package_patch`]: verifies
 /// and patches the package at exactly the one `pkg_path` it is given.
@@ -3496,6 +3518,75 @@ mod tests {
             mode,
             foreign.mode() & 0o7777,
             "the mode is still restored after the failed chown"
+        );
+    }
+
+    /// The pnpm fan-out merge: a failed copy fails the whole result with the
+    /// `pnpm store copy … failed to patch` note; a copy that patched fine but
+    /// could not restore ownership keeps `success` and appends the advisory
+    /// verbatim (it already names the copy's file path); a copy's `--force`
+    /// all-skipped note is NOT carried (it describes the copy alone).
+    #[test]
+    fn fold_copy_result_carries_ownership_advisories_and_failures() {
+        let copy = Path::new("/store/pkg@1.0.0_peer");
+        let clean = || ApplyResult {
+            package_key: "pkg:npm/a@1.0.0".to_string(),
+            package_path: "/store/pkg@1.0.0".to_string(),
+            success: true,
+            files_verified: vec![],
+            files_patched: vec![],
+            applied_via: HashMap::new(),
+            error: None,
+            sidecar: None,
+        };
+
+        let mut primary = clean();
+        fold_copy_result(&mut primary, copy, clean());
+        assert!(primary.success && primary.error.is_none());
+
+        let advisory = format!(
+            "/store/pkg@1.0.0_peer/index.js: patched, but {OWNERSHIP_NOT_RESTORED_MARKER} to uid 1 gid 2: EPERM"
+        );
+        let mut primary = clean();
+        fold_copy_result(
+            &mut primary,
+            copy,
+            ApplyResult {
+                error: Some(advisory.clone()),
+                ..clean()
+            },
+        );
+        assert!(primary.success, "an advisory never fails the result");
+        assert_eq!(primary.error.as_deref(), Some(advisory.as_str()));
+
+        let mut primary = clean();
+        fold_copy_result(
+            &mut primary,
+            copy,
+            ApplyResult {
+                error: Some("All patch files were skipped: 1 not found on disk (--force)".into()),
+                ..clean()
+            },
+        );
+        assert!(
+            primary.success && primary.error.is_none(),
+            "a copy-only skip note is dropped"
+        );
+
+        let mut primary = clean();
+        fold_copy_result(
+            &mut primary,
+            copy,
+            ApplyResult {
+                success: false,
+                error: Some("boom".to_string()),
+                ..clean()
+            },
+        );
+        assert!(!primary.success);
+        assert_eq!(
+            primary.error.as_deref(),
+            Some("pnpm store copy /store/pkg@1.0.0_peer failed to patch: boom")
         );
     }
 }

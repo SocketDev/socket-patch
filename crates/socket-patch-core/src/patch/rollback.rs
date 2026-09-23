@@ -228,6 +228,25 @@ pub async fn verify_file_rollback(
             target_hash: None,
         };
     }
+    // The one path-component invariant the apply engine enforces
+    // (`read_blob`): a blob hash is 64 hex chars, so it can never carry a
+    // separator. The relative-path guard above stops `..`/absolute escapes
+    // but still lets `sub/x` through, where an intermediate `blobs/sub`
+    // symlink would defeat the entry-type checks below (they only inspect
+    // the FINAL component).
+    if !crate::patch::apply::is_valid_blob_hash(&file_info.before_hash) {
+        return VerifyRollbackResult {
+            file: file_name.to_string(),
+            status: VerifyRollbackStatus::MissingBlob,
+            message: Some(format!(
+                "Refusing to read blob with invalid hash {:?} (expected 64 hex chars)",
+                file_info.before_hash
+            )),
+            current_hash: Some(current_hash),
+            expected_hash: None,
+            target_hash: None,
+        };
+    }
 
     // Check if before blob exists (required to actually restore the file).
     // SECURITY: probe the directory ENTRY (`symlink_metadata`), not what it
@@ -338,24 +357,39 @@ pub async fn rollback_package_patch(
         for copy in crate::crawlers::npm_crawler::find_pnpm_peer_variant_copies(pkg_path).await {
             let copy_result =
                 rollback_package_patch_at(package_key, &copy, files, blobs_path, dry_run).await;
-            if !copy_result.success {
-                result.success = false;
-                let copy_err = copy_result
-                    .error
-                    .unwrap_or_else(|| "unknown error".to_string());
-                let note = format!(
-                    "pnpm store copy {} failed to roll back: {}",
-                    copy.display(),
-                    copy_err
-                );
-                result.error = Some(match result.error.take() {
-                    Some(prev) => format!("{prev}; {note}"),
-                    None => note,
-                });
-            }
+            fold_copy_result(&mut result, &copy, copy_result);
         }
     }
     result
+}
+
+/// Merge one pnpm store copy's result into the primary's. A failed copy
+/// fails the whole result with a `pnpm store copy <path> failed to roll
+/// back: …` note; a copy that restored fine but carries an advisory
+/// (`success: true, error: Some(…)` — e.g. "…ownership could not be
+/// restored…") keeps `success` and appends the advisory verbatim, so the
+/// CLI's `ownership_not_restored` warning sees every copy, not just the
+/// primary. The advisory already names the copy's full file path.
+fn fold_copy_result(result: &mut RollbackResult, copy: &Path, copy_result: RollbackResult) {
+    let note = if copy_result.success {
+        match copy_result.error {
+            Some(advisory) => advisory,
+            None => return,
+        }
+    } else {
+        result.success = false;
+        format!(
+            "pnpm store copy {} failed to roll back: {}",
+            copy.display(),
+            copy_result
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
+        )
+    };
+    result.error = Some(match result.error.take() {
+        Some(prev) => format!("{prev}; {note}"),
+        None => note,
+    });
 }
 
 /// The single-copy rollback engine behind [`rollback_package_patch`]:
@@ -466,6 +500,15 @@ async fn rollback_package_patch_at(
         if !crate::patch::apply::is_safe_relative_subpath(&file_info.before_hash) {
             result.error = Some(format!(
                 "Unsafe before-blob hash (escapes blobs directory): {}",
+                file_info.before_hash
+            ));
+            return result;
+        }
+        // Twin of the verify-time 64-hex gate (see `verify_file_rollback`):
+        // shared with the apply engine's `read_blob`.
+        if !crate::patch::apply::is_valid_blob_hash(&file_info.before_hash) {
+            result.error = Some(format!(
+                "Refusing to read blob with invalid hash {:?} (expected 64 hex chars)",
                 file_info.before_hash
             ));
             return result;
@@ -612,7 +655,8 @@ mod tests {
             .unwrap();
 
         let file_info = PatchFileInfo {
-            before_hash: "missing_blob_hash".to_string(),
+            // A well-formed (64-hex) hash that no blob carries.
+            before_hash: "0".repeat(64),
             after_hash: compute_git_sha256_from_bytes(content),
         };
 
@@ -1077,7 +1121,8 @@ mod tests {
         files.insert(
             "index.js".to_string(),
             PatchFileInfo {
-                before_hash: "missing_hash".to_string(),
+                // A well-formed (64-hex) hash that no blob carries.
+                before_hash: "0".repeat(64),
                 after_hash: "bbbb".to_string(),
             },
         );
@@ -1864,6 +1909,114 @@ mod tests {
         assert!(
             result.message.unwrap().contains("not a regular file"),
             "message must say why the blob is unusable"
+        );
+    }
+
+    /// SECURITY (intermediate symlink component): the relative-path guard
+    /// lets `sub/x` through, and the entry-type checks only inspect the
+    /// FINAL component — so a committed `blobs/sub -> <out of tree>`
+    /// symlink plus a `beforeHash` of `sub/secret.txt` would read the
+    /// out-of-tree file through the link and leak its content hash in the
+    /// mismatch error. The 64-hex gate shared with the apply engine
+    /// (`is_valid_blob_hash`) closes it: a hash can never carry a separator.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_rollback_refuses_before_hash_with_path_components() {
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = root.path().join("pkg");
+        let blobs_dir = root.path().join("blobs");
+        tokio::fs::create_dir_all(&pkg_dir).await.unwrap();
+        tokio::fs::create_dir_all(&blobs_dir).await.unwrap();
+        let secret = b"top secret contents\n";
+        tokio::fs::write(root.path().join("secret.txt"), secret)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("..", blobs_dir.join("sub")).unwrap();
+
+        let patched = b"patched content";
+        tokio::fs::write(pkg_dir.join("index.js"), patched)
+            .await
+            .unwrap();
+        let file_info = PatchFileInfo {
+            before_hash: "sub/secret.txt".to_string(),
+            after_hash: compute_git_sha256_from_bytes(patched),
+        };
+
+        let verify = verify_file_rollback(&pkg_dir, "index.js", &file_info, &blobs_dir).await;
+        assert_eq!(verify.status, VerifyRollbackStatus::MissingBlob);
+        assert!(
+            verify.message.as_deref().unwrap().contains("invalid hash"),
+            "{verify:?}"
+        );
+
+        let mut files = HashMap::new();
+        files.insert("index.js".to_string(), file_info);
+        let result =
+            rollback_package_patch("pkg:npm/test@1.0.0", &pkg_dir, &files, &blobs_dir, false).await;
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(
+            !err.contains(&compute_git_sha256_from_bytes(secret)),
+            "the out-of-tree file's hash must never leak: {err}"
+        );
+        assert_eq!(
+            tokio::fs::read(pkg_dir.join("index.js")).await.unwrap(),
+            patched,
+            "nothing is restored"
+        );
+    }
+
+    /// The pnpm fan-out merge: a failed copy fails the whole result with the
+    /// `pnpm store copy … failed to roll back` note; a copy that restored fine
+    /// but carries an ownership advisory keeps `success` and appends the
+    /// advisory verbatim (it already names the copy's file path); a clean copy
+    /// changes nothing.
+    #[test]
+    fn fold_copy_result_carries_advisories_and_failures() {
+        let copy = Path::new("/store/pkg@1.0.0_peer");
+        let clean = || RollbackResult {
+            package_key: "pkg:npm/a@1.0.0".to_string(),
+            package_path: "/store/pkg@1.0.0".to_string(),
+            success: true,
+            files_verified: vec![],
+            files_rolled_back: vec![],
+            error: None,
+            sidecar: None,
+        };
+
+        let mut primary = clean();
+        fold_copy_result(&mut primary, copy, clean());
+        assert!(primary.success && primary.error.is_none());
+
+        let advisory = "/store/pkg@1.0.0_peer/index.js: patched, but ownership could not be \
+                        restored to uid 1 gid 2: EPERM";
+        let mut primary = clean();
+        fold_copy_result(
+            &mut primary,
+            copy,
+            RollbackResult {
+                error: Some(advisory.to_string()),
+                ..clean()
+            },
+        );
+        assert!(primary.success, "an advisory never fails the result");
+        assert_eq!(primary.error.as_deref(), Some(advisory));
+
+        let mut primary = clean();
+        primary.error = Some("first".to_string());
+        fold_copy_result(
+            &mut primary,
+            copy,
+            RollbackResult {
+                success: false,
+                error: Some("boom".to_string()),
+                ..clean()
+            },
+        );
+        assert!(!primary.success);
+        assert_eq!(
+            primary.error.as_deref(),
+            Some("first; pnpm store copy /store/pkg@1.0.0_peer failed to roll back: boom")
         );
     }
 

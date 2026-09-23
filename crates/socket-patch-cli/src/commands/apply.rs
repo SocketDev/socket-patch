@@ -840,7 +840,7 @@ pub(crate) async fn run_locked(
             let mut run_warnings = run_warnings;
             run_warnings.extend(results.iter().filter_map(|r| {
                 let note = r.error.as_deref().filter(|_| r.success)?;
-                note.contains("ownership could not be restored")
+                note.contains(socket_patch_core::patch::apply::OWNERSHIP_NOT_RESTORED_MARKER)
                     .then(|| RunWarning {
                         code: "ownership_not_restored".to_string(),
                         detail: format!("{}: {note}", normalize_purl(&r.package_key)),
