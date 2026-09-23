@@ -123,7 +123,8 @@ pub struct ApiClient {
 /// Retry policy for the vendoring service's package-reference POST and
 /// archive GET: `attempts` tries in total, exponential delays from `base`
 /// with ±25% jitter, each capped at `max_delay` (a `Retry-After` in seconds
-/// is honored under the same cap). Retried: transport errors and HTTP 429,
+/// is honored under the same cap). Retried: transport errors (per-attempt
+/// timeouts and bodies cut off mid-transfer included) and HTTP 429,
 /// 500, 502, 503, 504. Never retried: auth (401/403), terminal misses
 /// (404/410), still-building (408), other 4xx, parse errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +132,12 @@ pub struct VendorRetryPolicy {
     pub attempts: u32,
     pub base: Duration,
     pub max_delay: Duration,
+    /// Bound on one attempt's POST round trip, and on the archive GET's
+    /// connect + response headers (a black-holed or stalled host fails the
+    /// attempt instead of hanging the run).
+    pub attempt_timeout: Duration,
+    /// Bound on one archive GET's body read.
+    pub body_timeout: Duration,
 }
 
 impl Default for VendorRetryPolicy {
@@ -139,17 +146,20 @@ impl Default for VendorRetryPolicy {
             attempts: 3,
             base: Duration::from_millis(400),
             max_delay: Duration::from_secs(4),
+            attempt_timeout: Duration::from_secs(30),
+            body_timeout: Duration::from_secs(300),
         }
     }
 }
 
 impl VendorRetryPolicy {
-    /// A single attempt, no retry.
+    /// A single attempt, no retry (the default per-attempt timeouts).
     pub fn none() -> Self {
         Self {
             attempts: 1,
             base: Duration::ZERO,
             max_delay: Duration::ZERO,
+            ..Self::default()
         }
     }
 
@@ -824,8 +834,12 @@ impl ApiClient {
         // every package's retries (and mixing sources package by package).
         let failures = self.vendor_outage.load(Ordering::Relaxed);
         if failures >= VENDOR_BREAKER_THRESHOLD {
+            // Worded to read inside the callers' "patch service request
+            // failed (...)" wrapper: no request was made, and the skip is
+            // scoped to this run.
             return VendorServiceOutcome::Failed(ApiError::Other(format!(
-                "patch service unavailable: skipped after {failures} consecutive failures"
+                "not attempted: the service failed for the previous {failures} packages in \
+                 this run"
             )));
         }
         let (outcome, retryable_failure) = self
@@ -1045,11 +1059,15 @@ impl ApiClient {
         let (url, use_auth) = self.vendor_package_url(vendor_url);
         debug_log(&format!("POST {url}"));
 
+        // The whole round trip (connect, response, JSON body) is bounded per
+        // attempt, so attempts × timeout + backoff bounds the step.
+        let timeout = self.vendor_retry.attempt_timeout;
         let resp = if use_auth {
             self.client
                 .post(&url)
                 .header(header::CONTENT_TYPE, "application/json")
                 .json(&body)
+                .timeout(timeout)
                 .send()
                 .await
         } else {
@@ -1059,6 +1077,7 @@ impl ApiClient {
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "application/json")
                 .json(&body)
+                .timeout(timeout)
                 .send()
                 .await
         };
@@ -1072,9 +1091,12 @@ impl ApiClient {
         let status = resp.status();
         if status == StatusCode::OK {
             let parsed = resp.json::<PackageVendorResponse>().await.map_err(|e| {
+                // A body cut off (or timed out) mid-transfer is transport,
+                // not a malformed answer.
+                let hint = (e.is_timeout() || e.is_body()).then_some(None);
                 (
                     ApiError::Parse(format!("Failed to parse package response: {e}")),
-                    None,
+                    hint,
                 )
             })?;
             return parsed.results.get(uuid).cloned().ok_or_else(|| {
@@ -1142,19 +1164,32 @@ impl ApiClient {
             );
         }
         debug_log(&format!("GET vendor package {url}"));
-        let resp = match self
-            .plain
-            .get(url)
-            .header(header::ACCEPT, "application/octet-stream")
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
+        // Connect + response headers are bounded per attempt; the body read
+        // below gets its own (larger) bound — archives can be big.
+        let sent = tokio::time::timeout(
+            self.vendor_retry.attempt_timeout,
+            self.plain
+                .get(url)
+                .header(header::ACCEPT, "application/octet-stream")
+                .send(),
+        )
+        .await;
+        let resp = match sent {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 return (
                     ServeDownload::Failed(ApiError::Network(format!(
                         "Network error fetching vendor package: {}",
                         network_error_detail(&e)
+                    ))),
+                    Some(None),
+                )
+            }
+            Err(_) => {
+                return (
+                    ServeDownload::Failed(ApiError::Network(format!(
+                        "Network error fetching vendor package: no response within {:?}",
+                        self.vendor_retry.attempt_timeout
                     ))),
                     Some(None),
                 )
@@ -1185,15 +1220,27 @@ impl ApiClient {
                 );
             }
         }
-        match crate::utils::http::read_capped(resp, MAX_VENDOR_PACKAGE_BYTES, "vendor package")
-            .await
-        {
+        use crate::utils::http::{read_capped_typed, ReadCappedError};
+        let body = tokio::time::timeout(
+            self.vendor_retry.body_timeout,
+            read_capped_typed(resp, MAX_VENDOR_PACKAGE_BYTES, "vendor package"),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(ReadCappedError::Truncated(format!(
+                "vendor package body not received within {:?}",
+                self.vendor_retry.body_timeout
+            )))
+        });
+        match body {
             Ok(bytes) => (ServeDownload::Ok(bytes), None),
             // A body cut off mid-transfer is a transport failure (retryable);
-            // a size-cap breach is not (read_capped's two error shapes).
-            Err(e) => {
-                let hint = e.starts_with("error reading ").then_some(None);
-                (ServeDownload::Failed(ApiError::Network(e)), hint)
+            // a size-cap breach is not (the same bytes would breach it again).
+            Err(ReadCappedError::Truncated(e)) => {
+                (ServeDownload::Failed(ApiError::Network(e)), Some(None))
+            }
+            Err(ReadCappedError::CapExceeded(e)) => {
+                (ServeDownload::Failed(ApiError::Network(e)), None)
             }
         }
     }
@@ -4015,6 +4062,7 @@ mod vendor_retry_tests {
             attempts: 3,
             base: Duration::from_millis(1),
             max_delay: Duration::from_millis(5),
+            ..VendorRetryPolicy::default()
         }
     }
 
@@ -4243,6 +4291,7 @@ mod vendor_retry_tests {
             attempts: 2,
             base: Duration::from_millis(1),
             max_delay: Duration::from_secs(5),
+            ..VendorRetryPolicy::default()
         };
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -4284,6 +4333,7 @@ mod vendor_retry_tests {
             attempts: 2,
             base: Duration::from_millis(1),
             max_delay: Duration::from_millis(20),
+            ..VendorRetryPolicy::default()
         };
         let started = std::time::Instant::now();
         let _ = client(&server.uri(), capped)
@@ -4291,6 +4341,182 @@ mod vendor_retry_tests {
             .await;
         assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(posts(&server).await, 2);
+    }
+
+    /// A policy whose attempts time out after `timeout`.
+    fn timing_out(timeout: Duration) -> VendorRetryPolicy {
+        VendorRetryPolicy {
+            attempts: 2,
+            attempt_timeout: timeout,
+            body_timeout: timeout,
+            ..fast()
+        }
+    }
+
+    /// A stalled POST fails the attempt at the per-attempt timeout (and is
+    /// retried as a transport failure), so the step's latency is bounded by
+    /// attempts × timeout + backoff instead of hanging.
+    #[tokio::test]
+    async fn stalled_post_times_out_per_attempt_and_is_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(granted(&server, UUID_A).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let started = std::time::Instant::now();
+        let outcome = client(&server.uri(), timing_out(Duration::from_millis(200)))
+            .fetch_vendor_package(UUID_A, false, None, None)
+            .await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Failed(ApiError::Network(_))),
+            "{outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(posts(&server).await, 2, "the timed-out attempt is retried");
+    }
+
+    /// The archive GET's response headers are bounded the same way.
+    #[tokio::test]
+    async fn stalled_get_times_out_per_attempt_and_is_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(granted(&server, UUID_A))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SERVE))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(BYTES.to_vec())
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let started = std::time::Instant::now();
+        let outcome = client(&server.uri(), timing_out(Duration::from_millis(200)))
+            .fetch_vendor_package(UUID_A, false, None, None)
+            .await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Failed(ApiError::Network(_))),
+            "{outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        let gets = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::GET)
+            .count();
+        assert_eq!(gets, 2);
+    }
+
+    /// A raw HTTP server for the serve GET: connection `i` gets
+    /// `responses[min(i, last)]` verbatim and is then closed. Returns the
+    /// base URL and the connection counter.
+    fn raw_serve(responses: Vec<Vec<u8>>) -> (String, Arc<AtomicU32>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicU32::new(0));
+        let seen = count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let i = seen.fetch_add(1, Ordering::SeqCst) as usize;
+                // Drain the request head.
+                let mut buf = [0u8; 4096];
+                let mut head = Vec::new();
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = stream.write_all(&responses[i.min(responses.len() - 1)]);
+                let _ = stream.flush();
+                drop(stream);
+            }
+        });
+        (format!("http://{addr}"), count)
+    }
+
+    async fn mount_grant_to(server: &MockServer, serve_base: &str) {
+        let url = format!("{serve_base}{SERVE}");
+        let sri = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(BYTES))
+        );
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID_A: { "status": "granted", "url": url,
+                    "artifacts": [{ "kind": "tarball", "url": url,
+                                    "integrity": { "sha512": sri } }] } }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// A body cut off mid-transfer (fewer bytes than `Content-Length`) is a
+    /// transport failure: retried, and the second, whole body is Ready.
+    #[tokio::test]
+    async fn truncated_body_is_retried() {
+        let mut cut = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            BYTES.len() + 90
+        )
+        .into_bytes();
+        cut.extend_from_slice(&BYTES[..4]);
+        let mut whole = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            BYTES.len()
+        )
+        .into_bytes();
+        whole.extend_from_slice(BYTES);
+        let (base, conns) = raw_serve(vec![cut, whole]);
+        let server = MockServer::start().await;
+        mount_grant_to(&server, &base).await;
+        let outcome = client(&server.uri(), fast())
+            .fetch_vendor_package(UUID_A, false, None, None)
+            .await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Ready(ref p) if p.tarball == BYTES),
+            "{outcome:?}"
+        );
+        assert_eq!(conns.load(Ordering::SeqCst), 2);
+    }
+
+    /// A size-cap breach is not retried: the same bytes would breach it
+    /// again.
+    #[tokio::test]
+    async fn cap_breach_is_not_retried() {
+        let over = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_VENDOR_PACKAGE_BYTES + 1
+        )
+        .into_bytes();
+        let (base, conns) = raw_serve(vec![over]);
+        let server = MockServer::start().await;
+        mount_grant_to(&server, &base).await;
+        let outcome = client(&server.uri(), fast())
+            .fetch_vendor_package(UUID_A, false, None, None)
+            .await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Failed(ApiError::Network(ref m)) if m.contains("too large")),
+            "{outcome:?}"
+        );
+        assert_eq!(conns.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -4339,7 +4565,9 @@ mod vendor_retry_tests {
         match o {
             VendorServiceOutcome::Failed(ApiError::Other(msg)) => {
                 assert!(
-                    msg.contains("skipped after 2 consecutive failures"),
+                    msg.contains(
+                        "not attempted: the service failed for the previous 2 packages in this run"
+                    ),
                     "{msg}"
                 )
             }
