@@ -146,6 +146,18 @@ pub struct ApplyResult {
 /// Normalize file path by removing the "package/" prefix if present.
 /// Patch files come from the API with paths like "package/lib/file.js"
 /// but we need relative paths like "lib/file.js" for the actual package directory.
+/// A patch's files in file-name order: the verify and write loops walk
+/// this, not the `HashMap`, so the file named in a "Cannot apply patch"
+/// error (the first one that fails) and every per-file list are the same
+/// on every run.
+pub(crate) fn files_in_order(
+    files: &HashMap<String, PatchFileInfo>,
+) -> Vec<(&String, &PatchFileInfo)> {
+    let mut ordered: Vec<_> = files.iter().collect();
+    ordered.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    ordered
+}
+
 pub(crate) fn normalize_file_path(file_name: &str) -> &str {
     const PACKAGE_PREFIX: &str = "package/";
     if let Some(stripped) = file_name.strip_prefix(PACKAGE_PREFIX) {
@@ -809,7 +821,7 @@ async fn apply_package_patch_at(
     };
 
     // First, verify all files
-    for (file_name, file_info) in files {
+    for (file_name, file_info) in files_in_order(files) {
         // SECURITY: reject any manifest key that would escape the package dir
         // (absolute path or `..`). Abort the whole package apply before any
         // disk write — NOT skippable by `--force`, since a path escape is never
@@ -913,7 +925,7 @@ async fn apply_package_patch_at(
     let mut warnings: Vec<String> = Vec::new();
 
     // Apply patches to files that need it.
-    for (file_name, file_info) in files {
+    for (file_name, file_info) in files_in_order(files) {
         let verify_result = result.files_verified.iter().find(|v| v.file == *file_name);
         if let Some(vr) = verify_result {
             if vr.status == VerifyStatus::AlreadyPatched || vr.status == VerifyStatus::NotFound {
@@ -2077,6 +2089,46 @@ mod tests {
         .await;
         assert!(result.success);
         assert_eq!(result.files_patched.len(), 0);
+    }
+
+    /// With several missing files the error always names the first one
+    /// in file-name order, not whichever the `HashMap` yields first.
+    #[tokio::test]
+    async fn test_apply_missing_files_error_names_the_first_in_order() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let mut files = HashMap::new();
+        for name in ["lodash.min.js", "lodash.js", "package/z.js", "fp.js"] {
+            files.insert(
+                name.to_string(),
+                PatchFileInfo {
+                    before_hash: "a".repeat(64),
+                    after_hash: "b".repeat(64),
+                },
+            );
+        }
+        let result = apply_package_patch(
+            "pkg:npm/lodash@4.17.20",
+            pkg_dir.path(),
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            None,
+            true,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Cannot apply patch: fp.js - File not found")
+        );
+        let order: Vec<_> = files_in_order(&files)
+            .into_iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            ["fp.js", "lodash.js", "lodash.min.js", "package/z.js"]
+        );
     }
 
     // ── Fallback-chain tests ─────────────────────────────────────────

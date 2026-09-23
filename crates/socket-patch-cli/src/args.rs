@@ -41,9 +41,18 @@ fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
             .map(|e| e.cli_name())
             .collect::<Vec<_>>()
             .join(", ");
-        Err(format!(
-            "unsupported ecosystem `{s}` in this build (supported: {supported})"
-        ))
+        Err(unsupported_ecosystem_message(s, &supported))
+    }
+}
+
+/// The `--ecosystems` rejection text. An empty token (`--ecosystems ,npm`,
+/// a trailing comma) gets its own wording: "unsupported ecosystem ``"
+/// reads like a rendering glitch.
+fn unsupported_ecosystem_message(token: &str, supported: &str) -> String {
+    if token.trim().is_empty() {
+        format!("empty ecosystem name in the list (supported: {supported})")
+    } else {
+        format!("unsupported ecosystem `{token}` (supported: {supported})")
     }
 }
 
@@ -78,49 +87,63 @@ pub(crate) fn parse_bool_flag(s: &str) -> Result<bool, String> {
     }
 }
 
-/// Arguments inherited by every subcommand via `#[command(flatten)]`.
-///
-/// **Every** global flag is parseable on **every** subcommand. Commands that
-/// don't use a given flag ignore it silently — e.g. `list --global` parses
-/// fine and the `global` field is unused at runtime.
+/// `--help` heading for every [`GlobalArgs`] flag, so each subcommand's own
+/// flags (listed first, under "Options") are not buried among the ~24 shared
+/// ones. Set per-arg rather than as the struct's `next_help_heading`: that
+/// would leak onto the subcommand-local flags declared after the flatten.
+const GLOBAL_OPTIONS: &str = "Global options";
+
+// Arguments inherited by every subcommand via `#[command(flatten)]`.
+//
+// **Every** global flag is parseable on **every** subcommand. Commands that
+// don't use a given flag ignore it silently — e.g. `list --global` parses
+// fine and the `global` field is unused at runtime.
+//
+// (Plain `//` comments: clap turns a doc comment here into the `--help`
+// description of any subcommand that has none of its own.)
 #[derive(Args, Debug, Clone)]
 pub struct GlobalArgs {
     /// Working directory.
-    #[arg(long, env = "SOCKET_CWD", default_value = ".")]
+    #[arg(help_heading = GLOBAL_OPTIONS, long, env = "SOCKET_CWD", default_value = ".")]
     pub cwd: PathBuf,
 
     /// Path to patch manifest file (resolved relative to --cwd).
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long = "manifest-path",
         env = "SOCKET_MANIFEST_PATH",
         default_value = DEFAULT_PATCH_MANIFEST_PATH,
     )]
     pub manifest_path: String,
 
-    /// Socket API URL (authenticated endpoint) [default:
-    /// https://api.socket.dev]. No clap default: `None` lets the core
-    /// resolver fall through env and the socket-cli config file before
-    /// applying `DEFAULT_SOCKET_API_URL`.
-    #[arg(long = "api-url", env = "SOCKET_API_URL")]
+    /// Socket API URL (authenticated endpoint). Falls back to the socket-cli
+    /// config file, then https://api.socket.dev.
+    //
+    // No clap default: `None` lets the core resolver fall through env and the
+    // socket-cli config file before applying `DEFAULT_SOCKET_API_URL`.
+    #[arg(help_heading = GLOBAL_OPTIONS, long = "api-url", env = "SOCKET_API_URL")]
     pub api_url: Option<String>,
 
     /// Socket API token. Absence selects the public patch proxy.
-    #[arg(long = "api-token", env = "SOCKET_API_TOKEN")]
+    #[arg(help_heading = GLOBAL_OPTIONS, long = "api-token", env = "SOCKET_API_TOKEN")]
     pub api_token: Option<String>,
 
     /// Organization slug. Auto-resolved when omitted and a token is set.
-    #[arg(long = "org", short = 'o', env = "SOCKET_ORG_SLUG")]
+    #[arg(help_heading = GLOBAL_OPTIONS, long = "org", short = 'o', env = "SOCKET_ORG_SLUG")]
     pub org: Option<String>,
 
-    /// Public proxy URL used when no API token is set [default:
-    /// https://patches-api.socket.dev]. No clap default, matching
-    /// `api_url` — resolution happens in `get_api_client_with_overrides`.
-    #[arg(long = "proxy-url", env = "SOCKET_PROXY_URL")]
+    /// Public patch proxy URL used when no API token is set
+    /// [default: https://patches-api.socket.dev].
+    //
+    // No clap default, matching `api_url` — resolution happens in
+    // `get_api_client_with_overrides`.
+    #[arg(help_heading = GLOBAL_OPTIONS, long = "proxy-url", env = "SOCKET_PROXY_URL")]
     pub proxy_url: Option<String>,
 
     /// Restrict to these ecosystems (comma-separated). Names that are not
     /// supported ecosystems are rejected.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long = "ecosystems",
         short = 'e',
         env = "SOCKET_ECOSYSTEMS",
@@ -133,6 +156,7 @@ pub struct GlobalArgs {
     /// `diff` (default) fetches the smallest delta archive; `file` falls back
     /// to legacy per-file blobs.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long = "download-mode",
         env = "SOCKET_DOWNLOAD_MODE",
         default_value = "diff"
@@ -143,9 +167,10 @@ pub struct GlobalArgs {
     /// (default) downloads the prebuilt archive from the patch.socket.dev
     /// vendoring service and silently falls back to a local build on any miss;
     /// `service` requires the service and fails closed; `build` always builds
-    /// locally (the pre-service behavior). Only `vendor` uses this; other
-    /// subcommands accept it silently.
+    /// locally. Only `vendor` and the vendored modes of `scan`/`get` use
+    /// this; other subcommands accept it silently.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long = "vendor-source",
         env = "SOCKET_VENDOR_SOURCE",
         default_value = "auto",
@@ -153,24 +178,31 @@ pub struct GlobalArgs {
     )]
     pub vendor_source: String,
 
-    /// Base URL for the patch vendoring service's package-reference request
-    /// (the step-1 POST). Defaults to the active API base (`--api-url`) when
+    /// Base URL for the patch vendoring service. Defaults to the active API base (`--api-url`) when
     /// authenticated or the proxy base (`--proxy-url`) otherwise. Override to
     /// point `vendor` at staging / local dev independently of `--api-url`.
-    #[arg(long = "vendor-url", env = "SOCKET_VENDOR_URL")]
+    // A dev/testing knob: listed in `--help`, left out of the `-h` summary.
+    #[arg(help_heading = GLOBAL_OPTIONS, long = "vendor-url", env = "SOCKET_VENDOR_URL", hide_short_help = true)]
     pub vendor_url: Option<String>,
 
     /// Override the host of the prebuilt-archive download URL the vendoring
-    /// service returns (the step-2 GET). When set, the CLI rewrites the
+    /// service returns. When set, the CLI rewrites the
     /// scheme + host (+ port) of the returned URL to this base, preserving the
     /// path. Mainly for local-dev / testing, where the host the server bakes
     /// into the URL is not the one to actually fetch from.
-    #[arg(long = "patch-server-url", env = "SOCKET_PATCH_SERVER_URL")]
+    // A dev/testing knob: listed in `--help`, left out of the `-h` summary.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "patch-server-url",
+        env = "SOCKET_PATCH_SERVER_URL",
+        hide_short_help = true
+    )]
     pub patch_server_url: Option<String>,
 
     /// Strict airgap: never contact the network. Operations that need remote
     /// data fail loudly when this is set.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long,
         env = "SOCKET_OFFLINE",
         default_value_t = false,
@@ -182,8 +214,10 @@ pub struct GlobalArgs {
     /// on-disk content matches neither the patch's beforeHash nor its
     /// afterHash is overwritten with the full verified patched content and
     /// surfaced as a stderr warning (`content_mismatch_overwritten`); this
-    /// flag restores the fail-closed behavior. `--force` overrides it.
+    /// flag restores the fail-closed behavior. On commands that have
+    /// `--force`, `--force` overrides it.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long,
         env = "SOCKET_STRICT",
         default_value_t = false,
@@ -193,6 +227,7 @@ pub struct GlobalArgs {
 
     /// Operate on globally-installed packages.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long = "global",
         short = 'g',
         env = "SOCKET_GLOBAL",
@@ -202,11 +237,12 @@ pub struct GlobalArgs {
     pub global: bool,
 
     /// Override the path used to discover globally-installed packages.
-    #[arg(long = "global-prefix", env = "SOCKET_GLOBAL_PREFIX")]
+    #[arg(help_heading = GLOBAL_OPTIONS, long = "global-prefix", env = "SOCKET_GLOBAL_PREFIX")]
     pub global_prefix: Option<PathBuf>,
 
     /// Emit machine-readable JSON output.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long = "json",
         short = 'j',
         env = "SOCKET_JSON",
@@ -217,6 +253,7 @@ pub struct GlobalArgs {
 
     /// Show extra detail in human-readable output.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long = "verbose",
         short = 'v',
         env = "SOCKET_VERBOSE",
@@ -227,6 +264,7 @@ pub struct GlobalArgs {
 
     /// Suppress non-error output.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long = "silent",
         short = 's',
         env = "SOCKET_SILENT",
@@ -237,6 +275,7 @@ pub struct GlobalArgs {
 
     /// Preview the operation without making any mutations.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long = "dry-run",
         env = "SOCKET_DRY_RUN",
         default_value_t = false,
@@ -246,6 +285,7 @@ pub struct GlobalArgs {
 
     /// Skip interactive prompts.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long = "yes",
         short = 'y',
         env = "SOCKET_YES",
@@ -254,21 +294,21 @@ pub struct GlobalArgs {
     )]
     pub yes: bool,
 
-    /// Seconds to wait for `<.socket>/apply.lock` before giving up.
-    /// Default (`None`) and `0` both mean a single non-blocking try
-    /// — failing immediately if another process holds the lock. A
-    /// positive value retries with a 100 ms backoff until the lock
-    /// frees or the budget elapses. Only meaningful for the lock-
-    /// contending subcommands (`apply`, `rollback`, `repair`, `remove`,
-    /// `vendor`, `setup --exclude`'s manifest write, and the hosted /
-    /// vendored modes of `scan`/`get`); other commands accept it
-    /// silently. Every holder removes the lock file on exit, so a
-    /// leftover from a crashed run never contends.
-    #[arg(long = "lock-timeout", env = "SOCKET_LOCK_TIMEOUT")]
+    /// Seconds to wait for the `.socket/apply.lock` lock before giving up.
+    /// By default (or with `0`) the lock is tried once, failing immediately
+    /// if another process holds it. A positive value retries with a 100 ms
+    /// backoff until the lock frees or the budget elapses. Only meaningful
+    /// for the commands that take the lock (`apply`, `rollback`, `repair`,
+    /// `remove`, `vendor`, `get` and `scan` when they record, apply,
+    /// vendor or redirect patches, and `setup --exclude`'s manifest write);
+    /// other commands accept it silently. Every holder removes the lock file on exit, so a leftover
+    /// from a crashed run never contends.
+    #[arg(help_heading = GLOBAL_OPTIONS, long = "lock-timeout", env = "SOCKET_LOCK_TIMEOUT")]
     pub lock_timeout: Option<u64>,
 
     /// Emit verbose debug logs to stderr.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long = "debug",
         env = "SOCKET_DEBUG",
         default_value_t = false,
@@ -278,6 +318,7 @@ pub struct GlobalArgs {
 
     /// Disable anonymous usage telemetry.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long = "no-telemetry",
         env = "SOCKET_TELEMETRY_DISABLED",
         default_value_t = false,
@@ -285,14 +326,16 @@ pub struct GlobalArgs {
     )]
     pub no_telemetry: bool,
 
-    /// Hosted mode (`scan --mode hosted`): do NOT auto-configure
+    /// Hosted mode (`scan`/`get --mode hosted`): do NOT auto-configure
     /// `trustLockfile: true` in pnpm-workspace.yaml after a pnpm-lock.yaml
     /// (lockfileVersion >= 9) is repointed at the hosted patch server.
     /// pnpm >= 11 rejects the repointed lock without that trust grant, so
     /// opting out means every install needs `pnpm install --trust-lockfile`
-    /// instead (the run's warning spells out both recoveries). Only `scan`
-    /// reads this; other subcommands accept it silently.
+    /// instead (the run's warning spells out both recoveries). Only
+    /// hosted-mode `scan` and `get` read this; other subcommands accept it
+    /// silently.
     #[arg(
+        help_heading = GLOBAL_OPTIONS,
         long = "no-trust-lockfile-config",
         env = "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
         default_value_t = false,
@@ -585,6 +628,28 @@ impl Default for GlobalArgs {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn ecosystem_rejection_messages() {
+        assert_eq!(
+            unsupported_ecosystem_message("rubygems", "npm, pypi"),
+            "unsupported ecosystem `rubygems` (supported: npm, pypi)"
+        );
+        assert_eq!(
+            unsupported_ecosystem_message("", "npm, pypi"),
+            "empty ecosystem name in the list (supported: npm, pypi)"
+        );
+        assert_eq!(
+            unsupported_ecosystem_message("  ", "npm"),
+            "empty ecosystem name in the list (supported: npm)"
+        );
+        let err = parse_supported_ecosystem("bogus").unwrap_err();
+        assert!(
+            err.starts_with("unsupported ecosystem `bogus` (supported: npm"),
+            "{err}"
+        );
+        assert!(!err.contains("in this build"), "{err}");
+    }
 
     /// Minimal harness so we can exercise clap's parse + env-var resolution of
     /// `GlobalArgs` exactly as a real subcommand would (it is `flatten`ed).

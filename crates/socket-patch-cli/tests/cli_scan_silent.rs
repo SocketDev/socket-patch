@@ -296,8 +296,8 @@ async fn scan_silent_apply_flow_produces_no_output_but_still_applies() {
         "non-silent scan must print the pre-apply listing; got {loud_stdout:?}"
     );
     assert!(
-        loud_stderr.contains("Found 1 packages"),
-        "non-silent scan must print the crawl summary on stderr; got {loud_stderr:?}"
+        loud_stderr.contains("Found 1 package ("),
+        "non-silent scan must print the singular crawl summary on stderr; got {loud_stderr:?}"
     );
 }
 
@@ -362,7 +362,7 @@ fn seed_manifest_with_gone_entry(root: &Path) {
 /// The vendored-mode GC line must honor `--silent` like the apply-mode one
 /// does: `scan --vendor --prune --silent --yes` prints nothing when it
 /// succeeds. Regression guard: `run_vendor_interactive_path` printed
-/// "GC: pruned N manifest entries." (and the vendored-revert GC line)
+/// "GC: pruned N manifest entries and removed …" (and the vendored-revert GC line)
 /// unconditionally.
 #[tokio::test]
 async fn scan_vendor_silent_gc_prints_nothing() {
@@ -467,7 +467,9 @@ async fn scan_vendor_silent_gc_prints_nothing() {
         "control run must succeed; stderr={loud_stderr:?}"
     );
     assert!(
-        loud_stdout.contains("GC: pruned 1 manifest entry."),
+        loud_stdout
+            .lines()
+            .any(|l| l == "GC: pruned 1 manifest entry and removed 0 orphan files (0 B)."),
         "non-silent vendor scan must print the GC line; got {loud_stdout:?}"
     );
 }
@@ -629,11 +631,11 @@ async fn scan_silent_keeps_error_output() {
         "all-batches-failed scan must exit 1; stderr={stderr:?}"
     );
     assert!(
-        stderr.contains("API batch queries failed"),
+        stderr.contains("Error: The API query failed: "),
         "--silent must NOT suppress error output; got {stderr:?}"
     );
     assert!(
-        !stderr.contains("Found 1 packages"),
+        !stderr.contains("Found 1 package"),
         "--silent must suppress the informational crawl summary even on \
          the error path; got {stderr:?}"
     );

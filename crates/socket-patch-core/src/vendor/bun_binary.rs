@@ -448,6 +448,77 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
     outcome
 }
 
+/// Mirrors are confined to a workspace's own Socket artifact directory.
+/// Check every existing component so a workspace symlink cannot redirect a
+/// write or deletion outside the project.
+pub(super) fn validate_mirror_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let (workspace, artifact) = rel
+        .rsplit_once("/.socket/vendor/npm/")
+        .ok_or("invalid workspace tarball path")?;
+    if workspace.is_empty()
+        || artifact.is_empty()
+        || rel.contains('\\')
+        || Path::new(rel)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err("unsafe workspace tarball path".into());
+    }
+    let parsed = parse_vendor_path(&format!(".socket/vendor/npm/{artifact}"))
+        .ok_or("invalid workspace vendor artifact")?;
+    let valid_leaf = match parsed.leaf.split_once('/') {
+        None => true,
+        Some((scope, bare)) => {
+            scope.starts_with('@') && scope.len() > 1 && !bare.is_empty() && !bare.contains('/')
+        }
+    };
+    if parsed.eco != "npm" || !valid_leaf || !parsed.leaf.ends_with(".tgz") {
+        return Err("invalid workspace tarball leaf".into());
+    }
+    let mut path = root.to_path_buf();
+    for component in Path::new(rel).components() {
+        path.push(component);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "workspace tarball path {} contains a symbolic link",
+                    path.display()
+                ))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot inspect workspace tarball path: {e}")),
+        }
+    }
+    Ok(path)
+}
+
+pub(super) async fn prune_mirror_parents(path: &Path) {
+    // Only empty directories through the workspace's .socket, never the member.
+    let mut parent = path.parent();
+    for _ in 0..5 {
+        let Some(dir) = parent else { break };
+        if tokio::fs::remove_dir(dir).await.is_err() {
+            break;
+        }
+        if dir.file_name().is_some_and(|name| name == ".socket") {
+            break;
+        }
+        parent = dir.parent();
+    }
+}
+
+pub(super) async fn undo_mirrors(backups: &[(PathBuf, Option<Vec<u8>>)]) {
+    for (path, before) in backups.iter().rev() {
+        if let Some(bytes) = before {
+            let _ = atomic_write_bytes_preserving_mode(path, bytes).await;
+        } else {
+            let _ = tokio::fs::remove_file(path).await;
+            prune_mirror_parents(path).await;
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod symlink_tests {
     use super::*;
@@ -672,77 +743,6 @@ mod rebuild_tests {
         assert!(!root.path().join(&entry.artifact.path).exists());
         for mirror in entry.wiring.iter().filter(|r| r.kind == MIRROR_KIND) {
             assert!(!root.path().join(&mirror.file).exists());
-        }
-    }
-}
-
-/// Mirrors are confined to a workspace's own Socket artifact directory.
-/// Check every existing component so a workspace symlink cannot redirect a
-/// write or deletion outside the project.
-pub(super) fn validate_mirror_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let (workspace, artifact) = rel
-        .rsplit_once("/.socket/vendor/npm/")
-        .ok_or("invalid workspace tarball path")?;
-    if workspace.is_empty()
-        || artifact.is_empty()
-        || rel.contains('\\')
-        || Path::new(rel)
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-    {
-        return Err("unsafe workspace tarball path".into());
-    }
-    let parsed = parse_vendor_path(&format!(".socket/vendor/npm/{artifact}"))
-        .ok_or("invalid workspace vendor artifact")?;
-    let valid_leaf = match parsed.leaf.split_once('/') {
-        None => true,
-        Some((scope, bare)) => {
-            scope.starts_with('@') && scope.len() > 1 && !bare.is_empty() && !bare.contains('/')
-        }
-    };
-    if parsed.eco != "npm" || !valid_leaf || !parsed.leaf.ends_with(".tgz") {
-        return Err("invalid workspace tarball leaf".into());
-    }
-    let mut path = root.to_path_buf();
-    for component in Path::new(rel).components() {
-        path.push(component);
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(format!(
-                    "workspace tarball path {} contains a symbolic link",
-                    path.display()
-                ))
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("cannot inspect workspace tarball path: {e}")),
-        }
-    }
-    Ok(path)
-}
-
-pub(super) async fn prune_mirror_parents(path: &Path) {
-    // Only empty directories through the workspace's .socket, never the member.
-    let mut parent = path.parent();
-    for _ in 0..5 {
-        let Some(dir) = parent else { break };
-        if tokio::fs::remove_dir(dir).await.is_err() {
-            break;
-        }
-        if dir.file_name().is_some_and(|name| name == ".socket") {
-            break;
-        }
-        parent = dir.parent();
-    }
-}
-
-pub(super) async fn undo_mirrors(backups: &[(PathBuf, Option<Vec<u8>>)]) {
-    for (path, before) in backups.iter().rev() {
-        if let Some(bytes) = before {
-            let _ = atomic_write_bytes_preserving_mode(path, bytes).await;
-        } else {
-            let _ = tokio::fs::remove_file(path).await;
-            prune_mirror_parents(path).await;
         }
     }
 }

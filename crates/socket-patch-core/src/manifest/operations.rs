@@ -61,7 +61,11 @@ pub async fn read_manifest(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    parse_manifest(&content).map(Some)
+    // Tolerate a UTF-8 byte-order mark (Windows editors add one on save):
+    // the file looks fine in an editor, yet serde_json rejects it with an
+    // opaque "expected value at line 1 column 1".
+    let json = content.strip_prefix('\u{feff}').unwrap_or(&content);
+    parse_manifest(json).map(Some)
 }
 
 /// Write a manifest to the filesystem with pretty-printed JSON.
@@ -321,6 +325,25 @@ mod tests {
         let result = read_manifest("/nonexistent/path/manifest.json").await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    // A manifest saved with a UTF-8 BOM (as some Windows editors do) reads
+    // like any other; a BOM anywhere but the start stays invalid.
+    #[tokio::test]
+    async fn test_read_manifest_tolerates_leading_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        tokio::fs::write(&path, "\u{feff}{\"patches\":{}}")
+            .await
+            .unwrap();
+        let manifest = read_manifest(&path).await.unwrap().unwrap();
+        assert!(manifest.patches.is_empty());
+
+        tokio::fs::write(&path, "{\"patches\":{}}\u{feff}\u{feff}")
+            .await
+            .unwrap();
+        let err = read_manifest(&path).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     // Regression: a missing file maps to Ok(None), but malformed JSON must

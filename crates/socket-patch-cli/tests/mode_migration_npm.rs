@@ -422,25 +422,24 @@ fn stage_yarn_fixture(tag: &str, pm: &str, berry: bool) -> Option<YarnFixture> {
         ),
     )
     .unwrap();
-    let extra_env: Vec<(String, String)>;
-    if berry {
+    let extra_env: Vec<(String, String)> = if berry {
         std::fs::write(
             proj.join(".yarnrc.yml"),
             "nodeLinker: node-modules\nenableGlobalCache: false\n",
         )
         .unwrap();
         let global = tmp.path().join("yarn-global");
-        extra_env = vec![(
+        vec![(
             "YARN_GLOBAL_FOLDER".into(),
             global.to_str().unwrap().to_string(),
-        )];
+        )]
     } else {
         let cache = tmp.path().join("yarn-cache");
-        extra_env = vec![(
+        vec![(
             "YARN_CACHE_FOLDER".into(),
             cache.to_str().unwrap().to_string(),
-        )];
-    }
+        )]
+    };
     let env_refs: Vec<(&str, &str)> = extra_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))

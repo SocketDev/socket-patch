@@ -347,8 +347,8 @@ async fn scan_discovers_case_encoded_modules() {
         output.status.code()
     );
     assert!(
-        combined.contains("Found 1 packages (1 go)"),
-        "Expected human scan to report 'Found 1 packages (1 go)', got:\n{combined}"
+        combined.contains("Found 1 package (1 go)"),
+        "Expected human scan to report 'Found 1 package (1 go)', got:\n{combined}"
     );
     assert!(
         !combined.contains("No packages found"),

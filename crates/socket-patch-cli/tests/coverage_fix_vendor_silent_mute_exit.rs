@@ -154,7 +154,7 @@ fn vendor_silent_online_fetch_failure_keeps_error_output() {
     assert!(
         chatter
             .iter()
-            .any(|l| l.contains("could not fetch patch content")),
+            .any(|l| l.contains("Could not fetch patch content")),
         "--silent must keep the fetch-failure error (errors only, \
          never nothing); stderr was: {stderr:?}"
     );

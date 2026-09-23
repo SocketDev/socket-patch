@@ -9,8 +9,8 @@ pub mod args;
 pub mod commands;
 pub(crate) mod ecosystem_dispatch;
 pub mod json_envelope;
-pub mod output;
 pub mod path_scope;
+pub mod ui;
 pub mod update_notifier;
 
 use clap::{Parser, Subcommand};
@@ -59,18 +59,21 @@ pub enum Commands {
     /// vulnerabilities mitigated by the applied patches.
     Vex(commands::vex::VexArgs),
 
-    /// Eject patched dependencies into committable `.socket/vendor/`
-    /// and rewire lockfiles so fresh checkouts build with the patches
-    /// (no socket-patch or Socket API needed). `--revert` undoes it.
+    /// Eject patched dependencies into committable `.socket/vendor/` and
+    /// rewire lockfiles to use them (`--revert` undoes it)
+    ///
+    /// Fresh checkouts then build with the patches, with no socket-patch or
+    /// Socket API needed.
     Vendor(commands::vendor::VendorArgs),
 
-    /// Configure package.json postinstall scripts to apply patches
+    /// Wire install hooks (npm, Python, Bundler, Composer) that re-apply
+    /// patches after install
     Setup(commands::setup::SetupArgs),
 
-    /// Rollback patches to restore original files
+    /// Roll back patches to restore original files
     Rollback(commands::rollback::RollbackArgs),
 
-    /// Get security patches from Socket API and apply them
+    /// Get security patches from the Socket API and apply them
     #[command(visible_alias = "download")]
     Get(commands::get::GetArgs),
 
@@ -80,21 +83,30 @@ pub enum Commands {
     /// Remove a patch from the manifest by PURL or UUID (rolls back files first)
     Remove(commands::remove::RemoveArgs),
 
-    /// Download missing blobs and clean up unused blobs.
+    /// Download missing patch artifacts and clean up unused ones
     ///
-    /// `repair` (alias `gc`) is a first-class command for cleaning up
-    /// the `.socket/` directory without running a scan. For the
-    /// combined workflow (discover + apply + GC), use
-    /// `scan --sync --json --yes`. `repair`/`gc` remain useful on
-    /// their own when the user wants to clean up without an apply pass.
+    /// Restores missing blobs and diff/package archives, rebuilds missing
+    /// or corrupt vendored artifacts, then deletes the artifacts nothing
+    /// references. It needs no scan; for the combined workflow (discover,
+    /// apply, clean up) use `scan --sync --json --yes`.
     #[command(visible_alias = "gc")]
     Repair(commands::repair::RepairArgs),
 
-    /// Internal parse target of the root `--update` flag (see the rewrite
-    /// in [`parse_argv_with_shortcuts`]). Hidden: the public contract
-    /// surface is `socket-patch --update`, and this name carries no
-    /// stability guarantee (documented as internal in CLI_CONTRACT.md).
-    #[command(hide = true, name = "self-update")]
+    // Internal parse target of the root `--update` flag (see the rewrite
+    // in `parse_argv_with_shortcuts`). Hidden: the public contract
+    // surface is `socket-patch --update`, and this name carries no
+    // stability guarantee (documented as internal in CLI_CONTRACT.md).
+    // Plain `//` comments plus an explicit `about`/`override_usage`: a doc
+    // comment here is what `socket-patch --update --help` printed, and the
+    // derived usage line named the hidden subcommand, and so did the
+    // `--update --version` line until `display_name` pinned it.
+    #[command(
+        hide = true,
+        name = "self-update",
+        display_name = "socket-patch",
+        about = "Update socket-patch itself to the latest (or a pinned) release",
+        override_usage = "socket-patch --update [VERSION] [OPTIONS]"
+    )]
     SelfUpdate(commands::update::UpdateArgs),
 }
 
@@ -608,7 +620,14 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
         assert!(!err.use_stderr());
         assert_eq!(err.exit_code(), 0);
-        assert!(err.to_string().contains("self-update"), "{err}");
+        // The page is self-update's, but spelled the public way: the hidden
+        // subcommand name must not leak into its usage line.
+        let text = err.to_string();
+        assert!(
+            text.contains("Usage: socket-patch --update [VERSION]"),
+            "{text}"
+        );
+        assert!(!text.contains("self-update"), "{text}");
     }
 
     #[test]

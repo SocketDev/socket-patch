@@ -1534,9 +1534,8 @@ mod tests {
                 Some(PathBuf::from("/data/virtualenvs"))
             );
         }
-        assert_eq!(
+        assert!(
             with(Some("  "), None).is_some(),
-            true,
             "blank WORKON_HOME falls through"
         );
         let no_home = |_: &str| None::<String>;

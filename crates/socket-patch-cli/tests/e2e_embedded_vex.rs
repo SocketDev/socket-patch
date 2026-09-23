@@ -584,7 +584,7 @@ fn apply_vex_write_failure_names_path() {
         .as_str()
         .expect("error.message is a string");
     assert!(
-        msg.contains("failed to write VEX document") && msg.contains("no-such-dir"),
+        msg.contains("Failed to write VEX document") && msg.contains("no-such-dir"),
         "the error must name the operation and the path; got {msg:?}"
     );
 }

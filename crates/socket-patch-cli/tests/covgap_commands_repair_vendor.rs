@@ -1266,6 +1266,35 @@ async fn repair_rebuild_fails_when_installed_patch_file_missing() {
     assert!(!tgz.exists(), "a failed dispatch replaced nothing");
 }
 
+/// Human twin: the failed rebuild exits 1, so the run must close on
+/// "Repair finished with errors." (stderr), never "Repair complete.".
+#[tokio::test]
+async fn human_repair_rebuild_failure_does_not_claim_complete() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(
+        tmp.path(),
+        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        "sha512-orig==",
+    );
+    let tgz = vendor_project(tmp.path(), &mock.uri());
+    std::fs::remove_file(&tgz).unwrap();
+    std::fs::remove_file(tmp.path().join("node_modules/left-pad/index.js")).unwrap();
+
+    let (code, stdout, stderr) = run_cli_human(tmp.path(), &mock.uri(), &["repair"]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    assert!(
+        !stdout.contains("Repair complete.") && !stderr.contains("Repair complete."),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(
+        stderr.lines().last(),
+        Some("Repair finished with errors."),
+        "stderr={stderr}"
+    );
+}
+
 // ─────────────────── soft-restore fallbacks ───────────────────
 
 /// Staging itself is Unavailable (offline, one candidate's patch content
@@ -1688,7 +1717,7 @@ async fn repair_human_output_lines() {
     let (code, stdout, stderr) = run_cli_human(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(
-        stdout.contains("Rebuilding 1 broken vendored artifact(s)"),
+        stdout.contains("Rebuilding 1 broken vendored artifact..."),
         "the rebuild header is printed: {stdout}"
     );
     assert!(
@@ -1704,7 +1733,7 @@ async fn repair_human_output_lines() {
     let (code, stdout, stderr) = run_cli_human(tmp.path(), &mock.uri(), &["repair"]);
     assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
     assert!(
-        stderr.contains(&format!("Cannot repair vendored artifact for {PURL}")),
+        stderr.contains(&format!("Error: Cannot repair vendored artifact for {PURL}")),
         "the failure line is printed to stderr: {stderr}"
     );
 }

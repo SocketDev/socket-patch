@@ -30,6 +30,7 @@ use crate::json_envelope::{
     AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile,
     RunWarning, Status, VexSummary,
 };
+use crate::ui::{plural, StatusLine};
 
 /// Files whose pre-apply content matched NEITHER hash and were (or would
 /// be) overwritten with the verified patched content — the promoted
@@ -55,11 +56,39 @@ fn warn_mismatch_overwrites(result: &ApplyResult, common: &GlobalArgs) {
     }
     for file in mismatch_overwritten_files(result) {
         eprintln!(
-            "Warning (content_mismatch_overwritten): {} {file} did not match the patch's \
-             expected original content; applied the full verified patched content instead \
-             (pass --strict to fail on mismatches)",
-            normalize_purl(&result.package_key)
+            "{}",
+            format_mismatch_warning(&normalize_purl(&result.package_key), &file, common.dry_run)
         );
+    }
+}
+
+/// The human stderr line for one mismatch-overwritten file. A dry run
+/// wrote nothing, so it says what *would* happen.
+fn format_mismatch_warning(purl: &str, file: &str, dry_run: bool) -> String {
+    let what = if dry_run { "would apply" } else { "applied" };
+    format!(
+        "Warning (content_mismatch_overwritten): {purl} {file} did not match the patch's \
+         expected original content; {what} the full verified patched content instead \
+         (pass --strict to fail on mismatches)"
+    )
+}
+
+/// The JSON event detail for one mismatch-overwritten file (tense follows
+/// `dry_run`, like [`format_mismatch_warning`]).
+fn mismatch_event_detail(file: &str, dry_run: bool) -> String {
+    let what = if dry_run { "would be" } else { "was" };
+    format!(
+        "{file} did not match the patch's expected original content; the full verified \
+         patched content {what} applied"
+    )
+}
+
+/// `1 mismatched file` / `2 mismatched files`, with the verb agreeing.
+fn mismatched_files_fail(n: usize) -> String {
+    if n == 1 {
+        "1 mismatched file will fail to apply".to_string()
+    } else {
+        format!("{n} mismatched files will fail to apply")
     }
 }
 
@@ -90,39 +119,66 @@ async fn ensure_blobs_for_mismatches(
     if needed.is_empty() {
         return;
     }
+    let quiet = args.common.silent || args.common.json;
     if args.common.offline {
-        if !args.common.silent && !args.common.json {
+        if !quiet {
             eprintln!(
-                "Warning: {} mismatched file(s) need their full patched blob, but --offline \
-                 prevents fetching; those files will fail to apply",
-                needed.len()
+                "Warning: {} {} the full patched blob, but --offline prevents fetching; {}",
+                plural(
+                    needed.len(),
+                    "mismatched file needs",
+                    "mismatched files need"
+                ),
+                if needed.len() == 1 { "its" } else { "their" },
+                if needed.len() == 1 {
+                    "that file will fail to apply"
+                } else {
+                    "those files will fail to apply"
+                }
             );
         }
         return;
-    }
-    if !args.common.silent && !args.common.json {
-        eprintln!(
-            "Downloading {} full patched blob(s) for mismatched file(s)...",
-            needed.len()
-        );
     }
     // Apply is read-only against `.socket/`: when the stage step returned
     // direct `.socket/` paths (everything had a local source), the on-demand
     // blobs must go to a transient overlay, never `.socket/blobs/`.
     let Some(blobs_path) = staged.writable_blobs().await else {
-        if !args.common.silent && !args.common.json {
+        if !quiet {
             eprintln!(
-                "Warning: could not stage a transient blob directory; {} mismatched file(s) \
-                 will fail to apply",
-                needed.len()
+                "Warning: could not stage a transient blob directory; {}",
+                mismatched_files_fail(needed.len())
             );
         }
         return;
     };
-    let _ = socket_patch_core::api::blob_fetcher::fetch_blobs_by_hash(
+    let mut status = StatusLine::stderr(args.common.json, args.common.silent);
+    status.set(format!(
+        "Downloading {} for mismatched files...",
+        plural(needed.len(), "full patched blob", "full patched blobs")
+    ));
+    let fetched = socket_patch_core::api::blob_fetcher::fetch_blobs_by_hash(
         &needed, blobs_path, client, None,
     )
     .await;
+    status.finish_with(format_mismatch_fetch_result(
+        fetched.downloaded,
+        needed.len(),
+    ));
+}
+
+/// The result line after fetching full blobs for mismatched files.
+fn format_mismatch_fetch_result(downloaded: usize, needed: usize) -> String {
+    if downloaded == needed {
+        format!(
+            "Downloaded {} for mismatched files",
+            plural(needed, "full patched blob", "full patched blobs")
+        )
+    } else {
+        format!(
+            "Downloaded {downloaded} of {} for mismatched files",
+            plural(needed, "full patched blob", "full patched blobs")
+        )
+    }
 }
 
 /// Probe the crawled packages for `beforeHash` mismatches whose
@@ -279,6 +335,29 @@ pub struct ApplyArgs {
     /// whole command exit non-zero even when patches applied cleanly.
     #[command(flatten)]
     pub vex: VexEmbedArgs,
+
+    /// Set when `get` / `scan --apply/--sync` runs this apply as its last
+    /// step (`None` for the `apply` command itself). Not a CLI flag.
+    #[arg(skip)]
+    pub nested: Option<NestedApply>,
+}
+
+/// What a nested apply knows about the command that runs it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NestedApply {
+    /// The caller runs under `--json`. The nested run itself is never JSON
+    /// (one envelope per command), but the caller's stdout is, so the
+    /// nested run's human error lines stay off stderr too.
+    pub caller_json: bool,
+}
+
+impl ApplyArgs {
+    /// Whether human-readable error lines go to stderr: never under
+    /// `--json` (the envelope is the channel), always otherwise — errors
+    /// are exempt from `--silent`.
+    fn prints_errors(&self) -> bool {
+        !self.common.json && !self.nested.is_some_and(|n| n.caller_json)
+    }
 }
 
 // ── local-go redirect helpers ────────────────────────────────────────────────
@@ -371,7 +450,14 @@ async fn reconcile_local_go(common: &GlobalArgs, target_manifest_purls: &HashSet
         } else {
             "Removed"
         };
-        println!("{verb} {} stale go patch redirect(s):", removed.len());
+        println!(
+            "{verb} {}:",
+            plural(
+                removed.len(),
+                "stale Go patch redirect",
+                "stale Go patch redirects"
+            )
+        );
         for purl in &removed {
             println!("  {purl}");
         }
@@ -393,7 +479,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         Err(e) => {
             let msg = format!(
                 "Patch redirect check could not read the manifest ({e}); \
-                 treating as drift (fail-closed)."
+                 treating it as drift (fail-closed)."
             );
             if args.common.json {
                 let mut env = Envelope::new(Command::Apply);
@@ -402,7 +488,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             } else {
                 // Errors print even under --silent ("errors only", never
                 // "nothing"): exit 1 with no message would be undiagnosable.
-                eprintln!("{msg}");
+                eprintln!("Error: {msg}");
             }
             return 1;
         }
@@ -455,7 +541,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         if args.common.json {
             println!("{}", Envelope::new(Command::Apply).to_pretty_json());
         } else if !args.common.silent {
-            println!("Patch redirects are in sync ({checked} checked).");
+            println!("{}", format_check_in_sync(checked));
         }
         0
     } else {
@@ -472,7 +558,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         } else {
             // Drift IS the error the exit code signals — it prints even
             // under --silent ("errors only", never "nothing").
-            eprintln!("Patch redirects are OUT OF SYNC:");
+            eprintln!("Error: Patch redirects are OUT OF SYNC:");
             for (_, _, detail) in &drifts {
                 eprintln!("  {detail}");
             }
@@ -482,9 +568,19 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     }
 }
 
-/// True when every file the engine verified for this package is already
-/// at its `afterHash` — i.e. the patch is a complete no-op on disk.
-///
+/// The `apply --check` success line. `--check` audits Go redirects only,
+/// so a project with none says so instead of a vacuous "in sync".
+fn format_check_in_sync(checked: usize) -> String {
+    if checked == 0 {
+        "No Go patch redirects to check.".to_string()
+    } else {
+        format!(
+            "Patch redirects are in sync ({} checked).",
+            plural(checked, "redirect", "redirects")
+        )
+    }
+}
+
 /// Sentinel `package_path` for a result synthesized because the purl is
 /// owned by `socket-patch vendor` (recorded in `.socket/vendor/state.json`).
 /// `result_to_event` routes it to `Skipped`/`vendored` by exact equality.
@@ -826,6 +922,8 @@ pub(crate) async fn run_locked(
             unmatched,
             run_warnings,
             fallback_skips,
+            targeted,
+            show_summary,
         }) => {
             let patched_count = results
                 .iter()
@@ -853,10 +951,50 @@ pub(crate) async fn run_locked(
             // the machine channel — same gating as scan's run warnings.
             if !args.common.json && !args.common.silent {
                 for w in &run_warnings {
-                    eprintln!("Warning ({}): {}", w.code, w.detail);
+                    // Sources-unavailable codes restate the staging layer's
+                    // own `Error:` diagnostic (already printed, even under
+                    // --silent); they exist for the JSON envelope.
+                    if !is_stage_failure_code(&w.code) {
+                        eprintln!("Warning ({}): {}", w.code, w.detail);
+                    }
                 }
                 for skip in &fallback_skips {
                     eprintln!("Warning (gem_fallback_home_skipped): {}", skip.detail());
+                }
+            }
+
+            // Human per-package report BEFORE the embedded VEX runs, so
+            // the VEX step's own notes follow the report instead of
+            // landing in the middle of it. Only the JSON envelope needs
+            // the VEX result first.
+            if !args.common.json && !args.common.silent {
+                let cwd = std::fs::canonicalize(&args.common.cwd)
+                    .unwrap_or_else(|_| args.common.cwd.clone());
+                let block = format_results_block(&results, args.common.dry_run, &cwd);
+                let mut block = block.iter().peekable();
+                // A nested apply's caller already ended its stdout with a
+                // blank line (its listing or table), so the block's leading
+                // separator goes to stderr: one blank line on a pipe, the
+                // same spacing on a terminal.
+                if args.nested.is_some() && block.next_if(|l| l.is_empty()).is_some() {
+                    eprintln!();
+                }
+                for line in block {
+                    println!("{line}");
+                }
+                if args.common.verbose && !results.is_empty() {
+                    print_verbose_verification(&results);
+                }
+                if show_summary {
+                    let tally = tally_results(&results);
+                    println!();
+                    if args.common.dry_run {
+                        for line in format_dry_run_summary(&tally, unmatched.len()) {
+                            println!("{line}");
+                        }
+                    } else {
+                        println!("{}", format_summary_line(&tally, targeted, unmatched.len()));
+                    }
                 }
             }
 
@@ -896,10 +1034,7 @@ pub(crate) async fn run_locked(
                             PatchEvent::new(PatchAction::Skipped, result.package_key.clone())
                                 .with_reason(
                                     "content_mismatch_overwritten",
-                                    format!(
-                                        "{file} did not match the patch's expected original \
-                                         content; the full verified patched content was applied"
-                                    ),
+                                    mismatch_event_detail(&file, args.common.dry_run),
                                 ),
                         );
                     }
@@ -933,8 +1068,9 @@ pub(crate) async fn run_locked(
                     );
                 }
                 // Run-level advisories (the gem config-root containment
-                // skip): the envelope's `warnings[]` is their machine
-                // channel — stderr is suppressed under --json.
+                // skip, the sources-unavailable reason): the envelope's
+                // `warnings[]` is their machine channel — stderr is
+                // suppressed under --json.
                 env.warnings.extend(run_warnings.iter().cloned());
                 if !success {
                     env.mark_partial_failure();
@@ -963,85 +1099,6 @@ pub(crate) async fn run_locked(
                     None => {}
                 }
                 println!("{}", env.to_pretty_json());
-            } else if !args.common.silent && !results.is_empty() {
-                // Vendor-owned synthesized results are `Skipped`/`vendored`
-                // in the JSON envelope — not appliable work — so keep them
-                // out of the human counts too ("N package(s) can be
-                // patched" must not count them).
-                let patched: Vec<_> = results
-                    .iter()
-                    .filter(|r| r.success && r.package_path != VENDOR_OWNED_MARKER)
-                    .collect();
-                let already_patched: Vec<_> = results
-                    .iter()
-                    .filter(|r| all_files_already_patched(r))
-                    .collect();
-
-                if args.common.dry_run {
-                    // An already-patched package is `Skipped` in the JSON
-                    // envelope, not `Verified`. Mirror that split here so
-                    // "can be patched" excludes the no-ops instead of
-                    // double-counting them against "already patched".
-                    let can_be_patched = patched.len().saturating_sub(already_patched.len());
-                    println!("\nPatch verification complete:");
-                    println!("  {} package(s) can be patched", can_be_patched);
-                    if !already_patched.is_empty() {
-                        println!("  {} package(s) already patched", already_patched.len());
-                    }
-                } else {
-                    println!("\nPatched packages:");
-                    for result in &patched {
-                        if !result.files_patched.is_empty() {
-                            // Summarize the per-file strategy used by this
-                            // package: if everything came from the same
-                            // source, show just that tag; otherwise list
-                            // distinct sources.
-                            let mut tags: Vec<&'static str> =
-                                result.applied_via.values().map(|v| v.as_tag()).collect();
-                            tags.sort_unstable();
-                            tags.dedup();
-                            let suffix = if tags.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" (via {})", tags.join("+"))
-                            };
-                            println!("  {}{}", normalize_purl(&result.package_key), suffix);
-                        } else if all_files_already_patched(result) {
-                            println!(
-                                "  {} (already patched)",
-                                normalize_purl(&result.package_key)
-                            );
-                        }
-                    }
-                }
-
-                if args.common.verbose {
-                    println!("\nDetailed verification:");
-                    for result in &results {
-                        println!("  {}:", result.package_key);
-                        for f in &result.files_verified {
-                            let status_str = match f.status {
-                                VerifyStatus::Ready => "ready",
-                                VerifyStatus::AlreadyPatched => "already patched",
-                                VerifyStatus::HashMismatch => "hash mismatch",
-                                VerifyStatus::NotFound => "not found",
-                            };
-                            println!("    {} [{}]", f.file, status_str);
-                            if let Some(ref msg) = f.message {
-                                println!("      message: {msg}");
-                            }
-                            if let Some(ref h) = f.current_hash {
-                                println!("      current:  {h}");
-                            }
-                            if let Some(ref h) = f.expected_hash {
-                                println!("      expected: {h}");
-                            }
-                            if let Some(ref h) = f.target_hash {
-                                println!("      target:   {h}");
-                            }
-                        }
-                    }
-                }
             }
 
             // Human-readable VEX status (JSON mode already folded the
@@ -1051,13 +1108,14 @@ pub(crate) async fn run_locked(
                     Some(Ok(summary)) => {
                         if !args.common.silent {
                             println!(
-                                "Wrote OpenVEX document with {} statement(s) to {}",
-                                summary.statements,
-                                args.vex
-                                    .vex
-                                    .as_ref()
-                                    .expect("vex_result is Some only when --vex was given")
-                                    .display(),
+                                "{}",
+                                crate::commands::vex::format_vex_written(
+                                    summary.statements,
+                                    args.vex
+                                        .vex
+                                        .as_ref()
+                                        .expect("vex_result is Some only when --vex was given"),
+                                )
                             );
                         }
                     }
@@ -1068,8 +1126,18 @@ pub(crate) async fn run_locked(
                         eprintln!("Error: VEX generation failed: {}", e.message);
                     }
                     None => {
-                        if !args.common.silent && args.common.dry_run && args.vex.vex.is_some() {
-                            println!("Skipping VEX generation (--dry-run: nothing was applied).");
+                        // Only a dry run that itself succeeded skips VEX
+                        // *because* of --dry-run; a failed one would have
+                        // skipped it anyway.
+                        if !args.common.silent
+                            && success
+                            && args.common.dry_run
+                            && args.vex.vex.is_some()
+                        {
+                            println!(
+                                "{}",
+                                crate::commands::vex::format_vex_dry_run_skip("applied")
+                            );
                         }
                     }
                 }
@@ -1133,7 +1201,7 @@ async fn report_apply_failure(
         env.mark_error(EnvelopeError::new("apply_failed", error.to_string()));
         println!("{}", env.to_pretty_json());
     } else {
-        eprintln!("Error: {error}");
+        eprintln!("Error: {}", super::rollback::capitalize_first(error));
     }
     1
 }
@@ -1217,6 +1285,248 @@ struct ApplyOutcome {
     /// (best-effort class): one non-fatal `Skipped` event each in the
     /// envelope, one gated stderr line each on the human path.
     fallback_skips: Vec<FallbackHomeSkip>,
+    /// In-scope (`--ecosystems`-filtered) manifest patches: the human
+    /// summary's denominator.
+    targeted: usize,
+    /// Whether the run got far enough to print the human summary (not on
+    /// the empty-scope no-op or the sources-unavailable bail, which print
+    /// their own one-line outcome).
+    show_summary: bool,
+}
+
+/// Run-warning code for the `--offline` sources-unavailable bail.
+const OFFLINE_MISSING_SOURCES: &str = "offline_missing_sources";
+/// Run-warning code for the download-failed sources-unavailable bail.
+const SOURCES_DOWNLOAD_FAILED: &str = "sources_download_failed";
+
+/// The sources-unavailable codes: the staging layer already printed their
+/// `Error:` line on the human path, so `run` keeps them for JSON only.
+fn is_stage_failure_code(code: &str) -> bool {
+    code == OFFLINE_MISSING_SOURCES || code == SOURCES_DOWNLOAD_FAILED
+}
+
+/// Why nothing could be applied when the patch sources are unavailable —
+/// the `--json` envelope's only explanation for its empty, failing run
+/// (the staging layer's stderr diagnostic is muted under `--json`).
+fn stage_failure_warning(offline: bool) -> RunWarning {
+    if offline {
+        RunWarning {
+            code: OFFLINE_MISSING_SOURCES.to_string(),
+            detail: "one or more patches have no local source and --offline is set; run \
+                     `socket-patch repair` to download the missing artifacts"
+                .to_string(),
+        }
+    } else {
+        RunWarning {
+            code: SOURCES_DOWNLOAD_FAILED.to_string(),
+            detail: "some patch artifacts could not be downloaded, so no patches were applied"
+                .to_string(),
+        }
+    }
+}
+
+/// Per-package counts for the human summary, keyed by manifest purl — so
+/// two physical copies of one package count once and the "applied"
+/// numerator can never exceed the targeted denominator. Vendor-owned
+/// synthesized results (not appliable work) are left out.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ApplyTally {
+    /// Some copy had files patched (wet run).
+    applied: usize,
+    /// Not applied, and some copy was already fully patched.
+    already: usize,
+    /// Some copy could be patched (dry run: not already patched).
+    can_patch: usize,
+    /// Some copy failed.
+    failed: usize,
+    /// Owned by `socket-patch vendor` (its committed artifact is the
+    /// patch; apply does no work for it).
+    vendored: usize,
+}
+
+fn tally_results(results: &[ApplyResult]) -> ApplyTally {
+    let mut by_purl: std::collections::BTreeMap<&str, Vec<&ApplyResult>> =
+        std::collections::BTreeMap::new();
+    let mut vendored: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for r in results {
+        if r.package_path == VENDOR_OWNED_MARKER {
+            vendored.insert(r.package_key.as_str());
+            continue;
+        }
+        by_purl.entry(r.package_key.as_str()).or_default().push(r);
+    }
+    let mut tally = ApplyTally {
+        vendored: vendored
+            .iter()
+            .filter(|k| !by_purl.contains_key(*k))
+            .count(),
+        ..ApplyTally::default()
+    };
+    for copies in by_purl.values() {
+        let applied = copies
+            .iter()
+            .any(|r| r.success && !r.files_patched.is_empty());
+        let can_patch = copies
+            .iter()
+            .any(|r| r.success && !all_files_already_patched(r));
+        let already = copies.iter().any(|r| all_files_already_patched(r));
+        if applied {
+            tally.applied += 1;
+        } else if already && !can_patch {
+            tally.already += 1;
+        }
+        if can_patch {
+            tally.can_patch += 1;
+        }
+        if copies.iter().any(|r| !r.success) {
+            tally.failed += 1;
+        }
+    }
+    tally
+}
+
+/// `Summary: 1 of 2 targeted patches applied, ...` (wet runs). The
+/// failed and vendored buckets appear only when non-empty, so the counts
+/// account for every targeted patch without cluttering the common case.
+fn format_summary_line(tally: &ApplyTally, targeted: usize, not_found: usize) -> String {
+    let mut parts = vec![
+        format!(
+            "{} of {} applied",
+            tally.applied,
+            plural(targeted, "targeted patch", "targeted patches")
+        ),
+        format!("{} already patched", tally.already),
+    ];
+    if tally.vendored > 0 {
+        parts.push(format!("{} vendored", tally.vendored));
+    }
+    if tally.failed > 0 {
+        parts.push(format!("{} failed", tally.failed));
+    }
+    parts.push(format!("{not_found} not found on disk"));
+    format!("Summary: {}", parts.join(", "))
+}
+
+/// The dry-run summary block: what a wet run would do, per package.
+fn format_dry_run_summary(tally: &ApplyTally, not_found: usize) -> Vec<String> {
+    let mut lines = vec![
+        "Patch verification complete:".to_string(),
+        format!(
+            "  {} can be patched",
+            plural(tally.can_patch, "package", "packages")
+        ),
+    ];
+    if tally.already > 0 {
+        lines.push(format!(
+            "  {} already patched",
+            plural(tally.already, "package", "packages")
+        ));
+    }
+    if tally.failed > 0 {
+        lines.push(format!(
+            "  {} cannot be patched",
+            plural(tally.failed, "package", "packages")
+        ));
+    }
+    if not_found > 0 {
+        lines.push(format!(
+            "  {} not found on disk",
+            plural(not_found, "package", "packages")
+        ));
+    }
+    lines
+}
+
+/// One `Patched packages:` line. `copy` names the physical copy when a
+/// package has more than one (otherwise the lines are indistinguishable).
+fn format_patched_line(purl: &str, copy: Option<&str>, detail: &str) -> String {
+    match copy {
+        Some(copy) => format!("  {purl} ({copy}, {detail})"),
+        None => format!("  {purl} ({detail})"),
+    }
+}
+
+/// The wet run's `Patched packages:` block (empty when nothing would be
+/// listed — no header over an empty list). Dry runs report through
+/// [`format_dry_run_summary`] instead.
+fn format_results_block(results: &[ApplyResult], dry_run: bool, cwd: &Path) -> Vec<String> {
+    if dry_run {
+        return Vec::new();
+    }
+    let mut copies: HashMap<&str, usize> = HashMap::new();
+    for r in results {
+        *copies.entry(r.package_key.as_str()).or_default() += 1;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for result in results
+        .iter()
+        .filter(|r| r.success && r.package_path != VENDOR_OWNED_MARKER)
+    {
+        let detail = if !result.files_patched.is_empty() {
+            // Summarize the per-file strategy used by this package: if
+            // everything came from the same source, show just that tag;
+            // otherwise list distinct sources.
+            let mut tags: Vec<&'static str> =
+                result.applied_via.values().map(|v| v.as_tag()).collect();
+            tags.sort_unstable();
+            tags.dedup();
+            if tags.is_empty() {
+                "patched".to_string()
+            } else {
+                format!("via {}", tags.join("+"))
+            }
+        } else if all_files_already_patched(result) {
+            "already patched".to_string()
+        } else {
+            continue;
+        };
+        let copy = (copies
+            .get(result.package_key.as_str())
+            .copied()
+            .unwrap_or(0)
+            > 1)
+        .then(|| super::rollback::display_copy_path(&result.package_path, cwd));
+        lines.push(format_patched_line(
+            &normalize_purl(&result.package_key),
+            copy.as_deref(),
+            &detail,
+        ));
+    }
+    if lines.is_empty() {
+        return lines;
+    }
+    let mut block = vec![String::new(), "Patched packages:".to_string()];
+    block.extend(lines);
+    block
+}
+
+/// `--verbose`: every verified file with its status and hashes.
+fn print_verbose_verification(results: &[ApplyResult]) {
+    println!("\nDetailed verification:");
+    for result in results {
+        println!("  {}:", result.package_key);
+        for f in &result.files_verified {
+            let status_str = match f.status {
+                VerifyStatus::Ready => "ready",
+                VerifyStatus::AlreadyPatched => "already patched",
+                VerifyStatus::HashMismatch => "hash mismatch",
+                VerifyStatus::NotFound => "not found",
+            };
+            println!("    {} [{}]", f.file, status_str);
+            if let Some(ref msg) = f.message {
+                println!("      message: {msg}");
+            }
+            if let Some(ref h) = f.current_hash {
+                println!("      current:  {h}");
+            }
+            if let Some(ref h) = f.expected_hash {
+                println!("      expected: {h}");
+            }
+            if let Some(ref h) = f.target_hash {
+                println!("      target:   {h}");
+            }
+        }
+    }
 }
 
 /// One gem-env fallback-home copy the fan-out skipped best-effort (a
@@ -1283,8 +1593,10 @@ async fn apply_patches_inner(
                 success: false,
                 results: Vec::new(),
                 unmatched: Vec::new(),
-                run_warnings: Vec::new(),
+                run_warnings: vec![stage_failure_warning(args.common.offline)],
                 fallback_skips: Vec::new(),
+                targeted: target_manifest_purls.len(),
+                show_summary: false,
             })
         }
     };
@@ -1315,6 +1627,8 @@ async fn apply_patches_inner(
             unmatched: Vec::new(),
             run_warnings: Vec::new(),
             fallback_skips: Vec::new(),
+            targeted: 0,
+            show_summary: false,
         });
     }
 
@@ -1398,19 +1712,17 @@ async fn apply_patches_inner(
             &matched_manifest_purls,
             &vendored_bases,
         );
-        // This diagnostic flips the exit code, so it prints even under
-        // --silent ("errors only", never nothing — the hooked `apply
-        // --silent` used to exit 1 mutely here); `--json` mutes stderr and
-        // the envelope's `package_not_installed` events are the channel.
-        if !unmatched.is_empty() && !args.common.json {
-            eprintln!("Warning: No packages found that match available patches");
-            eprintln!(
-                "  {} targeted manifest patch(es) were in scope, but no matching packages were found on disk.",
-                unmatched.len()
-            );
-            eprintln!(
-                "  Check that packages are installed and --cwd points to the right directory."
-            );
+        let mut unmatched = unmatched;
+        unmatched.sort();
+        // This diagnostic flips the exit code, so it is an error — and it
+        // prints even under --silent ("errors only", never nothing — the
+        // hooked `apply --silent` used to exit 1 mutely here); `--json`
+        // mutes stderr and the envelope's `package_not_installed` events
+        // are the channel.
+        if !unmatched.is_empty() && args.prints_errors() {
+            for line in format_none_installed_error(&unmatched) {
+                eprintln!("{line}");
+            }
         }
         return Ok(ApplyOutcome {
             success: unmatched.is_empty(),
@@ -1418,6 +1730,8 @@ async fn apply_patches_inner(
             unmatched,
             run_warnings,
             fallback_skips,
+            targeted: target_manifest_purls.len(),
+            show_summary: true,
         });
     }
 
@@ -1454,7 +1768,12 @@ async fn apply_patches_inner(
 
     let mut applied_base_purls: HashSet<String> = HashSet::new();
 
-    for (purl, pkg_paths) in &all_packages {
+    // PURL order, so the per-package Error/Warning lines, the results and
+    // the `Patched packages:` block read the same on every run (the map is
+    // a `HashMap`).
+    let mut ordered_packages: Vec<_> = all_packages.iter().collect();
+    ordered_packages.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    for (purl, pkg_paths) in ordered_packages {
         // The paths carry every resolved physical copy. Release-variant
         // ecosystems install one directory per `package@version` (the
         // variants are jars/wheels inside it) — EXCEPT gem, where bundler's
@@ -1642,11 +1961,14 @@ async fn apply_patches_inner(
                         // would leave a `failed` event in the envelope while the
                         // command still reported `success` / exit 0.
                         has_errors = true;
-                        if !args.common.silent && !args.common.json {
+                        // Errors print even under --silent.
+                        if args.prints_errors() {
                             eprintln!(
-                                "Failed to patch {}: {}",
-                                variant_purl,
-                                result.error.as_deref().unwrap_or("unknown error")
+                                "{}",
+                                format_patch_failure(
+                                    variant_purl,
+                                    result.error.as_deref().unwrap_or("unknown error")
+                                )
                             );
                         }
                         results.push(result);
@@ -1681,12 +2003,16 @@ async fn apply_patches_inner(
                     // variant fails loudly instead of silently staying
                     // vulnerable behind a sibling copy's success.
                     has_errors = true;
-                    if !attempted && !args.common.silent && !args.common.json {
+                    if !attempted && args.prints_errors() {
                         // No variant matched the installed distribution at all —
                         // the package on disk isn't any known release variant.
                         // (Attempted-but-failed variants already printed their own
-                        // per-variant failure line above.)
-                        eprintln!("Failed to patch {base_purl}: no matching variant found");
+                        // per-variant failure line above.) Errors print even
+                        // under --silent.
+                        eprintln!(
+                            "{}",
+                            format_patch_failure(&base_purl, "no matching variant found")
+                        );
                     }
                 }
             }
@@ -1742,11 +2068,14 @@ async fn apply_patches_inner(
                 warn_mismatch_overwrites(&result, &args.common);
                 if !result.success {
                     has_errors = true;
-                    if !args.common.silent && !args.common.json {
+                    // Errors print even under --silent.
+                    if args.prints_errors() {
                         eprintln!(
-                            "Failed to patch {}: {}",
-                            purl,
-                            result.error.as_deref().unwrap_or("unknown error")
+                            "{}",
+                            format_patch_failure(
+                                purl,
+                                result.error.as_deref().unwrap_or("unknown error")
+                            )
                         );
                     }
                 }
@@ -1757,50 +2086,36 @@ async fn apply_patches_inner(
     }
 
     // Check if targeted manifest entries had no matches.
-    let unmatched = unmatched_purls(
+    let mut unmatched = unmatched_purls(
         &target_manifest_purls,
         &matched_manifest_purls,
         &vendored_bases,
     );
+    unmatched.sort();
 
-    if !unmatched.is_empty() && !args.common.silent && !args.common.json {
+    let none_matched = !target_manifest_purls.is_empty()
+        && matched_manifest_purls.is_empty()
+        && !all_packages.is_empty();
+    if none_matched {
+        // Nothing matched: this fails the run, so it is an error — and
+        // errors print even under --silent.
+        has_errors = true;
+        if args.prints_errors() {
+            for line in format_none_installed_error(&unmatched) {
+                eprintln!("{line}");
+            }
+        }
+    } else if !unmatched.is_empty() && !args.common.silent && !args.common.json {
         eprintln!(
-            "\nWarning: {} manifest patch(es) had no matching installed package:",
-            unmatched.len()
+            "Warning: {} had no matching installed package:",
+            plural(unmatched.len(), "manifest patch", "manifest patches")
         );
         for purl in &unmatched {
             eprintln!("  - {}", normalize_purl(purl));
         }
     }
 
-    if !target_manifest_purls.is_empty()
-        && matched_manifest_purls.is_empty()
-        && !all_packages.is_empty()
-    {
-        if !args.common.silent && !args.common.json {
-            eprintln!("Warning: None of the targeted manifest patches matched installed packages.");
-        }
-        has_errors = true;
-    }
-
-    // Post-apply summary
-    if !args.common.silent && !args.common.json {
-        let applied_count = results
-            .iter()
-            .filter(|r| r.success && !r.files_patched.is_empty())
-            .count();
-        let already_count = results
-            .iter()
-            .filter(|r| all_files_already_patched(r))
-            .count();
-        println!(
-            "\nSummary: {}/{} targeted patches applied, {} already patched, {} not found on disk",
-            applied_count,
-            target_manifest_purls.len(),
-            already_count,
-            unmatched.len()
-        );
-    }
+    // The human summary is printed by `run`, after the per-package list.
 
     // Note: `apply` deliberately does NOT garbage-collect unused blobs in
     // `.socket/`. GC is the responsibility of `socket-patch repair` /
@@ -1814,7 +2129,39 @@ async fn apply_patches_inner(
         unmatched,
         run_warnings,
         fallback_skips,
+        targeted: target_manifest_purls.len(),
+        show_summary: true,
     })
+}
+
+/// `Error: Failed to patch <purl>: <why>` (stderr, even under --silent).
+fn format_patch_failure(purl: &str, why: &str) -> String {
+    format!("Error: Failed to patch {purl}: {why}")
+}
+
+/// The failing "no targeted patch matched an installed package" report:
+/// the error line, the unmatched purls, and the usual remedy.
+fn format_none_installed_error(unmatched: &[String]) -> Vec<String> {
+    let mut lines = vec![if unmatched.is_empty() {
+        "Error: None of the targeted manifest patches matched an installed package.".to_string()
+    } else if unmatched.len() == 1 {
+        "Error: The targeted manifest patch matched no installed package:".to_string()
+    } else {
+        format!(
+            "Error: None of the {} targeted manifest patches matched an installed package:",
+            unmatched.len()
+        )
+    }];
+    lines.extend(
+        unmatched
+            .iter()
+            .map(|p| format!("  - {}", normalize_purl(p))),
+    );
+    lines.push(
+        "Check that the packages are installed and --cwd points to the right directory."
+            .to_string(),
+    );
+    lines
 }
 
 #[cfg(test)]
@@ -2497,5 +2844,287 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
         assert_eq!(v["action"], "applied");
+    }
+
+    // ── human output formatters ──────────────────────────────────────────
+
+    fn copy_at(path: &str, status: VerifyStatus, patched: bool) -> ApplyResult {
+        let mut r = sample_applied(status);
+        r.package_key = "pkg:npm/nuxt@4.5.0".to_string();
+        r.package_path = path.to_string();
+        if !patched {
+            r.files_patched.clear();
+            r.applied_via.clear();
+        }
+        r
+    }
+
+    #[test]
+    fn summary_line_singular_and_plural() {
+        let one = ApplyTally {
+            applied: 1,
+            ..ApplyTally::default()
+        };
+        assert_eq!(
+            format_summary_line(&one, 1, 0),
+            "Summary: 1 of 1 targeted patch applied, 0 already patched, 0 not found on disk"
+        );
+        let mixed = ApplyTally {
+            applied: 1,
+            already: 2,
+            ..ApplyTally::default()
+        };
+        assert_eq!(
+            format_summary_line(&mixed, 4, 1),
+            "Summary: 1 of 4 targeted patches applied, 2 already patched, 1 not found on disk"
+        );
+        assert_eq!(
+            format_summary_line(&ApplyTally::default(), 0, 0),
+            "Summary: 0 of 0 targeted patches applied, 0 already patched, 0 not found on disk"
+        );
+        let failed = ApplyTally {
+            failed: 1,
+            ..ApplyTally::default()
+        };
+        assert_eq!(
+            format_summary_line(&failed, 1, 0),
+            "Summary: 0 of 1 targeted patch applied, 0 already patched, 1 failed, 0 not found on disk"
+        );
+    }
+
+    #[test]
+    fn tally_counts_each_manifest_purl_once_across_copies() {
+        // Two physical copies of one purl, both patched: 1 applied, never
+        // "2/1 targeted patches applied".
+        let results = vec![
+            copy_at("/p/node_modules/nuxt", VerifyStatus::Ready, true),
+            copy_at(
+                "/p/node_modules/vite/node_modules/nuxt",
+                VerifyStatus::Ready,
+                true,
+            ),
+        ];
+        let t = tally_results(&results);
+        assert_eq!(t.applied, 1);
+        assert_eq!(t.already, 0);
+        assert_eq!(t.failed, 0);
+        assert!(format_summary_line(&t, 1, 0).starts_with("Summary: 1 of 1 targeted patch "));
+    }
+
+    #[test]
+    fn tally_already_patched_failed_and_vendored() {
+        let already = copy_at("/p/a", VerifyStatus::AlreadyPatched, false);
+        let mut failed = sample_applied(VerifyStatus::Ready);
+        failed.package_key = "pkg:npm/broken@1.0.0".into();
+        failed.success = false;
+        failed.files_patched.clear();
+        let mut vendored = sample_applied(VerifyStatus::Ready);
+        vendored.package_key = "pkg:npm/vend@1.0.0".into();
+        vendored.package_path = VENDOR_OWNED_MARKER.into();
+        let t = tally_results(&[already, failed, vendored]);
+        assert_eq!(
+            t,
+            ApplyTally {
+                applied: 0,
+                already: 1,
+                can_patch: 0,
+                failed: 1,
+                vendored: 1,
+            }
+        );
+        assert_eq!(
+            format_summary_line(&t, 3, 0),
+            "Summary: 0 of 3 targeted patches applied, 1 already patched, 1 vendored, 1 failed, \
+             0 not found on disk"
+        );
+        assert_eq!(tally_results(&[]), ApplyTally::default());
+    }
+
+    #[test]
+    fn dry_run_summary_lists_every_nonzero_bucket() {
+        let t = ApplyTally {
+            can_patch: 1,
+            already: 2,
+            failed: 1,
+            applied: 0,
+            vendored: 0,
+        };
+        assert_eq!(
+            format_dry_run_summary(&t, 3),
+            vec![
+                "Patch verification complete:",
+                "  1 package can be patched",
+                "  2 packages already patched",
+                "  1 package cannot be patched",
+                "  3 packages not found on disk",
+            ]
+        );
+        // Zero buckets other than "can be patched" are omitted.
+        assert_eq!(
+            format_dry_run_summary(&ApplyTally::default(), 0),
+            vec![
+                "Patch verification complete:",
+                "  0 packages can be patched"
+            ]
+        );
+    }
+
+    #[test]
+    fn results_block_omits_header_when_nothing_to_list() {
+        let mut failed = sample_applied(VerifyStatus::Ready);
+        failed.success = false;
+        failed.files_patched.clear();
+        assert!(format_results_block(&[failed], false, Path::new("/p")).is_empty());
+        assert!(format_results_block(&[], false, Path::new("/p")).is_empty());
+        // Dry runs report through the verification block instead.
+        let ok = sample_applied(VerifyStatus::Ready);
+        assert!(format_results_block(&[ok], true, Path::new("/p")).is_empty());
+    }
+
+    #[test]
+    fn results_block_single_copy_has_no_path() {
+        let ok = sample_applied(VerifyStatus::Ready);
+        let already = {
+            let mut r = sample_applied(VerifyStatus::AlreadyPatched);
+            r.package_key = "pkg:npm/other@2.0.0".into();
+            r.files_patched.clear();
+            r.applied_via.clear();
+            r
+        };
+        assert_eq!(
+            format_results_block(&[ok, already], false, Path::new("/tmp")),
+            vec![
+                "",
+                "Patched packages:",
+                "  pkg:npm/minimist@1.2.2 (via diff)",
+                "  pkg:npm/other@2.0.0 (already patched)",
+            ]
+        );
+    }
+
+    #[test]
+    fn results_block_names_each_copy_of_a_duplicated_purl() {
+        let results = vec![
+            copy_at("/p/node_modules/nuxt", VerifyStatus::Ready, true),
+            copy_at(
+                "/p/node_modules/vite/node_modules/nuxt",
+                VerifyStatus::Ready,
+                true,
+            ),
+        ];
+        assert_eq!(
+            format_results_block(&results, false, Path::new("/p")),
+            vec![
+                "",
+                "Patched packages:",
+                "  pkg:npm/nuxt@4.5.0 (node_modules/nuxt, via diff)",
+                "  pkg:npm/nuxt@4.5.0 (node_modules/vite/node_modules/nuxt, via diff)",
+            ]
+        );
+    }
+
+    #[test]
+    fn patched_line_shapes() {
+        assert_eq!(
+            format_patched_line("pkg:npm/a@1", None, "via blob+diff"),
+            "  pkg:npm/a@1 (via blob+diff)"
+        );
+        assert_eq!(
+            format_patched_line("pkg:npm/a@1", Some("node_modules/a"), "already patched"),
+            "  pkg:npm/a@1 (node_modules/a, already patched)"
+        );
+    }
+
+    #[test]
+    fn mismatch_messages_follow_dry_run_tense() {
+        assert_eq!(
+            format_mismatch_warning("pkg:npm/nuxt@4.5.0", "dist/index.mjs", false),
+            "Warning (content_mismatch_overwritten): pkg:npm/nuxt@4.5.0 dist/index.mjs did \
+             not match the patch's expected original content; applied the full verified \
+             patched content instead (pass --strict to fail on mismatches)"
+        );
+        assert!(format_mismatch_warning("p", "f", true)
+            .contains("; would apply the full verified patched content instead"));
+        assert_eq!(
+            mismatch_event_detail("f.js", false),
+            "f.js did not match the patch's expected original content; the full verified \
+             patched content was applied"
+        );
+        assert!(mismatch_event_detail("f.js", true).ends_with("content would be applied"));
+    }
+
+    #[test]
+    fn mismatch_fetch_and_fail_counts() {
+        assert_eq!(
+            format_mismatch_fetch_result(1, 1),
+            "Downloaded 1 full patched blob for mismatched files"
+        );
+        assert_eq!(
+            format_mismatch_fetch_result(3, 3),
+            "Downloaded 3 full patched blobs for mismatched files"
+        );
+        assert_eq!(
+            format_mismatch_fetch_result(1, 2),
+            "Downloaded 1 of 2 full patched blobs for mismatched files"
+        );
+        assert_eq!(
+            mismatched_files_fail(1),
+            "1 mismatched file will fail to apply"
+        );
+        assert_eq!(
+            mismatched_files_fail(2),
+            "2 mismatched files will fail to apply"
+        );
+    }
+
+    #[test]
+    fn check_in_sync_line() {
+        assert_eq!(format_check_in_sync(0), "No Go patch redirects to check.");
+        assert_eq!(
+            format_check_in_sync(1),
+            "Patch redirects are in sync (1 redirect checked)."
+        );
+        assert_eq!(
+            format_check_in_sync(3),
+            "Patch redirects are in sync (3 redirects checked)."
+        );
+    }
+
+    #[test]
+    fn failure_and_none_installed_errors() {
+        assert_eq!(
+            format_patch_failure("pkg:npm/a@1", "File not found"),
+            "Error: Failed to patch pkg:npm/a@1: File not found"
+        );
+        assert_eq!(
+            format_none_installed_error(&["pkg:npm/a@1".to_string()]),
+            vec![
+                "Error: The targeted manifest patch matched no installed package:",
+                "  - pkg:npm/a@1",
+                "Check that the packages are installed and --cwd points to the right directory.",
+            ]
+        );
+        let two = format_none_installed_error(&["pkg:npm/a@1".into(), "pkg:npm/b@2".into()]);
+        assert_eq!(
+            two[0],
+            "Error: None of the 2 targeted manifest patches matched an installed package:"
+        );
+        assert_eq!(two.len(), 4);
+        assert_eq!(
+            format_none_installed_error(&[])[0],
+            "Error: None of the targeted manifest patches matched an installed package."
+        );
+    }
+
+    #[test]
+    fn stage_failure_warning_names_the_cause() {
+        let off = stage_failure_warning(true);
+        assert_eq!(off.code, "offline_missing_sources");
+        assert!(off.detail.contains("--offline"), "{}", off.detail);
+        assert!(is_stage_failure_code(&off.code));
+        let dl = stage_failure_warning(false);
+        assert_eq!(dl.code, "sources_download_failed");
+        assert!(is_stage_failure_code(&dl.code));
+        assert!(!is_stage_failure_code("gem_config_path_ignored"));
     }
 }

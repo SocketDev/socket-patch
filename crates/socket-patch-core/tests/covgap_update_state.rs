@@ -31,7 +31,7 @@ const STATE_DIR_VARS: [&str; 5] = [
 async fn no_resolvable_state_dir_degrades_load_and_save() {
     // Blank (empty means unset, per the env_dir convention — avoids
     // remove_var churn) every var the resolution chain consults.
-    let prev: Vec<_> = STATE_DIR_VARS.iter().map(|v| std::env::var_os(v)).collect();
+    let prev: Vec<_> = STATE_DIR_VARS.iter().map(std::env::var_os).collect();
     for v in STATE_DIR_VARS {
         std::env::set_var(v, "");
     }

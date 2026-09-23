@@ -881,7 +881,7 @@ async fn scan_non_json_with_patches_prints_table() {
     let code = run_scrubbed(args).await;
     // Non-JSON path: discovery → batch query → render table → fetch
     // per-package details. We only mount the batch mock, so detail-fetch
-    // 404s and scan exits 1 ("Could not fetch patch details"). That exit is
+    // 404s and scan exits 1 ("Error: could not fetch patch details"). That exit is
     // deterministic given these mocks.
     assert_eq!(code, 1, "missing detail mock → detail fetch fails → exit 1");
     // Prove the table-rendering path actually ran against real discovered

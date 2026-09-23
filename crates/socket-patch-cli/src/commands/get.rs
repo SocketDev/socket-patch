@@ -2,6 +2,7 @@ use clap::Args;
 use regex::Regex;
 use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate, ApiClient,
+    ApiError,
 };
 use socket_patch_core::api::ranking::{cmp_search_results, severity_order};
 use socket_patch_core::api::types::{
@@ -14,7 +15,7 @@ use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants};
-use socket_patch_core::patch::apply_lock::{self, LockError, LockGuard};
+use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
 use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use socket_patch_core::utils::purl::{
     canonical_purl, is_purl, normalize_purl, strip_purl_qualifiers,
@@ -34,7 +35,7 @@ use crate::commands::lock_cli::lock_failure;
 use crate::ecosystem_dispatch::{
     crawl_all_ecosystems, find_packages_for_rollback, partition_purls,
 };
-use crate::output::{confirm, print_json, select_one, SelectError};
+use crate::ui::{print_json, select_one, SelectError};
 
 /// Best-effort ecosystem extractor for a `pkg:<eco>/...` PURL. Used as
 /// the telemetry `ecosystem` field. Returns an empty string when the
@@ -186,21 +187,6 @@ fn merge_metadata(record: &mut serde_json::Value, meta: serde_json::Value) {
     }
 }
 
-/// Truncate `s` to at most `limit` displayed characters, appending an
-/// ellipsis when it was longer (so the result is never wider than
-/// `limit`). Operates on `char` boundaries, NOT bytes: a byte-index slice
-/// like `&s[..n]` panics when `n` lands in the middle of a multi-byte
-/// UTF-8 sequence, and patch descriptions come straight from the API and
-/// routinely contain non-ASCII text.
-pub(crate) fn truncate_with_ellipsis(s: &str, limit: usize) -> String {
-    if s.chars().count() <= limit {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(limit.saturating_sub(3)).collect();
-        format!("{head}...")
-    }
-}
-
 /// Short, display-only prefix of a UUID for log lines. Returns
 /// the first 8 bytes when they fall on a char boundary, otherwise the
 /// whole string. A naive `&uuid[..8]` panics on a malformed/short UUID in
@@ -258,7 +244,12 @@ fn report_error(json: bool, message: impl std::fmt::Display) {
 /// early-return guard. The message/code mapping is
 /// [`crate::commands::lock_cli::lock_failure`]'s, so the waited clause and
 /// the I/O rendering cannot drift from `apply`'s.
-fn report_lock_failure(json: bool, err: &LockError, timeout: Duration) -> serde_json::Value {
+fn report_lock_failure(
+    json: bool,
+    socket_dir: &Path,
+    err: &LockError,
+    timeout: Duration,
+) -> serde_json::Value {
     let (code, message) = lock_failure(err, timeout);
     let envelope = serde_json::json!({
         "status": "error",
@@ -268,7 +259,10 @@ fn report_lock_failure(json: bool, err: &LockError, timeout: Duration) -> serde_
     if json {
         print_json(&envelope);
     } else {
-        eprintln!("Error: {message}");
+        eprint!(
+            "{}",
+            crate::commands::lock_cli::format_lock_error(socket_dir, err, timeout)
+        );
     }
     envelope
 }
@@ -492,13 +486,12 @@ pub struct GetArgs {
     #[arg(short = 'p', long = "package", default_value_t = false)]
     pub package: bool,
 
-    /// Download patch without applying it.
-    ///
-    /// `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
-    /// clap's default bool parser accepts only the literal strings
-    /// `true`/`false` from the env binding, so `SOCKET_SAVE_ONLY=1` (or an
-    /// exported-but-empty `SOCKET_SAVE_ONLY=`) aborted every `get`
-    /// invocation.
+    /// Download the patch and record it in the manifest without applying it.
+    // `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
+    // clap's default bool parser accepts only the literal strings
+    // `true`/`false` from the env binding, so `SOCKET_SAVE_ONLY=1` (or an
+    // exported-but-empty `SOCKET_SAVE_ONLY=`) aborted every `get`
+    // invocation.
     #[arg(
         long = "save-only",
         alias = "no-apply",
@@ -508,27 +501,33 @@ pub struct GetArgs {
     )]
     pub save_only: bool,
 
-    /// Apply patch immediately without saving to .socket folder.
-    ///
-    /// `value_parser = parse_bool_flag`: same env-crash fix as `--save-only`
-    /// above — and `SOCKET_ONE_OFF` is shared with `rollback --one-off`,
-    /// which already parses boolishly; the two must not diverge.
+    /// Apply the patch without saving it to the .socket folder (not yet
+    /// implemented).
+    // Hidden: it always fails with "not yet implemented" (see `run`), but
+    // stays parseable so scripts and `SOCKET_ONE_OFF` keep getting that
+    // explicit error instead of a clap parse failure.
+    // `value_parser = parse_bool_flag`: same env-crash fix as `--save-only`
+    // above — and `SOCKET_ONE_OFF` is shared with `rollback --one-off`,
+    // which already parses boolishly; the two must not diverge.
     #[arg(
         long = "one-off",
         env = "SOCKET_ONE_OFF",
         default_value_t = false,
         value_parser = crate::args::parse_bool_flag,
+        hide = true,
     )]
     pub one_off: bool,
 
-    /// Download patches for every release/distribution variant of a
-    /// matched package, not just the one(s) matching the locally-
-    /// installed distribution. Affects ecosystems with per-release
-    /// variants — PyPI (wheel/sdist via `artifact_id`), RubyGems
-    /// (`platform`), and Maven (`classifier`). Off by default: only the
-    /// patch(es) for the installed dist are fetched. Also disables the
-    /// coarse installed-VERSION narrowing of CVE/GHSA fan-outs (see
-    /// `--mode`): every version's patch is fetched, installed or not.
+    /// Download patches for every release variant of a matched package,
+    /// not just the one matching the locally-installed distribution.
+    ///
+    /// Affects ecosystems with per-release variants: PyPI (wheel/sdist),
+    /// RubyGems (platform) and Maven (classifier). Also turns off the
+    /// installed-version filter for CVE/GHSA searches, so every version's
+    /// patch is fetched, installed or not.
+    // Variant keys: PyPI `artifact_id`, RubyGems `platform`, Maven
+    // `classifier`. Off by default: only the patch(es) for the installed
+    // dist are fetched.
     #[arg(
         long = "all-releases",
         env = "SOCKET_ALL_RELEASES",
@@ -537,16 +536,17 @@ pub struct GetArgs {
     )]
     pub all_releases: bool,
 
-    /// How to consume the patch(es) — the same three modes as `scan`:
-    /// `agent` (default; record in `.socket/manifest.json` + blobs and
-    /// apply in place), `hosted` (rewrite lockfiles so the patched deps
-    /// resolve to Socket's hosted patch server; no manifest, no blobs —
-    /// state lives in the redirect ledger), or `vendored` (commit patched
-    /// artifacts under `.socket/vendor/` and rewire the lockfile; no
-    /// manifest, no blobs — the vendor ledger carries the records).
-    /// Hosted/vendored runs produce the same on-disk result as
-    /// `scan --mode hosted|vendored` selecting the same patch. No env
-    /// binding, matching `scan --mode`.
+    /// How to consume the patches: the same modes as `scan --mode`
+    /// (default: agent).
+    // agent = record in .socket/manifest.json + blobs and apply in place;
+    // hosted = rewrite lockfiles so the patched deps resolve to Socket's
+    // hosted patch server (no manifest, no blobs; state lives in the
+    // redirect ledger); vendored = commit patched artifacts under
+    // .socket/vendor/ and rewire the lockfile (no manifest, no blobs; the
+    // vendor ledger carries the records). Hosted/vendored runs produce the
+    // same on-disk result as `scan --mode hosted|vendored` selecting the
+    // same patch. The per-value help comes from `ScanMode`'s variant docs.
+    // No env binding, matching `scan --mode`.
     #[arg(long = "mode", value_enum)]
     pub mode: Option<super::scan::ScanMode>,
 }
@@ -596,33 +596,479 @@ fn detect_identifier_type(identifier: &str) -> Option<IdentifierType> {
     }
 }
 
-/// Render one patch as an interactive-selection option line:
-/// `<uuid> [<tier>] (fixes: <summaries>) - <description>`.
-///
-/// Each advisory is summarized by its CVE ids joined with `", "` when it
-/// has any, falling back to the advisory id itself (e.g. a GHSA with no
-/// CVE assigned yet); the `(fixes: …)` segment is omitted entirely for a
-/// patch with no vulnerabilities. The description is truncated to 60
-/// characters.
-fn format_patch_option(p: &PatchSearchResult) -> String {
-    let vuln_summary: Vec<String> = p
-        .vulnerabilities
+/// Advisory labels for a patch: every advisory's CVE ids, or the advisory
+/// id itself when it has no CVE assigned yet (a fresh GHSA). Sorted and
+/// deduplicated, so the text never depends on `HashMap` iteration order.
+fn vuln_labels(vulns: &HashMap<String, VulnerabilityResponse>) -> Vec<String> {
+    let mut labels: Vec<String> = vulns
         .iter()
-        .map(|(id, v)| {
+        .flat_map(|(id, v)| {
             if v.cves.is_empty() {
-                id.clone()
+                vec![id.clone()]
             } else {
-                v.cves.join(", ")
+                v.cves.clone()
             }
         })
         .collect();
-    let vulns = if vuln_summary.is_empty() {
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+/// Render one patch as an interactive-selection option line:
+/// `<uuid> [<TIER>] (fixes: <ids>) - <description>`.
+///
+/// The `(fixes: …)` segment is omitted for a patch with no
+/// vulnerabilities, and ` - <description>` for an empty description (no
+/// dangling dash). The tier is upper-cased to match the search listing.
+/// The description is truncated to 60 characters.
+fn format_patch_option(p: &PatchSearchResult) -> String {
+    let labels = vuln_labels(&p.vulnerabilities);
+    let vulns = if labels.is_empty() {
         String::new()
     } else {
-        format!(" (fixes: {})", vuln_summary.join(", "))
+        format!(" (fixes: {})", labels.join(", "))
     };
-    let desc = truncate_with_ellipsis(&p.description, 60);
-    format!("{} [{}]{} - {}", p.uuid, p.tier, vulns, desc)
+    let desc = crate::ui::truncate(&p.description, 60);
+    let desc = if desc.is_empty() {
+        String::new()
+    } else {
+        format!(" - {desc}")
+    };
+    format!("{} [{}]{vulns}{desc}", p.uuid, p.tier.to_uppercase())
+}
+
+/// One-line human summary of a patch:
+/// `<purl> [<TIER>] <short uuid>: fixes <id> (<SEVERITY>)`, or with
+/// several advisories `fixes <ids> (highest: <SEVERITY>)` — a bare
+/// `(HIGH)` after a list reads as the last id's severity.
+///
+/// `patch_id` is omitted (with its colon) when `None`, the `fixes` part
+/// when the patch has no advisories, and the severity when none is known.
+/// The severity is colored when `color` is on. The purl is shown decoded
+/// (`%40scope` → `@scope`).
+fn format_patch_summary(
+    purl: &str,
+    tier: &str,
+    patch_id: Option<&str>,
+    vulns: &HashMap<String, VulnerabilityResponse>,
+    color: bool,
+) -> String {
+    let mut line = format!("{} [{}]", normalize_purl(purl), tier.to_uppercase());
+    if let Some(id) = patch_id {
+        line.push(' ');
+        line.push_str(short_uuid(id));
+    }
+    let labels = vuln_labels(vulns);
+    if !labels.is_empty() {
+        let sep = if patch_id.is_some() { ": " } else { " " };
+        line.push_str(&format!("{sep}fixes {}", labels.join(", ")));
+        if let Some(sev) = max_vuln_severity(vulns) {
+            let sev = crate::ui::severity(&sev.to_uppercase(), color);
+            if labels.len() > 1 {
+                line.push_str(&format!(" (highest: {sev})"));
+            } else {
+                line.push_str(&format!(" ({sev})"));
+            }
+        }
+    }
+    line
+}
+
+/// Compare two strings the way a person sorts versions: runs of ASCII
+/// digits compare as numbers (`4.17.2` < `4.17.10`), everything else
+/// character by character. Ties on numeric value (`01` vs `1`) fall back
+/// to plain string order so the result is a total order.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut x, mut y) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (x.first(), y.first()) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(c), Some(d)) if c.is_ascii_digit() && d.is_ascii_digit() => {
+                let xl = x.iter().take_while(|c| c.is_ascii_digit()).count();
+                let yl = y.iter().take_while(|c| c.is_ascii_digit()).count();
+                let trim = |s: &[u8]| -> usize { s.iter().take_while(|&&c| c == b'0').count() };
+                let (xn, yn) = (&x[trim(&x[..xl])..xl], &y[trim(&y[..yl])..yl]);
+                let ord = xn.len().cmp(&yn.len()).then_with(|| xn.cmp(yn));
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+                x = &x[xl..];
+                y = &y[yl..];
+            }
+            (Some(c), Some(d)) => {
+                if c != d {
+                    return c.cmp(d);
+                }
+                x = &x[1..];
+                y = &y[1..];
+            }
+        }
+    }
+}
+
+/// The search listing printed before selection: grouped by PURL (in
+/// natural version order) and best-first within each PURL — the same
+/// order [`select_patches`] resolves in, so a package's first entry is the
+/// one that will be applied. A `by-cve` / `by-ghsa` search can span
+/// several packages, hence the grouping. Severities are colored when
+/// `color` is on. Ends with a blank line.
+fn format_search_results(
+    patches: &[&PatchSearchResult],
+    can_access_paid: bool,
+    color: bool,
+) -> String {
+    let mut patches: Vec<&PatchSearchResult> = patches.to_vec();
+    patches.sort_by(|a, b| natural_cmp(&a.purl, &b.purl).then_with(|| cmp_search_results(a, b)));
+
+    let mut out = format!(
+        "Found {}:\n\n",
+        crate::ui::plural(patches.len(), "patch", "patches")
+    );
+    for (i, patch) in patches.iter().enumerate() {
+        let tier_label = if patch.tier == "paid" {
+            " [PAID]"
+        } else {
+            " [FREE]"
+        };
+        let access_label = if patch.tier == "paid" && !can_access_paid {
+            " (no access)"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "  {}. {}{tier_label}{access_label}\n",
+            i + 1,
+            normalize_purl(&patch.purl)
+        ));
+        out.push_str(&format!("     UUID: {}\n", patch.uuid));
+        let desc = crate::ui::truncate(&patch.description, 80);
+        if !desc.is_empty() {
+            out.push_str(&format!("     Description: {desc}\n"));
+        }
+        let mut fixes: Vec<(String, String)> = patch
+            .vulnerabilities
+            .iter()
+            .map(|(id, vuln)| {
+                let ids = if vuln.cves.is_empty() {
+                    id.to_string()
+                } else {
+                    let mut cves = vuln.cves.clone();
+                    cves.sort();
+                    cves.join(", ")
+                };
+                (ids, vuln.severity.clone())
+            })
+            .collect();
+        fixes.sort();
+        if !fixes.is_empty() {
+            let fixes: Vec<String> = fixes
+                .iter()
+                .map(|(ids, sev)| {
+                    if sev.is_empty() {
+                        ids.clone()
+                    } else {
+                        format!("{ids} ({})", crate::ui::severity(sev, color))
+                    }
+                })
+                .collect();
+            out.push_str(&format!("     Fixes: {}\n", fixes.join(", ")));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// The stderr line naming the package a package-name search went with
+/// (only the best fuzzy match is searched).
+fn format_best_match(purl: &str, matches: usize) -> String {
+    if matches > 1 {
+        format!(
+            "Best match: {} (of {} matching packages)",
+            normalize_purl(purl),
+            matches
+        )
+    } else {
+        format!("Best match: {}", normalize_purl(purl))
+    }
+}
+
+/// The `--verbose` per-version detail behind [`format_skip_summary`]: one
+/// `[skip]` line per purl (a free and a paid patch for the same version
+/// would otherwise repeat it), in natural version order.
+fn format_verbose_skips(skips: &[serde_json::Value]) -> Vec<String> {
+    let mut by_purl: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for rec in skips {
+        let purl = rec["purl"].as_str().unwrap_or_default();
+        let reason = match rec["errorCode"].as_str() {
+            Some("package_not_installed") | None => "version not installed",
+            Some(code) => code,
+        };
+        by_purl.entry(purl).or_insert(reason);
+    }
+    let mut rows: Vec<(String, &str)> = by_purl
+        .into_iter()
+        .map(|(purl, reason)| (normalize_purl(purl).into_owned(), reason))
+        .collect();
+    rows.sort_by(|a, b| natural_cmp(&a.0, &b.0));
+    rows.into_iter()
+        .map(|(purl, reason)| format!("  [skip] {purl} ({reason})"))
+        .collect()
+}
+
+/// Whether [`select_patches`] has a choice to make that nobody made in
+/// advance: a free user, several accessible patches for one purl, and no
+/// `--yes`/`--json`. It then shows a menu (interactive stdin) or prints
+/// the non-interactive note (unless `--silent`).
+pub(crate) fn selection_has_choice(
+    candidates: &[PatchSearchResult],
+    can_access_paid: bool,
+    common: &GlobalArgs,
+) -> bool {
+    if can_access_paid || common.yes || common.json {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::new();
+    candidates
+        .iter()
+        .filter(|p| p.tier == "free")
+        .any(|p| !seen.insert(p.purl.as_str()))
+}
+
+/// Whether [`select_patches`] will put a menu in front of the user for
+/// these candidates: [`selection_has_choice`] and an interactive stdin
+/// (mirrors `select_one`).
+fn selection_prompted(
+    candidates: &[PatchSearchResult],
+    can_access_paid: bool,
+    common: &GlobalArgs,
+) -> bool {
+    use std::io::IsTerminal;
+    selection_has_choice(candidates, can_access_paid, common) && std::io::stdin().is_terminal()
+}
+
+/// The "which patch will be installed" block printed before the prompt
+/// when the listing above showed more patches than were selected (a paid
+/// user's auto-pick, or narrowing): one [`format_patch_summary`] line per
+/// selected patch. Ends with a blank line.
+fn format_selected_patches(selected: &[PatchSearchResult], color: bool) -> String {
+    let mut out = String::from("Selected:\n");
+    for p in selected {
+        out.push_str(&format!(
+            "  {}\n",
+            format_patch_summary(&p.purl, &p.tier, Some(&p.uuid), &p.vulnerabilities, color)
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// Number of distinct purls among skip records.
+fn distinct_skip_purls(skips: &[serde_json::Value]) -> usize {
+    let purls: std::collections::BTreeSet<&str> = skips
+        .iter()
+        .map(|r| r["purl"].as_str().unwrap_or_default())
+        .collect();
+    purls.len()
+}
+
+/// Summary lines for the patches the installed-version narrowing dropped,
+/// one line per reason (instead of one `[skip]` line per version), in a
+/// fixed order: not installed first, then each layout code alphabetically.
+fn format_skip_summary(skips: &[serde_json::Value]) -> Vec<String> {
+    let mut by_code: std::collections::BTreeMap<&str, Vec<serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    for rec in skips {
+        let code = rec["errorCode"].as_str().unwrap_or("package_not_installed");
+        by_code.entry(code).or_default().push(rec.clone());
+    }
+    let mut lines = Vec::new();
+    if let Some(recs) = by_code.remove("package_not_installed") {
+        let n = recs.len();
+        let versions = distinct_skip_purls(&recs);
+        lines.push(format!(
+            "Skipped {} for {} not installed here (use --all-releases to include {}).",
+            crate::ui::plural(n, "patch", "patches"),
+            crate::ui::plural(versions, "package version", "package versions"),
+            if n == 1 { "it" } else { "them" },
+        ));
+    }
+    for (code, recs) in by_code {
+        lines.push(format!(
+            "Skipped {} for {} ({code}; see the warning above).",
+            crate::ui::plural(recs.len(), "patch", "patches"),
+            crate::ui::plural(
+                distinct_skip_purls(&recs),
+                "package version",
+                "package versions"
+            ),
+        ));
+    }
+    lines
+}
+
+/// The result line when the installed-version narrowing dropped EVERY
+/// accessible patch.
+fn format_all_narrowed(skips: &[serde_json::Value]) -> String {
+    // When every skip is a PnP layout refusal, "not installed" and the
+    // --all-releases advice would both be wrong: the packages were never
+    // judged (structurally invisible), and the escape hatch cannot make a
+    // PnP layout patchable — point at the layout warning instead.
+    let pnp_only = skips.iter().all(|rec| {
+        matches!(
+            rec["errorCode"].as_str(),
+            Some("yarn_pnp_unsupported" | "pnpm_pnp_unsupported")
+        )
+    });
+    if pnp_only {
+        return format!(
+            "Found {}, but this project's Plug'n'Play layout makes its npm packages \
+             unpatchable here; see the layout warning above for the remedy.",
+            crate::ui::plural(skips.len(), "patch", "patches")
+        );
+    }
+    match distinct_skip_purls(skips) {
+        1 => "Patches exist for 1 package version, but it is not installed here. \
+              Use --all-releases to fetch it anyway."
+            .to_string(),
+        n => format!(
+            "Patches exist for {n} package versions, but none of them are installed here. \
+             Use --all-releases to fetch them anyway."
+        ),
+    }
+}
+
+/// The confirmation question for `n` selected patches.
+fn format_confirm_prompt(mode: super::scan::ScanMode, n: usize, save_only: bool) -> String {
+    let patches = crate::ui::plural(n, "patch", "patches");
+    match mode {
+        super::scan::ScanMode::Agent if save_only => format!("Download {patches}?"),
+        super::scan::ScanMode::Agent => format!("Download and apply {patches}?"),
+        super::scan::ScanMode::Vendored => format!("Download and vendor {patches}?"),
+        super::scan::ScanMode::Hosted => format!(
+            "Redirect {} to the hosted patch server?",
+            crate::ui::plural(n, "package", "packages")
+        ),
+    }
+}
+
+/// The `--dry-run` result line: `[dry-run] Would <action> N patches. No
+/// changes made.`
+fn format_dry_run(action: &str, n: usize) -> String {
+    format!(
+        "[dry-run] Would {action} {}. No changes made.",
+        crate::ui::plural(n, "patch", "patches")
+    )
+}
+
+/// What a package-name search says when the crawl found nothing: scan's
+/// empty-crawl line (get has no ecosystem or path filter to name).
+fn no_packages_message(global: bool) -> String {
+    crate::commands::scan::render::no_packages_message(global, None, &[])
+}
+
+/// The human result for a patch the caller's plan cannot download.
+/// `patch` names it (a purl, or the uuid when the purl is unknown).
+fn format_paid_required(patch: &str) -> String {
+    format!(
+        "This patch requires a paid subscription to download.\n  \
+         Patch: {patch}\n  \
+         Upgrade at: https://socket.dev/pricing"
+    )
+}
+
+/// The summary after the multi-patch download loop. A run that changed
+/// nothing says so instead of claiming the patches were "saved".
+fn format_save_summary(
+    manifest_path: &Path,
+    added: usize,
+    updated: usize,
+    skipped: usize,
+    failed: usize,
+) -> String {
+    let mut out = if added + updated > 0 {
+        format!("Patches saved to {}", manifest_path.display())
+    } else {
+        format!("No changes to {}", manifest_path.display())
+    };
+    out.push_str(&format!("\n  Added: {added}"));
+    for (label, n) in [
+        ("Updated", updated),
+        ("Skipped", skipped),
+        ("Failed", failed),
+    ] {
+        if n > 0 {
+            out.push_str(&format!("\n  {label}: {n}"));
+        }
+    }
+    out
+}
+
+/// The summary after a single-uuid save. `what` is `"Patch"` or `"Patch
+/// record"`. `ends_run` says an unchanged record really ends the run (the
+/// agent path skips apply); the vendored path still runs its vendor step,
+/// so it must not promise "nothing to update".
+fn format_single_save(
+    what: &str,
+    action: &PatchAction,
+    manifest_path: &Path,
+    purl: &str,
+    ends_run: bool,
+) -> String {
+    match action {
+        PatchAction::Added => format!("{what} saved to {}\n  Added: 1", manifest_path.display()),
+        PatchAction::Updated { old_uuid } => format!(
+            "{what} saved to {}\n  Updated: 1 (replacing {})",
+            manifest_path.display(),
+            short_uuid(old_uuid)
+        ),
+        PatchAction::Skipped => format!(
+            "{} already has this patch recorded in {}{}",
+            normalize_purl(purl),
+            manifest_path.display(),
+            if ends_run {
+                "; nothing to update."
+            } else {
+                "."
+            }
+        ),
+    }
+}
+
+/// `  [skip] <purl> (<why>)` for a record the download phase reuses, with
+/// the purl decoded for display (`%40scope` reads as `@scope`).
+fn format_record_skip(purl: &str, why: &str) -> String {
+    format!("  [skip] {} ({why})", normalize_purl(purl))
+}
+
+/// The closing error printed when the nested apply failed. Apply's own
+/// per-package `Error: Failed to patch …` lines print above it, even
+/// under `--silent`, so this line needs no "re-run" hint.
+const APPLY_FAILED: &str = "Error: Some patches could not be applied.";
+
+/// Local shape check for an identifier forced with `--id` / `--cve` /
+/// `--ghsa`, so a typo fails fast with a readable message instead of a raw
+/// API 400 body. `None` when it is well-formed (or the type is not
+/// shape-checked).
+fn forced_identifier_error(identifier: &str, id_type: IdentifierType) -> Option<String> {
+    let (ok, what, form) = match id_type {
+        IdentifierType::Uuid => (
+            crate::looks_like_uuid(identifier),
+            "patch UUID",
+            "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+        ),
+        IdentifierType::Cve => (CVE_RE.is_match(identifier), "CVE ID", "CVE-YYYY-NNNN"),
+        IdentifierType::Ghsa => (
+            GHSA_RE.is_match(identifier),
+            "GHSA ID",
+            "GHSA-xxxx-xxxx-xxxx",
+        ),
+        IdentifierType::Purl | IdentifierType::Package => return None,
+    };
+    (!ok).then(|| format!("\"{identifier}\" is not a valid {what} (expected {form})"))
 }
 
 /// Select one patch per PURL from available patches.
@@ -633,7 +1079,8 @@ fn format_patch_option(p: &PatchSearchResult) -> String {
 /// free critical patch outranks a paid low one.
 ///
 /// - Users with paid access: auto-select the top-ranked patch per PURL.
-/// - Free users with one patch: auto-select it.
+/// - Free users with one patch, or with `--yes`: auto-select the
+///   top-ranked one.
 /// - Free users with multiple patches: interactive selection via dialoguer,
 ///   with the options presented in ranked order so the best patch is both
 ///   the highlighted default and what a non-TTY run auto-picks.
@@ -648,7 +1095,7 @@ fn format_patch_option(p: &PatchSearchResult) -> String {
 pub(crate) fn select_patches(
     patches: &[PatchSearchResult],
     can_access_paid: bool,
-    is_json: bool,
+    common: &GlobalArgs,
 ) -> Result<Vec<PatchSearchResult>, i32> {
     // Group accessible patches by PURL
     let mut by_purl: HashMap<String, Vec<&PatchSearchResult>> = HashMap::new();
@@ -677,7 +1124,10 @@ pub(crate) fn select_patches(
             // tier only breaks ties once merge status, severity and recency
             // have all tied.
             selected.push(group[0].clone());
-        } else if group.len() == 1 {
+        } else if group.len() == 1 || (common.yes && !common.json) {
+            // One candidate, or `--yes` (which answers every prompt with its
+            // default — the menu's default is the top-ranked patch). JSON
+            // mode keeps its `selection_required` contract below.
             selected.push(group[0].clone());
         } else {
             // Free user with multiple patches: interactive selection
@@ -686,7 +1136,7 @@ pub(crate) fn select_patches(
             match select_one(
                 &format!("Multiple patches available for {purl}. Select one:"),
                 &options,
-                is_json,
+                common,
             ) {
                 Ok(idx) => {
                     selected.push(group[idx].clone());
@@ -917,8 +1367,8 @@ async fn filter_to_installed_releases(
             // Not installed: cannot determine the relevant release. Keep
             // every variant so the patch is still obtainable.
             warnings.push(format!(
-                "{base} is not installed locally; keeping all {} release variant(s).",
-                variants.len()
+                "{base} is not installed locally; keeping all {}.",
+                crate::ui::plural(variants.len(), "release variant", "release variants")
             ));
             kept.extend(variants);
             continue;
@@ -954,8 +1404,8 @@ async fn filter_to_installed_releases(
             // back to broad rather than silently dropping a package the
             // user asked about.
             warnings.push(format!(
-                "No release variant of {base} matches the installed distribution; keeping all {} variant(s).",
-                variants.len()
+                "No release variant of {base} matches the installed distribution; keeping all {}.",
+                crate::ui::plural(variants.len(), "variant", "variants")
             ));
             kept.extend(variants);
         } else {
@@ -1343,6 +1793,10 @@ async fn fetch_selected_patches(
     // Narrow multi-release selections to the installed distribution unless
     // --all-releases was passed (a no-op for non-variant ecosystems and
     // single-variant packages). The views it fetched serve the loop below.
+    // The narrowing queries the API: show that something is happening
+    // right after the confirm prompt.
+    let mut status = crate::ui::StatusLine::stderr(params.json, params.silent);
+    status.set("Preparing download...");
     let (selected, warnings, views) = filter_to_installed_releases(
         selected,
         params.all_releases,
@@ -1351,9 +1805,14 @@ async fn fetch_selected_patches(
         api_client,
     )
     .await;
+    status.finish();
     prefetched.extend(views);
+    // No leading blank line: the prompt's answer already ended its line.
     if matches!(store, RecordStore::Manifest(_)) && !quiet {
-        eprintln!("\nDownloading {} patch(es)...", selected.len());
+        eprintln!(
+            "Downloading {}...",
+            crate::ui::plural(selected.len(), "patch", "patches")
+        );
     }
 
     let mut batch = FetchBatch {
@@ -1397,7 +1856,7 @@ async fn fetch_selected_patches(
                 .and_then(|e| e.record.clone())
             {
                 if !quiet {
-                    eprintln!("  [skip] {purl} (already vendored)");
+                    eprintln!("{}", format_record_skip(purl, "already vendored"));
                 }
                 batch.patches_json.push(serde_json::json!({
                     "purl": purl,
@@ -1458,10 +1917,7 @@ async fn fetch_selected_patches(
         };
         if action == PatchAction::Skipped {
             if !quiet {
-                eprintln!(
-                    "  [skip] {} (already in manifest)",
-                    normalize_purl(&patch.purl)
-                );
+                eprintln!("{}", format_record_skip(&patch.purl, "already in manifest"));
             }
             batch.patches_json.push(serde_json::json!({
                 "purl": patch.purl,
@@ -1530,13 +1986,13 @@ async fn fetch_selected_patches(
                 // panic the loop — `short_uuid` never does.
                 eprintln!(
                     "  [{tag}] {} (replacing {})",
-                    patch.purl,
+                    normalize_purl(&patch.purl),
                     short_uuid(old_uuid)
                 );
             }
             record["oldUuid"] = serde_json::json!(old_uuid);
         } else if !quiet {
-            eprintln!("  [{tag}] {}", patch.purl);
+            eprintln!("  [{tag}] {}", normalize_purl(&patch.purl));
         }
         // Splice description / severity / vulnerability IDs into the record
         // so PR-comment bots, dashboards, and CLI consumers can render the
@@ -1777,13 +2233,14 @@ fn nested_apply_args_from_params(
 /// its manifest write — one lock window for download → manifest write →
 /// apply (a same-process re-acquire would contend), released by apply once
 /// its last mutation is done. Returns whether apply exited 0. Callers print
-/// their own "Applying patches..." line (they differ on stdout vs stderr).
-/// The read-only cargo-redirect verifier stays off and embedded VEX is
-/// opt-in on the top-level command only, never on this internal
-/// invocation.
+/// their own "Applying patches..." line. `json` is the caller's flag: a
+/// JSON caller gets no human error lines, from this function or from the
+/// nested apply (`common` itself is never JSON). The read-only cargo-redirect verifier stays off
+/// and embedded VEX is opt-in on the top-level command only, never on this
+/// internal invocation.
 async fn run_nested_apply(
     common: GlobalArgs,
-    quiet: bool,
+    json: bool,
     client: &ApiClient,
     lock: LockGuard,
 ) -> bool {
@@ -1793,10 +2250,13 @@ async fn run_nested_apply(
         force: false,
         check: false,
         vex: Default::default(),
+        nested: Some(super::apply::NestedApply { caller_json: json }),
     };
     let code = super::apply::run_locked(apply_args, manifest_path, client, lock).await;
-    if code != 0 && !quiet {
-        eprintln!("\nSome patches could not be applied.");
+    // An error, so exempt from --silent ("errors only": a failing exit must
+    // say why); JSON runs carry the failure in the envelope instead.
+    if code != 0 && !json {
+        eprintln!("{APPLY_FAILED}");
     }
     code == 0
 }
@@ -1824,9 +2284,14 @@ pub async fn download_and_apply_patches_with(
     // drop removes `apply.lock` and prunes an otherwise-empty `.socket/`, so
     // a run that records nothing leaves no residue. The nested apply runs
     // under this SAME guard (one lock window; see `run_nested_apply`).
-    let guard = match apply_lock::acquire(&socket_dir, lock_timeout) {
+    let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, lock_timeout) {
         Ok(guard) => guard,
-        Err(e) => return (1, report_lock_failure(params.json, &e, lock_timeout)),
+        Err(e) => {
+            return (
+                1,
+                report_lock_failure(params.json, &socket_dir, &e, lock_timeout),
+            )
+        }
     };
 
     let mut manifest = match read_manifest(&manifest_path).await {
@@ -1888,14 +2353,9 @@ pub async fn download_and_apply_patches_with(
             // The blobs this run just wrote have no record pointing at them:
             // unwind exactly those (a pre-existing record's blobs stay).
             unwind_new_blobs(&blobs_dir, &new_blobs).await;
-            let msg = format!("Error writing manifest: {e}");
-            let err_json = serde_json::json!({ "status": "error", "error": &msg });
-            if params.json {
-                print_json(&err_json);
-            } else {
-                eprintln!("{msg}");
-            }
-            return (1, err_json);
+            let msg = format!("Failed to write manifest: {e}");
+            report_error(params.json, &msg);
+            return (1, serde_json::json!({ "status": "error", "error": msg }));
         }
     }
     // The lock outlives the manifest write only when a nested apply follows
@@ -1919,28 +2379,23 @@ pub async fn download_and_apply_patches_with(
     warn_on_vendored_uuid_drift(&params.cwd, quiet, &batch.patches_json, &mut warnings).await;
 
     if !quiet {
-        eprintln!("\nPatches saved to {}", manifest_path.display());
-        eprintln!("  Added: {added}");
-        if batch.skipped > 0 {
-            eprintln!("  Skipped: {}", batch.skipped);
-        }
-        if batch.failed > 0 {
-            eprintln!("  Failed: {}", batch.failed);
-        }
-        if updated > 0 {
-            eprintln!("  Updated: {updated}");
-        }
+        eprintln!();
+        eprintln!(
+            "{}",
+            format_save_summary(&manifest_path, added, updated, batch.skipped, batch.failed)
+        );
     }
 
     // Auto-apply unless --save-only (the lock decision above).
     let mut apply_succeeded = false;
     if let Some(lock) = apply_lock {
         if !quiet {
-            eprintln!("\nApplying patches...");
+            eprintln!();
+            eprintln!("Applying patches...");
         }
         apply_succeeded = run_nested_apply(
             nested_apply_args_from_params(params, run, &manifest_path),
-            quiet,
+            params.json,
             run.api_client,
             lock,
         )
@@ -2030,16 +2485,40 @@ pub async fn run(args: GetArgs) -> i32 {
     if args.common.offline {
         report_error(
             args.common.json,
-            "get requires network access to fetch patches and cannot run with \
+            "Fetching patches needs network access, so `get` cannot run with \
              --offline/SOCKET_OFFLINE (strict airgap)",
         );
         return 1;
+    }
+
+    // Determine identifier type
+    let id_type = if args.id {
+        IdentifierType::Uuid
+    } else if args.cve {
+        IdentifierType::Cve
+    } else if args.ghsa {
+        IdentifierType::Ghsa
+    } else if args.package {
+        IdentifierType::Package
+    } else {
+        detect_identifier_type(&args.identifier).unwrap_or(IdentifierType::Package)
+    };
+    // A forced type is shape-checked locally, before any network call, so
+    // a typo reads as a plain message instead of a raw API 400 body.
+    if args.id || args.cve || args.ghsa {
+        if let Some(err) = forced_identifier_error(&args.identifier, id_type) {
+            report_error(args.common.json, err);
+            return 1;
+        }
     }
 
     apply_env_toggles(&args.common);
     // `--silent` is "errors only" (CLI_CONTRACT.md): every informational
     // print below is gated on this; errors and JSON envelopes are not.
     let quiet = args.common.json || args.common.silent;
+    if !quiet && id_type == IdentifierType::Package && !args.package {
+        eprintln!("Treating \"{}\" as a package name search", args.identifier);
+    }
     let overrides = args.common.api_client_overrides();
     let (mut api_client, mut use_public_proxy) =
         get_api_client_with_overrides(overrides.clone()).await;
@@ -2052,32 +2531,14 @@ pub async fn run(args: GetArgs) -> i32 {
     // incidence of stale-token fallbacks.
     let mut fallback_to_proxy = false;
 
-    // Determine identifier type
-    let id_type = if args.id {
-        IdentifierType::Uuid
-    } else if args.cve {
-        IdentifierType::Cve
-    } else if args.ghsa {
-        IdentifierType::Ghsa
-    } else if args.package {
-        IdentifierType::Package
-    } else {
-        match detect_identifier_type(&args.identifier) {
-            Some(t) => t,
-            None => {
-                if !quiet {
-                    println!("Treating \"{}\" as a package name search", args.identifier);
-                }
-                IdentifierType::Package
-            }
-        }
-    };
+    // Progress for the network/crawl phases below. Built after the client:
+    // building it may print core advisories straight to stderr, which
+    // would land on the end of a live line.
+    let mut status = crate::ui::StatusLine::stderr(args.common.json, args.common.silent);
 
     // Handle UUID: fetch and download directly
     if id_type == IdentifierType::Uuid {
-        if !quiet {
-            println!("Fetching patch by UUID: {}", args.identifier);
-        }
+        status.set(format!("Fetching patch {}...", args.identifier));
         let mut fetch_result = api_client.fetch_patch(&args.identifier).await;
         // 401/403 from the auth endpoint → swap to the public proxy
         // and retry once. Free patches still surface; paid patches
@@ -2085,47 +2546,50 @@ pub async fn run(args: GetArgs) -> i32 {
         if !use_public_proxy {
             if let Err(ref e) = fetch_result {
                 if is_fallback_candidate(e) {
-                    eprintln!(
-                        "Warning: authenticated API returned {e}; \
-                         falling back to public patch API proxy (free patches only)."
-                    );
+                    // Errors-only under --silent; --json keeps it on stderr
+                    // (same gate as scan's batch fallback).
+                    if !args.common.silent {
+                        status.println(format!(
+                            "Warning: authenticated API returned {e}; \
+                             falling back to public patch API proxy (free patches only)."
+                        ));
+                    }
+                    // Building the proxy client may print core's proxy
+                    // notice straight to stderr: take the line down first.
+                    status.finish();
                     api_client = build_proxy_fallback_client(&overrides);
                     use_public_proxy = true;
                     fallback_to_proxy = true;
+                    status.set(format!("Fetching patch {}...", args.identifier));
                     fetch_result = api_client.fetch_patch(&args.identifier).await;
                 }
             }
         }
+        status.finish();
         match fetch_result {
             Ok(Some(patch)) => {
                 if patch.tier == "paid" && use_public_proxy {
-                    track_patch_fetch_failed(
+                    return report_paid_required_uuid(
+                        &args,
+                        Some(&patch.purl),
                         &patch.uuid,
-                        "paid_required",
                         fallback_to_proxy,
                         telemetry_token.as_deref(),
                         telemetry_org.as_deref(),
                     )
                     .await;
-                    if args.common.json {
-                        print_json(&serde_json::json!({
-                            "status": "paid_required",
-                            "found": 1,
-                            "downloaded": 0,
-                            "applied": 0,
-                            "patches": [{
-                                "purl": patch.purl,
-                                "uuid": patch.uuid,
-                                "tier": "paid",
-                            }],
-                        }));
-                    } else if !args.common.silent {
-                        println!("\nThis patch requires a paid subscription to download.");
-                        println!("\n  Patch: {}", patch.purl);
-                        println!("  Tier:  paid");
-                        println!("\n  Upgrade at: https://socket.dev/pricing\n");
-                    }
-                    return 0;
+                }
+                if !quiet {
+                    eprintln!(
+                        "Found patch for {}",
+                        format_patch_summary(
+                            &patch.purl,
+                            &patch.tier,
+                            None,
+                            &patch.vulnerabilities,
+                            crate::ui::stderr_color(),
+                        )
+                    );
                 }
 
                 // Record the fetch BEFORE the save+apply step so the
@@ -2174,6 +2638,20 @@ pub async fn run(args: GetArgs) -> i32 {
                     }
                 };
             }
+            // The public proxy answers a paid patch with 403 rather than
+            // a tier=paid view: the same outcome as the branch above, not
+            // a raw "Forbidden" error.
+            Err(ApiError::Forbidden(_)) if use_public_proxy => {
+                return report_paid_required_uuid(
+                    &args,
+                    None,
+                    &args.identifier,
+                    fallback_to_proxy,
+                    telemetry_token.as_deref(),
+                    telemetry_org.as_deref(),
+                )
+                .await;
+            }
             Ok(None) => {
                 track_patch_fetch_failed(
                     &args.identifier,
@@ -2209,9 +2687,10 @@ pub async fn run(args: GetArgs) -> i32 {
     // the matching endpoint, and surface errors via `report_fetch_failure`.
     let search_response: SearchResponse = match id_type {
         IdentifierType::Cve | IdentifierType::Ghsa | IdentifierType::Purl => {
-            if !quiet {
-                println!("Searching patches for {id_type}: {}", args.identifier);
-            }
+            status.set(format!(
+                "Searching patches for {id_type} {}...",
+                args.identifier
+            ));
             let result = match id_type {
                 IdentifierType::Cve => api_client.search_patches_by_cve(&args.identifier).await,
                 IdentifierType::Ghsa => api_client.search_patches_by_ghsa(&args.identifier).await,
@@ -2220,6 +2699,7 @@ pub async fn run(args: GetArgs) -> i32 {
                 }
                 _ => unreachable!(),
             };
+            status.finish();
             match result {
                 Ok(r) => r,
                 Err(e) => {
@@ -2236,28 +2716,24 @@ pub async fn run(args: GetArgs) -> i32 {
             }
         }
         IdentifierType::Package => {
-            if !quiet {
-                println!("Enumerating packages...");
-            }
+            status.set("Enumerating packages...");
             let (all_packages, _, _) =
                 crawl_all_ecosystems(&crawler_options_for(&args.common)).await;
 
             if all_packages.is_empty() {
+                status.finish();
                 if args.common.json {
                     print_json(&empty_result_json("no_packages"));
                 } else if !args.common.silent {
-                    if args.common.global {
-                        println!("No global packages found.");
-                    } else {
-                        println!("No packages found. Run your package manager's install first.");
-                    }
+                    println!("{}", no_packages_message(args.common.global));
                 }
                 return 0;
             }
 
-            if !quiet {
-                println!("Found {} packages", all_packages.len());
-            }
+            status.finish_with(format!(
+                "Found {}",
+                crate::ui::plural(all_packages.len(), "package", "packages")
+            ));
 
             let matches = fuzzy_match_packages(&args.identifier, &all_packages, 20);
 
@@ -2270,16 +2746,19 @@ pub async fn run(args: GetArgs) -> i32 {
                 return 0;
             }
 
-            if !quiet {
-                println!(
-                    "Found {} matching package(s), checking for available patches...",
-                    matches.len()
-                );
-            }
-
-            // Search for patches for the best match.
+            // Only the best match is searched: name it, so a fuzzy pick
+            // of the wrong package is visible.
             let best_match = &matches[0];
-            match api_client.search_patches_by_package(&best_match.purl).await {
+            if !quiet {
+                eprintln!("{}", format_best_match(&best_match.purl, matches.len()));
+            }
+            status.set(format!(
+                "Searching patches for {}...",
+                normalize_purl(&best_match.purl)
+            ));
+            let result = api_client.search_patches_by_package(&best_match.purl).await;
+            status.finish();
+            match result {
                 Ok(r) => r,
                 Err(e) => {
                     return report_fetch_failure(
@@ -2296,6 +2775,7 @@ pub async fn run(args: GetArgs) -> i32 {
         }
         _ => unreachable!(),
     };
+    drop(status);
 
     if search_response.patches.is_empty() {
         if args.common.json {
@@ -2306,12 +2786,7 @@ pub async fn run(args: GetArgs) -> i32 {
         return 0;
     }
 
-    if !quiet {
-        display_search_results(
-            &search_response.patches,
-            search_response.can_access_paid_patches,
-        );
-    }
+    let color = crate::ui::stdout_color();
 
     // Filter accessible patches
     let accessible: Vec<_> = search_response
@@ -2335,8 +2810,18 @@ pub async fn run(args: GetArgs) -> i32 {
                 })).collect::<Vec<_>>(),
             }));
         } else if !args.common.silent {
-            println!("\nAll available patches require a paid subscription.");
-            println!("\n  Upgrade at: https://socket.dev/pricing\n");
+            let all: Vec<&PatchSearchResult> = search_response.patches.iter().collect();
+            if id_type == IdentifierType::Package && !quiet {
+                // Separate the stderr `Best match` line above on a terminal;
+                // stdout itself starts with the result.
+                eprintln!();
+            }
+            print!(
+                "{}",
+                format_search_results(&all, search_response.can_access_paid_patches, color)
+            );
+            println!("All available patches require a paid subscription.");
+            println!("  Upgrade at: https://socket.dev/pricing");
         }
         return 0;
     }
@@ -2354,11 +2839,30 @@ pub async fn run(args: GetArgs) -> i32 {
         || args.save_only
         || id_type == IdentifierType::Package
         || (id_type == IdentifierType::Purl && purl_has_version(&args.identifier));
-    let (accessible, narrow_skips, narrow_warnings) = if narrowing_exempt {
-        (accessible, Vec::new(), Vec::new())
+    // The narrowing runs over EVERY result (one crawl), paid no-access ones
+    // included, so the listing can still show an installed package's paid
+    // fix as `[PAID] (no access)`; selection, the skip records and the
+    // JSON envelope only ever see the accessible share.
+    let (accessible, listed, narrow_skips, narrow_warnings) = if narrowing_exempt {
+        let listed: Vec<PatchSearchResult> = search_response.patches.clone();
+        (accessible, listed, Vec::new(), Vec::new())
     } else {
-        let narrowing = filter_to_installed_purls(&accessible, &args.common, mode).await;
-        (narrowing.kept, narrowing.skip_records, narrowing.warnings)
+        let narrowing =
+            filter_to_installed_purls(&search_response.patches, &args.common, mode).await;
+        let accessible_uuids: std::collections::HashSet<&str> =
+            accessible.iter().map(|p| p.uuid.as_str()).collect();
+        let kept_accessible: Vec<PatchSearchResult> = narrowing
+            .kept
+            .iter()
+            .filter(|p| accessible_uuids.contains(p.uuid.as_str()))
+            .cloned()
+            .collect();
+        let skips: Vec<serde_json::Value> = narrowing
+            .skip_records
+            .into_iter()
+            .filter(|r| accessible_uuids.contains(r["uuid"].as_str().unwrap_or_default()))
+            .collect();
+        (kept_accessible, narrowing.kept, skips, narrowing.warnings)
     };
     // Layout refusals print even when informational output is quieted only
     // by --json (stderr; the envelope carries them too) — but --silent
@@ -2366,18 +2870,6 @@ pub async fn run(args: GetArgs) -> i32 {
     if !args.common.silent {
         for (code, detail) in &narrow_warnings {
             eprintln!("Warning ({code}): {detail}");
-        }
-    }
-    if !quiet {
-        for rec in &narrow_skips {
-            let reason = match rec["errorCode"].as_str() {
-                Some("package_not_installed") | None => "version not installed",
-                Some(code) => code,
-            };
-            eprintln!(
-                "  [skip] {} ({reason})",
-                rec["purl"].as_str().unwrap_or_default()
-            );
         }
     }
     if accessible.is_empty() {
@@ -2395,32 +2887,41 @@ pub async fn run(args: GetArgs) -> i32 {
             fold_narrowing_into_result(&mut result, &[], &narrow_warnings);
             print_json(&result);
         } else if !args.common.silent {
-            // When EVERY skip is a PnP layout refusal, "not installed" and
-            // the --all-releases advice would both be wrong: the packages
-            // were never judged (structurally invisible), and the escape
-            // hatch cannot make a PnP layout patchable — point at the
-            // layout warning above instead.
-            let pnp_only = narrow_skips.iter().all(|rec| {
-                matches!(
-                    rec["errorCode"].as_str(),
-                    Some("yarn_pnp_unsupported" | "pnpm_pnp_unsupported")
-                )
-            });
-            if pnp_only {
-                println!(
-                    "Found {} patch(es), but this project's Plug'n'Play layout makes its npm \
-                     packages unpatchable here — see the layout warning above for the remedy.",
-                    narrow_skips.len()
-                );
-            } else {
-                println!(
-                    "Patches exist for {} package version(s), but none of those versions are \
-                     installed here. Use --all-releases to fetch them anyway.",
-                    narrow_skips.len()
-                );
+            println!("{}", format_all_narrowed(&narrow_skips));
+            if !quiet && args.common.verbose {
+                for line in format_verbose_skips(&narrow_skips) {
+                    eprintln!("{line}");
+                }
             }
         }
         return 0;
+    }
+
+    // The listing shows only what survived the narrowing (a CVE fan-out
+    // can span dozens of versions that are not installed here): the
+    // skipped ones are summarized in one line each instead, with the
+    // per-version detail after the summary under --verbose.
+    let listed: Vec<&PatchSearchResult> = listed.iter().collect();
+    if !quiet {
+        if id_type == IdentifierType::Package || !narrow_warnings.is_empty() {
+            // Separate the stderr lines above (`Best match`, warnings) on a
+            // terminal; stdout itself starts with the result.
+            eprintln!();
+        }
+        print!(
+            "{}",
+            format_search_results(&listed, search_response.can_access_paid_patches, color)
+        );
+        let mut skip_lines = format_skip_summary(&narrow_skips);
+        if args.common.verbose {
+            skip_lines.extend(format_verbose_skips(&narrow_skips));
+        }
+        for line in &skip_lines {
+            eprintln!("{line}");
+        }
+        if !skip_lines.is_empty() {
+            eprintln!();
+        }
     }
 
     // Smart patch selection: pick one patch per PURL. `accessible` is
@@ -2429,29 +2930,56 @@ pub async fn run(args: GetArgs) -> i32 {
     let selected = match select_patches(
         &accessible,
         search_response.can_access_paid_patches,
-        args.common.json,
+        &args.common,
     ) {
         Ok(s) => s,
         Err(code) => return code,
     };
 
+    // The candidates can hold several patches per package and the pick
+    // was made without the user (paid auto-pick, `--yes`, non-TTY): say
+    // which will be installed. A menu pick is not echoed back, and paid
+    // no-access entries (never candidates) do not count.
+    if !quiet
+        && accessible.len() > selected.len()
+        && !selection_prompted(
+            &accessible,
+            search_response.can_access_paid_patches,
+            &args.common,
+        )
+    {
+        print!("{}", format_selected_patches(&selected, color));
+    }
+
+    // Agent-mode dry run: preview against the manifest, write nothing.
+    // (Hosted/vendored dry runs are handled inside their engines.) The
+    // per-release variant narrowing the wet run applies inside the
+    // download engine runs here too, so the preview names only the
+    // variants a wet run would fetch.
+    if args.common.dry_run && mode == super::scan::ScanMode::Agent {
+        let (selected, variant_warnings, _views) = filter_to_installed_releases(
+            &selected,
+            args.all_releases,
+            &crawler_options_for(&args.common),
+            quiet,
+            &api_client,
+        )
+        .await;
+        let mut narrow_warnings = narrow_warnings;
+        narrow_warnings.extend(
+            variant_warnings
+                .into_iter()
+                .map(|w| ("release_narrowing".to_string(), w)),
+        );
+        return agent_dry_run(&args, &selected, &narrow_skips, &narrow_warnings).await;
+    }
+
     // Confirm before acting (default YES), with mode-appropriate wording.
-    // Hosted/vendored dry-runs skip the prompt — nothing mutates (scan's
-    // dry-run posture); agent mode keeps today's behavior.
-    let prompt = match mode {
-        super::scan::ScanMode::Agent => format!("Download {} patch(es)?", selected.len()),
-        super::scan::ScanMode::Vendored => {
-            format!("Download and vendor {} patch(es)?", selected.len())
-        }
-        super::scan::ScanMode::Hosted => format!(
-            "Redirect {} package(s) to the hosted patch server?",
-            selected.len()
-        ),
-    };
-    let skip_confirm = mode != super::scan::ScanMode::Agent && args.common.dry_run;
-    if !skip_confirm && !confirm(&prompt, true, args.common.yes, args.common.json) {
+    // Dry runs skip the prompt: nothing mutates, so nothing to confirm.
+    let prompt = format_confirm_prompt(mode, selected.len(), args.save_only);
+    if !args.common.dry_run && !crate::ui::confirm(&prompt, true, &args.common) {
         if !quiet {
-            println!("Download cancelled.");
+            eprintln!("Cancelled; no changes made.");
         }
         return 0;
     }
@@ -2534,54 +3062,125 @@ pub async fn run(args: GetArgs) -> i32 {
     code
 }
 
-/// Print the patches a search turned up, grouped by PURL and best-first
-/// within each PURL — the same order [`select_patches`] resolves in, so the
-/// listing's first entry for a package is the one that will be applied.
-/// A `by-cve` / `by-ghsa` search can span several packages, hence the PURL
-/// grouping.
-fn display_search_results(patches: &[PatchSearchResult], can_access_paid: bool) {
-    println!("\nFound patches:\n");
-
-    let mut patches: Vec<&PatchSearchResult> = patches.iter().collect();
-    patches.sort_by(|a, b| a.purl.cmp(&b.purl).then_with(|| cmp_search_results(a, b)));
-
-    for (i, patch) in patches.iter().enumerate() {
-        let tier_label = if patch.tier == "paid" {
-            " [PAID]"
-        } else {
-            " [FREE]"
-        };
-        let access_label = if patch.tier == "paid" && !can_access_paid {
-            " (no access)"
-        } else {
-            ""
-        };
-
-        println!("  {}. {}{}{}", i + 1, patch.purl, tier_label, access_label);
-        println!("     UUID: {}", patch.uuid);
-        if !patch.description.is_empty() {
-            let desc = truncate_with_ellipsis(&patch.description, 80);
-            println!("     Description: {desc}");
+/// `paid_required` for the uuid path: the patch exists but the caller
+/// (on the public proxy) cannot download it. A clean outcome, exit 0.
+/// `purl` is `None` when the proxy refused with 403 before naming it.
+async fn report_paid_required_uuid(
+    args: &GetArgs,
+    purl: Option<&str>,
+    patch_id: &str,
+    fallback_to_proxy: bool,
+    telemetry_token: Option<&str>,
+    telemetry_org: Option<&str>,
+) -> i32 {
+    track_patch_fetch_failed(
+        patch_id,
+        "paid_required",
+        fallback_to_proxy,
+        telemetry_token,
+        telemetry_org,
+    )
+    .await;
+    if args.common.json {
+        let mut record = serde_json::json!({ "uuid": patch_id, "tier": "paid" });
+        if let Some(purl) = purl {
+            record["purl"] = serde_json::json!(purl);
         }
-
-        let vuln_ids: Vec<_> = patch.vulnerabilities.keys().collect();
-        if !vuln_ids.is_empty() {
-            let vuln_summary: Vec<String> = patch
-                .vulnerabilities
-                .iter()
-                .map(|(id, vuln)| {
-                    let cves = if vuln.cves.is_empty() {
-                        id.to_string()
-                    } else {
-                        vuln.cves.join(", ")
-                    };
-                    format!("{cves} ({})", vuln.severity)
-                })
-                .collect();
-            println!("     Fixes: {}", vuln_summary.join(", "));
-        }
-        println!();
+        print_json(&serde_json::json!({
+            "status": "paid_required",
+            "found": 1,
+            "downloaded": 0,
+            "applied": 0,
+            "patches": [record],
+        }));
+    } else if !args.common.silent {
+        let name = purl.map(|p| normalize_purl(p).into_owned());
+        println!(
+            "{}",
+            format_paid_required(name.as_deref().unwrap_or(patch_id))
+        );
     }
+    0
+}
+
+/// Agent-mode `--dry-run`: classify each selected patch against the
+/// manifest (read-only) and report what a wet run would do — no download,
+/// no manifest or blob write, no apply, no prompt. JSON carries
+/// `dryRun: true` and per-patch `would_add` / `would_update` (+`oldUuid`)
+/// / `skipped` records, plus the narrowing skips.
+async fn agent_dry_run(
+    args: &GetArgs,
+    selected: &[PatchSearchResult],
+    narrow_skips: &[serde_json::Value],
+    narrow_warnings: &[(String, String)],
+) -> i32 {
+    // Fail closed like the wet run: a preview over an unreadable manifest
+    // would promise an outcome the wet run refuses.
+    let manifest = match read_manifest(&args.common.resolved_manifest_path()).await {
+        Ok(m) => m.unwrap_or_else(PatchManifest::new),
+        Err(e) => {
+            report_error(args.common.json, format!("Failed to read manifest: {e}"));
+            return 1;
+        }
+    };
+    let mut records = Vec::new();
+    let mut lines = Vec::new();
+    let mut changing = 0usize;
+    let mut skipped = 0usize;
+    for p in selected {
+        let shown = normalize_purl(&p.purl);
+        match decide_patch_action(&manifest, &p.purl, &p.uuid) {
+            PatchAction::Added => {
+                changing += 1;
+                lines.push(format!("  [would-add] {shown}"));
+                records.push(serde_json::json!({
+                    "purl": p.purl, "uuid": p.uuid, "action": "would_add",
+                }));
+            }
+            PatchAction::Updated { old_uuid } => {
+                changing += 1;
+                lines.push(format!(
+                    "  [would-update] {shown} (replacing {})",
+                    short_uuid(&old_uuid)
+                ));
+                records.push(serde_json::json!({
+                    "purl": p.purl, "uuid": p.uuid, "action": "would_update",
+                    "oldUuid": old_uuid,
+                }));
+            }
+            PatchAction::Skipped => {
+                skipped += 1;
+                lines.push(format!("  [skip] {shown} (already in manifest)"));
+                records.push(serde_json::json!({
+                    "purl": p.purl, "uuid": p.uuid, "action": "skipped",
+                }));
+            }
+        }
+    }
+    if args.common.json {
+        let mut result = serde_json::json!({
+            "status": "success",
+            "dryRun": true,
+            "found": selected.len(),
+            "downloaded": 0,
+            "skipped": skipped,
+            "applied": 0,
+            "patches": records,
+        });
+        fold_narrowing_into_result(&mut result, narrow_skips, narrow_warnings);
+        print_json(&result);
+    } else if !args.common.silent {
+        for line in &lines {
+            println!("{line}");
+        }
+        let action = if args.save_only {
+            "download and record"
+        } else {
+            "download and apply"
+        };
+        println!("{}", format_dry_run(action, changing));
+    }
+    0
 }
 
 /// The manifest-record half of the agent single-uuid save, under the apply
@@ -2675,7 +3274,7 @@ async fn save_patch_record(
     if let Err(e) = write_manifest(manifest_path, &manifest).await {
         // No record points at the blobs just written: unwind exactly those.
         unwind_new_blobs(&blobs_dir, &new_blobs).await;
-        report_error(args.common.json, format!("Error writing manifest: {e}"));
+        report_error(args.common.json, format!("Failed to write manifest: {e}"));
         return Err(1);
     }
     Ok(action)
@@ -2692,13 +3291,18 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
     let manifest_path = args.common.resolved_manifest_path();
     let socket_dir = args.common.socket_dir();
     let lock_timeout = Duration::from_secs(args.common.lock_timeout.unwrap_or(0));
+    // A dry run previews against the manifest and writes nothing — not
+    // even the lock (which would create `.socket/`).
+    if args.common.dry_run {
+        return agent_dry_run(args, &[search_result_from_response(patch)], &[], &[]).await;
+    }
     // See `download_and_apply_patches_with`: the RMW runs under the lock,
     // which also creates `.socket/` and prunes it again when nothing lands;
     // an error return below drops the guard.
-    let guard = match apply_lock::acquire(&socket_dir, lock_timeout) {
+    let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, lock_timeout) {
         Ok(guard) => guard,
         Err(e) => {
-            report_lock_failure(args.common.json, &e, lock_timeout);
+            report_lock_failure(args.common.json, &socket_dir, &e, lock_timeout);
             return 1;
         }
     };
@@ -2741,25 +3345,23 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
         .await;
     }
 
+    // Progress narration goes to stderr, like the search path's.
     if !quiet {
-        println!("\nPatch saved to {}", manifest_path.display());
-        match &action {
-            PatchAction::Added => println!("  Added: 1"),
-            PatchAction::Updated { old_uuid } => {
-                println!("  Updated: 1 (replacing {})", short_uuid(old_uuid));
-            }
-            PatchAction::Skipped => println!("  Skipped: 1 (already exists)"),
-        }
+        eprintln!(
+            "{}",
+            format_single_save("Patch", &action, &manifest_path, &patch.purl, true)
+        );
     }
 
     let mut apply_succeeded = false;
     if let Some(lock) = apply_lock {
         if !quiet {
-            println!("\nApplying patches...");
+            eprintln!();
+            eprintln!("Applying patches...");
         }
         apply_succeeded = run_nested_apply(
             nested_apply_args(&args.common, &manifest_path, quiet),
-            quiet,
+            args.common.json,
             client,
             lock,
         )
@@ -2927,10 +3529,7 @@ async fn run_get_vendored(
             result["vendor"] = preview;
             print_json(&result);
         } else if !args.common.silent {
-            println!(
-                "[dry-run] Would download and vendor {} patch(es).",
-                selected.len()
-            );
+            println!("{}", format_dry_run("download and vendor", selected.len()));
             super::scan::print_dry_run_refusals(&preview);
         }
         return 0;
@@ -2990,7 +3589,10 @@ async fn run_get_vendored(
                     }],
                 }));
             } else {
-                eprintln!("Error ({code}): {detail}");
+                eprintln!(
+                    "{}",
+                    crate::commands::scan::vendor_flow::format_vendor_step_error(code, detail)
+                );
             }
             return 1;
         }
@@ -3089,7 +3691,10 @@ async fn run_get_vendored(
                 result["error"] = serde_json::json!({ "code": code, "message": message });
                 print_json(&result);
             } else {
-                eprintln!("Error ({code}): {message}");
+                eprintln!(
+                    "{}",
+                    crate::commands::scan::vendor_flow::format_vendor_step_error(code, &message)
+                );
             }
             1
         }
@@ -3294,6 +3899,17 @@ mod tests {
 
     // --- select_patches ---------------------------------------------------
 
+    fn human_args() -> GlobalArgs {
+        GlobalArgs::default()
+    }
+
+    fn json_args() -> GlobalArgs {
+        GlobalArgs {
+            json: true,
+            ..GlobalArgs::default()
+        }
+    }
+
     fn mk_patch(uuid: &str, purl: &str, tier: &str, published_at: &str) -> PatchSearchResult {
         PatchSearchResult {
             uuid: uuid.into(),
@@ -3331,7 +3947,7 @@ mod tests {
     #[test]
     fn select_free_user_one_free_patch_returns_it() {
         let patches = vec![mk_patch("u1", "pkg:npm/foo@1.0", "free", "2024-01-01")];
-        let out = select_patches(&patches, false, false).expect("ok");
+        let out = select_patches(&patches, false, &human_args()).expect("ok");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].uuid, "u1");
     }
@@ -3351,7 +3967,7 @@ mod tests {
                 "critical",
             ),
         ];
-        let out = select_patches(&patches, true, false).expect("ok");
+        let out = select_patches(&patches, true, &human_args()).expect("ok");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].uuid, "old_crit");
     }
@@ -3371,7 +3987,7 @@ mod tests {
                 "critical",
             ),
         ];
-        let out = select_patches(&patches, true, false).expect("ok");
+        let out = select_patches(&patches, true, &human_args()).expect("ok");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].uuid, "free_crit");
         assert_eq!(out[0].tier, "free");
@@ -3418,7 +4034,7 @@ mod tests {
                 &["high", "high"],
             ),
         ];
-        let out = select_patches(&patches, true, false).expect("ok");
+        let out = select_patches(&patches, true, &human_args()).expect("ok");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].uuid, "z_merged");
     }
@@ -3445,7 +4061,7 @@ mod tests {
                 "critical",
             ),
         ];
-        let out = select_patches(&patches, true, false).expect("ok");
+        let out = select_patches(&patches, true, &human_args()).expect("ok");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].uuid, "z_critical");
     }
@@ -3465,7 +4081,7 @@ mod tests {
             mk_patch_sev("a_older", "pkg:npm/foo@1.0", "paid", older, "high"),
             mk_patch_sev("z_newer", "pkg:npm/foo@1.0", "paid", newer, "high"),
         ];
-        let out = select_patches(&patches, true, false).expect("ok");
+        let out = select_patches(&patches, true, &human_args()).expect("ok");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].uuid, "z_newer");
     }
@@ -3497,7 +4113,7 @@ mod tests {
                 "HIGH",
             ),
         ];
-        let out = select_patches(&patches, true, false).expect("ok");
+        let out = select_patches(&patches, true, &human_args()).expect("ok");
         assert_eq!(out.len(), 1, "one patch per PURL");
         assert_eq!(out[0].uuid, "83f5a654");
     }
@@ -3513,7 +4129,7 @@ mod tests {
             mk_patch("b", "pkg:npm/bbb@1.0", "paid", "2024-01-01"),
         ];
         for _ in 0..8 {
-            let out = select_patches(&patches, true, false).expect("ok");
+            let out = select_patches(&patches, true, &human_args()).expect("ok");
             let purls: Vec<&str> = out.iter().map(|p| p.purl.as_str()).collect();
             assert_eq!(
                 purls,
@@ -3530,7 +4146,7 @@ mod tests {
             mk_patch("free1", "pkg:npm/foo@1.0", "free", "2024-01-01"),
             mk_patch("paid1", "pkg:npm/foo@1.0", "paid", "2024-01-01"),
         ];
-        let out = select_patches(&patches, true, false).expect("ok");
+        let out = select_patches(&patches, true, &human_args()).expect("ok");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].uuid, "paid1");
         assert_eq!(out[0].tier, "paid");
@@ -3542,7 +4158,7 @@ mod tests {
             mk_patch("old", "pkg:npm/foo@1.0", "paid", "2024-01-01"),
             mk_patch("new", "pkg:npm/foo@1.0", "paid", "2024-06-01"),
         ];
-        let out = select_patches(&patches, true, false).expect("ok");
+        let out = select_patches(&patches, true, &human_args()).expect("ok");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].uuid, "new");
     }
@@ -3553,7 +4169,7 @@ mod tests {
             mk_patch("old", "pkg:npm/foo@1.0", "free", "2024-01-01"),
             mk_patch("new", "pkg:npm/foo@1.0", "free", "2024-06-01"),
         ];
-        let out = select_patches(&patches, true, false).expect("ok");
+        let out = select_patches(&patches, true, &human_args()).expect("ok");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].uuid, "new");
     }
@@ -3566,17 +4182,17 @@ mod tests {
             mk_patch("a", "pkg:npm/foo@1.0", "free", "2024-01-01"),
             mk_patch("b", "pkg:npm/foo@1.0", "free", "2024-06-01"),
         ];
-        let err = select_patches(&patches, false, true).expect_err("should fail");
+        let err = select_patches(&patches, false, &json_args()).expect_err("should fail");
         assert_eq!(err, 1);
     }
 
     #[test]
     fn select_empty_input_returns_empty() {
-        let out = select_patches(&[], false, false).expect("ok");
+        let out = select_patches(&[], false, &human_args()).expect("ok");
         assert!(out.is_empty());
-        let out = select_patches(&[], true, false).expect("ok");
+        let out = select_patches(&[], true, &human_args()).expect("ok");
         assert!(out.is_empty());
-        let out = select_patches(&[], false, true).expect("ok");
+        let out = select_patches(&[], false, &json_args()).expect("ok");
         assert!(out.is_empty());
     }
 
@@ -3589,7 +4205,7 @@ mod tests {
             mk_patch("paid", "pkg:npm/foo@1.0", "paid", "2024-06-01"),
             mk_patch("free", "pkg:npm/foo@1.0", "free", "2024-01-01"),
         ];
-        let out = select_patches(&patches, false, false).expect("ok");
+        let out = select_patches(&patches, false, &human_args()).expect("ok");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].uuid, "free");
         assert_eq!(out[0].tier, "free");
@@ -3939,54 +4555,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    // --- truncate_with_ellipsis ------------------------------------------
-    // Patch descriptions come from the API and may contain multi-byte
-    // UTF-8. The old `&desc[..n]` byte slicing panicked when `n` fell mid
-    // codepoint; these lock in char-safe behavior.
-
-    #[test]
-    fn truncate_short_string_unchanged() {
-        assert_eq!(truncate_with_ellipsis("hello", 60), "hello");
-    }
-
-    #[test]
-    fn truncate_at_limit_unchanged() {
-        let s = "a".repeat(60);
-        assert_eq!(truncate_with_ellipsis(&s, 60), s);
-    }
-
-    #[test]
-    fn truncate_long_ascii_adds_ellipsis_and_respects_limit() {
-        let s = "a".repeat(100);
-        let out = truncate_with_ellipsis(&s, 60);
-        // 57 content chars + "..." == 60, never wider than the limit.
-        assert_eq!(out.chars().count(), 60);
-        assert!(out.ends_with("..."));
-        assert_eq!(out, format!("{}...", "a".repeat(57)));
-    }
-
-    #[test]
-    fn truncate_multibyte_does_not_panic_and_is_char_safe() {
-        // 90 bytes (30 * 3-byte chars) but only 30 chars: the byte length
-        // exceeds 80 while the char count does not. A `&s[..77]` byte slice
-        // would land mid-codepoint and panic; this must return the string
-        // untouched because it fits within the char limit.
-        let s = "日".repeat(30);
-        let out = truncate_with_ellipsis(&s, 80);
-        assert_eq!(out, s);
-    }
-
-    #[test]
-    fn truncate_multibyte_long_truncates_on_char_boundary() {
-        // 100 multi-byte chars (300 bytes) — must truncate to 77 chars plus
-        // the ellipsis without ever slicing through a codepoint.
-        let s = "é".repeat(100);
-        let out = truncate_with_ellipsis(&s, 80);
-        assert_eq!(out.chars().count(), 80);
-        assert!(out.ends_with("..."));
-        assert_eq!(out, format!("{}...", "é".repeat(77)));
     }
 
     // --- write_blob_entry ------------------------------------------------
@@ -4444,7 +5012,7 @@ mod tests {
         );
         assert_eq!(
             format_patch_option(&a),
-            "a [free] (fixes: CVE-2024-0001, CVE-2024-0002) - desc-a"
+            "a [FREE] (fixes: CVE-2024-0001, CVE-2024-0002) - desc-a"
         );
     }
 
@@ -4464,14 +5032,581 @@ mod tests {
         );
         assert_eq!(
             format_patch_option(&b),
-            "b [free] (fixes: GHSA-no-cves) - desc-b"
+            "b [FREE] (fixes: GHSA-no-cves) - desc-b"
         );
     }
 
     #[test]
     fn patch_option_line_omits_fixes_segment_without_vulnerabilities() {
         let c = mk_patch("c", "pkg:npm/foo@1.0", "paid", "2024-06-01");
-        assert_eq!(format_patch_option(&c), "c [paid] - desc-c");
+        assert_eq!(format_patch_option(&c), "c [PAID] - desc-c");
+    }
+
+    // --- terminal-UI text helpers ------------------------------------------
+
+    fn vuln(cves: &[&str], severity: &str, summary: &str) -> VulnerabilityResponse {
+        VulnerabilityResponse {
+            cves: cves.iter().map(|c| c.to_string()).collect(),
+            summary: summary.into(),
+            severity: severity.into(),
+            description: String::new(),
+        }
+    }
+
+    fn with_vulns(
+        mut p: PatchSearchResult,
+        vulns: &[(&str, VulnerabilityResponse)],
+    ) -> PatchSearchResult {
+        for (id, v) in vulns {
+            p.vulnerabilities.insert(id.to_string(), v.clone());
+        }
+        p
+    }
+
+    #[test]
+    fn patch_option_line_has_no_dangling_dash_for_empty_description() {
+        let mut p = mk_patch("u1", "pkg:npm/nuxt@4.5.0", "free", "2024-01-01");
+        p.description = String::new();
+        let p = with_vulns(p, &[("GHSA-x", vuln(&["CVE-2026-71315"], "high", ""))]);
+        assert_eq!(format_patch_option(&p), "u1 [FREE] (fixes: CVE-2026-71315)");
+        // Whitespace-only descriptions collapse to nothing too.
+        let mut q = mk_patch("u2", "pkg:npm/nuxt@4.5.0", "free", "2024-01-01");
+        q.description = "  \n ".into();
+        assert_eq!(format_patch_option(&q), "u2 [FREE]");
+    }
+
+    #[test]
+    fn patch_option_line_sorts_ids_across_advisories_and_truncates_multibyte() {
+        let mut p = mk_patch("u", "pkg:npm/a@1", "free", "2024-01-01");
+        p.description = "é".repeat(100);
+        let p = with_vulns(
+            p,
+            &[
+                ("GHSA-b", vuln(&["CVE-2026-2"], "low", "")),
+                ("GHSA-a", vuln(&["CVE-2026-1", "CVE-2025-9"], "high", "")),
+                ("GHSA-z", vuln(&[], "low", "")),
+            ],
+        );
+        assert_eq!(
+            format_patch_option(&p),
+            format!(
+                "u [FREE] (fixes: CVE-2025-9, CVE-2026-1, CVE-2026-2, GHSA-z) - {}...",
+                "é".repeat(57)
+            )
+        );
+    }
+
+    #[test]
+    fn vuln_labels_dedup_and_sort() {
+        let mut m = HashMap::new();
+        m.insert("GHSA-1".to_string(), vuln(&["CVE-2", "CVE-1"], "high", ""));
+        m.insert("GHSA-2".to_string(), vuln(&["CVE-1"], "low", ""));
+        assert_eq!(vuln_labels(&m), vec!["CVE-1", "CVE-2"]);
+        assert!(vuln_labels(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn patch_summary_line_shapes() {
+        let mut m = HashMap::new();
+        m.insert(
+            "GHSA-1".to_string(),
+            vuln(&["CVE-2021-44906"], "critical", ""),
+        );
+        assert_eq!(
+            format_patch_summary("pkg:npm/minimist@1.2.5", "free", None, &m, false),
+            "pkg:npm/minimist@1.2.5 [FREE] fixes CVE-2021-44906 (CRITICAL)"
+        );
+        assert_eq!(
+            format_patch_summary(
+                "pkg:npm/%40scope/x@1.0.0",
+                "paid",
+                Some("a8b05a61-1e2f-4c5f-a65b-93e71deba1ae"),
+                &m,
+                false
+            ),
+            "pkg:npm/@scope/x@1.0.0 [PAID] a8b05a61: fixes CVE-2021-44906 (CRITICAL)"
+        );
+        // No advisories: no `fixes`, no colon.
+        assert_eq!(
+            format_patch_summary(
+                "pkg:npm/a@1",
+                "free",
+                Some("abcdef0123"),
+                &HashMap::new(),
+                false
+            ),
+            "pkg:npm/a@1 [FREE] abcdef01"
+        );
+        // Unknown severity: ids without a severity suffix.
+        let mut u = HashMap::new();
+        u.insert("GHSA-2".to_string(), vuln(&[], "", ""));
+        assert_eq!(
+            format_patch_summary("pkg:npm/a@1", "free", None, &u, false),
+            "pkg:npm/a@1 [FREE] fixes GHSA-2"
+        );
+        // Several advisories: the max severity is labeled as such, and
+        // colored like the listing when color is on.
+        let mut several = HashMap::new();
+        several.insert("GHSA-1".to_string(), vuln(&["CVE-2026-1"], "high", ""));
+        several.insert("GHSA-2".to_string(), vuln(&["CVE-2026-2"], "moderate", ""));
+        assert_eq!(
+            format_patch_summary(
+                "pkg:npm/nuxt@4.5.0",
+                "paid",
+                Some("884e9f6d-x"),
+                &several,
+                false
+            ),
+            "pkg:npm/nuxt@4.5.0 [PAID] 884e9f6d: fixes CVE-2026-1, CVE-2026-2 (highest: HIGH)"
+        );
+        assert_eq!(
+            format_patch_summary("pkg:npm/minimist@1.2.5", "free", None, &m, true),
+            "pkg:npm/minimist@1.2.5 [FREE] fixes CVE-2021-44906 (\x1b[91mCRITICAL\x1b[0m)"
+        );
+    }
+
+    #[test]
+    fn natural_cmp_orders_versions_numerically() {
+        let mut v = vec![
+            "pkg:npm/lodash@4.17.10",
+            "pkg:npm/lodash@4.2.0",
+            "pkg:npm/lodash@4.17.2",
+            "pkg:npm/lodash@4.10.0",
+            "pkg:npm/lodash@4.9.0",
+            "pkg:npm/lodash-amd@4.0.0",
+        ];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(
+            v,
+            vec![
+                "pkg:npm/lodash-amd@4.0.0",
+                "pkg:npm/lodash@4.2.0",
+                "pkg:npm/lodash@4.9.0",
+                "pkg:npm/lodash@4.10.0",
+                "pkg:npm/lodash@4.17.2",
+                "pkg:npm/lodash@4.17.10",
+            ]
+        );
+        use std::cmp::Ordering;
+        assert_eq!(natural_cmp("a1", "a01"), "a1".cmp("a01"));
+        assert_ne!(natural_cmp("a1", "a01"), Ordering::Equal);
+        assert_eq!(natural_cmp("", ""), Ordering::Equal);
+        assert_eq!(natural_cmp("a", "a1"), Ordering::Less);
+        assert_eq!(
+            natural_cmp("x99999999999999999999999", "x1"),
+            Ordering::Greater
+        );
+        assert_eq!(natural_cmp("é2", "é10"), Ordering::Less);
+    }
+
+    #[test]
+    fn search_results_listing_exact_text() {
+        let a = with_vulns(
+            mk_patch("uuid-a", "pkg:npm/lodash@4.17.10", "free", "2024-01-01"),
+            &[
+                ("GHSA-b", vuln(&["CVE-2026-2"], "MODERATE", "")),
+                ("GHSA-a", vuln(&["CVE-2026-1"], "HIGH", "")),
+            ],
+        );
+        let mut b = mk_patch("uuid-b", "pkg:npm/lodash@4.17.2", "paid", "2024-01-01");
+        b.description = String::new();
+        let out = format_search_results(&[&a, &b], false, false);
+        assert_eq!(
+            out,
+            "Found 2 patches:\n\n\
+             \x20 1. pkg:npm/lodash@4.17.2 [PAID] (no access)\n\
+             \x20    UUID: uuid-b\n\n\
+             \x20 2. pkg:npm/lodash@4.17.10 [FREE]\n\
+             \x20    UUID: uuid-a\n\
+             \x20    Description: desc-uuid-a\n\
+             \x20    Fixes: CVE-2026-1 (HIGH), CVE-2026-2 (MODERATE)\n\n"
+        );
+        let one = format_search_results(&[&a], true, false);
+        assert!(one.starts_with("Found 1 patch:\n\n"), "{one}");
+        assert_eq!(
+            format_search_results(&[], true, false),
+            "Found 0 patches:\n\n"
+        );
+        let colored = format_search_results(&[&a], true, true);
+        assert!(
+            colored.contains("CVE-2026-1 (\x1b[31mHIGH\x1b[0m)"),
+            "{colored:?}"
+        );
+    }
+
+    #[test]
+    fn selected_block_names_uuid_and_fixes() {
+        let a = with_vulns(
+            mk_patch(
+                "6332e781-0a42-4b0e-95c4-61f834461268",
+                "pkg:npm/lodash@4.17.20",
+                "free",
+                "2024-01-01",
+            ),
+            &[("GHSA-a", vuln(&["CVE-2026-4800"], "HIGH", ""))],
+        );
+        assert_eq!(
+            format_selected_patches(&[a], false),
+            "Selected:\n  pkg:npm/lodash@4.17.20 [FREE] 6332e781: fixes CVE-2026-4800 (HIGH)\n\n"
+        );
+        assert_eq!(format_selected_patches(&[], false), "Selected:\n\n");
+    }
+
+    fn skip(purl: &str, code: &str) -> serde_json::Value {
+        serde_json::json!({"purl": purl, "uuid": "u", "action": "skipped", "errorCode": code})
+    }
+
+    #[test]
+    fn skip_summary_one_line_per_reason() {
+        assert!(format_skip_summary(&[]).is_empty());
+        assert_eq!(
+            format_skip_summary(&[skip("pkg:npm/a@1", "package_not_installed")]),
+            vec![
+                "Skipped 1 patch for 1 package version not installed here \
+                 (use --all-releases to include it)."
+            ]
+        );
+        let many = vec![
+            skip("pkg:npm/a@1", "package_not_installed"),
+            skip("pkg:npm/a@1", "package_not_installed"),
+            skip("pkg:npm/a@2", "package_not_installed"),
+            skip("pkg:npm/b@1", "yarn_pnp_unsupported"),
+        ];
+        assert_eq!(
+            format_skip_summary(&many),
+            vec![
+                "Skipped 3 patches for 2 package versions not installed here \
+                 (use --all-releases to include them)."
+                    .to_string(),
+                "Skipped 1 patch for 1 package version (yarn_pnp_unsupported; \
+                 see the warning above)."
+                    .to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn all_narrowed_message_plurals_and_pnp() {
+        assert_eq!(
+            format_all_narrowed(&[skip("pkg:npm/a@1", "package_not_installed")]),
+            "Patches exist for 1 package version, but it is not installed here. \
+             Use --all-releases to fetch it anyway."
+        );
+        assert_eq!(
+            format_all_narrowed(&[
+                skip("pkg:npm/a@1", "package_not_installed"),
+                skip("pkg:npm/a@2", "package_not_installed"),
+                skip("pkg:npm/a@2", "package_not_installed"),
+            ]),
+            "Patches exist for 2 package versions, but none of them are installed here. \
+             Use --all-releases to fetch them anyway."
+        );
+        assert_eq!(
+            format_all_narrowed(&[skip("pkg:npm/a@1", "pnpm_pnp_unsupported")]),
+            "Found 1 patch, but this project's Plug'n'Play layout makes its npm packages \
+             unpatchable here; see the layout warning above for the remedy."
+        );
+    }
+
+    #[test]
+    fn confirm_prompts_per_mode() {
+        use super::super::scan::ScanMode;
+        assert_eq!(
+            format_confirm_prompt(ScanMode::Agent, 1, false),
+            "Download and apply 1 patch?"
+        );
+        assert_eq!(
+            format_confirm_prompt(ScanMode::Agent, 2, false),
+            "Download and apply 2 patches?"
+        );
+        assert_eq!(
+            format_confirm_prompt(ScanMode::Agent, 1, true),
+            "Download 1 patch?"
+        );
+        assert_eq!(
+            format_confirm_prompt(ScanMode::Vendored, 3, false),
+            "Download and vendor 3 patches?"
+        );
+        assert_eq!(
+            format_confirm_prompt(ScanMode::Hosted, 1, false),
+            "Redirect 1 package to the hosted patch server?"
+        );
+        assert_eq!(
+            format_confirm_prompt(ScanMode::Hosted, 0, false),
+            "Redirect 0 packages to the hosted patch server?"
+        );
+    }
+
+    #[test]
+    fn dry_run_line_plurals() {
+        assert_eq!(
+            format_dry_run("download and apply", 1),
+            "[dry-run] Would download and apply 1 patch. No changes made."
+        );
+        assert_eq!(
+            format_dry_run("download and vendor", 0),
+            "[dry-run] Would download and vendor 0 patches. No changes made."
+        );
+    }
+
+    #[test]
+    fn no_packages_message_points_at_the_package_manager() {
+        assert_eq!(no_packages_message(true), "No global packages found.");
+        assert_eq!(
+            no_packages_message(false),
+            "No packages found. Run your package manager's install first."
+        );
+    }
+
+    #[test]
+    fn paid_required_text() {
+        assert_eq!(
+            format_paid_required("pkg:npm/a@1"),
+            "This patch requires a paid subscription to download.\n  \
+             Patch: pkg:npm/a@1\n  \
+             Upgrade at: https://socket.dev/pricing"
+        );
+    }
+
+    #[test]
+    fn save_summary_lines() {
+        let m = Path::new(".socket/manifest.json");
+        assert_eq!(
+            format_save_summary(m, 2, 0, 0, 0),
+            "Patches saved to .socket/manifest.json\n  Added: 2"
+        );
+        assert_eq!(
+            format_save_summary(m, 1, 1, 1, 1),
+            "Patches saved to .socket/manifest.json\n  Added: 1\n  Updated: 1\n  Skipped: 1\n  Failed: 1"
+        );
+        assert_eq!(
+            format_save_summary(m, 0, 0, 2, 0),
+            "No changes to .socket/manifest.json\n  Added: 0\n  Skipped: 2"
+        );
+        assert_eq!(
+            format_save_summary(m, 0, 0, 0, 1),
+            "No changes to .socket/manifest.json\n  Added: 0\n  Failed: 1"
+        );
+    }
+
+    #[test]
+    fn best_match_line_names_the_count_only_when_there_was_a_choice() {
+        assert_eq!(
+            format_best_match("pkg:npm/%40s/a@1", 1),
+            "Best match: pkg:npm/@s/a@1"
+        );
+        assert_eq!(
+            format_best_match("pkg:npm/a@1", 3),
+            "Best match: pkg:npm/a@1 (of 3 matching packages)"
+        );
+    }
+
+    #[test]
+    fn verbose_skips_dedupe_and_sort_naturally() {
+        let rec = |purl: &str, code: Option<&str>| {
+            let mut r = serde_json::json!({"purl": purl, "action": "skipped"});
+            if let Some(c) = code {
+                r["errorCode"] = serde_json::json!(c);
+            }
+            r
+        };
+        let skips = vec![
+            rec("pkg:npm/a@4.10.0", Some("package_not_installed")),
+            rec("pkg:npm/a@4.2.0", None),
+            rec("pkg:npm/a@4.10.0", Some("package_not_installed")),
+            rec("pkg:npm/a@4.1.0", Some("yarn_pnp_unsupported")),
+        ];
+        assert_eq!(
+            format_verbose_skips(&skips),
+            vec![
+                "  [skip] pkg:npm/a@4.1.0 (yarn_pnp_unsupported)",
+                "  [skip] pkg:npm/a@4.2.0 (version not installed)",
+                "  [skip] pkg:npm/a@4.10.0 (version not installed)",
+            ]
+        );
+        assert!(format_verbose_skips(&[]).is_empty());
+    }
+
+    #[test]
+    fn selection_prompted_only_for_an_interactive_free_choice() {
+        let two = vec![
+            mk_patch("a", "pkg:npm/x@1", "free", "2024-01-01"),
+            mk_patch("b", "pkg:npm/x@1", "free", "2024-02-01"),
+        ];
+        let one_plus_paid = vec![
+            mk_patch("a", "pkg:npm/x@1", "free", "2024-01-01"),
+            mk_patch("b", "pkg:npm/x@1", "paid", "2024-02-01"),
+        ];
+        let plain = GlobalArgs::default();
+        let yes = GlobalArgs {
+            yes: true,
+            ..GlobalArgs::default()
+        };
+        let json = GlobalArgs {
+            json: true,
+            ..GlobalArgs::default()
+        };
+        // Paid users, --yes and --json never see a menu.
+        assert!(!selection_prompted(&two, true, &plain));
+        assert!(!selection_prompted(&two, false, &yes));
+        assert!(!selection_prompted(&two, false, &json));
+        // A single free candidate is auto-picked.
+        assert!(!selection_prompted(&one_plus_paid, false, &plain));
+        // Several free candidates prompt exactly when stdin is a terminal.
+        use std::io::IsTerminal;
+        assert_eq!(
+            selection_prompted(&two, false, &plain),
+            std::io::stdin().is_terminal()
+        );
+    }
+
+    #[test]
+    fn single_save_lines() {
+        let m = Path::new("p/.socket/manifest.json");
+        assert_eq!(
+            format_single_save("Patch", &PatchAction::Added, m, "pkg:npm/a@1", true),
+            "Patch saved to p/.socket/manifest.json\n  Added: 1"
+        );
+        assert_eq!(
+            format_single_save(
+                "Patch record",
+                &PatchAction::Updated {
+                    old_uuid: "0123456789abcdef".into()
+                },
+                m,
+                "pkg:npm/a@1",
+                false
+            ),
+            "Patch record saved to p/.socket/manifest.json\n  Updated: 1 (replacing 01234567)"
+        );
+        // A malformed short uuid never panics.
+        assert!(format_single_save(
+            "Patch",
+            &PatchAction::Updated {
+                old_uuid: "é".into()
+            },
+            m,
+            "x",
+            true
+        )
+        .ends_with("(replacing é)"));
+        assert_eq!(
+            format_single_save("Patch", &PatchAction::Skipped, m, "pkg:npm/%40s/a@1", true),
+            "pkg:npm/@s/a@1 already has this patch recorded in p/.socket/manifest.json; \
+             nothing to update."
+        );
+        // The vendored path still runs its vendor step: no "nothing to
+        // update" promise.
+        assert_eq!(
+            format_single_save(
+                "Patch record",
+                &PatchAction::Skipped,
+                m,
+                "pkg:npm/a@1",
+                false
+            ),
+            "pkg:npm/a@1 already has this patch recorded in p/.socket/manifest.json."
+        );
+    }
+
+    #[test]
+    fn record_skip_line_decodes_the_purl() {
+        assert_eq!(
+            format_record_skip("pkg:npm/%40scope/a@1.0.0", "already vendored"),
+            "  [skip] pkg:npm/@scope/a@1.0.0 (already vendored)"
+        );
+        assert_eq!(
+            format_record_skip("pkg:npm/a@1", "already in manifest"),
+            "  [skip] pkg:npm/a@1 (already in manifest)"
+        );
+    }
+
+    #[test]
+    fn apply_failed_line_is_an_error_even_when_silent() {
+        assert_eq!(APPLY_FAILED, "Error: Some patches could not be applied.");
+    }
+
+    #[test]
+    fn forced_identifier_shapes() {
+        assert_eq!(
+            forced_identifier_error("lodash", IdentifierType::Uuid).as_deref(),
+            Some("\"lodash\" is not a valid patch UUID (expected xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)")
+        );
+        assert_eq!(
+            forced_identifier_error("lodash", IdentifierType::Cve).as_deref(),
+            Some("\"lodash\" is not a valid CVE ID (expected CVE-YYYY-NNNN)")
+        );
+        assert_eq!(
+            forced_identifier_error("GHSA-1", IdentifierType::Ghsa).as_deref(),
+            Some("\"GHSA-1\" is not a valid GHSA ID (expected GHSA-xxxx-xxxx-xxxx)")
+        );
+        assert_eq!(
+            forced_identifier_error("a8b05a61-1e2f-4c5f-a65b-93e71deba1ae", IdentifierType::Uuid),
+            None
+        );
+        assert_eq!(
+            forced_identifier_error("cve-2021-44906", IdentifierType::Cve),
+            None
+        );
+        assert_eq!(
+            forced_identifier_error("GHSA-xvch-5gv4-984h", IdentifierType::Ghsa),
+            None
+        );
+        assert_eq!(
+            forced_identifier_error("anything", IdentifierType::Package),
+            None
+        );
+        assert_eq!(
+            forced_identifier_error("anything", IdentifierType::Purl),
+            None
+        );
+    }
+
+    #[test]
+    fn yes_auto_picks_the_top_ranked_free_patch_without_a_prompt() {
+        // Two free patches for one purl would open the interactive menu;
+        // --yes answers it with its default (the top-ranked patch).
+        let patches = vec![
+            mk_patch("old", "pkg:npm/foo@1.0", "free", "2024-01-01"),
+            mk_patch("new", "pkg:npm/foo@1.0", "free", "2024-06-01"),
+        ];
+        let yes = GlobalArgs {
+            yes: true,
+            ..GlobalArgs::default()
+        };
+        let out = select_patches(&patches, false, &yes).expect("ok");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].uuid, "new");
+        // --json keeps its selection_required contract even with --yes.
+        let json_yes = GlobalArgs {
+            yes: true,
+            json: true,
+            ..GlobalArgs::default()
+        };
+        assert_eq!(select_patches(&patches, false, &json_yes).unwrap_err(), 1);
+    }
+
+    #[test]
+    fn help_text_has_no_implementation_notes() {
+        use clap::CommandFactory;
+        let mut cmd = crate::Cli::command();
+        let get = cmd
+            .find_subcommand_mut("get")
+            .expect("get subcommand")
+            .clone();
+        let mut get = get;
+        let help = get.render_long_help().to_string();
+        for leak in [
+            "value_parser",
+            "parse_bool_flag",
+            "No env binding",
+            "locally- installed",
+            "SOCKET_ONE_OFF",
+            "--one-off",
+        ] {
+            assert!(!help.contains(leak), "get --help leaks {leak:?}:\n{help}");
+        }
+        assert!(help.contains("locally-installed distribution"), "{help}");
     }
 
     // --- download_patch_records (detached download phase) ------------------
@@ -4731,7 +5866,7 @@ mod tests {
                 description: "desc-b".to_string(),
             },
         );
-        let result = select_patches(&[a, b], false, true);
+        let result = select_patches(&[a, b], false, &json_args());
         assert_eq!(
             result.err(),
             Some(1),

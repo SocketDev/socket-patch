@@ -5,7 +5,6 @@
 use socket_patch_core::manifest::cleanup_blobs::CleanupResult;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::patch::apply_lock;
 use socket_patch_core::utils::purl::{canonical_purl, strip_purl_qualifiers};
 use socket_patch_core::vendor::VENDOR_STATE_REL;
 use std::collections::HashSet;
@@ -221,7 +220,7 @@ pub(super) async fn run_apply_gc(
     // halves: flock is per open file description, so a nested acquire in
     // the vendored half would read as a live holder and silently skip it.
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    let _guard = match apply_lock::acquire(socket_dir, timeout) {
+    let _guard = match crate::commands::lock_cli::acquire_with_status(socket_dir, timeout) {
         Ok(g) => g,
         Err(e) => {
             return GcSummary {
@@ -257,9 +256,8 @@ pub(super) async fn run_apply_gc(
             write_failure = Some((
                 "manifest_write_failed",
                 format!(
-                    "pruned {} manifest entr{} but could not update {}: {e}",
-                    prunable.len(),
-                    if prunable.len() == 1 { "y" } else { "ies" },
+                    "pruned {} but could not update {}: {e}",
+                    count(prunable.len(), "manifest entry", "manifest entries"),
                     manifest_path.display()
                 ),
             ));
@@ -336,20 +334,35 @@ pub(super) async fn gc_json(
     }
 }
 
-/// Human-readable line(s) for the vendored-state half of a GC pass (and
-/// the lock-skip reason / failed rewrites, when the pass could not run or
-/// persist in full); prints nothing when there is nothing to report.
-pub(super) fn print_gc_vendored_line(gc: &GcSummary) {
-    for line in gc_vendored_lines(gc) {
-        println!("{line}");
-    }
+/// `1 manifest entry` / `2 manifest entries` (and friends).
+fn count(n: usize, one: &str, many: &str) -> String {
+    crate::ui::plural(n, one, many)
 }
 
-/// The lines [`print_gc_vendored_line`] prints, in order — split out so the
-/// contract's human GC vocabulary (`GC: skipped (<code>): <message>.`, one
-/// `GC: <detail>.` per warning, `GC: failed to revert N vendored
-/// entr(y|ies): …`) is unit-testable without capturing stdout.
-fn gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
+/// The main human GC line for a pass that pruned or swept something
+/// (`None` when it did nothing). `preview`: the `--dry-run` wording.
+pub(super) fn format_gc_line(gc: &GcSummary, preview: bool) -> Option<String> {
+    let files = gc.blobs.blobs_removed + gc.diffs.blobs_removed + gc.packages.blobs_removed;
+    if gc.pruned.is_empty() && files == 0 {
+        return None;
+    }
+    let entries = count(gc.pruned.len(), "manifest entry", "manifest entries");
+    let files_s = count(files, "orphan file", "orphan files");
+    let bytes = socket_patch_core::manifest::cleanup_blobs::format_bytes(gc.total_bytes());
+    Some(if preview {
+        format!("[dry-run] GC would prune {entries} and remove {files_s} ({bytes}).")
+    } else {
+        format!("GC: pruned {entries} and removed {files_s} ({bytes}).")
+    })
+}
+
+/// Human-readable line(s) for the vendored-state half of a GC pass (and
+/// the lock-skip reason / failed rewrites, when the pass could not run or
+/// persist in full), in order; empty when there is nothing to report.
+/// Split out so the contract's human GC vocabulary (`GC: skipped (<code>):
+/// <message>.`, one `GC: <detail>.` per warning, `GC: failed to revert N
+/// vendored entry/entries: …`) is unit-testable without capturing stdout.
+pub(super) fn format_gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some((code, message)) = &gc.skipped {
         lines.push(format!("GC: skipped ({code}): {message}."));
@@ -359,15 +372,17 @@ fn gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
     }
     if !gc.vendored_reverted.is_empty() || gc.vendor_orphan_dirs > 0 {
         lines.push(format!(
-            "GC: reverted {} vendored entr{}; swept {} orphan vendor dir{}.",
-            gc.vendored_reverted.len(),
-            if gc.vendored_reverted.len() == 1 {
-                "y"
-            } else {
-                "ies"
-            },
-            gc.vendor_orphan_dirs,
-            if gc.vendor_orphan_dirs == 1 { "" } else { "s" },
+            "GC: reverted {}; swept {}.",
+            count(
+                gc.vendored_reverted.len(),
+                "vendored entry",
+                "vendored entries"
+            ),
+            count(
+                gc.vendor_orphan_dirs,
+                "orphan vendor dir",
+                "orphan vendor dirs"
+            ),
         ));
     }
     // Drift-keeps are the one GC outcome that silently contradicts the
@@ -376,15 +391,14 @@ fn gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
     // other drift-keep caller prints.
     if !gc.vendored_kept.is_empty() {
         lines.push(format!(
-            "GC: kept {} drifted vendored entr{}: lock entries were re-resolved since \
-             vendoring, so their artifacts and manifest/ledger entries were retained — undo \
-             the drift and re-run `vendor --revert` to finish.",
-            gc.vendored_kept.len(),
-            if gc.vendored_kept.len() == 1 {
-                "y"
-            } else {
-                "ies"
-            },
+            "GC: kept {}: lock entries were re-resolved since vendoring, so their \
+             artifacts and manifest/ledger entries were retained; undo the drift and \
+             re-run `vendor --revert` to finish.",
+            count(
+                gc.vendored_kept.len(),
+                "drifted vendored entry",
+                "drifted vendored entries"
+            ),
         ));
     }
     // A failed revert leaves the entry and its artifacts in place; the
@@ -392,17 +406,55 @@ fn gc_vendored_lines(gc: &GcSummary) -> Vec<String> {
     // not reclaimed.
     if !gc.vendored_failed.is_empty() {
         lines.push(format!(
-            "GC: failed to revert {} vendored entr{}: {}.",
-            gc.vendored_failed.len(),
-            if gc.vendored_failed.len() == 1 {
-                "y"
-            } else {
-                "ies"
-            },
+            "GC: failed to revert {}: {}.",
+            count(
+                gc.vendored_failed.len(),
+                "vendored entry",
+                "vendored entries"
+            ),
             gc.vendored_failed.join(", "),
         ));
     }
     lines
+}
+
+/// Print [`format_gc_vendored_lines`].
+pub(super) fn print_gc_vendored_line(gc: &GcSummary) {
+    for line in format_gc_vendored_lines(gc) {
+        println!("{line}");
+    }
+}
+
+/// The human path's `--prune` pass: the mutating GC, or its read-only
+/// preview under `--dry-run`, with its summary lines (unless `--silent`).
+/// Mirrors the JSON path, which runs the GC whether or not anything was
+/// applied.
+pub(super) async fn run_human_gc(
+    common: &GlobalArgs,
+    manifest_path: &Path,
+    socket_dir: &Path,
+    scanned_purls: &HashSet<String>,
+    vendored: &HashSet<String>,
+) {
+    let preview = common.dry_run;
+    let gc = if preview {
+        preview_apply_gc(common, manifest_path, socket_dir, scanned_purls, vendored).await
+    } else {
+        run_apply_gc(common, manifest_path, socket_dir, scanned_purls, vendored).await
+    };
+    if common.silent {
+        return;
+    }
+    if let Some(line) = format_gc_line(&gc, preview) {
+        println!("\n{line}");
+    }
+    for line in format_gc_vendored_lines(&gc) {
+        if preview {
+            println!("[dry-run] {line}");
+        } else {
+            println!("{line}");
+        }
+    }
 }
 
 /// PURL strings present in the manifest but absent from `scanned_purls`.
@@ -461,6 +513,65 @@ fn detect_prunable(
 
 #[cfg(test)]
 mod tests {
+
+    // ---- human GC lines ------------------------------------------------------
+
+    fn summary(pruned: usize, files: usize, bytes: u64) -> GcSummary {
+        GcSummary {
+            pruned: (0..pruned).map(|i| format!("pkg:npm/p{i}@1")).collect(),
+            blobs: CleanupResult {
+                blobs_removed: files,
+                bytes_freed: bytes,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn format_gc_line_singular_plural_and_preview() {
+        assert_eq!(format_gc_line(&summary(0, 0, 0), false), None);
+        assert_eq!(
+            format_gc_line(&summary(1, 1, 12), false).as_deref(),
+            Some("GC: pruned 1 manifest entry and removed 1 orphan file (12 B).")
+        );
+        assert_eq!(
+            format_gc_line(&summary(2, 0, 0), false).as_deref(),
+            Some("GC: pruned 2 manifest entries and removed 0 orphan files (0 B).")
+        );
+        assert_eq!(
+            format_gc_line(&summary(1, 3, 0), true).as_deref(),
+            Some("[dry-run] GC would prune 1 manifest entry and remove 3 orphan files (0 B).")
+        );
+    }
+
+    #[test]
+    fn format_gc_vendored_lines_counts() {
+        assert!(format_gc_vendored_lines(&GcSummary::default()).is_empty());
+        let gc = GcSummary {
+            vendored_reverted: vec!["a".into()],
+            vendor_orphan_dirs: 2,
+            vendored_kept: vec!["b".into(), "c".into()],
+            ..Default::default()
+        };
+        let lines = format_gc_vendored_lines(&gc);
+        assert_eq!(
+            lines[0],
+            "GC: reverted 1 vendored entry; swept 2 orphan vendor dirs."
+        );
+        assert!(
+            lines[1].starts_with("GC: kept 2 drifted vendored entries: lock entries"),
+            "{lines:?}"
+        );
+        let gc = GcSummary {
+            vendor_orphan_dirs: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_gc_vendored_lines(&gc),
+            vec!["GC: reverted 0 vendored entries; swept 1 orphan vendor dir."]
+        );
+    }
     use super::*;
     use crate::commands::scan::tests::manifest_with;
 
@@ -1465,11 +1576,11 @@ mod tests {
 
     /// The human GC vocabulary the contract pins (`GC: skipped (<code>):
     /// <message>.`, one `GC: <detail>.` per warning, `GC: failed to revert N
-    /// vendored entr(y|ies): …`), rendered in order; a clean pass prints
+    /// vendored entry/entries: …`), rendered in order; a clean pass prints
     /// nothing.
     #[test]
     fn gc_vendored_lines_render_the_contract_vocabulary() {
-        assert!(gc_vendored_lines(&GcSummary::default()).is_empty());
+        assert!(format_gc_vendored_lines(&GcSummary::default()).is_empty());
 
         let mut gc = GcSummary {
             skipped: Some((
@@ -1484,7 +1595,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            gc_vendored_lines(&gc),
+            format_gc_vendored_lines(&gc),
             vec![
                 "GC: skipped (lock_held): another socket-patch process is operating in this \
                  directory."
@@ -1502,7 +1613,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            gc_vendored_lines(&one),
+            format_gc_vendored_lines(&one),
             vec![
                 "GC: reverted 1 vendored entry; swept 1 orphan vendor dir.".to_string(),
                 "GC: failed to revert 1 vendored entry: pkg:npm/c@1.0.0.".to_string(),

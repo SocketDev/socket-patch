@@ -292,7 +292,7 @@ fn apply_silent_unmatched_manifest_keeps_warning_output() {
         "silent human mode writes the diagnostic to stderr, not stdout: {stdout}"
     );
     assert!(
-        stderr.contains("Warning: No packages found that match available patches"),
+        stderr.contains("Error: The targeted manifest patch matched no installed package:"),
         "--silent must keep the exit-flipping diagnostic (errors only, never \
          nothing); stderr was: {stderr:?}"
     );

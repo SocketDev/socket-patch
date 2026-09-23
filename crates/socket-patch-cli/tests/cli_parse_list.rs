@@ -469,7 +469,7 @@ fn populated_manifest_plain_lists_full_record_via_binary() {
 
     // Every field of the single record must be rendered, not just an exit 0.
     assert!(
-        stdout.contains("Found 1 patch(es):"),
+        stdout.contains("Found 1 patch:"),
         "missing count header: {stdout}"
     );
     assert!(
@@ -496,7 +496,7 @@ fn populated_manifest_plain_lists_full_record_via_binary() {
     );
     assert!(stdout.contains("CVE-2024-0001"), "missing cve: {stdout}");
     assert!(
-        stdout.contains("Severity: high"),
+        stdout.contains("Severity: HIGH"),
         "missing severity: {stdout}"
     );
     assert!(
@@ -695,7 +695,7 @@ fn multi_manifest_plain_lists_all_records_sorted_via_binary() {
 
     // Count header must reflect the real number of patches, not a hardcode.
     assert!(
-        stdout.contains("Found 3 patch(es):"),
+        stdout.contains("Found 3 patches:"),
         "count header must say 3, got: {stdout}"
     );
 
@@ -1066,7 +1066,7 @@ fn hosted_only_project_list_plain_labels_hosted_via_binary() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        stdout.contains("Found 1 patch(es):"),
+        stdout.contains("Found 1 patch:"),
         "count header must include the hosted record: {stdout}"
     );
     assert!(
@@ -1182,6 +1182,39 @@ fn edits_only_ledger_without_manifest_still_manifest_not_found_via_binary() {
         "no records anywhere must exit 1"
     );
     assert_eq!(v["error"]["code"], "manifest_not_found", "envelope={v}");
+}
+
+#[test]
+fn missing_manifest_with_corrupt_ledger_keeps_warning_in_error_envelope_via_binary() {
+    // No manifest and a corrupt ledger: the run takes the
+    // manifest_not_found exit, but the ledger corruption must still reach
+    // a JSON consumer via the error envelope's `warnings[]` (stderr is not
+    // the machine channel), and nothing may leak onto stderr.
+    let tmp = tempfile::tempdir().unwrap();
+    let vendor_dir = tmp.path().join(".socket/vendor");
+    std::fs::create_dir_all(&vendor_dir).unwrap();
+    std::fs::write(vendor_dir.join("redirect-state.json"), "{ not json").unwrap();
+
+    let out = run_list_binary(tmp.path(), &["--json"]);
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(v["error"]["code"], "manifest_not_found", "envelope={v}");
+    let warnings = v["warnings"].as_array().expect("warnings[] present");
+    assert_eq!(warnings.len(), 1, "envelope={v}");
+    assert_eq!(warnings[0]["code"], "redirect_ledger_corrupt", "envelope={v}");
+    assert!(
+        out.stderr.is_empty(),
+        "--json must keep stderr clean: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Human mode: the warning still reaches stderr ahead of the error.
+    let out = run_list_binary(tmp.path(), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr.contains("Warning: "), "stderr={stderr}");
+    assert!(stderr.contains("Error: Manifest not found at "), "stderr={stderr}");
 }
 
 #[test]
@@ -1415,7 +1448,7 @@ fn vendored_only_project_list_plain_labels_vendored_via_binary() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        stdout.contains("Found 1 patch(es):"),
+        stdout.contains("Found 1 patch:"),
         "count header must include the vendored record: {stdout}"
     );
     assert!(

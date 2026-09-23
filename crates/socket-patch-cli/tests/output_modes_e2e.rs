@@ -105,7 +105,7 @@ fn apply_non_json_prints_human_readable_summary() {
     // The human-readable summary must report the count *and* name the
     // patched package — not merely print one of two loosely-OR'd words.
     assert!(
-        stdout.contains("Summary:") && stdout.contains("1/1 targeted patches applied"),
+        stdout.contains("Summary:") && stdout.contains("1 of 1 targeted patch applied"),
         "non-JSON apply should print the patch-count summary; got: {stdout}"
     );
     assert!(
@@ -212,12 +212,13 @@ fn apply_dry_run_non_json_prints_verification_summary() {
         stdout.contains("Patch verification complete") && stdout.contains("can be patched"),
         "dry-run non-JSON should print the verification summary; got: {stdout}"
     );
-    // Dry-run reports 0 patches *applied* and, critically, must NOT touch
-    // the file on disk. The old test never checked this, so a dry-run
-    // that actually mutated files would have passed.
+    // Dry-run reports what WOULD apply (never an "applied" summary) and,
+    // critically, must NOT touch the file on disk. The old test never
+    // checked this, so a dry-run that actually mutated files would have
+    // passed.
     assert!(
-        stdout.contains("0/1 targeted patches applied"),
-        "dry-run must report nothing applied; got: {stdout}"
+        stdout.contains("1 package can be patched") && !stdout.contains("Summary:"),
+        "dry-run must report the would-be work, not an applied summary; got: {stdout}"
     );
     let on_disk = std::fs::read(tmp.path().join("node_modules/dry-target/index.js")).unwrap();
     assert_eq!(
@@ -251,7 +252,7 @@ fn list_non_json_prints_table() {
         "list non-JSON must print the CVE id; got: {stdout}"
     );
     assert!(
-        stdout.contains("Found 1 patch(es)"),
+        stdout.contains("Found 1 patch:"),
         "list non-JSON must report the patch count; got: {stdout}"
     );
 }
@@ -344,7 +345,7 @@ fn repair_non_json_no_orphans_prints_summary() {
     // deleted the in-use blob — or skipped the cleanup scan entirely — still
     // passed.
     assert!(
-        stdout.contains("Checked 1 blob(s), all are in use."),
+        stdout.contains("Checked 1 blob: in use."),
         "no-orphan repair must report the single blob as in-use; got: {stdout}"
     );
     assert!(
@@ -382,7 +383,7 @@ fn repair_non_json_with_orphans_prints_cleanup_summary() {
     // 2) so a repair that removes too few OR too many blobs fails here; the
     // old `contains("Removed")` accepted any nonzero count.
     assert!(
-        stdout.contains("Removed 2 unused blob(s)"),
+        stdout.contains("Removed 2 unused blobs"),
         "repair with orphans must report exactly 2 removed unused blobs; got: {stdout}"
     );
     assert!(
@@ -423,7 +424,7 @@ fn remove_non_json_prints_what_will_be_removed() {
     );
     assert_eq!(code, 0);
     assert!(
-        stdout.contains("Removed 1 patch(es) from manifest")
+        stdout.contains("Removed 1 patch from manifest")
             && stdout.contains("pkg:npm/remove-target@1.0.0"),
         "non-JSON remove must print confirmation naming the PURL; stdout={stdout}"
     );
@@ -504,7 +505,7 @@ fn get_non_json_invalid_uuid_falls_through_to_package_search() {
     // Invalid identifier without --cve/--ghsa/--package etc. The binary
     // should fall through to package-name search and either succeed or
     // exit 1 cleanly. We're exercising the type-detection branch.
-    let (code, stdout, _stderr) = common::run_with_env(
+    let (code, stdout, stderr) = common::run_with_env(
         tmp.path(),
         &[
             "get",
@@ -530,9 +531,10 @@ fn get_non_json_invalid_uuid_falls_through_to_package_search() {
         code, 0,
         "package-name fall-through should exit cleanly; stdout={stdout}"
     );
+    // The routing note is stderr narration (stdout stays for results).
     assert!(
-        stdout.contains("as a package name search"),
-        "get with a bare identifier must fall through to package-name search; got: {stdout}"
+        stderr.contains("as a package name search"),
+        "get with a bare identifier must fall through to package-name search; got: {stderr}"
     );
 }
 
@@ -579,8 +581,9 @@ fn get_with_explicit_cve_flag_works() {
 #[test]
 fn get_with_explicit_ghsa_flag_works() {
     let tmp = tempfile::tempdir().unwrap();
-    // Non-JSON so we can assert the human-readable routing line on stdout
-    // and the network error (with the by-ghsa endpoint) on stderr.
+    // Non-JSON so we can assert the human-readable network error (with the
+    // by-ghsa endpoint) on stderr. The "Searching patches for GHSA ..."
+    // progress is a transient status line that never reaches a pipe.
     let (code, stdout, stderr) = common::run_with_env(
         tmp.path(),
         &[
@@ -600,8 +603,8 @@ fn get_with_explicit_ghsa_flag_works() {
     );
     assert_eq!(code, 1, "unreachable API must yield a failure exit");
     assert!(
-        stdout.contains("Searching patches for GHSA: GHSA-1111-2222-3333"),
-        "--ghsa must announce a GHSA search; got: {stdout}"
+        !stdout.contains("Searching patches for"),
+        "search progress must not land on stdout; got: {stdout}"
     );
     assert!(
         stderr.contains("by-ghsa/GHSA-1111-2222-3333"),

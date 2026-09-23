@@ -55,8 +55,9 @@ async fn update_force_swaps_binary_end_to_end() {
         "update must succeed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("Updated socket-patch"),
-        "human output must report the update: {stdout}"
+        // A --force install of the running version is a reinstall.
+        stdout.contains(&format!("Reinstalled socket-patch {CURRENT}")),
+        "human output must report the reinstall: {stdout}"
     );
 
     // The installed file now IS the served payload…

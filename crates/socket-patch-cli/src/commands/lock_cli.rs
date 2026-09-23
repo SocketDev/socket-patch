@@ -47,18 +47,93 @@ pub(crate) fn acquire_or_emit(
     dry_run: bool,
     timeout: Duration,
 ) -> Result<LockGuard, i32> {
-    match acquire(socket_dir, timeout) {
+    match acquire_with_status(socket_dir, timeout) {
         Ok(guard) => Ok(guard),
         Err(err) => {
-            let hint = match err {
-                LockError::Held => Hint::Wait,
-                LockError::Io { .. } => Hint::None,
-            };
+            let hint = failure_hint(&err, &socket_dir.join("apply.lock"), timeout);
             let (code, message) = lock_failure(&err, timeout);
-            emit(command, json, dry_run, code, &message, hint);
+            emit(command, json, dry_run, code, &message, &hint);
             Err(1)
         }
     }
+}
+
+/// [`acquire`] with the contended-wait status line: a `--lock-timeout 30`
+/// run that finds the lock held says what it is waiting on instead of
+/// sitting there silently for 30 s. The status line is terminal-only and
+/// quiet under --json/--silent (the process-wide quiet switch). Every
+/// lock site goes through this (or [`acquire_or_emit`], which wraps it).
+pub(crate) fn acquire_with_status(
+    socket_dir: &Path,
+    timeout: Duration,
+) -> Result<LockGuard, LockError> {
+    match acquire(socket_dir, Duration::ZERO) {
+        Err(LockError::Held) if timeout > Duration::ZERO => {
+            let mut status = crate::ui::StatusLine::stderr(crate::ui::quiet(), false);
+            status.set(waiting_message(&socket_dir.join("apply.lock"), timeout));
+            let result = acquire(socket_dir, timeout);
+            status.finish();
+            result
+        }
+        other => other,
+    }
+}
+
+/// The remediation line under a human lock error (empty when there is no
+/// useful advice).
+fn failure_hint(err: &LockError, lock_path: &Path, timeout: Duration) -> String {
+    match err {
+        LockError::Held => held_hint(lock_path, timeout),
+        LockError::Io { path, source } if source.kind() == std::io::ErrorKind::PermissionDenied => {
+            format!(
+                "Check that {} is writable.",
+                path.parent().unwrap_or(path).display()
+            )
+        }
+        LockError::Io { .. } => String::new(),
+    }
+}
+
+/// The human (stderr) report of a lock failure, for the sites that build
+/// their own JSON envelope: the same `Error: <Message>` line plus hint
+/// that [`acquire_or_emit`] prints.
+pub(crate) fn format_lock_error(socket_dir: &Path, err: &LockError, timeout: Duration) -> String {
+    let (_, message) = lock_failure(err, timeout);
+    format_human_error(
+        &message,
+        &failure_hint(err, &socket_dir.join("apply.lock"), timeout),
+    )
+}
+
+/// The status line shown while waiting out a contended lock.
+fn waiting_message(lock_path: &Path, timeout: Duration) -> String {
+    format!(
+        "Waiting for another socket-patch process to release {} (up to {})...",
+        lock_path.display(),
+        fmt_duration(timeout)
+    )
+}
+
+/// The wait hint under a `lock_held` error from a step that builds its own
+/// error line (the scan/get vendor step, hosted scan), which has no lock
+/// path to name.
+pub(crate) const HELD_RETRY_HINT: &str =
+    "Wait for it to finish, or retry with --lock-timeout <secs> to wait for the lock.";
+
+/// Remediation printed under a human-mode `lock_held` error. `Held`
+/// always means a live process (leftover files never contend), so the
+/// only honest advice is to wait; how depends on whether this run already
+/// waited.
+fn held_hint(lock_path: &Path, timeout: Duration) -> String {
+    let how = if timeout > Duration::ZERO {
+        "retry with a longer --lock-timeout"
+    } else {
+        "pass --lock-timeout <secs> to wait for it automatically"
+    };
+    format!(
+        "Wait for it to finish, or {how}. (Lock file: {})",
+        lock_path.display()
+    )
 }
 
 /// The one `LockError` → (`errorCode`, message) mapping every lock
@@ -120,16 +195,7 @@ pub(crate) fn error_envelope(
     env
 }
 
-/// Remediation hint appended under the human-mode error line. `Held`
-/// always means a live process (leftover files never contend), so the
-/// only honest advice is to wait — pointing at another socket-patch
-/// command would just hit the same contention.
-enum Hint {
-    None,
-    Wait,
-}
-
-fn emit(command: Command, json: bool, dry_run: bool, code: &str, message: &str, hint: Hint) {
+fn emit(command: Command, json: bool, dry_run: bool, code: &str, message: &str, hint: &str) {
     if json {
         println!(
             "{}",
@@ -140,15 +206,23 @@ fn emit(command: Command, json: bool, dry_run: bool, code: &str, message: &str, 
         // — CLI_CONTRACT.md): exit 1 with no message would be
         // undiagnosable. The remediation hint is part of the error report,
         // not informational chatter, so it prints with the error.
-        eprintln!("Error: {message}.");
-        match hint {
-            Hint::None => {}
-            Hint::Wait => {
-                eprintln!(
-                    "  Wait for it to finish, or retry with --lock-timeout <secs> to wait for the lock."
-                );
-            }
-        }
+        eprint!("{}", format_human_error(message, hint));
+    }
+}
+
+/// The human-mode error report: `Error: <Message>` (first letter
+/// capitalized; the envelope keeps the message verbatim), then the
+/// indented hint when there is one.
+fn format_human_error(message: &str, hint: &str) -> String {
+    let mut chars = message.chars();
+    let message: String = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    };
+    if hint.is_empty() {
+        format!("Error: {message}\n")
+    } else {
+        format!("Error: {message}\n  {hint}\n")
     }
 }
 
@@ -370,6 +444,90 @@ mod tests {
                 "failed to open lock file at {}: denied",
                 std::path::Path::new(".socket/apply.lock").display()
             )
+        );
+    }
+
+    /// The report the sites with their own envelope print (get, hosted
+    /// scan): the same capitalized line and wait hint as acquire_or_emit.
+    #[test]
+    fn format_lock_error_matches_acquire_or_emit() {
+        let dir = std::path::Path::new(".socket");
+        let lock = dir.join("apply.lock");
+        assert_eq!(
+            format_lock_error(dir, &LockError::Held, Duration::from_secs(2)),
+            format!(
+                "Error: Another socket-patch process is operating in this directory \
+                 (waited 2s)\n  Wait for it to finish, or retry with a longer \
+                 --lock-timeout. (Lock file: {})\n",
+                lock.display()
+            )
+        );
+        assert_eq!(
+            format_lock_error(dir, &LockError::Held, Duration::ZERO),
+            format!(
+                "Error: Another socket-patch process is operating in this directory\n  \
+                 Wait for it to finish, or pass --lock-timeout <secs> to wait for it \
+                 automatically. (Lock file: {})\n",
+                lock.display()
+            )
+        );
+    }
+
+    #[test]
+    fn acquire_with_status_takes_a_free_lock_and_reports_a_held_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = acquire_with_status(dir.path(), Duration::ZERO).unwrap();
+        assert!(matches!(
+            acquire_with_status(dir.path(), Duration::from_millis(200)),
+            Err(LockError::Held)
+        ));
+        drop(guard);
+    }
+
+    #[test]
+    fn human_error_is_capitalized_without_forced_period() {
+        assert_eq!(
+            format_human_error(
+                "another socket-patch process is operating in this directory",
+                ""
+            ),
+            "Error: Another socket-patch process is operating in this directory\n"
+        );
+        assert_eq!(
+            format_human_error(
+                "failed to open lock file at ro/.socket/apply.lock: Permission denied (os error 13)",
+                "Check that ro/.socket is writable."
+            ),
+            "Error: Failed to open lock file at ro/.socket/apply.lock: Permission denied \
+             (os error 13)\n  Check that ro/.socket is writable.\n"
+        );
+        assert_eq!(format_human_error("", ""), "Error: \n");
+    }
+
+    #[test]
+    fn held_hint_depends_on_whether_we_already_waited() {
+        let lock = Path::new("proj/.socket/apply.lock");
+        assert_eq!(
+            held_hint(lock, Duration::ZERO),
+            "Wait for it to finish, or pass --lock-timeout <secs> to wait for it \
+             automatically. (Lock file: proj/.socket/apply.lock)"
+        );
+        assert_eq!(
+            held_hint(lock, Duration::from_secs(2)),
+            "Wait for it to finish, or retry with a longer --lock-timeout. \
+             (Lock file: proj/.socket/apply.lock)"
+        );
+    }
+
+    #[test]
+    fn waiting_message_names_lock_and_budget() {
+        assert_eq!(
+            waiting_message(Path::new("p/.socket/apply.lock"), Duration::from_secs(5)),
+            "Waiting for another socket-patch process to release p/.socket/apply.lock (up to 5s)..."
+        );
+        assert_eq!(
+            waiting_message(Path::new("p/apply.lock"), Duration::from_millis(250)),
+            "Waiting for another socket-patch process to release p/apply.lock (up to 250ms)..."
         );
     }
 

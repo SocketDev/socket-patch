@@ -12,6 +12,8 @@
 //! remove_invariants.rs / remove_duality_invariants.rs /
 //! interactive_prompts_e2e.rs (do not edit those files).
 
+#[path = "common/pty_io.rs"]
+mod pty_io;
 use std::path::{Path, PathBuf};
 
 #[path = "common/mod.rs"]
@@ -377,7 +379,7 @@ fn remove_corrupt_vendor_ledger_fails_closed_human() {
     let (code, stdout, stderr) = run_remove(tmp.path(), &[purl, "--yes", "--offline"], &[]);
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr.contains("Error: cannot read .socket/vendor/state.json"),
+        stderr.contains("Error: Cannot read .socket/vendor/state.json"),
         "human mode must put the error line on stderr; got:\n{stderr}"
     );
     assert!(
@@ -746,7 +748,7 @@ fn remove_hosted_preserve_state_notes_no_preservable_state() {
         "the preserve-state hosted note must reach stderr; got:\n{stderr}"
     );
     assert!(
-        stdout.contains("Manifest entries and vendored artifacts preserved"),
+        stdout.contains("Manifest entry preserved (--preserve-state)"),
         "the preserve-state summary must print; got:\n{stdout}"
     );
 
@@ -795,7 +797,7 @@ fn remove_corrupt_hosted_ledger_warns_and_continues_human() {
         "the warning must reach stderr; got:\n{stderr}"
     );
     assert!(
-        stdout.contains("Removed 1 patch(es) from manifest:"),
+        stdout.contains("Removed 1 patch from manifest:"),
         "the removal must still report; got:\n{stdout}"
     );
     let manifest: serde_json::Value =
@@ -884,7 +886,7 @@ fn remove_hosted_only_human_lists_redirects_and_unwinds() {
     let (code, stdout, stderr) = run_remove(tmp.path(), &[NPM_PURL, "--yes", "--offline"], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr.contains("The following hosted redirect(s) will be unwound and removed:"),
+        stderr.contains("The following hosted redirect will be unwound and removed:"),
         "the hosted-only listing must reach stderr; got:\n{stderr}"
     );
     assert!(
@@ -1188,7 +1190,7 @@ fn remove_mixed_drift_keep_is_partial_failure_human() {
         "the error must carry the normalize remedy; got:\n{stderr}"
     );
     assert!(
-        stdout.contains("Removed 1 patch(es) from manifest:"),
+        stdout.contains("Removed 1 patch from manifest:"),
         "the partial removal must still report; got:\n{stdout}"
     );
 }
@@ -1439,13 +1441,11 @@ fn remove_multi_variant_blast_radius_prints_expansion() {
     let (code, stdout, stderr) = run_remove(tmp.path(), &[base, "--yes", "--offline"], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stderr.contains(&format!(
-            "{base} matches 2 release variant(s) — all will be removed:"
-        )),
+        stderr.contains(&format!("{base} matches 2 release variants — all will be removed:")),
         "the blast-radius line must reach stderr; got:\n{stderr}"
     );
     assert!(
-        stdout.contains("Removed 2 patch(es) from manifest:"),
+        stdout.contains("Removed 2 patches from manifest:"),
         "both variants must be removed; got:\n{stdout}"
     );
     let manifest: serde_json::Value =
@@ -1509,11 +1509,11 @@ fn remove_already_original_human_prints_count_line() {
     let (code, stdout, stderr) = run_remove(tmp.path(), &[purl, "--yes", "--offline"], &[]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
     assert!(
-        stdout.contains("1 package(s) already in original state"),
+        stdout.contains("1 package already in original state"),
         "the already-original count line must print; got:\n{stdout}"
     );
     assert!(
-        stdout.contains("Removed 1 patch(es) from manifest:"),
+        stdout.contains("Removed 1 patch from manifest:"),
         "the removal must still report; got:\n{stdout}"
     );
     let manifest: serde_json::Value =
@@ -1552,7 +1552,7 @@ fn remove_preserve_state_vendored_human_wet_surfaces() {
         "the per-key preserve line must print; got:\n{stdout}"
     );
     assert!(
-        stdout.contains("Manifest entries and vendored artifacts preserved"),
+        stdout.contains("Manifest entry and vendored artifact preserved"),
         "the preserve summary must print; got:\n{stdout}"
     );
     // All state kept: manifest, ledger, artifact.
@@ -1616,7 +1616,7 @@ fn remove_cleanup_failures_warn_not_fatal() {
         "cleanup failures must never fail the remove; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("Removed 1 patch(es) from manifest:"),
+        stdout.contains("Removed 1 patch from manifest:"),
         "the removal must succeed; got:\n{stdout}"
     );
     assert!(
@@ -1734,7 +1734,6 @@ fn remove_rollback_infrastructure_error_surfaces_rollback_failed() {
 mod pty {
     use super::*;
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-    use std::io::{Read, Write};
     use std::time::Duration;
 
     fn binary() -> PathBuf {
@@ -1778,12 +1777,9 @@ mod pty {
         let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().expect("clone reader");
-        let reader_handle = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
-        });
+        let reader_handle = crate::pty_io::PtyOutput::spawn(
+            pair.master.try_clone_reader().expect("clone reader"),
+        );
 
         let mut killer = child.clone_killer();
         std::thread::spawn(move || {
@@ -1792,17 +1788,13 @@ mod pty {
         });
 
         let mut writer = pair.master.take_writer().expect("take writer");
-        let _ = writer.write_all(input.as_bytes());
-        let _ = writer.flush();
+        crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input.as_bytes());
         drop(writer);
 
         let status = child.wait().expect("child.wait");
         drop(pair.master);
-        let output = reader_handle.join().expect("reader thread join");
-        (
-            status.exit_code() as i32,
-            String::from_utf8_lossy(&output).to_string(),
-        )
+        let output = reader_handle.finish();
+        (status.exit_code() as i32, String::from_utf8_lossy(&output).to_string())
     }
 
     /// Declining the hosted-only confirm prompt must cancel cleanly (exit
@@ -1828,7 +1820,7 @@ mod pty {
         );
         // Vacuity guard: the hosted-only confirm prompt MUST have run.
         assert!(
-            output.contains("Remove 1 hosted redirect(s) and unwind their lockfile wiring?"),
+            output.contains("Remove 1 hosted redirect and unwind its lockfile wiring?"),
             "the hosted-only confirm prompt must have shown; got: {output}"
         );
         assert!(
@@ -1930,7 +1922,7 @@ fn remove_detached_preserve_state_keeps_artifact_and_ledger_entry() {
         "the preserve preview line must print; stdout=\n{stdout}"
     );
     assert!(
-        stderr.contains("will be unwired (artifacts and ledger entries preserved)"),
+        stderr.contains("would be unwired (artifacts and ledger entries preserved)"),
         "the listing must be honest about --preserve-state; stderr=\n{stderr}"
     );
     assert_eq!(

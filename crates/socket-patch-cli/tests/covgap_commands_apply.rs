@@ -215,7 +215,7 @@ fn check_json_in_sync_emits_success_envelope() {
     assert_eq!(env["command"], "apply", "envelope: {env}");
     assert_eq!(env["status"], "success", "envelope: {env}");
     assert!(
-        env["events"].as_array().map_or(true, |e| e.is_empty()),
+        env["events"].as_array().is_none_or(|e| e.is_empty()),
         "an in-sync check reports no drift events: {env}"
     );
 }
@@ -331,7 +331,7 @@ fn reconcile_announces_removed_stale_go_redirect_in_human_mode() {
         "pruning an orphan is a clean no-op; stderr={stderr}"
     );
     assert!(
-        stdout.contains("Removed 1 stale go patch redirect(s):"),
+        stdout.contains("Removed 1 stale Go patch redirect:"),
         "the removal must be announced; stdout={stdout}"
     );
     assert!(
@@ -364,7 +364,7 @@ fn reconcile_dry_run_says_would_remove_and_touches_nothing() {
         "dry-run reconcile is a clean no-op; stderr={stderr}"
     );
     assert!(
-        stdout.contains("Would remove 1 stale go patch redirect(s):"),
+        stdout.contains("Would remove 1 stale Go patch redirect:"),
         "dry-run must use the conditional verb; stdout={stdout}"
     );
     assert!(stdout.contains(GO_PURL), "stdout={stdout}");
@@ -427,7 +427,7 @@ fn offline_mismatch_blob_gap_warns_and_fails_in_human_mode() {
     let (code, _stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
     assert_eq!(code, 1, "the blob-less mismatch must fail; stderr={stderr}");
     assert!(
-        stderr.contains("need their full patched blob, but --offline prevents fetching"),
+        stderr.contains("the full patched blob, but --offline prevents fetching"),
         "the offline prefetch warning must print; stderr={stderr}"
     );
     assert!(
@@ -472,7 +472,7 @@ async fn online_mismatch_prefetch_prints_download_line_in_human_mode() {
         "the default policy warn-overwrites the mismatch; stderr={stderr}"
     );
     assert!(
-        stderr.contains("Downloading 1 full patched blob(s) for mismatched file(s)"),
+        stderr.contains("Downloaded 1 full patched blob for mismatched files"),
         "the human progress line must print before the prefetch; stderr={stderr}"
     );
     assert!(
@@ -583,12 +583,12 @@ fn no_matching_packages_prints_warning_block_and_fails() {
         "an in-scope patch with no installed package fails the run; stderr={stderr}"
     );
     assert!(
-        stderr.contains("Warning: No packages found that match available patches"),
-        "stderr={stderr}"
+        stderr.contains("Error: The targeted manifest patch matched no installed package:"),
+        "a failing run labels its cause an error; stderr={stderr}"
     );
     assert!(
-        stderr.contains("1 targeted manifest patch(es) were in scope"),
-        "the warning must carry the in-scope count; stderr={stderr}"
+        stderr.contains("  - pkg:npm/"),
+        "the error must list the unmatched purls; stderr={stderr}"
     );
     assert!(
         stderr.contains("--cwd points to the right directory"),
@@ -636,11 +636,11 @@ fn dry_run_after_apply_reports_already_patched_count() {
         "stdout={stdout}"
     );
     assert!(
-        stdout.contains("1 package(s) already patched"),
+        stdout.contains("1 package already patched"),
         "the no-op package must be counted as already patched; stdout={stdout}"
     );
     assert!(
-        stdout.contains("0 package(s) can be patched"),
+        stdout.contains("0 packages can be patched"),
         "an already-patched package must not double-count as patchable; stdout={stdout}"
     );
 }

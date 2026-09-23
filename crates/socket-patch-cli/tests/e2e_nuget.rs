@@ -84,7 +84,9 @@ async fn run(args: &[&str], cwd: &Path, nuget_packages: &Path, proxy_url: &str) 
 fn parse_found_count(combined: &str) -> usize {
     let line = combined
         .lines()
-        .find(|l| l.contains("Found") && l.contains("packages"))
+        // "Found 1 package (...)" / "Found N packages (...)": match the
+        // crawl summary in either number, not the "Found N patches" line.
+        .find(|l| l.contains("Found") && l.contains(" package"))
         .unwrap_or_else(|| {
             panic!("scan did not print a `Found N packages` line; output was:\n{combined}")
         });
@@ -99,7 +101,7 @@ fn parse_found_count(combined: &str) -> usize {
 
 /// Assert scan reported EXACTLY `n` packages and that ALL of them were
 /// attributed to the NuGet ecosystem, via the contiguous breakdown line
-/// `Found <n> packages (<n> nuget)`.
+/// `Found <n> package(s) (<n> nuget)` (singular noun when `n == 1`).
 ///
 /// This is deliberately stricter than checking the count and the substring
 /// "nuget" independently: a split-ecosystem regression that mis-attributed a
@@ -115,7 +117,8 @@ fn assert_all_nuget(combined: &str, n: usize) {
         found, n,
         "expected exactly {n} discovered packages, got {found}:\n{combined}"
     );
-    let needle = format!("Found {n} packages ({n} nuget)");
+    let noun = if n == 1 { "package" } else { "packages" };
+    let needle = format!("Found {n} {noun} ({n} nuget)");
     assert!(
         combined.contains(&needle),
         "expected the contiguous breakdown line {needle:?} \
@@ -228,7 +231,8 @@ async fn scan_discovers_global_cache_packages() {
     // the bug the old substring check ("packages" ⊂ "No packages found.")
     // masked.
     assert!(
-        !combined.contains("No packages found") && !combined.contains("No global packages found"),
+        !combined.contains("No packages found")
+            && !combined.contains("No packages found") && !combined.contains("No global packages found"),
         "scan failed to discover the fake global cache:\n{combined}"
     );
     // Exactly the two packages we planted (Newtonsoft.Json, System.Text.Json),
@@ -286,7 +290,8 @@ async fn scan_discovers_legacy_packages() {
         output.status.code()
     );
     assert!(
-        !combined.contains("No packages found") && !combined.contains("No global packages found"),
+        !combined.contains("No packages found")
+            && !combined.contains("No packages found") && !combined.contains("No global packages found"),
         "scan failed to discover the legacy packages/ layout:\n{combined}"
     );
     // Exactly the single legacy package we planted (Newtonsoft.Json.13.0.3),

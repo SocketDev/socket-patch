@@ -66,8 +66,8 @@ fn run_remove(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 
 /// A successful `remove --silent --yes` (rollback included — the package
 /// is simply not installed) must produce no output on either stream:
-/// no "will be removed" listing, no "Rolling back" / "No packages found
-/// to rollback" progress, no "Removed N patch(es)" summary.
+/// no "will be removed" listing, no "Rolling back" progress or skipped-
+/// rollback warning, no "Removed N patches" summary.
 #[test]
 fn remove_silent_produces_no_output_on_success() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -112,12 +112,15 @@ fn remove_silent_produces_no_output_on_success() {
         &["pkg:npm/__remove_silent_test__@1.0.0", "--yes"],
     );
     assert_eq!(loud_code, 0);
+    // (The "Rolling back files..." progress is a transient status line,
+    // drawn only on a terminal; the crawler-miss warning is the loud
+    // run's rollback report here.)
     assert!(
-        loud_stdout.contains("Rolling back patch before removal"),
-        "non-silent run must print rollback progress; got {loud_stdout:?}"
+        loud_stderr.contains("had no matching installed package"),
+        "non-silent run must report the skipped rollback; got {loud_stderr:?}"
     );
     assert!(
-        loud_stdout.contains("Removed 1 patch(es) from manifest"),
+        loud_stdout.contains("Removed 1 patch from manifest"),
         "non-silent run must print the removal summary; got {loud_stdout:?}"
     );
     assert!(
@@ -347,7 +350,7 @@ fn remove_silent_suppresses_detached_revert_output() {
     let (loud_code, loud_stdout, loud_stderr) = run_remove(tmp2.path(), &[purl, "--yes"]);
     assert_eq!(loud_code, 0);
     assert!(
-        loud_stderr.contains("vendored patch(es) will be reverted and removed"),
+        loud_stderr.contains("vendored patch will be reverted and removed"),
         "non-silent detached run must print the listing; got {loud_stderr:?}"
     );
     assert!(

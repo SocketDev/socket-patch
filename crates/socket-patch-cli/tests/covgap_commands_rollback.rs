@@ -24,6 +24,8 @@
 //! types so fixtures can never drift from the on-disk schema (the
 //! `in_process_rollback_hosted.rs` convention).
 
+#[path = "common/pty_io.rs"]
+mod pty_io;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -291,16 +293,16 @@ fn human_dry_run_summary_lists_counts_and_would_free() {
         "the dry-run header must print; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("1 package(s) can be rolled back"),
+        stdout.contains("1 package can be rolled back"),
         "the can-rollback count must print; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("Would remove 1 patch(es) from manifest:")
+        stdout.contains("Would remove 1 patch from manifest:")
             && stdout.contains(&format!("  - {}", fx.purl)),
         "the would-be manifest removal must be previewed; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("Would free") && stdout.contains("bytes of unused blobs/archives"),
+        stdout.contains("Would free") && stdout.contains("of unused blobs and archives"),
         "the GC preview must print its would-free line; stdout=\n{stdout}"
     );
 
@@ -362,7 +364,7 @@ fn human_wet_reports_already_original_and_not_installed() {
         "the no-op must print its '(already original)' line; stdout=\n{stdout}"
     );
     assert!(
-        stderr.contains("Warning: 1 manifest patch(es) had no matching installed package:")
+        stderr.contains("Warning: 1 manifest patch had no matching installed package:")
             && stderr.contains(&format!("  - {ghost_purl}")),
         "the not-installed warning block must print on stderr; stderr=\n{stderr}"
     );
@@ -409,8 +411,13 @@ fn human_verbose_hash_mismatch_details() {
         "a hash mismatch must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("Failed to rollback:") && stdout.contains(purl),
+        stdout.contains("Failed to roll back:") && stdout.contains(purl),
         "the wet failure section must name the package; stdout=\n{stdout}"
+    );
+    // Exit 1: the error stream says so too, not only the stdout report.
+    assert!(
+        stderr.ends_with("Error: Some patches could not be rolled back.\n"),
+        "stderr=\n{stderr}"
     );
     assert!(
         stdout.contains("Detailed verification:"),
@@ -462,7 +469,7 @@ fn human_preserve_state_closing_message() {
         "preserve-state rollback exits 0; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("Manifest entries and vendored artifacts preserved"),
+        stdout.contains("Manifest entry preserved (--preserve-state)"),
         "the preserve-state closing message must print; stdout=\n{stdout}"
     );
     // The system IS restored, the state is NOT.
@@ -999,7 +1006,7 @@ fn vendored_wet_human_messages() {
         "the wet revert line must print; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("unwired packages keep their patched bytes"),
+        stdout.contains("1 unwired package keeps its patched bytes"),
         "the reinstall note must print; stdout=\n{stdout}"
     );
     assert_eq!(
@@ -1502,6 +1509,8 @@ fn hosted_human_wet_announces_and_unwinds() {
         code, 0,
         "the hosted-only rollback succeeds; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
+    // No manifest at all: "No patches found in manifest" would be a
+    // misleading line right above the hosted unwind.
     assert!(
         !stdout.contains("No patches found in manifest"),
         "the empty-manifest announce must not print when the hosted leg has work; \
@@ -1512,7 +1521,7 @@ fn hosted_human_wet_announces_and_unwinds() {
         "the wet unwind line must print; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("unwired packages keep their patched bytes"),
+        stdout.contains("1 unwired package keeps its patched bytes"),
         "the reinstall note must print; stdout=\n{stdout}"
     );
     assert_eq!(
@@ -2161,7 +2170,6 @@ fn manifest_write_failure_warns_and_exits_one() {
 mod interactive {
     use super::*;
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-    use std::io::{Read, Write};
     use std::time::Duration;
 
     /// Spawn the binary inside a PTY, send `input`, collect all output —
@@ -2210,12 +2218,9 @@ mod interactive {
             .expect("spawn socket-patch in PTY");
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader().expect("clone reader");
-        let reader_handle = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
-        });
+        let reader_handle = crate::pty_io::PtyOutput::spawn(
+            pair.master.try_clone_reader().expect("clone reader"),
+        );
 
         let mut killer = child.clone_killer();
         std::thread::spawn(move || {
@@ -2224,14 +2229,13 @@ mod interactive {
         });
 
         let mut writer = pair.master.take_writer().expect("take writer");
-        let _ = writer.write_all(input.as_bytes());
-        let _ = writer.flush();
+        crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input.as_bytes());
         drop(writer);
 
         let status = child.wait().expect("child.wait");
         drop(pair.master);
 
-        let output = reader_handle.join().expect("reader thread join");
+        let output = reader_handle.finish();
         (
             status.exit_code() as i32,
             String::from_utf8_lossy(&output).to_string(),
@@ -2266,7 +2270,9 @@ mod interactive {
         );
         assert_eq!(code, 0, "declining must exit 0; got: {output}");
         assert!(
-            output.contains("Roll back 1 patch(es) and remove them from the local manifest? [Y/n]"),
+            output.contains(
+                "Roll back 1 patch and remove it from the local manifest? [Y/n]"
+            ),
             "the composed confirm prompt must render verbatim; got: {output}"
         );
         assert!(
@@ -2497,7 +2503,7 @@ fn manifest_deleted_under_held_lock_fails_with_invalid_manifest() {
 }
 
 /// Human twin of `hosted_persist_failure_lands_in_hosted_failed`: the
-/// wet-run ledger persist failure prints the "Error: failed to persist
+/// wet-run ledger persist failure prints the "Error: Failed to persist
 /// the hosted redirect ledger" stderr line, exit 1 — after the replay
 /// already restored the wired file.
 #[cfg(unix)]
@@ -2525,7 +2531,7 @@ fn hosted_persist_failure_prints_human_error_line() {
         "a ledger persist failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Error: failed to persist the hosted redirect ledger"),
+        stderr.contains("Error: Failed to persist the hosted redirect ledger"),
         "the human persist-failure line must print on stderr; stderr=\n{stderr}"
     );
     assert_eq!(
@@ -2536,7 +2542,7 @@ fn hosted_persist_failure_prints_human_error_line() {
 }
 
 /// Human twin of `manifest_write_failure_warns_and_exits_one`: the failed
-/// manifest update prints the "Error: failed to update the manifest:"
+/// manifest update prints the "Error: Failed to update the manifest:"
 /// stderr line, exit 1, manifest byte-identical — after the file restore
 /// already landed.
 #[cfg(target_os = "macos")]
@@ -2579,7 +2585,7 @@ fn manifest_write_failure_prints_human_error_line() {
         "a manifest write failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Error: failed to update the manifest:"),
+        stderr.contains("Error: Failed to update the manifest:"),
         "the human write-failure line must print on stderr; stderr=\n{stderr}"
     );
     // The restore itself DID land...
@@ -2660,15 +2666,15 @@ fn human_dry_run_summary_reports_already_original_and_failed() {
         "the dry-run header must print; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("0 package(s) can be rolled back"),
+        stdout.contains("0 packages can be rolled back"),
         "a no-op and a failure leave nothing rollback-able; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("1 package(s) already in original state"),
+        stdout.contains("1 package already in original state"),
         "the already-original summary line must print; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("1 package(s) cannot be rolled back"),
+        stdout.contains("1 package cannot be rolled back"),
         "the cannot-rollback summary line must print; stdout=\n{stdout}"
     );
     // Preview, no mutations.
@@ -2718,7 +2724,7 @@ fn dry_run_blob_stage_survives_directory_squatting_blob_hash() {
          stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stdout.contains("1 package(s) already in original state"),
+        stdout.contains("1 package already in original state"),
         "the entry must still verify as already original; stdout=\n{stdout}"
     );
     assert!(
@@ -3283,5 +3289,59 @@ fn discovered_local_go_redirect_drops_wiring_not_cache_copy() {
     assert!(
         m["patches"].get(PURL).is_none(),
         "the rolled-back entry must leave the manifest; manifest={m}"
+    );
+}
+
+/// A dry run over a locally modified file exits 1 AND says why: the
+/// reason appears exactly once, under the verification counts (a dry run
+/// has no other failure report).
+#[test]
+fn dry_run_failure_prints_reason_once() {
+    let fx = patched_fixture();
+    std::fs::write(fx.pkg_dir.join("index.js"), b"locally-edited\n").expect("drift file");
+
+    let (code, stdout, stderr) = run(fx.root.path(), &["rollback", "--offline", "--dry-run"]);
+    assert_eq!(
+        code, 1,
+        "a dry run that cannot roll back exits 1; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 package cannot be rolled back"),
+        "the count line must print; stdout=\n{stdout}"
+    );
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        stdout.contains("Failed to roll back:"),
+        "the dry run must carry the failure section; stdout=\n{stdout}"
+    );
+    assert_eq!(
+        combined.matches("modified after patching").count(),
+        1,
+        "the reason must appear exactly once; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert_eq!(
+        combined.matches(fx.purl).count(),
+        1,
+        "the package must be named exactly once; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+}
+
+/// The unscoped empty-manifest announce still prints when it should: a
+/// manifest exists, lists no patches, and no vendored or hosted leg has
+/// work.
+#[test]
+fn empty_manifest_announces_no_patches() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    write_socket_manifest(tmp.path(), &[]);
+
+    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline", "-y"]);
+    assert_eq!(
+        code, 0,
+        "an empty manifest is a clean no-op; stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+    assert!(
+        stdout.contains("No patches found in manifest"),
+        "the empty-manifest announce must print; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
 }

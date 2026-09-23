@@ -12,6 +12,10 @@ pub struct UpdateResult {
     pub old_script: String,
     /// New `postinstall` script.
     pub new_script: String,
+    /// Previous `dependencies` script (empty if absent).
+    pub old_dependencies_script: String,
+    /// New `dependencies` script (equal to the old one when unchanged).
+    pub new_dependencies_script: String,
     pub error: Option<String>,
 }
 
@@ -41,13 +45,15 @@ pub async fn update_package_json(
                 status: UpdateStatus::Error,
                 old_script: String::new(),
                 new_script: String::new(),
+                old_dependencies_script: String::new(),
+                new_dependencies_script: String::new(),
                 error: Some(e.to_string()),
             };
         }
     };
 
     match update_package_json_content(&content, pm) {
-        Ok((modified, new_content, old_pi, new_pi, _, _)) => {
+        Ok((modified, new_content, old_pi, new_pi, old_deps, new_deps)) => {
             if modified && !dry_run {
                 if let Err(e) =
                     atomic_write_bytes_preserving_mode(package_json_path, new_content.as_bytes())
@@ -58,6 +64,8 @@ pub async fn update_package_json(
                         status: UpdateStatus::Error,
                         old_script: old_pi,
                         new_script: new_pi,
+                        old_dependencies_script: old_deps,
+                        new_dependencies_script: new_deps,
                         error: Some(e.to_string()),
                     };
                 }
@@ -72,6 +80,8 @@ pub async fn update_package_json(
                 },
                 old_script: old_pi,
                 new_script: new_pi,
+                old_dependencies_script: old_deps,
+                new_dependencies_script: new_deps,
                 error: None,
             }
         }
@@ -80,6 +90,8 @@ pub async fn update_package_json(
             status: UpdateStatus::Error,
             old_script: String::new(),
             new_script: String::new(),
+            old_dependencies_script: String::new(),
+            new_dependencies_script: String::new(),
             error: Some(e),
         },
     }

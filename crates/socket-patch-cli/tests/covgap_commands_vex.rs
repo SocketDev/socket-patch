@@ -381,7 +381,7 @@ fn corrupt_vendor_ledger_warns_and_fails_closed_in_human_mode() {
     assert!(out.stdout.is_empty(), "no document when nothing attests");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("unreadable vendor state"),
+        stderr.contains("Warning: Unreadable vendor state"),
         "the degrade must be disclosed on stderr. got: {stderr}"
     );
     assert!(
@@ -442,21 +442,22 @@ fn corrupt_vendor_ledger_json_mode_pins_channel_behavior() {
     assert_eq!(skipped["errorCode"], "package_not_found", "{skipped}");
     assert!(!vex_path.exists(), "no document when nothing attests");
 
-    // Channel pin (current behavior): `load_vendor_context`'s unreadable-
-    // vendor-state warning is gated only on --silent, so in --json mode it
-    // still lands on stderr rather than in the envelope's warnings[] (the
-    // error envelope carries no warnings at all). If the gating is ever
-    // reworked to fold this into warnings[] like note_warning does, update
-    // this pin alongside.
+    // Channel pin: like every other vex advisory, the unreadable-vendor-
+    // state warning rides the envelope's warnings[] under --json (the error
+    // envelope included) and stays off stderr.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("unreadable vendor state"),
-        "current contract: the degrade warning goes to stderr even under \
-         --json. got: {stderr}"
+        !stderr.contains("nreadable vendor state"),
+        "--json keeps the advisory off stderr. got: {stderr}"
     );
+    let warnings = env["warnings"].as_array().unwrap_or_else(|| panic!("{env}"));
+    let w = warnings
+        .iter()
+        .find(|w| w["code"] == "vendor_state_unreadable")
+        .unwrap_or_else(|| panic!("vendor_state_unreadable warning expected: {env}"));
     assert!(
-        env["warnings"].is_null(),
-        "current contract: the error envelope carries no warnings[]: {env}"
+        w["detail"].as_str().unwrap().contains("corrupt"),
+        "the detail carries load_state's cause: {w}"
     );
 }
 
@@ -533,6 +534,42 @@ fn auto_detect_multi_manifest_warns_on_stderr() {
     assert_eq!(
         doc["statements"][0]["products"][0]["@id"], "pkg:npm/app@1.0.0",
         "package.json wins the multi-manifest priority: {doc}"
+    );
+}
+
+#[test]
+fn auto_detect_multi_manifest_warning_reaches_json_envelope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    scaffold_multi_manifest_project(cwd);
+
+    let out_path = cwd.join("out.vex.json");
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--no-verify",
+            "--json",
+            "--output",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
+    let w = env["warnings"]
+        .as_array()
+        .and_then(|ws| ws.iter().find(|w| w["code"] == "product_multiple_manifests"))
+        .unwrap_or_else(|| panic!("product_multiple_manifests warning expected: {env}"));
+    assert!(
+        w["detail"].as_str().unwrap().contains("Multiple project manifests"),
+        "{w}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Multiple project manifests"),
+        "--json keeps the advisory off stderr. got: {stderr}"
     );
 }
 
@@ -874,7 +911,7 @@ fn corrupt_vendor_ledger_without_manifest_is_disclosed_before_manifest_not_found
     assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
     assert!(out.stdout.is_empty(), "no document");
     assert!(
-        stderr.contains("unreadable vendor state") && stderr.contains("corrupt"),
+        stderr.contains("Warning: Unreadable vendor state") && stderr.contains("corrupt"),
         "the unreadable ledger must be disclosed: {stderr}"
     );
     assert!(
@@ -903,7 +940,7 @@ fn corrupt_vendor_ledger_without_manifest_is_disclosed_before_manifest_not_found
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
     assert!(
-        !stderr.contains("Warning: unreadable vendor state"),
+        !stderr.contains("Unreadable vendor state"),
         "--silent mutes the advisory: {stderr}"
     );
     assert!(

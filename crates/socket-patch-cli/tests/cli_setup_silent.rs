@@ -100,14 +100,16 @@ fn setup_silent_configures_but_prints_nothing() {
     // header and summary — otherwise the assertions above pass vacuously.
     let tmp2 = tempfile::tempdir().expect("tempdir");
     write_root(tmp2.path());
-    let (loud_code, loud_stdout, _) = run_setup(tmp2.path(), &["--yes"]);
+    let (loud_code, loud_stdout, loud_stderr) = run_setup(tmp2.path(), &["--yes"]);
     assert_eq!(loud_code, 0);
+    // (Its progress is a transient status line, so a piped stderr stays
+    // empty even without --silent; the stdout summary is the control.)
     assert!(
-        loud_stdout.contains("Configuring socket-patch install hooks"),
-        "non-silent setup must print the header; got {loud_stdout:?}"
+        !loud_stderr.contains("Configuring socket-patch install hooks"),
+        "the progress line is transient; got {loud_stderr:?}"
     );
     assert!(
-        loud_stdout.contains("item(s) updated"),
+        loud_stdout.contains("1 item updated"),
         "non-silent setup must print the summary; got {loud_stdout:?}"
     );
 }
@@ -205,7 +207,7 @@ fn setup_remove_silent_prints_nothing_but_removes() {
         "non-silent remove must print the preview; got {loud_stdout:?}"
     );
     assert!(
-        loud_stdout.contains("item(s) had socket-patch removed"),
+        loud_stdout.contains("1 item had socket-patch removed"),
         "non-silent remove must print the summary; got {loud_stdout:?}"
     );
 }

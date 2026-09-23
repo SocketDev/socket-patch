@@ -10,21 +10,32 @@
 use clap::Args;
 use socket_patch_core::update::{
     self as core_update, asset_name_for_target, channel_label, current_version, detect_channel,
-    fetch_latest_version, is_newer, upgrade_hint, ChannelEnv, InstallChannel, UpdateEndpoints,
+    fetch_latest_version, is_newer, upgrade_hint_for, ChannelEnv, InstallChannel, UpdateEndpoints,
     UpdateError, UpdateRequest, UpdateTimeouts,
 };
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::lock_cli::error_envelope;
 use crate::json_envelope::{Command, Envelope, PatchAction, PatchEvent, RunWarning};
-use crate::output;
 
 /// The target triple this binary was compiled for, embedded by `build.rs`.
 /// Passed into core as a parameter so core stays testable with arbitrary
 /// triples.
 pub const UPDATE_TARGET: &str = env!("SOCKET_PATCH_TARGET");
 
+// `socket-patch --update --help` must describe the public `--update`
+// flag, not the hidden `self-update` subcommand it is rewritten to. The
+// variant's doc comment in lib.rs (developer notes) becomes the
+// subcommand's `about` and is applied after these attributes, so the help
+// text is fixed through a template that never renders `{about}`.
+// (The usage line still reads `socket-patch self-update ...`: lib.rs's
+// `update_help_shows_self_update_help` pins that; overriding it to
+// `socket-patch --update [VERSION] [OPTIONS]` belongs with that test.)
 #[derive(Args)]
+#[command(
+    help_template = "Update socket-patch itself to the latest release (or to VERSION).\n\n\
+                     {usage-heading} {usage}\n\n{all-args}{after-help}"
+)]
 pub struct UpdateArgs {
     #[command(flatten)]
     pub common: GlobalArgs,
@@ -34,10 +45,10 @@ pub struct UpdateArgs {
     /// version even if it is older than the current one. Also settable via
     /// SOCKET_PATCH_VERSION — the same pin install.sh and the gem launcher
     /// honor.
-    ///
-    /// Not named `version`: under `propagate_version` clap already owns a
-    /// `--version` arg id on every subcommand, and the collision panics at
-    /// parser construction.
+    //
+    // Not named `version`: under `propagate_version` clap already owns a
+    // `--version` arg id on every subcommand, and the collision panics at
+    // parser construction.
     #[arg(
         value_name = "VERSION",
         env = "SOCKET_PATCH_VERSION",
@@ -67,14 +78,101 @@ fn parse_version_pin(raw: &str) -> Result<String, String> {
 }
 
 /// Emit an error in the mode-appropriate shape and return the exit code.
+/// The envelope keeps the message verbatim; the human line capitalizes it
+/// (`Error: Could not check for updates: ...`).
 fn fail(args: &UpdateArgs, code: &str, message: &str) -> i32 {
     if args.common.json {
         let env = error_envelope(Command::Update, args.common.dry_run, code, message);
         println!("{}", env.to_pretty_json());
     } else {
-        eprintln!("Error: {message}");
+        eprintln!("Error: {}", capitalize_first(message));
     }
     1
+}
+
+/// `"could not ..."` → `"Could not ..."` (char-safe; empty stays empty).
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// The no-op message when there is nothing to install: a pin already
+/// satisfied, the latest release already running, or a build newer than
+/// the latest release (`latest` never downgrades).
+fn already_message(current: &semver::Version, target: &semver::Version, pinned: bool) -> String {
+    if pinned {
+        format!("socket-patch is already version {current}.")
+    } else if target < current {
+        format!("socket-patch {current} is newer than the latest release ({target}).")
+    } else {
+        format!("socket-patch {current} is already the latest version.")
+    }
+}
+
+/// The `--dry-run` report. `change` is whether a real run would install
+/// `target` (a pin may point below `current`: that is a downgrade, not an
+/// "update available").
+fn dry_run_message(
+    current: &semver::Version,
+    target: &semver::Version,
+    pinned: bool,
+    force: bool,
+    change: bool,
+) -> String {
+    if change && target < current {
+        format!("Would downgrade socket-patch {current} \u{2192} {target} (dry run; not installed)")
+    } else if change {
+        format!(
+            "Update available: socket-patch {current} \u{2192} {target} (dry run; not installed)"
+        )
+    } else if force {
+        format!("Would reinstall socket-patch {target} (dry run; --force)")
+    } else {
+        already_message(current, target, pinned)
+    }
+}
+
+/// The confirmation question before installing.
+fn confirm_prompt(current: &semver::Version, target: &semver::Version) -> String {
+    if target < current {
+        format!("Downgrade socket-patch {current} \u{2192} {target}?")
+    } else if target == current {
+        format!("Reinstall socket-patch {target}?")
+    } else {
+        format!("Update socket-patch {current} \u{2192} {target}?")
+    }
+}
+
+/// The line after a declined [`confirm_prompt`], naming the same action.
+fn cancelled_message(current: &semver::Version, target: &semver::Version) -> &'static str {
+    if target < current {
+        "Downgrade cancelled."
+    } else if target == current {
+        "Reinstall cancelled."
+    } else {
+        "Update cancelled."
+    }
+}
+
+/// The result line after a successful install, naming the same action as
+/// [`confirm_prompt`].
+fn installed_message(current: &semver::Version, target: &semver::Version, path: &std::path::Path) -> String {
+    let path = path.display();
+    if target < current {
+        format!("Downgraded socket-patch {current} \u{2192} {target} ({path})")
+    } else if target == current {
+        format!("Reinstalled socket-patch {target} ({path})")
+    } else {
+        format!("Updated socket-patch {current} \u{2192} {target} ({path})")
+    }
+}
+
+/// The status line shown while the release downloads and installs.
+fn download_status(target: &semver::Version, asset: &str) -> String {
+    format!("Downloading socket-patch {target} ({asset})...")
 }
 
 /// Record a non-fatal advisory: stderr for humans, `warnings[]` on the
@@ -88,13 +186,16 @@ fn fail(args: &UpdateArgs, code: &str, message: &str) -> i32 {
 /// rendered stderr line keeps update's own `Warning: <detail>` wording).
 fn note_warning(warnings: &mut Vec<RunWarning>, quiet: bool, code: &str, detail: String) {
     if !quiet {
-        eprintln!("Warning: {detail}");
+        eprintln!("Warning: {}", capitalize_first(&detail));
     }
     warnings.push(RunWarning {
         code: code.to_string(),
         detail,
     });
 }
+
+/// The status line while `--update` asks which release is the latest.
+const CHECKING_LATEST: &str = "Checking for the latest socket-patch release...";
 
 pub async fn run(args: UpdateArgs) -> i32 {
     apply_env_toggles(&args.common);
@@ -121,6 +222,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
         Err(e) => return fail(&args, e.error_code(), &e.to_string()),
     };
     let channel = detect_channel(&install_path, &ChannelEnv::from_env());
+    let hint = upgrade_hint_for(channel, &install_path);
     if channel != InstallChannel::Standalone {
         if args.force {
             note_warning(
@@ -142,7 +244,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
                      instead, or pass --force to replace it in place",
                     install_path.display(),
                     channel_label(channel),
-                    upgrade_hint(channel)
+                    hint
                 ),
             );
         }
@@ -159,10 +261,19 @@ pub async fn run(args: UpdateArgs) -> i32 {
             // path deserves a real error over a panic.
             Err(e) => return fail(&args, "check_failed", &format!("invalid version pin: {e}")),
         },
-        None => match fetch_latest_version(&endpoints, &timeouts).await {
-            Ok(v) => (v, false),
-            Err(e) => return fail(&args, e.error_code(), &e.to_string()),
-        },
+        None => {
+            // The check can take a while on a slow network (two probes,
+            // each with its own connect and read budget): say what is
+            // happening instead of a blank terminal.
+            let mut status = crate::ui::StatusLine::stderr(args.common.json, args.common.silent);
+            status.set(CHECKING_LATEST);
+            let latest = fetch_latest_version(&endpoints, &timeouts).await;
+            status.finish();
+            match latest {
+                Ok(v) => (v, false),
+                Err(e) => return fail(&args, e.error_code(), &e.to_string()),
+            }
+        }
     };
 
     // Whatever we just learned, remember it for the passive notifier
@@ -187,13 +298,13 @@ pub async fn run(args: UpdateArgs) -> i32 {
     //    zero downloads, zero mutation, exit 0, with `updateAvailable` in
     //    the details (scripts branch on it).
     if args.common.dry_run {
-        let msg = if update_available {
-            format!("Update available: socket-patch {current} → {target_version} (dry run; not installed)")
-        } else if args.force {
-            format!("Would reinstall socket-patch {target_version} (dry run; --force)")
-        } else {
-            format!("socket-patch {current} is already the latest version.")
-        };
+        let msg = dry_run_message(
+            &current,
+            &target_version,
+            pinned,
+            args.force,
+            update_available,
+        );
         if args.common.json {
             let mut env = Envelope::new(Command::Update);
             env.dry_run = true;
@@ -221,11 +332,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
     //    downgrades — a dev build newer than the newest release is left
     //    alone.) --force reinstalls regardless.
     if !update_available && !args.force {
-        let msg = if pinned {
-            format!("socket-patch is already version {current}.")
-        } else {
-            format!("socket-patch {current} is already the latest version.")
-        };
+        let msg = already_message(&current, &target_version, pinned);
         if args.common.json {
             // `--dry-run` returned above, so this envelope's `dryRun` is
             // always `Envelope::new`'s `false`.
@@ -246,26 +353,31 @@ pub async fn run(args: UpdateArgs) -> i32 {
         return 0;
     }
 
-    // 6. Confirm (auto-proceeds under --yes/--json; declines default-yes
-    //    only on an explicit "n").
-    let prompt = format!("Update socket-patch {current} → {target_version}?");
-    if !output::confirm(&prompt, true, args.common.yes, args.common.json) {
+    // 6. Confirm (auto-proceeds under --yes/--json; an empty answer takes
+    //    the default yes, while "n" or Ctrl-D/EOF declines).
+    let prompt = confirm_prompt(&current, &target_version);
+    if !crate::ui::confirm(&prompt, true, &args.common) {
         if !quiet {
-            eprintln!("Update cancelled.");
+            eprintln!("{}", cancelled_message(&current, &target_version));
         }
         return 1;
     }
 
-    // 7. Lock → download → verify → stage → sanity → swap (core).
-    let outcome = match core_update::perform_update(UpdateRequest {
+    // 7. Lock → download → verify → stage → sanity → swap (core). The
+    //    download can take a while (300 s budget), so a terminal gets a
+    //    status line instead of a silent pause after the prompt.
+    let mut status = crate::ui::StatusLine::stderr(args.common.json, args.common.silent);
+    status.set(download_status(&target_version, &asset));
+    let result = core_update::perform_update(UpdateRequest {
         target_triple: UPDATE_TARGET,
         version: &target_version,
         install_path: &install_path,
         endpoints: &endpoints,
         timeouts: &timeouts,
     })
-    .await
-    {
+    .await;
+    status.finish();
+    let outcome = match result {
         Ok(outcome) => outcome,
         Err(e) => {
             let mut message = e.to_string();
@@ -304,8 +416,8 @@ pub async fn run(args: UpdateArgs) -> i32 {
         println!("{}", env.to_pretty_json());
     } else if !args.common.silent {
         println!(
-            "Updated socket-patch {current} → {target_version} ({})",
-            outcome.installed_path.display()
+            "{}",
+            installed_message(&current, &target_version, &outcome.installed_path)
         );
     }
     0
@@ -314,6 +426,133 @@ pub async fn run(args: UpdateArgs) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checking_latest_status_line() {
+        assert_eq!(
+            CHECKING_LATEST,
+            "Checking for the latest socket-patch release..."
+        );
+    }
+
+    fn v(s: &str) -> semver::Version {
+        semver::Version::parse(s).unwrap()
+    }
+
+    #[test]
+    fn already_message_covers_pin_latest_and_newer_than_latest() {
+        assert_eq!(
+            already_message(&v("4.0.0"), &v("4.0.0"), true),
+            "socket-patch is already version 4.0.0."
+        );
+        assert_eq!(
+            already_message(&v("4.0.0"), &v("4.0.0"), false),
+            "socket-patch 4.0.0 is already the latest version."
+        );
+        assert_eq!(
+            already_message(&v("4.0.0"), &v("3.0.0"), false),
+            "socket-patch 4.0.0 is newer than the latest release (3.0.0)."
+        );
+    }
+
+    #[test]
+    fn dry_run_message_matches_the_real_run() {
+        // Pinned to the running version: same wording as the wet no-op.
+        assert_eq!(
+            dry_run_message(&v("4.0.0"), &v("4.0.0"), true, false, false),
+            "socket-patch is already version 4.0.0."
+        );
+        // A pin below the running version is a downgrade.
+        assert_eq!(
+            dry_run_message(&v("4.0.0"), &v("3.0.0"), true, false, true),
+            "Would downgrade socket-patch 4.0.0 \u{2192} 3.0.0 (dry run; not installed)"
+        );
+        assert_eq!(
+            dry_run_message(&v("4.0.0"), &v("9.9.9"), false, false, true),
+            "Update available: socket-patch 4.0.0 \u{2192} 9.9.9 (dry run; not installed)"
+        );
+        assert_eq!(
+            dry_run_message(&v("4.0.0"), &v("4.0.0"), false, true, false),
+            "Would reinstall socket-patch 4.0.0 (dry run; --force)"
+        );
+        // Running a build newer than the latest release.
+        assert_eq!(
+            dry_run_message(&v("4.0.0"), &v("3.0.0"), false, false, false),
+            "socket-patch 4.0.0 is newer than the latest release (3.0.0)."
+        );
+    }
+
+    #[test]
+    fn confirm_prompt_names_the_direction() {
+        assert_eq!(
+            confirm_prompt(&v("4.0.0"), &v("9.9.9")),
+            "Update socket-patch 4.0.0 \u{2192} 9.9.9?"
+        );
+        assert_eq!(
+            confirm_prompt(&v("4.0.0"), &v("3.0.0")),
+            "Downgrade socket-patch 4.0.0 \u{2192} 3.0.0?"
+        );
+        assert_eq!(
+            confirm_prompt(&v("4.0.0"), &v("4.0.0")),
+            "Reinstall socket-patch 4.0.0?"
+        );
+    }
+
+    #[test]
+    fn cancel_and_result_lines_match_the_prompt() {
+        assert_eq!(cancelled_message(&v("4.0.0"), &v("9.9.9")), "Update cancelled.");
+        assert_eq!(cancelled_message(&v("4.0.0"), &v("3.0.0")), "Downgrade cancelled.");
+        assert_eq!(cancelled_message(&v("4.0.0"), &v("4.0.0")), "Reinstall cancelled.");
+        let p = std::path::Path::new("/opt/sp/socket-patch");
+        assert_eq!(
+            installed_message(&v("4.0.0"), &v("9.9.9"), p),
+            "Updated socket-patch 4.0.0 \u{2192} 9.9.9 (/opt/sp/socket-patch)"
+        );
+        assert_eq!(
+            installed_message(&v("4.0.0"), &v("3.0.0"), p),
+            "Downgraded socket-patch 4.0.0 \u{2192} 3.0.0 (/opt/sp/socket-patch)"
+        );
+        assert_eq!(
+            installed_message(&v("4.0.0"), &v("4.0.0"), p),
+            "Reinstalled socket-patch 4.0.0 (/opt/sp/socket-patch)"
+        );
+    }
+
+    #[test]
+    fn download_status_and_error_capitalization() {
+        assert_eq!(
+            download_status(&v("9.9.9"), "socket-patch-x.tar.gz"),
+            "Downloading socket-patch 9.9.9 (socket-patch-x.tar.gz)..."
+        );
+        assert_eq!(
+            capitalize_first("could not check for updates: x"),
+            "Could not check for updates: x"
+        );
+        assert_eq!(capitalize_first(""), "");
+        assert_eq!(capitalize_first("éclair"), "Éclair");
+        assert_eq!(capitalize_first("Already"), "Already");
+    }
+
+    #[test]
+    fn help_describes_the_update_flag_not_the_internal_subcommand() {
+        use clap::CommandFactory;
+        let mut cmd = crate::Cli::command();
+        let sub = cmd
+            .find_subcommand_mut("self-update")
+            .expect("self-update subcommand");
+        let help = sub.render_long_help().to_string();
+        assert!(
+            help.starts_with("Update socket-patch itself to the latest release (or to VERSION)."),
+            "{help}"
+        );
+        for internal in [
+            "Internal parse target",
+            "propagate_version",
+            "parse_argv_with_shortcuts",
+        ] {
+            assert!(!help.contains(internal), "leaked {internal:?}: {help}");
+        }
+    }
 
     #[test]
     fn version_pin_parses_and_normalizes() {

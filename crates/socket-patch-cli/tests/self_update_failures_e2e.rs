@@ -49,7 +49,7 @@ async fn checksum_mismatch_aborts_pre_extraction() {
     );
     assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stderr.contains("checksum"),
+        stderr.contains("Error: Checksum verification failed"),
         "human error must name the checksum failure: {stderr}"
     );
 
@@ -220,7 +220,7 @@ async fn truncated_download_is_a_checksum_mismatch() {
     );
     assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stderr.contains("checksum"),
+        stderr.contains("Error: Checksum verification failed"),
         "truncation must report as a checksum failure: {stderr}"
     );
 
@@ -252,7 +252,10 @@ async fn downgrade_refused_without_force() {
     );
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stdout.contains("already the latest"),
+        stdout.contains(&format!(
+            "socket-patch {} is newer than the latest release (0.0.1).",
+            env!("CARGO_PKG_VERSION")
+        )),
         "an older latest must read as a no-op, not an error: {stdout}"
     );
 
@@ -283,7 +286,8 @@ async fn explicit_pin_downgrades_without_force() {
         &[("SOCKET_UPDATE_BASE_URL", &release.base_url)],
     );
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    assert!(stdout.contains("Updated socket-patch"), "{stdout}");
+    // A pin below the running version reads as the downgrade it is.
+    assert!(stdout.contains("Downgraded socket-patch"), "{stdout}");
     assert_eq!(
         sha256_file(&install.bin),
         served_hash,

@@ -17,16 +17,16 @@
 //! - it can never delay a command beyond the grace budget;
 //! - state corruption/unwritability is silently absorbed.
 
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use socket_patch_core::update::{
-    self as core_update, detect_channel, is_newer, upgrade_hint, ChannelEnv, InstallChannel,
-    UpdateEndpoints, UpdateTimeouts,
+    self as core_update, detect_channel, is_newer, upgrade_hint, upgrade_hint_for, ChannelEnv,
+    InstallChannel, UpdateEndpoints, UpdateTimeouts,
 };
 use socket_patch_core::utils::socket_cli_config::env_truthy;
 
 use crate::args::GlobalArgs;
-use crate::output;
 
 /// Everything the guard stack looks at, captured up front so the decision
 /// logic is a pure, table-testable function.
@@ -124,7 +124,9 @@ impl GuardCtx {
             silent: common.silent,
             json: common.json,
             ci: in_ci(),
-            stderr_tty: output::stderr_is_tty(),
+            // The notice prints on stderr; stdout may be legitimately piped
+            // (`list | jq`) in a perfectly interactive session.
+            stderr_tty: std::io::stderr().is_terminal(),
             forced: env_truthy("SOCKET_UPDATE_NOTIFIER_FORCE"),
             state_dir_resolvable: core_update::state::state_dir().is_some(),
         }
@@ -234,20 +236,22 @@ async fn refresh_latest(debug: bool) -> Option<semver::Version> {
 /// pointing an npm-installed user at `--update` would only route them into
 /// its managed-install refusal.
 fn upgrade_command() -> &'static str {
-    let channel = core_update::resolve_install_path()
-        .map(|p| detect_channel(&p, &ChannelEnv::from_env()))
-        .unwrap_or(InstallChannel::Standalone);
-    upgrade_hint(channel)
+    match core_update::resolve_install_path() {
+        Ok(p) => upgrade_hint_for(detect_channel(&p, &ChannelEnv::from_env()), &p),
+        Err(_) => upgrade_hint(InstallChannel::Standalone),
+    }
 }
 
-/// Render the two-line notice. Pure for unit tests.
+/// Render the two-line notice. Pure for unit tests. The caller prints a
+/// blank line before it (it follows the command's own output, often an
+/// `Error: ...` line, and must not read as part of that error).
 fn format_notice(
     current: &semver::Version,
     latest: &semver::Version,
     hint: &str,
     use_color: bool,
 ) -> String {
-    let new_version = output::color(&latest.to_string(), "32", use_color);
+    let new_version = crate::ui::paint(&latest.to_string(), "32", use_color);
     format!(
         "[socket-patch] Update available: {current} \u{2192} {new_version}\n\
          [socket-patch] Run `{hint}` to upgrade (set SOCKET_NO_UPDATE_CHECK=1 to hide)"
@@ -326,13 +330,15 @@ pub async fn finish(notifier: Option<Notifier>) {
         return;
     }
 
+    // Separator: the notice follows the command's own output.
+    eprintln!();
     eprintln!(
         "{}",
         format_notice(
             &current,
             &latest,
             upgrade_command(),
-            output::stderr_is_tty()
+            crate::ui::stderr_color()
         )
     );
 
@@ -462,7 +468,14 @@ mod tests {
         );
         let colored = format_notice(&current, &latest, "socket-patch --update", true);
         assert!(colored.contains("\u{1b}["), "{colored}");
-        // Two lines, both stderr-prefixed for grep-ability.
+        // Exactly two lines (the caller prints the separating blank line),
+        // both prefixed for grep-ability.
+        assert_eq!(
+            plain,
+            "[socket-patch] Update available: 3.3.0 \u{2192} 3.4.0\n\
+             [socket-patch] Run `socket-patch --update` to upgrade \
+             (set SOCKET_NO_UPDATE_CHECK=1 to hide)"
+        );
         for line in plain.lines() {
             assert!(line.starts_with("[socket-patch]"), "{line}");
         }

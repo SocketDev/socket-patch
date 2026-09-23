@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use clap::Args;
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
@@ -7,7 +9,7 @@ use socket_patch_core::vendor::state::{VendorEntry, VENDOR_STATE_REL};
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::json_envelope::{
-    Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile,
+    Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile, RunWarning,
 };
 
 #[derive(Args)]
@@ -173,15 +175,137 @@ fn build_list_envelope(entries: &[ListEntry<'_>]) -> Envelope {
 
 /// Emit the top-level envelope for `list` in error states. Used for the
 /// "manifest not found" and "manifest unreadable" paths so they share
-/// the same JSON shape as a successful list.
-fn emit_error(args: &ListArgs, code: &str, message: String) {
+/// the same JSON shape as a successful list. `warnings` gathered before
+/// the error (a corrupt redirect ledger) ride the error envelope too, so a
+/// JSON consumer sees them on every exit path.
+fn emit_error(args: &ListArgs, code: &str, message: String, warnings: Vec<RunWarning>) {
     if args.common.json {
         let mut env = Envelope::new(Command::List);
         env.mark_error(EnvelopeError::new(code, message));
+        env.warnings = warnings;
         println!("{}", env.to_pretty_json());
     } else {
         eprintln!("Error: {message}");
     }
+}
+
+/// The message for a manifest that exists but could not be read, naming
+/// the file (the bare io/serde text — "Permission denied (os error 13)",
+/// "EOF while parsing ..." — doesn't say which file). Shared with `repair`.
+pub(crate) fn manifest_error_message(path: &Path, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        let detail = e.to_string();
+        let detail = detail
+            .strip_prefix("Failed to parse manifest JSON: ")
+            .map(|d| format!("not valid JSON: {d}"))
+            .or_else(|| {
+                detail
+                    .strip_prefix("Invalid manifest: ")
+                    .map(str::to_string)
+            })
+            .unwrap_or(detail);
+        format!("Invalid manifest at {}: {detail}", path.display())
+    } else {
+        format!("Could not read manifest at {}: {e}", path.display())
+    }
+}
+
+/// Manifest/ledger text is free-form (API-sourced descriptions): drop
+/// control characters that would rewrite the terminal (ESC, a stray
+/// `\r`), keeping newlines and tabs, and normalize `\r\n`.
+fn sanitize(s: &str) -> String {
+    s.replace("\r\n", "\n")
+        .chars()
+        .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+        .collect()
+}
+
+/// `"{indent}{label}: {value}"`, or `None` when the value is blank (no
+/// dangling `License: ` line). Continuation lines of a multi-line value
+/// are indented two past the label so they stay inside the entry.
+fn field(indent: &str, label: &str, value: &str) -> Option<String> {
+    let value = sanitize(value);
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let continuation = format!("\n{indent}  ");
+    let body = value
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join(&continuation);
+    Some(format!("{indent}{label}: {body}"))
+}
+
+/// One entry of the human listing (no trailing newline).
+fn format_entry(entry: &ListEntry<'_>, color: bool) -> String {
+    let patch = entry.record;
+    let mut lines = vec![format!("Package: {}", sanitize(entry.purl))];
+    lines.extend(field("  ", "UUID", &patch.uuid));
+    if let Some((mode, ledger)) = ledger_label(entry.source) {
+        // Same labeling rule as the JSON details: the record comes from a
+        // ledger, not the manifest — hosted installs resolve the package
+        // to the hosted patch server, vendored ones to the committed
+        // `.socket/vendor/` artifact; no manifest entry exists or is
+        // needed.
+        lines.push(format!("  Mode: {mode} (recorded in {ledger})"));
+    }
+    lines.extend(field("  ", "Tier", &patch.tier));
+    lines.extend(field("  ", "License", &patch.license));
+    lines.extend(field("  ", "Exported", &patch.exported_at));
+    lines.extend(field("  ", "Description", &patch.description));
+
+    // Sort vulnerabilities by advisory ID for stable output.
+    let mut vuln_entries: Vec<_> = patch.vulnerabilities.iter().collect();
+    vuln_entries.sort_by(|a, b| a.0.cmp(b.0));
+    if !vuln_entries.is_empty() {
+        lines.push(format!("  Vulnerabilities ({}):", vuln_entries.len()));
+        for (id, vuln) in &vuln_entries {
+            let cve_list = if vuln.cves.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", sanitize(&vuln.cves.join(", ")))
+            };
+            lines.push(format!("    - {}{cve_list}", sanitize(id)));
+            // Upper-cased like scan's table, and colored by tier on a
+            // color terminal.
+            let severity = sanitize(vuln.severity.trim()).to_uppercase();
+            if !severity.is_empty() {
+                lines.push(format!(
+                    "      Severity: {}",
+                    crate::ui::severity(&severity, color)
+                ));
+            }
+            lines.extend(field("      ", "Summary", &vuln.summary));
+        }
+    }
+
+    // Sort patched files by path for stable output.
+    let mut file_list: Vec<_> = patch.files.keys().collect();
+    file_list.sort();
+    if !file_list.is_empty() {
+        lines.push(format!("  Files patched ({}):", file_list.len()));
+        for file_path in &file_list {
+            lines.push(format!("    - {}", sanitize(file_path)));
+        }
+    }
+    lines.join("\n")
+}
+
+/// The whole human listing for stdout: a count header, then the entries
+/// separated by one blank line (none after the last).
+fn format_listing(entries: &[ListEntry<'_>], color: bool) -> String {
+    if entries.is_empty() {
+        return "No patches found in manifest.".to_string();
+    }
+    let mut out = format!(
+        "Found {}:\n\n",
+        crate::ui::plural(entries.len(), "patch", "patches")
+    );
+    let blocks: Vec<String> = entries.iter().map(|e| format_entry(e, color)).collect();
+    out.push_str(&blocks.join("\n\n"));
+    out
 }
 
 pub async fn run(args: ListArgs) -> i32 {
@@ -212,7 +336,12 @@ pub async fn run(args: ListArgs) -> i32 {
             } else {
                 "manifest_unreadable"
             };
-            emit_error(&args, code, e.to_string());
+            emit_error(
+                &args,
+                code,
+                manifest_error_message(&manifest_path, &e),
+                Vec::new(),
+            );
             return 1;
         }
     };
@@ -226,9 +355,27 @@ pub async fn run(args: ListArgs) -> i32 {
     // with `--manifest-path` pointing at another project, reading the LOCAL
     // cwd's ledgers would interleave two projects' patch state (and a local
     // ledger could suppress the flagged project's manifest_not_found).
+    //
+    // Under --json a corrupt redirect ledger rides the envelope's
+    // `warnings[]` (stdout is the machine channel; a stderr-only warning
+    // would vanish for JSON consumers), the same split `update` uses.
     let project_root = args.common.project_root();
+    let mut warnings: Vec<RunWarning> = Vec::new();
     let redirect_state =
-        crate::commands::load_redirect_state_lenient(&project_root, args.common.silent).await;
+        match socket_patch_core::patch::redirect::load_redirect_state(&project_root).await {
+            Ok(state) => state,
+            Err(corrupt) => {
+                if args.common.json {
+                    warnings.push(RunWarning {
+                        code: "redirect_ledger_corrupt".to_string(),
+                        detail: corrupt.to_string(),
+                    });
+                } else if !args.common.silent {
+                    eprintln!("Warning: {corrupt}");
+                }
+                None
+            }
+        };
     let vendor_state =
         crate::commands::load_vendor_state_lenient(&project_root, args.common.silent).await;
 
@@ -252,6 +399,7 @@ pub async fn run(args: ListArgs) -> i32 {
             &args,
             "manifest_not_found",
             format!("Manifest not found at {}", manifest_path.display()),
+            warnings,
         );
         return 1;
     }
@@ -275,64 +423,15 @@ pub async fn run(args: ListArgs) -> i32 {
     .await;
 
     if args.common.json {
-        println!("{}", build_list_envelope(&entries).to_pretty_json());
+        let mut env = build_list_envelope(&entries);
+        env.warnings = warnings;
+        println!("{}", env.to_pretty_json());
     } else if args.common.silent {
         // `--silent` is "errors only" (CLI_CONTRACT.md): suppress the
         // entire human-readable listing, mirroring `get`/`repair`.
         // The exit code still distinguishes the manifest states.
-    } else if entries.is_empty() {
-        println!("No patches found in manifest.");
     } else {
-        println!("Found {} patch(es):\n", entries.len());
-        for entry in &entries {
-            let patch = entry.record;
-            println!("Package: {}", entry.purl);
-            println!("  UUID: {}", patch.uuid);
-            if let Some((mode, ledger)) = ledger_label(entry.source) {
-                // Same labeling rule as the JSON details: the record comes
-                // from a ledger, not the manifest — hosted installs resolve
-                // the package to the hosted patch server, vendored ones to
-                // the committed `.socket/vendor/` artifact; no manifest
-                // entry exists or is needed.
-                println!("  Mode: {mode} (recorded in {ledger})");
-            }
-            println!("  Tier: {}", patch.tier);
-            println!("  License: {}", patch.license);
-            println!("  Exported: {}", patch.exported_at);
-
-            if !patch.description.is_empty() {
-                println!("  Description: {}", patch.description);
-            }
-
-            // Sort vulnerabilities by advisory ID for stable output.
-            let mut vuln_entries: Vec<_> = patch.vulnerabilities.iter().collect();
-            vuln_entries.sort_by(|a, b| a.0.cmp(b.0));
-            if !vuln_entries.is_empty() {
-                println!("  Vulnerabilities ({}):", vuln_entries.len());
-                for (id, vuln) in &vuln_entries {
-                    let cve_list = if vuln.cves.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({})", vuln.cves.join(", "))
-                    };
-                    println!("    - {id}{cve_list}");
-                    println!("      Severity: {}", vuln.severity);
-                    println!("      Summary: {}", vuln.summary);
-                }
-            }
-
-            // Sort patched files by path for stable output.
-            let mut file_list: Vec<_> = patch.files.keys().collect();
-            file_list.sort();
-            if !file_list.is_empty() {
-                println!("  Files patched ({}):", file_list.len());
-                for file_path in &file_list {
-                    println!("    - {file_path}");
-                }
-            }
-
-            println!();
-        }
+        println!("{}", format_listing(&entries, crate::ui::stdout_color()));
     }
 
     0
@@ -725,5 +824,143 @@ mod tests {
         let a = manifest_envelope(&manifest).to_pretty_json();
         let b = manifest_envelope(&manifest).to_pretty_json();
         assert_eq!(a, b);
+    }
+
+    fn record_with(description: &str, license: &str, severity: &str, summary: &str) -> PatchRecord {
+        let mut rec = sample_manifest().patches["pkg:npm/minimist@1.2.2"].clone();
+        rec.description = description.to_string();
+        rec.license = license.to_string();
+        let vuln = rec.vulnerabilities.get_mut("GHSA-xyz-1234").unwrap();
+        vuln.severity = severity.to_string();
+        vuln.summary = summary.to_string();
+        rec
+    }
+
+    fn entry<'a>(purl: &'a str, record: &'a PatchRecord) -> ListEntry<'a> {
+        ListEntry {
+            purl,
+            record,
+            source: Source::Manifest,
+        }
+    }
+
+    #[test]
+    fn format_entry_exact_layout() {
+        let rec = record_with("Some fix", "MIT", "high", "Prototype Pollution");
+        assert_eq!(
+            format_entry(&entry("pkg:npm/minimist@1.2.2", &rec), false),
+            "Package: pkg:npm/minimist@1.2.2\n\
+             \x20 UUID: 11111111-1111-4111-8111-111111111111\n\
+             \x20 Tier: free\n\
+             \x20 License: MIT\n\
+             \x20 Exported: 2024-01-01T00:00:00Z\n\
+             \x20 Description: Some fix\n\
+             \x20 Vulnerabilities (1):\n\
+             \x20   - GHSA-xyz-1234 (CVE-2024-12345)\n\
+             \x20     Severity: HIGH\n\
+             \x20     Summary: Prototype Pollution\n\
+             \x20 Files patched (1):\n\
+             \x20   - package/index.js"
+        );
+    }
+
+    #[test]
+    fn format_entry_indents_multiline_and_skips_blank_fields() {
+        let rec = record_with("Multi\r\nline  \ndescription", "", "", "");
+        let out = format_entry(&entry("pkg:npm/x@1", &rec), false);
+        assert!(
+            out.contains("  Description: Multi\n    line\n    description\n"),
+            "{out}"
+        );
+        for gone in ["License:", "Severity:", "Summary:"] {
+            assert!(!out.contains(gone), "blank {gone} must be skipped: {out}");
+        }
+        assert!(
+            !out.lines().any(|l| l.ends_with(' ')),
+            "no trailing spaces: {out:?}"
+        );
+    }
+
+    #[test]
+    fn format_entry_strips_terminal_control_sequences() {
+        let rec = record_with("evil\x1b[2J\x07 text\rmore", "MIT", "low", "s\x1b]0;t\x07");
+        let out = format_entry(&entry("pkg:npm/x@1", &rec), false);
+        assert!(
+            !out.contains('\x1b') && !out.contains('\x07') && !out.contains('\r'),
+            "{out:?}"
+        );
+        assert!(out.contains("  Description: evil[2J textmore"), "{out}");
+    }
+
+    #[test]
+    fn format_entry_colors_severity_only_when_asked() {
+        let rec = record_with("d", "MIT", "critical", "s");
+        let plain = format_entry(&entry("pkg:npm/x@1", &rec), false);
+        assert!(!plain.contains('\x1b'));
+        let colored = format_entry(&entry("pkg:npm/x@1", &rec), true);
+        assert!(
+            colored.contains("Severity: \x1b[91mCRITICAL\x1b[0m"),
+            "{colored:?}"
+        );
+    }
+
+    #[test]
+    fn format_entry_multibyte_passes_through() {
+        let rec = record_with("修复 — é", "MIT", "medium", "漏洞");
+        let out = format_entry(&entry("pkg:npm/日本@1", &rec), false);
+        assert!(out.starts_with("Package: pkg:npm/日本@1\n"), "{out}");
+        assert!(out.contains("  Description: 修复 — é\n"), "{out}");
+        assert!(out.contains("      Summary: 漏洞\n"), "{out}");
+    }
+
+    #[test]
+    fn format_listing_counts_and_separates_entries() {
+        assert_eq!(format_listing(&[], false), "No patches found in manifest.");
+        let manifest = sample_manifest();
+        let one = combined_entries(Some(&manifest), None, None);
+        let out = format_listing(&one, false);
+        assert!(out.starts_with("Found 1 patch:\n\nPackage: "), "{out}");
+        assert!(!out.ends_with('\n'), "no trailing blank line: {out:?}");
+
+        let multi = multi_entry_manifest();
+        let many = combined_entries(Some(&multi), None, None);
+        let out = format_listing(&many, false);
+        assert!(
+            out.starts_with(&format!("Found {} patches:\n\n", many.len())),
+            "{out}"
+        );
+        // Exactly one blank line between entries, none doubled.
+        assert_eq!(out.matches("\n\nPackage: ").count(), many.len());
+        assert!(!out.contains("\n\n\n"), "{out:?}");
+    }
+
+    #[test]
+    fn manifest_error_message_names_the_file() {
+        let path = Path::new("proj/.socket/manifest.json");
+        let io = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(manifest_error_message(path, &io)
+            .starts_with("Could not read manifest at proj/.socket/manifest.json: "),);
+        let bad_json = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Failed to parse manifest JSON: EOF while parsing an object at line 2 column 0",
+        );
+        assert_eq!(
+            manifest_error_message(path, &bad_json),
+            "Invalid manifest at proj/.socket/manifest.json: not valid JSON: EOF while \
+             parsing an object at line 2 column 0"
+        );
+        let schema = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid manifest: missing field `exportedAt`",
+        );
+        assert_eq!(
+            manifest_error_message(path, &schema),
+            "Invalid manifest at proj/.socket/manifest.json: missing field `exportedAt`"
+        );
+        let other = std::io::Error::new(std::io::ErrorKind::InvalidData, "odd");
+        assert_eq!(
+            manifest_error_message(path, &other),
+            "Invalid manifest at proj/.socket/manifest.json: odd"
+        );
     }
 }

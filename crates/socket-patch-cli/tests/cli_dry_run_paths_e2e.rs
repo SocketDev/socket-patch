@@ -376,7 +376,7 @@ fn apply_dry_run_human_count_excludes_vendored() {
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("1 package(s) can be patched"),
+        stdout.contains("1 package can be patched"),
         "human dry-run count must exclude the vendored entry; stdout:\n{stdout}"
     );
 }

@@ -35,13 +35,37 @@ const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// 127.0.0.1 instead of leaking a request to real GitHub.
 const DEAD_BASE_URL: &str = "http://127.0.0.1:1";
 
+/// A project-local npm install (`<project>/node_modules/...`) refuses too,
+/// but must not suggest `npm update -g`: that updates some other, global
+/// copy and leaves this one alone.
+#[tokio::test]
+async fn npm_project_local_refuses_with_local_hint() {
+    let install = staged_install_at("app/node_modules/@socketsecurity/socket-patch-x/bin");
+    // A project is told apart from a prefix-less global install by the
+    // package.json beside its node_modules.
+    std::fs::write(install.root.path().join("app/package.json"), "{}").unwrap();
+    let (code, _stdout, stderr) = run_installed(
+        &install,
+        &["--update", "--yes"],
+        &[("SOCKET_UPDATE_BASE_URL", DEAD_BASE_URL)],
+    );
+    assert_eq!(code, 1, "managed install must refuse.\nstderr:\n{stderr}");
+    assert!(
+        stderr.contains("`npm install @socketsecurity/socket-patch@latest`"),
+        "a project install must get the in-project upgrade command: {stderr}"
+    );
+    assert!(!stderr.contains("npm update -g"), "{stderr}");
+    assert!(stderr.starts_with("Error: This socket-patch binary ("), "{stderr}");
+}
+
 /// An npm-bundled binary (any `node_modules` component) refuses with the
 /// npm upgrade command — and the refusal happens before ANY release
 /// traffic: a fully valid, newer release is mounted and its routes must
 /// never be hit. A wasted download before the refusal is the bug class.
 #[tokio::test]
 async fn npm_bundled_refuses_with_npm_hint() {
-    let install = staged_install_at("node_modules/@socketsecurity/socket-patch-x/bin");
+    // A global install (`<prefix>/lib/node_modules/...`): `npm update -g`.
+    let install = staged_install_at("lib/node_modules/@socketsecurity/socket-patch-x/bin");
     let (served, _) = make_served_binary();
     let release = FakeReleaseBuilder::new("9.9.9")
         .asset_for_current_target(&served)
@@ -323,7 +347,7 @@ async fn force_override_warning_survives_json() {
 #[cfg(unix)]
 #[tokio::test]
 async fn symlinked_invocation_still_detected() {
-    let install = staged_install_at("node_modules/@socketsecurity/socket-patch-x/bin");
+    let install = staged_install_at("lib/node_modules/@socketsecurity/socket-patch-x/bin");
     let straight = install.root.path().join("straight");
     std::fs::create_dir_all(&straight).expect("create symlink dir");
     let link = straight.join("socket-patch");

@@ -597,7 +597,7 @@ fn human_vendor_prints_summary_committables_and_reinstall_hint() {
     let (code, stdout, stderr) = human_vendor(&fx, &[]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stdout.contains("Vendored 1 package(s); 0 skipped; 0 failed."),
+        stdout.contains("Vendored 1 package."),
         "summary line: {stdout}"
     );
     assert!(
@@ -611,20 +611,18 @@ fn human_vendor_prints_summary_committables_and_reinstall_hint() {
 }
 
 /// Human `--dry-run`: the `Would vendor` verb and NO commit/reinstall
-/// hints (nothing was written). NOTE the pinned count: a dry-run success
-/// is translated to a `Verified` event (counted under `summary.verified`,
-/// not `applied`), while the human line prints `summary.applied` — so a
-/// would-vendor package prints as `Would vendor 0`; the JSON cross-check
-/// below anchors where the package actually lands. A future fix that
-/// prints the verified count must consciously update this pin.
+/// hints (nothing was written). A dry-run success is translated to a
+/// `Verified` event (counted under `summary.verified`, not `applied`); the
+/// human line counts it as a would-vendor package, and the JSON
+/// cross-check below anchors where the package actually lands.
 #[test]
 fn human_dry_run_prints_would_vendor_and_no_commit_hints() {
     let fx = npm_fixture();
     let (code, stdout, stderr) = human_vendor(&fx, &["--dry-run"]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stdout.contains("Would vendor 0 package(s); 0 skipped; 0 failed."),
-        "dry-run verb (applied stays 0 — the success is a Verified event): {stdout}"
+        stdout.contains("Would vendor 1 package."),
+        "dry-run verb, counting the Verified preview event: {stdout}"
     );
     let (json_code, env) = vendor_cli(fx.root(), &["--dry-run"]);
     assert_eq!(json_code, 0, "{env:#}");
@@ -660,7 +658,7 @@ fn human_not_installed_prints_cannot_vendor_to_stderr() {
         "stderr carries the on-disk cause: {stderr}"
     );
     assert!(
-        stdout.contains("Vendored 1 package(s); 1 skipped; 0 failed."),
+        stdout.contains("Vendored 1 package; 1 not installed."),
         "summary counts the skip: {stdout}"
     );
 }
@@ -674,7 +672,7 @@ async fn human_revert_prints_reverted_summary() {
     let (code, stdout, stderr) = human_vendor(&fx, &["--revert"]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stdout.contains("Reverted 1 vendored package(s); 0 failed."),
+        stdout.contains("Reverted 1 vendored package."),
         "revert summary: {stdout}"
     );
     assert!(
@@ -684,8 +682,8 @@ async fn human_revert_prints_reverted_summary() {
     assert_eq!(fx.lock_bytes(), fx.original_lock, "lock restored");
 }
 
-/// Human `--revert` over a drifted lock: `Reverted 0 …` plus the
-/// `Kept N drifted package(s)` explainer (counts come from the drift-skip
+/// Human `--revert` over a drifted lock: no `Reverted …` line, only the
+/// `Kept 1 drifted package` explainer (counts come from the drift-skip
 /// keep, not advisory warnings).
 #[tokio::test]
 async fn human_revert_drift_keep_prints_kept_explainer() {
@@ -702,11 +700,11 @@ async fn human_revert_drift_keep_prints_kept_explainer() {
     let (code, stdout, stderr) = human_vendor(&fx, &["--revert"]);
     assert_eq!(code, 0, "a drift keep is not an error:\n{stdout}\n{stderr}");
     assert!(
-        stdout.contains("Reverted 0 vendored package(s); 0 failed."),
-        "nothing reverted: {stdout}"
+        !stdout.contains("Reverted"),
+        "nothing reverted, so no package line: {stdout}"
     );
     assert!(
-        stdout.contains("Kept 1 drifted package(s)"),
+        stdout.contains("Kept 1 drifted package:"),
         "the drift-keep explainer: {stdout}"
     );
     assert!(fx.tgz_path().is_file(), "kept artifacts survive");
@@ -1054,7 +1052,7 @@ fn human_corrupt_manifest_prints_could_not_read() {
     let (code, stdout, stderr) = human_vendor(&fx, &[]);
     assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stderr.contains("Error: could not read manifest:"),
+        stderr.contains("Error: Could not read manifest:"),
         "the human explanation for the flipped exit code: {stderr}"
     );
     assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
@@ -1081,7 +1079,7 @@ async fn human_corrupt_committed_artifact_prints_repair_hint() {
         "the human line must carry the repair remedy: {stderr}"
     );
     assert!(
-        stdout.contains("Vendored 0 package(s); 0 skipped; 1 failed."),
+        stdout.contains("Vendored 0 packages; 1 failed."),
         "the summary counts the failure: {stdout}"
     );
 }
@@ -1123,7 +1121,7 @@ async fn human_fetch_failure_prints_fetch_failed() {
         "the human fetch-failure line: {stderr}"
     );
     assert!(
-        stdout.contains("Vendored 0 package(s); 0 skipped; 1 failed."),
+        stdout.contains("Vendored 0 packages; 1 failed."),
         "a fetch failure is counted as failed, not skipped: {stdout}"
     );
     assert!(
@@ -1147,7 +1145,7 @@ fn human_corrupt_redirect_ledger_prints_cannot_vendor() {
         "stderr names the refused purl: {stderr}"
     );
     assert!(
-        stdout.contains("Vendored 0 package(s); 0 skipped; 1 failed."),
+        stdout.contains("Vendored 0 packages; 1 failed."),
         "the fail-closed refusal is counted: {stdout}"
     );
     assert_eq!(fx.lock_bytes(), fx.original_lock, "lock untouched");
@@ -1206,7 +1204,7 @@ fn human_lockfile_missing_refusal_prints_cannot_vendor() {
         "the refusal detail surfaces verbatim: {stderr}"
     );
     assert!(
-        stdout.contains("Vendored 0 package(s); 0 skipped; 1 failed."),
+        stdout.contains("Vendored 0 packages; 1 failed."),
         "a non-benign refusal is counted as failed: {stdout}"
     );
 }
@@ -1238,7 +1236,7 @@ fn human_patch_failure_prints_failed_to_vendor() {
         "the human line carries the apply failure: {stderr}"
     );
     assert!(
-        stdout.contains("Vendored 0 package(s); 0 skipped; 1 failed."),
+        stdout.contains("Vendored 0 packages; 1 failed."),
         "the failed patch is counted: {stdout}"
     );
     assert!(
@@ -1249,7 +1247,7 @@ fn human_patch_failure_prints_failed_to_vendor() {
 }
 
 /// Human corrupt-ledger `--revert` surface: the
-/// `Error: could not read .socket/vendor/state.json` stderr line beside
+/// `Error: Could not read the vendor ledger` stderr line beside
 /// the `vendor_state_unreadable` exit contract section 1 pins under --json.
 #[test]
 fn human_corrupt_state_revert_prints_could_not_read() {
@@ -1260,7 +1258,7 @@ fn human_corrupt_state_revert_prints_could_not_read() {
     let (code, stdout, stderr) = human_vendor(&fx, &["--revert"]);
     assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stderr.contains("Error: could not read .socket/vendor/state.json:"),
+        stderr.contains("Error: Could not read the vendor ledger"),
         "the human explanation for the flipped exit code: {stderr}"
     );
 }
@@ -1280,7 +1278,7 @@ async fn human_revert_failure_prints_failed_to_revert() {
         "stderr names the failed purl: {stderr}"
     );
     assert!(
-        stdout.contains("Reverted 0 vendored package(s); 1 failed."),
+        stdout.contains("Reverted 0 vendored packages; 1 failed."),
         "the summary counts the failure: {stdout}"
     );
 }
@@ -1298,7 +1296,7 @@ async fn human_revert_dry_run_prints_would_revert_and_mutates_nothing() {
     let (code, stdout, stderr) = human_vendor(&fx, &["--revert", "--dry-run"]);
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        stdout.contains("Would revert 1 vendored package(s); 0 failed."),
+        stdout.contains("Would revert 1 vendored package."),
         "the dry-run verb and count: {stdout}"
     );
     assert_eq!(

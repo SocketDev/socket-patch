@@ -7036,7 +7036,8 @@ mod tests {
         fn t_checksum_new_none(e: &mut VendorEntry) {
             e.wiring[2].new = None;
         }
-        let cases: [(&str, fn(&mut VendorEntry)); 5] = [
+        type Tamper = fn(&mut VendorEntry);
+        let cases: [(&str, Tamper); 5] = [
             ("gemfile record without `new`", t_gemfile_new_none),
             (
                 "rewritten gemfile record without `original`",

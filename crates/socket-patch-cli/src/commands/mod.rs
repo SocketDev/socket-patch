@@ -39,7 +39,7 @@ pub(crate) const VENDORED_MODE_LABEL: &str = "vendored";
 /// from `load_redirect_state`'s contract — the warning is advisory
 /// (muted by `--silent`, "errors only"), because every path that would
 /// WRITE or ATTEST from the ledger hard-errors on the same corruption
-/// instead. Shared by `list` and both of scan's read-only consults.
+/// instead. Shared by both of scan's read-only consults.
 pub(crate) async fn load_redirect_state_lenient(
     cwd: &Path,
     silent: bool,

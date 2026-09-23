@@ -572,7 +572,7 @@ fn path_target_matching_nothing_errors() {
         "a no-match path pattern must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("path pattern matched no patched packages")
+        stderr.contains("Path pattern matched no patched packages")
             && stderr.contains("no/such/dir"),
         "the error must name the pattern; stderr=\n{stderr}"
     );
@@ -719,7 +719,7 @@ fn invalid_glob_is_usage_error() {
          discovery); stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("invalid path pattern"),
+        stderr.to_lowercase().contains("invalid path pattern"),
         "stderr must name the problem; stderr=\n{stderr}"
     );
 }

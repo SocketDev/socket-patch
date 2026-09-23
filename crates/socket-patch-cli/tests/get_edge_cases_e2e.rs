@@ -496,12 +496,20 @@ fn get_help_lists_all_identifier_flags() {
         "--ghsa",
         "--package",
         "--save-only",
-        "--one-off",
+        "--all-releases",
+        "--mode",
     ] {
         assert!(
             stdout.contains(flag),
             "get --help missing flag {flag}; got: {stdout}"
         );
+    }
+    // `--one-off` always fails with "not yet implemented": it stays
+    // parseable (scripts get that explicit error) but is not advertised.
+    assert!(!stdout.contains("--one-off"), "{stdout}");
+    // Help text is for users: no implementation notes from the source.
+    for leak in ["value_parser", "parse_bool_flag", "No env binding", "locally- installed"] {
+        assert!(!stdout.contains(leak), "get --help leaks {leak:?}: {stdout}");
     }
 }
 

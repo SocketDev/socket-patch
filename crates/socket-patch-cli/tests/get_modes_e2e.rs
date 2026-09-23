@@ -547,7 +547,7 @@ async fn get_hosted_silent_prints_nothing_to_stdout() {
         run_get(tmp2.path(), &server.uri(), &[UUID1, "--mode", "hosted"]);
     assert_eq!(loud_code, 0, "stderr:\n{loud_stderr}");
     assert!(
-        loud_stdout.contains("Redirected 1 package(s)"),
+        loud_stdout.contains("Redirected 1 package; rewrote 1 file."),
         "non-silent hosted run must print the redirect summary; got {loud_stdout:?}"
     );
 }

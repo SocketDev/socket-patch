@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::api::blob_fetcher::{ArtifactNoun, BLOB};
 use crate::manifest::operations::get_after_hash_blobs;
 use crate::manifest::schema::PatchManifest;
 
@@ -148,33 +149,63 @@ pub async fn cleanup_unused_archives(
     .await
 }
 
-/// Formats the cleanup result for human-readable output.
+/// Formats a blob cleanup result for human-readable output (see
+/// [`format_cleanup_result_for`]).
 pub fn format_cleanup_result(result: &CleanupResult, dry_run: bool) -> String {
+    format_cleanup_result_for(result, dry_run, BLOB)
+}
+
+/// Formats a cleanup result counting `noun`s: "Removed 2 unused diff
+/// archives (3 B freed)", and under a dry run the sorted list of what
+/// would go ("Unused diff archives:" then `  - <name>` lines; the
+/// directory walk's order is not stable).
+pub fn format_cleanup_result_for(
+    result: &CleanupResult,
+    dry_run: bool,
+    noun: ArtifactNoun,
+) -> String {
     if result.blobs_checked == 0 {
         // Absent directory, or one holding no regular non-hidden files.
-        return "No blobs to clean up.".to_string();
+        return format!("No {} to clean up.", noun.many);
     }
 
     if result.blobs_removed == 0 {
-        return format!("Checked {} blob(s), all are in use.", result.blobs_checked);
+        return format_all_in_use(&[noun.count(result.blobs_checked)], result.blobs_checked);
     }
 
     let action = if dry_run { "Would remove" } else { "Removed" };
     let bytes_formatted = format_bytes(result.bytes_freed);
+    let unused = noun
+        .count(result.blobs_removed)
+        .replacen(' ', " unused ", 1);
 
-    let mut output = format!(
-        "{} {} unused blob(s) ({} freed)",
-        action, result.blobs_removed, bytes_formatted
-    );
+    let mut output = format!("{action} {unused} ({bytes_formatted} freed)");
 
     if dry_run && !result.removed_blobs.is_empty() {
-        output.push_str("\nUnused blobs:");
-        for blob in &result.removed_blobs {
-            output.push_str(&format!("\n  - {}", blob));
+        let mut names: Vec<&String> = result.removed_blobs.iter().collect();
+        names.sort();
+        output.push_str(&format!("\nUnused {}:", noun.many));
+        for name in names {
+            output.push_str(&format!("\n  - {name}"));
         }
     }
 
     output
+}
+
+/// The "nothing unused" line, shared by every cleanup caller so the wording
+/// matches across commands: `parts` are the counted kinds checked ("2
+/// blobs", "1 diff archive"), joined as "a, b and c"; `total` is the item
+/// count across all of them, which picks "in use" (one item) or "all in
+/// use". "Checked 1 blob: in use." / "Checked 5 blobs: all in use."
+pub fn format_all_in_use(parts: &[String], total: usize) -> String {
+    let list = match parts {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    };
+    let state = if total == 1 { "in use" } else { "all in use" };
+    format!("Checked {list}: {state}.")
 }
 
 /// Formats bytes into a human-readable string.
@@ -521,7 +552,7 @@ mod tests {
         };
         assert_eq!(
             format_cleanup_result(&result, false),
-            "Checked 5 blob(s), all are in use."
+            "Checked 5 blobs: all in use."
         );
     }
 
@@ -536,7 +567,7 @@ mod tests {
         };
         assert_eq!(
             format_cleanup_result(&result, false),
-            "Removed 2 unused blob(s) (2.00 KB freed)"
+            "Removed 2 unused blobs (2.00 KB freed)"
         );
     }
 
@@ -871,9 +902,85 @@ mod tests {
             ..Default::default()
         };
         let formatted = format_cleanup_result(&result, true);
-        assert!(formatted.starts_with("Would remove 2 unused blob(s)"));
-        assert!(formatted.contains("Unused blobs:"));
-        assert!(formatted.contains("  - aaa"));
-        assert!(formatted.contains("  - bbb"));
+        assert_eq!(
+            formatted,
+            "Would remove 2 unused blobs (2.00 KB freed)\nUnused blobs:\n  - aaa\n  - bbb"
+        );
+    }
+
+    #[test]
+    fn format_cleanup_result_for_archives_uses_the_noun_everywhere() {
+        use crate::api::blob_fetcher::{DIFF_ARCHIVE, PACKAGE_ARCHIVE};
+        let result = CleanupResult {
+            blobs_checked: 2,
+            blobs_removed: 1,
+            bytes_freed: 2,
+            removed_blobs: vec!["3333.tar.gz".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            format_cleanup_result_for(&result, true, DIFF_ARCHIVE),
+            "Would remove 1 unused diff archive (2 B freed)\nUnused diff archives:\n  - 3333.tar.gz"
+        );
+        assert_eq!(
+            format_cleanup_result_for(&result, false, PACKAGE_ARCHIVE),
+            "Removed 1 unused package archive (2 B freed)"
+        );
+        let none = CleanupResult::default();
+        assert_eq!(
+            format_cleanup_result_for(&none, false, DIFF_ARCHIVE),
+            "No diff archives to clean up."
+        );
+    }
+
+    #[test]
+    fn format_cleanup_result_singular_and_sorted() {
+        let one_in_use = CleanupResult {
+            blobs_checked: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_cleanup_result(&one_in_use, false),
+            "Checked 1 blob: in use."
+        );
+        // Unsorted input (directory-walk order) prints sorted.
+        let result = CleanupResult {
+            blobs_checked: 3,
+            blobs_removed: 3,
+            bytes_freed: 3,
+            removed_blobs: vec!["c".into(), "a".into(), "b".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            format_cleanup_result(&result, true),
+            "Would remove 3 unused blobs (3 B freed)\nUnused blobs:\n  - a\n  - b\n  - c"
+        );
+    }
+
+    #[test]
+    fn all_in_use_wording_counts_items_not_kinds() {
+        assert_eq!(
+            format_all_in_use(&["1 blob".into()], 1),
+            "Checked 1 blob: in use."
+        );
+        assert_eq!(
+            format_all_in_use(&["2 blobs".into()], 2),
+            "Checked 2 blobs: all in use."
+        );
+        assert_eq!(
+            format_all_in_use(&["1 blob".into(), "1 diff archive".into()], 2),
+            "Checked 1 blob and 1 diff archive: all in use."
+        );
+        assert_eq!(
+            format_all_in_use(
+                &[
+                    "2 blobs".into(),
+                    "1 diff archive".into(),
+                    "3 package archives".into()
+                ],
+                6
+            ),
+            "Checked 2 blobs, 1 diff archive and 3 package archives: all in use."
+        );
     }
 }

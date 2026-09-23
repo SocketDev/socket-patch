@@ -106,9 +106,9 @@ pub async fn vendor_npm(
             return refused(
                 "vendor_lockfile_missing",
                 format!(
-                    "no {PACKAGE_LOCK} or {SHRINKWRAP} at {} — vendoring rewires the lockfile, \
+                    "no {PACKAGE_LOCK} or {SHRINKWRAP} {} — vendoring rewires the lockfile, \
                      so one must exist (run `npm install` first)",
-                    project_root.display()
+                    super::npm_flavor::project_root_location(project_root)
                 ),
             );
         }
@@ -862,6 +862,15 @@ fn escape_json_pointer_token(token: &str) -> String {
     token.replace('~', "~0").replace('/', "~1")
 }
 
+/// The parenthetical of a drifted-lock-entry warning: where the entry
+/// resolves now.
+fn drifted_resolved_note(resolved: Option<&str>) -> String {
+    match resolved {
+        Some(r) => format!("now resolved to {r}"),
+        None => "no `resolved` field".to_string(),
+    }
+}
+
 /// Apply one wiring record in reverse: restore `original` iff the live
 /// fragment is still ours (drift = third party re-resolved it; leave theirs
 /// alone, with a warning).
@@ -926,9 +935,8 @@ fn revert_one_record(
         warnings.push(VendorWarning::new(
             "vendor_lock_entry_drifted",
             format!(
-                "lock entry `{key}` was re-resolved since vendoring (resolved = {:?}); \
-                 left alone",
-                live_resolved
+                "lock entry `{key}` was re-resolved since vendoring ({}); left alone",
+                drifted_resolved_note(live_resolved)
             ),
         ));
         return;
@@ -2656,6 +2664,17 @@ mod tests {
     /// A live lock entry with NO `resolved` at all is not provably ours
     /// (`None => false` in the ownership gate): revert leaves it alone with
     /// a drift warning instead of clobbering an entry it cannot attribute.
+    #[test]
+    fn drifted_resolved_note_names_the_live_resolution() {
+        assert_eq!(
+            drifted_resolved_note(Some(
+                "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"
+            )),
+            "now resolved to https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz"
+        );
+        assert_eq!(drifted_resolved_note(None), "no `resolved` field");
+    }
+
     #[tokio::test]
     async fn revert_leaves_entry_missing_resolved_alone() {
         let fx = fixture().await;
@@ -2681,8 +2700,9 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|w| w.code == "vendor_lock_entry_drifted"
-                    && w.detail.contains("resolved = None")
-                    && w.detail.contains("left alone")),
+                    && w.detail
+                        == "lock entry `node_modules/left-pad` was re-resolved since \
+                            vendoring (no `resolved` field); left alone"),
             "{:?}",
             outcome.warnings
         );

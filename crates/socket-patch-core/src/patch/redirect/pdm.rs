@@ -206,7 +206,7 @@ mod tests {
         let mut result = RewriteResult::default();
         rewrite(
             &BTreeMap::from([("pdm.lock".into(), original.to_string())]),
-            &[other.clone()],
+            std::slice::from_ref(&other),
             &mut result,
         );
         assert!(

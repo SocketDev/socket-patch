@@ -575,7 +575,7 @@ async fn paths_with_hosted_or_vendored_mode_exit_2() {
         "an invalid glob must be a usage error (exit 2); stdout={stdout}; stderr={stderr}"
     );
     assert!(
-        stderr.contains("invalid path pattern"),
+        stderr.to_lowercase().contains("invalid path pattern"),
         "the error must name the invalid pattern; stderr={stderr}"
     );
 }

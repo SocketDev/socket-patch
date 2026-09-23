@@ -61,7 +61,7 @@ async fn main() {
     {
         Ok(argv) => argv,
         Err(bad_arg) => {
-            eprintln!("error: invalid UTF-8 was detected in one or more arguments: {bad_arg:?}");
+            eprintln!("Error: Invalid UTF-8 was detected in one or more arguments: {bad_arg:?}");
             std::process::exit(2);
         }
     };
@@ -76,10 +76,14 @@ async fn main() {
     // combination is contradictory; refuse with the contract's usage exit.
     if cli.update {
         eprintln!(
-            "error: --update cannot be combined with a subcommand; run `socket-patch --update` on its own"
+            "Error: --update cannot be combined with a subcommand; run `socket-patch --update` on its own"
         );
         std::process::exit(2);
     }
+
+    // Human-output policy (core advisories and prompt notes go quiet under
+    // --silent/--json) is fixed once, before any command code runs.
+    socket_patch_cli::ui::init(cli.command.global_args());
 
     // Passive update notifier: guards + (maybe) a background check kicked
     // off before dispatch, joined with a short grace budget after it.

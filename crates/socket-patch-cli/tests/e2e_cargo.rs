@@ -209,7 +209,8 @@ async fn scan_discovers_fake_registry_crates() {
         "Expected human scan to report exactly 'Found 2 packages (2 cargo)', got:\n{combined}"
     );
     assert!(
-        !combined.contains("No packages found"),
+        !combined.contains("No packages found")
+            && !combined.contains("No packages found"),
         "scan reported no packages despite a populated registry:\n{combined}"
     );
 
@@ -262,11 +263,12 @@ async fn scan_discovers_vendor_crates() {
     // substring form was a loophole. `(1 cargo)` proves the single discovered
     // package is the vendored crate and not an accidental npm/pypi pickup.
     assert!(
-        combined.contains("Found 1 packages (1 cargo)"),
-        "Expected human scan to report exactly 'Found 1 packages (1 cargo)', got:\n{combined}"
+        combined.contains("Found 1 package (1 cargo)"),
+        "Expected human scan to report exactly 'Found 1 package (1 cargo)', got:\n{combined}"
     );
     assert!(
-        !combined.contains("No packages found"),
+        !combined.contains("No packages found")
+            && !combined.contains("No packages found"),
         "scan reported no packages despite a populated vendor dir:\n{combined}"
     );
 

@@ -272,6 +272,73 @@ fn metadata_client(
         .map_err(|e| UpdateError::Network(format!("failed to build HTTP client: {e}")))
 }
 
+/// The failure of `GET url` as one readable line: `GET <url>: <cause>`,
+/// where `cause` is the innermost error of reqwest's source chain
+/// ("Connection refused (os error 61)") rather than its outer
+/// "error sending request for url (<url>)", which repeats the URL and
+/// hides why.
+pub(crate) fn request_error(url: &str, e: &reqwest::Error) -> UpdateError {
+    UpdateError::Network(format!("GET {url}: {}", request_cause(e)))
+}
+
+fn request_cause(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        return "timed out".to_string();
+    }
+    let mut inner: &dyn std::error::Error = e;
+    while let Some(next) = inner.source() {
+        inner = next;
+    }
+    inner.to_string()
+}
+
+/// `host[:port]` of `url`, for "cannot reach ..." messages.
+fn url_host(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
+/// The message for a failed latest-release lookup. When both routes died
+/// the same network death (the usual offline or firewalled case) it is one
+/// short line naming the host(s) and the cause; otherwise both legs are
+/// kept so a support log tells the whole story.
+fn combine_check_errors(
+    probe_url: &str,
+    probe_err: &UpdateError,
+    api_url: &str,
+    api_err: &UpdateError,
+) -> String {
+    let cause_of = |url: &str, err: &UpdateError| match err {
+        UpdateError::Network(msg) => msg
+            .strip_prefix(&format!("GET {url}: "))
+            .map(str::to_string),
+        _ => None,
+    };
+    if let (Some(a), Some(b)) = (cause_of(probe_url, probe_err), cause_of(api_url, api_err)) {
+        if a == b {
+            if let (Some(h1), Some(h2)) = (url_host(probe_url), url_host(api_url)) {
+                let hosts = if h1 == h2 {
+                    h1
+                } else {
+                    format!("{h1} or {h2}")
+                };
+                return format!("cannot reach {hosts}: {a}");
+            }
+        }
+    }
+    // Each leg without the "could not check for updates:" prefix the
+    // combined error is about to add again.
+    let leg = |err: &UpdateError| match err {
+        UpdateError::CheckFailed(msg) => msg.clone(),
+        other => other.to_string(),
+    };
+    format!("{}; API fallback: {}", leg(probe_err), leg(api_err))
+}
+
 /// Resolve the latest released version: redirect probe first, API fallback
 /// second (see module docs).
 pub async fn fetch_latest_version(
@@ -284,8 +351,11 @@ pub async fn fetch_latest_version(
     };
     match fetch_latest_via_api(endpoints, timeouts).await {
         Ok(version) => Ok(version),
-        Err(api_err) => Err(UpdateError::CheckFailed(format!(
-            "could not determine the latest release: {probe_err}; API fallback: {api_err}"
+        Err(api_err) => Err(UpdateError::CheckFailed(combine_check_errors(
+            &endpoints.latest_probe_url(),
+            &probe_err,
+            &endpoints.latest_api_url(),
+            &api_err,
         ))),
     }
 }
@@ -300,7 +370,7 @@ async fn probe_latest_redirect(
         .get(&url)
         .send()
         .await
-        .map_err(|e| UpdateError::Network(format!("GET {url}: {e}")))?;
+        .map_err(|e| request_error(&url, &e))?;
     if !resp.status().is_redirection() {
         return Err(UpdateError::CheckFailed(format!(
             "GET {url} returned {} (expected a redirect to the latest tag)",
@@ -328,7 +398,7 @@ async fn fetch_latest_via_api(
         .header(reqwest::header::ACCEPT, "application/vnd.github+json")
         .send()
         .await
-        .map_err(|e| UpdateError::Network(format!("GET {url}: {e}")))?;
+        .map_err(|e| request_error(&url, &e))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(UpdateError::CheckFailed(format!(
@@ -361,12 +431,13 @@ pub async fn fetch_sha256sums_entry(
         .get(&url)
         .send()
         .await
-        .map_err(|e| UpdateError::Network(format!("GET {url}: {e}")))?;
+        .map_err(|e| request_error(&url, &e))?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(UpdateError::CheckFailed(format!(
-            "release v{version} publishes no SHA256SUMS ({url} is 404) — cannot verify a download"
-        )));
+        return Err(UpdateError::SumsMissing {
+            version: version.to_string(),
+            url,
+        });
     }
     if !status.is_success() {
         return Err(UpdateError::Network(format!("GET {url} returned {status}")));
@@ -825,7 +896,92 @@ mod tests {
         assert!(msg.contains("returned 404"), "{msg}");
     }
 
+    #[tokio::test]
+    async fn fetch_latest_version_unreachable_host_is_one_short_line() {
+        // Nothing listens on the reserved port: both legs die the same
+        // connect death, reported once with the root cause instead of the
+        // doubled "error sending request for url (...)" chain.
+        let endpoints = overridden_endpoints("http://127.0.0.1:9");
+        let err = fetch_latest_version(&endpoints, &UpdateTimeouts::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.error_code(), "check_failed");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("could not check for updates: cannot reach 127.0.0.1:9: "),
+            "{msg}"
+        );
+        assert!(!msg.contains("error sending request"), "{msg}");
+        assert!(!msg.contains("API fallback"), "{msg}");
+        assert!(!msg.contains("/releases/latest"), "{msg}");
+    }
+
+    #[test]
+    fn combine_check_errors_collapses_identical_network_causes() {
+        let probe = "https://github.com/SocketDev/socket-patch/releases/latest";
+        let api = "https://api.github.com/repos/SocketDev/socket-patch/releases/latest";
+        let net = |url: &str, cause: &str| UpdateError::Network(format!("GET {url}: {cause}"));
+        assert_eq!(
+            combine_check_errors(probe, &net(probe, "timed out"), api, &net(api, "timed out")),
+            "cannot reach github.com or api.github.com: timed out"
+        );
+        // Different causes, or a non-network leg: both legs kept.
+        let mixed = combine_check_errors(
+            probe,
+            &net(probe, "timed out"),
+            api,
+            &UpdateError::CheckFailed(format!("GET {api} returned 500 Internal Server Error")),
+        );
+        assert_eq!(
+            mixed,
+            format!(
+                "network error: GET {probe}: timed out; API fallback: \
+                 GET {api} returned 500 Internal Server Error"
+            )
+        );
+        let differ = combine_check_errors(probe, &net(probe, "a"), api, &net(api, "b"));
+        assert!(differ.contains("API fallback:"), "{differ}");
+    }
+
+    #[test]
+    fn url_host_keeps_explicit_ports() {
+        assert_eq!(url_host("http://127.0.0.1:9/x").as_deref(), Some("127.0.0.1:9"));
+        assert_eq!(url_host("https://github.com/a").as_deref(), Some("github.com"));
+        assert_eq!(url_host("not a url"), None);
+    }
+
     // ---------- SHA256SUMS fetch ----------
+
+    #[tokio::test]
+    async fn sha256sums_404_says_verify_not_check() {
+        // Reached while installing, after the check already succeeded: the
+        // message must not claim the update *check* failed. The envelope
+        // code stays `check_failed` (stable contract).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/SocketDev/socket-patch/releases/download/v1.2.3/SHA256SUMS"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let endpoints = overridden_endpoints(&server.uri());
+        let err = fetch_sha256sums_entry(
+            &endpoints,
+            &UpdateTimeouts::default(),
+            &semver::Version::new(1, 2, 3),
+            "socket-patch-x.tar.gz",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.error_code(), "check_failed");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "could not verify release v1.2.3: it publishes no SHA256SUMS \
+                 ({}/SocketDev/socket-patch/releases/download/v1.2.3/SHA256SUMS is 404)",
+                server.uri()
+            )
+        );
+    }
 
     #[tokio::test]
     async fn sha256sums_server_error_status_is_reported() {

@@ -387,6 +387,7 @@ async fn pypi_scan_then_apply_force_patches_real_file() {
         force: true,
         check: false,
         vex: Default::default(),
+        nested: None,
     };
     let apply_code = apply_run(apply_args).await;
     assert_eq!(
