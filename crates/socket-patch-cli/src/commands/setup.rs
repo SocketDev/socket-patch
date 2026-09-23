@@ -2238,6 +2238,14 @@ fn format_setup_preview(
         for r in &npm_changes {
             out.push_str(&format!("  + {}\n", pathdiff(&r.path, cwd)));
             out.push_str(&format!("    -> postinstall: \"{}\"\n", r.new_script));
+            // The run writes the `dependencies` hook too; show it when it
+            // changes, so the preview matches what is written.
+            if r.new_dependencies_script != r.old_dependencies_script {
+                out.push_str(&format!(
+                    "    -> dependencies: \"{}\"\n",
+                    r.new_dependencies_script
+                ));
+            }
         }
     }
     let py_changes: Vec<_> = py
@@ -2368,6 +2376,8 @@ mod tests {
             status,
             old_script: String::new(),
             new_script: "npx @socketsecurity/socket-patch apply --silent".to_string(),
+            old_dependencies_script: "npx @socketsecurity/socket-patch apply --silent".to_string(),
+            new_dependencies_script: "npx @socketsecurity/socket-patch apply --silent".to_string(),
             error: err.map(str::to_string),
         }
     }
@@ -2554,6 +2564,19 @@ mod tests {
              1\n\nErrors:\n  ! packages/bad/package.json: Invalid package.json: EOF\n"
         );
         assert!(!out.contains("\n\n\n"), "{out:?}");
+    }
+
+    #[test]
+    fn setup_preview_shows_a_changed_dependencies_script() {
+        let mut r = update("/proj/package.json", UpdateStatus::Updated, None);
+        r.old_dependencies_script = String::new();
+        r.new_dependencies_script = "socket-patch apply --silent".to_string();
+        assert_eq!(
+            format_setup_preview(&[r], &[], &SetupOutcome::default(), &cwd(), 1),
+            "\npackage.json files to update:\n  + package.json\n    -> postinstall: \"npx \
+             @socketsecurity/socket-patch apply --silent\"\n    -> dependencies: \
+             \"socket-patch apply --silent\"\n"
+        );
     }
 
     #[test]
