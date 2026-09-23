@@ -447,7 +447,7 @@ exit 0
 /// `make_container_script` because bun hard-links from
 /// `~/.bun/install/cache/` into `node_modules/` by default (Linux
 /// backend), and this test additionally proves the apply pipeline's
-/// CoW guard (`break_hardlink_if_needed`) preserves cache integrity.
+/// CoW guard (the rename-over write in `socket_patch_core::utils::fs::atomic_write_bytes` (see its CoW guarantee doc)) preserves cache integrity.
 ///
 /// Mirror of `pypi_uv_venv_install_full_apply_chain`'s assertion
 /// pattern: prewarm cache → install → snapshot inode + cache twin
@@ -778,8 +778,8 @@ async fn assert_real_api_pipeline_ran(server: &MockServer) {
 
 /// Bun-managed install + apply, with CoW-isolation assertion. See
 /// `make_bun_script` for the inode/cache-twin/SHA256 gate that proves
-/// `break_hardlink_if_needed` in `patch/cow.rs` correctly isolates
-/// the test venv's copy of the package from `~/.bun/install/cache/`.
+/// the rename-over write in `socket_patch_core::utils::fs::atomic_write_bytes` (see its CoW guarantee doc) correctly isolates the test venv's copy of the package
+/// from `~/.bun/install/cache/`.
 #[tokio::test]
 async fn npm_bun_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_BYTES);

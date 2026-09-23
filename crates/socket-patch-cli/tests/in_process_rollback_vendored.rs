@@ -544,8 +544,9 @@ async fn drift_keep_exits_partial_failure_and_holds_manifest() {
 // 4. detached entries are reverted by the unscoped default
 // ─────────────────────────────────────────────────────────────────────
 
-/// A detached ledger entry (`scan --vendor --detached` — never
-/// manifest-tracked) is IN SCOPE for the unscoped default rollback: the
+/// A detached ledger entry (the ledger-only shape `scan --mode vendored`
+/// writes — never manifest-tracked) is IN SCOPE for the unscoped default
+/// rollback: the
 /// lock is restored byte-for-byte, the artifact is deleted, the emptied
 /// ledger is deleted, and the purl rides `vendoredReverted` (exit 0).
 /// The fixture detaches a REAL vendor run's entry (the
@@ -556,7 +557,7 @@ async fn detached_entries_reverted_by_unscoped_default() {
     let fx = npm_fixture();
     assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "vendor");
 
-    // Mark the entry detached (the shape `scan --vendor --detached` writes)
+    // Mark the entry detached (the shape `scan --mode vendored` writes)
     // and drop the patch from the manifest — detached entries are never
     // manifest-tracked.
     let mut state = fx.state_value();

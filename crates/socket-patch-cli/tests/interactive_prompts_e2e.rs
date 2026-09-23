@@ -489,8 +489,8 @@ fn remove_interactive_non_utf8_answer_declines_without_panic() {
 }
 
 /// Write a vendor ledger with one DETACHED npm entry (no manifest at all —
-/// the pure `scan --vendor --detached` layout), so `remove <purl>` routes to
-/// the detached-only path and its own confirm prompt.
+/// the ledger-only layout every `scan --mode vendored` run writes), so
+/// `remove <purl>` routes to the ledger-only path and its own confirm prompt.
 fn write_detached_vendor_state(root: &Path, purl: &str, uuid: &str) {
     let vendor = root.join(".socket/vendor");
     let artifact_dir = vendor.join("npm").join(uuid);

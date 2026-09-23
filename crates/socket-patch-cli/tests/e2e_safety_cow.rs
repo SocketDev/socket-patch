@@ -4,9 +4,8 @@
 //! install — but that test is `#[ignore]`-gated, network-dependent,
 //! and only exercises a single scenario (symlinked store +
 //! hardlinked files). This file fills the integration-coverage gap
-//! around `crates/socket-patch-core/src/patch/cow.rs` with
-//! hand-rolled hardlink and symlink topologies that run fast and
-//! deterministically:
+//! around the CoW defense — the rename-over write in `socket_patch_core::utils::fs::atomic_write_bytes` (see its CoW guarantee doc) — with hand-rolled hardlink
+//! and symlink topologies that run fast and deterministically:
 //!
 //!   * a hardlink pair (no pnpm) — apply mutates one side, the
 //!     other stays byte-identical. The single most important CoW
@@ -22,8 +21,8 @@
 //! manifest and after-hash blob are staged under `.socket/` so apply
 //! runs fully offline.
 //!
-//! Network: no. Toolchain: no. NOT `#[ignore]`. Unix-only (the
-//! cow.rs hardlink path is `#[cfg(unix)]`); symlink scenarios on
+//! Network: no. Toolchain: no. NOT `#[ignore]`. Unix-only (hardlink
+//! topologies are a Unix fixture concern); symlink scenarios on
 //! Windows are covered by the pnpm e2e on the Windows runner.
 
 #![cfg(unix)]
@@ -124,21 +123,16 @@ fn assert_applied(env: &serde_json::Value, purl: &str, expected_paths: &[&str]) 
 
 /// Assert no patch-time temp files leaked into `pkg_dir`.
 ///
-/// Two distinct stagers write into the package directory:
-///   * the atomic writer (`utils::fs::atomic_write_bytes`) stages `.socket-stage-*`,
-///   * **CoW** (`cow::write_via_stage_rename`, the hardlink and symlink
-///     branches) stages `.socket-cow-*`.
+/// One stager writes into the package directory: the atomic writer
+/// (`utils::fs::atomic_write_bytes`) stages `.socket-stage-*` and
+/// renames it over the target — which is also the CoW defense (the new
+/// inode never touches a shared hardlink or symlink target). The
+/// `.socket-cow-*` prefix belonged to the retired `patch/cow.rs` stager
+/// and is kept in the guard as a regression tripwire.
 ///
-/// Both must be renamed-over on success or unlinked on failure, so a
+/// The stage must be renamed-over on success or unlinked on failure, so a
 /// completed apply — success OR clean failure — must leave neither prefix
 /// behind.
-///
-/// Crucially, this is the assertion that actually polices CoW's stage
-/// cleanup: only the hardlink/symlink/multi-file scenarios drive
-/// `write_via_stage_rename` and thus ever create a `.socket-cow-*` file.
-/// The regular-file scenario takes the `AlreadyPrivate` fast path, which
-/// never stages a CoW copy — so a CoW stage-file leak is invisible there
-/// and only catchable from the link scenarios.
 fn assert_no_patch_litter(pkg_dir: &Path) {
     let names: Vec<String> = std::fs::read_dir(pkg_dir)
         .unwrap_or_else(|e| panic!("read_dir {}: {e}", pkg_dir.display()))

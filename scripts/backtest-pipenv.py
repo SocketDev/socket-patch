@@ -574,6 +574,11 @@ def main():
     def record_hashes(project, mode):
         if mode == "hosted":
             recs = json.loads((project / ".socket/vendor/redirect-state.json").read_text())["records"]
+        elif mode == "vendored":
+            # Vendored mode never writes `.socket/manifest.json`: the ledger
+            # entry embeds the patch record.
+            entries = json.loads((project / ".socket/vendor/state.json").read_text())["entries"]
+            recs = {k: e["record"] for k, e in entries.items() if e.get("record")}
         else:
             recs = json.loads((project / ".socket/manifest.json").read_text())["patches"]
         rec = next(iter(recs.values()))
@@ -1067,8 +1072,9 @@ def main():
             check("rollbackRemovesVendoredWheel", not (project / ".socket/vendor/pypi" / (uuid or "x")).exists())
             state = project / ".socket/vendor/state.json"
             check("rollbackClearsVendorState", not state.exists() or not json.loads(state.read_text()).get("entries"))
-        mf = project / ".socket/manifest.json"
-        check("rollbackClearsManifest", not mf.exists() or json.loads(mf.read_text()).get("patches") in ({}, None))
+        # Hosted and vendored runs are manifest-free (v5.0): nothing may have
+        # been written to `.socket/manifest.json` at any point.
+        check("noManifestWritten", not (project / ".socket/manifest.json").exists())
         info["rollbackEnvelope"] = {k: erb.get(k) for k in ("status", "rolledBack", "failed", "hosted", "vendoredReverted", "manifest") if k in erb}
         # Measured boundaries, recorded rather than required: Pipenv never
         # reinstalls a present release (warmInstallReplacesUpstream — the CLI

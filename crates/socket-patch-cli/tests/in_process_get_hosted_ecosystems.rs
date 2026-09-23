@@ -168,7 +168,7 @@ fn assert_no_manifest_no_blobs(cwd: &Path) {
 }
 
 // ---------------------------------------------------------------------------
-// pypi — requirements.txt (rewrite_pypi_requirements)
+// pypi — requirements.txt (requirements::rewrite)
 // ---------------------------------------------------------------------------
 
 /// A pip project pinning `requests==2.31.0`: the hosted grant must rewrite

@@ -404,8 +404,8 @@ and repair; pick by what you want back:
 
 | Command | What it does |
 |---------|--------------|
-| [`rollback`](#rollback) | Restores the original file bytes but **keeps the manifest entry** — the next `apply` re-applies the patch |
-| [`remove`](#remove) | Everything `rollback` does, **plus** it deletes the manifest entry and reverts any vendoring — **permanent**, the patch is fully gone in one command |
+| [`rollback`](#rollback) | **Fully unpatches, in every mode**: restores the original file bytes, unwinds vendored and hosted lockfile wiring, removes the rolled-back entries from the manifest (a zero-patch `{"patches": {}}` husk stays) and garbage-collects their blobs — everything, or just the given targets; `--preserve-state` keeps the local patch state for a later re-apply |
+| [`remove`](#remove) | The single-patch dual of `rollback`: everything `rollback <id>` does for one PURL/UUID (restore, unwind its vendoring or hosted redirect, drop the entry, GC), plus `--skip-rollback` to drop only the record — **permanent**, the patch is fully gone in one command |
 | [`vendor --revert`](#vendor) | **Un-vendors wholesale**: restores the recorded original lockfile fragments byte-for-byte and removes the `.socket/vendor/` artifacts — works without a manifest |
 | [`scan --prune`](#scan) | **Reconciles, doesn't reverse**: drops manifest entries for packages that have left the project and garbage-collects orphan blob/diff/archive files — installed patches stay |
 | [`repair`](#repair) (alias `gc`) | **Restores health, not originals**: re-downloads missing blobs, rebuilds missing/corrupt vendored artifacts, and cleans up unused ones |
@@ -468,7 +468,7 @@ settings, described in [Configuration sources](#configuration-sources) below.
 | `-s, --silent` | `SOCKET_SILENT` | Suppress non-error output. |
 | `--dry-run` | `SOCKET_DRY_RUN` | Preview the operation without making any mutations. |
 | `-y, --yes` | `SOCKET_YES` | Skip interactive confirmation prompts. |
-| `--lock-timeout <secs>` | `SOCKET_LOCK_TIMEOUT` | Seconds to wait for `.socket/apply.lock` before giving up. `0`/unset = a single non-blocking try; a positive value retries with backoff. Only meaningful for the commands that take the lock — `apply`, `rollback`, `repair`, `remove`, `vendor`, and `scan`/`get` in vendored or hosted mode. The lock file exists only while a command runs. |
+| `--lock-timeout <secs>` | `SOCKET_LOCK_TIMEOUT` | Seconds to wait for `.socket/apply.lock` before giving up. `0`/unset = a single non-blocking try; a positive value retries with backoff. Only meaningful for the commands that take the lock — `apply`, `rollback`, `repair`, `remove`, `vendor`, `setup` (while persisting `--exclude`), and `scan`/`get` whenever they write (agent-mode download + apply, vendored, hosted). The lock file exists only while a command runs. |
 | `--debug` | `SOCKET_DEBUG` | Emit verbose debug logs to stderr. |
 | `--no-telemetry` | `SOCKET_TELEMETRY_DISABLED` | Disable anonymous usage telemetry. |
 
@@ -873,25 +873,33 @@ socket-patch setup --json -y
 
 ### `rollback`
 
-Roll back patches to restore the original files. If no identifier is given, all patches
-are rolled back. The manifest entries are kept, so a later `apply` re-applies the patches
-— use [`remove`](#remove) to delete a patch permanently.
+Roll back patches to restore the system to unpatched. If no target is given, everything
+is rolled back, across all three modes: in-place file restores (agent), vendored unwire +
+artifact deletion + ledger-entry drop, and hosted lockfile-redirect unwind + record drop.
+The rolled-back entries are then removed from `.socket/manifest.json` (a zero-patch
+`{"patches": {}}` husk stays) and their blobs are garbage-collected — a later `apply` has
+nothing to re-apply. Pass `--preserve-state` to keep the local patch state (manifest
+entries, vendored artifacts + ledger entries) for a later re-apply; use
+[`remove`](#remove) for a single patch.
 
-Packages managed by [`vendor`](#vendor) are excluded — their patch lives in the committed
-artifact, not the installed tree — and are listed in the JSON output's `vendored` array
-(use `remove` or `vendor --revert` to undo them).
+A wet run confirms once (auto-accepted under `--yes`/`--json`/non-TTY). Vendor-owned purls
+the run did NOT act on (today: a corrupt vendor ledger) are listed in the JSON output's
+`vendored` array; acted-on entries ride `vendoredReverted` / `vendoredPreserved` /
+`vendoredKept`.
 
 **Usage:**
 ```bash
-socket-patch rollback [identifier] [options]
+socket-patch rollback [targets]... [options]
 ```
 
 **Arguments:**
-- `identifier` — package PURL or patch UUID to roll back. Omit to roll back all patches.
+- `targets` — zero or more package PURLs, patch UUIDs or path globs (unioned). Omit to roll
+  back everything.
 
 **Command-specific options** (plus all [Global options](#global-options)):
 | Flag | Env var | Description |
 |------|---------|-------------|
+| `--preserve-state` | `SOCKET_PRESERVE_STATE` | Unpatch the system but keep the local patch state — manifest entries, vendored artifacts + ledger entries — for a later re-apply, and skip GC. Hosted redirects have no preservable state and are unwound either way. |
 | `--one-off` | `SOCKET_ONE_OFF` | Reserved: rollback by fetching original (`beforeHash`) files from the API, no manifest required. **Not yet implemented** — the command currently errors up front. |
 
 **Examples:**
