@@ -560,8 +560,9 @@ async fn wet_takeover_refuses_unrevertable_vendored_flavor_fail_closed() {
     );
     assert!(
         stderr.contains(&format!(
-            "  Skipped {PURL}: its vendored state could not be reverted (see the warning)"
-        )) && stderr.contains("No patches could be redirected:"),
+            "No patches could be redirected:\n  {PURL}: its vendored state could not be \
+             reverted (see the warning)"
+        )),
         "the human skipped line must name purl + reason; stderr=\n{stderr}"
     );
     assert!(
@@ -706,7 +707,8 @@ async fn takeover_refuses_symlinked_wiring_file_before_reverting() {
 /// granted reference refuses a held lock with `lock_held` (the hosted
 /// envelope's top-level `errorCode`, the shared contention message, exit 1)
 /// BEFORE the ledger load or any file write; the human arm prints the
-/// `Error (lock_held):` line plus the `--lock-timeout` hint. A `--dry-run`,
+/// shared `Error: Another socket-patch process …` line plus the
+/// `--lock-timeout` hint. A `--dry-run`,
 /// and a wet run whose references are all skipped, never contend: nothing
 /// they do touches `.socket/`, so they succeed under the held lock. Once the
 /// holder releases, `.socket/` is gone — the hosted runs created nothing.
@@ -750,7 +752,7 @@ async fn hosted_lock_held_refuses_before_any_write() {
     let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
     assert_eq!(code, 1, "stderr=\n{stderr}");
     assert!(
-        stderr.contains(&format!("Error (lock_held): {HELD}")),
+        stderr.contains("Error: Another socket-patch process is operating in this directory\n"),
         "stderr=\n{stderr}"
     );
     assert!(
@@ -886,8 +888,8 @@ async fn zero_grant_wet_run_reports_a_malformed_ledger_without_moving_it() {
 /// fault, not contention — top-level `errorCode: "lock_io"`, a string
 /// `error` naming the squatting path, `redirect: {mode: "hosted"}` retained,
 /// exit 1, refused BEFORE the ledger is read or written. The human arm prints
-/// `Error (lock_io): …` WITHOUT the `--lock-timeout` hint (that is a
-/// live-holder remedy). The squatting file is never removed or truncated.
+/// the shared `Error: Failed to open lock file at …` line WITHOUT the
+/// `--lock-timeout` hint (that is a live-holder remedy). The squatting file is never removed or truncated.
 /// (A `--dry-run` never locks, but it still reads the ledger strictly and
 /// reports the squatted `.socket/` as an unreadable ledger location — a
 /// different, pre-existing refusal, not pinned here.)
@@ -921,7 +923,7 @@ async fn hosted_lock_io_when_a_file_squats_on_socket_dir() {
     let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &[], &[]);
     assert_eq!(code, 1, "stderr=\n{stderr}");
     assert!(
-        stderr.contains("Error (lock_io): failed to open lock file at"),
+        stderr.contains("Error: Failed to open lock file at"),
         "stderr=\n{stderr}"
     );
     assert!(
@@ -2314,8 +2316,8 @@ async fn human_unconfirmed_purl_is_listed_with_a_headline() {
     );
     assert!(
         stderr.contains(&format!(
-            "No patches could be redirected:\n  Not redirected {PURL}: no lockfile entry \
-             pinning it could be redirected"
+            "No patches could be redirected:\n  {PURL}: no lockfile entry pinning it could \
+             be redirected"
         )),
         "stderr=\n{stderr}"
     );

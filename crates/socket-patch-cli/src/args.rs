@@ -167,8 +167,8 @@ pub struct GlobalArgs {
     /// (default) downloads the prebuilt archive from the patch.socket.dev
     /// vendoring service and silently falls back to a local build on any miss;
     /// `service` requires the service and fails closed; `build` always builds
-    /// locally (the pre-service behavior). Only `vendor` and the vendored
-    /// modes of `scan`/`get` use this; other subcommands accept it silently.
+    /// locally. Only `vendor` and the vendored modes of `scan`/`get` use
+    /// this; other subcommands accept it silently.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "vendor-source",
@@ -178,8 +178,7 @@ pub struct GlobalArgs {
     )]
     pub vendor_source: String,
 
-    /// Base URL for the patch vendoring service's package-reference request
-    /// (the step-1 POST). Defaults to the active API base (`--api-url`) when
+    /// Base URL for the patch vendoring service. Defaults to the active API base (`--api-url`) when
     /// authenticated or the proxy base (`--proxy-url`) otherwise. Override to
     /// point `vendor` at staging / local dev independently of `--api-url`.
     // A dev/testing knob: listed in `--help`, left out of the `-h` summary.
@@ -187,7 +186,7 @@ pub struct GlobalArgs {
     pub vendor_url: Option<String>,
 
     /// Override the host of the prebuilt-archive download URL the vendoring
-    /// service returns (the step-2 GET). When set, the CLI rewrites the
+    /// service returns. When set, the CLI rewrites the
     /// scheme + host (+ port) of the returned URL to this base, preserving the
     /// path. Mainly for local-dev / testing, where the host the server bakes
     /// into the URL is not the one to actually fetch from.
@@ -299,10 +298,10 @@ pub struct GlobalArgs {
     /// By default (or with `0`) the lock is tried once, failing immediately
     /// if another process holds it. A positive value retries with a 100 ms
     /// backoff until the lock frees or the budget elapses. Only meaningful
-    /// for the lock-contending subcommands (`apply`, `rollback`, `repair`,
-    /// `remove`, `vendor`, `setup --exclude`'s manifest write, and the
-    /// hosted and vendored modes of `scan`/`get`); other commands accept it
-    /// silently. Every holder removes the lock file on exit, so a leftover
+    /// for the commands that take the lock (`apply`, `rollback`, `repair`,
+    /// `remove`, `vendor`, `get` and `scan` when they record, apply,
+    /// vendor or redirect patches, and `setup --exclude`'s manifest write);
+    /// other commands accept it silently. Every holder removes the lock file on exit, so a leftover
     /// from a crashed run never contends.
     #[arg(help_heading = GLOBAL_OPTIONS, long = "lock-timeout", env = "SOCKET_LOCK_TIMEOUT")]
     pub lock_timeout: Option<u64>,

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use socket_patch_core::api::types::BatchPackagePatches;
-use socket_patch_core::patch::apply_lock::{acquire, LockError, LockGuard};
+use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::redirect::DepOverride;
 
 use crate::commands::vex::generate_vex_from_manifest_path;
@@ -501,16 +501,16 @@ fn acquire_hosted_lock(
 ) -> Result<LockGuard, i32> {
     let socket_dir = common.socket_dir();
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    match acquire(&socket_dir, timeout) {
+    match crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout) {
         Ok(guard) => Ok(guard),
         Err(err) => {
             let (code, message) = crate::commands::lock_cli::lock_failure(&err, timeout);
             // Errors print even under --silent ("errors only", never
             // "nothing"): exit 1 with no message would be undiagnosable.
-            eprintln!("Error ({code}): {message}");
-            if matches!(err, LockError::Held) {
-                eprintln!("  {}", crate::commands::lock_cli::HELD_RETRY_HINT);
-            }
+            eprint!(
+                "{}",
+                crate::commands::lock_cli::format_lock_error(&socket_dir, &err, timeout)
+            );
             if common.json {
                 emit_json_error_with_code(scan_result.take(), Some(code), &message);
             }
@@ -2793,20 +2793,26 @@ fn format_unredirected(
         1 => " (see the warning below)",
         _ => " (see the warnings below)",
     };
-    let indent = if nothing_redirected { "  " } else { "" };
+    // Under the headline every line is a package that was not redirected,
+    // so it needs no "Skipped"/"Not redirected" lead of its own.
+    let (skip_lead, unpinned_lead) = if nothing_redirected {
+        ("  ", "  ")
+    } else {
+        ("Skipped ", "Not redirected ")
+    };
     let mut lines = Vec::new();
     if nothing_redirected {
         lines.push("No patches could be redirected:".to_string());
     }
     for (purl, reason) in skipped {
         lines.push(format!(
-            "{indent}Skipped {purl}: {}",
+            "{skip_lead}{purl}: {}",
             describe_skip_reason(reason)
         ));
     }
     for purl in unconfirmed {
         lines.push(format!(
-            "{indent}Not redirected {purl}: no lockfile entry pinning it could be redirected{see}"
+            "{unpinned_lead}{purl}: no lockfile entry pinning it could be redirected{see}"
         ));
     }
     lines
@@ -4194,8 +4200,16 @@ mod tests {
             format_unredirected(&[], &unconfirmed, true, 0),
             vec![
                 "No patches could be redirected:".to_string(),
-                "  Not redirected pkg:npm/minimist@1.2.5: no lockfile entry pinning it could \
-                 be redirected"
+                "  pkg:npm/minimist@1.2.5: no lockfile entry pinning it could be redirected"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            format_unredirected(&skipped, &[], true, 0),
+            vec![
+                "No patches could be redirected:".to_string(),
+                "  pkg:npm/lodash@4.17.20: not entitled to this patch (paid plan or no org \
+                 access)"
                     .to_string(),
             ]
         );

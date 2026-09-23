@@ -414,6 +414,11 @@ fn human_verbose_hash_mismatch_details() {
         stdout.contains("Failed to roll back:") && stdout.contains(purl),
         "the wet failure section must name the package; stdout=\n{stdout}"
     );
+    // Exit 1: the error stream says so too, not only the stdout report.
+    assert!(
+        stderr.ends_with("Error: Some patches could not be rolled back.\n"),
+        "stderr=\n{stderr}"
+    );
     assert!(
         stdout.contains("Detailed verification:"),
         "--verbose must print the details header; stdout=\n{stdout}"

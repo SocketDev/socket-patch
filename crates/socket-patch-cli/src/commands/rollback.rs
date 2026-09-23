@@ -243,6 +243,17 @@ pub(crate) fn format_rollback_failure(purl: &str, why: &str) -> String {
     format!("Error: Failed to roll back {purl}: {why}")
 }
 
+/// The closing stderr error of a human run whose stdout report lists
+/// failed packages (under `--silent` the per-package
+/// [`format_rollback_failure`] lines print instead).
+fn format_rollback_failed(dry_run: bool) -> &'static str {
+    if dry_run {
+        "Error: Some patches cannot be rolled back."
+    } else {
+        "Error: Some patches could not be rolled back."
+    }
+}
+
 /// Per-package counts, keyed by `package_key` so two physical copies of
 /// one purl count once (apply's summary counts the same way). A package
 /// with any failed copy counts as failed; otherwise it is "already
@@ -1972,6 +1983,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 for line in lines {
                     println!("{line}");
                 }
+                // The report above is on stdout; the run exits 1, so the
+                // error stream says so too.
+                if results.iter().any(|r| !r.success) {
+                    eprintln!("{}", format_rollback_failed(args.common.dry_run));
+                }
 
                 if args.common.verbose {
                     println!("\nDetailed verification:");
@@ -2697,7 +2713,8 @@ pub(crate) async fn rollback_patches_inner(
             // Under --silent (the summary muted) this line is the run's
             // only failure diagnostic ("errors only", never "nothing").
             // Otherwise the failure is reported once, in the summary's
-            // "Failed to roll back:" section (or by `remove`).
+            // "Failed to roll back:" section plus a closing stderr error
+            // (or by `remove`).
             if common.silent && !common.json {
                 eprintln!(
                     "{}",
@@ -4687,6 +4704,18 @@ mod tests {
         assert_eq!(
             format_rollback_failure("pkg:npm/a@1", "boom"),
             "Error: Failed to roll back pkg:npm/a@1: boom"
+        );
+    }
+
+    #[test]
+    fn rollback_failed_closing_line() {
+        assert_eq!(
+            format_rollback_failed(false),
+            "Error: Some patches could not be rolled back."
+        );
+        assert_eq!(
+            format_rollback_failed(true),
+            "Error: Some patches cannot be rolled back."
         );
     }
 

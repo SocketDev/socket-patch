@@ -204,6 +204,21 @@ fn quoted_list(items: &[String], one: &str, many: &str) -> String {
 
 /// Warning printed when `--prune` cannot run because nothing was crawled
 /// (pruning every manifest entry is too destructive to do implicitly).
+/// The warning for one failed API batch of several (the scan goes on
+/// with the others). A one-batch scan prints only [`all_batches_failed`].
+pub(super) fn batch_failed_warning(batch: usize, total: usize, err: &str) -> String {
+    format!("Warning: API batch {batch} of {total} failed: {err}")
+}
+
+/// The error when every API batch failed.
+pub(super) fn all_batches_failed(total: usize, err: &str) -> String {
+    if total == 1 {
+        format!("Error: The API query failed: {err}")
+    } else {
+        format!("Error: All {total} API batch queries failed (last error: {err})")
+    }
+}
+
 pub(super) const PRUNE_SKIPPED_EMPTY: &str = "Warning: --prune skipped: no installed packages \
      were found, and pruning every manifest entry is too destructive to do implicitly; run \
      `socket-patch repair` to clean up .socket/ explicitly.";
@@ -454,6 +469,22 @@ pub(super) fn patch_block(b: &PatchBlock) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_failure_lines() {
+        assert_eq!(
+            batch_failed_warning(2, 3, "Network error: refused"),
+            "Warning: API batch 2 of 3 failed: Network error: refused"
+        );
+        assert_eq!(
+            all_batches_failed(1, "Network error: refused"),
+            "Error: The API query failed: Network error: refused"
+        );
+        assert_eq!(
+            all_batches_failed(3, "Network error: refused"),
+            "Error: All 3 API batch queries failed (last error: Network error: refused)"
+        );
+    }
 
     fn vuln(cves: &[&str], summary: &str, severity: &str) -> VulnerabilityResponse {
         VulnerabilityResponse {

@@ -335,6 +335,29 @@ pub struct ApplyArgs {
     /// whole command exit non-zero even when patches applied cleanly.
     #[command(flatten)]
     pub vex: VexEmbedArgs,
+
+    /// Set when `get` / `scan --apply/--sync` runs this apply as its last
+    /// step (`None` for the `apply` command itself). Not a CLI flag.
+    #[arg(skip)]
+    pub nested: Option<NestedApply>,
+}
+
+/// What a nested apply knows about the command that runs it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NestedApply {
+    /// The caller runs under `--json`. The nested run itself is never JSON
+    /// (one envelope per command), but the caller's stdout is, so the
+    /// nested run's human error lines stay off stderr too.
+    pub caller_json: bool,
+}
+
+impl ApplyArgs {
+    /// Whether human-readable error lines go to stderr: never under
+    /// `--json` (the envelope is the channel), always otherwise — errors
+    /// are exempt from `--silent`.
+    fn prints_errors(&self) -> bool {
+        !self.common.json && !self.nested.is_some_and(|n| n.caller_json)
+    }
 }
 
 // ── local-go redirect helpers ────────────────────────────────────────────────
@@ -947,7 +970,16 @@ pub(crate) async fn run_locked(
             if !args.common.json && !args.common.silent {
                 let cwd = std::fs::canonicalize(&args.common.cwd)
                     .unwrap_or_else(|_| args.common.cwd.clone());
-                for line in format_results_block(&results, args.common.dry_run, &cwd) {
+                let block = format_results_block(&results, args.common.dry_run, &cwd);
+                let mut block = block.iter().peekable();
+                // A nested apply's caller already ended its stdout with a
+                // blank line (its listing or table), so the block's leading
+                // separator goes to stderr: one blank line on a pipe, the
+                // same spacing on a terminal.
+                if args.nested.is_some() && block.next_if(|l| l.is_empty()).is_some() {
+                    eprintln!();
+                }
+                for line in block {
                     println!("{line}");
                 }
                 if args.common.verbose && !results.is_empty() {
@@ -1687,7 +1719,7 @@ async fn apply_patches_inner(
         // hooked `apply --silent` used to exit 1 mutely here); `--json`
         // mutes stderr and the envelope's `package_not_installed` events
         // are the channel.
-        if !unmatched.is_empty() && !args.common.json {
+        if !unmatched.is_empty() && args.prints_errors() {
             for line in format_none_installed_error(&unmatched) {
                 eprintln!("{line}");
             }
@@ -1736,7 +1768,12 @@ async fn apply_patches_inner(
 
     let mut applied_base_purls: HashSet<String> = HashSet::new();
 
-    for (purl, pkg_paths) in &all_packages {
+    // PURL order, so the per-package Error/Warning lines, the results and
+    // the `Patched packages:` block read the same on every run (the map is
+    // a `HashMap`).
+    let mut ordered_packages: Vec<_> = all_packages.iter().collect();
+    ordered_packages.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    for (purl, pkg_paths) in ordered_packages {
         // The paths carry every resolved physical copy. Release-variant
         // ecosystems install one directory per `package@version` (the
         // variants are jars/wheels inside it) — EXCEPT gem, where bundler's
@@ -1925,7 +1962,7 @@ async fn apply_patches_inner(
                         // command still reported `success` / exit 0.
                         has_errors = true;
                         // Errors print even under --silent.
-                        if !args.common.json {
+                        if args.prints_errors() {
                             eprintln!(
                                 "{}",
                                 format_patch_failure(
@@ -1966,7 +2003,7 @@ async fn apply_patches_inner(
                     // variant fails loudly instead of silently staying
                     // vulnerable behind a sibling copy's success.
                     has_errors = true;
-                    if !attempted && !args.common.json {
+                    if !attempted && args.prints_errors() {
                         // No variant matched the installed distribution at all —
                         // the package on disk isn't any known release variant.
                         // (Attempted-but-failed variants already printed their own
@@ -2032,7 +2069,7 @@ async fn apply_patches_inner(
                 if !result.success {
                     has_errors = true;
                     // Errors print even under --silent.
-                    if !args.common.json {
+                    if args.prints_errors() {
                         eprintln!(
                             "{}",
                             format_patch_failure(
@@ -2063,7 +2100,7 @@ async fn apply_patches_inner(
         // Nothing matched: this fails the run, so it is an error — and
         // errors print even under --silent.
         has_errors = true;
-        if !args.common.json {
+        if args.prints_errors() {
             for line in format_none_installed_error(&unmatched) {
                 eprintln!("{line}");
             }

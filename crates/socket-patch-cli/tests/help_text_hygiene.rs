@@ -20,6 +20,9 @@ const DEV_TOKENS: &[&str] = &[
     "CLI_CONTRACT",
     "Internal parse target",
     "#[command",
+    "step-1",
+    "step-2",
+    "pre-service",
 ];
 
 fn leaks(text: &str) -> Vec<String> {
@@ -177,5 +180,32 @@ fn vendor_and_repair_summaries_read_as_one_line() {
              `scan --sync --json --yes`.\n"
         ),
         "{repair}"
+    );
+}
+
+/// `socket-patch --update --version` names the public binary, not the
+/// hidden `self-update` parse target.
+#[test]
+fn self_update_version_line_names_the_binary() {
+    let mut cmd = Cli::command();
+    cmd.build();
+    let sub = cmd
+        .find_subcommand_mut("self-update")
+        .expect("self-update subcommand");
+    assert_eq!(
+        sub.render_version(),
+        format!("socket-patch {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+/// `--lock-timeout`'s help names every command that takes the lock,
+/// agent-mode `get`/`scan` included.
+#[test]
+fn lock_timeout_help_names_get_and_scan() {
+    let text = long_help(&["list"]);
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("`get` and `scan` when they record, apply, vendor or redirect patches"),
+        "{flat}"
     );
 }

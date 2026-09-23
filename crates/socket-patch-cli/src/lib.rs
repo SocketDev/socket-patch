@@ -98,10 +98,12 @@ pub enum Commands {
     // stability guarantee (documented as internal in CLI_CONTRACT.md).
     // Plain `//` comments plus an explicit `about`/`override_usage`: a doc
     // comment here is what `socket-patch --update --help` printed, and the
-    // derived usage line named the hidden subcommand.
+    // derived usage line named the hidden subcommand, and so did the
+    // `--update --version` line until `display_name` pinned it.
     #[command(
         hide = true,
         name = "self-update",
+        display_name = "socket-patch",
         about = "Update socket-patch itself to the latest (or a pinned) release",
         override_usage = "socket-patch --update [VERSION] [OPTIONS]"
     )]

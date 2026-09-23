@@ -332,7 +332,7 @@ fn repair_dry_run_preview_truncates_missing_list_after_ten() {
         "the online header must carry the full missing count; stdout=\n{stdout}"
     );
     assert!(
-        stdout.contains("Dry run - would download:"),
+        stdout.contains("Would download:"),
         "the dry-run preview header must print; stdout=\n{stdout}"
     );
     let items = item_lines(&stdout);

@@ -444,7 +444,7 @@ fn get_interactive_dialoguer_enter_accepts_first_ranked_option() {
         "both candidate rows must have rendered in the menu; got: {output}"
     );
     assert!(
-        !output.contains("Non-interactive mode: auto-selecting"),
+        !output.contains("selecting the first option"),
         "get must NOT have taken the non-TTY auto-select branch in a PTY; got: {output}"
     );
     // Enter accepted the first-ranked option and get proceeded to save it.
@@ -575,7 +575,7 @@ fn get_interactive_dialoguer_quit_cancels_with_exit_zero() {
         "the dialoguer select prompt must have rendered; got: {output}"
     );
     assert!(
-        !output.contains("Non-interactive mode: auto-selecting"),
+        !output.contains("selecting the first option"),
         "get must NOT have taken the non-TTY auto-select branch in a PTY; got: {output}"
     );
     assert!(

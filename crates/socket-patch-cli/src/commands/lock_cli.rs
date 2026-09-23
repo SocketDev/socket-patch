@@ -47,40 +47,62 @@ pub(crate) fn acquire_or_emit(
     dry_run: bool,
     timeout: Duration,
 ) -> Result<LockGuard, i32> {
-    let lock_path = socket_dir.join("apply.lock");
-    let result = match acquire(socket_dir, Duration::ZERO) {
-        // Contended with a wait budget: say what we are waiting on, or a
-        // `--lock-timeout 30` run just sits there silently for 30 s. The
-        // status line is terminal-only and quiet under --json/--silent.
-        Err(LockError::Held) if timeout > Duration::ZERO => {
-            let mut status = crate::ui::StatusLine::stderr(crate::ui::quiet(), false);
-            status.set(waiting_message(&lock_path, timeout));
-            let result = acquire(socket_dir, timeout);
-            status.finish();
-            result
-        }
-        other => other,
-    };
-    match result {
+    match acquire_with_status(socket_dir, timeout) {
         Ok(guard) => Ok(guard),
         Err(err) => {
-            let hint = match &err {
-                LockError::Held => held_hint(&lock_path, timeout),
-                LockError::Io { path, source }
-                    if source.kind() == std::io::ErrorKind::PermissionDenied =>
-                {
-                    format!(
-                        "Check that {} is writable.",
-                        path.parent().unwrap_or(path).display()
-                    )
-                }
-                LockError::Io { .. } => String::new(),
-            };
+            let hint = failure_hint(&err, &socket_dir.join("apply.lock"), timeout);
             let (code, message) = lock_failure(&err, timeout);
             emit(command, json, dry_run, code, &message, &hint);
             Err(1)
         }
     }
+}
+
+/// [`acquire`] with the contended-wait status line: a `--lock-timeout 30`
+/// run that finds the lock held says what it is waiting on instead of
+/// sitting there silently for 30 s. The status line is terminal-only and
+/// quiet under --json/--silent (the process-wide quiet switch). Every
+/// lock site goes through this (or [`acquire_or_emit`], which wraps it).
+pub(crate) fn acquire_with_status(
+    socket_dir: &Path,
+    timeout: Duration,
+) -> Result<LockGuard, LockError> {
+    match acquire(socket_dir, Duration::ZERO) {
+        Err(LockError::Held) if timeout > Duration::ZERO => {
+            let mut status = crate::ui::StatusLine::stderr(crate::ui::quiet(), false);
+            status.set(waiting_message(&socket_dir.join("apply.lock"), timeout));
+            let result = acquire(socket_dir, timeout);
+            status.finish();
+            result
+        }
+        other => other,
+    }
+}
+
+/// The remediation line under a human lock error (empty when there is no
+/// useful advice).
+fn failure_hint(err: &LockError, lock_path: &Path, timeout: Duration) -> String {
+    match err {
+        LockError::Held => held_hint(lock_path, timeout),
+        LockError::Io { path, source } if source.kind() == std::io::ErrorKind::PermissionDenied => {
+            format!(
+                "Check that {} is writable.",
+                path.parent().unwrap_or(path).display()
+            )
+        }
+        LockError::Io { .. } => String::new(),
+    }
+}
+
+/// The human (stderr) report of a lock failure, for the sites that build
+/// their own JSON envelope: the same `Error: <Message>` line plus hint
+/// that [`acquire_or_emit`] prints.
+pub(crate) fn format_lock_error(socket_dir: &Path, err: &LockError, timeout: Duration) -> String {
+    let (_, message) = lock_failure(err, timeout);
+    format_human_error(
+        &message,
+        &failure_hint(err, &socket_dir.join("apply.lock"), timeout),
+    )
 }
 
 /// The status line shown while waiting out a contended lock.
@@ -423,6 +445,43 @@ mod tests {
                 std::path::Path::new(".socket/apply.lock").display()
             )
         );
+    }
+
+    /// The report the sites with their own envelope print (get, hosted
+    /// scan): the same capitalized line and wait hint as acquire_or_emit.
+    #[test]
+    fn format_lock_error_matches_acquire_or_emit() {
+        let dir = std::path::Path::new(".socket");
+        let lock = dir.join("apply.lock");
+        assert_eq!(
+            format_lock_error(dir, &LockError::Held, Duration::from_secs(2)),
+            format!(
+                "Error: Another socket-patch process is operating in this directory \
+                 (waited 2s)\n  Wait for it to finish, or retry with a longer \
+                 --lock-timeout. (Lock file: {})\n",
+                lock.display()
+            )
+        );
+        assert_eq!(
+            format_lock_error(dir, &LockError::Held, Duration::ZERO),
+            format!(
+                "Error: Another socket-patch process is operating in this directory\n  \
+                 Wait for it to finish, or pass --lock-timeout <secs> to wait for it \
+                 automatically. (Lock file: {})\n",
+                lock.display()
+            )
+        );
+    }
+
+    #[test]
+    fn acquire_with_status_takes_a_free_lock_and_reports_a_held_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = acquire_with_status(dir.path(), Duration::ZERO).unwrap();
+        assert!(matches!(
+            acquire_with_status(dir.path(), Duration::from_millis(200)),
+            Err(LockError::Held)
+        ));
+        drop(guard);
     }
 
     #[test]

@@ -14,7 +14,7 @@ pub(crate) const NON_INTERACTIVE_DECLINE: &str =
     "Non-interactive mode detected, declining by default.";
 /// Same, for [`select_one`], which takes the first option.
 pub(crate) const NON_INTERACTIVE_SELECT_FIRST: &str =
-    "Non-interactive mode: auto-selecting first option.";
+    "Non-interactive mode detected, selecting the first option.";
 
 /// Ask a yes/no question on stderr. Returns the answer.
 ///
@@ -199,16 +199,33 @@ pub fn select_one(
         }
         return Ok(0);
     }
+    let (prompt, options) = fit_menu(prompt, options, super::stderr_width());
     let _guard = CursorGuard::install();
     let picked = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
         .with_prompt(prompt)
-        .items(options)
+        .items(&options)
         .default(0)
         .interact_opt();
     match picked {
         Ok(Some(idx)) => Ok(idx),
         _ => Err(SelectError::Cancelled),
     }
+}
+
+/// Fit a [`select_one`] menu to a `width`-column terminal. dialoguer
+/// erases its menu by counting logical lines, so a prompt or option that
+/// wraps leaves rows of the old menu on screen. The prompt renders as
+/// `? <prompt> › ` (5 extra columns, one spare so the cursor never sits
+/// in the last column); each option renders as `❯ <option>` (2 extra, one
+/// spare).
+fn fit_menu(prompt: &str, options: &[String], width: usize) -> (String, Vec<String>) {
+    const MIN: usize = 10;
+    let prompt = super::truncate(prompt, width.saturating_sub(6).max(MIN));
+    let options = options
+        .iter()
+        .map(|o| super::truncate(o, width.saturating_sub(3).max(MIN)))
+        .collect();
+    (prompt, options)
 }
 
 /// dialoguer hides the cursor while its menu is up. Its own error paths
@@ -307,6 +324,46 @@ impl Drop for CursorGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_interactive_notes_share_one_wording() {
+        assert_eq!(
+            NON_INTERACTIVE_PROCEED,
+            "Non-interactive mode detected, proceeding automatically."
+        );
+        assert_eq!(
+            NON_INTERACTIVE_DECLINE,
+            "Non-interactive mode detected, declining by default."
+        );
+        assert_eq!(
+            NON_INTERACTIVE_SELECT_FIRST,
+            "Non-interactive mode detected, selecting the first option."
+        );
+    }
+
+    #[test]
+    fn fit_menu_keeps_every_row_on_one_terminal_line() {
+        let prompt = "Multiple patches available for pkg:npm/ws@7.4.5. Select one:";
+        let options = vec![
+            "77b662dd-cdb4-43d5-8e37-18dd0c605ab8 [FREE] (fixes: CVE-2026-48779)".to_string(),
+            "short".to_string(),
+        ];
+        let (p, o) = fit_menu(prompt, &options, 40);
+        assert_eq!(p, "Multiple patches available for...");
+        assert_eq!(
+            o,
+            vec![
+                "77b662dd-cdb4-43d5-8e37-18dd0c605a...".to_string(),
+                "short".to_string()
+            ]
+        );
+        assert!(p.chars().count() + 5 < 40);
+        assert!(o.iter().all(|o| o.chars().count() + 2 < 40));
+        // Wide enough: untouched.
+        let (p, o) = fit_menu(prompt, &options, 120);
+        assert_eq!(p, prompt);
+        assert_eq!(o, options);
+    }
 
     /// A person at a terminal answering `Apply 1 patch?`.
     fn at_tty(default_yes: bool) -> Ask {

@@ -298,6 +298,10 @@ pub struct RemoveArgs {
     pub preserve_state: bool,
 }
 
+/// The last line of a human `remove --dry-run` (the wording `repair
+/// --dry-run` ends with too).
+const DRY_RUN_FOOTER: &str = "Dry run: no changes made.";
+
 pub async fn run(args: RemoveArgs) -> i32 {
     apply_env_toggles(&args.common);
 
@@ -881,9 +885,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         for purl in &removed {
             println!("  - {purl}");
         }
-        if args.common.dry_run {
-            println!("\nDry run — nothing was changed.");
-        } else if !args.preserve_state {
+        if !args.common.dry_run && !args.preserve_state {
             println!("\nManifest updated at {}", manifest_path.display());
         }
     }
@@ -976,6 +978,12 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 archives_removed += r.blobs_removed;
             }
         }
+    }
+
+    // The dry-run footer closes the whole preview, the blob-cleanup
+    // preview above included.
+    if loud && args.common.dry_run {
+        println!("\n{DRY_RUN_FOOTER}");
     }
 
     if args.common.json {
@@ -1593,6 +1601,11 @@ mod tests {
     use super::*;
     use socket_patch_core::manifest::schema::PatchRecord;
     use std::collections::HashMap;
+
+    #[test]
+    fn dry_run_footer_matches_repair() {
+        assert_eq!(DRY_RUN_FOOTER, "Dry run: no changes made.");
+    }
 
     fn make_record(uuid: &str) -> PatchRecord {
         PatchRecord {

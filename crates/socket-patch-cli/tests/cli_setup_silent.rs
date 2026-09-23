@@ -102,9 +102,11 @@ fn setup_silent_configures_but_prints_nothing() {
     write_root(tmp2.path());
     let (loud_code, loud_stdout, loud_stderr) = run_setup(tmp2.path(), &["--yes"]);
     assert_eq!(loud_code, 0);
+    // (Its progress is a transient status line, so a piped stderr stays
+    // empty even without --silent; the stdout summary is the control.)
     assert!(
-        loud_stderr.contains("Configuring socket-patch install hooks"),
-        "non-silent setup must print the (stderr) header; got {loud_stderr:?}"
+        !loud_stderr.contains("Configuring socket-patch install hooks"),
+        "the progress line is transient; got {loud_stderr:?}"
     );
     assert!(
         loud_stdout.contains("1 item updated"),

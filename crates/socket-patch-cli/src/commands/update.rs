@@ -194,6 +194,9 @@ fn note_warning(warnings: &mut Vec<RunWarning>, quiet: bool, code: &str, detail:
     });
 }
 
+/// The status line while `--update` asks which release is the latest.
+const CHECKING_LATEST: &str = "Checking for the latest socket-patch release...";
+
 pub async fn run(args: UpdateArgs) -> i32 {
     apply_env_toggles(&args.common);
     let quiet = args.common.json || args.common.silent;
@@ -258,10 +261,19 @@ pub async fn run(args: UpdateArgs) -> i32 {
             // path deserves a real error over a panic.
             Err(e) => return fail(&args, "check_failed", &format!("invalid version pin: {e}")),
         },
-        None => match fetch_latest_version(&endpoints, &timeouts).await {
-            Ok(v) => (v, false),
-            Err(e) => return fail(&args, e.error_code(), &e.to_string()),
-        },
+        None => {
+            // The check can take a while on a slow network (two probes,
+            // each with its own connect and read budget): say what is
+            // happening instead of a blank terminal.
+            let mut status = crate::ui::StatusLine::stderr(args.common.json, args.common.silent);
+            status.set(CHECKING_LATEST);
+            let latest = fetch_latest_version(&endpoints, &timeouts).await;
+            status.finish();
+            match latest {
+                Ok(v) => (v, false),
+                Err(e) => return fail(&args, e.error_code(), &e.to_string()),
+            }
+        }
     };
 
     // Whatever we just learned, remember it for the passive notifier
@@ -414,6 +426,14 @@ pub async fn run(args: UpdateArgs) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checking_latest_status_line() {
+        assert_eq!(
+            CHECKING_LATEST,
+            "Checking for the latest socket-patch release..."
+        );
+    }
 
     fn v(s: &str) -> semver::Version {
         semver::Version::parse(s).unwrap()

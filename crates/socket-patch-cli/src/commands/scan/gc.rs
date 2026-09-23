@@ -5,7 +5,6 @@
 use socket_patch_core::manifest::cleanup_blobs::CleanupResult;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::patch::apply_lock;
 use socket_patch_core::utils::purl::{canonical_purl, strip_purl_qualifiers};
 use socket_patch_core::vendor::VENDOR_STATE_REL;
 use std::collections::HashSet;
@@ -221,7 +220,7 @@ pub(super) async fn run_apply_gc(
     // halves: flock is per open file description, so a nested acquire in
     // the vendored half would read as a live holder and silently skip it.
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    let _guard = match apply_lock::acquire(socket_dir, timeout) {
+    let _guard = match crate::commands::lock_cli::acquire_with_status(socket_dir, timeout) {
         Ok(g) => g,
         Err(e) => {
             return GcSummary {

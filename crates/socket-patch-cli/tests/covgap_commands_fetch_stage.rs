@@ -236,20 +236,18 @@ async fn apply_online_nonquiet_prints_download_progress_and_diff_fallback() {
     );
     assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
 
-    // The progress lines of the staging flow, in the shapes users see —
-    // on stderr (stdout is for results).
+    // The staging flow's progress is a transient status line (nothing
+    // on a non-terminal stderr); its result lines stay, on stderr (stdout
+    // is for results).
     assert!(
-        stderr.contains("Downloading missing patch artifacts (mode: diff)..."),
-        "the primary download is announced with its mode tag; stderr={stderr}"
+        !stderr.contains("Downloading missing patch artifacts")
+            && !stderr.contains("unavailable; fetching"),
+        "progress is transient, never a permanent line; stderr={stderr}"
     );
     assert!(
         !stderr.contains("Failed to download") && !stderr.contains("Diff archive not found"),
         "a missing diff archive the blob fallback covers is not reported as a failure; \
          stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("1 diff archive unavailable; fetching 1 per-file blob instead..."),
-        "the per-file blob fallback is announced with the gap size; stderr={stderr}"
     );
     assert!(
         stderr.contains("Downloaded 1 blob"),
@@ -346,8 +344,8 @@ fn run_vendor_human(root: &Path, mock_uri: &str) -> (i32, String, String) {
 }
 
 /// Shared postconditions for every malformed-view variant: exit 1, the
-/// fetch was really attempted (announcement on stderr), the non-quiet
-/// summary block names the failed purl on stderr, and the fail-closed run
+/// fetch was really attempted and its failure block names the failed purl
+/// on stderr (the progress line is transient), and the fail-closed run
 /// wrote nothing (no blobs — mem staging is disk-free — and no vendor
 /// tree).
 fn assert_failed_closed(root: &Path, code: i32, stdout: &str, stderr: &str) {
@@ -356,8 +354,8 @@ fn assert_failed_closed(root: &Path, code: i32, stdout: &str, stderr: &str) {
         "a malformed view response must fail the run; stdout={stdout}\nstderr={stderr}"
     );
     assert!(
-        stderr.contains("Fetching content for 1 patch..."),
-        "the run must have reached the view fetch (not bailed earlier); stderr={stderr}"
+        !stderr.contains("Fetching content for"),
+        "the fetch progress is a transient status line; stderr={stderr}"
     );
     assert!(
         stderr.contains("Error: Could not fetch patch content for 1 patch:"),

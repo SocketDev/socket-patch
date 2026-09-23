@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::manifest::schema::PatchFileInfo;
-use crate::patch::apply::normalize_file_path;
+use crate::patch::apply::{files_in_order, normalize_file_path};
 use crate::patch::file_hash::compute_file_git_sha256;
 
 /// Status of a file rollback verification.
@@ -413,7 +413,7 @@ async fn rollback_package_patch_at(
     };
 
     // First, verify all files
-    for (file_name, file_info) in files {
+    for (file_name, file_info) in files_in_order(files) {
         let verify_result = verify_file_rollback(pkg_path, file_name, file_info, blobs_path).await;
 
         // If any file has issues (not ready and not already original), we can't proceed
@@ -449,7 +449,7 @@ async fn rollback_package_patch_at(
     let mut warnings: Vec<String> = Vec::new();
 
     // Rollback files that need it
-    for (file_name, file_info) in files {
+    for (file_name, file_info) in files_in_order(files) {
         let already_original = result
             .files_verified
             .iter()
@@ -623,6 +623,36 @@ mod tests {
     // in `rollback_package_patch_at`); these tests pin the guarantees
     // rollback relies on from it.
     use crate::patch::apply::apply_file_patch_at;
+
+    /// With several missing files the error always names the first one
+    /// in file-name order, not whichever the `HashMap` yields first.
+    #[tokio::test]
+    async fn test_rollback_missing_files_error_names_the_first_in_order() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let mut files = HashMap::new();
+        for name in ["lodash.min.js", "lodash.js", "package/z.js", "fp.js"] {
+            files.insert(
+                name.to_string(),
+                PatchFileInfo {
+                    before_hash: "a".repeat(64),
+                    after_hash: "b".repeat(64),
+                },
+            );
+        }
+        let result = rollback_package_patch(
+            "pkg:npm/lodash@4.17.20",
+            pkg_dir.path(),
+            &files,
+            blobs_dir.path(),
+            true,
+        )
+        .await;
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Cannot roll back: fp.js - File not found")
+        );
+    }
 
     #[tokio::test]
     async fn test_verify_file_rollback_not_found() {

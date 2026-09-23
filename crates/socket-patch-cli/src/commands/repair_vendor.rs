@@ -384,7 +384,7 @@ fn format_repair_failure(purl: &str, detail: &str) -> String {
 /// `(purl, reason code, artifact path)`.
 fn format_rebuild_preview(items: &[(String, &str, &str)]) -> Vec<String> {
     let mut lines = vec![format!(
-        "Dry run - would rebuild {}:",
+        "Would rebuild {}:",
         plural(items.len(), "vendored artifact", "vendored artifacts")
     )];
     lines.extend(items.iter().map(|(purl, reason, path)| {
@@ -2253,7 +2253,7 @@ mod ui_format_tests {
         assert_eq!(
             format_rebuild_preview(&one),
             vec![
-                "Dry run - would rebuild 1 vendored artifact:",
+                "Would rebuild 1 vendored artifact:",
                 "  - pkg:npm/minimist@1.2.5 (missing: .socket/vendor/npm/u/minimist-1.2.5.tgz)",
             ]
         );
@@ -2272,7 +2272,7 @@ mod ui_format_tests {
         assert_eq!(
             format_rebuild_preview(&two),
             vec![
-                "Dry run - would rebuild 2 vendored artifacts:",
+                "Would rebuild 2 vendored artifacts:",
                 "  - pkg:npm/a@1 (corrupt: p/a.tgz)",
                 "  - pkg:gem/b@1 (unverified: p/b)",
             ]

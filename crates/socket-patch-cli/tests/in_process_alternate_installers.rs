@@ -125,6 +125,7 @@ fn default_apply(cwd: &Path) -> ApplyArgs {
         force: false,
         check: false,
         vex: Default::default(),
+        nested: None,
     }
 }
 

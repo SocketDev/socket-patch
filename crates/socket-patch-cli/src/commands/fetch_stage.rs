@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use super::get::base64_decode;
 use crate::args::GlobalArgs;
 use crate::commands::bun_preflight::LedgerLoad;
-use crate::ui::plural;
+use crate::ui::{plural, StatusLine};
 
 /// Resolved artifact locations for the patch pipeline. Holds the overlay
 /// `TempDir` alive — sources become invalid when this is dropped.
@@ -176,6 +176,14 @@ fn format_fetch_failures(result: &FetchMissingBlobsResult, (one, many): Noun) ->
 /// whose bytes differ from `beforeHash`, and the pipeline then falls back
 /// to the blob — so it is worded as a complement, not a failure, unless
 /// some archives really were unavailable.
+/// The disk stager's status line while it downloads what `.socket/` lacks.
+const DOWNLOADING_ARTIFACTS: &str = "Downloading missing patch artifacts...";
+
+/// The in-memory stager's status line while it fetches patch views.
+fn format_fetching_content(n: usize) -> String {
+    format!("Fetching content for {}...", plural(n, "patch", "patches"))
+}
+
 fn format_blob_fallback(diff_failed: usize, blobs: usize) -> String {
     let blobs = plural(blobs, "per-file blob", "per-file blobs");
     if diff_failed == 0 {
@@ -337,16 +345,14 @@ pub(crate) async fn stage_patch_sources(
     overlay_dir(&socket_diffs_path, &staged.diffs).await;
     overlay_dir(&socket_packages_path, &staged.packages).await;
 
-    // Progress: stderr, like every other status line (stdout is data).
-    if !quiet {
-        eprintln!(
-            "Downloading missing patch artifacts (mode: {})...",
-            download_mode.as_tag()
-        );
-    }
+    // Progress: a transient status line on stderr (stdout is data); the
+    // result lines below are what stays on screen.
+    let mut status = StatusLine::stderr(common.json, common.silent);
+    status.set(DOWNLOADING_ARTIFACTS);
 
     let sources = staged.as_patch_sources();
     let fetch_result = fetch_missing_sources(manifest, &sources, download_mode, client, None).await;
+    status.finish();
 
     // In diff mode an unavailable archive is routine (the blob top-up
     // below covers it), so its failure detail is held back and printed
@@ -369,13 +375,12 @@ pub(crate) async fn stage_patch_sources(
     if download_mode != DownloadMode::File {
         let still_missing_blobs = get_missing_blobs(manifest, &staged.blobs).await;
         if !still_missing_blobs.is_empty() {
-            if !quiet {
-                eprintln!(
-                    "{}",
-                    format_blob_fallback(fetch_result.failed, still_missing_blobs.len())
-                );
-            }
+            status.set(format_blob_fallback(
+                fetch_result.failed,
+                still_missing_blobs.len(),
+            ));
             let blob_result = fetch_missing_blobs(manifest, &staged.blobs, client, None).await;
+            status.finish();
             if !quiet {
                 for line in format_fetch_summary(&blob_result, BLOB, true) {
                     eprintln!("{line}");
@@ -486,7 +491,6 @@ pub(crate) async fn stage_vendor_sources_in_memory(
     seed: HashMap<String, Vec<u8>>,
     client: Option<&ApiClient>,
 ) -> MemStageOutcome {
-    let quiet = common.silent || common.json;
     let blobs = socket_dir.join("blobs");
     let diffs = socket_dir.join("diffs");
     let packages = socket_dir.join("packages");
@@ -547,12 +551,8 @@ pub(crate) async fn stage_vendor_sources_in_memory(
             return MemStageOutcome::Unavailable;
         }
 
-        if !quiet {
-            eprintln!(
-                "Fetching content for {}...",
-                plural(to_fetch.len(), "patch", "patches")
-            );
-        }
+        let mut status = StatusLine::stderr(common.json, common.silent);
+        status.set(format_fetching_content(to_fetch.len()));
 
         let built;
         let client = match client {
@@ -565,7 +565,15 @@ pub(crate) async fn stage_vendor_sources_in_memory(
             }
         };
         let mut failed: Vec<&str> = Vec::new();
-        for (purl, uuid) in &to_fetch {
+        for (i, (purl, uuid)) in to_fetch.iter().enumerate() {
+            if to_fetch.len() > 1 {
+                status.set(format!(
+                    "{} ({}/{})",
+                    format_fetching_content(to_fetch.len()),
+                    i + 1,
+                    to_fetch.len()
+                ));
+            }
             match client.fetch_patch(uuid).await {
                 Ok(Some(patch)) => {
                     let mut complete = true;
@@ -575,7 +583,9 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                             // under --silent (same rule as
                             // report_offline_missing above).
                             if !common.json {
-                                eprintln!("  [error] {purl}: no blob content served for {file}");
+                                status.println(format!(
+                                    "  [error] {purl}: no blob content served for {file}"
+                                ));
                             }
                             complete = false;
                             break;
@@ -603,6 +613,7 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                 _ => failed.push(purl),
             }
         }
+        status.finish();
         if !failed.is_empty() {
             // An error, not progress chatter: the vendor caller only marks
             // the envelope (printed exclusively under --json), so muting
@@ -633,6 +644,22 @@ pub(crate) async fn stage_vendor_sources_in_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_lines_name_no_internal_tags() {
+        assert_eq!(
+            DOWNLOADING_ARTIFACTS,
+            "Downloading missing patch artifacts..."
+        );
+        assert_eq!(
+            format_fetching_content(1),
+            "Fetching content for 1 patch..."
+        );
+        assert_eq!(
+            format_fetching_content(3),
+            "Fetching content for 3 patches..."
+        );
+    }
     use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord};
 
     const UUID: &str = "11111111-1111-4111-8111-111111111111";

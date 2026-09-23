@@ -631,7 +631,7 @@ async fn scan_silent_keeps_error_output() {
         "all-batches-failed scan must exit 1; stderr={stderr:?}"
     );
     assert!(
-        stderr.contains("API batch queries failed"),
+        stderr.contains("Error: The API query failed: "),
         "--silent must NOT suppress error output; got {stderr:?}"
     );
     assert!(

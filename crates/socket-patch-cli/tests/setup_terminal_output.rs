@@ -97,11 +97,9 @@ fn check_drifted_patch_points_at_apply_not_setup() {
         "setup cannot fix drift; stdout=\n{stdout}"
     );
     assert!(!stdout.contains("(s)"), "stdout=\n{stdout}");
-    // The progress line is stderr chrome.
-    assert!(
-        stderr.contains("Searching for package.json"),
-        "stderr=\n{stderr}"
-    );
+    // The progress line is a transient status line: nothing on a
+    // non-terminal stderr, never on stdout.
+    assert!(!stderr.contains("Searching for"), "stderr=\n{stderr}");
     assert!(!stdout.contains("Searching for"), "stdout=\n{stdout}");
 }
 
@@ -214,7 +212,8 @@ fn already_configured_run_prints_one_verdict() {
         stdout.trim(),
         "All install hooks are already configured with socket-patch!"
     );
-    assert_eq!(stderr.trim(), "Configuring socket-patch install hooks...");
+    // The progress line is transient: nothing on a non-terminal stderr.
+    assert_eq!(stderr, "");
 }
 
 #[test]

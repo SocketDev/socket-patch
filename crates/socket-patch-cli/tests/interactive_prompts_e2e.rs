@@ -213,7 +213,7 @@ fn setup_interactive_n_aborts_without_update() {
         "setup must NOT have taken the non-interactive branch in a PTY; got: {output}"
     );
     assert!(
-        output.contains("Aborted"),
+        output.contains("Setup cancelled."),
         "setup must print abort message; got: {output}"
     );
     // It must NOT have started applying changes.
@@ -249,7 +249,7 @@ fn setup_interactive_default_no_aborts() {
         "setup must NOT have taken the non-interactive branch in a PTY; got: {output}"
     );
     assert!(
-        output.contains("Aborted"),
+        output.contains("Setup cancelled."),
         "bare-Enter must default to N and print abort; got: {output}"
     );
     assert!(
@@ -294,7 +294,7 @@ fn setup_interactive_non_utf8_answer_aborts_without_panic() {
         "setup must NOT have taken the non-interactive branch in a PTY; got: {output}"
     );
     assert!(
-        output.contains("Aborted"),
+        output.contains("Setup cancelled."),
         "non-UTF-8 answer must be treated as 'no' and abort; got: {output}"
     );
     assert!(

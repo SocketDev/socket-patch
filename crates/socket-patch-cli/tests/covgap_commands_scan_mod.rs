@@ -1221,11 +1221,11 @@ async fn scan_human_pnp_refusal_prints_alongside_other_ecosystems() {
 // Empty batch response: the human result line
 // ---------------------------------------------------------------------------
 
-/// One installed package, a batch response with no patches: the status
-/// line finishes with exactly `No patches found for 1 package` (singular,
-/// on its own line — no stale status tail).
+/// One installed package, a batch response with no patches: the result is
+/// said once, on stdout — the status line ends without repeating it (and
+/// leaves no stale status tail).
 #[tokio::test]
-async fn scan_human_empty_batch_reports_no_patches_for_one_package() {
+async fn scan_human_empty_batch_reports_no_patches_once() {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
@@ -1243,11 +1243,11 @@ async fn scan_human_empty_batch_reports_no_patches_for_one_package() {
 
     let (code, stdout, stderr) = run_scan_human(tmp.path(), &mock.uri(), &[]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert_eq!(stdout, "\nNo patches available for installed packages.\n");
+    assert!(!stderr.contains("No patches"), "stderr={stderr:?}");
     assert!(
-        stderr
-            .lines()
-            .any(|l| l == "No patches found for 1 package"),
-        "expected the exact result line; got {stderr:?}"
+        stderr.lines().any(|l| l == "Found 1 package (1 npm)"),
+        "stderr={stderr:?}"
     );
 }
 

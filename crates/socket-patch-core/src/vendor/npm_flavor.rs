@@ -89,6 +89,18 @@ const LOCKFILE_FAMILIES: [(NpmLockFlavor, &[&str]); 4] = [
     (NpmLockFlavor::Bun, &["bun.lock", "bun.lockb"]),
 ];
 
+/// Where a missing lockfile was looked for, for a refusal message:
+/// `in the project root` for the default `.` (a bare `at .` reads as a
+/// typo), `at <path>` otherwise.
+pub(super) fn project_root_location(project_root: &Path) -> String {
+    let shown = project_root.display().to_string();
+    if shown.is_empty() || shown == "." || shown == "./" {
+        "in the project root".to_string()
+    } else {
+        format!("at {shown}")
+    }
+}
+
 /// Probe the project root for the lockfile flavor that drives npm installs.
 ///
 /// Decision table, first match wins:
@@ -215,10 +227,10 @@ pub(crate) async fn detect_npm_lock_flavor(
         return Err((
             "vendor_lockfile_missing",
             format!(
-                "no package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml, or \
-                 bun.lock, or bun.lockb at {} — vendoring rewires the lockfile, so one must exist (run \
-                 your package manager's install first)",
-                project_root.display()
+                "no package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml, \
+                 bun.lock, or bun.lockb {} — vendoring rewires the lockfile, so one must \
+                 exist (run your package manager's install first)",
+                project_root_location(project_root)
             ),
         ));
     };
@@ -496,6 +508,26 @@ mod tests {
 
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+    #[test]
+    fn project_root_location_reads_as_a_place() {
+        assert_eq!(project_root_location(Path::new(".")), "in the project root");
+        assert_eq!(project_root_location(Path::new("")), "in the project root");
+        assert_eq!(project_root_location(Path::new("/srv/app")), "at /srv/app");
+    }
+
+    #[tokio::test]
+    async fn missing_lockfile_detail_lists_every_lockfile_once() {
+        let (_, detail) = detect_npm_lock_flavor(Path::new("/nonexistent-socket-patch-root"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            detail,
+            "no package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml, bun.lock, \
+             or bun.lockb at /nonexistent-socket-patch-root — vendoring rewires the lockfile, \
+             so one must exist (run your package manager's install first)"
+        );
+    }
     use crate::manifest::schema::PatchFileInfo;
     use crate::vendor::state::VendorArtifact;
     use std::collections::HashMap;

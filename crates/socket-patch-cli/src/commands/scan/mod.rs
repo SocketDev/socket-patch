@@ -480,6 +480,14 @@ fn selection_args(common: &GlobalArgs) -> GlobalArgs {
     }
 }
 
+/// Print the blank stdout line that opens a paragraph, once: `opened`
+/// flips on the first call.
+fn open_paragraph(opened: &mut bool) {
+    if !std::mem::replace(opened, true) {
+        println!();
+    }
+}
+
 /// One `search_patches_by_package` query per package with patches, merged
 /// into one result list — the detail-fetch loop the apply, vendor, redirect
 /// and human-preview flows share. Returns the merged results plus every
@@ -2017,8 +2025,14 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             Err(e) => {
                 batch_error_count += 1;
                 last_batch_error = Some(e.to_string());
-                if !args.common.json {
-                    status.println(format!("Error querying batch {}: {e}", batch_idx + 1));
+                // Not fatal by itself: the scan goes on with the other
+                // batches. A one-batch scan says it once, below.
+                if !args.common.json && !args.common.silent && total_batches > 1 {
+                    status.println(render::batch_failed_warning(
+                        batch_idx + 1,
+                        total_batches,
+                        &e.to_string(),
+                    ));
                 }
             }
         }
@@ -2067,7 +2081,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             });
             print_json(&result);
         } else {
-            eprintln!("Error: all {total_batches} API batch queries failed: {err}");
+            eprintln!("{}", render::all_batches_failed(total_batches, &err));
         }
         return 1;
     }
@@ -2084,10 +2098,9 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             plural(all_packages_with_patches.len(), "package", "packages")
         ));
     } else {
-        status.finish_with(format!(
-            "No patches found for {}",
-            plural(package_count, "package", "packages")
-        ));
+        // The result line ("No patches available for installed packages.")
+        // is printed on stdout below; saying it here too would repeat it.
+        status.finish();
     }
 
     // Calculate patch counts
@@ -2724,15 +2737,39 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         return 1;
     }
 
-    // Smart selection
-    let selected: Vec<PatchSearchResult> = match select_patches(
-        &all_search_results,
-        can_access_paid_patches,
-        &selection_args(&args.common),
-    ) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
+    // Prompt to download. A MODE-LESS human scan (no `--mode`/`--apply`/
+    // `--sync`/`--vendor`/`--redirect` and no `--prune`) with a non-TTY
+    // stdin and no `--yes` is report-only: it stops before the prompt with
+    // exit 0 and a hint, never downloads, never creates `.socket/`. This is
+    // a scan-side pre-check — `confirm()` itself keeps its non-TTY
+    // auto-accept, so every explicit-intent flag (and every other command's
+    // prompt) still proceeds unattended, and a TTY always prompts.
+    let report_only = args.mode.is_none() && !args.prune && !args.common.yes && !ui::stdin_is_tty();
+
+    // Smart selection. A report-only run picks without the non-interactive
+    // note: it never downloads, so there is no pick to announce.
+    let mut select_common = selection_args(&args.common);
+    select_common.silent |= report_only;
+    // A menu or the non-interactive note opens its own paragraph under the
+    // table's Summary (stderr, like the prompt).
+    if !select_common.silent
+        && super::get::selection_has_choice(
+            &all_search_results,
+            can_access_paid_patches,
+            &select_common,
+        )
+    {
+        eprintln!();
+    }
+    let selected: Vec<PatchSearchResult> =
+        match select_patches(&all_search_results, can_access_paid_patches, &select_common) {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+
+    // The skip / already-recorded lines below open their own paragraph
+    // under the table's Summary: one blank line before the first of them.
+    let mut skip_paragraph = false;
 
     // Agent flow (mirrors the JSON arm): vendor-owned and lockfile-only
     // purls leave the selection as calm skips. In vendored mode nothing is
@@ -2745,9 +2782,11 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         let split = partition_agent_selection(selected, &vendored_purls, &lockfile_only);
         if !silent {
             for purl in &split.vendored_purls {
+                open_paragraph(&mut skip_paragraph);
                 println!("{}", render::vendored_skip_line(&normalize_purl(purl)));
             }
             for purl in &split.not_installed_purls {
+                open_paragraph(&mut skip_paragraph);
                 println!("{}", render::not_installed_skip_line(&normalize_purl(purl)));
             }
         }
@@ -2770,6 +2809,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     };
     if !silent {
         for p in &already_recorded {
+            open_paragraph(&mut skip_paragraph);
             println!(
                 "{}",
                 render::already_recorded_line(&normalize_purl(&p.purl), &p.uuid)
@@ -2779,6 +2819,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
 
     if selected.is_empty() {
         if !silent {
+            open_paragraph(&mut skip_paragraph);
             if already_recorded.is_empty() {
                 println!("No patches selected.");
             } else {
@@ -2871,14 +2912,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         return finish_human(0).await;
     }
 
-    // Prompt to download. A MODE-LESS human scan (no `--mode`/`--apply`/
-    // `--sync`/`--vendor`/`--redirect` and no `--prune`) with a non-TTY
-    // stdin and no `--yes` is report-only: it stops here with exit 0 and
-    // the hint below, never downloads, never creates `.socket/`. This is a
-    // scan-side pre-check — `confirm()` itself keeps its non-TTY
-    // auto-accept, so every explicit-intent flag (and every other command's
-    // prompt) still proceeds unattended, and a TTY always prompts.
-    let report_only = args.mode.is_none() && !args.prune && !args.common.yes && !ui::stdin_is_tty();
+    // Report-only (see `report_only` above): stop before the prompt.
     if report_only {
         // The "Patches to apply:" listing already ends with a blank line.
         if !silent {

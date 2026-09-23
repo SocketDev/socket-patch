@@ -90,9 +90,7 @@ pub async fn run(args: RepairArgs) -> i32 {
         }
         if !has_vendor_traces {
             if tokio::fs::metadata(&redirect_state).await.is_ok() {
-                let msg = "Hosted redirects need no local repair; re-run \
-                           `scan --mode hosted` to refresh the lockfile redirects \
-                           (it also re-checks for stale pre-redirect installs)";
+                let msg = HOSTED_ONLY_REASON;
                 if args.common.json {
                     let mut env = Envelope::new(Command::Repair);
                     env.dry_run = args.common.dry_run;
@@ -102,7 +100,9 @@ pub async fn run(args: RepairArgs) -> i32 {
                     );
                     println!("{}", env.to_pretty_json());
                 } else if !args.common.silent {
-                    println!("{msg}");
+                    // A sentence on the terminal; the JSON reason keeps
+                    // its historical, period-less text.
+                    println!("{msg}.");
                 }
                 return 0;
             }
@@ -255,6 +255,28 @@ fn format_id_list(ids: &[String], noun: ArtifactNoun, cap: usize) -> Vec<String>
 /// `Found 2 missing diff archives` / `Found 1 missing blob`.
 fn format_found_missing(n: usize, noun: ArtifactNoun) -> String {
     format!("Found {}", noun.count(n).replacen(' ', " missing ", 1))
+}
+
+/// Why a hosted-only project has nothing to repair (the JSON skip
+/// reason; the human line adds the period).
+const HOSTED_ONLY_REASON: &str = "Hosted redirects need no local repair; re-run \
+    `scan --mode hosted` to refresh the lockfile redirects (it also re-checks for stale \
+    pre-redirect installs)";
+
+/// Step 1's line when no patch artifact is missing: why there is nothing
+/// to download (no manifest, as in a vendored-only project, or an empty
+/// one), or that everything is on disk.
+fn format_nothing_missing(
+    manifest: Option<&socket_patch_core::manifest::schema::PatchManifest>,
+    noun: ArtifactNoun,
+) -> String {
+    match manifest {
+        None => "No manifest; no patch artifacts to download.".to_string(),
+        Some(m) if m.patches.is_empty() => {
+            "No patches in manifest; nothing to download.".to_string()
+        }
+        Some(_) => format!("All {} are present locally.", noun.many),
+    }
 }
 
 /// The `--offline` warning (stderr) for artifacts that cannot be fetched.
@@ -437,11 +459,7 @@ async fn repair_inner(
 
     if missing_artifacts.is_empty() {
         if !quiet {
-            if manifest.as_ref().is_some_and(|m| m.patches.is_empty()) {
-                println!("No patches in manifest; nothing to download.");
-            } else {
-                println!("All {} are present locally.", noun.many);
-            }
+            println!("{}", format_nothing_missing(manifest.as_ref(), noun));
         }
     } else if args.common.offline {
         if !quiet {
@@ -456,7 +474,7 @@ async fn repair_inner(
         if args.common.dry_run {
             if !quiet {
                 println!();
-                println!("Dry run - would download:");
+                println!("Would download:");
                 for line in format_id_list(&missing_artifacts, noun, DRY_RUN_LIST_CAP) {
                     println!("{line}");
                 }
@@ -670,6 +688,32 @@ mod tests {
     use super::*;
     use crate::args::GlobalArgs;
     use std::path::PathBuf;
+
+    #[test]
+    fn nothing_missing_line_says_why() {
+        use socket_patch_core::manifest::schema::PatchManifest;
+        assert_eq!(
+            format_nothing_missing(None, DIFF_ARCHIVE),
+            "No manifest; no patch artifacts to download."
+        );
+        let empty = PatchManifest::new();
+        assert_eq!(
+            format_nothing_missing(Some(&empty), DIFF_ARCHIVE),
+            "No patches in manifest; nothing to download."
+        );
+        let one: PatchManifest =
+            serde_json::from_str(MANIFEST_JSON).expect("fixture manifest parses");
+        assert!(!one.patches.is_empty());
+        assert_eq!(
+            format_nothing_missing(Some(&one), DIFF_ARCHIVE),
+            "All diff archives are present locally."
+        );
+        assert_eq!(
+            HOSTED_ONLY_REASON,
+            "Hosted redirects need no local repair; re-run `scan --mode hosted` to refresh \
+             the lockfile redirects (it also re-checks for stale pre-redirect installs)"
+        );
+    }
 
     const MANIFEST_JSON: &str = r#"{
       "patches": {

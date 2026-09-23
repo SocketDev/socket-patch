@@ -21,7 +21,6 @@ use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSearchResult};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::patch::apply_lock;
 use socket_patch_core::telemetry::track_patch_vendor_failed;
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
@@ -196,10 +195,11 @@ async fn run_scan_vendor_step(
     // it as `LockError::Io` (→ `lock_io`). The guard lives to the end of
     // the step so the ledger migration and the redirect-ledger reconcile
     // inside `note_vendor_supersedes_redirect` run under the lock too.
-    let _guard = apply_lock::acquire(&socket_dir, timeout).map_err(|e| {
-        let (code, message) = lock_failure(&e, timeout);
-        (code, message, None)
-    })?;
+    let _guard =
+        crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout).map_err(|e| {
+            let (code, message) = lock_failure(&e, timeout);
+            (code, message, None)
+        })?;
 
     // Staging probes blobs by the records' hashes; a manifest VIEW over the
     // in-memory records (a move, not a clone) is all it needs.

@@ -2421,7 +2421,8 @@ async fn mount_granted_reference(server: &MockServer, uuid: &str, purl: &str, ur
 /// envelope, so a held apply lock surfaces as the top-level `errorCode`
 /// with a string `error` — NOT the vendored `error: {code, message}`
 /// object — exit 1, `redirect.mode` retained, nothing written; the human
-/// arm prints `Error (lock_held):` plus the `--lock-timeout` hint. A
+/// arm prints the shared `Error: Another socket-patch process …` line plus
+/// the `--lock-timeout` hint. A
 /// `--dry-run` never contends: it previews the redirect under the held
 /// lock and exits 0.
 #[tokio::test]
@@ -2464,12 +2465,12 @@ async fn hosted_lock_held_get_errors_with_top_level_error_code() {
         "the hosted error envelope keeps its redirect block; stdout={stdout}"
     );
 
-    // Wet human: the coded line and the wait hint.
+    // Wet human: the shared lock error line and the wait hint.
     let (code, stdout, stderr) =
         run_get_bin(tmp.path(), &server.uri(), &[UUID, "--mode", "hosted"]);
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stderr.contains(&format!("Error (lock_held): {HELD}")),
+        stderr.contains("Error: Another socket-patch process is operating in this directory\n"),
         "stderr={stderr}"
     );
     assert!(
@@ -2749,14 +2750,27 @@ async fn silent_apply_failure_still_prints_an_error() {
     let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID, "--silent"]);
     assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
     assert!(stdout.is_empty(), "stdout={stdout}");
+    // The per-package reason prints even under --silent, so the closing
+    // line needs no "re-run without --silent" hint.
     assert!(
-        stderr.contains(
-            "Error: Some patches could not be applied (re-run without --silent for details)."
-        ),
+        stderr.contains(&format!("Error: Failed to patch {PURL}: ")),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.ends_with("Error: Some patches could not be applied.\n"),
         "stderr={stderr}"
     );
 
-    // Loud twin: the plain error line, no --silent hint.
+    // --json: the envelope is the only channel; the nested apply's
+    // per-package error lines stay off stderr too.
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID, "--json"]);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    assert!(!stderr.contains("Error"), "stderr={stderr}");
+    serde_json::from_str::<serde_json::Value>(&stdout).expect("one JSON envelope");
+
+    // Loud twin: the same closing line.
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
     let (code, _stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID]);
@@ -2765,6 +2779,36 @@ async fn silent_apply_failure_still_prints_an_error() {
         stderr.contains("Error: Some patches could not be applied.\n"),
         "stderr={stderr}"
     );
+}
+
+/// The nested apply's `Patched packages:` block puts its leading blank
+/// line on stderr: stdout gets no blank line of its own before it, and
+/// never two in a row.
+#[tokio::test]
+async fn nested_apply_block_starts_stdout_without_a_blank_line() {
+    let server = MockServer::start().await;
+    mount_view_files(
+        &server,
+        UUID,
+        PURL,
+        serde_json::json!({
+            "package/index.js": {
+                "beforeHash": git_hash(BEFORE_BYTES),
+                "afterHash": git_hash(AFTER_BYTES),
+                "blobContent": b64(AFTER_BYTES),
+            }
+        }),
+    )
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.starts_with(&format!("Patched packages:\n  {PURL}")),
+        "stdout={stdout:?}"
+    );
+    assert!(!stdout.contains("\n\n\n"), "stdout={stdout:?}");
 }
 
 /// A forced `--id` / `--cve` / `--ghsa` identifier is shape-checked before

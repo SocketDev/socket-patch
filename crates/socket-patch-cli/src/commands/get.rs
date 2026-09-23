@@ -15,7 +15,7 @@ use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
 };
 use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants};
-use socket_patch_core::patch::apply_lock::{self, LockError, LockGuard};
+use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
 use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
 use socket_patch_core::utils::purl::{
     canonical_purl, is_purl, normalize_purl, strip_purl_qualifiers,
@@ -244,7 +244,12 @@ fn report_error(json: bool, message: impl std::fmt::Display) {
 /// early-return guard. The message/code mapping is
 /// [`crate::commands::lock_cli::lock_failure`]'s, so the waited clause and
 /// the I/O rendering cannot drift from `apply`'s.
-fn report_lock_failure(json: bool, err: &LockError, timeout: Duration) -> serde_json::Value {
+fn report_lock_failure(
+    json: bool,
+    socket_dir: &Path,
+    err: &LockError,
+    timeout: Duration,
+) -> serde_json::Value {
     let (code, message) = lock_failure(err, timeout);
     let envelope = serde_json::json!({
         "status": "error",
@@ -254,7 +259,10 @@ fn report_lock_failure(json: bool, err: &LockError, timeout: Duration) -> serde_
     if json {
         print_json(&envelope);
     } else {
-        eprintln!("Error: {message}");
+        eprint!(
+            "{}",
+            crate::commands::lock_cli::format_lock_error(socket_dir, err, timeout)
+        );
     }
     envelope
 }
@@ -631,16 +639,20 @@ fn format_patch_option(p: &PatchSearchResult) -> String {
 }
 
 /// One-line human summary of a patch:
-/// `<purl> [<TIER>] <short uuid>: fixes <ids> (<SEVERITY>)`.
+/// `<purl> [<TIER>] <short uuid>: fixes <id> (<SEVERITY>)`, or with
+/// several advisories `fixes <ids> (highest: <SEVERITY>)` — a bare
+/// `(HIGH)` after a list reads as the last id's severity.
 ///
 /// `patch_id` is omitted (with its colon) when `None`, the `fixes` part
 /// when the patch has no advisories, and the severity when none is known.
-/// The purl is shown decoded (`%40scope` → `@scope`).
+/// The severity is colored when `color` is on. The purl is shown decoded
+/// (`%40scope` → `@scope`).
 fn format_patch_summary(
     purl: &str,
     tier: &str,
     patch_id: Option<&str>,
     vulns: &HashMap<String, VulnerabilityResponse>,
+    color: bool,
 ) -> String {
     let mut line = format!("{} [{}]", normalize_purl(purl), tier.to_uppercase());
     if let Some(id) = patch_id {
@@ -652,7 +664,12 @@ fn format_patch_summary(
         let sep = if patch_id.is_some() { ": " } else { " " };
         line.push_str(&format!("{sep}fixes {}", labels.join(", ")));
         if let Some(sev) = max_vuln_severity(vulns) {
-            line.push_str(&format!(" ({})", sev.to_uppercase()));
+            let sev = crate::ui::severity(&sev.to_uppercase(), color);
+            if labels.len() > 1 {
+                line.push_str(&format!(" (highest: {sev})"));
+            } else {
+                line.push_str(&format!(" ({sev})"));
+            }
         }
     }
     line
@@ -802,16 +819,16 @@ fn format_verbose_skips(skips: &[serde_json::Value]) -> Vec<String> {
         .collect()
 }
 
-/// Whether [`select_patches`] will put a menu in front of the user for
-/// these candidates: a free user, several accessible patches for one purl,
-/// no `--yes`/`--json`, and an interactive stdin (mirrors `select_one`).
-fn selection_prompted(
+/// Whether [`select_patches`] has a choice to make that nobody made in
+/// advance: a free user, several accessible patches for one purl, and no
+/// `--yes`/`--json`. It then shows a menu (interactive stdin) or prints
+/// the non-interactive note (unless `--silent`).
+pub(crate) fn selection_has_choice(
     candidates: &[PatchSearchResult],
     can_access_paid: bool,
     common: &GlobalArgs,
 ) -> bool {
-    use std::io::IsTerminal;
-    if can_access_paid || common.yes || common.json || !std::io::stdin().is_terminal() {
+    if can_access_paid || common.yes || common.json {
         return false;
     }
     let mut seen = std::collections::HashSet::new();
@@ -821,16 +838,28 @@ fn selection_prompted(
         .any(|p| !seen.insert(p.purl.as_str()))
 }
 
+/// Whether [`select_patches`] will put a menu in front of the user for
+/// these candidates: [`selection_has_choice`] and an interactive stdin
+/// (mirrors `select_one`).
+fn selection_prompted(
+    candidates: &[PatchSearchResult],
+    can_access_paid: bool,
+    common: &GlobalArgs,
+) -> bool {
+    use std::io::IsTerminal;
+    selection_has_choice(candidates, can_access_paid, common) && std::io::stdin().is_terminal()
+}
+
 /// The "which patch will be installed" block printed before the prompt
 /// when the listing above showed more patches than were selected (a paid
 /// user's auto-pick, or narrowing): one [`format_patch_summary`] line per
 /// selected patch. Ends with a blank line.
-fn format_selected_patches(selected: &[PatchSearchResult]) -> String {
+fn format_selected_patches(selected: &[PatchSearchResult], color: bool) -> String {
     let mut out = String::from("Selected:\n");
     for p in selected {
         out.push_str(&format!(
             "  {}\n",
-            format_patch_summary(&p.purl, &p.tier, Some(&p.uuid), &p.vulnerabilities)
+            format_patch_summary(&p.purl, &p.tier, Some(&p.uuid), &p.vulnerabilities, color)
         ));
     }
     out.push('\n');
@@ -1015,16 +1044,10 @@ fn format_record_skip(purl: &str, why: &str) -> String {
     format!("  [skip] {} ({why})", normalize_purl(purl))
 }
 
-/// The error printed when the nested apply failed. Under `--silent`
-/// apply's own per-patch failure lines are muted, so this one line is all
-/// the user gets: point at how to see the details.
-fn format_apply_failed(silent: bool) -> &'static str {
-    if silent {
-        "Error: Some patches could not be applied (re-run without --silent for details)."
-    } else {
-        "Error: Some patches could not be applied."
-    }
-}
+/// The closing error printed when the nested apply failed. Apply's own
+/// per-package `Error: Failed to patch …` lines print above it, even
+/// under `--silent`, so this line needs no "re-run" hint.
+const APPLY_FAILED: &str = "Error: Some patches could not be applied.";
 
 /// Local shape check for an identifier forced with `--id` / `--cve` /
 /// `--ghsa`, so a typo fails fast with a readable message instead of a raw
@@ -2210,15 +2233,14 @@ fn nested_apply_args_from_params(
 /// its manifest write — one lock window for download → manifest write →
 /// apply (a same-process re-acquire would contend), released by apply once
 /// its last mutation is done. Returns whether apply exited 0. Callers print
-/// their own "Applying patches..." line. `json` / `silent` are the
-/// caller's flags: they decide the failure line (`common` itself is always
-/// quiet and never JSON). The read-only cargo-redirect verifier stays off
+/// their own "Applying patches..." line. `json` is the caller's flag: a
+/// JSON caller gets no human error lines, from this function or from the
+/// nested apply (`common` itself is never JSON). The read-only cargo-redirect verifier stays off
 /// and embedded VEX is opt-in on the top-level command only, never on this
 /// internal invocation.
 async fn run_nested_apply(
     common: GlobalArgs,
     json: bool,
-    silent: bool,
     client: &ApiClient,
     lock: LockGuard,
 ) -> bool {
@@ -2228,12 +2250,13 @@ async fn run_nested_apply(
         force: false,
         check: false,
         vex: Default::default(),
+        nested: Some(super::apply::NestedApply { caller_json: json }),
     };
     let code = super::apply::run_locked(apply_args, manifest_path, client, lock).await;
     // An error, so exempt from --silent ("errors only": a failing exit must
     // say why); JSON runs carry the failure in the envelope instead.
     if code != 0 && !json {
-        eprintln!("{}", format_apply_failed(silent));
+        eprintln!("{APPLY_FAILED}");
     }
     code == 0
 }
@@ -2261,9 +2284,14 @@ pub async fn download_and_apply_patches_with(
     // drop removes `apply.lock` and prunes an otherwise-empty `.socket/`, so
     // a run that records nothing leaves no residue. The nested apply runs
     // under this SAME guard (one lock window; see `run_nested_apply`).
-    let guard = match apply_lock::acquire(&socket_dir, lock_timeout) {
+    let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, lock_timeout) {
         Ok(guard) => guard,
-        Err(e) => return (1, report_lock_failure(params.json, &e, lock_timeout)),
+        Err(e) => {
+            return (
+                1,
+                report_lock_failure(params.json, &socket_dir, &e, lock_timeout),
+            )
+        }
     };
 
     let mut manifest = match read_manifest(&manifest_path).await {
@@ -2368,7 +2396,6 @@ pub async fn download_and_apply_patches_with(
         apply_succeeded = run_nested_apply(
             nested_apply_args_from_params(params, run, &manifest_path),
             params.json,
-            params.silent,
             run.api_client,
             lock,
         )
@@ -2559,7 +2586,8 @@ pub async fn run(args: GetArgs) -> i32 {
                             &patch.purl,
                             &patch.tier,
                             None,
-                            &patch.vulnerabilities
+                            &patch.vulnerabilities,
+                            crate::ui::stderr_color(),
                         )
                     );
                 }
@@ -2920,7 +2948,7 @@ pub async fn run(args: GetArgs) -> i32 {
             &args.common,
         )
     {
-        print!("{}", format_selected_patches(&selected));
+        print!("{}", format_selected_patches(&selected, color));
     }
 
     // Agent-mode dry run: preview against the manifest, write nothing.
@@ -3271,10 +3299,10 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
     // See `download_and_apply_patches_with`: the RMW runs under the lock,
     // which also creates `.socket/` and prunes it again when nothing lands;
     // an error return below drops the guard.
-    let guard = match apply_lock::acquire(&socket_dir, lock_timeout) {
+    let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, lock_timeout) {
         Ok(guard) => guard,
         Err(e) => {
-            report_lock_failure(args.common.json, &e, lock_timeout);
+            report_lock_failure(args.common.json, &socket_dir, &e, lock_timeout);
             return 1;
         }
     };
@@ -3334,7 +3362,6 @@ async fn save_and_apply_patch(args: &GetArgs, client: &ApiClient, patch: &PatchR
         apply_succeeded = run_nested_apply(
             nested_apply_args(&args.common, &manifest_path, quiet),
             args.common.json,
-            args.common.silent,
             client,
             lock,
         )
@@ -5086,7 +5113,7 @@ mod tests {
             vuln(&["CVE-2021-44906"], "critical", ""),
         );
         assert_eq!(
-            format_patch_summary("pkg:npm/minimist@1.2.5", "free", None, &m),
+            format_patch_summary("pkg:npm/minimist@1.2.5", "free", None, &m, false),
             "pkg:npm/minimist@1.2.5 [FREE] fixes CVE-2021-44906 (CRITICAL)"
         );
         assert_eq!(
@@ -5094,21 +5121,47 @@ mod tests {
                 "pkg:npm/%40scope/x@1.0.0",
                 "paid",
                 Some("a8b05a61-1e2f-4c5f-a65b-93e71deba1ae"),
-                &m
+                &m,
+                false
             ),
             "pkg:npm/@scope/x@1.0.0 [PAID] a8b05a61: fixes CVE-2021-44906 (CRITICAL)"
         );
         // No advisories: no `fixes`, no colon.
         assert_eq!(
-            format_patch_summary("pkg:npm/a@1", "free", Some("abcdef0123"), &HashMap::new()),
+            format_patch_summary(
+                "pkg:npm/a@1",
+                "free",
+                Some("abcdef0123"),
+                &HashMap::new(),
+                false
+            ),
             "pkg:npm/a@1 [FREE] abcdef01"
         );
         // Unknown severity: ids without a severity suffix.
         let mut u = HashMap::new();
         u.insert("GHSA-2".to_string(), vuln(&[], "", ""));
         assert_eq!(
-            format_patch_summary("pkg:npm/a@1", "free", None, &u),
+            format_patch_summary("pkg:npm/a@1", "free", None, &u, false),
             "pkg:npm/a@1 [FREE] fixes GHSA-2"
+        );
+        // Several advisories: the max severity is labeled as such, and
+        // colored like the listing when color is on.
+        let mut several = HashMap::new();
+        several.insert("GHSA-1".to_string(), vuln(&["CVE-2026-1"], "high", ""));
+        several.insert("GHSA-2".to_string(), vuln(&["CVE-2026-2"], "moderate", ""));
+        assert_eq!(
+            format_patch_summary(
+                "pkg:npm/nuxt@4.5.0",
+                "paid",
+                Some("884e9f6d-x"),
+                &several,
+                false
+            ),
+            "pkg:npm/nuxt@4.5.0 [PAID] 884e9f6d: fixes CVE-2026-1, CVE-2026-2 (highest: HIGH)"
+        );
+        assert_eq!(
+            format_patch_summary("pkg:npm/minimist@1.2.5", "free", None, &m, true),
+            "pkg:npm/minimist@1.2.5 [FREE] fixes CVE-2021-44906 (\x1b[91mCRITICAL\x1b[0m)"
         );
     }
 
@@ -5193,10 +5246,10 @@ mod tests {
             &[("GHSA-a", vuln(&["CVE-2026-4800"], "HIGH", ""))],
         );
         assert_eq!(
-            format_selected_patches(&[a]),
+            format_selected_patches(&[a], false),
             "Selected:\n  pkg:npm/lodash@4.17.20 [FREE] 6332e781: fixes CVE-2026-4800 (HIGH)\n\n"
         );
-        assert_eq!(format_selected_patches(&[]), "Selected:\n\n");
+        assert_eq!(format_selected_patches(&[], false), "Selected:\n\n");
     }
 
     fn skip(purl: &str, code: &str) -> serde_json::Value {
@@ -5470,14 +5523,7 @@ mod tests {
 
     #[test]
     fn apply_failed_line_is_an_error_even_when_silent() {
-        assert_eq!(
-            format_apply_failed(false),
-            "Error: Some patches could not be applied."
-        );
-        assert_eq!(
-            format_apply_failed(true),
-            "Error: Some patches could not be applied (re-run without --silent for details)."
-        );
+        assert_eq!(APPLY_FAILED, "Error: Some patches could not be applied.");
     }
 
     #[test]

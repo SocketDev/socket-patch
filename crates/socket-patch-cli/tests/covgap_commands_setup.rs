@@ -733,8 +733,8 @@ fn remove_interactive_decline_aborts_without_change() {
         "a PTY child must take the interactive branch; got: {output}"
     );
     assert!(
-        output.contains("Aborted"),
-        "declining must print the abort message; got: {output}"
+        output.contains("Hook removal cancelled."),
+        "declining must print the cancel message; got: {output}"
     );
     assert!(
         !output.contains("Removing changes..."),
@@ -1704,8 +1704,9 @@ fn remove_json_surfaces_poetry_lock_refresh_warning() {
     );
 }
 
-/// `--yes` shows no prompt, so the prompt separator must not stack on the
-/// blank line that opens "Applying changes..." / "Removing install hooks...".
+/// `--yes` shows no prompt, so no prompt separator either: the progress
+/// ("Applying changes..." / "Removing install hooks...") is a transient
+/// status line, and a piped `--yes` run leaves stderr empty.
 #[test]
 fn setup_and_remove_with_yes_print_no_double_blank_line() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1714,19 +1715,13 @@ fn setup_and_remove_with_yes_print_no_double_blank_line() {
 
     let (code, stdout, stderr) = run(cwd, &["setup", "--yes"]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stderr.contains("\nApplying changes..."),
-        "stderr=\n{stderr}"
-    );
-    assert!(!stderr.contains("\n\n\n"), "stderr=\n{stderr:?}");
+    assert_eq!(stderr, "", "stderr=\n{stderr:?}");
+    assert!(!stdout.contains("\n\n\n"), "stdout=\n{stdout:?}");
 
     let (code, stdout, stderr) = run(cwd, &["setup", "--remove", "--yes"]);
     assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
-    assert!(
-        stderr.contains("\nRemoving install hooks..."),
-        "stderr=\n{stderr}"
-    );
-    assert!(!stderr.contains("\n\n\n"), "stderr=\n{stderr:?}");
+    assert_eq!(stderr, "", "stderr=\n{stderr:?}");
+    assert!(!stdout.contains("\n\n\n"), "stdout=\n{stdout:?}");
 }
 
 /// A mistyped `--exclude` is warned about and NOT persisted, so later runs

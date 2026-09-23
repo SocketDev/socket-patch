@@ -2039,7 +2039,7 @@ async fn redirect_human_mode_warnings_are_not_json_quoted() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains(&format!(
-            "Skipped {PURL}: not entitled to this patch (paid plan or no org access)"
+            "{PURL}: not entitled to this patch (paid plan or no org access)"
         )),
         "the skipped line must print the bare purl/reason, not JSON-quoted \
          values; stderr=\n{stderr}"

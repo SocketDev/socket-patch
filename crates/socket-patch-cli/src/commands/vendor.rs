@@ -48,7 +48,7 @@ use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning, Status, VexSummary,
 };
-use crate::ui::plural;
+use crate::ui::{plural, StatusLine};
 
 #[derive(Args)]
 pub struct VendorArgs {
@@ -397,6 +397,16 @@ fn format_vendor_failure(purl: &str, detail: &str) -> String {
 /// Report one package that failed to vendor. An error, so it prints even
 /// under `--silent` ("errors only", never nothing); `--json` carries it
 /// in the envelope instead.
+/// The status line while one package's vendor engine call runs.
+fn format_vendor_progress(dry_run: bool, purl: &str, n: usize, total: usize) -> String {
+    let verb = if dry_run { "Checking" } else { "Vendoring" };
+    if total > 1 {
+        format!("{verb} {purl}... ({n}/{total})")
+    } else {
+        format!("{verb} {purl}...")
+    }
+}
+
 fn report_vendor_failure(common: &GlobalArgs, purl: &str, detail: &str) {
     if !common.json {
         eprintln!("{}", format_vendor_failure(purl, detail));
@@ -471,6 +481,15 @@ impl VendorTally {
 /// `Vendored 2 packages.` / `Would vendor 1 package; 1 already vendored;
 /// 1 failed.` Zero clauses are left out; the headline count never is.
 fn format_vendor_summary(dry_run: bool, t: &VendorTally) -> String {
+    // Everything already in sync: say so, instead of "Vendored 0 packages".
+    if t.vendored == 0 && t.already > 0 && t.not_installed == 0 && t.skipped == 0 && t.failed == 0 {
+        let all = if t.already == 1 {
+            "1 package is".to_string()
+        } else {
+            format!("All {} packages are", t.already)
+        };
+        return format!("{all} already vendored; nothing to do.");
+    }
     let verb = if dry_run { "Would vendor" } else { "Vendored" };
     let mut line = format!(
         "{verb} {}",
@@ -615,11 +634,12 @@ pub async fn run(args: VendorArgs) -> i32 {
             env.dry_run = args.common.dry_run;
             println!("{}", env.to_pretty_json());
         } else if !args.common.silent {
-            let tracked = load_state(&args.common.cwd)
-                .await
-                .map(|s| s.entries.len())
-                .unwrap_or(0);
-            println!("{}", no_manifest_message(tracked));
+            // An unreadable ledger is not "no entries": say so (stderr)
+            // instead of the calm nothing-to-vendor line.
+            match load_state(&args.common.cwd).await {
+                Ok(state) => println!("{}", no_manifest_message(state.entries.len())),
+                Err(e) => eprintln!("{}", no_manifest_ledger_unreadable(&e.to_string())),
+            }
         }
         return 0;
     }
@@ -765,6 +785,14 @@ pub async fn run(args: VendorArgs) -> i32 {
 /// tracks entries, i.e. a `scan`/`get --mode vendored` project — says so
 /// instead of implying nothing is vendored: their refresh path is `scan
 /// --mode vendored`, and `repair` is what re-verifies the ledger.
+/// The no-manifest warning when the vendor ledger cannot be read either.
+fn no_manifest_ledger_unreadable(err: &str) -> String {
+    format!(
+        "Warning: No manifest to vendor from, and the vendor ledger could not be read: \
+         {err}\n  Run `socket-patch repair` to check the vendored artifacts."
+    )
+}
+
 fn no_manifest_message(tracked_entries: usize) -> String {
     match tracked_entries {
         0 => "No manifest found, nothing to vendor.".to_string(),
@@ -1366,7 +1394,12 @@ pub(crate) async fn vendor_records(
     // Sorted, so per-package lines print in the same order every run.
     let mut all_packages: Vec<(String, std::path::PathBuf)> = all_packages.into_iter().collect();
     all_packages.sort();
-    for (purl, pkg_path) in &all_packages {
+    // Progress over the per-package engine calls (download, pack, lockfile
+    // rewrite): shown only while an engine call runs, so every per-package
+    // line prints on a clean line.
+    let mut status = StatusLine::stderr(common.json, common.silent);
+    let total = all_packages.len();
+    for (index, (purl, pkg_path)) in all_packages.iter().enumerate() {
         let is_variant_eco =
             Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
         let candidates: Vec<String> = if is_variant_eco {
@@ -1626,6 +1659,12 @@ pub(crate) async fn vendor_records(
                 }
             }
 
+            status.set(format_vendor_progress(
+                common.dry_run,
+                &normalize_purl(candidate),
+                index + 1,
+                total,
+            ));
             let outcome = dispatch_vendor_one(
                 candidate,
                 pkg_path,
@@ -1639,6 +1678,7 @@ pub(crate) async fn vendor_records(
                 &pipenv_version,
             )
             .await;
+            status.finish();
 
             match outcome {
                 None => {
@@ -3629,6 +3669,16 @@ mod scope_and_hint_tests {
     /// the old "No .socket folder found" text was false on every such
     /// project (`.socket/vendor/` exists).
     #[test]
+    fn no_manifest_with_unreadable_ledger_warns() {
+        assert_eq!(
+            no_manifest_ledger_unreadable("corrupt .socket/vendor/state.json: expected value"),
+            "Warning: No manifest to vendor from, and the vendor ledger could not be read: \
+             corrupt .socket/vendor/state.json: expected value\n  Run `socket-patch repair` \
+             to check the vendored artifacts."
+        );
+    }
+
+    #[test]
     fn no_manifest_message_names_the_manifest_and_tracked_entries() {
         assert_eq!(
             no_manifest_message(0),
@@ -4000,6 +4050,18 @@ mod pristine_fetch_tests {
 mod ui_format_tests {
     use super::*;
 
+    #[test]
+    fn vendor_progress_line() {
+        assert_eq!(
+            format_vendor_progress(false, "pkg:npm/lodash@4.17.20", 1, 2),
+            "Vendoring pkg:npm/lodash@4.17.20... (1/2)"
+        );
+        assert_eq!(
+            format_vendor_progress(true, "pkg:npm/lodash@4.17.20", 1, 1),
+            "Checking pkg:npm/lodash@4.17.20..."
+        );
+    }
+
     fn tally(
         vendored: u32,
         already: u32,
@@ -4046,13 +4108,22 @@ mod ui_format_tests {
             format_vendor_summary(false, &tally(1, 2, 1, 3, 1)),
             "Vendored 1 package; 2 already vendored; 1 not installed; 3 skipped; 1 failed."
         );
+        // Nothing but in-sync packages: no "Vendored 0 packages" headline.
         assert_eq!(
             format_vendor_summary(false, &tally(0, 2, 0, 0, 0)),
-            "Vendored 0 packages; 2 already vendored."
+            "All 2 packages are already vendored; nothing to do."
         );
         assert_eq!(
             format_vendor_summary(true, &tally(0, 2, 0, 0, 0)),
-            "Would vendor 0 packages; 2 already vendored."
+            "All 2 packages are already vendored; nothing to do."
+        );
+        assert_eq!(
+            format_vendor_summary(false, &tally(0, 1, 0, 0, 0)),
+            "1 package is already vendored; nothing to do."
+        );
+        assert_eq!(
+            format_vendor_summary(false, &tally(0, 2, 0, 0, 1)),
+            "Vendored 0 packages; 2 already vendored; 1 failed."
         );
         assert_eq!(
             format_vendor_summary(false, &tally(1, 0, 1, 0, 0)),
@@ -4102,7 +4173,7 @@ mod ui_format_tests {
         );
         assert_eq!(
             format_vendor_summary(true, &VendorTally::from_envelope(&dry, true, 3)),
-            "Would vendor 0 packages; 3 already vendored."
+            "All 3 packages are already vendored; nothing to do."
         );
     }
 

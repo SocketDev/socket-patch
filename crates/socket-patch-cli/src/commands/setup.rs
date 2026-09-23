@@ -12,7 +12,6 @@ use socket_patch_core::package_json::update::{
     remove_package_json, update_package_json, RemoveResult, RemoveStatus, UpdateResult,
     UpdateStatus,
 };
-use socket_patch_core::patch::apply_lock::acquire;
 use socket_patch_core::setup::composer::{self, ComposerSetupStatus};
 use socket_patch_core::setup::gem::{self, GemSetupStatus};
 use socket_patch_core::setup::pypi::detect::{
@@ -82,8 +81,8 @@ pub struct SetupArgs {
     pub check: bool,
 
     /// Revert the install hooks that `setup` added: npm `package.json` scripts,
-    /// the Python `socket-patch[hook]` dependency, and the gem Bundler plugin
-    /// wiring.
+    /// the Python `socket-patch[hook]` dependency, the gem Bundler plugin
+    /// wiring, and the Composer `composer.json` script.
     #[arg(
         long = "remove",
         default_value_t = false,
@@ -407,7 +406,8 @@ async fn persist_setup_excludes(
 
     let path = common.resolved_manifest_path();
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    let _lock = match acquire(&common.socket_dir(), timeout) {
+    let _lock = match crate::commands::lock_cli::acquire_with_status(&common.socket_dir(), timeout)
+    {
         Ok(guard) => guard,
         Err(err) => {
             let (code, message) = crate::commands::lock_cli::lock_failure(&err, timeout);
@@ -1194,13 +1194,15 @@ fn format_check_footer(hooks: usize, drifted: usize, errors: usize) -> String {
 /// the Python dependency manifest) is configured for socket-patch. Never writes
 /// (so `--dry-run` is a harmless no-op here). Exits 0 only when all are
 /// configured and none failed to parse.
+/// The status line while `setup --check` / `--remove` discover manifests.
+const SEARCHING: &str = "Searching for package.json / Python / Bundler / Composer manifests...";
+
 async fn run_check(args: &SetupArgs) -> i32 {
     // `--silent` is "errors only" (CLI_CONTRACT.md): suppress the entire
     // human-readable report, mirroring `list`/`repair`/`get`/`remove`/`scan`.
     // The exit code still distinguishes the configuration states.
-    if !args.common.json && !args.common.silent {
-        eprintln!("Searching for package.json / Python / Bundler / Composer manifests...");
-    }
+    let mut status = crate::ui::StatusLine::stderr(args.common.json, args.common.silent);
+    status.set(SEARCHING);
 
     // Excluded members (persisted in the manifest + any passed via `--exclude`)
     // are skipped by discovery. Read-only: `--check` never persists.
@@ -1268,6 +1270,7 @@ async fn run_check(args: &SetupArgs) -> i32 {
     // every in-scope manifest patch must be applied on disk (`apply --check`
     // invariant). Drifted/un-applied patches add `needs_configuration` entries.
     append_patch_consistency_entries(&args.common, existing.ok().flatten(), &mut entries).await;
+    status.finish();
 
     if entries.is_empty() {
         return report_no_files(
@@ -1335,6 +1338,9 @@ async fn run_check(args: &SetupArgs) -> i32 {
         }
         println!();
         println!("{}", format_check_footer(needs - drifted, drifted, errs));
+        if errs > 0 {
+            eprintln!("{}", format_items_failed(errs));
+        }
     } else {
         // `--silent` is "errors only": the status report is muted, but
         // read/parse failures must still reach stderr. A plain
@@ -1362,6 +1368,19 @@ async fn run_check(args: &SetupArgs) -> i32 {
 // remove
 // ─────────────────────────────────────────────────────────────────────────
 
+/// One script's before/after pair in the remove preview, the two values
+/// aligned in one column:
+///
+/// ```text
+///     postinstall:    "socket-patch apply && echo hi"
+///     -> postinstall: "echo hi"
+/// ```
+fn format_script_change(key: &str, old: &str, new: &str) -> String {
+    let label = format!("{key}:");
+    let width = label.len() + 3; // the width of "-> <key>:"
+    format!("    {label:<width$} \"{old}\"\n    -> {label} {new}\n")
+}
+
 /// Render a removed script value: `None` means the key is being deleted.
 fn render_removed(new: &Option<String>) -> String {
     match new {
@@ -1370,17 +1389,17 @@ fn render_removed(new: &Option<String>) -> String {
     }
 }
 
-/// Revert the install hooks `setup` added (npm package.json scripts + the
-/// Python `socket-patch-hook` dependency). Honors `--dry-run`, `--yes`, `--json`.
+/// Revert the install hooks `setup` added (npm package.json scripts, the
+/// Python `socket-patch-hook` dependency, the gem Bundler plugin wiring and
+/// the Composer script). Honors `--dry-run`, `--yes`, `--json`.
 async fn run_remove(args: &SetupArgs) -> i32 {
     let common = &args.common;
     // `--silent` is "errors only" (CLI_CONTRACT.md): mute the human-readable
     // chatter just like `--json` does; the mutation and exit code are
     // unaffected, and prompting follows the shared `confirm()` semantics.
     let quiet = common.json || common.silent;
-    if !quiet {
-        eprintln!("Searching for package.json / Python / Bundler / Composer manifests...");
-    }
+    let mut status = crate::ui::StatusLine::stderr(common.json, common.silent);
+    status.set(SEARCHING);
 
     // Honor the persisted/`--exclude` member set so we never touch a member that
     // was deliberately excluded from setup. Remove does not change the set.
@@ -1400,6 +1419,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     .await;
     let composer_preview =
         build_composer_outcome(common, composer_json.as_deref(), true, true).await;
+    status.finish();
     if npm_files.is_empty()
         && py_plan.is_none()
         && !gem_preview.present
@@ -1474,7 +1494,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
                 println!("No socket-patch install hooks found to remove.");
             }
         }
-        eprint_errors_when_silent(
+        eprint_errors(
             common,
             &remove_error_messages(&npm_preview, &py_preview, &extra_preview, &common.cwd),
         );
@@ -1496,7 +1516,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
                 )
             );
         }
-        eprint_errors_when_silent(
+        eprint_errors(
             common,
             &remove_error_messages(&npm_preview, &py_preview, &extra_preview, &common.cwd),
         );
@@ -1513,14 +1533,12 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     }
     if !crate::ui::confirm_or_proceed("Remove these install hooks?", common) {
         if !common.silent {
-            eprintln!("Aborted.");
+            eprintln!("{REMOVE_CANCELLED}");
         }
         return 0;
     }
 
-    if !quiet {
-        eprintln!("\nRemoving install hooks...");
-    }
+    status.set("Removing install hooks...");
     let mut npm_results = Vec::new();
     for loc in &npm_files {
         npm_results.push(remove_package_json(&loc.path, false).await);
@@ -1542,6 +1560,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
         .await,
         build_composer_outcome(common, composer_json.as_deref(), true, false).await,
     );
+    status.finish();
 
     let errs = npm_results
         .iter()
@@ -1599,7 +1618,7 @@ async fn run_remove(args: &SetupArgs) -> i32 {
     }
 
     print_warnings(common, &warnings);
-    eprint_errors_when_silent(
+    eprint_errors(
         common,
         &remove_error_messages(&npm_results, &py_results, &extra_results, &common.cwd),
     );
@@ -1665,13 +1684,34 @@ fn format_warning(w: &str) -> String {
 /// before an error exit the failures themselves must still reach stderr —
 /// mirroring `remove`/`scan`, whose error paths keep their stderr output.
 /// JSON mode is exempt: its envelope already carries the errors.
-fn eprint_errors_when_silent(common: &GlobalArgs, errs: &[String]) {
-    if !common.silent || common.json {
+///
+/// Without `--silent` the per-item errors are in the stdout report
+/// already, so stderr gets one closing [`format_items_failed`] line: the
+/// run exits 1, and the error stream says so.
+fn eprint_errors(common: &GlobalArgs, errs: &[String]) {
+    if common.json || errs.is_empty() {
         return;
     }
-    for e in errs {
-        eprintln!("Error: {e}");
+    if common.silent {
+        for e in errs {
+            eprintln!("Error: {e}");
+        }
+    } else {
+        eprintln!("{}", format_items_failed(errs.len()));
     }
+}
+
+/// The closing stderr error of a human run whose report lists per-item
+/// errors.
+fn format_items_failed(n: usize) -> String {
+    format!(
+        "Error: {}.",
+        plural(
+            n,
+            "item could not be processed",
+            "items could not be processed"
+        )
+    )
 }
 
 /// Per-item error messages across the three remove result families (npm +
@@ -1728,7 +1768,7 @@ fn format_remove_preview(
     extra: &SetupOutcome,
     cwd: &Path,
 ) -> String {
-    let mut out = String::from("\nProposed changes:\n");
+    let mut out = String::new();
     let to_remove: Vec<_> = npm
         .iter()
         .filter(|r| r.status == RemoveStatus::Removed)
@@ -1737,19 +1777,20 @@ fn format_remove_preview(
         out.push_str("\nWill remove socket-patch from:\n");
         for r in &to_remove {
             out.push_str(&format!("  - {}\n", pathdiff(&r.path, cwd)));
-            out.push_str(&format!("    postinstall:   \"{}\"\n", r.old_script));
-            out.push_str(&format!(
-                "    -> postinstall: {}\n",
-                render_removed(&r.new_script)
-            ));
-            out.push_str(&format!(
-                "    dependencies:  \"{}\"\n",
-                r.old_dependencies_script
-            ));
-            out.push_str(&format!(
-                "    -> dependencies: {}\n",
-                render_removed(&r.new_dependencies_script)
-            ));
+            // Only the scripts the file actually has: a missing hook has
+            // nothing to remove.
+            for (key, old, new) in [
+                ("postinstall", &r.old_script, &r.new_script),
+                (
+                    "dependencies",
+                    &r.old_dependencies_script,
+                    &r.new_dependencies_script,
+                ),
+            ] {
+                if !old.is_empty() {
+                    out.push_str(&format_script_change(key, old, &render_removed(new)));
+                }
+            }
         }
     }
     let py_remove: Vec<_> = py
@@ -1766,7 +1807,12 @@ fn format_remove_preview(
     // Surface failures so the "(see errors above)" line `run_remove` prints when
     // nothing could be removed actually points at something.
     push_errors(&mut out, &remove_error_messages(npm, py, extra, cwd));
-    out
+    // No header over an empty preview: `run_remove` then says there is
+    // nothing to remove.
+    if out.is_empty() {
+        return out;
+    }
+    format!("\nProposed changes:\n{out}")
 }
 
 /// The gem/composer preview lines, as their own blank-line-led section.
@@ -1874,15 +1920,22 @@ fn print_remove_envelope(
 // setup (npm package.json + Python .pth hook, combined)
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Declining the `setup` / `setup --remove` prompt (the "<Action>
+/// cancelled." wording every other command uses).
+const SETUP_CANCELLED: &str = "Setup cancelled.";
+const REMOVE_CANCELLED: &str = "Hook removal cancelled.";
+
+/// The status line while `setup` discovers what to configure.
+const CONFIGURING: &str = "Configuring socket-patch install hooks...";
+
 async fn run_setup(args: &SetupArgs) -> i32 {
     let common = &args.common;
     // `--silent` is "errors only" (CLI_CONTRACT.md): mute the human-readable
     // chatter just like `--json` does; the mutation and exit code are
     // unaffected, and prompting follows the shared `confirm()` semantics.
     let quiet = common.json || common.silent;
-    if !quiet {
-        eprintln!("Configuring socket-patch install hooks...");
-    }
+    let mut status = crate::ui::StatusLine::stderr(common.json, common.silent);
+    status.set(CONFIGURING);
 
     // Resolve the effective exclude set (persisted + `--exclude`); excluded
     // members are skipped by discovery. Persisting it waits for the mutation
@@ -1895,7 +1948,12 @@ async fn run_setup(args: &SetupArgs) -> i32 {
         .as_ref()
         .map(|f| unmatched_excludes(f, &common.cwd, &excludes))
         .unwrap_or_default();
-    warn_unmatched_excludes(common, &unmatched);
+    if !unmatched.is_empty() {
+        // A permanent line: take the status down, then put it back.
+        status.finish();
+        warn_unmatched_excludes(common, &unmatched);
+        status.set(CONFIGURING);
+    }
     // A new `--exclude` value that matches no member is warned about above
     // and not persisted, so a typo does not ride into every later run and
     // clone. Values already persisted stay (they warn on every run instead
@@ -1922,6 +1980,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     let gem_preview = build_gem_outcome(common, gem_add(), true).await;
     let composer_preview =
         build_composer_outcome(common, composer_json.as_deref(), false, true).await;
+    status.finish();
 
     if npm_files.is_empty()
         && py_plan.is_none()
@@ -2039,7 +2098,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
             }
         }
         print_warnings(common, &warnings);
-        eprint_errors_when_silent(
+        eprint_errors(
             common,
             &setup_error_messages(&npm_preview, &py_preview, &extra_preview, &common.cwd),
         );
@@ -2070,7 +2129,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
                 plural(n_changes, "item would be updated", "items would be updated")
             );
         }
-        eprint_errors_when_silent(
+        eprint_errors(
             common,
             &setup_error_messages(&npm_preview, &py_preview, &extra_preview, &common.cwd),
         );
@@ -2086,7 +2145,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     }
     if !crate::ui::confirm_or_proceed("Proceed with these changes?", common) {
         if !common.silent {
-            eprintln!("Aborted.");
+            eprintln!("{SETUP_CANCELLED}");
         }
         return 0;
     }
@@ -2095,9 +2154,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     // returned above; an aborted or no-project run never gets here).
     let persist_warning = persist_setup_excludes(common, &existing, &to_persist).await;
 
-    if !quiet {
-        eprintln!("\nApplying changes...");
-    }
+    status.set("Applying changes...");
 
     let mut npm_results = Vec::new();
     for loc in &npm_files {
@@ -2124,6 +2181,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     if gem_present {
         warnings.extend(finalize_gem(common).await);
     }
+    status.finish();
 
     let errors = npm_results
         .iter()
@@ -2185,7 +2243,7 @@ async fn run_setup(args: &SetupArgs) -> i32 {
     }
 
     print_warnings(common, &warnings);
-    eprint_errors_when_silent(
+    eprint_errors(
         common,
         &setup_error_messages(&npm_results, &py_results, &extra_results, &common.cwd),
     );
@@ -2609,6 +2667,55 @@ mod tests {
     }
 
     #[test]
+    fn cancel_lines_name_the_action() {
+        assert_eq!(SETUP_CANCELLED, "Setup cancelled.");
+        assert_eq!(REMOVE_CANCELLED, "Hook removal cancelled.");
+        assert_eq!(
+            SEARCHING,
+            "Searching for package.json / Python / Bundler / Composer manifests..."
+        );
+        assert_eq!(CONFIGURING, "Configuring socket-patch install hooks...");
+    }
+
+    #[test]
+    fn remove_preview_is_empty_when_nothing_would_change() {
+        let npm = vec![remove("/proj/package.json", RemoveStatus::NotConfigured)];
+        assert_eq!(
+            format_remove_preview(&npm, &[], &SetupOutcome::default(), &cwd()),
+            ""
+        );
+        assert_eq!(
+            format_items_failed(1),
+            "Error: 1 item could not be processed."
+        );
+        assert_eq!(
+            format_items_failed(2),
+            "Error: 2 items could not be processed."
+        );
+    }
+
+    #[test]
+    fn remove_preview_lists_only_the_scripts_the_file_has() {
+        let mut only_postinstall = remove("/proj/package.json", RemoveStatus::Removed);
+        only_postinstall.old_script =
+            "npx @socketsecurity/socket-patch apply --silent --ecosystems npm".to_string();
+        only_postinstall.new_script = None;
+        only_postinstall.old_dependencies_script = String::new();
+        only_postinstall.new_dependencies_script = None;
+        let out = format_remove_preview(&[only_postinstall], &[], &SetupOutcome::default(), &cwd());
+        assert_eq!(
+            out,
+            "\nProposed changes:\n\nWill remove socket-patch from:\n  - package.json\n    \
+             postinstall:    \"npx @socketsecurity/socket-patch apply --silent --ecosystems \
+             npm\"\n    -> postinstall: (removed)\n"
+        );
+        assert_eq!(
+            format_script_change("dependencies", "socket-patch apply", "(removed)"),
+            "    dependencies:    \"socket-patch apply\"\n    -> dependencies: (removed)\n"
+        );
+    }
+
+    #[test]
     fn remove_preview_layout_has_no_double_blank_lines() {
         let npm = vec![remove("/proj/package.json", RemoveStatus::Removed)];
         let py = vec![PthEditResult {
@@ -2627,8 +2734,8 @@ mod tests {
         assert_eq!(
             out,
             "\nProposed changes:\n\nWill remove socket-patch from:\n  - package.json\n    \
-             postinstall:   \"socket-patch apply && echo hi\"\n    -> postinstall: \"echo \
-             hi\"\n    dependencies:  \"socket-patch apply\"\n    -> dependencies: \
+             postinstall:    \"socket-patch apply && echo hi\"\n    -> postinstall: \"echo \
+             hi\"\n    dependencies:    \"socket-patch apply\"\n    -> dependencies: \
              (removed)\n\nWill remove the socket-patch-hook dependency from:\n  - \
              requirements.txt\n\nGem: remove the socket-patch Bundler plugin wiring from:\n  \
              - Gemfile\n"
