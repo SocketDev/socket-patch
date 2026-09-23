@@ -342,6 +342,23 @@ pub struct GlobalArgs {
         value_parser = parse_bool_flag,
     )]
     pub no_trust_lockfile_config: bool,
+
+    /// Hosted mode (`scan`/`get --mode hosted`): do NOT auto-configure
+    /// `allow-remote=all` in the project .npmrc after a root
+    /// package-lock.json / npm-shrinkwrap.json is repointed at the hosted
+    /// patch server. npm >= 12 defaults to `allow-remote=none` and refuses
+    /// the repointed lock (EALLOWREMOTE), so opting out means every install
+    /// needs `npm ci --allow-remote=all` instead (the run's warning spells
+    /// it out). Only hosted-mode `scan` and `get` read this; other
+    /// subcommands accept it silently.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "no-npm-allow-remote-config",
+        env = "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub no_npm_allow_remote_config: bool,
 }
 
 impl GlobalArgs {
@@ -529,6 +546,7 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_DEBUG",
     "SOCKET_TELEMETRY_DISABLED",
     "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
+    "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
 ];
 
 /// Every env var a **subcommand-local** flag binds (one per `env = "..."`
@@ -620,6 +638,7 @@ impl Default for GlobalArgs {
             debug: false,
             no_telemetry: false,
             no_trust_lockfile_config: false,
+            no_npm_allow_remote_config: false,
         }
     }
 }

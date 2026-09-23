@@ -72,6 +72,11 @@ enum Inverse {
     /// The pnpm `trustLockfile` auto-config (kind-specific: `created`
     /// deletes the scaffold, `added` removes exactly one line).
     PnpmTrust,
+    /// The npm `.npmrc` `allow-remote=all` auto-config (kind-specific:
+    /// `created` deletes the untouched file, `added` removes exactly one
+    /// line — see [`super::npmrc`]). Grouped with the npm lock kinds so a
+    /// surviving (refused) package-lock edit keeps the setting it needs.
+    NpmrcAllowRemote,
     BunBinaryPackage,
     /// Owned by a per-purl revert (npm JSON kinds). Present here only
     /// when that revert failed — refuse the group rather than guess.
@@ -148,6 +153,7 @@ fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
             ("golang", Inverse::NoopDrop)
         }
         "redirect_npm_lock_entry" | "redirect_npm_lock_dep" => ("npm", Inverse::PerPurlOnly),
+        super::npmrc::NPMRC_ALLOW_REMOTE_EDIT_KIND => ("npm", Inverse::NpmrcAllowRemote),
         "redirect_maven_repository"
         | "redirect_maven_dep_management"
         | "redirect_maven_config"
@@ -666,6 +672,55 @@ pub async fn revert_remaining_redirect_edits(
                             group_drops.insert(idx);
                         }
                     }
+                }
+                Inverse::NpmrcAllowRemote => {
+                    // Refuse a symlinked / non-regular `.npmrc` while
+                    // planning — never at flush time, after sibling files
+                    // of the group may already have landed.
+                    if !staged.contains_key(&edit.path) {
+                        if let Ok(meta) =
+                            tokio::fs::symlink_metadata(project_root.join(&edit.path)).await
+                        {
+                            if !meta.is_file() {
+                                refuse(
+                                    format!("{} is not a regular file", edit.path),
+                                    &mut outcome,
+                                );
+                                refused_groups.insert(group);
+                                continue 'group;
+                            }
+                        }
+                    }
+                    let content = match staged_read(&staged, project_root, &edit.path).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            refuse(e, &mut outcome);
+                            refused_groups.insert(group);
+                            continue 'group;
+                        }
+                    };
+                    match super::npmrc::unwind_npmrc_allow_remote(&edit.action, content.as_deref())
+                    {
+                        Ok(super::npmrc::NpmrcUnwind::Unchanged) => {}
+                        Ok(super::npmrc::NpmrcUnwind::Delete) => {
+                            staged.insert(edit.path.clone(), None);
+                        }
+                        Ok(super::npmrc::NpmrcUnwind::Write {
+                            content,
+                            modified_created,
+                        }) => {
+                            staged.insert(edit.path.clone(), Some(content));
+                            if modified_created {
+                                group_warnings.push(super::npmrc::npmrc_modified_warning());
+                            }
+                        }
+                        Err(e) => {
+                            refuse(e, &mut outcome);
+                            refused_groups.insert(group);
+                            continue 'group;
+                        }
+                    }
+                    group_drops.insert(idx);
                 }
             }
         }
@@ -1507,6 +1562,144 @@ mod tests {
         assert_eq!(state.edits.len(), 1, "only the refused npm edit remains");
     }
 
+    // ---------- npm .npmrc allow-remote ----------
+
+    fn npmrc_edit(action: &str) -> FileEdit {
+        FileEdit {
+            path: ".npmrc".into(),
+            kind: "redirect_npmrc_allow_remote".into(),
+            action: action.into(),
+            key: Some("allow-remote".into()),
+            original: None,
+            new: Some(json!("all")),
+        }
+    }
+
+    #[tokio::test]
+    async fn npmrc_created_file_is_deleted_when_unmodified() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".npmrc", "allow-remote=all\n").await;
+        let mut state = state_with(vec![npmrc_edit("created")], &[]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert!(!dir.path().join(".npmrc").exists());
+        assert!(state.edits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn npmrc_appended_line_is_removed_exactly_and_user_edits_survive() {
+        let dir = TempDir::new().unwrap();
+        // The user added their own setting after our line (CRLF file).
+        write(
+            dir.path(),
+            ".npmrc",
+            "registry=https://r.example/\r\nallow-remote=all\r\nfund=false\r\n",
+        )
+        .await;
+        let mut state = state_with(vec![npmrc_edit("added")], &[]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(
+            read(dir.path(), ".npmrc").await,
+            "registry=https://r.example/\r\nfund=false\r\n"
+        );
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    #[tokio::test]
+    async fn npmrc_modified_created_file_keeps_the_file_and_warns() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".npmrc", "allow-remote=all\nfund=false\n").await;
+        let mut state = state_with(vec![npmrc_edit("created")], &[]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(read(dir.path(), ".npmrc").await, "fund=false\n");
+        assert!(out
+            .warnings
+            .iter()
+            .any(|(code, _)| code == "redirect_npmrc_allow_remote_modified"));
+    }
+
+    #[tokio::test]
+    async fn npmrc_edit_is_kept_while_an_npm_lock_edit_refuses() {
+        // A package-lock edit the per-purl revert failed to claim refuses
+        // the npm group — and with it the `.npmrc` setting that lock needs.
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".npmrc", "allow-remote=all\n").await;
+        let mut state = state_with(
+            vec![
+                FileEdit {
+                    path: "package-lock.json".into(),
+                    kind: "redirect_npm_lock_entry".into(),
+                    action: "rewritten".into(),
+                    key: Some("node_modules/a".into()),
+                    original: Some(json!({"resolved": "https://registry/a-1.tgz"})),
+                    new: Some(json!({"resolved": "https://patch.example/a-1.tgz"})),
+                },
+                npmrc_edit("created"),
+            ],
+            &["pkg:npm/a@1"],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert_eq!(out.refusals[0].group, "npm");
+        assert_eq!(read(dir.path(), ".npmrc").await, "allow-remote=all\n");
+        assert_eq!(state.edits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn npmrc_duplicate_line_refuses_and_dry_run_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".npmrc", "allow-remote=all\nallow-remote=all\n").await;
+        let mut state = state_with(vec![npmrc_edit("added")], &[]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert_eq!(state.edits.len(), 1);
+
+        write(dir.path(), ".npmrc", "allow-remote=all\n").await;
+        let mut state = state_with(vec![npmrc_edit("created")], &[]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, true).await;
+        assert!(out.fully_reverted());
+        assert!(out.reverted_files.contains(".npmrc"));
+        assert_eq!(read(dir.path(), ".npmrc").await, "allow-remote=all\n");
+    }
+
+    /// The replay twin of the per-purl finding: a symlinked `.npmrc`
+    /// refuses the npm group while planning (the link and its target are
+    /// never written), and a section-scoped copy of the line no longer
+    /// makes the unwind ambiguous.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn npmrc_symlink_refuses_at_plan_time_and_section_copies_are_inert() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "shared.npmrc", "allow-remote=all\n").await;
+        std::os::unix::fs::symlink("shared.npmrc", dir.path().join(".npmrc")).unwrap();
+        let mut state = state_with(vec![npmrc_edit("created")], &[]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert!(
+            out.refusals[0].reason.contains("not a regular file"),
+            "{out:?}"
+        );
+        assert_eq!(state.edits.len(), 1);
+        assert_eq!(read(dir.path(), "shared.npmrc").await, "allow-remote=all\n");
+
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            ".npmrc",
+            "allow-remote=all\n[sec]\nallow-remote=all\n",
+        )
+        .await;
+        let mut state = state_with(vec![npmrc_edit("added")], &[]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{out:?}");
+        assert_eq!(
+            read(dir.path(), ".npmrc").await,
+            "[sec]\nallow-remote=all\n"
+        );
+    }
+
     // ---------- pnpm trust ----------
 
     #[tokio::test]
@@ -1801,6 +1994,8 @@ mod tests {
             ("redirect_golang_stale_gosum_removed", "removed"),
             ("redirect_npm_lock_entry", "rewritten"),
             ("redirect_npm_lock_dep", "rewritten"),
+            ("redirect_npmrc_allow_remote", "created"),
+            ("redirect_npmrc_allow_remote", "added"),
             ("redirect_maven_repository", "added"),
             ("redirect_maven_dep_management", "added"),
             ("redirect_maven_dep_version", "rewritten"),

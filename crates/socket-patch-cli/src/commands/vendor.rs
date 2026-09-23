@@ -1592,7 +1592,23 @@ pub(crate) async fn vendor_records(
                     )
                     .await
                     {
-                        Ok(_) => {
+                        Ok(revert) => {
+                            // Advisories from the same transaction (a
+                            // redirect-created `.npmrc` modified since —
+                            // kept, only the `allow-remote=all` line removed).
+                            for (code, detail) in &revert.warnings {
+                                if code == "redirect_npmrc_allow_remote_modified" {
+                                    record_warning(
+                                        env,
+                                        candidate,
+                                        &VendorWarning::new(
+                                            "redirect_npmrc_allow_remote_modified",
+                                            detail.clone(),
+                                        ),
+                                        common,
+                                    );
+                                }
+                            }
                             if let Err(e) =
                                 socket_patch_core::patch::redirect::persist_redirect_state(
                                     &common.cwd,

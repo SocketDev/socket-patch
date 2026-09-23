@@ -1151,8 +1151,25 @@ pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: boo
 /// (envelope contract: codes are additive and stable; only the free-text
 /// detail differs), and it fires exactly once — the reconciled ledger no
 /// longer overlaps, so re-runs stay silent.
-pub(super) fn mode_takeover_reconciled_detail(reconciled: &[String]) -> String {
+pub(super) fn mode_takeover_reconciled_detail(
+    reconciled: &[String],
+    npmrc_unwound: bool,
+) -> String {
     let list = reconciled.join(", ");
+    // The `.npmrc` sentence is conditional: only a run that actually
+    // unwound the hosted npm allow-remote auto-config says so, and then the
+    // "restores the hosted wiring" claim gains its npm >= 12 caveat.
+    let npmrc = if npmrc_unwound {
+        " The hosted redirect's `.npmrc` `allow-remote=all` auto-config was \
+         unwound too (a redirect-created file deleted, an appended line \
+         removed): the vendored `file:` specs do not need it. If you later \
+         restore the hosted lock wiring with `vendor --revert`, npm >=12 \
+         refuses it (EALLOWREMOTE) until `allow-remote=all` is back — re-run \
+         `scan --mode hosted` afterwards to re-establish it and its ledger \
+         record."
+    } else {
+        ""
+    };
     format!(
         "vendored artifacts superseded the hosted redirect ledger for: {list}; \
          reconciled automatically. Both halves of each superseded entry — the \
@@ -1161,9 +1178,9 @@ pub(super) fn mode_takeover_reconciled_detail(reconciled: &[String]) -> String {
          deleted). The lockfile points at the committed `.socket/vendor/` \
          files, and the pre-vendor lock values (including the hosted-spliced \
          fragment) are preserved as the vendor ledger's wiring originals, so \
-         `vendor --revert` still restores the hosted wiring losslessly. \
-         Ledger data for other, still-redirected package(s) was left \
-         untouched. No action needed."
+         `vendor --revert` still restores the hosted lock wiring \
+         byte-for-byte.{npmrc} Ledger data for other, still-redirected \
+         package(s) was left untouched. No action needed."
     )
 }
 
@@ -1174,16 +1191,21 @@ pub(super) fn mode_takeover_reconciled_detail(reconciled: &[String]) -> String {
 /// against the LIVE lockfile: the gate that makes the warning truthful is
 /// the one that makes the drop lossless (the vendor ledger's wiring
 /// `original` embeds the hosted-spliced fragment, so `vendor --revert` needs
-/// nothing from these records). `Ok(false)` when nothing matched (degenerate
-/// — the caller falls back to the manual advisory rather than claiming a
-/// reconciliation that did not happen); `Err` when the ledger could not be
-/// read back or persisted (fail closed: the atomic writer leaves the on-disk
-/// ledger either untouched or fully pre-drop, and the caller surfaces the
-/// failure inside the warning).
-async fn reconcile_superseded_redirect(cwd: &Path, purls: &[String]) -> Result<bool, String> {
+/// nothing from these records). `Ok(Some(npmrc))` — reconciled, with the
+/// outcome of the `.npmrc` allow-remote unwind (whether the file changed,
+/// and its advisories for the caller to surface); `Ok(None)` when nothing
+/// matched (degenerate — the caller falls back to the manual advisory
+/// rather than claiming a reconciliation that did not happen); `Err` when
+/// the ledger could not be read back or persisted (fail closed: the atomic
+/// writer leaves the on-disk ledger either untouched or fully pre-drop, and
+/// the caller surfaces the failure inside the warning).
+async fn reconcile_superseded_redirect(
+    cwd: &Path,
+    purls: &[String],
+) -> Result<Option<socket_patch_core::patch::redirect::npmrc::NpmrcStandaloneUnwind>, String> {
     let mut state = match socket_patch_core::patch::redirect::load_redirect_state(cwd).await {
         Ok(Some(state)) => state,
-        Ok(None) => return Ok(false),
+        Ok(None) => return Ok(None),
         Err(corrupt) => return Err(corrupt.to_string()),
     };
     let mut dropped = false;
@@ -1191,12 +1213,23 @@ async fn reconcile_superseded_redirect(cwd: &Path, purls: &[String]) -> Result<b
         dropped |= socket_patch_core::patch::redirect::drop_superseded_purl(&mut state, purl);
     }
     if !dropped {
-        return Ok(false);
+        return Ok(None);
     }
+    // The dropped npm purls may have been the last package-lock entries the
+    // hosted `.npmrc` `allow-remote=all` auto-config served: unwind it
+    // (created file deleted / appended line removed) before persisting, so
+    // a hosted→vendored migration leaves no loosened install policy behind.
+    // Vendored `file:` specs never needed it (npm gates them by
+    // `allow-file`, default `all`).
+    // Its outcome (and advisories such as
+    // `redirect_npmrc_allow_remote_modified`) goes back to the caller.
+    let npmrc =
+        socket_patch_core::patch::redirect::npmrc::unwind_unneeded_npmrc(cwd, &mut state, false)
+            .await?;
     socket_patch_core::patch::redirect::persist_redirect_state(cwd, &state)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(true)
+    Ok(Some(npmrc))
 }
 
 /// Record a run-level advisory: stderr `Warning (code): detail` in human
@@ -1272,15 +1305,23 @@ pub(super) async fn note_vendor_supersedes_redirect(
         return;
     }
     match reconcile_superseded_redirect(cwd, &reconcilable).await {
-        Ok(true) => push_run_warning(
-            env,
-            common,
-            VENDOR_SUPERSEDES_REDIRECT,
-            mode_takeover_reconciled_detail(&reconcilable),
-        ),
+        Ok(Some(npmrc)) => {
+            push_run_warning(
+                env,
+                common,
+                VENDOR_SUPERSEDES_REDIRECT,
+                mode_takeover_reconciled_detail(&reconcilable, npmrc.file_changed),
+            );
+            // The `.npmrc` unwind's own advisories (a redirect-created file
+            // the user has since added to: kept, only our line removed) —
+            // surfaced like rollback / vendor surface them.
+            for (code, detail) in npmrc.warnings {
+                push_run_warning(env, common, &code, detail);
+            }
+        }
         // Nothing matched to drop — do not claim a reconciliation that did
         // not happen; hand out the manual remediation instead.
-        Ok(false) => push_run_warning(
+        Ok(None) => push_run_warning(
             env,
             common,
             VENDOR_SUPERSEDES_REDIRECT,
@@ -4538,6 +4579,69 @@ mod tests {
         );
     }
 
+    /// Finding: the reconcile unwound the hosted `.npmrc` auto-config but
+    /// threw away the unwind's warnings (a user-edited redirect-created
+    /// `.npmrc` was rewritten with no `redirect_npmrc_allow_remote_modified`)
+    /// and its detail never mentioned `.npmrc` while still promising
+    /// `vendor --revert` restores the hosted wiring (npm 12 then refuses it
+    /// without the line). Both are now surfaced.
+    #[tokio::test]
+    async fn vendored_takeover_reconcile_surfaces_the_npmrc_unwind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_redirect_ledger_with_edits(
+            root,
+            &[NPM_TAKEOVER_PURL],
+            vec![
+                redirect_edit("package-lock.json", "minimist@1.2.2"),
+                socket_patch_core::patch::redirect::FileEdit {
+                    path: ".npmrc".into(),
+                    kind: "redirect_npmrc_allow_remote".into(),
+                    action: "created".into(),
+                    key: Some("allow-remote".into()),
+                    original: None,
+                    new: Some(serde_json::json!("all")),
+                },
+            ],
+        )
+        .await;
+        write_vendor_ledger_wired(root, &[NPM_TAKEOVER_PURL]).await;
+        write_lock_pointing_at_vendored(root, "minimist", "1.2.2").await;
+        // The user added their own setting to the redirect-created file.
+        tokio::fs::write(root.join(".npmrc"), "allow-remote=all\nfund=false\n")
+            .await
+            .unwrap();
+
+        let mut env = vendor_env();
+        note_vendor_supersedes_redirect(&mut env, root, &takeover_common()).await;
+
+        let codes: Vec<&str> = env.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            [
+                VENDOR_SUPERSEDES_REDIRECT,
+                "redirect_npmrc_allow_remote_modified"
+            ],
+            "{:?}",
+            env.warnings
+        );
+        let detail = &env.warnings[0].detail;
+        assert!(detail.contains("reconciled automatically"), "{detail}");
+        assert!(detail.contains("`.npmrc` `allow-remote=all`"), "{detail}");
+        assert!(detail.contains("EALLOWREMOTE"), "{detail}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(".npmrc"))
+                .await
+                .unwrap(),
+            "fund=false\n",
+            "only our line removed"
+        );
+        assert!(load_ledger(root).await.is_none(), "emptied ledger deleted");
+
+        // Without a recorded `.npmrc` edit the detail stays silent on it.
+        assert!(!mode_takeover_reconciled_detail(&["p".into()], false).contains(".npmrc"));
+    }
+
     #[tokio::test]
     async fn vendored_takeover_dry_run_warns_manual_and_leaves_the_ledger() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4602,7 +4706,7 @@ mod tests {
         assert_eq!(
             env.warnings[0].detail,
             mode_takeover_detail(&[NPM_TAKEOVER_PURL.to_string()], false),
-            "an Ok(false) reconcile must fall back to the manual detail verbatim"
+            "an Ok(None) reconcile must fall back to the manual detail verbatim"
         );
         let after = tokio::fs::read(&ledger_path).await.unwrap();
         assert_eq!(

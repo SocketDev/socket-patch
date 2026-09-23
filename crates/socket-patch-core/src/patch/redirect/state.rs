@@ -38,8 +38,10 @@ pub struct RedirectState {
     /// hosted pnpm flow's `redirect_pnpm_workspace_trust`, recording the
     /// auto-configured pnpm-workspace.yaml `trustLockfile: true` with
     /// `action` `"created"` for a new file or `"added"` for a spliced-in
-    /// line) must round-trip through ledgers written before they existed,
-    /// so no field here may ever tighten into an enum.
+    /// line; likewise the hosted npm flow's `redirect_npmrc_allow_remote`
+    /// for the project `.npmrc` `allow-remote=all`) must round-trip through
+    /// ledgers written before they existed, so no field here may ever
+    /// tighten into an enum.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edits: Vec<FileEdit>,
     /// PURL -> manifest patch record. Present so VEX can attest redirected

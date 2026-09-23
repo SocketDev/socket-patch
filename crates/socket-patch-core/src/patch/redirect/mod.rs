@@ -28,6 +28,7 @@ use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 mod bun_binary;
 pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
 pub mod golang_local;
+pub mod npmrc;
 mod pdm;
 mod pipenv;
 mod pnpm;
