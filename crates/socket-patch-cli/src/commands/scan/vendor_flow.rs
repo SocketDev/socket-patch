@@ -37,13 +37,13 @@ use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
     note_classic_migration_risk, track_outcomes_for_vendor, vendor_records,
 };
-use crate::json_envelope::{Command as EnvelopeCommand, Envelope, RunWarning};
+use crate::json_envelope::{Command as EnvelopeCommand, Envelope};
 use crate::output::print_json;
 
 use super::gc::{gc_json, print_gc_vendored_line, run_apply_gc};
 use super::{
     discover_selected, download_params, embed_vex_into_json, emit_discovery_error_json,
-    note_vendor_supersedes_redirect, ScanArgs,
+    note_vendor_supersedes_redirect, push_run_warning, ScanArgs,
 };
 
 /// Run-level warning: a `.socket/manifest.json` record for a purl the
@@ -272,19 +272,6 @@ async fn stage_and_vendor(
     // locally.
     let service = common.vendor_service_config(Some(client), use_public_proxy);
     Ok(boxed_vendor_records(common, &manifest.patches, &sources, Some(&service), env).await)
-}
-
-/// Record a run-level advisory: stderr `Warning (code): detail` in human
-/// mode (informational, so muted by `--silent`) and `warnings[]` on the
-/// envelope for JSON consumers.
-fn push_run_warning(env: &mut Envelope, common: &GlobalArgs, code: &str, detail: String) {
-    if !common.silent && !common.json {
-        eprintln!("Warning ({code}): {detail}");
-    }
-    env.warnings.push(RunWarning {
-        code: code.to_string(),
-        detail,
-    });
 }
 
 /// The ledger key addressable as `purl`: the exact key, else the entry

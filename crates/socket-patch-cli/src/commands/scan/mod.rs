@@ -1196,6 +1196,25 @@ async fn reconcile_superseded_redirect(cwd: &Path, purls: &[String]) -> Result<b
     Ok(true)
 }
 
+/// Record a run-level advisory: stderr `Warning (code): detail` in human
+/// mode (informational, so muted by `--silent`) and `warnings[]` on the
+/// envelope for JSON consumers. Shared by the vendored flows here and in
+/// `vendor_flow.rs`.
+pub(super) fn push_run_warning(
+    env: &mut crate::json_envelope::Envelope,
+    common: &GlobalArgs,
+    code: &str,
+    detail: String,
+) {
+    if !common.silent && !common.json {
+        eprintln!("Warning ({code}): {detail}");
+    }
+    env.warnings.push(crate::json_envelope::RunWarning {
+        code: code.to_string(),
+        detail,
+    });
+}
+
 /// Cross-mode takeover advisory shared by every VENDORED flow (`vendor`,
 /// `scan --mode vendored`): when this ledger and a committed hosted redirect
 /// ledger both claim package(s) AND the live lockfile proves vendored won,
@@ -1224,15 +1243,6 @@ pub(super) async fn note_vendor_supersedes_redirect(
     if superseded.is_empty() {
         return;
     }
-    fn push_warning(env: &mut crate::json_envelope::Envelope, common: &GlobalArgs, detail: String) {
-        if !common.silent && !common.json {
-            eprintln!("Warning ({VENDOR_SUPERSEDES_REDIRECT}): {detail}");
-        }
-        env.warnings.push(crate::json_envelope::RunWarning {
-            code: VENDOR_SUPERSEDES_REDIRECT.to_string(),
-            detail,
-        });
-    }
     // Reconciliation is gated three ways, each fail-closed to the manual
     // advisory: never under --dry-run (this advisory runs even on preview
     // flows, and a dry run must not mutate the ledger); only npm-family
@@ -1248,9 +1258,10 @@ pub(super) async fn note_vendor_supersedes_redirect(
             .partition(|purl| purl.starts_with("pkg:npm/"))
     };
     if !manual.is_empty() {
-        push_warning(
+        push_run_warning(
             env,
             common,
+            VENDOR_SUPERSEDES_REDIRECT,
             mode_takeover_detail(&manual, /*current_is_hosted=*/ false),
         );
     }
@@ -1258,17 +1269,24 @@ pub(super) async fn note_vendor_supersedes_redirect(
         return;
     }
     match reconcile_superseded_redirect(cwd, &reconcilable).await {
-        Ok(true) => push_warning(env, common, mode_takeover_reconciled_detail(&reconcilable)),
+        Ok(true) => push_run_warning(
+            env,
+            common,
+            VENDOR_SUPERSEDES_REDIRECT,
+            mode_takeover_reconciled_detail(&reconcilable),
+        ),
         // Nothing matched to drop — do not claim a reconciliation that did
         // not happen; hand out the manual remediation instead.
-        Ok(false) => push_warning(
+        Ok(false) => push_run_warning(
             env,
             common,
+            VENDOR_SUPERSEDES_REDIRECT,
             mode_takeover_detail(&reconcilable, /*current_is_hosted=*/ false),
         ),
-        Err(e) => push_warning(
+        Err(e) => push_run_warning(
             env,
             common,
+            VENDOR_SUPERSEDES_REDIRECT,
             format!(
                 "{} Automatic reconciliation failed ({e}); the ledger was left \
                  as it was, so this warning will fire again until the cleanup \

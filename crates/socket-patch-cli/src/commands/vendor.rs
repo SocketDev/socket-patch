@@ -24,7 +24,6 @@ use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
-use socket_patch_core::patch::apply_lock::{self, LockError};
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
@@ -42,7 +41,7 @@ use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::apply::{representative_file, result_to_event, variant_matches_installed};
 use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
-use crate::commands::lock_cli::{acquire_or_emit, lock_failure};
+use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::rollback::VendorRevertStep;
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
 use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
@@ -1885,11 +1884,6 @@ pub(crate) struct VendorGcSummary {
     /// ledger, nothing reclaimed. Only purls; the pass-level outcomes below
     /// have their own fields.
     pub failed: Vec<String>,
-    /// Set when a wet pass skipped ALL its work because the apply lock
-    /// could not be taken: `("lock_held", <marker>)` for a live holder,
-    /// `lock_cli::lock_failure`'s `("lock_io", <message>)` for a lock file
-    /// that could not be created or opened. Never set on dry runs.
-    pub skipped: Option<(&'static str, String)>,
     /// Post-revert rewrites that failed: `("vendor_state_write_failed" |
     /// "manifest_write_failed", <detail>)`. The reverts themselves already
     /// happened on disk; the stale record is what the caller must report.
@@ -1924,67 +1918,16 @@ pub(crate) struct VendorGcSummary {
 /// manifest skips (a) only (a prune must not mass-revert on a deleted
 /// manifest — that is `vendor --revert`'s explicit contract).
 ///
-/// Wet runs take the apply lock (lockfiles + the manifest are rewritten),
-/// honoring `--lock-timeout`; a live holder records the contention skip
-/// ([`VendorGcSummary::skipped`]) and returns — it never fails the scan —
-/// while a lock that cannot even be opened (`lock_io`) records the distinct
-/// reason plus a human-mode warning. The ledger and manifest are rewritten
-/// only when a pass removed something; a failed rewrite is recorded in
-/// [`VendorGcSummary::write_failures`] (the reverts themselves already
-/// happened on disk). Dry runs are read-only, lock-free, and list-only.
-///
-/// A caller already holding the apply lock (`scan --prune`'s manifest
-/// prune runs under the same guard) uses [`run_vendor_gc_locked`]: flock is
-/// per open file description, so a nested acquire here would read as a
-/// live holder and silently skip every revert.
+/// Lock-free: the caller holds the apply lock for a wet pass (`scan
+/// --prune`'s `run_apply_gc` takes ONE lock for the vendored half and the
+/// manifest prune — flock is per open file description, so a nested acquire
+/// here would read as a live holder and silently skip every revert); a dry
+/// run needs none (read-only, list-only). Re-reads the ledger itself — under
+/// the caller's lock it is the authoritative copy. The ledger and manifest
+/// are rewritten only when a pass removed something; a failed rewrite is
+/// recorded in [`VendorGcSummary::write_failures`] (the reverts themselves
+/// already happened on disk).
 pub(crate) async fn run_vendor_gc(
-    common: &GlobalArgs,
-    manifest_path: &Path,
-    dry_run: bool,
-) -> VendorGcSummary {
-    if dry_run {
-        return run_vendor_gc_locked(common, manifest_path, true).await;
-    }
-    // Existence gate BEFORE the lock (`acquire` creates `.socket/`): a
-    // project with no ledger entries has nothing this pass could reclaim.
-    if !load_state(&common.cwd)
-        .await
-        .is_ok_and(|s| !s.entries.is_empty())
-    {
-        return VendorGcSummary::default();
-    }
-    let socket_dir = crate::args::socket_dir_of(manifest_path, &common.cwd);
-    let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    let _guard = match apply_lock::acquire(&socket_dir, timeout) {
-        Ok(g) => g,
-        Err(LockError::Held) => {
-            return VendorGcSummary {
-                skipped: Some((
-                    "lock_held",
-                    "vendor GC skipped: another socket-patch run holds the apply lock".to_string(),
-                )),
-                ..Default::default()
-            };
-        }
-        Err(e) => {
-            // Not contention: a file squatting on `.socket/`, a directory
-            // on `apply.lock`, a permissions problem. Mislabelling it as
-            // a live holder would hide a real fault behind a benign skip.
-            let (code, message) = lock_failure(&e, timeout);
-            gc_note(common, code, &format!("vendor GC skipped: {message}"));
-            return VendorGcSummary {
-                skipped: Some((code, message)),
-                ..Default::default()
-            };
-        }
-    };
-    run_vendor_gc_locked(common, manifest_path, false).await
-}
-
-/// [`run_vendor_gc`]'s body, lock-free: the caller holds the apply lock
-/// for a wet pass (or `dry_run` is set, which needs none). Re-reads the
-/// ledger itself — under the caller's lock it is the authoritative copy.
-pub(crate) async fn run_vendor_gc_locked(
     common: &GlobalArgs,
     manifest_path: &Path,
     dry_run: bool,
@@ -2794,49 +2737,6 @@ mod gc_tests {
         );
     }
 
-    /// A lock the GC cannot even OPEN (a directory squatting on
-    /// `apply.lock`) is a fault, not contention: it records a distinct
-    /// `lock_io` marker — never the "another run holds the apply lock"
-    /// text a live holder produces — and reclaims nothing.
-    #[tokio::test]
-    async fn vendor_gc_lock_io_is_reported_distinctly_from_contention() {
-        let (tmp, common, manifest_path) = gc_fixture(false).await;
-        write_manifest(&manifest_path, &PatchManifest::new())
-            .await
-            .unwrap();
-        tokio::fs::create_dir(tmp.path().join(".socket/apply.lock"))
-            .await
-            .unwrap();
-
-        let out = run_vendor_gc(&common, &manifest_path, false).await;
-        let (code, message) = out
-            .skipped
-            .as_ref()
-            .expect("the I/O fault is the skip reason");
-        assert_eq!(*code, "lock_io", "{out:?}");
-        assert!(
-            message.contains("apply.lock"),
-            "an I/O fault is reported as lock_io naming the path: {out:?}"
-        );
-        assert!(
-            !message.contains("holds the apply lock"),
-            "an I/O fault must not be mislabelled as contention: {out:?}"
-        );
-        assert!(
-            out.failed.is_empty(),
-            "a pass-level skip is not a per-purl failure: {out:?}"
-        );
-        assert!(out.dropped_reverted.is_empty(), "{out:?}");
-        assert!(
-            load_state(tmp.path())
-                .await
-                .unwrap()
-                .entries
-                .contains_key(PURL),
-            "a GC that could not lock must not touch the ledger"
-        );
-    }
-
     /// An entry that is BOTH manifest-dropped and lockfile-unused must be
     /// listed exactly once. The wet pass removes it from the ledger in (a)
     /// before (b) runs; the dry-run preview leaves the ledger untouched, so
@@ -3261,12 +3161,13 @@ mod gc_tests {
             .exists());
     }
 
-    /// Wet GC under apply-lock contention: the run records the single skip
-    /// marker and reclaims NOTHING (the scan-must-not-fail contract), while
-    /// a dry-run preview with the same lock held still lists (dry runs are
-    /// read-only and lock-free).
+    /// The GC body is lock-free and runs under the CALLER's guard: with the
+    /// apply lock held by the caller (as `scan --prune`'s `run_apply_gc`
+    /// holds it), a dry pass lists and a wet pass reclaims — the held lock
+    /// is no obstacle because nothing here acquires (flock is per open file
+    /// description, so a nested acquire would have read as a live holder).
     #[tokio::test]
-    async fn vendor_gc_lock_contention_skips_without_reverting() {
+    async fn vendor_gc_body_runs_under_callers_held_lock() {
         let (tmp, common, manifest_path) = gc_fixture(false).await;
         // Both passes WOULD reclaim: patch dropped + dependency gone.
         write_manifest(&manifest_path, &PatchManifest::new())
@@ -3282,61 +3183,32 @@ mod gc_tests {
         )
         .expect("test holds the apply lock first");
 
-        let out = run_vendor_gc(&common, &manifest_path, false).await;
+        let dry = run_vendor_gc(&common, &manifest_path, true).await;
         assert_eq!(
-            out.skipped,
-            Some((
-                "lock_held",
-                "vendor GC skipped: another socket-patch run holds the apply lock".to_string()
-            )),
-            "{out:?}"
+            dry.dropped_reverted,
+            vec![PURL.to_string()],
+            "the lock-free dry preview lists under the held lock: {dry:?}"
         );
-        assert!(out.failed.is_empty(), "{out:?}");
-        assert!(out.dropped_reverted.is_empty(), "{out:?}");
-        assert!(out.unused_reverted.is_empty(), "{out:?}");
-        assert_eq!(out.orphan_dirs, 0, "{out:?}");
+        assert!(dry.failed.is_empty(), "{dry:?}");
         assert!(
             load_state(tmp.path())
                 .await
                 .unwrap()
                 .entries
                 .contains_key(PURL),
-            "a contended GC must not touch the ledger"
-        );
-        assert!(
-            tmp.path()
-                .join(format!(".socket/vendor/npm/{UUID}"))
-                .exists(),
-            "a contended GC must not touch artifacts"
+            "a dry pass reverts nothing"
         );
 
-        let dry = run_vendor_gc(&common, &manifest_path, true).await;
-        assert_eq!(
-            dry.dropped_reverted,
-            vec![PURL.to_string()],
-            "the lock-free dry preview still lists: {dry:?}"
-        );
-        assert!(dry.failed.is_empty(), "{dry:?}");
-        assert!(dry.skipped.is_none(), "a dry run takes no lock: {dry:?}");
-
-        // A caller that already HOLDS the lock runs the body directly: the
-        // same held lock is no obstacle (flock is per open description, so
-        // a nested `run_vendor_gc` would have skipped here) and the pass
-        // reclaims normally.
-        let locked = run_vendor_gc_locked(&common, &manifest_path, false).await;
-        assert!(locked.skipped.is_none(), "{locked:?}");
-        assert_eq!(
-            locked.dropped_reverted,
-            vec![PURL.to_string()],
-            "{locked:?}"
-        );
+        let wet = run_vendor_gc(&common, &manifest_path, false).await;
+        assert_eq!(wet.dropped_reverted, vec![PURL.to_string()], "{wet:?}");
+        assert!(wet.failed.is_empty(), "{wet:?}");
         assert!(
             !load_state(tmp.path())
                 .await
                 .unwrap()
                 .entries
                 .contains_key(PURL),
-            "the locked body reverts under the caller's guard"
+            "the wet body reverts under the caller's guard"
         );
     }
 
