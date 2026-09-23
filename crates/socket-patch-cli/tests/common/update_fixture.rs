@@ -533,6 +533,29 @@ impl FakeReleaseBuilder {
 mod fixture_selftests {
     use super::*;
 
+    /// Spawn a binary this process just wrote, tolerating `ETXTBSY`.
+    ///
+    /// Linux refuses to exec a file while any process holds it open for
+    /// writing. `fs::write` closed our handle, but the suite runs tests
+    /// in parallel threads: a sibling thread that forks between our
+    /// `open` and its `exec` inherits the still-open write fd, and our
+    /// `exec` in that window fails with "Text file busy" (os error 26).
+    /// The window is a fork/exec race, not a property of the binary, so
+    /// retry briefly rather than failing the run. Observed on
+    /// `ubuntu-latest` here and on PR #139's `coverage` job.
+    fn exec_freshly_written(path: &std::path::Path) -> std::process::Output {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match std::process::Command::new(path).arg("--version").output() {
+                Ok(out) => return out,
+                Err(e) if e.raw_os_error() == Some(26) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(e) => panic!("spawn served binary: {e:?}"),
+            }
+        }
+    }
+
     /// THE canary: if a platform ever stops tolerating trailer bytes on
     /// its executables, this fails here — loudly — instead of the crux
     /// test silently degrading.
@@ -547,10 +570,7 @@ mod fixture_selftests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let out = std::process::Command::new(&path)
-            .arg("--version")
-            .output()
-            .expect("spawn served binary");
+        let out = exec_freshly_written(&path);
         assert!(
             out.status.success(),
             "served binary must exec --version cleanly (trailer tolerance)"
