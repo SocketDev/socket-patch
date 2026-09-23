@@ -345,6 +345,29 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Terminal output is clean on every command.** Progress lines no longer
+  leave stale text behind (`scan` printed e.g. `Found 7 patches for 1
+  packagesatch 7/7)`) or run into warnings printed while they are active.
+  Progress, prompts, color and truncation now share one implementation.
+  - **Progress lines:** a status line clears itself on finish. It is never
+    drawn off a TTY, under `TERM=dumb`, in debug mode, or under
+    `--json`/`--silent`. `fetch`, `vendor`, `setup`, lock waits and
+    `--update` checks now show progress instead of going quiet.
+  - **Prompts:** Ctrl-D at a `[Y/n]` prompt now declines instead of
+    accepting. Keys pressed while a scan is running no longer answer the
+    prompt that follows. The cursor is restored when a selection menu is
+    interrupted.
+  - **Color:** `NO_COLOR`, `CLICOLOR`, `CLICOLOR_FORCE` and `TERM=dumb` are
+    honored. Colored table rows now align.
+  - **Wording:** counted nouns read `1 package` / `2 packages` instead of
+    `package(s)`. `Error:` / `Warning:` prefixes are consistent, and
+    warnings go to stderr. `--silent` is errors-only, but a failing run
+    still prints why. Output that came out in random order is now sorted.
+    `--help` pages no longer show developer notes.
+  - **Behavior fixes:** `get --dry-run` and `vex --dry-run` no longer write
+    anything, and `vex -O -` writes to stdout. `scan --json` never stops at
+    an interactive menu. API errors show the server's message instead of a
+    raw JSON body.
 - **Reversal leaves no `.socket/` residue.** `rollback`, `remove`,
   `vendor --revert`, the hosted unwind and the GC sweeps now prune what they
   empty: an emptied redirect or vendor ledger is deleted together with the
