@@ -8222,4 +8222,19 @@ mod tests {
             );
         }
     }
+
+    /// `--vendor-source=service` with no configured client must
+    /// fail closed, never quietly build locally.
+    #[tokio::test]
+    async fn service_mode_without_client_refuses() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let mut cfg = gem_service_cfg("http://127.0.0.1:1", VendorSource::Service, false);
+        cfg.client = None;
+        let outcome = run_vendor_service(&root, &blobs, &installed, &record, &cfg).await;
+        let VendorOutcome::Refused { code, .. } = outcome else {
+            panic!("service mode without a client built locally: {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(".socket").exists(), "nothing written");
+    }
 }

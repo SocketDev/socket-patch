@@ -6006,6 +6006,33 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
         assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
         assert!(!fx.root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
     }
+
+    /// `--vendor-source=service` with no configured client must fail
+    /// closed, never quietly build locally.
+    #[tokio::test]
+    async fn service_mode_without_client_refuses() {
+        let fx = e2e_fixture().await;
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let mut cfg = pypi_service_cfg("http://127.0.0.1:1", VendorSource::Service, false);
+        cfg.client = None;
+        let outcome = vendor_pypi(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &fx.root,
+            &fx.record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cfg),
+        )
+        .await;
+        let VendorOutcome::Refused { code, .. } = outcome else {
+            panic!("service mode without a client built locally: {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!fx.root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+    }
 }
 
 #[cfg(test)]

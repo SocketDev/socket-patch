@@ -4882,4 +4882,19 @@ mod tests {
         assert!(!root.join(".socket").exists(), "nothing written");
         assert!(!root.join("nuget.config").exists());
     }
+
+    /// `--vendor-source=service` with no configured client must
+    /// fail closed, never quietly build locally.
+    #[tokio::test]
+    async fn service_mode_without_client_refuses() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let cfg = integrity_cfg(None, crate::vendor::VendorSource::Service);
+        let outcome = run_vendor_cfg(root, &blobs, &installed, &record, Some(&cfg)).await;
+        let VendorOutcome::Refused { code, .. } = outcome else {
+            panic!("service mode without a client built locally: {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(".socket").exists(), "nothing written");
+    }
 }

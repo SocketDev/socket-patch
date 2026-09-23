@@ -3513,4 +3513,26 @@ mod tests {
             .join(format!(".socket/vendor/composer/{UUID}"))
             .exists());
     }
+
+    /// `--vendor-source=service` with no configured client must fail
+    /// closed, never quietly build locally.
+    #[tokio::test]
+    async fn service_mode_without_client_refuses() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let lock_before = tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap();
+        let mut cfg = composer_service_cfg("http://127.0.0.1:1", VendorSource::Service, false);
+        cfg.client = None;
+        let (code, _) =
+            unwrap_refused(vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root
+            .join(format!(".socket/vendor/composer/{UUID}"))
+            .exists());
+        assert_eq!(
+            tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
+            lock_before
+        );
+    }
 }

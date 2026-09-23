@@ -136,8 +136,8 @@ pub(crate) async fn service_archive_copy(
     warnings: &mut Vec<VendorWarning>,
 ) -> ServiceCopy {
     // The maven/nuget flows have no earlier guard, so the fail-closed
-    // `--vendor-source=service` + `--offline` refusal lives here (the other
-    // backends check the same helper at their entry points).
+    // `--vendor-source=service` refusals (`--offline`, no API client) live
+    // here (the other backends check the same helper at their entry points).
     if let Some(refusal) = service_offline_conflict(service) {
         return ServiceCopy::HardFail(Box::new(refusal));
     }

@@ -3563,4 +3563,20 @@ mod tests {
         assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), before);
         assert!(!fx.root().join(fx.expected_rel_tgz()).exists());
     }
+
+    /// `--vendor-source=service` with no configured client must fail
+    /// closed, never quietly build locally.
+    #[tokio::test]
+    async fn service_mode_without_client_refuses() {
+        let fx = fixture().await;
+        let before = tokio::fs::read(fx.lock_path()).await.unwrap();
+        let mut cfg = service_cfg("http://127.0.0.1:1", VendorSource::Service, false);
+        cfg.client = None;
+        match vendor_service(&fx, &cfg).await {
+            VendorOutcome::Refused { code, .. } => assert_eq!(code, "vendor_prebuilt_required"),
+            other => panic!("service mode without a client built locally: {other:?}"),
+        }
+        assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), before);
+        assert!(!fx.root().join(fx.expected_rel_tgz()).exists());
+    }
 }

@@ -3148,4 +3148,29 @@ mod tests {
         assert!(!backup_dir_for(&copy).exists(), "no parked backup");
         assert!(stage.exists(), "the stage is left for the caller's cleanup");
     }
+
+    /// `--vendor-source=service` with no configured client must fail
+    /// closed, never quietly build locally.
+    #[tokio::test]
+    async fn service_mode_without_client_refuses() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let mut cfg = cargo_service_cfg("http://127.0.0.1:1", VendorSource::Service, false);
+        cfg.client = None;
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cfg),
+        )
+        .await;
+        expect_refused(outcome, "vendor_prebuilt_required");
+        assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
+    }
 }

@@ -674,6 +674,13 @@ into the new version's section — see docs/releasing.md.
   integrity detail). Under `--vendor-source=service`, golang, composer, gem
   and pypi now report `vendor_prebuilt_integrity_mismatch` instead of
   `vendor_prebuilt_required`.
+- **`service` vendor source without an API client is refused.** This affects
+  `socket-patch-core` callers that pass a `VendorServiceConfig` with
+  `source: Service` and no `client` (the CLI always configures a client).
+  Every backend used to build the artifact locally in that case, even though
+  `service` promises that only the patch service's artifact is used. They now
+  refuse with `vendor_prebuilt_required` before doing any work, the same way
+  `--offline` is already refused.
 
 ### Changed
 

@@ -479,6 +479,7 @@ per service outcome:
 | gem stub gemspec missing / invalid | local build + `vendor_prebuilt_stub_missing` / `vendor_prebuilt_stub_invalid` (invalid + gem not installed: refuse `vendor_prebuilt_stub_invalid` — no stub source exists) | refuse (`vendor_prebuilt_required` / `vendor_prebuilt_stub_invalid`) |
 | 401 / 403 grant / 5xx / network error | local build + `vendor_prebuilt_unavailable` | refuse |
 | `--offline` | local build | refuse (`vendor_service_offline_conflict`) |
+| no API client configured (library callers of the vendor engine; the CLI always configures one) | local build | refuse (`vendor_prebuilt_required`) |
 
 **golang service leg staging (v5.0)**: the module zip is downloaded, extracted and `h1:`-verified in a `<copy>.socket-stage` sibling and swapped into place only afterwards; a failed re-download of a WIRED, present copy keeps the copy and its `replace` directive (previously both were torn down), while a missing copy still drops the dangling directive.
 
