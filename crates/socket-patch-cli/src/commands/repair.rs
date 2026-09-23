@@ -291,14 +291,23 @@ fn format_cleanup_summary(results: &[(ArtifactNoun, CleanupResult)], dry_run: bo
     format_all_in_use(&checked, total)
 }
 
-/// The closing line of a human repair run.
-fn format_final_line(download_failed: usize, noun: ArtifactNoun, dry_run: bool) -> String {
+/// The closing line of a human repair run. `other_failure` is a failure
+/// recorded elsewhere in the run (a vendored artifact that could not be
+/// rebuilt): the run exits 1, so it must not close on "Repair complete.".
+fn format_final_line(
+    download_failed: usize,
+    other_failure: bool,
+    noun: ArtifactNoun,
+    dry_run: bool,
+) -> String {
     if download_failed > 0 {
         let verb = if download_failed == 1 { "was" } else { "were" };
         format!(
             "Repair finished with errors: {} {verb} not downloaded.",
             noun.count(download_failed)
         )
+    } else if other_failure {
+        "Repair finished with errors.".to_string()
     } else if dry_run {
         "Dry run: no changes made.".to_string()
     } else {
@@ -581,8 +590,14 @@ async fn repair_inner(
         // The blank separator goes to the same stream as the final line,
         // so a piped stdout never ends in a stray blank line when the
         // line itself goes to stderr.
-        let line = format_final_line(download_failed_count, noun, args.common.dry_run);
-        if download_failed_count > 0 {
+        let other_failure = matches!(env.status, Status::PartialFailure | Status::Error);
+        let line = format_final_line(
+            download_failed_count,
+            other_failure,
+            noun,
+            args.common.dry_run,
+        );
+        if download_failed_count > 0 || other_failure {
             if stdout_started {
                 eprintln!();
             }
@@ -1133,18 +1148,27 @@ mod tests {
 
     #[test]
     fn final_line_reflects_failures_and_dry_run() {
-        assert_eq!(format_final_line(0, BLOB, false), "Repair complete.");
+        assert_eq!(format_final_line(0, false, BLOB, false), "Repair complete.");
         assert_eq!(
-            format_final_line(0, BLOB, true),
+            format_final_line(0, false, BLOB, true),
             "Dry run: no changes made."
         );
         assert_eq!(
-            format_final_line(1, DIFF_ARCHIVE, false),
+            format_final_line(1, false, DIFF_ARCHIVE, false),
             "Repair finished with errors: 1 diff archive was not downloaded."
         );
         assert_eq!(
-            format_final_line(2, BLOB, false),
+            format_final_line(2, true, BLOB, false),
             "Repair finished with errors: 2 blobs were not downloaded."
+        );
+        // A failed vendored rebuild (exit 1) never closes on "complete".
+        assert_eq!(
+            format_final_line(0, true, BLOB, false),
+            "Repair finished with errors."
+        );
+        assert_eq!(
+            format_final_line(0, true, BLOB, true),
+            "Repair finished with errors."
         );
     }
 
