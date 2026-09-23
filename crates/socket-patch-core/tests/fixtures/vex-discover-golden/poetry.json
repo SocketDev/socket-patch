@@ -1,0 +1,197 @@
+{
+  "poetry/0.12.17": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/1.0.10": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/1.1.15": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/1.2.2": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/1.3.2": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/1.4.2": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/1.5.1": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/1.6.1": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/1.7.1": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/1.8.5": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/2.0.1": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/2.1.4": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/2.2.1": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/2.3.4": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "poetry/2.4.3": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "poetry.lock"
+      }
+    ],
+    "live_claims": []
+  }
+}

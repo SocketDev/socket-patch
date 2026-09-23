@@ -1,0 +1,111 @@
+{
+  "redirect/pypi/requirements/basic/expected": {
+    "refs": [
+      {
+        "purl": "pkg:pypi/requests@2.28.1",
+        "uuid": "33333333-3333-3333-3333-333333333333",
+        "mode": "hosted",
+        "source_file": "requirements.txt",
+        "artifact_rel": null,
+        "locked_integrity": "Sha256Hex(\"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/pypi/requests/2.28.1/11111111-1111-1111-1111-111111111111/33333333-3333-3333-3333-333333333333/requests-2.28.1-py3-none-any.whl",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "requirements.txt"
+      },
+      {
+        "uuid": "33333333-3333-3333-3333-333333333333",
+        "mode": "hosted",
+        "file": "requirements.txt"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/flask@2.0.1",
+        "file": "requirements.txt"
+      }
+    ],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "33333333-3333-3333-3333-333333333333",
+        "purl": "pkg:pypi/requests@2.28.1"
+      }
+    ]
+  },
+  "redirect/pypi/requirements/basic/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/flask@2.0.1",
+        "file": "requirements.txt"
+      },
+      {
+        "purl": "pkg:pypi/requests@2.28.1",
+        "file": "requirements.txt"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/pypi/uv/basic/expected": {
+    "refs": [
+      {
+        "purl": "pkg:pypi/click@8.1.7",
+        "uuid": "88888888-8888-8888-8888-888888888888",
+        "mode": "hosted",
+        "source_file": "uv.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sha256Hex(\"deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/pypi/click/8.1.7/11111111-1111-1111-1111-111111111111/88888888-8888-8888-8888-888888888888/click-8.1.7-py3-none-any.whl",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "uv.lock"
+      },
+      {
+        "uuid": "88888888-8888-8888-8888-888888888888",
+        "mode": "hosted",
+        "file": "uv.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "88888888-8888-8888-8888-888888888888",
+        "purl": "pkg:pypi/click@8.1.7"
+      }
+    ]
+  },
+  "redirect/pypi/uv/basic/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/click@8.1.7",
+        "file": "uv.lock"
+      }
+    ],
+    "live_claims": []
+  }
+}

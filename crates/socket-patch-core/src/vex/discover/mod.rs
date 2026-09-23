@@ -116,7 +116,11 @@
 //!    bun-lockb}/…`) where they exist; include negative cases (non-Socket
 //!    host carrying a uuid, placeholder tokens, uuid-shaped grant token,
 //!    path traversal in a vendored leaf). `Project::run` asserts that every
-//!    emitted ref's uuid was recognized (rule 11).
+//!    emitted ref's uuid was recognized (rule 11). The committed fixture
+//!    projects are also pinned end to end by a golden snapshot of the full
+//!    discovery output (`testing::golden`,
+//!    `tests/fixtures/vex-discover-golden/`): an output change shows up as a
+//!    golden diff to review (`SOCKET_PATCH_UPDATE_GOLDEN=1` regenerates).
 //! 10. **Pins, not definitions; what the package manager READS.** Emit a
 //!     ref only where the file routes THIS package's resolution (a lock
 //!     entry, a `Cargo.toml` `registry = "socket-patch-<U>"`, a nuget
@@ -1968,6 +1972,8 @@ pub(crate) mod testing {
     use std::pin::Pin;
 
     use super::{DiscoverCtx, Discovery, Recognized, WiringMode};
+
+    pub(crate) mod golden;
 
     /// Canonical patch uuids for fixtures.
     pub(crate) const UUID_A: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";

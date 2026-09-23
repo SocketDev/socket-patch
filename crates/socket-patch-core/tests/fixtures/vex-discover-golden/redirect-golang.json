@@ -1,0 +1,47 @@
+{
+  "redirect/golang/gomod/basic/expected": {
+    "refs": [
+      {
+        "purl": "pkg:golang/github.com/foo/bar@v1.4.2",
+        "uuid": "55555555-5555-5555-5555-555555555555",
+        "mode": "hosted",
+        "source_file": "go.mod",
+        "artifact_rel": null,
+        "locked_integrity": "GoH1(\"h1:mU9vN/n1hbXktM62lJ6MbRKOk3aI8NDH+szCf62RXtE=\")",
+        "integrity_required": true,
+        "url": "patch.socket.dev/gopatch/55555555-5555-5555-5555-555555555555@v1.4.2-socketpatch.1",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "55555555-5555-5555-5555-555555555555",
+        "mode": "hosted",
+        "file": "go.mod"
+      },
+      {
+        "uuid": "55555555-5555-5555-5555-555555555555",
+        "mode": "hosted",
+        "file": "go.sum"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "55555555-5555-5555-5555-555555555555",
+        "purl": "pkg:golang/github.com/foo/bar@v1.4.2"
+      }
+    ]
+  },
+  "redirect/golang/gomod/basic/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  }
+}
