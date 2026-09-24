@@ -78,6 +78,10 @@ What socket-patch does with those files:
 | mixed CRLF / LF, or a bare CR | refused untouched: `redirect_yarn_berry_mixed_line_endings` | refused before any write: `vendor_yarn_berry_mixed_line_endings` |
 | revert (`rollback`, `remove`, takeovers) | byte-exact; a ledger recorded before a uniform LF ↔ CRLF checkout flip is replayed respelled; a mixed lock refuses as drift | byte-exact; a lock mixed after vendoring gets the restored entry in the terminator of the entry it replaces |
 
+`setup` / `setup --remove` write `package.json` in the same layout-keeping
+way (BOM, indent, ending, trailing newline), so the pair round-trips
+byte-exactly on a CRLF manifest too.
+
 Every reader — manifest-less `vex`, the lockfile inventory, the npm flavor
 sniff, `repair` — splits CRLF lines like LF ones and skips a leading BOM.
 The shared hosted golden fixtures stay LF: their TypeScript twin in the

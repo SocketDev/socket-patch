@@ -334,7 +334,9 @@ in particular, are behavior changes that gate a version bump when implemented).
    (v5.0) prunes an emptied `.socket/` (non-recursive `remove_dir` — a `.socket/` still holding a
    manifest, blobs, vendored state or a user-authored `.gitignore` is kept), so a project that never
    ran `apply` is back to its pre-setup tree. *(Implemented for the manifest edits — npm
-   `package.json` and Python deps round-trip byte-for-byte.)*
+   `package.json` and Python deps round-trip byte-for-byte. `package.json` is re-serialized in its
+   own layout — BOM, indent, line ending and trailing-newline shape (v5.0) — so a Windows manifest
+   (yarn berry pretty-prints it with CRLF) keeps CRLF through `setup` and `setup --remove`.)*
 
 9. **Nested workspaces, with exclude.** Setup applies to every subproject below the repo root: npm /
    yarn / pnpm / bun workspace members are all discovered and configured (pnpm is root-package-only by

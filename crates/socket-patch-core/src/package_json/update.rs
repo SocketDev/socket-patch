@@ -422,7 +422,11 @@ mod tests {
             result.error
         );
         let content = fs::read_to_string(&pkg).await.unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        // The BOM survives the rewrite (the editor that added it keeps it).
+        let body = content
+            .strip_prefix('\u{feff}')
+            .expect("setup must keep the manifest's BOM");
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
         assert!(parsed["scripts"]["postinstall"].is_string());
         assert!(parsed["scripts"]["dependencies"].is_string());
         assert_eq!(parsed["scripts"]["build"], "tsc");
@@ -678,8 +682,79 @@ mod tests {
         );
         let content = fs::read_to_string(&pkg).await.unwrap();
         assert!(!content.contains("socket-patch"));
-        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let body = content
+            .strip_prefix('\u{feff}')
+            .expect("setup --remove must keep the manifest's BOM");
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(parsed["scripts"]["build"], "tsc");
+    }
+
+    /// A Windows yarn-berry manifest (persistManifest pretty-prints with
+    /// `os.EOL`, so CRLF; an editor may add a BOM; some tools drop the final
+    /// newline) must keep its layout through `setup`, and `setup --remove`
+    /// must land byte-identical on the pre-setup file. serde's serializer
+    /// emits bare `\n` and no BOM, which used to flip every line to LF — a
+    /// whole-file diff yarn then keeps (it follows the majority ending).
+    #[tokio::test]
+    async fn test_setup_then_remove_round_trips_crlf_bom_and_final_newline_shape() {
+        let lf = "{\n  \"name\": \"x\",\n  \"version\": \"1.0.0\",\n  \"scripts\": {\n    \"build\": \"tsc\"\n  },\n  \"packageManager\": \"yarn@4.12.0\"\n}";
+        let crlf = lf.replace('\n', "\r\n");
+        let cases = [
+            ("lf", format!("{lf}\n")),
+            ("lf-no-final-newline", lf.to_string()),
+            ("crlf", format!("{crlf}\r\n")),
+            ("bom-crlf", format!("\u{feff}{crlf}\r\n")),
+            ("crlf-no-final-newline", crlf.clone()),
+            ("bom-lf", format!("\u{feff}{lf}\n")),
+            ("crlf-two-final-newlines", format!("{crlf}\r\n\r\n")),
+        ];
+        for (label, original) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let pkg = dir.path().join("package.json");
+            fs::write(&pkg, &original).await.unwrap();
+
+            let up = update_package_json(&pkg, false, PackageManager::Npm).await;
+            assert_eq!(up.status, UpdateStatus::Updated, "{label}: {:?}", up.error);
+            let wired = fs::read_to_string(&pkg).await.unwrap();
+            assert_eq!(
+                wired.starts_with('\u{feff}'),
+                original.starts_with('\u{feff}'),
+                "{label}: BOM presence must survive setup:\n{wired:?}"
+            );
+            if original.contains("\r\n") {
+                assert!(
+                    !wired.replace("\r\n", "").contains('\n'),
+                    "{label}: setup left a bare LF in a CRLF manifest:\n{wired:?}"
+                );
+            } else {
+                assert!(
+                    !wired.contains('\r'),
+                    "{label}: setup added CR to an LF manifest"
+                );
+            }
+            let trailer = |t: &str| t.len() - t.trim_end_matches(['\r', '\n']).len();
+            assert_eq!(
+                trailer(&wired),
+                trailer(&original),
+                "{label}: trailing-newline shape must survive setup:\n{wired:?}"
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_str(wired.trim_start_matches('\u{feff}')).unwrap();
+            assert!(parsed["scripts"]["postinstall"].is_string(), "{label}");
+
+            let down = remove_package_json(&pkg, false).await;
+            assert_eq!(
+                down.status,
+                RemoveStatus::Removed,
+                "{label}: {:?}",
+                down.error
+            );
+            assert_eq!(
+                fs::read_to_string(&pkg).await.unwrap(),
+                original,
+                "{label}: setup --remove must restore the pre-setup bytes"
+            );
+        }
     }
 
     /// mkfifo(2) directly rather than shelling out to the `mkfifo` binary —

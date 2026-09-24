@@ -595,6 +595,13 @@ into the new version's section — see docs/releasing.md.
   4.12.0 (hosted, vendored, workspaces, pnpm linker, both mode takeovers)
   with the fixtures re-spelled CRLF, and on yarn 2.4.3 / 3.8.7 (still
   refused for their cacheKey, never for their endings).
+- **`setup` keeps a CRLF `package.json` CRLF.** `setup` and `setup --remove`
+  re-serialized `package.json` with bare LF and dropped a leading BOM, so on
+  a Windows yarn berry project (yarn pretty-prints the manifest with CRLF) a
+  two-key script edit became a whole-file diff that yarn then kept, and
+  `setup --remove` could not land byte-identical on the pre-setup file.
+  `package.json` is now written in its own layout (BOM, indent, line ending,
+  trailing-newline shape), the same helper the vendored backends use.
 - **A vendoring-service outage no longer re-vendors packages.** An npm
   re-run (every lock flavor, `bun.lockb` included) re-acquired its tarball
   from whichever source answered — the service's prebuilt, or a local pack

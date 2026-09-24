@@ -1,4 +1,4 @@
-use crate::vendor::common::{detect_indent, serialize_json};
+use crate::vendor::common::JsonLayout;
 
 /// Package manager type for selecting the correct command prefix.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -318,17 +318,20 @@ fn remove_package_json_object(package_json: &mut serde_json::Value) -> ScriptRem
     }
 }
 
-/// Re-serialize a package.json, keeping the indent unit the file already uses.
+/// Re-serialize a package.json in the layout the file already uses.
 ///
-/// serde's `to_string_pretty` is hard-wired to 2 spaces, so a 4-space or
-/// tab-indented manifest came back reformatted top to bottom — turning a
-/// two-key edit into a whole-file diff. The vendor backends already respect the
-/// project's formatting when they rewrite package.json / lockfiles; reuse the
-/// same helpers so `setup` touches only the lines it means to.
+/// serde's `to_string_pretty` is hard-wired to 2 spaces and bare `\n`, so a
+/// 4-space or tab-indented manifest came back reformatted top to bottom, and
+/// a Windows one (yarn berry's persistManifest pretty-prints with `os.EOL`)
+/// flipped every CRLF to LF and lost its BOM — turning a two-key edit into a
+/// whole-file diff that `setup --remove` could never undo byte-exactly. The
+/// vendor backends render through [`JsonLayout`] (BOM, indent, line ending,
+/// trailing-newline shape); reuse it so `setup` touches only the lines it
+/// means to.
 fn serialize_preserving_indent(value: &serde_json::Value, original: &str) -> String {
-    let indent = detect_indent(strip_bom(original));
-    match serialize_json(value, &indent) {
-        // Always valid UTF-8: serde_json emits escaped ASCII/UTF-8 only.
+    match JsonLayout::of(original).render(value) {
+        // Always valid UTF-8: the original was a &str and serde_json emits
+        // escaped ASCII/UTF-8 only.
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         // Serializing a `Value` cannot fail; fall back to the 2-space form.
         Err(_) => serde_json::to_string_pretty(value).unwrap_or_default() + "\n",
