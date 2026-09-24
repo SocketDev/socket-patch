@@ -522,6 +522,14 @@
     "elsewhere": [],
     "live_claims": []
   },
+  "redirect/cargo/cargo/transitive-refusal/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
   "redirect/cargo/cargo/two-sections/expected": {
     "refs": [
       {

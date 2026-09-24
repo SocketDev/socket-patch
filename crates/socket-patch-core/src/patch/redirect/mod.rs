@@ -912,7 +912,12 @@ fn rewrite_cargo(
         if toml_plans.is_empty() {
             result.warnings.push(RewriteWarning {
                 code: "redirect_cargo_toml_dep_not_found".into(),
-                detail: cargo_not_declared_detail(&dep.name, manifests.len()),
+                detail: cargo_not_declared_detail(
+                    &dep.name,
+                    &dep.version,
+                    manifests.len(),
+                    cargo_lock.as_deref(),
+                ),
             });
             continue;
         }
@@ -1052,17 +1057,40 @@ fn is_cargo_member_manifest_key(key: &str) -> bool {
 }
 
 /// The not-declared warning for a crate no manifest names at the patched
-/// version.
-fn cargo_not_declared_detail(crate_name: &str, manifests: usize) -> String {
+/// version. A crate Cargo.lock nonetheless resolves is a TRANSITIVE-only
+/// dependency: a `registry = "…"` pin reaches only the declaration it sits
+/// on, so hosted mode cannot redirect it at all — say so, and name the mode
+/// that can (vendored `[patch.crates-io]` applies to the whole graph).
+fn cargo_not_declared_detail(
+    crate_name: &str,
+    version: &str,
+    manifests: usize,
+    lock: Option<&str>,
+) -> String {
     let scope = if manifests > 1 {
         format!("any of the {manifests} workspace manifests")
     } else {
         "Cargo.toml".to_string()
     };
-    format!(
-        "no [dependencies] entry for {crate_name} in {scope}; dependency skipped \
-         (nothing rewritten)"
-    )
+    let head = format!("[[package]]\nname = \"{crate_name}\"\nversion = \"{version}\"\n");
+    let transitive = lock.is_some_and(|lock| {
+        lock.match_indices(head.as_str())
+            .any(|(at, _)| at == 0 || lock.as_bytes()[at - 1] == b'\n')
+    });
+    if transitive {
+        format!(
+            "{crate_name}@{version} is a transitive-only dependency (Cargo.lock resolves it, \
+             but no [dependencies] entry in {scope} declares it); hosted mode can pin only \
+             direct dependencies, so it was NOT redirected and stays unpatched — patch it with \
+             `socket-patch scan --mode vendored`, or declare it directly and re-run \
+             (nothing rewritten)"
+        )
+    } else {
+        format!(
+            "no [dependencies] entry for {crate_name} in {scope}; dependency skipped \
+             (nothing rewritten)"
+        )
+    }
 }
 
 /// Sparse index URLs land verbatim inside quoted TOML strings in both
@@ -9306,6 +9334,38 @@ mod tests {
         assert_eq!(
             warning_codes(&r),
             vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
+    }
+
+    /// Bug J (kept a refusal): a crate only reached transitively cannot be
+    /// pinned by a manifest `registry` key. Nothing is written or
+    /// confirmed, and the warning says it is transitive-only, unpatched, and
+    /// which mode can patch it.
+    #[test]
+    fn cargo_transitive_only_crate_is_refused_loudly() {
+        let mut files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nother = \"1\"\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert!(r.confirmed_cargo_uuids.is_empty());
+        assert_eq!(warning_codes(&r), vec!["redirect_cargo_toml_dep_not_found"]);
+        let detail = &r.warnings[0].detail;
+        assert!(
+            detail.contains("transitive-only")
+                && detail.contains("NOT redirected")
+                && detail.contains("--mode vendored"),
+            "{detail}"
+        );
+        // Not in the lock either: the plain not-declared wording.
+        files.remove("Cargo.lock");
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(
+            r.warnings[0]
+                .detail
+                .starts_with("no [dependencies] entry for serde"),
+            "{:?}",
+            r.warnings
         );
     }
 
