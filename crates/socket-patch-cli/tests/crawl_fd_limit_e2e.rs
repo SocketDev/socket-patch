@@ -7,9 +7,11 @@
 //! concurrently) would silently drop packages under a limit the old walk
 //! handled. Below the walk pool's tight-limit threshold the crawl keeps
 //! the sequential descriptor profile; this suite pins that by scanning the
-//! same tree under `ulimit -n 16` and under the inherited limit and
-//! requiring byte-identical JSON. (The sequential walk scans this tree
-//! fully at 14; with one walk thread per CPU it lost most of it at 16.)
+//! same tree under a tight `ulimit -n` and under the inherited limit and
+//! requiring byte-identical JSON. The npm-only tree pins the single walk
+//! thread (the sequential walk scans it fully at 14; with one walk thread
+//! per CPU it lost most of it at 16); the multi-ecosystem tree pins the
+//! crawlers running one at a time.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -87,6 +89,58 @@ fn build_tree(root: &Path) -> usize {
     count
 }
 
+/// [`build_tree`] plus installs for three more ecosystems — a Python
+/// virtualenv, a Bundler `vendor/bundle` and a Composer `vendor/` — so the
+/// crawlers that run alongside npm hold descriptors of their own: run
+/// concurrently instead of one at a time, they need more than a tight
+/// limit leaves. Returns the number of distinct packages it holds.
+fn build_multi_ecosystem_tree(root: &Path) -> usize {
+    let mut count = build_tree(root);
+    let site = root
+        .join(".venv")
+        .join("lib")
+        .join("python3.11")
+        .join("site-packages");
+    for i in 0..40 {
+        let dist = site.join(format!("pydist{i}-1.0.{i}.dist-info"));
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(
+            dist.join("METADATA"),
+            format!("Metadata-Version: 2.1\nName: pydist{i}\nVersion: 1.0.{i}\n\n"),
+        )
+        .unwrap();
+        count += 1;
+    }
+    let gems = root
+        .join("vendor")
+        .join("bundle")
+        .join("ruby")
+        .join("3.2.0");
+    for i in 0..40 {
+        let gem = gems.join("gems").join(format!("rgem{i}-2.0.{i}"));
+        std::fs::create_dir_all(gem.join("lib")).unwrap();
+        std::fs::write(gem.join("lib").join(format!("rgem{i}.rb")), "").unwrap();
+        count += 1;
+    }
+    std::fs::create_dir_all(gems.join("specifications")).unwrap();
+    let composer = root.join("vendor").join("composer");
+    std::fs::create_dir_all(&composer).unwrap();
+    let mut installed = Vec::new();
+    for i in 0..20 {
+        let name = format!("acme/lib{i}");
+        std::fs::create_dir_all(root.join("vendor").join(&name)).unwrap();
+        installed.push(serde_json::json!({"name": name, "version": format!("3.0.{i}")}));
+        count += 1;
+    }
+    std::fs::write(root.join("composer.json"), "{}").unwrap();
+    std::fs::write(
+        composer.join("installed.json"),
+        serde_json::json!({ "packages": installed }).to_string(),
+    )
+    .unwrap();
+    count
+}
+
 /// `scan --json` against an unreachable API (the crawl still runs and the
 /// JSON still reports what it found), optionally under `ulimit -n`.
 fn scan(root: &Path, nofile: Option<u32>) -> Output {
@@ -117,6 +171,16 @@ fn scan(root: &Path, nofile: Option<u32>) -> Output {
         {
             cmd.env_remove(&key);
         }
+    }
+    // Keep the Python and Bundler discovery on the fixture's own installs.
+    for key in [
+        "VIRTUAL_ENV",
+        "BUNDLE_PATH",
+        "BUNDLE_APP_CONFIG",
+        "GEM_HOME",
+        "GEM_PATH",
+    ] {
+        cmd.env_remove(key);
     }
     cmd.output().unwrap()
 }
@@ -149,4 +213,57 @@ fn tight_descriptor_limit_scans_the_same_packages() {
         String::from_utf8_lossy(&tight.stderr)
     );
     assert_eq!(tight.status.code(), ample.status.code());
+}
+
+/// The same, with every crawler finding packages: the tight-limit run
+/// must crawl the ecosystems one at a time, as the sequential dispatch
+/// did, or the concurrently running crawlers' descriptors crowd each other
+/// out and packages go missing. At 16 that is headroom; at 12 (checked on
+/// macOS, where it was measured: the sequential dispatch scans this tree
+/// fully down to 11, while running the crawlers concurrently loses 40-80
+/// of its packages at 12) it is what pins the one-at-a-time dispatch.
+#[test]
+fn tight_descriptor_limit_scans_every_ecosystem_the_same() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let expected = build_multi_ecosystem_tree(root);
+
+    let ample = scan(root, None);
+    let ample_json: Value = serde_json::from_slice(&ample.stdout).unwrap_or_else(|e| {
+        panic!(
+            "ample-limit scan printed no JSON ({e}); stderr:\n{}",
+            String::from_utf8_lossy(&ample.stderr)
+        )
+    });
+    assert_eq!(
+        ample_json["scannedPackages"].as_u64(),
+        Some(expected as u64),
+        "{ample_json}"
+    );
+
+    let limits: &[u32] = if cfg!(target_os = "macos") {
+        // The concurrent crawlers' overlap is timing-dependent: repeat.
+        &[16, 12, 12, 12]
+    } else {
+        &[16]
+    };
+    for &limit in limits {
+        let tight = scan(root, Some(limit));
+        assert_ne!(
+            tight.status.code(),
+            Some(99),
+            "ulimit -n {limit} was refused"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&tight.stdout),
+            String::from_utf8_lossy(&ample.stdout),
+            "ulimit -n {limit} stderr:\n{}",
+            String::from_utf8_lossy(&tight.stderr)
+        );
+        assert_eq!(
+            tight.status.code(),
+            ample.status.code(),
+            "ulimit -n {limit}"
+        );
+    }
 }
