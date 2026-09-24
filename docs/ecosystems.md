@@ -211,7 +211,7 @@ project on the machine, and is silently reset by `cargo clean` or a cache prune.
 Vendored mode (v5+) wires a patched crate with a `[patch.crates-io]` path
 entry in the **workspace-root `Cargo.toml`** (the manifest beside the
 `Cargo.lock` it detaches) plus the lock surgery that drops the crate's
-`source`/`checksum`:
+`source`/`checksum` and records the copy's **tagged version**:
 
 ```toml
 [patch.crates-io]
@@ -220,15 +220,40 @@ cfg-if-socket-9f6b2c4e = { package = "cfg-if", path = ".socket/vendor/cargo/<uui
 cfg-if-socket-0a1b2c3d = { package = "cfg-if", path = ".socket/vendor/cargo/<uuid2>/cfg-if-0.1.10" }
 ```
 
+```toml
+# Cargo.lock
+[[package]]
+name = "cfg-if"
+version = "1.0.4+socket.<uuid>"
+```
+
+- **Tagged versions.** The vendored copy's own `Cargo.toml` version is
+  rewritten to `<version>+socket.<uuid>` (a version with build metadata
+  keeps it: `2.0.1+zstd.1.5.2` → `2.0.1+zstd.1.5.2.socket.<uuid>`), and the
+  detached lock entry carries the same tagged version — the lock cargo
+  itself writes for the tagged copy. Cargo ignores build metadata when
+  matching requirements, so `1.0.4`, `=1.0.4`, `1`, `^1` in any dependent
+  still select the copy. The lock alone therefore names the patch uuid of
+  the copy cargo builds (a `[patch]` override elsewhere changes the locked
+  version), and stripping the tag gives the purl version. Every lock
+  reference that spells the version (`"cfg-if 1.0.4"`, v1's full ids) is
+  rewritten with it, in lock formats v1–v4; a lock that cannot be kept
+  consistent refuses with `cargo_lock_untaggable` before any write.
+  **The patched crate sees the tag in `CARGO_PKG_VERSION`** — e.g. a
+  vendored binary crate's `--version` output shows it; semver-parsing code
+  is unaffected. Revert restores the original lock byte for byte. Copies
+  and locks vendored before tagged versions are tagged by the next re-run
+  or `repair` (`cargo_version_tagged`).
 - **Why the manifest.** Socket's scanners already ingest `Cargo.toml`, so
   the patch uuid in the path is recoverable for SBOM annotation without
   uploading `.cargo/config*` (which can hold registry tokens), and manifest
   `[patch]` builds on cargo older than 1.56, the floor of config-file
-  `[patch]` (proven on 1.56 and older toolchains by the old-toolchain e2e
-  tests). On such old cargo, two vendored versions of ONE crate also need
-  `cargo build --offline` (or a reachable registry index): it loads the
-  crates.io index to tell the two entries apart. Current stable needs
-  neither.
+  `[patch]` (proven by the old-toolchain e2e tests on cargo 1.41 in docker,
+  which builds and runs the patched copy with no network, and on 1.56).
+  Two vendored versions of ONE crate need `cargo build --offline` on 1.56,
+  and on older cargo (1.41) a populated crates.io index in `$CARGO_HOME`
+  (or network access) — it loads the index to tell the two entries apart.
+  Current stable needs neither.
 - **Keys.** Always the Socket-owned `<name>-socket-<first 8 hex of the
   uuid>` with `package = "<name>"` (the full uuid hex if that key is
   taken), never the bare crate name: cargo lets a config-file `[patch]`
@@ -267,7 +292,9 @@ cfg-if-socket-0a1b2c3d = { package = "cfg-if", path = ".socket/vendor/cargo/<uui
   A project hit by the old multi-version overwrite (a second vendored
   version repointed the crate-named config key, leaving the first
   version's lock entry detached and unwired) is healed the same way
-  (`cargo_wiring_restored`). Every revert removes both spellings.
+  (`cargo_wiring_restored`). The same re-run or `repair` also tags an
+  untagged copy and lock entry (`cargo_version_tagged`). Every revert
+  removes both spellings.
 
 ## Go: directory replaces and go.sum
 

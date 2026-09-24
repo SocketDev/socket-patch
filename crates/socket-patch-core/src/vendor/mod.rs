@@ -57,6 +57,7 @@ pub mod cargo;
 pub mod cargo_config;
 pub mod cargo_lock;
 pub mod cargo_manifest;
+pub mod cargo_tag;
 pub(crate) mod common;
 pub mod composer_lock;
 pub mod gem;

@@ -510,6 +510,21 @@ fn fresh_checkout(proj: &Path, tmp: &Path, tag: &str) -> (PathBuf, PathBuf) {
     (fresh, home)
 }
 
+/// `version` tagged for `uuid` (the vendored copy's version).
+fn tagged(version: &str, uuid: &str) -> String {
+    socket_patch_core::vendor::cargo_tag::tag_version(version, uuid)
+}
+
+/// The dep's `Cargo.lock` entry has exactly version `want`.
+fn assert_lock_version(proj: &Path, want: &str, tag: &str) {
+    let lock = read(proj, "Cargo.lock");
+    assert_eq!(
+        locked_version(&lock, DEP).as_deref(),
+        Some(want),
+        "{tag}: the {DEP} lock entry version:\n{lock}"
+    );
+}
+
 fn read(proj: &Path, rel: &str) -> String {
     std::fs::read_to_string(proj.join(rel)).unwrap_or_default()
 }
@@ -596,6 +611,8 @@ async fn vendored_then_hosted_takeover_leaves_pure_hosted() {
         config.contains(&format!("[registries.socket-patch-{UUID_H}]")),
         "{config}"
     );
+    // The hosted lock entry is the registry version, the vendored tag gone.
+    assert_lock_version(&proj, &version, "vendored -> hosted");
     assert!(
         !vendor_ledger_claims(&proj, &purl),
         "the displaced vendored ledger entry must be dropped: {}",
@@ -777,6 +794,7 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
         !lock_block.contains("source ="),
         "vendored lock entry is detached: {lock_block}"
     );
+    assert_lock_version(&proj, &tagged(&version, UUID_V), "hosted -> vendored");
 
     // C: the vendored contract — fresh checkout, EMPTY home, offline locked
     // build (pre-fix: "no matching package named cfg-if found").
@@ -919,7 +937,9 @@ async fn double_takeover_a_b_a_preserves_lock_originals() {
         "C3: the ledger must keep the registry tarball checksum: {entry}"
     );
 
-    // The vendored contract still holds after the round trip.
+    // The vendored contract still holds after the round trip, and the lock
+    // names the vendored patch again (tagged), not the hosted one.
+    assert_lock_version(&proj, &tagged(&version, UUID_V), "A -> B -> A");
     let (fresh, home) = fresh_checkout(&proj, tmp.path(), "aba");
     assert_build_ok(
         "cargo build --locked --offline (A->B->A fresh checkout)",

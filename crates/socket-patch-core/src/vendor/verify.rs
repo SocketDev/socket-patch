@@ -97,7 +97,7 @@ pub async fn verify_vendored_patch_record(
     let is_zip =
         path_str.ends_with(".whl") || path_str.ends_with(".nupkg") || path_str.ends_with(".jar");
     if !is_tarball && !is_zip {
-        verify_dir_members(&artifact, record).await?;
+        verify_dir_members(&artifact, record, entry.ecosystem == "cargo").await?;
         // Whole-tree cross-check: a dir-shaped artifact's bytes are covered
         // by NO lockfile integrity (bundler path sources, cargo path deps,
         // …), so the members above are the only thing the record can vouch
@@ -124,12 +124,22 @@ pub async fn verify_vendored_patch_record(
 
 /// Dir-shaped ecosystems (cargo/golang/composer/gem): hash files in place,
 /// reusing the hardened per-file verifier (it normalizes manifest keys and
-/// fail-closes on path-escaping keys).
-async fn verify_dir_members(dir: &Path, record: &PatchRecord) -> Result<(), String> {
+/// fail-closes on path-escaping keys). A cargo copy's `Cargo.toml` carries
+/// the `+socket.<uuid>` version tag written after the patch applied
+/// (`vendor::cargo_tag`): a patched `Cargo.toml` verifies with the tag
+/// dropped.
+async fn verify_dir_members(dir: &Path, record: &PatchRecord, cargo: bool) -> Result<(), String> {
     for (file_name, info) in &record.files {
         let result = verify_file_patch(dir, file_name, info).await;
         match result.status {
             VerifyStatus::AlreadyPatched => continue,
+            VerifyStatus::Ready | VerifyStatus::HashMismatch
+                if cargo
+                    && super::cargo_tag::is_copy_manifest_key(file_name)
+                    && untagged_manifest_matches(dir, &info.after_hash).await =>
+            {
+                continue
+            }
             VerifyStatus::Ready | VerifyStatus::HashMismatch => {
                 return Err("vendor_hash_mismatch".to_string())
             }
@@ -137,6 +147,16 @@ async fn verify_dir_members(dir: &Path, record: &PatchRecord) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+/// Does the cargo copy's `Cargo.toml`, Socket tag dropped, hash to
+/// `after_hash`?
+async fn untagged_manifest_matches(dir: &Path, after_hash: &str) -> bool {
+    let Ok(text) = crate::utils::fs::read_regular_to_string(&dir.join("Cargo.toml")).await else {
+        return false;
+    };
+    super::cargo_tag::untagged_manifest_bytes(text.as_bytes())
+        .is_some_and(|b| compute_git_sha256_from_bytes(&b).eq_ignore_ascii_case(after_hash))
 }
 
 fn read_wheel_to_map(whl: &Path) -> Result<HashMap<String, Vec<u8>>, String> {

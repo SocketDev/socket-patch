@@ -671,11 +671,14 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
         }
         // Pre-v5 cargo wiring in `.cargo/config*`: move it into the root
         // Cargo.toml (the v5 location) and record the move in the ledger —
-        // or restore the manifest entry a pre-v5 multi-version vendor lost.
+        // or restore the manifest entry a pre-v5 multi-version vendor lost —
+        // and tag an untagged copy + lock entry with the patch uuid.
         let entry = if entry.ecosystem == "cargo" {
             match vendor::cargo::migrate_legacy_wiring(&entry, &common.cwd, common.dry_run).await {
-                Ok(Some((migrated, warning))) => {
-                    record_warning(env, purl, &warning, common);
+                Ok(Some((migrated, warnings))) => {
+                    for warning in &warnings {
+                        record_warning(env, purl, warning, common);
+                    }
                     if common.dry_run {
                         entry
                     } else if persist_vendor_entry(

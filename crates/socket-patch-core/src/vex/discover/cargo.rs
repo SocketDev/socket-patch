@@ -56,8 +56,18 @@
 //!
 //! ## Vendored (`vendor`, `vendor::cargo` + `vendor::cargo_manifest`)
 //!
-//! NOT visible in `Cargo.lock` beyond the entry losing `source` + `checksum`
-//! (`vendor::cargo_lock::detach_lock_entry`). The identity is a
+//! `Cargo.lock` is the PRIMARY identity signal: the detached entry loses
+//! `source` + `checksum` and its version is the copy's TAGGED version
+//! `<version>+socket.<uuid>` (`vendor::cargo_lock::detach_lock_entry`,
+//! `vendor::cargo_tag`) — what cargo locks for the tagged copy it builds.
+//! The purl version is the tag stripped (`pkg:cargo/<name>@<version>`), and
+//! the tag's uuid must be the uuid of the wiring's copy path: a sourceless
+//! entry tagged for ANOTHER uuid means the copy cargo builds is not the one
+//! this wiring names (a config override elsewhere, or a stale `[patch]`) →
+//! no ref ([`DIAG_REF_INVALID`]). A tagged entry that no visible wiring
+//! names (the `[patch]` lives in a config discovery does not read, or was
+//! removed) is [`DIAG_REF_UNATTRIBUTABLE`]. An UNTAGGED sourceless entry is
+//! a copy vendored before tagged versions and still counts. The wiring is a
 //! `[patch.crates-io]` path entry
 //! `<key> = { path = ".socket/vendor/cargo/<uuid>/<name>-<version>" }` —
 //! PRIMARILY in the root `Cargo.toml` (what v5+ `vendor` writes; `<key>` is
@@ -96,7 +106,8 @@ use toml_edit::{DocumentMut, Item, TableLike};
 
 use super::{
     names_vendor_dir, simple_purl, socket_patch_name_uuid, toml_or_diag, vendor_ref, DiscoverCtx,
-    Discovery, PatchedRef, TomlDiag, UnlockedPin, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
+    Discovery, PatchedRef, TomlDiag, UnlockedPin, VendorRef, DIAG_REF_INVALID,
+    DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::utils::digest::is_hex64_lower;
 use crate::vendor::cargo_config::{
@@ -104,9 +115,10 @@ use crate::vendor::cargo_config::{
     CONFIG_TOML, SOCKET_REGISTRY_PREFIX,
 };
 use crate::vendor::cargo_lock::{
-    locked_packages, unused_patches, vendored_copy_consumed, LockedPackage,
+    detached_tag, locked_packages, unused_patches, vendored_copy_consumed, LockedPackage,
 };
 use crate::vendor::cargo_manifest::{crates_io_url_alias_tables, is_crates_io_source};
+use crate::vendor::cargo_tag;
 use crate::vendor::lock_inventory::LockIntegrity;
 
 const CARGO_LOCK: &str = "Cargo.lock";
@@ -199,6 +211,50 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     }
     if let Some((file, doc)) = &config {
         vendored_from_patches(file, doc, &lock, &|_| None, out);
+    }
+    let wired: Vec<VendorRef> = manifest
+        .iter()
+        .chain(config.iter().map(|(_, doc)| doc))
+        .flat_map(socket_copies)
+        .collect();
+    unattributed_tags(&lock, &wired, out);
+}
+
+/// Every Socket copy a file's `[patch]` tables point at.
+fn socket_copies(doc: &DocumentMut) -> Vec<VendorRef> {
+    patch_entries(doc)
+        .into_iter()
+        .filter_map(|e| e.path.and_then(vendor_ref))
+        .filter(|v| v.eco == "cargo")
+        .collect()
+}
+
+/// Diagnose Socket-tagged sourceless lock entries that no visible
+/// `[patch]` wiring names (`.socket/vendor/cargo/<uuid>/<name>-<version>`):
+/// the lock records a vendored copy the files discovery reads cannot
+/// attribute, so it is not attested.
+fn unattributed_tags(lock: &Lock, wired: &[VendorRef], out: &mut Discovery) {
+    for pkg in lock.packages() {
+        if pkg.source.is_some() {
+            continue;
+        }
+        let Some((version, uuid)) = cargo_tag::split_tag(&pkg.version) else {
+            continue;
+        };
+        let leaf = format!("{}-{version}", pkg.name);
+        if wired.iter().any(|v| v.uuid == uuid && v.leaf == leaf) {
+            continue;
+        }
+        out.diag(
+            DIAG_REF_UNATTRIBUTABLE,
+            CARGO_LOCK,
+            format!(
+                "{CARGO_LOCK}: {} {} is a Socket-vendored copy (patch {uuid}), but no \
+                 [patch] entry in {CARGO_TOML} or the project cargo config points at \
+                 .socket/vendor/cargo/{uuid}/{leaf}; not counted",
+                pkg.name, pkg.version
+            ),
+        );
     }
 }
 
@@ -635,7 +691,23 @@ fn vendored_from_patches(
             continue;
         };
         if let Lock::Parsed { pkgs, unused } = lock {
-            if !vendored_copy_consumed(pkgs, unused, name, version) {
+            if let Some(Some(tag)) = detached_tag(pkgs, name, version) {
+                if tag != vref.uuid {
+                    out.diag(
+                        DIAG_REF_INVALID,
+                        file,
+                        format!(
+                            "{file}: [patch] entry for {name} points at {}, but {CARGO_LOCK} \
+                             builds the copy tagged for patch {tag} \
+                             ({name} {}); not counted",
+                            vref.artifact_rel,
+                            cargo_tag::tag_version(version, tag)
+                        ),
+                    );
+                    continue;
+                }
+            }
+            if !vendored_copy_consumed(pkgs, unused, name, version, &vref.uuid) {
                 out.diag(
                     DIAG_REF_INVALID,
                     file,
@@ -1776,5 +1848,78 @@ mod tests {
             out.diagnostics
         );
         assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+    }
+
+    // ── tagged vendored versions ─────────────────────────────────────
+
+    fn socket_manifest(rel: &str) -> String {
+        format!(
+            "{}\n[patch.crates-io]\ncfg-if-socket-aaaaaaaa = {{ package = \"cfg-if\", path = \"{rel}\" }}\n",
+            manifest("cfg-if = \"1\"")
+        )
+    }
+
+    /// The v5 shape: the lock's detached entry carries the copy's tagged
+    /// version. The purl is the tag stripped; a pre-release and a version
+    /// with its own build metadata read the same way.
+    #[tokio::test]
+    async fn tagged_lock_version_is_the_identity() {
+        for version in ["1.0.4", "1.0.0-rc.1", "2.0.1+zstd.1.5.2"] {
+            let rel = vendor_path(UUID_A, &format!("cfg-if-{version}"));
+            let tagged = crate::vendor::cargo_tag::tag_version(version, UUID_A);
+            let p = Project::new();
+            p.write("Cargo.toml", socket_manifest(&rel));
+            p.write("Cargo.lock", lock(&[("cfg-if", &tagged, None, None)]));
+            let out = run(&p).await;
+            let purl = format!("pkg:cargo/cfg-if@{version}");
+            assert_refs(&out, &[(purl.as_str(), UUID_A, WiringMode::Vendored)]);
+            assert!(
+                out.diagnostics.is_empty(),
+                "{version}: {:#?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    /// A detached entry tagged for ANOTHER uuid: cargo builds a different
+    /// copy than the wiring names — no ref, and the ledger entry for the
+    /// named copy is dead.
+    #[tokio::test]
+    async fn lock_tag_for_another_uuid_is_dead_wiring() {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        let p = Project::new();
+        p.write("Cargo.toml", socket_manifest(&rel));
+        p.write(
+            "Cargo.lock",
+            lock(&[("cfg-if", &format!("1.0.4+socket.{UUID_B}"), None, None)]),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(
+            diag_codes(&out),
+            vec![DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE],
+            "{:#?}",
+            out.diagnostics
+        );
+        assert!(out.diagnostics.iter().any(|d| d.detail.contains(UUID_B)));
+        assert_eq!(
+            out.vendored_claim("pkg:cargo/cfg-if@1.0.4", UUID_A, &rel),
+            Some(false)
+        );
+    }
+
+    /// A tagged lock entry no visible wiring points at is diagnosed, never
+    /// attested from the lock alone.
+    #[tokio::test]
+    async fn tagged_lock_entry_without_wiring_is_unattributable() {
+        let p = Project::new();
+        p.write("Cargo.toml", manifest("cfg-if = \"1\""));
+        p.write(
+            "Cargo.lock",
+            lock(&[("cfg-if", &format!("1.0.4+socket.{UUID_A}"), None, None)]),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(diag_codes(&out), vec![DIAG_REF_UNATTRIBUTABLE]);
     }
 }

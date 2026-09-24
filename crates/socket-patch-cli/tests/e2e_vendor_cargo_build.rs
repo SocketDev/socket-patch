@@ -11,13 +11,15 @@
 //!      and cfg-if's own `#![deny(missing_docs)]` fires on undocumented items
 //!      (spike-verified).
 //!   3. `socket-patch vendor --json --offline` — asserts the patched copy at
-//!      `.socket/vendor/cargo/<uuid>/cfg-if-<ver>/`, the `[patch.crates-io]`
-//!      entry in the root `Cargo.toml` (no `.cargo/` is created), and the
-//!      surgical lock detach (the `[[package]]` entry keeps name+version but
-//!      loses source+checksum).
+//!      `.socket/vendor/cargo/<uuid>/cfg-if-<ver>/` with its `Cargo.toml`
+//!      version TAGGED `<ver>+socket.<uuid>`, the `[patch.crates-io]` entry
+//!      in the root `Cargo.toml` (no `.cargo/` is created), and the surgical
+//!      lock detach (the `[[package]]` entry loses source+checksum and its
+//!      version is the tagged one — what `cargo metadata` reports too).
 //!   4. COMPILE ORACLE: the consumer's `main.rs` is rewritten to call
 //!      `cfg_if::socket_patched()` — it only compiles if the patched bytes
-//!      are what cargo links — and `cargo run --locked --offline` prints it.
+//!      are what cargo links — and `cargo run --locked --offline` prints it,
+//!      plus the patched crate's `CARGO_PKG_VERSION` (the tagged version).
 //!   5. **Fresh-checkout proof**: copy ONLY the committable files
 //!      (Cargo.toml + Cargo.lock + src/ + .socket/) to a new dir
 //!      and `cargo build --locked --offline` with an EMPTY CARGO_HOME — and
@@ -29,11 +31,14 @@
 //! distinct `[patch.crates-io]` keys and both compile under `--locked`),
 //! LEGACY MIGRATION (a pre-v5 `.cargo/config.toml` wiring is moved into
 //! `Cargo.toml` by `repair` and by a `vendor` re-run, and the result still
-//! builds), and an OLD-TOOLCHAIN proof (manifest `[patch]` + the detached
-//! lock type-check the patched copy with no network on every installed
-//! rustup toolchain 1.36..=1.56 — config-file `[patch]` needs 1.56+; two
-//! versions of one crate there need `--offline`; skipped when none is
-//! installed, required by the `cargo-old-toolchains` CI leg). Also: a
+//! builds; an untagged pre-tag copy + lock is tagged by `repair` and by a
+//! re-run), and an OLD-TOOLCHAIN proof (manifest `[patch]` + the detached,
+//! tagged lock build the patched copy with no network on cargo 1.41 / 1.56
+//! — the local `rust:1.41-slim` / `rust:1.56-slim` docker images, preferred,
+//! else installed rustup toolchains 1.36..=1.56 (type-check only) —
+//! config-file `[patch]` needs 1.56+; two versions of one crate there need
+//! `--offline`; skipped when neither is available, required by the
+//! `cargo-old-toolchains` CI leg). Also: a
 //! URL-spelled crates.io `[patch]` table is refused, an ancestor-directory
 //! config entry cannot silently shadow the vendored copy, and the pre-v5
 //! multi-version overwrite is healed by a re-run and by `repair`.
@@ -103,7 +108,86 @@ fn socket_entry(uuid: &str, copy_rel: &str) -> String {
 /// Appended to the dep's `src/lib.rs`. Doc comment required: cfg-if denies
 /// `missing_docs` and path deps get no `--cap-lints allow`.
 const PATCH_SUFFIX: &str =
-    "\n/// Socket-patch capstone marker (added by the vendored patch).\npub fn socket_patched() -> u32 { 1 }\n";
+    "\n/// Socket-patch capstone marker (added by the vendored patch).\npub fn socket_patched() -> u32 { 1 }\n\
+     /// The version cargo compiled this copy as.\npub fn socket_pkg_version() -> &'static str { env!(\"CARGO_PKG_VERSION\") }\n";
+
+/// The consumer `main.rs` of the compile oracle: the patched-only marker and
+/// the patched crate's `CARGO_PKG_VERSION`.
+const ORACLE_MAIN: &str =
+    "fn main() { println!(\"MARKER:{}:{}\", cfg_if::socket_patched(), cfg_if::socket_pkg_version()); }\n";
+
+/// `version` tagged for `uuid` (the vendored copy's version).
+fn tagged(version: &str, uuid: &str) -> String {
+    socket_patch_core::vendor::cargo_tag::tag_version(version, uuid)
+}
+
+/// The oracle's expected output line for `version` vendored under `uuid`.
+fn oracle_line(version: &str, uuid: &str) -> String {
+    format!("MARKER:1:{}", tagged(version, uuid))
+}
+
+/// Assert `proj` carries the tagged vendored version for `uuid` in both
+/// the copy's `Cargo.toml` and the detached `Cargo.lock` entry.
+fn assert_tagged(proj: &Path, version: &str, uuid: &str, tag: &str) {
+    let copy = proj.join(format!(
+        ".socket/vendor/cargo/{uuid}/{DEP}-{version}/Cargo.toml"
+    ));
+    let text = std::fs::read_to_string(&copy).unwrap();
+    assert_eq!(
+        socket_patch_core::vendor::cargo_tag::manifest_tag_uuid(&text).as_deref(),
+        Some(uuid),
+        "{tag}: the copy's version is tagged:\n{text}"
+    );
+    let lock = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
+    assert!(
+        lock.contains(&format!(
+            "name = \"{DEP}\"\nversion = \"{}\"\n",
+            tagged(version, uuid)
+        )),
+        "{tag}: the lock entry carries the tagged version:\n{lock}"
+    );
+}
+
+/// Undo the tag in `proj` (copy + lock): the untagged shape a pre-tag
+/// release committed.
+fn untag_project(proj: &Path, version: &str, uuid: &str) {
+    let copy = proj.join(format!(
+        ".socket/vendor/cargo/{uuid}/{DEP}-{version}/Cargo.toml"
+    ));
+    let text = std::fs::read_to_string(&copy).unwrap();
+    let untagged = socket_patch_core::vendor::cargo_tag::untag_manifest_text(&text)
+        .expect("the copy is tagged");
+    std::fs::write(&copy, untagged).unwrap();
+    let lock = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
+    std::fs::write(
+        proj.join("Cargo.lock"),
+        lock.replace(&tagged(version, uuid), version),
+    )
+    .unwrap();
+}
+
+/// The version `cargo metadata --locked --offline` reports for the dep.
+fn metadata_version(dir: &Path, cargo_home: &Path) -> String {
+    let out = cargo(
+        dir,
+        &["metadata", "--format-version", "1", "--locked", "--offline"],
+        cargo_home,
+    );
+    assert!(
+        out.status.success(),
+        "cargo metadata:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    doc["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == DEP)
+        .and_then(|p| p["version"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
 
 // ── self-contained helpers ────────────────────────────────────────────
 
@@ -636,14 +720,16 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         "the ledger records the manifest wiring: {state}"
     );
 
-    // Lock surgery: the entry keeps name+version but loses source+checksum
-    // (without this, `cargo build --locked` fails closed on the [patch]).
+    // Lock surgery: the entry loses source+checksum (without this, `cargo
+    // build --locked` fails closed on the [patch]) and carries the copy's
+    // tagged version — the uuid is readable from Cargo.lock alone.
     let lock_text = std::fs::read_to_string(&lock_path).unwrap();
     let block = package_block(&lock_text, DEP).expect("cfg-if lock entry must survive");
     assert!(
-        block.contains(&format!("version = \"{version}\"")),
-        "lock entry keeps the version:\n{block}"
+        block.contains(&format!("version = \"{}\"", tagged(&version, UUID))),
+        "lock entry carries the tagged version:\n{block}"
     );
+    assert_tagged(&proj, &version, UUID, "main");
     assert!(
         !block.contains("source = ") && !block.contains("checksum = "),
         "lock entry must be detached from the registry (no source/checksum):\n{block}"
@@ -654,12 +740,9 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         "the detach must keep the lock format:\n{lock_text}"
     );
 
-    // COMPILE ORACLE: the consumer references the patched-only symbol.
-    std::fs::write(
-        proj.join("src/main.rs"),
-        "fn main() { println!(\"MARKER:{}\", cfg_if::socket_patched()); }\n",
-    )
-    .unwrap();
+    // COMPILE ORACLE: the consumer references the patched-only symbol, and
+    // the patched crate reports its tagged CARGO_PKG_VERSION.
+    std::fs::write(proj.join("src/main.rs"), ORACLE_MAIN).unwrap();
     let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
     assert!(
         run.status.success(),
@@ -668,9 +751,14 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         String::from_utf8_lossy(&run.stderr),
     );
     assert!(
-        String::from_utf8_lossy(&run.stdout).contains("MARKER:1"),
-        "patched symbol must be linked: {}",
+        String::from_utf8_lossy(&run.stdout).contains(&oracle_line(&version, UUID)),
+        "patched symbol must be linked, compiled as the tagged version: {}",
         String::from_utf8_lossy(&run.stdout)
+    );
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        lock_text.as_bytes(),
+        "cargo keeps the tagged lock byte-stable"
     );
 
     // FRESH-CHECKOUT PROOF: only the committable files, EMPTY CARGO_HOME,
@@ -699,9 +787,14 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         .output()
         .expect("run fresh consumer binary");
     assert!(
-        String::from_utf8_lossy(&bin.stdout).contains("MARKER:1"),
+        String::from_utf8_lossy(&bin.stdout).contains(&oracle_line(&version, UUID)),
         "fresh build must link the PATCHED dep: {}",
         String::from_utf8_lossy(&bin.stdout)
+    );
+    assert_eq!(
+        metadata_version(&fresh, &fresh_home),
+        tagged(&version, UUID),
+        "cargo metadata reports the tagged version"
     );
     // Zero registry/network access: the empty CARGO_HOME gained no crate
     // sources (cargo only writes its dotfile bookkeeping caches).
@@ -1007,9 +1100,10 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
     let lock_text = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
     let block = package_block(&lock_text, DEP).expect("cfg-if lock entry must survive");
     assert!(
-        block.contains(&format!("version = \"{version}\"")),
-        "lock entry keeps the version:\n{block}"
+        block.contains(&format!("version = \"{}\"", tagged(&version, UUID))),
+        "lock entry carries the tagged version:\n{block}"
     );
+    assert_tagged(&proj, &version, UUID, "get");
     assert!(
         !block.contains("source = ") && !block.contains("checksum = "),
         "lock entry must be detached from the registry (no source/checksum):\n{block}"
@@ -1297,6 +1391,9 @@ fn cargo_vendor_two_versions_of_one_crate_locked_build() {
         );
     }
     assert!(!proj.join(".cargo").exists());
+    // Each version's copy and lock entry carry their own patch's tag.
+    assert_tagged(&proj, &new_v, UUID, "multi-version 1.x");
+    assert_tagged(&proj, &old_v, UUID_OLD, "multi-version 0.1.x");
 
     // COMPILE ORACLE: a patched-only symbol from each version.
     std::fs::write(proj.join("src/main.rs"), TWO_VERSION_MAIN).unwrap();
@@ -1340,8 +1437,11 @@ fn cargo_vendor_two_versions_of_one_crate_locked_build() {
 
 /// Turn the v5 wiring of `proj` into what a pre-v5 release wrote: the
 /// `[patch.crates-io]` entry in `.cargo/config.toml` (Cargo.toml without
-/// it), and the ledger's patch-entry record naming the config.
+/// it), the copy and lock entry untagged, and the ledger's patch-entry
+/// record naming the config.
 fn downgrade_to_legacy_wiring(proj: &Path, purl: &str, copy_rel: &str) {
+    let version = purl.rsplit('@').next().unwrap();
+    untag_project(proj, version, UUID);
     let manifest = std::fs::read_to_string(proj.join("Cargo.toml")).unwrap();
     std::fs::write(proj.join("Cargo.toml"), strip_patch_table(&manifest)).unwrap();
     std::fs::create_dir_all(proj.join(".cargo")).unwrap();
@@ -1391,14 +1491,18 @@ fn assert_migrated(proj: &Path, purl: &str, copy_rel: &str, tag: &str) {
         entry["lock"]["source"], "registry+https://github.com/rust-lang/crates.io-index",
         "{tag}: the unrecoverable lock originals survive the migration: {entry}"
     );
+    let version = purl.rsplit('@').next().unwrap();
+    assert_tagged(proj, version, UUID, tag);
 }
 
 /// LEGACY MIGRATION: a project vendored by a pre-v5 release (the
-/// `[patch.crates-io]` entry in `.cargo/config.toml`) still builds, and
-/// both `repair` and a plain `vendor` re-run move the wiring into
-/// Cargo.toml — ledger updated, lock originals kept — after which the
-/// project still builds `--locked --offline` on a fresh checkout and the
-/// revert restores the pristine files.
+/// `[patch.crates-io]` entry in `.cargo/config.toml`, untagged copy and
+/// lock) still builds, and both `repair` and a plain `vendor` re-run move
+/// the wiring into Cargo.toml and tag the copy + lock — ledger updated,
+/// lock originals kept — after which the project still builds `--locked
+/// --offline` on a fresh checkout and the revert restores the pristine
+/// files. The untagged MANIFEST shape (an earlier v5 build) is tagged by
+/// `repair` too.
 #[test]
 fn cargo_legacy_config_wiring_migrates_to_the_manifest() {
     if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (legacy-migration)") {
@@ -1418,11 +1522,7 @@ fn cargo_legacy_config_wiring_migrates_to_the_manifest() {
     let lock_before = std::fs::read(proj.join("Cargo.lock")).unwrap();
     let manifest_before = std::fs::read(proj.join("Cargo.toml")).unwrap();
     vendor_ok(&proj, &cargo_home, "legacy-migration");
-    std::fs::write(
-        proj.join("src/main.rs"),
-        "fn main() { println!(\"MARKER:{}\", cfg_if::socket_patched()); }\n",
-    )
-    .unwrap();
+    std::fs::write(proj.join("src/main.rs"), ORACLE_MAIN).unwrap();
 
     // The pre-v5 shape builds (config `[patch]`, cargo 1.56+).
     downgrade_to_legacy_wiring(&proj, &purl, &copy_rel);
@@ -1432,8 +1532,8 @@ fn cargo_legacy_config_wiring_migrates_to_the_manifest() {
     );
     let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
     assert!(
-        String::from_utf8_lossy(&run.stdout).contains("MARKER:1"),
-        "the legacy wiring builds: {}",
+        String::from_utf8_lossy(&run.stdout).contains(&format!("MARKER:1:{version}\n")),
+        "the legacy (untagged) wiring builds: {}",
         String::from_utf8_lossy(&run.stderr)
     );
 
@@ -1454,18 +1554,41 @@ fn cargo_legacy_config_wiring_migrates_to_the_manifest() {
         "repair failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(stdout.contains("cargo_wiring_migrated"), "{stdout}");
+    assert!(stdout.contains("cargo_version_tagged"), "{stdout}");
     assert_migrated(&proj, &purl, &copy_rel, "repair");
 
     // (2) A plain `vendor` re-run migrates.
     downgrade_to_legacy_wiring(&proj, &purl, &copy_rel);
     let env = vendor_ok(&proj, &cargo_home, "legacy re-run");
     assert!(env.to_string().contains("cargo_wiring_migrated"), "{env}");
+    assert!(env.to_string().contains("cargo_version_tagged"), "{env}");
     assert_migrated(&proj, &purl, &copy_rel, "vendor re-run");
+
+    // (3) The untagged manifest shape: `repair` tags it in place.
+    untag_project(&proj, &version, UUID);
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "repair",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        &cargo_home,
+    );
+    assert_eq!(
+        code, 0,
+        "repair (tag) failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("cargo_version_tagged"), "{stdout}");
+    assert!(!stdout.contains("cargo_wiring_migrated"), "{stdout}");
+    assert_migrated(&proj, &purl, &copy_rel, "repair (tag only)");
 
     let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
     assert!(
-        String::from_utf8_lossy(&run.stdout).contains("MARKER:1"),
-        "the migrated wiring builds: {}",
+        String::from_utf8_lossy(&run.stdout).contains(&oracle_line(&version, UUID)),
+        "the migrated wiring builds the tagged copy: {}",
         String::from_utf8_lossy(&run.stderr)
     );
     let (fresh, home) = fresh_checkout(&proj, tmp.path(), "migrated");
@@ -1494,10 +1617,56 @@ fn cargo_legacy_config_wiring_migrates_to_the_manifest() {
     assert!(!proj.join(".socket/vendor").exists());
 }
 
-/// Set to `1` by the CI leg that installs old toolchains: then finding none
+/// Set to `1` by the CI leg that provides old cargos: then finding none
 /// is a failure, not a skip (the regular matrix legs set
-/// `SOCKET_PATCH_CARGO_E2E_REQUIRED` but install no old toolchain).
+/// `SOCKET_PATCH_CARGO_E2E_REQUIRED` but provide no old cargo).
 const OLD_TOOLCHAINS_REQUIRED_ENV: &str = "SOCKET_PATCH_CARGO_OLD_TOOLCHAINS_REQUIRED";
+
+/// The official images of the old cargos under test, used when present
+/// locally (the test never pulls; the CI leg does).
+const OLD_CARGO_IMAGES: [(&str, u32); 2] = [("rust:1.41-slim", 41), ("rust:1.56-slim", 56)];
+
+/// One old cargo under test.
+#[derive(Clone, Debug)]
+enum OldCargo {
+    /// A local docker image: runs with `--network none`, and BUILDS (and
+    /// runs) the consumer — Linux links fine.
+    Docker { image: String, minor: u32 },
+    /// A rustup toolchain on the host: type-check only (old rustc cannot
+    /// link against a current Xcode on Apple Silicon).
+    Rustup { toolchain: String, minor: u32 },
+}
+
+impl OldCargo {
+    fn minor(&self) -> u32 {
+        match self {
+            Self::Docker { minor, .. } | Self::Rustup { minor, .. } => *minor,
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Self::Docker { image, .. } => format!("docker {image}"),
+            Self::Rustup { toolchain, .. } => format!("rustup {toolchain}"),
+        }
+    }
+
+    /// The lock format this cargo writes (v3 from 1.53, v2 from 1.41).
+    fn lock_version(&self) -> u8 {
+        match self.minor() {
+            m if m >= 53 => 3,
+            m if m >= 41 => 2,
+            _ => 1,
+        }
+    }
+}
+
+fn docker_image_present(image: &str) -> bool {
+    Command::new("docker")
+        .args(["image", "inspect", "--format", "{{.Id}}", image])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
 
 /// Installed rustup toolchains 1.36 (`--offline`) through 1.56 (the floor of
 /// config-file `[patch]`): `(full toolchain name, minor)`.
@@ -1520,39 +1689,98 @@ fn old_toolchains() -> Vec<(String, u32)> {
         .collect()
 }
 
-/// The old toolchains, or `None` (skip printed) when none is installed —
-/// a failure under [`OLD_TOOLCHAINS_REQUIRED_ENV`].
-fn old_toolchains_or_skip(suite: &str) -> Option<Vec<(String, u32)>> {
-    let toolchains = old_toolchains();
-    if toolchains.is_empty() {
-        assert!(
-            std::env::var(OLD_TOOLCHAINS_REQUIRED_ENV).as_deref() != Ok("1"),
-            "{suite}: no rustup toolchain 1.36..=1.56 installed, and \
-             {OLD_TOOLCHAINS_REQUIRED_ENV}=1 is set"
-        );
-        println!("SKIP {suite}: no rustup toolchain 1.36..=1.56 installed");
-        return None;
+/// The old cargos available here: the local docker images first
+/// (preferred), then any installed rustup toolchain 1.36..=1.56 for a minor
+/// no image covers.
+fn old_cargos() -> Vec<OldCargo> {
+    let mut out: Vec<OldCargo> = OLD_CARGO_IMAGES
+        .iter()
+        .filter(|(image, _)| docker_image_present(image))
+        .map(|(image, minor)| OldCargo::Docker {
+            image: image.to_string(),
+            minor: *minor,
+        })
+        .collect();
+    for (toolchain, minor) in old_toolchains() {
+        if !out.iter().any(|c| c.minor() == minor) {
+            out.push(OldCargo::Rustup { toolchain, minor });
+        }
     }
-    Some(toolchains)
+    out
 }
 
-/// `cargo check -q --locked` (plus `extra`) on `tc` with a private
-/// CARGO_HOME. `check`, not `build`: old rustc cannot link against a
-/// current Xcode on Apple Silicon, and type-checking the consumer against
-/// the patched-only symbol is already the compile oracle. The network is
-/// made unreachable (a dead proxy), so anything cargo tries to fetch fails.
-fn old_cargo_check(dir: &Path, home: &Path, tc: &str, extra: &[&str]) -> Output {
-    Command::new("cargo")
-        .args(["check", "-q", "--locked"])
-        .args(extra)
-        .current_dir(dir)
-        .env("CARGO_HOME", home)
-        .env("RUSTUP_TOOLCHAIN", tc)
-        .env("CARGO_HTTP_PROXY", "http://127.0.0.1:9")
-        .env("CARGO_NET_RETRY", "0")
-        .env_remove("CARGO_TARGET_DIR")
-        .output()
-        .expect("run old cargo")
+/// The old cargos, or `None` (skip printed) when none is available — a
+/// failure under [`OLD_TOOLCHAINS_REQUIRED_ENV`].
+fn old_cargos_or_skip(suite: &str) -> Option<Vec<OldCargo>> {
+    let cargos = old_cargos();
+    if cargos.is_empty() {
+        assert!(
+            std::env::var(OLD_TOOLCHAINS_REQUIRED_ENV).as_deref() != Ok("1"),
+            "{suite}: no local rust:1.41-slim / rust:1.56-slim docker image and no rustup \
+             toolchain 1.36..=1.56, and {OLD_TOOLCHAINS_REQUIRED_ENV}=1 is set"
+        );
+        println!(
+            "SKIP {suite}: no local rust:1.41-slim / rust:1.56-slim docker image and no \
+             rustup toolchain 1.36..=1.56"
+        );
+        return None;
+    }
+    Some(cargos)
+}
+
+/// What one old-cargo run produced.
+struct OldRun {
+    out: Output,
+    /// The private CARGO_HOME gained a `registry/` (something was fetched).
+    fetched: bool,
+}
+
+/// Run `cargo <build|check> -q --locked` (plus `extra`) on the fresh
+/// checkout `dir` with an empty private CARGO_HOME and NO network: a docker
+/// image runs `--network none` and builds, then runs, the consumer (its
+/// stdout is the oracle's); a rustup toolchain type-checks with the network
+/// pointed at a dead proxy.
+fn old_cargo_run(cargo: &OldCargo, dir: &Path, extra: &[&str]) -> OldRun {
+    let home_rel = ".old-cargo-home";
+    let out = match cargo {
+        OldCargo::Docker { image, .. } => {
+            let id = |flag: &str| {
+                Command::new("id")
+                    .arg(flag)
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default()
+            };
+            let script = format!(
+                "cargo build -q --locked {} && ./target/debug/consumer",
+                extra.join(" ")
+            );
+            Command::new("docker")
+                .args(["run", "--rm", "--network", "none"])
+                .args(["-u", &format!("{}:{}", id("-u"), id("-g"))])
+                .args(["-v", &format!("{}:/w", dir.display()), "-w", "/w"])
+                .args(["-e", &format!("CARGO_HOME=/w/{home_rel}"), "-e", "HOME=/w"])
+                .arg(image)
+                .args(["sh", "-c", &script])
+                .output()
+                .expect("run docker")
+        }
+        OldCargo::Rustup { toolchain, .. } => Command::new("cargo")
+            .args(["check", "-q", "--locked"])
+            .args(extra)
+            .current_dir(dir)
+            .env("CARGO_HOME", dir.join(home_rel))
+            .env("RUSTUP_TOOLCHAIN", toolchain)
+            .env("CARGO_HTTP_PROXY", "http://127.0.0.1:9")
+            .env("CARGO_NET_RETRY", "0")
+            .env_remove("CARGO_TARGET_DIR")
+            .output()
+            .expect("run old cargo"),
+    };
+    OldRun {
+        out,
+        fetched: dir.join(home_rel).join("registry").exists(),
+    }
 }
 
 /// A current-cargo (v4) registry-only lock rewritten in the format `minor`
@@ -1564,16 +1792,18 @@ fn lock_for_minor(lock: &str, minor: u32) -> String {
 }
 
 /// OLD TOOLCHAIN: the committed v5 wiring (manifest `[patch]` under the
-/// Socket-owned renamed key + detached lock, in the lock format that
-/// toolchain reads) type-checks the patched copy on every installed
-/// toolchain 1.36..=1.56 — below the 1.56 floor of config-file `[patch]` —
-/// with an empty CARGO_HOME and NO network and NO `--offline`, fetching
-/// nothing. Skips when no such toolchain is installed (never installs one);
-/// the `cargo-old-toolchains` CI leg installs 1.41 and 1.56 and requires it.
+/// Socket-owned renamed key + the detached, TAGGED lock, in the lock format
+/// that cargo writes) builds the patched copy on cargo 1.41 and 1.56 —
+/// below the 1.56 floor of config-file `[patch]` — with an empty
+/// CARGO_HOME, NO network and NO `--offline`, fetching nothing; in docker
+/// the consumer runs and prints the patched marker and the tagged
+/// `CARGO_PKG_VERSION`. Skips when no old cargo is available (never pulls
+/// or installs one); the `cargo-old-toolchains` CI leg pulls the images and
+/// requires it.
 #[test]
 fn cargo_vendored_manifest_patch_builds_on_old_toolchains() {
     const SUITE: &str = "e2e_vendor_cargo_build (old-toolchain)";
-    let Some(toolchains) = old_toolchains_or_skip(SUITE) else {
+    let Some(cargos) = old_cargos_or_skip(SUITE) else {
         return;
     };
     if !cargo_e2e_matrix::cargo_available(SUITE) {
@@ -1602,54 +1832,55 @@ fn cargo_vendored_manifest_patch_builds_on_old_toolchains() {
             .contains(&format!("{} = {{ package = ", socket_key(UUID))),
         "the renamed Socket-owned key is what old cargo must accept"
     );
-    std::fs::write(
-        proj.join("src/main.rs"),
-        "fn main() { println!(\"MARKER:{}\", cfg_if::socket_patched()); }\n",
-    )
-    .unwrap();
+    assert_tagged(&proj, &version, UUID, "old-toolchain");
+    std::fs::write(proj.join("src/main.rs"), ORACLE_MAIN).unwrap();
     let pkgs =
         cargo_e2e_matrix::parse_lock(&std::fs::read_to_string(proj.join("Cargo.lock")).unwrap());
-    for (tc, minor) in toolchains {
-        let (fresh, home) = fresh_checkout(&proj, tmp.path(), &tc);
-        // The lock format that toolchain writes (v3 from 1.53, v2 from 1.41).
-        let lock_version = if minor >= 53 {
-            3
-        } else if minor >= 41 {
-            2
-        } else {
-            1
-        };
+    for old in cargos {
+        let name = old.name();
+        let (fresh, _) = fresh_checkout(&proj, tmp.path(), &format!("old-{}", old.minor()));
+        let lock_version = old.lock_version();
         std::fs::write(
             fresh.join("Cargo.lock"),
             cargo_e2e_matrix::write_lock(&pkgs, lock_version),
         )
         .unwrap();
-        let out = old_cargo_check(&fresh, &home, &tc, &[]);
+        let run = old_cargo_run(&old, &fresh, &[]);
         assert!(
-            out.status.success(),
-            "{tc}: manifest [patch] + detached lock v{lock_version} must type-check the \
+            run.out.status.success(),
+            "{name}: manifest [patch] + detached tagged lock v{lock_version} must build the \
              patched copy with no network:\n{}",
-            String::from_utf8_lossy(&out.stderr)
+            String::from_utf8_lossy(&run.out.stderr)
         );
         assert!(
-            !home.join("registry").exists(),
-            "{tc}: nothing is fetched (not even the registry index)"
+            !run.fetched,
+            "{name}: nothing is fetched (not even the registry index)"
         );
-        println!("old-toolchain {tc}: OK (lock v{lock_version})");
+        if matches!(old, OldCargo::Docker { .. }) {
+            assert!(
+                String::from_utf8_lossy(&run.out.stdout).contains(&oracle_line(&version, UUID)),
+                "{name}: the patched copy runs as the tagged version: {}",
+                String::from_utf8_lossy(&run.out.stdout)
+            );
+        }
+        println!("old-toolchain {name}: OK (lock v{lock_version})");
         let _ = std::fs::remove_dir_all(&fresh);
     }
 }
 
 /// OLD TOOLCHAIN, TWO VERSIONS of one crate: older cargo loads the
-/// crates.io index to tell two same-named `[patch]` entries apart, so the
-/// committed two-version wiring type-checks on 1.36..=1.56 under
-/// `--offline` (what the docs require there); without `--offline` and with
-/// no network the outcome is only reported (current stable needs neither —
-/// see `cargo_vendor_two_versions_of_one_crate_locked_build`).
+/// crates.io index to tell two same-named `[patch]` entries apart. Cargo
+/// 1.56 builds the committed two-version wiring under `--offline` from an
+/// empty CARGO_HOME (what the docs require there); older cargo (1.41) needs
+/// the index itself — it fails even under `--offline` with no registry
+/// cache, the same for tagged and untagged locks — so below 1.56 only that
+/// documented failure is accepted. Without `--offline` the outcome is only
+/// reported (current stable needs neither — see
+/// `cargo_vendor_two_versions_of_one_crate_locked_build`).
 #[test]
 fn cargo_vendored_two_versions_on_old_toolchains_need_offline() {
     const SUITE: &str = "e2e_vendor_cargo_build (old-toolchain multi-version)";
-    let Some(toolchains) = old_toolchains_or_skip(SUITE) else {
+    let Some(cargos) = old_cargos_or_skip(SUITE) else {
         return;
     };
     if !cargo_e2e_matrix::cargo_available(SUITE) {
@@ -1667,24 +1898,43 @@ fn cargo_vendored_two_versions_on_old_toolchains_need_offline() {
         let _ = cargo_e2e_matrix::skip(SUITE, "the baseline lock is not v4 (pinned toolchain)");
         return;
     }
-    for (tc, minor) in toolchains {
-        let (fresh, home) = fresh_checkout(&fx.proj, tmp.path(), &format!("mv-{tc}"));
-        std::fs::write(fresh.join("Cargo.lock"), lock_for_minor(&lock, minor)).unwrap();
-        let online = old_cargo_check(&fresh, &home, &tc, &[]);
+    for old in cargos {
+        let name = old.name();
+        let (fresh, _) = fresh_checkout(&fx.proj, tmp.path(), &format!("mv-{}", old.minor()));
+        std::fs::write(fresh.join("Cargo.lock"), lock_for_minor(&lock, old.minor())).unwrap();
+        let online = old_cargo_run(&old, &fresh, &[]);
         println!(
-            "old-toolchain multi-version {tc} without --offline: {}",
-            if online.status.success() {
+            "old-toolchain multi-version {name} without --offline: {}",
+            if online.out.status.success() {
                 "ok"
             } else {
                 "needs --offline (registry index unreachable)"
             }
         );
-        let out = old_cargo_check(&fresh, &home, &tc, &["--offline"]);
+        let run = old_cargo_run(&old, &fresh, &["--offline"]);
+        if old.minor() < 56 && !run.out.status.success() {
+            let stderr = String::from_utf8_lossy(&run.out.stderr);
+            assert!(
+                stderr.contains("unable to fetch registry") && stderr.contains("in offline mode"),
+                "{name}: the only accepted failure below 1.56 is the missing registry \
+                 index:\n{stderr}"
+            );
+            println!("old-toolchain multi-version {name}: needs a registry index (documented)");
+            let _ = std::fs::remove_dir_all(&fresh);
+            continue;
+        }
         assert!(
-            out.status.success(),
-            "{tc}: two vendored versions must type-check under --offline:\n{}",
-            String::from_utf8_lossy(&out.stderr)
+            run.out.status.success(),
+            "{name}: two vendored versions must build under --offline:\n{}",
+            String::from_utf8_lossy(&run.out.stderr)
         );
+        if matches!(old, OldCargo::Docker { .. }) {
+            assert!(
+                String::from_utf8_lossy(&run.out.stdout).contains("MARKER:1:2"),
+                "{name}: both patched copies run: {}",
+                String::from_utf8_lossy(&run.out.stdout)
+            );
+        }
         let _ = std::fs::remove_dir_all(&fresh);
     }
 }

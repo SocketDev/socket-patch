@@ -1458,9 +1458,12 @@ jobs:
           cargo test -p socket-patch-cli --test e2e_redirect_cargo_build --test e2e_vendor_cargo_build --test mode_migration_cargo
           cargo test -p socket-patch-cli --test e2e_safety_cargo_build -- --ignored
 
-  # Manifest `[patch]` (the v5 vendored cargo wiring) on toolchains older
-  # than the 1.56 floor of config-file `[patch]`. The old-toolchain tests
-  # skip when none is installed; this leg installs two and requires them.
+  # Manifest `[patch]` + the tagged detached lock (the v5 vendored cargo
+  # wiring) on cargo 1.41 and 1.56 — below / at the 1.56 floor of
+  # config-file `[patch]`. The old-toolchain tests prefer the local
+  # `rust:1.41-slim` / `rust:1.56-slim` docker images (run `--network none`;
+  # they build AND run the consumer) and skip when no old cargo is
+  # available; this leg pulls both images and requires them.
   cargo-old-toolchains:
     name: cargo old toolchains (manifest [patch])
     needs: test
@@ -1473,10 +1476,10 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         run: rustup show
-      - name: Install the old cargos under test
+      - name: Pull the old cargos under test
         run: |
-          rustup toolchain install 1.41.0 --profile minimal
-          rustup toolchain install 1.56.0 --profile minimal
+          docker pull rust:1.41-slim
+          docker pull rust:1.56-slim
       - name: Cache cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:

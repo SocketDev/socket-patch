@@ -379,7 +379,8 @@ fn advisory_tier(code: &str) -> AdvisoryTier {
         "vendor_fetched_missing"
         | "vendor_would_revert_redirect"
         | "vendor_takeover_reverted_redirect"
-        | "cargo_wiring_migrated" => AdvisoryTier::Note,
+        | "cargo_wiring_migrated"
+        | "cargo_version_tagged" => AdvisoryTier::Note,
         _ => AdvisoryTier::Warning,
     }
 }

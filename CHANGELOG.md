@@ -20,21 +20,63 @@ into the new version's section — see docs/releasing.md.
 > **Semver note:** this entry changes `rollback`'s default behavior, narrows
 > the meaning of its existing `vendored: []` JSON key, makes vendored mode
 > manifest-free, moves vendored cargo wiring from `.cargo/config*` into
-> `Cargo.toml`, turns a plain non-TTY `scan` report-only, and makes `vex`
+> `Cargo.toml`, tags vendored cargo copies' versions with `+socket.<uuid>`
+> (visible to the patched crate as `CARGO_PKG_VERSION`), turns a plain
+> non-TTY `scan` report-only, and makes `vex`
 > refuse to attest stale ledger records and corrupt vendor ledgers — all
 > MAJOR per CLI_CONTRACT.md's semver policy — so it ships as the next major
 > release (v5.0).
 
 ### Changed (BREAKING)
 
+- **Vendored cargo copies carry a tagged version: `<version>+socket.<uuid>`.**
+  The vendored copy's own `Cargo.toml` `[package] version` is rewritten to
+  the patch-tagged version (`1.0.4+socket.<uuid>`; a version that already
+  has build metadata keeps it: `2.0.1+zstd.1.5.2.socket.<uuid>`), and the
+  detached `Cargo.lock` entry records that tagged version with no
+  `source` / `checksum` — exactly the lock cargo itself writes when it
+  resolves the `[patch]` against the tagged copy (verified on cargo 1.41,
+  1.56 and current stable: `--locked` builds, the patched bytes compile,
+  transitive `^1` / `=1.0.4` dependents resolve to the copy since cargo
+  ignores build metadata when matching requirements, and `cargo metadata`
+  reports the tagged version). Every lock reference that spells the old
+  version (`"cfg-if 1.0.4"`, v1's `"cfg-if 1.0.4 (registry+…)"`) is
+  rewritten to the tagged version, in lock formats v1–v4; a lock the edit
+  cannot keep consistent (a leftover reference in another spelling, a v1
+  `replace`, an entry already at the tagged version) refuses before any
+  write with `cargo_lock_untaggable`, and a copy manifest whose version
+  literal cannot be rewritten byte-exactly fails the package with
+  `cargo_copy_untaggable`. The patch uuid of the copy cargo actually
+  builds is therefore recoverable from `Cargo.lock` alone (a config-level
+  `[patch]` override pointing elsewhere changes the locked version). **The
+  patched crate sees the tag in `CARGO_PKG_VERSION`** (and in
+  `env!("CARGO_PKG_VERSION")`-derived strings such as `--version` output
+  of a vendored binary crate); code that parses its own version with a
+  semver parser is unaffected, code that compares it as a string is not.
+  Re-runs are idempotent; a uuid bump re-tags the copy and the lock;
+  `vendor --revert` / `rollback` / `remove` / GC / the hosted takeover
+  restore the original lock byte for byte (tag dropped with the
+  `source` / `checksum`). Projects vendored before tagged versions (the
+  pre-v5 `.cargo/config*` wiring, or an untagged manifest wiring) are
+  tagged by the next re-run or `repair` (`cargo_version_tagged` note; a
+  tag `repair` cannot write is the `cargo_version_untagged` warning). VEX
+  discovery treats the tagged lock version as the primary identity
+  (`pkg:cargo/<name>@<version>` is the tag stripped): a detached entry
+  tagged for a different uuid than the wiring's copy path is dead wiring
+  (not attested), a tagged entry no visible wiring names is diagnosed
+  unattributable, and an untagged detached entry (vendored before tagged
+  versions) still counts. A patch that edits the crate's own `Cargo.toml`
+  verifies with the tag dropped.
 - **Vendored cargo wiring moved to `Cargo.toml`.** `vendor` / `scan` /
   `get --mode vendored` write the `[patch.crates-io]` path entry into the
   workspace-root `Cargo.toml` (beside the `Cargo.lock` it detaches) instead
   of `.cargo/config.toml` / `.cargo/config`, so Socket scanners can recover
   the patch uuid from the manifest alone and single-version wiring builds
-  on cargo older than 1.56 (the floor of config-file `[patch]`); two
-  vendored versions of one crate additionally need `--offline` (or a
-  reachable registry index) on such old cargo. The edit is
+  on cargo older than 1.56 (the floor of config-file `[patch]`; proven on
+  cargo 1.41 with no network); two vendored versions of one crate need
+  `--offline` on cargo 1.56, and a populated registry index (the crates.io
+  index in `$CARGO_HOME`, or network access) on older cargo such as 1.41,
+  which loads it to tell the two entries apart. The edit is
   format-preserving (comments, ordering, CRLF / mixed line endings, a
   UTF-8 BOM and the trailing-newline state survive; a revert restores the
   manifest byte for byte and keeps a user's own `[patch]` /
