@@ -7,8 +7,9 @@ use rayon::prelude::*;
 use serde::Deserialize;
 
 use super::types::{CrawledPackage, CrawlerOptions};
+use super::walk_pool::run_walk;
 use crate::patch::path_safety;
-use crate::utils::fs::{is_dir, is_dir_sync, read_dir_entries_sync, run_blocking};
+use crate::utils::fs::{is_dir, is_dir_sync, read_dir_entries_sync};
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
 #[cfg(test)]
@@ -618,13 +619,14 @@ impl NpmCrawler {
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
         let options = options.clone();
-        Ok(run_blocking(move || Self::node_modules_paths_sync(&options)).await)
+        Ok(run_walk(move || Self::node_modules_paths_sync(&options)).await)
     }
 
     /// Crawl all discovered `node_modules` and return every package found.
     ///
-    /// The whole walk runs as ONE blocking-pool task (instead of one
-    /// `spawn_blocking` round trip per readdir/stat/read): directory I/O is
+    /// The whole walk runs as ONE task on the walk pool (instead of one
+    /// `spawn_blocking` round trip per readdir/stat/read; see
+    /// [`super::walk_pool`]): directory I/O is
     /// gathered in parallel into per-root [`ScanEvent`] trees that record
     /// the sequential visit order, then [`Self::merge_scan_events`] replays
     /// them single-threaded so the order-dependent `seen` dedup (and the
@@ -632,7 +634,7 @@ impl NpmCrawler {
     /// sequential walk would have — same packages, same paths, same order.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
         let options = options.clone();
-        run_blocking(move || Self::crawl_all_sync(&options)).await
+        run_walk(move || Self::crawl_all_sync(&options)).await
     }
 
     fn crawl_all_sync(options: &CrawlerOptions) -> Vec<CrawledPackage> {
@@ -707,12 +709,12 @@ impl NpmCrawler {
             });
         }
 
-        // Both passes run as one blocking-pool task: each visited dir is
+        // Both passes run as one walk-pool task: each visited dir is
         // listed once, and that listing both bounds which targets are
         // probed there and drives the descent (see
         // `resolve_pending_targets`).
         let node_modules_path = node_modules_path.to_path_buf();
-        Ok(run_blocking(move || {
+        Ok(run_walk(move || {
             let mut result: HashMap<String, Vec<CrawledPackage>> = HashMap::new();
 
             // Pass 1 — filtered: `.pnpm` virtual-store entries are enqueued
@@ -1510,7 +1512,7 @@ impl NpmCrawler {
     /// [`Self::list_pnpm_store_entries_sync`] for the async callers.
     async fn list_pnpm_store_entries(store_path: &Path) -> Vec<(String, PathBuf)> {
         let store_path = store_path.to_path_buf();
-        run_blocking(move || {
+        run_walk(move || {
             Self::list_pnpm_store_entries_sync(&store_path, false)
                 .into_iter()
                 .map(|entry| (entry.name, entry.node_modules))
@@ -1599,9 +1601,7 @@ impl NpmCrawler {
     #[cfg(test)]
     async fn collect_nested_store_entries(host_path: &Path, entries: &mut Vec<(String, PathBuf)>) {
         let host_path = host_path.to_path_buf();
-        entries.extend(
-            run_blocking(move || Self::collect_nested_store_entries_sync(&host_path)).await,
-        );
+        entries.extend(run_walk(move || Self::collect_nested_store_entries_sync(&host_path)).await);
     }
 
     // ------------------------------------------------------------------

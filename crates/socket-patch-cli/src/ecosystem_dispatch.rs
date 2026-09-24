@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::args::GlobalArgs;
 
+use socket_patch_core::crawlers::walk_pool;
 use socket_patch_core::crawlers::CargoCrawler;
 use socket_patch_core::crawlers::ComposerCrawler;
 use socket_patch_core::crawlers::DenoCrawler;
@@ -549,18 +550,37 @@ pub async fn crawl_all_ecosystems(
     // fixed order below, so packages and counts are exactly the serial
     // run's. Each future is heap-allocated through `boxed` (constructed
     // in that helper's frame) so joining nine does not grow the caller's
-    // poll frame by their combined size.
-    let (npm, pypi, cargo, (gems, gem_discovery), golang, maven, composer, nuget, deno) = tokio::join!(
-        boxed(|| NpmCrawler.crawl_all(options)),
-        boxed(|| PythonCrawler.crawl_all(options)),
-        boxed(|| CargoCrawler.crawl_all(options)),
-        boxed(|| RubyCrawler.crawl_all_with_discovery(options)),
-        boxed(|| GoCrawler.crawl_all(options)),
-        boxed(|| MavenCrawler.crawl_all(options)),
-        boxed(|| ComposerCrawler.crawl_all(options)),
-        boxed(|| NuGetCrawler.crawl_all(options)),
-        boxed(|| DenoCrawler.crawl_all(options)),
-    );
+    // poll frame by their combined size. Under a tight descriptor limit
+    // they run one at a time instead, keeping the serial run's descriptor
+    // profile (see `walk_pool`): a crawler treats a failed open as an
+    // absent dir, so extra concurrent descriptors could silently drop
+    // packages there.
+    let (npm, pypi, cargo, (gems, gem_discovery), golang, maven, composer, nuget, deno) =
+        if walk_pool::fd_limit_is_tight() {
+            (
+                boxed(|| NpmCrawler.crawl_all(options)).await,
+                boxed(|| PythonCrawler.crawl_all(options)).await,
+                boxed(|| CargoCrawler.crawl_all(options)).await,
+                boxed(|| RubyCrawler.crawl_all_with_discovery(options)).await,
+                boxed(|| GoCrawler.crawl_all(options)).await,
+                boxed(|| MavenCrawler.crawl_all(options)).await,
+                boxed(|| ComposerCrawler.crawl_all(options)).await,
+                boxed(|| NuGetCrawler.crawl_all(options)).await,
+                boxed(|| DenoCrawler.crawl_all(options)).await,
+            )
+        } else {
+            tokio::join!(
+                boxed(|| NpmCrawler.crawl_all(options)),
+                boxed(|| PythonCrawler.crawl_all(options)),
+                boxed(|| CargoCrawler.crawl_all(options)),
+                boxed(|| RubyCrawler.crawl_all_with_discovery(options)),
+                boxed(|| GoCrawler.crawl_all(options)),
+                boxed(|| MavenCrawler.crawl_all(options)),
+                boxed(|| ComposerCrawler.crawl_all(options)),
+                boxed(|| NuGetCrawler.crawl_all(options)),
+                boxed(|| DenoCrawler.crawl_all(options)),
+            )
+        };
 
     let mut all_packages = Vec::new();
     let mut counts: HashMap<Ecosystem, usize> = HashMap::new();

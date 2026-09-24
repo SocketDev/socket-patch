@@ -10,6 +10,7 @@ pub mod pkg_managers;
 pub mod python_crawler;
 pub mod ruby_crawler;
 pub mod types;
+pub mod walk_pool;
 
 pub use cargo_crawler::CargoCrawler;
 pub use composer_crawler::ComposerCrawler;
