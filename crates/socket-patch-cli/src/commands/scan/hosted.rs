@@ -1828,9 +1828,20 @@ pub(crate) async fn run_redirect_selected(
         // The wheels are fetched concurrently but folded in dep order, so
         // `python_metadata`, `unavailable_python_artifacts` and `skipped`
         // come out exactly as the serial loop's did.
+        //
+        // Kept small on purpose: the gain is overlapped round trips, while
+        // each in-flight download buffers a whole wheel (up to
+        // MAX_VENDOR_PACKAGE_BYTES) under its own body timeout and retry
+        // budget, so peak memory and link sharing scale with this limit and
+        // a 429 `Retry-After` pauses only the download that received it. The
+        // status line names the dep whose result is being awaited (the
+        // baseline's messages, in the baseline's order), and the client's
+        // opt-in debug lines (GET / attempt-failed) interleave across the
+        // in-flight downloads.
         // TODO(perf): switch to `utils::concurrent::ordered_concurrent` once
-        // it lands (added in parallel on the scan-concurrency branch).
-        const WHEEL_METADATA_CONCURRENCY: usize = 8;
+        // it lands (added in parallel on the scan-concurrency branch), and
+        // let a `Retry-After` pause the whole fan-out rather than one fetch.
+        const WHEEL_METADATA_CONCURRENCY: usize = 4;
         use futures_util::StreamExt as _;
         let mut fetches = std::pin::pin!(futures_util::stream::iter(wheel_deps.iter())
             .map(|&(dep, sha256)| {

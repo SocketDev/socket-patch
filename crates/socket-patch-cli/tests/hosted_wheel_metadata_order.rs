@@ -5,7 +5,9 @@
 //! one-at-a-time loop produced, whatever order the downloads finish in.
 //!
 //! The first failing wheel is served SLOWLY and the second fails at once,
-//! so a fold in completion order would swap them.
+//! so a fold in completion order would swap them. Request arrivals are
+//! recorded too, so a regression to one-at-a-time fetching (which keeps the
+//! order but loses the overlap) fails as well.
 //!
 //! Runs the built binary as a subprocess (`common::run_with_env`) against a
 //! wiremock patch API. Unix-only: the fabricated `.venv` uses the POSIX
@@ -14,11 +16,12 @@
 #![cfg(unix)]
 
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path, path_regex};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -121,10 +124,32 @@ fn write_uv_project(root: &Path) {
     }
 }
 
+/// When each wheel request ARRIVED at the mock (before its response delay).
+type Arrivals = Arc<Mutex<Vec<(&'static str, Instant)>>>;
+
+/// Serves `template` and records the request's arrival under `name`.
+struct RecordArrival {
+    name: &'static str,
+    template: ResponseTemplate,
+    arrivals: Arrivals,
+}
+
+impl Respond for RecordArrival {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        self.arrivals
+            .lock()
+            .unwrap()
+            .push((self.name, Instant::now()));
+        self.template.clone()
+    }
+}
+
 /// Discovery, per-package search and the reference grants for all of PKGS;
 /// wheels: `aaa` and `ccc` serve valid bytes (reversed delays), `bbb` is a
 /// SLOW 404 and `ddd` serves bytes that do not match the granted sha256.
-async fn mock_api(server: &MockServer) {
+/// Returns the wheel-request arrival log.
+async fn mock_api(server: &MockServer) -> Arrivals {
+    let arrivals: Arrivals = Arc::default();
     let patch = |name: &str, version: &str, uuid: &str| {
         json!({
             "uuid": uuid, "purl": purl(name, version), "tier": "free",
@@ -175,7 +200,11 @@ async fn mock_api(server: &MockServer) {
         };
         Mock::given(method("GET"))
             .and(path(format!("/wheels/{file}")))
-            .respond_with(response.set_delay(delay))
+            .respond_with(RecordArrival {
+                name,
+                template: response.set_delay(delay),
+                arrivals: arrivals.clone(),
+            })
             .mount(server)
             .await;
         results.insert(
@@ -194,12 +223,13 @@ async fn mock_api(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "results": results })))
         .mount(server)
         .await;
+    arrivals
 }
 
 #[tokio::test]
 async fn wheel_metadata_failures_fold_in_dep_order() {
     let server = MockServer::start().await;
-    mock_api(&server).await;
+    let arrivals = mock_api(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("proj");
     write_uv_project(&root);
@@ -265,5 +295,24 @@ async fn wheel_metadata_failures_fold_in_dep_order() {
         std::fs::read(root.join("uv.lock")).unwrap(),
         lock_before,
         "--dry-run writes nothing"
+    );
+
+    // The fetches overlap: `bbb` is requested while `aaa`'s 600 ms response
+    // is still pending. A one-at-a-time loop cannot request `bbb` until
+    // `aaa` has been answered. (No wall-clock budget: arrival order only.)
+    let arrivals = arrivals.lock().unwrap().clone();
+    let first = |name: &str| {
+        arrivals
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, at)| *at)
+            .unwrap_or_else(|| panic!("no request for {name}: {arrivals:?}"))
+    };
+    let (aaa, bbb) = (first("aaa-pkg"), first("bbb-pkg"));
+    assert!(
+        bbb < aaa + Duration::from_millis(600),
+        "bbb must be requested before aaa's delayed response is due \
+         (arrived {:?} after aaa): {arrivals:?}",
+        bbb.saturating_duration_since(aaa)
     );
 }
