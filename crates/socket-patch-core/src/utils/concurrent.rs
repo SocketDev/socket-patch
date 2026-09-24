@@ -28,8 +28,23 @@ pub const PROXY_API_CONCURRENCY: usize = 4;
 
 /// The in-flight cap for a client on the public proxy (`true`) or the
 /// authenticated API (`false`).
+///
+/// Under a tight `RLIMIT_NOFILE`
+/// ([`crate::crawlers::walk_pool::fd_limit_is_tight`]) the cap is 1: each
+/// in-flight request holds its own socket, and the serial loop never held
+/// more than one, so extra connections could fail with `EMFILE` where the
+/// serial loop's single connection succeeded (or failed differently).
 pub fn api_concurrency(use_public_proxy: bool) -> usize {
-    if use_public_proxy {
+    api_concurrency_under(
+        use_public_proxy,
+        crate::crawlers::walk_pool::fd_limit_is_tight(),
+    )
+}
+
+fn api_concurrency_under(use_public_proxy: bool, fd_limit_is_tight: bool) -> usize {
+    if fd_limit_is_tight {
+        1
+    } else if use_public_proxy {
         PROXY_API_CONCURRENCY
     } else {
         API_CONCURRENCY
@@ -58,6 +73,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_tight_descriptor_limit_runs_requests_one_at_a_time() {
+        assert_eq!(api_concurrency_under(false, false), API_CONCURRENCY);
+        assert_eq!(api_concurrency_under(true, false), PROXY_API_CONCURRENCY);
+        assert_eq!(api_concurrency_under(false, true), 1);
+        assert_eq!(api_concurrency_under(true, true), 1);
+    }
+
     use super::*;
     use std::cell::Cell;
     use std::time::Duration;

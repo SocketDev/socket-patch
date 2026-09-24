@@ -1843,7 +1843,14 @@ pub(crate) async fn run_redirect_selected(
         //
         // Kept small on purpose: each in-flight download buffers a whole
         // wheel (up to MAX_VENDOR_PACKAGE_BYTES) under its own body timeout.
-        const WHEEL_METADATA_CONCURRENCY: usize = 4;
+        // Under a tight descriptor limit it is 1, like the API loops (see
+        // `api_concurrency`): the serial loop held one socket at a time.
+        let wheel_metadata_concurrency =
+            if socket_patch_core::crawlers::walk_pool::fd_limit_is_tight() {
+                1
+            } else {
+                4
+            };
         use futures_util::StreamExt as _;
         use socket_patch_core::vendor::pypi::{
             fetch_hosted_wheel_metadata, try_fetch_hosted_wheel_metadata_once,
@@ -1855,7 +1862,7 @@ pub(crate) async fn run_redirect_selected(
         });
         let mut in_flight: futures_util::stream::FuturesOrdered<_> = unstarted
             .by_ref()
-            .take(WHEEL_METADATA_CONCURRENCY)
+            .take(wheel_metadata_concurrency)
             .collect();
         // Once serial: the attempts that were in flight when a dep needed a
         // retry, in dep order (the deps after them were never started).
