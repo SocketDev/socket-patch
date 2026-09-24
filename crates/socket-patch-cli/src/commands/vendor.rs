@@ -378,7 +378,8 @@ fn advisory_tier(code: &str) -> AdvisoryTier {
         // The run did what was asked; these explain how.
         "vendor_fetched_missing"
         | "vendor_would_revert_redirect"
-        | "vendor_takeover_reverted_redirect" => AdvisoryTier::Note,
+        | "vendor_takeover_reverted_redirect"
+        | "cargo_wiring_migrated" => AdvisoryTier::Note,
         _ => AdvisoryTier::Warning,
     }
 }

@@ -19,13 +19,57 @@ into the new version's section — see docs/releasing.md.
 
 > **Semver note:** this entry changes `rollback`'s default behavior, narrows
 > the meaning of its existing `vendored: []` JSON key, makes vendored mode
-> manifest-free, turns a plain non-TTY `scan` report-only, and makes `vex`
+> manifest-free, moves vendored cargo wiring from `.cargo/config*` into
+> `Cargo.toml`, turns a plain non-TTY `scan` report-only, and makes `vex`
 > refuse to attest stale ledger records and corrupt vendor ledgers — all
 > MAJOR per CLI_CONTRACT.md's semver policy — so it ships as the next major
 > release (v5.0).
 
 ### Changed (BREAKING)
 
+- **Vendored cargo wiring moved to `Cargo.toml`.** `vendor` / `scan` /
+  `get --mode vendored` write the `[patch.crates-io]` path entry into the
+  workspace-root `Cargo.toml` (beside the `Cargo.lock` it detaches) instead
+  of `.cargo/config.toml` / `.cargo/config`, so Socket scanners can recover
+  the patch uuid from the manifest alone and single-version wiring builds
+  on cargo older than 1.56 (the floor of config-file `[patch]`); two
+  vendored versions of one crate additionally need `--offline` (or a
+  reachable registry index) on such old cargo. The edit is
+  format-preserving (comments, ordering, CRLF / mixed line endings, a
+  UTF-8 BOM and the trailing-newline state survive; a revert restores the
+  manifest byte for byte and keeps a user's own `[patch]` /
+  `[patch.crates-io]` headers). The key is always the Socket-owned
+  `<name>-socket-<uuid8>` with `package = "<name>"`, never the bare crate
+  name: cargo lets a config-file `[patch]` item (project, ancestor
+  directory or `$CARGO_HOME`) replace the manifest item with the same key
+  whatever its version, so a crate-named key could be silently shadowed —
+  and two vendored versions of one crate get distinct keys instead of
+  clobbering each other (the config wiring keyed by crate name let the
+  second overwrite the first). The ledger's `cargo_patch_entry` record now
+  names `Cargo.toml` (its `key` is the TOML key). New refusals, each before
+  any write: `cargo_manifest_unreadable`, `cargo_manifest_unparseable`,
+  `cargo_manifest_symlink_unsupported` (vendor and revert),
+  `cargo_manifest_not_workspace_root` (run from a workspace member, whose
+  `[patch]` cargo ignores) and `cargo_manifest_patch_source_alias` (the
+  manifest spells crates.io by URL in `[patch."https://github.com/rust-lang/crates.io-index"]`,
+  which replaces `[patch.crates-io]` wholesale);
+  `user_authored_patch_entry` now covers user entries in `Cargo.toml` and
+  in every cargo config file cargo merges (project, ancestors,
+  `$CARGO_HOME`) and matches by crate (`package` or key), sparing a path
+  patch that is provably another version. **Old wiring migrates
+  automatically**: a re-run or `repair` moves a Socket-owned
+  `.cargo/config*` entry into `Cargo.toml` (`cargo_wiring_migrated` note; a
+  migrating vendor re-run reports the package `applied`) and cleans a
+  config file / `.cargo/` the move emptied — a legacy entry that cannot be
+  removed fails the run and unwinds it (`cargo_legacy_wiring_kept`) — while
+  `rollback` / `remove` / `vendor --revert` / GC / hosted takeover remove
+  both spellings. Projects hit by the pre-v5 multi-version overwrite (a
+  detached lock entry nothing wired) are healed by a re-run or `repair`
+  (`cargo_wiring_restored`). User config entries are never touched. VEX
+  discovery reads the manifest first (key-agnostic), skips a manifest entry
+  that cargo ignores (a same-key project-config item or a URL-spelled
+  crates.io table replaces it), and still honors pre-v5 config wiring. The
+  hosted takeover's missing-ledger guard is now per version.
 - **Binary Bun lockfiles are patched natively in place.** Hosted and vendored
   modes read and rewrite `bun.lockb` formats 1–3 directly, including mode
   changes, repair, and scoped rollback. Binary-to-text conversion, migration

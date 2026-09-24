@@ -442,6 +442,13 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
 /// Binary IDs are offsets into Bun's package array and may change after an
 /// installer re-save. Match the predecessor's semantic resolution instead.
 fn wiring_surface_matches(previous: &WiringRecord, current: &WiringRecord) -> bool {
+    // A cargo entry has ONE `[patch.crates-io]` surface wherever it lives:
+    // the pre-v5 `.cargo/config*` record and the v5 `Cargo.toml` record (or
+    // a manifest record under another key) are the same wiring, so a
+    // migrated entry never carries the retired config record forward.
+    if previous.kind == "cargo_patch_entry" && current.kind == "cargo_patch_entry" {
+        return true;
+    }
     if previous.file != current.file || previous.kind != current.kind {
         return false;
     }
@@ -671,6 +678,62 @@ mod tests {
             pdm: None,
             pipenv: None,
         }
+    }
+
+    /// A cargo entry migrated from the pre-v5 `.cargo/config.toml` wiring to
+    /// `Cargo.toml` must not carry the retired config record forward (one
+    /// `[patch]` surface per entry), while the lock record and originals
+    /// still carry over.
+    #[test]
+    fn carry_forward_drops_the_legacy_cargo_config_record() {
+        let rec = |file: &str, kind: &str, key: &str| WiringRecord {
+            file: file.into(),
+            kind: kind.into(),
+            action: WiringAction::Added,
+            key: Some(key.into()),
+            original: None,
+            new: None,
+        };
+        let uuid = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+        let base = |wiring: Vec<WiringRecord>, lock: Option<CargoLockOriginal>| VendorEntry {
+            ecosystem: "cargo".into(),
+            base_purl: "pkg:cargo/cfg-if@1.0.4".into(),
+            uuid: uuid.into(),
+            artifact: VendorArtifact {
+                path: format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4"),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring,
+            lock,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        };
+        let orig = CargoLockOriginal {
+            source: "registry+https://github.com/rust-lang/crates.io-index".into(),
+            checksum: Some("a".repeat(64)),
+        };
+        let prev = base(
+            vec![
+                rec(".cargo/config.toml", "cargo_patch_entry", "cfg-if"),
+                rec("Cargo.lock", "cargo_lock_entry", "cfg-if@1.0.4"),
+            ],
+            Some(orig.clone()),
+        );
+        let mut fresh = base(vec![rec("Cargo.toml", "cargo_patch_entry", "cfg-if")], None);
+        carry_forward_wiring(&prev, &mut fresh);
+        let files: Vec<&str> = fresh.wiring.iter().map(|w| w.file.as_str()).collect();
+        assert_eq!(files, vec!["Cargo.toml", "Cargo.lock"]);
+        assert_eq!(fresh.lock, Some(orig));
     }
 
     /// Every spelling `purl_keys` promises: the (possibly qualified,

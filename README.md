@@ -1246,7 +1246,7 @@ Behavior worth knowing:
 | pnpm | `pnpm-lock.yaml` (all generations), `shrinkwrap.yaml` (pnpm 1/2), Rush locks | Aliased / nested `resolution` shapes are diagnosed, not attested; `overrides` alone prove nothing |
 | yarn | `yarn.lock` (classic + berry) | Berry vendored entries also need the root `package.json` `resolutions` mapping; member locks are not read |
 | bun | `bun.lock`, else `bun.lockb` | A hosted entry that Bun < 1.3.10 re-saved without its sha512 attests only after install |
-| cargo | `Cargo.lock`, `Cargo.toml`, `.cargo/config[.toml]` | Root manifest + project config only (no `$CARGO_HOME` / parent configs); a lockless hosted pin needs the redirect ledger's record |
+| cargo | `Cargo.lock`, `Cargo.toml`, `.cargo/config[.toml]` | Root manifest + project config only (no `$CARGO_HOME` / parent configs); vendored `[patch.crates-io]` entries are read from `Cargo.toml` first (v5), the project config for pre-v5 projects; a manifest entry cargo ignores (a same-key project-config item, or a URL-spelled crates.io `[patch]` table) is not attested; a lockless hosted pin needs the redirect ledger's record |
 | golang | `go.mod`, `go.work`, `go.sum`, `go.work.sum` | A replace that `require` no longer selects is inert; `vendor/modules.txt` is not read |
 | pypi | `uv.lock`, `*.py.lock`, `pylock*.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `requirements.txt` (+ `-r` includes), `pyproject.toml` / `hatch.toml` | A `uv.lock` beside a `pyproject.toml` must agree with its `[tool.uv.sources]`; PDM 3.1 / 4.0–4.2 locks are refused; a Pipenv project needs `--product` (or a git remote) |
 | gem | `Gemfile.lock`, `gems.locked` | Platform gems unsupported; a Gemfile-only (pre-bundler-2.6, not yet locked) wiring needs the redirect ledger |

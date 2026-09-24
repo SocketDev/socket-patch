@@ -112,7 +112,9 @@ const WIRING_FILES: &[&str] = &[
     "package.json",
     "Cargo.toml",
     "Cargo.lock",
+    // Pre-v5 vendored cargo wiring (migrated into Cargo.toml on re-run).
     ".cargo/config.toml",
+    ".cargo/config",
     "go.mod",
     "composer.json",
     "composer.lock",
@@ -667,6 +669,53 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
             );
             continue;
         }
+        // Pre-v5 cargo wiring in `.cargo/config*`: move it into the root
+        // Cargo.toml (the v5 location) and record the move in the ledger —
+        // or restore the manifest entry a pre-v5 multi-version vendor lost.
+        let entry = if entry.ecosystem == "cargo" {
+            match vendor::cargo::migrate_legacy_wiring(&entry, &common.cwd, common.dry_run).await {
+                Ok(Some((migrated, warning))) => {
+                    record_warning(env, purl, &warning, common);
+                    if common.dry_run {
+                        entry
+                    } else if persist_vendor_entry(
+                        common,
+                        env,
+                        &mut state,
+                        purl,
+                        migrated.clone(),
+                        entry.detached,
+                        &record,
+                    )
+                    .await
+                    {
+                        continue;
+                    } else {
+                        migrated
+                    }
+                }
+                Ok(None) => entry,
+                Err(detail) => {
+                    record_warning(
+                        env,
+                        purl,
+                        &VendorWarning::new(
+                            "cargo_legacy_wiring_kept",
+                            format!(
+                                "the vendored wiring for {} could not be written into \
+                                 Cargo.toml ({detail}); any pre-v5 .cargo/config wiring was \
+                                 left in place",
+                                normalize_purl(purl)
+                            ),
+                        ),
+                        common,
+                    );
+                    entry
+                }
+            }
+        } else {
+            entry
+        };
         let health = check_vendored_artifact(&common.cwd, &entry, &record).await;
         if health == ArtifactHealth::Healthy || workspace_copy_issue(&health) {
             let mut healed = entry.clone();

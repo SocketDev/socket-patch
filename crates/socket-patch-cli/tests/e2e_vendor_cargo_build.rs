@@ -12,17 +12,31 @@
 //!      (spike-verified).
 //!   3. `socket-patch vendor --json --offline` — asserts the patched copy at
 //!      `.socket/vendor/cargo/<uuid>/cfg-if-<ver>/`, the `[patch.crates-io]`
-//!      entry in `.cargo/config.toml`, and the surgical lock detach (the
-//!      `[[package]]` entry keeps name+version but loses source+checksum).
+//!      entry in the root `Cargo.toml` (no `.cargo/` is created), and the
+//!      surgical lock detach (the `[[package]]` entry keeps name+version but
+//!      loses source+checksum).
 //!   4. COMPILE ORACLE: the consumer's `main.rs` is rewritten to call
 //!      `cfg_if::socket_patched()` — it only compiles if the patched bytes
 //!      are what cargo links — and `cargo run --locked --offline` prints it.
 //!   5. **Fresh-checkout proof**: copy ONLY the committable files
-//!      (Cargo.toml + Cargo.lock + .cargo/ + src/ + .socket/) to a new dir
+//!      (Cargo.toml + Cargo.lock + src/ + .socket/) to a new dir
 //!      and `cargo build --locked --offline` with an EMPTY CARGO_HOME — and
 //!      assert that CARGO_HOME gained no `registry/` (zero crate downloads).
-//!   6. **Revert proof**: `vendor --revert` restores Cargo.lock byte-for-byte
-//!      and removes `.socket/vendor/` + the managed `[patch]` entry.
+//!   6. **Revert proof**: `vendor --revert` restores Cargo.lock AND
+//!      Cargo.toml byte-for-byte and removes `.socket/vendor/`.
+//!
+//! Also here: MULTI-VERSION (two vendored versions of one crate get
+//! distinct `[patch.crates-io]` keys and both compile under `--locked`),
+//! LEGACY MIGRATION (a pre-v5 `.cargo/config.toml` wiring is moved into
+//! `Cargo.toml` by `repair` and by a `vendor` re-run, and the result still
+//! builds), and an OLD-TOOLCHAIN proof (manifest `[patch]` + the detached
+//! lock type-check the patched copy with no network on every installed
+//! rustup toolchain 1.36..=1.56 — config-file `[patch]` needs 1.56+; two
+//! versions of one crate there need `--offline`; skipped when none is
+//! installed, required by the `cargo-old-toolchains` CI leg). Also: a
+//! URL-spelled crates.io `[patch]` table is refused, an ancestor-directory
+//! config entry cannot silently shadow the vendored copy, and the pre-v5
+//! multi-version overwrite is healed by a re-run and by `repair`.
 //!
 //! A get-driven twin (`cargo_get_uuid_vendored_fresh_checkout_locked_build`,
 //! v3.6) reaches the same committed state through `get <uuid> --mode
@@ -73,6 +87,19 @@ use vex_e2e_common::{
 const ORG: &str = "test-org";
 const UUID: &str = "2b3c4d5e-6f70-4a1b-8c2d-0123456789ab";
 const DEP: &str = "cfg-if";
+
+/// The Socket-owned `[patch.crates-io]` key vendoring writes for `uuid`.
+fn socket_key(uuid: &str) -> String {
+    format!("{DEP}-socket-{}", &uuid.replace('-', "")[..8])
+}
+
+/// The manifest entry line vendoring writes for `copy_rel` under `uuid`.
+fn socket_entry(uuid: &str, copy_rel: &str) -> String {
+    format!(
+        "{} = {{ package = \"{DEP}\", path = \"{copy_rel}\" }}",
+        socket_key(uuid)
+    )
+}
 /// Appended to the dep's `src/lib.rs`. Doc comment required: cfg-if denies
 /// `missing_docs` and path deps get no `--cap-lints allow`.
 const PATCH_SUFFIX: &str =
@@ -173,6 +200,33 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
             std::fs::copy(entry.path(), &to).unwrap();
         }
     }
+}
+
+/// `manifest` without its `[patch.crates-io]` table (the header through the
+/// next table header or EOF, plus the blank line before it) — a hand revert
+/// of the vendored wiring.
+fn strip_patch_table(manifest: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut skipping = false;
+    for line in manifest.lines() {
+        let t = line.trim();
+        if t == "[patch.crates-io]" {
+            skipping = true;
+            while out.last().is_some_and(|l| l.trim().is_empty()) {
+                out.pop();
+            }
+            continue;
+        }
+        if skipping && t.starts_with('[') {
+            skipping = false;
+        }
+        if !skipping {
+            out.push(line);
+        }
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
 }
 
 /// The locked version of `name` in Cargo.lock (first `[[package]]` match).
@@ -399,9 +453,12 @@ impl ManifestlessVendored {
         //      kept, rebuilt for real from crates.io's copy.
         let revert = self.scratch.join("reverted");
         std::fs::create_dir_all(&revert).unwrap();
-        for file in ["Cargo.toml", "Cargo.lock"] {
-            std::fs::copy(fresh.join(file), revert.join(file)).unwrap();
-        }
+        std::fs::copy(fresh.join("Cargo.lock"), revert.join("Cargo.lock")).unwrap();
+        std::fs::write(
+            revert.join("Cargo.toml"),
+            strip_patch_table(&std::fs::read_to_string(fresh.join("Cargo.toml")).unwrap()),
+        )
+        .unwrap();
         copy_dir_recursive(&fresh.join("src"), &revert.join("src"));
         copy_dir_recursive(&fresh.join(".socket"), &revert.join(".socket"));
         std::fs::write(
@@ -461,6 +518,7 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
 
     let lock_path = proj.join("Cargo.lock");
     let lock_before = std::fs::read(&lock_path).unwrap();
+    let manifest_before = std::fs::read(proj.join("Cargo.toml")).unwrap();
 
     // Vendor (offline; blob staged locally).
     let (code, stdout, stderr) = run_socket(
@@ -551,16 +609,31 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         "vendored attestation must carry the (vendored) marker: {vex_doc}"
     );
 
-    // `[patch.crates-io]` entry in .cargo/config.toml points at the copy.
-    let config = std::fs::read_to_string(proj.join(".cargo/config.toml"))
-        .expect("vendor must create .cargo/config.toml");
-    assert!(
-        config.contains("[patch.crates-io]"),
-        "config must carry [patch.crates-io]:\n{config}"
+    // The `[patch.crates-io]` entry lives in the ROOT MANIFEST (appended
+    // after the user's content, which is otherwise byte-identical); no
+    // project config is created.
+    let manifest = std::fs::read_to_string(proj.join("Cargo.toml")).unwrap();
+    assert_eq!(
+        manifest,
+        format!(
+            "{}\n[patch.crates-io]\n{}\n",
+            String::from_utf8_lossy(&manifest_before),
+            socket_entry(UUID, &copy_rel)
+        ),
+        "the manifest gains exactly the Socket-owned [patch] entry"
     );
     assert!(
-        config.contains(&copy_rel),
-        "patch entry must point at the uuid copy path:\n{config}"
+        !proj.join(".cargo").exists(),
+        "vendored mode writes no .cargo/config.toml"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".socket/vendor/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state["entries"][purl.as_str()]["wiring"][0]["file"],
+        "Cargo.toml",
+        "the ledger records the manifest wiring: {state}"
     );
 
     // Lock surgery: the entry keeps name+version but loses source+checksum
@@ -606,7 +679,6 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("Cargo.toml"), fresh.join("Cargo.toml")).unwrap();
     std::fs::copy(&lock_path, fresh.join("Cargo.lock")).unwrap();
-    copy_dir_recursive(&proj.join(".cargo"), &fresh.join(".cargo"));
     copy_dir_recursive(&proj.join("src"), &fresh.join("src"));
     copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
 
@@ -702,13 +774,14 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         !proj.join(".socket/vendor").exists(),
         ".socket/vendor must be fully removed after revert"
     );
-    // The managed [patch] entry is gone (vendor created the config, so the
-    // whole file is removed; tolerate an empty leftover that lost the entry).
-    let config_after = std::fs::read_to_string(proj.join(".cargo/config.toml")).unwrap_or_default();
-    assert!(
-        !config_after.contains(DEP),
-        "revert must drop the managed [patch.crates-io] entry:\n{config_after}"
+    // The managed [patch] entry is gone: the manifest is byte-identical to
+    // the pre-vendor snapshot.
+    assert_eq!(
+        std::fs::read(proj.join("Cargo.toml")).unwrap(),
+        manifest_before,
+        "revert must restore Cargo.toml byte-identical to the pre-vendor snapshot"
     );
+    assert!(!proj.join(".cargo").exists());
 }
 
 /// Correct-behavior pin for the vendor envelope: a successful first-time
@@ -924,13 +997,13 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
         "the vendor ledger must be written"
     );
 
-    // `[patch.crates-io]` wiring + the surgical lock detach.
-    let config = std::fs::read_to_string(proj.join(".cargo/config.toml"))
-        .expect("get --mode vendored must create .cargo/config.toml");
+    // `[patch.crates-io]` wiring (root manifest) + the surgical lock detach.
+    let manifest = std::fs::read_to_string(proj.join("Cargo.toml")).unwrap();
     assert!(
-        config.contains("[patch.crates-io]") && config.contains(&copy_rel),
-        "config must patch crates-io to the uuid copy path:\n{config}"
+        manifest.contains("[patch.crates-io]") && manifest.contains(&copy_rel),
+        "Cargo.toml must patch crates-io to the uuid copy path:\n{manifest}"
     );
+    assert!(!proj.join(".cargo").exists(), "no .cargo/config.toml");
     let lock_text = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
     let block = package_block(&lock_text, DEP).expect("cfg-if lock entry must survive");
     assert!(
@@ -954,7 +1027,6 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("Cargo.toml"), fresh.join("Cargo.toml")).unwrap();
     std::fs::copy(proj.join("Cargo.lock"), fresh.join("Cargo.lock")).unwrap();
-    copy_dir_recursive(&proj.join(".cargo"), &fresh.join(".cargo"));
     copy_dir_recursive(&proj.join("src"), &fresh.join("src"));
     copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
 
@@ -1005,4 +1077,845 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
     }
     .run_async()
     .await;
+}
+
+// ── v5 manifest wiring: multi-version, legacy migration, old toolchains ─
+
+const UUID_OLD: &str = "3c4d5e6f-7081-4b2c-9d3e-123456789abc";
+const PATCH_SUFFIX_OLD: &str =
+    "\n/// Socket-patch marker for the OLD major (added by the vendored patch).\npub fn socket_patched_old() -> u32 { 2 }\n";
+
+fn vendor_ok(proj: &Path, cargo_home: &Path, tag: &str) -> serde_json::Value {
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        cargo_home,
+    );
+    assert_eq!(
+        code, 0,
+        "{tag}: vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    parse_envelope(&stdout)
+}
+
+fn revert_ok(proj: &Path, cargo_home: &Path, tag: &str) {
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        cargo_home,
+    );
+    assert_eq!(
+        code, 0,
+        "{tag}: revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// Copy the committable files (`.cargo/` only when present) to a fresh dir
+/// with an empty CARGO_HOME.
+fn fresh_checkout(proj: &Path, tmp: &Path, tag: &str) -> (PathBuf, PathBuf) {
+    let fresh = tmp.join(format!("fresh-{tag}"));
+    std::fs::create_dir_all(&fresh).unwrap();
+    for file in ["Cargo.toml", "Cargo.lock"] {
+        std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
+    }
+    for dir in ["src", ".socket", ".cargo"] {
+        if proj.join(dir).exists() {
+            copy_dir_recursive(&proj.join(dir), &fresh.join(dir));
+        }
+    }
+    let home = tmp.join(format!("fresh-home-{tag}"));
+    std::fs::create_dir_all(&home).unwrap();
+    (fresh, home)
+}
+
+/// The MULTI-VERSION fixture: a consumer locking cfg-if 1.x AND 0.1.x (a
+/// renamed dependency), its baseline build, and one staged manifest with a
+/// marker patch per version (`UUID` for 1.x, `UUID_OLD` for 0.1.x). `None`
+/// when the fixture build is impossible (skip already printed).
+struct TwoVersions {
+    proj: PathBuf,
+    cargo_home: PathBuf,
+    new_v: String,
+    old_v: String,
+    lock_before: Vec<u8>,
+    manifest_before: Vec<u8>,
+}
+
+fn stage_two_versions(tmp: &Path, tag: &str) -> Option<TwoVersions> {
+    let proj = tmp.join("proj");
+    let cargo_home = tmp.join("cargo-home");
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    std::fs::write(
+        proj.join("Cargo.toml"),
+        "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2018\"\n\n\
+         [dependencies]\ncfg-if = \"1.0\"\ncfg_if_old = { package = \"cfg-if\", version = \"0.1\" }\n",
+    )
+    .unwrap();
+    std::fs::write(proj.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let build = cargo(&proj, &["build", "-q"], &cargo_home);
+    if !build.status.success() {
+        let _ = cargo_e2e_matrix::skip(
+            &format!("e2e_vendor_cargo_build ({tag})"),
+            &format!(
+                "baseline `cargo build` failed (crates.io unreachable?):\n{}",
+                String::from_utf8_lossy(&build.stderr)
+            ),
+        );
+        return None;
+    }
+    // The toolchain's own lock format: the matrix re-encoder models one
+    // version per crate (`LockPackage::dependencies` holds names), which a
+    // two-version lock is not.
+    let lock_before = std::fs::read(proj.join("Cargo.lock")).unwrap();
+    let manifest_before = std::fs::read(proj.join("Cargo.toml")).unwrap();
+    let locked: Vec<String> = cargo_e2e_matrix::parse_lock(&String::from_utf8_lossy(&lock_before))
+        .into_iter()
+        .filter(|p| p.name == DEP)
+        .map(|p| p.version)
+        .collect();
+    let new_v = locked
+        .iter()
+        .find(|v| v.starts_with("1."))
+        .expect("cfg-if 1.x locked")
+        .clone();
+    let old_v = locked
+        .iter()
+        .find(|v| v.starts_with("0.1."))
+        .expect("cfg-if 0.1 locked")
+        .clone();
+
+    // One manifest, two patches (one per version), blobs from the real bytes.
+    let mut patches = serde_json::Map::new();
+    std::fs::create_dir_all(proj.join(".socket/blobs")).unwrap();
+    for (version, uuid, suffix) in [
+        (&new_v, UUID, PATCH_SUFFIX),
+        (&old_v, UUID_OLD, PATCH_SUFFIX_OLD),
+    ] {
+        let dir = find_registry_crate(&cargo_home, &format!("{DEP}-{version}"))
+            .unwrap_or_else(|| panic!("{DEP}-{version} extracted"));
+        let orig = std::fs::read(dir.join("src/lib.rs")).unwrap();
+        let patched: Vec<u8> = [orig.as_slice(), suffix.as_bytes()].concat();
+        std::fs::write(
+            proj.join(".socket/blobs").join(git_sha256(&patched)),
+            &patched,
+        )
+        .unwrap();
+        patches.insert(
+            format!("pkg:cargo/{DEP}@{version}"),
+            serde_json::json!({
+                "uuid": uuid,
+                "exportedAt": "2026-01-01T00:00:00Z",
+                "files": { "src/lib.rs": {
+                    "beforeHash": git_sha256(&orig),
+                    "afterHash": git_sha256(&patched),
+                }},
+                "vulnerabilities": {},
+                "description": "multi-version marker patch",
+                "license": "MIT",
+                "tier": "free",
+            }),
+        );
+    }
+    std::fs::write(
+        proj.join(".socket/manifest.json"),
+        serde_json::to_string_pretty(&serde_json::json!({ "patches": patches })).unwrap(),
+    )
+    .unwrap();
+
+    Some(TwoVersions {
+        proj,
+        cargo_home,
+        new_v,
+        old_v,
+        lock_before,
+        manifest_before,
+    })
+}
+
+/// The compile oracle for [`TwoVersions`]: a patched-only symbol from EACH
+/// version.
+const TWO_VERSION_MAIN: &str = "fn main() { println!(\"MARKER:{}:{}\", cfg_if::socket_patched(), cfg_if_old::socket_patched_old()); }\n";
+
+/// MULTI-VERSION: the consumer locks cfg-if 1.x AND 0.1.x (a renamed
+/// dependency). Both are vendored: the second version's `[patch.crates-io]`
+/// entry takes the Socket-owned `cfg-if-socket-<uuid8>` key with
+/// `package = "cfg-if"` (the pre-v5 config wiring keyed by crate name made
+/// the second version clobber the first). The compile oracle calls a
+/// patched-only symbol from EACH version, in place and on a fresh checkout
+/// with an empty CARGO_HOME under `--locked --offline`; the revert restores
+/// Cargo.toml and Cargo.lock byte for byte.
+#[test]
+fn cargo_vendor_two_versions_of_one_crate_locked_build() {
+    if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (multi-version)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(TwoVersions {
+        proj,
+        cargo_home,
+        new_v,
+        old_v,
+        lock_before,
+        manifest_before,
+    }) = stage_two_versions(tmp.path(), "multi-version")
+    else {
+        return;
+    };
+    let env = vendor_ok(&proj, &cargo_home, "multi-version");
+    assert_eq!(env["summary"]["failed"], 0, "{env}");
+    let manifest = std::fs::read_to_string(proj.join("Cargo.toml")).unwrap();
+    let new_rel = format!(".socket/vendor/cargo/{UUID}/{DEP}-{new_v}");
+    let old_rel = format!(".socket/vendor/cargo/{UUID_OLD}/{DEP}-{old_v}");
+    let entries: Vec<&str> = manifest
+        .lines()
+        .skip_while(|l| l.trim() != "[patch.crates-io]")
+        .skip(1)
+        .collect();
+    assert_eq!(entries.len(), 2, "two entries, distinct keys:\n{manifest}");
+    for (rel, uuid) in [(&new_rel, UUID), (&old_rel, UUID_OLD)] {
+        let line = entries
+            .iter()
+            .find(|l| l.contains(rel.as_str()))
+            .unwrap_or_else(|| panic!("an entry for {rel}:\n{manifest}"));
+        assert_eq!(
+            *line,
+            socket_entry(uuid, rel),
+            "each version takes its own Socket-owned key"
+        );
+    }
+    assert!(!proj.join(".cargo").exists());
+
+    // COMPILE ORACLE: a patched-only symbol from each version.
+    std::fs::write(proj.join("src/main.rs"), TWO_VERSION_MAIN).unwrap();
+    let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).contains("MARKER:1:2"),
+        "both vendored versions must be linked.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let (fresh, home) = fresh_checkout(&proj, tmp.path(), "multi");
+    let build = cargo(&fresh, &["build", "-q", "--locked", "--offline"], &home);
+    assert!(
+        build.status.success(),
+        "fresh multi-version checkout must build:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(!home.join("registry").exists(), "zero crate downloads");
+    let out = Command::new(fresh.join("target/debug/consumer"))
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("MARKER:1:2"));
+
+    // Re-vendor is a no-op; revert is byte-identical.
+    let lock_wired = std::fs::read(proj.join("Cargo.lock")).unwrap();
+    vendor_ok(&proj, &cargo_home, "multi-version rerun");
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Cargo.toml")).unwrap(),
+        manifest
+    );
+    assert_eq!(std::fs::read(proj.join("Cargo.lock")).unwrap(), lock_wired);
+    std::fs::write(proj.join("src/main.rs"), "fn main() {}\n").unwrap();
+    revert_ok(&proj, &cargo_home, "multi-version");
+    assert_eq!(
+        std::fs::read(proj.join("Cargo.toml")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(std::fs::read(proj.join("Cargo.lock")).unwrap(), lock_before);
+    assert!(!proj.join(".socket/vendor").exists());
+}
+
+/// Turn the v5 wiring of `proj` into what a pre-v5 release wrote: the
+/// `[patch.crates-io]` entry in `.cargo/config.toml` (Cargo.toml without
+/// it), and the ledger's patch-entry record naming the config.
+fn downgrade_to_legacy_wiring(proj: &Path, purl: &str, copy_rel: &str) {
+    let manifest = std::fs::read_to_string(proj.join("Cargo.toml")).unwrap();
+    std::fs::write(proj.join("Cargo.toml"), strip_patch_table(&manifest)).unwrap();
+    std::fs::create_dir_all(proj.join(".cargo")).unwrap();
+    std::fs::write(
+        proj.join(".cargo/config.toml"),
+        format!("[patch.crates-io]\n{DEP} = {{ path = \"{copy_rel}\" }}\n"),
+    )
+    .unwrap();
+    let state_path = proj.join(".socket/vendor/state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let wiring = state["entries"][purl]["wiring"].as_array_mut().unwrap();
+    for w in wiring.iter_mut() {
+        if w["kind"] == "cargo_patch_entry" {
+            w["file"] = ".cargo/config.toml".into();
+        }
+    }
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+}
+
+fn assert_migrated(proj: &Path, purl: &str, copy_rel: &str, tag: &str) {
+    let manifest = std::fs::read_to_string(proj.join("Cargo.toml")).unwrap();
+    assert!(
+        manifest.contains(&format!(
+            "[patch.crates-io]\n{}",
+            socket_entry(UUID, copy_rel)
+        )),
+        "{tag}: the entry moved into Cargo.toml:\n{manifest}"
+    );
+    assert!(
+        !proj.join(".cargo").exists(),
+        "{tag}: the socket-created legacy config (and .cargo/) are cleaned"
+    );
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(proj.join(".socket/vendor/state.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = &state["entries"][purl];
+    let files: Vec<&str> = entry["wiring"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(files, vec!["Cargo.toml", "Cargo.lock"], "{tag}: {entry}");
+    assert_eq!(
+        entry["lock"]["source"], "registry+https://github.com/rust-lang/crates.io-index",
+        "{tag}: the unrecoverable lock originals survive the migration: {entry}"
+    );
+}
+
+/// LEGACY MIGRATION: a project vendored by a pre-v5 release (the
+/// `[patch.crates-io]` entry in `.cargo/config.toml`) still builds, and
+/// both `repair` and a plain `vendor` re-run move the wiring into
+/// Cargo.toml — ledger updated, lock originals kept — after which the
+/// project still builds `--locked --offline` on a fresh checkout and the
+/// revert restores the pristine files.
+#[test]
+fn cargo_legacy_config_wiring_migrates_to_the_manifest() {
+    if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (legacy-migration)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, cargo_home, version, crate_dir)) =
+        stage_fixture(tmp.path(), "legacy-migration")
+    else {
+        return;
+    };
+    let purl = format!("pkg:cargo/{DEP}@{version}");
+    let copy_rel = format!(".socket/vendor/cargo/{UUID}/{DEP}-{version}");
+    let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    stage_patch(&proj, &purl, "src/lib.rs", &orig, &patched);
+    let lock_before = std::fs::read(proj.join("Cargo.lock")).unwrap();
+    let manifest_before = std::fs::read(proj.join("Cargo.toml")).unwrap();
+    vendor_ok(&proj, &cargo_home, "legacy-migration");
+    std::fs::write(
+        proj.join("src/main.rs"),
+        "fn main() { println!(\"MARKER:{}\", cfg_if::socket_patched()); }\n",
+    )
+    .unwrap();
+
+    // The pre-v5 shape builds (config `[patch]`, cargo 1.56+).
+    downgrade_to_legacy_wiring(&proj, &purl, &copy_rel);
+    assert_eq!(
+        std::fs::read(proj.join("Cargo.toml")).unwrap(),
+        manifest_before
+    );
+    let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("MARKER:1"),
+        "the legacy wiring builds: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // (1) `repair` migrates.
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "repair",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        &cargo_home,
+    );
+    assert_eq!(
+        code, 0,
+        "repair failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("cargo_wiring_migrated"), "{stdout}");
+    assert_migrated(&proj, &purl, &copy_rel, "repair");
+
+    // (2) A plain `vendor` re-run migrates.
+    downgrade_to_legacy_wiring(&proj, &purl, &copy_rel);
+    let env = vendor_ok(&proj, &cargo_home, "legacy re-run");
+    assert!(env.to_string().contains("cargo_wiring_migrated"), "{env}");
+    assert_migrated(&proj, &purl, &copy_rel, "vendor re-run");
+
+    let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("MARKER:1"),
+        "the migrated wiring builds: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let (fresh, home) = fresh_checkout(&proj, tmp.path(), "migrated");
+    let build = cargo(&fresh, &["build", "-q", "--locked", "--offline"], &home);
+    assert!(
+        build.status.success(),
+        "fresh migrated checkout must build:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(!home.join("registry").exists());
+
+    // A legacy ledger reverts cleanly too (config + manifest both cleaned).
+    downgrade_to_legacy_wiring(&proj, &purl, &copy_rel);
+    std::fs::write(
+        proj.join("src/main.rs"),
+        "fn main() { println!(\"baseline\"); }\n",
+    )
+    .unwrap();
+    revert_ok(&proj, &cargo_home, "legacy revert");
+    assert_eq!(
+        std::fs::read(proj.join("Cargo.toml")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(std::fs::read(proj.join("Cargo.lock")).unwrap(), lock_before);
+    assert!(!proj.join(".cargo").exists());
+    assert!(!proj.join(".socket/vendor").exists());
+}
+
+/// Set to `1` by the CI leg that installs old toolchains: then finding none
+/// is a failure, not a skip (the regular matrix legs set
+/// `SOCKET_PATCH_CARGO_E2E_REQUIRED` but install no old toolchain).
+const OLD_TOOLCHAINS_REQUIRED_ENV: &str = "SOCKET_PATCH_CARGO_OLD_TOOLCHAINS_REQUIRED";
+
+/// Installed rustup toolchains 1.36 (`--offline`) through 1.56 (the floor of
+/// config-file `[patch]`): `(full toolchain name, minor)`.
+fn old_toolchains() -> Vec<(String, u32)> {
+    let Ok(out) = Command::new("rustup").args(["toolchain", "list"]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let name = line.split_whitespace().next()?.to_string();
+            let minor: u32 = name
+                .strip_prefix("1.")?
+                .split(['.', '-'])
+                .next()?
+                .parse()
+                .ok()?;
+            (36..=56).contains(&minor).then_some((name, minor))
+        })
+        .collect()
+}
+
+/// The old toolchains, or `None` (skip printed) when none is installed —
+/// a failure under [`OLD_TOOLCHAINS_REQUIRED_ENV`].
+fn old_toolchains_or_skip(suite: &str) -> Option<Vec<(String, u32)>> {
+    let toolchains = old_toolchains();
+    if toolchains.is_empty() {
+        assert!(
+            std::env::var(OLD_TOOLCHAINS_REQUIRED_ENV).as_deref() != Ok("1"),
+            "{suite}: no rustup toolchain 1.36..=1.56 installed, and \
+             {OLD_TOOLCHAINS_REQUIRED_ENV}=1 is set"
+        );
+        println!("SKIP {suite}: no rustup toolchain 1.36..=1.56 installed");
+        return None;
+    }
+    Some(toolchains)
+}
+
+/// `cargo check -q --locked` (plus `extra`) on `tc` with a private
+/// CARGO_HOME. `check`, not `build`: old rustc cannot link against a
+/// current Xcode on Apple Silicon, and type-checking the consumer against
+/// the patched-only symbol is already the compile oracle. The network is
+/// made unreachable (a dead proxy), so anything cargo tries to fetch fails.
+fn old_cargo_check(dir: &Path, home: &Path, tc: &str, extra: &[&str]) -> Output {
+    Command::new("cargo")
+        .args(["check", "-q", "--locked"])
+        .args(extra)
+        .current_dir(dir)
+        .env("CARGO_HOME", home)
+        .env("RUSTUP_TOOLCHAIN", tc)
+        .env("CARGO_HTTP_PROXY", "http://127.0.0.1:9")
+        .env("CARGO_NET_RETRY", "0")
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("run old cargo")
+}
+
+/// A current-cargo (v4) registry-only lock rewritten in the format `minor`
+/// reads: for registry sources v3 differs from v4 only in the version
+/// marker, and v2 is v3 without it.
+fn lock_for_minor(lock: &str, minor: u32) -> String {
+    let marker = if minor >= 53 { "version = 3\n" } else { "" };
+    lock.replacen("version = 4\n", marker, 1)
+}
+
+/// OLD TOOLCHAIN: the committed v5 wiring (manifest `[patch]` under the
+/// Socket-owned renamed key + detached lock, in the lock format that
+/// toolchain reads) type-checks the patched copy on every installed
+/// toolchain 1.36..=1.56 — below the 1.56 floor of config-file `[patch]` —
+/// with an empty CARGO_HOME and NO network and NO `--offline`, fetching
+/// nothing. Skips when no such toolchain is installed (never installs one);
+/// the `cargo-old-toolchains` CI leg installs 1.41 and 1.56 and requires it.
+#[test]
+fn cargo_vendored_manifest_patch_builds_on_old_toolchains() {
+    const SUITE: &str = "e2e_vendor_cargo_build (old-toolchain)";
+    let Some(toolchains) = old_toolchains_or_skip(SUITE) else {
+        return;
+    };
+    if !cargo_e2e_matrix::cargo_available(SUITE) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path(), "old-toolchain")
+    else {
+        return;
+    };
+    // Edition 2021 needs cargo 1.56.
+    let manifest = std::fs::read_to_string(proj.join("Cargo.toml")).unwrap();
+    std::fs::write(
+        proj.join("Cargo.toml"),
+        manifest.replace("edition = \"2021\"", "edition = \"2018\""),
+    )
+    .unwrap();
+    let purl = format!("pkg:cargo/{DEP}@{version}");
+    let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    stage_patch(&proj, &purl, "src/lib.rs", &orig, &patched);
+    vendor_ok(&proj, &cargo_home, "old-toolchain");
+    assert!(
+        std::fs::read_to_string(proj.join("Cargo.toml"))
+            .unwrap()
+            .contains(&format!("{} = {{ package = ", socket_key(UUID))),
+        "the renamed Socket-owned key is what old cargo must accept"
+    );
+    std::fs::write(
+        proj.join("src/main.rs"),
+        "fn main() { println!(\"MARKER:{}\", cfg_if::socket_patched()); }\n",
+    )
+    .unwrap();
+    let pkgs =
+        cargo_e2e_matrix::parse_lock(&std::fs::read_to_string(proj.join("Cargo.lock")).unwrap());
+    for (tc, minor) in toolchains {
+        let (fresh, home) = fresh_checkout(&proj, tmp.path(), &tc);
+        // The lock format that toolchain writes (v3 from 1.53, v2 from 1.41).
+        let lock_version = if minor >= 53 {
+            3
+        } else if minor >= 41 {
+            2
+        } else {
+            1
+        };
+        std::fs::write(
+            fresh.join("Cargo.lock"),
+            cargo_e2e_matrix::write_lock(&pkgs, lock_version),
+        )
+        .unwrap();
+        let out = old_cargo_check(&fresh, &home, &tc, &[]);
+        assert!(
+            out.status.success(),
+            "{tc}: manifest [patch] + detached lock v{lock_version} must type-check the \
+             patched copy with no network:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !home.join("registry").exists(),
+            "{tc}: nothing is fetched (not even the registry index)"
+        );
+        println!("old-toolchain {tc}: OK (lock v{lock_version})");
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+}
+
+/// OLD TOOLCHAIN, TWO VERSIONS of one crate: older cargo loads the
+/// crates.io index to tell two same-named `[patch]` entries apart, so the
+/// committed two-version wiring type-checks on 1.36..=1.56 under
+/// `--offline` (what the docs require there); without `--offline` and with
+/// no network the outcome is only reported (current stable needs neither —
+/// see `cargo_vendor_two_versions_of_one_crate_locked_build`).
+#[test]
+fn cargo_vendored_two_versions_on_old_toolchains_need_offline() {
+    const SUITE: &str = "e2e_vendor_cargo_build (old-toolchain multi-version)";
+    let Some(toolchains) = old_toolchains_or_skip(SUITE) else {
+        return;
+    };
+    if !cargo_e2e_matrix::cargo_available(SUITE) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(fx) = stage_two_versions(tmp.path(), "old-toolchain multi-version") else {
+        return;
+    };
+    let env = vendor_ok(&fx.proj, &fx.cargo_home, "old-toolchain multi-version");
+    assert_eq!(env["summary"]["failed"], 0, "{env}");
+    std::fs::write(fx.proj.join("src/main.rs"), TWO_VERSION_MAIN).unwrap();
+    let lock = std::fs::read_to_string(fx.proj.join("Cargo.lock")).unwrap();
+    if !lock.contains("version = 4\n") {
+        let _ = cargo_e2e_matrix::skip(SUITE, "the baseline lock is not v4 (pinned toolchain)");
+        return;
+    }
+    for (tc, minor) in toolchains {
+        let (fresh, home) = fresh_checkout(&fx.proj, tmp.path(), &format!("mv-{tc}"));
+        std::fs::write(fresh.join("Cargo.lock"), lock_for_minor(&lock, minor)).unwrap();
+        let online = old_cargo_check(&fresh, &home, &tc, &[]);
+        println!(
+            "old-toolchain multi-version {tc} without --offline: {}",
+            if online.status.success() {
+                "ok"
+            } else {
+                "needs --offline (registry index unreachable)"
+            }
+        );
+        let out = old_cargo_check(&fresh, &home, &tc, &["--offline"]);
+        assert!(
+            out.status.success(),
+            "{tc}: two vendored versions must type-check under --offline:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+}
+
+/// A root manifest that spells crates.io by URL in `[patch]` (cargo lets
+/// that table replace `[patch.crates-io]` wholesale) is refused with no
+/// write, so the project keeps building `--locked --offline` exactly as
+/// before — never a "success" whose wiring cargo silently ignores.
+#[test]
+fn cargo_url_spelled_crates_io_patch_table_is_refused() {
+    const SUITE: &str = "e2e_vendor_cargo_build (url-patch-table)";
+    if !cargo_e2e_matrix::cargo_available(SUITE) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path(), "url-patch-table")
+    else {
+        return;
+    };
+    // A user's same-version fork of cfg-if under the URL spelling.
+    copy_dir_recursive(&crate_dir, &proj.join("fork-cfg-if"));
+    let manifest = format!(
+        "{}\n[patch.\"https://github.com/rust-lang/crates.io-index\"]\n{DEP} = {{ path = \"fork-cfg-if\" }}\n",
+        std::fs::read_to_string(proj.join("Cargo.toml")).unwrap()
+    );
+    std::fs::write(proj.join("Cargo.toml"), &manifest).unwrap();
+    let relock = cargo(&proj, &["build", "-q", "--offline"], &cargo_home);
+    assert!(
+        relock.status.success(),
+        "{}",
+        String::from_utf8_lossy(&relock.stderr)
+    );
+    let manifest = std::fs::read_to_string(proj.join("Cargo.toml")).unwrap();
+    let lock = std::fs::read(proj.join("Cargo.lock")).unwrap();
+    let purl = format!("pkg:cargo/{DEP}@{version}");
+    let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    stage_patch(&proj, &purl, "src/lib.rs", &orig, &patched);
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        &cargo_home,
+    );
+    assert!(
+        stdout.contains("cargo_manifest_patch_source_alias"),
+        "exit {code}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Cargo.toml")).unwrap(),
+        manifest
+    );
+    assert_eq!(std::fs::read(proj.join("Cargo.lock")).unwrap(), lock);
+    assert!(!proj.join(format!(".socket/vendor/cargo/{UUID}")).exists());
+    let build = cargo(
+        &proj,
+        &["build", "-q", "--locked", "--offline"],
+        &cargo_home,
+    );
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+}
+
+/// Cargo lets a config-file `[patch]` item — from ANY config it merges,
+/// including an ancestor directory's — replace the manifest item with the
+/// same key regardless of version. The Socket-owned key keeps a user's
+/// crate-named entry added after vendoring from silently building their
+/// unpatched copy: cargo fails loudly on the duplicate patch instead.
+#[test]
+fn cargo_ancestor_config_patch_cannot_silently_shadow_the_vendored_copy() {
+    const SUITE: &str = "e2e_vendor_cargo_build (ancestor-config)";
+    if !cargo_e2e_matrix::cargo_available(SUITE) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path(), "ancestor-config")
+    else {
+        return;
+    };
+    let purl = format!("pkg:cargo/{DEP}@{version}");
+    let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    stage_patch(&proj, &purl, "src/lib.rs", &orig, &patched);
+    vendor_ok(&proj, &cargo_home, "ancestor-config");
+    std::fs::write(
+        proj.join("src/main.rs"),
+        "fn main() { println!(\"MARKER:{}\", cfg_if::socket_patched()); }\n",
+    )
+    .unwrap();
+    let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
+    assert!(String::from_utf8_lossy(&run.stdout).contains("MARKER:1"));
+
+    // A monorepo-level config adds the user's same-version, unpatched fork
+    // under the bare crate name.
+    let fork = tmp.path().join(format!("forks/{DEP}-{version}"));
+    copy_dir_recursive(&crate_dir, &fork);
+    std::fs::create_dir_all(tmp.path().join(".cargo")).unwrap();
+    std::fs::write(
+        tmp.path().join(".cargo/config.toml"),
+        format!("[patch.crates-io]\n{DEP} = {{ path = \"forks/{DEP}-{version}\" }}\n"),
+    )
+    .unwrap();
+    let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        !run.status.success() && !stderr.contains("socket_patched"),
+        "the user's fork must never silently replace the vendored copy \
+         (a loud duplicate-patch error is expected).\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // A re-run refuses rather than wiring over the conflict.
+    let (_, out, _) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        &cargo_home,
+    );
+    assert!(out.contains("user_authored_patch_entry"), "{out}");
+}
+
+/// PRE-V5 OVERWRITE: a pre-v5 release keyed the config `[patch]` by crate
+/// name, so vendoring a second version repointed the first version's entry
+/// and left its lock entry detached with no wiring (every `--locked` build
+/// broken). Both a v5 `vendor` re-run and `repair` heal that layout into
+/// two manifest entries that build `--locked --offline`.
+#[test]
+fn cargo_pre_v5_multi_version_overwrite_is_healed() {
+    const SUITE: &str = "e2e_vendor_cargo_build (pre-v5 overwrite)";
+    if !cargo_e2e_matrix::cargo_available(SUITE) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some(fx) = stage_two_versions(tmp.path(), "pre-v5 overwrite") else {
+        return;
+    };
+    let proj = &fx.proj;
+    let env = vendor_ok(proj, &fx.cargo_home, "pre-v5 overwrite");
+    assert_eq!(env["summary"]["failed"], 0, "{env}");
+    std::fs::write(proj.join("src/main.rs"), TWO_VERSION_MAIN).unwrap();
+    let old_rel = format!(".socket/vendor/cargo/{UUID_OLD}/{DEP}-{}", fx.old_v);
+    let clobber = || {
+        let manifest = std::fs::read_to_string(proj.join("Cargo.toml")).unwrap();
+        std::fs::write(proj.join("Cargo.toml"), strip_patch_table(&manifest)).unwrap();
+        std::fs::create_dir_all(proj.join(".cargo")).unwrap();
+        std::fs::write(
+            proj.join(".cargo/config.toml"),
+            format!("[patch.crates-io]\n{DEP} = {{ path = \"{old_rel}\" }}\n"),
+        )
+        .unwrap();
+        let state_path = proj.join(".socket/vendor/state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        for (_, entry) in state["entries"].as_object_mut().unwrap() {
+            for w in entry["wiring"].as_array_mut().unwrap() {
+                if w["kind"] == "cargo_patch_entry" {
+                    w["file"] = ".cargo/config.toml".into();
+                    w["key"] = DEP.into();
+                }
+            }
+        }
+        std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+        let broken = cargo(
+            proj,
+            &["build", "-q", "--locked", "--offline"],
+            &fx.cargo_home,
+        );
+        assert!(!broken.status.success(), "the clobbered layout is broken");
+    };
+    let healed = |tag: &str| {
+        let manifest = std::fs::read_to_string(proj.join("Cargo.toml")).unwrap();
+        assert_eq!(
+            manifest.matches(&format!("{DEP}-socket-")).count(),
+            2,
+            "{tag}: both versions wired:\n{manifest}"
+        );
+        assert!(!proj.join(".cargo").exists(), "{tag}");
+        let run = cargo(
+            proj,
+            &["run", "-q", "--locked", "--offline"],
+            &fx.cargo_home,
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stdout).contains("MARKER:1:2"),
+            "{tag}: both patched versions build:\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    };
+
+    clobber();
+    vendor_ok(proj, &fx.cargo_home, "pre-v5 overwrite re-run");
+    healed("vendor re-run");
+
+    clobber();
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "repair",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        &fx.cargo_home,
+    );
+    assert_eq!(
+        code, 0,
+        "repair failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    healed("repair");
+
+    std::fs::write(proj.join("src/main.rs"), "fn main() {}\n").unwrap();
+    revert_ok(proj, &fx.cargo_home, "pre-v5 overwrite");
+    assert_eq!(
+        std::fs::read(proj.join("Cargo.toml")).unwrap(),
+        fx.manifest_before
+    );
+    assert_eq!(
+        std::fs::read(proj.join("Cargo.lock")).unwrap(),
+        fx.lock_before
+    );
 }

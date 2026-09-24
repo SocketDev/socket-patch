@@ -1,5 +1,9 @@
 //! Real-cargo mode-migration e2e: vendored ⇄ hosted takeovers must leave the
-//! project FULLY in the new mode — or refuse.
+//! project FULLY in the new mode — or refuse. The vendored wiring is the
+//! root `Cargo.toml`'s `[patch.crates-io]` (v5); the hosted wiring is the
+//! `registry = "socket-patch-<uuid>"` pin in the same manifest plus the
+//! `.cargo/config.toml` registry block — so both directions edit Cargo.toml
+//! and each must leave none of the other mode's lines behind.
 //!
 //! Adapted from the audit probes that empirically proved findings C1–C7 (the
 //! cargo mode-takeover bug class): both directions used to exit 0 while
@@ -583,9 +587,10 @@ async fn vendored_then_hosted_takeover_leaves_pure_hosted() {
     // The project is FULLY hosted: no leftover [patch.crates-io], no vendored
     // ledger claim, no committed vendor tree; the hosted wiring is present.
     let config = read(&proj, ".cargo/config.toml");
+    let toml = read(&proj, "Cargo.toml");
     assert!(
-        !config.contains("[patch.crates-io]"),
-        "leftover [patch.crates-io] breaks every --locked build (C1): {config}"
+        !config.contains("[patch.crates-io]") && !toml.contains("[patch.crates-io]"),
+        "leftover [patch.crates-io] breaks every --locked build (C1): {toml}\n{config}"
     );
     assert!(
         config.contains(&format!("[registries.socket-patch-{UUID_H}]")),
@@ -751,8 +756,13 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
         "the hosted registry pin must be reverted (C2 — [patch.crates-io] \
          cannot apply over it and the project is unbuildable): {toml}"
     );
+    assert!(
+        toml.contains("[patch.crates-io]")
+            && toml.contains(&format!(".socket/vendor/cargo/{UUID_V}/")),
+        "the vendored wiring lives in Cargo.toml: {toml}"
+    );
     let config = read(&proj, ".cargo/config.toml");
-    assert!(config.contains("[patch.crates-io]"), "{config}");
+    assert!(!config.contains("[patch.crates-io]"), "{config}");
     assert!(
         !config.contains("[registries.socket-patch-"),
         "the now-unused registries block must be dropped: {config}"
@@ -809,7 +819,8 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
     );
     assert_eq!(read(&proj, "Cargo.toml"), toml_pristine);
     assert!(
-        !read(&proj, ".cargo/config.toml").contains("[patch.crates-io]"),
+        !read(&proj, ".cargo/config.toml").contains("[patch.crates-io]")
+            && !read(&proj, "Cargo.toml").contains("[patch.crates-io]"),
         "vendored wiring gone after revert"
     );
 }
@@ -947,6 +958,10 @@ async fn double_takeover_a_b_a_preserves_lock_originals() {
     assert_eq!(read(&proj, "Cargo.toml"), toml_pristine);
     let config = read(&proj, ".cargo/config.toml");
     assert!(!config.contains("[patch.crates-io]"), "{config}");
+    assert!(
+        !proj.join(".cargo").exists(),
+        "no .cargo/ residue: {config}"
+    );
 }
 
 // ── FAIL CLOSED: vendoring over a hosted redirect with no ledger refuses ────
@@ -1015,5 +1030,6 @@ async fn vendor_over_hosted_without_ledger_is_refused() {
     assert_eq!(read(&proj, "Cargo.toml"), toml_before);
     assert_eq!(read(&proj, "Cargo.lock"), lock_before);
     assert!(!read(&proj, ".cargo/config.toml").contains("[patch.crates-io]"));
+    assert!(!read(&proj, "Cargo.toml").contains("[patch.crates-io]"));
     assert!(!vendor_ledger_claims(&proj, &purl));
 }

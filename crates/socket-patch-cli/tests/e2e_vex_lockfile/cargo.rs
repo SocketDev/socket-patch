@@ -41,11 +41,12 @@
 //! `Cargo.toml` `registry = "socket-patch-<uuid>"` (inline / table form),
 //! `.cargo/config.toml` / legacy `.cargo/config` / no project config; lock
 //! v1 (`[metadata]` checksums) / v2 (no `version` key) / v3 / v4;
-//! `registry+` source kind; the committed rewriter golden. Vendored —
-//! `[patch.crates-io]` in `.cargo/config.toml` (inline / sub-table /
-//! `./`-prefixed), legacy `.cargo/config`, the root `Cargo.toml`'s own
-//! `[patch.crates-io]`; the lock entry sourceless (v2 / v3 / v4, and no lock
-//! yet). Embedded: `scan --vex`, `apply --vex` and `vendor --vex` on a
+//! `registry+` source kind; the committed rewriter golden. Vendored — the
+//! root `Cargo.toml`'s `[patch.crates-io]` (what v5 `vendor` writes: inline,
+//! the Socket-owned `<name>-socket-<uuid8>` key with `package =`, sub-table,
+//! `./`-prefixed), and the pre-v5 wiring in `.cargo/config.toml` / legacy
+//! `.cargo/config`; the lock entry sourceless (v1 / v2 / v3 / v4, and no
+//! lock yet). Embedded: `scan --vex`, `apply --vex` and `vendor --vex` on a
 //! manifest-less lockfile-wired project.
 
 //! manifest-less lockfile-wired project.
@@ -617,16 +618,20 @@ fn cargo_artifact(uuid: &str) -> String {
 
 #[derive(Clone, Copy, Debug)]
 enum CargoVendored {
-    /// `.cargo/config.toml` `[patch.crates-io] serde = { path = "…" }`.
+    /// What v5 `vendor` writes: the root `Cargo.toml`'s
+    /// `[patch.crates-io] serde = { path = "…" }`.
     Inline,
-    /// `[patch.crates-io.serde] path = "…"`.
+    /// The Socket-owned fallback key (a second vendored version of the
+    /// crate): `serde-socket-<uuid8> = { package = "serde", path = "…" }`.
+    SocketKey,
+    /// `[patch.crates-io.serde] path = "…"` in the manifest.
     SubTable,
-    /// `./`-prefixed path spelling.
+    /// `./`-prefixed path spelling in the manifest.
     DotSlash,
-    /// Legacy `.cargo/config`.
-    Legacy,
-    /// The root `Cargo.toml`'s own `[patch.crates-io]` (hand-wired).
-    Manifest,
+    /// Pre-v5 wiring: `.cargo/config.toml` `[patch.crates-io]`.
+    LegacyConfigToml,
+    /// Pre-v5 wiring in the legacy extensionless `.cargo/config`.
+    LegacyConfig,
 }
 
 /// The `vendor` cargo backend's committed state: the patched copy dir, the
@@ -641,42 +646,43 @@ fn write_cargo_vendored(fx: &Fx, uuid: &str, flavor: CargoVendored, lib: &[u8]) 
     fx.put(&format!("{rel}/src/lib.rs"), lib);
     let dep = format!("[dependencies]\n{CRATE} = \"{CRATE_VERSION}\"\n");
     let inline = format!("[patch.crates-io]\n{CRATE} = {{ path = \"{rel}\" }}\n");
+    let manifest = |patch: String| fx.put("Cargo.toml", cargo_toml(&format!("{dep}\n{patch}")));
     match flavor {
-        CargoVendored::Inline => {
+        CargoVendored::Inline => manifest(inline),
+        CargoVendored::SocketKey => manifest(format!(
+            "[patch.crates-io]\n{CRATE}-socket-{} = {{ package = \"{CRATE}\", path = \"{rel}\" }}\n",
+            &uuid[..8]
+        )),
+        CargoVendored::SubTable => {
+            manifest(format!("[patch.crates-io.{CRATE}]\npath = \"{rel}\"\n"))
+        }
+        CargoVendored::DotSlash => manifest(format!(
+            "[patch.crates-io]\n{CRATE} = {{ path = \"./{rel}\" }}\n"
+        )),
+        CargoVendored::LegacyConfigToml => {
             fx.put("Cargo.toml", cargo_toml(&dep));
             fx.put(".cargo/config.toml", inline);
         }
-        CargoVendored::SubTable => {
-            fx.put("Cargo.toml", cargo_toml(&dep));
-            fx.put(
-                ".cargo/config.toml",
-                format!("[patch.crates-io.{CRATE}]\npath = \"{rel}\"\n"),
-            );
-        }
-        CargoVendored::DotSlash => {
-            fx.put("Cargo.toml", cargo_toml(&dep));
-            fx.put(
-                ".cargo/config.toml",
-                format!("[patch.crates-io]\n{CRATE} = {{ path = \"./{rel}\" }}\n"),
-            );
-        }
-        CargoVendored::Legacy => {
+        CargoVendored::LegacyConfig => {
             fx.put("Cargo.toml", cargo_toml(&dep));
             fx.put(".cargo/config", inline);
-        }
-        CargoVendored::Manifest => {
-            fx.put("Cargo.toml", cargo_toml(&format!("{dep}\n{inline}")));
         }
     }
     fx.put("Cargo.lock", cargo_lock(4, ""));
 }
 
-const CARGO_VENDORED_FLAVORS: [CargoVendored; 5] = [
+/// The manifest `write_cargo_vendored` writes, minus the `[patch]` wiring.
+fn cargo_toml_unwired() -> String {
+    cargo_toml(&format!("[dependencies]\n{CRATE} = \"{CRATE_VERSION}\"\n"))
+}
+
+const CARGO_VENDORED_FLAVORS: [CargoVendored; 6] = [
     CargoVendored::Inline,
+    CargoVendored::SocketKey,
     CargoVendored::SubTable,
     CargoVendored::DotSlash,
-    CargoVendored::Legacy,
-    CargoVendored::Manifest,
+    CargoVendored::LegacyConfigToml,
+    CargoVendored::LegacyConfig,
 ];
 
 fn redirect_fixture(rel: &str) -> String {
@@ -1204,7 +1210,7 @@ fn cargo_vendored_c_ledger_record_attests_offline() {
     let fx = Fx::new();
     write_cargo_vendored(&fx, U, CargoVendored::Inline, PATCHED_RS);
     let wiring = [
-        (".cargo/config.toml", "cargo_patch_entry"),
+        ("Cargo.toml", "cargo_patch_entry"),
         ("Cargo.lock", "cargo_lock_entry"),
     ];
     write_vendor_ledger(
@@ -1248,32 +1254,45 @@ fn cargo_vendored_c_ledger_record_attests_offline() {
     );
 }
 
-/// d: the `[patch]` entry removed, the whole config deleted, or the lock
-/// re-resolved from crates.io (an unused patch) — artifact + ledger left
-/// behind → `vendor_unwired`, `--no-verify` or not.
+/// d: the manifest `[patch]` entry removed, a pre-v5 project's whole
+/// config deleted, or the lock re-resolved from crates.io (an unused patch)
+/// — artifact + ledger left behind → `vendor_unwired`, `--no-verify` or not.
 #[test]
 fn cargo_vendored_d_reverted_wiring_never_keeps_the_ledger_alive() {
-    let shapes: [(&str, &Shape); 3] = [
-        ("[patch] entry removed", &|fx: &Fx| {
-            fx.put(".cargo/config.toml", "[net]\nretry = 2\n")
-        }),
-        ("config deleted", &|fx: &Fx| fx.rm(".cargo/config.toml")),
-        ("lock re-resolved from crates.io", &|fx: &Fx| {
-            fx.put(
-                "Cargo.lock",
-                cargo_lock(
-                    4,
-                    &format!(
-                        "source = \"{CRATES_IO}\"\nchecksum = \"{}\"\n",
-                        "c".repeat(64)
+    let shapes: [(&str, CargoVendored, &str, &Shape); 3] = [
+        (
+            "[patch] entry removed",
+            CargoVendored::Inline,
+            "Cargo.toml",
+            &|fx: &Fx| fx.put("Cargo.toml", cargo_toml_unwired()),
+        ),
+        (
+            "legacy config deleted",
+            CargoVendored::LegacyConfigToml,
+            ".cargo/config.toml",
+            &|fx: &Fx| fx.rm(".cargo/config.toml"),
+        ),
+        (
+            "lock re-resolved from crates.io",
+            CargoVendored::Inline,
+            "Cargo.toml",
+            &|fx: &Fx| {
+                fx.put(
+                    "Cargo.lock",
+                    cargo_lock(
+                        4,
+                        &format!(
+                            "source = \"{CRATES_IO}\"\nchecksum = \"{}\"\n",
+                            "c".repeat(64)
+                        ),
                     ),
-                ),
-            )
-        }),
+                )
+            },
+        ),
     ];
-    for (name, revert) in shapes {
+    for (name, flavor, wiring_file, revert) in shapes {
         let fx = Fx::new();
-        write_cargo_vendored(&fx, U, CargoVendored::Inline, PATCHED_RS);
+        write_cargo_vendored(&fx, U, flavor, PATCHED_RS);
         write_vendor_ledger(
             &fx,
             "cargo",
@@ -1282,7 +1301,7 @@ fn cargo_vendored_d_reverted_wiring_never_keeps_the_ledger_alive() {
             &cargo_artifact(U),
             Some(cargo_record(U)),
             &[
-                (".cargo/config.toml", "cargo_patch_entry"),
+                (wiring_file, "cargo_patch_entry"),
                 ("Cargo.lock", "cargo_lock_entry"),
             ],
         );
@@ -1324,7 +1343,9 @@ fn cargo_vendored_d_patch_shadowed_by_a_path_dependency_is_unwired() {
     fx.put(
         "Cargo.toml",
         cargo_toml(&format!(
-            "[dependencies]\n{CRATE} = {{ path = \"my-serde\" }}\n"
+            "[dependencies]\n{CRATE} = {{ path = \"my-serde\" }}\n\n\
+             [patch.crates-io]\n{CRATE} = {{ path = \"{}\" }}\n",
+            cargo_artifact(U)
         )),
     );
     fx.put(
@@ -1352,7 +1373,7 @@ fn cargo_vendored_d_patch_shadowed_by_a_path_dependency_is_unwired() {
         &cargo_artifact(U),
         Some(cargo_record(U)),
         &[
-            (".cargo/config.toml", "cargo_patch_entry"),
+            ("Cargo.toml", "cargo_patch_entry"),
             ("Cargo.lock", "cargo_lock_entry"),
         ],
     );
@@ -1383,7 +1404,7 @@ fn cargo_vendored_e_tampered_artifact_member_is_omitted() {
         U,
         &cargo_artifact(U),
         Some(cargo_record(U)),
-        &[(".cargo/config.toml", "cargo_patch_entry")],
+        &[("Cargo.toml", "cargo_patch_entry")],
     );
     let run = fx.vex(&["--offline"]);
     assert_omitted(&run, CARGO_PURL, "vendor_hash_mismatch", "ledger");
@@ -1405,8 +1426,11 @@ fn cargo_vendored_f_spoofed_references_never_attest() {
         let fx = Fx::new();
         write_cargo_vendored(&fx, U, CargoVendored::Inline, PATCHED_RS);
         fx.put(
-            ".cargo/config.toml",
-            format!("[patch.crates-io]\n{CRATE} = {{ path = \"{path}\" }}\n"),
+            "Cargo.toml",
+            format!(
+                "{}\n[patch.crates-io]\n{CRATE} = {{ path = \"{path}\" }}\n",
+                cargo_toml_unwired()
+            ),
         );
         let run = fx.vex(&["--proxy-url", &api.uri()]);
         assert_ne!(run.code, Some(0), "{name}: {}", run.env);
@@ -1478,7 +1502,7 @@ fn cargo_vendored_injected_file_needs_the_ledger_inventory() {
         U,
         &rel,
         Some(cargo_record(U)),
-        &[(".cargo/config.toml", "cargo_patch_entry")],
+        &[("Cargo.toml", "cargo_patch_entry")],
     );
     let state_path = ".socket/vendor/state.json";
     let mut state: Value = serde_json::from_str(&fx.read(state_path)).unwrap();
@@ -1520,12 +1544,10 @@ fn write_cargo_mixed(fx: &Fx) {
     let toml = fx.read("Cargo.toml");
     fx.put(
         "Cargo.toml",
-        format!("{toml}{CRATE2} = \"{CRATE2_VERSION}\"\n"),
-    );
-    let config = fx.read(".cargo/config.toml");
-    fx.put(
-        ".cargo/config.toml",
-        format!("{config}\n[patch.crates-io]\n{CRATE2} = {{ path = \"{rel}\" }}\n"),
+        format!(
+            "{toml}{CRATE2} = \"{CRATE2_VERSION}\"\n\n[patch.crates-io]\n\
+             {CRATE2} = {{ path = \"{rel}\" }}\n"
+        ),
     );
     let lock = fx.read("Cargo.lock").replace(
         "dependencies = [\n \"serde\",\n]",

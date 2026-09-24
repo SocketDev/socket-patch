@@ -1491,8 +1491,6 @@ pub(crate) async fn run_redirect_selected(
         {
             return refuse_symlinked_file(common, scan_result.take(), linked);
         }
-        let patch_entries =
-            socket_patch_core::vendor::cargo_config::read_patch_entries(&common.cwd).await;
         let mut refused: Vec<String> = Vec::new();
         for (candidate, ledger_entry) in &takeover {
             let purl = &candidate.purl;
@@ -1608,23 +1606,30 @@ pub(crate) async fn run_redirect_selected(
                 // this crate is nevertheless present, the ledger is missing or
                 // corrupt — the originals needed to revert are unrecoverable,
                 // so redirecting on top would wedge the project. Refuse.
-                // (Cargo-only probe: `.cargo/config.toml` `[patch]` entries.
-                // An npm purl in this state falls through to the rewriters'
-                // own per-flavor diagnostics.)
-                let name = purl
+                // (Cargo-only probe: Socket-owned `[patch.crates-io]` entries
+                // for exactly this name@version in the root Cargo.toml or a
+                // legacy `.cargo/config*` — another vendored version of the
+                // crate has its own ledger entry. An npm purl in this state
+                // falls through to the rewriters' own per-flavor
+                // diagnostics.)
+                let coords = purl
                     .starts_with("pkg:cargo/")
-                    .then(|| purl_parts(purl).map(|(_, name, _)| name))
+                    .then(|| purl_parts(purl).map(|(_, name, version)| (name, version)))
                     .flatten();
-                let wired = name
-                    .as_deref()
-                    .is_some_and(|n| patch_entries.get(n).is_some_and(|i| i.socket_owned));
+                let wired = match &coords {
+                    Some((n, v)) => {
+                        socket_patch_core::vendor::cargo::socket_wiring_present(&common.cwd, n, v)
+                            .await
+                    }
+                    None => false,
+                };
                 if wired {
                     refused.push(purl.clone());
                     takeover_pre_warnings.push(serde_json::json!({
                         "code": "redirect_vendored_revert_failed",
                         "detail": format!(
-                            "{purl} has socket-owned vendored wiring in \
-                             .cargo/config.toml but no usable vendored ledger entry \
+                            "{purl} has socket-owned vendored `[patch.crates-io]` \
+                             wiring but no usable vendored ledger entry \
                              (.socket/vendor/state.json is missing or corrupt); NOT \
                              redirected — restore the ledger or remove the vendored \
                              wiring manually, then re-run"

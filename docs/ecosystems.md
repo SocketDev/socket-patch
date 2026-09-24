@@ -16,7 +16,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 |-----------|------------------------|------------------------------|--------------------------|
 | npm (`npm`) — pnpm / yarn / berry / bun | ✅ any install layout; `setup` postinstall hook | ✅ six lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun — pnpm, berry, and bun carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) |
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ `.pth` startup hook via `setup` | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
-| Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum) |
+| Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum) |
 | RubyGems (`gem`) | ✅ Bundler plugin via `setup` — needs bundler ≥ 2.2 (1.x cannot load `plugin ... path:` directives; `setup` refuses below the floor and `setup --check` red-flags a wired 1.x project) | ✅ Gemfile + Gemfile.lock path pair (`Gemfile` spelling only — a `gems.rb` project cannot vendor yet) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` when present (bundler prefers them over `Gemfile`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [golang-hosted.md](design/golang-hosted.md). Paid tier stays ❌ ([golang-hosted-no-go.md](design/golang-hosted-no-go.md)); `redirect_golang_unsupported` names the vendored remedy |
 | Maven (`maven`) | ✅ apply-only (no `setup` hook — reports `no_files`); in-place jar patching leaves the `~/.m2` checksum sidecars stale — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) | ✅ committed maven2 `file://` repository. A root pom declaring `<modules>` (multi-module aggregator) is refused (`vendor_maven_multimodule_unsupported`), and a gradle-only project is refused (`vendor_gradle_unsupported`) | ✅ **pom projects only, fail-closed** — the patched jar is pinned at a Socket-only `<version>-socket.<hex8>` suffix; `${property}` versions are refused; Gradle gets a manual `exclusiveContent` snippet — see [Maven & NuGet caveats](#maven--nuget-caveats) |
@@ -205,6 +205,69 @@ Agent mode patches the crate in place wherever the crawler finds it. For a non-v
 crate that means the **shared** `$CARGO_HOME/registry` cache: the patch affects every
 project on the machine, and is silently reset by `cargo clean` or a cache prune. Use
 `--mode vendored` for a project-local, committable patch.
+
+## Cargo: vendored wiring in Cargo.toml
+
+Vendored mode (v5+) wires a patched crate with a `[patch.crates-io]` path
+entry in the **workspace-root `Cargo.toml`** (the manifest beside the
+`Cargo.lock` it detaches) plus the lock surgery that drops the crate's
+`source`/`checksum`:
+
+```toml
+[patch.crates-io]
+cfg-if-socket-9f6b2c4e = { package = "cfg-if", path = ".socket/vendor/cargo/<uuid>/cfg-if-1.0.4" }
+# a second vendored version of the same crate:
+cfg-if-socket-0a1b2c3d = { package = "cfg-if", path = ".socket/vendor/cargo/<uuid2>/cfg-if-0.1.10" }
+```
+
+- **Why the manifest.** Socket's scanners already ingest `Cargo.toml`, so
+  the patch uuid in the path is recoverable for SBOM annotation without
+  uploading `.cargo/config*` (which can hold registry tokens), and manifest
+  `[patch]` builds on cargo older than 1.56, the floor of config-file
+  `[patch]` (proven on 1.56 and older toolchains by the old-toolchain e2e
+  tests). On such old cargo, two vendored versions of ONE crate also need
+  `cargo build --offline` (or a reachable registry index): it loads the
+  crates.io index to tell the two entries apart. Current stable needs
+  neither.
+- **Keys.** Always the Socket-owned `<name>-socket-<first 8 hex of the
+  uuid>` with `package = "<name>"` (the full uuid hex if that key is
+  taken), never the bare crate name: cargo lets a config-file `[patch]`
+  item — the project's, an ancestor directory's, or `$CARGO_HOME`'s —
+  replace the manifest item with the same key whatever its version, so a
+  crate-named key could be silently shadowed by your own config. Keys any
+  of those config files already use are avoided. Every lookup (re-run,
+  revert, VEX discovery) is key-agnostic: an entry belongs to
+  `name@version` when its crate (`package`, else the key) is `name` and its
+  path is `.socket/vendor/cargo/<uuid>/<name>-<version>`.
+- **Your entries.** User-authored `[patch.crates-io]` entries are never
+  modified. One — in `Cargo.toml` or any cargo config file cargo merges
+  (project, ancestors, `$CARGO_HOME`) — that patches the same crate and is
+  not provably another version (a git/registry patch, or a path whose
+  `Cargo.toml` version is unreadable or equal) refuses the vendor with
+  `user_authored_patch_entry`.
+- **Refusals.** `cargo_manifest_not_workspace_root`: run from a workspace
+  member (cargo ignores `[patch]` outside the workspace-root manifest) —
+  run from the root. `cargo_manifest_patch_source_alias`: the manifest also
+  has a `[patch."https://github.com/rust-lang/crates.io-index"]` table,
+  which cargo lets replace `[patch.crates-io]` wholesale — move its entries
+  under `[patch.crates-io]`. Also `cargo_manifest_unreadable`,
+  `cargo_manifest_unparseable`, `cargo_manifest_symlink_unsupported`.
+- **Formatting.** Comments, ordering, CRLF / mixed line endings, a UTF-8
+  BOM and the trailing-newline state are preserved; a revert with nothing
+  else changed restores `Cargo.toml` byte for byte, and keeps your own
+  `[patch]` / `[patch.crates-io]` headers (an explicit `[patch]`, or a
+  `[patch.crates-io]` that another table follows or that carries a
+  comment).
+- **Migration.** Projects vendored by an older release carry the entry in
+  `.cargo/config.toml` (or `.cargo/config`). Re-running `vendor`,
+  `scan`/`get --mode vendored`, or `repair` moves it into `Cargo.toml`
+  (`cargo_wiring_migrated`), updates the vendor ledger, and deletes a config
+  file (and `.cargo/`) the move emptied; a legacy entry that cannot be
+  removed fails the run with nothing changed (`cargo_legacy_wiring_kept`).
+  A project hit by the old multi-version overwrite (a second vendored
+  version repointed the crate-named config key, leaving the first
+  version's lock entry detached and unwired) is healed the same way
+  (`cargo_wiring_restored`). Every revert removes both spellings.
 
 ## Go: directory replaces and go.sum
 
