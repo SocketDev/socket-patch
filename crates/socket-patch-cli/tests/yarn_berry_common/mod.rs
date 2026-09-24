@@ -151,10 +151,20 @@ pub fn yarn_output(out: &Output) -> String {
 ///   instead of only on a runner;
 /// * sets `YARN_ENABLE_IMMUTABLE_INSTALLS=false`, so a plain `install` may
 ///   write the lock. The fresh-checkout installs are unaffected because they
-///   pass `--immutable` explicitly, and yarn's flag outranks the setting.
+///   pass `--immutable` explicitly, and yarn's flag outranks the setting;
+/// * sets `YARN_ENABLE_HARDENED_MODE=false`. yarn 4 turns hardened mode on
+///   when it detects a GitHub Actions run for a public pull request, and then
+///   re-resolves every lock entry against the registry. The fresh-checkout
+///   installs point the registry at an unreachable address on purpose (they
+///   must install from the committed lock and the hosted tarball alone), so
+///   hardened mode failed them with ECONNREFUSED 127.0.0.1:1 on PR runs
+///   only. Hardened mode guards against untrusted lockfiles; these suites
+///   exercise socket-patch's own rewrites, and `--immutable --check-cache`
+///   still verifies every checksum.
 pub fn pin_berry_ci_defaults(cmd: &mut std::process::Command) -> &mut std::process::Command {
     cmd.env("CI", "true")
         .env("YARN_ENABLE_IMMUTABLE_INSTALLS", "false")
+        .env("YARN_ENABLE_HARDENED_MODE", "false")
 }
 
 /// [`pin_berry_ci_defaults`] wins over an earlier value for either variable
@@ -162,7 +172,8 @@ pub fn pin_berry_ci_defaults(cmd: &mut std::process::Command) -> &mut std::proce
 #[test]
 fn pin_berry_ci_defaults_sets_ci_and_disables_implicit_immutable() {
     let mut cmd = corepack_command();
-    cmd.env("YARN_ENABLE_IMMUTABLE_INSTALLS", "true");
+    cmd.env("YARN_ENABLE_IMMUTABLE_INSTALLS", "true")
+        .env("YARN_ENABLE_HARDENED_MODE", "true");
     pin_berry_ci_defaults(&mut cmd);
     let envs: std::collections::HashMap<_, _> = cmd
         .get_envs()
@@ -174,6 +185,10 @@ fn pin_berry_ci_defaults_sets_ci_and_disables_implicit_immutable() {
     );
     assert_eq!(
         envs.get(std::ffi::OsStr::new("YARN_ENABLE_IMMUTABLE_INSTALLS")),
+        Some(&Some("false".into()))
+    );
+    assert_eq!(
+        envs.get(std::ffi::OsStr::new("YARN_ENABLE_HARDENED_MODE")),
         Some(&Some("false".into()))
     );
 }
