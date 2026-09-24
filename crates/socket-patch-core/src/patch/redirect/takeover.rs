@@ -148,6 +148,55 @@ static SOCKET_REGISTRY_UUID: LazyLock<Regex> = LazyLock::new(|| {
         .expect("static registry-uuid regex is valid")
 });
 
+/// The `socket-patch-<uuid>` registry uuids a recorded fragment names.
+fn registry_uuids(fragment: Option<&Value>) -> impl Iterator<Item = String> + '_ {
+    fragment
+        .and_then(Value::as_str)
+        .into_iter()
+        .flat_map(|s| SOCKET_REGISTRY_UUID.captures_iter(s))
+        .map(|c| c[1].to_string())
+}
+
+/// Every patch uuid `name@version` was redirected at: its record's, plus
+/// each managed registry whose index URL one of its (version-keyed)
+/// Cargo.lock edits names — the older links of a re-redirect chain.
+fn cargo_lineage(state: &RedirectState, name: &str, version: &str, uuid: &str) -> HashSet<String> {
+    let lock_key = format!("{name}@{version}");
+    let lock_fragments: Vec<&str> = state
+        .edits
+        .iter()
+        .filter(|e| {
+            e.kind == "redirect_cargo_lock_entry" && e.key.as_deref() == Some(lock_key.as_str())
+        })
+        .flat_map(|e| [e.original.as_ref(), e.new.as_ref()])
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let mut lineage: HashSet<String> = HashSet::from([uuid.to_string()]);
+    for e in state
+        .edits
+        .iter()
+        .filter(|e| e.kind == "redirect_cargo_registry")
+    {
+        let Some(u) = e
+            .key
+            .as_deref()
+            .and_then(|k| k.strip_prefix("socket-patch-"))
+        else {
+            continue;
+        };
+        let index = e
+            .new
+            .as_ref()
+            .and_then(Value::as_str)
+            .and_then(|block| block.split('"').nth(1));
+        if index.is_some_and(|index| lock_fragments.iter().any(|f| f.contains(index))) {
+            lineage.insert(u.to_string());
+        }
+    }
+    lineage
+}
+
 /// Revert every hosted-redirect edit the ledger records for `purl` (a cargo
 /// package), then drop that purl's record and edits from `state`. The caller
 /// persists the mutated ledger (see `persist_redirect_state`).
@@ -172,8 +221,25 @@ pub async fn revert_cargo_redirect_purl(
     let (name, version) = (name.into_owned(), version.into_owned());
     let lock_key = format!("{name}@{version}");
 
+    // Manifest edits are keyed by crate NAME (the shared golden ledger
+    // shape), so when another version of the crate is redirected too, its
+    // pins carry the same key: skip every manifest edit whose pin names a
+    // registry of a sibling version's lineage. Without a sibling the claim
+    // stays name-wide, as before.
+    let sibling_uuids: HashSet<String> = state
+        .records
+        .iter()
+        .filter(|(key, _)| **key != record_key)
+        .filter_map(|(key, rec)| {
+            let (n, v) = parse_cargo_purl(strip_purl_qualifiers(key))?;
+            (n == name && v != version).then(|| cargo_lineage(state, &n, &v, &rec.uuid))
+        })
+        .flatten()
+        .collect();
     let is_wiring_edit = |e: &FileEdit| {
-        (e.kind == "redirect_cargo_toml_dep" && e.key.as_deref() == Some(name.as_str()))
+        (e.kind == "redirect_cargo_toml_dep"
+            && e.key.as_deref() == Some(name.as_str())
+            && !registry_uuids(e.new.as_ref()).any(|u| sibling_uuids.contains(&u)))
             || (e.kind == "redirect_cargo_lock_entry"
                 && e.key.as_deref() == Some(lock_key.as_str()))
     };
@@ -1227,6 +1293,128 @@ mod tests {
         state.edits = rewrite.edits;
         state.records.insert(PURL.to_string(), record());
         (tmp, state)
+    }
+
+    /// Bug I: two redirected versions of one crate share the manifest edit
+    /// key (the crate name). Removing one version must revert ONLY its own
+    /// declaration + lock entry + registry block — claiming the sibling's
+    /// manifest edit reverted the other pin while its lock entry stayed
+    /// hosted (a broken build), and dropped the sibling's registry edit, so
+    /// the second removal left the created `.cargo/config.toml` behind.
+    #[tokio::test]
+    async fn multi_version_removes_each_version_independently() {
+        const UUID_OLD: &str = "3c5d7e9f-2a4b-4c6d-8e0f-1a3b5c7d9e1f";
+        const PURL_OLD: &str = "pkg:cargo/cfg-if@0.1.10";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let toml = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                    cfg-if = \"1.0\"\ncfg-if-legacy = { package = \"cfg-if\", version = \"0.1.10\" }\n";
+        let lock = format!(
+            "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"0.1.10\"\n\
+             source = \"{CRATES_IO}\"\nchecksum = \"{}\"\n\n{}\n",
+            "8".repeat(64),
+            pristine_lock_block()
+        );
+        let dep = |version: &str, uuid: &str| -> crate::patch::redirect::DepOverride {
+            serde_json::from_value(serde_json::json!({
+                "ecosystem": "cargo", "name": "cfg-if", "version": version, "token": "tok",
+                "patchUuid": uuid,
+                "artifactUrl": format!("http://127.0.0.1:5555/cfg-if-{version}.crate"),
+                "registryOverride": {
+                    "kind": "cargo-sparse",
+                    "indexUrl": format!("sparse+http://127.0.0.1:5555/{uuid}/index/"),
+                    "identifiers": {
+                        "name": "cfg-if", "version": version,
+                        "cargoCksumSha256": "a".repeat(64),
+                    },
+                },
+                "integrity": { "sha256": "a".repeat(64) },
+            }))
+            .unwrap()
+        };
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        files.insert("Cargo.toml".into(), toml.to_string());
+        files.insert("Cargo.lock".into(), lock.clone());
+        let rewrite = crate::patch::redirect::rewrite_registry_redirect(
+            &files,
+            &[dep("1.0.4", UUID), dep("0.1.10", UUID_OLD)],
+        );
+        assert_eq!(
+            rewrite.confirmed_cargo_uuids.len(),
+            2,
+            "{:?}",
+            rewrite.warnings
+        );
+        tokio::fs::write(root.join("Cargo.toml"), toml)
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("Cargo.lock"), &lock)
+            .await
+            .unwrap();
+        for (rel, content) in &rewrite.files {
+            let path = root.join(rel);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, content).await.unwrap();
+        }
+        let mut state = RedirectState::new();
+        state.edits = rewrite.edits;
+        state.records.insert(PURL.to_string(), record());
+        let mut old = record();
+        old.uuid = UUID_OLD.to_string();
+        state.records.insert(PURL_OLD.to_string(), old);
+
+        revert_cargo_redirect_purl(root, &mut state, PURL, false)
+            .await
+            .expect("1.0.4 reverts");
+        let t = tokio::fs::read_to_string(root.join("Cargo.toml"))
+            .await
+            .unwrap();
+        assert!(
+            t.contains("cfg-if = \"1.0\"\n")
+                && t.contains(&format!("registry = \"socket-patch-{UUID_OLD}\"")),
+            "only the 1.0.4 pin is reverted: {t}"
+        );
+        let l = tokio::fs::read_to_string(root.join("Cargo.lock"))
+            .await
+            .unwrap();
+        assert!(
+            l.contains(&format!("sparse+http://127.0.0.1:5555/{UUID_OLD}/index/")),
+            "{l}"
+        );
+        let cfg = tokio::fs::read_to_string(root.join(".cargo/config.toml"))
+            .await
+            .unwrap();
+        assert!(
+            !cfg.contains(&format!("socket-patch-{UUID}]")) && cfg.contains(UUID_OLD),
+            "{cfg}"
+        );
+
+        revert_cargo_redirect_purl(root, &mut state, PURL_OLD, false)
+            .await
+            .expect("0.1.10 reverts");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.toml"))
+                .await
+                .unwrap(),
+            toml
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock
+        );
+        assert!(
+            !root.join(".cargo/config.toml").exists(),
+            "the created config goes with the last block"
+        );
+        assert!(
+            state.edits.is_empty() && state.records.is_empty(),
+            "{:?}",
+            state.edits
+        );
     }
 
     #[tokio::test]
