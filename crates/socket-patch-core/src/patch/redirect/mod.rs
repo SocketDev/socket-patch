@@ -31,6 +31,8 @@ mod bun_binary;
 pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
 #[cfg(test)]
 mod cargo_lock_equivalence_tests;
+#[cfg(test)]
+mod golang_equivalence_tests;
 pub mod golang_local;
 #[cfg(test)]
 mod lock_index_equivalence_tests;
@@ -6550,7 +6552,7 @@ fn rewrite_golang(
     result: &mut RewriteResult,
 ) {
     use crate::vendor::go_mod_edit::{self, HOSTED_GO_MODULE_PREFIX};
-    use crate::vendor::go_sum_edit;
+    use crate::vendor::go_sum_edit::{self, GoSumEditor};
 
     let golang: Vec<&DepOverride> = overrides
         .iter()
@@ -6570,7 +6572,7 @@ fn rewrite_golang(
     let mut go_mod = orig_go_mod.clone();
     // An absent go.sum starts empty: the fully-replaced original needs no
     // lines of its own, so the two socket lines alone are a complete pin.
-    let mut go_sum = files.get("go.sum").cloned().unwrap_or_default();
+    let mut go_sum = GoSumEditor::new(files.get("go.sum").cloned().unwrap_or_default());
     let (mut mod_changed, mut sum_changed) = (false, false);
 
     for dep in &golang {
@@ -6652,13 +6654,20 @@ fn rewrite_golang(
             });
             continue;
         }
+        // One walk of go.mod reads the prior directive, the required version
+        // and the upsert's refresh line / conflict for this dep.
+        let scan = go_mod_edit::scan_hosted_replace(
+            &go_mod,
+            &fname,
+            &dep.version,
+            rhs_module,
+            rhs_version,
+        );
         // Any pre-existing socket-owned directive for the module (this run is
         // a refresh, or a takeover of a local/vendored redirect): capture its
         // text — the ledger's `original` is the only pre-redirect record.
-        let prior = go_mod_edit::parse_replace_entries(&go_mod)
-            .into_iter()
-            .find(|e| e.module == fname && e.socket_owned());
-        let prior_text = prior.as_ref().map(|e| {
+        let prior = scan.prior.as_ref();
+        let prior_text = prior.map(|e| {
             let target = e.path.clone().unwrap_or_else(|| match &e.rhs_version {
                 Some(v) => format!("{} {v}", e.rhs_module.as_deref().unwrap_or_default()),
                 None => e.rhs_module.clone().unwrap_or_default(),
@@ -6678,8 +6687,7 @@ fn rewrite_golang(
         // left in place, its module path keeps confirming the dep as
         // redirected (ledger + VEX attestation) while go links the unpatched
         // version.
-        let required = go_mod_edit::parse_required_versions(&go_mod);
-        if let Some(required) = required.get(&fname) {
+        if let Some(required) = scan.required.as_ref() {
             if required != &dep.version {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_golang_version_mismatch".into(),
@@ -6689,9 +6697,8 @@ fn rewrite_golang(
                         dep.version
                     ),
                 });
-                let stale_hosted = prior
-                    .as_ref()
-                    .filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
+                let stale_hosted =
+                    prior.filter(|e| e.owner == Some(go_mod_edit::ReplaceOwner::Hosted));
                 if let Some(stale) = stale_hosted {
                     if let Ok(Some(new)) = go_mod_edit::remove_replace_entry(
                         &go_mod,
@@ -6710,10 +6717,7 @@ fn rewrite_golang(
                         });
                     }
                     if let Some(stale_rhs) = stale.rhs_module.as_deref() {
-                        if let Some(new) =
-                            go_sum_edit::remove_module_prefix_lines(&go_sum, stale_rhs)
-                        {
-                            go_sum = new;
+                        if go_sum.remove_module_prefix_lines(stale_rhs) {
                             sum_changed = true;
                             result.edits.push(FileEdit {
                                 path: "go.sum".into(),
@@ -6728,10 +6732,8 @@ fn rewrite_golang(
                 }
                 continue;
             }
-        } else if !go_sum_edit::has_module_version(&go_sum, &fname, &dep.version)
-            && prior
-                .as_ref()
-                .is_none_or(|e| e.version.as_deref() != Some(dep.version.as_str()))
+        } else if !go_sum.has_module_version(&fname, &dep.version)
+            && prior.is_none_or(|e| e.version.as_deref() != Some(dep.version.as_str()))
         {
             // Not required, not in go.sum at this version, and not already
             // redirected by us: the module is outside this project's graph
@@ -6749,8 +6751,9 @@ fn rewrite_golang(
             continue;
         }
 
-        match go_mod_edit::upsert_hosted_replace_entry(
-            &go_mod,
+        match go_mod_edit::apply_hosted_replace(
+            &mut go_mod,
+            &scan,
             &fname,
             &dep.version,
             rhs_module,
@@ -6764,9 +6767,8 @@ fn rewrite_golang(
                 continue;
             }
             // Re-run over an already-redirected go.mod: nothing to record.
-            Ok(None) => {}
-            Ok(Some(new)) => {
-                go_mod = new;
+            Ok(false) => {}
+            Ok(true) => {
                 mod_changed = true;
                 result.edits.push(FileEdit {
                     path: "go.mod".into(),
@@ -6788,10 +6790,7 @@ fn rewrite_golang(
                 });
             }
         }
-        if let Some(new) =
-            go_sum_edit::upsert_module_lines(&go_sum, rhs_module, rhs_version, zip_h1, gomod_h1)
-        {
-            go_sum = new;
+        if go_sum.upsert_module_lines(rhs_module, rhs_version, zip_h1, gomod_h1) {
             sum_changed = true;
             result.edits.push(FileEdit {
                 path: "go.sum".into(),
@@ -6809,10 +6808,7 @@ fn rewrite_golang(
         // prunes exactly these — writing the tidy-stable state up front keeps
         // the first day-2 tidy a byte-level no-op. The removed lines ride in
         // `original` so the ledger can restore them on revert.
-        if let Some((new, removed)) =
-            go_sum_edit::remove_exact_module_version_lines(&go_sum, &fname, &dep.version)
-        {
-            go_sum = new;
+        if let Some(removed) = go_sum.remove_exact_module_version_lines(&fname, &dep.version) {
             sum_changed = true;
             result.edits.push(FileEdit {
                 path: "go.sum".into(),
@@ -6830,7 +6826,7 @@ fn rewrite_golang(
         result.files.insert("go.mod".into(), go_mod);
     }
     if sum_changed {
-        result.files.insert("go.sum".into(), go_sum);
+        result.files.insert("go.sum".into(), go_sum.into_string());
     }
 }
 
