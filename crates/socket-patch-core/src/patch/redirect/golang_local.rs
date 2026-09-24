@@ -325,6 +325,7 @@ pub async fn remove_go_redirect(
             format!("not a golang purl: {purl}"),
         )
     })?;
+    let (module, version) = (&*module, &*version);
 
     // SECURITY: the copy dir is `<base_rel>/<module>@<version>/` and is about
     // to be `remove_tree`d. Unsafe coordinates (`..` segment / separator /
@@ -360,7 +361,7 @@ pub async fn reconcile_go_redirects(
     desired: &HashSet<String>,
     dry_run: bool,
 ) -> Vec<String> {
-    let desired_modules: HashSet<&str> = desired
+    let desired_modules: HashSet<std::borrow::Cow<str>> = desired
         .iter()
         .filter_map(|p| parse_golang_purl(p).map(|(m, _)| m))
         .collect();
@@ -407,6 +408,7 @@ pub async fn reconcile_go_redirects(
             // Path-exact on purpose: a directive already repointed at the
             // desired version's copy is never touched.
             if let Some((module, version)) = parse_golang_purl(&purl) {
+                let (module, version) = (&*module, &*version);
                 let target = replace_target_path(GO_PATCHES_DIR, module, version);
                 if entries.iter().any(|e| {
                     e.owner == Some(ReplaceOwner::GoPatches)
@@ -456,7 +458,7 @@ pub async fn verify_go_redirect_state(
     // Required versions from go.mod (None ⇒ no go.mod ⇒ skip the version
     // cross-check). Read once, project-local, offline.
     let required = read_required_versions(project_root).await;
-    let desired_modules: HashSet<&str> = desired
+    let desired_modules: HashSet<std::borrow::Cow<str>> = desired
         .iter()
         .filter_map(|p| parse_golang_purl(p).map(|(m, _)| m))
         .collect();
@@ -465,6 +467,7 @@ pub async fn verify_go_redirect_state(
         let Some((module, version)) = parse_golang_purl(purl) else {
             continue;
         };
+        let (module, version) = (&*module, &*version);
         let Some(record) = manifest.patches.get(purl) else {
             continue;
         };
@@ -781,7 +784,7 @@ mod tests {
         let gomod = "module example.com/app\n\ngo 1.21\n\n\
                      require github.com/foo/bar v1.4.2\n\n\
                      replace github.com/foo/bar v1.4.2 => \
-                     patch.socket.dev/gopatch/some-uuid v1.4.2-socketpatch.1\n";
+                     patch.socket.dev/gopatch/55555555-5555-4555-8555-555555555555 v1.4.2-socketpatch.1\n";
         tokio::fs::write(root.join("go.mod"), gomod).await.unwrap();
         let sources = PatchSources::blobs_only(&blobs);
 
@@ -1855,8 +1858,8 @@ mod tests {
         let (module, version) = parse_golang_purl(qualified).unwrap();
         let result = apply_go_redirect(
             qualified,
-            module,
-            version,
+            &module,
+            &version,
             &pristine,
             root,
             GO_PATCHES_DIR,
@@ -2147,7 +2150,7 @@ mod tests {
             "module example.com/app\n\ngo 1.21\n\n\
              require github.com/foo/bar v1.4.2\n\n\
              replace github.com/foo/bar v1.4.2 => \
-             patch.socket.dev/gopatch/some-uuid v1.4.2-socketpatch.1\n",
+             patch.socket.dev/gopatch/55555555-5555-4555-8555-555555555555 v1.4.2-socketpatch.1\n",
         )
         .await
         .unwrap();

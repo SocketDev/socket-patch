@@ -181,6 +181,7 @@ impl GoCrawler {
 
         for purl in purls {
             if let Some((module_path, version)) = crate::utils::purl::parse_golang_purl(purl) {
+                let (module_path, version) = (&*module_path, &*version);
                 // SECURITY: `module_path`/`version` come straight from the
                 // (untrusted) manifest PURL and are joined onto the cache root
                 // below. In global mode the resolved directory is patched IN
@@ -943,6 +944,31 @@ mod tests {
         let crawler = GoCrawler;
         let result = crawler.parse_versioned_dir(base, dir, &mut seen).await;
         assert!(result.is_none(), "empty version must yield None");
+    }
+
+    /// Canonical purls percent-encode `+` in a version
+    /// (`v2.0.0%2Bincompatible`); the lookup must decode it before
+    /// case-escaping, or a `+incompatible` module is never found.
+    #[tokio::test]
+    async fn test_find_by_purls_percent_encoded_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let module_dir = dir
+            .path()
+            .join("github.com")
+            .join("foo")
+            .join("bar@v2.0.0+incompatible");
+        tokio::fs::create_dir_all(&module_dir).await.unwrap();
+
+        let crawler = GoCrawler::new();
+        let purl = "pkg:golang/github.com/foo/bar@v2.0.0%2Bincompatible".to_string();
+        let result = crawler
+            .find_by_purls(dir.path(), std::slice::from_ref(&purl))
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1, "encoded purl must resolve: {result:?}");
+        assert_eq!(result[&purl].version, "v2.0.0+incompatible");
+        assert_eq!(result[&purl].path, module_dir);
     }
 
     #[tokio::test]

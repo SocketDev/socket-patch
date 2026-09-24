@@ -345,6 +345,41 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Hosted Go redirects no longer claim patches that did not land.**
+  `scan`/`get --mode hosted` counted a Go module as redirected (recorded
+  it in the redirect ledger, so `vex` attested it) whenever any project
+  file contained the patch-server origin — e.g. an already hosted
+  `package-lock.json` — or leftover `patch.socket.dev/gopatch/…` go.sum
+  lines, even when the go.mod rewrite was refused. A Go module now counts
+  only when its go.mod `replace` and both go.sum lines are in place. A
+  module that go.mod does not require and go.sum does not list at the
+  patched version (another project's module found in the shared module
+  cache) is refused with `redirect_golang_not_in_module_graph` instead of
+  getting an inert `replace`.
+- **Switching a vendored Go module to hosted mode cleans up the vendored
+  copy.** `scan`/`get --mode hosted` rewrote the vendored `replace` but
+  left `.socket/vendor/golang/<uuid>/` and its vendor-ledger entry
+  behind, so the next `vendor` run switched the module back. The hosted
+  run now reverts the vendored state first, as it already did for cargo
+  and npm.
+- **Go `replace` directives the CLI did not write are left alone.** A
+  replace onto another checkout's vendored copy
+  (`../other/.socket/vendor/golang/…`) or onto a module under
+  `patch.socket.dev/gopatch/` other than `<patch uuid>` was treated as
+  socket-owned and could be rewritten or removed. Only
+  `./.socket/vendor/golang/…`, `./.socket/go-patches/…` and exactly
+  `patch.socket.dev/gopatch/<uuid>` are now owned.
+- **Go replace edits keep go.mod valid and readable.** A go.mod carrying
+  two socket-owned `replace` lines for one module (for example after a
+  merge) is collapsed to one instead of leaving a duplicate go rejects;
+  refreshing a directive keeps its trailing `// comment`; and quoted
+  module paths (`"github.com/x/y"`) are recognized, so a quoted user
+  replace is no longer duplicated and a quoted `require` still gets the
+  version check.
+- **`+incompatible` Go modules resolve in vendor and apply.** Purls that
+  spell the version `v2.0.0%2Bincompatible` are now percent-decoded, so
+  the module is found in the module cache and the `replace` and copy
+  directory carry the real `+incompatible` version.
 - **A vendoring-service outage no longer re-vendors packages.** An npm
   re-run (every lock flavor, `bun.lockb` included) re-acquired its tarball
   from whichever source answered — the service's prebuilt, or a local pack

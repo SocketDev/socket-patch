@@ -414,6 +414,7 @@ async fn try_local_go_apply(
     // `pkg_path` is the pristine, case-encoded module-cache dir; `module`/
     // `version` are the decoded PURL components keying the copy + `replace`.
     let (module, version) = parse_golang_purl(purl)?;
+    let (module, version) = (&*module, &*version);
     Some(
         apply_go_redirect(
             purl,

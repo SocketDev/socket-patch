@@ -96,6 +96,17 @@ pub fn upsert_module_lines(
     Some(joined)
 }
 
+/// True when `go.sum` carries a line (zip or `/go.mod` form) for exactly
+/// `module@version` — go records one for every module version its build
+/// graph loads.
+pub fn has_module_version(content: &str, module: &str, version: &str) -> bool {
+    let zip_key = format!("{module} {version} ");
+    let gomod_key = format!("{module} {version}/go.mod ");
+    content
+        .lines()
+        .any(|l| l.starts_with(&zip_key) || l.starts_with(&gomod_key))
+}
+
 /// Remove the lines for exactly `module@version` (both the zip and `/go.mod`
 /// forms). Used to prune the REPLACED original's lines: once a version-pinned
 /// `replace` covers the resolved version, go never fetches (or verifies) the

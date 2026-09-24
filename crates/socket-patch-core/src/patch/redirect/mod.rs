@@ -182,6 +182,13 @@ pub struct RewriteResult {
     /// presence in rewritten files (a `[registries.…]` config block alone
     /// pins nothing).
     pub confirmed_cargo_uuids: std::collections::BTreeSet<String>,
+    /// Patch uuids whose golang redirect landed: the go.mod replace plus the
+    /// socket module's go.sum pair, written by this run or already in place.
+    /// Like cargo, hosted confirmation keys off this set — substring presence
+    /// cannot prove it (the goproxy `indexUrl` is the bare patch-server
+    /// origin, which any other hosted lockfile contains, and go.sum lines
+    /// outlive a removed replace).
+    pub confirmed_golang_uuids: std::collections::BTreeSet<String>,
     pub confirmed_pipenv_uuids: std::collections::BTreeSet<String>,
     pub refused_pipenv_uuids: std::collections::BTreeSet<String>,
     /// Patch uuids whose `pdm.lock` redirect fully landed (written by this run
@@ -5186,12 +5193,12 @@ fn rewrite_golang(
         // Fail closed on a module path outside the socket namespace: the
         // prefix is the ONLY ownership signal — a directive we couldn't
         // recognize later would be unremovable, and go.sum removal keys on it.
-        if !rhs_module.starts_with(HOSTED_GO_MODULE_PREFIX) {
+        if !go_mod_edit::is_hosted_module_path(rhs_module) {
             result.warnings.push(RewriteWarning {
                 code: "redirect_golang_untrusted_module_path".into(),
                 detail: format!(
-                    "{fname}@{}: refusing hosted module path `{rhs_module}` outside \
-                     `{HOSTED_GO_MODULE_PREFIX}`",
+                    "{fname}@{}: refusing hosted module path `{rhs_module}`: not \
+                     `{HOSTED_GO_MODULE_PREFIX}<patch uuid>`",
                     dep.version
                 ),
             });
@@ -5262,7 +5269,8 @@ fn rewrite_golang(
         // left in place, its module path keeps confirming the dep as
         // redirected (ledger + VEX attestation) while go links the unpatched
         // version.
-        if let Some(required) = go_mod_edit::parse_required_versions(&go_mod).get(&fname) {
+        let required = go_mod_edit::parse_required_versions(&go_mod);
+        if let Some(required) = required.get(&fname) {
             if required != &dep.version {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_golang_version_mismatch".into(),
@@ -5311,6 +5319,25 @@ fn rewrite_golang(
                 }
                 continue;
             }
+        } else if !go_sum_edit::has_module_version(&go_sum, &fname, &dep.version)
+            && prior
+                .as_ref()
+                .is_none_or(|e| e.version.as_deref() != Some(dep.version.as_str()))
+        {
+            // Not required, not in go.sum at this version, and not already
+            // redirected by us: the module is outside this project's graph
+            // (local discovery crawls the whole module cache). Its replace
+            // would be inert, and confirming it would attest a patch no
+            // build links.
+            result.warnings.push(RewriteWarning {
+                code: "redirect_golang_not_in_module_graph".into(),
+                detail: format!(
+                    "{fname}@{}: not required by go.mod and absent from go.sum — the \
+                     module is not in this project's build graph; nothing redirected",
+                    dep.version
+                ),
+            });
+            continue;
         }
 
         match go_mod_edit::upsert_hosted_replace_entry(
@@ -5387,6 +5414,7 @@ fn rewrite_golang(
                 new: None,
             });
         }
+        result.confirmed_golang_uuids.insert(dep.patch_uuid.clone());
     }
 
     if mod_changed {
@@ -11638,6 +11666,80 @@ packages:
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert!(out.warnings.is_empty(), "warnings: {:?}", out.warnings);
         assert!(out.files["go.mod"].contains("replace github.com/foo/bar v1.4.2 =>"));
+    }
+
+    /// Local-mode discovery crawls the WHOLE module cache, so a module another
+    /// project downloaded can be granted here. Absent from `require` AND from
+    /// go.sum at the patched version, it is not in this module's graph: a
+    /// replace for it is inert, and confirming it would attest a patch no
+    /// build links.
+    #[test]
+    fn golang_module_outside_the_graph_is_refused() {
+        let mut files = golang_files();
+        files.insert(
+            "go.mod".to_string(),
+            "module example.com/app\n\ngo 1.21\n\nrequire example.com/direct v2.0.0\n".to_string(),
+        );
+        files.insert(
+            "go.sum".to_string(),
+            "example.com/direct v2.0.0 h1:DIRECT=\nexample.com/direct v2.0.0/go.mod h1:DIRECTM=\n\
+             github.com/foo/bar v1.3.0/go.mod h1:OLDER=\n"
+                .to_string(),
+        );
+        let ovr = golang_override();
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty(), "nothing written: {:?}", out.files);
+        assert_eq!(
+            out.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            ["redirect_golang_not_in_module_graph"]
+        );
+    }
+
+    /// Hosted confirmation keys off `confirmed_golang_uuids`: set when the
+    /// redirect lands or is already in place, never for a refused dep.
+    #[test]
+    fn golang_confirms_only_landed_redirects() {
+        let files = golang_files();
+        let ovr = golang_override();
+        let first = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(first.confirmed_golang_uuids.contains(GO_UUID));
+        let mut again = files.clone();
+        again.extend(first.files.clone());
+        let second = rewrite_registry_redirect(&again, std::slice::from_ref(&ovr));
+        assert!(second.files.is_empty());
+        assert!(second.confirmed_golang_uuids.contains(GO_UUID));
+
+        let mut conflict = golang_files();
+        conflict.insert(
+            "go.mod".to_string(),
+            "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n\nreplace github.com/foo/bar v1.4.2 => ../my-fork\n"
+                .to_string(),
+        );
+        let refused = rewrite_registry_redirect(&conflict, std::slice::from_ref(&ovr));
+        assert!(refused.confirmed_golang_uuids.is_empty());
+    }
+
+    /// Only `patch.socket.dev/gopatch/<canonical uuid>` is a hosted module;
+    /// anything deeper would be written but never recognized as ours again.
+    #[test]
+    fn golang_module_path_with_extra_segments_refused() {
+        let files = golang_files();
+        let mut ovr = golang_override();
+        ovr.registry_override
+            .as_mut()
+            .unwrap()
+            .identifiers
+            .go_module_path = Some(format!("{}/extra", golang_socket_module()));
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty());
+        assert_eq!(
+            out.warnings[0].code,
+            "redirect_golang_untrusted_module_path"
+        );
+        assert!(out.confirmed_golang_uuids.is_empty());
     }
 
     #[test]
