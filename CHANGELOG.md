@@ -380,6 +380,10 @@ into the new version's section — see docs/releasing.md.
   spell the version `v2.0.0%2Bincompatible` are now percent-decoded, so
   the module is found in the module cache and the `replace` and copy
   directory carry the real `+incompatible` version.
+- **`+incompatible` Go copies survive `apply` reconcile.** A manifest key
+  spelled `%2Bincompatible` no longer makes the freshly applied
+  `.socket/go-patches/…@v2.0.0+incompatible` copy look orphaned, so it and
+  its `replace` are kept.
 - **A vendoring-service outage no longer re-vendors packages.** An npm
   re-run (every lock flavor, `bun.lockb` included) re-acquired its tarball
   from whichever source answered — the service's prebuilt, or a local pack
