@@ -1779,6 +1779,54 @@ fn is_safe_npm_component(component: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn listing_of(names: &[&str], complete: bool) -> Listing {
+        Listing {
+            entries: names
+                .iter()
+                .map(|name| ListedEntry {
+                    name: OsString::from(name),
+                    name_str: name.to_string(),
+                    file_type: None,
+                })
+                .collect(),
+            complete,
+        }
+    }
+
+    /// A complete all-ASCII listing proves plain-ASCII absence (matched
+    /// ASCII-case-insensitively), but components a filesystem may resolve
+    /// to a differently spelled entry — `~` (8.3 short names), a trailing
+    /// `.`/space (Win32 stripping), non-ASCII (Unicode folding) — are
+    /// probed even when absent.
+    #[test]
+    fn probe_filter_only_skips_provably_absent_plain_ascii_names() {
+        let filter = ProbeFilter::new(&listing_of(&["foo", "Bar", "@scope"], true));
+        assert!(filter.may_resolve("foo"));
+        assert!(filter.may_resolve("FOO"));
+        assert!(filter.may_resolve("bar"));
+        assert!(filter.may_resolve("@Scope"));
+        assert!(!filter.may_resolve("absent"));
+        assert!(!filter.may_resolve("fo"));
+        for alias in [
+            "FOO~1",
+            "absent~2",
+            "absent.",
+            "absent ",
+            "foo.",
+            "caf\u{e9}",
+            "\u{212a}elvin",
+        ] {
+            assert!(filter.may_resolve(alias), "{alias:?} must be probed");
+        }
+
+        // An incomplete listing, or one holding a non-ASCII name, proves
+        // nothing: everything is probed.
+        let partial = ProbeFilter::new(&listing_of(&["foo"], false));
+        assert!(partial.may_resolve("absent"));
+        let unicode = ProbeFilter::new(&listing_of(&["foo", "caf\u{e9}"], true));
+        assert!(unicode.may_resolve("absent"));
+    }
+
     #[test]
     fn test_parse_package_name_scoped() {
         let (ns, name) = parse_package_name("@types/node");
