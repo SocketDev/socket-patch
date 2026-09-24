@@ -99,7 +99,7 @@ fn has_corepack_pm(pm: &str) -> bool {
     };
     // Isolated too: this probe is what actually downloads the package manager
     // the first time, and corepack stores it under `COREPACK_HOME`.
-    let mut cmd = Command::new("corepack");
+    let mut cmd = yarn_berry_common::corepack_command();
     cmd.args([pm, "--version"])
         .current_dir(probe.path())
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
@@ -143,7 +143,7 @@ fn scrub_socket_env(cmd: &mut Command) {
 }
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new("corepack");
+    let mut cmd = yarn_berry_common::corepack_command();
     cmd.arg(pm).args(args).current_dir(cwd);
     // Scrub FIRST (it removes YARN_* / SOCKET_* from the inherited env), then
     // set the hermetic flags so they survive.

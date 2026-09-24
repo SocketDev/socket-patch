@@ -109,6 +109,19 @@ pub fn yarn_berry() -> &'static str {
     .as_str()
 }
 
+/// A `Command` for `corepack`. On Windows Node installs corepack as the
+/// `corepack.cmd` batch shim, and `Command::new("corepack")` resolves only
+/// `corepack.exe`, so every berry suite's availability probe reported
+/// "`corepack yarn@4.12.0` unavailable" on the windows-latest yarn-berry leg
+/// although corepack was on PATH.
+pub fn corepack_command() -> std::process::Command {
+    std::process::Command::new(if cfg!(windows) {
+        "corepack.cmd"
+    } else {
+        "corepack"
+    })
+}
+
 /// Pin the yarn berry defaults that depend on whether yarn thinks it is
 /// running under CI. Apply it after the `YARN_*` scrub and `cache_env::isolate`,
 /// and before the call site's own env.
@@ -137,7 +150,7 @@ pub fn pin_berry_ci_defaults(cmd: &mut std::process::Command) -> &mut std::proce
 /// (`get_envs` reports the last value set for each key).
 #[test]
 fn pin_berry_ci_defaults_sets_ci_and_disables_implicit_immutable() {
-    let mut cmd = std::process::Command::new("corepack");
+    let mut cmd = corepack_command();
     cmd.env("YARN_ENABLE_IMMUTABLE_INSTALLS", "true");
     pin_berry_ci_defaults(&mut cmd);
     let envs: std::collections::HashMap<_, _> = cmd
