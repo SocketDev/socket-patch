@@ -21,6 +21,8 @@
 
 use std::sync::OnceLock;
 
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
 use crate::utils::fs::run_blocking;
 
 /// Stack size of each walk thread: the main thread's (see module docs).
@@ -94,30 +96,69 @@ fn walk_threads(cpus: usize, soft_limit: Option<u64>) -> usize {
     }
 }
 
-/// Logical CPUs, honoring `RAYON_NUM_THREADS` like rayon's global pool.
+/// Logical CPUs. `RAYON_NUM_THREADS` can lower the count (like rayon's
+/// global pool) but never raise it past the machine's parallelism.
 fn default_cpus() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     std::env::var("RAYON_NUM_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
-        .unwrap_or(1)
+        .map_or(cpus, |n| n.min(cpus))
 }
 
-/// The walk pool, built on first use. `None` if its threads could not be
-/// spawned; the walk then runs on the calling thread (rayon falls back to
-/// its global pool for the parallel parts).
+/// The walk pool, built on first use. `None` if not even one walk thread
+/// could be spawned; the walk then runs on the calling thread (see
+/// [`par_map`]).
 fn walk_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(walk_threads(default_cpus(), soft_nofile_limit()))
-            .stack_size(WALK_STACK_SIZE)
-            .thread_name(|i| format!("socket-patch-walk-{i}"))
-            .build()
-            .ok()
+        build_with_fallback(
+            walk_threads(default_cpus(), soft_nofile_limit()),
+            |threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .stack_size(WALK_STACK_SIZE)
+                    .thread_name(|i| format!("socket-patch-walk-{i}"))
+                    .build()
+            },
+        )
     })
     .as_ref()
+}
+
+/// Build a pool of `threads` threads, halving the count on every failure
+/// (the OS refusing threads: `RLIMIT_NPROC`, a cgroup `pids.max`, memory
+/// for the stacks) down to one. `None` once even one thread fails.
+fn build_with_fallback<P, E>(threads: usize, build: impl Fn(usize) -> Result<P, E>) -> Option<P> {
+    let mut threads = threads.max(1);
+    loop {
+        match build(threads) {
+            Ok(pool) => return Some(pool),
+            Err(_) if threads > 1 => threads /= 2,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// `items.map(f)` in order: in parallel on the walk pool's threads, and
+/// sequentially on any thread outside a rayon pool — the calling thread
+/// [`run_walk`] falls back to when no walk thread could be spawned. A
+/// parallel iterator there would instead build rayon's global pool, which
+/// needs the very threads the OS just refused, and panic when it cannot.
+pub(crate) fn par_map<I, F, T>(items: I, f: F) -> Vec<T>
+where
+    I: IntoParallelIterator + IntoIterator<Item = <I as IntoParallelIterator>::Item>,
+    F: Fn(<I as IntoParallelIterator>::Item) -> T + Sync + Send,
+    T: Send,
+{
+    if rayon::current_thread_index().is_some() {
+        items.into_par_iter().map(f).collect()
+    } else {
+        items.into_iter().map(f).collect()
+    }
 }
 
 /// Run a blocking walk on the walk pool, from a blocking-pool thread so
@@ -128,11 +169,53 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    run_blocking(move || match walk_pool() {
+    let pool_disabled = test_hooks::pool_disabled();
+    run_blocking(move || match walk_pool().filter(|_| !pool_disabled) {
         Some(pool) => pool.install(f),
         None => f(),
     })
     .await
+}
+
+/// Lets a test drive [`run_walk`]'s no-pool fallback (walk on the calling
+/// thread) without actually exhausting the OS's threads. The switch is
+/// per calling thread (read before the hop to the blocking pool), so it
+/// never leaks into concurrently running tests.
+pub(crate) mod test_hooks {
+    #[cfg(test)]
+    thread_local! {
+        static POOL_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pool_disabled() -> bool {
+        POOL_DISABLED.with(|d| d.get())
+    }
+
+    #[cfg(not(test))]
+    pub(crate) fn pool_disabled() -> bool {
+        false
+    }
+
+    /// Runs walks started from this thread without the walk pool until
+    /// the guard drops.
+    #[cfg(test)]
+    pub(crate) struct DisablePool(());
+
+    #[cfg(test)]
+    impl DisablePool {
+        pub(crate) fn new() -> Self {
+            POOL_DISABLED.with(|d| d.set(true));
+            Self(())
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for DisablePool {
+        fn drop(&mut self) {
+            POOL_DISABLED.with(|d| d.set(false));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +246,67 @@ mod tests {
             let threads = walk_threads(1024, Some(limit)) as u64;
             assert!(threads >= 1 && threads + RESERVED_FDS <= limit, "{limit}");
         }
+    }
+
+    #[test]
+    fn pool_build_halves_the_thread_count_until_it_succeeds() {
+        let tried = std::sync::Mutex::new(Vec::new());
+        let built = build_with_fallback(14, |n| {
+            tried.lock().unwrap().push(n);
+            if n <= 3 {
+                Ok(n)
+            } else {
+                Err(())
+            }
+        });
+        assert_eq!(built, Some(3));
+        assert_eq!(*tried.lock().unwrap(), [14, 7, 3]);
+
+        tried.lock().unwrap().clear();
+        let none = build_with_fallback(5, |n| {
+            tried.lock().unwrap().push(n);
+            Err::<usize, ()>(())
+        });
+        assert_eq!(none, None);
+        assert_eq!(*tried.lock().unwrap(), [5, 2, 1]);
+        assert_eq!(build_with_fallback(0, Ok::<usize, ()>), Some(1));
+    }
+
+    /// Outside a rayon pool (the no-walk-pool fallback) `par_map` runs
+    /// every item on the calling thread and never touches rayon's global
+    /// pool; inside one it fans out. Both keep input order.
+    #[test]
+    fn par_map_is_sequential_outside_a_pool_and_ordered_everywhere() {
+        let out = std::thread::spawn(|| {
+            assert!(rayon::current_thread_index().is_none());
+            let caller = std::thread::current().id();
+            par_map((0..1000).collect::<Vec<usize>>(), move |i| {
+                assert_eq!(std::thread::current().id(), caller);
+                i * 2
+            })
+        })
+        .join()
+        .unwrap();
+        assert_eq!(out, (0..1000).map(|i| i * 2).collect::<Vec<_>>());
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let items: Vec<usize> = (0..1000).collect();
+        let out = pool.install(|| par_map(&items, |&i| i + 1));
+        assert_eq!(out, (1..=1000).collect::<Vec<_>>());
+    }
+
+    /// With no walk pool the walk runs off-pool (so `par_map` stays
+    /// sequential); otherwise on a walk-pool thread.
+    #[tokio::test]
+    async fn walk_without_a_pool_runs_outside_rayon() {
+        {
+            let _off = test_hooks::DisablePool::new();
+            assert_eq!(run_walk(rayon::current_thread_index).await, None);
+        }
+        assert!(run_walk(rayon::current_thread_index).await.is_some());
     }
 
     /// The walk runs on a pool thread with the main thread's stack, not

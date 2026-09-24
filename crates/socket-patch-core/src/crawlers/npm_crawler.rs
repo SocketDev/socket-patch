@@ -3,11 +3,10 @@ use std::ffi::{OsStr, OsString};
 use std::fs::FileType;
 use std::path::{Path, PathBuf};
 
-use rayon::prelude::*;
 use serde::Deserialize;
 
 use super::types::{CrawledPackage, CrawlerOptions};
-use super::walk_pool::run_walk;
+use super::walk_pool::{par_map, run_walk};
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, read_dir_entries_sync};
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
@@ -639,10 +638,9 @@ impl NpmCrawler {
 
     fn crawl_all_sync(options: &CrawlerOptions) -> Vec<CrawledPackage> {
         let nm_paths = Self::node_modules_paths_sync(options);
-        let gathered: Vec<Vec<ScanEvent>> = nm_paths
-            .par_iter()
-            .map(|nm_path| Self::gather_node_modules(nm_path, None, false))
-            .collect();
+        let gathered: Vec<Vec<ScanEvent>> = par_map(&nm_paths, |nm_path| {
+            Self::gather_node_modules(nm_path, None, false)
+        });
 
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
@@ -787,10 +785,8 @@ impl NpmCrawler {
         }
         let mut level: Vec<PathBuf> = vec![node_modules_path.to_path_buf()];
         while !level.is_empty() {
-            let visits: Vec<ResolverVisit> = level
-                .into_par_iter()
-                .map(|nm_path| Self::visit_resolver_dir(nm_path, &pending))
-                .collect();
+            let visits: Vec<ResolverVisit> =
+                par_map(level, |nm_path| Self::visit_resolver_dir(nm_path, &pending));
             let mut next_level: Vec<PathBuf> = Vec::new();
             for visit in visits {
                 let nm_path = visit.nm_path;
@@ -890,11 +886,9 @@ impl NpmCrawler {
     /// Entries are examined in parallel; their contributions keep listing
     /// order.
     fn collect_nested_node_modules(nm_path: &Path, listing: Listing) -> Vec<NestedNodeModules> {
-        let found: Vec<Vec<NestedNodeModules>> = listing
-            .entries
-            .into_par_iter()
-            .map(|entry| Self::nested_node_modules_of(nm_path, entry))
-            .collect();
+        let found: Vec<Vec<NestedNodeModules>> = par_map(listing.entries, |entry| {
+            Self::nested_node_modules_of(nm_path, entry)
+        });
         found.into_iter().flatten().collect()
     }
 
@@ -1128,16 +1122,13 @@ impl NpmCrawler {
         let mut level = Self::workspace_children(dir, listing);
         let roots = 0..level.len();
         while !level.is_empty() {
-            let visits: Vec<(Option<PathBuf>, Vec<PathBuf>)> = level
-                .into_par_iter()
-                .map(|full_path| {
-                    let listing = list_dir_sync(&full_path);
-                    // Check if this subdirectory has its own node_modules
-                    let node_modules = has_node_modules_dir(&full_path, &listing)
-                        .then(|| full_path.join("node_modules"));
-                    (node_modules, Self::workspace_children(&full_path, listing))
-                })
-                .collect();
+            let visits: Vec<(Option<PathBuf>, Vec<PathBuf>)> = par_map(level, |full_path| {
+                let listing = list_dir_sync(&full_path);
+                // Check if this subdirectory has its own node_modules
+                let node_modules = has_node_modules_dir(&full_path, &listing)
+                    .then(|| full_path.join("node_modules"));
+                (node_modules, Self::workspace_children(&full_path, listing))
+            });
             let next_base = nodes.len() + visits.len();
             let mut next_level = Vec::new();
             for (node_modules, children) in visits {
@@ -1260,24 +1251,21 @@ impl NpmCrawler {
             children.push((node_modules_path.join(&name_str), name_str, file_type));
         }
 
-        let mut events: Vec<ScanEvent> = children
-            .into_par_iter()
-            .map(|(entry_path, name_str, file_type)| {
-                if name_str.starts_with('@') {
-                    // Scoped packages
-                    Self::gather_scoped_packages(&entry_path, &name_str, store_entry)
-                } else {
-                    Self::gather_package(
-                        entry_path,
-                        store_entry.then_some(name_str),
-                        file_type.is_dir(),
-                    )
-                }
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
-            .collect();
+        let mut events: Vec<ScanEvent> = par_map(children, |(entry_path, name_str, file_type)| {
+            if name_str.starts_with('@') {
+                // Scoped packages
+                Self::gather_scoped_packages(&entry_path, &name_str, store_entry)
+            } else {
+                Self::gather_package(
+                    entry_path,
+                    store_entry.then_some(name_str),
+                    file_type.is_dir(),
+                )
+            }
+        })
+        .into_iter()
+        .flatten()
+        .collect();
 
         if let Some(store_path) = pnpm_store {
             let entries = Self::list_pnpm_store_entries_sync(&store_path, true);
@@ -1355,19 +1343,16 @@ impl NpmCrawler {
             })
             .collect();
 
-        children
-            .into_par_iter()
-            .map(|(name_str, file_type)| {
-                Self::gather_package(
-                    scope_path.join(&name_str),
-                    store_entry.then(|| format!("{scope_name}/{name_str}")),
-                    file_type.is_dir(),
-                )
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
-            .collect()
+        par_map(children, |(name_str, file_type)| {
+            Self::gather_package(
+                scope_path.join(&name_str),
+                store_entry.then(|| format!("{scope_name}/{name_str}")),
+                file_type.is_dir(),
+            )
+        })
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// Gather each virtual-store entry's `node_modules` (entries come from
@@ -1375,13 +1360,10 @@ impl NpmCrawler {
     /// [`Self::collect_nested_store_entries_sync`]) under the store-entry
     /// policy, in parallel, preserving entry order.
     fn gather_store_entries(entries: Vec<StoreEntryDir>) -> Vec<ScanEvent> {
-        entries
-            .into_par_iter()
-            .map(|entry| ScanEvent::StoreEntry {
-                decoded: decode_pnpm_store_entry_name(&entry.name),
-                events: Self::gather_node_modules(&entry.node_modules, entry.listing, true),
-            })
-            .collect()
+        par_map(entries, |entry| ScanEvent::StoreEntry {
+            decoded: decode_pnpm_store_entry_name(&entry.name),
+            events: Self::gather_node_modules(&entry.node_modules, entry.listing, true),
+        })
     }
 
     /// Replay gathered [`ScanEvent`]s in order against `seen`, exactly as
@@ -1471,41 +1453,38 @@ impl NpmCrawler {
             })
             .collect();
 
-        candidates
-            .into_par_iter()
-            .map(|entry| {
-                let entry_path = store_path.join(&entry.name);
-                let entry_nm = entry_path.join("node_modules");
-                if read_listings {
-                    if let Some((entries, complete)) = read_dir_entries_sync(&entry_nm) {
-                        return vec![StoreEntryDir {
-                            name: entry.name_str,
-                            node_modules: entry_nm,
-                            listing: Some(Listing::from_entries(entries, complete)),
-                        }];
-                    }
-                }
-                if is_dir_sync(&entry_nm) {
-                    vec![StoreEntryDir {
+        par_map(candidates, |entry| {
+            let entry_path = store_path.join(&entry.name);
+            let entry_nm = entry_path.join("node_modules");
+            if read_listings {
+                if let Some((entries, complete)) = read_dir_entries_sync(&entry_nm) {
+                    return vec![StoreEntryDir {
                         name: entry.name_str,
                         node_modules: entry_nm,
-                        listing: None,
-                    }]
-                } else {
-                    Self::collect_nested_store_entries_sync(&entry_path)
-                        .into_iter()
-                        .map(|(name, node_modules)| StoreEntryDir {
-                            name,
-                            node_modules,
-                            listing: None,
-                        })
-                        .collect()
+                        listing: Some(Listing::from_entries(entries, complete)),
+                    }];
                 }
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
-            .collect()
+            }
+            if is_dir_sync(&entry_nm) {
+                vec![StoreEntryDir {
+                    name: entry.name_str,
+                    node_modules: entry_nm,
+                    listing: None,
+                }]
+            } else {
+                Self::collect_nested_store_entries_sync(&entry_path)
+                    .into_iter()
+                    .map(|(name, node_modules)| StoreEntryDir {
+                        name,
+                        node_modules,
+                        listing: None,
+                    })
+                    .collect()
+            }
+        })
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// Async `(name, node_modules)` view of

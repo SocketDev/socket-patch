@@ -1366,6 +1366,23 @@ mod tests {
         assert!(nonempty > 32, "only {nonempty} non-empty trees");
     }
 
+    /// With no walk pool (the OS refused every walk thread) the walk runs
+    /// sequentially on the calling thread and still matches the oracle.
+    #[tokio::test]
+    async fn walk_without_a_pool_matches_the_sequential_oracle() {
+        let _off = crate::crawlers::walk_pool::test_hooks::DisablePool::new();
+        for seed in 0..16u64 {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut guard = PermGuard(Vec::new());
+            let root = tmp.path().join("proj");
+            let mut gen = Gen::new(seed, tmp.path().join("scratch"));
+            gen.workspace(&root, 0);
+            gen.apply_locks(&mut guard);
+            assert_equivalent(&root, &format!("no pool, seed {seed}")).await;
+            drop(guard);
+        }
+    }
+
     /// Hand-built tree with one of every tricky shape (so each is covered
     /// regardless of what the random generator happens to draw), asserting
     /// equivalence and pinning a few load-bearing outcomes.
