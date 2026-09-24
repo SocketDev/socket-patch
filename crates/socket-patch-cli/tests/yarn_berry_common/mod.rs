@@ -122,6 +122,17 @@ pub fn corepack_command() -> std::process::Command {
     })
 }
 
+/// Both output streams of a finished yarn run, for a failure message. yarn
+/// berry reports its errors (YN0028, YN0018, …) on stdout and usually writes
+/// nothing to stderr, so a stderr-only message hides the reason.
+pub fn yarn_output(out: &Output) -> String {
+    format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
 /// Pin the yarn berry defaults that depend on whether yarn thinks it is
 /// running under CI. Apply it after the `YARN_*` scrub and `cache_env::isolate`,
 /// and before the call site's own env.

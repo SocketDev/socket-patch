@@ -330,7 +330,7 @@ async fn run_berry_capstone(driver: VendorDriver) {
         skip!(
             "SKIP e2e_vendor_yarn_berry_build: fixture `yarn install` failed (registry \
              unreachable?):\n{}",
-            String::from_utf8_lossy(&install.stderr)
+            yarn_berry_common::yarn_output(&install)
         );
         return;
     }

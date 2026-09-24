@@ -309,7 +309,7 @@ fn bootstrap_berry_checksum(tmp: &Path, patched_tgz: &Path) -> Option<String> {
     if !out.status.success() {
         skip!(
             "SKIP e2e_yarn4_pnpm_linker_build: bootstrap yarn install failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
+            yarn_berry_common::yarn_output(&out)
         );
         return None;
     }
@@ -348,7 +348,7 @@ fn install_pnpm_fixture(tag: &str, tmp: &Path, proj: &Path) -> Option<Vec<u8>> {
         skip!(
             "SKIP e2e_yarn4_pnpm_linker_build ({tag}): fixture `yarn install` failed \
              (registry unreachable?):\n{}",
-            String::from_utf8_lossy(&install.stderr)
+            yarn_berry_common::yarn_output(&install)
         );
         return None;
     }

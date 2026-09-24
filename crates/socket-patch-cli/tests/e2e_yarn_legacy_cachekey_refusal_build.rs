@@ -281,7 +281,7 @@ async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected
         skip!(
             "SKIP e2e_yarn_legacy_cachekey_refusal_build ({tag}): fixture `yarn install` \
              failed (registry unreachable?):\n{}",
-            String::from_utf8_lossy(&install.stderr)
+            yarn_berry_common::yarn_output(&install)
         );
         return;
     }
