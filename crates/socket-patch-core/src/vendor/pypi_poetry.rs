@@ -304,7 +304,7 @@ pub(super) async fn wire_poetry(
 
     let edits =
         if matches!(p.lock_version.as_str(), "0" | "1.0" | "1.1") || p.lock_text.contains("\r\n") {
-            let rewritten = crate::utils::poetry_lock::rewrite_poetry_lock(
+            let rewrite = crate::utils::poetry_lock::rewrite_poetry_lock_with_edits(
                 &p.lock_text,
                 canon_name,
                 version,
@@ -320,7 +320,8 @@ pub(super) async fn wire_poetry(
                     format!("no {canon_name}@{version} in {LOCK_FILE}"),
                 )
             })?;
-            crate::utils::poetry_lock::poetry_lock_edits(&p.lock_text, &rewritten, canon_name)
+            rewrite
+                .edits()
                 .map_err(|detail| ("pypi_poetry_lock_parse_failed", detail))?
         } else {
             vec![rewrite_target_package_unit(

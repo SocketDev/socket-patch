@@ -9,7 +9,7 @@ use toml_edit::DocumentMut;
 
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::utils::poetry_lock::{
-    generated_by_version, lock_version, poetry_lock_edits, rewrite_poetry_lock,
+    generated_by_version, lock_version, rewrite_poetry_lock_with_edits,
 };
 
 /// Whether the lock was written by a Poetry release older than 1.4. Those
@@ -36,6 +36,133 @@ pub(super) fn rewrite_poetry(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
+    let locks: Vec<(&String, &String)> = files
+        .iter()
+        .filter(|(path, _)| path.as_str() == "poetry.lock" || path.ends_with("/poetry.lock"))
+        .collect();
+    if locks.is_empty() {
+        return;
+    }
+    // Intake gate ONCE per dep, not once per lock file (uv parity).
+    let mut usable: Vec<(&DepOverride, &str)> = Vec::new();
+    for dep in overrides.iter().filter(|dep| dep.ecosystem == "pypi") {
+        result.python_lock_uuids.insert(dep.patch_uuid.clone());
+        match dep.integrity.sha256.as_deref() {
+            Some(sha256) => usable.push((dep, sha256)),
+            None => result.warnings.push(RewriteWarning {
+                code: "redirect_poetry_missing_sha256".into(),
+                detail: format!("{} has no SHA-256 integrity", dep.name),
+            }),
+        }
+    }
+    for (path, original) in locks {
+        let mut content = original.clone();
+        let mut stale_warned = false;
+        // `pre_1_4_writer` reads only the first line and `[metadata]
+        // lock-version`, which no package rewrite touches: judged once, on the
+        // lock as of its first rewrite (where it was always first judged).
+        let mut writer_format: Option<Option<&'static str>> = None;
+        for &(dep, sha256) in &usable {
+            let filename = dep.artifact_url.rsplit('/').next().unwrap_or("");
+            match rewrite_poetry_lock_with_edits(
+                &content,
+                &dep.name,
+                &dep.version,
+                "url",
+                &dep.artifact_url,
+                filename,
+                sha256,
+            ) {
+                Ok(Some(rewrite)) if rewrite.text != content => {
+                    match rewrite.edits() {
+                        Ok(edits) => {
+                            for (original, new) in edits {
+                                result.edits.push(FileEdit {
+                                    path: path.clone(),
+                                    kind: "redirect_poetry_lock_package".into(),
+                                    action: "rewritten".into(),
+                                    key: Some(format!("{}@{}", dep.name, dep.version)),
+                                    original: Some(Value::String(original)),
+                                    new: Some(Value::String(new)),
+                                });
+                            }
+                        }
+                        Err(detail) => {
+                            result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
+                            result.warnings.push(RewriteWarning {
+                                code: "redirect_poetry_lock_unsupported".into(),
+                                detail: format!("{path}: {detail}"),
+                            });
+                            continue;
+                        }
+                    }
+                    result.confirmed_python_lock_uuids.insert(dep.patch_uuid.clone());
+                    content = rewrite.text;
+                    if !stale_warned {
+                        if let Some(format) =
+                            *writer_format.get_or_insert_with(|| pre_1_4_writer(&content))
+                        {
+                            stale_warned = true;
+                            // Poetry 1.0 installs url sources through pip, which reads
+                            // the hash from the URL fragment; pip 22.3–23.0 take the
+                            // rest of the fragment (`&#egg=<name>`, appended by Poetry)
+                            // as part of the digest and refuse the install (measured;
+                            // pip <= 22.2 and >= 23.1 install and verify).
+                            let pip_note = if format == "1.0" {
+                                " Poetry 1.0 installs through pip: pip 22.3–23.0 misparse the \
+                                 hash fragment and refuse the install (fail-closed) — use pip \
+                                 <= 22.2 or >= 23.1 in the virtualenv."
+                            } else {
+                                ""
+                            };
+                            result.warnings.push(RewriteWarning {
+                                code: "redirect_poetry_stale_install_risk".into(),
+                                detail: format!(
+                                    "{path} was written by Poetry < 1.4, which does not replace \
+                                     an already-installed package at the same version: an \
+                                     existing virtualenv keeps the upstream {} until it is \
+                                     recreated (or the package is `pip uninstall`ed) before \
+                                     `poetry install`; fresh installs pick up the patched \
+                                     wheel.{pip_note}",
+                                    dep.name
+                                ),
+                            });
+                        }
+                    }
+                }
+                // Already redirected to this artifact (idempotent re-scan).
+                Ok(Some(_)) => {
+                    result.confirmed_python_lock_uuids.insert(dep.patch_uuid.clone());
+                }
+                Ok(None) => result.warnings.push(RewriteWarning {
+                    code: "redirect_poetry_entry_not_found".into(),
+                    detail: format!("no {path} entry for {}@{}", dep.name, dep.version),
+                }),
+                Err(detail) => {
+                    result.refused_python_lock_uuids.insert(dep.patch_uuid.clone());
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_poetry_lock_unsupported".into(),
+                        detail: format!("{path}: {detail}"),
+                    });
+                }
+            }
+        }
+        if content != *original {
+            result.files.insert(path.clone(), content);
+        }
+    }
+}
+
+/// The previous [`rewrite_poetry`], which re-derived each rewrite's edits
+/// and re-judged the lock's writer after every rewrite, kept as the
+/// equivalence oracle.
+#[cfg(test)]
+fn rewrite_poetry_reference(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    use crate::utils::poetry_lock::{poetry_lock_edits, rewrite_poetry_lock};
     let locks: Vec<(&String, &String)> = files
         .iter()
         .filter(|(path, _)| path.as_str() == "poetry.lock" || path.ends_with("/poetry.lock"))
@@ -143,6 +270,123 @@ pub(super) fn rewrite_poetry(
         }
         if content != *original {
             result.files.insert(path.clone(), content);
+        }
+    }
+}
+
+#[cfg(test)]
+mod equivalence_tests {
+    use super::*;
+    use crate::patch::redirect::Integrity;
+
+    const VERSIONS: &[&str] = &[
+        "0.12.17", "1.0.10", "1.1.15", "1.2.2", "1.3.2", "1.4.2", "1.5.1", "1.6.1", "1.7.1",
+        "1.8.5", "2.0.1", "2.1.4", "2.2.1", "2.3.4", "2.4.3",
+    ];
+    const SHA: &str = "34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07";
+
+    fn fixture(version: &str) -> String {
+        std::fs::read_to_string(format!(
+            "{}/tests/fixtures/poetry/{version}/poetry.lock",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replace("\r\n", "\n")
+    }
+
+    /// The single-package native fixture grown to `extra` more packages
+    /// (clones of the urllib3 unit, with their legacy integrity entries).
+    fn grown(version: &str, extra: usize) -> String {
+        let lock = fixture(version);
+        let meta = lock.find("\n[metadata]").unwrap();
+        let first = lock.find("[[package]]").unwrap();
+        let unit = &lock[first..meta];
+        let mut out = lock[..meta].to_string();
+        for i in 0..extra {
+            out.push('\n');
+            out.push_str(&unit.replace("name = \"urllib3\"", &format!("name = \"pkg{i}\"")));
+        }
+        let mut tail = lock[meta..].to_string();
+        let entries: String = (0..extra).map(|i| format!("\npkg{i} = []")).collect();
+        tail = tail.replacen("\nurllib3 = []", &format!("\nurllib3 = []{entries}"), 1);
+        out + &tail
+    }
+
+    fn dep(name: &str, version: &str, sha256: Option<&str>, uuid: usize) -> DepOverride {
+        let wheel = format!("{name}-{version}-py2.py3-none-any.whl");
+        DepOverride {
+            ecosystem: "pypi".into(),
+            name: name.into(),
+            namespace: None,
+            version: version.into(),
+            token: String::new(),
+            patch_uuid: format!("00000000-0000-4000-8000-{uuid:012}"),
+            artifact_url: format!("https://patch.socket.dev/patch/pypi/{name}/{uuid}/{wheel}"),
+            berry_zip_url: None,
+            registry_override: None,
+            integrity: Integrity {
+                sha256: sha256.map(str::to_string),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn overrides(extra: usize) -> Vec<DepOverride> {
+        let mut deps = vec![dep("urllib3", "1.26.18", Some(SHA), 0)];
+        for i in 0..extra {
+            deps.push(dep(&format!("pkg{i}"), "1.26.18", Some(SHA), i + 1));
+        }
+        deps.push(dep("absent", "1.0.0", Some(SHA), 900)); // entry not found
+        deps.push(dep("pkg0", "9.9.9", Some(SHA), 901)); // other version
+        deps.push(dep("nosha", "1.0.0", None, 902)); // intake refusal
+        deps.push(dep("pkg1", "1.26.18", Some("not-a-sha"), 903)); // rewriter refusal
+        deps
+    }
+
+    fn run(
+        f: fn(&BTreeMap<String, String>, &[DepOverride], &mut RewriteResult),
+        files: &BTreeMap<String, String>,
+        deps: &[DepOverride],
+    ) -> RewriteResult {
+        let mut result = RewriteResult::default();
+        f(files, deps, &mut result);
+        result
+    }
+
+    /// Every lock generation, LF and CRLF, in two lock files, then again over
+    /// the rewritten output (the idempotent re-scan): the production
+    /// rewriter's files, edits, warnings and uuid sets equal the oracle's.
+    #[test]
+    fn rewrite_matches_reference_on_every_lock_generation() {
+        for version in VERSIONS {
+            for extra in [0, 3] {
+                for crlf in [false, true] {
+                    let mut lock = grown(version, extra);
+                    if crlf {
+                        lock = lock.replace('\n', "\r\n");
+                    }
+                    let files = BTreeMap::from([
+                        ("poetry.lock".to_string(), lock.clone()),
+                        ("sub/poetry.lock".to_string(), lock),
+                        ("unrelated.txt".to_string(), "x".to_string()),
+                    ]);
+                    let deps = overrides(extra);
+                    let what = format!("{version} extra={extra} crlf={crlf}");
+                    let want = run(rewrite_poetry_reference, &files, &deps);
+                    let got = run(rewrite_poetry, &files, &deps);
+                    assert_eq!(format!("{got:?}"), format!("{want:?}"), "{what}");
+                    assert!(
+                        version.starts_with("0.") || !want.edits.is_empty(),
+                        "{what}: the corpus exercises the rewrite path"
+                    );
+
+                    let mut again = files.clone();
+                    again.extend(want.files.clone());
+                    let want = run(rewrite_poetry_reference, &again, &deps);
+                    let got = run(rewrite_poetry, &again, &deps);
+                    assert_eq!(format!("{got:?}"), format!("{want:?}"), "{what} re-run");
+                }
+            }
         }
     }
 }

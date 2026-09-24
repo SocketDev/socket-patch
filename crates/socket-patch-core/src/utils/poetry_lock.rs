@@ -130,6 +130,56 @@ pub fn rewrite_poetry_lock(
     filename: &str,
     sha256: &str,
 ) -> Result<Option<String>, String> {
+    Ok(rewrite_poetry_lock_with_edits(
+        text,
+        name,
+        version,
+        source_type,
+        source_url,
+        filename,
+        sha256,
+    )?
+    .map(|rewrite| rewrite.text))
+}
+
+/// A successful [`rewrite_poetry_lock_with_edits`].
+pub struct PoetryLockRewrite<'a> {
+    /// The rewritten lock text.
+    pub text: String,
+    original: &'a str,
+    name: &'a str,
+    /// The original's fragments, already taken to build `text`.
+    before: Vec<String>,
+    /// The fragment edits, when `text` is byte-identical to the serialized
+    /// document they were derived against (the common case: toml_edit
+    /// round-trips the untouched bytes) — then they are also the edits
+    /// against `text`.
+    known_edits: Option<Vec<(String, String)>>,
+}
+
+impl PoetryLockRewrite<'_> {
+    /// Exactly `poetry_lock_edits(original, &self.text, name)`, without
+    /// re-deriving what the rewrite already did.
+    pub fn edits(&self) -> Result<Vec<(String, String)>, String> {
+        if let Some(edits) = &self.known_edits {
+            return Ok(edits.clone());
+        }
+        let after = poetry_lock_fragments(&self.text, self.name)?;
+        pair_poetry_lock_fragments(self.original, &self.before, &self.text, after)
+    }
+}
+
+/// [`rewrite_poetry_lock`], also handing back what the caller needs to
+/// record the rewrite's fragment edits ([`PoetryLockRewrite::edits`]).
+pub fn rewrite_poetry_lock_with_edits<'a>(
+    text: &'a str,
+    name: &'a str,
+    version: &str,
+    source_type: &str,
+    source_url: &str,
+    filename: &str,
+    sha256: &str,
+) -> Result<Option<PoetryLockRewrite<'a>>, String> {
     if !matches!(source_type, "file" | "url")
         || sha256.len() != 64
         || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -262,12 +312,21 @@ pub fn rewrite_poetry_lock(
     if text.contains("\r\n") {
         rewritten = rewritten.replace("\r\n", "\n").replace('\n', "\r\n");
     }
-    let edits = poetry_lock_edits(text, &rewritten, name)?;
+    let before = poetry_lock_fragments(text, name)?;
+    let after = poetry_lock_fragments(&rewritten, name)?;
+    let edits = pair_poetry_lock_fragments(text, &before, &rewritten, after)?;
     let mut result = text.to_string();
-    for (original, replacement) in edits {
-        result = result.replacen(&original, &replacement, 1);
+    for (original, replacement) in &edits {
+        result = result.replacen(original, replacement, 1);
     }
-    Ok(Some(result))
+    let known_edits = (result == rewritten).then_some(edits);
+    Ok(Some(PoetryLockRewrite {
+        text: result,
+        original: text,
+        name,
+        before,
+        known_edits,
+    }))
 }
 
 /// End (exclusive, before its line break) of the first top-level TOML header
@@ -303,101 +362,114 @@ pub fn poetry_lock_edits(
     rewritten: &str,
     name: &str,
 ) -> Result<Vec<(String, String)>, String> {
-    fn fragments(text: &str, name: &str) -> Result<Vec<String>, String> {
-        let lock = toml_edit::Document::parse(text).map_err(|e| e.to_string())?;
-        let package = lock
-            .get("package")
-            .and_then(Item::as_array_of_tables)
-            .and_then(|packages| {
-                packages.iter().find(|package| {
-                    package
-                        .get("name")
-                        .and_then(Item::as_str)
-                        .is_some_and(|value| {
-                            canonicalize_pypi_name(value) == canonicalize_pypi_name(name)
-                        })
-                })
+    let before = poetry_lock_fragments(original, name)?;
+    let after = poetry_lock_fragments(rewritten, name)?;
+    pair_poetry_lock_fragments(original, &before, rewritten, after)
+}
+
+/// The fragments of `text` for `name` that [`poetry_lock_edits`] pairs up:
+/// the `[[package]]` unit and, for legacy formats, the integrity entry.
+fn poetry_lock_fragments(text: &str, name: &str) -> Result<Vec<String>, String> {
+    let lock = toml_edit::Document::parse(text).map_err(|e| e.to_string())?;
+    let package = lock
+        .get("package")
+        .and_then(Item::as_array_of_tables)
+        .and_then(|packages| {
+            packages.iter().find(|package| {
+                package
+                    .get("name")
+                    .and_then(Item::as_str)
+                    .is_some_and(|value| {
+                        canonicalize_pypi_name(value) == canonicalize_pypi_name(name)
+                    })
             })
-            .ok_or("missing Poetry package")?;
-        fn extend_span(table: &Table, span: &mut std::ops::Range<usize>) {
-            if let Some(own) = table.span() {
+        })
+        .ok_or("missing Poetry package")?;
+    fn extend_span(table: &Table, span: &mut std::ops::Range<usize>) {
+        if let Some(own) = table.span() {
+            span.start = span.start.min(own.start);
+            span.end = span.end.max(own.end);
+        }
+        for (_, item) in table.iter() {
+            if let Some(own) = item.span() {
                 span.start = span.start.min(own.start);
                 span.end = span.end.max(own.end);
             }
-            for (_, item) in table.iter() {
-                if let Some(own) = item.span() {
-                    span.start = span.start.min(own.start);
-                    span.end = span.end.max(own.end);
-                }
-                if let Some(child) = item.as_table() {
-                    extend_span(child, span);
-                }
+            if let Some(child) = item.as_table() {
+                extend_span(child, span);
             }
         }
-        let mut span = package.span().ok_or("missing Poetry package span")?;
-        extend_span(package, &mut span);
-        span.end += text[span.end..]
-            .find(['\r', '\n'])
-            .unwrap_or(text.len() - span.end);
-        // Carry the unit's BOUNDARY: the blank line(s) after it plus the next
-        // top-level header (`[[package]]`, `[metadata]`, `[extras]`, …) or
-        // EOF. The rewrite APPENDS `[package.source]` to the unit, so without
-        // the boundary the pristine fragment would be a strict prefix of every
-        // rewritten (or later relocked) unit: rollback's "already converged"
-        // check could never fire for lock 1.0, and a relock that dropped the
-        // inserted `files` line but kept the source block would match the
-        // pristine prefix and report a successful rollback while the lock
-        // still redirected. With the header included, the pristine fragment
-        // matches only a unit that really ends where it ended.
-        span.end = next_header_end(text, span.end);
-        let mut result = vec![text[span].to_string()];
-        let metadata = lock
-            .get("metadata")
-            .filter(|item| item.is_table_like())
-            .ok_or("missing Poetry metadata")?;
-        let format = metadata
-            .get("lock-version")
-            .and_then(Item::as_str)
-            .unwrap_or("0");
-        if !format.starts_with('2') {
-            let field = if format == "0" { "hashes" } else { "files" };
-            let table = metadata
-                .get(field)
-                .and_then(Item::as_table)
-                .ok_or_else(|| format!("missing Poetry integrity table [metadata.{field}]"))?;
-            let package_name = package
-                .get("name")
-                .and_then(Item::as_str)
-                .ok_or("missing package name")?;
-            let key_start = table
-                .key(package_name)
-                .and_then(|key| key.span())
-                .ok_or("missing Poetry integrity key")?
-                .start;
-            // Anchor the fragment at the preceding line break so a
-            // suffix-named sibling entry (`pyurllib3 = […]` vs `urllib3 = […]`)
-            // holding the same value can never contain it.
-            let start = text[..key_start].rfind('\n').unwrap_or(key_start);
-            let end = table
-                .get(package_name)
-                .and_then(Item::span)
-                .ok_or("missing Poetry integrity span")?
-                .end;
-            result.push(text[start..end].to_string());
-        }
-        Ok(result)
     }
-    let before = fragments(original, name)?;
-    let after = fragments(rewritten, name)?;
+    let mut span = package.span().ok_or("missing Poetry package span")?;
+    extend_span(package, &mut span);
+    span.end += text[span.end..]
+        .find(['\r', '\n'])
+        .unwrap_or(text.len() - span.end);
+    // Carry the unit's BOUNDARY: the blank line(s) after it plus the next
+    // top-level header (`[[package]]`, `[metadata]`, `[extras]`, …) or
+    // EOF. The rewrite APPENDS `[package.source]` to the unit, so without
+    // the boundary the pristine fragment would be a strict prefix of every
+    // rewritten (or later relocked) unit: rollback's "already converged"
+    // check could never fire for lock 1.0, and a relock that dropped the
+    // inserted `files` line but kept the source block would match the
+    // pristine prefix and report a successful rollback while the lock
+    // still redirected. With the header included, the pristine fragment
+    // matches only a unit that really ends where it ended.
+    span.end = next_header_end(text, span.end);
+    let mut result = vec![text[span].to_string()];
+    let metadata = lock
+        .get("metadata")
+        .filter(|item| item.is_table_like())
+        .ok_or("missing Poetry metadata")?;
+    let format = metadata
+        .get("lock-version")
+        .and_then(Item::as_str)
+        .unwrap_or("0");
+    if !format.starts_with('2') {
+        let field = if format == "0" { "hashes" } else { "files" };
+        let table = metadata
+            .get(field)
+            .and_then(Item::as_table)
+            .ok_or_else(|| format!("missing Poetry integrity table [metadata.{field}]"))?;
+        let package_name = package
+            .get("name")
+            .and_then(Item::as_str)
+            .ok_or("missing package name")?;
+        let key_start = table
+            .key(package_name)
+            .and_then(|key| key.span())
+            .ok_or("missing Poetry integrity key")?
+            .start;
+        // Anchor the fragment at the preceding line break so a
+        // suffix-named sibling entry (`pyurllib3 = […]` vs `urllib3 = […]`)
+        // holding the same value can never contain it.
+        let start = text[..key_start].rfind('\n').unwrap_or(key_start);
+        let end = table
+            .get(package_name)
+            .and_then(Item::span)
+            .ok_or("missing Poetry integrity span")?
+            .end;
+        result.push(text[start..end].to_string());
+    }
+    Ok(result)
+}
+
+/// [`poetry_lock_edits`] over fragments already taken from both sides.
+fn pair_poetry_lock_fragments(
+    original: &str,
+    before: &[String],
+    rewritten: &str,
+    after: Vec<String>,
+) -> Result<Vec<(String, String)>, String> {
     let mut edits = Vec::new();
-    for (old, new) in before.into_iter().zip(after) {
-        if old == new {
+    for (old, new) in before.iter().zip(after) {
+        if *old == new {
             continue;
         }
-        if original.matches(&old).count() != 1 || rewritten.matches(&new).count() != 1 {
+        if original.matches(old.as_str()).count() != 1 || rewritten.matches(&new).count() != 1 {
             return Err("ambiguous Poetry rollback fragment".into());
         }
-        edits.push((old, new));
+        edits.push((old.clone(), new));
     }
     Ok(edits)
 }
@@ -601,5 +673,39 @@ mod tests {
         assert_eq!(generated_by_version(&fixture("2.4.3")), Some((2, 4)));
         assert_eq!(generated_by_version(&fixture("1.3.2")), None);
         assert_eq!(generated_by_version(&fixture("1.2.2")), None);
+    }
+
+    /// The edits a rewrite hands back are exactly `poetry_lock_edits` of its
+    /// input and output — whether reused from the rewrite or re-derived.
+    #[test]
+    fn rewrite_edits_equal_poetry_lock_edits() {
+        for version in [
+            "0.12.17", "1.0.10", "1.1.15", "1.2.2", "1.3.2", "1.4.2", "1.8.5", "2.0.1", "2.4.3",
+        ] {
+            for crlf in [false, true] {
+                let mut text = fixture(version);
+                if crlf {
+                    text = text.replace('\n', "\r\n");
+                }
+                let rewrite = rewrite_poetry_lock_with_edits(
+                    &text,
+                    "urllib3",
+                    "1.26.18",
+                    "file",
+                    ".socket/vendor/pypi/x/urllib3-1.26.18-py2.py3-none-any.whl",
+                    WHEEL,
+                    &sha(),
+                )
+                .unwrap()
+                .unwrap();
+                let want = poetry_lock_edits(&text, &rewrite.text, "urllib3");
+                assert_eq!(rewrite.edits(), want, "{version} crlf={crlf}");
+                let rederived = PoetryLockRewrite {
+                    known_edits: None,
+                    ..rewrite
+                };
+                assert_eq!(rederived.edits(), want, "{version} crlf={crlf} re-derived");
+            }
+        }
     }
 }
