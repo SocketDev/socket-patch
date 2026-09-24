@@ -451,6 +451,10 @@ pub fn check_python_lock_source_scope(text: &str, name: &str, version: &str) -> 
     let document: DocumentMut = text
         .parse()
         .map_err(|error| format!("invalid Python lock: {error}"))?;
+    source_scope(&document, name, version)
+}
+
+fn source_scope(document: &DocumentMut, name: &str, version: &str) -> Result<(), String> {
     let name = canonicalize_pypi_name(name);
     for collection in ["package", "distribution"] {
         if let Some(packages) = document.get(collection).and_then(Item::as_array_of_tables) {
@@ -622,22 +626,33 @@ pub fn complete_python_lock_metadata(
     Ok(preserve_line_endings(text, document.to_string()))
 }
 
-pub fn rewrite_python_lock(
+/// Everything [`rewrite_python_lock`] decides before it mutates the
+/// document: every refusal (`Err`) and every not-applicable (`None`) is
+/// settled here, so a plan that exists always rewrites.
+struct PythonLockPlan {
+    pep751: bool,
+    legacy: bool,
+    collection: &'static str,
+    index: usize,
+    name: String,
+    original_source: Option<Item>,
+    legacy_strings: bool,
+    legacy_artifact_tables: bool,
+}
+
+fn plan_python_lock_rewrite(
+    document: &DocumentMut,
     text: &str,
     name: &str,
     version: &str,
     artifact: ArtifactSource<'_>,
-    sha256: &str,
-) -> Result<Option<String>, String> {
-    let mut document: DocumentMut = text
-        .parse()
-        .map_err(|error| format!("invalid Python lock: {error}"))?;
+) -> Result<Option<PythonLockPlan>, String> {
     if document
         .get("manifest")
         .and_then(Item::as_table_like)
         .is_some_and(|manifest| manifest.contains_key("requirements"))
     {
-        check_python_lock_source_scope(text, name, version)?;
+        source_scope(document, name, version)?;
     }
     let pep751 = document.get("lock-version").is_some();
     let legacy = document.get("distribution").is_some();
@@ -656,10 +671,7 @@ pub fn rewrite_python_lock(
         "package"
     };
     let name = canonicalize_pypi_name(name);
-    let Some(packages) = document
-        .get_mut(collection)
-        .and_then(Item::as_array_of_tables_mut)
-    else {
+    let Some(packages) = document.get(collection).and_then(Item::as_array_of_tables) else {
         return Ok(None);
     };
     let matches: Vec<usize> = packages
@@ -672,12 +684,10 @@ pub fn rewrite_python_lock(
             "multiple lock entries for {name}@{version}; source selection is ambiguous"
         ));
     }
-    let Some(index) = matches.first() else {
+    let Some(&index) = matches.first() else {
         return Ok(None);
     };
-    let package = packages
-        .get_mut(*index)
-        .expect("matching package index exists");
+    let package = packages.get(index).expect("matching package index exists");
     let original_source = package.get("source").cloned();
     // uv 0.2.18 through 0.2.34 kept the `[[distribution]]` table name but had
     // already moved to inline-table sources (`source = { registry = … }`,
@@ -731,8 +741,7 @@ pub fn rewrite_python_lock(
         .rsplit('/')
         .next()
         .unwrap_or(&location);
-    let wheel = filename.ends_with(".whl");
-    if !wheel
+    if !filename.ends_with(".whl")
         && !filename.ends_with(".tar.gz")
         && !filename.ends_with(".zip")
         && !filename.ends_with(".tar.bz2")
@@ -740,6 +749,91 @@ pub fn rewrite_python_lock(
     {
         return Err("patch artifact is not a Python distribution archive".to_string());
     }
+    if !pep751 && legacy && matches!(artifact, ArtifactSource::Path(_)) {
+        // Both `[[distribution]]` shapes record ABSOLUTE paths/file URLs
+        // for local artifacts (uv 0.2.34 writes `source = { path = "/abs/…" }`
+        // and `wheels = [{ url = "file:///abs/…" }]`), so a committed
+        // relative wheel cannot be expressed portably before 0.2.35.
+        return Err("uv `[[distribution]]` lockfiles (uv < 0.2.35, experimental `uv lock`) cannot carry a portable local wheel: `--locked` rejects relative paths and `uv lock`/`uv sync` rewrite them to absolute ones; upgrade to uv >=0.2.35 for native vendoring, or use a requirements.txt installation".to_string());
+    }
+    Ok(Some(PythonLockPlan {
+        pep751,
+        legacy,
+        collection,
+        index,
+        name,
+        original_source,
+        legacy_strings,
+        legacy_artifact_tables,
+    }))
+}
+
+/// A Python lock parsed ONCE for repeated "would [`rewrite_python_lock`]
+/// rewrite this dep?" checks — the hosted wheel-metadata gate asks it for
+/// every pypi dep without re-parsing and re-serializing the lock each time.
+pub struct PythonLockProbe<'t> {
+    text: &'t str,
+    /// `None` when the lock does not parse (every dep then probes false,
+    /// as `rewrite_python_lock`'s `Err` would).
+    document: Option<DocumentMut>,
+}
+
+impl<'t> PythonLockProbe<'t> {
+    pub fn new(text: &'t str) -> Self {
+        Self {
+            text,
+            document: text.parse().ok(),
+        }
+    }
+
+    /// Exactly `matches!(rewrite_python_lock(text, …), Ok(Some(_)))`.
+    pub fn rewrites(&self, name: &str, version: &str, artifact: ArtifactSource<'_>) -> bool {
+        self.document.as_ref().is_some_and(|document| {
+            matches!(
+                plan_python_lock_rewrite(document, self.text, name, version, artifact),
+                Ok(Some(_))
+            )
+        })
+    }
+}
+
+pub fn rewrite_python_lock(
+    text: &str,
+    name: &str,
+    version: &str,
+    artifact: ArtifactSource<'_>,
+    sha256: &str,
+) -> Result<Option<String>, String> {
+    let mut document: DocumentMut = text
+        .parse()
+        .map_err(|error| format!("invalid Python lock: {error}"))?;
+    let Some(PythonLockPlan {
+        pep751,
+        legacy,
+        collection,
+        index,
+        name,
+        original_source,
+        legacy_strings,
+        legacy_artifact_tables,
+    }) = plan_python_lock_rewrite(&document, text, name, version, artifact)?
+    else {
+        return Ok(None);
+    };
+    let package = document
+        .get_mut(collection)
+        .and_then(Item::as_array_of_tables_mut)
+        .and_then(|packages| packages.get_mut(index))
+        .expect("planned package index exists");
+    let location = artifact.location();
+    let filename = location
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(&location)
+        .rsplit('/')
+        .next()
+        .unwrap_or(&location);
+    let wheel = filename.ends_with(".whl");
     for key in ["sdist", "wheel", "wheels", "archive"] {
         package.remove(key);
     }
@@ -754,13 +848,7 @@ pub fn rewrite_python_lock(
             ])),
         );
     } else {
-        let source = if legacy && matches!(artifact, ArtifactSource::Path(_)) {
-            // Both `[[distribution]]` shapes record ABSOLUTE paths/file URLs
-            // for local artifacts (uv 0.2.34 writes `source = { path = "/abs/…" }`
-            // and `wheels = [{ url = "file:///abs/…" }]`), so a committed
-            // relative wheel cannot be expressed portably before 0.2.35.
-            return Err("uv `[[distribution]]` lockfiles (uv < 0.2.35, experimental `uv lock`) cannot carry a portable local wheel: `--locked` rejects relative paths and `uv lock`/`uv sync` rewrite them to absolute ones; upgrade to uv >=0.2.35 for native vendoring, or use a requirements.txt installation".to_string());
-        } else if legacy_strings {
+        let source = if legacy_strings {
             Item::Value(Value::from(format!("direct+{location}")))
         } else {
             Item::Value(inline(&[(artifact.key(), Value::from(location.clone()))]))
@@ -1608,6 +1696,143 @@ wheels = [
         assert!(
             manifest.as_table_like().unwrap().get("overrides").is_none(),
             "a direct dependency must not gain an overrides array: {rewritten}"
+        );
+    }
+}
+
+/// `PythonLockProbe::rewrites` must agree with `rewrite_python_lock`
+/// returning `Ok(Some(_))` for every lock shape and every refusal /
+/// not-applicable path — the hosted wheel-metadata gate relies on it.
+#[cfg(test)]
+mod probe_equivalence_tests {
+    use super::{rewrite_python_lock, ArtifactSource, PythonLockProbe};
+
+    const SHA256: &str = "ccc9a9e0b18a5efc7038c504cfc580e47d2e02e5390f2e29cad833cbccb956b6";
+    const NATIVE: &str = r#"version = 1
+revision = 3
+
+[[package]]
+name = "project"
+version = "1"
+source = { virtual = "." }
+dependencies = [
+    { name = "urllib3", version = "1.26.18", source = { registry = "https://pypi.org/simple" } },
+]
+
+[[package]]
+name = "urllib3"
+version = "1.26.18"
+source = { registry = "https://pypi.org/simple" }
+wheels = [{ url = "https://pypi.org/urllib3-1.26.18-py2.py3-none-any.whl", hash = "sha256:old" }]
+
+[[package]]
+name = "Zope.Interface"
+version = "6.0"
+source = { git = "https://example.test/zope" }
+
+[[package]]
+name = "six"
+version = "1.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://pypi.org/six-1.16.0.tar.gz", hash = "sha256:old" }
+"#;
+    const LEGACY_STRINGS: &str = r#"version = 1
+
+[[distribution]]
+name = "urllib3"
+version = "1.26.18"
+source = "registry+https://pypi.org/simple"
+
+[[distribution.wheel]]
+url = "https://pypi.org/urllib3-1.26.18-py2.py3-none-any.whl"
+hash = "sha256:old"
+
+[[distribution]]
+name = "six"
+version = "1.16.0"
+source = "git+https://example.test/six"
+"#;
+    const PEP751: &str = r#"lock-version = "1.0"
+
+[[packages]]
+name = "urllib3"
+version = "1.26.18"
+index = "https://pypi.org/simple"
+wheels = [{ url = "https://pypi.org/urllib3-1.26.18-py2.py3-none-any.whl", hashes = { sha256 = "old" } }]
+
+[[packages]]
+name = "six"
+version = "1.16.0"
+vcs = { type = "git", url = "https://example.test/six", commit-id = "abc" }
+"#;
+
+    #[test]
+    fn probe_matches_rewrite_outcome_for_every_shape() {
+        let script = NATIVE.replacen(
+            "[[package]]",
+            "[manifest]\nrequirements = [{ name = \"urllib3\", specifier = \"==1.26.18\" }]\n\n[[package]]",
+            1,
+        );
+        let multi_version = format!(
+            "{script}\n[[package]]\nname = \"urllib3\"\nversion = \"2.0.0\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\n"
+        );
+        let duplicate = NATIVE.replace(
+            "name = \"six\"\nversion = \"1.16.0\"",
+            "name = \"urllib3\"\nversion = \"1.26.18\"",
+        );
+        let locks = [
+            NATIVE.to_string(),
+            NATIVE.replace("\n", "\r\n"),
+            script,
+            multi_version,
+            duplicate,
+            LEGACY_STRINGS.to_string(),
+            PEP751.to_string(),
+            "version = 2\n".to_string(),
+            "lock-version = '2.0'\n".to_string(),
+            "version = 1\n".to_string(),
+            "this is [not toml".to_string(),
+        ];
+        let wheel = "https://patch.socket.dev/pkg/urllib3-1.26.18-py2.py3-none-any.whl";
+        let sdist = "https://patch.socket.dev/pkg/six-1.16.0.tar.gz?token=x#frag";
+        let artifacts = [
+            ArtifactSource::Url(wheel),
+            ArtifactSource::Url(sdist),
+            ArtifactSource::Url("https://patch.socket.dev/pkg/urllib3.exe"),
+            ArtifactSource::Path(".socket/vendor/pypi/id/urllib3-1.26.18-py2.py3-none-any.whl"),
+        ];
+        let targets = [
+            ("urllib3", "1.26.18"),
+            ("URLLIB3", "1.26.18"),
+            ("urllib3", "2.0.0"),
+            ("urllib3", "9.9.9"),
+            ("six", "1.16.0"),
+            ("zope-interface", "6.0"),
+            ("absent", "1.0"),
+        ];
+        let mut outcomes = std::collections::BTreeSet::new();
+        for lock in &locks {
+            let probe = PythonLockProbe::new(lock);
+            for (name, version) in targets {
+                for artifact in artifacts {
+                    let rewrite = rewrite_python_lock(lock, name, version, artifact, SHA256);
+                    outcomes.insert(match &rewrite {
+                        Ok(Some(_)) => "some",
+                        Ok(None) => "none",
+                        Err(_) => "err",
+                    });
+                    assert_eq!(
+                        probe.rewrites(name, version, artifact),
+                        matches!(rewrite, Ok(Some(_))),
+                        "{name}@{version} via {artifact:?} over:\n{lock}\nrewrite: {rewrite:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            outcomes.len(),
+            3,
+            "every outcome is exercised: {outcomes:?}"
         );
     }
 }

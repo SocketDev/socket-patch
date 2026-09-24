@@ -1779,66 +1779,90 @@ pub(crate) async fn run_redirect_selected(
     // it rides the same atomic-write / ledger-first machinery as the locks.
     let mut python_metadata = std::collections::BTreeMap::new();
     let mut unavailable_python_artifacts = std::collections::BTreeSet::new();
-    for dep in candidates
-        .iter()
-        .map(|c| &c.dep)
-        .filter(|dep| dep.ecosystem == "pypi")
     {
-        let Some(sha256) = dep.integrity.sha256.as_deref() else {
-            continue;
-        };
-        if !dep
-            .artifact_url
-            .split(['?', '#'])
-            .next()
-            .is_some_and(|path| path.ends_with(".whl"))
-        {
-            continue;
-        }
-        let native_target = files
+        use socket_patch_core::utils::python_lock::{ArtifactSource, PythonLockProbe};
+        // Each native Python lock is parsed once, on the first dep that
+        // needs the probe, rather than rewritten per dep just to learn
+        // whether it would be.
+        let mut probes: Option<Vec<PythonLockProbe>> = None;
+        let mut wheel_deps: Vec<(&DepOverride, &str)> = Vec::new();
+        for dep in candidates
             .iter()
-            .filter(|(path, _)| {
-                *path == "uv.lock"
-                    || socket_patch_core::utils::python_lock::is_script_lock_name(path)
-            })
-            .any(|(_, text)| {
-                socket_patch_core::utils::python_lock::rewrite_python_lock(
-                    text,
-                    &dep.name,
-                    &dep.version,
-                    socket_patch_core::utils::python_lock::ArtifactSource::Url(&dep.artifact_url),
+            .map(|c| &c.dep)
+            .filter(|dep| dep.ecosystem == "pypi")
+        {
+            let Some(sha256) = dep.integrity.sha256.as_deref() else {
+                continue;
+            };
+            if !dep
+                .artifact_url
+                .split(['?', '#'])
+                .next()
+                .is_some_and(|path| path.ends_with(".whl"))
+            {
+                continue;
+            }
+            let native_target = probes
+                .get_or_insert_with(|| {
+                    files
+                        .iter()
+                        .filter(|(path, _)| {
+                            *path == "uv.lock"
+                                || socket_patch_core::utils::python_lock::is_script_lock_name(path)
+                        })
+                        .map(|(_, text)| PythonLockProbe::new(text))
+                        .collect()
+                })
+                .iter()
+                .any(|probe| {
+                    probe.rewrites(
+                        &dep.name,
+                        &dep.version,
+                        ArtifactSource::Url(&dep.artifact_url),
+                    )
+                });
+            if native_target {
+                wheel_deps.push((dep, sha256));
+            }
+        }
+        // The wheels are fetched concurrently but folded in dep order, so
+        // `python_metadata`, `unavailable_python_artifacts` and `skipped`
+        // come out exactly as the serial loop's did.
+        // TODO(perf): switch to `utils::concurrent::ordered_concurrent` once
+        // it lands (added in parallel on the scan-concurrency branch).
+        const WHEEL_METADATA_CONCURRENCY: usize = 8;
+        use futures_util::StreamExt as _;
+        let mut fetches = std::pin::pin!(futures_util::stream::iter(wheel_deps.iter())
+            .map(|&(dep, sha256)| {
+                socket_patch_core::vendor::pypi::fetch_hosted_wheel_metadata(
+                    api_client,
+                    &dep.artifact_url,
                     sha256,
                 )
-                .ok()
-                .flatten()
-                .is_some()
-            });
-        if !native_target {
-            continue;
-        }
-        status.set(format!(
-            "Fetching hosted wheel metadata for {}...",
-            dep.name
-        ));
-        match socket_patch_core::vendor::pypi::fetch_hosted_wheel_metadata(
-            api_client,
-            &dep.artifact_url,
-            sha256,
-        )
-        .await
-        {
-            Ok(Some(metadata)) => {
-                python_metadata.insert(dep.artifact_url.clone(), metadata);
-            }
-            Ok(None) => {}
-            Err(detail) => {
-                unavailable_python_artifacts.insert(dep.artifact_url.clone());
-                skipped.push(serde_json::json!({
-                    "purl": format!("pkg:pypi/{}@{}", dep.name, dep.version),
-                    "uuid": dep.patch_uuid,
-                    "reason": "python_metadata_unavailable",
-                    "detail": detail.replace(&dep.artifact_url, "<hosted artifact>"),
-                }));
+            })
+            .buffered(WHEEL_METADATA_CONCURRENCY));
+        for &(dep, _) in &wheel_deps {
+            status.set(format!(
+                "Fetching hosted wheel metadata for {}...",
+                dep.name
+            ));
+            let Some(fetched) = fetches.next().await else {
+                break;
+            };
+            match fetched {
+                Ok(Some(metadata)) => {
+                    python_metadata.insert(dep.artifact_url.clone(), metadata);
+                }
+                Ok(None) => {}
+                Err(detail) => {
+                    unavailable_python_artifacts.insert(dep.artifact_url.clone());
+                    skipped.push(serde_json::json!({
+                        "purl": format!("pkg:pypi/{}@{}", dep.name, dep.version),
+                        "uuid": dep.patch_uuid,
+                        "reason": "python_metadata_unavailable",
+                        "detail": detail.replace(&dep.artifact_url, "<hosted artifact>"),
+                    }));
+                }
             }
         }
     }
