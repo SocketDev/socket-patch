@@ -18,6 +18,7 @@
 //! CLI_CONTRACT.md "Ownership, state, and reversal".
 
 use clap::Args;
+use futures_util::StreamExt;
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::constants::SOCKET_DIR;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
@@ -25,6 +26,7 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
+use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::{
@@ -1131,6 +1133,58 @@ pub(crate) async fn fetch_pristine_package(
     }
 }
 
+/// Where a vendorable purl with no installed copy stands after the local
+/// rungs of the pristine-source ladder (see [`missing_local_rung`]).
+enum MissingRung {
+    /// Staged from its own committed artifact (sha256-verified).
+    Staged(registry_fetch::FetchedPackage),
+    /// Its committed artifact is present but corrupt (the detail).
+    StageFailed(String),
+    /// `--offline`: no registry rung.
+    Offline,
+    /// Left for the registry fetch ([`fetch_pristine_package`]).
+    Fetch,
+}
+
+/// The local rungs for one missing purl, deciding without emitting
+/// anything: an already-vendored npm purl with no installed copy (fresh
+/// clone) stages from its own committed artifact, sha256-verified against
+/// the ledger — offline-safe, no registry traffic — and `--offline` stops
+/// before the registry. Also returns the committed artifact's path when it
+/// is missing (the caller's `vendor_artifact_missing` warning; the purl
+/// then falls through to the registry ladder, which recovers the
+/// pre-vendor resolution from the ledger and rebuilds).
+async fn missing_local_rung(
+    common: &GlobalArgs,
+    ledger_entry: Option<&VendorEntry>,
+) -> (Option<String>, MissingRung) {
+    let mut artifact_missing = None;
+    if let Some(entry) =
+        ledger_entry.filter(|e| e.ecosystem == "npm" && e.artifact.path.ends_with(".tgz"))
+    {
+        let tgz = common.cwd.join(&entry.artifact.path);
+        if tokio::fs::metadata(&tgz).await.is_err() {
+            artifact_missing = Some(entry.artifact.path.clone());
+        } else {
+            match registry_fetch::stage_local_artifact(&tgz, &entry.artifact.sha256).await {
+                Ok(staged) => return (None, MissingRung::Staged(staged)),
+                Err(registry_fetch::FetchError::Failed(detail)) => {
+                    return (None, MissingRung::StageFailed(detail))
+                }
+                // No recorded hash (legacy ledger) — fall through to the
+                // lockfile/registry path.
+                Err(registry_fetch::FetchError::Unverifiable(_)) => {}
+            }
+        }
+    }
+    let rung = if common.offline {
+        MissingRung::Offline
+    } else {
+        MissingRung::Fetch
+    };
+    (artifact_missing, rung)
+}
+
 /// The vendoring engine, decoupled from the manifest file. `records` is the
 /// purl → [`PatchRecord`] view to vendor: `manifest.patches` for the
 /// manifest-driven `vendor` command, or the in-memory record map
@@ -1318,76 +1372,101 @@ pub(crate) async fn vendor_records_reusing(
             .collect();
         if !missing.is_empty() {
             let client = registry_fetch::build_registry_client();
-            // Artifact-staging path: an already-vendored purl with no
-            // installed copy (fresh clone) stages from its own committed
-            // artifact, sha256-verified against the ledger — offline-safe,
-            // no registry traffic.
-            for purl in &missing {
-                let ledger_entry = lookup_entry(&state.entries, purl);
-                if let Some(entry) = ledger_entry
-                    .filter(|e| e.ecosystem == "npm" && e.artifact.path.ends_with(".tgz"))
-                {
-                    let tgz = common.cwd.join(&entry.artifact.path);
-                    if tokio::fs::metadata(&tgz).await.is_err() {
-                        // The committed artifact is GONE (gitignored or
-                        // deleted): not corruption — fall through to the
-                        // registry ladder, which recovers the pre-vendor
-                        // resolution from the ledger and rebuilds.
-                        record_warning(
-                            env,
-                            purl,
-                            &VendorWarning::new(
-                                "vendor_artifact_missing",
-                                format!(
-                                    "the committed vendored artifact {} is missing; \
-                                     recovering the registry resolution to rebuild it",
-                                    entry.artifact.path
-                                ),
-                            ),
-                            common,
-                        );
-                    } else {
-                        match registry_fetch::stage_local_artifact(&tgz, &entry.artifact.sha256)
-                            .await
-                        {
-                            Ok(staged) => {
-                                all_packages.insert(purl.clone(), staged.dir().to_path_buf());
-                                fetched_holders.push(staged);
-                                continue;
-                            }
-                            Err(registry_fetch::FetchError::Failed(detail)) => {
-                                // A PRESENT-but-corrupt committed artifact is
-                                // worth a loud failure — silently re-vendoring
-                                // over it would mask the corruption.
-                                fetch_failed.insert(purl.clone());
-                                let detail = format!(
-                                    "{detail}; run `socket-patch repair` to rebuild the \
-                                     vendored artifact"
-                                );
-                                env.record(
-                                    PatchEvent::new(PatchAction::Failed, purl.clone())
-                                        .with_error("vendor_fetch_failed", detail.clone()),
-                                );
-                                report_vendor_failure(common, purl, &detail);
-                                continue;
-                            }
-                            Err(registry_fetch::FetchError::Unverifiable(_)) => {
-                                // No recorded hash (legacy ledger) — fall
-                                // through to the lockfile/registry path.
-                            }
-                        }
-                    }
+            // Two passes over `missing`, so the registry fetches can run
+            // concurrently while every event, warning and stderr line still
+            // lands in `missing` order, exactly as the one-purl-at-a-time
+            // loop emitted them. Pass 1 decides each purl's local rungs (the
+            // committed-artifact staging and the offline stop: local and
+            // read-only, so deciding them early changes nothing) without
+            // emitting anything; the purls left for the registry are then
+            // fetched at most `api_concurrency` at a time, in order, and
+            // pass 2 emits every purl's outcome in turn.
+            let rungs: Vec<(Option<String>, MissingRung)> = {
+                let mut rungs = Vec::with_capacity(missing.len());
+                for purl in &missing {
+                    rungs
+                        .push(missing_local_rung(common, lookup_entry(&state.entries, purl)).await);
                 }
-                if common.offline {
+                rungs
+            };
+            // Parsed only when some purl reaches the registry rung (the
+            // serial loop's lazy first use).
+            if inventory.is_none() && rungs.iter().any(|(_, r)| matches!(r, MissingRung::Fetch)) {
+                inventory = Some(lock_inventory::inventory_project(&common.cwd).await);
+            }
+            let inv = inventory.as_deref().unwrap_or_default();
+            let (cwd, client, ledger) = (&common.cwd, &client, &state.entries);
+            let to_fetch: Vec<&String> = missing
+                .iter()
+                .zip(&rungs)
+                .filter(|(_, (_, rung))| matches!(rung, MissingRung::Fetch))
+                .map(|(purl, _)| purl)
+                .collect();
+            let mut pristine = std::pin::pin!(ordered_concurrent(
+                to_fetch,
+                api_concurrency(false),
+                |purl| fetch_pristine_package(cwd, inv, client, purl, lookup_entry(ledger, purl)),
+            ));
+            for (purl, (artifact_missing, rung)) in missing.iter().zip(rungs) {
+                if let Some(artifact) = artifact_missing {
+                    // The committed artifact is GONE (gitignored or
+                    // deleted): not corruption — fall through to the
+                    // registry ladder, which recovers the pre-vendor
+                    // resolution from the ledger and rebuilds.
+                    record_warning(
+                        env,
+                        purl,
+                        &VendorWarning::new(
+                            "vendor_artifact_missing",
+                            format!(
+                                "the committed vendored artifact {artifact} is missing; \
+                                 recovering the registry resolution to rebuild it"
+                            ),
+                        ),
+                        common,
+                    );
+                }
+                let fetched = match rung {
+                    MissingRung::Staged(staged) => {
+                        all_packages.insert(purl.clone(), staged.dir().to_path_buf());
+                        fetched_holders.push(staged);
+                        continue;
+                    }
+                    MissingRung::StageFailed(detail) => {
+                        // A PRESENT-but-corrupt committed artifact is
+                        // worth a loud failure — silently re-vendoring
+                        // over it would mask the corruption.
+                        fetch_failed.insert(purl.clone());
+                        let detail = format!(
+                            "{detail}; run `socket-patch repair` to rebuild the \
+                             vendored artifact"
+                        );
+                        env.record(
+                            PatchEvent::new(PatchAction::Failed, purl.clone())
+                                .with_error("vendor_fetch_failed", detail.clone()),
+                        );
+                        report_vendor_failure(common, purl, &detail);
+                        continue;
+                    }
                     // The enriched skip detail lands below in the unmatched
                     // pass (the purl stays unmatched).
-                    continue;
-                }
-                if inventory.is_none() {
-                    inventory = Some(lock_inventory::inventory_project(&common.cwd).await);
-                }
-                let inv = inventory.as_deref().expect("filled just above");
-                match fetch_pristine_package(&common.cwd, inv, &client, purl, ledger_entry).await {
+                    MissingRung::Offline => continue,
+                    MissingRung::Fetch => match pristine.next().await {
+                        Some(fetched) => fetched,
+                        // Unreachable: one fetch per Fetch rung.
+                        None => {
+                            fetch_pristine_package(
+                                cwd,
+                                inv,
+                                client,
+                                purl,
+                                lookup_entry(ledger, purl),
+                            )
+                            .await
+                        }
+                    },
+                };
+                match fetched {
                     PristineFetch::Fetched(fetched) => {
                         record_warning(
                             env,
