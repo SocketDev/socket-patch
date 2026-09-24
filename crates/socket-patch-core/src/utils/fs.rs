@@ -90,6 +90,50 @@ pub(crate) async fn is_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Blocking twin of [`list_dir_entries`] for walkers that run whole on the
+/// blocking pool (one hop per crawl instead of one per filesystem call).
+///
+/// Same tolerate-and-truncate contract — `None` when the directory cannot
+/// be opened, and iteration stops at the first entry error — plus a
+/// `complete` flag that is `false` when such an entry error cut the
+/// listing short, so a caller that answers "is child X here?" from the
+/// listing can tell a proven absence from an unread tail.
+pub(crate) fn read_dir_entries_sync(path: &Path) -> Option<(Vec<std::fs::DirEntry>, bool)> {
+    let entries = std::fs::read_dir(path).ok()?;
+    let mut out = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => out.push(entry),
+            Err(_) => return Some((out, false)),
+        }
+    }
+    Some((out, true))
+}
+
+/// Blocking twin of [`is_dir`]: follows symlinks, and a failed stat means
+/// "not a dir".
+pub(crate) fn is_dir_sync(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// Run a blocking closure on tokio's blocking pool and hand back its value.
+/// A panic inside `f` is re-raised on the awaiting task (the same outcome
+/// as when the closure's body ran inline on that task); cancellation only
+/// happens at runtime shutdown, when nothing is left to observe the value.
+pub(crate) async fn run_blocking<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(value) => value,
+        Err(err) => match err.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(err) => panic!("blocking crawl task cancelled: {err}"),
+        },
+    }
+}
+
 /// Check whether `path` is a regular file, following symlinks.
 ///
 /// Returns `false` if the stat fails (missing path, broken symlink,

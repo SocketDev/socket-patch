@@ -23,6 +23,7 @@ regex = { workspace = true }
 toml_edit = { workspace = true }
 once_cell = { workspace = true }
 qbsdiff = { workspace = true }
+rayon = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 fs2 = { workspace = true }

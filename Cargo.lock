@@ -1699,6 +1699,7 @@ dependencies = [
  "libc",
  "once_cell",
  "qbsdiff",
+ "rayon",
  "regex",
  "reqwest",
  "same-file",

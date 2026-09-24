@@ -1,11 +1,17 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::{OsStr, OsString};
+use std::fs::FileType;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use serde::Deserialize;
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
-use crate::utils::fs::is_dir;
+use crate::utils::fs::{is_dir, is_dir_sync, read_dir_entries_sync, run_blocking};
+
+#[cfg(test)]
+mod oracle;
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
 /// Directories to skip when searching for workspace node_modules.
@@ -40,11 +46,25 @@ pub async fn read_package_json(pkg_json_path: &Path) -> Option<(String, String)>
     let content = crate::utils::fs::read_regular_to_string(pkg_json_path)
         .await
         .ok()?;
+    parse_package_json_identity(&content)
+}
+
+/// Blocking twin of [`read_package_json`] for the walks that run whole on
+/// the blocking pool: the same FIFO-safe `read_regular_to_string_sync`
+/// open and the same parse.
+fn read_package_json_sync(pkg_json_path: &Path) -> Option<(String, String)> {
+    let content = crate::utils::fs::read_regular_to_string_sync(pkg_json_path).ok()?;
+    parse_package_json_identity(&content)
+}
+
+/// `(name, version)` from package.json text, if both are present and
+/// non-empty.
+fn parse_package_json_identity(content: &str) -> Option<(String, String)> {
     // npm and Node both tolerate a leading UTF-8 BOM in package.json
     // (Windows-authored packages ship them), but serde_json rejects it —
     // a BOM'd install would be invisible to scan and unpatchable.
     let pkg: PackageJsonPartial =
-        serde_json::from_str(crate::package_json::detect::strip_bom(&content)).ok()?;
+        serde_json::from_str(crate::package_json::detect::strip_bom(content)).ok()?;
     let name = pkg.name?;
     let version = pkg.version?;
     if name.is_empty() || version.is_empty() {
@@ -185,6 +205,128 @@ const NESTED_STORE_MAX_DIRS: usize = 16_384;
 /// walk arbitrary tool caches.
 fn is_legacy_pnpm_store_dir_name(name: &str) -> bool {
     name.starts_with(".registry.")
+}
+
+// ---------------------------------------------------------------------------
+// Blocking-pool walk primitives
+// ---------------------------------------------------------------------------
+
+/// One entry of a directory listing read on the blocking pool.
+struct ListedEntry {
+    /// The raw name — what the walks join wherever they always joined the
+    /// `OsString`.
+    name: OsString,
+    /// The lossy UTF-8 spelling every name test (and the joins that always
+    /// used it) goes through.
+    name_str: String,
+    /// The entry's own, symlink-unaware kind; `None` when that stat failed,
+    /// which every walk treats as "skip this entry".
+    file_type: Option<FileType>,
+}
+
+/// A directory listing plus whether it is known complete (see
+/// [`read_dir_entries_sync`]). A directory that cannot be opened lists as
+/// empty and incomplete.
+#[derive(Default)]
+struct Listing {
+    entries: Vec<ListedEntry>,
+    complete: bool,
+}
+
+impl Listing {
+    fn from_entries(entries: Vec<std::fs::DirEntry>, complete: bool) -> Self {
+        let entries = entries
+            .into_iter()
+            .map(|entry| {
+                let name = entry.file_name();
+                ListedEntry {
+                    name_str: name.to_string_lossy().into_owned(),
+                    file_type: entry.file_type().ok(),
+                    name,
+                }
+            })
+            .collect();
+        Self { entries, complete }
+    }
+}
+
+/// List `path` (empty when it cannot be read — the walks' long-standing
+/// tolerate-and-skip contract).
+fn list_dir_sync(path: &Path) -> Listing {
+    match read_dir_entries_sync(path) {
+        Some((entries, complete)) => Listing::from_entries(entries, complete),
+        None => Listing::default(),
+    }
+}
+
+/// Whether `dir/node_modules` is a directory, following symlinks — the
+/// workspace roots walk's `is_dir` probe — skipping the stat when `dir`'s
+/// own listing (which the walk reads anyway) already proves the answer is
+/// no: the listing is complete and holds no entry that could be
+/// `node_modules`, even on a case-insensitive filesystem (APFS, NTFS; see
+/// [`may_alias_ascii_name`]). The stat then could only have failed.
+///
+/// Every other case stats, including a listed real-directory
+/// `node_modules`: a directory readable but not searchable (mode `r--`)
+/// lists its entries' kinds while a stat through it still fails, so a
+/// positive answer is never taken from the listing. Only the negative
+/// case is common (most walked dirs have no `node_modules`).
+fn has_node_modules_dir(dir: &Path, listing: &Listing) -> bool {
+    if listing.complete
+        && !listing
+            .entries
+            .iter()
+            .any(|e| may_alias_ascii_name(&e.name, "node_modules"))
+    {
+        return false;
+    }
+    is_dir_sync(&dir.join("node_modules"))
+}
+
+/// Whether a directory entry called `name` could be what a lookup of the
+/// plain-ASCII `target` resolves to on a case-insensitive filesystem: an
+/// ASCII-case-insensitive match — or, conservatively, any name that is not
+/// plain ASCII (Unicode case folding and normalization can map non-ASCII
+/// spellings such as `ſ` or the Kelvin sign onto ASCII letters) or not
+/// UTF-8 at all.
+fn may_alias_ascii_name(name: &OsStr, target: &str) -> bool {
+    match name.to_str() {
+        Some(name) if name.is_ascii() => name.eq_ignore_ascii_case(target),
+        _ => true,
+    }
+}
+
+/// What the blocking-pool scan of one `node_modules` tree records, in the
+/// exact order the sequential walk visits it;
+/// [`NpmCrawler::merge_scan_events`] then replays the order-dependent
+/// `seen` dedup single-threaded.
+enum ScanEvent {
+    /// A `check_package` candidate: the package dir, its package.json
+    /// identity (`None` = unreadable/invalid), and — for a direct child of
+    /// a virtual-store entry's `node_modules` only — the dir's package key
+    /// (`name` or `@scope/name`), which the entry's `identity_seen` skip
+    /// compares against.
+    Package {
+        path: PathBuf,
+        identity: Option<(String, String)>,
+        entry_key: Option<String>,
+    },
+    /// One virtual-store entry: its dir name decoded, and the events of its
+    /// `node_modules` walked under the store-entry policy.
+    StoreEntry {
+        decoded: Option<(String, String)>,
+        events: Vec<ScanEvent>,
+    },
+}
+
+/// A virtual-store entry found by
+/// [`NpmCrawler::list_pnpm_store_entries_sync`]: its flat (or synthesized
+/// nested) name, its `node_modules`, and — when the caller asked for
+/// listings and the dir opened — that `node_modules`' listing.
+struct StoreEntryDir {
+    name: String,
+    node_modules: PathBuf,
+    listing: Option<Listing>,
 }
 
 // ---------------------------------------------------------------------------
@@ -394,28 +536,6 @@ struct Target {
     dir_key: String,
 }
 
-/// Which kind of `node_modules` directory a scan pass is walking — the one
-/// traversal-policy bit that differs between them.
-#[derive(Clone, Copy)]
-enum ScanPolicy<'a> {
-    /// An importer's or package's `node_modules`: symlinked entries are
-    /// recorded (pnpm links direct deps; `npm link` targets) but never
-    /// traversed into, and a `.pnpm` child is the virtual store, scanned
-    /// in a deferred pass.
-    Importer,
-    /// One pnpm virtual-store entry's `node_modules`: only REAL
-    /// directories are inventoried — a symlinked entry here is the
-    /// package's dependency pointing at a sibling `.pnpm` store entry,
-    /// which is inventoried via that entry; following it would record the
-    /// same package under a path owned by a different store entry.
-    /// `identity_seen` optionally carries the entry's own package name
-    /// (what the store dir name decodes to) when its name@version is
-    /// already inventoried — the importer pass wins the `seen` dedup for
-    /// every root-linked direct dep — so that child's package.json is not
-    /// read a second time; everything below it is still scanned.
-    StoreEntry { identity_seen: Option<&'a str> },
-}
-
 impl NpmCrawler {
     /// Create a new `NpmCrawler`.
     pub fn new() -> Self {
@@ -435,31 +555,36 @@ impl NpmCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
-        if options.global || options.global_prefix.is_some() {
-            if let Some(ref custom) = options.global_prefix {
-                return Ok(vec![custom.clone()]);
-            }
-            return Ok(self.get_global_node_modules_paths());
-        }
-
-        Ok(self.find_local_node_modules_dirs(&options.cwd).await)
+        let options = options.clone();
+        Ok(run_blocking(move || Self::node_modules_paths_sync(&options)).await)
     }
 
     /// Crawl all discovered `node_modules` and return every package found.
+    ///
+    /// The whole walk runs as ONE blocking-pool task (instead of one
+    /// `spawn_blocking` round trip per readdir/stat/read): directory I/O is
+    /// gathered in parallel into per-root [`ScanEvent`] trees that record
+    /// the sequential visit order, then [`Self::merge_scan_events`] replays
+    /// them single-threaded so the order-dependent `seen` dedup (and the
+    /// store entries' `identity_seen` decisions) see exactly the state the
+    /// sequential walk would have — same packages, same paths, same order.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
+        let options = options.clone();
+        run_blocking(move || Self::crawl_all_sync(&options)).await
+    }
+
+    fn crawl_all_sync(options: &CrawlerOptions) -> Vec<CrawledPackage> {
+        let nm_paths = Self::node_modules_paths_sync(options);
+        let gathered: Vec<Vec<ScanEvent>> = nm_paths
+            .par_iter()
+            .map(|nm_path| Self::gather_node_modules(nm_path, None, false))
+            .collect();
+
         let mut packages = Vec::new();
         let mut seen = HashSet::new();
-
-        let nm_paths = self
-            .get_node_modules_paths(options)
-            .await
-            .unwrap_or_default();
-
-        for nm_path in &nm_paths {
-            let found = Self::scan_node_modules(nm_path, &mut seen, ScanPolicy::Importer).await;
-            packages.extend(found);
+        for events in gathered {
+            Self::merge_scan_events(events, None, &mut seen, &mut packages);
         }
-
         packages
     }
 
@@ -828,193 +953,337 @@ impl NpmCrawler {
     // Private helpers – local node_modules discovery
     // ------------------------------------------------------------------
 
+    /// Blocking body of [`Self::get_node_modules_paths`].
+    fn node_modules_paths_sync(options: &CrawlerOptions) -> Vec<PathBuf> {
+        if options.global || options.global_prefix.is_some() {
+            if let Some(ref custom) = options.global_prefix {
+                return vec![custom.clone()];
+            }
+            return NpmCrawler.get_global_node_modules_paths();
+        }
+
+        Self::find_local_node_modules_dirs(&options.cwd)
+    }
+
     /// Find `node_modules` directories within the project root.
     /// Recursively searches for workspace `node_modules` but stays within the
     /// project.
-    async fn find_local_node_modules_dirs(&self, start_path: &Path) -> Vec<PathBuf> {
+    fn find_local_node_modules_dirs(start_path: &Path) -> Vec<PathBuf> {
         let mut results = Vec::new();
+        let listing = list_dir_sync(start_path);
 
         // Direct node_modules in start_path
-        let direct = start_path.join("node_modules");
-        if is_dir(&direct).await {
-            results.push(direct);
+        if has_node_modules_dir(start_path, &listing) {
+            results.push(start_path.join("node_modules"));
         }
 
         // Recursively search for workspace node_modules
-        Self::find_workspace_node_modules(start_path, &mut results).await;
+        results.extend(Self::find_workspace_node_modules(start_path, listing));
 
         results
     }
 
-    /// Recursively find `node_modules` in subdirectories (for monorepos / workspaces).
-    /// Skips symlinks, hidden dirs, and well-known non-workspace dirs.
-    fn find_workspace_node_modules<'a>(
-        dir: &'a Path,
-        results: &'a mut Vec<PathBuf>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
-        Box::pin(async move {
-            for entry in crate::utils::fs::list_dir_entries(dir).await {
-                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
-                    continue;
-                };
-                if !file_type.is_dir() {
-                    continue;
-                }
+    /// Recursively find `node_modules` in subdirectories (for monorepos /
+    /// workspaces), given `dir`'s own listing. Skips symlinks, hidden dirs,
+    /// and well-known non-workspace dirs.
+    ///
+    /// Subdirectories are walked in parallel; the per-child results are
+    /// concatenated in listing order, each child contributing its own
+    /// `node_modules` first and then its subtree's — the sequential
+    /// depth-first order. A child whose listing (which the walk needs
+    /// anyway) proves it has no `node_modules` skips the stat; see
+    /// [`has_node_modules_dir`].
+    fn find_workspace_node_modules(dir: &Path, listing: Listing) -> Vec<PathBuf> {
+        let children: Vec<PathBuf> = listing
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                // Skip non-dirs (symlinks included), node_modules, hidden
+                // dirs, and well-known build dirs
+                entry.file_type.is_some_and(|ft| ft.is_dir())
+                    && !(entry.name_str == "node_modules"
+                        || entry.name_str.starts_with('.')
+                        || SKIP_DIRS.contains(&entry.name_str.as_str()))
+            })
+            .map(|entry| dir.join(&entry.name))
+            .collect();
 
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-
-                // Skip node_modules, hidden dirs, and well-known build dirs
-                if name_str == "node_modules"
-                    || name_str.starts_with('.')
-                    || SKIP_DIRS.contains(&name_str.as_ref())
-                {
-                    continue;
-                }
-
-                let full_path = dir.join(&name);
-
+        children
+            .into_par_iter()
+            .map(|full_path| {
+                let listing = list_dir_sync(&full_path);
+                let mut found = Vec::new();
                 // Check if this subdirectory has its own node_modules
-                let sub_nm = full_path.join("node_modules");
-                if is_dir(&sub_nm).await {
-                    results.push(sub_nm);
+                if has_node_modules_dir(&full_path, &listing) {
+                    found.push(full_path.join("node_modules"));
                 }
-
                 // Recurse
-                Self::find_workspace_node_modules(&full_path, results).await;
-            }
-        })
+                found.extend(Self::find_workspace_node_modules(&full_path, listing));
+                found
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect()
     }
-
     // ------------------------------------------------------------------
     // Private helpers – scanning
     // ------------------------------------------------------------------
 
-    /// Scan a `node_modules` directory, returning all valid packages found.
-    /// Recurses into each package's own nested `node_modules`. The one
-    /// policy bit distinguishing an importer/package tree from a pnpm
-    /// virtual-store entry is carried by [`ScanPolicy`].
-    fn scan_node_modules<'a>(
-        node_modules_path: &'a Path,
-        seen: &'a mut HashSet<String>,
-        policy: ScanPolicy<'a>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<CrawledPackage>> + 'a>> {
-        Box::pin(async move {
-            let mut results = Vec::new();
-            let mut pnpm_store: Option<PathBuf> = None;
-            let mut legacy_stores: Vec<PathBuf> = Vec::new();
-            let (store_entry, identity_seen) = match policy {
-                ScanPolicy::Importer => (false, None),
-                ScanPolicy::StoreEntry { identity_seen } => (true, identity_seen),
+    /// Gather one `node_modules` directory's scan into [`ScanEvent`]s, in
+    /// the exact order the sequential walk visits it: the directory's own
+    /// entries (each package followed by its nested `node_modules`), then
+    /// the deferred pnpm virtual store(s). `listing` is the directory's
+    /// listing when the caller already read it. `store_entry` selects the
+    /// one policy bit distinguishing an importer/package tree from a pnpm
+    /// virtual-store entry's `node_modules`:
+    /// - importer trees accept both directories and symlinks (pnpm links
+    ///   direct deps; `npm link` targets) but never traverse a symlink, and
+    ///   a `.pnpm` (or pnpm <=3 `.<registry-host>`) child is the virtual
+    ///   store, walked after the loop;
+    /// - a store entry accepts REAL directories only — a symlinked entry
+    ///   there is the package's dependency pointing at a sibling store
+    ///   entry, inventoried via that entry — and its direct children carry
+    ///   their package key so the merge can apply the entry's
+    ///   `identity_seen` skip.
+    ///
+    /// Sibling packages (and their subtrees) are gathered in parallel; the
+    /// results are concatenated back in listing order.
+    fn gather_node_modules(
+        node_modules_path: &Path,
+        listing: Option<Listing>,
+        store_entry: bool,
+    ) -> Vec<ScanEvent> {
+        let listing = listing.unwrap_or_else(|| list_dir_sync(node_modules_path));
+        let mut pnpm_store: Option<PathBuf> = None;
+        let mut legacy_stores: Vec<PathBuf> = Vec::new();
+        let mut children: Vec<(PathBuf, String, FileType)> = Vec::new();
+
+        for entry in listing.entries {
+            let name_str = entry.name_str;
+
+            // pnpm's virtual store: under the isolated linker it is the
+            // ONLY physical home of transitive dependencies (the
+            // importer's node_modules symlinks direct deps only), so
+            // skipping it as just-another-hidden-dir leaves every
+            // transitive-only install invisible to scan. Deferred until
+            // after this loop so root-level entries are inventoried
+            // first and win the `seen` name@version dedup at their
+            // importer-root paths. (A store entry's own children never
+            // include a nested `.pnpm`; under the store-entry policy the
+            // name falls through to the hidden-entry skip below.)
+            if !store_entry && name_str == ".pnpm" {
+                if entry.file_type.is_some_and(|ft| ft.is_dir()) {
+                    pnpm_store = Some(node_modules_path.join(&name_str));
+                }
+                continue;
+            }
+
+            // pnpm <=3 virtual store (a hidden `.<registry-host>` dir;
+            // no `.pnpm` exists on those layouts): same
+            // transitive-only-home property, same deferred scan so
+            // root-level entries win the `seen` dedup. Must run before
+            // the hidden-entry skip below, which would otherwise leave
+            // every transitive-only install invisible to scan.
+            if !store_entry && is_legacy_pnpm_store_dir_name(&name_str) {
+                if entry.file_type.is_some_and(|ft| ft.is_dir()) {
+                    legacy_stores.push(node_modules_path.join(&name_str));
+                }
+                continue;
+            }
+
+            // Skip hidden files and node_modules
+            if name_str.starts_with('.') || name_str == "node_modules" {
+                continue;
+            }
+
+            let Some(file_type) = entry.file_type else {
+                continue;
             };
+            if !Self::acceptable_package_entry(file_type, store_entry) {
+                continue;
+            }
 
-            for entry in crate::utils::fs::list_dir_entries(node_modules_path).await {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy().to_string();
+            children.push((node_modules_path.join(&name_str), name_str, file_type));
+        }
 
-                // pnpm's virtual store: under the isolated linker it is the
-                // ONLY physical home of transitive dependencies (the
-                // importer's node_modules symlinks direct deps only), so
-                // skipping it as just-another-hidden-dir leaves every
-                // transitive-only install invisible to scan. Deferred until
-                // after this loop so root-level entries are inventoried
-                // first and win the `seen` name@version dedup at their
-                // importer-root paths. (A store entry's own children never
-                // include a nested `.pnpm`; under `StoreEntry` policy the
-                // name falls through to the hidden-entry skip below.)
-                if !store_entry && name_str == ".pnpm" {
-                    let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
-                        continue;
-                    };
-                    if file_type.is_dir() {
-                        pnpm_store = Some(node_modules_path.join(&name_str));
-                    }
-                    continue;
-                }
-
-                // pnpm <=3 virtual store (a hidden `.<registry-host>` dir;
-                // no `.pnpm` exists on those layouts): same
-                // transitive-only-home property, same deferred scan so
-                // root-level entries win the `seen` dedup. Must run before
-                // the hidden-entry skip below, which would otherwise leave
-                // every transitive-only install invisible to scan.
-                if !store_entry && is_legacy_pnpm_store_dir_name(&name_str) {
-                    let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
-                        continue;
-                    };
-                    if file_type.is_dir() {
-                        legacy_stores.push(node_modules_path.join(&name_str));
-                    }
-                    continue;
-                }
-
-                // Skip hidden files and node_modules
-                if name_str.starts_with('.') || name_str == "node_modules" {
-                    continue;
-                }
-
-                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
-                    continue;
-                };
-
-                // Importer trees allow both directories and symlinks (pnpm
-                // links direct deps); a store entry accepts REAL dirs only
-                // (see `ScanPolicy::StoreEntry`).
-                let acceptable = if store_entry {
-                    file_type.is_dir()
-                } else {
-                    file_type.is_dir() || file_type.is_symlink()
-                };
-                if !acceptable {
-                    continue;
-                }
-
-                let entry_path = node_modules_path.join(&name_str);
-
+        let mut events: Vec<ScanEvent> = children
+            .into_par_iter()
+            .map(|(entry_path, name_str, file_type)| {
                 if name_str.starts_with('@') {
                     // Scoped packages
-                    let scoped = Self::scan_scoped_packages(&entry_path, seen, policy).await;
-                    results.extend(scoped);
+                    Self::gather_scoped_packages(&entry_path, &name_str, store_entry)
                 } else {
-                    // Regular package. `identity_seen` marks this exact dir
-                    // as already inventoried by the importer pass — skip
-                    // the redundant package.json read, but still descend
-                    // below: bundled dependencies are real dirs nested
-                    // inside the package itself (pnpm cannot link them
-                    // out), physically present only here.
-                    if identity_seen != Some(name_str.as_str()) {
-                        if let Some(pkg) = Self::check_package(&entry_path, seen).await {
-                            results.push(pkg);
-                        }
+                    Self::gather_package(
+                        entry_path,
+                        store_entry.then_some(name_str),
+                        file_type.is_dir(),
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect();
+
+        if let Some(store_path) = pnpm_store {
+            let entries = Self::list_pnpm_store_entries_sync(&store_path, true);
+            events.extend(Self::gather_store_entries(entries));
+        }
+        for store_path in legacy_stores {
+            let entries = Self::collect_nested_store_entries_sync(&store_path)
+                .into_iter()
+                .map(|(name, node_modules)| StoreEntryDir {
+                    name,
+                    node_modules,
+                    listing: None,
+                })
+                .collect();
+            events.extend(Self::gather_store_entries(entries));
+        }
+
+        events
+    }
+
+    /// Importer trees allow both directories and symlinks (pnpm links
+    /// direct deps); a store entry accepts REAL dirs only (see
+    /// [`Self::gather_node_modules`]).
+    fn acceptable_package_entry(file_type: FileType, store_entry: bool) -> bool {
+        if store_entry {
+            file_type.is_dir()
+        } else {
+            file_type.is_dir() || file_type.is_symlink()
+        }
+    }
+
+    /// One package dir: its `check_package` candidate event, then — only
+    /// for a real directory (`recurse`), never a symlink, which would walk
+    /// into pnpm's content-addressed store or an `npm link` target outside
+    /// the project — its nested `node_modules`, always an importer-style
+    /// tree. `entry_key` is set for a store entry's direct children (see
+    /// [`ScanEvent::Package`]); the dir is still descended when the merge
+    /// skips its package.json, because bundled dependencies are real dirs
+    /// nested inside the package itself (pnpm cannot link them out),
+    /// physically present only there.
+    fn gather_package(path: PathBuf, entry_key: Option<String>, recurse: bool) -> Vec<ScanEvent> {
+        let identity = read_package_json_sync(&path.join("package.json"));
+        let nested = recurse.then(|| path.join("node_modules"));
+        let mut events = vec![ScanEvent::Package {
+            path,
+            identity,
+            entry_key,
+        }];
+        if let Some(nested) = nested {
+            events.extend(Self::gather_node_modules(&nested, None, false));
+        }
+        events
+    }
+
+    /// Gather a scoped packages directory (`@scope/`). `store_entry`
+    /// carries the caller's traversal policy; nested `node_modules` below a
+    /// scoped package are always regular importer-style trees. A store
+    /// entry's `identity_seen` names the full `@scope/name`, so that is the
+    /// key recorded for its direct children.
+    fn gather_scoped_packages(
+        scope_path: &Path,
+        scope_name: &str,
+        store_entry: bool,
+    ) -> Vec<ScanEvent> {
+        let children: Vec<(String, FileType)> = list_dir_sync(scope_path)
+            .entries
+            .into_iter()
+            .filter_map(|entry| {
+                if entry.name_str.starts_with('.') {
+                    return None;
+                }
+                let file_type = entry.file_type?;
+                Self::acceptable_package_entry(file_type, store_entry)
+                    .then_some((entry.name_str, file_type))
+            })
+            .collect();
+
+        children
+            .into_par_iter()
+            .map(|(name_str, file_type)| {
+                Self::gather_package(
+                    scope_path.join(&name_str),
+                    store_entry.then(|| format!("{scope_name}/{name_str}")),
+                    file_type.is_dir(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Gather each virtual-store entry's `node_modules` (entries come from
+    /// [`Self::list_pnpm_store_entries_sync`] or
+    /// [`Self::collect_nested_store_entries_sync`]) under the store-entry
+    /// policy, in parallel, preserving entry order.
+    fn gather_store_entries(entries: Vec<StoreEntryDir>) -> Vec<ScanEvent> {
+        entries
+            .into_par_iter()
+            .map(|entry| ScanEvent::StoreEntry {
+                decoded: decode_pnpm_store_entry_name(&entry.name),
+                events: Self::gather_node_modules(&entry.node_modules, entry.listing, true),
+            })
+            .collect()
+    }
+
+    /// Replay gathered [`ScanEvent`]s in order against `seen`, exactly as
+    /// the sequential walk's `check_package` calls would have: a package
+    /// is recorded only if its package.json parsed and its PURL is new.
+    ///
+    /// A store entry whose name decodes to a name@version already
+    /// inventoried (every root-linked direct dep — the importer pass wins
+    /// the `seen` dedup) gets `identity_seen` = that name, decided HERE,
+    /// against the dedup state at this point of the replay: its matching
+    /// direct child is skipped (the sequential walk did not even read its
+    /// package.json), while everything below it is still replayed.
+    fn merge_scan_events(
+        events: Vec<ScanEvent>,
+        identity_seen: Option<&str>,
+        seen: &mut HashSet<String>,
+        packages: &mut Vec<CrawledPackage>,
+    ) {
+        for event in events {
+            match event {
+                ScanEvent::Package {
+                    path,
+                    identity,
+                    entry_key,
+                } => {
+                    if identity_seen.is_some() && entry_key.as_deref() == identity_seen {
+                        continue;
                     }
-                    // Recurse into nested node_modules only for real
-                    // directories (not symlinks). Following a symlink here
-                    // would walk into pnpm's content-addressed store (or an
-                    // `npm link` target outside the project).
-                    if file_type.is_dir() {
-                        let nested = Self::scan_node_modules(
-                            &entry_path.join("node_modules"),
-                            seen,
-                            ScanPolicy::Importer,
-                        )
-                        .await;
-                        results.extend(nested);
+                    let Some((full_name, version)) = identity else {
+                        continue;
+                    };
+                    let (namespace, name) = parse_package_name(&full_name);
+                    let purl = build_npm_purl(namespace.as_deref(), &name, &version);
+                    if !seen.insert(purl.clone()) {
+                        continue;
                     }
+                    packages.push(CrawledPackage {
+                        name,
+                        version,
+                        namespace,
+                        purl,
+                        path,
+                    });
+                }
+                ScanEvent::StoreEntry { decoded, events } => {
+                    let identity_seen = decoded
+                        .filter(|(full_name, version)| {
+                            let (ns, bare) = parse_package_name(full_name);
+                            seen.contains(&build_npm_purl(ns.as_deref(), &bare, version))
+                        })
+                        .map(|(full_name, _version)| full_name);
+                    Self::merge_scan_events(events, identity_seen.as_deref(), seen, packages);
                 }
             }
-
-            if let Some(store_path) = pnpm_store {
-                let entries = Self::list_pnpm_store_entries(&store_path).await;
-                results.extend(Self::scan_store_entries(entries, seen).await);
-            }
-            for store_path in legacy_stores {
-                let mut entries = Vec::new();
-                Self::collect_nested_store_entries(&store_path, &mut entries).await;
-                results.extend(Self::scan_store_entries(entries, seen).await);
-            }
-
-            results
-        })
+        }
     }
 
     /// Enumerate pnpm virtual-store (`node_modules/.pnpm`) entries,
@@ -1029,32 +1298,74 @@ impl NpmCrawler {
     /// treating it as an empty entry silently hid every transitive-only
     /// install (apply exited 0 claiming success with nothing written) —
     /// descend it instead. Shared by the resolver
-    /// (`collect_nested_node_modules`) and the scan pass
-    /// (`scan_store_entries` callers) so the store-layout policy lives
-    /// once.
+    /// (`collect_nested_node_modules`), the scan pass and the peer-variant
+    /// finder so the store-layout policy lives once.
+    ///
+    /// Entries are probed in parallel and yielded in listing order. With
+    /// `read_listings` (the scan, which lists every entry's `node_modules`
+    /// next anyway) the existence probe IS that readdir: a `node_modules`
+    /// that opens as a directory is one, and its listing rides along in
+    /// [`StoreEntryDir::listing`]; one that does not open falls back to
+    /// the `is_dir` stat so an unreadable-but-present dir keeps its
+    /// flat-entry classification.
+    fn list_pnpm_store_entries_sync(store_path: &Path, read_listings: bool) -> Vec<StoreEntryDir> {
+        let candidates: Vec<ListedEntry> = list_dir_sync(store_path)
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                !(entry.name_str.starts_with('.') || entry.name_str == "node_modules")
+                    && entry.file_type.is_some_and(|ft| ft.is_dir())
+            })
+            .collect();
+
+        candidates
+            .into_par_iter()
+            .map(|entry| {
+                let entry_path = store_path.join(&entry.name);
+                let entry_nm = entry_path.join("node_modules");
+                if read_listings {
+                    if let Some((entries, complete)) = read_dir_entries_sync(&entry_nm) {
+                        return vec![StoreEntryDir {
+                            name: entry.name_str,
+                            node_modules: entry_nm,
+                            listing: Some(Listing::from_entries(entries, complete)),
+                        }];
+                    }
+                }
+                if is_dir_sync(&entry_nm) {
+                    vec![StoreEntryDir {
+                        name: entry.name_str,
+                        node_modules: entry_nm,
+                        listing: None,
+                    }]
+                } else {
+                    Self::collect_nested_store_entries_sync(&entry_path)
+                        .into_iter()
+                        .map(|(name, node_modules)| StoreEntryDir {
+                            name,
+                            node_modules,
+                            listing: None,
+                        })
+                        .collect()
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Async `(name, node_modules)` view of
+    /// [`Self::list_pnpm_store_entries_sync`] for the async callers.
     async fn list_pnpm_store_entries(store_path: &Path) -> Vec<(String, PathBuf)> {
-        let mut entries = Vec::new();
-        for entry in crate::utils::fs::list_dir_entries(store_path).await {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || name_str == "node_modules" {
-                continue;
-            }
-            let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let entry_path = store_path.join(&name);
-            let entry_nm = entry_path.join("node_modules");
-            if is_dir(&entry_nm).await {
-                entries.push((name_str.into_owned(), entry_nm));
-            } else {
-                Self::collect_nested_store_entries(&entry_path, &mut entries).await;
-            }
-        }
-        entries
+        let store_path = store_path.to_path_buf();
+        run_blocking(move || {
+            Self::list_pnpm_store_entries_sync(&store_path, false)
+                .into_iter()
+                .map(|entry| (entry.name, entry.node_modules))
+                .collect()
+        })
+        .await
     }
 
     /// Descend a *nested* virtual-store host dir, yielding
@@ -1076,37 +1387,41 @@ impl NpmCrawler {
     /// (the pending-name filter, the `identity_seen` dedup) treat nested
     /// and flat entries identically; a shape that doesn't fit stays an
     /// undecodable — always-probed — name, the conservative direction.
-    async fn collect_nested_store_entries(host_path: &Path, entries: &mut Vec<(String, PathBuf)>) {
+    ///
+    /// Deliberately sequential: the `NESTED_STORE_MAX_DIRS` budget is
+    /// spent in breadth-first listing order, which decides exactly which
+    /// entries survive when it runs out.
+    fn collect_nested_store_entries_sync(host_path: &Path) -> Vec<(String, PathBuf)> {
+        let mut entries = Vec::new();
         let mut remaining = NESTED_STORE_MAX_DIRS;
         let mut queue: VecDeque<(PathBuf, String, usize)> =
             VecDeque::from([(host_path.to_path_buf(), String::new(), 0)]);
         while let Some((dir, rel, depth)) = queue.pop_front() {
-            for entry in crate::utils::fs::list_dir_entries(&dir).await {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
+            for entry in list_dir_sync(&dir).entries {
+                let name_str = entry.name_str;
                 // A `node_modules` here belongs to a parent entry (already
                 // yielded), never a name/version coordinate.
                 if name_str == "node_modules" {
                     continue;
                 }
-                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
+                let Some(file_type) = entry.file_type else {
                     continue;
                 };
                 if !file_type.is_dir() {
                     continue;
                 }
                 if remaining == 0 {
-                    return;
+                    return entries;
                 }
                 remaining -= 1;
-                let child = dir.join(&name);
+                let child = dir.join(&entry.name);
                 let child_rel = if rel.is_empty() {
-                    name_str.into_owned()
+                    name_str
                 } else {
                     format!("{rel}/{name_str}")
                 };
                 let child_nm = child.join("node_modules");
-                if is_dir(&child_nm).await {
+                if is_dir_sync(&child_nm) {
                     // `<name>/<version>/node_modules` — a package home.
                     // Anything deeper belongs to that package's own tree,
                     // which the store-entry scan walks itself.
@@ -1125,130 +1440,16 @@ impl NpmCrawler {
                 }
             }
         }
+        entries
     }
 
-    /// Inventory the packages under each virtual-store entry's
-    /// `node_modules` (entries come from `list_pnpm_store_entries` or
-    /// `collect_nested_store_entries`). An entry whose name decodes to a
-    /// name@version the importer pass already inventoried (every
-    /// root-linked direct dep) skips the redundant package.json re-read
-    /// via `identity_seen` — the entry is still walked, because
-    /// bundled/injected dependencies are real dirs that physically live
-    /// only inside the store entry.
-    async fn scan_store_entries(
-        entries: Vec<(String, PathBuf)>,
-        seen: &mut HashSet<String>,
-    ) -> Vec<CrawledPackage> {
-        let mut results = Vec::new();
-
-        for (entry_name, entry_nm) in entries {
-            let identity_seen = decode_pnpm_store_entry_name(&entry_name)
-                .filter(|(full_name, version)| {
-                    let (ns, bare) = parse_package_name(full_name);
-                    seen.contains(&build_npm_purl(ns.as_deref(), &bare, version))
-                })
-                .map(|(full_name, _version)| full_name);
-            let found = Self::scan_node_modules(
-                &entry_nm,
-                seen,
-                ScanPolicy::StoreEntry {
-                    identity_seen: identity_seen.as_deref(),
-                },
-            )
-            .await;
-            results.extend(found);
-        }
-
-        results
-    }
-
-    /// Scan a scoped packages directory (`@scope/`). `policy` carries the
-    /// caller's traversal rules (see [`ScanPolicy`]); nested `node_modules`
-    /// below a scoped package are always regular importer-style trees.
-    fn scan_scoped_packages<'a>(
-        scope_path: &'a Path,
-        seen: &'a mut HashSet<String>,
-        policy: ScanPolicy<'a>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<CrawledPackage>> + 'a>> {
-        Box::pin(async move {
-            let mut results = Vec::new();
-            let (store_entry, identity_seen) = match policy {
-                ScanPolicy::Importer => (false, None),
-                ScanPolicy::StoreEntry { identity_seen } => (true, identity_seen),
-            };
-            // `identity_seen` names the full `@scope/name`; this dir is the
-            // `@scope` half.
-            let scope_name = scope_path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-
-            for entry in crate::utils::fs::list_dir_entries(scope_path).await {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy().to_string();
-
-                if name_str.starts_with('.') {
-                    continue;
-                }
-
-                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
-                    continue;
-                };
-
-                let acceptable = if store_entry {
-                    file_type.is_dir()
-                } else {
-                    file_type.is_dir() || file_type.is_symlink()
-                };
-                if !acceptable {
-                    continue;
-                }
-
-                let pkg_path = scope_path.join(&name_str);
-                let already_inventoried =
-                    identity_seen.is_some_and(|full| full == format!("{scope_name}/{name_str}"));
-                if !already_inventoried {
-                    if let Some(pkg) = Self::check_package(&pkg_path, seen).await {
-                        results.push(pkg);
-                    }
-                }
-
-                // Nested node_modules only for real directories
-                if file_type.is_dir() {
-                    let nested = Self::scan_node_modules(
-                        &pkg_path.join("node_modules"),
-                        seen,
-                        ScanPolicy::Importer,
-                    )
-                    .await;
-                    results.extend(nested);
-                }
-            }
-
-            results
-        })
-    }
-
-    /// Check a package directory and return `CrawledPackage` if valid.
-    /// Deduplicates by PURL via the `seen` set.
-    async fn check_package(pkg_path: &Path, seen: &mut HashSet<String>) -> Option<CrawledPackage> {
-        let pkg_json_path = pkg_path.join("package.json");
-        let (full_name, version) = read_package_json(&pkg_json_path).await?;
-        let (namespace, name) = parse_package_name(&full_name);
-        let purl = build_npm_purl(namespace.as_deref(), &name, &version);
-
-        if seen.contains(&purl) {
-            return None;
-        }
-        seen.insert(purl.clone());
-
-        Some(CrawledPackage {
-            name,
-            version,
-            namespace,
-            purl,
-            path: pkg_path.to_path_buf(),
-        })
+    /// Async view of [`Self::collect_nested_store_entries_sync`], appending
+    /// to `entries`.
+    async fn collect_nested_store_entries(host_path: &Path, entries: &mut Vec<(String, PathBuf)>) {
+        let host_path = host_path.to_path_buf();
+        entries.extend(
+            run_blocking(move || Self::collect_nested_store_entries_sync(&host_path)).await,
+        );
     }
 
     // ------------------------------------------------------------------
