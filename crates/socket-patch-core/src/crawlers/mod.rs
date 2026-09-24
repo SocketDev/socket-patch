@@ -4,6 +4,8 @@ pub mod deno_crawler;
 pub mod fuzzy_match;
 pub mod go_crawler;
 pub mod maven_crawler;
+#[cfg(test)]
+mod maven_pom_equivalence_tests;
 pub mod npm_crawler;
 pub mod nuget_crawler;
 pub mod pkg_managers;

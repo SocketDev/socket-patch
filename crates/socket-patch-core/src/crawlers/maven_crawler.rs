@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -9,13 +10,65 @@ use crate::utils::fs::{is_dir, run_blocking};
 // POM XML minimal parser
 // ---------------------------------------------------------------------------
 
+/// The tag needles for one POM element, built at compile time so the
+/// per-line matching allocates nothing.
+struct Element {
+    /// `<name` — an opening tag's prefix ([`opening_tag_needle`]).
+    open: &'static str,
+    /// `</name` — a closing tag's prefix ([`closing_tag_needle`]).
+    close: &'static str,
+    /// `<name>` / `</name>` — a single-line value ([`xml_value_needles`]).
+    value_open: &'static str,
+    value_close: &'static str,
+}
+
+macro_rules! element {
+    ($name:literal) => {
+        Element {
+            open: concat!("<", $name),
+            close: concat!("</", $name),
+            value_open: concat!("<", $name, ">"),
+            value_close: concat!("</", $name, ">"),
+        }
+    };
+}
+
+const GROUP_ID: Element = element!("groupId");
+const ARTIFACT_ID: Element = element!("artifactId");
+const VERSION: Element = element!("version");
+const PARENT: Element = element!("parent");
+
+/// Sections whose `groupId`/`artifactId`/`version` are never the project's.
+const SKIP_SECTIONS: [Element; 11] = [
+    element!("dependencies"),
+    element!("build"),
+    element!("profiles"),
+    element!("reporting"),
+    element!("dependencyManagement"),
+    element!("pluginManagement"),
+    element!("modules"),
+    element!("distributionManagement"),
+    element!("repositories"),
+    element!("pluginRepositories"),
+    // Free-form (xs:any): a property may be named exactly `version`/
+    // `groupId`/`artifactId` (Maven warns but permits it) and would
+    // otherwise win first-match extraction over the project's own
+    // coordinates. Project coordinates never live in <properties>,
+    // so skipping it can only prevent leaks.
+    element!("properties"),
+];
+
 /// Extract the text value between `<element>` and `</element>` on a single line.
+#[cfg(test)]
 fn extract_xml_value(line: &str, element: &str) -> Option<String> {
-    let open = format!("<{element}>");
-    let close = format!("</{element}>");
-    let start = line.find(&open)?;
+    xml_value_needles(line, &format!("<{element}>"), &format!("</{element}>"))
+}
+
+/// [`extract_xml_value`] over prebuilt `<element>` / `</element>` needles.
+fn xml_value_needles(line: &str, open: &str, close: &str) -> Option<String> {
+    let start = line.find(open)?;
     let value_start = start + open.len();
-    let end = line[value_start..].find(&close)?;
+    let end = line[value_start..].find(close)?;
     let value = line[value_start..value_start + end].trim().to_string();
     if value.is_empty() {
         None
@@ -33,7 +86,11 @@ fn extract_xml_value(line: &str, element: &str) -> Option<String> {
 /// substring matching would otherwise miscount skip-section depth (e.g. a
 /// comment containing `</build>` could "close" a block that is still open
 /// and leak a plugin's coordinates as the project's).
-fn strip_comment_spans(line: &str, in_comment: &mut bool) -> String {
+fn strip_comment_spans<'a>(line: &'a str, in_comment: &mut bool) -> Cow<'a, str> {
+    // The common line: no comment open and none starting — nothing to strip.
+    if !*in_comment && !line.contains("<!--") {
+        return Cow::Borrowed(line);
+    }
     let mut out = String::new();
     let mut rest = line;
     loop {
@@ -43,7 +100,7 @@ fn strip_comment_spans(line: &str, in_comment: &mut bool) -> String {
                     rest = &rest[end + 3..];
                     *in_comment = false;
                 }
-                None => return out, // remainder of the line is inside a comment
+                None => return Cow::Owned(out), // remainder of the line is inside a comment
             }
         } else {
             match rest.find("<!--") {
@@ -54,7 +111,7 @@ fn strip_comment_spans(line: &str, in_comment: &mut bool) -> String {
                 }
                 None => {
                     out.push_str(rest);
-                    return out;
+                    return Cow::Owned(out);
                 }
             }
         }
@@ -73,10 +130,15 @@ fn strip_comment_spans(line: &str, in_comment: &mut bool) -> String {
 /// equals `</build>`, that phantom open would never be matched by a close and
 /// would leak the entire remainder of the document into the skip section,
 /// dropping the project's real coordinates.
+#[cfg(test)]
 fn opening_tag(line: &str, element: &str) -> Option<bool> {
-    let needle = format!("<{element}");
+    opening_tag_needle(line, &format!("<{element}"))
+}
+
+/// [`opening_tag`] over a prebuilt `<element` needle.
+fn opening_tag_needle(line: &str, needle: &str) -> Option<bool> {
     let mut from = 0;
-    while let Some(rel) = line[from..].find(&needle) {
+    while let Some(rel) = line[from..].find(needle) {
         let pos = from + rel;
         let after = &line[pos + needle.len()..];
         match after.chars().next() {
@@ -102,10 +164,15 @@ fn opening_tag(line: &str, element: &str) -> Option<bool> {
 /// whitespace before `>`, e.g. `</build >`)? The boundary `>` is required, so
 /// `</buildtools>` is not treated as a close of `</build>` — mirroring the
 /// boundary discipline of [`opening_tag`].
+#[cfg(test)]
 fn contains_closing_tag(line: &str, element: &str) -> bool {
-    let needle = format!("</{element}");
+    closing_tag_needle(line, &format!("</{element}"))
+}
+
+/// [`contains_closing_tag`] over a prebuilt `</element` needle.
+fn closing_tag_needle(line: &str, needle: &str) -> bool {
     let mut from = 0;
-    while let Some(rel) = line[from..].find(&needle) {
+    while let Some(rel) = line[from..].find(needle) {
         let pos = from + rel;
         let after = &line[pos + needle.len()..];
         if after.trim_start().starts_with('>') {
@@ -133,28 +200,15 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
     let mut in_comment = false;
     let mut skip_depth: u32 = 0;
 
-    let skip_sections = [
-        "dependencies",
-        "build",
-        "profiles",
-        "reporting",
-        "dependencyManagement",
-        "pluginManagement",
-        "modules",
-        "distributionManagement",
-        "repositories",
-        "pluginRepositories",
-        // Free-form (xs:any): a property may be named exactly `version`/
-        // `groupId`/`artifactId` (Maven warns but permits it) and would
-        // otherwise win first-match extraction over the project's own
-        // coordinates. Project coordinates never live in <properties>,
-        // so skipping it can only prevent leaks.
-        "properties",
-    ];
-
     for line in content.lines() {
         let cleaned = strip_comment_spans(line, &mut in_comment);
         let trimmed = cleaned.trim();
+        // Every open, close and value below needs a `<`: a tag-free line
+        // (text, attribute continuations, the inside of a comment) changes
+        // no state.
+        if !trimmed.contains('<') {
+            continue;
+        }
 
         // Check for skip section open/close. A tag that opens and closes on
         // the same line (`<modules></modules>`) or self-closes
@@ -169,10 +223,10 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
         // legitimately follows a close on the same line is sacrificed to
         // `None`, which scan rescues via the directory-path fallback.
         let mut saw_section_close = false;
-        for section in &skip_sections {
-            let open = opening_tag(trimmed, section);
+        for section in &SKIP_SECTIONS {
+            let open = opening_tag_needle(trimmed, section.open);
             let has_open = open.is_some();
-            let has_close = contains_closing_tag(trimmed, section);
+            let has_close = closing_tag_needle(trimmed, section.close);
             saw_section_close |= has_close;
             if has_open && !has_close && open != Some(true) {
                 skip_depth += 1;
@@ -187,22 +241,22 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
 
         // Track parent section (a self-closing `<parent/>` carries no
         // coordinates, so it never opens a parent block).
-        let parent_open = opening_tag(trimmed, "parent");
-        if parent_open.is_some()
-            && !contains_closing_tag(trimmed, "parent")
-            && parent_open != Some(true)
-        {
+        let parent_open = opening_tag_needle(trimmed, PARENT.open);
+        let parent_close = closing_tag_needle(trimmed, PARENT.close);
+        if parent_open.is_some() && !parent_close && parent_open != Some(true) {
             in_parent = true;
             continue;
         }
-        if contains_closing_tag(trimmed, "parent") {
+        if parent_close {
             in_parent = false;
             continue;
         }
 
         if in_parent {
             if parent_group_id.is_none() {
-                if let Some(val) = extract_xml_value(trimmed, "groupId") {
+                if let Some(val) =
+                    xml_value_needles(trimmed, GROUP_ID.value_open, GROUP_ID.value_close)
+                {
                     if val.contains("${") {
                         // Property reference in parent — skip
                     } else {
@@ -215,7 +269,8 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
 
         // Extract top-level coordinates
         if group_id.is_none() {
-            if let Some(val) = extract_xml_value(trimmed, "groupId") {
+            if let Some(val) = xml_value_needles(trimmed, GROUP_ID.value_open, GROUP_ID.value_close)
+            {
                 if val.contains("${") {
                     return None;
                 }
@@ -223,7 +278,9 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
             }
         }
         if artifact_id.is_none() {
-            if let Some(val) = extract_xml_value(trimmed, "artifactId") {
+            if let Some(val) =
+                xml_value_needles(trimmed, ARTIFACT_ID.value_open, ARTIFACT_ID.value_close)
+            {
                 if val.contains("${") {
                     return None;
                 }
@@ -231,12 +288,18 @@ pub fn parse_pom_group_artifact_version(content: &str) -> Option<(String, String
             }
         }
         if version.is_none() {
-            if let Some(val) = extract_xml_value(trimmed, "version") {
+            if let Some(val) = xml_value_needles(trimmed, VERSION.value_open, VERSION.value_close) {
                 if val.contains("${") {
                     return None;
                 }
                 version = Some(val);
             }
+        }
+        // All three are first-match: once set, later lines can neither
+        // replace them nor reach a `${` refusal, and a parent groupId only
+        // fills a missing top-level one.
+        if group_id.is_some() && artifact_id.is_some() && version.is_some() {
+            break;
         }
     }
 
