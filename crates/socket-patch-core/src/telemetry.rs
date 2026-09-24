@@ -259,22 +259,46 @@ fn resolve_telemetry_endpoint(api_token: Option<&str>, org_slug: Option<&str>) -
     }
 }
 
+/// A telemetry event with its destination resolved, ready to POST. Built
+/// synchronously where the event fires (timestamp, env and config reads,
+/// the "Sending telemetry" debug line), so sending it inline or from a
+/// background task posts the very same request.
+struct PreparedSend {
+    event: PatchTelemetryEvent,
+    url: String,
+    /// The bearer token to attach (authenticated endpoint only).
+    bearer: Option<String>,
+}
+
+/// Resolve `event`'s endpoint (see [`resolve_telemetry_endpoint`]).
+fn prepare_send(
+    event: PatchTelemetryEvent,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) -> PreparedSend {
+    let (url, use_auth) = resolve_telemetry_endpoint(api_token, org_slug);
+
+    debug_log(&format!("Sending telemetry to {url}"));
+
+    let bearer = if use_auth {
+        api_token.map(str::to_string)
+    } else {
+        None
+    };
+    PreparedSend { event, url, bearer }
+}
+
 /// Send a telemetry event to the API.
 ///
 /// This is fire-and-forget: errors are logged in debug mode but never
 /// propagated. Uses `reqwest` with a 5-second request timeout and a
-/// 2-second connect timeout: the send is awaited inline by every command
-/// before it prints, so a network that blackholes the endpoint (dropped
-/// SYNs, no RST) must give up on the handshake quickly rather than stall
-/// even a read-only `scan --json` for the full request budget.
-async fn send_telemetry_event(
-    event: &PatchTelemetryEvent,
-    api_token: Option<&str>,
-    org_slug: Option<&str>,
-) {
-    let (url, use_auth) = resolve_telemetry_endpoint(api_token, org_slug);
-
-    debug_log(&format!("Sending telemetry to {url}"));
+/// 2-second connect timeout: a command awaits every send before it exits
+/// (inline, or via [`PendingTelemetry::flush`]), so a network that
+/// blackholes the endpoint (dropped SYNs, no RST) must give up on the
+/// handshake quickly rather than stall even a read-only `scan --json` for
+/// the full request budget.
+async fn send_telemetry_event(prepared: PreparedSend) {
+    let PreparedSend { event, url, bearer } = prepared;
 
     let client = match reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(2))
@@ -293,13 +317,11 @@ async fn send_telemetry_event(
         .header("Content-Type", "application/json")
         .header("User-Agent", USER_AGENT);
 
-    if use_auth {
-        if let Some(token) = api_token {
-            request = request.header("Authorization", format!("Bearer {token}"));
-        }
+    if let Some(token) = bearer {
+        request = request.header("Authorization", format!("Bearer {token}"));
     }
 
-    match request.json(event).send().await {
+    match request.json(&event).send().await {
         Ok(response) => {
             let status = response.status();
             if status.is_success() {
@@ -314,6 +336,37 @@ async fn send_telemetry_event(
     }
 }
 
+/// Telemetry sends a command started off its critical path. Each send is
+/// spawned where its event fires (the event is built right there, so its
+/// body and timestamp are what an inline send would have posted) and the
+/// command awaits [`Self::flush`] before it returns, so every event is
+/// still delivered — or given up on within the same 2 s connect / 5 s
+/// request budget — before the process exits.
+#[derive(Debug, Default)]
+pub struct PendingTelemetry {
+    sends: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl PendingTelemetry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Await every send started so far, in start order.
+    pub async fn flush(self) {
+        for send in self.sends {
+            // A send never panics on its own; a JoinError here can only be
+            // a runtime shutting down, which leaves nothing to deliver.
+            let _ = send.await;
+        }
+    }
+
+    fn spawn(&mut self, prepared: PreparedSend) {
+        self.sends
+            .push(tokio::spawn(send_telemetry_event(prepared)));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-event tracker wrappers (the public API)
 //
@@ -321,24 +374,21 @@ async fn send_telemetry_event(
 // convenient (callers typically have `Option<String>` and call `.as_deref()`).
 // ---------------------------------------------------------------------------
 
-/// Shared fire-and-forget helper for the per-event tracker wrappers below.
-///
-/// Non-blocking and never returns errors: telemetry failures are logged in
-/// debug mode but do not affect CLI operation. Returns immediately when
+/// Build the event the tracker wrappers below send, or `None` when
 /// telemetry is disabled via environment variables. `metadata` is a
 /// `serde_json::json!({...})` object; non-object / empty values are dropped
 /// to avoid `.unwrap()` noise at every call site.
-async fn fire(
+fn prepare(
     event_type: PatchTelemetryEventType,
     command: &'static str,
     metadata: serde_json::Value,
     error: Option<impl std::fmt::Display>,
     api_token: Option<&str>,
     org_slug: Option<&str>,
-) {
+) -> Option<PreparedSend> {
     if is_telemetry_disabled() {
         debug_log("Telemetry is disabled, skipping event");
-        return;
+        return None;
     }
 
     let metadata = match metadata {
@@ -347,7 +397,25 @@ async fn fire(
     };
     let error = error.map(|e| ("Error".to_string(), e.to_string()));
     let event = build_telemetry_event(event_type, command, metadata, error);
-    send_telemetry_event(&event, api_token, org_slug).await;
+    Some(prepare_send(event, api_token, org_slug))
+}
+
+/// Shared fire-and-forget helper for the per-event tracker wrappers below.
+///
+/// Never returns errors: telemetry failures are logged in debug mode but
+/// do not affect CLI operation. Returns immediately when telemetry is
+/// disabled via environment variables.
+async fn fire(
+    event_type: PatchTelemetryEventType,
+    command: &'static str,
+    metadata: serde_json::Value,
+    error: Option<impl std::fmt::Display>,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    if let Some(prepared) = prepare(event_type, command, metadata, error, api_token, org_slug) {
+        send_telemetry_event(prepared).await;
+    }
 }
 
 /// Track a successful patch application.
@@ -497,6 +565,27 @@ pub async fn track_patch_rollback_failed(
 // Read-side trackers: scan + get
 // ---------------------------------------------------------------------------
 
+/// The `patch_scanned` metadata: per-tier patch counts and whether the
+/// call was downgraded to the public proxy after an auth-endpoint 401/403
+/// (`fallback_to_proxy`).
+fn patch_scanned_metadata(
+    packages_scanned: usize,
+    free_patches: usize,
+    paid_patches: usize,
+    can_access_paid: bool,
+    ecosystems: &[String],
+    fallback_to_proxy: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "packages_scanned": packages_scanned,
+        "free_patches": free_patches,
+        "paid_patches": paid_patches,
+        "can_access_paid": can_access_paid,
+        "ecosystems": ecosystems,
+        "fallback_to_proxy": fallback_to_proxy,
+    })
+}
+
 /// Track a successful `scan`. Reports per-tier patch counts and whether
 /// the call was downgraded to the public proxy after an auth-endpoint
 /// 401/403 (`fallback_to_proxy`).
@@ -519,19 +608,53 @@ pub async fn track_patch_scanned(
     fire(
         PatchTelemetryEventType::PatchScanned,
         "scan",
-        serde_json::json!({
-            "packages_scanned": packages_scanned,
-            "free_patches": free_patches,
-            "paid_patches": paid_patches,
-            "can_access_paid": can_access_paid,
-            "ecosystems": ecosystems,
-            "fallback_to_proxy": fallback_to_proxy,
-        }),
+        patch_scanned_metadata(
+            packages_scanned,
+            free_patches,
+            paid_patches,
+            can_access_paid,
+            ecosystems,
+            fallback_to_proxy,
+        ),
         None::<&str>,
         api_token,
         org_slug,
     )
     .await;
+}
+
+/// [`track_patch_scanned`], sent in the background: the event is built
+/// now and its send joins `pending`, which the command flushes before it
+/// returns.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_patch_scanned(
+    pending: &mut PendingTelemetry,
+    packages_scanned: usize,
+    free_patches: usize,
+    paid_patches: usize,
+    can_access_paid: bool,
+    ecosystems: &[String],
+    fallback_to_proxy: bool,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    if let Some(prepared) = prepare(
+        PatchTelemetryEventType::PatchScanned,
+        "scan",
+        patch_scanned_metadata(
+            packages_scanned,
+            free_patches,
+            paid_patches,
+            can_access_paid,
+            ecosystems,
+            fallback_to_proxy,
+        ),
+        None::<&str>,
+        api_token,
+        org_slug,
+    ) {
+        pending.spawn(prepared);
+    }
 }
 
 /// Track a failed `scan`.
@@ -550,6 +673,27 @@ pub async fn track_patch_scan_failed(
         org_slug,
     )
     .await;
+}
+
+/// [`track_patch_scan_failed`], sent in the background (see
+/// [`spawn_patch_scanned`]).
+pub fn spawn_patch_scan_failed(
+    pending: &mut PendingTelemetry,
+    error: impl std::fmt::Display,
+    fallback_to_proxy: bool,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) {
+    if let Some(prepared) = prepare(
+        PatchTelemetryEventType::PatchScanFailed,
+        "scan",
+        serde_json::json!({ "fallback_to_proxy": fallback_to_proxy }),
+        Some(error),
+        api_token,
+        org_slug,
+    ) {
+        pending.spawn(prepared);
+    }
 }
 
 /// Track a successful `get`. Reports patch identity + delivery mode and
@@ -724,6 +868,88 @@ pub async fn track_vex_failed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A prepared event posted to `server`'s `/telemetry` route.
+    fn prepared_for(server: &wiremock::MockServer) -> PreparedSend {
+        let mut metadata = HashMap::new();
+        metadata.insert("packages_scanned".to_string(), serde_json::json!(3));
+        PreparedSend {
+            event: build_telemetry_event(
+                PatchTelemetryEventType::PatchScanned,
+                "scan",
+                Some(metadata),
+                None,
+            ),
+            url: format!("{}/telemetry", server.uri()),
+            bearer: Some("tok".to_string()),
+        }
+    }
+
+    /// A background send posts exactly the request an inline send posts
+    /// (same body bytes and headers), and is delivered by `flush`.
+    #[tokio::test]
+    async fn background_send_posts_the_inline_request_and_flush_delivers_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/telemetry"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let prepared = prepared_for(&server);
+        let twin = PreparedSend {
+            event: prepared.event.clone(),
+            url: prepared.url.clone(),
+            bearer: prepared.bearer.clone(),
+        };
+        send_telemetry_event(prepared).await;
+        let mut pending = PendingTelemetry::new();
+        pending.spawn(twin);
+        pending.flush().await;
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].body, reqs[1].body);
+        for req in &reqs {
+            assert_eq!(req.headers.get("authorization").unwrap(), "Bearer tok");
+            assert_eq!(req.headers.get("user-agent").unwrap(), USER_AGENT);
+            assert_eq!(req.headers.get("content-type").unwrap(), "application/json");
+        }
+    }
+
+    /// Spawning returns at once; `flush` waits for the slow responses.
+    #[tokio::test]
+    async fn spawn_does_not_block_and_flush_waits_for_the_response() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let delay = std::time::Duration::from_millis(400);
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201).set_delay(delay))
+            .mount(&server)
+            .await;
+
+        let mut pending = PendingTelemetry::new();
+        pending.spawn(prepared_for(&server));
+        pending.spawn(prepared_for(&server));
+        // Nothing was awaited yet: both sends are still in flight.
+        assert_eq!(pending.sends.len(), 2);
+        assert!(pending.sends.iter().all(|s| !s.is_finished()));
+        let started = std::time::Instant::now();
+        pending.flush().await;
+        assert!(started.elapsed() >= delay, "flush must await the responses");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// Nothing started, nothing to wait for.
+    #[tokio::test]
+    async fn flushing_nothing_returns() {
+        PendingTelemetry::new().flush().await;
+    }
 
     /// Combined into a single test to avoid env-var races across parallel tests.
     /// Exercises the `SOCKET_TELEMETRY_DISABLED` name, the legacy

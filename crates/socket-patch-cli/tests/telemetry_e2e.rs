@@ -728,3 +728,98 @@ async fn list_skips_telemetry_in_airgap_mode() {
     let count = telemetry_post_count(&mock, None).await;
     assert_eq!(count, 0, "SOCKET_OFFLINE=1 must suppress patch_listed");
 }
+
+// ---------------------------------------------------------------------------
+// scan: background sends are flushed before exit
+// ---------------------------------------------------------------------------
+
+/// Scan sends its telemetry off the critical path but must flush it before
+/// the process exits. Against a telemetry endpoint that answers only after
+/// `TELEMETRY_DELAY`, each scan terminal — success, empty crawl, and
+/// all-batches-failed — must still deliver exactly its one event AND stay
+/// alive until the response arrives (the lower bound on wall time cannot
+/// flake under load: load only makes a run slower).
+#[tokio::test]
+async fn scan_flushes_background_telemetry_before_exit() {
+    const TELEMETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    struct Case {
+        label: &'static str,
+        batch_status: u16,
+        install_package: bool,
+        want_event: &'static str,
+        want_code: i32,
+    }
+    let cases = [
+        Case {
+            label: "success",
+            batch_status: 200,
+            install_package: true,
+            want_event: "patch_scanned",
+            want_code: 0,
+        },
+        Case {
+            label: "empty crawl",
+            batch_status: 200,
+            install_package: false,
+            want_event: "patch_scanned",
+            want_code: 0,
+        },
+        Case {
+            label: "all batches failed",
+            batch_status: 500,
+            install_package: true,
+            want_event: "patch_scan_failed",
+            want_code: 1,
+        },
+    ];
+
+    for case in cases {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(case.batch_status).set_body_json(
+                serde_json::json!({ "packages": [], "canAccessPaidPatches": false }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/telemetry")))
+            .respond_with(ResponseTemplate::new(201).set_delay(TELEMETRY_DELAY))
+            .mount(&mock)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_root_package_json(tmp.path());
+        if case.install_package {
+            write_npm_package(tmp.path(), "minimist", "1.2.2");
+        }
+
+        let started = std::time::Instant::now();
+        let (code, stdout, stderr) = run_cmd(tmp.path(), &mock.uri(), "scan", &[], &[]);
+        let elapsed = started.elapsed();
+        assert_eq!(
+            code, case.want_code,
+            "{}: stdout={stdout} stderr={stderr}",
+            case.label
+        );
+        assert_eq!(
+            telemetry_post_count(&mock, Some(case.want_event)).await,
+            1,
+            "{}: exactly one {} event must be delivered",
+            case.label,
+            case.want_event
+        );
+        assert_eq!(
+            telemetry_post_count(&mock, None).await,
+            1,
+            "{}: no other telemetry event",
+            case.label
+        );
+        assert!(
+            elapsed >= TELEMETRY_DELAY,
+            "{}: scan exited after {elapsed:?}, before its telemetry send completed",
+            case.label
+        );
+    }
+}

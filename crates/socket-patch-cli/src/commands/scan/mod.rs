@@ -17,7 +17,9 @@ use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned};
+use socket_patch_core::telemetry::{
+    spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry,
+};
 use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::{normalize_purl, purl_name_version, strip_purl_qualifiers};
 use socket_patch_core::vendor::VendorState;
@@ -1448,7 +1450,17 @@ fn print_zero_error_envelope(err: &str, paths: &[String]) {
     print_json(&result);
 }
 
-pub async fn run(mut args: ScanArgs) -> i32 {
+pub async fn run(args: ScanArgs) -> i32 {
+    // Scan's telemetry sends run off the critical path (spawned where each
+    // event fires) and are all awaited here, before the command returns —
+    // so every event is still delivered before the process exits.
+    let mut telemetry = PendingTelemetry::new();
+    let code = Box::pin(run_scan(args, &mut telemetry)).await;
+    telemetry.flush().await;
+    code
+}
+
+async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     apply_env_toggles(&args.common);
 
     // Fold the legacy mode booleans into `args.mode` before anything reads
@@ -1719,7 +1731,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             }
         }
         // Telemetry: empty-scan still counts as a successful scan.
-        track_patch_scanned(
+        spawn_patch_scanned(
+            telemetry,
             0,
             0,
             0,
@@ -1732,8 +1745,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
             false,
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
-        )
-        .await;
+        );
         if args.common.json {
             // When the crawler finds nothing, GC is intentionally skipped
             // — pruning every manifest entry on the assumption that the
@@ -1976,13 +1988,13 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     if total_batches > 0 && batch_error_count == total_batches {
         status.finish();
         let err = last_batch_error.unwrap_or_else(|| "all batches failed".to_string());
-        track_patch_scan_failed(
+        spawn_patch_scan_failed(
+            telemetry,
             &err,
             fallback_to_proxy,
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
-        )
-        .await;
+        );
 
         // A scan in which *every* batch failed produced no trustworthy
         // patch data. Surfacing `status: "success"` / exit 0 here would be
@@ -2046,7 +2058,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // per-tier counts. `fallback_to_proxy` is `true` iff the batch
     // loop downgraded from the authenticated endpoint to the public
     // proxy after a 401/403.
-    track_patch_scanned(
+    spawn_patch_scanned(
+        telemetry,
         package_count,
         free_patches,
         paid_patches,
@@ -2059,8 +2072,7 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         fallback_to_proxy,
         telemetry_token.as_deref(),
         telemetry_org.as_deref(),
-    )
-    .await;
+    );
 
     // Read existing manifest once for update detection. Used by both the
     // JSON-mode emission (always includes an `updates` array) and the
