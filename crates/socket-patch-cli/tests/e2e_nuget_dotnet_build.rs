@@ -91,6 +91,27 @@ fn pinned_version() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Serializes every `dotnet` process this binary spawns. The .NET 9 PAL
+/// races when two processes create the same named mutex while the machine's
+/// shared-memory root does not exist yet (a fresh CI runner has no
+/// `/tmp/.dotnet`): both first-run `dotnet restore`s take NuGet's
+/// `NuGet-Migrations` mutex, and the loser dies with `System.IO.IOException:
+/// ... 'NuGet-Migrations' ... mkdir("/tmp/.dotnet/shm/session<N>",
+/// AllUsers_ReadWriteExecute) == -1; errno == EEXIST` before restoring
+/// anything. The hosted and vendored tests run in parallel, so without this
+/// the SDK 9 leg failed whichever test lost. (Reproduced in
+/// `mcr.microsoft.com/dotnet/sdk:9.0`: two concurrent first-run CLI
+/// commands with fresh HOMEs and `/tmp/.dotnet` wiped before each of 60
+/// rounds lost up to 9 of the 120 processes; none with the root pre-created
+/// or the commands run one at a time.) Only the SDK phases
+/// serialize — the socket-patch runs between them stay parallel.
+static DOTNET_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn dotnet_output(cmd: &mut Command) -> std::io::Result<Output> {
+    let _one_at_a_time = DOTNET_SPAWN.lock().unwrap_or_else(|p| p.into_inner());
+    cmd.output()
+}
+
 /// The SDK under test: its `dotnet` muxer, `--version`, and major.
 struct Dotnet {
     bin: PathBuf,
@@ -127,12 +148,13 @@ impl Dotnet {
             )
             .unwrap();
         }
-        let out = Command::new(&bin)
-            .arg("--version")
-            .current_dir(sb.root())
-            .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
-            .env("DOTNET_NOLOGO", "1")
-            .output();
+        let out = dotnet_output(
+            Command::new(&bin)
+                .arg("--version")
+                .current_dir(sb.root())
+                .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+                .env("DOTNET_NOLOGO", "1"),
+        );
         let version = match out {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
             _ => {
@@ -198,7 +220,7 @@ impl Dotnet {
             // A dotnet-install.sh SDK dir: pin the muxer's own root.
             cmd.env("DOTNET_ROOT", self.bin.parent().unwrap());
         }
-        cmd.output().expect("spawn dotnet restore")
+        dotnet_output(&mut cmd).expect("spawn dotnet restore")
     }
 
     fn restore_ok(&self, sb: &Sandbox, cwd: &Path, store: &Path, extra: &[&str], what: &str) {
