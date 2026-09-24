@@ -1619,6 +1619,9 @@ pub(crate) async fn vendor_records(
                             let reverted_what = if candidate.starts_with("pkg:cargo/") {
                                 "the hosted edits (Cargo.toml registry pin, Cargo.lock \
                                  source/checksum, registries block)"
+                            } else if candidate.starts_with("pkg:golang/") {
+                                "the hosted edits (go.mod replace, the socket module's go.sum \
+                                 lines, the pruned upstream go.sum lines)"
                             } else {
                                 "the hosted lockfile edits back to their pre-redirect \
                                  registry values"

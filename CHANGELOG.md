@@ -389,6 +389,13 @@ into the new version's section — see docs/releasing.md.
   the file; they now return to the position `go mod tidy` sorts them to
   (semver order within a module). CRLF go.mod/go.sum files also unwind
   cleanly, with no leftover socket lines or blank lines.
+- **Vendoring a hosted Go module unwinds the hosted redirect first.**
+  `vendor` / `get --mode vendored` over a hosted-redirected Go module left
+  its redirect-ledger record and the socket module's go.sum lines behind
+  (with the upstream lines still pruned). Go now takes the same per-purl
+  takeover revert as cargo and npm (`vendor_takeover_reverted_redirect`),
+  and scoped `rollback <purl>` / `remove <purl>` of one hosted Go module
+  works without an unscoped rollback.
 - **A vendoring-service outage no longer re-vendors packages.** An npm
   re-run (every lock flavor, `bun.lockb` included) re-acquired its tarball
   from whichever source answered — the service's prebuilt, or a local pack

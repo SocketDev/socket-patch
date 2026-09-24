@@ -300,6 +300,17 @@ async fn hosted_takeover_of_vendored_module_removes_vendored_state() {
 const TEXT_SUM: &str = "golang.org/x/text v0.14.0 h1:ScX5w1eTa3QqT8oi6+ziP7dTV1S2+ALU0bI+0zXKWiQ=\n\
                         golang.org/x/text v0.14.0/go.mod h1:18ZOQIKpY8NJVqYksKHtTdi31H5itFRjB5/qKTNYzSU=\n";
 
+fn pristine_module(modcache: &Path) {
+    let module_dir = modcache.join(format!("{UMOD}@{UVER}"));
+    std::fs::create_dir_all(&module_dir).unwrap();
+    std::fs::write(
+        module_dir.join("go.mod"),
+        format!("module {UMOD}\n\ngo 1.21\n"),
+    )
+    .unwrap();
+    std::fs::write(module_dir.join("lib.go"), PRISTINE_LIB).unwrap();
+}
+
 /// Hosted `rollback` puts the pruned upstream go.sum pair back where go
 /// sorts it, so go.mod and go.sum return byte for byte.
 #[tokio::test(flavor = "multi_thread")]
@@ -338,5 +349,92 @@ async fn hosted_rollback_restores_go_sum_byte_for_byte() {
     assert_eq!(
         std::fs::read_to_string(consumer.join("go.sum")).unwrap(),
         go_sum
+    );
+}
+
+/// hosted → vendored takeover: vendoring must first unwind the hosted
+/// redirect (replace, socket go.sum lines, pruned upstream pair, ledger
+/// record), so the project is fully vendored — never a vendored go.mod
+/// beside a redirect ledger that still claims the module.
+#[tokio::test(flavor = "multi_thread")]
+async fn vendored_takeover_of_hosted_module_unwinds_the_redirect() {
+    let tmp = tempfile::tempdir().unwrap();
+    let consumer = tmp.path().join("consumer");
+    let go_sum = format!("{UPSTREAM_SUM}{TEXT_SUM}");
+    write_consumer(&consumer, &format!("require {UMOD} {UVER}\n"), &go_sum);
+    let modcache = tmp.path().join("modcache");
+    pristine_module(&modcache);
+    let server = MockServer::start().await;
+    mount_hosted_grant(&server).await;
+    let env = get_hosted(&consumer, &server, &modcache);
+    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+    let ledger_path = consumer.join(".socket/vendor/redirect-state.json");
+    assert!(
+        std::fs::read_to_string(&ledger_path)
+            .unwrap()
+            .contains(UPURL),
+        "precondition: the module is hosted-redirected"
+    );
+
+    let socket = consumer.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    let after = compute_git_sha256_from_bytes(PATCHED_LIB.as_bytes());
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "patches": { UPURL: {
+                "uuid": UUID_V,
+                "exportedAt": "2026-01-01T00:00:00Z",
+                "files": { "lib.go": {
+                    "beforeHash": compute_git_sha256_from_bytes(PRISTINE_LIB.as_bytes()),
+                    "afterHash": &after,
+                }},
+                "vulnerabilities": {},
+                "description": "vendored over hosted",
+                "license": "MIT",
+                "tier": "free",
+            }}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(socket.join("blobs").join(&after), PATCHED_LIB).unwrap();
+
+    let (code, stdout, stderr) = common::run_with_env(
+        &consumer,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            consumer.to_str().unwrap(),
+        ],
+        &[("GOMODCACHE", modcache.to_str().unwrap())],
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("vendor_takeover_reverted_redirect"),
+        "the takeover is reported: {stdout}"
+    );
+    let go_mod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
+    assert!(
+        go_mod.contains(&format!(
+            "replace {UMOD} {UVER} => ./.socket/vendor/golang/{UUID_V}/{UMOD}@{UVER}"
+        )),
+        "{go_mod}"
+    );
+    assert!(!go_mod.contains("gopatch"), "{go_mod}");
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("go.sum")).unwrap(),
+        go_sum,
+        "go.sum is back to its pre-redirect bytes"
+    );
+    let ledger = std::fs::read_to_string(&ledger_path).unwrap_or_default();
+    assert!(
+        !ledger.contains(UPURL),
+        "the redirect ledger no longer claims the module: {ledger}"
     );
 }

@@ -1,8 +1,9 @@
 //! Whole-ledger reverse replay of hosted-redirect edits.
 //!
-//! The per-purl reverts in [`super::takeover`] cover cargo and the
-//! npm-family lock flavors. Everything else the hosted rewriters touch —
-//! gem, golang, pypi, composer, bun, and the non-package rideshare edits
+//! The per-purl reverts in [`super::takeover`] cover cargo, the
+//! npm-family lock flavors, and golang (which reuses the golang inverses
+//! here). Everything else the hosted rewriters touch —
+//! gem, pypi, composer, bun, and the non-package rideshare edits
 //! (such as the pnpm `trustLockfile` auto-config) —
 //! has no per-purl revert: their unwind rides the ledger's designed
 //! whole-list contract ("edits appended in write order, a revert walks

@@ -43,8 +43,8 @@ pub use state::{
     CorruptRedirectState, RedirectState, REDIRECT_STATE_REL,
 };
 pub use takeover::{
-    redirect_revert_supported, revert_cargo_redirect_purl, revert_npm_redirect_purl,
-    revert_redirect_purl, RedirectRevert,
+    redirect_revert_supported, revert_cargo_redirect_purl, revert_golang_redirect_purl,
+    revert_npm_redirect_purl, revert_redirect_purl, RedirectRevert,
 };
 
 /// One ecosystem's integrity hashes (mirrors the TS `PatchArtifactIntegrity`).
