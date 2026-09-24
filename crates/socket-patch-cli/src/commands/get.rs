@@ -1,8 +1,9 @@
 use clap::Args;
+use futures_util::StreamExt;
 use regex::Regex;
 use socket_patch_core::api::client::{
-    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate, ApiClient,
-    ApiError,
+    build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
+    is_fallback_candidate, ApiClient, ApiError,
 };
 use socket_patch_core::api::ranking::{cmp_search_results, severity_order};
 use socket_patch_core::api::types::{
@@ -17,6 +18,7 @@ use socket_patch_core::manifest::schema::{
 use socket_patch_core::patch::apply::{is_valid_blob_hash, select_installed_variants};
 use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
 use socket_patch_core::telemetry::{track_patch_fetch_failed, track_patch_fetched};
+use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::{
     canonical_purl, is_purl, normalize_purl, strip_purl_qualifiers,
 };
@@ -1359,6 +1361,22 @@ async fn filter_to_installed_releases(
     let partitioned = partition_purls(&all_qualified, None);
     let paths = find_packages_for_rollback(&partitioned, crawler_options, true).await;
 
+    // Every installed base's variant views, fetched concurrently (at most
+    // `api_concurrency` in flight) in the order the loop below consumes
+    // them: bases in `multi` order, skipping the uninstalled ones, each
+    // base's variants in order. Nothing here prints between fetches, and
+    // each request's `--debug` lines are released at its old turn.
+    let installed_variants: Vec<String> = multi
+        .iter()
+        .filter(|(_, variants)| variants.iter().any(|s| paths.contains_key(&s.purl)))
+        .flat_map(|(_, variants)| variants.iter().map(|s| s.uuid.clone()))
+        .collect();
+    let mut variant_views = std::pin::pin!(ordered_concurrent(
+        installed_variants,
+        api_concurrency(api_client.uses_public_proxy()),
+        |uuid| async move { hold_back_debug(api_client.fetch_patch(&uuid)).await },
+    ));
+
     for (base, variants) in multi {
         // Any variant's resolved path works — they all map to the same
         // installed package directory.
@@ -1379,7 +1397,12 @@ async fn filter_to_installed_releases(
         // kept for the download loop — it is the same GET it would issue.
         let mut candidates: Vec<(String, HashMap<String, PatchFileInfo>)> = Vec::new();
         for s in &variants {
-            match api_client.fetch_patch(&s.uuid).await {
+            let view = match variant_views.next().await {
+                Some(view) => view.release(),
+                // Unreachable: the plan holds one view per variant here.
+                None => api_client.fetch_patch(&s.uuid).await,
+            };
+            match view {
                 Ok(Some(patch)) => {
                     candidates.push((s.purl.clone(), files_with_both_hashes(&patch)));
                     views.insert(s.uuid.clone(), patch);
@@ -1774,6 +1797,22 @@ impl FetchBatch {
     }
 }
 
+/// The record a detached ledger entry already carries for `purl` at
+/// exactly `uuid` — the ledger store's idempotency skip (no view fetch).
+/// Always `None` for the manifest store.
+fn detached_ledger_record<'a>(
+    store: RecordStore<'a>,
+    purl: &str,
+    uuid: &str,
+) -> Option<&'a PatchRecord> {
+    let RecordStore::Ledger(entries) = store else {
+        return None;
+    };
+    lookup_entry(entries, purl)
+        .filter(|e| e.detached && e.uuid == uuid)
+        .and_then(|e| e.record.as_ref())
+}
+
 /// The fetch loop both download engines share: installed-release
 /// narrowing, the caller's Bun refusal, the per-store skip decision, the
 /// view fetch (served from `prefetched` when the narrowing or the caller
@@ -1825,6 +1864,31 @@ async fn fetch_selected_patches(
         warnings,
     };
 
+    // The view GETs the loop below makes — every patch past the refusal
+    // and the ledger skip whose view is not already held in `prefetched`
+    // (the same three checks, in the loop's order, over inputs the loop
+    // never mutates) — run concurrently ahead of it, at most
+    // `api_concurrency` in flight, and come back in selection order. The
+    // loop takes the next one exactly where it used to await the request,
+    // and each request's `--debug` lines print there too, so stdout, the
+    // per-patch stderr lines and the JSON records fold exactly as the
+    // serial loop's did.
+    let mut held: std::collections::HashSet<&str> = prefetched.keys().map(String::as_str).collect();
+    let to_fetch: Vec<&str> = selected
+        .iter()
+        .filter(|sr| {
+            bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none()
+                && detached_ledger_record(store, &sr.purl, &sr.uuid).is_none()
+                && !held.remove(sr.uuid.as_str())
+        })
+        .map(|sr| sr.uuid.as_str())
+        .collect();
+    let mut views = std::pin::pin!(ordered_concurrent(
+        to_fetch,
+        api_concurrency(api_client.uses_public_proxy()),
+        |uuid| async move { (uuid, hold_back_debug(api_client.fetch_patch(uuid)).await) },
+    ));
+
     for search_result in &selected {
         let (purl, uuid) = (search_result.purl.as_str(), search_result.uuid.as_str());
 
@@ -1850,30 +1914,35 @@ async fn fetch_selected_patches(
 
         // Idempotency (ledger store): a detached entry already at this uuid
         // carries its own record — no view fetch needed.
-        if let RecordStore::Ledger(entries) = store {
-            if let Some(record) = lookup_entry(entries, purl)
-                .filter(|e| e.detached && e.uuid == uuid)
-                .and_then(|e| e.record.clone())
-            {
-                if !quiet {
-                    eprintln!("{}", format_record_skip(purl, "already vendored"));
-                }
-                batch.patches_json.push(serde_json::json!({
-                    "purl": purl,
-                    "uuid": uuid,
-                    "action": "skipped",
-                }));
-                batch.reused.push((purl.to_string(), record));
-                batch.skipped += 1;
-                continue;
+        if let Some(record) = detached_ledger_record(store, purl, uuid).cloned() {
+            if !quiet {
+                eprintln!("{}", format_record_skip(purl, "already vendored"));
             }
+            batch.patches_json.push(serde_json::json!({
+                "purl": purl,
+                "uuid": uuid,
+                "action": "skipped",
+            }));
+            batch.reused.push((purl.to_string(), record));
+            batch.skipped += 1;
+            continue;
         }
 
         // The view: from memory when the narrowing (or the uuid path's own
-        // identifier fetch) already fetched it, else the network.
+        // identifier fetch) already fetched it, else the network — the next
+        // of the concurrent GETs above, which were planned for exactly
+        // these turns.
         let view = match prefetched.remove(uuid) {
             Some(patch) => Ok(Some(patch)),
-            None => api_client.fetch_patch(uuid).await,
+            None => match views.next().await {
+                Some((planned, view)) if planned == uuid => view.release(),
+                // Unreachable (the plan mirrors this loop's checks); a
+                // live fetch keeps the outcome right regardless.
+                _ => {
+                    debug_assert!(false, "view prefetch plan out of step at {uuid}");
+                    api_client.fetch_patch(uuid).await
+                }
+            },
         };
         let patch = match view {
             Ok(Some(patch)) => patch,
@@ -6822,6 +6891,177 @@ mod tests {
             Some(new_uuid),
             "the superseding record is what the vendor step receives"
         );
+    }
+
+    /// The download loop's view GETs run concurrently but fold in selection
+    /// order: with later views answering FIRST (reversed latencies) and a
+    /// mix of 200 / 404 / 500 / held-in-memory / ledger-reused patches,
+    /// every per-patch record keeps its selection slot and its serial
+    /// action + error text, and only the views the serial loop fetched are
+    /// requested (the held and reused ones never are).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_patch_records_concurrent_views_fold_in_selection_order() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL", "SOCKET_PATCH_PROXY_URL"]);
+        let server = MockServer::start().await;
+        let uuid = |c: char| {
+            format!("{0}{0}{0}{0}{0}{0}{0}{0}-{0}{0}{0}{0}-4{0}{0}{0}-8{0}{0}{0}-{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}{0}", c)
+        };
+        let purl = |n: &str| format!("pkg:npm/covgap-order-{n}@1.0.0");
+        let view = |u: &str, p: &str| {
+            serde_json::json!({
+                "uuid": u, "purl": p,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "files": { "package/index.js": {
+                    "beforeHash": "0".repeat(64), "afterHash": "1".repeat(64),
+                }},
+                "vulnerabilities": {}, "description": "d", "license": "MIT", "tier": "free",
+            })
+        };
+        // Selection order a..f; the slowest answers belong to the earliest.
+        let (a, b, c, d, e, f) = (
+            uuid('a'),
+            uuid('b'),
+            uuid('c'),
+            uuid('d'),
+            uuid('e'),
+            uuid('f'),
+        );
+        let mount = |u: &str, resp: ResponseTemplate| {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/v0/orgs/test-org/patches/view/{u}")))
+                .respond_with(resp)
+                .expect(1)
+        };
+        mount(
+            &a,
+            ResponseTemplate::new(200)
+                .set_body_json(view(&a, &purl("a")))
+                .set_delay(Duration::from_millis(600)),
+        )
+        .mount(&server)
+        .await;
+        mount(
+            &b,
+            ResponseTemplate::new(404).set_delay(Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+        mount(
+            &c,
+            ResponseTemplate::new(500)
+                .set_body_string("boom")
+                .set_delay(Duration::from_millis(200)),
+        )
+        .mount(&server)
+        .await;
+        // `d` is held in memory and `e` is reused from the ledger: never
+        // requested.
+        for u in [&d, &e] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/v0/orgs/test-org/patches/view/{u}")))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&server)
+                .await;
+        }
+        mount(
+            &f,
+            ResponseTemplate::new(200).set_body_json(view(&f, &purl("f"))),
+        )
+        .mount(&server)
+        .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let vendor = tmp.path().join(".socket/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(
+            vendor.join("state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "entries": { purl("e"): {
+                    "ecosystem": "npm",
+                    "basePurl": purl("e"),
+                    "uuid": e,
+                    "detached": true,
+                    "record": {
+                        "uuid": e,
+                        "exportedAt": "2024-01-01T00:00:00Z",
+                        "files": { "package/index.js": {
+                            "beforeHash": "0".repeat(64), "afterHash": "1".repeat(64),
+                        }},
+                        "vulnerabilities": {},
+                        "description": "d", "license": "MIT", "tier": "free",
+                    },
+                    "artifact": {
+                        "path": format!(".socket/vendor/npm/{e}/covgap-order-e-1.0.0.tgz"),
+                    },
+                    "wiring": []
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut held: PatchResponse = serde_json::from_value(view(&d, &purl("d"))).unwrap();
+        held.uuid = d.clone();
+        let selected: Vec<PatchSearchResult> = [
+            (&a, "a"),
+            (&b, "b"),
+            (&c, "c"),
+            (&d, "d"),
+            (&e, "e"),
+            (&f, "f"),
+        ]
+        .iter()
+        .map(|(u, n)| mk_patch(u, &purl(n), "free", "2024-01-01"))
+        .collect();
+        let client = test_client(&server.uri()).await;
+        let (_code, json, records, _blobs) = download_patch_records_with(
+            &selected,
+            &detached_params(tmp.path()),
+            &client,
+            HashMap::from([(d.clone(), held)]),
+        )
+        .await;
+
+        let rows: Vec<(String, String, String)> = json["patches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["purl"].as_str().unwrap_or_default().to_string(),
+                    p["action"].as_str().unwrap_or_default().to_string(),
+                    p["error"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let row =
+            |n: &str, action: &str, error: &str| (purl(n), action.to_string(), error.to_string());
+        assert_eq!(
+            rows,
+            vec![
+                row("a", "downloaded", ""),
+                row("b", "failed", "could not fetch details"),
+                row("c", "failed", "API request failed with status 500: boom"),
+                row("d", "downloaded", ""),
+                row("e", "skipped", ""),
+                row("f", "downloaded", ""),
+            ],
+            "json={json}"
+        );
+        assert_eq!(json["downloaded"], 3, "json={json}");
+        assert_eq!(json["failed"], 2, "json={json}");
+        assert_eq!(json["skipped"], 1, "json={json}");
+        let mut got: Vec<&String> = records.keys().collect();
+        got.sort();
+        assert_eq!(got, vec![&purl("a"), &purl("d"), &purl("e"), &purl("f")]);
+        // `.expect` counts are verified on drop.
+        drop(server);
     }
 
     /// The env guard must RESTORE a variable that was set before the scrub —

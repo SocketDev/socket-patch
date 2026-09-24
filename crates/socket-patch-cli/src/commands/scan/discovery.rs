@@ -2,11 +2,14 @@
 //! supplements, update detection against the existing manifest, vendor
 //! baseline pre-verification, and the table's vuln-ID / severity helpers.
 
+use futures_util::StreamExt;
+use socket_patch_core::api::client::hold_back_debug;
 use socket_patch_core::api::ranking::cmp_batch_infos;
 use socket_patch_core::api::types::{
     BatchPackagePatches, BatchPatchInfo, PatchResponse, PatchSearchResult,
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
 use socket_patch_core::vendor::VendorState;
@@ -283,29 +286,58 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
 
     let mut mismatched: HashSet<String> = HashSet::new();
     let mut views: HashMap<String, PatchResponse> = HashMap::new();
-    for (i, patch) in selected.iter().enumerate() {
+    // Per patch, what the loop below compares: `None` to skip it, else the
+    // installed copy plus the ledger's embedded record (`None` = fetch the
+    // view). Local and read-only, so it is computed up front.
+    let plan: Vec<
+        Option<(
+            &socket_patch_core::crawlers::types::CrawledPackage,
+            Option<&PatchRecord>,
+        )>,
+    > = selected
+        .iter()
+        .map(|patch| {
+            // API purls come percent-encoded, crawler purls literal —
+            // purl_eq bridges the two spellings.
+            let base = strip_purl_qualifiers(&patch.purl);
+            // Lockfile-only packages have no installed bytes to compare
+            // — the vendor engine fetches them pristine (nothing to
+            // annotate).
+            if lockfile_only_contains(lockfile_only, base) {
+                return None;
+            }
+            let pkg = crawled.iter().find(|c| purl_eq(&c.purl, base))?;
+            // The same predicate as the download phase's ledger
+            // idempotency skip: its no-fetch set and this one must be
+            // the same set.
+            let embedded = vendor
+                .and_then(|entries| lookup_entry(entries, &patch.purl))
+                .filter(|e| e.detached && e.uuid == patch.uuid)
+                .and_then(|e| e.record.as_ref());
+            Some((pkg, embedded))
+        })
+        .collect();
+    // The views the loop needs, fetched concurrently (at most
+    // `api_concurrency` in flight) and consumed in `selected` order, each
+    // request's `--debug` lines released at its turn.
+    let mut details = std::pin::pin!(ordered_concurrent(
+        selected
+            .iter()
+            .zip(&plan)
+            .filter(|(_, step)| matches!(step, Some((_, None))))
+            .map(|(patch, _)| patch.uuid.as_str()),
+        api_concurrency(api_client.uses_public_proxy()),
+        |uuid| hold_back_debug(api_client.fetch_patch(uuid)),
+    ));
+    for (i, (patch, step)) in selected.iter().zip(&plan).enumerate() {
         status.set(format!(
             "Checking installed files against patch baselines... ({}/{})",
             i + 1,
             selected.len()
         ));
-        // API purls come percent-encoded, crawler purls literal — purl_eq
-        // bridges the two spellings.
-        let base = strip_purl_qualifiers(&patch.purl);
-        // Lockfile-only packages have no installed bytes to compare — the
-        // vendor engine fetches them pristine (nothing to annotate).
-        if lockfile_only_contains(lockfile_only, base) {
-            continue;
-        }
-        let Some(pkg) = crawled.iter().find(|c| purl_eq(&c.purl, base)) else {
+        let Some((pkg, embedded)) = *step else {
             continue;
         };
-        // The same predicate as the download phase's ledger idempotency
-        // skip: its no-fetch set and this one must be the same set.
-        let embedded = vendor
-            .and_then(|entries| lookup_entry(entries, &patch.purl))
-            .filter(|e| e.detached && e.uuid == patch.uuid)
-            .and_then(|e| e.record.as_ref());
         let files: Vec<(String, PatchFileInfo)> = match embedded {
             Some(record) => record
                 .files
@@ -313,7 +345,10 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
                 .map(|(file, info)| (file.clone(), info.clone()))
                 .collect(),
             None => {
-                let Ok(Some(detail)) = api_client.fetch_patch(&patch.uuid).await else {
+                let Some(detail) = details.next().await else {
+                    continue;
+                };
+                let Ok(Some(detail)) = detail.release() else {
                     continue;
                 };
                 let files = detail

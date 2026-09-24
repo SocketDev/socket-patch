@@ -69,11 +69,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use futures_util::StreamExt;
+
 use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate,
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::redirect::RedirectState;
+use socket_patch_core::utils::concurrent::ordered_concurrent;
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::state::{lookup_entry_kv, VendorArtifact, VendorEntry, VendorState};
 use socket_patch_core::vex::discover::{
@@ -902,28 +905,29 @@ async fn fetch_records(
     loop {
         let mut auth_refused: Vec<String> = Vec::new();
         let mut auth_error: Option<String> = None;
-        for chunk in pending.chunks(FETCH_CONCURRENCY) {
-            status.set(format!(
-                "Fetching {}... ({done}/{total})",
-                if total == 1 {
-                    "the patch record"
-                } else {
-                    "patch records"
-                }
+        // A sliding window of at most FETCH_CONCURRENCY views in flight
+        // (it used to wait for each whole chunk of that size to drain
+        // before starting the next), consumed in `pending` order.
+        {
+            let client = &client;
+            let mut views = std::pin::pin!(ordered_concurrent(
+                pending.iter(),
+                FETCH_CONCURRENCY,
+                |uuid| async move { (uuid, client.fetch_patch(uuid).await) },
             ));
-            let mut set = tokio::task::JoinSet::new();
-            for uuid in chunk {
-                let client = client.clone();
-                let uuid = uuid.clone();
-                set.spawn(async move {
-                    let result = client.fetch_patch(&uuid).await;
-                    (uuid, result)
-                });
-            }
-            while let Some(joined) = set.join_next().await {
-                let Ok((uuid, result)) = joined else {
-                    continue;
+            loop {
+                status.set(format!(
+                    "Fetching {}... ({done}/{total})",
+                    if total == 1 {
+                        "the patch record"
+                    } else {
+                        "patch records"
+                    }
+                ));
+                let Some((uuid, result)) = views.next().await else {
+                    break;
                 };
+                let uuid = uuid.clone();
                 done += 1;
                 match result {
                     Ok(Some(view)) => {

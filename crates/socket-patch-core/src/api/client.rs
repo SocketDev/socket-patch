@@ -119,6 +119,32 @@ pub(crate) fn flush_deferred_debug(lines: Vec<String>) {
     }
 }
 
+/// A request's output fetched ahead of the loop that consumes it, with its
+/// `--debug` lines held back until [`Self::release`] — call that where the
+/// one-at-a-time loop would have issued the request, so the debug stream
+/// keeps the serial interleaving with the loop's own stderr lines. Dropping
+/// it unreleased discards the lines (the serial loop never made the call).
+#[derive(Debug)]
+pub struct HeldBack<T> {
+    value: T,
+    debug: Vec<String>,
+}
+
+impl<T> HeldBack<T> {
+    /// The output, printing the held-back debug lines first.
+    pub fn release(self) -> T {
+        flush_deferred_debug(self.debug);
+        self.value
+    }
+}
+
+/// Run `fut` (a request made ahead of its turn) with its debug lines held
+/// back; see [`HeldBack`].
+pub async fn hold_back_debug<T>(fut: impl std::future::Future<Output = T>) -> HeldBack<T> {
+    let (value, debug) = with_deferred_debug(fut).await;
+    HeldBack { value, debug }
+}
+
 /// Options for constructing an [`ApiClient`].
 #[derive(Debug, Clone)]
 pub struct ApiClientOptions {
