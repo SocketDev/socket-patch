@@ -141,6 +141,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     // Scrub FIRST, then the hermetic flags so they survive (last env wins).
     scrub_socket_env(&mut cmd);
     cache_env::isolate(&mut cmd);
+    yarn_berry_common::pin_berry_ci_defaults(&mut cmd);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
         .env("YARN_ENABLE_GLOBAL_CACHE", "false");
     for (k, v) in extra_env {

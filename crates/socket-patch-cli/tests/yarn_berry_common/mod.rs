@@ -109,6 +109,51 @@ pub fn yarn_berry() -> &'static str {
     .as_str()
 }
 
+/// Pin the yarn berry defaults that depend on whether yarn thinks it is
+/// running under CI. Apply it after the `YARN_*` scrub and `cache_env::isolate`,
+/// and before the call site's own env.
+///
+/// yarn 3+ turns `enableImmutableInstalls` on by default when it detects CI
+/// (ci-info: `CI`, `GITHUB_ACTIONS`, …). Under that default, the plain
+/// `yarn install` that creates each fixture's lockfile fails with YN0028 ("The
+/// lockfile would have been created by this install, which is explicitly
+/// forbidden"), exit 1 and nothing on stderr. That broke every hosted,
+/// vendored, pnpm-linker, workspaces and yarn 3 refusal fixture on the
+/// ubuntu/macOS yarn-berry legs. yarn 2 keeps the default off, which is why
+/// its refusal legs stayed green. The pin:
+///
+/// * forces `CI=true`, so a developer's local run gets the same defaults as
+///   the CI leg. Without the second pin, every suite fails locally too,
+///   instead of only on a runner;
+/// * sets `YARN_ENABLE_IMMUTABLE_INSTALLS=false`, so a plain `install` may
+///   write the lock. The fresh-checkout installs are unaffected because they
+///   pass `--immutable` explicitly, and yarn's flag outranks the setting.
+pub fn pin_berry_ci_defaults(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd.env("CI", "true")
+        .env("YARN_ENABLE_IMMUTABLE_INSTALLS", "false")
+}
+
+/// [`pin_berry_ci_defaults`] wins over an earlier value for either variable
+/// (`get_envs` reports the last value set for each key).
+#[test]
+fn pin_berry_ci_defaults_sets_ci_and_disables_implicit_immutable() {
+    let mut cmd = std::process::Command::new("corepack");
+    cmd.env("YARN_ENABLE_IMMUTABLE_INSTALLS", "true");
+    pin_berry_ci_defaults(&mut cmd);
+    let envs: std::collections::HashMap<_, _> = cmd
+        .get_envs()
+        .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+        .collect();
+    assert_eq!(
+        envs.get(std::ffi::OsStr::new("CI")),
+        Some(&Some("true".into()))
+    );
+    assert_eq!(
+        envs.get(std::ffi::OsStr::new("YARN_ENABLE_IMMUTABLE_INSTALLS")),
+        Some(&Some("false".into()))
+    );
+}
+
 /// The cache-zip checksum a real yarn wrote into `lock` (the first entry
 /// `checksum:`), normalized to the prefixed `10c0/<hex>` the patch API's
 /// `yarnBerry10c0` carries. yarn 4.0.x writes the BARE hex under cacheKey
