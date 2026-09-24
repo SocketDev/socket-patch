@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
-use crate::utils::fs::is_dir;
+use crate::utils::fs::{is_dir_sync, read_dir_entries_sync, run_blocking};
+
+#[cfg(test)]
+mod oracle;
 
 // ---------------------------------------------------------------------------
 // Case-encoding helpers
@@ -154,77 +157,47 @@ impl GoCrawler {
     }
 
     /// Crawl the Go module cache and return all discovered packages.
+    ///
+    /// The whole walk is one blocking-pool task (a module cache holds tens
+    /// of thousands of directories; one runtime hop per readdir and stat
+    /// dominated the crawl), visiting entries in the same depth-first,
+    /// readdir order as before so the first-seen PURL dedup keeps the same
+    /// winners.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
-        let mut packages = Vec::new();
-        let mut seen = HashSet::new();
-
         let cache_paths = self
             .get_module_cache_paths(options)
             .await
             .unwrap_or_default();
-
-        for cache_path in &cache_paths {
-            self.scan_dir_recursive(cache_path, cache_path, &mut seen, &mut packages)
-                .await;
+        if cache_paths.is_empty() {
+            return Vec::new();
         }
 
-        packages
+        run_blocking(move || {
+            let mut packages = Vec::new();
+            let mut seen = HashSet::new();
+            for cache_path in &cache_paths {
+                scan_cache_sync(cache_path, &mut seen, &mut packages);
+            }
+            packages
+        })
+        .await
     }
 
     /// Find specific packages by PURL in the module cache.
+    ///
+    /// The per-PURL probes (a stat plus the partial-extraction marker stat)
+    /// run together as one blocking-pool task.
     pub async fn find_by_purls(
         &self,
         cache_path: &Path,
         purls: &[String],
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
-        let mut result: HashMap<String, CrawledPackage> = HashMap::new();
-
-        for purl in purls {
-            if let Some((module_path, version)) = crate::utils::purl::parse_golang_purl(purl) {
-                let (module_path, version) = (module_path.as_ref(), version.as_ref());
-                // SECURITY: `module_path`/`version` come straight from the
-                // (untrusted) manifest PURL and are joined onto the cache root
-                // below. In global mode the resolved directory is patched IN
-                // PLACE (no `replace`-redirect backend stands between the
-                // crawler and disk), so a tampered PURL with a `..` segment
-                // must not be able to escape the cache. Reject fail-closed
-                // before the `is_dir` probe — the twin of the deno crawler's
-                // `is_safe_jsr_component` gate.
-                if !is_safe_module_coordinate(module_path, version) {
-                    continue;
-                }
-                // Encode the module path AND the version for the filesystem.
-                // Go case-escapes both halves of the directory name, so a
-                // version like `v1.0.0-RC1` must be looked up as
-                // `v1.0.0-!r!c1` or the directory is never found.
-                let encoded = encode_module_path(module_path);
-                let encoded_version = encode_module_path(version);
-
-                // Go module cache layout: <encoded-module-path>@<encoded-version>/
-                let module_dir = cache_path.join(format!("{encoded}@{encoded_version}"));
-
-                if is_dir(&module_dir).await {
-                    if is_partially_extracted(cache_path, &encoded, &encoded_version).await {
-                        continue;
-                    }
-                    // Split module_path into namespace and name
-                    let (namespace, name) = split_module_path(module_path);
-
-                    result.insert(
-                        purl.clone(),
-                        CrawledPackage {
-                            name: name.to_string(),
-                            version: version.to_string(),
-                            namespace: Some(namespace.to_string()),
-                            purl: purl.clone(),
-                            path: module_dir,
-                        },
-                    );
-                }
-            }
+        if purls.is_empty() {
+            return Ok(HashMap::new());
         }
-
-        Ok(result)
+        let cache_path = cache_path.to_path_buf();
+        let purls = purls.to_vec();
+        Ok(run_blocking(move || find_by_purls_sync(&cache_path, &purls)).await)
     }
 
     // ------------------------------------------------------------------
@@ -260,110 +233,16 @@ impl GoCrawler {
         Some(PathBuf::from(home).join("go").join("pkg").join("mod"))
     }
 
-    /// Recursively scan the module cache directory tree.
-    ///
-    /// Go module cache has a hierarchical structure:
-    /// `<cache>/github.com/user/project@v1.0.0/`
-    ///
-    /// We walk the tree looking for directories whose name contains `@`
-    /// (the version separator), which marks a versioned module.
-    fn scan_dir_recursive<'a>(
-        &'a self,
-        base_path: &'a Path,
-        current_path: &'a Path,
-        seen: &'a mut HashSet<String>,
-        results: &'a mut Vec<CrawledPackage>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
-        Box::pin(async move {
-            for entry in crate::utils::fs::list_dir_entries(current_path).await {
-                if !crate::utils::fs::entry_is_dir(&entry).await {
-                    continue;
-                }
-
-                let dir_name = entry.file_name();
-                let dir_name_str = dir_name.to_string_lossy();
-
-                // Skip hidden directories anywhere, and the module cache's
-                // `cache/` metadata directory — but ONLY at the cache root.
-                // The download cache lives at `<root>/cache`; a `cache` path
-                // component deeper in the tree is a legitimate module name
-                // (e.g. `github.com/go-redis/cache/v9@v9.0.0`) and must not be
-                // pruned, or the versioned dir beneath it is never discovered.
-                if dir_name_str.starts_with('.')
-                    || (dir_name_str == "cache" && current_path == base_path)
-                {
-                    continue;
-                }
-
-                // Build the child path from the raw `OsStr` rather than the
-                // lossy UTF-8 rendering, so non-UTF-8 directory names still
-                // resolve to the correct on-disk path.
-                let full_path = current_path.join(&dir_name);
-
-                // Check if this directory has `@` in its name (versioned module)
-                if dir_name_str.contains('@') {
-                    if let Some(pkg) = self.parse_versioned_dir(base_path, &full_path, seen).await {
-                        results.push(pkg);
-                    }
-                } else {
-                    // Recurse into subdirectories
-                    self.scan_dir_recursive(base_path, &full_path, seen, results)
-                        .await;
-                }
-            }
-        })
-    }
-
-    /// Parse a versioned directory (containing `@`) into a `CrawledPackage`.
+    /// The unit tests' entry point to [`parse_versioned_dir`] (the walk
+    /// itself calls the free function on the blocking pool).
+    #[cfg(test)]
     async fn parse_versioned_dir(
         &self,
         base_path: &Path,
         dir_path: &Path,
         seen: &mut HashSet<String>,
     ) -> Option<CrawledPackage> {
-        // Get the relative path from the cache root.
-        // Normalize to forward slashes so PURLs are correct on Windows.
-        let rel_path = dir_path.strip_prefix(base_path).ok()?;
-        let rel_str = rel_path.to_string_lossy().replace('\\', "/");
-
-        // Find the last `@` to split module path and version
-        let at_idx = rel_str.rfind('@')?;
-        let encoded_module_path = &rel_str[..at_idx];
-        let version = &rel_str[at_idx + 1..];
-
-        if encoded_module_path.is_empty() || version.is_empty() {
-            return None;
-        }
-
-        // `version` is still the ENCODED on-disk form here, which is what
-        // the marker path is keyed by.
-        if is_partially_extracted(base_path, encoded_module_path, version).await {
-            return None;
-        }
-
-        // Decode case-encoding. Go escapes uppercase letters in BOTH the
-        // module path and the version, so a pre-release tag such as
-        // `v1.0.0-RC1` lands on disk as `v1.0.0-!r!c1`. Decoding only the
-        // path would leave an escaped version in the PURL.
-        let module_path = decode_module_path(encoded_module_path);
-        let version = decode_module_path(version);
-
-        let purl = crate::utils::purl::build_golang_purl(&module_path, &version);
-
-        if seen.contains(&purl) {
-            return None;
-        }
-        seen.insert(purl.clone());
-
-        let (namespace, name) = split_module_path(&module_path);
-
-        Some(CrawledPackage {
-            name: name.to_string(),
-            version: version.to_string(),
-            namespace: Some(namespace.to_string()),
-            purl,
-            path: dir_path.to_path_buf(),
-        })
+        parse_versioned_dir(base_path, dir_path, seen)
     }
 }
 
@@ -371,6 +250,206 @@ impl Default for GoCrawler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Blocking body of [`GoCrawler::find_by_purls`].
+fn find_by_purls_sync(cache_path: &Path, purls: &[String]) -> HashMap<String, CrawledPackage> {
+    let mut result: HashMap<String, CrawledPackage> = HashMap::new();
+
+    for purl in purls {
+        if let Some((module_path, version)) = crate::utils::purl::parse_golang_purl(purl) {
+            let (module_path, version) = (module_path.as_ref(), version.as_ref());
+            // SECURITY: `module_path`/`version` come straight from the
+            // (untrusted) manifest PURL and are joined onto the cache root
+            // below. In global mode the resolved directory is patched IN
+            // PLACE (no `replace`-redirect backend stands between the
+            // crawler and disk), so a tampered PURL with a `..` segment
+            // must not be able to escape the cache. Reject fail-closed
+            // before the `is_dir` probe — the twin of the deno crawler's
+            // `is_safe_jsr_component` gate.
+            if !is_safe_module_coordinate(module_path, version) {
+                continue;
+            }
+            // Encode the module path AND the version for the filesystem.
+            // Go case-escapes both halves of the directory name, so a
+            // version like `v1.0.0-RC1` must be looked up as
+            // `v1.0.0-!r!c1` or the directory is never found.
+            let encoded = encode_module_path(module_path);
+            let encoded_version = encode_module_path(version);
+
+            // Go module cache layout: <encoded-module-path>@<encoded-version>/
+            let module_dir = cache_path.join(format!("{encoded}@{encoded_version}"));
+
+            if is_dir_sync(&module_dir) {
+                if is_partially_extracted(cache_path, &encoded, &encoded_version) {
+                    continue;
+                }
+                // Split module_path into namespace and name
+                let (namespace, name) = split_module_path(module_path);
+
+                result.insert(
+                    purl.clone(),
+                    CrawledPackage {
+                        name: name.to_string(),
+                        version: version.to_string(),
+                        namespace: Some(namespace.to_string()),
+                        purl: purl.clone(),
+                        path: module_dir,
+                    },
+                );
+            }
+        }
+    }
+
+    result
+}
+
+/// One listed entry of a directory being walked: its raw name plus the
+/// `DirEntry`'s own (symlink-aware) file type, read while listing so the
+/// directory stream is closed before the walk descends.
+struct ListedEntry {
+    name: std::ffi::OsString,
+    file_type: Option<std::fs::FileType>,
+}
+
+/// List `path` (empty when it cannot be read; iteration stops at the first
+/// entry error — the tolerate-and-truncate contract of the crawlers).
+fn list_dir_sync(path: &Path) -> Vec<ListedEntry> {
+    read_dir_entries_sync(path)
+        .map(|(entries, _)| {
+            entries
+                .into_iter()
+                .map(|entry| ListedEntry {
+                    name: entry.file_name(),
+                    file_type: entry.file_type().ok(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a listed entry is a directory, following symlinks: a symlinked
+/// entry is resolved through a stat, and a failed `file_type`/stat means
+/// "not a dir" (`utils::fs::entry_is_dir`'s rule).
+fn listed_is_dir(dir: &Path, entry: &ListedEntry) -> bool {
+    match entry.file_type {
+        Some(kind) if kind.is_symlink() => is_dir_sync(&dir.join(&entry.name)),
+        Some(kind) => kind.is_dir(),
+        None => false,
+    }
+}
+
+/// Walk one module cache root.
+///
+/// Go module cache has a hierarchical structure:
+/// `<cache>/github.com/user/project@v1.0.0/`
+///
+/// We walk the tree looking for directories whose name contains `@`
+/// (the version separator), which marks a versioned module. Depth-first
+/// in readdir order with an explicit stack (each frame is one directory's
+/// listing and the index of its next entry), so packages come out in the
+/// order the recursive walk produced them.
+fn scan_cache_sync(
+    base_path: &Path,
+    seen: &mut HashSet<String>,
+    results: &mut Vec<CrawledPackage>,
+) {
+    let mut stack: Vec<(std::path::PathBuf, Vec<ListedEntry>, usize)> =
+        vec![(base_path.to_path_buf(), list_dir_sync(base_path), 0)];
+    while let Some((current_path, entries, next)) = stack.last_mut() {
+        let Some(entry) = entries.get(*next) else {
+            stack.pop();
+            continue;
+        };
+        *next += 1;
+        if !listed_is_dir(current_path, entry) {
+            continue;
+        }
+
+        let name = &entry.name;
+        let dir_name_str = name.to_string_lossy();
+
+        // Skip hidden directories anywhere, and the module cache's
+        // `cache/` metadata directory — but ONLY at the cache root.
+        // The download cache lives at `<root>/cache`; a `cache` path
+        // component deeper in the tree is a legitimate module name
+        // (e.g. `github.com/go-redis/cache/v9@v9.0.0`) and must not be
+        // pruned, or the versioned dir beneath it is never discovered.
+        if dir_name_str.starts_with('.')
+            || (dir_name_str == "cache" && current_path.as_path() == base_path)
+        {
+            continue;
+        }
+
+        // Build the child path from the raw `OsStr` rather than the
+        // lossy UTF-8 rendering, so non-UTF-8 directory names still
+        // resolve to the correct on-disk path.
+        let full_path = current_path.join(name);
+
+        // Check if this directory has `@` in its name (versioned module)
+        let versioned = dir_name_str.contains('@');
+        drop(dir_name_str);
+        if versioned {
+            if let Some(pkg) = parse_versioned_dir(base_path, &full_path, seen) {
+                results.push(pkg);
+            }
+        } else {
+            // Descend into subdirectories
+            let listing = list_dir_sync(&full_path);
+            stack.push((full_path, listing, 0));
+        }
+    }
+}
+
+/// Parse a versioned directory (containing `@`) into a `CrawledPackage`.
+fn parse_versioned_dir(
+    base_path: &Path,
+    dir_path: &Path,
+    seen: &mut HashSet<String>,
+) -> Option<CrawledPackage> {
+    // Get the relative path from the cache root.
+    // Normalize to forward slashes so PURLs are correct on Windows.
+    let rel_path = dir_path.strip_prefix(base_path).ok()?;
+    let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+
+    // Find the last `@` to split module path and version
+    let at_idx = rel_str.rfind('@')?;
+    let encoded_module_path = &rel_str[..at_idx];
+    let version = &rel_str[at_idx + 1..];
+
+    if encoded_module_path.is_empty() || version.is_empty() {
+        return None;
+    }
+
+    // `version` is still the ENCODED on-disk form here, which is what
+    // the marker path is keyed by.
+    if is_partially_extracted(base_path, encoded_module_path, version) {
+        return None;
+    }
+
+    // Decode case-encoding. Go escapes uppercase letters in BOTH the
+    // module path and the version, so a pre-release tag such as
+    // `v1.0.0-RC1` lands on disk as `v1.0.0-!r!c1`. Decoding only the
+    // path would leave an escaped version in the PURL.
+    let module_path = decode_module_path(encoded_module_path);
+    let version = decode_module_path(version);
+
+    let purl = crate::utils::purl::build_golang_purl(&module_path, &version);
+
+    if seen.contains(&purl) {
+        return None;
+    }
+    seen.insert(purl.clone());
+
+    let (namespace, name) = split_module_path(&module_path);
+
+    Some(CrawledPackage {
+        name: name.to_string(),
+        version: version.to_string(),
+        namespace: Some(namespace.to_string()),
+        purl,
+        path: dir_path.to_path_buf(),
+    })
 }
 
 /// Split a module path into (namespace, name).
@@ -414,18 +493,14 @@ fn is_safe_module_coordinate(module_path: &str, version: &str) -> bool {
 /// PURL lookup must therefore skip it. Mirrors Go's `os.Stat(partialPath)`
 /// succeeded check in `DownloadDir`; both halves of the coordinate are the
 /// case-ENCODED on-disk forms, matching Go's `CachePath(mod, "partial")`.
-async fn is_partially_extracted(
-    cache_path: &Path,
-    encoded_module: &str,
-    encoded_version: &str,
-) -> bool {
+fn is_partially_extracted(cache_path: &Path, encoded_module: &str, encoded_version: &str) -> bool {
     let marker = cache_path
         .join("cache")
         .join("download")
         .join(encoded_module)
         .join("@v")
         .join(format!("{encoded_version}.partial"));
-    tokio::fs::metadata(&marker).await.is_ok()
+    std::fs::metadata(&marker).is_ok()
 }
 
 #[cfg(test)]
@@ -1325,5 +1400,188 @@ mod tests {
         // Same Some("") pin as the crawl-side test above.
         assert_eq!(pkg.namespace, Some(String::new()));
         assert_eq!(pkg.path, module_dir);
+    }
+
+    // ── Equivalence with the per-call async walk (oracle) ─────────────
+
+    mod equivalence {
+        use super::super::oracle::LegacyGoCrawler;
+        use super::*;
+        use crate::crawlers::oracle_support::{
+            map_rows, mkdir, rows, symlink, write, PermGuard, Rng,
+        };
+
+        const NAMES: &[&str] = &[
+            "github.com",
+            "golang.org",
+            "x",
+            "sub",
+            "cache",
+            ".hidden",
+            "!azure",
+            "Azure",
+            "mod@v1.0.0",
+            "mod@v1.0.0-!r!c1",
+            "A@v1.2.0",
+            "!a@v1.2.0",
+            "a@b@v3.0.0",
+            "x@",
+            "@v2.0.0",
+            "text@v0.14.0",
+            "cache@v9.0.0",
+        ];
+
+        struct Gen {
+            rng: Rng,
+            root: PathBuf,
+            outside: PathBuf,
+            perms: PermGuard,
+            versioned: Vec<String>,
+        }
+
+        impl Gen {
+            fn dir(&mut self, dir: &Path, depth: usize) {
+                mkdir(dir);
+                for _ in 0..self.rng.below(6) {
+                    let name = self.rng.pick(NAMES).to_string();
+                    let child = dir.join(&name);
+                    match self.rng.below(12) {
+                        // A plain file (never a module, even with `@`).
+                        0 => write(&child, "x"),
+                        // A symlink to a real directory outside the root
+                        // (holding modules), or a dangling one.
+                        1 => {
+                            let target = if self.rng.chance(70) {
+                                let t = self.outside.join(format!("t{}", self.rng.next()));
+                                mkdir(&t.join("linked@v1.0.0"));
+                                mkdir(&t.join("deep").join("m@v0.1.0"));
+                                t
+                            } else {
+                                self.outside.join("missing")
+                            };
+                            symlink(&target, &child);
+                        }
+                        // An unreadable or unsearchable directory.
+                        2 if depth > 0 => {
+                            mkdir(&child.join("in@v1.0.0"));
+                            let mode = if self.rng.chance(50) { 0o000 } else { 0o600 };
+                            self.perms.plan(&child, mode);
+                        }
+                        _ if name.contains('@') => {
+                            mkdir(&child);
+                            if let Ok(rel) = child.strip_prefix(&self.root) {
+                                let rel = rel.to_string_lossy().replace('\\', "/");
+                                self.versioned.push(rel.clone());
+                                if self.rng.chance(20) {
+                                    if let Some(at) = rel.rfind('@') {
+                                        write(
+                                            &self
+                                                .root
+                                                .join("cache")
+                                                .join("download")
+                                                .join(&rel[..at])
+                                                .join("@v")
+                                                .join(format!("{}.partial", &rel[at + 1..])),
+                                            "",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ if depth < 4 => self.dir(&child, depth + 1),
+                        _ => mkdir(&child),
+                    }
+                }
+                #[cfg(unix)]
+                if self.rng.chance(5) {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    let raw = std::ffi::OsStr::from_bytes(b"bad\xffname@v1.0.0");
+                    let _ = std::fs::create_dir_all(dir.join(raw));
+                }
+            }
+        }
+
+        /// PURLs to probe: every versioned dir seen (decoded), plus
+        /// case-variant and unsafe coordinates.
+        fn probe_purls(gen: &Gen, crawled: &[CrawledPackage]) -> Vec<String> {
+            let mut purls: Vec<String> = crawled.iter().map(|p| p.purl.clone()).collect();
+            for rel in &gen.versioned {
+                if let Some(at) = rel.rfind('@') {
+                    purls.push(crate::utils::purl::build_golang_purl(
+                        &decode_module_path(&rel[..at]),
+                        &decode_module_path(&rel[at + 1..]),
+                    ));
+                }
+            }
+            purls.push("pkg:golang/github.com/../escape@v1.0.0".to_string());
+            purls.push("pkg:golang/mod@v1.0.0-RC1".to_string());
+            purls.push("pkg:golang/missing@v1.0.0".to_string());
+            purls.push("pkg:npm/lodash@1.0.0".to_string());
+            purls
+        }
+
+        /// Returns (packages crawled, PURLs found) so the caller can check
+        /// the fixtures are not vacuous.
+        async fn assert_equivalent(gen: &Gen, label: &str) -> (usize, usize) {
+            let options = CrawlerOptions {
+                cwd: gen.root.clone(),
+                global: false,
+                global_prefix: Some(gen.root.clone()),
+            };
+            let new = GoCrawler::new().crawl_all(&options).await;
+            let old = LegacyGoCrawler::crawl_all(&options).await;
+            assert_eq!(rows(&new), rows(&old), "{label}: crawl_all");
+
+            let purls = probe_purls(gen, &old);
+            let new_found = GoCrawler::new()
+                .find_by_purls(&gen.root, &purls)
+                .await
+                .unwrap();
+            let old_found = LegacyGoCrawler::find_by_purls(&gen.root, &purls).await;
+            assert_eq!(
+                map_rows(&new_found),
+                map_rows(&old_found),
+                "{label}: find_by_purls"
+            );
+            (old.len(), old_found.len())
+        }
+
+        #[tokio::test]
+        async fn randomized_caches_match_the_async_oracle() {
+            let (mut crawled, mut found) = (0, 0);
+            for seed in 0..48u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut gen = Gen {
+                    rng: Rng::new(seed),
+                    root: tmp.path().join("mod"),
+                    outside: tmp.path().join("outside"),
+                    perms: PermGuard::default(),
+                    versioned: Vec::new(),
+                };
+                let root = gen.root.clone();
+                gen.dir(&root, 0);
+                gen.perms.apply();
+                let (c, f) = assert_equivalent(&gen, &format!("seed {seed}")).await;
+                crawled += c;
+                found += f;
+            }
+            assert!(
+                crawled > 100 && found > 100,
+                "vacuous fixtures: {crawled}/{found}"
+            );
+        }
+
+        #[tokio::test]
+        async fn missing_cache_root_matches_the_async_oracle() {
+            let tmp = tempfile::tempdir().unwrap();
+            let gen = Gen {
+                rng: Rng::new(0),
+                root: tmp.path().join("absent"),
+                outside: tmp.path().join("outside"),
+                perms: PermGuard::default(),
+                versioned: vec!["mod@v1.0.0".to_string()],
+            };
+            assert_equivalent(&gen, "absent root").await;
+        }
     }
 }
