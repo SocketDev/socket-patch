@@ -765,6 +765,12 @@ fn rewrite_cargo(
     for (path, text) in manifests.iter_mut() {
         *text = to_lf(path, std::mem::take(text));
     }
+    // Each manifest's own `[package] name` — how Cargo.lock names the
+    // source-less (workspace / path) package it declares.
+    let manifest_packages: Vec<Option<String>> = manifests
+        .iter()
+        .map(|(_, text)| cargo_manifest_package_name(text))
+        .collect();
     let edits_before = result.edits.len();
     let mut changed_manifests: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
@@ -920,6 +926,26 @@ fn rewrite_cargo(
                 ),
             });
             continue;
+        }
+        // A pin reaches only the declarations it sits on: every OTHER lock
+        // package depending on the crate — a registry/git crate, or a path
+        // package whose manifest was not planned (outside the project, behind
+        // a symlink) — keeps resolving it from crates.io, so the repointed
+        // lock is unsatisfiable and that consumer compiles the unpatched copy.
+        if let Some(lock_text) = cargo_lock.as_deref() {
+            let pinned_packages: std::collections::BTreeSet<&str> = toml_plans
+                .iter()
+                .filter_map(|(i, _)| manifest_packages[*i].as_deref())
+                .collect();
+            let blocking =
+                cargo_unpinnable_dependents(lock_text, &dep.name, &dep.version, &pinned_packages);
+            if !blocking.is_empty() {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_cargo_transitive_dependents".into(),
+                    detail: cargo_transitive_dependents_detail(&dep.name, &dep.version, &blocking),
+                });
+                continue;
+            }
         }
 
         // 2. Plan the Cargo.lock repoint. A lock that exists but has no
@@ -1091,6 +1117,102 @@ fn cargo_not_declared_detail(
              (nothing rewritten)"
         )
     }
+}
+
+/// The `[package] name` a manifest declares (`None` for a virtual workspace
+/// root or an unparseable file).
+fn cargo_manifest_package_name(text: &str) -> Option<String> {
+    let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+    doc.get("package")?
+        .get("name")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The Cargo.lock packages that depend on `crate_name@version` and that a
+/// manifest pin cannot reach: any package with a `source` (a registry or
+/// git crate), and any source-less (workspace / path) package whose
+/// manifest is not among `pinned_packages`. Dependency edges are matched
+/// in every spelling — `"name"`, `"name version"` and the full
+/// `"name version (source)"` id — so a v1 lock and a twin's full id are
+/// covered alike. A lock that does not parse yields one entry saying so.
+fn cargo_unpinnable_dependents(
+    lock: &str,
+    crate_name: &str,
+    version: &str,
+    pinned_packages: &std::collections::BTreeSet<&str>,
+) -> Vec<String> {
+    let Ok(doc) = lock.parse::<toml_edit::DocumentMut>() else {
+        return vec!["Cargo.lock (it does not parse as TOML)".to_string()];
+    };
+    let Some(packages) = doc
+        .get("package")
+        .and_then(toml_edit::Item::as_array_of_tables)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for package in packages.iter() {
+        let field = |key: &str| package.get(key).and_then(toml_edit::Item::as_str);
+        let (Some(name), Some(pkg_version)) = (field("name"), field("version")) else {
+            continue;
+        };
+        let depends = package
+            .get("dependencies")
+            .and_then(toml_edit::Item::as_array)
+            .is_some_and(|deps| {
+                deps.iter().filter_map(|d| d.as_str()).any(|d| {
+                    let mut parts = d.splitn(3, ' ');
+                    parts.next() == Some(crate_name) && parts.next().is_none_or(|v| v == version)
+                })
+            });
+        if !depends {
+            continue;
+        }
+        match field("source") {
+            Some(source) => {
+                let kind = if source.starts_with("git+") {
+                    "git"
+                } else {
+                    "registry"
+                };
+                out.push(format!("{name} {pkg_version} ({kind})"));
+            }
+            None if !pinned_packages.contains(name) => {
+                out.push(format!(
+                    "{name} {pkg_version} (a path package whose Cargo.toml is outside the \
+                     project or not rewritable)"
+                ));
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// The refusal for a crate other lock packages also depend on.
+fn cargo_transitive_dependents_detail(
+    crate_name: &str,
+    version: &str,
+    blocking: &[String],
+) -> String {
+    const SHOWN: usize = 5;
+    let mut names = blocking
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if blocking.len() > SHOWN {
+        names.push_str(&format!(" and {} more", blocking.len() - SHOWN));
+    }
+    format!(
+        "{crate_name}@{version} is also a dependency of {names} in Cargo.lock; a `registry = …` \
+         pin reaches only the declarations it sits on, so those would keep resolving \
+         {crate_name} from crates.io (a `--locked` build fails, and the unpatched copy is \
+         compiled) — it was NOT redirected and stays unpatched; patch it with \
+         `socket-patch scan --mode vendored` (nothing rewritten)"
+    )
 }
 
 /// Sparse index URLs land verbatim inside quoted TOML strings in both
@@ -14289,8 +14411,7 @@ packages:
         let lock = format!(
             "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
              \"log 0.4.20 ({CRATES_IO})\",\n \"serde 1.0.190 ({CRATES_IO})\",\n]\n\n\
-             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\
-             dependencies = [\n \"serde 1.0.190 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\n\
              [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{CRATES_IO}\"\n\n\
              [metadata]\n\"checksum log 0.4.20 ({CRATES_IO})\" = \"{a}\"\n\
              \"checksum serde 1.0.190 ({CRATES_IO})\" = \"{b}\"\n",
@@ -14306,8 +14427,7 @@ packages:
         let want = format!(
             "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
              \"log 0.4.20 ({CRATES_IO})\",\n \"serde 1.0.190 ({idx})\",\n]\n\n\
-             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\
-             dependencies = [\n \"serde 1.0.190 ({idx})\",\n]\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\n\
              [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{idx}\"\n\n\
              [metadata]\n\"checksum log 0.4.20 ({CRATES_IO})\" = \"{a}\"\n\
              \"checksum serde 1.0.190 ({idx})\" = \"{cksum}\"\n",
@@ -14316,15 +14436,16 @@ packages:
         assert_eq!(out, &want, "v1 lock stays v1, fully repointed");
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
 
-        // Four fragment edits (entry, metadata line, two dependents), each
-        // unique in the rewritten file, and reverting them newest-first (the
-        // replay order) restores the original byte-for-byte.
+        // Three fragment edits (entry, metadata line, the dependent's
+        // reference), each unique in the rewritten file, and reverting them
+        // newest-first (the replay order) restores the original
+        // byte-for-byte.
         let edits: Vec<&FileEdit> = r
             .edits
             .iter()
             .filter(|e| e.kind == "redirect_cargo_lock_entry")
             .collect();
-        assert_eq!(edits.len(), 4, "{edits:#?}");
+        assert_eq!(edits.len(), 3, "{edits:#?}");
         let mut reverted = out.clone();
         for e in edits.iter().rev() {
             assert_eq!(e.key.as_deref(), Some("serde@1.0.190"));
@@ -14353,6 +14474,109 @@ packages:
                 .any(|e| e.kind == "redirect_cargo_lock_entry"),
             "{:?}",
             again.edits
+        );
+    }
+
+    /// A lock of `app` (source-less, declares serde + `extra`) where `extra`
+    /// resolves from `extra_source` and depends on serde via `edge`.
+    fn cargo_shared_dependency_files(
+        extra: &str,
+        extra_source: Option<&str>,
+        edge: &str,
+    ) -> BTreeMap<String, String> {
+        const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+        let source = extra_source.map_or(String::new(), |s| format!("source = \"{s}\"\n"));
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                 serde = \"1.0.190\"\n{extra} = {{ path = \"../{extra}\" }}\n"
+            ),
+        );
+        files.insert(
+            "Cargo.lock".to_string(),
+            format!(
+                "version = 3\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\n \"{extra}\",\n \"serde\",\n]\n\n\
+                 [[package]]\nname = \"{extra}\"\nversion = \"0.2.0\"\n{source}\
+                 dependencies = [\n \"{edge}\",\n]\n\n\
+                 [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{CRATES_IO}\"\n\
+                 checksum = \"{}\"\n",
+                "1".repeat(64)
+            ),
+        );
+        files
+    }
+
+    /// A crate that is BOTH a direct dependency and a dependency of another
+    /// crate (cfg-if, libc, serde…) cannot be hosted-redirected: the pin
+    /// reaches only the root's declaration, the other crate keeps resolving
+    /// it from crates.io, so the repointed lock fails `--locked` and the
+    /// unpatched copy is compiled. REGRESSION: it was pinned, repointed and
+    /// confirmed (reported redirected, attested by VEX).
+    #[test]
+    fn cargo_crate_another_lock_package_depends_on_is_refused() {
+        const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+        let git = "git+https://example.test/extra#0123456789abcdef";
+        for (source, edge, kind) in [
+            (Some(CRATES_IO), "serde".to_string(), "registry"),
+            (Some(CRATES_IO), "serde 1.0.190".to_string(), "registry"),
+            (
+                Some(CRATES_IO),
+                format!("serde 1.0.190 ({CRATES_IO})"),
+                "registry",
+            ),
+            (Some(git), "serde".to_string(), "git"),
+            // A source-less path package whose manifest was never supplied
+            // (outside the project root, or behind a symlink).
+            (None, "serde".to_string(), "a path package"),
+        ] {
+            let files = cargo_shared_dependency_files("extra", source, &edge);
+            let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(r.files.is_empty(), "{edge}: {:?}", r.files.keys());
+            assert!(r.edits.is_empty(), "{edge}: {:?}", r.edits);
+            assert!(r.confirmed_cargo_uuids.is_empty(), "{edge}");
+            let [w] = r.warnings.as_slice() else {
+                panic!("{edge}: one warning: {:?}", r.warnings);
+            };
+            assert_eq!(w.code, "redirect_cargo_transitive_dependents", "{edge}");
+            assert!(
+                w.detail.contains(&format!("extra 0.2.0 ({kind}")),
+                "{edge}: {}",
+                w.detail
+            );
+            assert!(w.detail.contains("--mode vendored"), "{}", w.detail);
+        }
+    }
+
+    /// The dependent check is edge-exact: another VERSION of the crate is
+    /// not ours, and a source-less dependent whose manifest is planned (and
+    /// pinned) resolves through the pin.
+    #[test]
+    fn cargo_dependents_that_the_pin_reaches_or_another_version_do_not_refuse() {
+        let files = cargo_shared_dependency_files(
+            "extra",
+            Some("registry+https://github.com/rust-lang/crates.io-index"),
+            "serde 1.0.100",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+
+        let mut files = cargo_shared_dependency_files("extra", None, "serde");
+        files.insert(
+            "extra/Cargo.toml".to_string(),
+            "[package]\nname = \"extra\"\nversion = \"0.2.0\"\n\n[dependencies]\nserde = \"1\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+        assert!(
+            r.files["extra/Cargo.toml"].contains(&format!("registry = \"{}\"", cargo_reg())),
+            "{:?}",
+            r.files
         );
     }
 

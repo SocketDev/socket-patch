@@ -12,6 +12,8 @@
 //! * `workspace_direct_member` — a virtual workspace whose root pins
 //!   `[workspace.dependencies]`, one member inheriting and one declaring the
 //!   crate itself: both members build against the patched copy.
+//! * `direct_and_transitive` — the crate is also a dependency of another
+//!   crates.io crate: hosted mode refuses it loudly and rewrites nothing.
 //!
 //! Every shape runs the same chain against the real cargo: a baseline build
 //! with a private CARGO_HOME (network to crates.io for fixture setup only),
@@ -84,6 +86,9 @@ struct Shape {
     /// Re-encode every `Cargo.toml` and the generated `Cargo.lock` with CRLF
     /// line endings (a Windows checkout) before the scan.
     crlf: bool,
+    /// A shape hosted mode must REFUSE: the rewriter warning code every
+    /// patch is skipped with. The scan must leave every file untouched.
+    refused: Option<&'static str>,
 }
 
 fn binary() -> PathBuf {
@@ -457,6 +462,36 @@ async fn run_shape(shape: Shape) -> Option<()> {
         shape.tag
     );
     let env: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    if let Some(code) = shape.refused {
+        assert_eq!(env["redirect"]["redirected"], 0, "{}: {env}", shape.tag);
+        let codes: Vec<&str> = env["redirect"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w["code"].as_str())
+            .collect();
+        assert_eq!(
+            codes,
+            vec![code; shape.patches.len()],
+            "{}: every patch refused loudly: {env}",
+            shape.tag
+        );
+        assert_eq!(
+            snapshot(&proj),
+            before,
+            "{}: a refused redirect rewrites nothing",
+            shape.tag
+        );
+        assert!(!proj.join(".socket").exists(), "{}", shape.tag);
+        let fetch = cargo(&proj, &["fetch", "--locked"], &home);
+        assert!(
+            fetch.status.success(),
+            "{}: the untouched project still fetches --locked:\n{}",
+            shape.tag,
+            stderr(&fetch)
+        );
+        return Some(());
+    }
     assert_eq!(
         env["redirect"]["redirected"],
         shape.patches.len(),
@@ -659,6 +694,7 @@ async fn cargo_hosted_multi_version_pins_each_declaration_and_removes_cleanly() 
                 .to_string(),
         )],
         crlf: false,
+        refused: None,
     };
     let _ = run_shape(shape).await;
 }
@@ -680,6 +716,7 @@ async fn cargo_hosted_legacy_config_is_restored_byte_for_byte() {
             "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
         )],
         crlf: false,
+        refused: None,
     };
     let _ = run_shape(shape).await;
 }
@@ -717,6 +754,7 @@ async fn cargo_hosted_workspace_member_declaration_is_pinned() {
             ("direct/src/lib.rs", oracle),
         ],
         crlf: false,
+        refused: None,
     };
     let _ = run_shape(shape).await;
 }
@@ -737,6 +775,31 @@ async fn cargo_hosted_crlf_project_keeps_its_line_endings() {
             "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
         )],
         crlf: true,
+        refused: None,
+    };
+    let _ = run_shape(shape).await;
+}
+
+/// A crate that is both a direct dependency and a dependency of another
+/// crates.io crate (`crc32fast` depends on `cfg-if ^1`): a hosted pin cannot
+/// reach crc32fast's edge, so the redirect is refused loudly instead of
+/// repointing the lock (`--locked` then fails, and crc32fast compiled the
+/// unpatched crates.io copy while scan reported the crate redirected).
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_refuses_a_crate_another_crate_depends_on() {
+    let shape = Shape {
+        tag: "direct-and-transitive",
+        files: vec![
+            (
+                "Cargo.toml",
+                consumer_manifest("cfg-if = \"1.0.4\"\ncrc32fast = \"=1.5.0\"\n"),
+            ),
+            ("src/main.rs", "fn main() {}\n".to_string()),
+        ],
+        patches: vec![CFG_IF_1],
+        oracle: Vec::new(),
+        crlf: false,
+        refused: Some("redirect_cargo_transitive_dependents"),
     };
     let _ = run_shape(shape).await;
 }
