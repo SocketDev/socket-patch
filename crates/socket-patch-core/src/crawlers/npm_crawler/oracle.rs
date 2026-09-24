@@ -813,7 +813,9 @@ mod tests {
     ];
 
     /// Restores permissions the generator stripped, before the tempdir is
-    /// removed (declare it AFTER the tempdir so it drops first).
+    /// removed (declare it AFTER the tempdir so it drops first). Only Unix
+    /// strips permissions.
+    #[cfg_attr(not(unix), allow(dead_code))]
     struct PermGuard(Vec<PathBuf>);
     impl Drop for PermGuard {
         fn drop(&mut self) {
@@ -825,6 +827,8 @@ mod tests {
         }
     }
 
+    // Symlinks, FIFOs and permission stripping are generated on Unix only.
+    #[cfg_attr(not(unix), allow(dead_code))]
     struct Gen {
         state: u64,
         /// Out-of-tree dir for symlink targets that get traversed.
