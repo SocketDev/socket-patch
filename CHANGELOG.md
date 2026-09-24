@@ -384,6 +384,11 @@ into the new version's section — see docs/releasing.md.
   spelled `%2Bincompatible` no longer makes the freshly applied
   `.socket/go-patches/…@v2.0.0+incompatible` copy look orphaned, so it and
   its `replace` are kept.
+- **Hosted Go rollback restores go.sum byte for byte.** The upstream
+  module's go.sum lines that the redirect pruned went back at the end of
+  the file; they now return to the position `go mod tidy` sorts them to
+  (semver order within a module). CRLF go.mod/go.sum files also unwind
+  cleanly, with no leftover socket lines or blank lines.
 - **A vendoring-service outage no longer re-vendors packages.** An npm
   re-run (every lock flavor, `bun.lockb` included) re-acquired its tarball
   from whichever source answered — the service's prebuilt, or a local pack

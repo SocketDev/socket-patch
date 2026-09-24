@@ -296,3 +296,47 @@ async fn hosted_takeover_of_vendored_module_removes_vendored_state() {
         "the vendor ledger no longer claims the module: {state}"
     );
 }
+
+const TEXT_SUM: &str = "golang.org/x/text v0.14.0 h1:ScX5w1eTa3QqT8oi6+ziP7dTV1S2+ALU0bI+0zXKWiQ=\n\
+                        golang.org/x/text v0.14.0/go.mod h1:18ZOQIKpY8NJVqYksKHtTdi31H5itFRjB5/qKTNYzSU=\n";
+
+/// Hosted `rollback` puts the pruned upstream go.sum pair back where go
+/// sorts it, so go.mod and go.sum return byte for byte.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_rollback_restores_go_sum_byte_for_byte() {
+    let tmp = tempfile::tempdir().unwrap();
+    let consumer = tmp.path().join("consumer");
+    let go_sum = format!("{UPSTREAM_SUM}{TEXT_SUM}");
+    write_consumer(&consumer, &format!("require {UMOD} {UVER}\n"), &go_sum);
+    let go_mod = std::fs::read_to_string(consumer.join("go.mod")).unwrap();
+    let modcache = tmp.path().join("modcache");
+    let server = MockServer::start().await;
+    mount_hosted_grant(&server).await;
+    let env = get_hosted(&consumer, &server, &modcache);
+    assert_eq!(env["redirect"]["redirected"], 1, "envelope: {env}");
+
+    let (code, stdout, stderr) = common::run_with_env(
+        &consumer,
+        &[
+            "rollback",
+            "--json",
+            "--yes",
+            "--offline",
+            "--cwd",
+            consumer.to_str().unwrap(),
+        ],
+        &[("GOMODCACHE", modcache.to_str().unwrap())],
+    );
+    assert_eq!(
+        code, 0,
+        "rollback failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("go.mod")).unwrap(),
+        go_mod
+    );
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("go.sum")).unwrap(),
+        go_sum
+    );
+}
