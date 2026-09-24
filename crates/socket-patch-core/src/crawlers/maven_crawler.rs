@@ -2,9 +2,15 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use super::types::{CrawledPackage, CrawlerOptions};
+use super::walk_pool::run_walk;
 use crate::patch::path_safety;
-use crate::utils::fs::{is_dir, run_blocking};
+use crate::utils::fs::is_dir;
+
+#[cfg(test)]
+mod oracle;
 
 // ---------------------------------------------------------------------------
 // POM XML minimal parser
@@ -462,9 +468,9 @@ impl MavenCrawler {
 
         for repo_path in repo_paths {
             // The walkdir walk and POM reads are blocking: run each repo
-            // on the blocking pool so concurrently crawled ecosystems keep
+            // on the walk pool so concurrently crawled ecosystems keep
             // making progress (the dedup set rides along and comes back).
-            let (found, returned_seen) = run_blocking(move || {
+            let (found, returned_seen) = run_walk(move || {
                 let found = MavenCrawler.scan_maven_repo(&repo_path, &mut seen);
                 (found, seen)
             })
@@ -570,9 +576,14 @@ impl MavenCrawler {
     ///
     /// Uses `walkdir` to recursively find `.pom` files, then extracts
     /// coordinates from the POM content or falls back to directory path parsing.
+    ///
+    /// Three phases: the (serial) walk collects the `.pom` paths in walk
+    /// order, the reads and parses run in parallel on the walk pool (each
+    /// POM's coordinates depend on that file alone), and the PURL dedup
+    /// runs serially in walk order — so the first-seen version dir wins
+    /// and packages come out exactly as the one-at-a-time scan's did.
     fn scan_maven_repo(&self, repo_path: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
-        let mut results = Vec::new();
-
+        let mut poms: Vec<PathBuf> = Vec::new();
         for entry in walkdir::WalkDir::new(repo_path)
             .follow_links(false)
             .into_iter()
@@ -585,18 +596,29 @@ impl MavenCrawler {
             if path.extension().is_none_or(|ext| ext != "pom") {
                 continue;
             }
+            if path.parent().is_none() {
+                continue;
+            }
+            poms.push(entry.into_path());
+        }
 
-            let version_dir = match path.parent() {
-                Some(p) => p,
-                None => continue,
+        let parsed: Vec<Option<(String, String, String)>> = poms
+            .par_iter()
+            .map(|path| {
+                let version_dir = path.parent()?;
+                // Try POM parsing first, fall back to directory path parsing
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|content| parse_pom_group_artifact_version(&content))
+                    .or_else(|| parse_path_coordinates(version_dir, repo_path))
+            })
+            .collect();
+
+        let mut results = Vec::new();
+        for (path, coords) in poms.iter().zip(parsed) {
+            let Some(version_dir) = path.parent() else {
+                continue;
             };
-
-            // Try POM parsing first, fall back to directory path parsing
-            let coords = std::fs::read_to_string(path)
-                .ok()
-                .and_then(|content| parse_pom_group_artifact_version(&content))
-                .or_else(|| parse_path_coordinates(version_dir, repo_path));
-
             if let Some((group_id, artifact_id, version)) = coords {
                 let purl = crate::utils::purl::build_maven_purl(&group_id, &artifact_id, &version);
                 if seen.insert(purl.clone()) {
@@ -1680,5 +1702,83 @@ mod tests {
         let paths = crawler.get_maven_repo_paths(&options).await.unwrap();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0], dir.path().to_path_buf());
+    }
+
+    // ── Equivalence with the serial scan (oracle) ────────────────────
+
+    mod equivalence {
+        use super::super::oracle::LegacyMavenCrawler;
+        use super::*;
+        use crate::crawlers::oracle_support::{
+            mkdir, rows, symlink, write, write_bytes, PermGuard, Rng,
+        };
+
+        const GROUPS: &[&str] = &["org/apache/commons", "com/google/guava", "io/netty"];
+        const ARTIFACTS: &[&str] = &["commons-lang3", "guava", "netty-all", "dup"];
+        const VERSIONS: &[&str] = &["3.12.0", "31.1-jre", "4.1.100.Final", "1.0-SNAPSHOT"];
+
+        fn pom(rng: &mut Rng, group: &str, artifact: &str, version: &str) -> String {
+            let g = group.replace('/', ".");
+            match rng.below(6) {
+                0 => format!("<project><parent><groupId>{g}</groupId><artifactId>parent</artifactId><version>{version}</version></parent><artifactId>{artifact}</artifactId></project>"),
+                1 => "<project><!-- <groupId>x</groupId> --></project>".to_string(),
+                2 => "<project>\n<groupId>dup.group</groupId>\n<artifactId>dup</artifactId>\n<version>1.0</version>\n</project>".to_string(),
+                3 => "not xml at all".to_string(),
+                _ => format!("<project>\n  <groupId>{g}</groupId>\n  <artifactId>{artifact}</artifactId>\n  <version>{version}</version>\n  <dependencies><dependency><groupId>z</groupId></dependency></dependencies>\n</project>"),
+            }
+        }
+
+        fn repo(rng: &mut Rng, root: &Path, outside: &Path, perms: &mut PermGuard) {
+            mkdir(root);
+            for i in 0..rng.below(30) {
+                let (group, artifact, version) =
+                    (rng.pick(GROUPS), rng.pick(ARTIFACTS), rng.pick(VERSIONS));
+                let dir = root.join(group).join(artifact).join(version);
+                let file = dir.join(format!("{artifact}-{version}.pom"));
+                match rng.below(12) {
+                    0 => mkdir(&file),
+                    1 => write_bytes(&file, b"<project><groupId>\xff</groupId></project>"),
+                    2 => write(&dir.join(format!("{artifact}-{version}.jar")), "jar"),
+                    3 => {
+                        let target = outside.join(format!("t{i}"));
+                        write(
+                            &target.join("linked-1.0.pom"),
+                            &pom(rng, group, artifact, version),
+                        );
+                        symlink(&target, &dir.join("linked"));
+                        symlink(&target.join("linked-1.0.pom"), &dir.join("link.pom"));
+                    }
+                    4 => {
+                        write(&file, &pom(rng, group, artifact, version));
+                        perms.plan(&dir, 0o000);
+                    }
+                    5 => write(&dir.join("extra.pom"), &pom(rng, group, artifact, version)),
+                    _ => write(&file, &pom(rng, group, artifact, version)),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn randomized_repos_match_the_serial_oracle() {
+            let mut total = 0;
+            for seed in 0..64u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut perms = PermGuard::default();
+                let mut rng = Rng::new(seed);
+                let root = tmp.path().join("repository");
+                repo(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                perms.apply();
+                let options = CrawlerOptions {
+                    cwd: tmp.path().to_path_buf(),
+                    global: false,
+                    global_prefix: Some(root.clone()),
+                };
+                let new = MavenCrawler::new().crawl_all(&options).await;
+                let old = LegacyMavenCrawler::crawl_all(&options).await;
+                assert_eq!(rows(&new), rows(&old), "seed {seed}");
+                total += old.len();
+            }
+            assert!(total > 200, "vacuous fixtures: {total}");
+        }
     }
 }
