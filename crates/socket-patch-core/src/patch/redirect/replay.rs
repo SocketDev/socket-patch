@@ -54,6 +54,10 @@ enum Inverse {
     /// writers record an `original` that is a substring of `new` (the
     /// Cargo.toml insert variant, the maven version suffix).
     ReplaceFragment,
+    /// Like [`Inverse::ReplaceFragment`], but `new` legitimately occurs
+    /// several times and stands for every occurrence (a cargo v1 lock's
+    /// full-id dependency reference, named by several dependents).
+    ReplaceEveryFragment,
     PipenvEntry,
     HatchDocument,
     /// action `added` with only `new` recorded: the redirect inserted the
@@ -106,6 +110,7 @@ fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
         "redirect_cargo_toml_dep" | "redirect_cargo_lock_entry" => {
             ("cargo", Inverse::ReplaceFragment)
         }
+        super::CARGO_LOCK_REFERENCE_KIND => ("cargo", Inverse::ReplaceEveryFragment),
         "redirect_cargo_registry" => (
             "cargo",
             if action == "added" {
@@ -450,7 +455,9 @@ pub async fn revert_remaining_redirect_edits(
                         }
                     }
                 }
-                Inverse::ReplaceFragment | Inverse::HatchDocument => {
+                Inverse::ReplaceFragment
+                | Inverse::ReplaceEveryFragment
+                | Inverse::HatchDocument => {
                     let (Some(original), Some(new)) =
                         (str_payload(&edit.original), str_payload(&edit.new))
                     else {
@@ -516,7 +523,10 @@ pub async fn revert_remaining_redirect_edits(
                     };
                     // `new` before `original`: original may be a substring
                     // of new (Cargo.toml insert, maven version suffix).
-                    if content.contains(new) {
+                    if inverse == Inverse::ReplaceEveryFragment && content.contains(new) {
+                        staged.insert(edit.path.clone(), Some(content.replace(new, original)));
+                        group_drops.insert(idx);
+                    } else if content.contains(new) {
                         if content.matches(new).count() > 1 {
                             refuse(
                                 format!(

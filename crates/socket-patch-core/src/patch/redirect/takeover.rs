@@ -157,6 +157,12 @@ fn registry_uuids(fragment: Option<&Value>) -> impl Iterator<Item = String> + '_
         .map(|c| c[1].to_string())
 }
 
+/// A Cargo.lock edit (keyed `<name>@<version>`): the entry / `[metadata]`
+/// fragments, or the dependents' full-id reference.
+fn is_cargo_lock_edit(e: &FileEdit) -> bool {
+    e.kind == "redirect_cargo_lock_entry" || e.kind == super::CARGO_LOCK_REFERENCE_KIND
+}
+
 /// Every patch uuid `name@version` was redirected at: its record's, plus
 /// each managed registry whose index URL one of its (version-keyed)
 /// Cargo.lock edits names — the older links of a re-redirect chain.
@@ -165,9 +171,7 @@ fn cargo_lineage(state: &RedirectState, name: &str, version: &str, uuid: &str) -
     let lock_fragments: Vec<&str> = state
         .edits
         .iter()
-        .filter(|e| {
-            e.kind == "redirect_cargo_lock_entry" && e.key.as_deref() == Some(lock_key.as_str())
-        })
+        .filter(|e| is_cargo_lock_edit(e) && e.key.as_deref() == Some(lock_key.as_str()))
         .flat_map(|e| [e.original.as_ref(), e.new.as_ref()])
         .flatten()
         .filter_map(Value::as_str)
@@ -240,8 +244,7 @@ pub async fn revert_cargo_redirect_purl(
         (e.kind == "redirect_cargo_toml_dep"
             && e.key.as_deref() == Some(name.as_str())
             && !registry_uuids(e.new.as_ref()).any(|u| sibling_uuids.contains(&u)))
-            || (e.kind == "redirect_cargo_lock_entry"
-                && e.key.as_deref() == Some(lock_key.as_str()))
+            || (is_cargo_lock_edit(e) && e.key.as_deref() == Some(lock_key.as_str()))
     };
     // Registry blocks tie to this purl via the `socket-patch-<uuid>` names in
     // its record + wiring edits (a patch uuid is per purl, so this cannot
@@ -295,7 +298,9 @@ pub async fn revert_cargo_redirect_purl(
     for &i in mine.iter().rev() {
         let edit = &state.edits[i];
         match edit.kind.as_str() {
-            "redirect_cargo_toml_dep" | "redirect_cargo_lock_entry" => {
+            "redirect_cargo_toml_dep"
+            | "redirect_cargo_lock_entry"
+            | super::CARGO_LOCK_REFERENCE_KIND => {
                 let (Some(new), Some(orig)) = (
                     edit.new.as_ref().and_then(Value::as_str),
                     edit.original.as_ref().and_then(Value::as_str),
@@ -314,7 +319,13 @@ pub async fn revert_cargo_redirect_purl(
                     ));
                 };
                 if content.contains(new) {
-                    let reverted = content.replacen(new, orig, 1);
+                    // A full-id reference edit stands for every dependent's
+                    // occurrence of that exact id.
+                    let reverted = if edit.kind == super::CARGO_LOCK_REFERENCE_KIND {
+                        content.replace(new, orig)
+                    } else {
+                        content.replacen(new, orig, 1)
+                    };
                     staged.insert(edit.path.clone(), Some(reverted));
                     out.reverted_files.push(edit.path.clone());
                 } else if content.contains(orig) {
@@ -1428,6 +1439,236 @@ mod tests {
             "{:?}",
             state.edits
         );
+    }
+
+    /// A hosted override for `name@version` at patch `uuid`.
+    fn cargo_dep(name: &str, version: &str, uuid: &str) -> crate::patch::redirect::DepOverride {
+        serde_json::from_value(serde_json::json!({
+            "ecosystem": "cargo", "name": name, "version": version, "token": "tok",
+            "patchUuid": uuid,
+            "artifactUrl": format!("http://127.0.0.1:5555/{name}-{version}.crate"),
+            "registryOverride": {
+                "kind": "cargo-sparse",
+                "indexUrl": format!("sparse+http://127.0.0.1:5555/{uuid}/index/"),
+                "identifiers": {
+                    "name": name, "version": version,
+                    "cargoCksumSha256": "a".repeat(64),
+                },
+            },
+            "integrity": { "sha256": "a".repeat(64) },
+        }))
+        .unwrap()
+    }
+
+    /// Redirect `deps` (applied in order) over a pristine project with the
+    /// real rewriter, write the output to a tempdir, and return the ledger
+    /// with one record per purl.
+    async fn redirect_on_disk(
+        toml: &str,
+        lock: &str,
+        deps: &[(&str, &str, &str)],
+    ) -> (tempfile::TempDir, RedirectState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        files.insert("Cargo.toml".into(), toml.to_string());
+        files.insert("Cargo.lock".into(), lock.to_string());
+        let overrides: Vec<_> = deps
+            .iter()
+            .map(|(name, version, uuid)| cargo_dep(name, version, uuid))
+            .collect();
+        let rewrite = crate::patch::redirect::rewrite_registry_redirect(&files, &overrides);
+        assert_eq!(
+            rewrite.confirmed_cargo_uuids.len(),
+            deps.len(),
+            "{:?}",
+            rewrite.warnings
+        );
+        for (rel, content) in files.iter().chain(rewrite.files.iter()) {
+            let path = root.join(rel);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, content).await.unwrap();
+        }
+        let mut state = RedirectState::new();
+        state.edits = rewrite.edits;
+        for (name, version, uuid) in deps {
+            let mut rec = record();
+            rec.uuid = uuid.to_string();
+            state
+                .records
+                .insert(format!("pkg:cargo/{name}@{version}"), rec);
+        }
+        (tmp, state)
+    }
+
+    /// Redirect `deps`, then remove the purls in EVERY order: each order
+    /// must succeed and restore the manifest and lock byte-for-byte, with no
+    /// config and no ledger left.
+    async fn assert_removes_in_every_order(toml: &str, lock: &str, deps: &[(&str, &str, &str)]) {
+        let purls: Vec<String> = deps
+            .iter()
+            .map(|(name, version, _)| format!("pkg:cargo/{name}@{version}"))
+            .collect();
+        for order in [purls.clone(), purls.iter().rev().cloned().collect()] {
+            let (tmp, mut state) = redirect_on_disk(toml, lock, deps).await;
+            let root = tmp.path();
+            for purl in &order {
+                revert_cargo_redirect_purl(root, &mut state, purl, false)
+                    .await
+                    .unwrap_or_else(|e| panic!("remove {purl} (order {order:?}): {e}"));
+            }
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("Cargo.toml"))
+                    .await
+                    .unwrap(),
+                toml,
+                "{order:?}"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("Cargo.lock"))
+                    .await
+                    .unwrap(),
+                lock,
+                "{order:?}"
+            );
+            assert!(!root.join(".cargo/config.toml").exists(), "{order:?}");
+            assert!(
+                state.edits.is_empty() && state.records.is_empty(),
+                "{order:?}: {:?}",
+                state.edits
+            );
+        }
+    }
+
+    /// A v1 lock names every dependency by its full id, so the root block
+    /// references BOTH patched cfg-if versions. REGRESSION: each dependent
+    /// block was one whole-block edit, the second version's edit recorded
+    /// the first one's output as its `original`, and removing the
+    /// first-applied version alone found neither fragment — `remove`
+    /// refused as drifted unless purls went in exact reverse apply order.
+    #[tokio::test]
+    async fn v1_lock_multi_version_removes_in_any_order() {
+        const UUID_OLD: &str = "3c5d7e9f-2a4b-4c6d-8e0f-1a3b5c7d9e1f";
+        let toml = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                    cfg-if = \"1.0\"\ncfg-if-legacy = { package = \"cfg-if\", version = \"0.1.10\" }\n";
+        let lock = format!(
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"cfg-if 0.1.10 ({CRATES_IO})\",\n \"cfg-if 1.0.4 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"0.1.10\"\nsource = \"{CRATES_IO}\"\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{CRATES_IO}\"\n\n\
+             [metadata]\n\"checksum cfg-if 0.1.10 ({CRATES_IO})\" = \"{}\"\n\
+             \"checksum cfg-if 1.0.4 ({CRATES_IO})\" = \"{}\"\n",
+            "8".repeat(64),
+            "9".repeat(64)
+        );
+        assert_removes_in_every_order(
+            toml,
+            &lock,
+            &[("cfg-if", "1.0.4", UUID), ("cfg-if", "0.1.10", UUID_OLD)],
+        )
+        .await;
+    }
+
+    /// The whole-ledger replay (rollback) inverts a v1 full-id reference
+    /// named by several dependents at every occurrence.
+    #[tokio::test]
+    async fn v1_lock_reference_named_by_several_dependents_replays_clean() {
+        let toml = "[workspace]\nmembers = [\"a\", \"b\"]\n\n\
+                    [workspace.dependencies]\ncfg-if = \"1.0\"\n";
+        let member = |name: &str| {
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n\n\
+                 [dependencies]\ncfg-if = {{ workspace = true }}\n"
+            )
+        };
+        let lock = format!(
+            "[[package]]\nname = \"a\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"cfg-if 1.0.4 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"b\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"cfg-if 1.0.4 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{CRATES_IO}\"\n\n\
+             [metadata]\n\"checksum cfg-if 1.0.4 ({CRATES_IO})\" = \"{}\"\n",
+            "9".repeat(64)
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        files.insert("Cargo.toml".into(), toml.to_string());
+        files.insert("Cargo.lock".into(), lock.clone());
+        files.insert("a/Cargo.toml".into(), member("a"));
+        files.insert("b/Cargo.toml".into(), member("b"));
+        let rewrite = crate::patch::redirect::rewrite_registry_redirect(
+            &files,
+            &[cargo_dep("cfg-if", "1.0.4", UUID)],
+        );
+        assert_eq!(
+            rewrite.confirmed_cargo_uuids.len(),
+            1,
+            "{:?}",
+            rewrite.warnings
+        );
+        let references: Vec<&FileEdit> = rewrite
+            .edits
+            .iter()
+            .filter(|e| e.kind == super::super::CARGO_LOCK_REFERENCE_KIND)
+            .collect();
+        assert_eq!(
+            references.len(),
+            1,
+            "one edit per full id: {:?}",
+            rewrite.edits
+        );
+        for (rel, content) in files.iter().chain(rewrite.files.iter()) {
+            let path = root.join(rel);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, content).await.unwrap();
+        }
+        let mut state = RedirectState::new();
+        state.edits = rewrite.edits;
+        state.records.insert(PURL.to_string(), record());
+        let outcome =
+            crate::patch::redirect::revert_remaining_redirect_edits(root, &mut state, false).await;
+        assert!(outcome.fully_reverted(), "{:?}", outcome.refusals);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.lock"))
+                .await
+                .unwrap(),
+            lock
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("Cargo.toml"))
+                .await
+                .unwrap(),
+            toml
+        );
+    }
+
+    /// Two different patched crates with one shared v1 dependent block.
+    #[tokio::test]
+    async fn v1_lock_two_crates_sharing_a_dependent_remove_in_any_order() {
+        const UUID_ITOA: &str = "4d6e8f0a-3b5c-4d7e-9f1a-2b4c6d8e0f2a";
+        let toml = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                    cfg-if = \"1.0\"\nitoa = \"1.0.11\"\n";
+        let lock = format!(
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"cfg-if 1.0.4 ({CRATES_IO})\",\n \"itoa 1.0.11 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{CRATES_IO}\"\n\n\
+             [[package]]\nname = \"itoa\"\nversion = \"1.0.11\"\nsource = \"{CRATES_IO}\"\n\n\
+             [metadata]\n\"checksum cfg-if 1.0.4 ({CRATES_IO})\" = \"{}\"\n\
+             \"checksum itoa 1.0.11 ({CRATES_IO})\" = \"{}\"\n",
+            "8".repeat(64),
+            "9".repeat(64)
+        );
+        assert_removes_in_every_order(
+            toml,
+            &lock,
+            &[("cfg-if", "1.0.4", UUID), ("itoa", "1.0.11", UUID_ITOA)],
+        )
+        .await;
     }
 
     #[tokio::test]

@@ -2069,6 +2069,11 @@ fn plan_cargo_toml(
     })
 }
 
+/// The Cargo.lock edit kind for dependents' full-id references: `original`
+/// / `new` are the quoted `"<name> <version> (<source>)"` ids, keyed
+/// `<name>@<version>`, and the inverse replaces EVERY occurrence of `new`.
+pub(crate) const CARGO_LOCK_REFERENCE_KIND: &str = "redirect_cargo_lock_reference";
+
 static CARGO_LOCK_SOURCE_LINE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?m)^source = "([^"]*)"$"#).expect("static lock source-line regex is valid")
 });
@@ -2096,8 +2101,9 @@ static CARGO_LOCK_AFTER_SOURCE_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Full-id references are rewritten in any format (v2+ spells them that way
 /// when a name + version is ambiguous). Each changed fragment is its own
 /// `redirect_cargo_lock_entry` edit (unique text, so the fragment revert is
-/// unambiguous): the entry, the `[metadata]` line, and each dependent's
-/// whole `[[package]]` block.
+/// unambiguous) — the entry and the `[metadata]` line — and the dependents'
+/// references are one `redirect_cargo_lock_reference` edit holding the
+/// quoted full id, reverted at every occurrence.
 fn plan_cargo_lock(
     content: &str,
     crate_name: &str,
@@ -2201,21 +2207,34 @@ fn plan_cargo_lock(
             edits.push(edit(&line, &pinned));
         }
     }
-    // Dependents' full-id references to the OLD source.
+    // Dependents' full-id references to the OLD source, recorded as ONE
+    // `redirect_cargo_lock_reference` edit holding just the quoted id —
+    // never a dependent's whole block: a block referencing two patched
+    // packages (the root of a v1 lock) would hold two overlapping block
+    // edits, and reverting the first-applied one alone found neither of its
+    // fragments. The id names this name + version + source exactly, so its
+    // inverse puts back EVERY occurrence, independently of any other
+    // package's edits and in any removal order.
     if let Some(old) = old_source.filter(|old| old != index_url) {
         let from = format!("\"{crate_name} {version} ({old})\"");
         let to = format!("\"{crate_name} {version} ({index_url})\"");
         let mut cursor = 0;
+        let mut repointed_any = false;
         while let Some((start, end)) = next_lock_block(&new_content, cursor) {
-            let block = new_content[start..end].to_string();
-            if block.contains(&from) {
-                let repointed = block.replace(&from, &to);
+            if new_content[start..end].contains(&from) {
+                let repointed = new_content[start..end].replace(&from, &to);
                 new_content.replace_range(start..end, &repointed);
-                edits.push(edit(&block, &repointed));
+                repointed_any = true;
                 cursor = start + repointed.len();
             } else {
                 cursor = end;
             }
+        }
+        if repointed_any {
+            edits.push(FileEdit {
+                kind: CARGO_LOCK_REFERENCE_KIND.into(),
+                ..edit(&from, &to)
+            });
         }
     }
     // Already redirected (re-run): every fragment is at the target values; a
@@ -14443,9 +14462,12 @@ packages:
         let edits: Vec<&FileEdit> = r
             .edits
             .iter()
-            .filter(|e| e.kind == "redirect_cargo_lock_entry")
+            .filter(|e| {
+                e.kind == "redirect_cargo_lock_entry" || e.kind == CARGO_LOCK_REFERENCE_KIND
+            })
             .collect();
         assert_eq!(edits.len(), 3, "{edits:#?}");
+        assert_eq!(edits[2].kind, CARGO_LOCK_REFERENCE_KIND, "{edits:#?}");
         let mut reverted = out.clone();
         for e in edits.iter().rev() {
             assert_eq!(e.key.as_deref(), Some("serde@1.0.190"));
@@ -14468,10 +14490,7 @@ packages:
         );
         let again = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
         assert!(
-            !again
-                .edits
-                .iter()
-                .any(|e| e.kind == "redirect_cargo_lock_entry"),
+            !again.edits.iter().any(|e| e.path == "Cargo.lock"),
             "{:?}",
             again.edits
         );

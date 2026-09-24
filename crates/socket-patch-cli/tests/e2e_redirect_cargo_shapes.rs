@@ -21,7 +21,9 @@
 //! wiremock sparse registry per patch, `scan --mode hosted`, then a FRESH
 //! checkout (only the committed files travel) where `cargo fetch --locked`
 //! and an offline `cargo build --locked` must link each patched-only symbol
-//! and a post-install `vex` must attest exactly the patches, and finally `remove <purl>` for every patch, which must leave the project
+//! and a post-install `vex` must attest exactly the patches, and finally
+//! `remove <purl>` for every patch — in apply order and, from the same
+//! post-scan state, in reverse — which must leave the project
 //! byte-identical to its pre-scan state.
 //!
 //! `SOCKET_PATCH_CARGO_E2E_LOCK_VERSION` / `_TOOLCHAIN` (see
@@ -589,45 +591,59 @@ async fn run_shape(shape: Shape) -> Option<()> {
     expected.sort();
     assert_eq!(attested, expected, "{}: attested purls: {doc}", shape.tag);
 
-    // Rollback: removing every purl restores the pre-scan project exactly.
-    for patch in &shape.patches {
-        let purl = patch.purl();
-        let (code, stdout, err) = run_socket(
-            &proj,
-            &[
-                "remove",
-                &purl,
-                "--cwd",
-                &proj_s,
-                "--json",
-                "--yes",
-                "--no-telemetry",
-            ],
-            &home,
-        );
-        assert_eq!(
-            code, 0,
-            "{}: remove {purl}\nstdout:\n{stdout}\nstderr:\n{err}",
+    // Rollback: removing every purl restores the pre-scan project exactly —
+    // in apply order AND in reverse (a v1 lock's shared dependent blocks
+    // once made the first-applied purl unremovable before its sibling).
+    let post_scan = tmp.path().join("post-scan");
+    copy_tree(&proj, &post_scan);
+    let mut orders = vec![shape.patches.clone()];
+    if shape.patches.len() > 1 {
+        orders.push(shape.patches.iter().rev().copied().collect());
+    }
+    for (n, order) in orders.iter().enumerate() {
+        if n > 0 {
+            std::fs::remove_dir_all(&proj).unwrap();
+            copy_tree(&post_scan, &proj);
+        }
+        for patch in order {
+            let purl = patch.purl();
+            let (code, stdout, err) = run_socket(
+                &proj,
+                &[
+                    "remove",
+                    &purl,
+                    "--cwd",
+                    &proj_s,
+                    "--json",
+                    "--yes",
+                    "--no-telemetry",
+                ],
+                &home,
+            );
+            assert_eq!(
+                code, 0,
+                "{} (removal order {n}): remove {purl}\nstdout:\n{stdout}\nstderr:\n{err}",
+                shape.tag
+            );
+        }
+        let after = snapshot(&proj);
+        for (rel, bytes) in &before {
+            assert_eq!(
+                after
+                    .get(rel)
+                    .map(|b| String::from_utf8_lossy(b).into_owned()),
+                Some(String::from_utf8_lossy(bytes).into_owned()),
+                "{} (removal order {n}): {rel} not restored byte-for-byte by remove",
+                shape.tag
+            );
+        }
+        let extra: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
+        assert!(
+            extra.is_empty(),
+            "{} (removal order {n}): remove left files behind: {extra:?}",
             shape.tag
         );
     }
-    let after = snapshot(&proj);
-    for (rel, bytes) in &before {
-        assert_eq!(
-            after
-                .get(rel)
-                .map(|b| String::from_utf8_lossy(b).into_owned()),
-            Some(String::from_utf8_lossy(bytes).into_owned()),
-            "{}: {rel} not restored byte-for-byte by remove",
-            shape.tag
-        );
-    }
-    let extra: Vec<&String> = after.keys().filter(|k| !before.contains_key(*k)).collect();
-    assert!(
-        extra.is_empty(),
-        "{}: remove left files behind: {extra:?}",
-        shape.tag
-    );
     Some(())
 }
 
