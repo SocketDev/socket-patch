@@ -47,7 +47,8 @@ use crate::commands::vex::{
     generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
 };
 use crate::ecosystem_dispatch::{
-    find_packages_for_rollback, npm_paths_by_identity, partition_purls,
+    find_packages_for_rollback_reusing, npm_paths_by_identity, npm_paths_by_identity_in,
+    partition_purls, NpmCrawlSnapshot,
 };
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning, Status, VexSummary,
@@ -1160,6 +1161,30 @@ pub(crate) async fn vendor_records(
     service: Option<&VendorServiceConfig>,
     ledger: std::io::Result<VendorState>,
 ) -> bool {
+    vendor_records_reusing(
+        common, records, sources, detached, force, env, service, ledger, None,
+    )
+    .await
+}
+
+/// [`vendor_records`], resolving npm packages from `prior` — the npm half
+/// of a crawl this process made earlier with the same options, over a tree
+/// nothing has touched since (`scan`'s own crawl) — instead of walking
+/// `node_modules` again: its roots feed the targeted lookup and its
+/// packages the alias identity fallback. `None` (or a snapshot taken with
+/// other options) crawls as before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn vendor_records_reusing(
+    common: &GlobalArgs,
+    records: &HashMap<String, PatchRecord>,
+    sources: &PatchSources<'_>,
+    detached: bool,
+    force: bool,
+    env: &mut Envelope,
+    service: Option<&VendorServiceConfig>,
+    ledger: std::io::Result<VendorState>,
+    prior: Option<&NpmCrawlSnapshot>,
+) -> bool {
     let mut has_errors = false;
     // Lockfile flavors the backends wired THIS run (from the returned ledger
     // entries, not the whole ledger — an old pnpm entry must not re-flavor
@@ -1240,10 +1265,11 @@ pub(crate) async fn vendor_records(
     // registry download, and (for gem) a HashMap-order platform coin-flip.
     // The rollback variant fans each base path back out to every qualified
     // manifest purl (same invariant as `find_manifest_package_paths`).
-    let mut all_packages = find_packages_for_rollback(
+    let mut all_packages = find_packages_for_rollback_reusing(
         &vendorable_partition,
         &crawler_options,
         common.silent || common.json,
+        prior,
     )
     .await;
 
@@ -1257,7 +1283,11 @@ pub(crate) async fn vendor_records(
         .flatten()
         .filter(|p| !all_packages.contains_key(*p))
         .collect();
-    for (purl, paths) in npm_paths_by_identity(&crawler_options, &missing_npm).await {
+    let by_identity = match prior.and_then(|p| p.packages_for(&crawler_options)) {
+        Some(installed) => npm_paths_by_identity_in(installed, &missing_npm),
+        None => npm_paths_by_identity(&crawler_options, &missing_npm).await,
+    };
+    for (purl, paths) in by_identity {
         all_packages.insert(purl, paths[0].clone());
     }
 

@@ -632,11 +632,23 @@ impl NpmCrawler {
     /// store entries' `identity_seen` decisions) see exactly the state the
     /// sequential walk would have — same packages, same paths, same order.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
+        self.crawl_all_with_roots(options).await.0
+    }
+
+    /// [`Self::crawl_all`], also handing back the `node_modules` roots it
+    /// walked — exactly what [`Self::get_node_modules_paths`] returns for
+    /// the same options and tree — so a caller that resolves purls against
+    /// the same untouched tree later in the process can skip rediscovering
+    /// them.
+    pub async fn crawl_all_with_roots(
+        &self,
+        options: &CrawlerOptions,
+    ) -> (Vec<CrawledPackage>, Vec<PathBuf>) {
         let options = options.clone();
         run_walk(move || Self::crawl_all_sync(&options)).await
     }
 
-    fn crawl_all_sync(options: &CrawlerOptions) -> Vec<CrawledPackage> {
+    fn crawl_all_sync(options: &CrawlerOptions) -> (Vec<CrawledPackage>, Vec<PathBuf>) {
         let nm_paths = Self::node_modules_paths_sync(options);
         let gathered: Vec<Vec<ScanEvent>> = par_map(&nm_paths, |nm_path| {
             Self::gather_node_modules(nm_path, None, false)
@@ -647,7 +659,7 @@ impl NpmCrawler {
         for events in gathered {
             Self::merge_scan_events(events, None, &mut seen, &mut packages);
         }
-        packages
+        (packages, nm_paths)
     }
 
     /// Find specific packages by PURL inside a single `node_modules` tree.
