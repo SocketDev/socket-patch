@@ -434,10 +434,12 @@ pub(crate) async fn vendor_bun(
     // The sha512 of the artifact already sitting at the target path, if
     // any — the one witness a digest-less in-sync tuple (see `classify`)
     // still has of the digest Bun dropped: the lock line was written from
-    // these bytes. Read BEFORE staging, which overwrites the file; a
-    // missing or non-regular path (a `repair` rebuild after deletion, a
-    // FIFO) yields `None`, which the in-sync check below treats as "not
-    // provably the same bytes". Only a digest-less 2-tuple of OURS at this
+    // these bytes. With a ledger anchor the shared pipeline reuses exactly
+    // these bytes (so this equals the staged integrity); without one it
+    // keeps today's behavior. Read BEFORE staging, which may overwrite the
+    // file; a missing or non-regular path (a `repair` rebuild after
+    // deletion, a FIFO) yields `None`, which the in-sync check below treats
+    // as "not provably the same bytes". Only a digest-less 2-tuple of OURS at this
     // path can consume it, so every other re-run skips the read + hash.
     let has_digestless_own_tuple = entries.iter().any(|e| {
         e.elems.len() == 2
@@ -557,10 +559,13 @@ pub(crate) async fn vendor_bun(
                             continue;
                         }
                         // Same path, different digest — or a digest-less line
-                        // whose artifact was missing or differed before staging
-                        // (a `repair` rebuild, a service-prebuilt ↔ local-pack
-                        // flip): re-pinned below like any stale tuple of ours,
-                        // so the returned entry carries the rebuilt artifact's
+                        // whose artifact was missing or differed before staging.
+                        // A source flip no longer reaches here when the ledger
+                        // verifies the committed tarball (it is reused, so the
+                        // digests agree); only a missing, corrupt or unanchored
+                        // artifact (a `repair` rebuild, a lost state.json) is
+                        // re-pinned below like any stale tuple of ours, so the
+                        // returned entry carries the rebuilt artifact's
                         // fingerprint (`carry_forward_wiring` refills the
                         // pristine original from the entry it replaces).
                         _ => {}
@@ -592,8 +597,9 @@ pub(crate) async fn vendor_bun(
     if !changed {
         // Every instance already points at this uuid with the packed
         // integrity (or with the digest Bun dropped, now re-pinned): in
-        // sync. The tarball re-pack above was byte-identical by
-        // determinism; synthesize AlreadyPatched and record nothing. The
+        // sync. The integrity is that of the reused committed tarball (or of
+        // a fresh acquisition that reproduced it when reuse missed);
+        // synthesize AlreadyPatched and record nothing. The
         // heal is the one write of an in-sync run, and a failed write
         // leaves the still-installable digest-less lock — reported as the
         // failure it is, like every other lock write below.
@@ -1142,6 +1148,329 @@ mod tests {
             )
             .await
         }
+    }
+
+    // ── source-flip / outage idempotence (vendor::test_support::npm_flip_suite) ──
+
+    impl crate::vendor::test_support::FlipFixture for Fixture {
+        fn flip_root(&self) -> &Path {
+            self.root()
+        }
+        fn flip_key(&self) -> String {
+            "pkg:npm/left-pad@1.3.0".to_string()
+        }
+        fn flip_uuid(&self) -> String {
+            self.record.uuid.clone()
+        }
+        fn flip_artifact_rel(&self) -> String {
+            self.rel_tgz()
+        }
+        fn flip_files(&self) -> Vec<String> {
+            vec![BUN_LOCK.to_string(), "package.json".to_string()]
+        }
+    }
+
+    async fn flip_run(
+        fx: &Fixture,
+        cfg: Option<&crate::vendor::VendorServiceConfig>,
+    ) -> VendorOutcome {
+        let blobs = fx.root().join(".socket/blobs");
+        vendor_bun(
+            "pkg:npm/left-pad@1.3.0",
+            &fx.installed,
+            fx.root(),
+            &fx.record,
+            &PatchSources::blobs_only(&blobs),
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            cfg,
+        )
+        .await
+    }
+
+    async fn flip_fixture() -> Fixture {
+        fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await
+    }
+
+    async fn flip_fixture_nested() -> Fixture {
+        fixture_with(
+            BN4C_BEFORE_LOCK,
+            "node_modules/haspad/node_modules/left-pad",
+        )
+        .await
+    }
+
+    crate::vendor::test_support::npm_flip_suite!(flip_suite, Fixture, flip_fixture, flip_run);
+    crate::vendor::test_support::npm_flip_suite!(
+        flip_suite_nested,
+        Fixture,
+        flip_fixture_nested,
+        flip_run
+    );
+
+    /// Run 1 from the service (`alt` = a re-encoding of the local build),
+    /// persisted like the CLI does; the server is left answering 503.
+    async fn bun_service_vendored() -> (Fixture, wiremock::MockServer, Vec<u8>, String) {
+        use crate::vendor::test_support as ts;
+        let probe = flip_fixture().await;
+        let _ = expect_done(flip_run(&probe, None).await);
+        let local = tokio::fs::read(probe.root().join(probe.rel_tgz()))
+            .await
+            .unwrap();
+        let alt = ts::regzip(&local);
+        let server = wiremock::MockServer::start().await;
+        ts::mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &alt).await;
+        let fx = flip_fixture().await;
+        let cfg = ts::service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let (r, e, _) = expect_done(flip_run(&fx, Some(&cfg)).await);
+        assert!(r.success, "{:?}", r.error);
+        let e = e.unwrap();
+        ts::persist(fx.root(), "pkg:npm/left-pad@1.3.0", e).await;
+        let wired = fx.read_lock().await;
+        assert!(wired.contains(&ts::sri(&alt)));
+        server.reset().await;
+        ts::mount_503(&server).await;
+        (fx, server, alt, wired)
+    }
+
+    async fn bun_outage_rerun(
+        fx: &Fixture,
+        server: &wiremock::MockServer,
+    ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
+        let cfg = crate::vendor::test_support::service_cfg(
+            &server.uri(),
+            crate::vendor::VendorSource::Auto,
+            false,
+        );
+        expect_done(flip_run(fx, Some(&cfg)).await)
+    }
+
+    /// Digest-less 2-tuple (a Bun < 1.3.10 re-save) over a SERVICE-built
+    /// artifact, re-run during an outage: the reused committed bytes are the
+    /// witness, so the digest heals back to the service SRI with no record,
+    /// no request and no rebuild.
+    #[tokio::test]
+    async fn digestless_tuple_over_service_artifact_heals_under_outage() {
+        let (fx, server, alt, wired) = bun_service_vendored().await;
+        let state = crate::vendor::state::load_state(fx.root()).await.unwrap();
+        let entry = state.entries.values().next().unwrap().clone();
+        let (_, digestless) = digestless_lock(&wired, &entry);
+        tokio::fs::write(fx.root().join(BUN_LOCK), &digestless)
+            .await
+            .unwrap();
+        let (r, e, w) = bun_outage_rerun(&fx, &server).await;
+        assert!(r.success, "{:?}", r.error);
+        assert!(e.is_none(), "healed in place, nothing recorded");
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(
+            fx.read_lock().await,
+            wired,
+            "digest healed to the service SRI"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.root().join(fx.rel_tgz())).await.unwrap(),
+            alt
+        );
+        assert_eq!(crate::vendor::test_support::request_count(&server).await, 0);
+    }
+
+    /// F6: a re-gzipped committed tarball with the ledger untouched fails
+    /// the anchor and is rebuilt (the lock is re-pinned to the local build).
+    #[tokio::test]
+    async fn bun_regzipped_tarball_with_untouched_ledger_is_not_reused() {
+        let (fx, server, alt, _) = bun_service_vendored().await;
+        let reencoded = crate::vendor::test_support::regzip_at(&alt, flate2::Compression::best());
+        tokio::fs::write(fx.root().join(fx.rel_tgz()), &reencoded)
+            .await
+            .unwrap();
+        let (r, e, _) = bun_outage_rerun(&fx, &server).await;
+        assert!(r.success, "{:?}", r.error);
+        assert!(e.is_some(), "not reused: re-acquired and re-pinned");
+        let lock = fx.read_lock().await;
+        assert!(!lock.contains(&crate::vendor::test_support::sri(&reencoded)));
+        assert!(lock.contains(&fx.actual_integrity().await));
+    }
+
+    /// F7: a patched member edited AND the ledger sha forged to match fails
+    /// the afterHash check; the tampered bytes are never pinned.
+    #[tokio::test]
+    async fn bun_forged_ledger_over_edited_patched_member_is_not_reused() {
+        use sha2::Sha256;
+        let (fx, server, _, _) = bun_service_vendored().await;
+        let evil = {
+            let mut b = tar::Builder::new(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            ));
+            for (n, data) in [
+                (
+                    "package/package.json",
+                    br#"{"name":"left-pad","version":"1.3.0"}"#.to_vec(),
+                ),
+                ("package/index.js", b"module.exports = 'evil';\n".to_vec()),
+            ] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, n, data.as_slice()).unwrap();
+            }
+            b.into_inner().unwrap().finish().unwrap()
+        };
+        tokio::fs::write(fx.root().join(fx.rel_tgz()), &evil)
+            .await
+            .unwrap();
+        let mut state = crate::vendor::state::load_state(fx.root()).await.unwrap();
+        let e = state.entries.get_mut("pkg:npm/left-pad@1.3.0").unwrap();
+        e.artifact.sha256 = hex::encode(Sha256::digest(&evil));
+        e.artifact.size = Some(evil.len() as u64);
+        crate::vendor::state::save_state(fx.root(), &state)
+            .await
+            .unwrap();
+        let (r, e, _) = bun_outage_rerun(&fx, &server).await;
+        assert!(r.success, "{:?}", r.error);
+        assert!(e.is_some(), "not reused: rebuilt and re-pinned");
+        let lock = fx.read_lock().await;
+        assert!(!lock.contains(&crate::vendor::test_support::sri(&evil)));
+        assert!(lock.contains(&fx.actual_integrity().await));
+    }
+
+    /// F9: a new record uuid acquires under the new uuid dir; the old
+    /// uuid's committed artifact is left alone.
+    #[tokio::test]
+    async fn bun_new_record_uuid_acquires_under_the_new_uuid_dir() {
+        const NEXT: &str = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d";
+        let (mut fx, server, alt, _) = bun_service_vendored().await;
+        fx.record.uuid = NEXT.to_string();
+        let (r, e, _) = bun_outage_rerun(&fx, &server).await;
+        assert!(r.success, "{:?}", r.error);
+        assert_eq!(
+            e.expect("a new uuid re-wires").artifact.path,
+            format!(".socket/vendor/npm/{NEXT}/left-pad-1.3.0.tgz")
+        );
+        assert_eq!(
+            tokio::fs::read(
+                fx.root()
+                    .join(format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"))
+            )
+            .await
+            .unwrap(),
+            alt
+        );
+    }
+
+    /// F8: no ledger, no anchor — today's re-pin (the documented residual).
+    #[tokio::test]
+    async fn bun_missing_ledger_keeps_todays_repin() {
+        let (fx, server, alt, _) = bun_service_vendored().await;
+        tokio::fs::remove_file(fx.root().join(".socket/vendor/state.json"))
+            .await
+            .unwrap();
+        let (r, e, w) = bun_outage_rerun(&fx, &server).await;
+        assert!(r.success, "{:?}", r.error);
+        assert!(e.is_some());
+        assert!(w.iter().any(|w| w.code == "vendor_prebuilt_unavailable"));
+        assert!(!fx
+            .read_lock()
+            .await
+            .contains(&crate::vendor::test_support::sri(&alt)));
+    }
+
+    /// F10: the tuple reset to the registry line (a `bun install` relock)
+    /// with tarball + ledger intact is re-pinned to the COMMITTED bytes.
+    #[tokio::test]
+    async fn bun_relocked_tuple_is_repinned_to_the_committed_bytes_without_network() {
+        let (fx, server, alt, wired) = bun_service_vendored().await;
+        tokio::fs::write(fx.root().join(BUN_LOCK), BN3_BEFORE_LOCK)
+            .await
+            .unwrap();
+        let (r, e, w) = bun_outage_rerun(&fx, &server).await;
+        assert!(r.success, "{:?}", r.error);
+        assert!(e.is_some(), "re-wired (Applied)");
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(fx.read_lock().await, wired);
+        assert_eq!(
+            tokio::fs::read(fx.root().join(fx.rel_tgz())).await.unwrap(),
+            alt
+        );
+        assert_eq!(crate::vendor::test_support::request_count(&server).await, 0);
+    }
+
+    /// F11: a FIFO at the artifact path never wedges and is never reused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bun_fifo_artifact_is_not_reused() {
+        let (fx, server, alt, _) = bun_service_vendored().await;
+        let tgz = fx.root().join(fx.rel_tgz());
+        tokio::fs::remove_file(&tgz).await.unwrap();
+        let c = std::ffi::CString::new(tgz.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let (r, e, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            bun_outage_rerun(&fx, &server),
+        )
+        .await
+        .expect("a FIFO must never wedge a vendor re-run");
+        assert!(r.success, "{:?}", r.error);
+        assert!(e.is_some(), "not reused");
+        assert!(!fx
+            .read_lock()
+            .await
+            .contains(&crate::vendor::test_support::sri(&alt)));
+    }
+
+    /// F12: a package.json-rewriting patch reuses the committed bytes and the
+    /// lock stays byte-identical across a flip.
+    #[tokio::test]
+    async fn bun_package_json_patch_reuse_is_byte_stable() {
+        use crate::vendor::test_support as ts;
+        async fn pkg_fixture() -> Fixture {
+            let mut fx = flip_fixture().await;
+            let before = tokio::fs::read(fx.installed.join("package.json"))
+                .await
+                .unwrap();
+            let after: &[u8] = br#"{"name":"left-pad","version":"1.3.0","description":"patched"}"#;
+            let after_hash = compute_git_sha256_from_bytes(after);
+            tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
+                .await
+                .unwrap();
+            fx.record.files.insert(
+                "package/package.json".to_string(),
+                PatchFileInfo {
+                    before_hash: compute_git_sha256_from_bytes(&before),
+                    after_hash,
+                },
+            );
+            fx
+        }
+        let probe = pkg_fixture().await;
+        let _ = expect_done(flip_run(&probe, None).await);
+        let alt = ts::regzip(
+            &tokio::fs::read(probe.root().join(probe.rel_tgz()))
+                .await
+                .unwrap(),
+        );
+        let server = wiremock::MockServer::start().await;
+        ts::mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &alt).await;
+        let fx = pkg_fixture().await;
+        let cfg = ts::service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let (r, e, _) = expect_done(flip_run(&fx, Some(&cfg)).await);
+        assert!(r.success, "{:?}", r.error);
+        ts::persist(fx.root(), "pkg:npm/left-pad@1.3.0", e.unwrap()).await;
+        let lock1 = fx.read_lock().await;
+        server.reset().await;
+        ts::mount_503(&server).await;
+        let (r, e, w) = expect_done(flip_run(&fx, Some(&cfg)).await);
+        assert!(r.success, "{:?}", r.error);
+        assert!(e.is_none());
+        // The (pre-existing, every-run) dependency-object advisory only.
+        assert!(
+            w.iter().all(|w| w.code == "vendor_dep_manifest_stale"),
+            "{w:?}"
+        );
+        assert_eq!(fx.read_lock().await, lock1);
+        assert_eq!(ts::request_count(&server).await, 0);
     }
 
     async fn fixture_with(lock: &str, installed_rel: &str) -> Fixture {

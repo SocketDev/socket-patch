@@ -322,8 +322,10 @@ fn check_target_unit(
     Ok(PdmTarget::Fresh)
 }
 
-/// `true` when the target `[[package]]` unit's `files` already list THIS run's
-/// patched wheel sha256.
+/// `true` when the target `[[package]]` unit's `files` list ANY sha256 this
+/// patch's wheel is known by (this run's, and the ledger's — after a
+/// service ↔ local source flip the two differ, and the guard must hold
+/// whichever source built the wheel the stale unit still carries).
 ///
 /// A `pdm add <other>` / partial relock on an already-vendored lock reuses the
 /// stale `files` entry — which still carries our PATCHED wheel hash — while
@@ -339,9 +341,13 @@ fn check_target_unit(
 fn target_carries_patched_wheel_hash(
     lock: &DocumentMut,
     canon_name: &str,
-    wheel_sha256_hex: &str,
+    known_patched_sha256: &[&str],
 ) -> bool {
-    let needle = format!("sha256:{}", wheel_sha256_hex.to_ascii_lowercase());
+    let needles: Vec<String> = known_patched_sha256
+        .iter()
+        .filter(|sha| !sha.is_empty())
+        .map(|sha| format!("sha256:{}", sha.to_ascii_lowercase()))
+        .collect();
     lock_units_named(lock, canon_name).into_iter().any(|unit| {
         crate::utils::pdm_lock::files_for(lock, unit)
             .map(|files| {
@@ -349,7 +355,7 @@ fn target_carries_patched_wheel_hash(
                     file.as_inline_table()
                         .and_then(|table| table.get("hash"))
                         .and_then(Value::as_str)
-                        == Some(needle.as_str())
+                        .is_some_and(|hash| needles.iter().any(|n| n == hash))
                 })
             })
             .unwrap_or(false)
@@ -361,6 +367,8 @@ fn target_carries_patched_wheel_hash(
 /// committed atomically). `rel_wheel` is the project-relative wheel path
 /// (`.socket/vendor/pypi/<uuid>/<wheel>`, no `./` prefix — the `./` idiom of
 /// pdm's own `path` serialization is applied here, fixture-pinned).
+/// `known_patched_sha256`: every sha256 this patch's wheel is known by
+/// (this run's and the ledger's), for the partial-relock guard.
 #[allow(clippy::too_many_arguments)]
 pub async fn wire_pdm(
     p: &PdmProject,
@@ -371,6 +379,7 @@ pub async fn wire_pdm(
     wheel_file_name: &str,
     wheel_sha256_hex: &str,
     record_uuid: &str,
+    known_patched_sha256: &[&str],
 ) -> Result<(Vec<WiringRecord>, PdmMeta), (&'static str, String)> {
     // Before ANY write: a symlinked lock would be replaced by the rename-over.
     refuse_symlinked(root, &[LOCK_FILE], "pypi_pdm_symlink_unsupported").await?;
@@ -399,7 +408,7 @@ pub async fn wire_pdm(
     // true registry original would be lost. Refuse with the repair path (a full
     // `pdm lock` re-resolves the registry hashes) so the ledger's real original
     // survives untouched.
-    if target_carries_patched_wheel_hash(&p.lock, canon_name, wheel_sha256_hex) {
+    if target_carries_patched_wheel_hash(&p.lock, canon_name, known_patched_sha256) {
         return Err((
             "pypi_pdm_source_already_exists",
             format!(
@@ -727,7 +736,15 @@ distribution = false
 
     async fn wire_default(p: &PdmProject, root: &Path) -> (Vec<WiringRecord>, PdmMeta) {
         wire_pdm(
-            p, root, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID,
+            p,
+            root,
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+            &[WHEEL_SHA],
         )
         .await
         .unwrap()
@@ -951,6 +968,7 @@ distribution = false
             WHEEL_NAME,
             WHEEL_SHA,
             UUID,
+            &[WHEEL_SHA],
         )
         .await
         .unwrap_err();
@@ -960,6 +978,53 @@ distribution = false
             before,
             "refusal writes nothing"
         );
+    }
+
+    /// Partial relock after a service ↔ local source flip: the stale unit
+    /// carries the PRIOR (ledger) sha, not this run's. The guard matches any
+    /// known patched sha, so it still refuses — and without the prior sha
+    /// it would have wired over it (the pre-fix, source-dependent hole).
+    #[tokio::test]
+    async fn partial_relock_guard_matches_any_known_patched_sha() {
+        let prior_sha = "c".repeat(64);
+        let stale = LOCK_DIRECT_REGISTRY.replace(
+            "8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254",
+            &prior_sha,
+        );
+        assert_ne!(stale, LOCK_DIRECT_REGISTRY);
+        let tmp = write_project(&stale, PYPROJECT_DIRECT).await;
+        let p = load_pdm_project(tmp.path()).await.unwrap();
+        let err = wire_pdm(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+            &[WHEEL_SHA, prior_sha.as_str()],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, "pypi_pdm_source_already_exists");
+        assert!(err.1.contains("pdm lock"), "{}", err.1);
+        assert_eq!(read_lock(tmp.path()).await, stale, "refusal writes nothing");
+
+        // Only this run's sha known: the stale unit reads as a registry one.
+        assert!(wire_pdm(
+            &p,
+            tmp.path(),
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+            &[WHEEL_SHA],
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]
@@ -1016,6 +1081,7 @@ distribution = false
             WHEEL_NAME,
             WHEEL_SHA,
             UUID,
+            &[WHEEL_SHA],
         )
         .await
         .unwrap_err();
@@ -1201,6 +1267,7 @@ distribution = false
             WHEEL_NAME,
             WHEEL_SHA,
             UUID,
+            &[WHEEL_SHA],
         )
         .await;
 
@@ -1438,7 +1505,15 @@ distribution = false
 
         let p = load_pdm_project(&root).await.unwrap();
         let err = wire_pdm(
-            &p, &root, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, UUID,
+            &p,
+            &root,
+            "six",
+            "1.16.0",
+            REL_WHEEL,
+            WHEEL_NAME,
+            WHEEL_SHA,
+            UUID,
+            &[WHEEL_SHA],
         )
         .await
         .unwrap_err();
@@ -1510,6 +1585,7 @@ distribution = false
             WHEEL_NAME,
             WHEEL_SHA,
             UUID,
+            &[WHEEL_SHA],
         )
         .await
         .unwrap_err();

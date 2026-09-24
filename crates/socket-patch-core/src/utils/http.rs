@@ -1,5 +1,25 @@
 //! Small shared HTTP primitives.
 
+/// Why [`read_capped_typed`] gave up — typed so a caller can tell a body cut
+/// off mid-transfer (a transport failure, worth a retry) from a cap breach
+/// (the same bytes would breach it again) without matching on wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadCappedError {
+    /// The body stream failed before it ended (connection reset, timeout,
+    /// truncated `Content-Length`, …).
+    Truncated(String),
+    /// The declared or streamed size exceeded the cap.
+    CapExceeded(String),
+}
+
+impl std::fmt::Display for ReadCappedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated(m) | Self::CapExceeded(m) => f.write_str(m),
+        }
+    }
+}
+
 /// Stream a response body into memory with a hard byte cap, rejecting both
 /// an over-large declared `Content-Length` and an actual stream that
 /// exceeds the cap mid-flight. `what` names the payload in error messages
@@ -8,25 +28,38 @@
 /// Hoisted from `api/client.rs` so the self-update downloader shares the
 /// exact cap semantics the vendor/artifact fetches already have.
 pub(crate) async fn read_capped(
-    mut resp: reqwest::Response,
+    resp: reqwest::Response,
     max: u64,
     what: &str,
 ) -> Result<Vec<u8>, String> {
+    read_capped_typed(resp, max, what)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// [`read_capped`] with a typed error.
+pub(crate) async fn read_capped_typed(
+    mut resp: reqwest::Response,
+    max: u64,
+    what: &str,
+) -> Result<Vec<u8>, ReadCappedError> {
     if let Some(len) = resp.content_length() {
         if len > max {
-            return Err(format!(
+            return Err(ReadCappedError::CapExceeded(format!(
                 "{what} too large: declared {len} bytes > {max} cap"
-            ));
+            )));
         }
     }
     let mut bytes: Vec<u8> = Vec::new();
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| format!("error reading {what} body: {e}"))?
+        .map_err(|e| ReadCappedError::Truncated(format!("error reading {what} body: {e}")))?
     {
         if bytes.len() as u64 + chunk.len() as u64 > max {
-            return Err(format!("{what} exceeded {max}-byte cap mid-stream"));
+            return Err(ReadCappedError::CapExceeded(format!(
+                "{what} exceeded {max}-byte cap mid-stream"
+            )));
         }
         bytes.extend_from_slice(&chunk);
     }

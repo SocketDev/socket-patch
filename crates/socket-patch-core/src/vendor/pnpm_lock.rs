@@ -350,9 +350,11 @@ pub async fn vendor_pnpm(
 
     if !pkg_changed && !lock_changed && ws_edit.new_text.is_none() {
         // Everything already carries this uuid + the packed integrity: the
-        // project is in sync. The tarball re-pack above was byte-identical
-        // by determinism; synthesize AlreadyPatched and record nothing (the
-        // existing ledger entry stays authoritative).
+        // project is in sync. The integrity is that of the reused committed
+        // tarball (the shared pipeline wrote nothing) or, when reuse missed,
+        // of a fresh acquisition that reproduced the pinned bytes;
+        // synthesize AlreadyPatched and record nothing (the existing ledger
+        // entry stays authoritative).
         return done(
             already_patched_result(purl, &project_root.join(&rel_tgz), &record.files),
             None,
@@ -2950,6 +2952,55 @@ snapshots:
             .await
         }
     }
+
+    // ── source-flip / outage idempotence (vendor::test_support::npm_flip_suite) ──
+
+    impl crate::vendor::test_support::FlipFixture for Fixture {
+        fn flip_root(&self) -> &Path {
+            self.root()
+        }
+        fn flip_key(&self) -> String {
+            "pkg:npm/left-pad@1.3.0".to_string()
+        }
+        fn flip_uuid(&self) -> String {
+            self.record.uuid.clone()
+        }
+        fn flip_artifact_rel(&self) -> String {
+            self.rel_tgz()
+        }
+        fn flip_files(&self) -> Vec<String> {
+            vec![
+                PACKAGE_JSON.to_string(),
+                PNPM_LOCK.to_string(),
+                PNPM_WORKSPACE.to_string(),
+            ]
+        }
+    }
+
+    async fn flip_run(
+        fx: &Fixture,
+        cfg: Option<&crate::vendor::VendorServiceConfig>,
+    ) -> VendorOutcome {
+        let blobs = fx.root().join(".socket/blobs");
+        vendor_pnpm(
+            "pkg:npm/left-pad@1.3.0",
+            &fx.installed(),
+            fx.root(),
+            &fx.record,
+            &PatchSources::blobs_only(&blobs),
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            cfg,
+        )
+        .await
+    }
+
+    async fn flip_fixture() -> Fixture {
+        fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await
+    }
+
+    crate::vendor::test_support::npm_flip_suite!(flip_suite, Fixture, flip_fixture, flip_run);
 
     async fn fixture_with(pkg_json: &str, lock: &str) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();

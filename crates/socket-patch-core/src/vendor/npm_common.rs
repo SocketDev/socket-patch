@@ -29,6 +29,7 @@ use super::common::{
 };
 use super::npm_pack::{pack_deterministic, PackedTarball};
 use super::path::vendor_uuid_dir_rel;
+use super::reuse;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
@@ -127,6 +128,12 @@ pub(super) struct NpmStagedPack {
     /// (a same-uuid re-vendor's dir may still be referenced by live wiring);
     /// backends feed this to [`done_failure_unstage`].
     pub uuid_dir_preexisted: bool,
+    /// The exact bytes a committed-artifact reuse hashed and verified
+    /// (`None` for a fresh pack / download, which this run just wrote).
+    /// A consumer that needs the tarball's bytes (yarn berry's checksum)
+    /// uses these instead of re-reading the file, so nothing swapped in
+    /// after verification can reach the lock.
+    pub verified_bytes: Option<Vec<u8>>,
 }
 
 /// Stage → patch → pack one installed npm package.
@@ -162,13 +169,34 @@ pub(super) async fn stage_patch_pack(
 ) -> Result<(Option<NpmStagedPack>, ApplyResult), Box<VendorOutcome>> {
     let coords = guard_coordinates(purl, record)?;
 
+    // ── Reuse the committed artifact (before any acquisition) ───────────
+    // A re-run whose tarball the ledger vouches for — sha256 anchored,
+    // every afterHash verified from the same bytes — keeps those bytes:
+    // no service call, no local pack, no write. Acquiring anew would make
+    // the lock's digests depend on which source answered THIS run (the
+    // service's prebuilt encoding and the local deterministic pack carry the
+    // same members but different bytes), so a service outage or its
+    // recovery would re-vendor every package. `--vendor-source` governs
+    // acquisition, not reuse; checked before `service_offline_conflict` so
+    // an in-sync `service` + `--offline` re-run succeeds (as cargo and
+    // composer already do). The probe is read-only and offline, so a dry
+    // run runs it too: on a hit it skips the offline refusal (the real run
+    // would not raise it) and keeps previewing the local build.
+    let mut reusable = false;
+    if let Some(pair) = reuse_committed_pack(purl, project_root, &coords, record).await {
+        if !dry_run {
+            return Ok(pair);
+        }
+        reusable = true;
+    }
+
     // ── Service-download fast path (Tier A: write the prebuilt tarball) ──
     // When the vendoring service is configured, try to download the already-
     // built, integrity-verified tarball instead of staging+patching+packing
     // locally. A dry run previews the local build (no network). Per the
     // `auto`/`service` policy a non-fatal miss falls back to the local build
     // below; under `service` it fails closed.
-    if let Some(refusal) = service_offline_conflict(service) {
+    if let Some(refusal) = service_offline_conflict(service).filter(|_| !reusable) {
         return Err(Box::new(refusal));
     }
     if let Some(cfg) = service {
@@ -315,6 +343,68 @@ pub(super) async fn stage_patch_pack(
             packed,
             staged_pkg_json,
             uuid_dir_preexisted,
+            verified_bytes: None,
+        }),
+        result,
+    ))
+}
+
+/// The staged pack for a verified committed tarball (see
+/// [`super::reuse`]), or `None` to acquire as usual. Nothing is written, so
+/// the pack reports `uuid_dir_preexisted: true` — a later wiring failure's
+/// [`done_failure_unstage`] must never delete the committed artifact the
+/// live ledger entry still names.
+async fn reuse_committed_pack(
+    purl: &str,
+    project_root: &Path,
+    coords: &NpmCoords,
+    record: &PatchRecord,
+) -> Option<(Option<NpmStagedPack>, ApplyResult)> {
+    let rel_tgz = format!(
+        "{}/{}",
+        coords.uuid_dir_rel,
+        tgz_rel_leaf(&coords.name, &coords.version)
+    );
+    let art = match reuse::reusable_committed_artifact(project_root, "npm", record, Some(&rel_tgz))
+        .await
+    {
+        Ok(art) => art,
+        Err(miss) => {
+            reuse::log_miss(purl, &miss);
+            return None;
+        }
+    };
+    // A patched package.json feeds the flavor's dependency-mirror
+    // recompute; read it from the SAME verified bytes.
+    let staged_pkg_json = if record
+        .files
+        .keys()
+        .any(|k| normalize_file_path(k) == "package.json")
+    {
+        match art
+            .members
+            .get("package.json")
+            .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+        {
+            Some(pkg) => Some(pkg),
+            None => {
+                reuse::log_miss(purl, &reuse::ReuseMiss::Unreadable);
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+    let result = already_patched_result(purl, &project_root.join(&rel_tgz), &record.files);
+    Some((
+        Some(NpmStagedPack {
+            name: coords.name.clone(),
+            version: coords.version.clone(),
+            rel_tgz,
+            packed: PackedTarball::from_bytes(&art.bytes),
+            staged_pkg_json,
+            uuid_dir_preexisted: true,
+            verified_bytes: Some(art.bytes),
         }),
         result,
     ))
@@ -519,6 +609,7 @@ async fn staged_pack_from_service_bytes(
         packed,
         staged_pkg_json,
         uuid_dir_preexisted,
+        verified_bytes: None,
     })
 }
 
@@ -1141,12 +1232,15 @@ mod tests {
     fn service_cfg(server_uri: &str, source: VendorSource) -> VendorServiceConfig {
         VendorServiceConfig {
             source,
-            client: Some(ApiClient::new(ApiClientOptions {
-                api_url: server_uri.to_string(),
-                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
-                use_public_proxy: false,
-                org_slug: Some("acme".into()),
-            })),
+            client: Some(
+                ApiClient::new(ApiClientOptions {
+                    api_url: server_uri.to_string(),
+                    api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                    use_public_proxy: false,
+                    org_slug: Some("acme".into()),
+                })
+                .with_vendor_retry(crate::api::client::VendorRetryPolicy::none()),
+            ),
             use_public_proxy: false,
             vendor_url: None,
             patch_server_url: None,
@@ -1437,6 +1531,58 @@ mod tests {
         let err = expect_err(service_bytes(tmp.path(), &record, &tgz, &sri).await);
         expect_done_failure(err, "vendored package.json is not parseable JSON");
         assert!(!tmp.path().join(".socket/vendor").exists());
+    }
+
+    /// A reuse hands the flavor the EXACT bytes it verified (yarn berry
+    /// derives its checksum from them rather than re-reading a file that
+    /// may have been swapped since); a fresh download carries none.
+    #[tokio::test]
+    async fn reused_pack_carries_the_verified_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut record = record_with_uuid(UUID);
+        record.files.get_mut("package/index.js").unwrap().after_hash =
+            crate::hash::git_sha256::compute_git_sha256_from_bytes(PATCHED_INDEX);
+        let tgz = build_tgz(&[
+            ("index.js", PATCHED_INDEX),
+            ("package.json", br#"{"name":"left-pad","version":"1.3.0"}"#),
+        ])
+        .await;
+        let sri = PackedTarball::from_bytes(&tgz).integrity;
+        let fresh = service_bytes(tmp.path(), &record, &tgz, &sri)
+            .await
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(fresh.verified_bytes.is_none());
+        let entry = crate::vendor::state::VendorEntry {
+            ecosystem: "npm".into(),
+            base_purl: LP_PURL.into(),
+            uuid: record.uuid.clone(),
+            artifact: crate::vendor::state::VendorArtifact {
+                path: fresh.rel_tgz.clone(),
+                sha256: fresh.packed.sha256_hex.clone(),
+                size: Some(fresh.packed.size),
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            flavor: Some("yarn-berry".into()),
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+            detached: false,
+            record: None,
+        };
+        crate::vendor::test_support::persist(tmp.path(), LP_PURL, entry).await;
+        let coords = guard_coordinates(LP_PURL, &record).unwrap();
+        let (staged, _) = reuse_committed_pack(LP_PURL, tmp.path(), &coords, &record)
+            .await
+            .expect("the committed tarball is reused");
+        let staged = staged.unwrap();
+        assert_eq!(staged.verified_bytes.as_deref(), Some(tgz.as_slice()));
+        assert!(staged.uuid_dir_preexisted);
     }
 
     /// Full service-bytes success: the tarball lands verbatim at the same

@@ -623,6 +623,46 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     assert_eq!(repeat["summary"]["applied"], 0, "vendor rerun: {repeat}");
     assert_eq!(repeat["summary"]["skipped"], 1, "vendor rerun: {repeat}");
     assert_eq!(fixture.lock(), vendor_lock);
+    // The same rerun during a vendoring-service outage (closed port): the
+    // committed archive is reused, so bun.lockb and the tarball stay
+    // byte-identical, and no outage advisory is raised (the pre-reuse
+    // fallback to a local pack also stayed in sync here, but only after
+    // warning `vendor_prebuilt_unavailable` — that event is the tell).
+    let tgz_path = project.join(format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz"));
+    let vendor_tgz = std::fs::read(&tgz_path).unwrap();
+    let outage = cli(
+        project,
+        &[
+            "vendor",
+            "--api-url",
+            &server.uri(),
+            "--vendor-url",
+            "http://127.0.0.1:9",
+            "--api-token",
+            "fake",
+            "--org",
+            ORG,
+        ],
+    );
+    assert_eq!(outage["summary"]["applied"], 0, "outage rerun: {outage}");
+    assert_eq!(outage["summary"]["skipped"], 1, "outage rerun: {outage}");
+    assert_eq!(fixture.lock(), vendor_lock);
+    assert_eq!(std::fs::read(&tgz_path).unwrap(), vendor_tgz);
+    let outage_events = outage["events"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        outage_events
+            .iter()
+            .filter(|e| e["errorCode"] == "already_vendored")
+            .count(),
+        1,
+        "outage rerun: {outage}"
+    );
+    assert!(
+        outage_events
+            .iter()
+            .all(|e| e["errorCode"] != "vendor_prebuilt_unavailable"),
+        "outage rerun must not touch the service: {outage}"
+    );
 
     // Rebuild a deleted artifact from the manifest, preserve binary wiring.
     std::fs::remove_dir_all(project.join(".socket/vendor/npm")).unwrap();

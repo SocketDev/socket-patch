@@ -1,5 +1,7 @@
 use std::collections::HashSet;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use reqwest::StatusCode;
@@ -110,7 +112,107 @@ pub struct ApiClient {
     api_token: Option<String>,
     use_public_proxy: bool,
     org_slug: Option<String>,
+    /// Retry policy for the vendoring service's two round trips.
+    vendor_retry: VendorRetryPolicy,
+    /// Consecutive [`Self::fetch_vendor_package`] calls that ended in a
+    /// retryable failure (transport / 429 / 5xx after every retry) — the
+    /// run-level circuit breaker. Shared by clones: one CLI run, one count.
+    vendor_outage: Arc<AtomicU32>,
 }
+
+/// Retry policy for the vendoring service's package-reference POST and
+/// archive GET: `attempts` tries in total, exponential delays from `base`
+/// with ±25% jitter, each capped at `max_delay` (a `Retry-After` in seconds
+/// is honored under the same cap). Retried: transport errors (per-attempt
+/// timeouts and bodies cut off mid-transfer included) and HTTP 429,
+/// 500, 502, 503, 504. Never retried: auth (401/403), terminal misses
+/// (404/410), still-building (408), other 4xx, parse errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VendorRetryPolicy {
+    pub attempts: u32,
+    pub base: Duration,
+    pub max_delay: Duration,
+    /// Bound on one attempt's POST round trip, and on the archive GET's
+    /// connect + response headers (a black-holed or stalled host fails the
+    /// attempt instead of hanging the run).
+    pub attempt_timeout: Duration,
+    /// Bound on one archive GET's body read.
+    pub body_timeout: Duration,
+}
+
+impl Default for VendorRetryPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 3,
+            base: Duration::from_millis(400),
+            max_delay: Duration::from_secs(4),
+            attempt_timeout: Duration::from_secs(30),
+            body_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+impl VendorRetryPolicy {
+    /// A single attempt, no retry (the default per-attempt timeouts).
+    pub fn none() -> Self {
+        Self {
+            attempts: 1,
+            base: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            ..Self::default()
+        }
+    }
+
+    /// The pause before retry number `retry` (1-based), given the server's
+    /// `Retry-After` (seconds), and a jitter sample in `[0, 1)`.
+    fn delay(&self, retry: u32, retry_after: Option<Duration>, jitter: f64) -> Duration {
+        if let Some(after) = retry_after {
+            return after.min(self.max_delay);
+        }
+        let exp = self
+            .base
+            .saturating_mul(1u32 << retry.saturating_sub(1).min(16));
+        // ±25%: scale by [0.75, 1.25).
+        exp.mul_f64(0.75 + 0.5 * jitter.clamp(0.0, 1.0))
+            .min(self.max_delay)
+    }
+}
+
+/// Consecutive retryable vendor-service failures after which the rest of the
+/// run skips the service without any I/O (`auto` then builds locally,
+/// `service` fails closed — the existing miss policy).
+const VENDOR_BREAKER_THRESHOLD: u32 = 2;
+
+/// A jitter sample in `[0, 1)` from std's randomly keyed hasher (no RNG
+/// dependency; the quality needed here is "not synchronized").
+fn jitter_sample() -> f64 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(0);
+    (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Is this vendor-service HTTP status worth another attempt?
+fn vendor_status_retryable(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
+}
+
+/// A `Retry-After: <seconds>` header (the HTTP-date form is ignored).
+fn retry_after_secs(headers: &HeaderMap) -> Option<Duration> {
+    headers
+        .get(header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+/// One vendor-service attempt's failure: the error, and — when the failure
+/// is retryable — the server's `Retry-After` hint (`Some(None)` = retryable
+/// without a hint).
+type VendorAttemptError = (ApiError, Option<Option<Duration>>);
 
 /// Body payload for the batch search POST endpoint.
 #[derive(Serialize)]
@@ -167,7 +269,16 @@ impl ApiClient {
             api_token: options.api_token,
             use_public_proxy: options.use_public_proxy,
             org_slug: options.org_slug,
+            vendor_retry: VendorRetryPolicy::default(),
+            vendor_outage: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// Override the vendoring-service retry policy (tests; a policy of
+    /// [`VendorRetryPolicy::none`] makes a single attempt).
+    pub fn with_vendor_retry(mut self, policy: VendorRetryPolicy) -> Self {
+        self.vendor_retry = policy;
+        self
     }
 
     /// Returns the API token, if set.
@@ -718,6 +829,44 @@ impl ApiClient {
                 "Invalid patch UUID: {uuid}"
             )));
         }
+        // Circuit breaker: after consecutive retryable failures the service
+        // is down for this run — skip it without any I/O instead of paying
+        // every package's retries (and mixing sources package by package).
+        let failures = self.vendor_outage.load(Ordering::Relaxed);
+        if failures >= VENDOR_BREAKER_THRESHOLD {
+            // Worded to read inside the callers' "patch service request
+            // failed (...)" wrapper: no request was made, and the skip is
+            // scoped to this run.
+            return VendorServiceOutcome::Failed(ApiError::Other(format!(
+                "not attempted: the service failed for the previous {failures} packages in \
+                 this run"
+            )));
+        }
+        let (outcome, retryable_failure) = self
+            .fetch_vendor_package_once(uuid, free_only, vendor_url, patch_server_url)
+            .await;
+        match &outcome {
+            VendorServiceOutcome::Failed(_) if retryable_failure => {
+                self.vendor_outage.fetch_add(1, Ordering::Relaxed);
+            }
+            // A non-retryable failure (auth, parse) says nothing about
+            // availability either way.
+            VendorServiceOutcome::Failed(_) => {}
+            _ => self.vendor_outage.store(0, Ordering::Relaxed),
+        }
+        outcome
+    }
+
+    /// [`Self::fetch_vendor_package`] without the breaker: the outcome, and
+    /// whether a `Failed` one was a retryable (availability) failure.
+    async fn fetch_vendor_package_once(
+        &self,
+        uuid: &str,
+        free_only: bool,
+        vendor_url: Option<&str>,
+        patch_server_url: Option<&str>,
+    ) -> (VendorServiceOutcome, bool) {
+        let done = |o: VendorServiceOutcome| (o, false);
 
         // ── Step 1: resolve the grant URL + integrity ──────────────────────
         let result = match self
@@ -725,21 +874,25 @@ impl ApiClient {
             .await
         {
             Ok(r) => r,
-            Err(e) => return VendorServiceOutcome::Failed(e),
+            Err((e, retryable)) => return (VendorServiceOutcome::Failed(e), retryable),
         };
         // Classify the build/grant status before attempting any download.
         match result.status.as_str() {
             "granted" | "reused" => {}
-            "pending_build" => return VendorServiceOutcome::Pending,
+            "pending_build" => return done(VendorServiceOutcome::Pending),
             "build_failed" | "withdrawn" | "not_found" => {
-                return VendorServiceOutcome::Unavailable(result.status.clone())
+                return done(VendorServiceOutcome::Unavailable(result.status.clone()))
             }
             "forbidden" => {
-                return VendorServiceOutcome::Failed(ApiError::Forbidden(
+                return done(VendorServiceOutcome::Failed(ApiError::Forbidden(
                     "Forbidden: not entitled to this patch (paid tier or no org access).".into(),
-                ))
+                )))
             }
-            other => return VendorServiceOutcome::Unavailable(format!("unknown status `{other}`")),
+            other => {
+                return done(VendorServiceOutcome::Unavailable(format!(
+                    "unknown status `{other}`"
+                )))
+            }
         }
 
         // Select the native tarball artifact and its sha512 (the universal
@@ -750,22 +903,26 @@ impl ApiClient {
             .as_ref()
             .and_then(|arts| arts.iter().find(|a| a.kind == "tarball"))
         else {
-            return VendorServiceOutcome::Unavailable("no tarball artifact in response".into());
+            return done(VendorServiceOutcome::Unavailable(
+                "no tarball artifact in response".into(),
+            ));
         };
         let Some(sha512_raw) = artifact.integrity.sha512.as_deref() else {
-            return VendorServiceOutcome::Unavailable(
+            return done(VendorServiceOutcome::Unavailable(
                 "tarball artifact has no sha512 integrity".into(),
-            );
+            ));
         };
         let integrity_sri = normalize_sha512_sri(sha512_raw);
         // The artifact's own URL wins; fall back to the top-level `url`.
         let Some(download_url) = artifact.url.as_deref().or(result.url.as_deref()) else {
-            return VendorServiceOutcome::Unavailable("granted result has no download url".into());
+            return done(VendorServiceOutcome::Unavailable(
+                "granted result has no download url".into(),
+            ));
         };
         let download_url = match patch_server_url {
             Some(base) => match rewrite_url_host(download_url, base) {
                 Ok(u) => u,
-                Err(e) => return VendorServiceOutcome::Failed(e),
+                Err(e) => return done(VendorServiceOutcome::Failed(e)),
             },
             None => download_url.to_string(),
         };
@@ -800,19 +957,21 @@ impl ApiClient {
         }
 
         // ── Step 2: download the prebuilt archive ──────────────────────────
-        match self.download_vendor_archive(&download_url).await {
-            ServeDownload::Ok(bytes) => VendorServiceOutcome::Ready(FetchedVendorPackage {
-                tarball: bytes,
-                integrity_sri,
-                dirhash_h1: artifact.integrity.dirhash_h1.clone(),
-                source_url: download_url,
-                secondary_artifacts,
-            }),
-            ServeDownload::NotFound => {
-                VendorServiceOutcome::Unavailable("serve returned 404/410".into())
+        match self.download_vendor_archive_retrying(&download_url).await {
+            (ServeDownload::Ok(bytes), _) => {
+                done(VendorServiceOutcome::Ready(FetchedVendorPackage {
+                    tarball: bytes,
+                    integrity_sri,
+                    dirhash_h1: artifact.integrity.dirhash_h1.clone(),
+                    source_url: download_url,
+                    secondary_artifacts,
+                }))
             }
-            ServeDownload::Pending => VendorServiceOutcome::Pending,
-            ServeDownload::Failed(e) => VendorServiceOutcome::Failed(e),
+            (ServeDownload::NotFound, _) => done(VendorServiceOutcome::Unavailable(
+                "serve returned 404/410".into(),
+            )),
+            (ServeDownload::Pending, _) => done(VendorServiceOutcome::Pending),
+            (ServeDownload::Failed(e), retryable) => (VendorServiceOutcome::Failed(e), retryable),
         }
     }
 
@@ -848,14 +1007,49 @@ impl ApiClient {
         }
     }
 
-    /// Step 1 of [`Self::fetch_vendor_package`]: POST the package-reference
-    /// endpoint and return the single requested UUID's result.
+    /// Pause before retry number `retry` (see [`VendorRetryPolicy`]).
+    async fn vendor_backoff(&self, retry: u32, retry_after: Option<Duration>) {
+        let delay = self.vendor_retry.delay(retry, retry_after, jitter_sample());
+        debug_log(&format!("vendor service retry {retry} in {delay:?}"));
+        tokio::time::sleep(delay).await;
+    }
+
+    /// Step 1 of [`Self::fetch_vendor_package`], retried per the client's
+    /// [`VendorRetryPolicy`]. `Err` carries whether the final failure was a
+    /// retryable (availability) one.
     async fn request_vendor_package(
         &self,
         uuid: &str,
         free_only: bool,
         vendor_url: Option<&str>,
-    ) -> Result<PackageVendorResult, ApiError> {
+    ) -> Result<PackageVendorResult, (ApiError, bool)> {
+        let attempts = self.vendor_retry.attempts.max(1);
+        let mut attempt = 1;
+        loop {
+            match self
+                .request_vendor_package_once(uuid, free_only, vendor_url)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err((e, Some(retry_after))) if attempt < attempts => {
+                    debug_log(&format!(
+                        "vendor package request attempt {attempt} failed: {e}"
+                    ));
+                    self.vendor_backoff(attempt, retry_after).await;
+                    attempt += 1;
+                }
+                Err((e, hint)) => return Err((e, hint.is_some())),
+            }
+        }
+    }
+
+    /// One package-reference POST: the single requested UUID's result.
+    async fn request_vendor_package_once(
+        &self,
+        uuid: &str,
+        free_only: bool,
+        vendor_url: Option<&str>,
+    ) -> Result<PackageVendorResult, VendorAttemptError> {
         let body = PackageVendorRequest {
             uuids: vec![uuid.to_string()],
             // Only send freeOnly when forcing it (the public-proxy contract);
@@ -865,11 +1059,15 @@ impl ApiClient {
         let (url, use_auth) = self.vendor_package_url(vendor_url);
         debug_log(&format!("POST {url}"));
 
+        // The whole round trip (connect, response, JSON body) is bounded per
+        // attempt, so attempts × timeout + backoff bounds the step.
+        let timeout = self.vendor_retry.attempt_timeout;
         let resp = if use_auth {
             self.client
                 .post(&url)
                 .header(header::CONTENT_TYPE, "application/json")
                 .json(&body)
+                .timeout(timeout)
                 .send()
                 .await
         } else {
@@ -879,57 +1077,122 @@ impl ApiClient {
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "application/json")
                 .json(&body)
+                .timeout(timeout)
                 .send()
                 .await
         };
 
         let resp = resp.map_err(|e| {
-            ApiError::Network(format!("Network error: {}", network_error_detail(&e)))
+            (
+                ApiError::Network(format!("Network error: {}", network_error_detail(&e))),
+                Some(None),
+            )
         })?;
         let status = resp.status();
         if status == StatusCode::OK {
-            let parsed = resp
-                .json::<PackageVendorResponse>()
-                .await
-                .map_err(|e| ApiError::Parse(format!("Failed to parse package response: {e}")))?;
+            let parsed = resp.json::<PackageVendorResponse>().await.map_err(|e| {
+                // A body cut off (or timed out) mid-transfer is transport,
+                // not a malformed answer.
+                let hint = (e.is_timeout() || e.is_body()).then_some(None);
+                (
+                    ApiError::Parse(format!("Failed to parse package response: {e}")),
+                    hint,
+                )
+            })?;
             return parsed.results.get(uuid).cloned().ok_or_else(|| {
-                ApiError::Other(format!("package response missing a result for {uuid}"))
+                (
+                    ApiError::Other(format!("package response missing a result for {uuid}")),
+                    None,
+                )
             });
         }
+        // 429 classifies as RateLimited but is still retried (the hint);
+        // 401/403 carry no hint.
+        let hint = vendor_status_retryable(status).then(|| retry_after_secs(resp.headers()));
         if let Some(err) = classify_auth_error(status, !use_auth) {
-            return Err(err);
+            return Err((err, hint));
         }
         let text = resp.text().await.unwrap_or_default();
-        Err(ApiError::Other(status_error(
-            "package request failed with status",
-            status,
-            &text,
-        )))
+        Err((
+            ApiError::Other(status_error(
+                "package request failed with status",
+                status,
+                &text,
+            )),
+            hint,
+        ))
     }
 
-    /// Step 2 of [`Self::fetch_vendor_package`]: GET the grant-tokenized serve
-    /// URL. The grant token in the path is the authorization, so this uses a
-    /// plain (no-auth) client.
+    /// Step 2 of [`Self::fetch_vendor_package`], retried per the client's
+    /// [`VendorRetryPolicy`]; the flag says whether a final `Failed` was a
+    /// retryable (availability) failure.
+    async fn download_vendor_archive_retrying(&self, url: &str) -> (ServeDownload, bool) {
+        let attempts = self.vendor_retry.attempts.max(1);
+        let mut attempt = 1;
+        loop {
+            match self.download_vendor_archive_once(url).await {
+                (ServeDownload::Failed(e), Some(retry_after)) if attempt < attempts => {
+                    debug_log(&format!(
+                        "vendor package download attempt {attempt} failed: {e}"
+                    ));
+                    self.vendor_backoff(attempt, retry_after).await;
+                    attempt += 1;
+                }
+                (outcome, hint) => return (outcome, hint.is_some()),
+            }
+        }
+    }
+
+    /// [`Self::download_vendor_archive_retrying`] without the flag.
     async fn download_vendor_archive(&self, url: &str) -> ServeDownload {
+        self.download_vendor_archive_retrying(url).await.0
+    }
+
+    /// One GET of the grant-tokenized serve URL. The grant token in the path
+    /// is the authorization, so this uses a plain (no-auth) client. The hint
+    /// is `Some` iff a `Failed` outcome is retryable.
+    async fn download_vendor_archive_once(
+        &self,
+        url: &str,
+    ) -> (ServeDownload, Option<Option<Duration>>) {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
-            return ServeDownload::Failed(ApiError::Other(format!(
-                "refusing non-http(s) artifact URL `{url}`"
-            )));
+            return (
+                ServeDownload::Failed(ApiError::Other(format!(
+                    "refusing non-http(s) artifact URL `{url}`"
+                ))),
+                None,
+            );
         }
         debug_log(&format!("GET vendor package {url}"));
-        let resp = match self
-            .plain
-            .get(url)
-            .header(header::ACCEPT, "application/octet-stream")
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                return ServeDownload::Failed(ApiError::Network(format!(
-                    "Network error fetching vendor package: {}",
-                    network_error_detail(&e)
-                )))
+        // Connect + response headers are bounded per attempt; the body read
+        // below gets its own (larger) bound — archives can be big.
+        let sent = tokio::time::timeout(
+            self.vendor_retry.attempt_timeout,
+            self.plain
+                .get(url)
+                .header(header::ACCEPT, "application/octet-stream")
+                .send(),
+        )
+        .await;
+        let resp = match sent {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                return (
+                    ServeDownload::Failed(ApiError::Network(format!(
+                        "Network error fetching vendor package: {}",
+                        network_error_detail(&e)
+                    ))),
+                    Some(None),
+                )
+            }
+            Err(_) => {
+                return (
+                    ServeDownload::Failed(ApiError::Network(format!(
+                        "Network error fetching vendor package: no response within {:?}",
+                        self.vendor_retry.attempt_timeout
+                    ))),
+                    Some(None),
+                )
             }
         };
         let status = resp.status();
@@ -937,25 +1200,48 @@ impl ApiClient {
             StatusCode::OK => {}
             // 404 (build_failed / not stored) and 410 (withdrawn) are terminal
             // misses; the caller decides build-fallback vs hard-fail.
-            StatusCode::NOT_FOUND | StatusCode::GONE => return ServeDownload::NotFound,
-            // 408 = the archive is still building (Retry-After) — retryable.
-            StatusCode::REQUEST_TIMEOUT => return ServeDownload::Pending,
+            StatusCode::NOT_FOUND | StatusCode::GONE => return (ServeDownload::NotFound, None),
+            // 408 = the archive is still building (Retry-After) — the
+            // caller's pending policy, never retried here.
+            StatusCode::REQUEST_TIMEOUT => return (ServeDownload::Pending, None),
             _ => {
+                let hint =
+                    vendor_status_retryable(status).then(|| retry_after_secs(resp.headers()));
                 if let Some(err) = classify_auth_error(status, true) {
-                    return ServeDownload::Failed(err);
+                    return (ServeDownload::Failed(err), hint);
                 }
                 let text = resp.text().await.unwrap_or_default();
-                return ServeDownload::Failed(ApiError::Other(format!(
-                    "vendor package download failed with status {}: {text}",
-                    status.as_u16(),
-                )));
+                return (
+                    ServeDownload::Failed(ApiError::Other(format!(
+                        "vendor package download failed with status {}: {text}",
+                        status.as_u16(),
+                    ))),
+                    hint,
+                );
             }
         }
-        match crate::utils::http::read_capped(resp, MAX_VENDOR_PACKAGE_BYTES, "vendor package")
-            .await
-        {
-            Ok(bytes) => ServeDownload::Ok(bytes),
-            Err(e) => ServeDownload::Failed(ApiError::Network(e)),
+        use crate::utils::http::{read_capped_typed, ReadCappedError};
+        let body = tokio::time::timeout(
+            self.vendor_retry.body_timeout,
+            read_capped_typed(resp, MAX_VENDOR_PACKAGE_BYTES, "vendor package"),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(ReadCappedError::Truncated(format!(
+                "vendor package body not received within {:?}",
+                self.vendor_retry.body_timeout
+            )))
+        });
+        match body {
+            Ok(bytes) => (ServeDownload::Ok(bytes), None),
+            // A body cut off mid-transfer is a transport failure (retryable);
+            // a size-cap breach is not (the same bytes would breach it again).
+            Err(ReadCappedError::Truncated(e)) => {
+                (ServeDownload::Failed(ApiError::Network(e)), Some(None))
+            }
+            Err(ReadCappedError::CapExceeded(e)) => {
+                (ServeDownload::Failed(ApiError::Network(e)), None)
+            }
         }
     }
 
@@ -3751,6 +4037,585 @@ mod vendor_package_tests {
             matches!(&err, ApiError::Network(m) if m.contains("Network error fetching vendor package")),
             "got: {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod vendor_retry_tests {
+    //! Retry + circuit breaker for the vendoring service's two round trips.
+    use super::*;
+    use base64::Engine as _;
+    use sha2::{Digest as _, Sha512};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const UUID_A: &str = "11111111-1111-4111-8111-111111111111";
+    const UUID_B: &str = "22222222-2222-4222-8222-222222222222";
+    const UUID_C: &str = "33333333-3333-4333-8333-333333333333";
+    const POST_PATH: &str = "/v0/orgs/acme/patches/package";
+    const SERVE: &str = "/serve/pkg.tgz";
+    const BYTES: &[u8] = b"prebuilt bytes";
+
+    /// A fast policy: three attempts, millisecond delays.
+    fn fast() -> VendorRetryPolicy {
+        VendorRetryPolicy {
+            attempts: 3,
+            base: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            ..VendorRetryPolicy::default()
+        }
+    }
+
+    fn client(uri: &str, policy: VendorRetryPolicy) -> ApiClient {
+        ApiClient::new(ApiClientOptions {
+            api_url: uri.to_string(),
+            api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+            use_public_proxy: false,
+            org_slug: Some("acme".into()),
+        })
+        .with_vendor_retry(policy)
+    }
+
+    fn granted(server: &MockServer, uuid: &str) -> ResponseTemplate {
+        let url = format!("{}{SERVE}", server.uri());
+        let sri = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(BYTES))
+        );
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": { uuid: { "status": "granted", "url": url,
+                "artifacts": [{ "kind": "tarball", "url": url,
+                                "integrity": { "sha512": sri } }] } }
+        }))
+    }
+
+    async fn mount_serve(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(SERVE))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(BYTES.to_vec()))
+            .mount(server)
+            .await;
+    }
+
+    /// `n` responses of `status` on the POST, then (optionally) a grant.
+    async fn mount_post_failures_then(server: &MockServer, status: u16, n: u64, then_grant: bool) {
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(status))
+            .up_to_n_times(n)
+            .with_priority(1)
+            .mount(server)
+            .await;
+        if then_grant {
+            Mock::given(method("POST"))
+                .and(path(POST_PATH))
+                .respond_with(granted(server, UUID_A))
+                .with_priority(2)
+                .mount(server)
+                .await;
+        }
+    }
+
+    async fn posts(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn post_503_twice_then_200_is_ready_after_three_requests() {
+        let server = MockServer::start().await;
+        mount_post_failures_then(&server, 503, 2, true).await;
+        mount_serve(&server).await;
+        let outcome = client(&server.uri(), fast())
+            .fetch_vendor_package(UUID_A, false, None, None)
+            .await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Ready(ref p) if p.tarball == BYTES),
+            "{outcome:?}"
+        );
+        assert_eq!(posts(&server).await, 3);
+    }
+
+    #[tokio::test]
+    async fn post_503_three_times_is_failed_after_three_requests() {
+        let server = MockServer::start().await;
+        mount_post_failures_then(&server, 503, 3, false).await;
+        let outcome = client(&server.uri(), fast())
+            .fetch_vendor_package(UUID_A, false, None, None)
+            .await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Failed(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(posts(&server).await, 3);
+    }
+
+    #[tokio::test]
+    async fn every_retryable_status_is_retried() {
+        for status in [429u16, 500, 502, 503, 504] {
+            let server = MockServer::start().await;
+            mount_post_failures_then(&server, status, 1, true).await;
+            mount_serve(&server).await;
+            let outcome = client(&server.uri(), fast())
+                .fetch_vendor_package(UUID_A, false, None, None)
+                .await;
+            assert!(
+                matches!(outcome, VendorServiceOutcome::Ready(_)),
+                "{status}: {outcome:?}"
+            );
+            assert_eq!(posts(&server).await, 2, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_502_then_200_is_ready() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(granted(&server, UUID_A))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SERVE))
+            .respond_with(ResponseTemplate::new(502))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SERVE))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(BYTES.to_vec()))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let outcome = client(&server.uri(), fast())
+            .fetch_vendor_package(UUID_A, false, None, None)
+            .await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Ready(ref p) if p.tarball == BYTES),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            posts(&server).await,
+            1,
+            "the POST is not repeated for a GET retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_errors_are_retried() {
+        // A closed port: every attempt is a connect error.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let c = client(&uri, fast());
+        let outcome = c.fetch_vendor_package(UUID_A, false, None, None).await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Failed(ApiError::Network(_))),
+            "{outcome:?}"
+        );
+        // A transport failure counts toward the breaker.
+        assert_eq!(c.vendor_outage.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_statuses_are_never_retried() {
+        // POST side: auth and other 4xx.
+        for status in [401u16, 403, 400, 404] {
+            let server = MockServer::start().await;
+            mount_post_failures_then(&server, status, 10, false).await;
+            let _ = client(&server.uri(), fast())
+                .fetch_vendor_package(UUID_A, false, None, None)
+                .await;
+            assert_eq!(posts(&server).await, 1, "POST {status}");
+        }
+        // GET side: 404/410 (terminal miss), 408 (pending), 403 (auth).
+        for status in [404u16, 410, 408, 403] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(POST_PATH))
+                .respond_with(granted(&server, UUID_A))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(SERVE))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            let outcome = client(&server.uri(), fast())
+                .fetch_vendor_package(UUID_A, false, None, None)
+                .await;
+            let gets = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == wiremock::http::Method::GET)
+                .count();
+            assert_eq!(gets, 1, "GET {status}: {outcome:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_200_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+        let c = client(&server.uri(), fast());
+        let outcome = c.fetch_vendor_package(UUID_A, false, None, None).await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Failed(ApiError::Parse(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(posts(&server).await, 1);
+        assert_eq!(
+            c.vendor_outage.load(Ordering::Relaxed),
+            0,
+            "not an availability failure"
+        );
+    }
+
+    /// `Retry-After` is honored (the pause is at least the header's second,
+    /// far above the 1ms base) and capped at `max_delay`.
+    #[tokio::test]
+    async fn retry_after_is_honored_and_capped() {
+        let honoring = VendorRetryPolicy {
+            attempts: 2,
+            base: Duration::from_millis(1),
+            max_delay: Duration::from_secs(5),
+            ..VendorRetryPolicy::default()
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "1"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(granted(&server, UUID_A))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        mount_serve(&server).await;
+        let started = std::time::Instant::now();
+        let outcome = client(&server.uri(), honoring)
+            .fetch_vendor_package(UUID_A, false, None, None)
+            .await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Ready(_)),
+            "{outcome:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(950),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // Retry-After: 30 with a 20ms cap retries almost immediately.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "30"))
+            .mount(&server)
+            .await;
+        let capped = VendorRetryPolicy {
+            attempts: 2,
+            base: Duration::from_millis(1),
+            max_delay: Duration::from_millis(20),
+            ..VendorRetryPolicy::default()
+        };
+        let started = std::time::Instant::now();
+        let _ = client(&server.uri(), capped)
+            .fetch_vendor_package(UUID_A, false, None, None)
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(posts(&server).await, 2);
+    }
+
+    /// A policy whose attempts time out after `timeout`.
+    fn timing_out(timeout: Duration) -> VendorRetryPolicy {
+        VendorRetryPolicy {
+            attempts: 2,
+            attempt_timeout: timeout,
+            body_timeout: timeout,
+            ..fast()
+        }
+    }
+
+    /// A stalled POST fails the attempt at the per-attempt timeout (and is
+    /// retried as a transport failure), so the step's latency is bounded by
+    /// attempts × timeout + backoff instead of hanging.
+    #[tokio::test]
+    async fn stalled_post_times_out_per_attempt_and_is_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(granted(&server, UUID_A).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        let started = std::time::Instant::now();
+        let outcome = client(&server.uri(), timing_out(Duration::from_millis(200)))
+            .fetch_vendor_package(UUID_A, false, None, None)
+            .await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Failed(ApiError::Network(_))),
+            "{outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(posts(&server).await, 2, "the timed-out attempt is retried");
+    }
+
+    /// The archive GET's response headers are bounded the same way.
+    #[tokio::test]
+    async fn stalled_get_times_out_per_attempt_and_is_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(granted(&server, UUID_A))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(SERVE))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(BYTES.to_vec())
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+        let started = std::time::Instant::now();
+        let outcome = client(&server.uri(), timing_out(Duration::from_millis(200)))
+            .fetch_vendor_package(UUID_A, false, None, None)
+            .await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Failed(ApiError::Network(_))),
+            "{outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        let gets = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::GET)
+            .count();
+        assert_eq!(gets, 2);
+    }
+
+    /// A raw HTTP server for the serve GET: connection `i` gets
+    /// `responses[min(i, last)]` verbatim and is then closed. Returns the
+    /// base URL and the connection counter.
+    fn raw_serve(responses: Vec<Vec<u8>>) -> (String, Arc<AtomicU32>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicU32::new(0));
+        let seen = count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let i = seen.fetch_add(1, Ordering::SeqCst) as usize;
+                // Drain the request head.
+                let mut buf = [0u8; 4096];
+                let mut head = Vec::new();
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = stream.write_all(&responses[i.min(responses.len() - 1)]);
+                let _ = stream.flush();
+                drop(stream);
+            }
+        });
+        (format!("http://{addr}"), count)
+    }
+
+    async fn mount_grant_to(server: &MockServer, serve_base: &str) {
+        let url = format!("{serve_base}{SERVE}");
+        let sri = format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(BYTES))
+        );
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID_A: { "status": "granted", "url": url,
+                    "artifacts": [{ "kind": "tarball", "url": url,
+                                    "integrity": { "sha512": sri } }] } }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// A body cut off mid-transfer (fewer bytes than `Content-Length`) is a
+    /// transport failure: retried, and the second, whole body is Ready.
+    #[tokio::test]
+    async fn truncated_body_is_retried() {
+        let mut cut = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            BYTES.len() + 90
+        )
+        .into_bytes();
+        cut.extend_from_slice(&BYTES[..4]);
+        let mut whole = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            BYTES.len()
+        )
+        .into_bytes();
+        whole.extend_from_slice(BYTES);
+        let (base, conns) = raw_serve(vec![cut, whole]);
+        let server = MockServer::start().await;
+        mount_grant_to(&server, &base).await;
+        let outcome = client(&server.uri(), fast())
+            .fetch_vendor_package(UUID_A, false, None, None)
+            .await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Ready(ref p) if p.tarball == BYTES),
+            "{outcome:?}"
+        );
+        assert_eq!(conns.load(Ordering::SeqCst), 2);
+    }
+
+    /// A size-cap breach is not retried: the same bytes would breach it
+    /// again.
+    #[tokio::test]
+    async fn cap_breach_is_not_retried() {
+        let over = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_VENDOR_PACKAGE_BYTES + 1
+        )
+        .into_bytes();
+        let (base, conns) = raw_serve(vec![over]);
+        let server = MockServer::start().await;
+        mount_grant_to(&server, &base).await;
+        let outcome = client(&server.uri(), fast())
+            .fetch_vendor_package(UUID_A, false, None, None)
+            .await;
+        assert!(
+            matches!(outcome, VendorServiceOutcome::Failed(ApiError::Network(ref m)) if m.contains("too large")),
+            "{outcome:?}"
+        );
+        assert_eq!(conns.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn delay_is_exponential_jittered_and_capped() {
+        let p = VendorRetryPolicy::default();
+        assert_eq!(p.attempts, 3);
+        // Midpoint jitter (0.5) is the nominal exponential value.
+        assert_eq!(p.delay(1, None, 0.5), Duration::from_millis(400));
+        assert_eq!(p.delay(2, None, 0.5), Duration::from_millis(800));
+        // ±25%.
+        assert_eq!(p.delay(1, None, 0.0), Duration::from_millis(300));
+        assert!(p.delay(1, None, 0.999_999) < Duration::from_millis(500));
+        // Capped at max_delay.
+        assert_eq!(p.delay(10, None, 0.5), Duration::from_secs(4));
+        // Retry-After wins, under the cap.
+        assert_eq!(
+            p.delay(1, Some(Duration::from_secs(2)), 0.5),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            p.delay(1, Some(Duration::from_secs(60)), 0.5),
+            Duration::from_secs(4)
+        );
+        let j = jitter_sample();
+        assert!((0.0..1.0).contains(&j));
+        assert_eq!(VendorRetryPolicy::none().attempts, 1);
+    }
+
+    /// Two uuids exhaust their retries; the third makes NO request and
+    /// fails fast. A later success resets the breaker.
+    #[tokio::test]
+    async fn breaker_opens_after_two_exhausted_fetches_and_resets_on_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let c = client(&server.uri(), fast());
+        for uuid in [UUID_A, UUID_B] {
+            let o = c.fetch_vendor_package(uuid, false, None, None).await;
+            assert!(matches!(o, VendorServiceOutcome::Failed(_)), "{o:?}");
+        }
+        assert_eq!(posts(&server).await, 6);
+        let o = c.fetch_vendor_package(UUID_C, false, None, None).await;
+        match o {
+            VendorServiceOutcome::Failed(ApiError::Other(msg)) => {
+                assert!(
+                    msg.contains(
+                        "not attempted: the service failed for the previous 2 packages in this run"
+                    ),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected the breaker's Failed, got {other:?}"),
+        }
+        assert_eq!(posts(&server).await, 6, "the open breaker makes no request");
+        // Clones share the breaker (one run, one count).
+        let clone = c.clone();
+        assert!(matches!(
+            clone.fetch_vendor_package(UUID_C, false, None, None).await,
+            VendorServiceOutcome::Failed(_)
+        ));
+        assert_eq!(posts(&server).await, 6);
+
+        // A success resets it.
+        c.vendor_outage.store(1, Ordering::Relaxed);
+        server.reset().await;
+        Mock::given(method("POST"))
+            .and(path(POST_PATH))
+            .respond_with(granted(&server, UUID_A))
+            .mount(&server)
+            .await;
+        mount_serve(&server).await;
+        assert!(matches!(
+            c.fetch_vendor_package(UUID_A, false, None, None).await,
+            VendorServiceOutcome::Ready(_)
+        ));
+        assert_eq!(c.vendor_outage.load(Ordering::Relaxed), 0);
+    }
+
+    /// Pending / Unavailable answers prove the service is up: they reset
+    /// the count, so an isolated failure never opens the breaker.
+    #[tokio::test]
+    async fn non_failure_answers_reset_the_breaker() {
+        for status in ["pending_build", "not_found"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(POST_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": { UUID_A: { "status": status, "url": null, "artifacts": [] } }
+                })))
+                .mount(&server)
+                .await;
+            let c = client(&server.uri(), fast());
+            c.vendor_outage.store(1, Ordering::Relaxed);
+            let _ = c.fetch_vendor_package(UUID_A, false, None, None).await;
+            assert_eq!(c.vendor_outage.load(Ordering::Relaxed), 0, "{status}");
+        }
     }
 }
 

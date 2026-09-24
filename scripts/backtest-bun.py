@@ -956,6 +956,18 @@ def main():
                 row['repeat'] = parse_envelope(repeat)
                 checks['repeatStableLock'] = lock.read_bytes() == patched_lock
                 checks['repeatClean'] = rerun_clean(code, row['repeat'], main_mode)
+                if main_mode != 'hosted':
+                    # The same re-run during a vendoring-service outage (a
+                    # closed port: every service call is a transport
+                    # failure). The committed artifact is reused, so the
+                    # lock stays byte-identical and the run is the same
+                    # already_vendored no-op — whichever source built it.
+                    outage_env = dict(env, SOCKET_VENDOR_URL='http://127.0.0.1:9')
+                    code, outage = run(command, project, outage_env, case / 'repeat-outage.log', False)
+                    exit_codes['repeatOutage'] = code
+                    row['repeatOutage'] = parse_envelope(outage)
+                    checks['repeatOutageStableLock'] = lock.read_bytes() == patched_lock
+                    checks['repeatOutageClean'] = rerun_clean(code, row['repeatOutage'], main_mode)
                 if shape == 'already-vendored-workspace' and main_mode != 'hosted':
                     # A deleted committed artifact is rebuilt by `repair`
                     # (locally, so its tarball digest may differ from the

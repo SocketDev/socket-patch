@@ -147,9 +147,6 @@ pub async fn vendor_go_module(
         wired && wired_version_ok && copy_matches_after_hashes(&copy_dir, &record.files).await;
 
     let mut warnings: Vec<VendorWarning> = Vec::new();
-    if let Some(refusal) = service_offline_conflict(service) {
-        return refusal;
-    }
 
     // Hot path (mirrors cargo.rs / composer_lock.rs): already wired to this
     // uuid with the committed copy intact → touch nothing and never consult
@@ -165,6 +162,15 @@ pub async fn vendor_go_module(
             None,
             warnings,
         );
+    }
+    // After the hot path (as in cargo.rs): an in-sync re-run acquires
+    // nothing, so `--vendor-source service --offline` must not refuse it.
+    // Gated on `copy_was_ok` rather than the return above so a dry run of an
+    // in-sync module previews the same success the real run reports.
+    if !copy_was_ok {
+        if let Some(refusal) = service_offline_conflict(service) {
+            return refusal;
+        }
     }
 
     // Acquire the patched module: prefer the prebuilt module zip from the patch
@@ -1549,12 +1555,15 @@ mod tests {
     fn go_service_cfg(uri: &str, source: VendorSource, offline: bool) -> VendorServiceConfig {
         VendorServiceConfig {
             source,
-            client: Some(ApiClient::new(ApiClientOptions {
-                api_url: uri.to_string(),
-                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
-                use_public_proxy: false,
-                org_slug: Some("acme".into()),
-            })),
+            client: Some(
+                ApiClient::new(ApiClientOptions {
+                    api_url: uri.to_string(),
+                    api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                    use_public_proxy: false,
+                    org_slug: Some("acme".into()),
+                })
+                .with_vendor_retry(crate::api::client::VendorRetryPolicy::none()),
+            ),
             use_public_proxy: false,
             vendor_url: None,
             patch_server_url: None,
@@ -2000,6 +2009,76 @@ mod tests {
         )
         .await;
         expect_refused(outcome, "vendor_service_offline_conflict");
+    }
+
+    /// An ALREADY-vendored module under `--offline` + `--vendor-source
+    /// service` is `already_vendored` (the hot path acquires nothing), as in
+    /// cargo and composer — the conflict only refuses real acquisition.
+    #[tokio::test]
+    async fn offline_service_mode_in_sync_rerun_is_already_vendored() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let (result, entry, _) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let gomod = tokio::fs::read(root.join("go.mod")).await.unwrap();
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(
+                "http://127.0.0.1:1",
+                VendorSource::Service,
+                true,
+            )),
+        )
+        .await;
+        let (result, entry, warnings) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "in sync: nothing recorded");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(tokio::fs::read(root.join("go.mod")).await.unwrap(), gomod);
+    }
+
+    /// Dry-run parity for the case above: previewing an in-sync re-run under
+    /// `--offline` + `--vendor-source service` predicts success, not the
+    /// refusal the real run never raises.
+    #[tokio::test]
+    async fn offline_service_mode_in_sync_dry_run_is_not_refused() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let (result, _, _) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let gomod = tokio::fs::read(root.join("go.mod")).await.unwrap();
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            true,
+            false,
+            Some(&go_service_cfg(
+                "http://127.0.0.1:1",
+                VendorSource::Service,
+                true,
+            )),
+        )
+        .await;
+        let (result, entry, _) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "a dry run records nothing");
+        assert_eq!(tokio::fs::read(root.join("go.mod")).await.unwrap(), gomod);
     }
 
     // ── missing-patch-target pre-check (fail-closed vs `--force`) ─────────
@@ -2599,6 +2678,95 @@ mod tests {
             root.join(copy_rel()).exists(),
             "the artifact dir survives a failed wiring restore (retryable)"
         );
+    }
+
+    // ── source-flip regression: the hot path decides "in sync" from the
+    //    COMMITTED copy before any service call, so a service ↔ local flip
+    //    between runs is a byte-identical no-op with no request. ──
+
+    async fn flip_run(
+        root: &Path,
+        blobs: &Path,
+        pristine: &Path,
+        record: &PatchRecord,
+        uri: &str,
+    ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
+        let sources = PatchSources::blobs_only(blobs);
+        expect_done(
+            vendor_go_module(
+                PURL,
+                pristine,
+                root,
+                record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                Some(&go_service_cfg(uri, VendorSource::Auto, false)),
+            )
+            .await,
+        )
+    }
+
+    fn flip_service_zip() -> Vec<u8> {
+        make_module_zip(&[
+            (
+                "go.mod",
+                b"module github.com/foo/bar\n\ngo 1.22 // service\n",
+            ),
+            ("bar.go", PATCHED),
+            ("SERVICE_ONLY.txt", b"x\n"),
+        ])
+    }
+
+    async fn flip_go_sum(root: &Path) {
+        tokio::fs::write(
+            root.join("go.sum"),
+            "github.com/foo/bar v1.4.2 h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\ngithub.com/foo/bar v1.4.2/go.mod h1:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\n",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn flip_local_then_service_is_noop() {
+        use crate::vendor::test_support as ts;
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        flip_go_sum(root).await;
+        let down = wiremock::MockServer::start().await;
+        ts::mount_503(&down).await;
+        let (r1, e1, _) = flip_run(root, &blobs, &pristine, &record, &down.uri()).await;
+        assert!(r1.success && e1.is_some());
+        let before = ts::tree_snapshot(root);
+        let up = wiremock::MockServer::start().await;
+        let z = flip_service_zip();
+        mount_go_granted(&up, &sri_sha512(&z), None, &z).await;
+        let (r2, e2, w2) = flip_run(root, &blobs, &pristine, &record, &up.uri()).await;
+        assert!(r2.success && e2.is_none() && w2.is_empty());
+        assert_eq!(ts::tree_snapshot(root), before);
+        assert_eq!(ts::request_count(&up).await, 0);
+    }
+
+    #[tokio::test]
+    async fn flip_service_then_local_is_noop() {
+        use crate::vendor::test_support as ts;
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        flip_go_sum(root).await;
+        let up = wiremock::MockServer::start().await;
+        let z = flip_service_zip();
+        mount_go_granted(&up, &sri_sha512(&z), None, &z).await;
+        let (r1, e1, w1) = flip_run(root, &blobs, &pristine, &record, &up.uri()).await;
+        assert!(r1.success && e1.is_some());
+        assert!(ts::has_warning(&w1, "vendor_prebuilt_downloaded"));
+        let before = ts::tree_snapshot(root);
+        let down = wiremock::MockServer::start().await;
+        ts::mount_503(&down).await;
+        let (r2, e2, w2) = flip_run(root, &blobs, &pristine, &record, &down.uri()).await;
+        assert!(r2.success && e2.is_none() && w2.is_empty());
+        assert_eq!(ts::tree_snapshot(root), before);
+        assert_eq!(ts::request_count(&down).await, 0);
     }
 
     /// An integrity mismatch is a hard failure under `auto` too —

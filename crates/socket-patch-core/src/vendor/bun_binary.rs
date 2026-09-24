@@ -595,33 +595,75 @@ mod symlink_tests {
 #[cfg(test)]
 mod rebuild_tests {
     use super::*;
-    use crate::api::client::{ApiClient, ApiClientOptions};
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::vendor::state::carry_forward_wiring;
+    use crate::vendor::test_support as ts;
     use crate::vendor::{VendorServiceConfig, VendorSource};
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    use sha2::Sha512;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// A service outage can switch an existing UUID from a prebuilt archive
-    /// to a locally packed one. Different archive bytes must advance the
-    /// integrity snapshot without losing the pristine registry predecessor.
-    #[tokio::test]
-    async fn same_uuid_prebuilt_then_local_fallback_reverts_exact_binary_and_mirrors() {
-        const UUID: &str = "11111111-1111-4111-8111-111111111111";
-        const PURL: &str = "pkg:npm/minimist@1.2.2";
-        const BEFORE: &[u8] = b"module.exports = 'original';\n";
-        const AFTER: &[u8] = b"module.exports = 'patched';\n";
-        const PACKAGE: &[u8] = br#"{"name":"minimist","version":"1.2.2"}"#;
-        let root = tempfile::tempdir().unwrap();
-        let original = include_bytes!("../../tests/fixtures/bun-lockb/1.1.45-extensions/bun.lockb");
-        std::fs::write(root.path().join(LOCK), original).unwrap();
-        let installed = root.path().join("node_modules/minimist");
+    const UUID: &str = "11111111-1111-4111-8111-111111111111";
+    const PURL: &str = "pkg:npm/minimist@1.2.2";
+    const BEFORE: &[u8] = b"module.exports = 'original';\n";
+    const AFTER: &[u8] = b"module.exports = 'patched';\n";
+    const PACKAGE: &[u8] = br#"{"name":"minimist","version":"1.2.2"}"#;
+    const ORIGINAL: &[u8] =
+        include_bytes!("../../tests/fixtures/bun-lockb/1.1.45-extensions/bun.lockb");
+
+    pub(super) struct Fixture {
+        tmp: tempfile::TempDir,
+        record: PatchRecord,
+    }
+
+    impl Fixture {
+        fn root(&self) -> &Path {
+            self.tmp.path()
+        }
+        fn installed(&self) -> PathBuf {
+            self.root().join("node_modules/minimist")
+        }
+    }
+
+    impl ts::FlipFixture for Fixture {
+        fn flip_root(&self) -> &Path {
+            self.root()
+        }
+        fn flip_key(&self) -> String {
+            PURL.to_string()
+        }
+        fn flip_uuid(&self) -> String {
+            UUID.to_string()
+        }
+        fn flip_artifact_rel(&self) -> String {
+            format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz")
+        }
+        /// The lock plus every workspace mirror the ledger records.
+        fn flip_files(&self) -> Vec<String> {
+            let mut files = vec![LOCK.to_string()];
+            if let Ok(bytes) = std::fs::read(self.root().join(".socket/vendor/state.json")) {
+                let state: crate::vendor::state::VendorState =
+                    serde_json::from_slice(&bytes).unwrap();
+                for entry in state.entries.values() {
+                    for rec in entry.wiring.iter().filter(|r| r.kind == MIRROR_KIND) {
+                        files.push(rec.file.clone());
+                    }
+                }
+            }
+            files.sort();
+            files.dedup();
+            files
+        }
+    }
+
+    pub(super) async fn flip_fixture() -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(LOCK), ORIGINAL).unwrap();
+        let installed = root.join("node_modules/minimist");
         std::fs::create_dir_all(&installed).unwrap();
         std::fs::write(installed.join("package.json"), PACKAGE).unwrap();
         std::fs::write(installed.join("index.js"), BEFORE).unwrap();
-        let blobs = root.path().join(".socket/blobs");
+        let blobs = root.join(".socket/blobs");
         std::fs::create_dir_all(&blobs).unwrap();
         let after_hash = compute_git_sha256_from_bytes(AFTER);
         std::fs::write(blobs.join(&after_hash), AFTER).unwrap();
@@ -631,6 +673,30 @@ mod rebuild_tests {
             }}, "vulnerabilities": {}, "description": "", "license": "MIT", "tier": "free",
         }))
         .unwrap();
+        Fixture { tmp, record }
+    }
+
+    pub(super) async fn flip_run(fx: &Fixture, cfg: Option<&VendorServiceConfig>) -> VendorOutcome {
+        let blobs = fx.root().join(".socket/blobs");
+        vendor(
+            PURL,
+            &fx.installed(),
+            fx.root(),
+            &fx.record,
+            &PatchSources::blobs_only(&blobs),
+            "",
+            false,
+            false,
+            cfg,
+        )
+        .await
+    }
+
+    ts::npm_flip_suite!(flip_suite, Fixture, flip_fixture, flip_run);
+
+    /// A prebuilt archive whose tar headers deliberately differ from the
+    /// local packer's (so its bytes never equal a local build's).
+    fn prebuilt_archive() -> Vec<u8> {
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
             Vec::new(),
             flate2::Compression::default(),
@@ -645,63 +711,77 @@ mod rebuild_tests {
             tar.append_data(&mut header, format!("package/{name}"), bytes)
                 .unwrap();
         }
-        let archive = tar.into_inner().unwrap().finish().unwrap();
-        let server = MockServer::start().await;
-        let url = format!("{}/minimist.tgz", server.uri());
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    async fn mount_403(server: &MockServer) {
+        server.reset().await;
         Mock::given(method("POST"))
-            .and(path("/v0/orgs/acme/patches/package"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "results": {UUID: {"status": "granted", "url": url, "artifacts": [{
-                    "kind": "tarball", "url": url,
-                    "integrity": {"sha512": format!("sha512-{}", STANDARD.encode(Sha512::digest(&archive)))},
-                }]}},
-            })))
-            .mount(&server)
+            .and(path(ts::PACKAGE_PATH))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(server)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/minimist.tgz"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.clone()))
-            .mount(&server)
-            .await;
-        let config = VendorServiceConfig {
-            source: VendorSource::Auto,
-            client: Some(ApiClient::new(ApiClientOptions {
-                api_url: server.uri(),
-                api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
-                use_public_proxy: false,
-                org_slug: Some("acme".into()),
-            })),
-            use_public_proxy: false,
-            vendor_url: None,
-            patch_server_url: None,
-            offline: false,
-        };
+    }
+
+    /// A service outage (here a 403) after a prebuilt vendor: the committed
+    /// prebuilt archive is anchored by the ledger, so the re-run reuses it —
+    /// entry `None`, bun.lockb and every workspace mirror byte-unchanged, no
+    /// request (the flip no longer re-pins).
+    #[tokio::test]
+    async fn same_uuid_prebuilt_then_outage_reuses_the_committed_archive() {
+        let archive = prebuilt_archive();
+        let server = MockServer::start().await;
+        ts::mount_granted(&server, UUID, "minimist-1.2.2.tgz", &archive).await;
+        let fx = flip_fixture().await;
+        let config = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
+        let (result, entry, warnings) = ts::expect_done(flip_run(&fx, Some(&config)).await);
+        assert!(result.success, "{result:?}");
+        assert!(ts::has_warning(&warnings, "vendor_prebuilt_downloaded"));
+        ts::persist(fx.root(), PURL, entry.unwrap()).await;
+        let before = ts::snapshot(&fx).await;
+        assert!(
+            before.len() > 2,
+            "fixture wires workspace mirrors: {:?}",
+            before.iter().map(|b| &b.0).collect::<Vec<_>>()
+        );
+
+        mount_403(&server).await;
+        let (result, entry, warnings) = ts::expect_done(flip_run(&fx, Some(&config)).await);
+        assert!(result.success, "{result:?}");
+        assert!(entry.is_none(), "in sync: nothing re-pinned");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(ts::snapshot(&fx).await, before);
+        assert_eq!(ts::request_count(&server).await, 0);
+    }
+
+    /// With the canonical tarball GONE, an outage switches the same UUID
+    /// from a prebuilt archive to a locally packed one. Different archive
+    /// bytes must advance the integrity snapshot without losing the pristine
+    /// registry predecessor, and revert must restore everything exactly.
+    #[tokio::test]
+    async fn same_uuid_prebuilt_then_local_fallback_reverts_exact_binary_and_mirrors() {
+        let archive = prebuilt_archive();
+        let server = MockServer::start().await;
+        ts::mount_granted(&server, UUID, "minimist-1.2.2.tgz", &archive).await;
+        let fx = flip_fixture().await;
+        let root = fx.tmp.path();
+        let config = ts::service_cfg(&server.uri(), VendorSource::Auto, false);
         let mut prior: Option<VendorEntry> = None;
         for prebuilt in [true, false] {
             if !prebuilt {
-                server.reset().await;
-                Mock::given(method("POST"))
-                    .and(path("/v0/orgs/acme/patches/package"))
-                    .respond_with(ResponseTemplate::new(403))
-                    .mount(&server)
-                    .await;
+                mount_403(&server).await;
+                // The committed artifact is missing (deleted, never
+                // committed): reuse cannot apply, so acquisition runs.
+                std::fs::remove_file(
+                    root.join(format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz")),
+                )
+                .unwrap();
             }
             let VendorOutcome::Done {
                 result,
                 entry: Some(mut entry),
                 warnings,
-            } = vendor(
-                PURL,
-                &installed,
-                root.path(),
-                &record,
-                &PatchSources::blobs_only(&blobs),
-                "",
-                false,
-                false,
-                Some(&config),
-            )
-            .await
+            } = flip_run(&fx, Some(&config)).await
             else {
                 panic!("vendoring must write a new binary snapshot");
             };
@@ -719,30 +799,28 @@ mod rebuild_tests {
                 assert_eq!(binary.len(), 1, "discard the superseded integrity snapshot");
                 assert_eq!(binary[0].original, previous.wiring[0].original);
             }
-            let lock = BunLockb::parse(&std::fs::read(root.path().join(LOCK)).unwrap()).unwrap();
+            let lock = BunLockb::parse(&std::fs::read(root.join(LOCK)).unwrap()).unwrap();
             let binary = entry.wiring.iter().find(|r| r.kind == KIND).unwrap();
             let id = binary.key.as_ref().unwrap().parse().unwrap();
             assert!(lock
                 .matches_snapshot(id, binary.new.as_ref().unwrap())
                 .unwrap());
-            let bytes = std::fs::read(root.path().join(&entry.artifact.path)).unwrap();
+            let bytes = std::fs::read(root.join(&entry.artifact.path)).unwrap();
             assert_eq!(bytes == archive, prebuilt);
             for mirror in entry.wiring.iter().filter(|r| r.kind == MIRROR_KIND) {
-                assert_eq!(
-                    std::fs::read(root.path().join(&mirror.file)).unwrap(),
-                    bytes
-                );
+                assert_eq!(std::fs::read(root.join(&mirror.file)).unwrap(), bytes);
             }
+            ts::persist(root, PURL, entry.clone()).await;
             prior = Some(entry);
         }
         let entry = prior.unwrap();
-        let outcome = revert(&entry, root.path(), RevertOpts::new(false)).await;
+        let outcome = revert(&entry, root, RevertOpts::new(false)).await;
         assert!(outcome.success, "{outcome:?}");
         assert!(outcome.warnings.is_empty(), "{outcome:?}");
-        assert_eq!(std::fs::read(root.path().join(LOCK)).unwrap(), original);
-        assert!(!root.path().join(&entry.artifact.path).exists());
+        assert_eq!(std::fs::read(root.join(LOCK)).unwrap(), ORIGINAL);
+        assert!(!root.join(&entry.artifact.path).exists());
         for mirror in entry.wiring.iter().filter(|r| r.kind == MIRROR_KIND) {
-            assert!(!root.path().join(&mirror.file).exists());
+            assert!(!root.join(&mirror.file).exists());
         }
     }
 }

@@ -481,6 +481,21 @@ per service outcome:
 | `--offline` | local build | refuse (`vendor_service_offline_conflict`) |
 | no API client configured (library callers of the vendor engine; the CLI always configures one) | local build | refuse (`vendor_prebuilt_required`) |
 
+`--vendor-source` governs ACQUISITION, not reuse: a re-run whose committed artifact the ledger
+vouches for (npm tarball / pypi wheel: path under this patch uuid, no symlink, whole-file sha256 and
+size equal to the ledger, every afterHash verified from the same bytes; the dir-shaped ecosystems:
+the wired copy's afterHashes) keeps it in every mode — no service request, no local build, no
+rewrite — whichever source built it. So a service outage (or its recovery) never re-vendors an
+already-vendored package: the re-run is `already_vendored`, including under `service` +
+`--offline`, and `build` does not rebuild a service-built artifact (delete the uuid dir to force
+a rebuild). The ledger records no provenance, so `service` cannot tell a locally built committed
+artifact from a prebuilt one; it keeps what verifies. A lock that drifted off a verified committed
+artifact (a relock, a hand revert) is re-wired to those exact bytes (pypi re-scans report the
+Verbose `vendor_artifact_reused`). Service round trips are retried on transport errors and
+429/500/502/503/504 (3 attempts, exponential backoff with jitter, `Retry-After` honored, 4s cap);
+after 2 consecutive exhausted fetches the rest of the run skips the service (`auto` builds
+locally, `service` refuses).
+
 **golang service leg staging (v5.0)**: the module zip is downloaded, extracted and `h1:`-verified in a `<copy>.socket-stage` sibling and swapped into place only afterwards; a failed re-download of a WIRED, present copy keeps the copy and its `replace` directive (previously both were torn down), while a missing copy still drops the dangling directive.
 
 Coverage today: **npm** (all lock flavors), **pypi** (wheel — sdist falls back / refuses), **cargo**
@@ -1125,6 +1140,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `vendor_fetch_unverifiable` | `skipped` (warning) | vendor: the lockfile records no usable integrity for the missing package; nothing was fetched (fail-closed) and the `package_not_installed` skip follows. |
 | `vendor_artifact_missing` | `skipped` (warning) / `failed` | vendor: the committed artifact is gone — the registry resolution is recovered from the ledger and the artifact rebuilt (warning); repair `--offline` with no local source surfaces it as the per-entry failure instead. |
 | `vendor_artifact_corrupt` | `failed` | repair `--offline`: the committed artifact fails verification (member afterHashes or the ledger's whole-file sha256) and no local source can rebuild it. Online repairs rebuild instead. |
+| `vendor_artifact_reused` | `skipped` (verbose note) | vendor / scan `--vendor` (pypi): the wiring was dropped by a relock but the committed wheel the ledger vouches for verified, so it was re-wired as-is — no service download, no rebuild; the lock pins the first run's sha again. |
 | `vendor_artifact_rebuilt` | `skipped` (warning) | vendor / scan `--vendor`: a wired-but-missing/stale artifact was rebuilt in place. The lockfiles are untouched, except that nuget re-pins `packages.lock.json` to the rebuilt bytes. gem/maven/nuget: the package's event is `applied` (also for a rebuild from the patch service), and the ledger entry's artifact fingerprint (gem `fileInventory`, maven/nuget `sha256` + `size`, and the nuget lock pin) is refreshed to the rebuilt bytes, and its wiring records are kept unchanged, so `--revert` still restores the pre-vendor files. A rebuild whose ledger has no entry for the package, or only one from another patch uuid, records none. cargo/composer/gem rebuilds honour `--vendor-source` like a fresh vendor (`service` downloads the prebuilt artifact and refuses when it cannot). Other ecosystems leave the ledger entry untouched. (Under `repair` the `rebuilt` event carries this signal.) |
 | `vendor_artifact_rebuild_failed` | `failed` | repair: the rebuild ran but the result failed verification against the recorded fingerprint (e.g. an edited state.json sha); the unverifiable artifact was removed. |
 | `vendor_artifact_unrepairable` | `failed` | repair: no verifiable pristine source exists (not installed + lockfile rewired + no recoverable ledger fragment), the wheel is platform-locked with no installed copy, or the ledger entry itself cannot be trusted. |

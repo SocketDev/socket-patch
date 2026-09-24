@@ -31,7 +31,7 @@
 use std::path::Path;
 
 use serde_json::Value;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
@@ -310,19 +310,36 @@ pub async fn vendor_yarn_berry(
     let dest = project_root.join(&rel_tgz);
 
     // ── 8. Berry identity facts of the packed tarball ─────────────────────
-    let tgz_bytes = match tokio::fs::read(&dest).await {
-        Ok(b) => b,
-        Err(e) => {
-            return done_failure_unstage(
-                purl,
-                format!("cannot re-read the packed tarball: {e}"),
-                project_root,
-                &uuid_dir_rel,
-                uuid_dir_preexisted,
-            )
-            .await
-        }
+    // A reuse hands over the exact bytes it verified; a fresh pack is
+    // re-read and must still be the bytes the pack hashed (the lock's
+    // checksum and `hash=` are derived from these, so a file swapped after
+    // verification must fail, never be pinned).
+    let tgz_bytes = match staged.verified_bytes {
+        Some(bytes) => bytes,
+        None => match tokio::fs::read(&dest).await {
+            Ok(b) => b,
+            Err(e) => {
+                return done_failure_unstage(
+                    purl,
+                    format!("cannot re-read the packed tarball: {e}"),
+                    project_root,
+                    &uuid_dir_rel,
+                    uuid_dir_preexisted,
+                )
+                .await
+            }
+        },
     };
+    if hex::encode(Sha256::digest(&tgz_bytes)) != packed.sha256_hex {
+        return done_failure_unstage(
+            purl,
+            format!("the packed tarball {rel_tgz} changed on disk after it was verified"),
+            project_root,
+            &uuid_dir_rel,
+            uuid_dir_preexisted,
+        )
+        .await;
+    }
     let tgz_sha512 = hex::encode(Sha512::digest(&tgz_bytes));
     // `hash=` — the first 6 hex chars of sha512(tgz): the lock-committed
     // tamper guard on the tarball itself (spike B3, flips on any byte edit).
@@ -1194,6 +1211,55 @@ __metadata:
             assert!(!self.root().join(".socket/vendor").exists());
         }
     }
+
+    // ── source-flip / outage idempotence (vendor::test_support::npm_flip_suite) ──
+
+    impl crate::vendor::test_support::FlipFixture for Fixture {
+        fn flip_root(&self) -> &Path {
+            self.root()
+        }
+        fn flip_key(&self) -> String {
+            "pkg:npm/left-pad@1.3.0".to_string()
+        }
+        fn flip_uuid(&self) -> String {
+            self.record.uuid.clone()
+        }
+        fn flip_artifact_rel(&self) -> String {
+            format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")
+        }
+        fn flip_files(&self) -> Vec<String> {
+            vec![
+                PACKAGE_JSON.to_string(),
+                YARN_LOCK.to_string(),
+                YARNRC.to_string(),
+            ]
+        }
+    }
+
+    async fn flip_run(
+        fx: &Fixture,
+        cfg: Option<&crate::vendor::VendorServiceConfig>,
+    ) -> VendorOutcome {
+        let blobs = fx.root().join(".socket/blobs");
+        vendor_yarn_berry(
+            "pkg:npm/left-pad@1.3.0",
+            &fx.installed(),
+            fx.root(),
+            &fx.record,
+            &PatchSources::blobs_only(&blobs),
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            cfg,
+        )
+        .await
+    }
+
+    async fn flip_fixture() -> Fixture {
+        fixture().await
+    }
+
+    crate::vendor::test_support::npm_flip_suite!(flip_suite, Fixture, flip_fixture, flip_run);
 
     async fn fixture_with(pkg: &str, lock: &str) -> Fixture {
         let tmp = tempfile::tempdir().unwrap();

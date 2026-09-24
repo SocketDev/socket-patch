@@ -2501,6 +2501,7 @@ mod tests {
                     use_public_proxy: false,
                     org_slug: Some("acme".into()),
                 })
+                .with_vendor_retry(crate::api::client::VendorRetryPolicy::none())
             }),
             use_public_proxy: false,
             vendor_url: None,
@@ -3631,6 +3632,107 @@ mod tests {
         // leading two-space + newline form) → not our section, untouched.
         let no_close = "<project>\n  <repositories>\n    <repository/></repositories></project>";
         assert_eq!(strip_empty_repositories(no_close), no_close);
+    }
+
+    // ── source-flip regression: the hot path decides "in sync" from the
+    //    COMMITTED copy before any service call, so a service ↔ local flip
+    //    between runs is a byte-identical no-op with no request. ──
+
+    /// A service jar: same members, STORED — bytes distinct from the local
+    /// deflate re-zip, as a real service build would be.
+    async fn flip_granted_jar() -> (wiremock::MockServer, Vec<u8>) {
+        use std::io::Write as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let body = {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, bytes) in [
+                ("META-INF/MANIFEST.MF", &b"Manifest-Version: 1.0\n"[..]),
+                (JAR_FILE, PATCHED),
+                (
+                    "org/apache/commons/text/StringSubstitutor.class",
+                    &b"\xca\xfe\xba\xbe-fake-class"[..],
+                ),
+            ] {
+                zw.start_file(name, opts).unwrap();
+                zw.write_all(bytes).unwrap();
+            }
+            zw.finish().unwrap().into_inner()
+        };
+        let sri = crate::vendor::test_support::sri(&body);
+        let serve_path = "/patch/maven/commons-text/1.10.0/tok/uuid/commons-text-1.10.0.jar";
+        let server = MockServer::start().await;
+        let serve_url = format!("{}{serve_path}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID: {
+                    "status": "granted", "url": serve_url,
+                    "artifacts": [{ "kind": "tarball", "url": serve_url,
+                                    "integrity": { "sha512": sri } }]
+                }}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(serve_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        (server, body)
+    }
+
+    fn flip_cfg(s: &wiremock::MockServer) -> VendorServiceConfig {
+        service_cfg(Some(&s.uri()), crate::vendor::VendorSource::Auto, false)
+    }
+
+    #[tokio::test]
+    async fn flip_local_then_service_is_noop() {
+        use crate::vendor::test_support as ts;
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let down = wiremock::MockServer::start().await;
+        ts::mount_503(&down).await;
+        let (r1, e1, _) = unwrap_done(
+            run_vendor_with_service(root, &blobs, &installed, &record, &flip_cfg(&down)).await,
+        );
+        assert!(r1.success && e1.is_some());
+        let local_jar = tokio::fs::read(root.join(jar_rel())).await.unwrap();
+        let before = ts::tree_snapshot(root);
+        let (up, served) = flip_granted_jar().await;
+        assert_ne!(local_jar, served, "sources produce different bytes");
+        let (r2, e2, _) = unwrap_done(
+            run_vendor_with_service(root, &blobs, &installed, &record, &flip_cfg(&up)).await,
+        );
+        assert!(r2.success);
+        assert!(e2.is_none());
+        assert_eq!(before, ts::tree_snapshot(root));
+        assert_eq!(ts::request_count(&up).await, 0);
+    }
+
+    #[tokio::test]
+    async fn flip_service_then_local_is_noop() {
+        use crate::vendor::test_support as ts;
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let (up, served) = flip_granted_jar().await;
+        let (r1, e1, _) = unwrap_done(
+            run_vendor_with_service(root, &blobs, &installed, &record, &flip_cfg(&up)).await,
+        );
+        assert!(r1.success && e1.is_some());
+        assert_eq!(tokio::fs::read(root.join(jar_rel())).await.unwrap(), served);
+        let before = ts::tree_snapshot(root);
+        let down = wiremock::MockServer::start().await;
+        ts::mount_503(&down).await;
+        let (r2, e2, _) = unwrap_done(
+            run_vendor_with_service(root, &blobs, &installed, &record, &flip_cfg(&down)).await,
+        );
+        assert!(r2.success);
+        assert!(e2.is_none());
+        assert_eq!(before, ts::tree_snapshot(root));
+        assert_eq!(ts::request_count(&down).await, 0);
     }
 
     /// Mount a granted service response serving `body` as the prebuilt jar.

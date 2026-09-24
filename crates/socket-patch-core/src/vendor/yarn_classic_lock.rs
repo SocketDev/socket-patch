@@ -233,8 +233,10 @@ pub async fn vendor_yarn_classic(
 
     if wiring.is_empty() {
         // Every block already points at this uuid with the packed hashes:
-        // in sync. Touch nothing (the tarball re-pack above was
-        // byte-identical by determinism) and synthesize AlreadyPatched.
+        // in sync. `#sha1` and `integrity` were derived from the reused
+        // committed tarball (or, when reuse missed, from a fresh acquisition
+        // that reproduced them); touch nothing and synthesize
+        // AlreadyPatched.
         return VendorOutcome::Done {
             result: already_patched_result(purl, &dest, &record.files),
             entry: None,
@@ -1053,6 +1055,51 @@ left-pad@^1.3.0, left-pad@~1.3.0:
         }
     }
 
+    // ── source-flip / outage idempotence (vendor::test_support::npm_flip_suite) ──
+
+    impl crate::vendor::test_support::FlipFixture for Fixture {
+        fn flip_root(&self) -> &Path {
+            self.root()
+        }
+        fn flip_key(&self) -> String {
+            "pkg:npm/left-pad@1.3.0".to_string()
+        }
+        fn flip_uuid(&self) -> String {
+            self.record.uuid.clone()
+        }
+        fn flip_artifact_rel(&self) -> String {
+            format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz")
+        }
+        fn flip_files(&self) -> Vec<String> {
+            vec![YARN_LOCK.to_string(), "package.json".to_string()]
+        }
+    }
+
+    async fn flip_run(
+        fx: &Fixture,
+        cfg: Option<&crate::vendor::VendorServiceConfig>,
+    ) -> VendorOutcome {
+        let blobs = fx.root().join(".socket/blobs");
+        vendor_yarn_classic(
+            "pkg:npm/left-pad@1.3.0",
+            &fx.installed(),
+            fx.root(),
+            &fx.record,
+            &PatchSources::blobs_only(&blobs),
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            cfg,
+        )
+        .await
+    }
+
+    async fn flip_fixture() -> Fixture {
+        fixture_with_lock(Y2_BEFORE).await
+    }
+
+    crate::vendor::test_support::npm_flip_suite!(flip_suite, Fixture, flip_fixture, flip_run);
+
     /// Build a project tempdir: installed left-pad, patched blob, the given
     /// yarn.lock bytes, and the PatchRecord.
     async fn fixture_with_lock(lock_text: &str) -> Fixture {
@@ -1300,6 +1347,66 @@ left-pad@^1.3.0:
             text.contains(want),
             "recomputed sub-maps (scoped key quoted): {text}"
         );
+    }
+
+    /// F10 + F12 twin: a relock back to the registry block, re-pinned
+    /// from the REUSED tarball (no request under the outage), recomputes
+    /// the dependency sub-maps from the reused bytes' patched package.json.
+    #[tokio::test]
+    async fn relock_with_pkg_json_patch_recomputes_submaps_from_reused_bytes() {
+        use crate::vendor::test_support as ts;
+        let lock = r#"# yarn lockfile v1
+
+left-pad@^1.3.0:
+  version "1.3.0"
+  resolved "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915589e782f8c94d1e"
+  integrity sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==
+  dependencies:
+    old-dep "^1.0.0"
+"#;
+        let mut fx = fixture_with_lock(lock).await;
+        let before: &[u8] = br#"{"name":"left-pad","version":"1.3.0"}"#;
+        let after: &[u8] =
+            br#"{"name":"left-pad","version":"1.3.0","dependencies":{"wow":"^1.0.0"}}"#;
+        let after_hash = compute_git_sha256_from_bytes(after);
+        tokio::fs::write(fx.root().join(".socket/blobs").join(&after_hash), after)
+            .await
+            .unwrap();
+        fx.record.files.insert(
+            "package/package.json".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(before),
+                after_hash,
+            },
+        );
+        let (r, e, _) = expect_done(flip_run(&fx, None).await);
+        assert!(r.success, "{:?}", r.error);
+        ts::persist(fx.root(), "pkg:npm/left-pad@1.3.0", e.unwrap()).await;
+        let lock1 = fx.lock_text().await;
+        let tgz1 = tokio::fs::read(fx.tgz_path()).await.unwrap();
+        // The relock.
+        tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
+            .await
+            .unwrap();
+        let server = wiremock::MockServer::start().await;
+        ts::mount_503(&server).await;
+        let cfg = ts::service_cfg(&server.uri(), crate::vendor::VendorSource::Auto, false);
+        let (r, e, w) = expect_done(flip_run(&fx, Some(&cfg)).await);
+        assert!(r.success, "{:?}", r.error);
+        assert!(e.is_some(), "the relocked block is re-wired");
+        assert!(
+            !ts::has_warning(&w, "vendor_prebuilt_unavailable"),
+            "reused: {w:?}"
+        );
+        assert_eq!(ts::request_count(&server).await, 0);
+        let text = fx.lock_text().await;
+        assert!(!text.contains("old-dep"), "{text}");
+        assert!(
+            text.contains("  dependencies:\n    wow \"^1.0.0\"\n"),
+            "{text}"
+        );
+        assert_eq!(text, lock1);
+        assert_eq!(tokio::fs::read(fx.tgz_path()).await.unwrap(), tgz1);
     }
 
     #[tokio::test]
