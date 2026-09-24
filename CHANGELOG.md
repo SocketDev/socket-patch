@@ -967,6 +967,30 @@ into the new version's section — see docs/releasing.md.
   vendored rewrites now follow the `[metadata]` checksum table and rewrite
   dependents' full-id references, so `cargo --locked` accepts the lock (and
   the revert stays byte-identical).
+- **Hosted cargo pins every declaration of the patched version.** Each
+  version of a multi-version crate is pinned only in the declarations whose
+  requirement selects it (a requirement matching several locked versions is
+  refused `redirect_cargo_toml_dep_unrewritable`), and workspace-member and
+  in-root path-dependency manifests are pinned beside the root, so
+  `cargo --locked` accepts the redirected lock. Member discovery never
+  follows a symbolic link, so nothing outside the project is rewritten.
+- **Hosted cargo refuses crates a pin cannot reach.** A crate another
+  `Cargo.lock` package also depends on (a crates.io or git crate, or a path
+  package outside the project) now warns
+  `redirect_cargo_transitive_dependents` and is skipped instead of being
+  reported redirected while that package compiled the unpatched copy; a
+  transitive-only crate's `redirect_cargo_toml_dep_not_found` detail now
+  says so and points to `--mode vendored`.
+- **CRLF cargo projects redirect in hosted mode.** All-CRLF `Cargo.toml`,
+  `Cargo.lock` and cargo configs are rewritten with their endings kept
+  (they were refused), and `remove` / rollback still find the recorded
+  edits after a checkout converts the line endings.
+- **Hosted cargo `remove` restores every byte, in any order.** An appended
+  registry block leaves the user's config exactly as it was (trailing blank
+  lines or a missing final newline included) and a created config is
+  deleted with the last block; v1-lock and multi-version patches, ledgers
+  written by older CLIs included, can be removed in any order; and a crate
+  declared with the same line in two sections gets both pins reverted.
 - **yarn 4.0.x checksums keep the lock's own spelling.** Vendored and hosted
   berry rewrites write bare-hex `cacheKey: 10c0` checksums when the lock
   does, so `yarn install --immutable` no longer fails with YN0028.
