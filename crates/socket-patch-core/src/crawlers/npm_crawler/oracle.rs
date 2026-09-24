@@ -1366,6 +1366,85 @@ mod tests {
         assert!(nonempty > 32, "only {nonempty} non-empty trees");
     }
 
+    /// A store entry whose own child's package.json disagrees with the
+    /// entry's name@version, for a root-installed package: the sequential
+    /// walk skips that child by name (`identity_seen`) without reading it,
+    /// so the foreign identity must never surface.
+    #[tokio::test]
+    async fn store_entry_child_with_a_foreign_identity_is_skipped_like_the_oracle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        let nm = root.join("node_modules");
+        let write = |dir: &Path, name: &str, version: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join("package.json"),
+                format!(r#"{{"name": "{name}", "version": "{version}"}}"#),
+            )
+            .unwrap();
+        };
+        write(&nm.join("qux"), "qux", "1.0.0");
+        write(&nm.join("@s").join("q"), "@s/q", "1.0.0");
+        let store = nm.join(".pnpm");
+        let q = store.join("qux@1.0.0").join("node_modules");
+        write(&q.join("qux"), "qux", "9.9.9");
+        // Below the skipped child is still walked.
+        write(
+            &q.join("qux").join("node_modules").join("inner"),
+            "inner",
+            "1.0.0",
+        );
+        // A sibling of the skipped child is not skipped.
+        write(&q.join("sib"), "sib", "1.0.0");
+        write(
+            &store
+                .join("@s+q@1.0.0")
+                .join("node_modules")
+                .join("@s")
+                .join("q"),
+            "@s/q",
+            "9.9.9",
+        );
+        // Not root-installed: its child is read, foreign identity and all.
+        write(
+            &store.join("free@1.0.0").join("node_modules").join("free"),
+            "free",
+            "7.7.7",
+        );
+
+        assert_equivalent(&root, "foreign identity").await;
+
+        let options = CrawlerOptions {
+            cwd: root.clone(),
+            global: false,
+            global_prefix: None,
+        };
+        let purls: Vec<String> = NpmCrawler::new()
+            .crawl_all(&options)
+            .await
+            .into_iter()
+            .map(|p| p.purl)
+            .collect();
+        for present in [
+            "pkg:npm/qux@1.0.0",
+            "pkg:npm/@s/q@1.0.0",
+            "pkg:npm/inner@1.0.0",
+            "pkg:npm/sib@1.0.0",
+            "pkg:npm/free@7.7.7",
+        ] {
+            assert!(
+                purls.iter().any(|p| p == present),
+                "missing {present}: {purls:?}"
+            );
+        }
+        for absent in ["pkg:npm/qux@9.9.9", "pkg:npm/@s/q@9.9.9"] {
+            assert!(
+                !purls.iter().any(|p| p == absent),
+                "{absent} must be skipped: {purls:?}"
+            );
+        }
+    }
+
     /// With no walk pool (the OS refused every walk thread) the walk runs
     /// sequentially on the calling thread and still matches the oracle.
     #[tokio::test]
