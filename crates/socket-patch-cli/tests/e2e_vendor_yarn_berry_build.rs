@@ -334,6 +334,13 @@ async fn run_berry_capstone(driver: VendorDriver) {
         );
         return;
     }
+    // Windows line endings (yarn writes CRLF there): see yarn_berry_common.
+    yarn_berry_common::adopt_yarn_line_endings(
+        &proj,
+        yarn_berry(),
+        &format!("vendor-{driver:?}"),
+        &["package.json", "yarn.lock"],
+    );
 
     let installed_index = proj.join("node_modules").join(DEP).join("index.js");
     let orig = std::fs::read(&installed_index).expect("installed index.js");

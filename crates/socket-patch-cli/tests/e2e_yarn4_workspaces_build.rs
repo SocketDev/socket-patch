@@ -343,6 +343,13 @@ fn install_workspace_fixture(tag: &str, tmp: &Path, proj: &Path) -> Option<Vec<u
         );
         return None;
     }
+    // Windows line endings (yarn writes CRLF there): see yarn_berry_common.
+    yarn_berry_common::adopt_yarn_line_endings(
+        proj,
+        yarn_berry(),
+        &format!("workspaces-{tag}"),
+        &["package.json", "packages/app/package.json", "yarn.lock"],
+    );
     // The member's dep hoists to the ROOT node_modules — the single-lock,
     // single-store berry layout this capstone exists to pin.
     let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js"))

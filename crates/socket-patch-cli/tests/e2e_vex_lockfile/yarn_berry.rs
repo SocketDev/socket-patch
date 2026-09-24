@@ -18,6 +18,7 @@
 //! | scoped | `@scope/pkg` hosted `__archiveUrl` + vendored `@scope/pkg-<v>.tgz` | both attest `pkg:npm/%40scope/pkg@v` (events: `@scope`) from the API record; offline `record_unavailable`, zero requests; pristine install `not_applied` |
 //! | npm alias | `"lp@npm:left-pad@1.3.0"` installed at `node_modules/lp` | the REAL package is attested after hashing the alias dir; tampered `hash_mismatch`; stale pristine `not_applied` (regression: the alias dir used to be "not installed", so the lock pin attested it) |
 //! | multi-descriptor + CRLF + BOM | one block for `^1.0.0, ^1.3.0` | attests from the `10c0` pin |
+//! | vendored CRLF + BOM | lock AND root `package.json` CRLF + BOM (yarn's Windows output) | the committed artifact attests; offline `record_unavailable`; `resolutions` reverted: nothing discovered |
 //! | two uuids for one package | two live blocks wiring one purl to different patches | never attested (`wiring_conflict`) |
 //! | user `yarn patch` on top | `patch:` entry wrapping the hosted locator | the hosted base entry still attests when the user patch leaves the Socket file intact; a user patch rewriting it is `hash_mismatch` |
 //! | foreign / look-alike hosts, uuid-shaped token only | `__archiveUrl` not on the patch host, or whose LAST uuid is the grant token of another patch | nothing discovered (exit 2), zero requests |
@@ -658,6 +659,72 @@ fn multi_descriptor_key_crlf_and_bom() {
     let api = api_for(LP);
     let out = run_vex(&binary(), cwd, &VexRun::online(&api));
     attested(&out, LP, Marker::Redirected, "multi-descriptor CRLF BOM");
+}
+
+/// The VENDORED pair on the Windows shapes: yarn berry writes a new
+/// `yarn.lock` AND the root `package.json` it first pretty-prints with
+/// `os.EOL` (CRLF), and editors add a BOM. The CRLF + BOM lock entry and the
+/// CRLF + BOM `resolutions` mapping are both read, so the committed artifact
+/// attests (offline without a ledger: `record_unavailable`); with the
+/// mapping reverted the `file:` entry is orphaned and nothing is wired.
+#[test]
+fn vendored_crlf_and_bom_lock_and_manifest() {
+    let windows = |text: &str| format!("\u{feff}{}", text.replace('\n', "\r\n"));
+    let manifest = |resolutions: Option<serde_json::Value>| {
+        let mut doc = serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "dependencies": { "left-pad": "1.3.0" }
+        });
+        if let Some(r) = resolutions {
+            doc["resolutions"] = r;
+        }
+        windows(&format!(
+            "{}\n",
+            serde_json::to_string_pretty(&doc).unwrap()
+        ))
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let rel = vendored_rel(UUID, "left-pad-1.3.0.tgz");
+    write_tgz(cwd, &rel, PATCHED);
+    put(
+        cwd,
+        ".yarnrc.yml",
+        b"nodeLinker: node-modules\r\nenableGlobalCache: false\r\n",
+    );
+    put(
+        cwd,
+        "package.json",
+        manifest(Some(
+            serde_json::json!({ "left-pad": format!("file:./{rel}") }),
+        ))
+        .as_bytes(),
+    );
+    put(
+        cwd,
+        "yarn.lock",
+        windows(&format!(
+            "{}{}{}",
+            header(),
+            workspace_block("app", ".", &[("left-pad", "npm:1.3.0")]),
+            vendored_block("left-pad", "1.3.0", &rel, ROOT_LOCATOR)
+        ))
+        .as_bytes(),
+    );
+    let api = api_for(LP);
+    let out = run_vex(&binary(), cwd, &VexRun::online(&api));
+    attested(&out, LP, Marker::Vendored, "vendored CRLF BOM");
+    let before = api.request_count();
+    let out = run_vex(&binary(), cwd, &VexRun::offline());
+    omitted(&out, LP, "record_unavailable", "vendored CRLF BOM offline");
+    assert_eq!(api.request_count(), before, "offline: zero requests");
+
+    // The `resolutions` mapping reverted (still CRLF + BOM): the lock's
+    // `file:` entry is orphaned — yarn would not install it.
+    put(cwd, "package.json", manifest(None).as_bytes());
+    let out = run_vex(&binary(), cwd, &VexRun::online(&api));
+    nothing_discovered(&out, "vendored CRLF BOM, resolutions reverted");
 }
 
 /// Two LIVE blocks wiring the same package version to two different

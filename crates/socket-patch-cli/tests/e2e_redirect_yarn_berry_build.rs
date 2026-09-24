@@ -336,6 +336,13 @@ async fn berry_hosted_project(
         );
         return None;
     }
+    // Windows line endings (yarn writes CRLF there): see yarn_berry_common.
+    yarn_berry_common::adopt_yarn_line_endings(
+        &proj,
+        yarn_berry(),
+        &format!("redirect-{tag}"),
+        &["package.json", "yarn.lock"],
+    );
     let installed_dir = proj.join("node_modules").join(DEP);
     let orig = std::fs::read(installed_dir.join("index.js")).expect("installed index.js");
     let registry_lock = std::fs::read(proj.join("yarn.lock")).expect("registry yarn.lock");

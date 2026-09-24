@@ -285,6 +285,14 @@ async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected
         );
         return;
     }
+    // Windows line endings (yarn 2/3 write CRLF there too): a CRLF legacy
+    // lock must still be refused for its cacheKey, never for its endings.
+    yarn_berry_common::adopt_yarn_line_endings(
+        &proj,
+        yarn_pm,
+        &format!("legacy-{tag}"),
+        &["package.json", "yarn.lock"],
+    );
 
     // 2. The cacheKey pin — the empirical fact the refusal contract below is
     //    conditioned on. Fails FIRST, with a self-describing message, if a

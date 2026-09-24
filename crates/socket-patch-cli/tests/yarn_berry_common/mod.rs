@@ -29,6 +29,20 @@
 //! unreachable" soft-skip into a failure, for a CI leg that provisioned
 //! corepack on purpose.
 //!
+//! # Line endings ([`EOL_ENV`])
+//!
+//! yarn berry writes a file it CREATES with the OS line ending (`os.EOL`)
+//! and keeps an existing file's majority ending on every later write
+//! (`normalizeLineEndings` in yarnpkg-fslib's `FakeFS.ts`, used by
+//! `Project.persistLockfile` and `Workspace.persistManifest`). On Windows
+//! every fixture here therefore runs on CRLF files: the first `yarn install`
+//! writes a CRLF `yarn.lock` and re-renders the compact fixture
+//! `package.json` pretty — with CRLF. [`EOL_ENV`]`=crlf` reproduces that on
+//! macOS / Linux: [`adopt_yarn_line_endings`] re-spells the files the
+//! fixture install wrote CRLF, and every later yarn run keeps them CRLF.
+//! Either way it prints one `BERRY-EOL|<yarn>|<flow>|<file>|yarn=<ending>|flow=<ending>`
+//! line per file: the ending yarn itself wrote, and the one the flow runs on.
+//!
 //! # The manifest-less VEX matrix ([`run_manifestless_vex_matrix`])
 //!
 //! A hosted (`scan --mode hosted`) or vendored (`vendor`, `get --mode
@@ -76,6 +90,70 @@ pub const REQUIRED_ENV: &str = "SOCKET_PATCH_YARN_E2E_REQUIRED";
 /// Whether [`REQUIRED_ENV`] forbids soft-skips.
 pub fn yarn_e2e_required() -> bool {
     std::env::var(REQUIRED_ENV).is_ok_and(|v| v == "1")
+}
+
+/// `=crlf`: run the real-yarn flows on CRLF files on every OS, the way
+/// yarn berry writes them on Windows (module docs, "Line endings").
+pub const EOL_ENV: &str = "SOCKET_PATCH_YARN_BERRY_EOL";
+
+/// Whether the flows run on CRLF files: always on Windows (yarn writes them
+/// that way there), elsewhere when [`EOL_ENV`] is `crlf`.
+pub fn windows_line_endings() -> bool {
+    cfg!(windows) || std::env::var(EOL_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("crlf"))
+}
+
+/// The line-ending style of `bytes`, for the `BERRY-EOL` report.
+fn eol_style(bytes: &[u8]) -> &'static str {
+    let crlf = bytes.windows(2).filter(|w| w == b"\r\n").count();
+    let lf = bytes.iter().filter(|&&b| b == b'\n').count() - crlf;
+    match (crlf, lf) {
+        (0, 0) => "none",
+        (_, 0) => "crlf",
+        (0, _) => "lf",
+        _ => "mixed",
+    }
+}
+
+/// Call right after a fixture's first `yarn install`: under
+/// [`windows_line_endings`], re-spell each of `files` (relative to `dir`)
+/// CRLF, as yarn itself writes them on Windows, and report each file as a
+/// `BERRY-EOL|<yarn>|<flow>|<file>|yarn=<ending>|flow=<ending>` line (the
+/// ending yarn wrote, the one the flow runs on). yarn keeps the majority
+/// ending on every later write,
+/// so the rest of the flow (socket-patch's rewrites, the fresh-checkout
+/// installs, the VEX matrix) runs on CRLF files. On Windows the files are
+/// CRLF already and the re-spelling is a no-op. Returns whether it
+/// converted anything.
+pub fn adopt_yarn_line_endings(dir: &Path, yarn_spec: &str, flow: &str, files: &[&str]) -> bool {
+    let crlf = windows_line_endings();
+    let mut converted = false;
+    for rel in files {
+        let path = dir.join(rel);
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let written = eol_style(&bytes);
+        let mut flow_style = written;
+        if crlf {
+            let text = String::from_utf8(bytes).expect("yarn writes UTF-8");
+            let respelled = text.replace("\r\n", "\n").replace('\n', "\r\n");
+            if respelled != text {
+                std::fs::write(&path, &respelled).unwrap();
+                converted = true;
+            }
+            flow_style = eol_style(respelled.as_bytes());
+        }
+        println!("BERRY-EOL|{yarn_spec}|{flow}|{rel}|yarn={written}|flow={flow_style}");
+    }
+    let _ = std::io::stdout().flush();
+    converted
+}
+
+/// [`eol_style`] classifies each file by its line breaks.
+#[test]
+fn eol_style_classifies_line_breaks() {
+    assert_eq!(eol_style(b"{}"), "none");
+    assert_eq!(eol_style(b"a\nb\n"), "lf");
+    assert_eq!(eol_style(b"a\r\nb\r\n"), "crlf");
+    assert_eq!(eol_style(b"a\r\nb\n"), "mixed");
 }
 
 /// The corepack spec (`yarn@<X>`) of the yarn 4 release under test.
@@ -256,7 +334,7 @@ pub fn expected_checksum_line(yarn_lock: &str, checksum_10c0: &str) -> String {
     }
 }
 
-/// Run `f` on a fresh OS thread and return its result (re-raising a panic)./// Run `f` on a fresh OS thread and return its result (re-raising a panic).
+/// Run `f` on a fresh OS thread and return its result (re-raising a panic).
 ///
 /// [`PatchApi`] owns its own tokio runtime; creating, blocking on or
 /// dropping one from inside a `#[tokio::test]` body panics ("Cannot start

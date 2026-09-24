@@ -352,6 +352,13 @@ fn install_pnpm_fixture(tag: &str, tmp: &Path, proj: &Path) -> Option<Vec<u8>> {
         );
         return None;
     }
+    // Windows line endings (yarn writes CRLF there): see yarn_berry_common.
+    yarn_berry_common::adopt_yarn_line_endings(
+        proj,
+        yarn_berry(),
+        &format!("pnpm-linker-{tag}"),
+        &["package.json", "yarn.lock"],
+    );
     assert_pnpm_store_layout(proj, tag);
     // Read THROUGH the symlink — the same path discovery crawls.
     let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js"))
