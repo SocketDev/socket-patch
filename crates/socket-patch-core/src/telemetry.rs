@@ -597,6 +597,10 @@ fn patch_scanned_metadata(
 /// dashboard needs — grouping them into a struct would force callers
 /// to build a config object for a single fire-and-forget call, which
 /// is worse ergonomics for a tracker.
+///
+/// The CLI's `scan` sends this event through [`spawn_patch_scanned`]; the
+/// inline tracker stays as this published crate's public API, alongside
+/// the inline tracker every other event has.
 #[allow(clippy::too_many_arguments)]
 pub async fn track_patch_scanned(
     packages_scanned: usize,
@@ -665,7 +669,9 @@ fn patch_scan_failed_metadata(fallback_to_proxy: bool) -> serde_json::Value {
     serde_json::json!({ "fallback_to_proxy": fallback_to_proxy })
 }
 
-/// Track a failed `scan`.
+/// Track a failed `scan`. The CLI sends it through
+/// [`spawn_patch_scan_failed`]; kept as public API like
+/// [`track_patch_scanned`].
 pub async fn track_patch_scan_failed(
     error: impl std::fmt::Display,
     fallback_to_proxy: bool,
