@@ -396,6 +396,12 @@ into the new version's section — see docs/releasing.md.
   takeover revert as cargo and npm (`vendor_takeover_reverted_redirect`),
   and scoped `rollback <purl>` / `remove <purl>` of one hosted Go module
   works without an unscoped rollback.
+- **Vendored Go fetches honor `GOPROXY=off`, `direct` and `GOPRIVATE`.**
+  With the module missing from the module cache, the pristine fetch fell
+  back to `https://proxy.golang.org` even when go itself would ask no
+  proxy, sending private module paths off the machine. It is now refused
+  (`vendor_fetch_unverifiable`, then the usual `package_not_installed`
+  skip) unless `SOCKET_GOPROXY` names a proxy.
 - **A vendoring-service outage no longer re-vendors packages.** An npm
   re-run (every lock flavor, `bun.lockb` included) re-acquired its tarball
   from whichever source answered — the service's prebuilt, or a local pack
