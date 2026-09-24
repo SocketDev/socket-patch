@@ -5,8 +5,11 @@
 //! The hosted cargo rewriter pins a patched crate in EVERY manifest that
 //! declares it — a member's own `cfg-if = "1"` resolves exactly like the
 //! root's, so leaving it unpinned makes the repointed Cargo.lock entry
-//! unsatisfiable. Only manifests inside the project root are returned: a
-//! file outside it is not the project's to rewrite.
+//! unsatisfiable. Only manifests inside the project root, reached without
+//! crossing a symbolic link, are returned: a file outside the root is not
+//! the project's to rewrite, and a link may lead outside it (the writer
+//! would follow it). Cargo still reads those manifests; the rewriter's
+//! Cargo.lock dependents check refuses a crate one of them depends on.
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
@@ -68,10 +71,25 @@ pub fn member_manifests(root: &Path) -> Vec<String> {
 }
 
 fn read_manifest(path: &Path) -> Option<DocumentMut> {
-    if !path.is_file() {
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
         return None;
     }
     std::fs::read_to_string(path).ok()?.parse().ok()
+}
+
+/// A directory that is not itself a symbolic link.
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// Every component of repo-relative `dir` is a real directory under
+/// `root` — none is a symbolic link (which may lead outside the root).
+fn is_real_dir_path(root: &Path, dir: &str) -> bool {
+    let mut at = root.to_path_buf();
+    dir.split('/').all(|seg| {
+        at.push(seg);
+        is_real_dir(&at)
+    })
 }
 
 fn enqueue(
@@ -80,7 +98,11 @@ fn enqueue(
     dirs: &mut BTreeSet<String>,
     queue: &mut Vec<(String, DocumentMut)>,
 ) {
-    if dir.is_empty() || dirs.len() >= MAX_MANIFESTS || dirs.contains(&dir) {
+    if dir.is_empty()
+        || dirs.len() >= MAX_MANIFESTS
+        || dirs.contains(&dir)
+        || !is_real_dir_path(root, &dir)
+    {
         return;
     }
     let Some(doc) = read_manifest(&root.join(&dir).join("Cargo.toml")) else {
@@ -185,7 +207,7 @@ fn expand_from(root: &Path, at: PathBuf, rest: &[&str], out: &mut Vec<String>) {
     };
     if !seg.contains(['*', '?']) {
         let next = at.join(seg);
-        if root.join(&next).is_dir() {
+        if is_real_dir(&root.join(&next)) {
             expand_from(root, next, tail, out);
         }
         return;
@@ -308,6 +330,63 @@ mod tests {
             member_manifests(root),
             vec!["m2/Cargo.toml", "x/y/m1/Cargo.toml"]
         );
+    }
+
+    /// Members and path dependencies behind a symbolic link — whether the
+    /// link is a literal member, matched by a glob, a path dependency, an
+    /// intermediate directory or the manifest itself — are never returned:
+    /// the writer would follow the link, possibly out of the project.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_members_and_path_dependencies_are_not_returned() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        write(&outside, "shared/Cargo.toml", &pkg("shared"));
+        write(&outside, "lone/Cargo.toml", &pkg("lone"));
+        let root = tmp.path().join("proj");
+        write(
+            &root,
+            "Cargo.toml",
+            &format!(
+                "[workspace]\nmembers = [\"crates/*\", \"linked\", \"nested/inner\"]\n\n\
+                 {}[dependencies]\nvia = {{ path = \"via\" }}\nreal = {{ path = \"real\" }}\n",
+                pkg("root")
+            ),
+        );
+        std::fs::create_dir_all(root.join("crates")).unwrap();
+        symlink(outside.join("shared"), root.join("crates/one")).unwrap();
+        write(&root, "crates/two/Cargo.toml", &pkg("two"));
+        symlink(outside.join("shared"), root.join("linked")).unwrap();
+        symlink(&outside, root.join("nested")).unwrap();
+        std::fs::create_dir_all(outside.join("inner")).unwrap();
+        std::fs::write(outside.join("inner/Cargo.toml"), pkg("inner")).unwrap();
+        symlink(outside.join("lone"), root.join("via")).unwrap();
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        symlink(
+            outside.join("lone/Cargo.toml"),
+            root.join("real/Cargo.toml"),
+        )
+        .unwrap();
+        assert_eq!(member_manifests(&root), vec!["crates/two/Cargo.toml"]);
+    }
+
+    #[test]
+    fn members_and_path_dependencies_outside_the_root_are_not_returned() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "lib/Cargo.toml", &pkg("lib"));
+        write(tmp.path(), "shared/Cargo.toml", &pkg("shared"));
+        let root = tmp.path().join("app");
+        write(
+            &root,
+            "Cargo.toml",
+            &format!(
+                "[workspace]\nmembers = [\"../shared\"]\n\n{}[dependencies]\n\
+                 lib = {{ path = \"../lib\" }}\n",
+                pkg("app")
+            ),
+        );
+        assert!(member_manifests(&root).is_empty());
     }
 
     #[test]

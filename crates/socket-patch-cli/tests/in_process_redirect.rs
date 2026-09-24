@@ -4059,6 +4059,98 @@ async fn cargo_transitive_only_crate_is_refused_loudly_and_not_attested() {
     );
 }
 
+/// A workspace member or path dependency the rewriter must not write —
+/// outside the project root, or reached through a symbolic link — still
+/// declares the patched crate to cargo. Pinning only the root would leave
+/// that package resolving crates.io (`--locked` fails, the unpatched copy is
+/// compiled) while the crate is reported redirected. REGRESSION: the root
+/// was pinned and the dep confirmed; a literal symlinked member was even
+/// written through the link, outside the project. Now the Cargo.lock
+/// dependents check refuses the crate and nothing is written anywhere.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn cargo_member_outside_the_project_or_behind_a_symlink_refuses_the_crate() {
+    const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.0";
+    const CARGO_UUID: &str = "33333333-3333-4333-8333-333333333333";
+    let cksum = "cd".repeat(32);
+    let index_url = format!("sparse+http://patch.test/registry/cargo/{CARGO_UUID}/index/");
+    let server = MockServer::start().await;
+    mock_cargo_patch(
+        &server,
+        CARGO_PURL,
+        CARGO_UUID,
+        "cfg-if",
+        "1.0.0",
+        &index_url,
+        &cksum,
+        "GHSA-carg-ssss-ssss",
+    )
+    .await;
+
+    let lib_manifest =
+        "[package]\nname = \"lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ncfg-if = \"1\"\n";
+    let lock = "version = 3\n\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ee\"\n\n[[package]]\nname = \"consumer\"\nversion = \"0.0.0\"\ndependencies = [\n \"cfg-if\",\n \"lib\",\n]\n\n[[package]]\nname = \"lib\"\nversion = \"0.1.0\"\ndependencies = [\n \"cfg-if\",\n]\n";
+    for (shape, root_manifest, link) in [
+        (
+            "out-of-root path dependency",
+            "[package]\nname = \"consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\ncfg-if = \"1.0.0\"\nlib = { path = \"../lib\" }\n",
+            None,
+        ),
+        (
+            "glob-matched symlinked member",
+            "[workspace]\nmembers = [\"crates/*\"]\n\n[package]\nname = \"consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\ncfg-if = \"1.0.0\"\n",
+            Some("crates/lib"),
+        ),
+        (
+            "literal symlinked member",
+            "[workspace]\nmembers = [\"lib\"]\n\n[package]\nname = \"consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[dependencies]\ncfg-if = \"1.0.0\"\n",
+            Some("lib"),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("lib");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("Cargo.toml"), lib_manifest).unwrap();
+        let app = tmp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("Cargo.toml"), root_manifest).unwrap();
+        std::fs::write(app.join("Cargo.lock"), lock).unwrap();
+        if let Some(link) = link {
+            let at = app.join(link);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&outside, at).unwrap();
+        }
+        write_vendored_crate(&app, "cfg-if", "1.0.0");
+
+        let env = run_redirect_subprocess(&app, &server.uri());
+        assert_eq!(env["redirect"]["redirected"], 0, "{shape}: {env}");
+        let warning = env["redirect"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["code"] == "redirect_cargo_transitive_dependents")
+            .unwrap_or_else(|| panic!("{shape}: {env}"));
+        let detail = warning["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("lib 0.1.0 (a path package") && detail.contains("--mode vendored"),
+            "{shape}: {detail}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("Cargo.toml")).unwrap(),
+            lib_manifest,
+            "{shape}: a manifest outside the project is never written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(app.join("Cargo.toml")).unwrap(),
+            root_manifest,
+            "{shape}"
+        );
+        assert_eq!(std::fs::read_to_string(app.join("Cargo.lock")).unwrap(), lock, "{shape}");
+        assert!(!app.join(".cargo").exists(), "{shape}");
+    }
+}
+
 /// AUDIT A2 (green side): the multi-line `[dependencies.<name>]` table form —
 /// with NO Cargo.lock — is fully pinned: the manifest entry gains a registry
 /// line, the managed registry block is wired in, and the patch is recorded +
