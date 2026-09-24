@@ -7,6 +7,8 @@
 //!   own version's registry, and removing both purls restores every byte.
 //! * `legacy_config` — an existing legacy `.cargo/config`: the registry
 //!   block lands there, and `remove` restores the file byte-for-byte.
+//! * `crlf` — CRLF `Cargo.toml` + `Cargo.lock`: rewritten with CRLF kept,
+//!   and restored byte-for-byte.
 //! * `workspace_direct_member` — a virtual workspace whose root pins
 //!   `[workspace.dependencies]`, one member inheriting and one declaring the
 //!   crate itself: both members build against the patched copy.
@@ -75,6 +77,9 @@ struct Shape {
     patches: Vec<Patch>,
     /// Written into the fresh checkout before the offline build.
     oracle: Vec<(&'static str, String)>,
+    /// Re-encode every `Cargo.toml` and the generated `Cargo.lock` with CRLF
+    /// line endings (a Windows checkout) before the scan.
+    crlf: bool,
 }
 
 fn binary() -> PathBuf {
@@ -379,6 +384,23 @@ async fn run_shape(shape: Shape) -> Option<()> {
         return None;
     }
     let _ = std::fs::remove_dir_all(proj.join("target"));
+    if shape.crlf {
+        for rel in snapshot(&proj).keys() {
+            if rel.ends_with("Cargo.toml") || rel == "Cargo.lock" {
+                let path = proj.join(rel);
+                let text = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(&path, text.replace('\n', "\r\n")).unwrap();
+            }
+        }
+        let rebuilt = cargo(&proj, &["build", "-q", "--locked"], &home);
+        assert!(
+            rebuilt.status.success(),
+            "{}: the CRLF baseline must build:\n{}",
+            shape.tag,
+            stderr(&rebuilt)
+        );
+        let _ = std::fs::remove_dir_all(proj.join("target"));
+    }
     let before = snapshot(&proj);
 
     let mut served = Vec::new();
@@ -442,6 +464,20 @@ async fn run_shape(shape: Shape) -> Option<()> {
         "{}: {env}",
         shape.tag
     );
+
+    if shape.crlf {
+        for (rel, bytes) in snapshot(&proj) {
+            if rel.ends_with("Cargo.toml") || rel == "Cargo.lock" {
+                let text = String::from_utf8(bytes).unwrap();
+                assert_eq!(
+                    text.matches("\r\n").count(),
+                    text.matches('\n').count(),
+                    "{}: {rel} must keep CRLF endings:\n{text}",
+                    shape.tag
+                );
+            }
+        }
+    }
 
     // Fresh checkout: only committed files travel; an EMPTY CARGO_HOME.
     let fresh = tmp.path().join("fresh");
@@ -617,6 +653,7 @@ async fn cargo_hosted_multi_version_pins_each_declaration_and_removes_cleanly() 
             "fn main() { println!(\"{}\", cfg_if::socket_patched() + cfg_if_legacy::socket_patched()); }\n"
                 .to_string(),
         )],
+        crlf: false,
     };
     let _ = run_shape(shape).await;
 }
@@ -637,6 +674,7 @@ async fn cargo_hosted_legacy_config_is_restored_byte_for_byte() {
             "src/main.rs",
             "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
         )],
+        crlf: false,
     };
     let _ = run_shape(shape).await;
 }
@@ -673,6 +711,27 @@ async fn cargo_hosted_workspace_member_declaration_is_pinned() {
             ("inherits/src/lib.rs", oracle.clone()),
             ("direct/src/lib.rs", oracle),
         ],
+        crlf: false,
+    };
+    let _ = run_shape(shape).await;
+}
+
+/// Bug K: a CRLF checkout is redirected (it was refused) with its line
+/// endings kept, and removed byte-for-byte.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_crlf_project_keeps_its_line_endings() {
+    let shape = Shape {
+        tag: "crlf",
+        files: vec![
+            ("Cargo.toml", consumer_manifest("cfg-if = \"1.0.4\"\n")),
+            ("src/main.rs", "fn main() {}\n".to_string()),
+        ],
+        patches: vec![CFG_IF_1],
+        oracle: vec![(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
+        )],
+        crlf: true,
     };
     let _ = run_shape(shape).await;
 }

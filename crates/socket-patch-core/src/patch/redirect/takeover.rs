@@ -4013,6 +4013,7 @@ mod tests {
             "[net]\nretry = 2\n",
             "[net]\n\n\n\nretry = 2\n",
             "# a comment\n\n[http]\ntimeout = 5\n",
+            "[net]\r\nretry = 2\r\n",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path();
@@ -4067,6 +4068,57 @@ mod tests {
                     .await
                     .unwrap(),
                 lock
+            );
+        }
+    }
+
+    /// Bug K: a CRLF project (manifest, lock and legacy config) is
+    /// redirected with CRLF kept and `remove` restores every byte.
+    #[tokio::test]
+    async fn crlf_project_reverts_byte_for_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let crlf = |s: &str| s.replace('\n', "\r\n");
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        files.insert("Cargo.toml".into(), crlf(&pristine_toml()));
+        files.insert(
+            "Cargo.lock".into(),
+            crlf(&format!("version = 4\n\n{}\n", pristine_lock_block())),
+        );
+        files.insert(".cargo/config".into(), crlf("[net]\nretry = 2\n"));
+        let dep: crate::patch::redirect::DepOverride = serde_json::from_value(serde_json::json!({
+            "ecosystem": "cargo", "name": "cfg-if", "version": "1.0.4",
+            "token": "tok", "patchUuid": UUID,
+            "artifactUrl": "http://127.0.0.1:5555/cfg-if-1.0.4.crate",
+            "registryOverride": {
+                "kind": "cargo-sparse", "indexUrl": INDEX,
+                "identifiers": {
+                    "name": "cfg-if", "version": "1.0.4",
+                    "cargoCksumSha256": "a".repeat(64),
+                },
+            },
+            "integrity": { "sha256": "a".repeat(64) },
+        }))
+        .unwrap();
+        let rewrite = crate::patch::redirect::rewrite_registry_redirect(&files, &[dep]);
+        assert_eq!(rewrite.files.len(), 3, "{:?}", rewrite.warnings);
+        tokio::fs::create_dir_all(root.join(".cargo"))
+            .await
+            .unwrap();
+        for (rel, content) in files.iter().chain(rewrite.files.iter()) {
+            tokio::fs::write(root.join(rel), content).await.unwrap();
+        }
+        let mut state = RedirectState::new();
+        state.edits = rewrite.edits;
+        state.records.insert(PURL.to_string(), record());
+        revert_cargo_redirect_purl(root, &mut state, PURL, false)
+            .await
+            .expect("revert succeeds");
+        for (rel, content) in &files {
+            assert_eq!(
+                &tokio::fs::read_to_string(root.join(rel)).await.unwrap(),
+                content,
+                "{rel}"
             );
         }
     }

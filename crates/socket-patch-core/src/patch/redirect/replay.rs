@@ -251,6 +251,17 @@ fn safe_rel_path(path: &str) -> bool {
 /// and `"m\n" + "\nF\n"` produce identical files — so the tidy form (the
 /// one `go mod tidy` itself emits) is chosen.
 pub(super) fn remove_fragment_once(content: &str, fragment: &str) -> String {
+    // A CRLF file (its fragments recorded CRLF too) is inverted as LF and
+    // written back CRLF, so the separator bookkeeping below sees real line
+    // breaks instead of stranding a `\r` line.
+    let crlf = content.matches("\r\n").count();
+    if crlf > 0 && crlf == content.matches('\n').count() && content.contains(fragment) {
+        return remove_fragment_once(
+            &content.replace("\r\n", "\n"),
+            &fragment.replace("\r\n", "\n"),
+        )
+        .replace('\n', "\r\n");
+    }
     let Some(pos) = content.find(fragment) else {
         return content.to_string();
     };
@@ -2837,6 +2848,18 @@ mod tests {
     }
 
     // ---------- remove_fragment_once unit pins ----------
+
+    #[test]
+    fn remove_fragment_once_keeps_crlf_separators_straight() {
+        assert_eq!(
+            remove_fragment_once("[net]\r\nretry = 2\r\n\r\nF\r\nG\r\n", "F\r\nG\r\n"),
+            "[net]\r\nretry = 2\r\n"
+        );
+        assert_eq!(
+            remove_fragment_once("a\r\n\r\nF\r\n\r\nb\r\n", "F\r\n"),
+            "a\r\n\r\nb\r\n"
+        );
+    }
 
     #[test]
     fn remove_fragment_once_absent_fragment_is_identity() {

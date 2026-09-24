@@ -748,9 +748,30 @@ fn rewrite_cargo(
         )
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    // Every planner below matches LF text. A file whose every line ends in
+    // CRLF (a Windows checkout) is planned as LF and written back — edit
+    // fragments included, so `remove` finds them — as CRLF. Mixed endings
+    // stay as they are (and refuse where the LF grammar does not match).
+    let mut crlf_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut to_lf = |path: &str, text: String| -> String {
+        match crlf_to_lf(&text) {
+            Some(lf) => {
+                crlf_paths.insert(path.to_string());
+                lf
+            }
+            None => text,
+        }
+    };
+    for (path, text) in manifests.iter_mut() {
+        *text = to_lf(path, std::mem::take(text));
+    }
+    let edits_before = result.edits.len();
     let mut changed_manifests: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
-    let mut cargo_lock = files.get("Cargo.lock").cloned();
+    let mut cargo_lock = files
+        .get("Cargo.lock")
+        .cloned()
+        .map(|t| to_lf("Cargo.lock", t));
     // Cargo reads the LEGACY extensionless `.cargo/config` in preference to
     // `config.toml` when both exist (it warns about the duplicate), so a
     // managed `[registries.…]` block written to `config.toml` there is
@@ -762,7 +783,11 @@ fn rewrite_cargo(
     } else {
         ".cargo/config.toml"
     };
-    let mut cargo_config = files.get(cargo_config_key).cloned().unwrap_or_default();
+    let mut cargo_config = files
+        .get(cargo_config_key)
+        .cloned()
+        .map(|t| to_lf(cargo_config_key, t))
+        .unwrap_or_default();
     let (mut lock_changed, mut config_changed) = (false, false);
 
     for dep in &cargo {
@@ -966,19 +991,48 @@ fn rewrite_cargo(
         result.confirmed_cargo_uuids.insert(dep.patch_uuid.clone());
     }
 
+    let restore = |path: &str, text: String| -> String {
+        if crlf_paths.contains(path) {
+            text.replace('\n', "\r\n")
+        } else {
+            text
+        }
+    };
+    for edit in &mut result.edits[edits_before..] {
+        if crlf_paths.contains(&edit.path) {
+            for fragment in [&mut edit.original, &mut edit.new] {
+                if let Some(Value::String(text)) = fragment {
+                    *text = text.replace('\n', "\r\n");
+                }
+            }
+        }
+    }
     for (path, text) in manifests {
         if changed_manifests.contains(&path) {
+            let text = restore(&path, text);
             result.files.insert(path, text);
         }
     }
     if lock_changed {
         if let Some(l) = cargo_lock {
-            result.files.insert("Cargo.lock".into(), l);
+            result
+                .files
+                .insert("Cargo.lock".into(), restore("Cargo.lock", l));
         }
     }
     if config_changed {
-        result.files.insert(cargo_config_key.into(), cargo_config);
+        result.files.insert(
+            cargo_config_key.into(),
+            restore(cargo_config_key, cargo_config),
+        );
     }
+}
+
+/// `text` with every CRLF turned into LF, when every line break in it is a
+/// CRLF (and there is at least one); `None` for LF-only or mixed text.
+fn crlf_to_lf(text: &str) -> Option<String> {
+    let crlf = text.matches("\r\n").count();
+    (crlf > 0 && crlf == text.matches('\n').count()).then(|| text.replace("\r\n", "\n"))
 }
 
 /// A workspace-member manifest key the caller supplied: `<dir>/Cargo.toml`,
@@ -9182,6 +9236,77 @@ mod tests {
         ] {
             assert!(!is_cargo_member_manifest_key(bad), "{bad}");
         }
+    }
+
+    /// Bug K: CRLF manifests and locks (Windows checkouts) were refused —
+    /// every planner matched LF text only. A CRLF-only file is now planned
+    /// as LF and written back CRLF, recorded fragments included, and a
+    /// re-run over the output is a silent no-op.
+    #[test]
+    fn cargo_crlf_files_are_rewritten_with_crlf_kept() {
+        let lf = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        );
+        let crlf: BTreeMap<String, String> = lf
+            .iter()
+            .map(|(k, v)| (k.clone(), v.replace('\n', "\r\n")))
+            .collect();
+        let want = rewrite_registry_redirect(&lf, &[cargo_sparse_override()]);
+        let got = rewrite_registry_redirect(&crlf, &[cargo_sparse_override()]);
+        assert!(got.warnings.is_empty(), "{:?}", got.warnings);
+        assert!(got.confirmed_cargo_uuids.contains(CARGO_UUID));
+        for key in ["Cargo.toml", "Cargo.lock"] {
+            assert_eq!(
+                got.files[key],
+                want.files[key].replace('\n', "\r\n"),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            got.files[".cargo/config.toml"], want.files[".cargo/config.toml"],
+            "a created config stays LF"
+        );
+        let lock_edit = got
+            .edits
+            .iter()
+            .find(|e| e.kind == "redirect_cargo_lock_entry")
+            .unwrap();
+        let (Some(Value::String(orig)), Some(Value::String(new))) =
+            (&lock_edit.original, &lock_edit.new)
+        else {
+            panic!("lock edit fragments");
+        };
+        assert!(crlf["Cargo.lock"].contains(orig.as_str()));
+        assert!(got.files["Cargo.lock"].contains(new.as_str()));
+
+        let mut again = crlf.clone();
+        again.extend(got.files.clone());
+        let rerun = rewrite_registry_redirect(&again, &[cargo_sparse_override()]);
+        assert!(
+            rerun.files.is_empty() && rerun.edits.is_empty() && rerun.warnings.is_empty(),
+            "{:?} {:?}",
+            rerun.files.keys(),
+            rerun.warnings
+        );
+    }
+
+    /// Mixed line endings are not normalized: the LF grammar still refuses
+    /// what it cannot match, writing nothing.
+    #[test]
+    fn cargo_mixed_line_endings_still_refuse() {
+        let mut files = cargo_files(
+            "[package]\r\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\r\nserde = \"1.0.190\"\r\n",
+        );
+        files.insert(
+            "Cargo.lock".into(),
+            files["Cargo.lock"].replace('\n', "\r\n"),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
     }
 
     /// A cargo dep whose override kind is not `cargo-sparse` warns (the TS
