@@ -16,8 +16,9 @@
 #   CWD=/path/to/project   (required; passed as --cwd)
 #   BIN=/path/to/binary    (record/replay; default: <repo>/target/release/socket-patch)
 #   BASE=... NEW=...       (ab; the two binaries to compare)
-#   PORT=18080             (api.socket.dev stand-in; PORT+1 = patch.socket.dev,
-#                           PORT+2 = patches-api.socket.dev public proxy)
+#   PORT=18080             (api.socket.dev stand-in)
+#   PATCH_PORT=PORT+1      (patch.socket.dev stand-in)
+#   PROXY_PORT=PORT+2      (patches-api.socket.dev public proxy stand-in)
 #   CONN_MS=0              (replay/ab: extra latency per new TCP connection)
 #   FILL=1                 (replay/ab: forward + record misses instead of 599)
 #   PRE_RUN='cmd'          (shell command run before every CLI invocation,
@@ -63,7 +64,14 @@ case "$STORE/" in
 esac
 mkdir -p "$STORE"
 
-PORT="${PORT:-18080}"; PATCH_PORT="$((PORT + 1))"; PROXY_PORT="$((PORT + 2))"
+PORT="${PORT:-18080}"; PATCH_PORT="${PATCH_PORT:-$((PORT + 1))}"; PROXY_PORT="${PROXY_PORT:-$((PORT + 2))}"
+# Refuse (never kill) a port someone else is listening on: it is usually
+# another bench, and killing it would corrupt that run.
+for p in "$PORT" "$PATCH_PORT" "$PROXY_PORT"; do
+  if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "port $p is already in use (another bench?): pick another PORT; do not kill it" >&2; exit 2
+  fi
+done
 OUT="${OUT:-$STORE/runs}"; mkdir -p "$OUT"
 
 lat_args=(--latency-ms 0); lat_tag="${LAT}ms"

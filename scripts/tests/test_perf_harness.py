@@ -282,6 +282,40 @@ class BenchScriptTests(unittest.TestCase):
         finally:
             shutil.rmtree(inside, ignore_errors=True)
 
+    def test_refuses_a_busy_port_without_killing_its_listener(self):
+        port = free_port_run(3)
+        with socket.socket() as busy:
+            busy.bind(('127.0.0.1', port + 2))
+            busy.listen()
+            r = self.bench('replay', str(self.root / 'store'), '--', 'scan',
+                           BIN=shutil.which('true'), PORT=str(port))
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn(f'port {port + 2} is already in use', r.stderr)
+            # The other bench's listener is still there and still accepting.
+            with socket.create_connection(('127.0.0.1', port + 2), timeout=5):
+                pass
+        self.assertFalse((self.root / 'out' / 'proxy.log').exists(),
+                         'replay.py must not start when a port is refused')
+
+    def test_patch_and_proxy_ports_can_be_set_explicitly(self):
+        # Three distinct, typically non-consecutive ports: hold all three
+        # sockets open while the OS picks them.
+        socks = [socket.socket() for _ in range(3)]
+        try:
+            for s in socks:
+                s.bind(('127.0.0.1', 0))
+            port, patch_port, proxy_port = (s.getsockname()[1] for s in socks)
+        finally:
+            for s in socks:
+                s.close()
+        r = self.bench('replay', str(self.root / 'store'), '0', '1', '--', 'scan',
+                       BIN=shutil.which('true'), PORT=str(port),
+                       PATCH_PORT=str(patch_port), PROXY_PORT=str(proxy_port))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        log = (self.root / 'out' / 'proxy.log').read_text()
+        for p in (port, patch_port, proxy_port):
+            self.assertIn(f'127.0.0.1:{p}', log)
+
     def test_ab_checks_stdout_sha_against_the_first_base_run(self):
         # Seed the store with the batch the fake CLI sends (unit tests never
         # reach the real services).

@@ -48,7 +48,8 @@ CWD=$P BASE=$S/socket-patch-base NEW=./target/release/socket-patch PORT=18200 \
 ```
 
 Use a different `PORT` for each concurrent bench (it takes `PORT` through
-`PORT+2`). Latency `0` isolates local work such as the crawl and rewrites.
+`PORT+2`, or set `PATCH_PORT` / `PROXY_PORT` explicitly). `bench.sh` refuses
+to start if any of them is already listening, rather than killing it. Latency `0` isolates local work such as the crawl and rewrites.
 `recorded` gives realistic totals. `FILL=1` forwards and records requests the
 store doesn't have yet, for when a change adds endpoints.
 
