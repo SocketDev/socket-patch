@@ -528,13 +528,20 @@ impl RubyCrawler {
     /// (100-400 ms) each time — and the answers are RubyGems configuration
     /// that nothing in a run changes. The memo is keyed on everything the
     /// subprocess inherits (the environment and working directory), so a
-    /// caller that swaps `PATH` or `GEM_HOME` still asks afresh.
+    /// caller that swaps `PATH` or `GEM_HOME` still asks afresh. Only a
+    /// complete answer is kept: a failed ask (spawn error under fd pressure,
+    /// a non-zero exit from a racing shim, empty output) is asked again by
+    /// the next caller, as every caller used to ask — and so is an answer
+    /// the environment changed under, which the key would misfile.
     async fn gem_env_homes() -> GemEnvHomes {
         static MEMO: once_cell::sync::Lazy<GemEnvMemo> =
             once_cell::sync::Lazy::new(Default::default);
-        let cell = gem_env_cell(&MEMO, gem_env_key());
-        memoize_gem_env_homes(&cell, || async {
-            tokio::join!(Self::run_gem_env("gemdir"), Self::run_gem_env("gempath"))
+        let key = gem_env_key();
+        let cell = gem_env_cell(&MEMO, key.clone());
+        memoize_gem_env_homes(&cell, || async move {
+            let homes = tokio::join!(Self::run_gem_env("gemdir"), Self::run_gem_env("gempath"));
+            let env_unchanged = gem_env_key() == key;
+            (homes, env_unchanged)
         })
         .await
     }
@@ -797,17 +804,36 @@ fn gem_env_cell(
 }
 
 /// The first caller runs `ask`; concurrent callers wait for its answer and
-/// later ones reuse it. Split from [`RubyCrawler::gem_env_homes`] so tests
-/// can count the asks against a cell of their own.
+/// later ones reuse it — once it is complete (both homes answered) and
+/// `ask` vouches it is keepable. Otherwise the asker gets its own answer and
+/// the cell stays empty, so the next caller asks again. Split from
+/// [`RubyCrawler::gem_env_homes`] so tests can count the asks against a cell
+/// of their own.
 async fn memoize_gem_env_homes<F, Fut>(
     cell: &tokio::sync::OnceCell<GemEnvHomes>,
     ask: F,
 ) -> GemEnvHomes
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = GemEnvHomes>,
+    Fut: std::future::Future<Output = (GemEnvHomes, bool)>,
 {
-    cell.get_or_init(ask).await.clone()
+    let mut unkept = None;
+    let slot = &mut unkept;
+    let kept = cell
+        .get_or_try_init(|| async move {
+            let (homes, keepable) = ask().await;
+            if keepable && homes.0.is_some() && homes.1.is_some() {
+                Ok(homes)
+            } else {
+                *slot = Some(homes);
+                Err(())
+            }
+        })
+        .await;
+    match kept {
+        Ok(homes) => homes.clone(),
+        Err(()) => unkept.expect("a refused ask leaves its answer"),
+    }
 }
 
 /// Split a `gem env gempath` value into the `<home>/gems` directories it
@@ -2120,20 +2146,61 @@ mod tests {
                 memoize_gem_env_homes(&cell, || async {
                     let n = asks.fetch_add(1, Ordering::SeqCst);
                     tokio::task::yield_now().await;
-                    (Some(format!("/gems/home-{n}")), None)
+                    (
+                        (Some(format!("/gems/home-{n}")), Some("/gems/path".into())),
+                        true,
+                    )
                 })
                 .await
             }));
         }
+        let first = (
+            Some("/gems/home-0".to_string()),
+            Some("/gems/path".to_string()),
+        );
         for task in tasks {
-            assert_eq!(
-                task.await.expect("memo task"),
-                (Some("/gems/home-0".to_string()), None)
-            );
+            assert_eq!(task.await.expect("memo task"), first);
         }
         assert_eq!(asks.load(Ordering::SeqCst), 1);
-        let later = memoize_gem_env_homes(&cell, || async { (None, Some("x".into())) }).await;
-        assert_eq!(later, (Some("/gems/home-0".to_string()), None));
+        let later =
+            memoize_gem_env_homes(&cell, || async { ((None, Some("x".into())), true) }).await;
+        assert_eq!(later, first);
+    }
+
+    /// A failed or partial ask is not kept: the asker gets its own answer
+    /// and the next caller asks again, as every caller did before the memo.
+    /// So is an answer the environment changed under.
+    #[tokio::test]
+    async fn gem_env_homes_failures_are_asked_again() {
+        let cell = tokio::sync::OnceCell::new();
+        let good = (
+            Some("/gems/home".to_string()),
+            Some("/gems/path".to_string()),
+        );
+        for unkept in [
+            ((None, None), true),
+            ((Some("/gems/home".to_string()), None), true),
+            ((None, Some("/gems/path".to_string())), true),
+            (good.clone(), false),
+        ] {
+            let want = unkept.0.clone();
+            assert_eq!(
+                memoize_gem_env_homes(&cell, || async { unkept }).await,
+                want
+            );
+            assert!(cell.get().is_none(), "{want:?} must not be kept");
+        }
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let ask = || async {
+            asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (good.clone(), true)
+        };
+        assert_eq!(memoize_gem_env_homes(&cell, ask).await, good);
+        assert_eq!(
+            memoize_gem_env_homes(&cell, || async { ((None, None), true) }).await,
+            good
+        );
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// One cell per inherited environment: the same key shares a cell, a
