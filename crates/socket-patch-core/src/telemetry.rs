@@ -660,6 +660,11 @@ pub fn spawn_patch_scanned(
     }
 }
 
+/// The `patch_scan_failed` metadata (see [`patch_scanned_metadata`]).
+fn patch_scan_failed_metadata(fallback_to_proxy: bool) -> serde_json::Value {
+    serde_json::json!({ "fallback_to_proxy": fallback_to_proxy })
+}
+
 /// Track a failed `scan`.
 pub async fn track_patch_scan_failed(
     error: impl std::fmt::Display,
@@ -670,7 +675,7 @@ pub async fn track_patch_scan_failed(
     fire(
         PatchTelemetryEventType::PatchScanFailed,
         "scan",
-        serde_json::json!({ "fallback_to_proxy": fallback_to_proxy }),
+        patch_scan_failed_metadata(fallback_to_proxy),
         Some(error),
         api_token,
         org_slug,
@@ -690,7 +695,7 @@ pub fn spawn_patch_scan_failed(
     if let Some(prepared) = prepare(
         PatchTelemetryEventType::PatchScanFailed,
         "scan",
-        serde_json::json!({ "fallback_to_proxy": fallback_to_proxy }),
+        patch_scan_failed_metadata(fallback_to_proxy),
         Some(error),
         api_token,
         org_slug,
