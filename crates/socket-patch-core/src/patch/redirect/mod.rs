@@ -29,6 +29,8 @@ use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 
 mod bun_binary;
 pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
+#[cfg(test)]
+mod cargo_lock_equivalence_tests;
 pub mod golang_local;
 #[cfg(test)]
 mod lock_index_equivalence_tests;
@@ -2538,7 +2540,29 @@ fn next_lock_block(content: &str, from: usize) -> Option<(usize, usize)> {
 /// TS rewriter's `(?=\n*$)` lookahead — while the file keeps its newlines).
 fn lock_block_end(content: &str, body_start: usize) -> usize {
     // The next block, or the `[metadata]` / `[[patch.unused]]` tables that
-    // trail the packages.
+    // trail the packages. The trailing tables are searched only up to the
+    // next block: they sit after every `[[package]]` (absent entirely from
+    // v3/v4 locks), and an unbounded search per block scanned to EOF for
+    // every block of every dep. Each marker holds its only `\n` at offset 0,
+    // so a hit starting before the next block also ends by it — the bounded
+    // minimum is the unbounded one.
+    let rest = &content[body_start..];
+    let next_block = rest.find("\n[[package]]").unwrap_or(rest.len());
+    let mut end = ["\n[metadata]", "\n[[patch.unused]]", "\n[patch"]
+        .iter()
+        .filter_map(|marker| rest[..next_block].find(marker))
+        .min()
+        .map_or(body_start + next_block, |rel| body_start + rel);
+    while end > body_start && content.as_bytes()[end - 1] == b'\n' {
+        end -= 1;
+    }
+    end
+}
+
+/// The previous, unbounded [`lock_block_end`], kept as the equivalence
+/// oracle.
+#[cfg(test)]
+fn lock_block_end_unbounded(content: &str, body_start: usize) -> usize {
     let mut end = [
         "\n[[package]]",
         "\n[metadata]",
