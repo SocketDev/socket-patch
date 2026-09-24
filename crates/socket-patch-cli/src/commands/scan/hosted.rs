@@ -6,9 +6,11 @@
 use std::path::Path;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use socket_patch_core::api::types::BatchPackagePatches;
 use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::redirect::DepOverride;
+use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::purl_parts;
 
 use crate::commands::vex::generate_vex_from_manifest_path;
@@ -2476,9 +2478,20 @@ pub(crate) async fn run_redirect_selected(
 
     if !common.dry_run {
         let total = confirmed.len();
-        for (i, (purl, uuid)) in confirmed.iter().enumerate() {
+        // The views are fetched concurrently but consumed in `confirmed`
+        // order, so `records` (newest wins) and `record_warnings` fold
+        // exactly as the serial loop's did.
+        let mut views = std::pin::pin!(ordered_concurrent(
+            confirmed.iter(),
+            api_concurrency(api_client.uses_public_proxy()),
+            |(_, uuid)| api_client.fetch_patch(uuid),
+        ));
+        for (i, (purl, _)) in confirmed.iter().enumerate() {
             status.set(format!("Fetching patch records... ({}/{total})", i + 1));
-            match api_client.fetch_patch(uuid).await {
+            let Some(view) = views.next().await else {
+                break;
+            };
+            match view {
                 Ok(Some(resp)) => {
                     let (rec_purl, record) =
                         crate::commands::get::record_from_patch_response(&resp);
