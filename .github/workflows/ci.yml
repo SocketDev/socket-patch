@@ -1455,7 +1455,7 @@ jobs:
           SOCKET_PATCH_CARGO_E2E_LOCK_VERSION: ${{ matrix.lock }}
         run: |
           set -euo pipefail
-          cargo test -p socket-patch-cli --test e2e_redirect_cargo_build --test e2e_vendor_cargo_build --test mode_migration_cargo
+          cargo test -p socket-patch-cli --test e2e_redirect_cargo_build --test e2e_redirect_cargo_shapes --test e2e_vendor_cargo_build --test mode_migration_cargo
           cargo test -p socket-patch-cli --test e2e_safety_cargo_build -- --ignored
 
   # Manifest `[patch]` + the tagged detached lock (the v5 vendored cargo

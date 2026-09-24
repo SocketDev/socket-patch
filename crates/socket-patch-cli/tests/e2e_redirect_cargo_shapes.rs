@@ -22,6 +22,10 @@
 //! and a post-install `vex` must attest exactly the patches, and finally `remove <purl>` for every patch, which must leave the project
 //! byte-identical to its pre-scan state.
 //!
+//! `SOCKET_PATCH_CARGO_E2E_LOCK_VERSION` / `_TOOLCHAIN` (see
+//! `cargo_e2e_matrix`) re-encode the baseline lock, so a v1 lock's full-id
+//! dependency edges and `[metadata]` checksums meet every shape too.
+//!
 //! Skips (with a println) when `cargo` is missing or crates.io is
 //! unreachable (a failure instead under `SOCKET_PATCH_CARGO_E2E_REQUIRED=1`).
 
@@ -372,6 +376,7 @@ async fn run_shape(shape: Shape) -> Option<()> {
         return None;
     }
     pin_patched_versions(&proj, &home, &shape.patches);
+    cargo_e2e_matrix::apply_lock_version(&proj);
     let build = cargo(&proj, &["build", "-q", "--locked"], &home);
     if !build.status.success() {
         let _ = cargo_e2e_matrix::skip(
