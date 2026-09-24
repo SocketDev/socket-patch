@@ -9,7 +9,7 @@ use toml_edit::DocumentMut;
 
 use super::{DepOverride, FileEdit, RewriteResult, RewriteWarning};
 use crate::utils::poetry_lock::{
-    generated_by_version, lock_version, rewrite_poetry_lock_with_edits,
+    generated_by_version, lock_version, rewrite_poetry_lock_in, PoetryLockParse,
 };
 
 /// Whether the lock was written by a Poetry release older than 1.4. Those
@@ -62,9 +62,13 @@ pub(super) fn rewrite_poetry(
         // lock-version`, which no package rewrite touches: judged once, on the
         // lock as of its first rewrite (where it was always first judged).
         let mut writer_format: Option<Option<&'static str>> = None;
+        // Each lock state is parsed once: a rewrite hands its parsed output
+        // to the next dep.
+        let mut parse = PoetryLockParse::default();
         for &(dep, sha256) in &usable {
             let filename = dep.artifact_url.rsplit('/').next().unwrap_or("");
-            match rewrite_poetry_lock_with_edits(
+            match rewrite_poetry_lock_in(
+                &mut parse,
                 &content,
                 &dep.name,
                 &dep.version,
