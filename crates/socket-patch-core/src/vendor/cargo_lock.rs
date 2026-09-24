@@ -16,7 +16,12 @@
 //! `dependencies` arrays disambiguate with FULL package-id strings
 //! (`"cfg-if 1.0.0 (registry+…)"`); detaching `source`/`checksum` from one
 //! entry dangles those references and breaks `--locked` builds. Vendor
-//! refuses that shape upstream via [`count_lock_entries`].
+//! refuses that shape upstream via [`count_lock_entries`]. Once a copy is
+//! vendored, a user's same-version PATH crate may still be locked beside it
+//! (an untagged sourceless `"<name> <version>"` next to the tagged copy):
+//! every helper here selects entries by [`entry_rank`], so the fork is never
+//! mistaken for the copy, and the restore spells the registry entry by its
+//! full id while the fork shares its name+version.
 //!
 //! The lock is generated-but-committed, so edits are text-preserving
 //! (`toml_edit`): untouched entries, the `@generated` header comment, and the
@@ -114,23 +119,58 @@ pub(crate) async fn read_lock(
     Ok((path, doc))
 }
 
-/// The `[[package]]` table for `name` whose version DENOTES `version` —
-/// the version itself or a Socket-tagged spelling of it (multi-entry
-/// name+version shapes are refused upstream by [`count_lock_entries`]).
-fn find_denoting_mut<'a>(
+/// How strongly a `[[package]]` at `found` (with a `source` or not) is THE
+/// entry Socket's lock edits for `version` (and patch `uuid`, when known)
+/// act on — lower wins, `None` when it does not denote `version` at all:
+///
+/// 0. sourceless at exactly `<version>+socket.<uuid>` (this patch's copy);
+/// 1. sourceless and Socket-tagged for another uuid (another copy);
+/// 2. registry-sourced (the pre-vendor / re-resolved shape);
+/// 3. sourceless and untagged — a copy vendored before tagged versions, or
+///    a user's own same-version path crate: real cargo 1.97 locks a
+///    member's path fork `cfg-if 1.0.4` beside the tagged copy
+///    `cfg-if 1.0.4+socket.<uuid>` (sorted first), so an untagged
+///    sourceless entry is only ever picked when nothing better denotes the
+///    version.
+fn entry_rank(found: &str, sourced: bool, version: &str, uuid: Option<&str>) -> Option<u8> {
+    if !cargo_tag::denotes(found, version) {
+        return None;
+    }
+    Some(match (sourced, cargo_tag::tag_uuid(found)) {
+        (false, Some(tag)) if Some(tag) == uuid => 0,
+        (false, Some(_)) => 1,
+        (true, _) => 2,
+        (false, None) => 3,
+    })
+}
+
+/// Index (into the `[[package]]` array) of the entry for `name` that
+/// [`entry_rank`] picks for `version`/`uuid`; ties keep lock order.
+fn pick_index(doc: &DocumentMut, name: &str, version: &str, uuid: Option<&str>) -> Option<usize> {
+    doc.get("package")?
+        .as_array_of_tables()?
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.get("name").and_then(Item::as_str) == Some(name))
+        .filter_map(|(i, t)| {
+            let found = t.get("version").and_then(Item::as_str)?;
+            entry_rank(found, t.contains_key("source"), version, uuid).map(|r| (r, i))
+        })
+        .min()
+        .map(|(_, i)| i)
+}
+
+/// The `[[package]]` table [`pick_index`] selects.
+fn find_entry_mut<'a>(
     doc: &'a mut DocumentMut,
     name: &str,
     version: &str,
+    uuid: Option<&str>,
 ) -> Option<&'a mut Table> {
+    let idx = pick_index(doc, name, version, uuid)?;
     doc.get_mut("package")?
         .as_array_of_tables_mut()?
-        .iter_mut()
-        .find(|t| {
-            t.get("name").and_then(Item::as_str) == Some(name)
-                && t.get("version")
-                    .and_then(Item::as_str)
-                    .is_some_and(|v| cargo_tag::denotes(v, version))
-        })
+        .get_mut(idx)
 }
 
 /// Replace the entry's `version` value, keeping its formatting.
@@ -218,44 +258,92 @@ pub(crate) fn unused_patches(doc: &DocumentMut) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// How `Cargo.lock` relates to the `[patch]` path copy of `name`@`version`
+/// vendored for patch `uuid` ([`vendored_copy_claim`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CopyClaim<'a> {
+    /// The lock builds this copy.
+    Consumed,
+    /// The lock builds the copy tagged for ANOTHER patch uuid (and none
+    /// tagged for this one): a stale lock, or a `[patch]` override
+    /// elsewhere.
+    OtherTag(&'a str),
+    /// The copy is tagged, but the lock holds only UNTAGGED sourceless
+    /// entries: cargo built some other untagged crate (a config-level
+    /// override, a user path dependency), never this copy.
+    UntaggedOverride,
+    /// No sourceless entry for it, or cargo recorded the patch as
+    /// `[[patch.unused]]`.
+    NotConsumed,
+}
+
 /// Whether the lock BUILDS the `[patch]` path copy of `name`@`version`
-/// vendored for patch `uuid`: it holds a SOURCELESS `[[package]]` for that
-/// name at the copy's tagged version `<version>+socket.<uuid>` — or, for a
-/// copy vendored before tagged versions, at the untagged version — and no
-/// `[[patch.unused]]` entry for it. A sourceless entry tagged for ANOTHER
-/// uuid is another copy's resolution: not this one. A sourceless entry alone
-/// does not prove the copy builds — a path dependency on the user's own
-/// checkout of the crate is sourceless too, and cargo records the `[patch]`
-/// it resolved but left out of the graph as `[[patch.unused]]` (real cargo
-/// 1.97: `serde = { path = "my-serde" }` beside a stale `[patch]` locks a
-/// sourceless serde AND `[[patch.unused]] serde`).
-pub(crate) fn vendored_copy_consumed(
-    pkgs: &[LockedPackage],
+/// vendored for patch `uuid`. `copy_tagged`: the copy's own `Cargo.toml`
+/// carries a Socket version tag (every copy vendored since tagged
+/// versions; `false` for a copy vendored before them, or none on disk).
+///
+/// * a SOURCELESS entry at the tagged version `<version>+socket.<uuid>`
+///   (and no `[[patch.unused]]` for it) is this copy — whatever untagged
+///   sourceless siblings exist (real cargo 1.97 locks a member's own path
+///   dependency on a same-version fork beside the tagged copy);
+/// * otherwise a sourceless entry tagged for ANOTHER uuid is another
+///   copy's resolution → [`CopyClaim::OtherTag`], even beside an untagged
+///   sibling;
+/// * an UNTAGGED sourceless entry is the pre-tag legacy shape only while
+///   the copy is untagged too: cargo locks a tagged copy at its tagged
+///   version, so for a tagged copy the untagged entry is something else
+///   cargo built → [`CopyClaim::UntaggedOverride`].
+///
+/// A sourceless entry alone does not prove the copy builds — a path
+/// dependency on the user's own checkout of the crate is sourceless too,
+/// and cargo records the `[patch]` it resolved but left out of the graph as
+/// `[[patch.unused]]` (real cargo 1.97: `serde = { path = "my-serde" }`
+/// beside a stale `[patch]` locks a sourceless serde AND
+/// `[[patch.unused]] serde`).
+pub(crate) fn vendored_copy_claim<'a>(
+    pkgs: &'a [LockedPackage],
     unused: &[(String, String)],
     name: &str,
     version: &str,
     uuid: &str,
-) -> bool {
-    pkgs.iter().any(|p| {
-        p.name == name
-            && p.source.is_none()
-            && (p.version == version || cargo_tag::split_tag(&p.version) == Some((version, uuid)))
-    }) && !unused
+    copy_tagged: bool,
+) -> CopyClaim<'a> {
+    let mut own = false;
+    let mut other: Option<&'a str> = None;
+    let mut untagged = false;
+    for p in pkgs
         .iter()
-        .any(|(n, v)| n == name && cargo_tag::denotes(v, version))
-}
-
-/// The uuid of the Socket tag on the SOURCELESS `[[package]]` for `name`
-/// that denotes `version`: `Some(None)` for an untagged sourceless entry,
-/// `None` when there is no sourceless entry for it.
-pub(crate) fn detached_tag<'a>(
-    pkgs: &'a [LockedPackage],
-    name: &str,
-    version: &str,
-) -> Option<Option<&'a str>> {
-    pkgs.iter()
-        .find(|p| p.name == name && p.source.is_none() && cargo_tag::denotes(&p.version, version))
-        .map(|p| cargo_tag::tag_uuid(&p.version))
+        .filter(|p| p.name == name && p.source.is_none() && cargo_tag::denotes(&p.version, version))
+    {
+        match cargo_tag::tag_uuid(&p.version) {
+            Some(tag) if tag == uuid => own = true,
+            Some(tag) => {
+                other.get_or_insert(tag);
+            }
+            None => untagged = true,
+        }
+    }
+    let unused_hit = unused
+        .iter()
+        .any(|(n, v)| n == name && cargo_tag::denotes(v, version));
+    if own {
+        return if unused_hit {
+            CopyClaim::NotConsumed
+        } else {
+            CopyClaim::Consumed
+        };
+    }
+    if let Some(tag) = other {
+        return CopyClaim::OtherTag(tag);
+    }
+    if !untagged || unused_hit {
+        return CopyClaim::NotConsumed;
+    }
+    if copy_tagged {
+        CopyClaim::UntaggedOverride
+    } else {
+        CopyClaim::Consumed
+    }
 }
 
 /// A v1 lock: no top-level `version` key and a `[metadata]` table (kept,
@@ -409,7 +497,28 @@ pub async fn detach_lock_entry(
     dry_run: bool,
 ) -> Result<CargoLockOriginal, LockEditError> {
     let (path, mut doc) = read_lock(project_root).await?;
-    let table = find_denoting_mut(&mut doc, name, version).ok_or(LockEditError::EntryMissing)?;
+    // The registry entry is what gets detached (an entry already at the
+    // tagged version beside it then refuses in `ensure_consistent`).
+    let registry = doc
+        .get("package")
+        .and_then(Item::as_array_of_tables)
+        .and_then(|pkgs| {
+            pkgs.iter().position(|t| {
+                t.get("name").and_then(Item::as_str) == Some(name)
+                    && t.contains_key("source")
+                    && t.get("version")
+                        .and_then(Item::as_str)
+                        .is_some_and(|v| cargo_tag::denotes(v, version))
+            })
+        });
+    let table = match registry {
+        Some(idx) => doc
+            .get_mut("package")
+            .and_then(Item::as_array_of_tables_mut)
+            .and_then(|pkgs| pkgs.get_mut(idx)),
+        None => find_entry_mut(&mut doc, name, version, Some(uuid)),
+    }
+    .ok_or(LockEditError::EntryMissing)?;
 
     // A workspace/path/git dependency has no `source` — vendoring it would be
     // wrong (the user already controls those bytes); refuse.
@@ -468,7 +577,10 @@ pub async fn retag_lock_entry(
 }
 
 /// [`retag_lock_entry`] to an explicit `target` spelling of `version`
-/// (tagged or not).
+/// (tagged or not). The entry moved is the one already at `target`, else a
+/// Socket-tagged sourceless one, else the untagged sourceless one
+/// ([`entry_rank`]) — never a user's untagged path fork beside a tagged
+/// copy.
 pub async fn retag_lock_entry_to(
     project_root: &Path,
     name: &str,
@@ -477,7 +589,8 @@ pub async fn retag_lock_entry_to(
     dry_run: bool,
 ) -> Result<Option<String>, LockEditError> {
     let (path, mut doc) = read_lock(project_root).await?;
-    let table = find_denoting_mut(&mut doc, name, version).ok_or(LockEditError::EntryMissing)?;
+    let table = find_entry_mut(&mut doc, name, version, cargo_tag::tag_uuid(target))
+        .ok_or(LockEditError::EntryMissing)?;
     if table.get("source").is_some() {
         return Err(LockEditError::Inconsistent(format!(
             "the entry for {name} {version} still carries a registry source"
@@ -507,7 +620,17 @@ pub async fn retag_lock_entry_to(
 /// dropped), already carries a `source` (cargo/the user re-resolved it), or
 /// is tagged for ANOTHER patch — in which case the lock is left alone and
 /// the caller warns instead of clobbering a newer resolution. An untagged
-/// sourceless entry (vendored before tagged versions) is restored.
+/// sourceless entry (vendored before tagged versions) is restored only when
+/// nothing better denotes the version ([`entry_rank`]).
+///
+/// A user's own same-version path crate locked beside the tagged copy (a
+/// sourceless `"<name> <version>"`, which cargo sorts first) is never
+/// touched: the tagged entry is restored, and since the restored registry
+/// entry then shares its name+version with that sibling, dependents name it
+/// by its full id `"<name> <version> (<source>)"` — exactly the lock cargo
+/// writes for the fork plus the registry crate (real cargo 1.97). A
+/// registry entry for the same source already beside it (a partial
+/// re-resolve) is `Ok(false)`.
 pub async fn restore_lock_entry(
     project_root: &Path,
     name: &str,
@@ -518,7 +641,27 @@ pub async fn restore_lock_entry(
 ) -> Result<bool, LockEditError> {
     let (path, mut doc) = read_lock(project_root).await?;
     let v1 = is_v1_lock(&doc);
-    let Some(table) = find_denoting_mut(&mut doc, name, version) else {
+    let Some(idx) = pick_index(&doc, name, version, Some(uuid)) else {
+        return Ok(false);
+    };
+    // Same-name entries already at the plain `version` besides this one.
+    let siblings: Vec<Option<String>> = doc
+        .get("package")
+        .and_then(Item::as_array_of_tables)
+        .into_iter()
+        .flat_map(|pkgs| pkgs.iter().enumerate())
+        .filter(|(i, t)| {
+            *i != idx
+                && t.get("name").and_then(Item::as_str) == Some(name)
+                && t.get("version").and_then(Item::as_str) == Some(version)
+        })
+        .map(|(_, t)| t.get("source").and_then(Item::as_str).map(str::to_string))
+        .collect();
+    let Some(table) = doc
+        .get_mut("package")
+        .and_then(Item::as_array_of_tables_mut)
+        .and_then(|pkgs| pkgs.get_mut(idx))
+    else {
         return Ok(false);
     };
     if table.get("source").is_some() {
@@ -532,6 +675,13 @@ pub async fn restore_lock_entry(
     if current != version && cargo_tag::tag_uuid(&current) != Some(uuid) {
         return Ok(false);
     }
+    if siblings
+        .iter()
+        .any(|s| s.as_deref() == Some(original.source.as_str()))
+    {
+        return Ok(false);
+    }
+    let ambiguous = !siblings.is_empty();
     set_version(table, version);
 
     table.insert("source", toml_edit::value(original.source.as_str()));
@@ -565,8 +715,9 @@ pub async fn restore_lock_entry(
         }
     }
     // Dependents named the detached entry `"<name> <tagged>"`: back to the
-    // original spelling (v1's full id, v2+'s `"<name> <version>"`).
-    let back = if v1 {
+    // original spelling (v1's full id, v2+'s `"<name> <version>"` — or the
+    // full id too while a same-version sibling makes that ambiguous).
+    let back = if v1 || ambiguous {
         format!("{name} {version} ({})", original.source)
     } else {
         format!("{name} {version}")
@@ -625,6 +776,20 @@ pub enum LockEntryProbe {
 /// read as [`LockEntryProbe::Unreadable`] so callers stay fail-safe (cannot
 /// determine ⇒ keep / stay silent).
 pub async fn probe_lock_entry(project_root: &Path, name: &str, version: &str) -> LockEntryProbe {
+    probe_lock_entry_for(project_root, name, version, None).await
+}
+
+/// [`probe_lock_entry`] for the copy of patch `uuid`: of several entries
+/// denoting the version, the one [`entry_rank`] picks — this patch's tagged
+/// entry, else another Socket-tagged one, else a registry one, else an
+/// untagged sourceless one (so a user's same-version path fork beside the
+/// tagged copy never masks it).
+pub async fn probe_lock_entry_for(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+    uuid: Option<&str>,
+) -> LockEntryProbe {
     let doc = match read_lock(project_root).await {
         Ok((_path, doc)) => doc,
         Err(LockEditError::NoLockfile) => return LockEntryProbe::NoLockfile,
@@ -632,7 +797,10 @@ pub async fn probe_lock_entry(project_root: &Path, name: &str, version: &str) ->
     };
     match locked_packages(&doc)
         .into_iter()
-        .find(|p| p.name == name && cargo_tag::denotes(&p.version, version))
+        .filter(|p| p.name == name)
+        .filter_map(|p| entry_rank(&p.version, p.source.is_some(), version, uuid).map(|r| (r, p)))
+        .min_by_key(|(r, _)| *r)
+        .map(|(_, p)| p)
     {
         None => LockEntryProbe::EntryMissing,
         Some(LockedPackage {
@@ -650,13 +818,27 @@ pub async fn probe_lock_entry(project_root: &Path, name: &str, version: &str) ->
 /// callers refuse to vendor it. A missing/unparseable lock (or one without a
 /// `[[package]]` array) counts zero: the same "no usable lock" treatment as
 /// [`read_locked_versions`].
+///
+/// An untagged sourceless entry beside a Socket-tagged sourceless one does
+/// not count: it is a user's same-version path crate that cargo locks next
+/// to the vendored copy (dependents name each by its distinct version), and
+/// the only lock edits a vendored crate still needs — a retag between tags —
+/// never touch it.
 pub async fn count_lock_entries(project_root: &Path, name: &str, version: &str) -> usize {
     let Ok((_path, doc)) = read_lock(project_root).await else {
         return 0;
     };
-    locked_packages(&doc)
-        .iter()
+    let hits: Vec<LockedPackage> = locked_packages(&doc)
+        .into_iter()
         .filter(|p| p.name == name && cargo_tag::denotes(&p.version, version))
+        .collect();
+    let untagged_detached =
+        |p: &LockedPackage| p.source.is_none() && cargo_tag::tag_uuid(&p.version).is_none();
+    let tagged_detached = hits
+        .iter()
+        .any(|p| p.source.is_none() && cargo_tag::tag_uuid(&p.version).is_some());
+    hits.iter()
+        .filter(|p| !(tagged_detached && untagged_detached(p)))
         .count()
 }
 
@@ -1474,50 +1656,186 @@ mod tests {
         let tagged = format!("1.0.4+socket.{UUID}");
         let other = format!("1.0.4+socket.{UUID2}");
         let none: Vec<(String, String)> = Vec::new();
-        assert!(vendored_copy_consumed(
-            &[pkg(&tagged, None)],
-            &none,
-            "cfg-if",
-            "1.0.4",
-            UUID
-        ));
-        assert!(!vendored_copy_consumed(
-            &[pkg(&other, None)],
-            &none,
-            "cfg-if",
-            "1.0.4",
-            UUID
-        ));
-        assert!(
-            vendored_copy_consumed(&[pkg("1.0.4", None)], &none, "cfg-if", "1.0.4", UUID),
-            "an untagged pre-tag vendor still counts"
+        let claim = |pkgs: &[LockedPackage], unused: &[(String, String)], copy_tagged: bool| {
+            format!(
+                "{:?}",
+                vendored_copy_claim(pkgs, unused, "cfg-if", "1.0.4", UUID, copy_tagged)
+            )
+        };
+        let consumed = format!("{:?}", CopyClaim::Consumed);
+        let not = format!("{:?}", CopyClaim::NotConsumed);
+        let other_tag = format!("{:?}", CopyClaim::OtherTag(UUID2));
+        let override_ = format!("{:?}", CopyClaim::UntaggedOverride);
+        assert_eq!(claim(&[pkg(&tagged, None)], &none, true), consumed);
+        assert_eq!(claim(&[pkg(&other, None)], &none, true), other_tag);
+        assert_eq!(
+            claim(&[pkg("1.0.4", None)], &none, false),
+            consumed,
+            "an untagged pre-tag vendor (untagged copy) still counts"
         );
-        assert!(!vendored_copy_consumed(
-            &[pkg("1.0.4", Some(SOURCE))],
-            &none,
-            "cfg-if",
-            "1.0.4",
-            UUID
-        ));
+        assert_eq!(
+            claim(&[pkg("1.0.4", None)], &none, true),
+            override_,
+            "cargo locks a TAGGED copy at its tagged version: an untagged entry is \
+             something else cargo built"
+        );
+        assert_eq!(claim(&[pkg("1.0.4", Some(SOURCE))], &none, true), not);
+        assert_eq!(claim(&[], &none, false), not);
         let unused = vec![("cfg-if".to_string(), tagged.clone())];
-        assert!(!vendored_copy_consumed(
-            &[pkg(&tagged, None)],
-            &unused,
-            "cfg-if",
-            "1.0.4",
-            UUID
-        ));
-        assert_eq!(
-            detached_tag(&[pkg(&other, None)], "cfg-if", "1.0.4"),
-            Some(Some(UUID2))
+        assert_eq!(claim(&[pkg(&tagged, None)], &unused, true), not);
+        // A user's same-version path fork beside a copy (cargo sorts the
+        // untagged entry first): the tag decides, in either order.
+        for pkgs in [
+            [pkg("1.0.4", None), pkg(&other, None)],
+            [pkg(&other, None), pkg("1.0.4", None)],
+        ] {
+            assert_eq!(claim(&pkgs, &none, true), other_tag, "{pkgs:?}");
+            assert_eq!(claim(&pkgs, &none, false), other_tag, "{pkgs:?}");
+        }
+        for pkgs in [
+            [pkg("1.0.4", None), pkg(&tagged, None)],
+            [pkg(&tagged, None), pkg("1.0.4", None)],
+        ] {
+            assert_eq!(claim(&pkgs, &none, true), consumed, "{pkgs:?}");
+        }
+    }
+
+    /// The lock real cargo 1.97 writes for a workspace whose member `m`
+    /// path-depends on its own same-version fork of cfg-if 1.0.4 while
+    /// `app` builds the vendored copy tagged for `UUID` (the fork sorts
+    /// first) — and, unpatched, the lock cargo writes for the fork plus the
+    /// crates.io crate (dependents then name the registry one by full id).
+    fn fork_locks(v1: bool) -> (String, String) {
+        let tagged = format!("1.0.4+socket.{UUID}");
+        let header = if v1 {
+            ""
+        } else {
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n"
+        };
+        let entries = |app_ref: &str, copy: &str| {
+            format!(
+                "{header}[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"{app_ref}\",\n]\n\n\
+                 [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\n\
+                 [[package]]\nname = \"cfg-if\"\n{copy}\n\
+                 [[package]]\nname = \"m\"\nversion = \"0.1.0\"\ndependencies = [\n \"cfg-if 1.0.4\",\n]\n"
+            )
+        };
+        let patched = entries(
+            &format!("cfg-if {tagged}"),
+            &format!("version = \"{tagged}\"\n"),
         );
-        assert_eq!(
-            detached_tag(&[pkg("1.0.4", None)], "cfg-if", "1.0.4"),
-            Some(None)
+        let unpatched = if v1 {
+            entries(
+                &format!("cfg-if 1.0.4 ({SOURCE})"),
+                &format!("version = \"1.0.4\"\nsource = \"{SOURCE}\"\n"),
+            )
+        } else {
+            entries(
+                &format!("cfg-if 1.0.4 ({SOURCE})"),
+                &format!("version = \"1.0.4\"\nsource = \"{SOURCE}\"\nchecksum = \"{CHECKSUM}\"\n"),
+            )
+        };
+        if v1 {
+            (
+                format!("{patched}\n[metadata]\n"),
+                format!("{unpatched}\n[metadata]\n\"checksum cfg-if 1.0.4 ({SOURCE})\" = \"{CHECKSUM}\"\n"),
+            )
+        } else {
+            (patched, unpatched)
+        }
+    }
+
+    /// A user's same-version path fork locked beside the tagged copy is
+    /// never the entry the probes, a retag or the restore act on: the probe
+    /// sees the copy, the count ignores the fork, a uuid bump moves only the
+    /// copy, a stale uuid's restore is refused, and the restore turns the
+    /// copy back into the registry entry with the full-id reference — the
+    /// exact lock cargo writes without the patch (v4 and v1).
+    #[tokio::test]
+    async fn a_same_version_path_fork_beside_the_copy_is_never_touched() {
+        let orig = CargoLockOriginal {
+            source: SOURCE.to_string(),
+            checksum: Some(CHECKSUM.to_string()),
+        };
+        let tagged = format!("1.0.4+socket.{UUID}");
+        for v1 in [false, true] {
+            let (patched, unpatched) = fork_locks(v1);
+            let dir = lock_dir(&patched).await;
+            let root = dir.path();
+            for uuid in [Some(UUID), None] {
+                assert_eq!(
+                    probe_lock_entry_for(root, "cfg-if", "1.0.4", uuid).await,
+                    LockEntryProbe::Detached(Some(UUID.to_string())),
+                    "v1={v1}"
+                );
+            }
+            assert_eq!(count_lock_entries(root, "cfg-if", "1.0.4").await, 1);
+
+            let prev = retag_lock_entry(root, "cfg-if", "1.0.4", UUID2, false)
+                .await
+                .unwrap();
+            assert_eq!(prev.as_deref(), Some(tagged.as_str()));
+            assert_eq!(read(&dir).await, patched.replace(UUID, UUID2), "v1={v1}");
+            assert!(
+                !restore_lock_entry(root, "cfg-if", "1.0.4", UUID, &orig, false)
+                    .await
+                    .unwrap(),
+                "the lock builds another uuid's copy: not ours to restore"
+            );
+            assert_eq!(read(&dir).await, patched.replace(UUID, UUID2));
+            retag_lock_entry_to(root, "cfg-if", "1.0.4", &tagged, false)
+                .await
+                .unwrap();
+            assert_eq!(read(&dir).await, patched);
+
+            assert!(
+                restore_lock_entry(root, "cfg-if", "1.0.4", UUID, &orig, false)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(read(&dir).await, unpatched, "v1={v1}");
+            assert_eq!(
+                probe_lock_entry(root, "cfg-if", "1.0.4").await,
+                LockEntryProbe::Source(SOURCE.to_string())
+            );
+            assert_eq!(
+                count_lock_entries(root, "cfg-if", "1.0.4").await,
+                2,
+                "registry + fork: a fresh vendor refuses it"
+            );
+            assert!(
+                !restore_lock_entry(root, "cfg-if", "1.0.4", UUID, &orig, false)
+                    .await
+                    .unwrap(),
+                "a second restore finds the registry entry and leaves it"
+            );
+        }
+    }
+
+    /// Only the untagged fork left (the copy's entry is gone) beside the
+    /// registry entry: the restore does not mistake the fork for a pre-tag
+    /// copy.
+    #[tokio::test]
+    async fn restore_never_attaches_the_registry_source_to_a_fork() {
+        let orig = CargoLockOriginal {
+            source: SOURCE.to_string(),
+            checksum: Some(CHECKSUM.to_string()),
+        };
+        let (_, unpatched) = fork_locks(false);
+        let dir = lock_dir(&unpatched).await;
+        assert!(
+            !restore_lock_entry(dir.path(), "cfg-if", "1.0.4", UUID, &orig, false)
+                .await
+                .unwrap()
         );
-        assert_eq!(
-            detached_tag(&[pkg("1.0.4", Some(SOURCE))], "cfg-if", "1.0.4"),
-            None
+        assert_eq!(read(&dir).await, unpatched);
+        assert!(
+            retag_lock_entry(dir.path(), "cfg-if", "1.0.4", UUID, true)
+                .await
+                .is_err(),
+            "the registry entry outranks the fork: nothing sourceless to retag"
         );
     }
 }

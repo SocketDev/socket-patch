@@ -35,9 +35,12 @@ into the new version's section — see docs/releasing.md.
   has build metadata keeps it: `2.0.1+zstd.1.5.2.socket.<uuid>`), and the
   detached `Cargo.lock` entry records that tagged version with no
   `source` / `checksum` — exactly the lock cargo itself writes when it
-  resolves the `[patch]` against the tagged copy (verified on cargo 1.41,
-  1.56 and current stable: `--locked` builds, the patched bytes compile,
-  transitive `^1` / `=1.0.4` dependents resolve to the copy since cargo
+  resolves the `[patch]` against the tagged copy (verified by building on
+  cargo 1.41 in docker and on current stable, and by the CI
+  `cargo-old-toolchains` leg on the 1.41 / 1.56 docker images — a local
+  run without those images only type-checks on rustup toolchains:
+  `--locked` builds, the patched bytes compile, a registry crate that
+  depends on the patched one (`^1`) resolves to the copy too, since cargo
   ignores build metadata when matching requirements, and `cargo metadata`
   reports the tagged version). Every lock reference that spells the old
   version (`"cfg-if 1.0.4"`, v1's `"cfg-if 1.0.4 (registry+…)"`) is
@@ -51,22 +54,40 @@ into the new version's section — see docs/releasing.md.
   `[patch]` override pointing elsewhere changes the locked version). **The
   patched crate sees the tag in `CARGO_PKG_VERSION`** (and in
   `env!("CARGO_PKG_VERSION")`-derived strings such as `--version` output
-  of a vendored binary crate); code that parses its own version with a
-  semver parser is unaffected, code that compares it as a string is not.
-  Re-runs are idempotent; a uuid bump re-tags the copy and the lock;
-  `vendor --revert` / `rollback` / `remove` / GC / the hosted takeover
-  restore the original lock byte for byte (tag dropped with the
-  `source` / `checksum`). Projects vendored before tagged versions (the
-  pre-v5 `.cargo/config*` wiring, or an untagged manifest wiring) are
-  tagged by the next re-run or `repair` (`cargo_version_tagged` note; a
-  tag `repair` cannot write is the `cargo_version_untagged` warning). VEX
+  of a vendored binary crate): requirement matching on it
+  (`semver::VersionReq::matches`) is unaffected, but string comparisons
+  AND equality / ordering on a parsed `semver::Version` see the tag
+  (`semver` 1.x compares build metadata: `1.0.4+socket.<uuid>` is not
+  `== Version::new(1, 0, 4)` and sorts above it). Re-runs are idempotent
+  (a dry run previews the tag as "would tag", and the wet run's
+  `cargo_lock_untaggable` / `cargo_copy_untaggable` refusals); a uuid bump
+  re-tags the copy and the lock; `vendor --revert` / `rollback` /
+  `remove` / GC / the hosted takeover restore the original lock byte for
+  byte (tag dropped with the `source` / `checksum`; a crate vendored
+  before any `Cargo.lock` existed has no originals, so only the tag its
+  first build locked is dropped). A user's own same-version path crate
+  that cargo later locks beside the tagged copy (an untagged sourceless
+  entry) is never mistaken for it: re-runs stay in sync, and the revert
+  restores the registry entry — spelled by its full id while the fork
+  shares its name+version, exactly as cargo writes it — without touching
+  the fork. GC keeps an entry whose lock tag is stale (another uuid) while
+  the manifest still wires this entry's copy: cargo re-locks any unlocked
+  build to the wired copy, and the next re-run retags. Projects vendored
+  before tagged versions (the pre-v5 `.cargo/config*` wiring, or an
+  untagged manifest wiring) are tagged by the next re-run or `repair`
+  (`cargo_version_tagged` note; a tag `repair` cannot write is the
+  `cargo_version_untagged` warning); a whole-tree file inventory recorded
+  for the copy is kept, and still verifies through exactly this uuid's
+  tag, so tagging never re-baselines it over unverified bytes. VEX
   discovery treats the tagged lock version as the primary identity
   (`pkg:cargo/<name>@<version>` is the tag stripped): a detached entry
   tagged for a different uuid than the wiring's copy path is dead wiring
-  (not attested), a tagged entry no visible wiring names is diagnosed
-  unattributable, and an untagged detached entry (vendored before tagged
-  versions) still counts. A patch that edits the crate's own `Cargo.toml`
-  verifies with the tag dropped.
+  (not attested), and so is a copy whose own `Cargo.toml` is tagged for
+  another uuid than its path; a tagged entry no visible wiring names is
+  diagnosed unattributable; an untagged detached entry counts only beside
+  an untagged copy (the pre-tag vendored shape) — beside a tagged copy it
+  is some other crate cargo built, not attested. A patch that edits the
+  crate's own `Cargo.toml` verifies with the tag dropped.
 - **Vendored cargo wiring moved to `Cargo.toml`.** `vendor` / `scan` /
   `get --mode vendored` write the `[patch.crates-io]` path entry into the
   workspace-root `Cargo.toml` (beside the `Cargo.lock` it detaches) instead

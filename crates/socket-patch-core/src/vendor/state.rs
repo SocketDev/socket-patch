@@ -369,6 +369,13 @@ impl Default for VendorState {
 ///     entry is its only home. A re-vendor over already-detached wiring
 ///     records `lock: None` (there was nothing left to detach), and taking
 ///     the fresh entry verbatim would destroy the first run's originals;
+///   * carries forward a cargo copy's whole-tree file inventory when the
+///     fresh entry names the SAME copy (same uuid + artifact path) and
+///     records none — the cargo backend never inventories, and a re-run
+///     that only (re)tags or migrates the wiring of that copy must not
+///     silently downgrade whole-tree verification to the patched members
+///     (the inventory check compares the copy's `Cargo.toml` with this
+///     uuid's tag dropped, so the tag itself still verifies);
 ///   * preserves the go-patch-takeover flag.
 ///
 /// The wiring UNION is scoped to a re-vendor of the SAME patch generation
@@ -387,6 +394,14 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
     entry.took_over_go_patches = entry.took_over_go_patches || prev.took_over_go_patches;
     if entry.lock.is_none() {
         entry.lock = prev.lock.clone();
+    }
+    if entry.ecosystem == "cargo"
+        && prev.ecosystem == "cargo"
+        && entry.artifact.file_inventory.is_none()
+        && prev.uuid == entry.uuid
+        && prev.artifact.path == entry.artifact.path
+    {
+        entry.artifact.file_inventory = prev.artifact.file_inventory.clone();
     }
 
     for rec in &mut entry.wiring {
@@ -734,6 +749,62 @@ mod tests {
         let files: Vec<&str> = fresh.wiring.iter().map(|w| w.file.as_str()).collect();
         assert_eq!(files, vec!["Cargo.toml", "Cargo.lock"]);
         assert_eq!(fresh.lock, Some(orig));
+    }
+
+    /// A cargo re-run that only (re)tags or migrates the SAME copy records
+    /// no inventory (the cargo backend never takes one): the previous
+    /// entry's whole-tree inventory carries forward, so verification is not
+    /// silently downgraded to the patched members. A new uuid or copy path
+    /// is a new tree: nothing carries.
+    #[test]
+    fn carry_forward_keeps_a_cargo_inventory_for_the_same_copy() {
+        let uuid2 = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+        let cargo = |uuid: &str, inventory: Option<BTreeMap<String, String>>| {
+            let mut e = sample_entry();
+            e.ecosystem = "cargo".into();
+            e.base_purl = "pkg:cargo/cfg-if@1.0.4".into();
+            e.uuid = uuid.into();
+            e.wiring.clear();
+            e.artifact.path = format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4");
+            e.artifact.file_inventory = inventory;
+            e
+        };
+        let inventory: BTreeMap<String, String> = [("Cargo.toml".to_string(), "ab".repeat(32))]
+            .into_iter()
+            .collect();
+        let prev = cargo(UUID, Some(inventory.clone()));
+
+        let mut same = cargo(UUID, None);
+        carry_forward_wiring(&prev, &mut same);
+        assert_eq!(same.artifact.file_inventory, Some(inventory.clone()));
+
+        let mut fresh_inventory: BTreeMap<String, String> = BTreeMap::new();
+        fresh_inventory.insert("src/lib.rs".into(), "cd".repeat(32));
+        let mut own = cargo(UUID, Some(fresh_inventory.clone()));
+        carry_forward_wiring(&prev, &mut own);
+        assert_eq!(
+            own.artifact.file_inventory,
+            Some(fresh_inventory),
+            "never overwritten"
+        );
+
+        let mut bumped = cargo(uuid2, None);
+        carry_forward_wiring(&prev, &mut bumped);
+        assert_eq!(
+            bumped.artifact.file_inventory, None,
+            "another uuid: another tree"
+        );
+
+        let mut moved = cargo(UUID, None);
+        moved.artifact.path = format!(".socket/vendor/cargo/{UUID}/cfg-if-1.0.5");
+        carry_forward_wiring(&prev, &mut moved);
+        assert_eq!(moved.artifact.file_inventory, None, "another copy path");
+
+        let mut npm_prev = sample_entry();
+        npm_prev.artifact.file_inventory = Some(inventory);
+        let mut npm = sample_entry();
+        carry_forward_wiring(&npm_prev, &mut npm);
+        assert_eq!(npm.artifact.file_inventory, None, "cargo only");
     }
 
     /// Every spelling `purl_keys` promises: the (possibly qualified,

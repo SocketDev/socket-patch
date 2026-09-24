@@ -1659,8 +1659,11 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                 // here would delete the rebuild, strand the wired pair on a
                 // dead dir, and deterministically re-fail every later
                 // repair — so refresh the inventory from the verified
-                // rebuild instead, loudly.
-                if !from_backend
+                // rebuild instead, loudly. A backend entry whose inventory
+                // is the repaired entry's own (carried forward — the cargo
+                // backend records none) is the same case.
+                if (!from_backend
+                    || check_entry.artifact.file_inventory == c.entry.artifact.file_inventory)
                     && !c.reconstructed
                     && matches!(&health, ArtifactHealth::Corrupt { reason }
                         if reason == "vendor_inventory_mismatch")

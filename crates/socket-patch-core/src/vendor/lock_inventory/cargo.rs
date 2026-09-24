@@ -17,8 +17,11 @@ use super::{dedup_prefer_integrity, LockIntegrity, LockfileEntry, SourceKind};
 /// version carries the `+socket.<uuid>` tag, see `vendor::cargo_tag`) are
 /// skipped, and git/custom-registry sources stay listed for discovery
 /// without a verifier. A version is inventoried under its purl identity:
-/// a Socket tag, should a sourced entry carry one, is stripped. A lock
-/// that is not TOML yields nothing — cargo itself refuses to build from it.
+/// a Socket tag, should a sourced entry carry one (no Socket writer does —
+/// a hand-edited or foreign lock), is stripped, and that entry gets no
+/// verifier (its checksum pins a tagged version no registry serves under
+/// the purl's version). A lock that is not TOML yields nothing — cargo
+/// itself refuses to build from it.
 pub(super) async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     inventory_cargo_lock_raw(project_root)
         .await
@@ -37,6 +40,7 @@ pub(super) async fn inventory_cargo_lock_raw(project_root: &Path) -> Option<Vec<
             continue; // workspace member
         };
         let version = crate::vendor::cargo_tag::strip_tag(&pkg.version).to_string();
+        let tagged = version != pkg.version;
         let Some(purl) = simple_purl("cargo", &pkg.name, &version) else {
             continue;
         };
@@ -45,7 +49,7 @@ pub(super) async fn inventory_cargo_lock_raw(project_root: &Path) -> Option<Vec<
         // The crates.io provenance is recorded exactly where the checksum is
         // kept as the `.crate`'s sha256.
         let (integrity, source_kind) = match pkg.checksum {
-            Some(c) if crates_io && is_hex(&c, 64) => {
+            Some(c) if crates_io && !tagged && is_hex(&c, 64) => {
                 (LockIntegrity::Sha256Hex(c), SourceKind::CratesIo)
             }
             _ => (LockIntegrity::None, SourceKind::Unspecified),

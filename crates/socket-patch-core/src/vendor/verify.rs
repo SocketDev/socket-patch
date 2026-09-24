@@ -105,7 +105,8 @@ pub async fn verify_vendored_patch_record(
         // (missing / extra / modified unpatched files, the stub gemspec).
         // Pre-inventory entries carry `None` and keep member-only behavior.
         if let Some(inventory) = &entry.artifact.file_inventory {
-            verify_dir_inventory(&artifact, inventory).await?;
+            let cargo_uuid = (entry.ecosystem == "cargo").then_some(entry.uuid.as_str());
+            verify_dir_inventory(&artifact, inventory, cargo_uuid).await?;
         }
         return Ok(());
     }
@@ -347,9 +348,17 @@ pub async fn compute_dir_inventory(dir: &Path) -> Result<BTreeMap<String, String
 /// missing, extra and modified files all fail with the
 /// `vendor_inventory_mismatch` routing tag; a tree that cannot be walked
 /// (planted symlink/FIFO, unreadable file) is `vendor_artifact_unreadable`.
+///
+/// `cargo_uuid` (a cargo copy's patch uuid): the copy's root `Cargo.toml`
+/// may ALSO match with its Socket version tag dropped, provided the tag is
+/// exactly `cargo_uuid` — an inventory recorded over a copy vendored
+/// before tagged versions keeps verifying once a re-run / repair tags it,
+/// while every other byte (including any other tag) stays pinned. So the
+/// tag step never re-baselines the inventory over bytes nobody verified.
 async fn verify_dir_inventory(
     dir: &Path,
     inventory: &BTreeMap<String, String>,
+    cargo_uuid: Option<&str>,
 ) -> Result<(), String> {
     let actual = compute_dir_inventory(dir)
         .await
@@ -357,13 +366,37 @@ async fn verify_dir_inventory(
     if actual.len() != inventory.len() {
         return Err("vendor_inventory_mismatch".to_string());
     }
+    let untagged_manifest = match cargo_uuid {
+        Some(uuid) => untagged_manifest_sha256(dir, uuid).await,
+        None => None,
+    };
     for (rel, recorded) in inventory {
         match actual.get(rel) {
             Some(live) if live.eq_ignore_ascii_case(recorded) => {}
+            Some(_)
+                if rel == "Cargo.toml"
+                    && untagged_manifest
+                        .as_deref()
+                        .is_some_and(|h| h.eq_ignore_ascii_case(recorded)) => {}
             _ => return Err("vendor_inventory_mismatch".to_string()),
         }
     }
     Ok(())
+}
+
+/// Plain sha256 of the cargo copy manifest `<dir>/Cargo.toml` with its
+/// Socket tag dropped — `None` unless the manifest is tagged for exactly
+/// `uuid`.
+async fn untagged_manifest_sha256(dir: &Path, uuid: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let text = crate::utils::fs::read_regular_to_string(&dir.join("Cargo.toml"))
+        .await
+        .ok()?;
+    if super::cargo_tag::manifest_tag_uuid(&text).as_deref() != Some(uuid) {
+        return None;
+    }
+    super::cargo_tag::untagged_manifest_bytes(text.as_bytes())
+        .map(|b| hex::encode(Sha256::digest(&b)))
 }
 
 /// Classified health of one ledger entry's committed artifact, for
@@ -660,6 +693,76 @@ mod tests {
             ArtifactHealth::Corrupt {
                 reason: "vendor_sha256_mismatch".into()
             }
+        );
+    }
+
+    /// A cargo copy's inventory taken before tagged versions keeps
+    /// verifying once its `Cargo.toml` carries THIS entry's tag (the check
+    /// drops exactly that tag); a tag for another uuid, a drifted byte in
+    /// the manifest beside the tag, or the same tag on a non-cargo entry all
+    /// fail.
+    #[tokio::test]
+    async fn cargo_inventory_accepts_only_this_uuids_manifest_tag() {
+        const OTHER: &str = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/cargo/{UUID}/cfg-if-1.0.4");
+        let dir = root.join(&rel);
+        tokio::fs::create_dir_all(dir.join("src")).await.unwrap();
+        tokio::fs::write(dir.join("src/lib.rs"), PATCHED)
+            .await
+            .unwrap();
+        let untagged = "[package]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n";
+        tokio::fs::write(dir.join("Cargo.toml"), untagged)
+            .await
+            .unwrap();
+
+        let rec = record(UUID, "package/src/lib.rs");
+        let mut ent = entry("cargo", UUID, &rel);
+        ent.base_purl = "pkg:cargo/cfg-if@1.0.4".into();
+        ent.artifact.file_inventory = Some(compute_dir_inventory(&dir).await.unwrap());
+        assert!(verify_vendored_patch_record(root, &ent, &rec).await.is_ok());
+
+        let tagged = |uuid: &str| untagged.replace("1.0.4", &format!("1.0.4+socket.{uuid}"));
+        tokio::fs::write(dir.join("Cargo.toml"), tagged(UUID))
+            .await
+            .unwrap();
+        assert!(
+            verify_vendored_patch_record(root, &ent, &rec).await.is_ok(),
+            "this uuid's tag verifies"
+        );
+
+        for (why, text) in [
+            ("another uuid's tag", tagged(OTHER)),
+            (
+                "drift beside the tag",
+                tagged(UUID) + "build = \"build.rs\"\n",
+            ),
+        ] {
+            tokio::fs::write(dir.join("Cargo.toml"), text)
+                .await
+                .unwrap();
+            assert_eq!(
+                verify_vendored_patch_record(root, &ent, &rec)
+                    .await
+                    .unwrap_err(),
+                "vendor_inventory_mismatch",
+                "{why}"
+            );
+        }
+
+        tokio::fs::write(dir.join("Cargo.toml"), tagged(UUID))
+            .await
+            .unwrap();
+        let rec_gem = record(UUID, "src/lib.rs");
+        let mut gem = entry("gem", UUID, &rel);
+        gem.artifact.file_inventory = ent.artifact.file_inventory.clone();
+        assert_eq!(
+            verify_vendored_patch_record(root, &gem, &rec_gem)
+                .await
+                .unwrap_err(),
+            "vendor_inventory_mismatch",
+            "the tag allowance is cargo's alone"
         );
     }
 

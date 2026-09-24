@@ -41,7 +41,12 @@
 //! `cargo-old-toolchains` CI leg). Also: a
 //! URL-spelled crates.io `[patch]` table is refused, an ancestor-directory
 //! config entry cannot silently shadow the vendored copy, and the pre-v5
-//! multi-version overwrite is healed by a re-run and by `repair`.
+//! multi-version overwrite is healed by a re-run and by `repair`. TRANSITIVE:
+//! a registry crate (`log 0.4.14`) that depends on the patched one follows
+//! the tag in every lock format (v1's full-id reference is rewritten) and
+//! links the patched copy under `--locked --offline`. REPAIR INVENTORY: a
+//! recorded whole-tree inventory carried onto a tagged rebuild is refreshed
+//! from the verified rebuild (`vendor_inventory_refreshed`), never deleted.
 //!
 //! A get-driven twin (`cargo_get_uuid_vendored_fresh_checkout_locked_build`,
 //! v3.6) reaches the same committed state through `get <uuid> --mode
@@ -360,6 +365,16 @@ fn find_registry_crate(cargo_home: &Path, leaf: &str) -> Option<PathBuf> {
 /// when the toolchain/network makes the fixture impossible (caller skips;
 /// `tag` names the calling test in the skip message).
 fn stage_fixture(tmp: &Path, tag: &str) -> Option<(PathBuf, PathBuf, String, PathBuf)> {
+    stage_fixture_with(tmp, tag, "")
+}
+
+/// [`stage_fixture`] with `extra_deps` (TOML lines) appended to the
+/// consumer's `[dependencies]`.
+fn stage_fixture_with(
+    tmp: &Path,
+    tag: &str,
+    extra_deps: &str,
+) -> Option<(PathBuf, PathBuf, String, PathBuf)> {
     let proj = tmp.join("proj");
     let cargo_home = tmp.join("cargo-home");
     std::fs::create_dir_all(proj.join("src")).unwrap();
@@ -367,7 +382,7 @@ fn stage_fixture(tmp: &Path, tag: &str) -> Option<(PathBuf, PathBuf, String, Pat
     std::fs::write(
         proj.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{DEP} = \"1.0\"\n"
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{DEP} = \"1.0\"\n{extra_deps}"
         ),
     )
     .unwrap();
@@ -1433,6 +1448,200 @@ fn cargo_vendor_two_versions_of_one_crate_locked_build() {
     );
     assert_eq!(std::fs::read(proj.join("Cargo.lock")).unwrap(), lock_before);
     assert!(!proj.join(".socket/vendor").exists());
+}
+
+/// TRANSITIVE: the patched crate is also a dependency of a REGISTRY crate
+/// (`log 0.4.14` requires `cfg-if ^1.0`) — the usual real-world shape. The
+/// registry crate's own `dependencies` entry must follow the tag (a v1
+/// lock spells it `"cfg-if <v> (registry+…)"`, the form the detach
+/// rewrites to `"cfg-if <tagged>"`), so under every
+/// `SOCKET_PATCH_CARGO_E2E_LOCK_VERSION` the lock names no untagged
+/// cfg-if, `cargo run --locked --offline` links the patched bytes for both
+/// dependents, the lock is byte-stable across the build, and the revert
+/// restores it byte-identically.
+#[test]
+fn cargo_vendor_transitive_registry_dependent_locked_build() {
+    if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (transitive)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, cargo_home, version, crate_dir)) =
+        stage_fixture_with(tmp.path(), "transitive", "log = \"=0.4.14\"\n")
+    else {
+        return;
+    };
+    let purl = format!("pkg:cargo/{DEP}@{version}");
+    let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    stage_patch(&proj, &purl, "src/lib.rs", &orig, &patched);
+    let lock_before = std::fs::read(proj.join("Cargo.lock")).unwrap();
+    let manifest_before = std::fs::read(proj.join("Cargo.toml")).unwrap();
+    let log_before = package_block(&String::from_utf8_lossy(&lock_before), "log")
+        .expect("the fixture locks log");
+    assert!(
+        log_before.contains(&format!("\"{DEP}")),
+        "the registry crate depends on {DEP}:\n{log_before}"
+    );
+
+    let env = vendor_ok(&proj, &cargo_home, "transitive");
+    assert_eq!(env["summary"]["failed"], 0, "{env}");
+    assert_tagged(&proj, &version, UUID, "transitive");
+    let lock = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
+    let t = tagged(&version, UUID);
+    for stale in [
+        format!("\"{DEP} {version}\""),
+        format!("\"{DEP} {version} ("),
+    ] {
+        assert!(
+            !lock.contains(&stale),
+            "no dependency still names the untagged {DEP} ({stale}):\n{lock}"
+        );
+    }
+    let log_after = package_block(&lock, "log").unwrap();
+    if cargo_e2e_matrix::lock_format(&lock) == 1 {
+        assert!(
+            log_after.contains(&format!("\"{DEP} {t}\"")),
+            "v1: the registry crate's full-id reference follows the tag:\n{log_after}"
+        );
+    } else {
+        assert_eq!(
+            log_after, log_before,
+            "v2+: a plain-name reference needs nothing"
+        );
+    }
+
+    std::fs::write(proj.join("src/main.rs"), ORACLE_MAIN).unwrap();
+    let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
+    assert!(
+        run.status.success()
+            && String::from_utf8_lossy(&run.stdout).contains(&oracle_line(&version, UUID)),
+        "the patched copy must be linked for the direct AND the transitive dependent.\n\
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("Cargo.lock")).unwrap(),
+        lock,
+        "the tagged lock is byte-stable across the locked build"
+    );
+    assert_eq!(metadata_version(&proj, &cargo_home), t);
+    assert_eq!(
+        lock.matches(&format!("name = \"{DEP}\"\n")).count(),
+        1,
+        "one {DEP} in the graph — the tagged copy — so log builds it too:\n{lock}"
+    );
+
+    std::fs::write(proj.join("src/main.rs"), "fn main() {}\n").unwrap();
+    revert_ok(&proj, &cargo_home, "transitive");
+    assert_eq!(std::fs::read(proj.join("Cargo.lock")).unwrap(), lock_before);
+    assert_eq!(
+        std::fs::read(proj.join("Cargo.toml")).unwrap(),
+        manifest_before
+    );
+    assert!(!proj.join(".socket/vendor").exists());
+}
+
+/// Plain-sha256 inventory of every file under `dir` (forward-slashed
+/// relative paths) — the ledger's `fileInventory` shape.
+fn dir_inventory(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+    fn walk(base: &Path, dir: &Path, out: &mut serde_json::Map<String, serde_json::Value>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let digest = hex::encode(Sha256::digest(std::fs::read(&path).unwrap()));
+                out.insert(rel, serde_json::Value::String(digest));
+            }
+        }
+    }
+    let mut out = serde_json::Map::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// `repair` over a pre-tag cargo vendor whose ledger carries a whole-tree
+/// inventory of ANOTHER build source's tree (an extra file the local
+/// rebuild does not reproduce) and whose copy is gone: the rebuild (tagged,
+/// with its lock retag) comes back from the backend as a fresh entry with
+/// the recorded inventory carried forward, the patched members verify, and
+/// the tree mismatch is refreshed from the verified rebuild
+/// (`vendor_inventory_refreshed`) — never a deleted rebuild stranding the
+/// wiring on a dead dir. The result builds `--locked --offline`.
+#[test]
+fn cargo_repair_refreshes_a_carried_inventory_over_a_verified_rebuild() {
+    if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (repair-inventory)") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, cargo_home, version, crate_dir)) =
+        stage_fixture(tmp.path(), "repair-inventory")
+    else {
+        return;
+    };
+    let purl = format!("pkg:cargo/{DEP}@{version}");
+    let copy_rel = format!(".socket/vendor/cargo/{UUID}/{DEP}-{version}");
+    let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    stage_patch(&proj, &purl, "src/lib.rs", &orig, &patched);
+    vendor_ok(&proj, &cargo_home, "repair-inventory");
+    untag_project(&proj, &version, UUID);
+
+    let copy = proj.join(&copy_rel);
+    std::fs::write(copy.join("PREBUILT_STUB"), "service-only file\n").unwrap();
+    let recorded = dir_inventory(&copy);
+    let state_path = proj.join(".socket/vendor/state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    state["entries"][purl.as_str()]["artifact"]["fileInventory"] =
+        serde_json::Value::Object(recorded.clone());
+    std::fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    std::fs::remove_dir_all(&copy).unwrap();
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "repair",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        &cargo_home,
+    );
+    assert_eq!(
+        code, 0,
+        "repair failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("vendor_inventory_refreshed"), "{stdout}");
+    assert!(stdout.contains("cargo_version_tagged"), "{stdout}");
+    assert_tagged(&proj, &version, UUID, "repair-inventory");
+    assert_eq!(std::fs::read(copy.join("src/lib.rs")).unwrap(), patched);
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let inventory = state["entries"][purl.as_str()]["artifact"]["fileInventory"]
+        .as_object()
+        .unwrap_or_else(|| panic!("the refreshed inventory is persisted: {state}"));
+    assert!(!inventory.contains_key("PREBUILT_STUB"), "{inventory:?}");
+    assert_eq!(
+        inventory,
+        &dir_inventory(&copy),
+        "the verified rebuild's tree"
+    );
+
+    std::fs::write(proj.join("src/main.rs"), ORACLE_MAIN).unwrap();
+    let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains(&oracle_line(&version, UUID)),
+        "the repaired copy builds: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 /// Turn the v5 wiring of `proj` into what a pre-v5 release wrote: the

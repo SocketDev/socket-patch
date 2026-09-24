@@ -1171,10 +1171,18 @@ fn cargo_vendored_a_attests_every_flavor_without_manifest_or_ledgers() {
 #[test]
 fn cargo_vendored_a_attests_in_every_lock_version() {
     let api = Api::start(vec![(U, cargo_view(U))]);
+    let copy_toml = format!("{}/Cargo.toml", cargo_artifact(U));
+    let copy_at = |v: &str| format!("[package]\nname = \"{CRATE}\"\nversion = \"{v}\"\n");
     for version in 1..=4u8 {
         let fx = Fx::new();
         write_cargo_vendored(&fx, U, CargoVendored::Inline, PATCHED_RS);
-        for locked in [tagged_version(U), CRATE_VERSION.to_string()] {
+        // The tagged copy + tagged lock (v5), and the pre-tag shape: an
+        // untagged copy with its untagged lock entry.
+        for (copy, locked) in [
+            (tagged_version(U), tagged_version(U)),
+            (CRATE_VERSION.to_string(), CRATE_VERSION.to_string()),
+        ] {
+            fx.put(&copy_toml, copy_at(&copy));
             fx.put("Cargo.lock", cargo_lock_at(version, &locked, ""));
             let run = fx.vex(&["--proxy-url", &api.uri()]);
             assert_attested(
@@ -1183,10 +1191,41 @@ fn cargo_vendored_a_attests_in_every_lock_version() {
                 CARGO_PURL,
                 U,
                 "vendored",
-                &format!("lock v{version} at {locked}"),
+                &format!("lock v{version} at {locked}, copy at {copy}"),
             );
             assert!(warning_codes(&run).is_empty(), "v{version}: {}", run.env);
         }
+        // A TAGGED copy beside an untagged lock entry: cargo locks the copy
+        // at its tagged version, so the untagged entry is some other crate
+        // cargo built — never attested, and explained.
+        fx.put(&copy_toml, copy_at(&tagged_version(U)));
+        fx.put("Cargo.lock", cargo_lock_at(version, CRATE_VERSION, ""));
+        let run = fx.vex(&["--proxy-url", &api.uri()]);
+        assert_nothing_discovered(
+            &run,
+            &format!("lock v{version}: tagged copy, untagged lock"),
+        );
+        assert!(
+            warning_codes(&run)
+                .iter()
+                .any(|c| c == "patched_ref_invalid"),
+            "v{version}: {}",
+            run.env
+        );
+        // A copy whose own Cargo.toml is tagged for ANOTHER uuid than its
+        // path names is dead wiring, whatever the lock says.
+        fx.put(&copy_toml, copy_at(&tagged_version(OTHER_U)));
+        fx.put("Cargo.lock", cargo_lock_at(version, &tagged_version(U), ""));
+        let run = fx.vex(&["--proxy-url", &api.uri()]);
+        assert!(
+            run.doc.is_none()
+                && warning_codes(&run)
+                    .iter()
+                    .any(|c| c == "patched_ref_invalid"),
+            "v{version}: copy tagged for another uuid: {}",
+            run.env
+        );
+        fx.put(&copy_toml, copy_at(&tagged_version(U)));
 
         fx.put(
             "Cargo.lock",
@@ -1206,7 +1245,8 @@ fn cargo_vendored_a_attests_in_every_lock_version() {
 /// f: a detached lock entry tagged for ANOTHER patch uuid names a copy
 /// other than the one the `[patch]` points at (a config override elsewhere,
 /// or a stale wiring): never attested — in any lock format, with or
-/// without the ledger.
+/// without the ledger (a vendor ledger entry for the wired copy is dead
+/// evidence too: the lock does not build it).
 #[test]
 fn cargo_vendored_f_lock_tag_for_another_uuid_never_attests() {
     let api = Api::start(vec![(U, cargo_view(U)), (OTHER_U, cargo_view(OTHER_U))]);
@@ -1219,6 +1259,32 @@ fn cargo_vendored_f_lock_tag_for_another_uuid_never_attests() {
         );
         let run = fx.vex(&["--proxy-url", &api.uri()]);
         assert_nothing_discovered(&run, &format!("lock v{version} tagged for another uuid"));
+
+        write_vendor_ledger(
+            &fx,
+            "cargo",
+            CARGO_PURL,
+            U,
+            &cargo_artifact(U),
+            Some(cargo_record(U)),
+            &[
+                ("Cargo.toml", "cargo_patch_entry"),
+                ("Cargo.lock", "cargo_lock_entry"),
+            ],
+        );
+        for extra in [&["--offline"][..], &["--proxy-url", &api.uri()][..]] {
+            let run = fx.vex(extra);
+            assert!(
+                run.doc.is_none(),
+                "lock v{version} tagged for another uuid, ledger for U, {extra:?}: {}",
+                run.env
+            );
+            assert!(
+                run.code != Some(0) && run.env["status"] != "success",
+                "lock v{version}, ledger, {extra:?}: nothing attested: {}",
+                run.env
+            );
+        }
     }
 }
 

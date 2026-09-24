@@ -93,8 +93,9 @@ pub fn denotes(found: &str, version: &str) -> bool {
 pub enum TagError {
     /// Not TOML.
     Unparseable(String),
-    /// No `[package] version` string literal (a workspace-inherited or
-    /// missing version: never a crates.io-published manifest).
+    /// No `[package]` (or legacy `[project]`) version string literal (a
+    /// workspace-inherited or missing version: never a crates.io-published
+    /// manifest).
     NoVersion,
     /// The manifest names another version than the copy is for.
     VersionMismatch(String),
@@ -130,9 +131,11 @@ impl std::fmt::Display for TagError {
 /// literal (quotes included) and the quote character.
 fn version_literal(text: &str) -> Result<(String, std::ops::Range<usize>, char), TagError> {
     let doc = toml_edit::Document::parse(text).map_err(|e| TagError::Unparseable(e.to_string()))?;
-    let item = doc
-        .get("package")
-        .and_then(toml_edit::Item::as_table_like)
+    // `[project]` is the legacy spelling of `[package]` cargo still accepts
+    // (crates published before manifest normalization ship it verbatim).
+    let item = ["package", "project"]
+        .iter()
+        .find_map(|table| doc.get(table).and_then(toml_edit::Item::as_table_like))
         .and_then(|p| p.get("version"))
         .ok_or(TagError::NoVersion)?;
     let value = item.as_str().ok_or(TagError::NoVersion)?.to_string();
@@ -373,6 +376,20 @@ mod tests {
             tag_manifest_text("[package\n", "1.0.4", UUID),
             Err(TagError::Unparseable(_))
         ));
+    }
+
+    /// Cargo still accepts the legacy `[project]` table, and crates.io
+    /// uploads that predate manifest normalization ship it verbatim.
+    #[test]
+    fn manifest_tag_reads_the_legacy_project_table() {
+        let text = "[project]\nname = \"x\"\nversion = \"0.1.2\"\n";
+        let tagged = tag_manifest_text(text, "0.1.2", UUID).unwrap().unwrap();
+        assert_eq!(
+            tagged,
+            format!("[project]\nname = \"x\"\nversion = \"0.1.2+socket.{UUID}\"\n")
+        );
+        assert_eq!(manifest_tag_uuid(&tagged).as_deref(), Some(UUID));
+        assert_eq!(untag_manifest_text(&tagged).as_deref(), Some(text));
     }
 
     #[test]

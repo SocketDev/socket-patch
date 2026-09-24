@@ -240,16 +240,26 @@ version = "1.0.4+socket.<uuid>"
   rewritten with it, in lock formats v1–v4; a lock that cannot be kept
   consistent refuses with `cargo_lock_untaggable` before any write.
   **The patched crate sees the tag in `CARGO_PKG_VERSION`** — e.g. a
-  vendored binary crate's `--version` output shows it; semver-parsing code
-  is unaffected. Revert restores the original lock byte for byte. Copies
-  and locks vendored before tagged versions are tagged by the next re-run
-  or `repair` (`cargo_version_tagged`).
+  vendored binary crate's `--version` output shows it; requirement
+  matching (`semver::VersionReq`) is unaffected, but string comparisons
+  and equality / ordering on a parsed `semver::Version` (which compares
+  build metadata) see it. Revert restores the original lock byte for
+  byte — including when you later lock your own same-version path crate
+  beside the copy: that entry is left alone and the registry entry comes
+  back under its full id, as cargo writes it. Copies and locks vendored
+  before tagged versions are tagged by the next re-run or `repair`
+  (`cargo_version_tagged`; a dry run says "would tag"). For VEX, an
+  untagged detached lock entry counts only beside an untagged (pre-tag)
+  copy, and a copy whose `Cargo.toml` is tagged for another uuid than its
+  path is dead wiring.
 - **Why the manifest.** Socket's scanners already ingest `Cargo.toml`, so
   the patch uuid in the path is recoverable for SBOM annotation without
   uploading `.cargo/config*` (which can hold registry tokens), and manifest
   `[patch]` builds on cargo older than 1.56, the floor of config-file
-  `[patch]` (proven by the old-toolchain e2e tests on cargo 1.41 in docker,
-  which builds and runs the patched copy with no network, and on 1.56).
+  `[patch]` (proven by the old-toolchain e2e tests, which build and run
+  the patched copy with no network on the cargo 1.41 and 1.56 docker
+  images — the CI `cargo-old-toolchains` leg; without the images a local
+  run falls back to type-checking on rustup toolchains).
   Two vendored versions of ONE crate need `cargo build --offline` on 1.56,
   and on older cargo (1.41) a populated crates.io index in `$CARGO_HOME`
   (or network access) — it loads the index to tell the two entries apart.

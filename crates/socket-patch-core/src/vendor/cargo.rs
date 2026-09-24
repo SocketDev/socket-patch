@@ -80,23 +80,26 @@ async fn is_vendored(project_root: &Path, name: &str, version: &str) -> bool {
 ///   socket-patch takeover) → `Some(false)` — the committed copy is NOT what
 ///   the lock consumes, so GC may reclaim the entry (its revert restores /
 ///   keeps the registry resolution and drops the dead `[patch]` wiring);
-/// * entry detached but TAGGED for another patch uuid → `Some(false)` (the
-///   lock builds another generation's copy);
-/// * entry detached (tagged for this entry's uuid, or untagged — vendored
-///   before tagged versions) AND a Socket-owned `[patch.crates-io]` entry
-///   (root manifest, or a legacy project-config one) points at THIS entry's
-///   committed copy → `Some(true)` (the wired vendored shape);
+/// * entry detached (tagged for any uuid, or untagged — vendored before
+///   tagged versions) AND a Socket-owned `[patch.crates-io]` entry (root
+///   manifest, or a legacy project-config one) points at THIS entry's
+///   committed copy → `Some(true)` (the wired vendored shape). A lock tag
+///   for ANOTHER uuid is then only stale (a checkout/merge of the lock from
+///   another patch generation): cargo re-locks any unlocked build to this
+///   copy, and the vendor hot path retags it — reclaiming the entry would
+///   leave the stale tag with no provider and silently build pristine
+///   crates.io bytes;
 /// * detached but the `[patch]` points elsewhere / is gone → `Some(false)`
-///   (nothing consumes the copy; the revert re-attaches the recorded
-///   registry originals, repairing the half-wired lock);
+///   (nothing consumes the copy — a lock tagged for another uuid builds
+///   that generation's copy; the revert re-attaches the recorded registry
+///   originals, repairing the half-wired lock);
 /// * no readable lock → `None` (cannot determine — callers keep, fail-safe).
 pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     let (name, version) = parse_cargo_purl(&entry.base_purl)?;
-    match cargo_lock::probe_lock_entry(project_root, name, version).await {
+    match cargo_lock::probe_lock_entry_for(project_root, name, version, Some(&entry.uuid)).await {
         cargo_lock::LockEntryProbe::NoLockfile | cargo_lock::LockEntryProbe::Unreadable => None,
         cargo_lock::LockEntryProbe::EntryMissing => Some(false),
         cargo_lock::LockEntryProbe::Source(_) => Some(false),
-        cargo_lock::LockEntryProbe::Detached(Some(tag)) if tag != entry.uuid => Some(false),
         cargo_lock::LockEntryProbe::Detached(_) => {
             let marker = vendor_uuid_dir_rel("cargo", &entry.uuid)?;
             let wired = socket_patch_paths(project_root, name)
@@ -564,6 +567,10 @@ pub async fn vendor_cargo_crate(
     // already detached — exactly the shape this run produces.
     let prior_socket_copy = socket_copy_present(project_root, name, version).await;
 
+    // Wiring (manifest or legacy config) already points at THIS copy.
+    let points_here = prior_manifest_path.as_deref() == Some(copy_rel.as_str())
+        || legacy_paths.contains(&copy_rel);
+
     // A patch with no files is meaningless: no-op success, nothing wired.
     if record.files.is_empty() {
         return done(
@@ -597,6 +604,57 @@ pub async fn vendor_cargo_crate(
         if !legacy_paths.is_empty() {
             dry_warnings.push(migration_warning(project_root, name, version, true).await);
         }
+        // Preview the wet run's lock edit — unless a live hosted redirect
+        // still owns the lock entry: the wet run reverts it from the
+        // redirect ledger first, so its lock is not this one.
+        if hosted_redirect_residue(project_root, name, version)
+            .await
+            .is_none()
+        {
+            let (lock_probe, refusal) =
+                lock_tag_preflight(project_root, name, version, &record.uuid).await;
+            if let Some(refusal) = refusal {
+                return refusal;
+            }
+            // The hot path (re)tags a copy + detached lock vendored before
+            // tagged versions (or for another uuid): say so, and prove the
+            // copy takes the tag. A missing / stale copy is rebuilt tagged
+            // by the wet run, so only its lock retag is previewed.
+            if points_here
+                && matches!(
+                    lock_probe,
+                    cargo_lock::LockEntryProbe::Detached(_)
+                        | cargo_lock::LockEntryProbe::NoLockfile
+                )
+            {
+                let would_tag = if cargo_copy_matches(&copy_dir, &record.files).await {
+                    tag_vendored_copy(
+                        project_root,
+                        name,
+                        version,
+                        &record.uuid,
+                        &copy_dir,
+                        false,
+                        true,
+                    )
+                    .await
+                } else {
+                    Ok(matches!(
+                        &lock_probe,
+                        cargo_lock::LockEntryProbe::Detached(tag)
+                            if tag.as_deref() != Some(record.uuid.as_str())
+                    ))
+                };
+                match would_tag {
+                    Ok(true) => dry_warnings.push(tag_warning(name, version, &record.uuid, true)),
+                    Ok(false) => {}
+                    Err(e) => {
+                        result.success = false;
+                        result.error = Some(e);
+                    }
+                }
+            }
+        }
         return done(result, None, dry_warnings);
     }
 
@@ -624,38 +682,10 @@ pub async fn vendor_cargo_crate(
         );
     }
 
-    // Wiring (manifest or legacy config) already points at THIS copy.
-    let points_here = prior_manifest_path.as_deref() == Some(copy_rel.as_str())
-        || legacy_paths.contains(&copy_rel);
-
-    // The lock edit this run will make (a registry entry is detached and
-    // tagged; a detached one — an earlier generation, or vendored before
-    // tagged versions — is retagged) must be consistent: prove it before
-    // anything is written.
-    let lock_probe = cargo_lock::probe_lock_entry(project_root, name, version).await;
-    let preflight = match &lock_probe {
-        cargo_lock::LockEntryProbe::Source(_) => {
-            cargo_lock::detach_lock_entry(project_root, name, version, &record.uuid, true)
-                .await
-                .err()
-        }
-        cargo_lock::LockEntryProbe::Detached(tag)
-            if tag.as_deref() != Some(record.uuid.as_str()) =>
-        {
-            cargo_lock::retag_lock_entry(project_root, name, version, &record.uuid, true)
-                .await
-                .err()
-        }
-        _ => None,
-    };
-    if let Some(e @ LockEditError::Inconsistent(_)) = preflight {
-        return refused(
-            LOCK_UNTAGGABLE,
-            format!(
-                "cannot tag the Cargo.lock entry for {name}@{version} with the vendored \
-                 copy's version: {e}"
-            ),
-        );
+    let (lock_probe, lock_refusal) =
+        lock_tag_preflight(project_root, name, version, &record.uuid).await;
+    if let Some(refusal) = lock_refusal {
+        return refusal;
     }
 
     // Hot path: the wiring points here and the lock entry needs no detach
@@ -1180,10 +1210,12 @@ async fn cargo_copy_matches(
 /// Tag the committed copy at `copy_dir` and its DETACHED lock entry for
 /// `uuid` (an untagged copy vendored before tagged versions, or one tagged
 /// for a previous uuid). `Ok(true)` when anything changed (or, with
-/// `dry_run`, would). The lock retag is proven first; a failed lock write
-/// untags the copy again when this call tagged it (or `untag_on_failure`:
-/// the caller just rebuilt it tagged) so copy and lock never disagree.
-/// A missing lock needs no edit (the first build locks the tagged copy).
+/// `dry_run`, would — the dry run proves both edits, lock and copy
+/// manifest, writing nothing). The lock retag is proven first; a failed
+/// lock write untags the copy again when this call tagged it (or
+/// `untag_on_failure`: the caller just rebuilt it tagged) so copy and lock
+/// never disagree. A missing lock needs no edit (the first build locks the
+/// tagged copy).
 async fn tag_vendored_copy(
     project_root: &Path,
     name: &str,
@@ -1194,7 +1226,7 @@ async fn tag_vendored_copy(
     dry_run: bool,
 ) -> Result<bool, String> {
     let lock_retag = matches!(
-        cargo_lock::probe_lock_entry(project_root, name, version).await,
+        cargo_lock::probe_lock_entry_for(project_root, name, version, Some(uuid)).await,
         cargo_lock::LockEntryProbe::Detached(tag) if tag.as_deref() != Some(uuid)
     );
     if lock_retag {
@@ -1205,8 +1237,13 @@ async fn tag_vendored_copy(
             ));
         }
     }
-    let copy_retag = cargo_tag::copy_manifest_tag(copy_dir).await.as_deref() != Some(uuid);
     if dry_run {
+        let text = read_regular_to_string(&copy_dir.join("Cargo.toml"))
+            .await
+            .map_err(|e| format!("{COPY_UNTAGGABLE}: the copy's Cargo.toml: {e}"))?;
+        let copy_retag = cargo_tag::tag_manifest_text(&text, version, uuid)
+            .map_err(|e| format!("{COPY_UNTAGGABLE}: {e}"))?
+            .is_some();
         return Ok(lock_retag || copy_retag);
     }
     let copy_changed = cargo_tag::tag_copy_manifest(copy_dir, version, uuid)
@@ -1224,6 +1261,44 @@ async fn tag_vendored_copy(
         }
     }
     Ok(copy_changed || lock_retag)
+}
+
+/// The lock edit a vendor run makes (a registry entry is detached and
+/// tagged; a detached one — an earlier generation, or vendored before
+/// tagged versions — is retagged) must be consistent: prove it read-only
+/// before anything is written. Returns the probe and, when the edit cannot
+/// be made consistently, the [`LOCK_UNTAGGABLE`] refusal.
+async fn lock_tag_preflight(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+    uuid: &str,
+) -> (cargo_lock::LockEntryProbe, Option<VendorOutcome>) {
+    let probe = cargo_lock::probe_lock_entry_for(project_root, name, version, Some(uuid)).await;
+    let preflight = match &probe {
+        cargo_lock::LockEntryProbe::Source(_) => {
+            cargo_lock::detach_lock_entry(project_root, name, version, uuid, true)
+                .await
+                .err()
+        }
+        cargo_lock::LockEntryProbe::Detached(tag) if tag.as_deref() != Some(uuid) => {
+            cargo_lock::retag_lock_entry(project_root, name, version, uuid, true)
+                .await
+                .err()
+        }
+        _ => None,
+    };
+    let refusal = match preflight {
+        Some(e @ LockEditError::Inconsistent(_)) => Some(refused(
+            LOCK_UNTAGGABLE,
+            format!(
+                "cannot tag the Cargo.lock entry for {name}@{version} with the vendored \
+                 copy's version: {e}"
+            ),
+        )),
+        _ => None,
+    };
+    (probe, refusal)
 }
 
 /// The [`VERSION_TAGGED`] advisory.
@@ -1493,8 +1568,13 @@ pub async fn socket_wiring_present(project_root: &Path, name: &str, version: &st
 ///   `cargo_version_untagged` warning, nothing else undone).
 ///
 /// `Ok(Some((entry, warnings)))` is the updated ledger entry (the
-/// `cargo_patch_entry` record names `Cargo.toml`; a recorded file
-/// inventory is refreshed over the tagged copy); `Ok(None)` when there is
+/// `cargo_patch_entry` record names `Cargo.toml`). A recorded file
+/// inventory is KEPT as is: it was taken over the untagged copy, and the
+/// inventory check accepts the copy's `Cargo.toml` with exactly this
+/// entry's tag dropped (`verify::verify_vendored_patch_record`) — so the
+/// tag step never re-baselines the inventory over bytes nobody verified,
+/// and a copy that drifted before it was tagged still fails verification.
+/// `Ok(None)` when there is
 /// nothing to do; `Err` when the manifest cannot take the entry (nothing
 /// was changed).
 pub async fn migrate_legacy_wiring(
@@ -1522,7 +1602,7 @@ pub async fn migrate_legacy_wiring(
         .any(|(_, p)| cargo_manifest::normalize_socket_path(&p).as_deref() == Some(&copy_rel));
     let unwired_here = !legacy_here
         && matches!(
-            cargo_lock::probe_lock_entry(project_root, name, version).await,
+            cargo_lock::probe_lock_entry_for(project_root, name, version, Some(&entry.uuid)).await,
             cargo_lock::LockEntryProbe::Detached(_)
         )
         && !socket_wiring_present(project_root, name, version).await
@@ -1561,13 +1641,7 @@ pub async fn migrate_legacy_wiring(
         )
         .await
         {
-            Ok(true) => {
-                warnings.push(tag_warning(name, version, &entry.uuid, dry_run));
-                if !dry_run && migrated.artifact.file_inventory.is_some() {
-                    migrated.artifact.file_inventory =
-                        super::verify::compute_dir_inventory(&copy_dir).await.ok();
-                }
-            }
+            Ok(true) => warnings.push(tag_warning(name, version, &entry.uuid, dry_run)),
             Ok(false) => {}
             Err(e) => warnings.push(VendorWarning::new(
                 "cargo_version_untagged",
@@ -1770,6 +1844,26 @@ pub async fn revert_cargo_vendor_opts(
                     error: Some(format!("failed to restore the Cargo.lock entry: {e}")),
                 }
             }
+        }
+    } else if matches!(
+        cargo_lock::probe_lock_entry_for(project_root, name, version, Some(&entry.uuid)).await,
+        cargo_lock::LockEntryProbe::Detached(Some(ref tag)) if *tag == entry.uuid
+    ) {
+        // Vendored before any Cargo.lock existed (no originals recorded):
+        // the first build then locked the tagged copy. Drop the tag, back
+        // to the untagged sourceless entry such a vendor always left — an
+        // unlocked build re-resolves it, and a hosted takeover finds it by
+        // its version; a tag nothing provides would do neither.
+        if let Err(e) =
+            cargo_lock::retag_lock_entry_to(project_root, name, version, version, dry_run).await
+        {
+            out.warnings.push(VendorWarning::new(
+                "lock_restore_skipped",
+                format!(
+                    "the Cargo.lock entry for {name}@{version} keeps the tagged version of \
+                     the removed copy ({e}); re-lock it with `cargo update -p {name}`"
+                ),
+            ));
         }
     }
 
@@ -5348,8 +5442,9 @@ mod tests {
     }
 
     /// `repair`'s migration step tags an untagged copy + lock (dry run
-    /// writes nothing), and refreshes a recorded file inventory over the
-    /// tagged copy.
+    /// writes nothing) and KEEPS a recorded file inventory: it still
+    /// verifies over the tagged copy (the check drops exactly this uuid's
+    /// tag from `Cargo.toml`), so nothing is re-baselined.
     #[tokio::test]
     async fn repair_migration_tags_an_untagged_vendor() {
         let (dir, blobs, pristine, record) = fixture().await;
@@ -5385,29 +5480,81 @@ mod tests {
         assert_eq!(warnings[0].code, VERSION_TAGGED);
         assert!(lock_text(root).await.contains(&tagged(UUID)));
         assert!(copy_toml(root).await.contains(&tagged(UUID)));
-        assert_ne!(
-            migrated.artifact.file_inventory,
-            entry.artifact.file_inventory
-        );
         assert_eq!(
-            migrated.artifact.file_inventory,
-            Some(
-                crate::vendor::verify::compute_dir_inventory(&root.join(copy_rel()))
-                    .await
-                    .unwrap()
-            )
+            migrated.artifact.file_inventory, entry.artifact.file_inventory,
+            "the recorded inventory is kept, never re-baselined"
         );
+        crate::vendor::verify::verify_vendored_patch_record(root, &migrated, &record)
+            .await
+            .expect("the kept inventory verifies through this uuid's tag");
         assert!(migrate_legacy_wiring(&migrated, root, false)
             .await
             .unwrap()
             .is_none());
     }
 
-    /// A lock whose detached entry is tagged for ANOTHER uuid while the
-    /// wiring points at this copy is retagged by a re-run; GC sees the
-    /// other-tagged lock as not consuming this entry's copy.
+    /// A copy that drifted BEFORE it was tagged (an unpatched file edited,
+    /// or one planted) still fails the inventory check after the migration
+    /// tags it; so does a copy manifest tagged for another uuid.
     #[tokio::test]
-    async fn stale_tag_is_retagged_and_gc_sees_it_unconsumed() {
+    async fn repair_migration_never_launders_pre_tag_drift() {
+        for drift in ["manifest", "planted", "other_tag"] {
+            let (dir, blobs, pristine, record) = fixture().await;
+            let root = dir.path();
+            let (_, entry, _) =
+                expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+            let mut entry = entry.unwrap();
+            untag_project(root).await;
+            let copy = root.join(copy_rel());
+            entry.artifact.file_inventory = Some(
+                crate::vendor::verify::compute_dir_inventory(&copy)
+                    .await
+                    .unwrap(),
+            );
+            match drift {
+                "manifest" => {
+                    let text = copy_toml(root).await + "build = \"build.rs\"\n";
+                    tokio::fs::write(copy.join("Cargo.toml"), text)
+                        .await
+                        .unwrap();
+                }
+                "planted" => {
+                    tokio::fs::write(copy.join("build.rs"), "fn main() {}\n")
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+            let (migrated, _) = migrate_legacy_wiring(&entry, root, false)
+                .await
+                .unwrap()
+                .unwrap();
+            if drift == "other_tag" {
+                let text = copy_toml(root).await.replace(UUID, UUID2);
+                tokio::fs::write(copy.join("Cargo.toml"), text)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                migrated.artifact.file_inventory,
+                entry.artifact.file_inventory
+            );
+            let err = crate::vendor::verify::verify_vendored_patch_record(root, &migrated, &record)
+                .await
+                .expect_err(drift);
+            assert!(err.contains("vendor_inventory_mismatch"), "{drift}: {err}");
+        }
+    }
+
+    /// A lock whose detached entry is tagged for ANOTHER uuid while the
+    /// wiring points at this copy (a lock checked out from another patch
+    /// generation) is only stale: cargo re-locks an unlocked build to the
+    /// wired copy, so GC keeps the entry (reclaiming it would leave the
+    /// stale tag with no provider and build pristine crates.io bytes), the
+    /// other uuid's entry — wired nowhere — is reclaimable, and a re-run
+    /// retags the lock.
+    #[tokio::test]
+    async fn stale_tag_is_retagged_and_gc_keeps_the_wired_entry() {
         let (dir, blobs, pristine, record) = fixture().await;
         let root = dir.path();
         let (_, entry, _) =
@@ -5418,7 +5565,12 @@ mod tests {
         tokio::fs::write(root.join("Cargo.lock"), &stale)
             .await
             .unwrap();
-        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(false));
+        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(true));
+        assert_eq!(
+            vendored_entry_in_use(&ledger_entry_for(UUID2), root).await,
+            Some(false),
+            "the lock's uuid is wired nowhere"
+        );
 
         let (result, _, warnings) =
             expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
@@ -5471,7 +5623,8 @@ mod tests {
     }
 
     /// A lock the tag cannot be written into consistently (a v1 `replace`
-    /// naming the crate) refuses before anything is written.
+    /// naming the crate) refuses before anything is written — the dry run
+    /// previews the same refusal.
     #[tokio::test]
     async fn untaggable_lock_refuses_before_writing() {
         let (dir, blobs, pristine, record) = fixture().await;
@@ -5486,10 +5639,12 @@ mod tests {
             .await
             .unwrap();
         let manifest = tokio::fs::read(root.join("Cargo.toml")).await.unwrap();
-        expect_refused(
-            run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
-            LOCK_UNTAGGABLE,
-        );
+        for dry_run in [true, false] {
+            expect_refused(
+                run_vendor(PURL, root, &blobs, &pristine, &record, dry_run).await,
+                LOCK_UNTAGGABLE,
+            );
+        }
         assert_eq!(lock_text(root).await, lock);
         assert_eq!(
             tokio::fs::read(root.join("Cargo.toml")).await.unwrap(),
@@ -5529,5 +5684,250 @@ mod tests {
         let out = revert_cargo_vendor(&entry.unwrap(), root, false).await;
         assert!(out.success, "{:?}", out.error);
         assert_eq!(lock_text(root).await, lock);
+    }
+
+    /// Vendored before any Cargo.lock existed (no originals recorded), then
+    /// the first build locked the tagged copy: the revert drops the tag,
+    /// back to the untagged sourceless entry such a vendor always left (an
+    /// unlocked build re-resolves it; a hosted takeover finds it). A dry run
+    /// writes nothing.
+    #[tokio::test]
+    async fn revert_without_originals_drops_the_first_builds_tag() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        tokio::fs::remove_file(root.join("Cargo.lock"))
+            .await
+            .unwrap();
+        let (result, entry, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(warnings.iter().any(|w| w.code == "no_lockfile"));
+        let entry = entry.unwrap();
+        assert_eq!(entry.lock, None);
+        let first_build = format!(
+            "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+             dependencies = [\n \"cfg-if\",\n]\n\n[[package]]\nname = \"cfg-if\"\nversion = \"{}\"\n",
+            tagged(UUID)
+        );
+        tokio::fs::write(root.join("Cargo.lock"), &first_build)
+            .await
+            .unwrap();
+
+        let dry = revert_cargo_vendor(&entry, root, true).await;
+        assert!(dry.success && dry.warnings.is_empty(), "{dry:?}");
+        assert_eq!(lock_text(root).await, first_build);
+
+        let out = revert_cargo_vendor(&entry, root, false).await;
+        assert!(out.success && out.warnings.is_empty(), "{out:?}");
+        assert_eq!(
+            lock_text(root).await,
+            first_build.replace(&tagged(UUID), "1.0.4")
+        );
+        assert!(!root.join(".socket/vendor").exists());
+    }
+
+    /// The same, when another uuid's tag is locked (not this entry's
+    /// copy): left alone.
+    #[tokio::test]
+    async fn revert_without_originals_leaves_another_uuids_tag() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        tokio::fs::remove_file(root.join("Cargo.lock"))
+            .await
+            .unwrap();
+        let (_, entry, _) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        let other = format!(
+            "version = 4\n\n[[package]]\nname = \"cfg-if\"\nversion = \"{}\"\n",
+            tagged(UUID2)
+        );
+        tokio::fs::write(root.join("Cargo.lock"), &other)
+            .await
+            .unwrap();
+        let out = revert_cargo_vendor(&entry.unwrap(), root, false).await;
+        assert!(out.success, "{out:?}");
+        assert_eq!(lock_text(root).await, other);
+    }
+
+    /// The lock real cargo 1.97 writes once a workspace member path-depends
+    /// on its own same-version fork of the vendored crate: the fork's
+    /// untagged sourceless entry sorts before the tagged copy.
+    fn lock_with_fork(copy_version: &str, app_ref: &str) -> String {
+        format!(
+            "# This file is automatically @generated by Cargo.\n\
+             # It is not intended for manual editing.\n\
+             version = 4\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"{app_ref}\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\n\
+             [[package]]\nname = \"cfg-if\"\n{copy_version}\n\
+             [[package]]\nname = \"m\"\nversion = \"0.1.0\"\ndependencies = [\n \"cfg-if 1.0.4\",\n]\n"
+        )
+    }
+
+    /// A same-version path fork locked beside the vendored copy after the
+    /// vendor: re-runs stay in sync (no `locked_multi_source_conflict`), GC
+    /// sees the copy in use, and the revert restores the REGISTRY entry
+    /// (spelled by its full id beside the fork) — never the fork — leaving
+    /// exactly the lock cargo writes for the fork plus crates.io.
+    #[tokio::test]
+    async fn a_user_path_fork_beside_the_copy_survives_rerun_and_revert() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let (_, entry, _) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        let entry = entry.unwrap();
+        let t = tagged(UUID);
+        let with_fork = lock_with_fork(&format!("version = \"{t}\"\n"), &format!("cfg-if {t}"));
+        tokio::fs::write(root.join("Cargo.lock"), &with_fork)
+            .await
+            .unwrap();
+        assert_eq!(vendored_entry_in_use(&entry, root).await, Some(true));
+
+        let (result, again, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(again.is_none() && warnings.is_empty(), "{warnings:?}");
+        assert_eq!(lock_text(root).await, with_fork);
+
+        let out = revert_cargo_vendor(&entry, root, false).await;
+        assert!(out.success && out.warnings.is_empty(), "{out:?}");
+        assert_eq!(
+            lock_text(root).await,
+            lock_with_fork(
+                &format!("version = \"1.0.4\"\nsource = \"{SOURCE}\"\nchecksum = \"{CHECKSUM}\"\n"),
+                &format!("cfg-if 1.0.4 ({SOURCE})"),
+            )
+        );
+    }
+
+    /// Dry runs preview the wet run's tag work: `would tag` for an
+    /// untagged vendor (nothing written), and the wet run's refusals — a
+    /// lock the tag cannot be written into, a copy manifest that cannot
+    /// take it.
+    #[tokio::test]
+    async fn dry_runs_preview_the_tag_edit_and_its_refusals() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        untag_project(root).await;
+        let lock = lock_text(root).await;
+        let copy = copy_toml(root).await;
+        let (result, entry, warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, true).await);
+        assert!(result.success && entry.is_none(), "{:?}", result.error);
+        let tag = warnings
+            .iter()
+            .find(|w| w.code == VERSION_TAGGED)
+            .unwrap_or_else(|| panic!("{warnings:?}"));
+        assert!(tag.detail.starts_with("would tag"), "{tag:?}");
+        assert_eq!(lock_text(root).await, lock, "dry run writes nothing");
+        assert_eq!(copy_toml(root).await, copy);
+
+        // A copy manifest that names another version cannot take the tag.
+        tokio::fs::write(
+            root.join(copy_rel()).join("Cargo.toml"),
+            copy.replace("1.0.4", "1.0.5"),
+        )
+        .await
+        .unwrap();
+        let (result, _, _) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, true).await);
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(COPY_UNTAGGABLE)),
+            "{:?}",
+            result.error
+        );
+        let (wet, _, _) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(!wet.success, "the wet run fails the same way");
+        assert_eq!(lock_text(root).await, lock);
+    }
+
+    /// A pristine crate whose `Cargo.toml` cannot take the tag
+    /// (a workspace-inherited version) fails the local build with
+    /// `cargo_copy_untaggable`: nothing is swapped in, no stage or vendor
+    /// dir survives, and the manifest and lock are untouched. The same
+    /// crate from the patch service is a MISS: auto mode falls back to the
+    /// local build.
+    #[tokio::test]
+    async fn an_untaggable_copy_manifest_swaps_nothing_in() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        tokio::fs::write(
+            pristine.join("Cargo.toml"),
+            "[package]\nname = \"cfg-if\"\nversion.workspace = true\n",
+        )
+        .await
+        .unwrap();
+        let manifest = tokio::fs::read(root.join("Cargo.toml")).await.unwrap();
+        let (result, entry, _) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(!result.success && entry.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(COPY_UNTAGGABLE)),
+            "{:?}",
+            result.error
+        );
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "no copy, stage or husk"
+        );
+        assert_eq!(lock_text(root).await, lock_body());
+        assert_eq!(
+            tokio::fs::read(root.join("Cargo.toml")).await.unwrap(),
+            manifest
+        );
+
+        // Service crate untaggable, pristine fine: auto falls back.
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let crate_tgz = make_crate_tgz(
+            "cfg-if-1.0.4",
+            &[
+                (
+                    "Cargo.toml",
+                    b"[package]\nname = \"cfg-if\"\nversion.workspace = true\n",
+                ),
+                ("src/lib.rs", PATCHED),
+            ],
+        );
+        let sri = sri_sha512(&crate_tgz);
+        let server = wiremock::MockServer::start().await;
+        mount_cargo_granted(&server, &sri, &crate_tgz).await;
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        let (result, entry, warnings) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_layout_mismatch"
+                    && w.detail.contains("cannot tag its version")),
+            "{warnings:?}"
+        );
+        assert!(
+            copy_toml(root).await.contains(&tagged(UUID)),
+            "the local build"
+        );
+        assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
     }
 }

@@ -695,6 +695,96 @@ async fn vendored_then_hosted_takeover_leaves_pure_hosted() {
     );
 }
 
+// ── no-lock vendor → first build → hosted takeover ─────────────────────────
+// Vendored before any Cargo.lock existed, the ledger records no lock
+// originals; the first build then locks the TAGGED copy. The takeover's
+// revert must drop that tag (back to the untagged sourceless entry), so the
+// redirect finds the crate by its version and the project ends fully hosted
+// and `--locked`-buildable — not a lock naming a tagged version nothing
+// provides.
+#[tokio::test(flavor = "multi_thread")]
+async fn lockless_vendor_then_first_build_then_hosted_takeover() {
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path()) else {
+        return;
+    };
+    let purl = format!("pkg:cargo/{DEP}@{version}");
+    let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    stage_patch(&proj, &purl, &orig, &patched);
+    std::fs::remove_file(proj.join("Cargo.lock")).unwrap();
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        &cargo_home,
+    );
+    assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
+    assert!(stdout.contains("no_lockfile"), "{stdout}");
+    assert_build_ok(
+        "first build (locks the tagged copy)",
+        &cargo(&proj, &["build", "--offline"], &cargo_home),
+    );
+    assert_lock_version(&proj, &tagged(&version, UUID_V), "first build");
+
+    let server = MockServer::start().await;
+    let crate_bytes =
+        build_patched_crate(&tmp.path().join("stage"), &crate_dir, &version, &patched);
+    mount_hosted_mocks(&server, &purl, &version, &crate_bytes, &orig, &patched).await;
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+        &cargo_home,
+    );
+    assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
+    assert!(
+        stdout.contains("redirect_takeover_reverted_vendored"),
+        "takeover warning missing: {stdout}"
+    );
+    assert!(
+        !stdout.contains("redirect_cargo_lock_pkg_not_found"),
+        "the reverted lock names the crate by its version: {stdout}"
+    );
+    assert_eq!(envelope["redirect"]["redirected"], 1, "{stdout}");
+    assert_lock_version(&proj, &version, "lockless vendor -> hosted");
+    let lock_block = package_block(&read(&proj, "Cargo.lock"), DEP).unwrap_or_default();
+    assert!(
+        lock_block.contains("sparse+"),
+        "lock points hosted: {lock_block}"
+    );
+
+    let (fresh, home) = fresh_checkout(&proj, tmp.path(), "lockless");
+    assert_build_ok(
+        "cargo fetch --locked",
+        &cargo(&fresh, &["fetch", "--locked"], &home),
+    );
+    assert_build_ok(
+        "cargo build --locked",
+        &cargo(&fresh, &["build", "--locked"], &home),
+    );
+}
+
 // ── C2 / C7: hosted → vendored takeover via the plain `vendor` command ──────
 // The primary migration entry point must revert the hosted edits first (from
 // the redirect ledger), surface the takeover, leave the project PURELY
