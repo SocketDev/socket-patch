@@ -2592,6 +2592,13 @@ pub(crate) async fn run_redirect_selected(
                     }
                 }
             }
+            // Dedup against the ledger as this run found it, never within
+            // this run: one run legitimately records identical edits (a
+            // Cargo.toml declaring the crate with the same line in two
+            // sections), and each one reverts one occurrence — collapsing
+            // them made `remove` leave the second pin (and its registry
+            // block) in place while reporting success.
+            let recorded = ledger.edits.len();
             for edit in &rewrite.edits {
                 let is_rebased = REBASE_KINDS.contains(&edit.kind.as_str())
                     && rebased.iter().any(|&t| {
@@ -2601,7 +2608,7 @@ pub(crate) async fn run_redirect_selected(
                             && old.key == edit.key
                             && old.new == edit.new
                     });
-                if !is_rebased && !ledger.edits.contains(edit) {
+                if !is_rebased && !ledger.edits[..recorded].contains(edit) {
                     ledger.edits.push(edit.clone());
                 }
             }

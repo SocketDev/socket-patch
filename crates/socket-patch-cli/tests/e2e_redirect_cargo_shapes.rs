@@ -13,6 +13,8 @@
 //! * `workspace_direct_member` — a virtual workspace whose root pins
 //!   `[workspace.dependencies]`, one member inheriting and one declaring the
 //!   crate itself: both members build against the patched copy.
+//! * `two_sections` — the same declaration line in `[dependencies]` and
+//!   `[dev-dependencies]`: both pins revert on `remove`.
 //! * `direct_and_transitive` — the crate is also a dependency of another
 //!   crates.io crate: hosted mode refuses it loudly and rewrites nothing.
 //!
@@ -774,6 +776,35 @@ async fn cargo_hosted_config_trailing_bytes_are_restored() {
             return;
         }
     }
+}
+
+/// The crate declared with the SAME line in two dependency sections: the
+/// rewrite records two identical manifest edits, and the ledger must keep
+/// both — it collapsed them, so `remove` reverted one pin, kept the other
+/// (and the registry block it references) and still reported success.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_same_line_in_two_sections_removes_cleanly() {
+    let shape = Shape {
+        tag: "two-sections",
+        files: vec![
+            (
+                "Cargo.toml",
+                format!(
+                    "{}\n[dev-dependencies]\ncfg-if = \"1.0.4\"\n",
+                    consumer_manifest("cfg-if = \"1.0.4\"\n")
+                ),
+            ),
+            ("src/main.rs", "fn main() {}\n".to_string()),
+        ],
+        patches: vec![CFG_IF_1],
+        oracle: vec![(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
+        )],
+        crlf: false,
+        refused: None,
+    };
+    let _ = run_shape(shape).await;
 }
 
 /// Bug F: a workspace member's own declaration must be pinned too.
