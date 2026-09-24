@@ -6574,6 +6574,11 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
                 "evil-9.9-py3-none-any.whl",
                 "six-6.6.6-py3-none-any.whl",
             ] {
+                // Windows rejects a newline in a filename, so the forged
+                // file cannot exist there to tempt the reuse path.
+                if cfg!(windows) && leaf.contains('\n') {
+                    continue;
+                }
                 let fx = flavor_fixture(&[]).await;
                 let registry = snap(&fx).await;
                 let _ = first_run(&fx, None).await;

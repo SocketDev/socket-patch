@@ -165,8 +165,12 @@ pub async fn vendor_go_module(
     }
     // After the hot path (as in cargo.rs): an in-sync re-run acquires
     // nothing, so `--vendor-source service --offline` must not refuse it.
-    if let Some(refusal) = service_offline_conflict(service) {
-        return refusal;
+    // Gated on `copy_was_ok` rather than the return above so a dry run of an
+    // in-sync module previews the same success the real run reports.
+    if !copy_was_ok {
+        if let Some(refusal) = service_offline_conflict(service) {
+            return refusal;
+        }
     }
 
     // Acquire the patched module: prefer the prebuilt module zip from the patch
@@ -2035,6 +2039,40 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         assert!(entry.is_none(), "in sync: nothing recorded");
         assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(tokio::fs::read(root.join("go.mod")).await.unwrap(), gomod);
+    }
+
+    /// Dry-run parity for the case above: previewing an in-sync re-run under
+    /// `--offline` + `--vendor-source service` predicts success, not the
+    /// refusal the real run never raises.
+    #[tokio::test]
+    async fn offline_service_mode_in_sync_dry_run_is_not_refused() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let (result, _, _) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let gomod = tokio::fs::read(root.join("go.mod")).await.unwrap();
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            true,
+            false,
+            Some(&go_service_cfg(
+                "http://127.0.0.1:1",
+                VendorSource::Service,
+                true,
+            )),
+        )
+        .await;
+        let (result, entry, _) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "a dry run records nothing");
         assert_eq!(tokio::fs::read(root.join("go.mod")).await.unwrap(), gomod);
     }
 
