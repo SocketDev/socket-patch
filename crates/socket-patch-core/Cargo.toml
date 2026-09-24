@@ -45,9 +45,12 @@ self-replace = { workspace = true }
 # sha2 0.10 compiles its aarch64 SHA-256 hardware path only under the `asm`
 # feature (x86/x86_64 already select SHA-NI at runtime without it); the
 # soft fallback is 3-5x slower on every git-sha256 in apply, verify and
-# vendor. The digests are identical. Windows-on-ARM is left on the soft
-# path: the feature also builds sha2-asm, whose GNU-syntax assembly the
-# MSVC toolchain does not assemble.
+# vendor. The digests are identical. The hardware path is sha2's own
+# in-crate intrinsics (runtime-detected, soft fallback on CPUs without the
+# crypto extension); the feature also builds and links sha2-asm, which
+# aarch64 never calls — sha2 0.11 needs neither the feature nor a C
+# toolchain for it. Windows-on-ARM is left on the soft path: sha2-asm's
+# GNU-syntax assembly does not assemble under the MSVC toolchain.
 [target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
 sha2 = { workspace = true, features = ["asm"] }
 
