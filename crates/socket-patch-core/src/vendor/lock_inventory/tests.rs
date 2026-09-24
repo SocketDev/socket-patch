@@ -930,6 +930,34 @@ async fn yarn_berry_registry_resolutions_inventory_with_checksums() {
     assert!(!entries.iter().any(|e| e.name == "fixture"), "{entries:?}");
 }
 
+/// yarn berry writes a CRLF `yarn.lock` on Windows (a new lockfile gets
+/// `os.EOL`), and editors add a BOM: the Windows spellings — header-less
+/// too — inventory exactly like the LF lock, with no stray `\r` riding into
+/// a checksum pin.
+#[tokio::test]
+async fn yarn_berry_crlf_and_bom_locks_inventory_like_their_lf_twin() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "yarn.lock", YARN_BERRY).await;
+    let (_, lf) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    let headerless = YARN_BERRY.trim_start_matches(|c| c != '_');
+    for lock in [
+        YARN_BERRY.replace('\n', "\r\n"),
+        format!("\u{feff}{}", YARN_BERRY.replace('\n', "\r\n")),
+        format!("\u{feff}{}", headerless.replace('\n', "\r\n")),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "yarn.lock", &lock).await;
+        let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+        assert_eq!(flavor, NpmLockFlavor::YarnBerry, "{lock:?}");
+        assert_eq!(sorted_pairs(&entries), sorted_pairs(&lf), "{lock:?}");
+        assert_eq!(
+            entry(&entries, "left-pad").integrity,
+            LockIntegrity::BerryChecksum("10c0/deadbeefcafe==".into()),
+            "no stray \\r in the pin: {lock:?}"
+        );
+    }
+}
+
 // ── bun ───────────────────────────────────────────────────────────────
 
 const BUN_LOCK: &str = r#"{

@@ -27,6 +27,17 @@
 //! the package.json edit is unwound when the lock write fails — a resolutions
 //! entry without its lock counterpart would make a plain `yarn install`
 //! re-resolve and rewrite the lock underneath the user.
+//!
+//! Line endings: yarn writes a file it creates with `os.EOL` — so on Windows
+//! BOTH files are CRLF (a fresh `yarn.lock`, and a `package.json` it first
+//! pretty-prints) — and keeps each file's majority ending on every later
+//! write; a `core.autocrlf` checkout makes them CRLF on any OS. The lock
+//! entry is spliced in the file's own terminator and `package.json` is
+//! re-serialized in its own layout ([`JsonLayout`]: BOM, indent, terminator,
+//! trailing newline), so vendor + revert round-trip both byte-exactly. A
+//! file mixing CRLF and LF is refused before any write
+//! (`vendor_yarn_berry_mixed_line_endings`, see
+//! [`refuse_mixed_line_endings`]); a revert never refuses on line endings.
 
 use std::path::Path;
 
@@ -39,11 +50,12 @@ use crate::patch::apply::{normalize_file_path, PatchSources};
 use crate::utils::fs::{
     atomic_write_bytes_preserving_mode, read_regular_to_bytes, read_regular_to_string,
 };
+use crate::utils::line_endings::LineEndings;
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::utils::uri::encode_uri_component;
 
 use super::berry_zip::berry_cache_checksum_10c0;
-use super::common::{already_patched_result, detect_eol, detect_indent, refused, serialize_json};
+use super::common::{already_patched_result, parse_json_manifest, refused, JsonLayout};
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
@@ -52,7 +64,7 @@ use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::yarn_classic_lock::{
-    body_field_line, lines_to_json, pattern_real_name, read_yarn_lock, replace_block,
+    block_eol, body_field_line, lines_to_json, pattern_real_name, read_yarn_lock, replace_block,
     revert_recorded_block, scan_blocks, split_berry_key_patterns, split_pattern, LockBlock,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
@@ -103,6 +115,11 @@ pub async fn vendor_yarn_berry(
         Ok(t) => t,
         Err(outcome) => return *outcome,
     };
+    // A uniformly CRLF lock (what yarn writes on Windows) is spliced in its
+    // own line ending below; only a mixed one is refused.
+    if let Some(outcome) = refuse_mixed_line_endings(YARN_LOCK, &lock_text) {
+        return outcome;
+    }
     let blocks = scan_blocks(&lock_text);
     let Some(meta) = berry_metadata(&blocks) else {
         return refused(
@@ -172,7 +189,13 @@ pub async fn vendor_yarn_berry(
             );
         }
     };
-    let pkg: Value = match serde_json::from_slice(&pkg_bytes) {
+    // Its layout (BOM, indent, line ending, trailing newline) carries into
+    // the rewritten bytes; a mixed-ending file has none to carry.
+    let pkg_text = String::from_utf8_lossy(&pkg_bytes);
+    if let Some(outcome) = refuse_mixed_line_endings(PACKAGE_JSON, &pkg_text) {
+        return outcome;
+    }
+    let pkg: Value = match parse_json_manifest(&pkg_bytes) {
         Ok(v) => v,
         Err(e) => {
             return refused(
@@ -419,8 +442,7 @@ pub async fn vendor_yarn_berry(
         };
         res_obj.insert(name.to_string(), Value::String(spec.clone()));
     }
-    let pkg_indent = detect_indent(&String::from_utf8_lossy(&pkg_bytes));
-    let new_pkg_bytes = match serialize_json(&new_pkg, &pkg_indent) {
+    let new_pkg_bytes = match JsonLayout::of(&pkg_text).render(&new_pkg) {
         Ok(b) => b,
         Err(e) => {
             return done_failure_unstage(
@@ -433,7 +455,12 @@ pub async fn vendor_yarn_berry(
             .await
         }
     };
-    let new_lock_text = replace_block(&lock_text, target, &new_lines, detect_eol(&lock_text));
+    let new_lock_text = replace_block(
+        &lock_text,
+        target,
+        &new_lines,
+        block_eol(&lock_text, target),
+    );
     if let Err(e) = commit_pair(
         project_root,
         &new_pkg_bytes,
@@ -632,7 +659,7 @@ pub async fn revert_yarn_berry_opts(
         let pkg_path = project_root.join(PACKAGE_JSON);
         match read_regular_to_bytes(&pkg_path).await {
             Ok(bytes) => {
-                let mut pkg: Value = match serde_json::from_slice(&bytes) {
+                let mut pkg: Value = match parse_json_manifest(&bytes) {
                     Ok(v) => v,
                     // Fail-closed: rewriting a manifest we cannot parse
                     // risks destroying it.
@@ -653,8 +680,10 @@ pub async fn revert_yarn_berry_opts(
                     );
                 }
                 if changed {
-                    let indent = detect_indent(&String::from_utf8_lossy(&bytes));
-                    match serialize_json(&pkg, &indent) {
+                    // The file's current layout — the one vendoring kept —
+                    // so the restore lands byte-identical on the pre-vendor
+                    // bytes (CRLF, BOM and trailing newline included).
+                    match JsonLayout::of(&String::from_utf8_lossy(&bytes)).render(&pkg) {
                         Ok(out) => {
                             if let Err(e) =
                                 atomic_write_bytes_preserving_mode(&pkg_path, &out).await
@@ -828,6 +857,32 @@ fn revert_resolution_record(
 }
 
 // ───────────────────────────── vendor internals ─────────────────────────────
+
+/// The pre-write refusal for a berry file (`yarn.lock` / `package.json`)
+/// whose line endings mix CRLF and LF, or that holds a bare CR.
+///
+/// yarn berry keeps ONE line ending per file: a new file gets `os.EOL`
+/// (CRLF on Windows) and every later write re-renders the whole file in its
+/// majority ending (`normalizeLineEndings` in yarnpkg-fslib `FakeFS.ts`,
+/// used by `Project.persistLockfile` and `Workspace.persistManifest`). A
+/// uniformly CRLF or LF file is therefore spliced (yarn.lock) or
+/// re-serialized (package.json) in its own ending; a mixed one has no
+/// ending to keep — and `yarn install --immutable` already rejects a mixed
+/// lock (YN0028), because the re-render differs from the file. `yarn
+/// install` normalizes both files, after which vendoring proceeds.
+fn refuse_mixed_line_endings(file: &str, text: &str) -> Option<VendorOutcome> {
+    (LineEndings::of(text) == LineEndings::Mixed).then(|| {
+        refused(
+            "vendor_yarn_berry_mixed_line_endings",
+            format!(
+                "{file} mixes CRLF and LF line endings (or holds a bare carriage return), so \
+                 no single line ending can be kept — yarn rewrites the file with one ending \
+                 on its next install and rejects a lockfile like this under `--immutable` \
+                 (YN0028); run `yarn install` once to normalize it, then re-run"
+            ),
+        )
+    })
+}
 
 /// Commit the pair in contract order — package.json first, yarn.lock second
 /// — unwinding package.json to its original bytes when the lock write fails
@@ -1067,7 +1122,12 @@ fn root_workspace_name(blocks: &[LockBlock]) -> Option<String> {
 /// enough: yarn writes the knob as a top-level scalar (spike B4), and any
 /// value we cannot positively read as `0` makes the caller refuse. Shared
 /// with the hosted-redirect rewriter, whose cache-checksum gate is identical.
+/// CRLF lines split like LF ones (`str::lines`), and a leading BOM is
+/// skipped the way yarn's YAML parser skips it — otherwise a knob on the
+/// first line of a BOM'd file would read as unset (the offline-reproducible
+/// default) while yarn applies it and every install fails YN0018.
 pub(crate) fn yarnrc_compression_level(rc: &str) -> Option<&str> {
+    let rc = rc.strip_prefix('\u{feff}').unwrap_or(rc);
     rc.lines().find_map(|line| {
         let rest = line.strip_prefix("compressionLevel:")?;
         Some(rest.trim().trim_matches(['\'', '"']))
@@ -3318,6 +3378,193 @@ __metadata:
         assert_eq!(
             tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
             written
+        );
+    }
+
+    /// `text` with every line break respelled CRLF (idempotent).
+    fn crlf(text: &str) -> String {
+        text.replace("\r\n", "\n").replace('\n', "\r\n")
+    }
+
+    /// The Windows shape — yarn writes a new `yarn.lock` and the
+    /// `package.json` it first pretty-prints with `os.EOL` (CRLF) — plus a
+    /// BOM and a missing trailing newline: vendoring keeps each file's
+    /// layout (the spike's LF oracle bytes in that layout), the ledger
+    /// records terminator-free lines, the re-run is in sync, and revert
+    /// lands byte-exactly on the pre-vendor files.
+    #[tokio::test]
+    async fn crlf_bom_and_newline_shapes_vendor_and_revert_byte_exact() {
+        for (label, pkg_shape, lock_shape) in [
+            (
+                "crlf",
+                crlf as fn(&str) -> String,
+                crlf as fn(&str) -> String,
+            ),
+            (
+                "bom+crlf",
+                (|t: &str| format!("\u{feff}{}", crlf(t))) as fn(&str) -> String,
+                (|t: &str| format!("\u{feff}{}", crlf(t))) as fn(&str) -> String,
+            ),
+            (
+                "bom+lf pkg, lf lock",
+                (|t: &str| format!("\u{feff}{t}")) as fn(&str) -> String,
+                (|t: &str| t.to_string()) as fn(&str) -> String,
+            ),
+            (
+                "crlf pkg without final newline, crlf lock",
+                (|t: &str| crlf(t.strip_suffix('\n').unwrap())) as fn(&str) -> String,
+                crlf as fn(&str) -> String,
+            ),
+        ] {
+            let pkg_before = pkg_shape(B3_BEFORE_PKG);
+            let lock_before = lock_shape(B3_BEFORE_LOCK);
+            let fx = fixture_with(&pkg_before, &lock_before).await;
+            let (result, entry, warnings) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{label}: {:?}", result.error);
+            assert!(warnings.is_empty(), "{label}: {warnings:?}");
+            let entry = entry.expect("a ledger entry");
+
+            let (hash6, checksum) = fx.packed_berry_facts().await;
+            assert_eq!(
+                tokio::fs::read_to_string(fx.pkg_path()).await.unwrap(),
+                pkg_shape(B3_AFTER_PKG),
+                "{label}: package.json keeps its layout"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+                lock_shape(&spike_after_lock(&hash6, &checksum)),
+                "{label}: yarn.lock keeps its line endings and BOM"
+            );
+            // Ledger lines carry no terminators, whatever the file's ending.
+            let lock_rec = entry
+                .wiring
+                .iter()
+                .find(|w| w.kind == KIND_LOCK_ENTRY)
+                .unwrap();
+            for v in [&lock_rec.original, &lock_rec.new] {
+                let text = serde_json::to_string(v).unwrap();
+                assert!(!text.contains("\\r"), "{label}: {text}");
+            }
+            assert_eq!(
+                lock_rec.original.as_ref().unwrap()[0],
+                json!("\"left-pad@npm:1.3.0\":"),
+                "{label}: the BOM never leaks into a recorded key"
+            );
+
+            let (pkg_wired, lock_wired) = (
+                tokio::fs::read(fx.pkg_path()).await.unwrap(),
+                tokio::fs::read(fx.lock_path()).await.unwrap(),
+            );
+            let (result, again, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{label}: {:?}", result.error);
+            assert!(again.is_none(), "{label}: the re-run is in sync");
+            assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), pkg_wired);
+            assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), lock_wired);
+
+            let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+            assert!(outcome.success, "{label}: {:?}", outcome.error);
+            assert!(
+                outcome.warnings.is_empty(),
+                "{label}: {:?}",
+                outcome.warnings
+            );
+            assert_eq!(
+                tokio::fs::read(fx.pkg_path()).await.unwrap(),
+                pkg_before.as_bytes(),
+                "{label}: package.json restored byte-exactly"
+            );
+            assert_eq!(
+                tokio::fs::read(fx.lock_path()).await.unwrap(),
+                lock_before.as_bytes(),
+                "{label}: yarn.lock restored byte-exactly"
+            );
+            assert!(!fx.tgz_path().exists(), "{label}: artifact removed");
+        }
+    }
+
+    /// A lock or manifest mixing CRLF and LF (or holding a bare CR) has no
+    /// single line ending to keep: vendoring refuses before any write, with
+    /// a code and a detail naming the file and the `yarn install` remedy.
+    #[tokio::test]
+    async fn mixed_line_endings_refuse_before_any_write() {
+        let half = |t: &str| {
+            let c = crlf(t);
+            let at = c.rfind("\r\n").unwrap();
+            format!("{}\n{}", &c[..at], &c[at + 2..])
+        };
+        for (file, pkg, lock) in [
+            (YARN_LOCK, B3_BEFORE_PKG.to_string(), half(B3_BEFORE_LOCK)),
+            (
+                YARN_LOCK,
+                B3_BEFORE_PKG.to_string(),
+                B3_BEFORE_LOCK.replacen("proceed with", "proceed\rwith", 1),
+            ),
+            (PACKAGE_JSON, half(B3_BEFORE_PKG), crlf(B3_BEFORE_LOCK)),
+        ] {
+            let fx = fixture_with(&pkg, &lock).await;
+            let detail = expect_refused(
+                fx.vendor(false).await,
+                "vendor_yarn_berry_mixed_line_endings",
+            );
+            assert!(
+                detail.starts_with(file) && detail.contains("yarn install"),
+                "{file}: {detail}"
+            );
+            fx.assert_untouched().await;
+        }
+    }
+
+    /// Revert never refuses on line endings. A lock mixed AFTER vendoring
+    /// (an editor saving one line LF into a CRLF lock) restores the entry in
+    /// the terminator of the block it replaces, every other byte kept; a
+    /// BOM added to package.json since vendoring stays.
+    #[tokio::test]
+    async fn revert_keeps_foreign_line_endings_and_a_later_bom() {
+        let fx = fixture_with(&crlf(B3_BEFORE_PKG), &crlf(B3_BEFORE_LOCK)).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let wired = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        let mixed = wired.replacen("proceed with caution!\r\n", "proceed with caution!\n", 1);
+        assert_ne!(mixed, wired, "the fixture edit must hit");
+        tokio::fs::write(fx.lock_path(), &mixed).await.unwrap();
+        let pkg = tokio::fs::read_to_string(fx.pkg_path()).await.unwrap();
+        tokio::fs::write(fx.pkg_path(), format!("\u{feff}{pkg}"))
+            .await
+            .unwrap();
+
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+            crlf(B3_BEFORE_LOCK).replacen(
+                "proceed with caution!\r\n",
+                "proceed with caution!\n",
+                1
+            ),
+            "the entry comes back CRLF; the foreign LF line stays LF"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(fx.pkg_path()).await.unwrap(),
+            format!("\u{feff}{}", crlf(B3_BEFORE_PKG)),
+            "the resolutions entry is gone; the BOM added since stays"
+        );
+    }
+
+    /// A `.yarnrc.yml` saved with a BOM (and CRLF) still has its first-line
+    /// `compressionLevel` knob read — yarn applies it, so it must refuse.
+    #[test]
+    fn yarnrc_compression_level_reads_past_a_bom_and_crlf() {
+        assert_eq!(
+            yarnrc_compression_level("\u{feff}compressionLevel: mixed\r\nnodeLinker: pnp\r\n"),
+            Some("mixed")
+        );
+        assert_eq!(
+            yarnrc_compression_level("nodeLinker: pnp\r\ncompressionLevel: 0\r\n"),
+            Some("0")
+        );
+        assert_eq!(
+            yarnrc_compression_level("\u{feff}nodeLinker: pnp\r\n"),
+            None
         );
     }
 

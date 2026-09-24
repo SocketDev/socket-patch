@@ -163,6 +163,76 @@ pub(crate) fn serialize_json(value: &Value, indent: &str) -> std::io::Result<Vec
     Ok(out)
 }
 
+/// Parse a JSON manifest, reading past a leading UTF-8 BOM the way npm,
+/// Node and yarn berry (`Manifest.loadFromText`'s `stripBOM`) all do —
+/// serde_json rejects one.
+pub(crate) fn parse_json_manifest(bytes: &[u8]) -> serde_json::Result<Value> {
+    serde_json::from_slice(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes))
+}
+
+/// The byte layout a re-serialized JSON manifest keeps from the text it
+/// replaces, so a vendor edit and its revert change nothing but the edited
+/// keys: the leading UTF-8 BOM, the indent unit ([`detect_indent`]), the
+/// line terminator, and whatever trails the closing brace (the
+/// trailing-newline shape, verbatim).
+///
+/// The terminator is CRLF for a CRLF file — yarn berry writes a
+/// `package.json` it creates or first pretty-prints with `os.EOL`, so every
+/// Windows project carries one — LF for an LF or single-line file, and, for
+/// a file mixing both, the majority terminator yarn itself would rewrite it
+/// with ([`majority_terminator`]; the forward vendor paths refuse such a
+/// file before this runs, so only a revert reaches that arm).
+pub(crate) struct JsonLayout {
+    bom: bool,
+    indent: String,
+    eol: &'static str,
+    trailer: String,
+}
+
+impl JsonLayout {
+    /// The layout of `text` (a manifest's current contents).
+    pub(crate) fn of(text: &str) -> Self {
+        use crate::utils::line_endings::{majority_terminator, LineEndings};
+        let (bom, body) = match text.strip_prefix('\u{feff}') {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
+        let content = body.trim_end_matches([' ', '\t', '\r', '\n']);
+        let eol = match LineEndings::of(body) {
+            LineEndings::Crlf => "\r\n",
+            LineEndings::Mixed => majority_terminator(body),
+            LineEndings::Lf | LineEndings::None => "\n",
+        };
+        Self {
+            bom,
+            indent: detect_indent(body),
+            eol,
+            trailer: body[content.len()..].to_string(),
+        }
+    }
+
+    /// `value` pretty-printed ([`serialize_json`]) in this layout.
+    pub(crate) fn render(&self, value: &Value) -> std::io::Result<Vec<u8>> {
+        let mut pretty = serialize_json(value, &self.indent)?;
+        // serialize_json's own trailing newline gives way to the trailer.
+        pretty.pop();
+        let pretty = String::from_utf8(pretty).map_err(std::io::Error::other)?;
+        let mut out = String::with_capacity(pretty.len() + self.trailer.len() + 3);
+        if self.bom {
+            out.push('\u{feff}');
+        }
+        // serde_json escapes every newline INSIDE a string value, so each
+        // `\n` it emits is a line break of the layout.
+        if self.eol == "\n" {
+            out.push_str(&pretty);
+        } else {
+            out.push_str(&pretty.replace('\n', self.eol));
+        }
+        out.push_str(&self.trailer);
+        Ok(out.into_bytes())
+    }
+}
+
 /// Serialize `(name, bytes, unix mode)` entries — in the given order — into
 /// a deterministic zip: a fixed DOS timestamp (1980-01-01 00:00:00) and a
 /// fixed deflate level, so rebuilding the same content always yields
@@ -779,6 +849,70 @@ mod tests {
     use super::*;
 
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+    /// A manifest re-rendered in its own layout is byte-identical to itself
+    /// whenever it is in the canonical pretty shape (what yarn / npm write):
+    /// indent, CRLF vs LF, BOM and the trailing-newline shape all carry.
+    #[test]
+    fn json_layout_round_trips_canonical_manifests_in_every_shape() {
+        let lf = "{\n  \"name\": \"a\",\n  \"dependencies\": {\n    \"x\": \"1\"\n  }\n}\n";
+        let shapes = [
+            lf.to_string(),
+            lf.replace('\n', "\r\n"),
+            format!("\u{feff}{lf}"),
+            format!("\u{feff}{}", lf.replace('\n', "\r\n")),
+            lf.trim_end().to_string(),
+            lf.trim_end().replace('\n', "\r\n"),
+            format!("{lf}\n"),
+            lf.replace("  ", "\t"),
+            lf.replace("  ", "    ").replace('\n', "\r\n"),
+        ];
+        for text in shapes {
+            let value = parse_json_manifest(text.as_bytes()).unwrap();
+            let out = JsonLayout::of(&text).render(&value).unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), text, "{text:?}");
+        }
+    }
+
+    /// An edit lands in the file's layout; a single-line file becomes a
+    /// pretty LF one (no line ending to inherit, and none from the OS); a
+    /// mixed file takes the ending yarn would rewrite it with (majority,
+    /// ties LF); a newline inside a string value stays escaped.
+    #[test]
+    fn json_layout_renders_edits_in_the_file_layout() {
+        let render = |text: &str, value: serde_json::Value| {
+            String::from_utf8(JsonLayout::of(text).render(&value).unwrap()).unwrap()
+        };
+        let value = serde_json::json!({ "a": "x\ny", "b": 1 });
+        assert_eq!(
+            render("\u{feff}{\r\n  \"a\": 0\r\n}\r\n", value.clone()),
+            "\u{feff}{\r\n  \"a\": \"x\\ny\",\r\n  \"b\": 1\r\n}\r\n"
+        );
+        assert_eq!(
+            render("{\"a\":0}", value.clone()),
+            "{\n  \"a\": \"x\\ny\",\n  \"b\": 1\n}"
+        );
+        assert_eq!(
+            render("{\r\n  \"a\": 0,\r\n  \"c\": 2\n}\r\n", value.clone()),
+            "{\r\n  \"a\": \"x\\ny\",\r\n  \"b\": 1\r\n}\r\n",
+            "majority CRLF"
+        );
+        assert_eq!(
+            render("{\r\n  \"a\": 0\n}", value),
+            "{\n  \"a\": \"x\\ny\",\n  \"b\": 1\n}",
+            "a tie is LF"
+        );
+    }
+
+    #[test]
+    fn parse_json_manifest_reads_past_one_bom_only() {
+        assert_eq!(
+            parse_json_manifest(b"\xef\xbb\xbf{\"a\":1}").unwrap(),
+            serde_json::json!({ "a": 1 })
+        );
+        assert!(parse_json_manifest(b"\xef\xbb\xbf\xef\xbb\xbf{}").is_err());
+        assert!(parse_json_manifest(b"{} \xef\xbb\xbf").is_err());
+    }
 
     /// `[project] dependencies` and every optional-dependencies extra, by
     /// PEP 508 name; groups, tool tables, non-array extras and non-string

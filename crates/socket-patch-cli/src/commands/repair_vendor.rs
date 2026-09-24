@@ -310,8 +310,14 @@ async fn detect_reference_flavor(project_root: &Path, eco: &str, uuid: &str) -> 
     }
     if let Some(text) = read("yarn.lock").await {
         if text.contains(&needle) {
-            // Same head sniff as core's `sniff_yarn_lock`; berry wins.
-            let head: Vec<&str> = text.lines().take(30).collect();
+            // Same head sniff as core's `sniff_yarn_lock` (BOM skipped,
+            // CRLF-tolerant); berry wins.
+            let head: Vec<&str> = text
+                .strip_prefix('\u{feff}')
+                .unwrap_or(&text)
+                .lines()
+                .take(30)
+                .collect();
             return if head.iter().any(|l| l.starts_with("__metadata:")) {
                 Some("yarn-berry".to_string())
             } else if head.iter().any(|l| l.trim() == "# yarn lockfile v1") {

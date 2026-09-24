@@ -284,7 +284,13 @@ async fn read_lock(project_root: &Path, name: &str) -> Result<String, (&'static 
 /// mistaken for classic.
 async fn sniff_yarn_lock(project_root: &Path) -> Result<NpmLockFlavor, (&'static str, String)> {
     let text = read_lock(project_root, "yarn.lock").await?;
-    let head: Vec<&str> = text.lines().take(YARN_SNIFF_HEAD_LINES).collect();
+    // CRLF lines split like LF ones; a leading BOM is not key text.
+    let head: Vec<&str> = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&text)
+        .lines()
+        .take(YARN_SNIFF_HEAD_LINES)
+        .collect();
     // Berry wins the check (it must never be mistaken for classic). The
     // node-modules linker keeps packages on disk for staging, and berry's
     // cache-zip checksum is reproducible from our tarball (berry_zip), so the
@@ -709,6 +715,25 @@ mod tests {
         touch(tmp.path(), "yarn.lock", "garbage: true\n").await;
         let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
         assert_eq!(code, "vendor_lockfile_version_unsupported");
+
+        // Windows spellings sniff the same: CRLF lines, and a BOM right in
+        // front of a header-less `__metadata:` / the v1 comment.
+        for (lock, want) in [
+            (YARN_BERRY.replace('\n', "\r\n"), NpmLockFlavor::YarnBerry),
+            (
+                format!("\u{feff}{}", YARN_BERRY.trim_start_matches(|c| c != '_')),
+                NpmLockFlavor::YarnBerry,
+            ),
+            (
+                format!("\u{feff}{}", YARN_V1.replace('\n', "\r\n")),
+                NpmLockFlavor::YarnClassic,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            touch(tmp.path(), "yarn.lock", &lock).await;
+            let (flavor, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap();
+            assert_eq!(flavor, want, "{lock:?}");
+        }
     }
 
     #[tokio::test]
