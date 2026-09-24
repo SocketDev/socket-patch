@@ -30,35 +30,94 @@ pub(crate) async fn fresh_copy(
 ) -> std::io::Result<()> {
     let src = src.to_path_buf();
     let dst = dst.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        force_remove_dir_all(&dst)?;
-        std::fs::create_dir_all(&dst)?;
-        for entry in walkdir::WalkDir::new(&src).follow_links(false) {
-            let entry = entry.map_err(to_io)?;
-            let rel = entry.path().strip_prefix(&src).map_err(to_io)?;
-            if rel.as_os_str().is_empty() {
+    tokio::task::spawn_blocking(move || copy_tree_blocking(&src, &dst, skip_file_name))
+        .await
+        .map_err(to_io)?
+}
+
+/// The body of [`fresh_copy`].
+///
+/// WalkDir yields a directory before its contents, and every copied
+/// directory is created when it is yielded, so a file's parent already
+/// exists — except under a directory whose name matched `skip_file_name`:
+/// the skip is not pruned, so its contents are still copied and must create
+/// the skipped directory on demand (it then exists in the copy only when it
+/// has contents, as it always has).
+fn copy_tree_blocking(
+    src: &Path,
+    dst: &Path,
+    skip_file_name: Option<&'static str>,
+) -> std::io::Result<()> {
+    force_remove_dir_all(dst)?;
+    std::fs::create_dir_all(dst)?;
+    // Depth of the outermost skipped directory the walk is inside.
+    let mut skipped_dir_depth: Option<usize> = None;
+    for entry in walkdir::WalkDir::new(src).follow_links(false) {
+        let entry = entry.map_err(to_io)?;
+        let rel = entry.path().strip_prefix(src).map_err(to_io)?;
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        if skipped_dir_depth.is_some_and(|depth| entry.depth() <= depth) {
+            skipped_dir_depth = None;
+        }
+        let ft = entry.file_type();
+        if let Some(skip) = skip_file_name {
+            if entry.file_name() == skip {
+                if ft.is_dir() && skipped_dir_depth.is_none() {
+                    skipped_dir_depth = Some(entry.depth());
+                }
                 continue;
             }
-            if let Some(skip) = skip_file_name {
-                if entry.file_name() == skip {
-                    continue;
-                }
-            }
-            let target = dst.join(rel);
-            let ft = entry.file_type();
-            if ft.is_dir() {
-                std::fs::create_dir_all(&target)?;
-            } else if ft.is_file() {
+        }
+        let target = dst.join(rel);
+        if ft.is_dir() {
+            std::fs::create_dir_all(&target)?;
+        } else if ft.is_file() {
+            if skipped_dir_depth.is_some() {
                 if let Some(p) = target.parent() {
                     std::fs::create_dir_all(p)?;
                 }
-                std::fs::copy(entry.path(), &target)?;
+            }
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// The previous [`copy_tree_blocking`], which created every file's parent,
+/// kept as the equivalence oracle.
+#[cfg(test)]
+fn copy_tree_blocking_reference(
+    src: &Path,
+    dst: &Path,
+    skip_file_name: Option<&'static str>,
+) -> std::io::Result<()> {
+    force_remove_dir_all(dst)?;
+    std::fs::create_dir_all(dst)?;
+    for entry in walkdir::WalkDir::new(src).follow_links(false) {
+        let entry = entry.map_err(to_io)?;
+        let rel = entry.path().strip_prefix(src).map_err(to_io)?;
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        if let Some(skip) = skip_file_name {
+            if entry.file_name() == skip {
+                continue;
             }
         }
-        Ok(())
-    })
-    .await
-    .map_err(to_io)?
+        let target = dst.join(rel);
+        let ft = entry.file_type();
+        if ft.is_dir() {
+            std::fs::create_dir_all(&target)?;
+        } else if ft.is_file() {
+            if let Some(p) = target.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 /// Recursively remove a tree, retrying once after relaxing *directory* perms
@@ -118,6 +177,146 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    /// Every entry under `root` as (relative path, kind, bytes, mode), in
+    /// sorted walk order.
+    fn tree_snapshot(root: &Path) -> Vec<(String, &'static str, Vec<u8>, u32)> {
+        walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .sort_by_file_name()
+            .into_iter()
+            .map(|e| {
+                let e = e.unwrap();
+                let rel = e
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let meta = e.path().symlink_metadata().unwrap();
+                #[cfg(unix)]
+                let mode = meta.permissions().mode();
+                #[cfg(not(unix))]
+                let mode = u32::from(meta.permissions().readonly());
+                if meta.is_dir() {
+                    (rel, "dir", Vec::new(), mode)
+                } else if meta.is_file() {
+                    (rel, "file", fs::read(e.path()).unwrap(), mode)
+                } else {
+                    (rel, "other", Vec::new(), mode)
+                }
+            })
+            .collect()
+    }
+
+    /// Deterministic xorshift64* — no `rand` dev-dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const SKIP: &str = ".cargo-checksum.json";
+
+    /// A random tree under `dir`: nested and empty dirs, files (some
+    /// read-only, some named [`SKIP`]), directories named [`SKIP`] holding
+    /// files and subdirectories, and (unix) file and dir symlinks.
+    fn synth_tree(rng: &mut Rng, dir: &Path, depth: usize) {
+        for i in 0..rng.below(6) {
+            let name = match rng.below(8) {
+                0 => SKIP.to_string(),
+                _ => format!("e{i}"),
+            };
+            let path = dir.join(&name);
+            if path.symlink_metadata().is_ok() {
+                continue; // a second [`SKIP`] in this directory
+            }
+            match rng.below(6) {
+                0 | 1 if depth < 4 => {
+                    fs::create_dir(&path).unwrap();
+                    synth_tree(rng, &path, depth + 1);
+                }
+                #[cfg(unix)]
+                2 => {
+                    let target = if rng.below(2) == 0 { "e0" } else { ".." };
+                    std::os::unix::fs::symlink(target, &path).unwrap();
+                }
+                _ => {
+                    fs::write(&path, format!("{name}:{}", rng.next())).unwrap();
+                    #[cfg(unix)]
+                    if rng.below(3) == 0 {
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn copy_matches_reference_on_random_trees() {
+        let mut rng = Rng(0x94D0_49BB_1331_11EB);
+        for case in 0..150 {
+            let src = tempfile::tempdir().unwrap();
+            synth_tree(&mut rng, src.path(), 0);
+            let out = tempfile::tempdir().unwrap();
+            for skip in [None, Some(SKIP)] {
+                let (want, got) = (out.path().join("want"), out.path().join("got"));
+                let want_result = copy_tree_blocking_reference(src.path(), &want, skip);
+                let got_result = copy_tree_blocking(src.path(), &got, skip);
+                assert_eq!(
+                    got_result.as_ref().map_err(|e| e.kind()),
+                    want_result.as_ref().map_err(|e| e.kind()),
+                    "case {case} skip={skip:?}: result"
+                );
+                assert_eq!(
+                    tree_snapshot(&got),
+                    tree_snapshot(&want),
+                    "case {case} skip={skip:?}: copied tree"
+                );
+            }
+        }
+    }
+
+    /// The one shape where a file's parent is not created by the walk: a
+    /// directory named like the skipped file. Its contents are copied and
+    /// recreate it; an empty one stays absent.
+    #[tokio::test]
+    async fn skipped_name_directory_contents_are_still_copied() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let d = dst.path().join("copy");
+        fs::create_dir_all(src.path().join("a").join(SKIP).join("deep")).unwrap();
+        fs::write(src.path().join("a").join(SKIP).join("f.txt"), b"f").unwrap();
+        fs::write(src.path().join("a").join(SKIP).join("deep/g.txt"), b"g").unwrap();
+        fs::create_dir_all(src.path().join("b").join(SKIP)).unwrap();
+        fs::write(src.path().join("b/after.txt"), b"after").unwrap();
+
+        fresh_copy(src.path(), &d, Some(SKIP)).await.unwrap();
+
+        assert_eq!(
+            fs::read(d.join("a").join(SKIP).join("f.txt")).unwrap(),
+            b"f"
+        );
+        assert_eq!(
+            fs::read(d.join("a").join(SKIP).join("deep/g.txt")).unwrap(),
+            b"g"
+        );
+        assert!(!d.join("b").join(SKIP).exists());
+        assert_eq!(fs::read(d.join("b/after.txt")).unwrap(), b"after");
+        let reference = dst.path().join("reference");
+        copy_tree_blocking_reference(src.path(), &reference, Some(SKIP)).unwrap();
+        assert_eq!(tree_snapshot(&d), tree_snapshot(&reference));
+    }
 
     #[tokio::test]
     async fn copies_nested_and_empty_dirs() {
