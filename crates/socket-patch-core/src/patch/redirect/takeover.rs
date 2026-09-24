@@ -58,6 +58,7 @@ use crate::vendor::go_mod_edit::{
     is_hosted_module_path, parse_replace_entries, HOSTED_GO_MODULE_PREFIX,
 };
 
+use super::replay::FragmentRevert;
 use super::staged::{flush_staged, read_rel, staged_read, Staged, StagedBytes};
 use super::state::RedirectState;
 use super::FileEdit;
@@ -318,27 +319,28 @@ pub async fn revert_cargo_redirect_purl(
                         edit.path
                     ));
                 };
-                if content.contains(new) {
-                    // A full-id reference edit stands for every dependent's
-                    // occurrence of that exact id.
-                    let reverted = if edit.kind == super::CARGO_LOCK_REFERENCE_KIND {
-                        content.replace(new, orig)
-                    } else {
-                        content.replacen(new, orig, 1)
-                    };
-                    staged.insert(edit.path.clone(), Some(reverted));
-                    out.reverted_files.push(edit.path.clone());
-                } else if content.contains(orig) {
+                // A full-id reference edit stands for every dependent's
+                // occurrence of that exact id. Matching ignores a CRLF/LF
+                // conversion since the scan (a Windows checkout's CRLF
+                // fragments against an LF checkout, and vice versa).
+                let every = edit.kind == super::CARGO_LOCK_REFERENCE_KIND;
+                match super::replay::revert_fragment_eol(&content, new, orig, every) {
+                    FragmentRevert::Reverted(reverted) => {
+                        staged.insert(edit.path.clone(), Some(reverted));
+                        out.reverted_files.push(edit.path.clone());
+                    }
                     // Already at (or unwound to) the pre-redirect fragment.
-                } else {
-                    return Err(format!(
-                        "the {} entry for {name}@{version} has drifted from the \
-                         recorded hosted redirect (neither the redirected nor the \
-                         original fragment is present); refusing to touch it — \
-                         re-run `scan --mode hosted` to normalize the redirect, \
-                         or restore the crates.io wiring manually, then re-run",
-                        edit.path
-                    ));
+                    FragmentRevert::AlreadyOriginal => {}
+                    FragmentRevert::Drifted => {
+                        return Err(format!(
+                            "the {} entry for {name}@{version} has drifted from the \
+                             recorded hosted redirect (neither the redirected nor the \
+                             original fragment is present); refusing to touch it — \
+                             re-run `scan --mode hosted` to normalize the redirect, \
+                             or restore the crates.io wiring manually, then re-run",
+                            edit.path
+                        ));
+                    }
                 }
             }
             "redirect_cargo_registry" => {
@@ -348,7 +350,7 @@ pub async fn revert_cargo_redirect_purl(
                 let Some(content) = staged_read(&staged, project_root, &edit.path).await? else {
                     continue; // config already gone
                 };
-                if !content.contains(block) {
+                if !super::replay::contains_eol(&content, block) {
                     continue; // block already removed
                 }
                 // Keep the block while anything still references its registry
@@ -379,9 +381,12 @@ pub async fn revert_cargo_redirect_purl(
                 // it as `original`) restores that pre-existing region instead
                 // of deleting it: the original bytes are the user's.
                 if let Some(orig) = edit.original.as_ref().and_then(Value::as_str) {
-                    let reverted = content.replacen(block, orig, 1);
-                    staged.insert(edit.path.clone(), Some(reverted));
-                    out.reverted_files.push(edit.path.clone());
+                    if let FragmentRevert::Reverted(reverted) =
+                        super::replay::revert_fragment_eol(&content, block, orig, false)
+                    {
+                        staged.insert(edit.path.clone(), Some(reverted));
+                        out.reverted_files.push(edit.path.clone());
+                    }
                     continue;
                 }
                 // The block leaves with exactly the blank separator the
@@ -4380,6 +4385,82 @@ mod tests {
                 content,
                 "{rel}"
             );
+        }
+    }
+
+    /// A ledger recorded on one side of a line-ending conversion reverts
+    /// files checked out on the other: a Windows scan (CRLF fragments,
+    /// JSON-escaped, so git never converts them) removed on an LF checkout,
+    /// and an LF scan removed on a CRLF (`core.autocrlf`) checkout — through
+    /// `remove` and through the whole-ledger replay. REGRESSION: both
+    /// refused as "drifted" (neither fragment found byte-for-byte).
+    #[tokio::test]
+    async fn revert_survives_a_checkout_line_ending_conversion() {
+        let crlf = |s: &str| s.replace('\n', "\r\n");
+        let lf = |s: &str| s.replace("\r\n", "\n");
+        let pristine: Vec<(&str, String)> = vec![
+            ("Cargo.toml", pristine_toml()),
+            (
+                "Cargo.lock",
+                format!("version = 4\n\n{}\n", pristine_lock_block()),
+            ),
+            (".cargo/config", "[net]\nretry = 2\n".to_string()),
+        ];
+        for (scan_crlf, replay) in [(true, false), (false, false), (true, true), (false, true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let scanned = |s: &str| if scan_crlf { crlf(s) } else { s.to_string() };
+            let checked_out = |s: &str| if scan_crlf { lf(s) } else { crlf(s) };
+            let files: BTreeMap<String, String> = pristine
+                .iter()
+                .map(|(rel, text)| (rel.to_string(), scanned(text)))
+                .collect();
+            let rewrite = crate::patch::redirect::rewrite_registry_redirect(
+                &files,
+                &[cargo_dep("cfg-if", "1.0.4", UUID)],
+            );
+            assert_eq!(rewrite.files.len(), 3, "{:?}", rewrite.warnings);
+            tokio::fs::create_dir_all(root.join(".cargo"))
+                .await
+                .unwrap();
+            for (rel, content) in files.iter().chain(rewrite.files.iter()) {
+                tokio::fs::write(root.join(rel), checked_out(content))
+                    .await
+                    .unwrap();
+            }
+            // The ledger round-trips through its JSON file unchanged.
+            let mut state: RedirectState = serde_json::from_str(
+                &serde_json::to_string(&{
+                    let mut state = RedirectState::new();
+                    state.edits = rewrite.edits.clone();
+                    state.records.insert(PURL.to_string(), record());
+                    state
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            if replay {
+                let outcome = crate::patch::redirect::revert_remaining_redirect_edits(
+                    root, &mut state, false,
+                )
+                .await;
+                assert!(
+                    outcome.fully_reverted(),
+                    "scan crlf {scan_crlf}: {:?}",
+                    outcome.refusals
+                );
+            } else {
+                revert_cargo_redirect_purl(root, &mut state, PURL, false)
+                    .await
+                    .unwrap_or_else(|e| panic!("scan crlf {scan_crlf}: {e}"));
+            }
+            for (rel, text) in &pristine {
+                assert_eq!(
+                    tokio::fs::read_to_string(root.join(rel)).await.unwrap(),
+                    checked_out(text),
+                    "{rel} (scan crlf {scan_crlf}, replay {replay})"
+                );
+            }
         }
     }
 

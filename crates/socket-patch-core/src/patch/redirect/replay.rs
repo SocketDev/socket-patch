@@ -310,6 +310,73 @@ pub(super) fn remove_fragment_once(content: &str, fragment: &str) -> String {
     format!("{}{}", &content[..start], &content[end..])
 }
 
+/// Every line break in `text` is a CRLF (and there is at least one).
+fn is_all_crlf(text: &str) -> bool {
+    let crlf = text.matches("\r\n").count();
+    crlf > 0 && crlf == text.matches('\n').count()
+}
+
+/// One fragment-edit inverse, tolerant of a line-ending conversion between
+/// the scan and the revert (git `core.autocrlf` rewrites the committed
+/// files but never the JSON-escaped fragments in the ledger).
+#[derive(Debug, PartialEq)]
+pub(super) enum FragmentRevert {
+    /// `new` was found and put back to `original` (the file's own line
+    /// endings kept).
+    Reverted(String),
+    /// `new` is gone but `original` is present: already unwound.
+    AlreadyOriginal,
+    /// Neither fragment is present.
+    Drifted,
+}
+
+/// Replace `new` with `original` in `content` — once, or at `every`
+/// occurrence — matching regardless of CRLF/LF: an all-CRLF file is
+/// matched as LF and written back CRLF; any other file is matched with the
+/// recorded fragments, then with their LF forms. `new` is looked for
+/// before `original` (an `original` may be a substring of `new`).
+pub(super) fn revert_fragment_eol(
+    content: &str,
+    new: &str,
+    original: &str,
+    every: bool,
+) -> FragmentRevert {
+    if is_all_crlf(content) {
+        return match revert_fragment_eol(
+            &content.replace("\r\n", "\n"),
+            &new.replace("\r\n", "\n"),
+            &original.replace("\r\n", "\n"),
+            every,
+        ) {
+            FragmentRevert::Reverted(lf) => FragmentRevert::Reverted(lf.replace('\n', "\r\n")),
+            other => other,
+        };
+    }
+    let (lf_new, lf_original) = (new.replace("\r\n", "\n"), original.replace("\r\n", "\n"));
+    for (n, o) in [(new, original), (lf_new.as_str(), lf_original.as_str())] {
+        if content.contains(n) {
+            return FragmentRevert::Reverted(if every {
+                content.replace(n, o)
+            } else {
+                content.replacen(n, o, 1)
+            });
+        }
+    }
+    if content.contains(original) || content.contains(&lf_original) {
+        FragmentRevert::AlreadyOriginal
+    } else {
+        FragmentRevert::Drifted
+    }
+}
+
+/// Whether `content` holds `fragment`, ignoring CRLF/LF differences.
+pub(super) fn contains_eol(content: &str, fragment: &str) -> bool {
+    content.contains(fragment)
+        || content
+            .replace("\r\n", "\n")
+            .contains(&fragment.replace("\r\n", "\n"))
+}
+
 /// Invert the cargo rewriter's append of a `[registries.…]` block: it wrote
 /// `config + "\n" + block` (just `block` into an empty config) and records
 /// `block` — or `"\n" + block` when the config lacked a final newline (the
@@ -321,8 +388,7 @@ pub(super) fn remove_fragment_once(content: &str, fragment: &str) -> String {
 /// endings (a checkout converted them) still matches. `None` when the
 /// fragment is not in the file.
 pub(super) fn remove_appended_cargo_block(content: &str, fragment: &str) -> Option<String> {
-    let crlf = content.matches("\r\n").count();
-    if crlf > 0 && crlf == content.matches('\n').count() {
+    if is_all_crlf(content) {
         return remove_appended_cargo_block(
             &content.replace("\r\n", "\n"),
             &fragment.replace("\r\n", "\n"),
@@ -560,10 +626,50 @@ pub async fn revert_remaining_redirect_edits(
                     };
                     // `new` before `original`: original may be a substring
                     // of new (Cargo.toml insert, maven version suffix).
-                    if inverse == Inverse::ReplaceEveryFragment && content.contains(new) {
-                        staged.insert(edit.path.clone(), Some(content.replace(new, original)));
-                        group_drops.insert(idx);
-                    } else if content.contains(new) {
+                    // cargo: matched regardless of a CRLF/LF conversion since
+                    // the scan (a checkout's `core.autocrlf` rewrites the
+                    // files, never the ledger's escaped fragments).
+                    if *group == "cargo" {
+                        let every = inverse == Inverse::ReplaceEveryFragment;
+                        let lf = |t: &str| t.replace("\r\n", "\n");
+                        if !every && lf(&content).matches(&lf(new)).count() > 1 {
+                            refuse(
+                                format!(
+                                    "{}: the redirected fragment appears more than once — \
+                                     ambiguous, refusing to guess",
+                                    edit.path
+                                ),
+                                &mut outcome,
+                            );
+                            refused_groups.insert(group);
+                            continue 'group;
+                        }
+                        match revert_fragment_eol(&content, new, original, every) {
+                            FragmentRevert::Reverted(restored) => {
+                                staged.insert(edit.path.clone(), Some(restored));
+                                group_drops.insert(idx);
+                            }
+                            // Same substring guard as below.
+                            FragmentRevert::AlreadyOriginal if !lf(new).contains(&lf(original)) => {
+                                group_drops.insert(idx);
+                            }
+                            _ => {
+                                refuse(
+                                    format!(
+                                        "{}: content matches neither the redirected nor the \
+                                         original fragment for {} — the file drifted; re-run \
+                                         `scan --mode hosted` to normalize",
+                                        edit.path, edit.kind
+                                    ),
+                                    &mut outcome,
+                                );
+                                refused_groups.insert(group);
+                                continue 'group;
+                            }
+                        }
+                        continue;
+                    }
+                    if content.contains(new) {
                         if content.matches(new).count() > 1 {
                             refuse(
                                 format!(
