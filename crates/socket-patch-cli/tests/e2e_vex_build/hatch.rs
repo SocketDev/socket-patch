@@ -345,8 +345,16 @@ fn flow(flavor: Flavor, mode: Mode) {
         out_text(&out)
     );
     assert_eq!(git_sha256(&bytes), git_sha256(&patched), "{what}");
+    // Both sides canonical: a macOS framework CPython (python.org /
+    // actions/setup-python, Homebrew) realpaths `sys.prefix`, so `six.__file__`
+    // reads `/private/var/…` while `hatch env find` echoes the `/var/…`
+    // spelling of the same temp dir.
+    let (module_real, env_real) = (
+        module.canonicalize().unwrap(),
+        env_dir.canonicalize().unwrap(),
+    );
     assert!(
-        module.starts_with(&env_dir),
+        module_real.starts_with(&env_real),
         "{what}: {module:?} outside {env_dir:?}"
     );
     record(
