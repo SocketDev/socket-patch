@@ -992,6 +992,24 @@ async fn gem_stale_install_warnings(
     out
 }
 
+/// Whether the hosted flow's Pipenv probe is CERTAIN to run: the candidates
+/// that no wheel-metadata failure can drop (none shares a fetched wheel's
+/// artifact URL) already target an entry of Pipfile.lock, so
+/// `pipenv_lock_targets` over the post-fetch overrides — a superset of
+/// them — is true whatever the fetch returns.
+fn pipenv_probe_certain<'a>(
+    files: &std::collections::BTreeMap<String, String>,
+    candidates: impl Iterator<Item = &'a DepOverride>,
+    fetched_wheel_urls: impl Iterator<Item = &'a str>,
+) -> bool {
+    let droppable: std::collections::BTreeSet<&str> = fetched_wheel_urls.collect();
+    let kept: Vec<DepOverride> = candidates
+        .filter(|dep| !droppable.contains(dep.artifact_url.as_str()))
+        .cloned()
+        .collect();
+    socket_patch_core::patch::redirect::pipenv_lock_targets(files, &kept)
+}
+
 /// The `(name, version)` key the gem artifact-sha map uses — derived from
 /// the purl so overrides (which carry no purl) and confirmed purls meet on
 /// neutral ground.
@@ -1803,6 +1821,9 @@ pub(crate) async fn run_redirect_selected(
     // it rides the same atomic-write / ledger-first machinery as the locks.
     let mut python_metadata = std::collections::BTreeMap::new();
     let mut unavailable_python_artifacts = std::collections::BTreeSet::new();
+    // `pipenv --version` (see `pipenv_major` below), started before the
+    // wheel metadata fetch when that probe is certain to be needed.
+    let mut pipenv_probe: Option<tokio::task::JoinHandle<Option<u32>>> = None;
     {
         use socket_patch_core::utils::python_lock::{ArtifactSource, PythonLockProbe};
         // Each native Python lock is parsed once, on the first dep that
@@ -1848,6 +1869,21 @@ pub(crate) async fn run_redirect_selected(
             if native_target {
                 wheel_deps.push((dep, sha256));
             }
+        }
+        // The only candidates the metadata fetch can still drop are those
+        // sharing a fetched wheel's artifact URL. If the rest already
+        // target an entry of Pipfile.lock, the Pipenv probe below is certain
+        // to run: start it now so it overlaps the fetch. Otherwise it runs
+        // (or not) exactly where it always did.
+        if pipenv_probe_certain(
+            &files,
+            candidates.iter().map(|c| &c.dep),
+            wheel_deps.iter().map(|(dep, _)| dep.artifact_url.as_str()),
+        ) {
+            let root = common.cwd.clone();
+            pipenv_probe = Some(tokio::spawn(async move {
+                socket_patch_core::utils::pipenv::installed_major(&root).await
+            }));
         }
         // The wheels' FIRST attempts run concurrently and are folded in dep
         // order, so `python_metadata`, `unavailable_python_artifacts` and
@@ -1942,10 +1978,19 @@ pub(crate) async fn run_redirect_selected(
     // run must neither spawn Pipenv nor warn about its absence.
     let targets_pipenv_lock =
         socket_patch_core::patch::redirect::pipenv_lock_targets(&files, &overrides);
-    let pipenv_major = if targets_pipenv_lock {
-        socket_patch_core::utils::pipenv::installed_major(&common.cwd).await
-    } else {
-        None
+    let pipenv_major = match (targets_pipenv_lock, pipenv_probe) {
+        (true, Some(probe)) => match probe.await {
+            Ok(major) => major,
+            Err(err) => std::panic::resume_unwind(err.into_panic()),
+        },
+        (true, None) => socket_patch_core::utils::pipenv::installed_major(&common.cwd).await,
+        // Unreachable (the early start implies the target), but never leave
+        // a probe running: aborting drops it, which reaps the child.
+        (false, Some(probe)) => {
+            probe.abort();
+            None
+        }
+        (false, None) => None,
     };
     let binary_content = if binary_bun && overrides.iter().any(|o| o.ecosystem == "npm") {
         Some(
@@ -3745,6 +3790,73 @@ mod tests {
             "{detail}"
         );
         assert!(detail.contains("pnpm clean --lockfile"), "{detail}");
+    }
+
+    /// The early Pipenv probe start is exact: whenever it fires, the
+    /// post-fetch gate is true for EVERY outcome of the wheel metadata
+    /// fetch (any subset of the fetched wheels' URLs dropped).
+    #[test]
+    fn pipenv_probe_certain_implies_the_post_fetch_gate() {
+        use super::pipenv_probe_certain;
+        use socket_patch_core::patch::redirect::pipenv_lock_targets;
+
+        let lock = serde_json::json!({
+            "_meta": {"pipfile-spec": 6, "hash": {"sha256": "x"}},
+            "default": {"urllib3": {"version": "==1.26.18"}, "six": {"version": "==1.16.0"}},
+            "develop": {},
+        });
+        let files = std::collections::BTreeMap::from([(
+            "Pipfile.lock".to_string(),
+            serde_json::to_string_pretty(&lock).unwrap(),
+        )]);
+        let names = ["urllib3", "Six", "requests", "idna"];
+        let urls = ["u0", "u1", "u2", "u3"];
+        let (mut fired, mut held) = (0, 0);
+        for seed in 0..4096u64 {
+            // Deterministic spread over names, ecosystems, URLs and the
+            // fetched-URL set.
+            let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = |n: u64| {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                (x.wrapping_mul(0x2545_F491_4F6C_DD1D) % n) as usize
+            };
+            let candidates: Vec<DepOverride> = (0..next(4))
+                .map(|_| {
+                    let mut dep = npm_override(urls[next(4)]);
+                    dep.name = names[next(4)].to_string();
+                    if next(4) != 0 {
+                        dep.ecosystem = "pypi".to_string();
+                    }
+                    dep
+                })
+                .collect();
+            let fetched: Vec<&str> = urls.iter().copied().filter(|_| next(2) == 0).collect();
+            if !pipenv_probe_certain(&files, candidates.iter(), fetched.iter().copied()) {
+                held += 1;
+                continue;
+            }
+            fired += 1;
+            for mask in 0..(1u32 << fetched.len()) {
+                let dropped: Vec<&str> = fetched
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask & (1 << i) != 0)
+                    .map(|(_, url)| *url)
+                    .collect();
+                let kept: Vec<DepOverride> = candidates
+                    .iter()
+                    .filter(|dep| !dropped.contains(&dep.artifact_url.as_str()))
+                    .cloned()
+                    .collect();
+                assert!(
+                    pipenv_lock_targets(&files, &kept),
+                    "seed {seed} mask {mask}"
+                );
+            }
+        }
+        assert!(fired > 100 && held > 100, "{fired}/{held}");
     }
 
     fn npm_override(artifact_url: &str) -> DepOverride {
