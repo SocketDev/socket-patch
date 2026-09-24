@@ -360,12 +360,12 @@ pub async fn revert_cargo_redirect_purl(
                     out.reverted_files.push(edit.path.clone());
                     continue;
                 }
-                let mut trimmed = content.replacen(block, "", 1);
-                // Collapse the blank separator the rewrite inserted.
-                while trimmed.contains("\n\n\n") {
-                    trimmed = trimmed.replace("\n\n\n", "\n\n");
-                }
-                let trimmed = trimmed.trim_start_matches('\n').to_string();
+                // The block leaves with the blank separator the rewrite put
+                // before it, so an appended block leaves the user's config
+                // ending exactly as it did — and no other spacing of the
+                // user's is touched (the old triple-newline collapse
+                // rewrote any blank run anywhere in the file).
+                let trimmed = super::replay::remove_fragment_once(&content, block);
                 if trimmed.trim().is_empty() {
                     staged.insert(edit.path.clone(), None);
                 } else {
@@ -3988,6 +3988,74 @@ mod tests {
         );
         assert!(state.records.is_empty(), "record dropped");
         assert!(state.edits.is_empty(), "edits dropped");
+    }
+
+    /// Bug H: removing the block the redirect APPENDED to an existing
+    /// config (the legacy `.cargo/config` here) restores the user's bytes —
+    /// it left a trailing blank line (`[net]\nretry = 2\n\n`) — and never
+    /// touches blank runs of the user's own elsewhere in the file.
+    #[tokio::test]
+    async fn appended_registry_block_revert_restores_the_config_bytes() {
+        for user_cfg in [
+            "[net]\nretry = 2\n",
+            "[net]\n\n\n\nretry = 2\n",
+            "# a comment\n\n[http]\ntimeout = 5\n",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let lock = format!("version = 4\n\n{}\n", pristine_lock_block());
+            let mut files: BTreeMap<String, String> = BTreeMap::new();
+            files.insert("Cargo.toml".into(), pristine_toml());
+            files.insert("Cargo.lock".into(), lock.clone());
+            files.insert(".cargo/config".into(), user_cfg.to_string());
+            let dep: crate::patch::redirect::DepOverride =
+                serde_json::from_value(serde_json::json!({
+                    "ecosystem": "cargo", "name": "cfg-if", "version": "1.0.4",
+                    "token": "tok", "patchUuid": UUID,
+                    "artifactUrl": "http://127.0.0.1:5555/cfg-if-1.0.4.crate",
+                    "registryOverride": {
+                        "kind": "cargo-sparse", "indexUrl": INDEX,
+                        "identifiers": {
+                            "name": "cfg-if", "version": "1.0.4",
+                            "cargoCksumSha256": "a".repeat(64),
+                        },
+                    },
+                    "integrity": { "sha256": "a".repeat(64) },
+                }))
+                .unwrap();
+            let rewrite = crate::patch::redirect::rewrite_registry_redirect(&files, &[dep]);
+            tokio::fs::create_dir_all(root.join(".cargo"))
+                .await
+                .unwrap();
+            for (rel, content) in files.iter().chain(rewrite.files.iter()) {
+                tokio::fs::write(root.join(rel), content).await.unwrap();
+            }
+            let mut state = RedirectState::new();
+            state.edits = rewrite.edits;
+            state.records.insert(PURL.to_string(), record());
+
+            revert_cargo_redirect_purl(root, &mut state, PURL, false)
+                .await
+                .expect("revert succeeds");
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(".cargo/config"))
+                    .await
+                    .unwrap(),
+                user_cfg
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("Cargo.toml"))
+                    .await
+                    .unwrap(),
+                pristine_toml()
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("Cargo.lock"))
+                    .await
+                    .unwrap(),
+                lock
+            );
+        }
     }
 
     /// The socket block was already hand-removed (the config now holds only

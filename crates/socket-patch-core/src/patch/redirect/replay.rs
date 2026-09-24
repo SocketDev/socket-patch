@@ -250,7 +250,7 @@ fn safe_rel_path(path: &str) -> bool {
 /// fragment + newline) is byte-AMBIGUOUS to invert — `"m\n\n" + "F\n"`
 /// and `"m\n" + "\nF\n"` produce identical files — so the tidy form (the
 /// one `go mod tidy` itself emits) is chosen.
-fn remove_fragment_once(content: &str, fragment: &str) -> String {
+pub(super) fn remove_fragment_once(content: &str, fragment: &str) -> String {
     let Some(pos) = content.find(fragment) else {
         return content.to_string();
     };

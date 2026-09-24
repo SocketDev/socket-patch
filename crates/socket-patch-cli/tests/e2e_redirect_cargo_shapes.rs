@@ -5,6 +5,8 @@
 //! * `multi_version` — two patched versions of one crate (`cfg-if` 1.0.4 and
 //!   a renamed `cfg-if-legacy` at 0.1.10): each declaration is pinned to its
 //!   own version's registry, and removing both purls restores every byte.
+//! * `legacy_config` — an existing legacy `.cargo/config`: the registry
+//!   block lands there, and `remove` restores the file byte-for-byte.
 //!
 //! Every shape runs the same chain against the real cargo: a baseline build
 //! with a private CARGO_HOME (network to crates.io for fixture setup only),
@@ -568,6 +570,26 @@ async fn cargo_hosted_multi_version_pins_each_declaration_and_removes_cleanly() 
             "src/main.rs",
             "fn main() { println!(\"{}\", cfg_if::socket_patched() + cfg_if_legacy::socket_patched()); }\n"
                 .to_string(),
+        )],
+    };
+    let _ = run_shape(shape).await;
+}
+
+/// Bug H: an existing legacy `.cargo/config` gets the registry block
+/// appended; removing the purl must restore its exact bytes.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_legacy_config_is_restored_byte_for_byte() {
+    let shape = Shape {
+        tag: "legacy-config",
+        files: vec![
+            ("Cargo.toml", consumer_manifest("cfg-if = \"1.0.4\"\n")),
+            ("src/main.rs", "fn main() {}\n".to_string()),
+            (".cargo/config", "[net]\nretry = 2\n".to_string()),
+        ],
+        patches: vec![CFG_IF_1],
+        oracle: vec![(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
         )],
     };
     let _ = run_shape(shape).await;
