@@ -1100,49 +1100,83 @@ impl NpmCrawler {
         results
     }
 
-    /// Recursively find `node_modules` in subdirectories (for monorepos /
-    /// workspaces), given `dir`'s own listing. Skips symlinks, hidden dirs,
-    /// and well-known non-workspace dirs.
+    /// Find `node_modules` in subdirectories (for monorepos / workspaces),
+    /// at any depth, given `dir`'s own listing. Skips symlinks, hidden
+    /// dirs, and well-known non-workspace dirs.
     ///
-    /// Subdirectories are walked in parallel; the per-child results are
-    /// concatenated in listing order, each child contributing its own
-    /// `node_modules` first and then its subtree's — the sequential
-    /// depth-first order. A child whose listing (which the walk needs
-    /// anyway) proves it has no `node_modules` skips the stat; see
-    /// [`has_node_modules_dir`].
+    /// The result is in the sequential depth-first order: children in
+    /// listing order, each contributing its own `node_modules` first and
+    /// then its subtree's. The tree is read one level at a time, each
+    /// level's dirs in parallel, and the order is reassembled from the
+    /// recorded child ranges afterwards — no recursion, so an arbitrarily
+    /// deep directory chain cannot exhaust a thread's stack. A child whose
+    /// listing (which the walk needs anyway) proves it has no
+    /// `node_modules` skips the stat; see [`has_node_modules_dir`].
     fn find_workspace_node_modules(dir: &Path, listing: Listing) -> Vec<PathBuf> {
-        let children: Vec<PathBuf> = listing
+        /// One walked dir: its `node_modules` (if any) and the indices of
+        /// its walked children in `nodes`.
+        struct WalkedDir {
+            node_modules: Option<PathBuf>,
+            children: std::ops::Range<usize>,
+        }
+
+        // Dirs are numbered in visit order, level by level, so each dir's
+        // children occupy a contiguous range of the next level.
+        let mut nodes: Vec<WalkedDir> = Vec::new();
+        let mut level = Self::workspace_children(dir, listing);
+        let roots = 0..level.len();
+        while !level.is_empty() {
+            let visits: Vec<(Option<PathBuf>, Vec<PathBuf>)> = level
+                .into_par_iter()
+                .map(|full_path| {
+                    let listing = list_dir_sync(&full_path);
+                    // Check if this subdirectory has its own node_modules
+                    let node_modules = has_node_modules_dir(&full_path, &listing)
+                        .then(|| full_path.join("node_modules"));
+                    (node_modules, Self::workspace_children(&full_path, listing))
+                })
+                .collect();
+            let next_base = nodes.len() + visits.len();
+            let mut next_level = Vec::new();
+            for (node_modules, children) in visits {
+                let start = next_base + next_level.len();
+                next_level.extend(children);
+                nodes.push(WalkedDir {
+                    node_modules,
+                    children: start..next_base + next_level.len(),
+                });
+            }
+            level = next_level;
+        }
+
+        // Pre-order emission with an explicit stack.
+        let mut results = Vec::new();
+        let mut stack: Vec<usize> = roots.rev().collect();
+        while let Some(index) = stack.pop() {
+            let node = &mut nodes[index];
+            results.extend(node.node_modules.take());
+            stack.extend(node.children.clone().rev());
+        }
+        results
+    }
+
+    /// The subdirectories of `dir` the workspace walk descends into, in
+    /// listing order: real dirs only (symlinks are never followed), minus
+    /// `node_modules`, hidden dirs and well-known build dirs.
+    fn workspace_children(dir: &Path, listing: Listing) -> Vec<PathBuf> {
+        listing
             .entries
             .into_iter()
             .filter(|entry| {
-                // Skip non-dirs (symlinks included), node_modules, hidden
-                // dirs, and well-known build dirs
                 entry.file_type.is_some_and(|ft| ft.is_dir())
                     && !(entry.name_str == "node_modules"
                         || entry.name_str.starts_with('.')
                         || SKIP_DIRS.contains(&entry.name_str.as_str()))
             })
             .map(|entry| dir.join(&entry.name))
-            .collect();
-
-        children
-            .into_par_iter()
-            .map(|full_path| {
-                let listing = list_dir_sync(&full_path);
-                let mut found = Vec::new();
-                // Check if this subdirectory has its own node_modules
-                if has_node_modules_dir(&full_path, &listing) {
-                    found.push(full_path.join("node_modules"));
-                }
-                // Recurse
-                found.extend(Self::find_workspace_node_modules(&full_path, listing));
-                found
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
             .collect()
     }
+
     // ------------------------------------------------------------------
     // Private helpers – scanning
     // ------------------------------------------------------------------
@@ -2623,5 +2657,40 @@ mod tests {
             paths.contains(&fnm_nm),
             "fnm layout must be discovered under $HOME; got {paths:?}"
         );
+    }
+
+    /// The workspace roots walk is iterative: a directory chain far deeper
+    /// than a small stack can recurse through completes on walk threads
+    /// with only 256 KiB of stack (the recursive walk overflowed there),
+    /// and still yields depth-first order — each dir's `node_modules`
+    /// before anything below it.
+    #[test]
+    fn test_workspace_walk_deep_chain_small_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        // Stay well inside macOS's 1024-byte PATH_MAX.
+        let depth = 400.min(900usize.saturating_sub(root.as_os_str().len()) / 2);
+        assert!(depth >= 200, "temp dir path too long: {}", root.display());
+
+        let mut expected = vec![root.join("node_modules")];
+        let mut chain = root.clone();
+        for level in 1..=depth {
+            chain.push("a");
+            if level == depth / 2 || level == depth {
+                expected.push(chain.join("node_modules"));
+            }
+        }
+        std::fs::create_dir_all(&chain).unwrap();
+        for nm in &expected {
+            std::fs::create_dir_all(nm).unwrap();
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .stack_size(256 * 1024)
+            .build()
+            .unwrap();
+        let found = pool.install(|| NpmCrawler::find_local_node_modules_dirs(&root));
+        assert_eq!(found, expected);
     }
 }
