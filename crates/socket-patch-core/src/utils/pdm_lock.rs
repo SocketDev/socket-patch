@@ -1,9 +1,11 @@
-use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, Value};
+#[cfg(test)]
+use toml_edit::DocumentMut;
+use toml_edit::{value, Array, InlineTable, Item, Table, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::python_lock::preserve_line_endings;
 
-pub fn lock_version(lock: &DocumentMut) -> Result<&str, String> {
+pub fn lock_version(lock: &Table) -> Result<&str, String> {
     let version = lock
         .get("metadata")
         .and_then(|metadata| metadata.get("lock_version"))
@@ -16,7 +18,7 @@ pub fn lock_version(lock: &DocumentMut) -> Result<&str, String> {
     }
 }
 
-pub fn validate_strategy(lock: &DocumentMut) -> Result<Vec<String>, String> {
+pub fn validate_strategy(lock: &Table) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     let Some(metadata) = lock.get("metadata") else {
         return Ok(result);
@@ -100,7 +102,7 @@ pub fn legacy_files_key(package: &Table) -> Option<String> {
     Some(format!("{name}{suffix} {version}"))
 }
 
-pub fn files_for<'a>(lock: &'a DocumentMut, package: &'a Table) -> Option<&'a Array> {
+pub fn files_for<'a>(lock: &'a Table, package: &'a Table) -> Option<&'a Array> {
     package.get("files").and_then(Item::as_array).or_else(|| {
         lock.get("metadata")?
             .get("files")?
@@ -192,6 +194,50 @@ pub fn rewrite_pdm_lock_with_edits<'a>(
     filename: &str,
     sha256: &str,
 ) -> Result<PdmLockRewrite<'a>, String> {
+    rewrite_pdm_lock_in(
+        &mut PdmLockParse::default(),
+        text,
+        name,
+        version,
+        source,
+        filename,
+        sha256,
+    )
+}
+
+/// The parse of the lock text last seen or produced, carried between calls
+/// so a caller working through one `pdm.lock` dep by dep parses each state
+/// once: [`Self::parsed`] reuses it for byte-identical text, and a rewrite
+/// hands on the parse of its own output (which it takes anyway, for the
+/// output's fragments) when the splice reproduced that output byte for byte.
+/// `DocumentMut`'s own parser is exactly `Document::parse(..).into_mut()`, so
+/// every result is the fresh parse's.
+#[derive(Default)]
+pub struct PdmLockParse {
+    doc: Option<toml_edit::Document<String>>,
+}
+
+impl PdmLockParse {
+    /// The parse of `text`, reusing the held one when it is of these bytes.
+    pub fn parsed(&mut self, text: &str) -> Result<&Table, toml_edit::TomlError> {
+        if self.doc.as_ref().is_none_or(|doc| doc.raw() != text) {
+            self.doc = None;
+            self.doc = Some(toml_edit::Document::parse(text.to_owned())?);
+        }
+        Ok(self.doc.as_ref().expect("parsed just above").as_table())
+    }
+}
+
+/// [`rewrite_pdm_lock_with_edits`], reusing (and refreshing) `parse`.
+pub fn rewrite_pdm_lock_in<'a>(
+    parse: &mut PdmLockParse,
+    text: &'a str,
+    name: &'a str,
+    version: &str,
+    source: (&str, &str),
+    filename: &str,
+    sha256: &str,
+) -> Result<PdmLockRewrite<'a>, String> {
     let (kind, location) = source;
     if !matches!(kind, "url" | "path")
         || sha256.len() != 64
@@ -202,9 +248,85 @@ pub fn rewrite_pdm_lock_with_edits<'a>(
     if !wheel_matches(filename, name, version) {
         return Err("PDM patch wheel does not match package".into());
     }
-    let mut lock: DocumentMut = text.parse().map_err(|e| format!("invalid PDM lock: {e}"))?;
-    lock_version(&lock)?;
-    validate_strategy(&lock)?;
+    let doc = match parse.doc.take() {
+        Some(doc) if doc.raw() == text => doc,
+        _ => toml_edit::Document::parse(text.to_owned())
+            .map_err(|e| format!("invalid PDM lock: {e}"))?,
+    };
+    let edits = match plan_pdm_rewrite(&doc, name, version, kind, location) {
+        Ok(edits) => edits,
+        Err(detail) => {
+            // Nothing was mutated: the parse still describes `text`.
+            parse.doc = Some(doc);
+            return Err(detail);
+        }
+    };
+    // The original's fragments come from the same parse; an error surfaces
+    // where the fresh parse used to raise it, after the rewrite.
+    let before = pdm_lock_fragments_in(&doc, text, name);
+    let mut lock = doc.into_mut();
+    for (index, inline_files, files_key) in edits {
+        let mut file = InlineTable::new();
+        file.insert("file", Value::from(filename));
+        file.insert(
+            "hash",
+            Value::from(format!("sha256:{}", sha256.to_ascii_lowercase())),
+        );
+        let mut files = Array::new();
+        files.push(file);
+        let package = lock
+            .get_mut("package")
+            .and_then(Item::as_array_of_tables_mut)
+            .and_then(|packages| packages.get_mut(index))
+            .ok_or("missing PDM package")?;
+        package.insert(kind, value(location));
+        if inline_files {
+            package.insert("files", value(files));
+        } else {
+            let table = lock
+                .get_mut("metadata")
+                .and_then(|metadata| metadata.get_mut("files"))
+                .and_then(Item::as_table_like_mut)
+                .ok_or("missing PDM metadata.files")?;
+            table.insert(&files_key, value(files));
+        }
+    }
+    let rendered = preserve_line_endings(text, lock.to_string());
+    let before = before?;
+    let after_doc = toml_edit::Document::parse(rendered).map_err(|e| e.to_string())?;
+    let rendered = after_doc.raw();
+    let after = pdm_lock_fragments_in(&after_doc, rendered, name)?;
+    let edits = pair_pdm_lock_fragments(text, &before, rendered, after)?;
+    let mut result = text.to_string();
+    for (old, new) in &edits {
+        result = result.replacen(old, new, 1);
+    }
+    let known_edits = (result == rendered).then_some(edits);
+    if known_edits.is_some() {
+        // The output IS the rendered text just parsed: the next dep's input.
+        parse.doc = Some(after_doc);
+    }
+    Ok(PdmLockRewrite {
+        text: result,
+        original: text,
+        name,
+        before,
+        known_edits,
+    })
+}
+
+/// Every refusal of [`rewrite_pdm_lock_in`], read from the parsed lock before
+/// it mutates anything: the `(package index, inline files, legacy files key)`
+/// of each unit to rewrite.
+fn plan_pdm_rewrite(
+    lock: &Table,
+    name: &str,
+    version: &str,
+    kind: &str,
+    location: &str,
+) -> Result<Vec<(usize, bool, String)>, String> {
+    lock_version(lock)?;
+    validate_strategy(lock)?;
     let packages = lock
         .get("package")
         .and_then(Item::as_array_of_tables)
@@ -275,7 +397,7 @@ pub fn rewrite_pdm_lock_with_edits<'a>(
                 }
             }
         }
-        let original_files = files_for(&lock, package).ok_or("missing PDM file hashes")?;
+        let original_files = files_for(lock, package).ok_or("missing PDM file hashes")?;
         if original_files.is_empty()
             || original_files.iter().any(|file| {
                 !file
@@ -294,48 +416,7 @@ pub fn rewrite_pdm_lock_with_edits<'a>(
         let files_key = legacy_files_key(package).ok_or("missing PDM files key")?;
         edits.push((index, package.contains_key("files"), files_key));
     }
-    for (index, inline_files, files_key) in edits {
-        let mut file = InlineTable::new();
-        file.insert("file", Value::from(filename));
-        file.insert(
-            "hash",
-            Value::from(format!("sha256:{}", sha256.to_ascii_lowercase())),
-        );
-        let mut files = Array::new();
-        files.push(file);
-        let package = lock
-            .get_mut("package")
-            .and_then(Item::as_array_of_tables_mut)
-            .and_then(|packages| packages.get_mut(index))
-            .ok_or("missing PDM package")?;
-        package.insert(kind, value(location));
-        if inline_files {
-            package.insert("files", value(files));
-        } else {
-            let table = lock
-                .get_mut("metadata")
-                .and_then(|metadata| metadata.get_mut("files"))
-                .and_then(Item::as_table_like_mut)
-                .ok_or("missing PDM metadata.files")?;
-            table.insert(&files_key, value(files));
-        }
-    }
-    let rendered = preserve_line_endings(text, lock.to_string());
-    let before = pdm_lock_fragments(text, name)?;
-    let after = pdm_lock_fragments(&rendered, name)?;
-    let edits = pair_pdm_lock_fragments(text, &before, &rendered, after)?;
-    let mut result = text.to_string();
-    for (old, new) in &edits {
-        result = result.replacen(old, new, 1);
-    }
-    let known_edits = (result == rendered).then_some(edits);
-    Ok(PdmLockRewrite {
-        text: result,
-        original: text,
-        name,
-        before,
-        known_edits,
-    })
+    Ok(edits)
 }
 
 /// End (exclusive, before its line break) of the first top-level TOML header
@@ -373,6 +454,15 @@ pub fn pdm_lock_edits(
 /// every `[[package]]` unit and each legacy `[metadata.files]` entry.
 fn pdm_lock_fragments(text: &str, name: &str) -> Result<Vec<String>, String> {
     let lock = toml_edit::Document::parse(text).map_err(|e| e.to_string())?;
+    pdm_lock_fragments_in(&lock, text, name)
+}
+
+/// [`pdm_lock_fragments`] of `text` from its (spanned) parse `lock`.
+fn pdm_lock_fragments_in<S>(
+    lock: &toml_edit::Document<S>,
+    text: &str,
+    name: &str,
+) -> Result<Vec<String>, String> {
     let packages = lock
         .get("package")
         .and_then(Item::as_array_of_tables)
@@ -797,5 +887,384 @@ mod tests {
             rederived >= 4,
             "the corpus exercises the re-derive ({rederived})"
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod parse_reuse_tests {
+    //! Shared by the pdm parse-reuse oracles: the previous
+    //! [`rewrite_pdm_lock_with_edits`], kept verbatim, and the native
+    //! fixtures grown to several packages.
+    use super::*;
+
+    pub(crate) fn rewrite_pdm_lock_with_edits_oracle<'a>(
+        text: &'a str,
+        name: &'a str,
+        version: &str,
+        source: (&str, &str),
+        filename: &str,
+        sha256: &str,
+    ) -> Result<PdmLockRewrite<'a>, String> {
+        let (kind, location) = source;
+        if !matches!(kind, "url" | "path")
+            || sha256.len() != 64
+            || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("invalid PDM artifact source or SHA-256".into());
+        }
+        if !wheel_matches(filename, name, version) {
+            return Err("PDM patch wheel does not match package".into());
+        }
+        let mut lock: DocumentMut = text.parse().map_err(|e| format!("invalid PDM lock: {e}"))?;
+        lock_version(&lock)?;
+        validate_strategy(&lock)?;
+        let packages = lock
+            .get("package")
+            .and_then(Item::as_array_of_tables)
+            .ok_or("missing PDM packages")?;
+        let indices: Vec<_> = packages
+            .iter()
+            .enumerate()
+            .filter(|(_, package)| {
+                package
+                    .get("name")
+                    .and_then(Item::as_str)
+                    .is_some_and(|candidate| {
+                        canonicalize_pypi_name(candidate) == canonicalize_pypi_name(name)
+                    })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if indices.is_empty() {
+            return Err("missing PDM package".into());
+        }
+        // A marker/multi-target lock (PDM >= 2.17 `pdm lock --append`) can carry the
+        // same package at several versions, one per resolution fork. A single
+        // surgical rewrite would patch one fork and leave the others pinned to the
+        // registry, so refuse the whole lock ahead of the per-unit version check —
+        // the target version IS present, so the plain "version differs" below would
+        // misdirect the user to re-lock.
+        let locked_versions: std::collections::BTreeSet<&str> = indices
+            .iter()
+            .filter_map(|&index| packages.get(index)?.get("version").and_then(Item::as_str))
+            .collect();
+        if locked_versions.len() > 1 {
+            return Err(
+                "PDM lock resolves this package at multiple versions (a marker or \
+                        multi-target fork); patching one fork would leave the others unpatched"
+                    .into(),
+            );
+        }
+        let mut variants = std::collections::BTreeSet::new();
+        let mut edits = Vec::new();
+        for index in indices {
+            let package = packages.get(index).ok_or("missing PDM package")?;
+            if package.get("version").and_then(Item::as_str) != Some(version) {
+                return Err("PDM locked version differs from installed version".into());
+            }
+            let mut extras = Vec::new();
+            if let Some(value) = package.get("extras") {
+                for extra in value.as_array().ok_or("invalid PDM extras")? {
+                    extras.push(extra.as_str().ok_or("invalid PDM extra")?.to_string());
+                }
+            }
+            extras.sort();
+            if !variants.insert(extras) {
+                return Err("forked PDM package".into());
+            }
+            for field in [
+                "url", "path", "git", "hg", "svn", "bzr", "editable", "source",
+            ] {
+                if let Some(existing) = package.get(field) {
+                    let same_target = field == kind && existing.as_str() == Some(location);
+                    // A prior socket-hosted `url` (rotated grant token or a
+                    // superseded patch uuid — same origin and wheel leaf) is taken
+                    // over in place; foreign urls and every other source refuse.
+                    let prior_hosted = field == kind
+                        && kind == "url"
+                        && existing
+                            .as_str()
+                            .is_some_and(|existing| is_prior_hosted_url(existing, location));
+                    if !same_target && !prior_hosted {
+                        return Err(format!("refusing existing PDM {field} source"));
+                    }
+                }
+            }
+            let original_files = files_for(&lock, package).ok_or("missing PDM file hashes")?;
+            if original_files.is_empty()
+                || original_files.iter().any(|file| {
+                    !file
+                        .as_inline_table()
+                        .and_then(|file| file.get("hash"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|hash| {
+                            hash.strip_prefix("sha256:").is_some_and(|hex| {
+                                hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            })
+                        })
+                })
+            {
+                return Err("invalid PDM file hashes".into());
+            }
+            let files_key = legacy_files_key(package).ok_or("missing PDM files key")?;
+            edits.push((index, package.contains_key("files"), files_key));
+        }
+        for (index, inline_files, files_key) in edits {
+            let mut file = InlineTable::new();
+            file.insert("file", Value::from(filename));
+            file.insert(
+                "hash",
+                Value::from(format!("sha256:{}", sha256.to_ascii_lowercase())),
+            );
+            let mut files = Array::new();
+            files.push(file);
+            let package = lock
+                .get_mut("package")
+                .and_then(Item::as_array_of_tables_mut)
+                .and_then(|packages| packages.get_mut(index))
+                .ok_or("missing PDM package")?;
+            package.insert(kind, value(location));
+            if inline_files {
+                package.insert("files", value(files));
+            } else {
+                let table = lock
+                    .get_mut("metadata")
+                    .and_then(|metadata| metadata.get_mut("files"))
+                    .and_then(Item::as_table_like_mut)
+                    .ok_or("missing PDM metadata.files")?;
+                table.insert(&files_key, value(files));
+            }
+        }
+        let rendered = preserve_line_endings(text, lock.to_string());
+        let before = pdm_lock_fragments(text, name)?;
+        let after = pdm_lock_fragments(&rendered, name)?;
+        let edits = pair_pdm_lock_fragments(text, &before, &rendered, after)?;
+        let mut result = text.to_string();
+        for (old, new) in &edits {
+            result = result.replacen(old, new, 1);
+        }
+        let known_edits = (result == rendered).then_some(edits);
+        Ok(PdmLockRewrite {
+            text: result,
+            original: text,
+            name,
+            before,
+            known_edits,
+        })
+    }
+
+    /// Every native pdm lock generation in `tests/fixtures/pdm-native`.
+    pub(crate) fn fixtures() -> Vec<(String, String)> {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pdm-native");
+        let mut out: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "lock"))
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read_to_string(&path).unwrap())
+            })
+            .collect();
+        out.sort();
+        assert!(out.len() >= 15, "every native pdm lock generation");
+        out
+    }
+
+    /// `lock` (LF) with every `urllib3` package unit cloned as `pkg0`..,
+    /// and — when `[metadata.files]` closes the file — its legacy entries.
+    pub(crate) fn grown(lock: &str, extra: usize) -> String {
+        let lines: Vec<&str> = lock.split_inclusive('\n').collect();
+        let is_top_header = |l: &str| {
+            l.starts_with("[[package]]") || (l.starts_with('[') && !l.starts_with("[package."))
+        };
+        let mut blocks: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].starts_with("[[package]]") {
+                let start = i;
+                i += 1;
+                while i < lines.len() && !is_top_header(lines[i]) {
+                    i += 1;
+                }
+                blocks.push((start, i));
+            } else {
+                i += 1;
+            }
+        }
+        let Some(&(_, last_end)) = blocks.last() else {
+            return lock.to_string();
+        };
+        let mut clones = String::new();
+        for n in 0..extra {
+            for &(start, end) in &blocks {
+                let block: String = lines[start..end].concat();
+                if block.contains("name = \"urllib3\"") {
+                    let mut block =
+                        block.replace("name = \"urllib3\"", &format!("name = \"pkg{n}\""));
+                    if !block.ends_with("\n\n") {
+                        block.push_str(if block.ends_with('\n') { "\n" } else { "\n\n" });
+                    }
+                    clones.push_str(&block);
+                }
+            }
+        }
+        let mut out: String = lines[..last_end].concat();
+        if !out.ends_with("\n\n") {
+            out.push_str(if out.ends_with('\n') { "\n" } else { "\n\n" });
+        }
+        out.push_str(&clones);
+        out.push_str(&lines[last_end..].concat());
+        let last_header = lines.iter().rev().find(|l| l.starts_with('['));
+        if last_header.is_some_and(|l| l.starts_with("[metadata.files]")) {
+            let mut entries = String::new();
+            let mut j = 0;
+            while j < lines.len() {
+                if lines[j].starts_with("\"urllib3") {
+                    let start = j;
+                    while j < lines.len() && !lines[j].starts_with(']') {
+                        j += 1;
+                    }
+                    let entry: String = lines[start..=j.min(lines.len() - 1)].concat();
+                    for n in 0..extra {
+                        entries.push_str(&entry.replacen("\"urllib3", &format!("\"pkg{n}"), 1));
+                    }
+                }
+                j += 1;
+            }
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&entries);
+        }
+        out
+    }
+
+    const SHA: &str = "34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07";
+
+    /// The step sequence: landing deps, a re-run, a rotated-token takeover,
+    /// and refusals (other version, bad hash, foreign path source) between.
+    pub(crate) fn steps(extra: usize) -> Vec<(String, String, (String, String), String)> {
+        let url = |name: &str, tag: &str, version: &str| {
+            format!("https://patch.socket.dev/patch/pypi/{name}/{tag}/{name}-{version}-py3-none-any.whl")
+        };
+        let hosted = |name: &str, tag: &str, version: &str, sha: &str| {
+            (
+                name.to_string(),
+                version.to_string(),
+                ("url".to_string(), url(name, tag, version)),
+                sha.to_string(),
+            )
+        };
+        let mut out = vec![hosted("urllib3", "a", "1.26.18", SHA)];
+        for n in 0..extra {
+            out.push(hosted(&format!("pkg{n}"), "a", "1.26.18", SHA));
+        }
+        out.push(hosted("PySocks", "a", "1.7.1", SHA));
+        out.push(hosted("absent", "a", "1.0.0", SHA));
+        out.push(hosted("urllib3", "a", "9.9.9", SHA));
+        out.push(hosted("urllib3", "a", "1.26.18", "not-a-sha"));
+        out.push(hosted("urllib3", "a", "1.26.18", SHA));
+        out.push(hosted("urllib3", "rotated", "1.26.18", SHA));
+        out.push((
+            "urllib3".into(),
+            "1.26.18".into(),
+            (
+                "path".into(),
+                "./.socket/vendor/pypi/u/urllib3-1.26.18-py3-none-any.whl".into(),
+            ),
+            SHA.into(),
+        ));
+        if extra > 1 {
+            out.push(hosted("pkg1", "b", "1.26.18", &SHA.to_ascii_uppercase()));
+        }
+        out
+    }
+
+    #[test]
+    fn reused_parse_matches_the_fresh_parse_rewrite() {
+        let mut landed = 0;
+        for (fixture, lock) in fixtures() {
+            for extra in [0, 3] {
+                for crlf in [false, true] {
+                    let mut lock = grown(&lock.replace("\r\n", "\n"), extra);
+                    if crlf {
+                        lock = lock.replace('\n', "\r\n");
+                    }
+                    let (mut want_text, mut got_text) = (lock.clone(), lock);
+                    let mut parse = PdmLockParse::default();
+                    for (i, (name, version, (kind, location), sha)) in
+                        steps(extra).iter().enumerate()
+                    {
+                        let what = format!("{fixture} extra={extra} crlf={crlf} step {i}");
+                        let filename = location.rsplit('/').next().unwrap();
+                        let source = (kind.as_str(), location.as_str());
+                        let want = rewrite_pdm_lock_with_edits_oracle(
+                            &want_text, name, version, source, filename, sha,
+                        );
+                        let got = rewrite_pdm_lock_in(
+                            &mut parse, &got_text, name, version, source, filename, sha,
+                        );
+                        match (want, got) {
+                            (Err(w), Err(g)) => assert_eq!(g, w, "{what}"),
+                            (Ok(w), Ok(g)) => {
+                                assert_eq!(g.text, w.text, "{what}: text");
+                                assert_eq!(g.edits(), w.edits(), "{what}: edits");
+                                landed += 1;
+                                want_text = w.text;
+                                got_text = g.text;
+                            }
+                            (w, g) => panic!(
+                                "{what}: verdicts differ: {:?} vs {:?}",
+                                w.map(|r| r.text),
+                                g.map(|r| r.text)
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        assert!(landed > 100, "only {landed} rewrites landed");
+    }
+
+    /// A parse is reused only for byte-identical text.
+    #[test]
+    fn reused_parse_misses_on_changed_text() {
+        let lock = grown(&fixtures().pop().unwrap().1.replace("\r\n", "\n"), 2);
+        let mut parse = PdmLockParse::default();
+        let url = "https://patch.socket.dev/patch/pypi/pkg0/a/pkg0-1.26.18-py3-none-any.whl";
+        let first = rewrite_pdm_lock_in(
+            &mut parse,
+            &lock,
+            "pkg0",
+            "1.26.18",
+            ("url", url),
+            "pkg0-1.26.18-py3-none-any.whl",
+            SHA,
+        )
+        .unwrap();
+        let edited = first.text.replace("name = \"pkg1\"", "name = \"gone\"");
+        let url = "https://patch.socket.dev/patch/pypi/pkg1/a/pkg1-1.26.18-py3-none-any.whl";
+        let got = rewrite_pdm_lock_in(
+            &mut parse,
+            &edited,
+            "pkg1",
+            "1.26.18",
+            ("url", url),
+            "pkg1-1.26.18-py3-none-any.whl",
+            SHA,
+        );
+        assert_eq!(got.err().as_deref(), Some("missing PDM package"));
+        // `parsed` likewise re-parses changed text.
+        let names = |parse: &mut PdmLockParse, text: &str| -> Vec<String> {
+            parse.parsed(text).unwrap()["package"]
+                .as_array_of_tables()
+                .unwrap()
+                .iter()
+                .filter_map(|p| p.get("name")?.as_str().map(str::to_string))
+                .collect()
+        };
+        assert!(names(&mut parse, &edited).contains(&"gone".to_string()));
+        assert!(names(&mut parse, &first.text).contains(&"pkg1".to_string()));
     }
 }
