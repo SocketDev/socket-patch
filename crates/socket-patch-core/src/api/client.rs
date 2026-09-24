@@ -291,6 +291,13 @@ impl ApiClient {
         self.org_slug.as_ref()
     }
 
+    /// Whether this client talks to the public patch proxy (vs. the
+    /// authenticated org API) — picks the concurrency cap
+    /// ([`crate::utils::concurrent::api_concurrency`]).
+    pub fn uses_public_proxy(&self) -> bool {
+        self.use_public_proxy
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────
 
     /// Internal GET that deserialises JSON. Returns `Ok(None)` on 404.

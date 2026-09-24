@@ -7,6 +7,7 @@
 //! small helpers shared across the submodules.
 
 use clap::Args;
+use futures_util::StreamExt;
 use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate, ApiClient,
 };
@@ -16,6 +17,7 @@ use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned};
+use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::{normalize_purl, purl_name_version, strip_purl_qualifiers};
 use socket_patch_core::vendor::VendorState;
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
@@ -530,13 +532,24 @@ async fn fetch_patch_details(
     // `show_progress` off reads as `--json` to the status line: never
     // drawn. On, it is live only on a terminal; it never prints a result.
     let mut status = StatusLine::stderr(!show_progress, false);
-    for (i, pkg) in packages.iter().enumerate() {
+    // The queries run concurrently but come back in `packages` order, so
+    // `results` and `failures` fold exactly as the serial loop's did. The
+    // counter names the next result awaited.
+    let mut responses = std::pin::pin!(ordered_concurrent(
+        packages,
+        api_concurrency(api_client.uses_public_proxy()),
+        |pkg| async move { (pkg, api_client.search_patches_by_package(&pkg.purl).await) },
+    ));
+    for i in 0..packages.len() {
         status.set(format!(
             "Fetching patch details... ({}/{})",
             i + 1,
             packages.len()
         ));
-        match api_client.search_patches_by_package(&pkg.purl).await {
+        let Some((pkg, response)) = responses.next().await else {
+            break;
+        };
+        match response {
             Ok(response) => results.extend(response.patches),
             Err(e) => failures.push((pkg.purl.clone(), e.to_string())),
         }
