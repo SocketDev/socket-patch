@@ -136,6 +136,60 @@ pub async fn fetch_hosted_wheel_metadata(
     decode_hosted_wheel_metadata(&bytes, sha256)
 }
 
+/// One speculative [`fetch_hosted_wheel_metadata`], for running several
+/// concurrently while keeping the one-at-a-time loop's outcomes.
+pub enum HostedWheelMetadataAttempt {
+    /// Settled on the first attempt: [`Self::into_result`] gives exactly
+    /// what `fetch_hosted_wheel_metadata` would have returned.
+    Settled {
+        result: Result<Option<String>, String>,
+        debug: Vec<String>,
+    },
+    /// The first attempt failed in a way `fetch_hosted_wheel_metadata`
+    /// retries; the caller must run that instead (with a fresh budget).
+    Retry,
+}
+
+impl HostedWheelMetadataAttempt {
+    /// The settled result, printing the attempt's held-back debug lines —
+    /// call it where the one-at-a-time loop would have fetched this wheel.
+    pub fn into_result(self) -> Option<Result<Option<String>, String>> {
+        match self {
+            Self::Settled { result, debug } => {
+                crate::api::client::flush_deferred_debug(debug);
+                Some(result)
+            }
+            Self::Retry => None,
+        }
+    }
+}
+
+/// [`fetch_hosted_wheel_metadata`]'s first attempt only, with its debug
+/// lines held back (see [`HostedWheelMetadataAttempt`]).
+pub async fn try_fetch_hosted_wheel_metadata_once(
+    client: &ApiClient,
+    url: &str,
+    sha256: &str,
+) -> HostedWheelMetadataAttempt {
+    if let Err(error) = validate_hosted_wheel_sha256(sha256) {
+        return HostedWheelMetadataAttempt::Settled {
+            result: Err(error),
+            debug: Vec::new(),
+        };
+    }
+    let (attempt, debug) =
+        crate::api::client::with_deferred_debug(client.download_artifact_first_attempt(url)).await;
+    match attempt {
+        None => HostedWheelMetadataAttempt::Retry,
+        Some(downloaded) => HostedWheelMetadataAttempt::Settled {
+            result: downloaded
+                .map_err(|error| format!("cannot fetch hosted wheel metadata: {error}"))
+                .and_then(|bytes| decode_hosted_wheel_metadata(&bytes, sha256)),
+            debug,
+        },
+    }
+}
+
 const SETUP_ALTERNATIVE: &str =
     "use the `socket-patch setup` .pth install hook instead, which patches installed \
      site-packages without lockfile edits";

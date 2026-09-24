@@ -77,7 +77,45 @@ fn status_error(head: &str, status: StatusCode, text: &str) -> String {
 /// Log debug messages when debug mode is enabled.
 fn debug_log(message: &str) {
     if is_debug_enabled() {
-        eprintln!("[socket-patch debug] {}", message);
+        let line = format!("[socket-patch debug] {}", message);
+        let mut line = Some(line);
+        let deferred = DEFERRED_DEBUG.try_with(|lines| {
+            if let Some(line) = line.take() {
+                lines.borrow_mut().push(line);
+            }
+        });
+        if deferred.is_err() {
+            if let Some(line) = line {
+                eprintln!("{line}");
+            }
+        }
+    }
+}
+
+tokio::task_local! {
+    /// Set around a speculative (concurrent) request so its debug lines are
+    /// held back and the caller can print them, or drop them, in the order a
+    /// one-at-a-time loop would have produced.
+    static DEFERRED_DEBUG: std::cell::RefCell<Vec<String>>;
+}
+
+/// Run `fut` with its [`debug_log`] lines captured instead of printed;
+/// returns its output and the captured lines, in emission order.
+pub(crate) async fn with_deferred_debug<T>(
+    fut: impl std::future::Future<Output = T>,
+) -> (T, Vec<String>) {
+    DEFERRED_DEBUG
+        .scope(std::cell::RefCell::new(Vec::new()), async move {
+            let out = fut.await;
+            (out, DEFERRED_DEBUG.with(|lines| lines.take()))
+        })
+        .await
+}
+
+/// Print lines captured by [`with_deferred_debug`] (already prefixed).
+pub(crate) fn flush_deferred_debug(lines: Vec<String>) {
+    for line in lines {
+        eprintln!("{line}");
     }
 }
 
@@ -1283,18 +1321,36 @@ impl ApiClient {
     /// integrity. A 404/410/408 surfaces as an error (a secondary the
     /// reference promised should be present).
     pub(crate) async fn download_artifact(&self, url: &str) -> Result<Vec<u8>, ApiError> {
-        match self.download_vendor_archive(url).await {
-            ServeDownload::Ok(bytes) => Ok(bytes),
-            ServeDownload::NotFound => Err(ApiError::Other(format!("artifact not found: {url}"))),
-            ServeDownload::Pending => {
-                Err(ApiError::Other(format!("artifact still building: {url}")))
-            }
-            ServeDownload::Failed(e) => Err(e),
+        artifact_download_result(self.download_vendor_archive(url).await, url)
+    }
+
+    /// The first attempt of [`Self::download_artifact`] alone: `Some` with
+    /// exactly the result `download_artifact` would return when that attempt
+    /// settles it (success, or a failure it would not retry), `None` when it
+    /// would retry. A caller that gets `None` runs `download_artifact` from
+    /// scratch, so it keeps the full retry budget and `Retry-After` pacing.
+    pub(crate) async fn download_artifact_first_attempt(
+        &self,
+        url: &str,
+    ) -> Option<Result<Vec<u8>, ApiError>> {
+        match self.download_vendor_archive_once(url).await {
+            (ServeDownload::Failed(_), Some(_)) if self.vendor_retry.attempts.max(1) > 1 => None,
+            (outcome, _) => Some(artifact_download_result(outcome, url)),
         }
     }
 }
 
 // ── Free functions ────────────────────────────────────────────────────
+
+/// [`ApiClient::download_artifact`]'s mapping of a serve outcome.
+fn artifact_download_result(outcome: ServeDownload, url: &str) -> Result<Vec<u8>, ApiError> {
+    match outcome {
+        ServeDownload::Ok(bytes) => Ok(bytes),
+        ServeDownload::NotFound => Err(ApiError::Other(format!("artifact not found: {url}"))),
+        ServeDownload::Pending => Err(ApiError::Other(format!("artifact still building: {url}"))),
+        ServeDownload::Failed(e) => Err(e),
+    }
+}
 
 /// Cap on a single prebuilt-archive download (defensive bound against a
 /// runaway / hostile serve response). Generous enough for any real package.
@@ -4106,6 +4162,72 @@ mod vendor_retry_tests {
             org_slug: Some("acme".into()),
         })
         .with_vendor_retry(policy)
+    }
+
+    /// `download_artifact_first_attempt` settles exactly what
+    /// `download_artifact` would return on its first attempt, and declines
+    /// (`None`, one request, no backoff) wherever `download_artifact` would
+    /// retry — unless the policy has no retry to give, where it settles.
+    #[tokio::test]
+    async fn first_attempt_settles_or_defers_like_download_artifact() {
+        let server = MockServer::start().await;
+        for (route, status) in [("/ok", 200), ("/gone", 404), ("/busy", 429), ("/down", 503)] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(status).set_body_bytes(BYTES.to_vec()))
+                .mount(&server)
+                .await;
+        }
+        let url = |route: &str| format!("{}{route}", server.uri());
+        let retrying = client(&server.uri(), fast());
+
+        let ok = retrying.download_artifact_first_attempt(&url("/ok")).await;
+        assert_eq!(ok.expect("200 settles").expect("200 is Ok"), BYTES);
+        let gone = retrying
+            .download_artifact_first_attempt(&url("/gone"))
+            .await
+            .expect("404 is terminal, so it settles")
+            .expect_err("404 is an error");
+        let full = retrying
+            .download_artifact(&url("/gone"))
+            .await
+            .expect_err("404 is an error");
+        assert_eq!(gone.to_string(), full.to_string());
+        for route in ["/busy", "/down"] {
+            assert!(
+                retrying
+                    .download_artifact_first_attempt(&url(route))
+                    .await
+                    .is_none(),
+                "{route} is retried by download_artifact, so it defers"
+            );
+        }
+        let gets = |route: &'static str| {
+            let server = &server;
+            async move {
+                server
+                    .received_requests()
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|r| r.url.path() == route)
+                    .count()
+            }
+        };
+        assert_eq!(gets("/busy").await, 1, "a deferral makes one request");
+        assert_eq!(gets("/down").await, 1, "a deferral makes one request");
+
+        let single = client(&server.uri(), VendorRetryPolicy::none());
+        let settled = single
+            .download_artifact_first_attempt(&url("/down"))
+            .await
+            .expect("with no retry budget the first attempt is final")
+            .expect_err("503 is an error");
+        let full = single
+            .download_artifact(&url("/down"))
+            .await
+            .expect_err("503 is an error");
+        assert_eq!(settled.to_string(), full.to_string());
     }
 
     fn granted(server: &MockServer, uuid: &str) -> ResponseTemplate {

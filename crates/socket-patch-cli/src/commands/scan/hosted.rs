@@ -1825,40 +1825,66 @@ pub(crate) async fn run_redirect_selected(
                 wheel_deps.push((dep, sha256));
             }
         }
-        // The wheels are fetched concurrently but folded in dep order, so
-        // `python_metadata`, `unavailable_python_artifacts` and `skipped`
-        // come out exactly as the serial loop's did.
+        // The wheels' FIRST attempts run concurrently and are folded in dep
+        // order, so `python_metadata`, `unavailable_python_artifacts` and
+        // `skipped` come out exactly as the serial loop's did; each attempt's
+        // opt-in debug lines are held back and printed at its fold, so they
+        // keep the serial order too.
         //
-        // Kept small on purpose: the gain is overlapped round trips, while
-        // each in-flight download buffers a whole wheel (up to
-        // MAX_VENDOR_PACKAGE_BYTES) under its own body timeout and retry
-        // budget, so peak memory and link sharing scale with this limit and
-        // a 429 `Retry-After` pauses only the download that received it. The
-        // status line names the dep whose result is being awaited (the
-        // baseline's messages, in the baseline's order), and the client's
-        // opt-in debug lines (GET / attempt-failed) interleave across the
-        // in-flight downloads.
-        // TODO(perf): let a `Retry-After` pause the whole fan-out rather
-        // than one fetch.
+        // An attempt the client would RETRY (a 429 / 5xx / transport
+        // failure) is never settled concurrently. At the first one no
+        // further attempt is started, the ones already in flight are awaited
+        // (so the host is idle again, as the serial loop would find it), and
+        // that dep plus every later one without a settled attempt are
+        // fetched one at a time with the full retry budget and `Retry-After`
+        // pacing, exactly as the serial loop fetched them. A rate-limited or
+        // struggling host therefore sees the serial loop's behavior from
+        // there on, and no outcome can be worse than the serial loop's.
+        //
+        // Kept small on purpose: each in-flight download buffers a whole
+        // wheel (up to MAX_VENDOR_PACKAGE_BYTES) under its own body timeout.
         const WHEEL_METADATA_CONCURRENCY: usize = 4;
-        let mut fetches = std::pin::pin!(ordered_concurrent(
-            wheel_deps.iter(),
-            WHEEL_METADATA_CONCURRENCY,
-            |&(dep, sha256)| {
-                socket_patch_core::vendor::pypi::fetch_hosted_wheel_metadata(
-                    api_client,
-                    &dep.artifact_url,
-                    sha256,
-                )
-            },
-        ));
-        for &(dep, _) in &wheel_deps {
+        use futures_util::StreamExt as _;
+        use socket_patch_core::vendor::pypi::{
+            fetch_hosted_wheel_metadata, try_fetch_hosted_wheel_metadata_once,
+            HostedWheelMetadataAttempt,
+        };
+        // Lazily built: a dep's attempt starts only once it is pulled here.
+        let mut unstarted = wheel_deps.iter().map(|&(dep, sha256)| {
+            try_fetch_hosted_wheel_metadata_once(api_client, &dep.artifact_url, sha256)
+        });
+        let mut in_flight: futures_util::stream::FuturesOrdered<_> = unstarted
+            .by_ref()
+            .take(WHEEL_METADATA_CONCURRENCY)
+            .collect();
+        // Once serial: the attempts that were in flight when a dep needed a
+        // retry, in dep order (the deps after them were never started).
+        let mut drained: Option<std::collections::VecDeque<_>> = None;
+        for &(dep, sha256) in &wheel_deps {
             status.set(format!(
                 "Fetching hosted wheel metadata for {}...",
                 dep.name
             ));
-            let Some(fetched) = fetches.next().await else {
-                break;
+            let settled = match drained.as_mut() {
+                Some(drained) => drained.pop_front(),
+                None => match in_flight.next().await {
+                    Some(HostedWheelMetadataAttempt::Retry) | None => {
+                        let mut rest = std::collections::VecDeque::new();
+                        while let Some(later) = in_flight.next().await {
+                            rest.push_back(later);
+                        }
+                        drained = Some(rest);
+                        None
+                    }
+                    Some(settled) => {
+                        in_flight.extend(unstarted.next());
+                        Some(settled)
+                    }
+                },
+            };
+            let fetched = match settled.and_then(|settled| settled.into_result()) {
+                Some(fetched) => fetched,
+                None => fetch_hosted_wheel_metadata(api_client, &dep.artifact_url, sha256).await,
             };
             match fetched {
                 Ok(Some(metadata)) => {

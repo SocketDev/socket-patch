@@ -144,12 +144,60 @@ impl Respond for RecordArrival {
     }
 }
 
-/// Discovery, per-package search and the reference grants for all of PKGS;
-/// wheels: `aaa` and `ccc` serve valid bytes (reversed delays), `bbb` is a
-/// SLOW 404 and `ddd` serves bytes that do not match the granted sha256.
-/// Returns the wheel-request arrival log.
+/// A serve host that handles ONE download at a time: a wheel request that
+/// arrives while another is still being answered gets `429 Retry-After: 1`
+/// (a per-token rate limiter / CDN cap). Records every arrival and status.
+struct OneAtATime {
+    name: &'static str,
+    body: Vec<u8>,
+    busy_until: Arc<Mutex<Instant>>,
+    log: Arc<Mutex<Vec<(&'static str, u16)>>>,
+}
+
+impl Respond for OneAtATime {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let now = Instant::now();
+        let mut busy_until = self.busy_until.lock().unwrap();
+        let (status, template) = if now < *busy_until {
+            (
+                429,
+                ResponseTemplate::new(429).insert_header("Retry-After", "1"),
+            )
+        } else {
+            let delay = Duration::from_millis(200);
+            *busy_until = now + delay;
+            (
+                200,
+                ResponseTemplate::new(200)
+                    .set_body_bytes(self.body.clone())
+                    .set_delay(delay),
+            )
+        };
+        self.log.lock().unwrap().push((self.name, status));
+        template
+    }
+}
+
+/// Which wheel host [`mock_api`] mounts.
+enum WheelHost {
+    /// `aaa` and `ccc` serve valid bytes (reversed delays), `bbb` is a SLOW
+    /// 404 and `ddd` serves bytes that do not match the granted sha256.
+    Mixed(Arrivals),
+    /// Every wheel is valid, behind a [`OneAtATime`] host.
+    OneAtATime(Arc<Mutex<Vec<(&'static str, u16)>>>),
+}
+
+/// Discovery, per-package search and the reference grants for all of PKGS,
+/// with the wheels served per [`WheelHost::Mixed`]. Returns the
+/// wheel-request arrival log.
 async fn mock_api(server: &MockServer) -> Arrivals {
     let arrivals: Arrivals = Arc::default();
+    mock_api_with(server, WheelHost::Mixed(arrivals.clone())).await;
+    arrivals
+}
+
+async fn mock_api_with(server: &MockServer, host: WheelHost) {
+    let busy_until = Arc::new(Mutex::new(Instant::now()));
     let patch = |name: &str, version: &str, uuid: &str| {
         json!({
             "uuid": uuid, "purl": purl(name, version), "tier": "free",
@@ -190,23 +238,38 @@ async fn mock_api(server: &MockServer) -> Arrivals {
         let file = wheel_file(name, version);
         let url = format!("{}/wheels/{file}", server.uri());
         let (bytes, sha256) = build_wheel(name, version);
-        let delay = Duration::from_millis([600, 900, 0, 0][i]);
-        let response = match name {
-            "bbb-pkg" => ResponseTemplate::new(404),
-            "ddd-pkg" => {
-                ResponseTemplate::new(200).set_body_bytes(b"not the granted wheel".to_vec())
+        let wheel = Mock::given(method("GET")).and(path(format!("/wheels/{file}")));
+        match &host {
+            WheelHost::Mixed(arrivals) => {
+                let delay = Duration::from_millis([600, 900, 0, 0][i]);
+                let response = match name {
+                    "bbb-pkg" => ResponseTemplate::new(404),
+                    "ddd-pkg" => {
+                        ResponseTemplate::new(200).set_body_bytes(b"not the granted wheel".to_vec())
+                    }
+                    _ => ResponseTemplate::new(200).set_body_bytes(bytes),
+                };
+                wheel
+                    .respond_with(RecordArrival {
+                        name,
+                        template: response.set_delay(delay),
+                        arrivals: arrivals.clone(),
+                    })
+                    .mount(server)
+                    .await;
             }
-            _ => ResponseTemplate::new(200).set_body_bytes(bytes),
-        };
-        Mock::given(method("GET"))
-            .and(path(format!("/wheels/{file}")))
-            .respond_with(RecordArrival {
-                name,
-                template: response.set_delay(delay),
-                arrivals: arrivals.clone(),
-            })
-            .mount(server)
-            .await;
+            WheelHost::OneAtATime(log) => {
+                wheel
+                    .respond_with(OneAtATime {
+                        name,
+                        body: bytes,
+                        busy_until: busy_until.clone(),
+                        log: log.clone(),
+                    })
+                    .mount(server)
+                    .await;
+            }
+        }
         results.insert(
             uuid.to_string(),
             json!({
@@ -223,7 +286,6 @@ async fn mock_api(server: &MockServer) -> Arrivals {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "results": results })))
         .mount(server)
         .await;
-    arrivals
 }
 
 #[tokio::test]
@@ -314,5 +376,90 @@ async fn wheel_metadata_failures_fold_in_dep_order() {
         "bbb must be requested before aaa's delayed response is due \
          (arrived {:?} after aaa): {arrivals:?}",
         bbb.saturating_duration_since(aaa)
+    );
+}
+
+/// A host that serves one download at a time and 429s the rest must end up
+/// with the one-at-a-time loop's outcome: every wheel's metadata fetched,
+/// nothing skipped. Concurrent attempts that share a `Retry-After` wake up
+/// together and collide again, so letting each one retry on its own drains
+/// the budgets and drops a redirect the serial loop makes; a retryable
+/// failure must hand the rest of the fan-out back to the serial loop. The
+/// opt-in debug stream must also match the serial loop's: one wheel GET per
+/// dep, in dep order, and no failed attempt (the serial loop never collides).
+#[tokio::test]
+async fn rate_limited_wheel_host_matches_the_serial_outcome() {
+    let server = MockServer::start().await;
+    let log: Arc<Mutex<Vec<(&'static str, u16)>>> = Arc::default();
+    mock_api_with(&server, WheelHost::OneAtATime(log.clone())).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    write_uv_project(&root);
+
+    let cwd = root.to_str().unwrap().to_string();
+    let api = server.uri();
+    let (code, stdout, stderr) = common::run_with_env(
+        &root,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--dry-run",
+            "--json",
+            "--cwd",
+            &cwd,
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+        &[("SOCKET_DEBUG", "1")],
+    );
+    let doc: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("JSON envelope ({e}):\n{stdout}\n{stderr}"));
+    assert_eq!(code, 0, "{doc:#}\n{stderr}");
+    let log = log.lock().unwrap().clone();
+    assert_eq!(
+        doc["redirect"]["redirected"],
+        PKGS.len(),
+        "every wheel redirects, as in the serial loop: {doc:#}\nwheel requests: {log:?}"
+    );
+    let metadata_skips: Vec<&Value> = doc["redirect"]["skipped"]
+        .as_array()
+        .map(|skipped| {
+            skipped
+                .iter()
+                .filter(|s| s["reason"] == "python_metadata_unavailable")
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        metadata_skips.is_empty(),
+        "no wheel may be skipped: {metadata_skips:?}\nwheel requests: {log:?}"
+    );
+
+    let wheel_debug: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("[socket-patch debug]") && line.contains("/wheels/"))
+        .collect();
+    let expected: Vec<String> = PKGS
+        .iter()
+        .map(|(name, version, _)| {
+            format!(
+                "[socket-patch debug] GET vendor package {}/wheels/{}",
+                server.uri(),
+                wheel_file(name, version)
+            )
+        })
+        .collect();
+    assert_eq!(
+        wheel_debug, expected,
+        "debug lines must follow the serial loop's order:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("vendor package download attempt"),
+        "the serial loop never collides, so no attempt fails:\n{stderr}"
     );
 }
