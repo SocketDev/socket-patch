@@ -91,11 +91,39 @@ pub(crate) fn symlink(target: &Path, link: &Path) {
     let _ = (target, link);
 }
 
+/// Create a FIFO (Unix only; a no-op elsewhere). Only for paths the crawler
+/// under test reads through the FIFO-safe opener — a plain read would wedge
+/// both implementations.
+pub(crate) fn fifo(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path.
+        let _ = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// Write `content` to `path`, creating parents. Best effort: a random
 /// generator may already have put a directory (or a file) in the way.
 pub(crate) fn write(path: &Path, content: &str) {
+    write_bytes(path, content.as_bytes());
+}
+
+/// [`write`] for raw bytes.
+pub(crate) fn write_bytes(path: &Path, content: &[u8]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+    }
+    // Never open anything but a regular file (or nothing): writing into a
+    // FIFO planted earlier in the tree would block the generator.
+    if std::fs::symlink_metadata(path).is_ok_and(|m| !m.is_file()) {
+        return;
     }
     let _ = std::fs::write(path, content);
 }
