@@ -200,6 +200,25 @@ pub fn corepack_command() -> std::process::Command {
     })
 }
 
+/// Serializes yarn berry spawns on Windows. The suites' parallel tests share
+/// one yarn cache folder (`cache_env::isolate` points `YARN_CACHE_FOLDER` at
+/// a single per-run root), and two yarn processes fetching the same package
+/// both write `<pkg>.zip-<rand>.tmp` then rename it over the cache zip. On
+/// Windows the loser's rename fails with `EPERM` while the winner holds the
+/// file (seen on the windows-latest yarn-berry 4.12.0 leg:
+/// `EPERM: operation not permitted, rename '...left-pad-npm-1.3.0-....zip-....tmp'`).
+/// Unix rename-over is atomic, so other platforms stay parallel. Only the
+/// yarn processes serialize; the socket-patch runs between them do not.
+static BERRY_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run a yarn/corepack `Command`, one at a time on Windows (see
+/// [`BERRY_SPAWN`]).
+pub fn berry_spawn_output(cmd: &mut std::process::Command) -> std::io::Result<Output> {
+    let _one_at_a_time =
+        cfg!(windows).then(|| BERRY_SPAWN.lock().unwrap_or_else(|p| p.into_inner()));
+    cmd.output()
+}
+
 /// Both output streams of a finished yarn run, for a failure message. yarn
 /// berry reports its errors (YN0028, YN0018, …) on stdout and usually writes
 /// nothing to stderr, so a stderr-only message hides the reason.

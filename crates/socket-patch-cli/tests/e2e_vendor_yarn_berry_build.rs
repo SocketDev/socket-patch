@@ -116,7 +116,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.output().expect("failed to run corepack")
+    yarn_berry_common::berry_spawn_output(&mut cmd).expect("failed to run corepack")
 }
 
 /// Remove ambient `SOCKET_*` and `YARN_*` vars (so a developer's settings

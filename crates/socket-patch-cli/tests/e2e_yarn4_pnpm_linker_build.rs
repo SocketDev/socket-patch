@@ -147,7 +147,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.output().expect("failed to run corepack")
+    yarn_berry_common::berry_spawn_output(&mut cmd).expect("failed to run corepack")
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
