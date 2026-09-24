@@ -1,10 +1,14 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
-use crate::utils::fs::{is_dir, is_file, normalize_lexically, run_blocking};
+use crate::utils::fs::{is_dir, is_dir_sync, is_file, normalize_lexically, run_blocking};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
+
+#[cfg(test)]
+mod oracle;
 
 /// PHP/Composer ecosystem crawler for discovering packages in Composer
 /// vendor directories.
@@ -89,17 +93,27 @@ impl ComposerCrawler {
         for vendor_path in &vendor_paths {
             let project_root = resolve_project_root(vendor_path).await;
             let entries = read_installed_json(vendor_path).await;
-            for entry in entries {
+            // Resolve every entry's directory first (pure path logic), then
+            // stat them all in one blocking-pool task instead of one hop
+            // each; the loop below consumes the answers in entry order.
+            let resolved: Vec<Option<PathBuf>> = entries
+                .iter()
+                .map(|entry| {
+                    entry.name.split_once('/')?;
+                    resolve_package_dir(vendor_path, &project_root, entry)
+                })
+                .collect();
+            let on_disk = dirs_exist(resolved.clone()).await;
+            for ((entry, pkg_path), on_disk) in entries.into_iter().zip(resolved).zip(on_disk) {
                 if let Some((namespace, name)) = entry.name.split_once('/') {
                     // Skip packages that installed.json lists but that are
                     // not actually on disk (stale metadata, a metapackage).
                     // This keeps crawl_all consistent with find_by_purls,
                     // which only returns packages whose directory exists.
-                    let Some(pkg_path) = resolve_package_dir(vendor_path, &project_root, &entry)
-                    else {
+                    let Some(pkg_path) = pkg_path else {
                         continue;
                     };
-                    if !is_dir(&pkg_path).await {
+                    if !on_disk {
                         continue;
                     }
 
@@ -161,12 +175,20 @@ impl ComposerCrawler {
             .collect();
         let project_root = resolve_project_root(vendor_path).await;
 
+        // Resolve each PURL's directory first (pure lookups), then stat
+        // them all in one blocking-pool task instead of one hop each.
+        // (namespace, name, version), as the purl parser handed them back.
+        type Coords<'a> = (Cow<'a, str>, Cow<'a, str>, Cow<'a, str>);
+        let mut matches: Vec<(&String, Coords<'_>, PathBuf)> = Vec::new();
         for purl in purls {
-            if let Some(((namespace, name), version)) =
+            if let Some(((namespace_part, name_part), version_part)) =
                 crate::utils::purl::parse_composer_purl(purl)
             {
-                let (namespace, name, version) =
-                    (namespace.as_ref(), name.as_ref(), version.as_ref());
+                let (namespace, name, version) = (
+                    namespace_part.as_ref(),
+                    name_part.as_ref(),
+                    version_part.as_ref(),
+                );
                 let full_name = format!("{namespace}/{name}").to_ascii_lowercase();
 
                 let Some(entry) = installed.get(&full_name) else {
@@ -190,21 +212,28 @@ impl ComposerCrawler {
                     continue;
                 };
 
-                if !is_dir(&pkg_dir).await {
-                    continue;
-                }
-
-                result.insert(
-                    purl.clone(),
-                    CrawledPackage {
-                        name: name.to_ascii_lowercase(),
-                        version: version.to_string(),
-                        namespace: Some(namespace.to_ascii_lowercase()),
-                        purl: purl.clone(),
-                        path: pkg_dir,
-                    },
-                );
+                matches.push((purl, (namespace_part, name_part, version_part), pkg_dir));
             }
+        }
+
+        let on_disk = dirs_exist(matches.iter().map(|m| Some(m.2.clone())).collect()).await;
+        for ((purl, (namespace, name, version), pkg_dir), on_disk) in
+            matches.into_iter().zip(on_disk)
+        {
+            if !on_disk {
+                continue;
+            }
+
+            result.insert(
+                purl.clone(),
+                CrawledPackage {
+                    name: name.to_ascii_lowercase(),
+                    version: version.to_string(),
+                    namespace: Some(namespace.to_ascii_lowercase()),
+                    purl: purl.clone(),
+                    path: pkg_dir,
+                },
+            );
         }
 
         Ok(result)
@@ -215,6 +244,21 @@ impl Default for ComposerCrawler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether each path is a directory (following symlinks; a failed stat is
+/// "no", `None` is "no" without a stat), in one blocking-pool task.
+async fn dirs_exist(paths: Vec<Option<PathBuf>>) -> Vec<bool> {
+    if paths.iter().all(Option::is_none) {
+        return vec![false; paths.len()];
+    }
+    run_blocking(move || {
+        paths
+            .iter()
+            .map(|path| path.as_deref().is_some_and(is_dir_sync))
+            .collect()
+    })
+    .await
 }
 
 /// Pure parser for `composer global config home` stdout. Returns
@@ -230,6 +274,56 @@ pub fn parse_composer_home_output(stdout: &str) -> Option<PathBuf> {
     }
 }
 
+/// A process-wide memo of one subprocess answer, reused only while the
+/// whole environment (every variable, and the working directory) is exactly
+/// what it was when the answer was produced — the subprocess's only inputs
+/// the CLI controls. A different environment re-runs it and replaces the
+/// entry; concurrent first callers may each run it, as before.
+struct EnvKeyedMemo {
+    slot: std::sync::Mutex<Option<(EnvKey, Option<String>)>>,
+}
+
+type EnvKey = (
+    Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    Option<PathBuf>,
+);
+
+impl EnvKeyedMemo {
+    const fn new() -> Self {
+        Self {
+            slot: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn get_or_run(&self, run: impl FnOnce() -> Option<String>) -> Option<String> {
+        self.get_or_run_keyed(
+            (std::env::vars_os().collect(), std::env::current_dir().ok()),
+            run,
+        )
+    }
+
+    fn get_or_run_keyed(
+        &self,
+        key: EnvKey,
+        run: impl FnOnce() -> Option<String>,
+    ) -> Option<String> {
+        let lock = || self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_key, answer)) = lock().as_ref() {
+            if *cached_key == key {
+                return answer.clone();
+            }
+        }
+        let answer = run();
+        *lock() = Some((key, answer.clone()));
+        answer
+    }
+}
+
+/// `composer global config home` boots PHP and Composer (0.3-1 s), and
+/// global discovery asks for it on every pass (the crawl, then each
+/// package-lookup pass of the same command).
+static COMPOSER_GLOBAL_HOME: EnvKeyedMemo = EnvKeyedMemo::new();
+
 /// Get the Composer home directory.
 ///
 /// Checks `$COMPOSER_HOME`, then runs `composer global config home`,
@@ -243,9 +337,13 @@ async fn get_composer_home() -> Option<PathBuf> {
         }
     }
 
-    // Try `composer global config home` (a subprocess: on the blocking pool)
-    let stdout =
-        run_blocking(|| SystemCommandRunner.run("composer", &["global", "config", "home"])).await;
+    // Try `composer global config home` (a subprocess: on the blocking pool;
+    // memoized for an unchanged environment, see `COMPOSER_GLOBAL_HOME`)
+    let stdout = run_blocking(|| {
+        COMPOSER_GLOBAL_HOME
+            .get_or_run(|| SystemCommandRunner.run("composer", &["global", "config", "home"]))
+    })
+    .await;
     if let Some(stdout) = stdout {
         if let Some(path) = parse_composer_home_output(&stdout) {
             if is_dir(&path).await {
@@ -1600,5 +1698,150 @@ mod tests {
             read_installed_json(vendor_dir).await.is_empty(),
             "invalid UTF-8 installed.json must yield no entries"
         );
+    }
+
+    // ── Equivalence with the per-package async stats (oracle) ─────────
+
+    mod equivalence {
+        use super::super::oracle::LegacyComposerCrawler;
+        use super::*;
+        use crate::crawlers::oracle_support::{map_rows, mkdir, rows, symlink, write, Rng};
+
+        const NAMES: &[&str] = &[
+            "monolog/monolog",
+            "Symfony/Console",
+            "symfony/console",
+            "a/b",
+            "nons",
+            "wp/plugin",
+        ];
+        const VERSIONS: &[&str] = &["3.5.0", "v6.4.1", "dev-main", "1.0.x-dev"];
+
+        fn project(rng: &mut Rng, root: &Path) -> Vec<(String, String)> {
+            let vendor = root.join("vendor");
+            write(&root.join("composer.json"), "{}");
+            let mut listed = Vec::new();
+            let mut packages = Vec::new();
+            for i in 0..rng.below(16) {
+                let name = rng.pick(NAMES).to_string();
+                let version = rng.pick(VERSIONS).to_string();
+                let install_path = match rng.below(6) {
+                    0 => None,
+                    1 => Some(format!("../../web/plugins/p{i}")),
+                    2 => Some("../../../outside".to_string()),
+                    3 => Some(root.join(format!("abs{i}")).display().to_string()),
+                    _ => Some(format!("../{}", name.to_lowercase())),
+                };
+                // Where the package would live on disk.
+                let dir = match &install_path {
+                    Some(p) => vendor.join("composer").join(p),
+                    None => vendor.join(&name),
+                };
+                match rng.below(6) {
+                    0 => {}
+                    1 => write(&dir, "file"),
+                    2 => symlink(&root.join(format!("missing{i}")), &dir),
+                    _ => mkdir(&dir),
+                }
+                let mut entry = serde_json::json!({ "name": name, "version": version });
+                if let Some(p) = &install_path {
+                    entry["install-path"] = serde_json::json!(p);
+                }
+                listed.push(entry);
+                packages.push((name, version));
+            }
+            let doc = if rng.chance(20) {
+                serde_json::Value::Array(listed)
+            } else {
+                serde_json::json!({ "packages": listed })
+            };
+            write(
+                &vendor.join("composer").join("installed.json"),
+                &doc.to_string(),
+            );
+            packages
+        }
+
+        #[tokio::test]
+        async fn randomized_vendor_trees_match_the_async_oracle() {
+            let (mut crawled, mut found) = (0, 0);
+            for seed in 0..64u64 {
+                let mut rng = Rng::new(seed);
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path().join("proj");
+                let packages = project(&mut rng, &root);
+                let options = CrawlerOptions {
+                    cwd: root.clone(),
+                    global: false,
+                    global_prefix: None,
+                };
+                let new = ComposerCrawler::new().crawl_all(&options).await;
+                let old = LegacyComposerCrawler::crawl_all(&options).await;
+                assert_eq!(rows(&new), rows(&old), "seed {seed}: crawl_all");
+
+                let mut purls: Vec<String> = old.iter().map(|p| p.purl.clone()).collect();
+                for (name, version) in &packages {
+                    purls.push(format!("pkg:composer/{name}@{version}"));
+                    purls.push(format!(
+                        "pkg:composer/{}@{}",
+                        name.to_uppercase(),
+                        normalize_version(version)
+                    ));
+                }
+                let vendor = root.join("vendor");
+                let new_found = ComposerCrawler::new()
+                    .find_by_purls(&vendor, &purls)
+                    .await
+                    .unwrap();
+                let old_found = LegacyComposerCrawler::find_by_purls(&vendor, &purls).await;
+                assert_eq!(
+                    map_rows(&new_found),
+                    map_rows(&old_found),
+                    "seed {seed}: find_by_purls"
+                );
+                crawled += old.len();
+                found += old_found.len();
+            }
+            assert!(
+                crawled > 50 && found > 50,
+                "vacuous fixtures: {crawled}/{found}"
+            );
+        }
+
+        /// The `composer global config home` memo re-runs only when the
+        /// environment changed.
+        #[test]
+        fn env_keyed_memo_reuses_only_an_identical_environment() {
+            use std::ffi::OsString;
+            let env = |path: &str| -> EnvKey {
+                (
+                    vec![(OsString::from("PATH"), OsString::from(path))],
+                    Some(PathBuf::from("/cwd")),
+                )
+            };
+            let memo = EnvKeyedMemo::new();
+            let mut runs = 0;
+            let mut run = |answer: Option<&str>| {
+                runs += 1;
+                answer.map(str::to_string)
+            };
+            assert_eq!(
+                memo.get_or_run_keyed(env("/a"), || run(Some("home"))),
+                Some("home".into())
+            );
+            assert_eq!(
+                memo.get_or_run_keyed(env("/a"), || run(Some("x"))),
+                Some("home".into())
+            );
+            // A different environment misses and replaces the entry — a
+            // failed probe (`None`) included.
+            assert_eq!(memo.get_or_run_keyed(env("/b"), || run(None)), None);
+            assert_eq!(memo.get_or_run_keyed(env("/b"), || run(Some("x"))), None);
+            assert_eq!(
+                memo.get_or_run_keyed(env("/a"), || run(Some("again"))),
+                Some("again".into())
+            );
+            assert_eq!(runs, 3);
+        }
     }
 }
