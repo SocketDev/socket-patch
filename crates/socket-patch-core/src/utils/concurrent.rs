@@ -56,21 +56,21 @@ where
     stream::iter(items).map(f).buffered(limit.max(1))
 }
 
-/// [`ordered_concurrent`], collected: every result, in input order.
-pub async fn map_ordered_concurrent<I, F, Fut>(items: I, limit: usize, f: F) -> Vec<Fut::Output>
-where
-    I: IntoIterator,
-    F: FnMut(I::Item) -> Fut,
-    Fut: Future,
-{
-    ordered_concurrent(items, limit, f).collect().await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
     use std::time::Duration;
+
+    /// [`ordered_concurrent`], collected: every result, in input order.
+    async fn map_ordered_concurrent<I, F, Fut>(items: I, limit: usize, f: F) -> Vec<Fut::Output>
+    where
+        I: IntoIterator,
+        F: FnMut(I::Item) -> Fut,
+        Fut: Future,
+    {
+        ordered_concurrent(items, limit, f).collect().await
+    }
 
     /// Later items finish first (reversed latencies); results still come
     /// back in input order.
