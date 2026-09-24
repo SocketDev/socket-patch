@@ -152,6 +152,46 @@ pub fn rewrite_pdm_lock(
     filename: &str,
     sha256: &str,
 ) -> Result<String, String> {
+    Ok(rewrite_pdm_lock_with_edits(text, name, version, source, filename, sha256)?.text)
+}
+
+/// A successful [`rewrite_pdm_lock_with_edits`].
+pub struct PdmLockRewrite<'a> {
+    /// The rewritten lock text.
+    pub text: String,
+    original: &'a str,
+    name: &'a str,
+    /// The original's fragments, already taken to build `text`.
+    before: Vec<String>,
+    /// The fragment edits, when `text` is byte-identical to the rendered
+    /// document they were derived against (the common case: toml_edit
+    /// round-trips the untouched bytes) — then they are also the edits
+    /// against `text`.
+    known_edits: Option<Vec<(String, String)>>,
+}
+
+impl PdmLockRewrite<'_> {
+    /// Exactly `pdm_lock_edits(original, &self.text, name)`, without
+    /// re-deriving what the rewrite already did.
+    pub fn edits(&self) -> Result<Vec<(String, String)>, String> {
+        if let Some(edits) = &self.known_edits {
+            return Ok(edits.clone());
+        }
+        let after = pdm_lock_fragments(&self.text, self.name)?;
+        pair_pdm_lock_fragments(self.original, &self.before, &self.text, after)
+    }
+}
+
+/// [`rewrite_pdm_lock`], also handing back what the caller needs to record
+/// the rewrite's fragment edits ([`PdmLockRewrite::edits`]).
+pub fn rewrite_pdm_lock_with_edits<'a>(
+    text: &'a str,
+    name: &'a str,
+    version: &str,
+    source: (&str, &str),
+    filename: &str,
+    sha256: &str,
+) -> Result<PdmLockRewrite<'a>, String> {
     let (kind, location) = source;
     if !matches!(kind, "url" | "path")
         || sha256.len() != 64
@@ -281,11 +321,21 @@ pub fn rewrite_pdm_lock(
         }
     }
     let rendered = preserve_line_endings(text, lock.to_string());
+    let before = pdm_lock_fragments(text, name)?;
+    let after = pdm_lock_fragments(&rendered, name)?;
+    let edits = pair_pdm_lock_fragments(text, &before, &rendered, after)?;
     let mut result = text.to_string();
-    for (old, new) in pdm_lock_edits(text, &rendered, name)? {
-        result = result.replacen(&old, &new, 1);
+    for (old, new) in &edits {
+        result = result.replacen(old, new, 1);
     }
-    Ok(result)
+    let known_edits = (result == rendered).then_some(edits);
+    Ok(PdmLockRewrite {
+        text: result,
+        original: text,
+        name,
+        before,
+        known_edits,
+    })
 }
 
 /// End (exclusive, before its line break) of the first top-level TOML header
@@ -314,89 +364,102 @@ pub fn pdm_lock_edits(
     rewritten: &str,
     name: &str,
 ) -> Result<Vec<(String, String)>, String> {
-    fn fragments(text: &str, name: &str) -> Result<Vec<String>, String> {
-        let lock = toml_edit::Document::parse(text).map_err(|e| e.to_string())?;
-        let packages = lock
-            .get("package")
-            .and_then(Item::as_array_of_tables)
-            .ok_or("missing PDM packages")?;
-        let mut result = Vec::new();
-        let mut integrity_keys = std::collections::BTreeSet::new();
-        for package in packages.iter().filter(|package| {
-            package
-                .get("name")
-                .and_then(Item::as_str)
-                .is_some_and(|candidate| {
-                    canonicalize_pypi_name(candidate) == canonicalize_pypi_name(name)
-                })
-        }) {
-            fn extend_span(table: &Table, span: &mut std::ops::Range<usize>) {
-                for (_, item) in table.iter() {
-                    if let Some(own) = item.span() {
-                        span.start = span.start.min(own.start);
-                        span.end = span.end.max(own.end);
-                    }
-                    if let Some(child) = item.as_table() {
-                        extend_span(child, span);
-                    }
+    let before = pdm_lock_fragments(original, name)?;
+    let after = pdm_lock_fragments(rewritten, name)?;
+    pair_pdm_lock_fragments(original, &before, rewritten, after)
+}
+
+/// The fragments of `text` for `name` that [`pdm_lock_edits`] pairs up:
+/// every `[[package]]` unit and each legacy `[metadata.files]` entry.
+fn pdm_lock_fragments(text: &str, name: &str) -> Result<Vec<String>, String> {
+    let lock = toml_edit::Document::parse(text).map_err(|e| e.to_string())?;
+    let packages = lock
+        .get("package")
+        .and_then(Item::as_array_of_tables)
+        .ok_or("missing PDM packages")?;
+    let mut result = Vec::new();
+    let mut integrity_keys = std::collections::BTreeSet::new();
+    for package in packages.iter().filter(|package| {
+        package
+            .get("name")
+            .and_then(Item::as_str)
+            .is_some_and(|candidate| {
+                canonicalize_pypi_name(candidate) == canonicalize_pypi_name(name)
+            })
+    }) {
+        fn extend_span(table: &Table, span: &mut std::ops::Range<usize>) {
+            for (_, item) in table.iter() {
+                if let Some(own) = item.span() {
+                    span.start = span.start.min(own.start);
+                    span.end = span.end.max(own.end);
+                }
+                if let Some(child) = item.as_table() {
+                    extend_span(child, span);
                 }
             }
-            let mut span = package.span().ok_or("missing PDM package span")?;
-            extend_span(package, &mut span);
-            span.end += text[span.end..]
-                .find(['\r', '\n'])
-                .unwrap_or(text.len() - span.end);
-            // Carry the unit's BOUNDARY (blank line(s) after it plus the next
-            // top-level header, or EOF): the rewrite APPENDS `url` to the unit,
-            // so for a lock_version-2 unit — whose body carries no inline
-            // `files` to diverge — the pristine fragment would otherwise be a
-            // strict prefix of the rewritten one, and replay's "already
-            // converged" guard (`!new.contains(original)`) could never fire for
-            // a relocked lock.
-            span.end = next_header_end(text, span.end);
-            result.push(text[span].to_string());
-            if !package.contains_key("files") {
-                let key = legacy_files_key(package).ok_or("missing PDM files key")?;
-                if !integrity_keys.insert(key.clone()) {
-                    continue;
-                }
-                let table = lock
-                    .get("metadata")
-                    .and_then(|metadata| metadata.get("files"))
-                    .and_then(Item::as_table)
-                    .ok_or("missing PDM metadata.files")?;
-                let start = table
-                    .key(&key)
-                    .and_then(|key| key.span())
-                    .ok_or("missing PDM files key")?
-                    .start;
-                let end = table
-                    .get(&key)
-                    .and_then(Item::span)
-                    .ok_or("missing PDM files span")?
-                    .end;
-                result.push(text[start..end].to_string());
+        }
+        let mut span = package.span().ok_or("missing PDM package span")?;
+        extend_span(package, &mut span);
+        span.end += text[span.end..]
+            .find(['\r', '\n'])
+            .unwrap_or(text.len() - span.end);
+        // Carry the unit's BOUNDARY (blank line(s) after it plus the next
+        // top-level header, or EOF): the rewrite APPENDS `url` to the unit,
+        // so for a lock_version-2 unit — whose body carries no inline
+        // `files` to diverge — the pristine fragment would otherwise be a
+        // strict prefix of the rewritten one, and replay's "already
+        // converged" guard (`!new.contains(original)`) could never fire for
+        // a relocked lock.
+        span.end = next_header_end(text, span.end);
+        result.push(text[span].to_string());
+        if !package.contains_key("files") {
+            let key = legacy_files_key(package).ok_or("missing PDM files key")?;
+            if !integrity_keys.insert(key.clone()) {
+                continue;
             }
+            let table = lock
+                .get("metadata")
+                .and_then(|metadata| metadata.get("files"))
+                .and_then(Item::as_table)
+                .ok_or("missing PDM metadata.files")?;
+            let start = table
+                .key(&key)
+                .and_then(|key| key.span())
+                .ok_or("missing PDM files key")?
+                .start;
+            let end = table
+                .get(&key)
+                .and_then(Item::span)
+                .ok_or("missing PDM files span")?
+                .end;
+            result.push(text[start..end].to_string());
         }
-        if result.is_empty() {
-            return Err("missing PDM package fragments".into());
-        }
-        Ok(result)
     }
-    let before = fragments(original, name)?;
-    let after = fragments(rewritten, name)?;
+    if result.is_empty() {
+        return Err("missing PDM package fragments".into());
+    }
+    Ok(result)
+}
+
+/// [`pdm_lock_edits`] over fragments already taken from both sides.
+fn pair_pdm_lock_fragments(
+    original: &str,
+    before: &[String],
+    rewritten: &str,
+    after: Vec<String>,
+) -> Result<Vec<(String, String)>, String> {
     if before.len() != after.len() {
         return Err("PDM package fragments changed shape".into());
     }
     let mut edits = Vec::new();
-    for (old, new) in before.into_iter().zip(after) {
-        if old == new {
+    for (old, new) in before.iter().zip(after) {
+        if *old == new {
             continue;
         }
-        if original.matches(&old).count() != 1 || rewritten.matches(&new).count() != 1 {
+        if original.matches(old.as_str()).count() != 1 || rewritten.matches(&new).count() != 1 {
             return Err("ambiguous PDM rollback fragment".into());
         }
-        edits.push((old, new));
+        edits.push((old.clone(), new));
     }
     Ok(edits)
 }
@@ -651,6 +714,53 @@ mod tests {
         assert_eq!(
             legacy_files_key(&table).as_deref(),
             Some("zope.interface 6.0")
+        );
+    }
+
+    /// The edits a rewrite hands back are exactly `pdm_lock_edits` of its
+    /// input and output — whether reused from the rewrite or re-derived.
+    #[test]
+    fn rewrite_edits_equal_pdm_lock_edits() {
+        let mut rewritten = 0;
+        for name in [
+            "0.12.3",
+            "0.12.3-extras",
+            "1.15.5",
+            "2.0.3",
+            "2.8.2",
+            "2.10.4",
+            "2.17.3",
+            "2.29.2",
+        ] {
+            for crlf in [false, true] {
+                let mut text = fixture(name).replace("\r\n", "\n");
+                if crlf {
+                    text = text.replace('\n', "\r\n");
+                }
+                // Formats the rewriter refuses (lock_version 3.1) have no edits.
+                let Ok(rewrite) = rewrite_pdm_lock_with_edits(
+                    &text,
+                    "urllib3",
+                    "1.26.18",
+                    ("path", PATH),
+                    WHEEL,
+                    &"a".repeat(64),
+                ) else {
+                    continue;
+                };
+                rewritten += 1;
+                let want = pdm_lock_edits(&text, &rewrite.text, "urllib3");
+                assert_eq!(rewrite.edits(), want, "{name} crlf={crlf}");
+                let rederived = PdmLockRewrite {
+                    known_edits: None,
+                    ..rewrite
+                };
+                assert_eq!(rederived.edits(), want, "{name} crlf={crlf} re-derived");
+            }
+        }
+        assert!(
+            rewritten >= 10,
+            "the corpus exercises the rewrite ({rewritten})"
         );
     }
 }

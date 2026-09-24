@@ -417,7 +417,7 @@ pub async fn wire_pdm(
         ));
     }
 
-    let new_lock = crate::utils::pdm_lock::rewrite_pdm_lock(
+    let rewrite = crate::utils::pdm_lock::rewrite_pdm_lock_with_edits(
         &p.lock_text,
         canon_name,
         version,
@@ -426,8 +426,10 @@ pub async fn wire_pdm(
         wheel_sha256_hex,
     )
     .map_err(|detail| ("pypi_pdm_lock_parse_failed", detail))?;
-    let fragments = crate::utils::pdm_lock::pdm_lock_edits(&p.lock_text, &new_lock, canon_name)
+    let fragments = rewrite
+        .edits()
         .map_err(|detail| ("pypi_pdm_lock_parse_failed", detail))?;
+    let new_lock = rewrite.text;
     // The edit was computed from the pre-flight snapshot; a `pdm lock` /
     // editor save that landed during the wheel build must not be clobbered.
     ensure_unchanged(root, LOCK_FILE, &p.lock_text, "pypi_pdm_changed").await?;
