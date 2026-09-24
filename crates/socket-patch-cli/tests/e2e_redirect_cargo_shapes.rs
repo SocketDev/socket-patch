@@ -6,7 +6,8 @@
 //!   a renamed `cfg-if-legacy` at 0.1.10): each declaration is pinned to its
 //!   own version's registry, and removing both purls restores every byte.
 //! * `legacy_config` — an existing legacy `.cargo/config`: the registry
-//!   block lands there, and `remove` restores the file byte-for-byte.
+//!   block lands there, and `remove` restores the file byte-for-byte —
+//!   also when it lacks a final newline or ends in a blank line.
 //! * `crlf` — CRLF `Cargo.toml` + `Cargo.lock`: rewritten with CRLF kept,
 //!   and restored byte-for-byte.
 //! * `workspace_direct_member` — a virtual workspace whose root pins
@@ -735,6 +736,44 @@ async fn cargo_hosted_legacy_config_is_restored_byte_for_byte() {
         refused: None,
     };
     let _ = run_shape(shape).await;
+}
+
+/// Bug H, exactly: a config without a final newline, and one ending in a
+/// blank line, both come back byte-for-byte (the appended block's removal
+/// once normalized the trailing newline run).
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_config_trailing_bytes_are_restored() {
+    for (tag, rel, config) in [
+        (
+            "config-unterminated",
+            ".cargo/config.toml",
+            "[net]\nretry = 2",
+        ),
+        (
+            "config-trailing-blank",
+            ".cargo/config",
+            "[net]\nretry = 2\n\n",
+        ),
+    ] {
+        let shape = Shape {
+            tag,
+            files: vec![
+                ("Cargo.toml", consumer_manifest("cfg-if = \"1.0.4\"\n")),
+                ("src/main.rs", "fn main() {}\n".to_string()),
+                (rel, config.to_string()),
+            ],
+            patches: vec![CFG_IF_1],
+            oracle: vec![(
+                "src/main.rs",
+                "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
+            )],
+            crlf: false,
+            refused: None,
+        };
+        if run_shape(shape).await.is_none() {
+            return;
+        }
+    }
 }
 
 /// Bug F: a workspace member's own declaration must be pinned too.

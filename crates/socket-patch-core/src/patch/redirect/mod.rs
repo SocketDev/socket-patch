@@ -2364,6 +2364,10 @@ fn plan_cargo_config(
         ""
     };
     let prefix = if config.is_empty() { "" } else { "\n" };
+    // The newline a config without a final one needed rides in the recorded
+    // fragment, so the revert (which also drops the one blank separator
+    // before the fragment) restores the config's exact bytes.
+    let recorded = format!("{sep}{block}");
     Some(CargoConfigPlan {
         content: format!("{config}{sep}{prefix}{block}"),
         edit: FileEdit {
@@ -2372,7 +2376,7 @@ fn plan_cargo_config(
             action: "added".into(),
             key: Some(reg.to_string()),
             original: None,
-            new: Some(Value::String(block)),
+            new: Some(Value::String(recorded)),
         },
     })
 }

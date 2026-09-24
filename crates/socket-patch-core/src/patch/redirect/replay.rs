@@ -72,6 +72,11 @@ enum Inverse {
     /// go.sum lines the redirect added (`new`, `\n`-joined): each is removed
     /// as a whole line, whatever the file's line endings.
     RemoveAddedLines,
+    /// The appended cargo `[registries.…]` block (`redirect_cargo_registry`,
+    /// action `added`): removed together with exactly the one blank
+    /// separator the rewriter put before it — see
+    /// [`remove_appended_cargo_block`].
+    RemoveAppendedCargoBlock,
     /// Cleanup of PRIOR socket wiring performed during a redirect refresh
     /// (`redirect_golang_stale_*`). The removal already moved the file
     /// toward pristine; restoring it would re-create socket wiring, so
@@ -114,7 +119,7 @@ fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
         "redirect_cargo_registry" => (
             "cargo",
             if action == "added" {
-                Inverse::RemoveAddedFragment
+                Inverse::RemoveAppendedCargoBlock
             } else {
                 Inverse::ReplaceFragment
             },
@@ -303,6 +308,38 @@ pub(super) fn remove_fragment_once(content: &str, fragment: &str) -> String {
         return format!("{trimmed}{eol}");
     }
     format!("{}{}", &content[..start], &content[end..])
+}
+
+/// Invert the cargo rewriter's append of a `[registries.…]` block: it wrote
+/// `config + "\n" + block` (just `block` into an empty config) and records
+/// `block` — or `"\n" + block` when the config lacked a final newline (the
+/// extra newline it had to add first). Removing the recorded fragment plus
+/// the one newline before it therefore restores the config's exact bytes:
+/// a missing final newline or trailing blank lines included, and anything
+/// the user appended after the block kept. An all-CRLF file is inverted as
+/// LF and written back CRLF; a fragment recorded with the other line
+/// endings (a checkout converted them) still matches. `None` when the
+/// fragment is not in the file.
+pub(super) fn remove_appended_cargo_block(content: &str, fragment: &str) -> Option<String> {
+    let crlf = content.matches("\r\n").count();
+    if crlf > 0 && crlf == content.matches('\n').count() {
+        return remove_appended_cargo_block(
+            &content.replace("\r\n", "\n"),
+            &fragment.replace("\r\n", "\n"),
+        )
+        .map(|lf| lf.replace('\n', "\r\n"));
+    }
+    let lf_fragment = fragment.replace("\r\n", "\n");
+    let (pos, len) = match content.find(fragment) {
+        Some(pos) => (pos, fragment.len()),
+        None => (content.find(&lf_fragment)?, lf_fragment.len()),
+    };
+    let before = &content[..pos];
+    let before = before
+        .strip_suffix("\r\n")
+        .or_else(|| before.strip_suffix('\n'))
+        .unwrap_or(before);
+    Some(format!("{before}{}", &content[pos + len..]))
 }
 
 /// The string payloads of an edit, or `None` when a payload is missing or
@@ -589,6 +626,37 @@ pub async fn revert_remaining_redirect_edits(
                                 refused_groups.insert(group);
                                 continue 'group;
                             }
+                        }
+                    }
+                }
+                Inverse::RemoveAppendedCargoBlock => {
+                    let Some(new) = str_payload(&edit.new) else {
+                        refuse(
+                            format!("{} edit is missing its recorded fragment", edit.kind),
+                            &mut outcome,
+                        );
+                        refused_groups.insert(group);
+                        continue 'group;
+                    };
+                    match staged_read(&staged, project_root, &edit.path).await {
+                        Ok(Some(content)) => {
+                            // Absent fragment == already clean. A config the
+                            // rewrite created ends empty and goes with it.
+                            if let Some(restored) = remove_appended_cargo_block(&content, new) {
+                                staged.insert(
+                                    edit.path.clone(),
+                                    (!restored.is_empty()).then_some(restored),
+                                );
+                            }
+                            group_drops.insert(idx);
+                        }
+                        Ok(None) => {
+                            group_drops.insert(idx);
+                        }
+                        Err(e) => {
+                            refuse(e, &mut outcome);
+                            refused_groups.insert(group);
+                            continue 'group;
                         }
                     }
                 }
@@ -2869,6 +2937,45 @@ mod tests {
             remove_fragment_once("a\r\n\r\nF\r\n\r\nb\r\n", "F\r\n"),
             "a\r\n\r\nb\r\n"
         );
+    }
+
+    #[test]
+    fn remove_appended_cargo_block_inverts_exactly_what_was_appended() {
+        let block = "[registries.r]\nindex = \"i\"\n";
+        for (written, fragment, want) in [
+            // Empty config: the block alone (a created file ends empty).
+            (block.to_string(), block.to_string(), ""),
+            // One separator after a config ending in newline(s).
+            (format!("a\n\n{block}"), block.to_string(), "a\n"),
+            (format!("a\n\n\n{block}"), block.to_string(), "a\n\n"),
+            // No final newline: the added newline rides in the fragment.
+            (format!("a\n\n{block}"), format!("\n{block}"), "a"),
+            // The user appended after the block: kept.
+            (
+                format!("a\n\n{block}b = 1\n"),
+                block.to_string(),
+                "a\nb = 1\n",
+            ),
+            // CRLF file, and a CRLF-recorded fragment against an LF file.
+            (
+                format!("a\r\n\r\n{}", block.replace('\n', "\r\n")),
+                block.replace('\n', "\r\n"),
+                "a\r\n",
+            ),
+            (format!("a\n\n{block}"), block.replace('\n', "\r\n"), "a\n"),
+            (
+                format!("a\r\n\r\n{}", block.replace('\n', "\r\n")),
+                block.to_string(),
+                "a\r\n",
+            ),
+        ] {
+            assert_eq!(
+                remove_appended_cargo_block(&written, &fragment).as_deref(),
+                Some(want),
+                "{written:?}"
+            );
+        }
+        assert_eq!(remove_appended_cargo_block("a\n", block), None);
     }
 
     #[test]

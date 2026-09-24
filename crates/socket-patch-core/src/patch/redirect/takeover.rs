@@ -384,17 +384,19 @@ pub async fn revert_cargo_redirect_purl(
                     out.reverted_files.push(edit.path.clone());
                     continue;
                 }
-                // The block leaves with the blank separator the rewrite put
-                // before it, so an appended block leaves the user's config
-                // ending exactly as it did — and no other spacing of the
-                // user's is touched (the old triple-newline collapse
-                // rewrote any blank run anywhere in the file).
-                let trimmed = super::replay::remove_fragment_once(&content, block);
-                if trimmed.trim().is_empty() {
-                    staged.insert(edit.path.clone(), None);
-                } else {
-                    staged.insert(edit.path.clone(), Some(trimmed));
-                }
+                // The block leaves with exactly the blank separator the
+                // rewrite put before it, so the user's config comes back
+                // byte-for-byte — its trailing newlines (or missing final
+                // newline) included. A config the rewrite created ends
+                // empty and is deleted.
+                let Some(restored) = super::replay::remove_appended_cargo_block(&content, block)
+                else {
+                    continue;
+                };
+                staged.insert(
+                    edit.path.clone(),
+                    (!restored.is_empty()).then_some(restored),
+                );
                 out.reverted_files.push(edit.path.clone());
             }
             _ => {}
@@ -4250,12 +4252,20 @@ mod tests {
     /// touches blank runs of the user's own elsewhere in the file.
     #[tokio::test]
     async fn appended_registry_block_revert_restores_the_config_bytes() {
-        for user_cfg in [
+        let cases = [
             "[net]\nretry = 2\n",
             "[net]\n\n\n\nretry = 2\n",
             "# a comment\n\n[http]\ntimeout = 5\n",
             "[net]\r\nretry = 2\r\n",
-        ] {
+            // No final newline, trailing blank lines, whitespace only.
+            "[net]\nretry = 2",
+            "[net]\r\nretry = 2",
+            "[net]\nretry = 2\n\n",
+            "[net]\r\nretry = 2\r\n\r\n",
+            "\n",
+        ];
+        // Both unwind paths: `remove <purl>` and the whole-ledger replay.
+        for (user_cfg, replay) in cases.iter().flat_map(|cfg| [(*cfg, false), (*cfg, true)]) {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path();
             let lock = format!("version = 4\n\n{}\n", pristine_lock_block());
@@ -4289,14 +4299,23 @@ mod tests {
             state.edits = rewrite.edits;
             state.records.insert(PURL.to_string(), record());
 
-            revert_cargo_redirect_purl(root, &mut state, PURL, false)
-                .await
-                .expect("revert succeeds");
+            if replay {
+                let outcome = crate::patch::redirect::revert_remaining_redirect_edits(
+                    root, &mut state, false,
+                )
+                .await;
+                assert!(outcome.fully_reverted(), "{:?}", outcome.refusals);
+            } else {
+                revert_cargo_redirect_purl(root, &mut state, PURL, false)
+                    .await
+                    .expect("revert succeeds");
+            }
             assert_eq!(
                 tokio::fs::read_to_string(root.join(".cargo/config"))
                     .await
                     .unwrap(),
-                user_cfg
+                user_cfg,
+                "replay: {replay}"
             );
             assert_eq!(
                 tokio::fs::read_to_string(root.join("Cargo.toml"))
