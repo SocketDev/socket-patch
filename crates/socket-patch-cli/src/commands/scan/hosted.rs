@@ -1838,20 +1838,20 @@ pub(crate) async fn run_redirect_selected(
         // baseline's messages, in the baseline's order), and the client's
         // opt-in debug lines (GET / attempt-failed) interleave across the
         // in-flight downloads.
-        // TODO(perf): switch to `utils::concurrent::ordered_concurrent` once
-        // it lands (added in parallel on the scan-concurrency branch), and
-        // let a `Retry-After` pause the whole fan-out rather than one fetch.
+        // TODO(perf): let a `Retry-After` pause the whole fan-out rather
+        // than one fetch.
         const WHEEL_METADATA_CONCURRENCY: usize = 4;
-        use futures_util::StreamExt as _;
-        let mut fetches = std::pin::pin!(futures_util::stream::iter(wheel_deps.iter())
-            .map(|&(dep, sha256)| {
+        let mut fetches = std::pin::pin!(ordered_concurrent(
+            wheel_deps.iter(),
+            WHEEL_METADATA_CONCURRENCY,
+            |&(dep, sha256)| {
                 socket_patch_core::vendor::pypi::fetch_hosted_wheel_metadata(
                     api_client,
                     &dep.artifact_url,
                     sha256,
                 )
-            })
-            .buffered(WHEEL_METADATA_CONCURRENCY));
+            },
+        ));
         for &(dep, _) in &wheel_deps {
             status.set(format!(
                 "Fetching hosted wheel metadata for {}...",
