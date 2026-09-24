@@ -1078,10 +1078,9 @@ pub(crate) async fn run_redirect_selected(
     /// records and the confirmation probe key on; everything the probe
     /// needs AFTER the rewrite to decide whether the dep was actually
     /// redirected (artifact URL, registry index URL, fail-closed maven's
-    /// suffixed version, golang's content-addressed module path) already
-    /// rides the override. The single vector is filtered in place by every
-    /// withhold/refusal step, and the rewriters' `overrides` slice is
-    /// materialized from it once, after the last filter.
+    /// suffixed version) already rides the override. The single vector is
+    /// filtered in place by every withhold/refusal step, and the rewriters'
+    /// `overrides` slice is materialized from it once, after the last filter.
     struct Candidate {
         purl: String,
         dep: DepOverride,
@@ -1307,7 +1306,10 @@ pub(crate) async fn run_redirect_selected(
     // VENDORED — for cargo a committed `[patch.crates-io]` path entry, a
     // detached Cargo.lock entry, a committed copy, and a vendored ledger
     // entry; for the npm family a `file:./.socket/vendor/…` lock resolution
-    // (plus a berry `resolutions` pin) and its committed tarball. The hosted
+    // (plus a berry `resolutions` pin) and its committed tarball; for golang
+    // the vendor-owned go.mod `replace`, its committed module copy, and its
+    // ledger entry (left behind, a later `vendor` run takes the module back
+    // and the modes flip-flop). The hosted
     // rewriters know nothing about that wiring: cargo then refuses every
     // `--locked` build over the now-unused `[patch]` entry while this run
     // reports success, and the npm rewriters either hijack the vendored
@@ -1323,7 +1325,9 @@ pub(crate) async fn run_redirect_selected(
     // whose vendored state cannot be cleanly reverted (revert failure, or
     // vendored wiring with a missing/corrupt ledger) is REFUSED — skipped
     // with an actionable error — never half-migrated.
-    let takeover_capable = |p: &str| p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/");
+    let takeover_capable = |p: &str| {
+        p.starts_with("pkg:cargo/") || p.starts_with("pkg:npm/") || p.starts_with("pkg:golang/")
+    };
     let mut takeover_pre_warnings: Vec<serde_json::Value> = Vec::new();
     // Dry-run takeover previews: `(purl, uuid)` pairs whose vendored state
     // the wet run would revert and then redirect. Withheld from the
@@ -2326,17 +2330,20 @@ pub(crate) async fn run_redirect_selected(
             if purl.starts_with("pkg:cargo/") {
                 return rewrite.confirmed_cargo_uuids.contains(uuid);
             }
+            // Golang likewise: the goproxy `indexUrl` is the bare
+            // patch-server origin (present in any other hosted lock), and
+            // the socket module's go.sum lines outlive a removed replace.
+            if purl.starts_with("pkg:golang/") {
+                return rewrite.confirmed_golang_uuids.contains(uuid);
+            }
             // The override's own targets: artifact URL; per-dependency
             // registry index URL; fail-closed maven's globally-unique
-            // `-socket.<hex8>` suffixed version (never the `.pom` URL);
-            // golang's content-addressed `patch.socket.dev/gopatch/<uuid>`
-            // module path (go.mod + go.sum never carry a URL).
+            // `-socket.<hex8>` suffixed version (never the `.pom` URL).
             let artifact_url = c.dep.artifact_url.as_str();
             let registry = c.dep.registry_override.as_ref();
             let index_url = registry.map(|o| o.index_url.as_str());
             let suffixed_version =
                 registry.and_then(|o| o.identifiers.maven_suffixed_version.as_deref());
-            let go_module_path = registry.and_then(|o| o.identifiers.go_module_path.as_deref());
             let encoded = socket_patch_core::utils::uri::encode_uri_component(artifact_url);
             final_texts.iter().any(|text| {
                 // The rewriters' own predicate — raw, or the `\/`-escaped
@@ -2352,7 +2359,6 @@ pub(crate) async fn run_redirect_selected(
                     || text.contains(encoded.as_str())
                     || index_url.is_some_and(|iu| text.contains(iu))
                     || suffixed_version.is_some_and(|sv| text.contains(sv))
-                    || go_module_path.is_some_and(|gm| text.contains(gm))
             })
         })
         .map(|c| (c.purl.clone(), c.dep.patch_uuid.clone()))

@@ -31,7 +31,7 @@ use crate::patch::apply::{
     MismatchPolicy, PatchSources,
 };
 use crate::patch::file_hash::compute_file_git_sha256;
-use crate::utils::purl::{build_golang_purl, parse_golang_purl, strip_purl_qualifiers};
+use crate::utils::purl::{build_golang_purl, canonical_purl, parse_golang_purl};
 use crate::vendor::common::{
     already_patched_result, copy_matches_after_hashes, synthesized_result,
 };
@@ -325,6 +325,7 @@ pub async fn remove_go_redirect(
             format!("not a golang purl: {purl}"),
         )
     })?;
+    let (module, version) = (&*module, &*version);
 
     // SECURITY: the copy dir is `<base_rel>/<module>@<version>/` and is about
     // to be `remove_tree`d. Unsafe coordinates (`..` segment / separator /
@@ -360,7 +361,7 @@ pub async fn reconcile_go_redirects(
     desired: &HashSet<String>,
     dry_run: bool,
 ) -> Vec<String> {
-    let desired_modules: HashSet<&str> = desired
+    let desired_modules: HashSet<std::borrow::Cow<str>> = desired
         .iter()
         .filter_map(|p| parse_golang_purl(p).map(|(m, _)| m))
         .collect();
@@ -393,12 +394,12 @@ pub async fn reconcile_go_redirects(
     // key may carry `?qualifiers`/`#subpath` (raw API PURL), while the PURL
     // reconstructed from the copy dir is the canonical base — compare bases, or
     // a qualified key's freshly applied copy is pruned as an orphan.
-    let desired_bases: HashSet<&str> = desired.iter().map(|p| strip_purl_qualifiers(p)).collect();
+    let desired_bases: HashSet<String> = desired.iter().map(|p| canonical_purl(p)).collect();
     // Re-read after (a)'s drops so the dangling-directive probe below sees the
     // current file.
     let entries = read_replace_entries(project_root).await;
     for (purl, dir) in collect_copy_modules(&project_root.join(GO_PATCHES_DIR)).await {
-        if !desired_bases.contains(purl.as_str()) {
+        if !desired_bases.contains(&purl) {
             // A go-patches directive still targeting THIS copy dangles once the
             // copy is pruned — loop (a) keeps it whenever the module is desired
             // at ANOTHER version (a bump whose apply hasn't succeeded), and a
@@ -407,6 +408,7 @@ pub async fn reconcile_go_redirects(
             // Path-exact on purpose: a directive already repointed at the
             // desired version's copy is never touched.
             if let Some((module, version)) = parse_golang_purl(&purl) {
+                let (module, version) = (&*module, &*version);
                 let target = replace_target_path(GO_PATCHES_DIR, module, version);
                 if entries.iter().any(|e| {
                     e.owner == Some(ReplaceOwner::GoPatches)
@@ -456,7 +458,7 @@ pub async fn verify_go_redirect_state(
     // Required versions from go.mod (None ⇒ no go.mod ⇒ skip the version
     // cross-check). Read once, project-local, offline.
     let required = read_required_versions(project_root).await;
-    let desired_modules: HashSet<&str> = desired
+    let desired_modules: HashSet<std::borrow::Cow<str>> = desired
         .iter()
         .filter_map(|p| parse_golang_purl(p).map(|(m, _)| m))
         .collect();
@@ -465,6 +467,7 @@ pub async fn verify_go_redirect_state(
         let Some((module, version)) = parse_golang_purl(purl) else {
             continue;
         };
+        let (module, version) = (&*module, &*version);
         let Some(record) = manifest.patches.get(purl) else {
             continue;
         };
@@ -781,7 +784,7 @@ mod tests {
         let gomod = "module example.com/app\n\ngo 1.21\n\n\
                      require github.com/foo/bar v1.4.2\n\n\
                      replace github.com/foo/bar v1.4.2 => \
-                     patch.socket.dev/gopatch/some-uuid v1.4.2-socketpatch.1\n";
+                     patch.socket.dev/gopatch/55555555-5555-4555-8555-555555555555 v1.4.2-socketpatch.1\n";
         tokio::fs::write(root.join("go.mod"), gomod).await.unwrap();
         let sources = PatchSources::blobs_only(&blobs);
 
@@ -1855,8 +1858,8 @@ mod tests {
         let (module, version) = parse_golang_purl(qualified).unwrap();
         let result = apply_go_redirect(
             qualified,
-            module,
-            version,
+            &module,
+            &version,
             &pristine,
             root,
             GO_PATCHES_DIR,
@@ -1886,6 +1889,64 @@ mod tests {
                 .iter()
                 .any(|e| e.module == MODULE && e.socket_owned()),
             "socket-owned replace must survive"
+        );
+    }
+
+    /// Regression: reconcile must match by canonical (decoded) base PURL —
+    /// the API serves `%2B` but `parse_golang_purl` decodes to `+`, so the
+    /// on-disk copy carries `+incompatible` and `collect_copy_modules` rebuilds
+    /// the PURL with `+`. The desired manifest key still has `%2B` as received
+    /// from the API. Without decoding in the comparison, the fresh copy looks
+    /// like an orphan and is pruned, dropping the socket-owned `replace`.
+    #[tokio::test]
+    async fn test_reconcile_keeps_percent_encoded_version() {
+        let (dir, blobs, pristine, files, _after) = fixture().await;
+        let root = dir.path();
+        let sources = PatchSources::blobs_only(&blobs);
+        // API form: percent-encoded `+`.
+        let encoded_purl = "pkg:golang/github.com/foo/bar@v2.0.0%2Bincompatible";
+        let (module, version) = parse_golang_purl(encoded_purl).unwrap();
+        // After parsing, version is `v2.0.0+incompatible` (decoded).
+        assert_eq!(version, "v2.0.0+incompatible");
+
+        let result = apply_go_redirect(
+            encoded_purl,
+            &module,
+            &version,
+            &pristine,
+            root,
+            GO_PATCHES_DIR,
+            &files,
+            &sources,
+            None,
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+        assert!(result.success, "apply failed: {:?}", result.error);
+
+        // Reconcile with the same encoded manifest key — canonical_purl
+        // decodes both sides, so they match.
+        let desired: HashSet<String> = [encoded_purl.to_string()].into_iter().collect();
+        let removed = reconcile_go_redirects(root, &desired, false).await;
+        assert!(
+            removed.is_empty(),
+            "a desired encoded version must not be pruned: {removed:?}"
+        );
+        // The on-disk copy uses the decoded `+`.
+        assert!(
+            root.join(".socket/go-patches/github.com/foo/bar@v2.0.0+incompatible")
+                .exists(),
+            "copy with decoded version must survive reconcile"
+        );
+        assert!(
+            read_replace_entries(root)
+                .await
+                .iter()
+                .any(|e| e.module == "github.com/foo/bar"
+                    && e.version.as_deref() == Some("v2.0.0+incompatible")
+                    && e.socket_owned()),
+            "socket-owned replace for the decoded version must survive"
         );
     }
 
@@ -2147,7 +2208,7 @@ mod tests {
             "module example.com/app\n\ngo 1.21\n\n\
              require github.com/foo/bar v1.4.2\n\n\
              replace github.com/foo/bar v1.4.2 => \
-             patch.socket.dev/gopatch/some-uuid v1.4.2-socketpatch.1\n",
+             patch.socket.dev/gopatch/55555555-5555-4555-8555-555555555555 v1.4.2-socketpatch.1\n",
         )
         .await
         .unwrap();

@@ -1,8 +1,9 @@
 //! Whole-ledger reverse replay of hosted-redirect edits.
 //!
-//! The per-purl reverts in [`super::takeover`] cover cargo and the
-//! npm-family lock flavors. Everything else the hosted rewriters touch —
-//! gem, golang, pypi, composer, bun, and the non-package rideshare edits
+//! The per-purl reverts in [`super::takeover`] cover cargo, the
+//! npm-family lock flavors, and golang (which reuses the golang inverses
+//! here). Everything else the hosted rewriters touch —
+//! gem, pypi, composer, bun, and the non-package rideshare edits
 //! (such as the pnpm `trustLockfile` auto-config) —
 //! has no per-purl revert: their unwind rides the ledger's designed
 //! whole-list contract ("edits appended in write order, a revert walks
@@ -60,10 +61,13 @@ enum Inverse {
     /// (an absent fragment is the desired end state — no-op).
     RemoveAddedFragment,
     /// action `removed` with only `original` recorded: the redirect
-    /// pruned lines the pristine file needs back (go.sum entries of the
-    /// upstream module). Re-insert by appending — go.sum lines are
-    /// order-insensitive.
+    /// pruned go.sum lines of the upstream module that the pristine file
+    /// needs back. Re-inserted at go's sorted position, so the file returns
+    /// byte for byte.
     ReinsertRemoved,
+    /// go.sum lines the redirect added (`new`, `\n`-joined): each is removed
+    /// as a whole line, whatever the file's line endings.
+    RemoveAddedLines,
     /// Cleanup of PRIOR socket wiring performed during a redirect refresh
     /// (`redirect_golang_stale_*`). The removal already moved the file
     /// toward pristine; restoring it would re-create socket wiring, so
@@ -147,7 +151,7 @@ fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
                 Inverse::ReplaceFragment
             },
         ),
-        "redirect_golang_gosum" => ("golang", Inverse::RemoveAddedFragment),
+        "redirect_golang_gosum" => ("golang", Inverse::RemoveAddedLines),
         "redirect_golang_gosum_prune" => ("golang", Inverse::ReinsertRemoved),
         "redirect_golang_stale_replace_removed" | "redirect_golang_stale_gosum_removed" => {
             ("golang", Inverse::NoopDrop)
@@ -266,16 +270,21 @@ fn remove_fragment_once(content: &str, fragment: &str) -> String {
     // non-whitespace prefix (the user commented the line out) leaves the
     // prefix as its own line, and eating the newline would join that
     // prefix onto the FOLLOWING line, commenting it out too.
-    if start == line_start && content[end..].starts_with('\n') {
-        end += 1;
+    if start == line_start {
+        if content[end..].starts_with("\r\n") {
+            end += 2;
+        } else if content[end..].starts_with('\n') {
+            end += 1;
+        }
     }
     if end >= content.len() {
         // EOF removal: collapse the (ambiguous) trailing separator run.
-        let trimmed = content[..start].trim_end_matches('\n');
+        let trimmed = content[..start].trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             return String::new();
         }
-        return format!("{trimmed}\n");
+        let eol = crate::vendor::common::detect_eol(content);
+        return format!("{trimmed}{eol}");
     }
     format!("{}{}", &content[..start], &content[end..])
 }
@@ -606,17 +615,56 @@ pub async fn revert_remaining_redirect_edits(
                             continue 'group;
                         }
                     };
-                    if content.contains(original) {
-                        group_drops.insert(idx);
-                    } else {
-                        let mut restored = content;
-                        if !restored.is_empty() && !restored.ends_with('\n') {
-                            restored.push('\n');
-                        }
-                        restored.push_str(original);
-                        restored.push('\n');
+                    if let Some(restored) =
+                        crate::vendor::go_sum_edit::reinsert_lines(&content, original)
+                    {
                         staged.insert(edit.path.clone(), Some(restored));
-                        group_drops.insert(idx);
+                    }
+                    group_drops.insert(idx);
+                }
+                Inverse::RemoveAddedLines => {
+                    let Some(new) = str_payload(&edit.new) else {
+                        refuse(
+                            format!("{} edit is missing its recorded fragment", edit.kind),
+                            &mut outcome,
+                        );
+                        refused_groups.insert(group);
+                        continue 'group;
+                    };
+                    match staged_read(&staged, project_root, &edit.path).await {
+                        Ok(Some(content)) => {
+                            if new
+                                .lines()
+                                .filter(|l| !l.is_empty())
+                                .any(|line| content.lines().filter(|l| l == &line).count() > 1)
+                            {
+                                refuse(
+                                    format!(
+                                        "{}: an added line appears more than once — \
+                                         ambiguous, refusing to guess",
+                                        edit.path
+                                    ),
+                                    &mut outcome,
+                                );
+                                refused_groups.insert(group);
+                                continue 'group;
+                            }
+                            if let Some(removed) =
+                                crate::vendor::go_sum_edit::remove_lines(&content, new)
+                            {
+                                staged.insert(edit.path.clone(), Some(removed));
+                            }
+                            group_drops.insert(idx);
+                        }
+                        // File gone entirely: the lines are gone with it.
+                        Ok(None) => {
+                            group_drops.insert(idx);
+                        }
+                        Err(e) => {
+                            refuse(e, &mut outcome);
+                            refused_groups.insert(group);
+                            continue 'group;
+                        }
                     }
                 }
                 Inverse::PnpmTrust => {
@@ -1301,6 +1349,45 @@ mod tests {
         assert!(!go_sum.contains("gopatch.socket.dev"));
         assert!(state.edits.is_empty());
         assert!(state.records.is_empty());
+    }
+
+    /// The pruned pair goes back where `go mod tidy` writes it — module
+    /// path, then SEMVER version (`v1.9.0/go.mod` before `v1.10.0`, though
+    /// bytewise greater) — so go.sum is restored byte for byte.
+    #[tokio::test]
+    async fn reinsert_restores_the_go_sorted_position() {
+        let pristine = "example.com/leaf v1.0.0 h1:L=\n\
+                        example.com/leaf v1.0.0/go.mod h1:LM=\n\
+                        example.com/lib v1.9.0/go.mod h1:N9=\n\
+                        example.com/lib v1.10.0 h1:T=\n\
+                        example.com/lib v1.10.0/go.mod h1:TM=\n\
+                        example.com/zeta v0.1.0 h1:Z=\n";
+        for eol in ["\n", "\r\n"] {
+            let dir = TempDir::new().unwrap();
+            let pruned = pristine
+                .lines()
+                .filter(|l| !l.starts_with("example.com/lib v1.10.0"))
+                .map(|l| format!("{l}{eol}"))
+                .collect::<String>();
+            write(dir.path(), "go.sum", &pruned).await;
+            let mut state = state_with(
+                vec![edit(
+                    "go.sum",
+                    "redirect_golang_gosum_prune",
+                    "removed",
+                    Some("example.com/lib v1.10.0 h1:T=\nexample.com/lib v1.10.0/go.mod h1:TM="),
+                    None,
+                )],
+                &[],
+            );
+            let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+            assert!(out.fully_reverted(), "{:?}", out.refusals);
+            assert_eq!(
+                read(dir.path(), "go.sum").await,
+                pristine.replace('\n', eol),
+                "eol {eol:?}"
+            );
+        }
     }
 
     #[tokio::test]

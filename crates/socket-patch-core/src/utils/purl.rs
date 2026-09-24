@@ -231,11 +231,17 @@ pub(crate) fn build_maven_purl(group_id: &str, artifact_id: &str, version: &str)
     format!("pkg:maven/{group_id}/{artifact_id}@{version}")
 }
 
-/// Parse a Go module PURL to extract module path and version.
+/// Parse a Go module PURL to extract module path and version, each
+/// percent-decoded (the API's canonical purls spell `+incompatible` as
+/// `%2Bincompatible`).
 ///
 /// e.g., `"pkg:golang/github.com/gin-gonic/gin@v1.9.1"` -> `Some(("github.com/gin-gonic/gin", "v1.9.1"))`
-pub fn parse_golang_purl(purl: &str) -> Option<(&str, &str)> {
-    parse_name_version(purl, "pkg:golang/")
+pub fn parse_golang_purl(purl: &str) -> Option<(Cow<'_, str>, Cow<'_, str>)> {
+    let (module, version) = parse_name_version(purl, "pkg:golang/")?;
+    Some((
+        percent_decode_purl_component(module),
+        percent_decode_purl_component(version),
+    ))
 }
 
 /// Build a Go module PURL from components.
@@ -692,15 +698,30 @@ mod tests {
     fn test_parse_golang_purl() {
         assert_eq!(
             parse_golang_purl("pkg:golang/github.com/gin-gonic/gin@v1.9.1"),
-            Some(("github.com/gin-gonic/gin", "v1.9.1"))
+            Some(("github.com/gin-gonic/gin".into(), "v1.9.1".into()))
         );
         assert_eq!(
             parse_golang_purl("pkg:golang/golang.org/x/text@v0.14.0"),
-            Some(("golang.org/x/text", "v0.14.0"))
+            Some(("golang.org/x/text".into(), "v0.14.0".into()))
         );
         assert_eq!(parse_golang_purl("pkg:npm/lodash@4.17.21"), None);
         assert_eq!(parse_golang_purl("pkg:golang/@v1.0.0"), None);
         assert_eq!(parse_golang_purl("pkg:golang/github.com/foo/bar@"), None);
+    }
+
+    /// The API's canonical purls percent-encode `+` (`%2B`); every consumer
+    /// of the parsed coordinates (crawler lookup, go.mod replace, vendor
+    /// copy dir) needs the decoded `+incompatible` version Go uses.
+    #[test]
+    fn test_parse_golang_purl_percent_decodes() {
+        let (module, version) =
+            parse_golang_purl("pkg:golang/github.com/foo/bar@v2.0.0%2Bincompatible").unwrap();
+        assert_eq!(module, "github.com/foo/bar");
+        assert_eq!(version, "v2.0.0+incompatible");
+        assert_eq!(
+            parse_golang_purl("pkg:golang/github.com/Azure/x@v1.0.0"),
+            Some(("github.com/Azure/x".into(), "v1.0.0".into()))
+        );
     }
 
     #[test]
@@ -923,7 +944,7 @@ mod tests {
         // version is split off. A trailing qualifier is ignored.
         assert_eq!(
             parse_golang_purl("pkg:golang/github.com/gin-gonic/gin@v1.9.1?type=module"),
-            Some(("github.com/gin-gonic/gin", "v1.9.1"))
+            Some(("github.com/gin-gonic/gin".into(), "v1.9.1".into()))
         );
     }
 
@@ -999,7 +1020,7 @@ mod tests {
         // version must remain clean.
         assert_eq!(
             parse_golang_purl("pkg:golang/github.com/gin-gonic/gin@v1.9.1#middleware"),
-            Some(("github.com/gin-gonic/gin", "v1.9.1"))
+            Some(("github.com/gin-gonic/gin".into(), "v1.9.1".into()))
         );
     }
 

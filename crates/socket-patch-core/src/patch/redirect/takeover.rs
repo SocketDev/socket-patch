@@ -28,6 +28,11 @@
 //! the pre-revert the package cannot be vendored at all
 //! (`vendor_lock_entry_not_found`).
 //!
+//! golang: the module's go.mod `replace` and the socket module's go.sum
+//! lines are removed and the pruned upstream go.sum lines come back in
+//! go's sort order, so the vendor backend wires its `replace` over the
+//! pristine files instead of taking over the hosted directive.
+//!
 //! FAIL CLOSED: a file that matches neither the recorded redirected fragment
 //! nor the recorded original has drifted — the revert refuses (`Err`) rather
 //! than half-applying, and the caller must then refuse to vendor that purl.
@@ -46,7 +51,10 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::utils::purl::{canonical_purl, parse_cargo_purl, parse_name_version};
+use crate::utils::purl::{canonical_purl, parse_cargo_purl, parse_golang_purl, parse_name_version};
+use crate::vendor::go_mod_edit::{
+    is_hosted_module_path, parse_replace_entries, HOSTED_GO_MODULE_PREFIX,
+};
 
 use super::staged::{flush_staged, read_rel, staged_read, Staged, StagedBytes};
 use super::state::RedirectState;
@@ -66,7 +74,9 @@ pub struct RedirectRevert {
 /// ecosystem? Callers (the vendor dispatch loop's cross-mode takeover gate)
 /// must consult this instead of hardcoding `pkg:cargo/`.
 pub fn redirect_revert_supported(purl: &str) -> bool {
-    purl.starts_with("pkg:cargo/") || purl.starts_with("pkg:npm/")
+    purl.starts_with("pkg:cargo/")
+        || purl.starts_with("pkg:npm/")
+        || purl.starts_with("pkg:golang/")
 }
 
 /// Revert every hosted-redirect edit the ledger records for `purl`, then
@@ -91,6 +101,8 @@ pub async fn revert_redirect_purl(
         revert_cargo_redirect_purl(project_root, state, purl, dry_run).await
     } else if purl.starts_with("pkg:npm/") {
         revert_npm_redirect_purl(project_root, state, purl, dry_run).await
+    } else if purl.starts_with("pkg:golang/") {
+        revert_golang_redirect_purl(project_root, state, purl, dry_run).await
     } else {
         Err(format!(
             "no hosted-redirect revert implementation for {purl}"
@@ -306,6 +318,117 @@ pub async fn revert_cargo_redirect_purl(
 
     drop_claimed(state, mine, &record_key);
     Ok(out)
+}
+
+/// Revert one Go module's hosted redirect: its go.mod `replace`, the
+/// socket module's go.sum lines, and the pruned upstream go.sum pair, then
+/// drop its record and edits from `state`. The claimed edits unwind through
+/// the whole-ledger replay's golang inverses, staged all-or-nothing. A
+/// go.mod whose directive for the module is no longer the recorded one has
+/// drifted and refuses byte-untouched.
+pub async fn revert_golang_redirect_purl(
+    project_root: &Path,
+    state: &mut RedirectState,
+    purl: &str,
+    dry_run: bool,
+) -> Result<RedirectRevert, String> {
+    let (record_key, target) = find_record_key(state, purl)?;
+    let Some((module, version)) = parse_golang_purl(&target) else {
+        return Err(format!("not a golang purl: {purl}"));
+    };
+    let (module, version) = (module.into_owned(), version.into_owned());
+    let lhs = format!("{module} {version} =>");
+    let is_replace_edit = |e: &FileEdit| {
+        matches!(
+            e.kind.as_str(),
+            "redirect_golang_replace" | "redirect_golang_stale_replace_removed"
+        ) && e.key.as_deref() == Some(module.as_str())
+            && [&e.new, &e.original].iter().any(|v| {
+                v.as_ref()
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t.contains(&lhs))
+            })
+    };
+    // The socket modules this purl's directives pointed at: go.sum edits
+    // key by those, never by the upstream module.
+    let mut socket_modules: HashSet<String> = HashSet::new();
+    socket_modules.insert(format!(
+        "{HOSTED_GO_MODULE_PREFIX}{}",
+        state.records[&record_key].uuid
+    ));
+    for e in state.edits.iter().filter(|e| is_replace_edit(e)) {
+        for text in [&e.new, &e.original]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            for entry in parse_replace_entries(text) {
+                if let Some(rhs) = entry.rhs_module.filter(|m| is_hosted_module_path(m)) {
+                    socket_modules.insert(rhs);
+                }
+            }
+        }
+    }
+    let prune_key = format!("{module}@{version}");
+    let mine: Vec<usize> = state
+        .edits
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| match e.kind.as_str() {
+            "redirect_golang_replace" | "redirect_golang_stale_replace_removed" => {
+                is_replace_edit(e)
+            }
+            "redirect_golang_gosum_prune" => e.key.as_deref() == Some(prune_key.as_str()),
+            "redirect_golang_gosum" => e
+                .key
+                .as_deref()
+                .and_then(|k| k.rsplit_once('@'))
+                .is_some_and(|(m, _)| socket_modules.contains(m)),
+            "redirect_golang_stale_gosum_removed" => {
+                e.key.as_deref().is_some_and(|k| socket_modules.contains(k))
+            }
+            _ => false,
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    // Drift: the newest recorded directive must still be live, or the
+    // module must carry no replace at all (already unwound).
+    let newest = mine
+        .iter()
+        .rev()
+        .map(|&i| &state.edits[i])
+        .find(|e| e.kind == "redirect_golang_replace");
+    if let Some(directive) = newest.and_then(|e| e.new.as_ref()).and_then(Value::as_str) {
+        let go_mod = read_rel(project_root, "go.mod").await?.unwrap_or_default();
+        if !go_mod.contains(directive)
+            && parse_replace_entries(&go_mod)
+                .iter()
+                .any(|e| e.module == module)
+        {
+            return Err(format!(
+                "go.mod's replace for {module} has drifted from the recorded hosted \
+                 redirect; refusing to touch it — re-run `scan --mode hosted` to \
+                 normalize the redirect, or remove the replace manually, then re-run"
+            ));
+        }
+    }
+
+    let mut claimed = RedirectState::new();
+    claimed.edits = mine.iter().map(|&i| state.edits[i].clone()).collect();
+    claimed
+        .records
+        .insert(record_key.clone(), state.records[&record_key].clone());
+    let replay =
+        super::replay::revert_remaining_redirect_edits(project_root, &mut claimed, dry_run).await;
+    if let Some(refusal) = replay.refusals.first() {
+        return Err(refusal.reason.clone());
+    }
+    drop_claimed(state, mine, &record_key);
+    Ok(RedirectRevert {
+        reverted_files: replay.reverted_files.into_iter().collect(),
+        warnings: replay.warnings,
+    })
 }
 
 /// The npm-family text-fragment edit kinds CLAIMED BY KEY: `original`/`new`
@@ -4128,5 +4251,193 @@ mod tests {
             "{:?}",
             state.records.keys()
         );
+    }
+
+    const GO_PURL: &str = "pkg:golang/example.com/lib@v1.10.0";
+    const GO_UUID: &str = "7d8e9f0a-1b2c-4d3e-8f4a-5b6c7d8e9f0a";
+    const GO_OTHER_PURL: &str = "pkg:golang/example.com/other@v0.2.0";
+    const GO_OTHER_UUID: &str = "8e9f0a1b-2c3d-4e4f-9a5b-6c7d8e9f0a1b";
+    const GO_ZIP_H1: &str = "h1:mU9vN/n1hbXktM62lJ6MbRKOk3aI8NDH+szCf62RXtE=";
+    const GO_MOD_H1: &str = "h1:XgagPTRZSCprrzR+3Ro36/XJpibdovhAbsKThYI8bxg=";
+
+    fn go_override(module: &str, version: &str, uuid: &str) -> crate::patch::redirect::DepOverride {
+        let socket_module = format!("patch.socket.dev/gopatch/{uuid}");
+        let socket_version = format!("{version}-socketpatch.1");
+        serde_json::from_value(serde_json::json!({
+            "ecosystem": "golang",
+            "name": module,
+            "version": version,
+            "token": "",
+            "patchUuid": uuid,
+            "artifactUrl": format!("https://patch.socket.dev/{socket_module}/@v/{socket_version}.zip"),
+            "registryOverride": {
+                "kind": "goproxy",
+                "indexUrl": "https://patch.socket.dev",
+                "identifiers": {
+                    "name": module, "version": version,
+                    "goModulePath": socket_module,
+                    "goModuleVersion": socket_version,
+                },
+            },
+            "integrity": { "dirhashH1": GO_ZIP_H1, "goModH1": GO_MOD_H1 },
+        }))
+        .unwrap()
+    }
+
+    /// go's own go.sum order: `v1.9.0/go.mod` sorts BEFORE `v1.10.0`
+    /// (semver), although it is bytewise greater.
+    fn go_pristine(eol: &str) -> (String, String) {
+        let go_mod = "module example.com/app\n\ngo 1.21\n\nrequire (\n\texample.com/lib v1.10.0\n\texample.com/other v0.2.0\n)\n"
+            .replace('\n', eol);
+        let go_sum = "example.com/leaf v1.0.0 h1:L=\n\
+                      example.com/leaf v1.0.0/go.mod h1:LM=\n\
+                      example.com/lib v1.9.0/go.mod h1:N9=\n\
+                      example.com/lib v1.10.0 h1:T=\n\
+                      example.com/lib v1.10.0/go.mod h1:TM=\n\
+                      example.com/other v0.2.0 h1:O=\n\
+                      example.com/other v0.2.0/go.mod h1:OM=\n"
+            .replace('\n', eol);
+        (go_mod, go_sum)
+    }
+
+    /// Both modules hosted-redirected by the real rewriter, written to disk.
+    async fn go_redirected_fixture(eol: &str) -> (tempfile::TempDir, RedirectState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (go_mod, go_sum) = go_pristine(eol);
+        let mut files: BTreeMap<String, String> = BTreeMap::new();
+        files.insert("go.mod".into(), go_mod);
+        files.insert("go.sum".into(), go_sum);
+        let rewrite = crate::patch::redirect::rewrite_registry_redirect(
+            &files,
+            &[
+                go_override("example.com/lib", "v1.10.0", GO_UUID),
+                go_override("example.com/other", "v0.2.0", GO_OTHER_UUID),
+            ],
+        );
+        assert!(rewrite.warnings.is_empty(), "{:?}", rewrite.warnings);
+        for (rel, content) in &rewrite.files {
+            tokio::fs::write(tmp.path().join(rel), content)
+                .await
+                .unwrap();
+        }
+        let mut state = RedirectState::new();
+        state.edits = rewrite.edits;
+        let mut lib = record();
+        lib.uuid = GO_UUID.to_string();
+        let mut other = record();
+        other.uuid = GO_OTHER_UUID.to_string();
+        state.records.insert(GO_PURL.to_string(), lib);
+        state.records.insert(GO_OTHER_PURL.to_string(), other);
+        (tmp, state)
+    }
+
+    /// hosted → vendored takeover of one Go module: its replace and gopatch
+    /// go.sum lines go, its pruned go.sum pair comes back where go sorts it,
+    /// and its ledger record is dropped. The other hosted module is intact.
+    #[tokio::test]
+    async fn golang_per_purl_revert_unwinds_only_that_module() {
+        for eol in ["\n", "\r\n"] {
+            let (tmp, mut state) = go_redirected_fixture(eol).await;
+            let root = tmp.path();
+            assert!(redirect_revert_supported(GO_PURL));
+            revert_redirect_purl(root, &mut state, GO_PURL, false)
+                .await
+                .expect("golang takeover revert succeeds");
+
+            let go_mod = tokio::fs::read_to_string(root.join("go.mod"))
+                .await
+                .unwrap();
+            let go_sum = tokio::fs::read_to_string(root.join("go.sum"))
+                .await
+                .unwrap();
+            assert!(!go_mod.contains(GO_UUID), "{go_mod:?}");
+            assert!(
+                go_mod.contains(&format!(
+                    "replace example.com/other v0.2.0 => patch.socket.dev/gopatch/{GO_OTHER_UUID}"
+                )),
+                "{go_mod:?}"
+            );
+            let expected_sum = format!(
+                "example.com/leaf v1.0.0 h1:L={eol}\
+                 example.com/leaf v1.0.0/go.mod h1:LM={eol}\
+                 example.com/lib v1.9.0/go.mod h1:N9={eol}\
+                 example.com/lib v1.10.0 h1:T={eol}\
+                 example.com/lib v1.10.0/go.mod h1:TM={eol}\
+                 patch.socket.dev/gopatch/{GO_OTHER_UUID} v0.2.0-socketpatch.1 {GO_ZIP_H1}{eol}\
+                 patch.socket.dev/gopatch/{GO_OTHER_UUID} v0.2.0-socketpatch.1/go.mod {GO_MOD_H1}{eol}"
+            );
+            assert_eq!(go_sum, expected_sum, "eol {eol:?}");
+            assert!(!state.records.contains_key(GO_PURL));
+            assert!(state.records.contains_key(GO_OTHER_PURL));
+            assert!(
+                state.edits.iter().all(|e| {
+                    let text = format!("{:?}{:?}{:?}", e.key, e.new, e.original);
+                    !text.contains(GO_UUID) && !text.contains("example.com/lib")
+                }),
+                "{:?}",
+                state.edits
+            );
+
+            // The remaining module unwinds through the same path, back to
+            // the pristine bytes.
+            revert_redirect_purl(root, &mut state, GO_OTHER_PURL, false)
+                .await
+                .expect("second revert succeeds");
+            let (pristine_mod, pristine_sum) = go_pristine(eol);
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("go.mod"))
+                    .await
+                    .unwrap(),
+                pristine_mod
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("go.sum"))
+                    .await
+                    .unwrap(),
+                pristine_sum
+            );
+            assert!(state.records.is_empty() && state.edits.is_empty());
+        }
+    }
+
+    /// A go.mod whose socket replace was hand-edited away from the recorded
+    /// directive has drifted: refuse, byte-untouched, ledger kept.
+    #[tokio::test]
+    async fn golang_per_purl_revert_refuses_a_drifted_replace() {
+        let (tmp, mut state) = go_redirected_fixture("\n").await;
+        let root = tmp.path();
+        let go_mod = tokio::fs::read_to_string(root.join("go.mod"))
+            .await
+            .unwrap();
+        let drifted = go_mod.replace(
+            &format!("patch.socket.dev/gopatch/{GO_UUID} v1.10.0-socketpatch.1"),
+            "../my-fork",
+        );
+        tokio::fs::write(root.join("go.mod"), &drifted)
+            .await
+            .unwrap();
+        let go_sum = tokio::fs::read_to_string(root.join("go.sum"))
+            .await
+            .unwrap();
+        let before = state.clone();
+
+        let err = revert_redirect_purl(root, &mut state, GO_PURL, false)
+            .await
+            .expect_err("a drifted replace refuses");
+        assert!(err.contains("go.mod"), "{err}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("go.mod"))
+                .await
+                .unwrap(),
+            drifted
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("go.sum"))
+                .await
+                .unwrap(),
+            go_sum
+        );
+        assert_eq!(state.records.len(), before.records.len());
+        assert_eq!(state.edits.len(), before.edits.len());
     }
 }

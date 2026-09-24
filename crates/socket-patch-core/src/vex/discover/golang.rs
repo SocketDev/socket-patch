@@ -246,10 +246,42 @@ async fn extract_file(
                 }
                 out.push(PatchedRef::vendored(purl, &vref, file, None));
             }
+            // Socket-shaped but not something we write (another tree's copy,
+            // an absolute path, a malformed hosted module): diagnosed, never a ref.
+            None if is_foreign_socket_target(entry) => {
+                let target = entry
+                    .path
+                    .as_deref()
+                    .or(entry.rhs_module.as_deref())
+                    .unwrap_or_default();
+                out.diag(
+                    DIAG_REF_INVALID,
+                    file,
+                    format!(
+                        "{file}: replace {} => {target}: not a project-root \
+                         `./.socket/vendor/golang/<patch-uuid>/<module>@<version>` path or \
+                         `{HOSTED_GO_MODULE_PREFIX}<patch-uuid>` module",
+                        entry.module
+                    ),
+                );
+            }
             // `.socket/go-patches/` carries no uuid; user replaces are not ours.
             Some(ReplaceOwner::GoPatches) | None => {}
         }
     }
+}
+
+/// A replace target no socket backend owns that still names Socket's vendor
+/// tree or hosted module namespace.
+fn is_foreign_socket_target(entry: &ReplaceEntry) -> bool {
+    entry
+        .path
+        .as_deref()
+        .is_some_and(|p| p.replace('\\', "/").contains(".socket/vendor/golang/"))
+        || entry
+            .rhs_module
+            .as_deref()
+            .is_some_and(|m| m.starts_with(HOSTED_GO_MODULE_PREFIX))
 }
 
 /// `pkg:golang/<M>@<v>` for the module a Socket `replace` substitutes, with

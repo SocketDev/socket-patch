@@ -471,27 +471,84 @@ async fn fetch_cargo(
     })
 }
 
-/// Default Go module proxy; `SOCKET_GOPROXY` wins, else the standard
-/// `GOPROXY` env (first element that isn't `direct`/`off`).
+/// go's default module proxy (the first element of go's default
+/// `GOPROXY=https://proxy.golang.org,direct`).
 pub const DEFAULT_GOPROXY: &str = "https://proxy.golang.org";
 
-fn goproxy_base() -> String {
+/// The module proxy go itself would ask for `module`, or `Err` when go would
+/// not use a proxy for it: GOPROXY's first element is `off` or `direct`, or
+/// the module matches GONOPROXY (defaulting to GOPRIVATE). Falling back to a
+/// public proxy there would send a private module path off the machine.
+/// A non-empty `SOCKET_GOPROXY` is an explicit choice and always wins.
+fn goproxy_base(module: &str) -> Result<String, String> {
     if let Ok(v) = std::env::var("SOCKET_GOPROXY") {
         let v = v.trim_end_matches('/').to_string();
         if !v.is_empty() {
-            return v;
+            return Ok(v);
         }
     }
-    if let Ok(v) = std::env::var("GOPROXY") {
-        // GOPROXY is a comma- OR pipe-separated list (go help goproxy).
-        for part in v.split([',', '|']) {
-            let part = part.trim().trim_end_matches('/');
-            if !part.is_empty() && part != "direct" && part != "off" {
-                return part.to_string();
-            }
+    let nonempty = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+    if let Some((key, patterns)) = nonempty("GONOPROXY")
+        .map(|v| ("GONOPROXY", v))
+        .or_else(|| nonempty("GOPRIVATE").map(|v| ("GOPRIVATE", v)))
+    {
+        if go_match_prefix_patterns(&patterns, module) {
+            return Err(format!(
+                "{module} matches {key}, so go fetches it directly, never through a \
+                 module proxy; not fetching it (set SOCKET_GOPROXY to name a proxy \
+                 that serves it)"
+            ));
         }
     }
-    DEFAULT_GOPROXY.to_string()
+    let goproxy = nonempty("GOPROXY").unwrap_or_else(|| format!("{DEFAULT_GOPROXY},direct"));
+    // A comma- OR pipe-separated list (go help goproxy); go tries the first
+    // element first, and `off` / `direct` there mean no proxy is consulted.
+    let first = goproxy
+        .split([',', '|'])
+        .map(|part| part.trim().trim_end_matches('/'))
+        .find(|part| !part.is_empty())
+        .unwrap_or(DEFAULT_GOPROXY);
+    match first {
+        "off" => Err("GOPROXY=off disables module downloads; not fetching".to_string()),
+        "direct" => Err(
+            "GOPROXY=direct fetches modules from their version control origin, which \
+             socket-patch does not do; not fetching (set SOCKET_GOPROXY to name a proxy)"
+                .to_string(),
+        ),
+        proxy => Ok(proxy.to_string()),
+    }
+}
+
+/// `golang.org/x/mod/module.MatchPrefixPatterns`: does any comma-separated
+/// glob match a leading path-element prefix of `target`? A glob with
+/// syntax this matcher does not implement (`[...]`, `\`) counts as a
+/// match, so an unrecognized private pattern never leaks a module path.
+fn go_match_prefix_patterns(globs: &str, target: &str) -> bool {
+    globs
+        .split(',')
+        .map(str::trim)
+        .filter(|g| !g.is_empty())
+        .any(|glob| {
+            let elements = glob.matches('/').count() + 1;
+            let prefix: Vec<&str> = target.splitn(elements + 1, '/').take(elements).collect();
+            prefix.len() == elements
+                && (glob.contains(['[', '\\'])
+                    || go_glob_match(glob.as_bytes(), prefix.join("/").as_bytes()))
+        })
+}
+
+/// `path.Match` for `*` and `?` (neither crosses a `/`) and literals.
+fn go_glob_match(pattern: &[u8], name: &[u8]) -> bool {
+    match pattern.split_first() {
+        None => name.is_empty(),
+        Some((b'*', rest)) => (0..=name.len())
+            .take_while(|&i| i == 0 || name[i - 1] != b'/')
+            .any(|i| go_glob_match(rest, &name[i..])),
+        Some((b'?', rest)) => {
+            name.first().is_some_and(|&c| c != b'/') && go_glob_match(rest, &name[1..])
+        }
+        Some((&c, rest)) => name.first() == Some(&c) && go_glob_match(rest, &name[1..]),
+    }
 }
 
 /// go.sum's `h1:` dirhash over a module zip: sha256 of the sorted
@@ -674,14 +731,15 @@ async fn fetch_golang(
             "go module entries verify via the go.sum h1 dirhash only".to_string(),
         ));
     };
-    let url = entry.resolved.clone().unwrap_or_else(|| {
-        format!(
+    let url = match &entry.resolved {
+        Some(url) => url.clone(),
+        None => format!(
             "{}/{}/@v/{}.zip",
-            goproxy_base(),
+            goproxy_base(&entry.name).map_err(FetchError::Unverifiable)?,
             encode_module_path(&entry.name),
             encode_module_path(&entry.version)
-        )
-    });
+        ),
+    };
     let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
     let actual = go_h1_of_zip(&bytes).map_err(FetchError::Failed)?;
     if &actual != expected {
@@ -2170,6 +2228,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn goproxy_base_splits_on_pipe_separator() {
+        const MODULE: &str = "example.com/m";
         // GOPROXY is a comma- OR pipe-separated list (go help goproxy); a
         // pipe-separated value must yield the first usable proxy, not a
         // `https://a|b`-shaped base that builds an unparseable URL.
@@ -2180,9 +2239,9 @@ mod tests {
             "GOPROXY",
             "https://athens.example|https://proxy.golang.org|direct",
         );
-        let piped = goproxy_base();
-        std::env::set_var("GOPROXY", "off|https://mirror.example/,direct");
-        let mixed = goproxy_base();
+        let piped = goproxy_base(MODULE);
+        std::env::set_var("GOPROXY", "https://mirror.example/,direct");
+        let mixed = goproxy_base(MODULE);
         match saved {
             Some(v) => std::env::set_var("GOPROXY", v),
             None => std::env::remove_var("GOPROXY"),
@@ -2191,8 +2250,8 @@ mod tests {
             Some(v) => std::env::set_var("SOCKET_GOPROXY", v),
             None => std::env::remove_var("SOCKET_GOPROXY"),
         }
-        assert_eq!(piped, "https://athens.example");
-        assert_eq!(mixed, "https://mirror.example");
+        assert_eq!(piped.as_deref(), Ok("https://athens.example"));
+        assert_eq!(mixed.as_deref(), Ok("https://mirror.example"));
     }
 
     #[tokio::test]
@@ -2577,27 +2636,100 @@ mod tests {
         assert!(fetched.dir().join("go.mod").is_file());
     }
 
+    /// go never sends a module path to a proxy when GOPROXY starts with
+    /// `off` / `direct`, or when the module matches GONOPROXY (defaulting to
+    /// GOPRIVATE). The pristine fetch must not either: it refuses before any
+    /// network I/O instead of falling back to proxy.golang.org.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn golang_fetch_never_uses_a_proxy_go_would_not() {
+        let mock = MockServer::start().await;
+        let entry = LockfileEntry {
+            ecosystem: "golang",
+            name: "example.com/private/mod".into(),
+            version: "v1.0.0".into(),
+            purl: "pkg:golang/example.com/private/mod@v1.0.0".into(),
+            resolved: None,
+            integrity: LockIntegrity::GoH1("h1:AAAA".into()),
+            source_kind: SourceKind::Unspecified,
+        };
+        let keys = ["SOCKET_GOPROXY", "GOPROXY", "GOPRIVATE", "GONOPROXY"];
+        let saved: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+        let proxy = mock.uri();
+        let cases: Vec<(String, &str, &str, bool)> = vec![
+            ("off".into(), "", "", false),
+            ("direct".into(), "", "", false),
+            (format!("off,{proxy}"), "", "", false),
+            (format!("direct|{proxy}"), "", "", false),
+            (proxy.clone(), "example.com/private", "", false),
+            (proxy.clone(), "example.com/*", "", false),
+            (proxy.clone(), "*.example", "", true),
+            (proxy.clone(), "example.com/private", "other.example", true),
+        ];
+        let mut outcomes = Vec::new();
+        for (goproxy, goprivate, gonoproxy, uses_proxy) in &cases {
+            std::env::set_var("GOPROXY", goproxy);
+            std::env::set_var("GOPRIVATE", goprivate);
+            std::env::set_var("GONOPROXY", gonoproxy);
+            let result = fetch_and_stage(&entry, &build_registry_client()).await;
+            outcomes.push((
+                goproxy.clone(),
+                *goprivate,
+                *gonoproxy,
+                *uses_proxy,
+                result.err(),
+            ));
+        }
+        for (k, v) in keys.iter().zip(saved) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        for (goproxy, goprivate, gonoproxy, uses_proxy, err) in &outcomes {
+            let case = format!("GOPROXY={goproxy} GOPRIVATE={goprivate} GONOPROXY={gonoproxy}");
+            if *uses_proxy {
+                assert!(
+                    matches!(err, Some(FetchError::Failed(_))),
+                    "{case}: {err:?}"
+                );
+            } else {
+                assert!(
+                    matches!(err, Some(FetchError::Unverifiable(d)) if d.contains("GO")),
+                    "{case}: {err:?}"
+                );
+            }
+        }
+        let hits = mock.received_requests().await.unwrap_or_default().len();
+        assert_eq!(hits, 2, "only the two proxy-eligible cases reach the proxy");
+    }
+
     #[test]
     #[serial_test::serial]
     fn goproxy_base_env_precedence() {
+        const MODULE: &str = "example.com/m";
         let saved_socket = std::env::var("SOCKET_GOPROXY").ok();
         let saved = std::env::var("GOPROXY").ok();
 
         // SOCKET_GOPROXY wins over GOPROXY (trailing slash trimmed).
         std::env::set_var("SOCKET_GOPROXY", "https://socket.example/");
         std::env::set_var("GOPROXY", "https://ignored.example");
-        let socket_wins = goproxy_base();
+        let socket_wins = goproxy_base(MODULE);
         // An EMPTY SOCKET_GOPROXY falls through to GOPROXY.
         std::env::set_var("SOCKET_GOPROXY", "");
         std::env::set_var("GOPROXY", "https://fallback.example");
-        let empty_falls_through = goproxy_base();
+        let empty_falls_through = goproxy_base(MODULE);
         // Neither set → the default proxy.
         std::env::remove_var("SOCKET_GOPROXY");
         std::env::remove_var("GOPROXY");
-        let neither = goproxy_base();
-        // A GOPROXY of only direct/off parts is unusable → the default.
+        let neither = goproxy_base(MODULE);
+        // A GOPROXY led by direct/off consults no proxy: refused, never the
+        // default proxy.
         std::env::set_var("GOPROXY", "direct,off");
-        let all_unusable = goproxy_base();
+        let no_proxy = goproxy_base(MODULE);
 
         match saved_socket {
             Some(v) => std::env::set_var("SOCKET_GOPROXY", v),
@@ -2607,10 +2739,13 @@ mod tests {
             Some(v) => std::env::set_var("GOPROXY", v),
             None => std::env::remove_var("GOPROXY"),
         }
-        assert_eq!(socket_wins, "https://socket.example");
-        assert_eq!(empty_falls_through, "https://fallback.example");
-        assert_eq!(neither, DEFAULT_GOPROXY);
-        assert_eq!(all_unusable, DEFAULT_GOPROXY);
+        assert_eq!(socket_wins.as_deref(), Ok("https://socket.example"));
+        assert_eq!(
+            empty_falls_through.as_deref(),
+            Ok("https://fallback.example")
+        );
+        assert_eq!(neither.as_deref(), Ok(DEFAULT_GOPROXY));
+        assert!(no_proxy.is_err(), "{no_proxy:?}");
     }
 
     #[test]

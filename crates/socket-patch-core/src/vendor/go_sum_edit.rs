@@ -96,6 +96,17 @@ pub fn upsert_module_lines(
     Some(joined)
 }
 
+/// True when `go.sum` carries a line (zip or `/go.mod` form) for exactly
+/// `module@version` — go records one for every module version its build
+/// graph loads.
+pub fn has_module_version(content: &str, module: &str, version: &str) -> bool {
+    let zip_key = format!("{module} {version} ");
+    let gomod_key = format!("{module} {version}/go.mod ");
+    content
+        .lines()
+        .any(|l| l.starts_with(&zip_key) || l.starts_with(&gomod_key))
+}
+
 /// Remove the lines for exactly `module@version` (both the zip and `/go.mod`
 /// forms). Used to prune the REPLACED original's lines: once a version-pinned
 /// `replace` covers the resolved version, go never fetches (or verifies) the
@@ -146,6 +157,88 @@ pub fn remove_module_prefix_lines(content: &str, module_prefix: &str) -> Option<
                 .is_none_or(|m| !m.starts_with(module_prefix))
         })
         .collect();
+    if kept.len() == content.lines().count() {
+        return None;
+    }
+    if kept.is_empty() {
+        return Some(String::new());
+    }
+    let eol = super::common::detect_eol(content);
+    let mut joined = kept.join(eol);
+    joined.push_str(eol);
+    Some(joined)
+}
+
+/// go's go.sum line order, as `go mod tidy` writes it (`module.Sort`, then
+/// the hashes sorted): module path bytewise, then the version by semver
+/// (`v1.9.0` before `v1.10.0`), then the `/go.mod` suffix, then the hash.
+fn go_sum_line_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    fn split(line: &str) -> (&str, &str, &str, &str) {
+        let mut fields = line.splitn(3, ' ');
+        let path = fields.next().unwrap_or_default();
+        let version = fields.next().unwrap_or_default();
+        let hash = fields.next().unwrap_or_default();
+        let (version, file) = version.split_at(version.find('/').unwrap_or(version.len()));
+        (path, version, file, hash)
+    }
+    let (path_a, version_a, file_a, hash_a) = split(a);
+    let (path_b, version_b, file_b, hash_b) = split(b);
+    path_a
+        .cmp(path_b)
+        .then_with(|| go_semver_cmp(version_a, version_b))
+        .then_with(|| file_a.cmp(file_b))
+        .then_with(|| hash_a.cmp(hash_b))
+}
+
+/// `golang.org/x/mod/semver.Compare`: build metadata (`+incompatible`) is
+/// ignored and an invalid version sorts before every valid one.
+fn go_semver_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse = |v: &str| {
+        v.strip_prefix('v')
+            .and_then(|s| semver::Version::parse(s).ok())
+    };
+    match (parse(a), parse(b)) {
+        (Some(x), Some(y)) => (x.major, x.minor, x.patch)
+            .cmp(&(y.major, y.minor, y.patch))
+            .then_with(|| x.pre.cmp(&y.pre)),
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, None) => a.cmp(b),
+    }
+}
+
+/// Put previously removed `go.sum` lines (`\n`-joined) back at go's sorted
+/// position, keeping the file's line endings, so a revert restores the
+/// bytes go wrote. Lines already present are skipped. Returns `None` when
+/// nothing was missing.
+pub fn reinsert_lines(content: &str, removed: &str) -> Option<String> {
+    let mut lines: Vec<&str> = content.lines().collect();
+    let mut changed = false;
+    for line in removed.lines().filter(|l| !l.is_empty()) {
+        if lines.contains(&line) {
+            continue;
+        }
+        let at = lines
+            .iter()
+            .position(|l| go_sum_line_cmp(line, l).is_lt())
+            .unwrap_or(lines.len());
+        lines.insert(at, line);
+        changed = true;
+    }
+    if !changed {
+        return None;
+    }
+    let eol = super::common::detect_eol(content);
+    let mut joined = lines.join(eol);
+    joined.push_str(eol);
+    Some(joined)
+}
+
+/// Remove each of `added` (`\n`-joined lines) where it appears as a whole
+/// line, whatever the file's line endings. Returns `None` when none did.
+pub fn remove_lines(content: &str, added: &str) -> Option<String> {
+    let drop: Vec<&str> = added.lines().filter(|l| !l.is_empty()).collect();
+    let kept: Vec<&str> = content.lines().filter(|l| !drop.contains(l)).collect();
     if kept.len() == content.lines().count() {
         return None;
     }
