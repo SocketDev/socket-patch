@@ -1420,6 +1420,10 @@ jobs:
       - name: Install Rust
         run: rustup show
       - name: Install the cargo under test
+        # bash, not the Windows default pwsh: in PowerShell
+        # "$CARGO_TEST_TOOLCHAIN" is an (unset) PowerShell variable, so the
+        # windows-latest leg ran `rustup toolchain install ""`.
+        shell: bash
         env:
           CARGO_TEST_TOOLCHAIN: ${{ matrix.toolchain }}
         run: rustup toolchain install "$CARGO_TEST_TOOLCHAIN" --profile minimal
