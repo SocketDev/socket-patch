@@ -466,6 +466,10 @@ fn indexed_pnpm_rewrite_matches_oracle_on_random_lock_sets() {
         Flavor::V51,
         Flavor::EarlyShrinkwrap,
     ];
+    // Which outcomes the sweep actually reached, so a generator change that
+    // stops producing the refusal / residual / duplicate shapes fails here
+    // instead of quietly testing only the plain rewrite path.
+    let mut outcomes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for seed in 1..=300u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let lock_count = 1 + rng.below(3);
@@ -549,7 +553,37 @@ fn indexed_pnpm_rewrite_matches_oracle_on_random_lock_sets() {
                 overrides.push(dep(&p, i + 100, tag, Some(&sri("DUP"))));
             }
         }
-        assert_equivalent(&files, &overrides);
+        let r = assert_equivalent(&files, &overrides);
+        if !r.edits.is_empty() {
+            outcomes.insert("edit".into());
+        }
+        if !r.refused_pnpm_uuids.is_empty() {
+            outcomes.insert("refused".into());
+        }
+        outcomes.extend(r.warnings.iter().map(|w| w.code.clone()));
+        if r.edits.iter().enumerate().any(|(i, e)| {
+            r.edits[..i]
+                .iter()
+                .any(|prior| prior.path == e.path && prior.key == e.key && prior.new == e.original)
+        }) {
+            outcomes.insert("duplicate_sees_prior".into());
+        }
+    }
+    // (`redirect_pnpm_entry_vendored` is not generated here; the
+    // depscan-sized sweep above requires it.)
+    for want in [
+        "edit",
+        "refused",
+        "duplicate_sees_prior",
+        "redirect_pnpm_entry_not_found",
+        "redirect_pnpm_legacy_lockfile_unsupported",
+        "redirect_pnpm_missing_sha512",
+        "redirect_pnpm_unsupported_lock_key",
+    ] {
+        assert!(
+            outcomes.contains(want),
+            "sweep never reached {want}: {outcomes:?}"
+        );
     }
 }
 

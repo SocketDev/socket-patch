@@ -3007,8 +3007,10 @@ fn rewrite_pnpm_lock(
             let v9_vendored_key = format!("{fname}@file:");
             let override_key = format!("{fname}@{}", dep.version);
             // Scanned over the post-splice text, so fold pending splices in.
-            let vendored = locks.iter_mut().any(|lock| {
+            for lock in locks.iter_mut() {
                 lock.materialize();
+            }
+            let vendored = locks.iter().any(|lock| {
                 lock.text.lines().any(|line| {
                     let t = line.trim_start();
                     let t = t.strip_prefix('\'').unwrap_or(t);
