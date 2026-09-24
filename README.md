@@ -235,8 +235,8 @@ The same patched bytes can reach your build three different ways. The modes diff
 | Mode | Where the patch lives | Install-time requirement | Trade-off |
 |------|----------------------|--------------------------|-----------|
 | **agent** — `scan --mode agent` (or [`apply`](#apply)) | `.socket/` manifest + blobs, committed; the CLI re-applies after each install | The `socket-patch` CLI must run (install hook via [`setup`](#setup), or an `apply` step in CI) | Small repo footprint (per-file blobs, not whole packages); no lockfile edits; the only mode that needs CI / install-hook changes |
-| **vendored** — `scan --mode vendored` (or [`vendor`](#vendor)) | Patched packages committed under `.socket/vendor/` (with a ledger that embeds the patch records — no manifest); the lockfile is rewired to consume them | **None** — the package manager installs the committed bytes | Fully airgapped and hermetic, at the cost of repo size |
-| **hosted** — `scan --mode hosted` | No patched bytes in your repo: the lockfile is rewritten so **only** the patched dependencies resolve to Socket-hosted, integrity-pinned packages on `patch.socket.dev`; the edits + patch records are ledgered in `.socket/vendor/redirect-state.json` (commit it — [`vex`](#vex) reads it, and [`rollback`](#rollback) replays its recorded pre-redirect originals to unwind the redirect, see [Undo things](#undo-things)) | Installs must be able to reach `patch.socket.dev` (no CLI, no install hook) | Smallest possible diff (lockfile + ledger); not for airgapped installs |
+| **vendored** — `scan --mode vendored` (or [`vendor`](#vendor)) | Patched packages committed under `.socket/vendor/` (with a ledger that embeds the patch records — `scan --mode vendored` writes no manifest; the standalone `vendor` command is manifest-driven and keeps only a fallback copy in the ledger); the lockfile is rewired to consume them | **None** — the package manager installs the committed bytes | Fully airgapped and hermetic, at the cost of repo size |
+| **hosted** — `scan --mode hosted` | No patched bytes in your repo: the lockfile is rewritten so **only** the patched dependencies resolve to Socket-hosted, integrity-pinned packages on `patch.socket.dev`; the edits + patch records are ledgered in `.socket/vendor/redirect-state.json` (commit it — [`rollback`](#rollback) replays its recorded pre-redirect originals to unwind the redirect, see [Undo things](#undo-things), and [`vex`](#vex) uses its records offline; `vex` also works from the rewritten lockfile alone) | Installs must be able to reach `patch.socket.dev` (no CLI, no install hook) | Smallest possible diff (lockfile + ledger); not for airgapped installs |
 
 Every mode pins the patched bytes: in agent mode the CLI verifies every file on each
 apply; vendored and hosted modes lean on your package manager's own lockfile integrity
@@ -256,6 +256,28 @@ it keeps the PR diff small.)
 Mode support varies by ecosystem — e.g. Go can't do hosted, Rush monorepos can't do
 vendored. See the full **[mode × ecosystem matrix](docs/ecosystems.md#mode--ecosystem-matrix)**
 for details and per-ecosystem caveats.
+
+### npm compatibility (hosted mode and npm 12)
+
+npm 12 defaults to `allow-remote=none` and refuses (`EALLOWREMOTE`) any lockfile
+entry whose tarball is not served by your configured registry — which is what a
+hosted redirect writes. So when `scan --mode hosted` (or `get --mode hosted`) leaves a
+`package-lock.json` / `npm-shrinkwrap.json` pointing at `patch.socket.dev`, it also
+writes `allow-remote=all` to the project `.npmrc` (creating it, or appending one line
+and keeping everything else byte-for-byte) and warns `redirect_npm_allow_remote`.
+Commit the `.npmrc` with the lock; a plain `npm ci` then installs the patched
+packages on every npm from 7 to 12. The tradeoff: `allow-remote=all` lets npm install
+**any** URL-resolved dependency, not just Socket's patched ones — the per-entry sha512
+integrity pins are still enforced. An explicit `allow-remote=none` / `root` of yours is
+never changed or overridden — whether it sits in the project `.npmrc`, in your user
+(`~/.npmrc`), global or builtin npm config, or in an `npm_config_allow_remote`
+environment variable (the warning names where it found it and how to install anyway),
+`--no-npm-allow-remote-config`
+(`SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG`) turns the write off (install with
+`npm ci --allow-remote=all` instead), and `rollback` / `remove` / switching to vendored
+mode remove exactly the line or file the run added. Vendored mode needs none of this:
+npm treats its `file:` tarballs under `allow-file`, which defaults to `all`. See
+[npm compatibility](docs/testing/npm-compatibility.md) for the tested majors.
 
 ### Bun compatibility
 
@@ -350,7 +372,7 @@ git add .socket package-lock.json            # your lockfile may differ
 
 # Hosted: smallest diff — patched deps resolve from patch.socket.dev
 socket-patch scan --json --mode hosted --yes
-git add .socket/vendor/redirect-state.json package-lock.json
+git add .socket/vendor/redirect-state.json package-lock.json .npmrc # .npmrc: npm 12 allow-remote
 ```
 
 No `setup` hook or CI `apply` step is needed — the package manager installs the patched
@@ -416,8 +438,9 @@ And `setup --remove` reverts the install hooks that `setup` added.
 > lockfile / registry-config fragments recorded in `.socket/vendor/redirect-state.json`
 > and drops the redirect records. If you revert a hosted edit by hand instead (e.g.
 > `git checkout -- <lockfile>`), also delete that ledger — its recorded originals are
-> then stale, and a leftover ledger would still let [`vex`](#vex) attest the removed
-> redirects.
+> then stale. (A leftover ledger no longer makes [`vex`](#vex) attest the removed
+> redirects: a record attests only while a lockfile still wires its hosted patch, and is
+> otherwise omitted as `redirect_unwired`.)
 
 ## Command reference
 
@@ -650,8 +673,9 @@ socket-patch apply --vex socket.vex.json
 ### `vex`
 
 Generate an [OpenVEX](https://github.com/openvex) 0.2.0 attestation describing the
-vulnerabilities that the applied patches have mitigated. See [OpenVEX
-attestations](#openvex-attestations) below for the full workflow.
+vulnerabilities that the applied patches have mitigated — agent-mode patches from the
+manifest, and hosted / vendored patches straight from the lockfiles (no manifest needed).
+See [OpenVEX attestations](#openvex-attestations) below for the full workflow.
 
 **Usage:**
 ```bash
@@ -663,7 +687,7 @@ socket-patch vex [options]
 |------|---------|-------------|
 | `-O, --output <path>` | `SOCKET_VEX_OUTPUT` | Write the VEX document to this path instead of stdout. Required when combined with `--json`. |
 | `--product <id>` | `SOCKET_VEX_PRODUCT` | Override the auto-detected top-level product PURL/identifier. |
-| `--no-verify` | `SOCKET_VEX_NO_VERIFY` | Skip the on-disk file-hash check and trust the manifest — useful on a build machine that doesn't have the patched files laid out. |
+| `--no-verify` | `SOCKET_VEX_NO_VERIFY` | Skip the on-disk file-hash check and trust the patch records — useful on a build machine that doesn't have the patched files laid out. The wiring checks still apply: a hosted/vendored ledger record the lockfile no longer wires, or a lockfile reference whose record is unavailable or names another package, is omitted either way. |
 | `--doc-id <id>` | `SOCKET_VEX_DOC_ID` | Override the document `@id`. Default is a random `urn:uuid:<v4>` regenerated each run; pin this for a reproducible identifier. |
 | `--compact` | `SOCKET_VEX_COMPACT` | Emit compact JSON instead of pretty-printed. |
 
@@ -691,7 +715,8 @@ in one pass). Instead of patching installed packages in place (machine-local sta
 rewires your lockfile so the project consumes the vendored copy. Commit `.socket/vendor/` —
 the vendored artifacts plus the ledger whose embedded patch records [`vex`](#vex),
 [`list`](#list), and [`repair`](#repair) read (vendored mode writes nothing else under
-`.socket/`) — along with the lockfile edits, and **every fresh checkout
+`.socket/`; `vex` can also attest from the lockfile wiring alone) — along with the lockfile
+edits, and **every fresh checkout
 builds with the patched dependency**: no `socket-patch` binary, no Socket API access, no
 install hook required on the consuming machine.
 
@@ -1101,30 +1126,38 @@ socket-patch repair --json
 
 ## OpenVEX attestations
 
-`socket-patch vex` turns your local manifest into a machine-readable statement of *which
+`socket-patch vex` turns the patches your project carries into a machine-readable statement of *which
 known vulnerabilities no longer affect your build* because a Socket patch has been applied.
 This lets vulnerability scanners stop flagging CVEs that you've already remediated in
 place — without bumping the package version.
 
 **How it works**
 
-1. Reads `.socket/manifest.json` and, unless `--no-verify` is passed, re-checks each
-   patched file's hash on disk so the attestation only covers patches that are actually
-   applied. [Vendored](#vendor) patches are verified against the **committed artifact**
-   instead of the installed tree (their impact statement carries a `(vendored)` marker),
-   and need no `setup` install hook to be attested. Patches vendored by
-   `scan --mode vendored` attest from the vendor ledger's embedded records, and
-   [hosted-mode](#three-patch-modes) patches attest from the redirect ledger
-   (`.socket/vendor/redirect-state.json`, marker `(redirected)` — hash-verified against
-   the installed tree post-install), so `vex` works even with no manifest file at all.
-2. Auto-detects the top-level **product** identifier (override with `--product`), probing
+1. Gathers every patch the project can prove: agent-mode patches from
+   `.socket/manifest.json`, and [vendored](#vendor) / [hosted](#three-patch-modes) patches
+   from the wiring in your **lockfiles** (plus the `.socket/vendor` ledgers when they are
+   committed). See [No manifest needed for hosted and vendored
+   patches](#no-manifest-needed-for-hosted-and-vendored-patches).
+2. Unless `--no-verify` is passed, re-checks each patch's bytes so the attestation only
+   covers patches that are actually applied: agent patches against the installed tree,
+   vendored patches against the **committed artifact** (marker `(vendored)`), and hosted
+   patches against the installed copy the build consumes — or, before any install, against
+   the lockfile's integrity pin (marker `(redirected)`). Vendored and hosted patches need
+   no `setup` install hook to be attested. Whatever `--no-verify` says, a ledger record the
+   lockfile no longer wires is never attested.
+3. Auto-detects the top-level **product** identifier (override with `--product`), probing
    in order:
    - `.git/config` `[remote "origin"]` → `pkg:github/<owner>/<repo>` (similar for
      GitLab/Bitbucket; raw URL otherwise)
    - `package.json` → `pkg:npm/<name>@<version>`
    - `pyproject.toml` → `pkg:pypi/<name>@<version>`
    - `Cargo.toml` → `pkg:cargo/<name>@<version>`
-3. Emits an OpenVEX 0.2.0 document whose statements mark each mitigated vulnerability as
+   - `go.mod` → `pkg:golang/<module>`
+   - `composer.json` → `pkg:composer/<vendor>/<name>[@<version>]`
+   - `pom.xml` → `pkg:maven/<groupId>/<artifactId>[@<version>]`
+   - the root's single `*.csproj` → `pkg:nuget/<id>[@<version>]`
+   - the root's single `*.gemspec` → `pkg:gem/<name>[@<version>]`
+4. Emits an OpenVEX 0.2.0 document whose statements mark each mitigated vulnerability as
    `not_affected` (justification: the patch is present), suitable for piping into
    `vexctl`, Grype, Trivy, and similar tools.
 
@@ -1137,7 +1170,7 @@ Each statement's impact string records *how* the patch is persisted — one mark
 |---|---|---|---|
 | `Patched via Socket patch <uuid>` | agent | The installed tree: every patched file's hash was verified against the manifest's `afterHash` | Trust the statement as long as the agent install hook (or a CI `apply`) keeps re-applying; ecosystems without a hook must be declared in `setup.manual` |
 | `Patched via Socket patch <uuid> (vendored)` | vendored | The **committed** `.socket/vendor/` artifact was hash-verified — no install hook needed; the lockfile wiring is the persistence mechanism | Trust it on any checkout; the committed bytes are the patch |
-| `Patched via Socket patch <uuid> (redirected)` | hosted | The lockfile's integrity pin points at the Socket-hosted patched package. When emitted in-run by `scan --mode hosted --vex`, the statement is attested **from the redirect ledger without hash verification** (the bytes are fetched at install time — the JSON `vex` summary carries `verified: false`) | Ensure installs still resolve from `patch.socket.dev` (the lockfile edit is intact), and run `socket-patch vex` **after installing** — it re-reads the ledger and hash-verifies the redirected patches against the installed tree |
+| `Patched via Socket patch <uuid> (redirected)` | hosted | The lockfile's integrity pin points at the Socket-hosted patched package. A post-install `socket-patch vex` hash-verifies the installed copy; before any install it attests from the pin. When emitted in-run by `scan --mode hosted --vex`, the statement is attested **without hash verification** (the bytes are fetched at install time — the JSON `vex` summary carries `verified: false`) | Ensure installs still resolve from `patch.socket.dev` (the lockfile edit is intact), and run `socket-patch vex` **after installing** to have the redirected patches hash-verified against the installed tree |
 
 The markers are stable strings (see
 [CLI_CONTRACT.md](crates/socket-patch-cli/CLI_CONTRACT.md)); scanners and policy engines
@@ -1167,9 +1200,63 @@ grype <image-or-dir> --vex socket.vex.json
 trivy image --vex socket.vex.json <image>
 ```
 
-Apply patches first (in any mode) — `vex` errors with `no_patches` when there is nothing
-to attest (an empty or missing manifest, no vendored ledger entries, and no hosted
-redirect records).
+Apply patches first (in any mode). When nothing names a patch anywhere — no manifest
+entry, no `.socket/vendor` ledger entry, no hosted or vendored lockfile reference — `vex`
+errors with `no_patches` (exit 1) when the manifest file exists but is empty, or with
+`manifest_not_found` (exit 2) when there is no manifest either. When there are patches but
+none can be attested, it exits 1 with `no_applicable_patches`, and each omission is listed
+with its reason: `hash_mismatch`, `record_unavailable`, `redirect_unwired`, and so on.
+
+### No manifest needed for hosted and vendored patches
+
+A hosted or vendored checkout needs no `.socket/manifest.json`, and no `.socket/vendor`
+ledgers either. This covers a depscan-opened PR, a clone of a repo that never committed its
+ledgers, and a `scan --mode hosted` run. `vex` reads the patch reference out of each root
+lockfile or config: a `patch.socket.dev` URL or a `.socket/vendor/<eco>/<uuid>/…` path
+carries the patch uuid. It then finds that patch's record in the manifest or ledgers, or
+fetches it from the patch API. The references it accepts are what socket-patch's own
+rewriters write: a URL on any other host, or an entry the package manager would not
+install from, is ignored.
+
+```bash
+# Fresh clone of a hosted or vendored project: nothing installed, no .socket/manifest.json
+socket-patch vex --output socket.vex.json
+```
+
+Behavior worth knowing:
+
+- **Network.** Without a local record, `vex` fetches the patch by uuid from the patch API.
+  With `--offline`, or when the fetch fails or the patch is paid and not entitled, the patch
+  is omitted as `record_unavailable`. Commit the ledgers, or keep the manifest, to attest
+  offline.
+- **Liveness.** A ledger entry attests only while a lockfile still wires it. Otherwise it is
+  omitted as `vendor_unwired` or `redirect_unwired`, even under `--no-verify`. Lockfiles
+  that wire one package to different patches (`wiring_conflict`) attest none of them. A
+  package that one lock wires to a patch while another lock resolves it from the registry
+  is not attested either.
+- **Diagnostics.** A lockfile that cannot be read or parsed, or a Socket reference that
+  fails validation, is reported as a warning (`lockfile_unparseable`, `patched_ref_invalid`,
+  …) and never aborts the run. With `--json` these go in `warnings[]`.
+- **Scope.** Only the project root is read (plus Rush's `common/config` pnpm locks). Nested
+  workspace-member lockfiles are not.
+
+| Ecosystem | Files read (project root) | Limitations |
+|---|---|---|
+| npm | `package-lock.json`, `npm-shrinkwrap.json` (both) | `link` / bundled entries never count |
+| pnpm | `pnpm-lock.yaml` (all generations), `shrinkwrap.yaml` (pnpm 1/2), Rush locks | Aliased / nested `resolution` shapes are diagnosed, not attested; `overrides` alone prove nothing |
+| yarn | `yarn.lock` (classic + berry) | Berry vendored entries also need the root `package.json` `resolutions` mapping; member locks are not read |
+| bun | `bun.lock`, else `bun.lockb` | A hosted entry that Bun < 1.3.10 re-saved without its sha512 attests only after install |
+| cargo | `Cargo.lock`, `Cargo.toml`, `.cargo/config[.toml]` | Root manifest + project config only (no `$CARGO_HOME` / parent configs); a lockless hosted pin needs the redirect ledger's record |
+| golang | `go.mod`, `go.work`, `go.sum`, `go.work.sum` | A replace that `require` no longer selects is inert; `vendor/modules.txt` is not read |
+| pypi | `uv.lock`, `*.py.lock`, `pylock*.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `requirements.txt` (+ `-r` includes), `pyproject.toml` / `hatch.toml` | A `uv.lock` beside a `pyproject.toml` must agree with its `[tool.uv.sources]`; PDM 3.1 / 4.0–4.2 locks are refused; a Pipenv project needs `--product` (or a git remote) |
+| gem | `Gemfile.lock`, `gems.locked` | Platform gems unsupported; a Gemfile-only (pre-bundler-2.6, not yet locked) wiring needs the redirect ledger |
+| composer | `composer.lock` | `installed.json` and `COMPOSER=`-renamed locks are not read |
+| maven | `pom.xml` (+ `.mvn/` checksums) | Root pom only (no parents / submodules, no Gradle); legacy same-GAV hosted repositories cannot be attributed |
+| nuget | `nuget.config`, `packages.lock.json` | Hosted needs a `packages.lock.json` entry for the id (with no lock at all, an exclusive exact-id mapping still keeps the redirect ledger's record live); root config only |
+| deno | none | No hosted or vendored mode exists; Deno patches attest only through the manifest (agent mode + `setup.manual`) |
+
+The full recognition rules are in
+[CLI_CONTRACT.md](crates/socket-patch-cli/CLI_CONTRACT.md) ("Manifest-less VEX").
 
 ### Inline VEX on `apply` / `scan` / `vendor`
 
@@ -1195,12 +1282,16 @@ Contract:
 - The document is **always written to the file** (never stdout), so it never collides
   with the command's own `--json` output. JSON mode adds a top-level `vex` summary —
   `{ path, statements, format }` — to the envelope (`apply`) / result (`scan`).
-- It's built from the manifest **as it stands after the run** (including any
-  `--mode agent` writes, with or without `--prune`) and verified against on-disk state
-  unless `--vex-no-verify` is set. Generated for real applies, `--dry-run`, and read-only
-  scans alike.
+- It's built from the project **as it stands after the run** — the manifest (including
+  any `--mode agent` writes, with or without `--prune`), the `.socket/vendor` ledgers, and
+  the lockfile wiring — and verified against on-disk state unless `--vex-no-verify` is set.
+  Generated for real applies and read-only scans alike; `--dry-run` skips it (nothing was
+  changed, so nothing is attested).
+- `apply --vex` and `vendor --vex` with **no manifest** still attest what the lockfiles and
+  ledgers wire. A project with nothing wired anywhere keeps the calm exit 0 and writes no
+  document. `apply --check` never generates one.
 - **Fail-the-command:** if `--vex` was requested but generation fails (no detectable
-  product, empty/missing manifest, nothing verified, unwritable path), the command exits
+  product, nothing attestable, a corrupt ledger, unwritable path), the command exits
   non-zero **even when the apply/scan itself succeeded**, with a stable error code in the
   JSON output.
 

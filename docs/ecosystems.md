@@ -35,6 +35,27 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 
 ## npm hosted-mode notes
 
+- **npm (package-lock.json / npm-shrinkwrap.json)** — every present npm lock is
+  rewritten (npm 12 installs from the package-lock.json twin it keeps beside a
+  committed shrinkwrap). npm 12 defaults `allow-remote=none` and refuses the
+  redirected tarballs (EALLOWREMOTE) unless the project `.npmrc` sets
+  `allow-remote=all`, so the hosted run writes it (new file, or one appended
+  line; ledger-recorded as `redirect_npmrc_allow_remote` and removed again by
+  `rollback` / `remove` / the vendored takeover) and always warns
+  `redirect_npm_allow_remote` with the tradeoff (any url-resolved dependency is
+  then admitted; sha512 pins stay enforced). Commit `.npmrc` with the lock. An
+  explicit user `allow-remote=none` / `root` is respected (never rewritten or
+  overridden) — in the project `.npmrc`, the user / global / builtin npm config,
+  or an `npm_config_allow_remote` environment variable — and
+  `--no-npm-allow-remote-config` opts out (install with
+  `npm ci --allow-remote=all`). Vendored `file:` tarballs are unaffected (npm
+  gates them by `allow-file`, default `all`). npm 6 ignores `resolved` for registry
+  dependencies, so a redirected lockfileVersion 1 lock fails closed with
+  EINTEGRITY under npm 6 (`redirect_npm_legacy_client`) and installs under npm
+  >= 7. Vendoring needs a lockfileVersion 2/3 lock (npm 6 still installs a
+  vendored v2 lock from its legacy mirror) and rewires both locks in npm 12's
+  dual-lock state. Majors 6–12 are measured in
+  [npm compatibility](testing/npm-compatibility.md).
 - **pnpm** — hosted rewriting supports legacy `shrinkwrap.yaml` (pnpm 1/2),
   lockfileVersion 5.x (pnpm 3–7), 6.0 (pnpm 8), and 9.0 (pnpm 9–12).
   Early pnpm 1 locks with shrinkwrapVersion 3 and no positive minor version

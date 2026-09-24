@@ -82,9 +82,9 @@ use super::state::{
     WiringRecord,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
+use crate::constants::npm_family::PNPM_LOCK;
 
 const PACKAGE_JSON: &str = "package.json";
-const PNPM_LOCK: &str = "pnpm-lock.yaml";
 
 /// The [`VendorEntry::flavor`] string legacy wirings are stamped with.
 /// Distinct from the v9 backend's `"pnpm"` so an older binary (which has no

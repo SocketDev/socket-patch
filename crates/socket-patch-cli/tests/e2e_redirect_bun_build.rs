@@ -96,6 +96,8 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "vex_e2e_common/bun.rs"]
+mod bun_vex;
 #[path = "common/cache_env.rs"]
 mod cache_env;
 
@@ -110,6 +112,7 @@ const MARKER: &str = "/* SOCKET-PATCHED */\n";
 /// a real assertion, not a trailing-byte no-op.
 const TAMPER_MARKER: &str = "/* SOCKET-TAMPERED */\n";
 const GHSA: &str = "GHSA-redirect-bun-real";
+const CVE: &str = "CVE-2026-1111";
 const PRODUCT: &str = "pkg:npm/app@1.0.0";
 
 /// The scoped, dependency-bearing target of the meta-preserving leg. It
@@ -815,7 +818,7 @@ async fn bun_hosted_project(
             },
             "vulnerabilities": {
                 GHSA: {
-                    "cves": ["CVE-2026-1111"], "summary": "redirect bun capstone vuln",
+                    "cves": [CVE], "summary": "redirect bun capstone vuln",
                     "severity": "high", "description": "d"
                 }
             },
@@ -1131,6 +1134,51 @@ fn assert_patched_fresh_install(fx: &BunRedirectFixture) {
         assert_scoped_meta_honored(&fresh);
     }
     eprintln!("PLAIN INSTALL LOCK-STABLE");
+    manifestless_vex(fx, "fresh", &fx.lock_before);
+}
+
+/// The manifest-less VEX step ([`bun_vex::run_bun_vex_matrix`]) on a fresh
+/// checkout of the hosted project with its manifest deleted (hosted mode
+/// never writes one) and a real frozen install: attested `(redirected)`
+/// with the ledger, with the ledgers deleted too (lockfile + patch API),
+/// `record_unavailable` offline with zero requests, and NOT attested once
+/// the lock is back to `registry_lock` (ledger + patched install left).
+/// The hosted URL lives on the wiremock origin, so vex is told that origin
+/// is the patch server (a uuid on any other host is not a patch).
+fn manifestless_vex(fx: &BunRedirectFixture, tag: &str, registry_lock: &[u8]) {
+    let case = bun_vex::BunVexCase {
+        tag,
+        mode: bun_vex::BunMode::Hosted,
+        purl: fx.target.purl(),
+        uuid: UUID,
+        files: vec![(
+            "package/index.js".to_string(),
+            bun_vex::git_sha256(&fx.patched),
+        )],
+        vulns: &[(GHSA, &[CVE])],
+        lock: "bun.lock",
+        registry_lock: registry_lock.to_vec(),
+        patch_server_url: Some(fx._server.uri()),
+    };
+    bun_vex::run_bun_vex_matrix(&fx.proj, fx.tmp.path(), &case, |checkout| {
+        let cache = fx.tmp.path().join(format!("vex-{tag}-bun-cache"));
+        let ci = bun(
+            checkout,
+            &["install", "--frozen-lockfile", "--ignore-scripts"],
+            &cache,
+        );
+        assert!(
+            ci.status.success(),
+            "vex checkout frozen install.\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&ci.stdout),
+            String::from_utf8_lossy(&ci.stderr)
+        );
+        assert_eq!(
+            std::fs::read(fx.target.installed_dir(checkout).join("index.js")).unwrap(),
+            fx.patched,
+            "the vex checkout must hold the patched install"
+        );
+    });
 }
 
 // ── the capstone ──────────────────────────────────────────────────────
@@ -1296,6 +1344,38 @@ async fn bun_redirect_tampered_hosted_tarball_digest_boundary() {
              digests (enforced from 1.3.10) — rejection proof unavailable, acceptance pinned",
             fx.bun_raw
         );
+        // The installed tree beats the lock pin: with the manifest and the
+        // ledger deleted, manifest-less VEX over the TAMPERED install must
+        // omit the patch (`hash_mismatch`) — ledger or no ledger.
+        let patched = bun_vex::git_sha256(&fx.patched);
+        let uri = fx._server.uri();
+        bun_vex::outside_runtime(|| {
+            let api = bun_vex::PatchApi::start(vec![(
+                UUID.to_string(),
+                bun_vex::patch_view(
+                    UUID,
+                    fx.target.purl(),
+                    &[("package/index.js", &patched)],
+                    &[(GHSA, &[CVE])],
+                ),
+            )]);
+            for strip in [false, true] {
+                if strip {
+                    bun_vex::strip_ledgers(&fresh);
+                }
+                let out = bun_vex::run_vex(
+                    &bun_vex::binary(),
+                    &fresh,
+                    &bun_vex::VexRun {
+                        patch_server_url: Some(uri.clone()),
+                        ..bun_vex::VexRun::online(&api)
+                    },
+                );
+                assert_eq!(out.code, Some(1), "tampered install (strip={strip}): {out}");
+                bun_vex::assert_not_attested(&out.envelope, fx.target.purl(), "hash_mismatch");
+            }
+        });
+        eprintln!("BUN-VEX tampered hosted hash-mismatch ok");
     }
 }
 
@@ -1498,6 +1578,14 @@ async fn bun_redirect_survives_a_digest_dropping_lock_resave() {
         fx.bun_raw,
         if expect_drop { "dropped" } else { "kept" }
     );
+    // Manifest-less VEX over the lock bun re-saved (digest-less 2-tuple
+    // below 1.3.10): the hosted URL is still the wiring, and the fresh
+    // install's tree is the evidence. Reverted = the grown lock with the
+    // pristine registry line put back.
+    let lock_before = String::from_utf8(fx.lock_before.clone()).unwrap();
+    let grown_registry = resaved.replace(&live_line, &packages_line(&lock_before, DEP));
+    assert_ne!(grown_registry, resaved);
+    manifestless_vex(&fx, "resaved", grown_registry.as_bytes());
 
     // 2. The unwind must already resolve over the re-saved lock (dry run).
     let (code, stdout, stderr) = run_socket(

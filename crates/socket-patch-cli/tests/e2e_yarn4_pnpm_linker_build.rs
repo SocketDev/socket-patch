@@ -29,6 +29,16 @@
 //! LOCAL capstones (not behind docker-e2e): each skips with a `println` +
 //! return when `corepack yarn@4.12.0` is unavailable or the fixture install
 //! cannot reach the registry; every assertion after that is HARD.
+//!
+//! Every capstone ends with the manifest-less VEX matrix
+//! (`yarn_berry_common::run_manifestless_vex_matrix`): fresh checkouts of the
+//! wired state without the manifest, without the ledgers, `--offline`,
+//! tampered, reverted to the registry and installed under PnP — each
+//! installed by the REAL yarn and attested (or refused) by standalone and
+//! embedded VEX against a mock patch API. The yarn 4 release is
+//! `SOCKET_PATCH_YARN_BERRY_VERSION` (default 4.12.0; loop:
+//! `scripts/yarn-berry-vex-matrix.sh`); `SOCKET_PATCH_YARN_E2E_REQUIRED=1`
+//! turns every soft-skip into a failure.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -47,8 +57,29 @@ const PURL: &str = "pkg:npm/left-pad@1.3.0";
 const UUID: &str = "5e6f7a8b-9c0d-4e5f-8a6b-456789abcdef";
 const TOKEN: &str = "55555555-5555-4555-8555-555555555555";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
+const CVE: &str = "CVE-2026-4444";
 const GHSA: &str = "GHSA-yarn4-pnpm-linker";
-const YARN_BERRY: &str = "yarn@4.12.0";
+// The yarn 4 release under test is `yarn_berry()` (`yarn@4.12.0` unless
+// `SOCKET_PATCH_YARN_BERRY_VERSION` pins another 4.x — see yarn_berry_common).
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+#[path = "yarn_berry_common/mod.rs"]
+mod yarn_berry_common;
+use yarn_berry_common::{yarn_berry, yarn_e2e_required};
+
+/// Print a SKIP line — or, under `SOCKET_PATCH_YARN_E2E_REQUIRED=1` (a leg
+/// that provisioned corepack yarn on purpose), FAIL: a required leg must
+/// never report green on an unexercised toolchain or an unreachable fixture
+/// registry.
+macro_rules! skip {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        if yarn_e2e_required() {
+            panic!("{msg} (SOCKET_PATCH_YARN_E2E_REQUIRED=1 forbids skipping)");
+        }
+        println!("{msg}");
+    }};
+}
 /// The project yarnrc for every leg: berry's pnpm-style store layout.
 const YARNRC_PNPM: &str = "nodeLinker: pnpm\nenableGlobalCache: false\n";
 
@@ -172,7 +203,7 @@ fn assert_pnpm_store_layout(root: &Path, ctx: &str) {
 fn assert_yarn_node_resolves_patched(root: &Path, patched: &[u8]) {
     let out = corepack(
         root,
-        YARN_BERRY,
+        yarn_berry(),
         &["node", "-p", &format!("require.resolve('{DEP}')")],
         &[],
     );
@@ -209,7 +240,10 @@ fn stage_patch(proj: &Path, purl: &str, before: &[u8], after: &[u8]) {
                 "beforeHash": git_sha256(before),
                 "afterHash": git_sha256(after),
             }},
-            "vulnerabilities": {},
+            "vulnerabilities": { GHSA: {
+                "cves": [CVE], "summary": "capstone vuln",
+                "severity": "high", "description": "d",
+            }},
             "description": "pnpm-linker capstone marker patch",
             "license": "MIT",
             "tier": "free",
@@ -267,25 +301,29 @@ fn bootstrap_berry_checksum(tmp: &Path, patched_tgz: &Path) -> Option<String> {
     let global = tmp.join("berry-bootstrap-global");
     let out = corepack(
         &boot,
-        YARN_BERRY,
+        yarn_berry(),
         &["install"],
         &[("YARN_GLOBAL_FOLDER", global.to_str().unwrap())],
     );
     if !out.status.success() {
-        println!(
+        skip!(
             "SKIP e2e_yarn4_pnpm_linker_build: bootstrap yarn install failed:\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
         return None;
     }
     let lock = std::fs::read_to_string(boot.join("yarn.lock")).ok()?;
-    let checksum = lock
-        .lines()
-        .map(str::trim)
-        .find(|l| l.starts_with("checksum: 10c0/"))?
-        .trim_start_matches("checksum: ")
-        .to_string();
-    Some(checksum)
+    // yarn 4.0.x writes the bare hex, 4.1+ `10c0/<hex>`: the API form is the
+    // prefixed one. A lock with neither is a harness failure, never a
+    // silent pass (the old `?` here returned before any assertion ran).
+    let checksum = yarn_berry_common::yarn_written_checksum(&lock);
+    if checksum.is_none() {
+        skip!(
+            "SKIP: bootstrap `{} install` wrote no 10c0 cache checksum:\n{lock}",
+            yarn_berry()
+        );
+    }
+    checksum
 }
 
 /// Install the single-package pnpm-linker fixture; `None` = skip printed.
@@ -301,12 +339,12 @@ fn install_pnpm_fixture(tag: &str, tmp: &Path, proj: &Path) -> Option<Vec<u8>> {
     let global = tmp.join("yarn-global");
     let install = corepack(
         proj,
-        YARN_BERRY,
+        yarn_berry(),
         &["install"],
         &[("YARN_GLOBAL_FOLDER", global.to_str().unwrap())],
     );
     if !install.status.success() {
-        println!(
+        skip!(
             "SKIP e2e_yarn4_pnpm_linker_build ({tag}): fixture `yarn install` failed \
              (registry unreachable?):\n{}",
             String::from_utf8_lossy(&install.stderr)
@@ -336,7 +374,7 @@ fn fresh_checkout_install(tmp: &Path, proj: &Path, yarnrc: &str) -> (PathBuf, Ou
     let fresh_global = tmp.join("fresh-yarn-global");
     let ci = corepack(
         &fresh,
-        YARN_BERRY,
+        yarn_berry(),
         &["install", "--immutable", "--check-cache"],
         &[("YARN_GLOBAL_FOLDER", fresh_global.to_str().unwrap())],
     );
@@ -347,12 +385,15 @@ fn fresh_checkout_install(tmp: &Path, proj: &Path, yarnrc: &str) -> (PathBuf, Ou
 
 #[tokio::test(flavor = "multi_thread")]
 async fn yarn4_pnpm_linker_hosted_redirect_fresh_checkout_installs_patched_bytes() {
-    if !has_corepack_pm(YARN_BERRY) {
-        println!("SKIP e2e_yarn4_pnpm_linker_build (hosted): `corepack {YARN_BERRY}` unavailable");
+    if !has_corepack_pm(yarn_berry()) {
+        skip!(
+            "SKIP e2e_yarn4_pnpm_linker_build (hosted): `corepack {}` unavailable",
+            yarn_berry()
+        );
         return;
     }
     if !has_command("tar") {
-        println!("SKIP e2e_yarn4_pnpm_linker_build (hosted): `tar` not installed");
+        skip!("SKIP e2e_yarn4_pnpm_linker_build (hosted): `tar` not installed");
         return;
     }
 
@@ -363,6 +404,7 @@ async fn yarn4_pnpm_linker_hosted_redirect_fresh_checkout_installs_patched_bytes
         return;
     };
     let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let registry_lock = std::fs::read(proj.join("yarn.lock")).unwrap();
 
     // Patched tarball + the exact `10c0` checksum yarn computes for it.
     let tgz_path = tmp.path().join(format!("{DEP}-{DEP_VERSION}.tgz"));
@@ -443,7 +485,7 @@ async fn yarn4_pnpm_linker_hosted_redirect_fresh_checkout_installs_patched_bytes
             },
             "vulnerabilities": {
                 GHSA: {
-                    "cves": ["CVE-2026-4444"], "summary": "pnpm-linker capstone vuln",
+                    "cves": [CVE], "summary": "pnpm-linker capstone vuln",
                     "severity": "high", "description": "d"
                 }
             },
@@ -506,9 +548,14 @@ async fn yarn4_pnpm_linker_hosted_redirect_fresh_checkout_installs_patched_bytes
         lock.contains("::__archiveUrl=") && lock.contains(&encoded),
         "yarn.lock must carry the encoded __archiveUrl; got:\n{lock}"
     );
+    let checksum_line = yarn_berry_common::expected_checksum_line(
+        &String::from_utf8_lossy(&registry_lock),
+        &checksum,
+    );
     assert!(
-        lock.contains(&checksum),
-        "yarn.lock must carry the 10c0 checksum ({checksum}); got:\n{lock}"
+        lock.lines().any(|l| l == checksum_line),
+        "yarn.lock must carry the cache checksum in yarn's own spelling \
+         ({checksum_line:?}); got:\n{lock}"
     );
     assert_eq!(
         std::fs::read(proj.join("package.json")).unwrap(),
@@ -540,15 +587,48 @@ async fn yarn4_pnpm_linker_hosted_redirect_fresh_checkout_installs_patched_bytes
     );
     assert_yarn_node_resolves_patched(&fresh, &patched);
     eprintln!("FRESH INSTALL + YARN NODE RESOLUTION OK");
+
+    // MANIFEST-LESS VEX over the hosted wiring (see `yarn_berry_common`).
+    let registry_state = [("yarn.lock", registry_lock)];
+    let yarn =
+        |cwd: &Path, args: &[&str], env: &[(&str, &str)]| corepack(cwd, yarn_berry(), args, env);
+    let api_url = server.uri();
+    let flow = yarn_berry_common::BerryVexFlow {
+        yarn_spec: yarn_berry(),
+        flow: "pnpm-linker",
+        wiring: yarn_berry_common::BerryWiring::Hosted {
+            patch_server: api_url.clone(),
+        },
+        proj: &proj,
+        scratch: tmp.path(),
+        committable: &["package.json", "yarn.lock"],
+        yarnrc: &yarnrc,
+        registry_state: &registry_state,
+        purl: PURL,
+        uuid: UUID,
+        vulns: &[(GHSA, &[CVE])],
+        patched: &patched,
+        pristine: &orig,
+        installed: "node_modules/left-pad/index.js",
+        registry_cache: proj.join(".yarn/cache"),
+        yarn: &yarn,
+        flow_api: Some(yarn_berry_common::FlowApi {
+            api_url,
+            org: ORG.to_string(),
+        }),
+        pnp_cell: true,
+    };
+    yarn_berry_common::off_runtime(|| yarn_berry_common::run_manifestless_vex_matrix(&flow));
 }
 
 // ── vendored capstone ─────────────────────────────────────────────────
 
 #[test]
 fn yarn4_pnpm_linker_vendor_fresh_checkout_installs_patched_bytes_and_reverts() {
-    if !has_corepack_pm(YARN_BERRY) {
-        println!(
-            "SKIP e2e_yarn4_pnpm_linker_build (vendored): `corepack {YARN_BERRY}` unavailable"
+    if !has_corepack_pm(yarn_berry()) {
+        skip!(
+            "SKIP e2e_yarn4_pnpm_linker_build (vendored): `corepack {}` unavailable",
+            yarn_berry()
         );
         return;
     }
@@ -640,6 +720,38 @@ fn yarn4_pnpm_linker_vendor_fresh_checkout_installs_patched_bytes_and_reverts() 
     );
     assert_yarn_node_resolves_patched(&fresh, &patched);
     eprintln!("FRESH INSTALL + YARN NODE RESOLUTION OK");
+
+    // MANIFEST-LESS VEX over the vendored wiring (see `yarn_berry_common`),
+    // BEFORE the revert below consumes the project's wiring.
+    let registry_state = [
+        ("yarn.lock", lock_before.clone()),
+        ("package.json", pkg_before.clone()),
+    ];
+    let yarn =
+        |cwd: &Path, args: &[&str], env: &[(&str, &str)]| corepack(cwd, yarn_berry(), args, env);
+    let flow = yarn_berry_common::BerryVexFlow {
+        yarn_spec: yarn_berry(),
+        flow: "pnpm-linker",
+        wiring: yarn_berry_common::BerryWiring::Vendored {
+            artifact_rel: tgz_rel.clone(),
+        },
+        proj: &proj,
+        scratch: tmp.path(),
+        committable: &["package.json", "yarn.lock"],
+        yarnrc: YARNRC_PNPM,
+        registry_state: &registry_state,
+        purl: PURL,
+        uuid: UUID,
+        vulns: &[(GHSA, &[CVE])],
+        patched: &patched,
+        pristine: &orig,
+        installed: "node_modules/left-pad/index.js",
+        registry_cache: proj.join(".yarn/cache"),
+        yarn: &yarn,
+        flow_api: None,
+        pnp_cell: true,
+    };
+    yarn_berry_common::off_runtime(|| yarn_berry_common::run_manifestless_vex_matrix(&flow));
 
     // REVERT PROOF: package.json AND yarn.lock restored byte-for-byte.
     let (code, stdout, stderr) = run_socket(

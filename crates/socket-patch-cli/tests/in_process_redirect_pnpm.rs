@@ -14,6 +14,9 @@
 use serial_test::serial;
 use socket_patch_cli::commands::scan::{run, ScanArgs, ScanMode};
 use std::path::Path;
+
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -623,6 +626,126 @@ async fn hosted_pnpm_vex_emits_redirected_attestation() {
         impact.contains("(redirected)"),
         "the attestation must carry the (redirected) marker: {impact}"
     );
+}
+
+/// Manifest-less VEX after the in-process hosted rewrite of a v9 root lock
+/// AND a legacy shrinkwrap-3 lock (pnpm 1/2): the project carries no
+/// manifest (hosted mode never writes one), the hosted URL sits on the
+/// operator's patch server (`--patch-server-url http://patch.test`).
+///
+/// * not installed, ledger kept: the ledger record + the lock's
+///   integrity-pinned wiring attest `(redirected)`;
+/// * ledgers deleted: the lockfile reference + the patch API record attest,
+///   first from the pin, then hash-verified against an installed copy;
+/// * `--offline`, no ledgers: `record_unavailable`, zero requests;
+/// * lock reverted, ledger restored: `redirect_unwired`, `--no-verify` too.
+#[tokio::test]
+#[serial]
+async fn hosted_pnpm_manifestless_vex_from_lockfile_ledger_and_api() {
+    use vex_e2e_common::{
+        assert_absent, assert_attested, assert_not_attested, git_sha256, patch_view, run_vex,
+        strip_ledgers, strip_manifest, Marker, PatchApi, VexRun,
+    };
+    const PATCHED: &[u8] = b"/* patched */\nmodule.exports = 1;\n";
+    let vulns: &[(&str, &[&str])] = &[(GHSA, &["CVE-2024-9"])];
+
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    for legacy in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_pnpm_project(root);
+        let lock_name = if legacy {
+            std::fs::remove_file(root.join("pnpm-lock.yaml")).unwrap();
+            std::fs::write(
+                root.join("shrinkwrap.yaml"),
+                format!(
+                    "dependencies:\n  {NAME}: {VERSION}\npackages:\n  /{NAME}/{VERSION}:\n    dev: false\n    resolution:\n      integrity: {UPSTREAM_SHA512}\nregistry: 'https://registry.npmjs.org/'\nshrinkwrapMinorVersion: 9\nshrinkwrapVersion: 3\nspecifiers:\n  {NAME}: {VERSION}\n"
+                ),
+            )
+            .unwrap();
+            "shrinkwrap.yaml"
+        } else {
+            "pnpm-lock.yaml"
+        };
+        let pristine = std::fs::read(root.join(lock_name)).unwrap();
+        let code = run(hosted_args(root, server.uri())).await;
+        assert_eq!(code, 0, "scan --mode hosted ({lock_name})");
+        let wired = std::fs::read_to_string(root.join(lock_name)).unwrap();
+        assert!(wired.contains(HOSTED_URL), "{wired}");
+        assert!(!root.join(".socket/manifest.json").exists());
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let bin = vex_e2e_common::binary();
+                let api = PatchApi::start(vec![(
+                    UUID.to_string(),
+                    patch_view(
+                        UUID,
+                        PURL,
+                        &[("package/index.js", &git_sha256(PATCHED))],
+                        vulns,
+                    ),
+                )]);
+                let online = |no_verify| VexRun {
+                    patch_server_url: Some("http://patch.test".to_string()),
+                    no_verify,
+                    ..VexRun::online(&api)
+                };
+                strip_manifest(root);
+                std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+                let out = run_vex(&bin, root, &online(false));
+                assert_eq!(out.code, Some(0), "[{lock_name}] ledger kept: {out}");
+                assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+
+                let ledger = root.join(".socket/vendor/redirect-state.json");
+                let ledger_bytes = std::fs::read(&ledger).unwrap();
+                strip_ledgers(root);
+                let out = run_vex(&bin, root, &online(false));
+                assert_eq!(out.code, Some(0), "[{lock_name}] ledger-less: {out}");
+                assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+                assert!(api.view_requests(UUID) >= 1);
+                let pkg = root.join("node_modules").join(NAME);
+                std::fs::create_dir_all(&pkg).unwrap();
+                std::fs::write(
+                    pkg.join("package.json"),
+                    format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+                )
+                .unwrap();
+                std::fs::write(pkg.join("index.js"), PATCHED).unwrap();
+                let out = run_vex(&bin, root, &online(false));
+                assert_eq!(out.code, Some(0), "[{lock_name}] installed: {out}");
+                assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+
+                let seen = api.request_count();
+                let out = run_vex(
+                    &bin,
+                    root,
+                    &VexRun {
+                        patch_server_url: Some("http://patch.test".to_string()),
+                        ..VexRun::offline()
+                    },
+                );
+                assert_eq!(out.code, Some(1), "[{lock_name}] offline: {out}");
+                assert_not_attested(&out.envelope, PURL, "record_unavailable");
+                assert_eq!(api.request_count(), seen);
+
+                std::fs::write(&ledger, &ledger_bytes).unwrap();
+                std::fs::write(root.join(lock_name), &pristine).unwrap();
+                for no_verify in [false, true] {
+                    let out = run_vex(&bin, root, &online(no_verify));
+                    assert_eq!(out.code, Some(1), "[{lock_name}] reverted: {out}");
+                    assert_not_attested(&out.envelope, PURL, "redirect_unwired");
+                    assert_absent(out.doc.as_ref(), PURL);
+                }
+            })
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+        });
+    }
 }
 
 /// The CLI binary with ambient SOCKET_* env scrubbed (same hermeticity rule

@@ -34,6 +34,8 @@
 
 #[path = "docker_vendor_common/mod.rs"]
 mod docker_vendor_common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
 use docker_vendor_common::{
     assert_stage_markers, bash_prelude, json_assert_fns, run_in_image, run_in_image_network_none,
@@ -208,6 +210,14 @@ grep -q 'SOCKET-PATCH-VENDOR-E2E-MARKER' "$F" || { head -5 "$F" >&2; fail "insta
   || fail "installed LICENSE.md not byte-identical to the patched blob"
 echo "===FRESH INSTALL VERIFIED==="
 
+# Manifest-less VEX input: the fresh checkout right after its REAL cold
+# install, before the tamper probe mutates the feed. The host runs the VEX
+# matrix on its own copy (see `assert_manifestless_vex_from_host`).
+rm -rf /workspace/fresh-vex && cp -R /workspace/fresh /workspace/fresh-vex \
+  && rm -rf /workspace/fresh-vex/obj || fail "snapshotting the fresh checkout"
+chmod -R a+rX /workspace/fresh-vex /workspace/snap
+echo "===VEX SNAPSHOT VERIFIED==="
+
 # TAMPER PROBE: mutate the vendored nupkg → the contentHash pin must reject it
 # (NU1403) on a cold restore.
 printf 'TAMPER' >> .socket/vendor/nuget/__UUID__/newtonsoft.json.13.0.3.nupkg
@@ -351,6 +361,113 @@ fn assert_vex_attested_from_host(host_dir: &std::path::Path) {
     );
 }
 
+/// Host-side manifest-less VEX matrix on the fresh checkout stage 2 really
+/// restored (copied off the bind mount first — the container wrote it as
+/// root): with the manifest deleted the ledger's record attests
+/// `(vendored)` online and `--offline`; with the ledgers deleted too the
+/// nuget.config feed wiring + the patch API record attest it (standalone,
+/// `vendor --vex` and `apply --vex`); `--offline` without ledgers omits it
+/// `record_unavailable` with zero API requests; with the wiring reverted to
+/// the pre-vendor registry state (config gone, lock restored) and the
+/// ledger + committed nupkg left behind it is `vendor_unwired`, with and
+/// without `--no-verify`.
+fn assert_manifestless_vex_from_host(host_dir: &std::path::Path) {
+    use vex_e2e_common::*;
+    const PURL: &str = "pkg:nuget/Newtonsoft.Json@13.0.3";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proj = tmp.path().join("checkout");
+    copy_tree(&host_dir.join("fresh-vex"), &proj);
+    // The record the manifest carries (hashes from the REAL installed bytes).
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(proj.join(".socket/manifest.json")).expect("fresh checkout manifest"),
+    )
+    .expect("manifest parses");
+    let after = manifest["patches"][PURL]["files"]["LICENSE.md"]["afterHash"]
+        .as_str()
+        .expect("LICENSE.md afterHash")
+        .to_string();
+    strip_manifest(&proj);
+    let _ = std::fs::remove_dir_all(proj.join(".socket/blobs"));
+    let vulns: &[(&str, &[&str])] = &[(GHSA, &["CVE-2024-77777"])];
+    let api = PatchApi::start(vec![(
+        UUID.to_string(),
+        patch_view(UUID, PURL, &[("LICENSE.md", &after)], vulns),
+    )]);
+    let store = tempfile::tempdir().expect("store");
+    let run = |r: VexRun| {
+        let r = VexRun {
+            product: Some("pkg:nuget/app@1.0.0".to_string()),
+            ..r
+        }
+        .env("NUGET_PACKAGES", store.path());
+        run_vex(&binary(), &proj, &r)
+    };
+    let omitted = |out: &VexOutcome, reason: &str| {
+        assert_eq!(out.code, Some(1), "{reason}: {out}");
+        let hit = out.envelope["events"].as_array().is_some_and(|events| {
+            events.iter().any(|e| {
+                e["action"] == "skipped"
+                    && e["errorCode"] == reason
+                    && e["purl"]
+                        .as_str()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(PURL))
+            })
+        });
+        assert!(hit, "{PURL} skipped with {reason}: {out}");
+        assert_absent(out.doc.as_ref(), PURL);
+    };
+
+    for r in [VexRun::online(&api), VexRun::offline()] {
+        let out = run(r);
+        assert_eq!(out.code, Some(0), "manifest-less, ledger kept: {out}");
+        assert_attested(out.doc(), PURL, UUID, Marker::Vendored, vulns);
+    }
+    let ledger = std::fs::read(proj.join(".socket/vendor/state.json")).expect("vendor ledger");
+    strip_ledgers(&proj);
+    for via in [VexVia::Vex, VexVia::Vendor, VexVia::Apply] {
+        let out = run(VexRun::online(&api).via(via));
+        assert_eq!(out.code, Some(0), "{via:?}, no manifest, no ledgers: {out}");
+        assert_attested(out.doc(), PURL, UUID, Marker::Vendored, vulns);
+        assert!(!proj.join(".socket/manifest.json").exists());
+    }
+    assert!(api.view_requests(UUID) >= 1, "the record came from the API");
+    let quiet = PatchApi::empty();
+    omitted(
+        &run(VexRun {
+            proxy_url: Some(quiet.uri()),
+            ..VexRun::offline()
+        }),
+        "record_unavailable",
+    );
+    quiet.assert_no_requests();
+
+    std::fs::write(proj.join(".socket/vendor/state.json"), ledger).unwrap();
+    std::fs::remove_file(proj.join("nuget.config")).expect("remove the created nuget.config");
+    std::fs::copy(
+        host_dir.join("snap/packages.lock.prevendor"),
+        proj.join("packages.lock.json"),
+    )
+    .expect("restore the pre-vendor lock");
+    for no_verify in [false, true] {
+        let mut r = VexRun::offline();
+        r.no_verify = no_verify;
+        omitted(&run(r), "vendor_unwired");
+    }
+}
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap_or_else(|e| panic!("{}: {e}", from.display())) {
+        let entry = entry.unwrap();
+        let dst = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &dst);
+        } else {
+            std::fs::copy(entry.path(), dst).unwrap();
+        }
+    }
+}
+
 #[test]
 fn nuget_vendor_fresh_checkout_install_and_revert() {
     if skip_if_no_image(IMAGE) {
@@ -376,8 +493,14 @@ fn nuget_vendor_fresh_checkout_install_and_revert() {
     assert_stage_markers(
         "nuget stage 2 (fresh checkout, --network none)",
         &out,
-        &["RED PROBE", "FRESH INSTALL", "TAMPER NU1403"],
+        &[
+            "RED PROBE",
+            "FRESH INSTALL",
+            "VEX SNAPSHOT",
+            "TAMPER NU1403",
+        ],
     );
+    assert_manifestless_vex_from_host(&host_dir);
 
     // Stage 3 — idempotency, revert, re-vendor (still no network).
     let out = run_in_image_network_none(IMAGE, &host_dir, &render(STAGE3));

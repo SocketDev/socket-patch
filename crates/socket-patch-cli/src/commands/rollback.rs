@@ -1058,6 +1058,9 @@ pub(crate) async fn run_hosted_leg(
         if !defer_bun && redirect_revert_supported(purl) {
             match revert_redirect_purl(&common.cwd, state, purl, common.dry_run).await {
                 Ok(revert) => {
+                    for (code, detail) in &revert.warnings {
+                        out.warnings.push((code.clone(), detail.clone()));
+                    }
                     if !common.json && !common.silent {
                         if common.dry_run {
                             println!("Would unwind hosted redirect for {purl}");
@@ -1093,7 +1096,11 @@ pub(crate) async fn run_hosted_leg(
     // (however it was spelled), and also as the "last one out turns off
     // the lights" pass — per-purl reverts never claim the non-package
     // shared settings edits (such as pnpm trustLockfile), so an emptied
-    // record map with leftover edits replays them here too.
+    // record map with leftover edits replays them here too. (The npm
+    // `.npmrc` `allow-remote=all` edit is the one exception: the per-purl
+    // npm revert of the LAST package-lock entry unwinds it itself, so a
+    // scoped rollback leaves no loosened policy behind while other
+    // ecosystems' records remain.)
     if replay_eligible || (state.records.is_empty() && !state.edits.is_empty()) {
         let replay = revert_remaining_redirect_edits(&common.cwd, state, common.dry_run).await;
         for refusal in &replay.refusals {

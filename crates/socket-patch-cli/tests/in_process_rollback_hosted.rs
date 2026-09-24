@@ -22,6 +22,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+#[path = "vex_pipenv_pip_steps/mod.rs"]
+mod vex_pipenv_pip_steps;
+
 use serde_json::Value;
 use serial_test::serial;
 use socket_patch_cli::commands::rollback::{run as rollback_run, RollbackArgs};
@@ -626,29 +631,30 @@ async fn pypi_requirements_hosted_round_trip() {
         "http://patch.test/patch/pypi/requests/2.31.0/22222222-2222-4222-8222-222222222222/{PY_UUID}/requests-2.31.0-py3-none-any.whl"
     );
 
+    let py_view = serde_json::json!({
+        "uuid": PY_UUID,
+        "purl": PY_PURL,
+        "publishedAt": "2024-01-01T00:00:00Z",
+        "files": {
+            "requests/api.py": {
+                "beforeHash": "a".repeat(64),
+                "afterHash": "b".repeat(64),
+            }
+        },
+        "vulnerabilities": {
+            "GHSA-pypi-eeee-ffff": {
+                "cves": ["CVE-2024-2"],
+                "summary": "pypi hosted rollback fixture",
+                "severity": "high",
+                "description": "d"
+            }
+        },
+        "description": "x", "license": "MIT", "tier": "free"
+    });
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{PY_UUID}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": PY_UUID,
-            "purl": PY_PURL,
-            "publishedAt": "2024-01-01T00:00:00Z",
-            "files": {
-                "requests/api.py": {
-                    "beforeHash": "a".repeat(64),
-                    "afterHash": "b".repeat(64),
-                }
-            },
-            "vulnerabilities": {
-                "GHSA-pypi-eeee-ffff": {
-                    "cves": ["CVE-2024-2"],
-                    "summary": "pypi hosted rollback fixture",
-                    "severity": "high",
-                    "description": "d"
-                }
-            },
-            "description": "x", "license": "MIT", "tier": "free"
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(py_view.clone()))
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -709,6 +715,30 @@ async fn pypi_requirements_hosted_round_trip() {
         "the ledger must record the pypi redirect; got:\n{ledger}"
     );
 
+    // Manifest-less VEX over the committed hosted state (an EMPTY in-project
+    // venv keeps the crawl hermetic; the `--hash` pin is the evidence).
+    let site = if cfg!(windows) {
+        tmp.path().join(".venv/Lib/site-packages")
+    } else {
+        tmp.path().join(".venv/lib/python3.12/site-packages")
+    };
+    std::fs::create_dir_all(site).unwrap();
+    vex_pipenv_pip_steps::run_manifestless_steps(&vex_pipenv_pip_steps::Steps {
+        what: "get --mode hosted requirements.txt (rollback round trip)".into(),
+        project: tmp.path(),
+        purl: PY_PURL,
+        uuid: PY_UUID,
+        marker: vex_e2e_common::Marker::Redirected,
+        vulns: Some(&[("GHSA-pypi-eeee-ffff", &["CVE-2024-2"])]),
+        records: vex_pipenv_pip_steps::Records::Mock(vec![(PY_UUID.into(), py_view.clone())]),
+        patch_server_url: Some("http://patch.test".into()),
+        product: "pkg:pypi/app@1.0.0",
+        revert: &|p: &Path| std::fs::write(p.join("requirements.txt"), pristine).unwrap(),
+        envs: Vec::new(),
+        on_step: None,
+        expect_verified: true,
+    });
+
     let code = rollback_in_process(tmp.path(), Vec::new(), false).await;
     assert_eq!(
         code, 0,
@@ -731,6 +761,31 @@ async fn pypi_requirements_hosted_round_trip() {
     assert!(
         !tmp.path().join(".socket").exists(),
         "a fully unwound hosted project keeps no .socket/ residue"
+    );
+
+    // After the rollback nothing references the patch any more: VEX finds
+    // nothing to attest (online, the API would still vouch for the uuid).
+    let dir = tmp.path().to_path_buf();
+    let view = py_view.clone();
+    std::thread::spawn(move || {
+        let api = vex_e2e_common::PatchApi::start(vec![(PY_UUID.into(), view)]);
+        let out = vex_e2e_common::run_vex(
+            &vex_e2e_common::binary(),
+            &dir,
+            &vex_e2e_common::VexRun {
+                patch_server_url: Some("http://patch.test".into()),
+                ..vex_e2e_common::VexRun::online(&api)
+            },
+        );
+        assert_eq!(out.code, Some(2), "{out}");
+        assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
+        api.assert_no_requests();
+    })
+    .join()
+    .unwrap_or_else(|e| std::panic::resume_unwind(e));
+    assert!(
+        !tmp.path().join(".socket").exists(),
+        "vex is read-only: it never recreates .socket/"
     );
 }
 
@@ -920,4 +975,113 @@ async fn preserve_state_still_unwinds_hosted() {
         !tmp.path().join(".socket").exists(),
         "with nothing preservable, the emptied .socket/ is gone too"
     );
+}
+
+/// Manifest-less VEX across the hosted npm round trip. Before the rollback
+/// a checkout of the committed state (package.json, the redirected lock,
+/// `.socket/`; nothing installable — the host is fictional — so the lock pin
+/// is the basis) attests `(redirected)` with the ledger, and without it from
+/// lockfile discovery + the patch API. After the bare rollback the restored
+/// lock names no patch and the ledger is gone: nothing attests, online or
+/// `--no-verify`, and the patch API is never asked.
+#[tokio::test]
+#[serial]
+async fn npm_hosted_round_trip_manifest_less_vex() {
+    use vex_e2e_common::{
+        assert_absent, assert_attested, patch_view, run_vex, strip_ledgers, Marker, PatchApi,
+        VexRun,
+    };
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path());
+    assert_eq!(
+        scan_run(hosted_scan_args(tmp.path(), server.uri())).await,
+        0,
+        "scan --mode hosted"
+    );
+
+    let checkout = |name: &str| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["package.json", "package-lock.json"] {
+            std::fs::copy(tmp.path().join(f), dir.join(f)).unwrap();
+        }
+        if tmp.path().join(".socket/vendor").is_dir() {
+            std::fs::create_dir_all(dir.join(".socket/vendor")).unwrap();
+            for entry in std::fs::read_dir(tmp.path().join(".socket/vendor")).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() {
+                    std::fs::copy(
+                        entry.path(),
+                        dir.join(".socket/vendor").join(entry.file_name()),
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        dir
+    };
+    let wired = checkout("wired");
+
+    let code = rollback_in_process(tmp.path(), Vec::new(), false).await;
+    assert_eq!(code, 0, "bare rollback");
+    let reverted = checkout("reverted");
+
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let api = PatchApi::start(vec![(
+                    UUID.to_string(),
+                    patch_view(
+                        UUID,
+                        PURL,
+                        &[("package/index.js", &"b".repeat(64))],
+                        &[(GHSA, &["CVE-2024-9"])],
+                    ),
+                )]);
+                let online = || VexRun {
+                    patch_server_url: Some("http://patch.test".to_string()),
+                    ..VexRun::online(&api)
+                };
+                let out = run_vex(&vex_e2e_common::binary(), &wired, &online());
+                assert_eq!(out.code, Some(0), "wired, ledger:\n{out}");
+                assert_attested(
+                    out.doc(),
+                    PURL,
+                    UUID,
+                    Marker::Redirected,
+                    &[(GHSA, &["CVE-2024-9"])],
+                );
+                strip_ledgers(&wired);
+                let out = run_vex(&vex_e2e_common::binary(), &wired, &online());
+                assert_eq!(out.code, Some(0), "wired, no ledger:\n{out}");
+                assert_attested(
+                    out.doc(),
+                    PURL,
+                    UUID,
+                    Marker::Redirected,
+                    &[(GHSA, &["CVE-2024-9"])],
+                );
+
+                let before = api.request_count();
+                for no_verify in [false, true] {
+                    let out = run_vex(
+                        &vex_e2e_common::binary(),
+                        &reverted,
+                        &VexRun {
+                            no_verify,
+                            ..online()
+                        },
+                    );
+                    assert_ne!(out.code, Some(0), "rolled back:\n{out}");
+                    assert_absent(out.doc.as_ref(), PURL);
+                }
+                assert_eq!(api.request_count(), before, "{:?}", api.requests());
+            })
+            .join()
+            .expect("manifest-less VEX cells panicked");
+    });
 }

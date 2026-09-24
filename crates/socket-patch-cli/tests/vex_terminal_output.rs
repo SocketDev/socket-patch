@@ -355,9 +355,12 @@ fn missing_manifest_suggests_next_step() {
     let tmp = tempfile::tempdir().unwrap();
     let o = vex(tmp.path(), &[]);
     assert_eq!(o.status.code(), Some(2));
+    // Manifest-less VEX: the error also says the lockfiles and ledgers
+    // wired nothing, since those alone could have supplied patches.
     let expected = format!(
-        "Error: Manifest not found at {}. Run `socket-patch scan` or `socket-patch get` \
-         first, or pass --manifest-path.\n",
+        "Error: Manifest not found at {}, and no hosted or vendored patch references were \
+         found in the project's lockfiles or .socket/vendor ledgers — nothing to attest. Run \
+         `socket-patch scan` or `socket-patch get` first, or pass --manifest-path.\n",
         tmp.path().join(".socket/manifest.json").display()
     );
     assert_eq!(stderr(&o), expected);
@@ -370,8 +373,9 @@ fn missing_custom_manifest_does_not_suggest_manifest_path() {
     let o = vex(tmp.path(), &["--manifest-path", "nope.json"]);
     assert_eq!(o.status.code(), Some(2));
     let expected = format!(
-        "Error: Manifest not found at {}. Run `socket-patch scan` or `socket-patch get` \
-         first.\n",
+        "Error: Manifest not found at {}, and no hosted or vendored patch references were \
+         found in the project's lockfiles or .socket/vendor ledgers — nothing to attest. Run \
+         `socket-patch scan` or `socket-patch get` first.\n",
         tmp.path().join("nope.json").display()
     );
     assert_eq!(stderr(&o), expected);

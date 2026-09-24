@@ -36,6 +36,8 @@
 
 #[path = "setup_matrix_common/mod.rs"]
 mod smc;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
 /// Documentation/negative-control pass through the shared Docker matrix.
 /// Kept for parity with the other ecosystems and to run the maven negative
@@ -313,5 +315,146 @@ mod host_guard {
             Some(1),
             "positive control: exactly the package.json must count as needing configuration.\n{out}"
         );
+    }
+
+    /// `setup` is a no-op for maven, and it must STAY one for a checkout
+    /// whose patches live in the pom: the hosted (`scan --mode hosted`) and
+    /// vendored (`vendor`) wirings survive `setup --check` / `setup` /
+    /// `setup --remove` byte-for-byte, no manifest appears, and the
+    /// manifest-less `vex` attests both before and after — `(redirected)`
+    /// from the fail-closed pom pin, `(vendored)` from the committed maven2
+    /// tree (online record, no ledgers).
+    #[test]
+    #[serial_test::serial]
+    fn maven_setup_keeps_hosted_and_vendored_wiring_attestable_without_manifest() {
+        use crate::vex_e2e_common::*;
+        use sha1::{Digest as _, Sha1};
+        use std::io::Write as _;
+
+        const HOSTED_UUID: &str = "77777777-7777-7777-7777-777777777777";
+        const HOSTED_PURL: &str = "pkg:maven/org.slf4j/slf4j-api@1.7.36";
+        const VENDOR_UUID: &str = "7b7b7b7b-2222-4222-8222-7b7b7b7b7b7b";
+        const VENDOR_PURL: &str = "pkg:maven/org.apache.commons/commons-text@1.10.0";
+        const MEMBER: &str = "META-INF/NOTICE.txt";
+        let vulns: [(&str, &[&str]); 1] = [("GHSA-setup-mvn-0001", &["CVE-2026-7300"])];
+
+        // Hosted: the committed rewriter golden (pom + `.mvn/`).
+        let hosted = tempfile::tempdir().unwrap();
+        let golden = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../socket-patch-core/tests/fixtures/redirect/maven/pom/basic/expected");
+        let pom = std::fs::read(golden.join("pom.xml")).unwrap();
+        std::fs::write(hosted.path().join("pom.xml"), &pom).unwrap();
+        for rel in [".mvn/maven.config", ".mvn/checksums/checksums.sha256"] {
+            let dst = hosted.path().join(rel);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            std::fs::copy(golden.join(rel), dst).unwrap();
+        }
+
+        // Vendored: `vendor_maven`'s repository + the committed jar/sidecar.
+        let vendored = tempfile::tempdir().unwrap();
+        let patched = b"upstream NOTICE\nSOCKET-PATCHED\n";
+        let mut jar = std::io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut jar);
+            w.start_file(MEMBER, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            w.write_all(patched).unwrap();
+            w.finish().unwrap();
+        }
+        let jar = jar.into_inner();
+        let leaf = vendored.path().join(format!(
+            ".socket/vendor/maven/{VENDOR_UUID}/org/apache/commons/commons-text/1.10.0"
+        ));
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(leaf.join("commons-text-1.10.0.jar"), &jar).unwrap();
+        std::fs::write(
+            leaf.join("commons-text-1.10.0.jar.sha1"),
+            hex::encode(Sha1::digest(&jar)),
+        )
+        .unwrap();
+        std::fs::write(leaf.join("commons-text-1.10.0.pom"), "<project/>").unwrap();
+        std::fs::write(
+            vendored.path().join("pom.xml"),
+            format!(
+                "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
+                 <modelVersion>4.0.0</modelVersion>\n  <groupId>dev.socket</groupId>\n  \
+                 <artifactId>sm-maven-proj</artifactId>\n  <version>1.0.0</version>\n  \
+                 <dependencies>\n    <dependency>\n      \
+                 <groupId>org.apache.commons</groupId>\n      \
+                 <artifactId>commons-text</artifactId>\n      <version>1.10.0</version>\n    \
+                 </dependency>\n  </dependencies>\n  <repositories>\n    <repository>\n      \
+                 <id>socket-patch-vendor-{VENDOR_UUID}</id>\n      \
+                 <url>file://${{project.basedir}}/.socket/vendor/maven/{VENDOR_UUID}</url>\n      \
+                 <releases>\n        <checksumPolicy>fail</checksumPolicy>\n      </releases>\n    \
+                 </repository>\n  </repositories>\n</project>\n"
+            ),
+        )
+        .unwrap();
+
+        let api = PatchApi::start(vec![
+            (
+                HOSTED_UUID.to_string(),
+                patch_view(
+                    HOSTED_UUID,
+                    HOSTED_PURL,
+                    &[("slf4j-api-1.7.36.jar", &git_sha256(b"patched jar"))],
+                    &vulns,
+                ),
+            ),
+            (
+                VENDOR_UUID.to_string(),
+                patch_view(
+                    VENDOR_UUID,
+                    VENDOR_PURL,
+                    &[(MEMBER, &git_sha256(patched))],
+                    &vulns,
+                ),
+            ),
+        ]);
+        let m2 = tempfile::tempdir().unwrap();
+        let cases = [
+            (hosted.path(), HOSTED_PURL, HOSTED_UUID, Marker::Redirected),
+            (vendored.path(), VENDOR_PURL, VENDOR_UUID, Marker::Vendored),
+        ];
+        let attest = |stage: &str| {
+            for (root, purl, uuid, marker) in cases {
+                let out = run_vex(
+                    &binary(),
+                    root,
+                    &VexRun {
+                        product: Some("pkg:maven/dev.socket/sm-maven-proj@1.0.0".to_string()),
+                        ..VexRun::online(&api)
+                    }
+                    .env("MAVEN_REPO_LOCAL", m2.path().as_os_str()),
+                );
+                assert_eq!(out.code, Some(0), "{stage} {purl}: {out}");
+                assert_attested(out.doc(), purl, uuid, marker, &vulns);
+                std::fs::remove_file(&out.output).unwrap();
+            }
+        };
+        attest("before setup");
+        for (root, _, _, _) in cases {
+            let snapshot = std::fs::read(root.join("pom.xml")).unwrap();
+            let root_s = root.to_str().unwrap();
+            for args in [
+                &["setup", "--check", "--cwd", root_s, "--json"][..],
+                &["setup", "--cwd", root_s, "--yes", "--json"][..],
+                &["setup", "--remove", "--cwd", root_s, "--yes", "--json"][..],
+            ] {
+                let (code, out, err) = run(root, args);
+                assert_eq!(code, 0, "{args:?}\nstdout:\n{out}\nstderr:\n{err}");
+                assert_no_files_envelope(&parse_json(&out, "setup (wired)"), "setup (wired)");
+                assert_eq!(
+                    std::fs::read(root.join("pom.xml")).unwrap(),
+                    snapshot,
+                    "{args:?} must leave the wired pom.xml byte-for-byte"
+                );
+                assert!(
+                    !root.join(".socket/manifest.json").exists(),
+                    "{args:?} must not create a manifest"
+                );
+            }
+        }
+        attest("after setup");
     }
 }

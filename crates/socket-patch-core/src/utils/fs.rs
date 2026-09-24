@@ -366,6 +366,33 @@ pub async fn atomic_write_bytes_preserving_mode(
     atomic_write_bytes_as(path, content, perms).await
 }
 
+/// Create the stage file for [`atomic_write_bytes_as`]. On Unix, when the
+/// destination's permissions are being preserved, the stage is CREATED with
+/// those bits (narrowed further by the umask) rather than the 0666 & ~umask
+/// default: the full new content — a `.npmrc` `_authToken`, a 0600 private
+/// manifest — is written and fsynced into the stage before the final
+/// chmod, so a default-mode stage would expose it to other local users for
+/// the whole write, and leave a world-readable copy behind if the process
+/// is killed before the rename.
+async fn create_stage(
+    stage: &Path,
+    perms: Option<&std::fs::Permissions>,
+) -> std::io::Result<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(p) = perms {
+        use std::os::unix::fs::PermissionsExt;
+        // Permission bits only (never setuid/setgid/sticky on a stage). A
+        // read-only mode (0400) is fine: O_CREAT still hands back a
+        // writable descriptor for the file it just created.
+        options.mode(p.mode() & 0o777);
+    }
+    #[cfg(not(unix))]
+    let _ = perms;
+    options.open(stage).await
+}
+
 async fn atomic_write_bytes_as(
     path: &Path,
     content: &[u8],
@@ -380,11 +407,7 @@ async fn atomic_write_bytes_as(
 
     // `create_new` failing leaves no stage to clean up; every step after it
     // does, so they share one error arm.
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&stage)
-        .await?;
+    let file = create_stage(&stage, perms.as_ref()).await?;
     if let Err(e) = commit_stage(file, content, perms, &stage, path).await {
         let _ = tokio::fs::remove_file(&stage).await;
         return Err(e);
@@ -653,6 +676,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tokio::fs::read(&fresh).await.unwrap(), b"x");
+    }
+
+    /// The stage of a mode-preserving write is CREATED with the preserved
+    /// bits, never the 0666 & ~umask default: the full new content (a
+    /// `.npmrc` auth token) is written and fsynced into it before the final
+    /// chmod, and a killed process leaves it behind. Red before the fix:
+    /// the 0600 destination's stage came out 0644 (umask 022).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preserving_stage_is_created_with_the_destination_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        for mode in [0o600, 0o400, 0o640] {
+            let stage = tmp.path().join(format!(".socket-stage-npmrc-{mode:o}"));
+            let perms = std::fs::Permissions::from_mode(mode);
+            let mut file = create_stage(&stage, Some(&perms)).await.unwrap();
+            use tokio::io::AsyncWriteExt;
+            // A read-only preserved mode still yields a writable stage fd.
+            file.write_all(b"//r/:_authToken=secret\n").await.unwrap();
+            file.flush().await.unwrap();
+            let got = std::fs::metadata(&stage).unwrap().permissions().mode() & 0o777;
+            assert_eq!(got & !mode, 0, "stage {got:o} must not exceed {mode:o}");
+            assert_eq!(
+                got & 0o077 & !mode,
+                0,
+                "no group/other bits beyond {mode:o}"
+            );
+        }
+        // No preserved mode: the plain umask default, as before.
+        let plain = tmp.path().join(".socket-stage-plain");
+        create_stage(&plain, None).await.unwrap();
+        assert!(plain.is_file());
     }
 
     /// The post-rename parent-directory fsync is best-effort: when the

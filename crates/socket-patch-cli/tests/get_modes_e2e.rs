@@ -23,6 +23,10 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "npm_e2e_common/manifestless.rs"]
+mod npm_e2e_common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
 const ORG: &str = "test-org";
 const NAME: &str = "getmodes-pkg";
@@ -227,6 +231,12 @@ async fn get_uuid_hosted_json_envelope_nests_redirect() {
 
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
+    // npm >= 12 needs `allow-remote=all` for a hosted lock; with it already
+    // committed the run writes no `.npmrc` (so `rewrittenFiles` stays the
+    // lock alone) and emits exactly the already-set
+    // `redirect_npm_allow_remote` caveat (the auto-config has its own suite:
+    // tests/redirect_npm_allow_remote.rs).
+    std::fs::write(tmp.path().join(".npmrc"), "allow-remote=all\n").unwrap();
 
     let (code, stdout, stderr) = run_get(
         tmp.path(),
@@ -239,6 +249,15 @@ async fn get_uuid_hosted_json_envelope_nests_redirect() {
     );
 
     let v = parse_single_json_doc(&stdout);
+    let allow_remote = v["redirect"]["warnings"][0]["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        allow_remote.contains("already sets `allow-remote=all`")
+            && allow_remote.contains("lets npm install ANY url-resolved"),
+        "{v}"
+    );
     let expected = serde_json::json!({
         "status": "success",
         "found": 1,
@@ -248,7 +267,7 @@ async fn get_uuid_hosted_json_envelope_nests_redirect() {
             "redirected": 1,
             "rewrittenFiles": ["package-lock.json"],
             "skipped": [],
-            "warnings": [],
+            "warnings": [{ "code": "redirect_npm_allow_remote", "detail": allow_remote }],
             "dryRun": false,
         },
     });
@@ -546,8 +565,10 @@ async fn get_hosted_silent_prints_nothing_to_stdout() {
     let (loud_code, loud_stdout, loud_stderr) =
         run_get(tmp2.path(), &server.uri(), &[UUID1, "--mode", "hosted"]);
     assert_eq!(loud_code, 0, "stderr:\n{loud_stderr}");
+    // Two files: the lock, plus the project `.npmrc` the npm 12
+    // `allow-remote=all` auto-config creates.
     assert!(
-        loud_stdout.contains("Redirected 1 package; rewrote 1 file."),
+        loud_stdout.contains("Redirected 1 package; rewrote 2 files."),
         "non-silent hosted run must print the redirect summary; got {loud_stdout:?}"
     );
 }
@@ -567,6 +588,12 @@ async fn get_hosted_dry_run_json_envelope() {
 
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
+    // npm >= 12 needs `allow-remote=all` for a hosted lock; with it already
+    // committed the run writes no `.npmrc` (so `rewrittenFiles` stays the
+    // lock alone) and emits exactly the already-set
+    // `redirect_npm_allow_remote` caveat (the auto-config has its own suite:
+    // tests/redirect_npm_allow_remote.rs).
+    std::fs::write(tmp.path().join(".npmrc"), "allow-remote=all\n").unwrap();
     let lock_before = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
 
     let (code, stdout, stderr) = run_get(
@@ -577,6 +604,15 @@ async fn get_hosted_dry_run_json_envelope() {
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
 
     let v = parse_single_json_doc(&stdout);
+    let allow_remote = v["redirect"]["warnings"][0]["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        allow_remote.contains("already sets `allow-remote=all`")
+            && allow_remote.contains("lets npm install ANY url-resolved"),
+        "{v}"
+    );
     let expected = serde_json::json!({
         "status": "success",
         "found": 1,
@@ -586,7 +622,7 @@ async fn get_hosted_dry_run_json_envelope() {
             "redirected": 1,
             "rewrittenFiles": ["package-lock.json"],
             "skipped": [],
-            "warnings": [],
+            "warnings": [{ "code": "redirect_npm_allow_remote", "detail": allow_remote }],
             "dryRun": true,
         },
     });
@@ -1065,4 +1101,79 @@ async fn get_save_only_agent_ignores_bun_preflight() {
             .is_file(),
         "the agent download persists the after-blob"
     );
+}
+
+/// Manifest-less VEX over what `get <uuid> --mode hosted` and `get <uuid>
+/// --mode vendored` commit for an npm project: a checkout of package.json,
+/// the lock and `.socket/` (no manifest — hosted never writes one, vendored's
+/// is deleted like an uncommitted one) attests with the ledger, then from
+/// lockfile discovery + the patch API with the ledgers gone, never
+/// `--offline` (`record_unavailable`, zero requests), and not once the lock
+/// is reverted (`redirect_unwired` / `vendor_unwired`, `--no-verify` too).
+/// Hosted checkouts carry no install (the host is fictional → lockfile
+/// pin); vendored ones are judged by the committed tarball.
+#[tokio::test]
+async fn get_modes_state_attests_manifest_less() {
+    for hosted in [true, false] {
+        let server = MockServer::start().await;
+        mock_view(&server, UUID1, PURL1).await;
+        if hosted {
+            mock_reference(&server).await;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(tmp.path());
+        let pristine = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+        let argv: &[&str] = if hosted {
+            &[UUID1, "--mode", "hosted", "--json"]
+        } else {
+            &[
+                UUID1,
+                "--mode",
+                "vendored",
+                "--vendor-source",
+                "build",
+                "--json",
+            ]
+        };
+        let (code, stdout, stderr) = run_get(tmp.path(), &server.uri(), argv);
+        assert_eq!(
+            code, 0,
+            "hosted={hosted}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        let checkout = tmp.path().join("checkout");
+        npm_e2e_common::fresh_checkout(tmp.path(), &checkout, &["package-lock.json"]);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let api = vex_e2e_common::PatchApi::start(vec![(
+                        UUID1.to_string(),
+                        vex_e2e_common::patch_view(
+                            UUID1,
+                            PURL1,
+                            &[("package/index.js", &common::git_sha256(AFTER_BYTES))],
+                            &[(GHSA, &["CVE-2024-1234"])],
+                        ),
+                    )]);
+                    npm_e2e_common::manifestless_vex_matrix(&npm_e2e_common::ManifestlessCase {
+                        label: format!("get --mode {}", if hosted { "hosted" } else { "vendored" }),
+                        project: &checkout,
+                        purl: PURL1,
+                        uuid: UUID1,
+                        marker: if hosted {
+                            vex_e2e_common::Marker::Redirected
+                        } else {
+                            vex_e2e_common::Marker::Vendored
+                        },
+                        vulns: &[(GHSA, &["CVE-2024-1234"])],
+                        api: &api,
+                        patch_server_url: hosted.then(|| "http://patch.test".to_string()),
+                        registry_locks: vec![("package-lock.json", pristine.clone())],
+                        embedded: &[vex_e2e_common::VexVia::Apply],
+                    });
+                })
+                .join()
+                .expect("manifest-less VEX tail panicked");
+        });
+    }
 }

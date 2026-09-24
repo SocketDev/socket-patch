@@ -18,13 +18,13 @@ pub(super) fn unsupported_early_shrinkwrap(content: &str) -> bool {
         && !minor.is_some_and(|v| v.trim().parse::<u32>().is_ok_and(|v| v > 0))
 }
 
-pub(super) struct Entry<'a> {
+pub(crate) struct Entry<'a> {
     pub key: &'a str,
     pub body: &'a str,
     pub offset: usize,
 }
 
-pub(super) fn entries(content: &str) -> Vec<Entry<'_>> {
+pub(crate) fn entries(content: &str) -> Vec<Entry<'_>> {
     let mut out = Vec::new();
     let mut in_packages = false;
     let mut current: Option<(&str, usize)> = None;
@@ -62,11 +62,41 @@ pub(super) fn entries(content: &str) -> Vec<Entry<'_>> {
     out
 }
 
-fn unquote(s: &str) -> &str {
+/// Strip one layer of YAML single/double quotes (pnpm quotes keys that
+/// start with `@` and scalars carrying flow delimiters). Lockfile discovery
+/// reads keys and resolution fields through it too.
+pub(crate) fn unquote(s: &str) -> &str {
     s.strip_prefix('\'')
         .and_then(|s| s.strip_suffix('\''))
         .or_else(|| s.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
         .unwrap_or(s)
+}
+
+/// Whether `text` is a pnpm lock at all: a column-0 `lockfileVersion:`
+/// (pnpm >= 3) or `shrinkwrapVersion:` (pnpm 1 / 2) line — lockfile
+/// discovery's sniff before it reads any entry.
+pub(crate) fn is_pnpm_lock_text(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.starts_with("lockfileVersion:") || line.starts_with("shrinkwrapVersion:"))
+}
+
+/// The value of the entry-level (four-space) `field:` line of a packages
+/// entry body, unquoted; `None` when absent, empty, or given more than once
+/// (ambiguous — fail closed). Nested (deeper-indented) lines are never
+/// entry fields. Reads the `name:` / `version:` lines the vendor backends
+/// write on rekeyed entries.
+pub(crate) fn entry_field<'a>(entry: &Entry<'a>, field: &str) -> Option<&'a str> {
+    let mut values = entry.body.lines().filter_map(|line| {
+        let line = line.trim_end_matches('\r');
+        let rest = line.strip_prefix("    ")?;
+        if rest.starts_with(' ') {
+            return None;
+        }
+        let (k, v) = rest.split_once(':')?;
+        (k == field).then(|| unquote(v.trim()))
+    });
+    let first = values.next().filter(|v| !v.is_empty())?;
+    values.next().is_none().then_some(first)
 }
 
 /// Loose identity match, also used to refuse unsupported suffixes atomically.
@@ -103,19 +133,29 @@ pub(super) fn supported_suffix(suffix: &str) -> bool {
     depth == 0
 }
 
-pub(super) struct Resolution<'a> {
+pub(crate) struct Resolution<'a> {
     pub range: Range<usize>,
     pub fields: Vec<(&'a str, &'a str)>,
     block: bool,
     newline: &'static str,
 }
 
-impl Resolution<'_> {
+impl<'a> Resolution<'a> {
     pub fn tarball(&self) -> Option<&str> {
         self.fields
             .iter()
             .find(|(k, _)| *k == "tarball")
             .map(|(_, v)| unquote(v))
+    }
+
+    /// The `integrity` field, unquoted — UNFILTERED: the lock inventory
+    /// records whatever the lock says, lockfile discovery keeps only SRI
+    /// pins (`is_sri_pin`) at its call site.
+    pub fn integrity(&self) -> Option<&'a str> {
+        self.fields
+            .iter()
+            .find(|(k, _)| *k == "integrity")
+            .map(|(_, v)| unquote(v.trim()))
     }
 
     pub fn rewrite(&self, integrity: &str, url: &str) -> String {
@@ -152,30 +192,51 @@ impl Resolution<'_> {
     }
 }
 
+/// The key line every `packages:` entry's resolution map starts at.
+const RESOLUTION_KEY: &str = "    resolution:";
+
+/// The raw text of an entry's `resolution:` value(s), whatever their shape:
+/// the rest of each `resolution:` line and every deeper-indented line under
+/// it. For readers that must still SEE a mapping [`resolution`] refuses
+/// (lockfile discovery diagnoses one that names a Socket patch).
+pub(crate) fn resolution_raw_lines<'a>(entry: &Entry<'a>) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut in_resolution = false;
+    for line in entry.body.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix(RESOLUTION_KEY) {
+            in_resolution = true;
+            out.push(rest);
+        } else if in_resolution && line.starts_with("     ") {
+            out.push(line);
+        } else if !line.trim().is_empty() {
+            in_resolution = false;
+        }
+    }
+    out
+}
+
 /// Flat string mapping only. Aliases, nested values, duplicate keys and
 /// malformed mappings are refused, never guessed or partially replaced.
-pub(super) fn resolution<'a>(entry: &Entry<'a>) -> Option<Resolution<'a>> {
+pub(crate) fn resolution<'a>(entry: &Entry<'a>) -> Option<Resolution<'a>> {
     let mut offset = entry.offset;
     let mut lines = entry.body.split_inclusive('\n').peekable();
     while let Some(line) = lines.next() {
         let text = line.trim_end_matches(['\r', '\n']);
         let start = offset;
         offset += line.len();
-        let Some(value) = text.strip_prefix("    resolution:") else {
+        let Some(value) = text.strip_prefix(RESOLUTION_KEY) else {
             continue;
         };
         // A second resolution key is invalid YAML, so do not bless it.
-        if lines
-            .clone()
-            .any(|line| line.starts_with("    resolution:"))
-        {
+        if lines.clone().any(|line| line.starts_with(RESOLUTION_KEY)) {
             return None;
         }
         let block = value.trim().is_empty();
         let mut parts = Vec::new();
         let range;
         if block {
-            let begin = start + "    resolution:".len();
+            let begin = start + RESOLUTION_KEY.len();
             let mut end = begin;
             while let Some(child) = lines.peek() {
                 let Some(field) = child.strip_prefix("      ").filter(|s| !s.starts_with(' '))

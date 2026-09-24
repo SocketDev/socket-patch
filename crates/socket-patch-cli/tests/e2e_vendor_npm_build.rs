@@ -18,8 +18,22 @@
 //!   6. **Revert proof**: `vendor --revert` restores the lock byte-for-byte
 //!      and removes `.socket/vendor/` entirely.
 //!
+//! v5 ends every flow in the MANIFEST-LESS VEX tail
+//! (`npm_e2e_common::manifestless_vex_matrix`: manifest deleted, ledgers
+//! deleted → lockfile discovery + mock patch API, `--offline` →
+//! `record_unavailable`, lock reverted → `vendor_unwired`, plus the embedded
+//! `apply --vex` / `vendor --vex` twins) and runs against EVERY npm major
+//! (`SOCKET_PATCH_NPM_E2E_BIN` / `_VERSION` / `_REQUIRED`, see
+//! `npm_e2e_common`). npm 6 writes lockfileVersion 1, which vendoring
+//! refuses (`vendor_lockfile_version_unsupported`); its cross-version cell
+//! vendors a v2 lock written by a modern npm and proves npm 6 installs the
+//! vendored tarball from the v2 legacy mirror. The shrinkwrap flavor
+//! (npm <= 11 `npm shrinkwrap`, npm 12's shrinkwrap + package-lock twin) has
+//! its own capstone — npm 12 installs from the twin, so both must be wired.
+//!
 //! Skips (with a println) when `npm` is not installed or the fixture install
-//! cannot reach the registry; every assertion after that is hard.
+//! cannot reach the registry — unless `SOCKET_PATCH_NPM_E2E_REQUIRED` is
+//! set; every assertion after that is hard.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -28,8 +42,13 @@ use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
+#[path = "npm_e2e_common/mod.rs"]
+mod npm_e2e_common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+
+use npm_e2e_common::{LockFlavor, ManifestlessCase};
+use vex_e2e_common::{patch_view, Marker, PatchApi, VexVia};
 
 /// Canonical lowercase patch uuid (a dedicated path level under
 /// `.socket/vendor/npm/`).
@@ -45,17 +64,6 @@ const ORG: &str = "test-org";
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
-
-fn has_command(cmd: &str) -> bool {
-    let mut probe = Command::new(cmd);
-    probe.arg("--version");
-    cache_env::isolate(&mut probe);
-    probe
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
 }
 
 /// Run the socket-patch binary with a scrubbed environment: every ambient
@@ -78,36 +86,10 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
-/// Run npm with ambient `npm_config_*` env scrubbed. npm reads any
-/// `npm_config_<key>` variable (case-insensitive) as config wherever the
-/// invocation doesn't pin a flag: an ambient `npm_config_dry_run=true` turns
-/// the fixture install into a no-op that still exits 0 (so the skip-gate
-/// passes and the marker asserts panic), and `npm_config_save=false`
-/// suppresses the package-lock.json every later oracle reads. Both verified
-/// hostile values are seeded and then scrubbed — `env_remove` clears the seed
-/// too, so the child never sees it, but if a scrub line is ever dropped the
-/// seed (not a developer's shell) turns the suite red immediately.
+/// Run the npm under test (`npm_e2e_common`: ambient `npm_config_*`
+/// scrubbed, private cache/home sandbox, `SOCKET_PATCH_NPM_E2E_BIN`).
 fn npm(cwd: &Path, args: &[&str]) -> Output {
-    let mut cmd = Command::new("npm");
-    cmd.args(args)
-        .current_dir(cwd)
-        .env("npm_config_dry_run", "true")
-        .env("npm_config_save", "false")
-        .env_remove("npm_config_dry_run")
-        .env_remove("npm_config_save");
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy()
-            .to_ascii_lowercase()
-            .starts_with("npm_config_")
-        {
-            cmd.env_remove(&k);
-        }
-    }
-    // After the scrub (it would otherwise strip an ambient `npm_config_cache`
-    // right back out) and before the caller's flags. The `--cache` argument
-    // each call site passes is a flag, not env, so it still wins.
-    cache_env::isolate(&mut cmd);
-    cmd.output().expect("failed to run npm")
+    npm_e2e_common::npm(cwd, args)
 }
 
 /// Git-blob SHA-256 (`sha256("blob <len>\0" ++ bytes)`) — the hash format
@@ -125,35 +107,9 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// Write `.socket/manifest.json` + the after-hash blob so vendor runs fully
-/// offline.
-fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[u8]) {
-    let socket = proj.join(".socket");
-    std::fs::create_dir_all(socket.join("blobs")).unwrap();
-    let manifest = serde_json::json!({
-        "patches": { purl: {
-            "uuid": UUID,
-            "exportedAt": "2026-01-01T00:00:00Z",
-            "files": { file_key: {
-                "beforeHash": git_sha256(before),
-                "afterHash": git_sha256(after),
-            }},
-            "vulnerabilities": {},
-            "description": "capstone marker patch",
-            "license": "MIT",
-            "tier": "free",
-        }}
-    });
-    std::fs::write(
-        socket.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
-    std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
-}
-
-/// Like [`stage_patch`] but records a vulnerability so a generated VEX
-/// document has a statement to emit.
+/// Write `.socket/manifest.json` + the after-hash blob (so vendor runs
+/// fully offline), recording a vulnerability so a generated VEX document
+/// has a statement to emit.
 fn stage_patch_with_vuln(
     proj: &Path,
     purl: &str,
@@ -197,26 +153,119 @@ fn parse_envelope(stdout: &str) -> serde_json::Value {
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
+    npm_e2e_common::copy_dir_recursive(src, dst)
+}
+
+/// The npm major under test, or `None` after a skip (REQUIRED: a failure).
+fn npm_major_or_skip(suite: &str) -> Option<u32> {
+    let major = npm_e2e_common::npm_major();
+    if major.is_none() {
+        npm_e2e_common::skip(suite, "`npm` not installed");
     }
+    major
+}
+
+/// npm <= 6 writes lockfileVersion 1, which vendoring refuses up front (no
+/// `packages` object to rewire): exit 1, the stable refusal code, nothing
+/// written. Returns `true` when this project is such a v1 project (the
+/// caller's v2/v3 flow then stops here).
+fn v1_lock_is_refused(proj: &Path, major: u32) -> bool {
+    if major > 6 {
+        return false;
+    }
+    assert_eq!(
+        npm_e2e_common::lockfile_version(proj),
+        Some(1),
+        "npm {major} lock"
+    );
+    let lock_before = std::fs::read(proj.join("package-lock.json")).unwrap();
+    let (code, stdout, stderr) = run_socket(
+        proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_ne!(
+        code, 0,
+        "vendoring a v1 lock must be refused.\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("vendor_lockfile_version_unsupported"),
+        "the refusal must carry its stable code:\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("package-lock.json")).unwrap(),
+        lock_before,
+        "a refused vendor leaves the lock byte-identical"
+    );
+    assert!(
+        !proj.join(".socket/vendor/npm").exists(),
+        "no artifact on refusal"
+    );
+    true
+}
+
+const TAIL_GHSA: &str = "GHSA-vend-npm-tail";
+const TAIL_CVE: &str = "CVE-2024-99999";
+
+/// The manifest-less VEX tail over a vendored checkout (`project`), whose
+/// record the mock patch API serves once the ledger is gone. Runs on its
+/// own thread: PatchApi owns a runtime, which cannot nest in a tokio test.
+fn vendored_manifestless_tail(
+    label: &str,
+    project: &Path,
+    patched: &[u8],
+    ghsa: &str,
+    registry_locks: Vec<(&'static str, Vec<u8>)>,
+    embedded: &[VexVia],
+) {
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let api = PatchApi::start(vec![(
+                    UUID.to_string(),
+                    patch_view(
+                        UUID,
+                        &purl,
+                        &[("package/index.js", &git_sha256(patched))],
+                        &[(ghsa, &[TAIL_CVE])],
+                    ),
+                )]);
+                let case = ManifestlessCase {
+                    label: label.to_string(),
+                    project,
+                    purl: &purl,
+                    uuid: UUID,
+                    marker: Marker::Vendored,
+                    vulns: &[(ghsa, &[TAIL_CVE])],
+                    api: &api,
+                    patch_server_url: None,
+                    registry_locks,
+                    embedded,
+                };
+                let report = npm_e2e_common::manifestless_vex_matrix(&case);
+                npm_e2e_common::record_results(&format!(
+                    "npm={} mode=vendored {label} {report}",
+                    npm_e2e_common::npm_version().unwrap_or_default()
+                ));
+            })
+            .join()
+            .expect("manifest-less VEX tail panicked");
+    });
 }
 
 // ── the capstone ──────────────────────────────────────────────────────
 
 #[test]
 fn npm_vendor_fresh_checkout_npm_ci_and_revert() {
-    if !has_command("npm") {
-        println!("SKIP e2e_vendor_npm_build: `npm` not installed");
+    let Some(major) = npm_major_or_skip("e2e_vendor_npm_build") else {
         return;
-    }
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
@@ -229,23 +278,12 @@ fn npm_vendor_fresh_checkout_npm_ci_and_revert() {
 
     // 1. REAL fixture: npm install (network allowed here, private cache).
     let cache = tmp.path().join("npm-cache");
-    let install = npm(
+    if !npm_e2e_common::install_fixture(
+        "e2e_vendor_npm_build",
         &proj,
-        &[
-            "install",
-            &format!("{DEP}@{DEP_VERSION}"),
-            "--no-audit",
-            "--no-fund",
-            "--cache",
-            cache.to_str().unwrap(),
-        ],
-    );
-    if !install.status.success() {
-        println!(
-            "SKIP e2e_vendor_npm_build: `npm install {DEP}@{DEP_VERSION}` failed (registry \
-             unreachable?):\n{}",
-            String::from_utf8_lossy(&install.stderr)
-        );
+        &cache,
+        &format!("{DEP}@{DEP_VERSION}"),
+    ) {
         return;
     }
 
@@ -260,7 +298,10 @@ fn npm_vendor_fresh_checkout_npm_ci_and_revert() {
 
     // 2. Manifest + blob from the ACTUAL installed bytes (npm file keys carry
     //    the `package/` prefix).
-    stage_patch(&proj, &purl, "package/index.js", &orig, &patched);
+    stage_patch_with_vuln(&proj, &purl, "package/index.js", &orig, &patched, TAIL_GHSA);
+    if v1_lock_is_refused(&proj, major) {
+        return;
+    }
 
     let lock_path = proj.join("package-lock.json");
     let lock_before = std::fs::read(&lock_path).expect("package-lock.json after npm install");
@@ -386,6 +427,16 @@ fn npm_vendor_fresh_checkout_npm_ci_and_revert() {
         fresh_installed, patched,
         "fresh install must be byte-identical to the patched content"
     );
+    // MANIFEST-LESS VEX over the fresh checkout (its own copy — the
+    // idempotency / revert legs below keep running on `proj`).
+    vendored_manifestless_tail(
+        "flavor=package-lock install=patched",
+        &fresh,
+        &patched,
+        TAIL_GHSA,
+        vec![("package-lock.json", lock_before.clone())],
+        &[VexVia::Apply, VexVia::Vendor],
+    );
 
     // 5. Idempotency: a re-run exits 0 and leaves the lock byte-stable.
     let lock_wired = std::fs::read(&lock_path).unwrap();
@@ -447,10 +498,9 @@ fn npm_vendor_fresh_checkout_npm_ci_and_revert() {
 /// just the synthetic cargo-dir fixtures).
 #[test]
 fn npm_vendor_vex_attests_against_vendored_tarball() {
-    if !has_command("npm") {
-        println!("SKIP e2e_vendor_npm_build (vex): `npm` not installed");
+    let Some(major) = npm_major_or_skip("e2e_vendor_npm_build (vex)") else {
         return;
-    }
+    };
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -461,19 +511,12 @@ fn npm_vendor_vex_attests_against_vendored_tarball() {
     .unwrap();
 
     let cache = tmp.path().join("npm-cache");
-    let install = npm(
+    if !npm_e2e_common::install_fixture(
+        "e2e_vendor_npm_build (vex)",
         &proj,
-        &[
-            "install",
-            &format!("{DEP}@{DEP_VERSION}"),
-            "--no-audit",
-            "--no-fund",
-            "--cache",
-            cache.to_str().unwrap(),
-        ],
-    );
-    if !install.status.success() {
-        println!("SKIP e2e_vendor_npm_build (vex): npm install failed (registry unreachable?)");
+        &cache,
+        &format!("{DEP}@{DEP_VERSION}"),
+    ) {
         return;
     }
 
@@ -483,6 +526,10 @@ fn npm_vendor_vex_attests_against_vendored_tarball() {
     let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
     const GHSA: &str = "GHSA-vend-npm-real";
     stage_patch_with_vuln(&proj, &purl, "package/index.js", &orig, &patched, GHSA);
+    if v1_lock_is_refused(&proj, major) {
+        return;
+    }
+    let lock_before = std::fs::read(proj.join("package-lock.json")).unwrap();
 
     // Vendor (offline: blob staged locally).
     let (code, stdout, stderr) = run_socket(
@@ -532,6 +579,17 @@ fn npm_vendor_vex_attests_against_vendored_tarball() {
         impact.contains("(vendored)"),
         "vendored attestation must carry the (vendored) marker: {impact}"
     );
+
+    // MANIFEST-LESS VEX in place (no reinstall: the committed tarball is the
+    // evidence).
+    vendored_manifestless_tail(
+        "flavor=package-lock install=none",
+        &proj,
+        &patched,
+        GHSA,
+        vec![("package-lock.json", lock_before)],
+        &[VexVia::Apply],
+    );
 }
 
 /// get-driven twin of the capstone (v3.6): instead of hand-staging
@@ -548,10 +606,9 @@ fn npm_vendor_vex_attests_against_vendored_tarball() {
 // wiremock keeps serving the view route on the others.
 #[tokio::test(flavor = "multi_thread")]
 async fn npm_get_uuid_vendored_fresh_checkout_npm_ci() {
-    if !has_command("npm") {
-        println!("SKIP e2e_vendor_npm_build (get vendored): `npm` not installed");
+    let Some(major) = npm_major_or_skip("e2e_vendor_npm_build (get vendored)") else {
         return;
-    }
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
@@ -564,23 +621,12 @@ async fn npm_get_uuid_vendored_fresh_checkout_npm_ci() {
 
     // 1. REAL fixture: npm install (network allowed here, private cache).
     let cache = tmp.path().join("npm-cache");
-    let install = npm(
+    if !npm_e2e_common::install_fixture(
+        "e2e_vendor_npm_build (get vendored)",
         &proj,
-        &[
-            "install",
-            &format!("{DEP}@{DEP_VERSION}"),
-            "--no-audit",
-            "--no-fund",
-            "--cache",
-            cache.to_str().unwrap(),
-        ],
-    );
-    if !install.status.success() {
-        println!(
-            "SKIP e2e_vendor_npm_build (get vendored): `npm install {DEP}@{DEP_VERSION}` failed \
-             (registry unreachable?):\n{}",
-            String::from_utf8_lossy(&install.stderr)
-        );
+        &cache,
+        &format!("{DEP}@{DEP_VERSION}"),
+    ) {
         return;
     }
 
@@ -609,7 +655,12 @@ async fn npm_get_uuid_vendored_fresh_checkout_npm_ci() {
                     "blobContent": b64(&patched),
                 }
             },
-            "vulnerabilities": {},
+            "vulnerabilities": { TAIL_GHSA: {
+                "cves": [TAIL_CVE],
+                "summary": "get vendored vex vuln",
+                "severity": "high",
+                "description": "d",
+            }},
             "description": "capstone marker patch",
             "license": "MIT",
             "tier": "free",
@@ -618,6 +669,14 @@ async fn npm_get_uuid_vendored_fresh_checkout_npm_ci() {
         .await;
 
     let lock_path = proj.join("package-lock.json");
+    if major <= 6 {
+        // lockfileVersion 1: vendoring refuses it (asserted by the capstone's
+        // `v1_lock_is_refused`); the npm 6 install path is covered by
+        // `npm6_installs_a_vendored_v2_lock_from_its_legacy_mirror`.
+        println!("N/A e2e_vendor_npm_build (get vendored): npm {major} writes a v1 lock");
+        return;
+    }
+    let lock_before = std::fs::read(&lock_path).unwrap();
     let pre_lock: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&lock_path).unwrap()).unwrap();
     let registry_integrity = pre_lock["packages"][format!("node_modules/{DEP}")]["integrity"]
@@ -754,5 +813,235 @@ async fn npm_get_uuid_vendored_fresh_checkout_npm_ci() {
     assert_eq!(
         fresh_installed, patched,
         "fresh install must be byte-identical to the patched content"
+    );
+
+    vendored_manifestless_tail(
+        "flavor=package-lock via=get install=patched",
+        &fresh,
+        &patched,
+        TAIL_GHSA,
+        vec![("package-lock.json", lock_before)],
+        &[VexVia::Apply, VexVia::Vendor],
+    );
+}
+
+/// Shrinkwrap flavor of the capstone. npm <= 11: `npm shrinkwrap` renames
+/// the lock, so only npm-shrinkwrap.json is committed and rewired. npm 12
+/// removed the command and keeps a package-lock.json twin beside a committed
+/// shrinkwrap — and installs FROM the twin — so BOTH locks must be rewired
+/// (the dual-lock vendor fix) for the fresh `npm ci` to install the patched
+/// bytes; the manifest-less tail then attests them, and revert restores
+/// every lock byte-for-byte.
+#[test]
+fn npm_vendor_shrinkwrap_fresh_checkout_npm_ci_and_manifestless_vex() {
+    let suite = "e2e_vendor_npm_build (shrinkwrap)";
+    let Some(major) = npm_major_or_skip(suite) else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"vendor-shrinkwrap","version":"0.0.0","private":true}"#,
+    )
+    .unwrap();
+    let cache = tmp.path().join("npm-cache");
+    if !npm_e2e_common::install_fixture(suite, &proj, &cache, &format!("{DEP}@{DEP_VERSION}")) {
+        return;
+    }
+    if major <= 6 {
+        println!("N/A {suite}: npm {major} writes a v1 lock (vendoring refuses it)");
+        return;
+    }
+    let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js")).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    stage_patch_with_vuln(&proj, &purl, "package/index.js", &orig, &patched, TAIL_GHSA);
+    let locks = npm_e2e_common::commit_lock_flavor(&proj, LockFlavor::Shrinkwrap, major);
+    assert_eq!(locks.len(), if major >= 12 { 2 } else { 1 }, "{locks:?}");
+    let pristine: Vec<(&'static str, Vec<u8>)> = locks
+        .iter()
+        .map(|l| (*l, std::fs::read(proj.join(l)).unwrap()))
+        .collect();
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("vendor_npm_sibling_lock_unwired"),
+        "every committed lock must be rewired: {stdout}"
+    );
+    let tgz_rel = format!(".socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
+    for lock in &locks {
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(proj.join(lock)).unwrap()).unwrap();
+        assert_eq!(
+            v["packages"][format!("node_modules/{DEP}")]["resolved"],
+            format!("file:{tgz_rel}"),
+            "{lock} must resolve to the vendored tarball"
+        );
+    }
+
+    let fresh = tmp.path().join("fresh");
+    npm_e2e_common::fresh_checkout(&proj, &fresh, &locks);
+    let ci = npm_e2e_common::npm_ci(&fresh, &tmp.path().join("fresh-npm-cache"));
+    assert!(
+        ci.status.success(),
+        "fresh-checkout `npm ci` (shrinkwrap) must succeed.\n{}",
+        npm_e2e_common::output_text(&ci)
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+        patched,
+        "npm {major} must install the PATCHED bytes from the shrinkwrap checkout"
+    );
+    vendored_manifestless_tail(
+        "flavor=shrinkwrap install=patched",
+        &fresh,
+        &patched,
+        TAIL_GHSA,
+        pristine.clone(),
+        &[VexVia::Apply, VexVia::Vendor],
+    );
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--revert",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "revert failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    for (lock, bytes) in &pristine {
+        assert_eq!(
+            &std::fs::read(proj.join(lock)).unwrap(),
+            bytes,
+            "revert must restore {lock} byte-for-byte"
+        );
+    }
+    assert!(!proj.join(".socket/vendor/npm").exists());
+}
+
+/// npm 6 cross-version cell. npm 6 writes lockfileVersion 1, which vendoring
+/// refuses — but a v2 lock (written by npm 7/8 for exactly this audience)
+/// keeps a legacy `dependencies` mirror that npm 6 installs from, and the
+/// vendor backend rewires the mirror too. Prove it end to end: a modern npm
+/// writes the v2 lock, `vendor` rewires both halves, npm 6's fresh `npm ci`
+/// installs the PATCHED bytes, and the manifest-less tail attests them.
+/// N/A for npm >= 7 (their own v2/v3 flows are the capstones above).
+#[test]
+fn npm6_installs_a_vendored_v2_lock_from_its_legacy_mirror() {
+    let suite = "e2e_vendor_npm_build (npm 6 × v2 lock)";
+    let Some(major) = npm_major_or_skip(suite) else {
+        return;
+    };
+    if major > 6 {
+        println!("N/A {suite}: npm {major} is not npm 6");
+        return;
+    }
+    let Some(writer) = npm_e2e_common::modern_npm_writer() else {
+        npm_e2e_common::skip(
+            suite,
+            "no npm >= 7 to write the v2 lock (set SOCKET_PATCH_NPM_E2E_LOCK_WRITER_BIN)",
+        );
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(
+        proj.join("package.json"),
+        r#"{"name":"vendor-npm6","version":"0.0.0","private":true}"#,
+    )
+    .unwrap();
+    let cache = tmp.path().join("npm-cache");
+    let install = npm_e2e_common::npm_command_for(&writer, &proj)
+        .args([
+            "install",
+            &format!("{DEP}@{DEP_VERSION}"),
+            "--lockfile-version",
+            "2",
+            "--no-audit",
+            "--no-fund",
+            "--cache",
+            cache.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    if !install.status.success() {
+        npm_e2e_common::skip(suite, &npm_e2e_common::output_text(&install));
+        return;
+    }
+    assert_eq!(npm_e2e_common::lockfile_version(&proj), Some(2));
+    let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js")).unwrap();
+    let patched: Vec<u8> = [MARKER.as_bytes(), orig.as_slice()].concat();
+    let purl = format!("pkg:npm/{DEP}@{DEP_VERSION}");
+    stage_patch_with_vuln(&proj, &purl, "package/index.js", &orig, &patched, TAIL_GHSA);
+    let lock_before = std::fs::read(proj.join("package-lock.json")).unwrap();
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "vendor failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let lock: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proj.join("package-lock.json")).unwrap()).unwrap();
+    let want = format!("file:.socket/vendor/npm/{UUID}/{DEP}-{DEP_VERSION}.tgz");
+    assert_eq!(
+        lock["packages"][format!("node_modules/{DEP}")]["resolved"],
+        want
+    );
+    assert_eq!(
+        lock["dependencies"][DEP]["resolved"], want,
+        "the v2 legacy mirror (what npm 6 reads) must be rewired too"
+    );
+
+    let fresh = tmp.path().join("fresh");
+    npm_e2e_common::fresh_checkout(&proj, &fresh, &["package-lock.json"]);
+    let ci = npm_e2e_common::npm_ci(&fresh, &tmp.path().join("fresh-npm-cache"));
+    assert!(
+        ci.status.success(),
+        "npm {major} `npm ci` of the vendored v2 lock must succeed.\n{}",
+        npm_e2e_common::output_text(&ci)
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+        patched,
+        "npm 6 must install the PATCHED bytes from the vendored tarball"
+    );
+    vendored_manifestless_tail(
+        "flavor=package-lock-v2 install=patched",
+        &fresh,
+        &patched,
+        TAIL_GHSA,
+        vec![("package-lock.json", lock_before)],
+        &[VexVia::Apply, VexVia::Vendor],
     );
 }

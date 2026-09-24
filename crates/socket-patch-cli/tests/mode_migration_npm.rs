@@ -33,6 +33,13 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+// yarn legs: release selection (classic) + the manifest-less VEX matrices.
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+#[path = "yarn_berry_common/mod.rs"]
+mod yarn_berry_common;
+#[path = "common/yarn_classic_vex.rs"]
+mod yarn_classic_vex;
 
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
@@ -45,7 +52,6 @@ const UUID_H: &str = "8d9e0f1a-2b3c-4d4e-8f5a-6b7c8d9e0f1a";
 const TOKEN: &str = "44444444-4444-4444-8444-444444444444";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const GHSA: &str = "GHSA-migr-npm-test";
-const YARN_CLASSIC: &str = "yarn@1.22.22";
 const YARN_BERRY: &str = "yarn@4.12.0";
 
 // ── self-contained helpers (harness patterns shared with the redirect /
@@ -566,7 +572,7 @@ fn assert_pure_vendored_and_round_trip(
         let fresh_cache = fx.tmp.path().join(format!("fresh-cache-{tag}"));
         corepack(
             &fresh,
-            YARN_CLASSIC,
+            &yarn_classic_vex::yarn_classic(),
             &["install", "--frozen-lockfile", "--offline", "--no-progress"],
             &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
         )
@@ -615,11 +621,112 @@ fn assert_pure_vendored_and_round_trip(
     );
 }
 
+/// Manifest-less VEX after a classic takeover (yarn classic legs only): a
+/// fresh checkout of the terminal state, really installed (`--offline` for
+/// vendored — the committed tarball is the only source), then the
+/// `ManifestlessVex` matrix for the surviving patch `uuid`. The displaced
+/// patch `gone_uuid` must never be attested: the takeover removed its
+/// wiring, whatever else survived.
+#[allow(clippy::too_many_arguments)]
+fn classic_manifestless_vex(
+    fx: &YarnFixture,
+    tag: &str,
+    wiring: yarn_classic_vex::Wiring,
+    uuid: &str,
+    cve: &str,
+    gone_uuid: &str,
+    patch_server_url: Option<String>,
+    registry_lock: &[u8],
+) {
+    use yarn_classic_vex::{via_apply, via_vendor, yarn_classic, ManifestlessVex, Wiring};
+    let fresh = fresh_checkout(&fx.proj, fx.tmp.path(), tag, false);
+    let cache = fx.tmp.path().join(format!("fresh-cache-{tag}"));
+    let args: &[&str] = match wiring {
+        Wiring::Vendored => &["install", "--frozen-lockfile", "--offline", "--no-progress"],
+        Wiring::Hosted => &["install", "--frozen-lockfile", "--no-progress"],
+    };
+    let ci = corepack(
+        &fresh,
+        &yarn_classic(),
+        args,
+        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+    );
+    assert!(
+        ci.status.success(),
+        "{tag}: fresh-checkout install failed:\n{}",
+        String::from_utf8_lossy(&ci.stderr)
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap(),
+        fx.patched,
+        "{tag}: fresh install must carry the patched bytes"
+    );
+    let api = vex_e2e_common::PatchApi::start(vec![(
+        uuid.to_string(),
+        vex_e2e_common::patch_view(
+            uuid,
+            PURL,
+            &[("package/index.js", &git_sha256(&fx.patched))],
+            &[(GHSA, &[cve])],
+        ),
+    )]);
+    let m = ManifestlessVex {
+        leg: tag,
+        wiring,
+        purl: PURL,
+        uuid,
+        vulns: &[(GHSA, &[cve])],
+        api: &api,
+        proxy_override: None,
+        patch_server_url,
+        registry_lock: registry_lock.to_vec(),
+        reinstall: Some(Box::new(|dir: &Path| {
+            std::fs::remove_dir_all(dir.join("node_modules")).expect("rm node_modules");
+            let out = corepack(
+                dir,
+                &yarn_classic(),
+                &["install", "--frozen-lockfile", "--no-progress"],
+                &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+            );
+            assert!(
+                out.status.success(),
+                "{tag}: reverted-lock install failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                std::fs::read(dir.join("node_modules").join(DEP).join("index.js")).unwrap(),
+                fx.orig,
+                "{tag}: the reverted lock installs pristine bytes"
+            );
+        })),
+        embedded: match wiring {
+            Wiring::Vendored => vec![("apply --vex", via_apply()), ("vendor --vex", via_vendor())],
+            Wiring::Hosted => vec![("apply --vex", via_apply())],
+        },
+    };
+    vex_e2e_common::strip_manifest(&fresh);
+    let out = vex_e2e_common::run_vex(&vex_e2e_common::binary(), &fresh, &m.online());
+    assert!(
+        !out.stdout.contains(gone_uuid)
+            && !out
+                .doc
+                .as_ref()
+                .is_some_and(|d| d.to_string().contains(gone_uuid)),
+        "{tag}: the displaced patch must not be attested:\n{out}"
+    );
+    m.run(&fresh);
+}
+
 // ── hosted → vendored takeover, yarn classic ────────────────────────────────
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_hosted_then_vendored_takeover_round_trips_to_registry() {
-    let Some(fx) = stage_yarn_fixture("classic", YARN_CLASSIC, false) else {
+    let pm = yarn_classic_vex::yarn_classic();
+    if !yarn_classic_vex::installs_file_tarballs(&yarn_classic_vex::yarn_classic_version()) {
+        println!("N/A classic hosted→vendored: {pm} cannot install vendored `file:` tarballs");
+        return;
+    }
+    let Some(fx) = stage_yarn_fixture("classic", &pm, false) else {
         return;
     };
     let proj = fx.proj.clone();
@@ -660,6 +767,20 @@ async fn classic_hosted_then_vendored_takeover_round_trips_to_registry() {
     assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
     assert_eq!(envelope["summary"]["applied"], 1, "{stdout}");
+
+    // Manifest-less VEX of the takeover's terminal (vendored) state.
+    tokio::task::block_in_place(|| {
+        classic_manifestless_vex(
+            &fx,
+            "classic-h2v-vex",
+            yarn_classic_vex::Wiring::Vendored,
+            UUID_V,
+            "CVE-2026-99999",
+            UUID_H,
+            None,
+            &lock_pristine,
+        )
+    });
 
     assert_pure_vendored_and_round_trip(
         &fx,
@@ -717,6 +838,42 @@ async fn berry_hosted_then_vendored_takeover_round_trips_to_registry() {
     let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
     assert_eq!(envelope["summary"]["applied"], 1, "{stdout}");
 
+    // MANIFEST-LESS VEX over the post-takeover (pure vendored) state, before
+    // the round trip below reverts it: the superseded HOSTED patch (UUID_H,
+    // same advisory) must never be attested alongside the vendored one — the
+    // matrix's exact-statement-set assertions would see it.
+    let tgz_rel = format!(".socket/vendor/npm/{UUID_V}/{DEP}-{DEP_VERSION}.tgz");
+    let registry_state = [
+        ("yarn.lock", lock_pristine.clone()),
+        ("package.json", pkg_json_pristine.clone().into_bytes()),
+    ];
+    let yarn =
+        |cwd: &Path, args: &[&str], env: &[(&str, &str)]| corepack(cwd, YARN_BERRY, args, env);
+    let yarnrc = read(&proj, ".yarnrc.yml");
+    let flow = yarn_berry_common::BerryVexFlow {
+        flow: "hosted-then-vendored-takeover",
+        yarn_spec: YARN_BERRY,
+        wiring: yarn_berry_common::BerryWiring::Vendored {
+            artifact_rel: tgz_rel,
+        },
+        proj: &proj,
+        scratch: fx.tmp.path(),
+        committable: &["package.json", "yarn.lock"],
+        yarnrc: &yarnrc,
+        registry_state: &registry_state,
+        purl: PURL,
+        uuid: UUID_V,
+        vulns: &[(GHSA, &["CVE-2026-99999"])],
+        patched: &fx.patched,
+        pristine: &fx.orig,
+        installed: "node_modules/left-pad/index.js",
+        registry_cache: proj.join(".yarn/cache"),
+        yarn: &yarn,
+        flow_api: None,
+        pnp_cell: false,
+    };
+    yarn_berry_common::off_runtime(|| yarn_berry_common::run_manifestless_vex_matrix(&flow));
+
     assert_pure_vendored_and_round_trip(
         &fx,
         "berry",
@@ -736,10 +893,12 @@ async fn berry_hosted_then_vendored_takeover_round_trips_to_registry() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
-    let Some(fx) = stage_yarn_fixture("classic-rev", YARN_CLASSIC, false) else {
+    let Some(fx) = stage_yarn_fixture("classic-rev", &yarn_classic_vex::yarn_classic(), false)
+    else {
         return;
     };
     let proj = fx.proj.clone();
+    let lock_pristine = std::fs::read(proj.join("yarn.lock")).unwrap();
 
     // A: vendor (offline).
     stage_patch(&proj, &fx.orig, &fx.patched);
@@ -804,7 +963,7 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
     let fresh_cache = fx.tmp.path().join("fresh-cache-classic-rev");
     let ci = corepack(
         &fresh,
-        YARN_CLASSIC,
+        &yarn_classic_vex::yarn_classic(),
         &["install", "--frozen-lockfile", "--no-progress"],
         &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
     );
@@ -819,4 +978,159 @@ async fn classic_vendored_then_hosted_takeover_leaves_pure_hosted() {
         installed.starts_with(MARKER.as_bytes()),
         "hosted install must carry the PATCHED bytes"
     );
+
+    // Manifest-less VEX of the takeover's terminal (hosted) state.
+    tokio::task::block_in_place(|| {
+        classic_manifestless_vex(
+            &fx,
+            "classic-v2h-vex",
+            yarn_classic_vex::Wiring::Hosted,
+            UUID_H,
+            "CVE-2026-3333",
+            UUID_V,
+            Some(server.uri()),
+            &lock_pristine,
+        )
+    });
+}
+
+// ── vendored → hosted takeover, yarn berry (reverse direction) ─────────────
+// The berry twin of the classic reverse leg: the hosted scan must revert the
+// vendored wiring (the root `resolutions` entry AND the `file:` lock entry),
+// the ledger entry and the committed artifact FIRST, then redirect. The
+// terminal state is proven by a fresh `--immutable --check-cache` install
+// from the hosted tarball, then by the manifest-less VEX matrix over it:
+// the displaced VENDORED patch (UUID_V) must never be attested.
+#[tokio::test(flavor = "multi_thread")]
+#[serial_test::serial]
+async fn berry_vendored_then_hosted_takeover_leaves_pure_hosted() {
+    let Some(fx) = stage_yarn_fixture("berry-rev", YARN_BERRY, true) else {
+        return;
+    };
+    let proj = fx.proj.clone();
+    let lock_pristine = std::fs::read(proj.join("yarn.lock")).unwrap();
+    let pkg_json_pristine = read(&proj, "package.json");
+
+    // A: vendor (offline).
+    stage_patch(&proj, &fx.orig, &fx.patched);
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 0, "vendor failed: {stdout}\n{stderr}");
+    assert!(
+        read(&proj, "package.json").contains(".socket/vendor/npm/"),
+        "berry vendoring adds the resolutions entry"
+    );
+
+    // B: hosted redirect over the vendored state — the takeover.
+    let tgz_path = fx.tmp.path().join("patched.tgz");
+    build_patched_tgz(&proj.join("node_modules").join(DEP), &fx.patched, &tgz_path);
+    let tgz = std::fs::read(&tgz_path).unwrap();
+    let Some(checksum) = bootstrap_berry_checksum(fx.tmp.path(), &tgz_path) else {
+        return;
+    };
+    let server = MockServer::start().await;
+    let hosted_url =
+        mount_hosted_mocks(&server, &tgz, &fx.orig, &fx.patched, Some(&checksum)).await;
+    let (code, stdout, stderr) = run_hosted_scan(&proj, &server.uri());
+    assert_eq!(code, 0, "hosted scan failed: {stdout}\n{stderr}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
+    assert_eq!(envelope["redirect"]["redirected"], 1, "{stdout}");
+    assert!(
+        stdout.contains("redirect_takeover_reverted_vendored"),
+        "takeover warning missing: {stdout}"
+    );
+
+    // Fully hosted: no vendored ledger claim, artifact, resolutions entry or
+    // `file:` residue; the lock pins the hosted archive.
+    assert!(
+        !read(&proj, ".socket/vendor/state.json").contains(PURL),
+        "the displaced vendored ledger entry must be dropped"
+    );
+    assert!(
+        !proj.join(format!(".socket/vendor/npm/{UUID_V}")).exists(),
+        "the orphaned committed artifact must be removed"
+    );
+    assert_eq!(
+        read(&proj, "package.json"),
+        pkg_json_pristine,
+        "the berry resolutions entry must be reverted"
+    );
+    let lock = read(&proj, "yarn.lock");
+    let encoded = socket_patch_core::utils::uri::encode_uri_component(&hosted_url);
+    assert!(
+        lock.contains("::__archiveUrl=") && lock.contains(&encoded) && lock.contains(&checksum),
+        "lock points hosted:\n{lock}"
+    );
+    assert!(
+        !lock.contains(".socket/vendor/"),
+        "no vendored residue in the lock:\n{lock}"
+    );
+
+    // Fresh checkout installs the patched bytes from the hosted tarball.
+    let fresh = fresh_checkout(&proj, fx.tmp.path(), "berry-rev", true);
+    let host = server.uri().replace("http://", "");
+    let yarnrc = format!(
+        "nodeLinker: node-modules\nenableGlobalCache: false\n\
+         unsafeHttpWhitelist:\n  - \"{}\"\nnpmRegistryServer: \"http://127.0.0.1:1\"\n",
+        host.split(':').next().unwrap_or("127.0.0.1")
+    );
+    std::fs::write(fresh.join(".yarnrc.yml"), &yarnrc).unwrap();
+    let fresh_global = fx.tmp.path().join("fresh-global-berry-rev");
+    let ci = corepack(
+        &fresh,
+        YARN_BERRY,
+        &["install", "--immutable", "--check-cache"],
+        &[("YARN_GLOBAL_FOLDER", fresh_global.to_str().unwrap())],
+    );
+    assert!(
+        ci.status.success(),
+        "fresh-checkout hosted install must succeed.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ci.stdout),
+        String::from_utf8_lossy(&ci.stderr),
+    );
+    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    assert_eq!(
+        installed, fx.patched,
+        "hosted install must carry the PATCHED bytes"
+    );
+
+    // MANIFEST-LESS VEX over the pure hosted state (see yarn_berry_common).
+    let registry_state = [("yarn.lock", lock_pristine)];
+    let yarn =
+        |cwd: &Path, args: &[&str], env: &[(&str, &str)]| corepack(cwd, YARN_BERRY, args, env);
+    let api_url = server.uri();
+    let flow = yarn_berry_common::BerryVexFlow {
+        flow: "vendored-then-hosted-takeover",
+        yarn_spec: YARN_BERRY,
+        wiring: yarn_berry_common::BerryWiring::Hosted {
+            patch_server: api_url.clone(),
+        },
+        proj: &proj,
+        scratch: fx.tmp.path(),
+        committable: &["package.json", "yarn.lock"],
+        yarnrc: &yarnrc,
+        registry_state: &registry_state,
+        purl: PURL,
+        uuid: UUID_H,
+        vulns: &[(GHSA, &["CVE-2026-3333"])],
+        patched: &fx.patched,
+        pristine: &fx.orig,
+        installed: "node_modules/left-pad/index.js",
+        registry_cache: proj.join(".yarn/cache"),
+        yarn: &yarn,
+        flow_api: Some(yarn_berry_common::FlowApi {
+            api_url,
+            org: ORG.to_string(),
+        }),
+        pnp_cell: false,
+    };
+    yarn_berry_common::off_runtime(|| yarn_berry_common::run_manifestless_vex_matrix(&flow));
 }

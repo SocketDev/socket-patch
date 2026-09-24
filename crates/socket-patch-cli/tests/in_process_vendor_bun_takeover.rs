@@ -43,6 +43,9 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "vex_e2e_common/bun.rs"]
+mod bun_vex;
+
 const ORG: &str = "test-org";
 const NAME: &str = "left-pad";
 const VERSION: &str = "1.3.0";
@@ -54,6 +57,10 @@ const HOSTED_URL: &str = "http://patch.test/patch/npm/left-pad/1.3.0/55555555-55
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 const ORIG_INDEX: &[u8] = b"module.exports = () => 'orig';\n";
 const PATCHED_INDEX: &[u8] = b"module.exports = () => 'patched';\n";
+/// The vulnerability the patch record carries — what manifest-less VEX must
+/// attest after each mode lands.
+const GHSA: &str = "GHSA-bunt-akeo-0001";
+const CVE: &str = "CVE-2026-5555";
 
 /// The second hosted record of the scoped-unwind scenarios.
 const OTHER_NAME: &str = "other";
@@ -145,7 +152,10 @@ fn patch_record(uuid: &str) -> Value {
                 "afterHash": compute_git_sha256_from_bytes(PATCHED_INDEX),
             }
         },
-        "vulnerabilities": {},
+        "vulnerabilities": { GHSA: {
+            "cves": [CVE], "summary": "bun takeover vuln",
+            "severity": "high", "description": "d"
+        }},
         "description": "bun takeover fixture",
         "license": "MIT",
         "tier": "free"
@@ -235,6 +245,36 @@ async fn mock_api(server: &MockServer) {
         .respond_with(ResponseTemplate::new(200).set_body_json(view))
         .mount(server)
         .await;
+}
+
+/// The manifest-less VEX step ([`bun_vex::run_bun_vex_matrix`]) on a
+/// lockfile-only checkout of `root` (no bun here: nothing is installed, so
+/// a hosted ref is judged by the lock's sha512 pin and a vendored one by
+/// the committed artifact): attested with `mode`'s marker from the ledger
+/// and from the lock + patch API; offline → `record_unavailable`; the
+/// pristine lock back → NOT attested.
+fn manifestless_vex(
+    root: &Path,
+    scratch: &Path,
+    mode: bun_vex::BunMode,
+    pristine: &[u8],
+    tag: &str,
+) {
+    let case = bun_vex::BunVexCase {
+        tag,
+        mode,
+        purl: PURL,
+        uuid: UUID,
+        files: vec![(
+            "package/index.js".to_string(),
+            compute_git_sha256_from_bytes(PATCHED_INDEX),
+        )],
+        vulns: &[(GHSA, &[CVE])],
+        lock: "bun.lock",
+        registry_lock: pristine.to_vec(),
+        patch_server_url: Some("http://patch.test".to_string()),
+    };
+    bun_vex::run_bun_vex_matrix(root, scratch, &case, |_| {});
 }
 
 // ───────────────────────── subprocess runner ─────────────────────────
@@ -426,6 +466,14 @@ async fn bun_hosted_then_scan_vendored_takeover_round_trips_to_registry() {
         json!(LEFT_PAD_REGISTRY_LINE),
         "{ledger:#}"
     );
+    let scratch = tempfile::tempdir().unwrap();
+    manifestless_vex(
+        root,
+        scratch.path(),
+        bun_vex::BunMode::Hosted,
+        &pristine,
+        "hosted",
+    );
 
     // The scan-side vendored preview is ledger-only by contract
     // (`would_vendor` / `already_vendored` / `would_revendor`, CLI_CONTRACT
@@ -465,6 +513,13 @@ async fn bun_hosted_then_scan_vendored_takeover_round_trips_to_registry() {
     assert!(
         !root.join(".socket/manifest.json").exists(),
         "a vendored scan must not write a manifest"
+    );
+    manifestless_vex(
+        root,
+        scratch.path(),
+        bun_vex::BunMode::Vendored,
+        &pristine,
+        "vendored",
     );
 
     // C: a re-run is an in-sync no-op with no second takeover.

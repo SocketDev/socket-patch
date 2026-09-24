@@ -784,6 +784,129 @@ VARIANTS = [
 VARIANT_INSTALLS = ['frozen', 'locked', 'plain']
 
 
+VEX_PURL = 'pkg:pypi/urllib3@1.26.18'
+VEX_LEDGERS = ['.socket/vendor/state.json', '.socket/vendor/redirect-state.json']
+
+
+def vex(case, key, rows, *flags):
+    """Run `socket-patch vex --json --output` in `case` and record whether
+    urllib3 was attested, under which provenance marker, and the skip reason
+    when it was not."""
+    doc_path = case / 'vex.json'
+    doc_path.unlink(missing_ok=True)
+    row = run(
+        CLI,
+        [
+            'vex', '--cwd', str(case), '--json', '--output', str(doc_path),
+            '--product', 'pkg:pypi/socket-uv-patch-fixture@0.1.0', *flags,
+        ],
+        case,
+        key,
+        rows,
+    )
+    try:
+        doc = json.loads(doc_path.read_text())
+    except (OSError, ValueError):
+        doc = {}
+    statements = [
+        st
+        for st in doc.get('statements', [])
+        if any(
+            sub.get('@id', '').split('?')[0] == VEX_PURL
+            for product in st.get('products', [])
+            for sub in product.get('subcomponents', [])
+        )
+    ]
+    row['vexAttested'] = bool(statements)
+    row['vexMarkers'] = sorted(
+        {
+            marker
+            for st in statements
+            for marker in ['redirected', 'vendored']
+            if f'({marker})' in st.get('impact_statement', '')
+        }
+    )
+    try:
+        envelope = json.loads(row['stdout'])
+    except ValueError:
+        envelope = {}
+    row['vexSkip'] = next(
+        (
+            event.get('errorCode')
+            for event in envelope.get('events', [])
+            if event.get('action') == 'skipped'
+            and event.get('purl', '').split('?')[0] == VEX_PURL
+        ),
+        (envelope.get('error') or {}).get('code'),
+    )
+    return row
+
+
+def vex_matrix(version):
+    """Manifest-less VEX over every installed hosted / vendored case: with
+    `.socket/manifest.json` deleted, `vex` must attest urllib3 with the
+    mode's marker; with both ledgers deleted too it must still attest (the
+    lockfile references + the public patch API); `--offline` then has no
+    record (`record_unavailable`); and for the native project cases, the
+    pair reverted to the registry lock with the ledgers left behind must
+    NOT attest — verified or `--no-verify`. Each case runs in a copy, so
+    the other phases' results are untouched."""
+    base = ROOT / 'matrix' / version
+    rows = []
+    cases = [
+        ('project', ['pyproject.toml', 'uv.lock']),
+        ('export-pylock', None),
+        ('script-direct', None),
+        ('pylock-direct', None),
+    ]
+    for kind, revert in cases:
+        for mode in ['hosted', 'vendored']:
+            source = base / (kind + '-' + mode)
+            if not (source / '.venv').is_dir():
+                continue
+            case = base / (kind + '-' + mode + '-vex')
+            shutil.rmtree(case, ignore_errors=True)
+            shutil.copytree(
+                source,
+                case,
+                symlinks=True,
+                ignore=shutil.ignore_patterns('.uv-cache', 'vex.json'),
+            )
+            (case / '.socket' / 'manifest.json').unlink(missing_ok=True)
+            prefix = kind + '-' + mode + '-vex-'
+            vex(case, prefix + 'manifest-deleted', rows)
+            ledgers = {
+                name: (case / name).read_bytes()
+                for name in VEX_LEDGERS
+                if (case / name).is_file()
+            }
+            for name in ledgers:
+                (case / name).unlink()
+            vex(case, prefix + 'ledgers-deleted', rows)
+            vex(case, prefix + 'offline', rows, '--offline')
+            if revert:
+                for name, data in ledgers.items():
+                    (case / name).write_bytes(data)
+                for name in revert:
+                    shutil.copyfile(base / 'original' / name, case / name)
+                # project_matrix exports the WIRED lock beside it; a
+                # `pylock.toml` export is live wiring of its own (`uv pip
+                # sync pylock.toml` installs the patch), so a revert that
+                # left it would rightly still attest.
+                for name in ['pylock.toml', 'export-requirements.txt']:
+                    (case / name).unlink(missing_ok=True)
+                shutil.rmtree(case / '.venv', ignore_errors=True)
+                vex(case, prefix + 'reverted', rows)
+                vex(case, prefix + 'reverted-no-verify', rows, '--no-verify')
+    (base / 'vex-backtest.json').write_text(
+        json.dumps({'version': version, 'commands': rows}, indent=2) + '\n'
+    )
+    return {
+        'version': version,
+        'commands': [(r['key'], r['exitCode'], r['vexAttested']) for r in rows],
+    }
+
+
 def variant_matrix(version):
     exe = ROOT / 'bin' / version / 'uv'
     base = ROOT / 'matrix' / version
@@ -936,6 +1059,7 @@ def write_summary():
             'format-backtest.json',
             'unfrozen-backtest.json',
             'variant-backtest.json',
+            'vex-backtest.json',
         ]:
             path = base / filename
             if not path.exists():
@@ -981,6 +1105,9 @@ def write_summary():
                     item['lockUnchanged'] = row['lockUnchanged']
                 if 'patchInLock' in row:
                     item['patchInLock'] = row['patchInLock']
+                for field in ['vexAttested', 'vexMarkers', 'vexSkip']:
+                    if field in row:
+                        item[field] = row[field]
                 if row.get('installedResponseSha256'):
                     item['installedResponseSha256'] = row['installedResponseSha256']
                     item['installedPatch'] = (
@@ -1318,6 +1445,7 @@ def backtest(version):
         format_matrix(version),
         unfrozen_matrix(version),
         variant_matrix(version),
+        vex_matrix(version),
     ]
 
 

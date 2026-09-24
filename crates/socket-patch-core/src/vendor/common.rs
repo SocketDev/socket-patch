@@ -572,32 +572,62 @@ pub(crate) fn lock_units_named<'a>(lock: &'a DocumentMut, canon_name: &str) -> V
         .unwrap_or_default()
 }
 
+/// The pyproject table a PEP 508 dependency string is declared in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeclTable {
+    /// `[project] dependencies`.
+    Project,
+    /// A `[project.optional-dependencies]` extra.
+    Optional,
+    /// A PEP 735 `[dependency-groups]` group.
+    Group,
+    /// A Hatch environment's `dependencies` / `extra-dependencies`
+    /// (`utils::hatch::dependency_specs`).
+    Env,
+}
+
+/// Every PEP 508 string of `doc`'s PEP 621 / PEP 735 declaration tables, in
+/// document order: `[project] dependencies`, then each
+/// `[project.optional-dependencies]` extra, then each `[dependency-groups]`
+/// group. Non-string members (a PEP 735 `{include-group = …}`) and
+/// non-array groups are skipped. The one walk the uv / pdm / poetry
+/// classifiers, the uv metadata rewriter, the Hatch planner and lockfile
+/// discovery share; each applies its own name rule to the strings.
+pub(crate) fn pyproject_dependency_specs(doc: &DocumentMut) -> Vec<(DeclTable, &str)> {
+    fn strings(item: Option<&Item>) -> impl Iterator<Item = &str> {
+        item.and_then(Item::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml_edit::Value::as_str)
+    }
+    fn groups(item: Option<&Item>) -> impl Iterator<Item = (&str, &Item)> {
+        item.and_then(Item::as_table_like)
+            .into_iter()
+            .flat_map(|table| table.iter())
+    }
+    let project = doc.get("project");
+    let mut specs: Vec<(DeclTable, &str)> = strings(project.and_then(|p| p.get("dependencies")))
+        .map(|s| (DeclTable::Project, s))
+        .collect();
+    for (_, group) in groups(project.and_then(|p| p.get("optional-dependencies"))) {
+        specs.extend(strings(Some(group)).map(|s| (DeclTable::Optional, s)));
+    }
+    for (_, group) in groups(doc.get("dependency-groups")) {
+        specs.extend(strings(Some(group)).map(|s| (DeclTable::Group, s)));
+    }
+    specs
+}
+
 /// Collect the PEP 621 `[project] dependencies` / `optional-dependencies`
 /// distribution names into `declared` — the pyproject surface shared by the
 /// poetry/pdm/uv dep classifiers (each adds its tool-specific tables on top).
 pub(crate) fn pep621_declared_names(doc: &DocumentMut, declared: &mut Vec<String>) {
-    let Some(project) = doc.get("project") else {
-        return;
-    };
-    if let Some(deps) = item_get(project, "dependencies").and_then(Item::as_array) {
-        declared.extend(
-            deps.iter()
-                .filter_map(toml_edit::Value::as_str)
-                .map(|s| pep508_name(s).to_string()),
-        );
-    }
-    if let Some(optional) = item_get(project, "optional-dependencies").and_then(Item::as_table_like)
-    {
-        for (_, item) in optional.iter() {
-            if let Some(arr) = item.as_array() {
-                declared.extend(
-                    arr.iter()
-                        .filter_map(toml_edit::Value::as_str)
-                        .map(|s| pep508_name(s).to_string()),
-                );
-            }
-        }
-    }
+    declared.extend(
+        pyproject_dependency_specs(doc)
+            .into_iter()
+            .filter(|(table, _)| *table != DeclTable::Group)
+            .map(|(_, spec)| pep508_name(spec).to_string()),
+    );
 }
 
 /// Shared revert for the single-file, single-kind lock-splice backends
@@ -749,6 +779,26 @@ mod tests {
     use super::*;
 
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+    /// `[project] dependencies` and every optional-dependencies extra, by
+    /// PEP 508 name; groups, tool tables, non-array extras and non-string
+    /// members are not PEP 621 declarations.
+    #[test]
+    fn pep621_declared_names_reads_dependencies_and_extras_only() {
+        let doc: DocumentMut = "[project]\ndependencies = [\" Alpha >=1\", 3]\n\
+                                [project.optional-dependencies]\nx = [\"beta[extra]; os_name == 'nt'\"]\n\
+                                y = \"gamma\"\nz = [{ include = 1 }, \"delta\"]\n\
+                                [dependency-groups]\nqa = [\"epsilon\"]\n\
+                                [tool.uv]\ndev-dependencies = [\"zeta\"]\n"
+            .parse()
+            .unwrap();
+        let mut declared = vec!["kept".to_string()];
+        pep621_declared_names(&doc, &mut declared);
+        assert_eq!(declared, ["kept", "Alpha", "beta", "delta"]);
+        let mut none = Vec::new();
+        pep621_declared_names(&"[tool.x]\ny = 1\n".parse().unwrap(), &mut none);
+        assert!(none.is_empty());
+    }
 
     /// An archive over the size cap reads as out-of-sync (`None`) without
     /// being read, and one within it is returned whole.

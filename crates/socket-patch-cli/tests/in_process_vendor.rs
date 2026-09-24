@@ -27,6 +27,11 @@ use socket_patch_cli::args::GlobalArgs;
 use socket_patch_cli::commands::vendor::{run as vendor_run, VendorArgs};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
+#[path = "npm_e2e_common/manifestless.rs"]
+mod npm_e2e_common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+
 /// Canonical-grammar patch UUID — the vendor path layer validates the uuid
 /// path level fail-closed, so fixtures must use the real shape.
 const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
@@ -2722,6 +2727,86 @@ snapshots:
             "revert must byte-restore the pristine registry lock"
         );
     }
+
+    /// package-lock.json twin of [`write_pnpm_project`]: a lockfileVersion 3
+    /// lock resolving the package from the registry.
+    fn write_package_lock_project(root: &Path) {
+        std::fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{CONV_NAME}": "{CONV_VERSION}" }} }}"#
+            ),
+        )
+        .unwrap();
+        let pkg = root.join("node_modules").join(CONV_NAME);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            format!(r#"{{ "name": "{CONV_NAME}", "version": "{CONV_VERSION}" }}"#),
+        )
+        .unwrap();
+        std::fs::write(pkg.join("index.js"), ORIG_INDEX).unwrap();
+        let lock = json!({
+            "name": "consumer", "version": "0.0.0", "lockfileVersion": 3, "requires": true,
+            "packages": {
+                "": { "name": "consumer", "version": "0.0.0", "dependencies": { CONV_NAME: CONV_VERSION } },
+                format!("node_modules/{CONV_NAME}"): {
+                    "version": CONV_VERSION,
+                    "resolved": format!("https://registry.npmjs.org/{CONV_NAME}/-/{CONV_NAME}-{CONV_VERSION}.tgz"),
+                    "integrity": UPSTREAM_SHA512,
+                }
+            }
+        });
+        let mut bytes = serde_json::to_vec_pretty(&lock).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(root.join("package-lock.json"), bytes).unwrap();
+    }
+
+    /// Hosted → vendored takeover on a package-lock project: the hosted run
+    /// auto-configures `allow-remote=all` in a NEW `.npmrc` (npm >= 12
+    /// refuses the hosted tarball otherwise); the vendor takeover reverts
+    /// the last package-lock redirect and, in the same transaction, deletes
+    /// the `.npmrc` it created — vendored `file:` specs never need it (npm
+    /// gates them by `allow-file`, default `all`).
+    #[tokio::test]
+    #[serial]
+    async fn hosted_then_vendor_takeover_removes_the_npmrc_allow_remote_config() {
+        let server = MockServer::start().await;
+        mock_hosted_api(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_package_lock_project(root);
+
+        let code = scan_run(hosted_args(root, server.uri())).await;
+        assert_eq!(code, 0, "scan --mode hosted must succeed");
+        assert!(std::fs::read_to_string(root.join("package-lock.json"))
+            .unwrap()
+            .contains(HOSTED_URL));
+        assert_eq!(
+            std::fs::read_to_string(root.join(".npmrc")).unwrap(),
+            "allow-remote=all\n",
+            "the hosted run auto-configures npm 12's allow-remote"
+        );
+
+        seed_manifest_and_blob(root);
+        let (code, env) = vendor_cli(root, &[]);
+        assert_eq!(code, 0, "vendor over the hosted lock must succeed: {env:#}");
+        find_event(&env, "applied", None);
+        find_event(&env, "skipped", Some("vendor_takeover_reverted_redirect"));
+        assert!(
+            !root.join(".npmrc").exists(),
+            "the takeover must remove the .npmrc the hosted run created: {env:#}"
+        );
+        let lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
+        assert!(
+            !lock.contains(HOSTED_URL) && lock.contains(".socket/vendor/"),
+            "{lock}"
+        );
+        assert!(
+            !root.join(".socket/vendor/redirect-state.json").exists(),
+            "the emptied redirect ledger is deleted"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2888,4 +2973,63 @@ async fn revert_completes_when_lock_already_matches_the_original() {
             .map(|s| !s["entries"][PURL].is_object())
             .unwrap_or(true);
     assert!(state_gone, "ledger entry pruned once the revert converges");
+}
+
+/// Manifest-less VEX over the committed state of an in-process npm
+/// `vendor` (the in-process twin of `e2e_vendor_npm_build`'s tail): the
+/// committed tarball is the evidence, so the checkout attests `(vendored)`
+/// with the manifest deleted, with the ledgers deleted too (lockfile
+/// discovery + patch API), not `--offline` (`record_unavailable`, zero
+/// requests), and not once the lock is reverted (`vendor_unwired`,
+/// `--no-verify` too); embedded `apply --vex` / `vendor --vex` agree.
+#[tokio::test]
+async fn in_process_vendor_state_attests_manifest_less() {
+    const GHSA: &str = "GHSA-inpv-vend-npm0";
+    let fx = npm_fixture();
+    // Give the record a vulnerability so the document has statements.
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+    manifest["patches"][PURL]["vulnerabilities"] = json!({ GHSA: {
+        "cves": ["CVE-2026-7001"], "summary": "s", "severity": "high", "description": "d"
+    }});
+    std::fs::write(
+        fx.manifest_path(),
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "vendor");
+
+    let checkout = fx.root().join("checkout");
+    npm_e2e_common::fresh_checkout(fx.root(), &checkout, &["package-lock.json"]);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let api = vex_e2e_common::PatchApi::start(vec![(
+                    UUID.to_string(),
+                    vex_e2e_common::patch_view(
+                        UUID,
+                        PURL,
+                        &[("package/index.js", &fx.after_hash)],
+                        &[(GHSA, &["CVE-2026-7001"])],
+                    ),
+                )]);
+                npm_e2e_common::manifestless_vex_matrix(&npm_e2e_common::ManifestlessCase {
+                    label: "in-process vendor".to_string(),
+                    project: &checkout,
+                    purl: PURL,
+                    uuid: UUID,
+                    marker: vex_e2e_common::Marker::Vendored,
+                    vulns: &[(GHSA, &["CVE-2026-7001"])],
+                    api: &api,
+                    patch_server_url: None,
+                    registry_locks: vec![("package-lock.json", fx.original_lock.clone())],
+                    embedded: &[
+                        vex_e2e_common::VexVia::Apply,
+                        vex_e2e_common::VexVia::Vendor,
+                    ],
+                });
+            })
+            .join()
+            .expect("manifest-less VEX tail panicked");
+    });
 }

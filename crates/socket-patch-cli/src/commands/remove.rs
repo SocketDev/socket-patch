@@ -97,6 +97,19 @@ async fn emit_not_found(
     }
 }
 
+/// Print the hosted leg's run-level advisories (`Warning (<code>): …`) on
+/// stderr — never under `--silent` / `--json` (JSON carries them in the
+/// envelope's `warnings[]`). Printed as soon as the leg returns, so a
+/// human run that then fails still says what it did to the files.
+fn print_hosted_leg_warnings(common: &GlobalArgs, warnings: &[(String, String)]) {
+    if common.silent || common.json {
+        return;
+    }
+    for (code, detail) in warnings {
+        eprintln!("Warning ({code}): {detail}");
+    }
+}
+
 /// Emit a `remove` error envelope and return. Used by the many error
 /// paths in `run` so they all share the same JSON shape. `dry_run` rides
 /// the envelope so preview failures report `dryRun: true`.
@@ -741,6 +754,10 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // wiring above; `--preserve-state` still unwinds — hosted has no
     // preservable local state.
     let mut hosted_reverted_events: Vec<PatchEvent> = Vec::new();
+    // The hosted leg's run-level advisories (e.g.
+    // `redirect_npmrc_allow_remote_modified`): printed as they arrive,
+    // carried into the success envelope's `warnings[]`.
+    let mut hosted_leg_warnings: Vec<(String, String)> = Vec::new();
     if !args.skip_rollback {
         match load_redirect_state(cwd).await {
             Err(e) => {
@@ -759,7 +776,10 @@ pub async fn run(args: RemoveArgs) -> i32 {
                         match unwind_hosted(&args.common, &hosted_matches, &mut redirect_state)
                             .await
                         {
-                            Ok(leg) => leg,
+                            Ok(leg) => {
+                                hosted_leg_warnings.extend(leg.warnings.iter().cloned());
+                                leg
+                            }
                             Err(err) => {
                                 let (code, msg) = hosted_unwind_error(err, true);
                                 emit_error_envelope(
@@ -1045,6 +1065,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
         for ev in vendor_leg.skipped {
             env.record(ev);
         }
+        env.warnings
+            .extend(hosted_leg_warnings.iter().map(|(code, detail)| {
+                crate::json_envelope::RunWarning {
+                    code: code.clone(),
+                    detail: detail.clone(),
+                }
+            }));
         // One Removed event per purl whose manifest entry was deleted
         // (Verified on --dry-run).
         for purl in &removed {
@@ -1298,6 +1325,9 @@ async fn unwind_hosted(
     let replay_eligible = state.records.keys().all(|p| hosted_matches.contains(p));
     let before = (state.edits.len(), state.records.len());
     let leg = run_hosted_leg(common, hosted_matches, state, replay_eligible).await;
+    // Printed as soon as the leg returns, so a human run that then fails
+    // still says what it did to the files.
+    print_hosted_leg_warnings(common, &leg.warnings);
     if !common.dry_run && (state.edits.len(), state.records.len()) != before {
         if let Err(e) = persist_redirect_state(&common.cwd, state).await {
             return Err(HostedUnwindError::Persist(e.to_string()));
@@ -1441,6 +1471,12 @@ async fn remove_hosted_only(
     } else {
         PatchAction::Removed
     };
+    for (code, detail) in &leg.warnings {
+        env.warnings.push(crate::json_envelope::RunWarning {
+            code: code.clone(),
+            detail: detail.clone(),
+        });
+    }
     // Human per-purl lines already printed inside `run_hosted_leg`.
     for purl in &leg.reverted {
         env.record(PatchEvent::new(action, purl.clone()).with_reason(

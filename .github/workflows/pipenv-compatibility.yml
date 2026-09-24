@@ -23,6 +23,9 @@ on:
       - 'crates/socket-patch-cli/src/commands/vex.rs'
       - 'crates/socket-patch-core/src/patch/redirect/replay.rs'
       - 'scripts/backtest-pipenv.py'
+      - 'scripts/tests/test_backtest_harnesses.py'
+      - 'crates/socket-patch-core/src/vex/**'
+      - 'crates/socket-patch-cli/src/commands/vex_sources.rs'
       - '.github/workflows/pipenv-compatibility.yml'
   push:
     branches: [main]
@@ -70,6 +73,8 @@ jobs:
           cargo build --locked -p socket-patch-cli
           mkdir -p "$RUNNER_TEMP/bin"
           cp target/debug/socket-patch "$RUNNER_TEMP/bin/socket-patch"
+      - name: Harness unit tests
+        run: python3 -m unittest scripts/tests/test_backtest_harnesses.py
       - name: Run the Pipenv matrix
         env:
           SOCKET_NO_CONFIG: '1'

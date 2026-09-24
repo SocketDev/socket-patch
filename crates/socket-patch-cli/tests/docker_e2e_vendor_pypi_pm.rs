@@ -20,6 +20,13 @@
 //!     (lock + pyproject/Pipfile + .socket/) are copied to a fresh dir; the
 //!     tool's STRICTEST install runs cold+offline and a Python import probe
 //!     proves `six.py` is the PATCHED bytes.
+//!   stage 2b (poetry, `--network none`, then the host): manifest-less VEX
+//!     over copies of the installed fresh checkout — manifest deleted →
+//!     attested offline from the ledger (standalone + `apply --vex`);
+//!     ledgers deleted → attested from the poetry.lock wiring + a wiremock
+//!     patch API (host side), `record_unavailable` under `--offline`; lock
+//!     reverted with ledger + artifact kept → `vendor_unwired`, `--no-verify`
+//!     too.
 //!   stage 3 (`--network none`): re-vendor is idempotent (already_vendored,
 //!     lock byte-stable) → `vendor --revert` restores the lock byte-identical
 //!     to the pre-vendor snapshot and removes `.socket/vendor` → re-vendor
@@ -42,6 +49,8 @@
 
 #[path = "docker_vendor_common/mod.rs"]
 mod docker_vendor_common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
 use docker_vendor_common::{
     assert_stage_markers, bash_prelude, json_assert_fns, run_in_image, run_in_image_network_none,
@@ -141,6 +150,11 @@ mkdir -p /workspace/snap
 cp pyproject.toml /workspace/snap/pyproject.prevendor
 cp poetry.lock /workspace/snap/poetry.lock.prevendor
 
+# The staged record carries one advisory so the manifest-less VEX stage has
+# a statement to attest (a poetry-only wrapper; the shared body is as-is).
+eval "stage_patch_without_vuln() $(declare -f stage_patch | tail -n +2)"
+stage_patch() { stage_patch_without_vuln "$@" __GHSA__ __CVE__; }
+
 __VENDOR_COMMON__
 
 # Lock wiring (poetry row): the six [[package]] unit now carries the single
@@ -210,6 +224,75 @@ echo "===RUNTIME MARKER VERIFIED==="
 exit 0
 "#;
 
+/// Advisory the poetry capstone's staged record carries (VEX statement id).
+const POETRY_GHSA: &str = "GHSA-poet-ryvx-dk01";
+const POETRY_CVE: &str = "CVE-2026-7301";
+
+/// Poetry stage 2b (`--network none`): manifest-less VEX over copies of the
+/// installed fresh checkout (`/workspace/fresh`, patched six installed from
+/// the vendored wheel), with the IMAGE's binary and no network at all:
+///   (1) `.socket/manifest.json` deleted, ledger kept → attested `(vendored)`
+///       offline from the ledger's embedded record (standalone `vex` and
+///       embedded `apply --vex`);
+///   (3) both ledgers deleted, `--offline` → `record_unavailable`, no doc;
+///   (4) the lock reverted to the registry version, ledger + artifact kept →
+///       `vendor_unwired`, under `--no-verify` too.
+/// Step (2) — no ledgers, record from the patch API — runs on the HOST
+/// against `/workspace/vex-noledger` (a wiremock API needs a network).
+/// Every copy is made world-writable at the end so the host can clean up.
+const POETRY_STAGE2_VEX: &str = r#"
+export SOCKET_TELEMETRY_DISABLED=1
+PRODUCT="pkg:pypi/socket-vendor-capstone@0.1.0"
+fresh_copy() {
+  rm -rf "/workspace/$1" && cp -R /workspace/fresh "/workspace/$1" || fail "copy $1"
+  rm -f "/workspace/$1/.socket/manifest.json"
+}
+
+fresh_copy vex-ledger
+cd /workspace/vex-ledger
+[ -f .socket/vendor/state.json ] || fail "vendor ledger missing from the committed state"
+socket-patch vex --json --offline --output /tmp/v1.json --product "$PRODUCT" > /tmp/v1.env 2>/tmp/v1.err
+RC=$?
+[ "$RC" -eq 0 ] || { cat /tmp/v1.env /tmp/v1.err >&2; fail "manifest-less vex (ledger, offline) exited $RC"; }
+assert_json_field /tmp/v1.json "Patched via Socket patch __UUID__ (vendored)"
+assert_json_field /tmp/v1.json '"__GHSA__"'
+assert_json_field /tmp/v1.json '"__CVE__"'
+assert_json_field /tmp/v1.json 'pkg:pypi/six@1.16.0'
+[ ! -e .socket/manifest.json ] || fail "vex wrote a manifest"
+socket-patch apply --json --offline --vex /tmp/va.json --vex-product "$PRODUCT" > /tmp/va.env 2>/tmp/va.err
+RC=$?
+[ "$RC" -eq 0 ] || { cat /tmp/va.env /tmp/va.err >&2; fail "manifest-less apply --vex exited $RC"; }
+assert_json_field /tmp/va.env '"noManifest"'
+assert_json_field /tmp/va.json "Patched via Socket patch __UUID__ (vendored)"
+echo "===VEX LEDGER VERIFIED==="
+
+fresh_copy vex-noledger
+cd /workspace/vex-noledger
+rm -f .socket/vendor/state.json .socket/vendor/redirect-state.json
+socket-patch vex --json --offline --output /tmp/v3.json --product "$PRODUCT" > /tmp/v3.env 2>/tmp/v3.err
+RC=$?
+[ "$RC" -eq 1 ] || { cat /tmp/v3.env /tmp/v3.err >&2; fail "offline ledger-less vex exited $RC (expected 1)"; }
+assert_json_field /tmp/v3.env '"record_unavailable"'
+[ ! -e /tmp/v3.json ] || fail "offline ledger-less vex wrote a document"
+echo "===VEX OFFLINE VERIFIED==="
+
+fresh_copy vex-reverted
+cd /workspace/vex-reverted
+cp /workspace/snap/poetry.lock.prevendor poetry.lock
+[ -d .socket/vendor/pypi/__UUID__ ] || fail "artifact must stay behind"
+for NV in "" "--no-verify"; do
+  rm -f /tmp/v4.json
+  socket-patch vex --json --offline --output /tmp/v4.json --product "$PRODUCT" $NV > /tmp/v4.env 2>/tmp/v4.err
+  RC=$?
+  [ "$RC" -eq 1 ] || { cat /tmp/v4.env /tmp/v4.err >&2; fail "reverted-lock vex $NV exited $RC (expected 1)"; }
+  assert_json_field /tmp/v4.env '"vendor_unwired"'
+  [ ! -e /tmp/v4.json ] || fail "reverted-lock vex $NV wrote a document"
+done
+echo "===VEX REVERTED VERIFIED==="
+chmod -R a+rwX /workspace/vex-ledger /workspace/vex-noledger /workspace/vex-reverted
+exit 0
+"#;
+
 /// Poetry stage 3 (`--network none`): idempotent re-vendor → revert
 /// (byte-identical lock restore + full `.socket/vendor` removal) → re-vendor.
 const POETRY_STAGE3: &str = r#"
@@ -269,6 +352,12 @@ ORIG=$(ls .venv/lib/python*/site-packages/six.py 2>/dev/null | head -1)
 mkdir -p /workspace/snap
 cp pyproject.toml /workspace/snap/pyproject.prevendor
 cp pdm.lock /workspace/snap/pdm.lock.prevendor
+
+# The PDM record carries one vulnerability (the shared staging leaves it
+# empty) so stage 2's manifest-less VEX has a statement to attest: wrap the
+# shared `stage_patch` for this flavor only.
+eval "orig_$(declare -f stage_patch)"
+stage_patch() { orig_stage_patch "$@" GHSA-pdmv-dock-0001 CVE-2026-7301; }
 
 __VENDOR_COMMON__
 
@@ -330,6 +419,46 @@ OUT=$(pdm run python -c 'import six; print(six.SOCKET_PATCH_VENDOR_E2E)' 2>&1) \
   || { echo "$OUT" >&2; fail "import six probe failed"; }
 echo "$OUT" | grep -qF "__UUID__" || { echo "$OUT" >&2; fail "import six did not carry the patch uuid"; }
 echo "===RUNTIME MARKER VERIFIED==="
+
+# Manifest-less VEX on the installed fresh checkout (`--offline`: the
+# container has no network; the online record fetch is covered by the host
+# suites e2e_vex_lockfile::pdm / e2e_vex_build::pdm).
+vex_run() {  # vex_run <tag> [flags...] -> RC, /tmp/<tag>.env, /tmp/<tag>.vex
+  local tag="$1"; shift
+  rm -f "/tmp/$tag.vex"
+  socket-patch vex --json --offline --output "/tmp/$tag.vex" --product pkg:pypi/app@0.1.0 "$@" \
+    > "/tmp/$tag.env" 2> "/tmp/$tag.err"
+  RC=$?
+}
+attests() {  # attests <doc>
+  [ -f "$1" ] && grep -qF 'pkg:pypi/six@1.16.0' "$1" && grep -qF 'GHSA-pdmv-dock-0001' "$1" \
+    && grep -qF 'Patched via Socket patch __UUID__ (vendored)' "$1"
+}
+[ -f .socket/manifest.json ] || fail "stage 1 staged a manifest; the fresh copy must carry it"
+rm .socket/manifest.json
+vex_run ledger
+[ "$RC" -eq 0 ] && attests /tmp/ledger.vex \
+  || { cat /tmp/ledger.env /tmp/ledger.err >&2; fail "manifest-less vex (ledger kept) did not attest"; }
+socket-patch apply --json --offline --vex /tmp/apply.vex --vex-product pkg:pypi/app@0.1.0 > /tmp/apply.env 2>&1 \
+  && attests /tmp/apply.vex \
+  || { cat /tmp/apply.env >&2; fail "manifest-less apply --vex did not attest"; }
+[ ! -e .socket/manifest.json ] || fail "vex/apply must never write a manifest"
+echo "===VEX MANIFEST DELETED VERIFIED==="
+mv .socket/vendor/state.json /tmp/state.json.stash
+vex_run noledger
+[ "$RC" -eq 1 ] && [ ! -e /tmp/noledger.vex ] && grep -qF '"errorCode": "record_unavailable"' /tmp/noledger.env \
+  || { cat /tmp/noledger.env /tmp/noledger.err >&2; fail "offline vex with no ledger must omit record_unavailable"; }
+echo "===VEX OFFLINE NO LEDGER VERIFIED==="
+mv /tmp/state.json.stash .socket/vendor/state.json
+cp pdm.lock /tmp/pdm.lock.wired
+cp /workspace/snap/pdm.lock.prevendor pdm.lock
+for nv in "" --no-verify; do
+  vex_run reverted $nv
+  [ "$RC" -eq 1 ] && [ ! -e /tmp/reverted.vex ] && grep -qF '"errorCode": "vendor_unwired"' /tmp/reverted.env \
+    || { cat /tmp/reverted.env /tmp/reverted.err >&2; fail "reverted lock must omit vendor_unwired ($nv)"; }
+done
+cp /tmp/pdm.lock.wired pdm.lock
+echo "===VEX REVERTED VERIFIED==="
 exit 0
 "#;
 
@@ -472,6 +601,93 @@ echo "===RUNTIME MARKER VERIFIED==="
 exit 0
 "#;
 
+/// pipenv stage 2b (`--network none`): manifest-less VEX over the
+/// INSTALLED fresh checkout stage 2 left behind (each step on its own copy):
+/// manifest deleted, vendor ledger kept → attested `(vendored)` offline from
+/// the ledger record; ledger deleted too → `--offline` is
+/// `record_unavailable` (no API in this sandbox — the online ledger-less
+/// step is covered by `e2e_vex_build/pipenv.rs` / `e2e_vex_lockfile/pipenv.rs`);
+/// Pipfile.lock reverted to the registry with ledger + wheel kept →
+/// `vendor_unwired`, `--no-verify` too; `apply --vex` on the manifest-less
+/// checkout attests.
+const PIPENV_STAGE_VEX: &str = r#"
+PRODUCT="pkg:pypi/app@0.1.0"
+checkout() {
+  rm -rf "/workspace/vex-$1" && cp -R /workspace/fresh "/workspace/vex-$1" && cd "/workspace/vex-$1" \
+    || fail "copying the fresh checkout"
+  [ -d .venv ] || fail "stage 2 left no installed venv"
+  [ -f .socket/manifest.json ] || fail "fixture: the committed state carries the manifest"
+  rm -f .socket/manifest.json
+}
+# vex_json <envelope> <doc> [flags...]: standalone vex, exit code in $RC.
+vex_json() {
+  local env="$1" doc="$2"; shift 2
+  rm -f "$doc"
+  socket-patch vex --json --output "$doc" --product "$PRODUCT" "$@" > "$env" 2>"$env.err"
+  RC=$?
+}
+# attested <doc>: exactly one not_affected six statement via the patch.
+attested() {
+  python3 - "$1" <<'PYEOF' || { cat "$1" >&2; fail "$1 does not attest six via __UUID__ (vendored)"; }
+import json, sys
+d = json.load(open(sys.argv[1]))
+st = d["statements"]
+assert len(st) == 1, st
+s = st[0]
+assert s["status"] == "not_affected", s
+assert s["vulnerability"]["name"] == "GHSA-dock-pipv-0001", s
+assert "CVE-2026-7501" in s["vulnerability"].get("aliases", []), s
+subs = [c["@id"] for p in s["products"] for c in p.get("subcomponents", [])]
+assert [x.split("?")[0] for x in subs] == ["pkg:pypi/six@1.16.0"], subs
+assert "Patched via Socket patch __UUID__ (vendored)" in s["impact_statement"], s
+PYEOF
+}
+# omitted <envelope> <reason>: six skipped with that errorCode, not verified.
+omitted() {
+  python3 - "$1" "$2" <<'PYEOF' || { cat "$1" >&2; fail "$1 does not omit six as $2"; }
+import json, sys
+e = json.load(open(sys.argv[1]))
+ev = [x for x in e.get("events", []) if x.get("purl", "").split("?")[0] == "pkg:pypi/six@1.16.0"]
+assert not any(x["action"] == "verified" for x in ev), ev
+assert any(x["action"] == "skipped" and x.get("errorCode") == sys.argv[2] for x in ev), ev
+PYEOF
+}
+
+checkout manifest
+vex_json /tmp/vex1.json /tmp/vex1.doc --offline
+[ "$RC" -eq 0 ] || { cat /tmp/vex1.json /tmp/vex1.json.err >&2; fail "manifest-less vex exited $RC"; }
+attested /tmp/vex1.doc
+[ ! -e .socket/manifest.json ] || fail "vex must never write the manifest"
+echo "===VEX MANIFEST-DELETED VERIFIED==="
+
+checkout offline
+rm -f .socket/vendor/state.json .socket/vendor/redirect-state.json
+vex_json /tmp/vex2.json /tmp/vex2.doc --offline
+[ "$RC" -eq 1 ] || { cat /tmp/vex2.json >&2; fail "ledger-less offline vex exited $RC (expected 1)"; }
+[ ! -e /tmp/vex2.doc ] || fail "no document without a record"
+omitted /tmp/vex2.json record_unavailable
+echo "===VEX OFFLINE VERIFIED==="
+
+checkout reverted
+cp /workspace/snap/Pipfile.lock.prevendor Pipfile.lock
+[ -f .socket/vendor/state.json ] || fail "fixture: the ledger stays"
+for flag in "" --no-verify; do
+  vex_json /tmp/vex3.json /tmp/vex3.doc --offline $flag
+  [ "$RC" -eq 1 ] || { cat /tmp/vex3.json >&2; fail "reverted vex $flag exited $RC (expected 1)"; }
+  [ ! -e /tmp/vex3.doc ] || fail "reverted $flag: no document"
+  omitted /tmp/vex3.json vendor_unwired
+done
+echo "===VEX REVERTED VERIFIED==="
+
+checkout apply
+socket-patch apply --json --offline --vex /tmp/vex4.doc --vex-product "$PRODUCT" > /tmp/vex4.json 2>/tmp/vex4.err
+RC=$?
+[ "$RC" -eq 0 ] || { cat /tmp/vex4.json /tmp/vex4.err >&2; fail "apply --vex exited $RC"; }
+attested /tmp/vex4.doc
+echo "===VEX APPLY VERIFIED==="
+exit 0
+"#;
+
 /// pipenv stage 3 (`--network none`): idempotent → revert → re-vendor.
 const PIPENV_STAGE3: &str = r#"
 cd /workspace/proj
@@ -515,6 +731,73 @@ fn render_stage1(template: &str, uuid: &str) -> String {
     )
 }
 
+/// Render a poetry stage that names the capstone advisory.
+fn render_poetry(stage: &str) -> String {
+    render(stage, UUID_POETRY)
+        .replace("__GHSA__", POETRY_GHSA)
+        .replace("__CVE__", POETRY_CVE)
+}
+
+/// Step (2) of the manifest-less VEX matrix, on the HOST (stage 2b left the
+/// copies world-readable): the ledger-less copy of the installed fresh
+/// checkout attests `(vendored)` from the poetry.lock wiring + the record a
+/// patch API serves (the committed wheel is hash-verified), while the
+/// reverted copy stays unattested online too. The record is the one stage 1
+/// staged (`proj/.socket/manifest.json`).
+fn poetry_manifestless_vex_online(host: &std::path::Path) {
+    use vex_e2e_common::{
+        assert_attested, assert_not_attested, binary, run_vex, Marker, PatchApi, VexRun,
+    };
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(host.join("proj/.socket/manifest.json")).expect("stage-1 manifest"),
+    )
+    .unwrap();
+    let record = &manifest["patches"]["pkg:pypi/six@1.16.0"];
+    assert_eq!(record["uuid"], UUID_POETRY, "{manifest}");
+    let mut view = record.clone();
+    view["purl"] = "pkg:pypi/six@1.16.0".into();
+    view["publishedAt"] = "Tue, 01 Sep 2026 00:00:00 GMT".into();
+    let api = PatchApi::start(vec![(UUID_POETRY.into(), view)]);
+    let out_dir = tempfile::tempdir().unwrap();
+    let run = |project: &str, offline: bool, extra: &[&str]| {
+        let mut run = VexRun {
+            offline,
+            proxy_url: Some(api.uri()),
+            product: Some("pkg:pypi/socket-vendor-capstone@0.1.0".into()),
+            output: Some(out_dir.path().join(format!("{project}.vex.json"))),
+            ..VexRun::default()
+        };
+        for arg in extra {
+            run = run.arg(*arg);
+        }
+        let _ = std::fs::remove_file(out_dir.path().join(format!("{project}.vex.json")));
+        run_vex(&binary(), &host.join(project), &run)
+    };
+    let out = run("vex-noledger", false, &[]);
+    assert_eq!(out.code, Some(0), "host vex, no ledgers, online: {out}");
+    assert_attested(
+        out.doc(),
+        "pkg:pypi/six@1.16.0",
+        UUID_POETRY,
+        Marker::Vendored,
+        &[(POETRY_GHSA, &[POETRY_CVE])],
+    );
+    assert!(
+        api.view_requests(UUID_POETRY) >= 1,
+        "record came from the API"
+    );
+    let seen = api.request_count();
+    let out = run("vex-noledger", true, &[]);
+    assert_eq!(out.code, Some(1), "{out}");
+    assert_not_attested(&out.envelope, "pkg:pypi/six@1.16.0", "record_unavailable");
+    assert_eq!(api.request_count(), seen, "--offline made a request");
+    for extra in [&[][..], &["--no-verify"][..]] {
+        let out = run("vex-reverted", false, extra);
+        assert_eq!(out.code, Some(1), "reverted {extra:?}: {out}");
+        assert_not_attested(&out.envelope, "pkg:pypi/six@1.16.0", "vendor_unwired");
+    }
+}
+
 fn host_dir() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Canonicalize so the macOS `/var` → `/private/var` symlink doesn't
@@ -530,7 +813,13 @@ fn poetry_vendor_fresh_checkout_install_and_revert() {
     }
     let (_tmp, host) = host_dir();
 
-    let out = run_in_image(IMAGE, &host, &render_stage1(POETRY_STAGE1, UUID_POETRY));
+    let out = run_in_image(
+        IMAGE,
+        &host,
+        &render_stage1(POETRY_STAGE1, UUID_POETRY)
+            .replace("__GHSA__", POETRY_GHSA)
+            .replace("__CVE__", POETRY_CVE),
+    );
     assert_stage_markers(
         "poetry stage 1 (install+vendor)",
         &out,
@@ -543,6 +832,14 @@ fn poetry_vendor_fresh_checkout_install_and_revert() {
         &out,
         &["RED PROBE", "FRESH INSTALL", "RUNTIME MARKER"],
     );
+
+    let out = run_in_image_network_none(IMAGE, &host, &render_poetry(POETRY_STAGE2_VEX));
+    assert_stage_markers(
+        "poetry stage 2b (manifest-less vex, --network none)",
+        &out,
+        &["VEX LEDGER", "VEX OFFLINE", "VEX REVERTED"],
+    );
+    poetry_manifestless_vex_online(&host);
 
     let out = run_in_image_network_none(IMAGE, &host, &render(POETRY_STAGE3, UUID_POETRY));
     assert_stage_markers(
@@ -570,7 +867,14 @@ fn pdm_vendor_fresh_checkout_install_and_revert() {
     assert_stage_markers(
         "pdm stage 2 (fresh checkout, --network none)",
         &out,
-        &["RED PROBE", "FRESH INSTALL", "RUNTIME MARKER"],
+        &[
+            "RED PROBE",
+            "FRESH INSTALL",
+            "RUNTIME MARKER",
+            "VEX MANIFEST DELETED",
+            "VEX OFFLINE NO LEDGER",
+            "VEX REVERTED",
+        ],
     );
 
     let out = run_in_image_network_none(IMAGE, &host, &render(PDM_STAGE3, UUID_PDM));
@@ -588,7 +892,18 @@ fn pipenv_vendor_fresh_checkout_install_and_revert() {
     }
     let (_tmp, host) = host_dir();
 
-    let out = run_in_image(IMAGE, &host, &render_stage1(PIPENV_STAGE1, UUID_PIPENV));
+    // The staged patch carries one advisory, so the manifest-less VEX stage
+    // has a statement to attest.
+    let stage_call = r#""six.py" "$ORIG" /tmp/patched.py
+"#;
+    let stage1 = render_stage1(PIPENV_STAGE1, UUID_PIPENV);
+    assert!(stage1.contains(stage_call), "stage_patch call moved");
+    let stage1 = stage1.replace(
+        stage_call,
+        r#""six.py" "$ORIG" /tmp/patched.py GHSA-dock-pipv-0001 CVE-2026-7501
+"#,
+    );
+    let out = run_in_image(IMAGE, &host, &stage1);
     assert_stage_markers(
         "pipenv stage 1 (install+vendor)",
         &out,
@@ -606,6 +921,18 @@ fn pipenv_vendor_fresh_checkout_install_and_revert() {
         "pipenv stage 2 (fresh checkout, --network none)",
         &out,
         &["RED PROBE", "FRESH INSTALL", "RUNTIME MARKER"],
+    );
+
+    let out = run_in_image_network_none(IMAGE, &host, &render(PIPENV_STAGE_VEX, UUID_PIPENV));
+    assert_stage_markers(
+        "pipenv stage 2b (manifest-less vex, --network none)",
+        &out,
+        &[
+            "VEX MANIFEST-DELETED",
+            "VEX OFFLINE",
+            "VEX REVERTED",
+            "VEX APPLY",
+        ],
     );
 
     let out = run_in_image_network_none(IMAGE, &host, &render(PIPENV_STAGE3, UUID_PIPENV));

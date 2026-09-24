@@ -14,8 +14,21 @@
 //! the crates.io fixture build only; the hosted registry is wiremock) and
 //! proves the terminal state with `cargo build --locked` on a fresh checkout.
 //!
+//! MANIFEST-LESS VEX after every takeover (`vex_e2e_common`): on the fresh
+//! checkout the terminal mode's patch — and ONLY it — attests with its
+//! marker: `(redirected)` for the hosted uuid after vendored → hosted,
+//! `(vendored)` for the vendored uuid after hosted → vendored and after the
+//! A → B → A round trip. (0) with the manifest still naming the displaced
+//! patch (the wired uuid wins), (1) manifest deleted / ledger kept (zero
+//! API calls), (2) ledgers deleted (lockfile wiring + API record), (3)
+//! `--offline` with no ledger → `record_unavailable`, zero requests. The
+//! displaced patch is never attested.
+//!
+//! Toolchain / lock format: `cargo_e2e_matrix` (`SOCKET_PATCH_CARGO_E2E_*`).
+//!
 //! Skips (println) when `cargo` is missing or crates.io is unreachable for
-//! the fixture build; all assertions after that are hard.
+//! the fixture build (a failure instead under
+//! `SOCKET_PATCH_CARGO_E2E_REQUIRED=1`); all assertions after that are hard.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -24,6 +37,15 @@ use sha2::{Digest, Sha256};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[path = "cargo_e2e_matrix/mod.rs"]
+mod cargo_e2e_matrix;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+use vex_e2e_common::{
+    assert_absent, assert_attested, assert_not_attested, run_vex, strip_ledgers, strip_manifest,
+    Marker, PatchApi, VexRun,
+};
 
 const ORG: &str = "test-org";
 const DEP: &str = "cfg-if";
@@ -58,12 +80,11 @@ fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, Str
     )
 }
 
+/// Real cargo under the matrix's pinned toolchain (if any), the fixture's
+/// private CARGO_HOME and no ambient CARGO_TARGET_DIR.
 fn cargo(cwd: &Path, args: &[&str], cargo_home: &Path) -> Output {
-    Command::new("cargo")
+    cargo_e2e_matrix::cargo_command(cwd, cargo_home)
         .args(args)
-        .current_dir(cwd)
-        .env("CARGO_HOME", cargo_home)
-        .env_remove("CARGO_TARGET_DIR")
         .output()
         .expect("failed to run cargo")
 }
@@ -197,6 +218,9 @@ fn build_patched_crate(
 /// private CARGO_HOME + Cargo.lock. `None` (with a SKIP println) when the
 /// toolchain or network is unavailable.
 fn stage_fixture(tmp: &Path) -> Option<(PathBuf, PathBuf, String, PathBuf)> {
+    if !cargo_e2e_matrix::cargo_available("mode_migration_cargo") {
+        return None;
+    }
     let proj = tmp.join("proj");
     let cargo_home = tmp.join("cargo-home");
     std::fs::create_dir_all(proj.join("src")).unwrap();
@@ -215,12 +239,17 @@ fn stage_fixture(tmp: &Path) -> Option<(PathBuf, PathBuf, String, PathBuf)> {
     .unwrap();
     let build = cargo(&proj, &["build", "-q"], &cargo_home);
     if !build.status.success() {
-        println!(
-            "SKIP: baseline cargo build failed (no cargo or no network):\n{}",
-            String::from_utf8_lossy(&build.stderr)
+        let _ = cargo_e2e_matrix::skip(
+            "mode_migration_cargo",
+            &format!(
+                "baseline cargo build failed (no cargo or no network):\n{}",
+                String::from_utf8_lossy(&build.stderr)
+            ),
         );
         return None;
     }
+    // The matrix's lock format (v1–v4) for the committed baseline.
+    cargo_e2e_matrix::apply_lock_version(&proj);
     let lock_text = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
     let version = locked_version(&lock_text, DEP).unwrap();
     let crate_dir = find_registry_crate(&cargo_home, &format!("{DEP}-{version}")).unwrap();
@@ -238,7 +267,10 @@ async fn mount_hosted_mocks(
     patched: &[u8],
 ) -> String {
     let cksum = sha256_hex(crate_bytes);
-    let index_url = format!("sparse+{}/index/", server.uri());
+    // Production-shaped index path: manifest-less VEX reads the hosted
+    // uuid out of the lock's `source` (with `--patch-server-url`).
+    let index_rel = format!("/patch-registry/cargo/{TOKEN}/{UUID_H}/index");
+    let index_url = format!("sparse+{}{index_rel}/", server.uri());
     let hosted_url = format!(
         "{}/patch/cargo/{DEP}/{version}/{TOKEN}/{UUID_H}/{DEP}-{version}.crate",
         server.uri()
@@ -323,7 +355,7 @@ async fn mount_hosted_mocks(
         .mount(server)
         .await;
     Mock::given(method("GET"))
-        .and(path("/index/config.json"))
+        .and(path(format!("{index_rel}/config.json")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "dl": format!("{}/dl", server.uri()),
             "api": server.uri(),
@@ -336,7 +368,7 @@ async fn mount_hosted_mocks(
     })
     .to_string();
     Mock::given(method("GET"))
-        .and(path(format!("/index/{}", sparse_index_rel(DEP))))
+        .and(path(format!("{index_rel}/{}", sparse_index_rel(DEP))))
         .respond_with(ResponseTemplate::new(200).set_body_raw(index_line, "text/plain"))
         .mount(server)
         .await;
@@ -349,6 +381,111 @@ async fn mount_hosted_mocks(
         .mount(server)
         .await;
     index_url
+}
+
+/// Manifest-less VEX over a post-takeover fresh checkout: `wired` (uuid +
+/// marker) must attest, `displaced` never. Runs on a blocking thread (the
+/// shared `PatchApi` brings its own runtime).
+struct TakeoverVex {
+    fresh: PathBuf,
+    home: PathBuf,
+    purl: String,
+    patched: Vec<u8>,
+    wired: (&'static str, Marker),
+    displaced: &'static str,
+    /// The hosted index origin (`--patch-server-url`).
+    server_uri: String,
+}
+
+impl TakeoverVex {
+    async fn run(self) {
+        if let Err(e) = tokio::task::spawn_blocking(move || self.steps()).await {
+            std::panic::resume_unwind(e.into_panic());
+        }
+    }
+
+    fn steps(self) {
+        let bin = binary();
+        // Each patch's own alias: the vendored record (the staged
+        // manifest's) and the hosted one (the view mock's) differ.
+        let vulns_of = |u: &str| -> [(&'static str, &'static [&'static str]); 1] {
+            if u == UUID_V {
+                [(GHSA, &["CVE-2026-88888"])]
+            } else {
+                [(GHSA, &["CVE-2026-2222"])]
+            }
+        };
+        let (uuid, marker) = self.wired;
+        let vulns = vulns_of(uuid);
+        let vulns = vulns.as_slice();
+        let after = vex_e2e_common::git_sha256(&self.patched);
+        let view = |u: &str| {
+            vex_e2e_common::patch_view(u, &self.purl, &[("src/lib.rs", &after)], &vulns_of(u))
+        };
+        let api = PatchApi::start(vec![
+            (UUID_V.to_string(), view(UUID_V)),
+            (UUID_H.to_string(), view(UUID_H)),
+        ]);
+        let run = VexRun {
+            product: Some("pkg:cargo/app@1.0.0".to_string()),
+            patch_server_url: Some(self.server_uri.clone()),
+            ..VexRun::online(&api)
+        }
+        .env("CARGO_HOME", &self.home);
+        let fresh = self.fresh.as_path();
+        let only_wired = |doc: &serde_json::Value, step: &str| {
+            assert_attested(doc, &self.purl, uuid, marker, vulns);
+            assert!(
+                !doc.to_string().contains(self.displaced),
+                "{step}: the displaced patch {} must never be attested: {doc:#}",
+                self.displaced
+            );
+        };
+
+        // (0) The manifest (still naming the displaced vendored patch
+        //     after a hosted takeover) is present: the wired uuid wins.
+        if fresh.join(".socket/manifest.json").exists() {
+            let out = run_vex(&bin, fresh, &run);
+            assert_eq!(out.code, Some(0), "(0) with manifest:\n{out}");
+            only_wired(out.doc(), "(0)");
+        }
+        // (1) Manifest deleted, ledger kept.
+        strip_manifest(fresh);
+        let before = api.request_count();
+        let out = run_vex(&bin, fresh, &run);
+        assert_eq!(out.code, Some(0), "(1) ledger-backed:\n{out}");
+        only_wired(out.doc(), "(1)");
+        assert_eq!(
+            api.request_count(),
+            before,
+            "(1) the ledger record needs no API"
+        );
+        // (2) Ledgers deleted: the lockfile wiring + the API's record.
+        strip_ledgers(fresh);
+        let out = run_vex(&bin, fresh, &run);
+        assert_eq!(out.code, Some(0), "(2) lockfile-only:\n{out}");
+        only_wired(out.doc(), "(2)");
+        assert!(api.view_requests(uuid) >= 1, "(2) fetched the wired record");
+        assert_eq!(
+            api.view_requests(self.displaced),
+            0,
+            "(2) never asked for the displaced one"
+        );
+        // (3) Offline, no ledger.
+        let before = api.request_count();
+        let out = run_vex(
+            &bin,
+            fresh,
+            &VexRun {
+                offline: true,
+                ..run.clone()
+            },
+        );
+        assert_eq!(out.code, Some(1), "(3) offline:\n{out}");
+        assert_not_attested(&out.envelope, &self.purl, "record_unavailable");
+        assert_absent(out.doc.as_ref(), &self.purl);
+        assert_eq!(api.request_count(), before, "(3) --offline made a request");
+    }
 }
 
 /// Copy ONLY the committable files to a fresh dir (the fresh-checkout proof).
@@ -484,6 +621,17 @@ async fn vendored_then_hosted_takeover_leaves_pure_hosted() {
         "cargo build --locked",
         &cargo(&fresh, &["build", "--locked"], &home),
     );
+    TakeoverVex {
+        fresh: fresh.clone(),
+        home: home.clone(),
+        purl: purl.clone(),
+        patched: patched.clone(),
+        wired: (UUID_H, Marker::Redirected),
+        displaced: UUID_V,
+        server_uri: server.uri(),
+    }
+    .run()
+    .await;
 
     // D: a later vendored-flow no-op must NOT emit the inverted
     // vendor_supersedes_redirect warning (C4b: pre-fix it told the user to
@@ -627,6 +775,17 @@ async fn hosted_then_vendored_takeover_leaves_pure_vendored() {
         "cargo build --locked --offline (vendored fresh checkout)",
         &cargo(&fresh, &["build", "--locked", "--offline"], &home),
     );
+    TakeoverVex {
+        fresh: fresh.clone(),
+        home: home.clone(),
+        purl: purl.clone(),
+        patched: patched.clone(),
+        wired: (UUID_V, Marker::Vendored),
+        displaced: UUID_H,
+        server_uri: server.uri(),
+    }
+    .run()
+    .await;
 
     // D: revert restores the PRISTINE pre-hosted project — the crates.io
     // lock fragment (not a dead grant-tokenized sparse URL) and the plain
@@ -672,11 +831,11 @@ async fn double_takeover_a_b_a_preserves_lock_originals() {
     stage_patch(&proj, &purl, &orig, &patched);
     let toml_pristine = read(&proj, "Cargo.toml");
     let lock_pristine = std::fs::read(proj.join("Cargo.lock")).unwrap();
-    let pristine_block = package_block(&String::from_utf8_lossy(&lock_pristine), DEP).unwrap();
-    let pristine_checksum = pristine_block
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("checksum = \""))
-        .map(|s| s.trim_end_matches('"').to_string())
+    // Inline for lock v2+, `[metadata]` for v1.
+    let pristine_checksum = cargo_e2e_matrix::parse_lock(&String::from_utf8_lossy(&lock_pristine))
+        .into_iter()
+        .find(|p| p.name == DEP)
+        .and_then(|p| p.checksum)
         .expect("pristine lock has a checksum");
 
     // A: vendor.
@@ -755,6 +914,17 @@ async fn double_takeover_a_b_a_preserves_lock_originals() {
         "cargo build --locked --offline (A->B->A fresh checkout)",
         &cargo(&fresh, &["build", "--locked", "--offline"], &home),
     );
+    TakeoverVex {
+        fresh: fresh.clone(),
+        home: home.clone(),
+        purl: purl.clone(),
+        patched: patched.clone(),
+        wired: (UUID_V, Marker::Vendored),
+        displaced: UUID_H,
+        server_uri: server.uri(),
+    }
+    .run()
+    .await;
 
     // Revert: byte-identical pristine lock + Cargo.toml, no residue.
     let (code, stdout, stderr) = run_socket(

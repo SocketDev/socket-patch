@@ -140,16 +140,7 @@ pub(crate) fn names(edit: &FileEdit, name: &str, version: &str) -> Result<bool, 
         {
             return Some(version.into());
         }
-        let url = snapshot["resolution"].as_str()?;
-        let bare = name.rsplit('/').next()?;
-        let candidate = url
-            .rsplit('/')
-            .next()?
-            .strip_prefix(&format!("{bare}-"))?
-            .strip_suffix(".tgz")?;
-        (semver::Version::parse(candidate).is_ok()
-            && super::takeover::hosted_url_names(url, name, candidate))
-        .then(|| candidate.into())
+        super::takeover::hosted_url_version(snapshot["resolution"].as_str()?, name).map(Into::into)
     };
     let versions: Vec<_> = [original, new]
         .into_iter()

@@ -44,8 +44,28 @@
 //! Hosted get writes NO manifest and NO blobs (the redirect ledger is the
 //! persistence) and has no `--vex`.
 //!
+//! MANIFEST-LESS VEX (both drivers): the fresh checkout above is then
+//! driven through the lockfile-discovery steps with the shared
+//! `vex_e2e_common` helpers against a separate patch-API stand-in —
+//! (1) no manifest, ledger kept → `(redirected)` from the ledger record,
+//! zero API calls; embedded `apply --vex` attests too; (2) ledger deleted →
+//! the lockfile's hosted `source` + the API's record still attest — with
+//! the patched copy extracted, and with nothing installed (the lock's
+//! checksum pin) — and embedded `apply --vex` / `scan --vex` too; (3) `--offline` with no ledger →
+//! `record_unavailable`, zero API requests; (4) the lockfile reverted to
+//! crates.io with the ledger restored — the stale lock alone (the patched
+//! copy still extracted), and the full three-file revert re-fetched from
+//! crates.io by the real cargo — → NOT attested (`redirect_unwired`), also
+//! under `--no-verify`.
+//!
+//! Toolchain / lock format: `cargo_e2e_matrix` (`SOCKET_PATCH_CARGO_E2E_*`)
+//! runs every step under a pinned cargo release and re-encodes the
+//! baseline `Cargo.lock` as v1–v4 before the redirect; the rewrite must keep
+//! that format and `cargo fetch --locked` must accept it.
+//!
 //! Skips (with a println) when `cargo` is missing or crates.io is
-//! unreachable for the fixture build; every assertion after that is hard.
+//! unreachable for the fixture build (a failure instead under
+//! `SOCKET_PATCH_CARGO_E2E_REQUIRED=1`); every assertion after that is hard.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -54,6 +74,15 @@ use sha2::{Digest, Sha256};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[path = "cargo_e2e_matrix/mod.rs"]
+mod cargo_e2e_matrix;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+use vex_e2e_common::{
+    assert_absent, assert_attested, assert_not_attested, run_vex, strip_ledgers, strip_manifest,
+    Marker, PatchApi, VexRun, VexVia,
+};
 
 const ORG: &str = "test-org";
 const DEP: &str = "cfg-if";
@@ -64,6 +93,7 @@ const UUID: &str = "6b7c8d9e-0f1a-4a1b-8c2d-3e4f5a6b7c8d";
 /// it just writes what the reference endpoint hands back).
 const TOKEN: &str = "33333333-3333-4333-8333-333333333333";
 const GHSA: &str = "GHSA-redirect-cargo-real";
+const CVE: &str = "CVE-2026-2222";
 const PRODUCT: &str = "pkg:cargo/app@1.0.0";
 /// Appended to the dep's `src/lib.rs`. Doc comment kept from the vendor
 /// capstone (cfg-if denies `missing_docs`; registry deps get `--cap-lints
@@ -76,15 +106,6 @@ const PATCH_SUFFIX: &str =
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
-
-fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
 }
 
 /// Run socket-patch with ambient `SOCKET_*` vars scrubbed and the fixture's
@@ -108,14 +129,11 @@ fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, Str
     )
 }
 
+/// Real cargo under the matrix's pinned toolchain (if any), the fixture's
+/// private CARGO_HOME and no ambient CARGO_TARGET_DIR.
 fn cargo(cwd: &Path, args: &[&str], cargo_home: &Path) -> Output {
-    Command::new("cargo")
+    cargo_e2e_matrix::cargo_command(cwd, cargo_home)
         .args(args)
-        .current_dir(cwd)
-        .env("CARGO_HOME", cargo_home)
-        // An ambient CARGO_TARGET_DIR (shared-build-cache setups) would
-        // redirect child builds elsewhere; keep everything under the fixture.
-        .env_remove("CARGO_TARGET_DIR")
         .output()
         .expect("failed to run cargo")
 }
@@ -257,13 +275,18 @@ fn stage_fixture(tmp: &Path, tag: &str) -> Option<(PathBuf, PathBuf, String, Pat
 
     let build = cargo(&proj, &["build", "-q"], &cargo_home);
     if !build.status.success() {
-        println!(
-            "SKIP e2e_redirect_cargo_build ({tag}): baseline `cargo build` failed (crates.io \
-             unreachable?):\n{}",
-            String::from_utf8_lossy(&build.stderr)
+        let _ = cargo_e2e_matrix::skip(
+            &format!("e2e_redirect_cargo_build ({tag})"),
+            &format!(
+                "baseline `cargo build` failed (crates.io unreachable?):\n{}",
+                String::from_utf8_lossy(&build.stderr)
+            ),
         );
         return None;
     }
+    // The matrix's lock format (v1–v4), re-encoded from what the toolchain
+    // wrote: the committed-lockfile shape the rewrite must meet.
+    cargo_e2e_matrix::apply_lock_version(&proj);
 
     let lock_text = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
     let version = locked_version(&lock_text, DEP)
@@ -298,6 +321,11 @@ struct RedirectFixture {
     tmp: tempfile::TempDir,
     proj: PathBuf,
     version: String,
+    /// Pre-redirect (crates.io) `Cargo.toml` / `Cargo.lock`.
+    baseline_toml: String,
+    baseline_lock: String,
+    /// The mock origin serving the hosted index (`--patch-server-url`).
+    server_uri: String,
     /// The REAL patched `.crate` bytes (what the lockfile/index cksum pins).
     crate_bytes: Vec<u8>,
     /// The patched `src/lib.rs` content.
@@ -316,13 +344,16 @@ async fn redirect_scanned_project(
     tamper_served_crate: bool,
     driver: Driver,
 ) -> Option<RedirectFixture> {
-    if !has_command("cargo") {
-        println!("SKIP e2e_redirect_cargo_build ({tag}): `cargo` not installed");
+    if !cargo_e2e_matrix::cargo_available(&format!("e2e_redirect_cargo_build ({tag})")) {
         return None;
     }
     let tmp = tempfile::tempdir().unwrap();
     let (proj, cargo_home, version, crate_dir) = stage_fixture(tmp.path(), tag)?;
     let purl = format!("pkg:cargo/{DEP}@{version}");
+    // The committed crates.io state the redirect replaces (the revert leg).
+    let baseline_toml = std::fs::read_to_string(proj.join("Cargo.toml")).unwrap();
+    let baseline_lock = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
+    let lock_format = cargo_e2e_matrix::lock_format(&baseline_lock);
 
     // 2. Patched `.crate` from the ACTUAL crates.io bytes. The index cksum
     //    and (through the rewriter) the Cargo.lock checksum are ALWAYS the
@@ -351,7 +382,12 @@ async fn redirect_scanned_project(
     //    is what the rewriter writes verbatim into `.cargo/config.toml` and
     //    the Cargo.lock `source`.
     let server = MockServer::start().await;
-    let index_url = format!("sparse+{}/index/", server.uri());
+    // Production-shaped index path (`/patch-registry/cargo/<token>/<uuid>/
+    // index/`): manifest-less VEX reads the patch uuid out of the lock's
+    // `source` (the last canonical-uuid segment, never the uuid-shaped
+    // token) once `--patch-server-url` admits this origin.
+    let index_rel = format!("/patch-registry/cargo/{TOKEN}/{UUID}/index");
+    let index_url = format!("sparse+{}{index_rel}/", server.uri());
     let hosted_url = format!(
         "{}/patch/cargo/{DEP}/{version}/{TOKEN}/{UUID}/{DEP}-{version}.crate",
         server.uri()
@@ -449,7 +485,7 @@ async fn redirect_scanned_project(
     // `/{crate}/{version}/download`), the per-crate index file pins the
     // PATCHED tarball's cksum, and the download route serves the bytes.
     Mock::given(method("GET"))
-        .and(path("/index/config.json"))
+        .and(path(format!("{index_rel}/config.json")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "dl": format!("{}/dl", server.uri()),
             "api": server.uri(),
@@ -466,7 +502,7 @@ async fn redirect_scanned_project(
     })
     .to_string();
     Mock::given(method("GET"))
-        .and(path(format!("/index/{}", sparse_index_rel(DEP))))
+        .and(path(format!("{index_rel}/{}", sparse_index_rel(DEP))))
         .respond_with(ResponseTemplate::new(200).set_body_raw(index_line, "text/plain"))
         .mount(&server)
         .await;
@@ -577,9 +613,22 @@ async fn redirect_scanned_project(
         block.contains(&format!("source = \"{index_url}\"")),
         "lock source must be the hosted sparse index:\n{block}"
     );
-    assert!(
-        block.contains(&format!("checksum = \"{cksum}\"")),
-        "lock checksum must be the PATCHED .crate's sha256:\n{block}"
+    // The rewrite keeps the committed lock format, and the entry's pin is
+    // the PATCHED .crate's sha256 wherever that format keeps checksums
+    // (inline for v2+, `[metadata]` for v1).
+    assert_eq!(
+        cargo_e2e_matrix::lock_format(&lock_text),
+        lock_format,
+        "the hosted rewrite must keep the lock format:\n{lock_text}"
+    );
+    let pinned = cargo_e2e_matrix::parse_lock(&lock_text)
+        .into_iter()
+        .find(|p| p.name == DEP)
+        .and_then(|p| p.checksum);
+    assert_eq!(
+        pinned.as_deref(),
+        Some(cksum.as_str()),
+        "lock checksum must be the PATCHED .crate's sha256:\n{lock_text}"
     );
 
     // Ledger embeds the patch record so a post-install `vex` can verify.
@@ -605,6 +654,9 @@ async fn redirect_scanned_project(
         tmp,
         proj,
         version,
+        baseline_toml,
+        baseline_lock,
+        server_uri: server.uri(),
         crate_bytes,
         patched,
         _server: server,
@@ -629,6 +681,219 @@ fn fresh_checkout_cargo_fetch(fx: &RedirectFixture) -> (PathBuf, PathBuf, Output
     std::fs::create_dir_all(&fresh_home).unwrap();
     let fetch = cargo(&fresh, &["fetch", "--locked"], &fresh_home);
     (fresh, fresh_home, fetch)
+}
+
+// ── manifest-less VEX (lockfile discovery) ────────────────────────────
+
+/// Everything the manifest-less steps need, owned (they run on a blocking
+/// thread: the shared `PatchApi` brings its own runtime).
+struct ManifestlessHosted {
+    /// The fresh checkout (`cargo fetch --locked` already ran in it).
+    fresh: PathBuf,
+    /// Its CARGO_HOME, holding the extracted hosted (patched) sources.
+    fresh_home: PathBuf,
+    /// Scratch root for the revert checkout.
+    scratch: PathBuf,
+    purl: String,
+    patched: Vec<u8>,
+    baseline_toml: String,
+    baseline_lock: String,
+    /// The mock origin serving the hosted index + the org-scoped API.
+    server_uri: String,
+}
+
+impl ManifestlessHosted {
+    fn new(fx: &RedirectFixture, fresh: &Path, fresh_home: &Path) -> Self {
+        Self {
+            fresh: fresh.to_path_buf(),
+            fresh_home: fresh_home.to_path_buf(),
+            scratch: fx.tmp.path().join("manifestless"),
+            purl: format!("pkg:cargo/{DEP}@{}", fx.version),
+            patched: fx.patched.clone(),
+            baseline_toml: fx.baseline_toml.clone(),
+            baseline_lock: fx.baseline_lock.clone(),
+            server_uri: fx.server_uri.clone(),
+        }
+    }
+
+    /// Run [`Self::steps`] off the async runtime (and re-raise its panic).
+    async fn run(self) {
+        if let Err(e) = tokio::task::spawn_blocking(move || self.steps()).await {
+            std::panic::resume_unwind(e.into_panic());
+        }
+    }
+
+    /// A standalone run against `api` for the checkout at `cargo_home`,
+    /// hosted references on the fixture origin admitted.
+    fn vex_run(&self, api: &PatchApi, cargo_home: &Path) -> VexRun {
+        VexRun {
+            product: Some(PRODUCT.to_string()),
+            patch_server_url: Some(self.server_uri.clone()),
+            ..VexRun::online(api)
+        }
+        .env("CARGO_HOME", cargo_home)
+    }
+
+    fn steps(self) {
+        let bin = binary();
+        let vulns: &[(&str, &[&str])] = &[(GHSA, &[CVE])];
+        let api = PatchApi::start(vec![(
+            UUID.to_string(),
+            vex_e2e_common::patch_view(
+                UUID,
+                &self.purl,
+                &[("src/lib.rs", &vex_e2e_common::git_sha256(&self.patched))],
+                vulns,
+            ),
+        )]);
+        let fresh = self.fresh.as_path();
+        let ledger_path = fresh.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
+        let run = self.vex_run(&api, &self.fresh_home);
+
+        // (1) No manifest (hosted never writes one), ledger kept: the
+        //     ledger's record attests, verified against the extracted
+        //     hosted copy — no API call.
+        strip_manifest(fresh);
+        assert!(ledger_path.is_file(), "the redirect ledger travels");
+        let out = run_vex(&bin, fresh, &run);
+        assert_eq!(out.code, Some(0), "(1) ledger-backed:\n{out}");
+        assert_attested(out.doc(), &self.purl, UUID, Marker::Redirected, vulns);
+        assert_eq!(
+            api.view_requests(UUID),
+            0,
+            "(1) the ledger record needs no API"
+        );
+        let out = run_vex(&bin, fresh, &run.clone().via(VexVia::Apply));
+        assert_eq!(out.code, Some(0), "(1) apply --vex:\n{out}");
+        assert_eq!(
+            out.envelope["status"], "noManifest",
+            "(1) apply --vex:\n{out}"
+        );
+        assert_attested(out.doc(), &self.purl, UUID, Marker::Redirected, vulns);
+
+        // (2) Ledgers deleted: the lock's hosted `source` names the patch;
+        //     the record comes from the API.
+        let ledger = std::fs::read(&ledger_path).unwrap();
+        strip_ledgers(fresh);
+        let out = run_vex(&bin, fresh, &run);
+        assert_eq!(out.code, Some(0), "(2) lockfile-only:\n{out}");
+        assert_attested(out.doc(), &self.purl, UUID, Marker::Redirected, vulns);
+        assert!(
+            api.view_requests(UUID) >= 1,
+            "(2) the record came from the API"
+        );
+        let out = run_vex(&bin, fresh, &run.clone().via(VexVia::Apply));
+        assert_eq!(out.code, Some(0), "(2) apply --vex:\n{out}");
+        assert_eq!(
+            out.envelope["status"], "noManifest",
+            "(2) apply --vex:\n{out}"
+        );
+        assert_attested(out.doc(), &self.purl, UUID, Marker::Redirected, vulns);
+        // (2b) Not installed at all (a lockfile-only CI checkout: EMPTY
+        //      CARGO_HOME): the lock's checksum pin of the patched .crate
+        //      is the evidence — in every lock format (v1 keeps it in
+        //      `[metadata]`).
+        let empty_home = self.scratch.join("empty-cargo-home");
+        std::fs::create_dir_all(&empty_home).unwrap();
+        let out = run_vex(&bin, fresh, &self.vex_run(&api, &empty_home));
+        assert_eq!(out.code, Some(0), "(2b) not installed:\n{out}");
+        assert_attested(out.doc(), &self.purl, UUID, Marker::Redirected, vulns);
+        // Embedded read-only `scan --vex`, authenticated against the
+        // fixture's org-scoped API (batch discovery + the patch view).
+        let scan = VexRun {
+            via: VexVia::Scan,
+            api_url: Some(self.server_uri.clone()),
+            api_token: Some("fake".to_string()),
+            org: Some(ORG.to_string()),
+            proxy_url: None,
+            ..run.clone()
+        };
+        let out = run_vex(&bin, fresh, &scan);
+        assert_eq!(out.code, Some(0), "(2) scan --vex:\n{out}");
+        assert_attested(out.doc(), &self.purl, UUID, Marker::Redirected, vulns);
+        assert!(
+            !fresh.join(".socket/manifest.json").exists(),
+            "no VEX step writes the manifest"
+        );
+
+        // (3) Offline with no ledger: nothing local holds the record.
+        let before = api.request_count();
+        let out = run_vex(
+            &bin,
+            fresh,
+            &VexRun {
+                offline: true,
+                ..run.clone()
+            },
+        );
+        assert_eq!(out.code, Some(1), "(3) offline:\n{out}");
+        assert_not_attested(&out.envelope, &self.purl, "record_unavailable");
+        assert_absent(out.doc.as_ref(), &self.purl);
+        assert_eq!(api.request_count(), before, "(3) --offline made a request");
+
+        // (4a) The lock reverted to crates.io (ledger restored, the patched
+        //      hosted copy still extracted, the Cargo.toml pin + registry
+        //      definition left over): the stale ledger never attests.
+        std::fs::write(&ledger_path, &ledger).unwrap();
+        std::fs::write(fresh.join("Cargo.lock"), &self.baseline_lock).unwrap();
+        for no_verify in [false, true] {
+            let out = run_vex(
+                &bin,
+                fresh,
+                &VexRun {
+                    no_verify,
+                    ..run.clone()
+                },
+            );
+            assert_eq!(out.code, Some(1), "(4a) no_verify={no_verify}:\n{out}");
+            assert_not_attested(&out.envelope, &self.purl, "redirect_unwired");
+            assert_absent(out.doc.as_ref(), &self.purl);
+        }
+
+        // (4b) The full three-file revert, installed for real from
+        //      crates.io, with the ledger kept.
+        let revert = self.scratch.join("reverted");
+        let revert_home = self.scratch.join("reverted-cargo-home");
+        std::fs::create_dir_all(revert.join(".socket/vendor")).unwrap();
+        std::fs::create_dir_all(&revert_home).unwrap();
+        std::fs::write(revert.join("Cargo.toml"), &self.baseline_toml).unwrap();
+        std::fs::write(revert.join("Cargo.lock"), &self.baseline_lock).unwrap();
+        copy_dir_recursive(&fresh.join("src"), &revert.join("src"));
+        std::fs::write(
+            revert.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL),
+            &ledger,
+        )
+        .unwrap();
+        let fetch = cargo(&revert, &["fetch", "--locked"], &revert_home);
+        assert!(
+            fetch.status.success(),
+            "(4b) the reverted checkout fetches from crates.io:\n{}",
+            String::from_utf8_lossy(&fetch.stderr)
+        );
+        let leaf = self.purl.rsplit('/').next().unwrap().replace('@', "-");
+        let pristine = find_registry_crate(&revert_home, &leaf)
+            .map(|dir| std::fs::read(dir.join("src/lib.rs")).unwrap());
+        if let Some(pristine) = pristine {
+            assert!(
+                !String::from_utf8_lossy(&pristine).contains("socket_patched"),
+                "(4b) the reverted install is crates.io's copy"
+            );
+        }
+        let run = self.vex_run(&api, &revert_home);
+        for no_verify in [false, true] {
+            let out = run_vex(
+                &bin,
+                &revert,
+                &VexRun {
+                    no_verify,
+                    ..run.clone()
+                },
+            );
+            assert_eq!(out.code, Some(1), "(4b) no_verify={no_verify}:\n{out}");
+            assert_not_attested(&out.envelope, &self.purl, "redirect_unwired");
+            assert_absent(out.doc.as_ref(), &self.purl);
+        }
+    }
 }
 
 // ── the capstone ──────────────────────────────────────────────────────
@@ -727,6 +992,11 @@ async fn cargo_hosted_fresh_checkout_fetch_pulls_patched_crate_and_vex_verifies(
         format!("Patched via Socket patch {UUID} (redirected)"),
         "the post-install (hash-verified) attestation must carry the (redirected) marker"
     );
+
+    // 6. Manifest-less VEX on the same fresh checkout.
+    ManifestlessHosted::new(&fx, &fresh, &fresh_home)
+        .run()
+        .await;
 }
 
 /// get-driven twin (v3.6): `get <uuid> --mode hosted --json --yes` must land
@@ -743,7 +1013,7 @@ async fn cargo_get_uuid_hosted_fresh_checkout_fetch() {
         return;
     };
 
-    let (_fresh, fresh_home, fetch) = fresh_checkout_cargo_fetch(&fx);
+    let (fresh, fresh_home, fetch) = fresh_checkout_cargo_fetch(&fx);
     assert!(
         fetch.status.success(),
         "fresh-checkout `cargo fetch --locked` after `get --mode hosted` must succeed from the \
@@ -759,6 +1029,23 @@ async fn cargo_get_uuid_hosted_fresh_checkout_fetch() {
         fx.crate_bytes,
         "the fetched .crate must be byte-identical to the hosted patched tarball"
     );
+
+    // Manifest-less VEX: `cargo fetch` only downloads, so extract the
+    // sources the way the build does (an offline build) first — the
+    // installed-tree check then hashes the hosted copy.
+    let build = cargo(
+        &fresh,
+        &["build", "-q", "--locked", "--offline"],
+        &fresh_home,
+    );
+    assert!(
+        build.status.success(),
+        "offline build of the get-driven checkout:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    ManifestlessHosted::new(&fx, &fresh, &fresh_home)
+        .run()
+        .await;
 }
 
 /// Negative twin: the download route serves TAMPERED bytes while the index

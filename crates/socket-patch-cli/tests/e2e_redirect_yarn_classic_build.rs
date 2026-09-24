@@ -32,11 +32,25 @@
 //! lock keeps the real sha1/integrity pins: the fresh install MUST fail on
 //! the integrity/hash check — the lock pin is enforcement.
 //!
-//! Skips (with a println) when `corepack yarn@1.22.22` is unavailable or the
-//! fixture install cannot reach the registry; every assertion after is hard.
+//! Manifest-less VEX (the depscan / never-committed-manifest shape): once the
+//! fresh checkout has installed the hosted bytes, `ManifestlessVex` deletes
+//! `.socket/manifest.json`, then the redirect ledger, and proves the patch is
+//! still attested `(redirected)` from the `yarn.lock` wiring alone (record
+//! from the patch API), is `record_unavailable` `--offline` with zero API
+//! requests, and is NOT attested once the lock is reverted to the registry
+//! and really re-installed — plus the same through embedded `apply --vex`
+//! and `scan --mode hosted --vex`. A dev-flow twin re-serializes the hosted
+//! lock with `yarn add` (pre-1.10 releases drop the `integrity` line) and
+//! attests from that yarn-written lock, installed and lockfile-only.
+//!
+//! The yarn release is `yarn@1.22.22` unless
+//! `SOCKET_PATCH_YARN_CLASSIC_E2E_VERSION` names another 1.x (see
+//! `common/yarn_classic_vex.rs`). Skips (with a println) when that yarn is
+//! unavailable or the fixture install cannot reach the registry — unless
+//! `SOCKET_PATCH_YARN_E2E_REQUIRED=1`; every assertion after is hard.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
@@ -44,6 +58,14 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+#[path = "common/yarn_classic_vex.rs"]
+mod yarn_classic_vex;
+
+use yarn_classic_vex::{
+    require_yarn_classic, via_apply, yarn_classic, Embedded, ManifestlessVex, Wiring,
+};
 
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
@@ -54,35 +76,22 @@ const TOKEN: &str = "33333333-3333-4333-8333-333333333333";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const GHSA: &str = "GHSA-redirect-classic-real";
 const PRODUCT: &str = "pkg:npm/app@1.0.0";
-const YARN_CLASSIC: &str = "yarn@1.22.22";
+const CVE: &str = "CVE-2026-2222";
+
+/// Print a SKIP line — or, under `SOCKET_PATCH_YARN_E2E_REQUIRED=1` (a leg
+/// that provisioned corepack yarn on purpose), FAIL: a required leg must
+/// never report green on an unexercised toolchain or an unreachable fixture
+/// registry.
+macro_rules! skip {
+    ($($arg:tt)*) => {{
+        yarn_classic_vex::skip("e2e_redirect_yarn_classic_build", &format!($($arg)*));
+    }};
+}
 
 // ── self-contained helpers ────────────────────────────────────────────
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
-
-/// Probe corepack from a NEUTRAL temp dir: a `packageManager` field in an
-/// ancestor `package.json` (e.g. this monorepo's root) makes corepack refuse
-/// to run a different package manager, which would spuriously fail the gate.
-/// The real installs below all run in their own tempdirs, so the probe must
-/// too.
-fn has_corepack_pm(pm: &str) -> bool {
-    let Ok(probe) = tempfile::tempdir() else {
-        return false;
-    };
-    // Isolated too: this probe is what actually downloads the package manager
-    // the first time, and corepack stores it under `COREPACK_HOME`.
-    let mut cmd = Command::new("corepack");
-    cmd.args([pm, "--version"])
-        .current_dir(probe.path())
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
-    cache_env::isolate(&mut cmd);
-    cmd.stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 fn scrub_socket_env(cmd: &mut Command) {
@@ -201,8 +210,11 @@ fn sha512_sri(bytes: &[u8]) -> String {
 struct ClassicRedirectFixture {
     tmp: tempfile::TempDir,
     proj: PathBuf,
+    orig: Vec<u8>,
     patched: Vec<u8>,
-    _server: MockServer,
+    /// The registry `yarn.lock` the real install wrote, before the rewrite.
+    lock_pristine: Vec<u8>,
+    server: MockServer,
 }
 
 /// Which CLI front door drives the hosted engine. Both consume the SAME
@@ -227,10 +239,9 @@ async fn classic_hosted_project(
     tamper_served_tarball: bool,
     driver: HostedDriver,
 ) -> Option<ClassicRedirectFixture> {
-    if !has_corepack_pm(YARN_CLASSIC) {
-        println!(
-            "SKIP e2e_redirect_yarn_classic_build ({tag}): `corepack {YARN_CLASSIC}` unavailable"
-        );
+    if !require_yarn_classic(&format!("e2e_redirect_yarn_classic_build ({tag})"), |c| {
+        cache_env::isolate(c);
+    }) {
         return None;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -248,14 +259,13 @@ async fn classic_hosted_project(
     let cache = tmp.path().join("yarn-cache");
     let install = corepack(
         &proj,
-        YARN_CLASSIC,
+        &yarn_classic(),
         &["install", "--no-progress"],
         &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
     );
     if !install.status.success() {
-        println!(
-            "SKIP e2e_redirect_yarn_classic_build ({tag}): fixture `yarn install` failed \
-             (registry unreachable?):\n{}",
+        skip!(
+            "({tag}): fixture `yarn install` failed (registry unreachable?):\n{}",
             String::from_utf8_lossy(&install.stderr)
         );
         return None;
@@ -454,8 +464,10 @@ async fn classic_hosted_project(
     Some(ClassicRedirectFixture {
         tmp,
         proj,
+        orig,
         patched,
-        _server: server,
+        lock_pristine: lock_pristine.into_bytes(),
+        server,
     })
 }
 
@@ -471,11 +483,171 @@ fn fresh_checkout_yarn_install(fx: &ClassicRedirectFixture) -> (PathBuf, Output)
     let fresh_cache = fx.tmp.path().join("fresh-yarn-cache");
     let ci = corepack(
         &fresh,
-        YARN_CLASSIC,
+        &yarn_classic(),
         &["install", "--frozen-lockfile", "--no-progress"],
         &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
     );
     (fresh, ci)
+}
+
+/// Manifest-less VEX over the fresh checkout `fresh` (hosted bytes
+/// installed by the real yarn): see `ManifestlessVex::run` for the cells.
+/// The record's afterHash is the patched `index.js`; the lock references the
+/// fixture's mock host, so it is passed as `--patch-server-url`. `scan`
+/// adds the embedded `scan --mode hosted --vex` re-resolution against the
+/// fixture API (the command the flow itself ran).
+fn manifestless_vex(fx: &ClassicRedirectFixture, fresh: &Path, leg: &str, scan: bool) {
+    use vex_e2e_common::{git_sha256, patch_view, PatchApi, VexVia};
+    let api = PatchApi::start(vec![(
+        UUID.to_string(),
+        patch_view(
+            UUID,
+            PURL,
+            &[("package/index.js", &git_sha256(&fx.patched))],
+            &[(GHSA, &[CVE])],
+        ),
+    )]);
+    let server = fx.server.uri();
+    let mut embedded: Vec<(&str, Embedded)> = vec![("apply --vex", via_apply())];
+    if scan {
+        embedded.push((
+            "scan --mode hosted --vex",
+            Box::new(|run| {
+                let mut run = run
+                    .via(VexVia::Scan)
+                    .arg("--mode")
+                    .arg("hosted")
+                    .arg("--yes");
+                run.proxy_url = None;
+                run.api_url = Some(server.clone());
+                run.api_token = Some("fake".to_string());
+                run.org = Some(ORG.to_string());
+                run
+            }),
+        ));
+    }
+    let tmp = fx.tmp.path().to_path_buf();
+    let orig = fx.orig.clone();
+    ManifestlessVex {
+        leg,
+        wiring: Wiring::Hosted,
+        purl: PURL,
+        uuid: UUID,
+        vulns: &[(GHSA, &[CVE])],
+        api: &api,
+        proxy_override: None,
+        patch_server_url: Some(fx.server.uri()),
+        registry_lock: fx.lock_pristine.clone(),
+        // A real `yarn install --frozen-lockfile` of the reverted lock (from
+        // the registry): the installed tree is pristine again.
+        reinstall: Some(Box::new(move |dir: &Path| {
+            std::fs::remove_dir_all(dir.join("node_modules")).expect("rm node_modules");
+            let cache = tmp.join(format!("{leg}-reverted-cache"));
+            let out = corepack(
+                dir,
+                &yarn_classic(),
+                &["install", "--frozen-lockfile", "--no-progress"],
+                &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+            );
+            assert!(
+                out.status.success(),
+                "{leg}: reverted-lock `yarn install --frozen-lockfile` failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let installed = std::fs::read(dir.join("node_modules").join(DEP).join("index.js"))
+                .expect("reinstalled index.js");
+            assert_eq!(
+                installed, orig,
+                "{leg}: the reverted lock installs pristine bytes"
+            );
+        })),
+        embedded,
+    }
+    .run(fresh);
+}
+
+/// Dev flow over the hosted lock: `yarn add` re-serializes the WHOLE lock
+/// from yarn's in-memory model (a release < 1.10 drops every `integrity`
+/// line, leaving the `#sha1` fragment as the pin). The hosted block must
+/// survive with its Socket URL, and a manifest-less, ledger-less checkout of
+/// that yarn-written lock must still attest — installed, and lockfile-only
+/// (nothing installed: the surviving pin is the evidence).
+fn hosted_dev_resave_vex(fx: &ClassicRedirectFixture) {
+    use vex_e2e_common::{
+        assert_attested, binary, git_sha256, patch_view, run_vex, strip_ledgers, strip_manifest,
+        Marker, PatchApi, VexRun,
+    };
+    let dev = fx.tmp.path().join("dev-resave");
+    std::fs::create_dir_all(&dev).unwrap();
+    std::fs::copy(fx.proj.join("package.json"), dev.join("package.json")).unwrap();
+    std::fs::copy(fx.proj.join("yarn.lock"), dev.join("yarn.lock")).unwrap();
+    let cache = fx.tmp.path().join("dev-resave-cache");
+    let add = corepack(
+        &dev,
+        &yarn_classic(),
+        &["add", "isarray@2.0.5", "--no-progress"],
+        &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
+    );
+    assert!(
+        add.status.success() && String::from_utf8_lossy(&add.stdout).contains("Saved lockfile"),
+        "`yarn add` must re-serialize the hosted lock:\n{}\n{}",
+        String::from_utf8_lossy(&add.stdout),
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let lock = std::fs::read_to_string(dev.join("yarn.lock")).unwrap();
+    let hosted = format!("/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/");
+    assert!(
+        lock.contains(&hosted),
+        "hosted block lost by `yarn add`:\n{lock}"
+    );
+    if !yarn_classic_vex::writes_integrity(&yarn_classic_vex::yarn_classic_version()) {
+        // The attestations below then rest on the `#sha1` pin alone.
+        assert!(
+            !lock.contains("integrity "),
+            "a pre-1.10 re-save drops every `integrity` line:\n{lock}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(dev.join("node_modules").join(DEP).join("index.js")).unwrap(),
+        fx.patched,
+        "the re-linked tree carries the hosted (patched) bytes"
+    );
+    strip_manifest(&dev);
+    strip_ledgers(&dev);
+    let api = PatchApi::start(vec![(
+        UUID.to_string(),
+        patch_view(
+            UUID,
+            PURL,
+            &[("package/index.js", &git_sha256(&fx.patched))],
+            &[(GHSA, &[CVE])],
+        ),
+    )]);
+    let run = VexRun {
+        patch_server_url: Some(fx.server.uri()),
+        ..VexRun::online(&api)
+    };
+    for installed in [true, false] {
+        if !installed {
+            std::fs::remove_dir_all(dev.join("node_modules")).unwrap();
+        }
+        let out = run_vex(&binary(), &dev, &run);
+        assert_eq!(
+            out.code,
+            Some(0),
+            "re-saved hosted lock (installed={installed}):\n{out}"
+        );
+        assert_attested(out.doc(), PURL, UUID, Marker::Redirected, &[(GHSA, &[CVE])]);
+        println!(
+            "VEXCELL leg=redirect-dev-resave yarn={} mode=hosted cell={} PASS",
+            yarn_classic_vex::yarn_classic_version(),
+            if installed {
+                "resaved-installed"
+            } else {
+                "resaved-lockfile-only"
+            }
+        );
+    }
 }
 
 // ── the capstone ──────────────────────────────────────────────────────
@@ -508,6 +680,10 @@ async fn classic_redirect_fresh_checkout_installs_patched_bytes() {
         installed, fx.patched,
         "fresh install must be byte-identical to the patched content"
     );
+
+    // Off the async executor: the patch-API stand-in runs its own runtime.
+    tokio::task::block_in_place(|| manifestless_vex(&fx, &fresh, "redirect-scan", true));
+    tokio::task::block_in_place(|| hosted_dev_resave_vex(&fx));
 }
 
 /// get-driven hosted twin (v3.6): `get <uuid> --mode hosted --json --yes`
@@ -543,6 +719,8 @@ async fn classic_get_uuid_hosted_fresh_checkout_installs() {
         installed, fx.patched,
         "fresh install must be byte-identical to the patched content (get-driven)"
     );
+
+    tokio::task::block_in_place(|| manifestless_vex(&fx, &fresh, "redirect-get-uuid", false));
 }
 
 /// Negative twin: the hosted URL serves a DIFFERENT tarball while the lock

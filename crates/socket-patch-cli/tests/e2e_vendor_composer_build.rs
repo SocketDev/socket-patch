@@ -24,9 +24,24 @@
 //!      REAL directory (not a symlink) holding the patched bytes, and the
 //!      patch uuid survives into `vendor/composer/installed.json`
 //!      (`dist.reference`).
+//!      Then the **manifest-less VEX legs** run on that fresh checkout (the shape a
+//!      depscan PR / a `vendor --detached` checkout has): with
+//!      `.socket/manifest.json` deleted, standalone `vex` (and embedded
+//!      `vendor --vex` / `apply --vex`) still attests `(vendored)` from the
+//!      ledger; with both ledgers deleted too it attests from the
+//!      composer.lock path dist + the mock patch API's record; `--offline`
+//!      with no ledgers is `record_unavailable` with zero requests; and once
+//!      composer.lock is reverted to the registry dist (ledger + artifact
+//!      left behind, a real `composer install` re-run) nothing attests —
+//!      `--no-verify` included.
 //!   6. Idempotency: a re-vendor leaves composer.lock byte-identical.
 //!   7. **Revert proof**: `vendor --revert` restores composer.lock
 //!      byte-for-byte and removes `.socket/vendor/` entirely.
+//!
+//! A third twin drives `scan --vendor --detached --vex` (the depscan-style
+//! front door: batch discovery → vendored copy + lock wiring, NO manifest,
+//! embedded VEX in the same run) against the same mocked API, then the same
+//! fresh-checkout install and manifest-less VEX legs.
 //!
 //! The capstone also has a `get <uuid> --mode vendored` twin (v3.6): the
 //! SAME vendor engine driven through get's uuid path against a wiremock
@@ -34,19 +49,33 @@
 //! a locally staged manifest/blob), ending in the same fresh-checkout
 //! `composer install` proof.
 //!
-//! Skips (with a println) when `composer` is not installed (this host) or
-//! the fixture install cannot reach packagist; every assertion after that is
-//! hard.
+//! Both composer majors: the capstones drive whatever `composer` is on
+//! PATH (composer 1 resolves the fixture from an inline package repository,
+//! since packagist no longer serves composer 1 — see
+//! `composer_e2e_common`). Skips (with a println) when `composer` is not
+//! installed or the fixture install cannot reach its registry, unless
+//! `SOCKET_PATCH_COMPOSER_E2E_REQUIRED` is set (then those fail); every
+//! assertion after that is hard. `SOCKET_PATCH_COMPOSER_E2E_VERSION` pins
+//! the release a CI leg expects.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "composer_e2e_common/mod.rs"]
+mod composer_e2e_common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+
+use vex_e2e_common::{
+    assert_absent, assert_attested, assert_not_attested, run_vex, strip_ledgers, strip_manifest,
+    Marker, PatchApi, VexOutcome, VexRun, VexVia,
+};
 
 /// Canonical lowercase patch uuid (a dedicated path level under
 /// `.socket/vendor/composer/`) — also what `dist.reference` must carry.
@@ -64,17 +93,6 @@ const FIXTURE_VERSION: &str = "3.0.2";
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
-
-fn has_command(cmd: &str) -> bool {
-    let mut probe = Command::new(cmd);
-    probe.arg("--version");
-    cache_env::isolate(&mut probe);
-    probe
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
 }
 
 /// Run the socket-patch binary with a scrubbed environment: every ambient
@@ -100,15 +118,7 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// Run `composer <args>` in `cwd` with a PRIVATE home + cache (the host's
 /// composer state must neither leak in nor be polluted).
 fn composer(cwd: &Path, args: &[&str], home: &Path, cache: &Path) -> Output {
-    std::fs::create_dir_all(home).unwrap();
-    std::fs::create_dir_all(cache).unwrap();
-    let mut cmd = Command::new("composer");
-    cmd.args(args).arg("--no-interaction").current_dir(cwd);
-    cache_env::isolate(&mut cmd);
-    cmd.env("COMPOSER_HOME", home)
-        .env("COMPOSER_CACHE_DIR", cache)
-        .output()
-        .expect("failed to run composer")
+    composer_e2e_common::composer(cwd, args, home, cache)
 }
 
 /// Git-blob SHA-256 (`sha256("blob <len>\0" ++ bytes)`) — the hash format
@@ -155,19 +165,6 @@ fn stage_patch_with_vuln(proj: &Path, purl: &str, file_key: &str, before: &[u8],
 fn parse_envelope(stdout: &str) -> serde_json::Value {
     serde_json::from_str(stdout)
         .unwrap_or_else(|e| panic!("vendor --json output is not JSON: {e}\nstdout:\n{stdout}"))
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
 }
 
 /// The resolved (leading-`v`-stripped) version of `name` from composer.lock's
@@ -248,6 +245,42 @@ fn run_vendored(driver: &VendorDriver<'_>, proj: &Path) -> (i32, String, String)
     }
 }
 
+/// The discovery routes `scan --vendor` walks before the view fetch: batch
+/// search (the installed psr/log has one free patch) + the per-package
+/// search its selection consults.
+async fn mount_scan_mocks(server: &MockServer, purl: &str) {
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": purl,
+                "patches": [{
+                    "uuid": UUID, "purl": purl, "tier": "free",
+                    "cveIds": [VEX_CVE], "ghsaIds": [GHSA], "severity": "high",
+                    "title": "composer vendor capstone"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": purl,
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "capstone marker patch", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+}
+
 /// Mount `view/{UUID}` on the mock API: the patch record with REAL git-blob
 /// hashes over the ACTUAL installed bytes plus inline base64 `blobContent`,
 /// so `get --mode vendored` both saves the manifest record and stages the
@@ -289,32 +322,20 @@ async fn mount_view_mock(
 }
 
 /// REAL fixture: write the psr/log composer.json, then `composer update`
-/// resolves + installs it from packagist (network allowed here only,
-/// private home + cache). Returns false after printing the suite's SKIP
-/// line — `tag` names the calling test — when packagist is unreachable.
-fn setup_composer_project(proj: &Path, home: &Path, cache: &Path, tag: &str) -> bool {
-    std::fs::write(
-        proj.join("composer.json"),
-        r#"{
-    "name": "socket/vendor-capstone",
-    "description": "socket-patch vendor host capstone fixture",
-    "require": {
-        "psr/log": "3.0.*"
-    }
-}
-"#,
+/// resolves + installs it (packagist on composer 2, the inline package
+/// repository on composer 1; network allowed here only, private home +
+/// cache). Returns false after printing the suite's SKIP line — `tag` names
+/// the calling test — when the registry is unreachable (a failure instead
+/// when the leg requires composer).
+fn setup_composer_project(proj: &Path, home: &Path, cache: &Path, tag: &str, major: u32) -> bool {
+    composer_e2e_common::setup_psr_log_project(
+        &format!("e2e_vendor_composer_build{tag}"),
+        proj,
+        home,
+        cache,
+        major,
     )
-    .unwrap();
-    let update = composer(proj, &["update"], home, cache);
-    if !update.status.success() {
-        println!(
-            "SKIP e2e_vendor_composer_build{tag}: `composer update` failed (packagist \
-             unreachable?):\n{}",
-            String::from_utf8_lossy(&update.stderr)
-        );
-        return false;
-    }
-    true
+    .is_some()
 }
 
 /// FRESH-CHECKOUT PROOF: ONLY the committable files (composer.json,
@@ -323,16 +344,9 @@ fn setup_composer_project(proj: &Path, home: &Path, cache: &Path, tag: &str) -> 
 /// (not a symlink — `transport-options.symlink: false` is load-bearing)
 /// holding the `patched` bytes, with the patch uuid surviving into
 /// `vendor/composer/installed.json` (`dist.reference`).
-fn assert_fresh_checkout_installs_patched(tmp: &Path, proj: &Path, patched: &[u8]) {
+fn assert_fresh_checkout_installs_patched(tmp: &Path, proj: &Path, patched: &[u8]) -> PathBuf {
     let fresh = tmp.join("fresh");
-    std::fs::create_dir_all(&fresh).unwrap();
-    std::fs::copy(proj.join("composer.json"), fresh.join("composer.json")).unwrap();
-    std::fs::copy(proj.join("composer.lock"), fresh.join("composer.lock")).unwrap();
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
-    assert!(
-        !fresh.join("vendor").exists(),
-        "fresh checkout must not carry an installed tree (test bug)"
-    );
+    composer_e2e_common::fresh_checkout(proj, &fresh);
 
     let fresh_home = tmp.join("cold-composer-home");
     let fresh_cache = tmp.join("cold-composer-cache");
@@ -366,17 +380,9 @@ fn assert_fresh_checkout_installs_patched(tmp: &Path, proj: &Path, patched: &[u8
 
     // In-tree traceability: composer preserves dist.reference verbatim into
     // vendor/composer/installed.json — the patch uuid must survive there.
-    let installed_json: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(fresh.join("vendor/composer/installed.json")).unwrap(),
-    )
-    .unwrap();
-    // composer 2 wraps the list in {"packages": [...]}; composer 1 wrote a
+    // composer 2 wraps the list in {"packages": [...]}; composer 1 writes a
     // bare array — accept both like the docker twin's php oracle.
-    let installed_pkgs = installed_json
-        .get("packages")
-        .and_then(|p| p.as_array())
-        .or_else(|| installed_json.as_array())
-        .expect("installed.json package list");
+    let installed_pkgs = composer_e2e_common::installed_packages(&fresh);
     let installed_entry = installed_pkgs
         .iter()
         .find(|p| p["name"] == DEP)
@@ -384,6 +390,184 @@ fn assert_fresh_checkout_installs_patched(tmp: &Path, proj: &Path, patched: &[u8
     assert_eq!(
         installed_entry["dist"]["reference"], UUID,
         "installed.json must carry dist.reference == patch uuid: {installed_entry}"
+    );
+    fresh
+}
+
+// ── manifest-less VEX legs ────────────────────────────────────────────
+
+/// Product purl every VEX leg of this suite passes (composer has no product
+/// auto-detect from a bare fixture composer.json with no version).
+const VEX_PRODUCT: &str = "pkg:composer/app@1.0.0";
+const VEX_CVE: &str = "CVE-2026-44444";
+
+/// Step 5b over a fresh `composer install`ed checkout of the vendored
+/// project (`registry_lock` = the pre-vendor composer.lock the real composer
+/// wrote): the four manifest-less legs plus the embedded `vendor --vex` /
+/// `apply --vex` twins. The record comes from a mock patch API whose view
+/// carries the REAL after-hash of the patched file.
+fn assert_manifestless_vendored_vex(
+    tmp: &Path,
+    fresh: &Path,
+    purl: &str,
+    patched: &[u8],
+    registry_lock: &[u8],
+    tag: &str,
+) {
+    let vulns: &[(&str, &[&str])] = &[(GHSA, &[VEX_CVE])];
+    let api = PatchApi::start(vec![(
+        UUID.to_string(),
+        vex_e2e_common::patch_view(
+            UUID,
+            purl,
+            &[("src/LoggerInterface.php", &git_sha256(patched))],
+            vulns,
+        ),
+    )]);
+    let product = |run: VexRun| VexRun {
+        product: Some(VEX_PRODUCT.to_string()),
+        ..run
+    };
+    let vex_in = |dir: &Path, run: VexRun| -> VexOutcome { run_vex(&binary(), dir, &product(run)) };
+    let lock_wired = std::fs::read(fresh.join("composer.lock")).unwrap();
+    let artifact = fresh.join(format!(
+        ".socket/vendor/composer/{UUID}/{DEP}@{}",
+        purl.rsplit('@').next().unwrap()
+    ));
+    assert!(
+        artifact.is_dir(),
+        "[{tag}] the committed artifact travelled"
+    );
+
+    // (1) manifest deleted, ledgers kept: standalone + embedded attest.
+    strip_manifest(fresh);
+    let out = vex_in(fresh, VexRun::online(&api));
+    assert_eq!(out.code, Some(0), "[{tag}] manifest deleted:\n{out}");
+    assert_attested(out.doc(), purl, UUID, Marker::Vendored, vulns);
+    for via in [VexVia::Vendor, VexVia::Apply] {
+        let out = vex_in(fresh, VexRun::online(&api).via(via));
+        assert_eq!(out.code, Some(0), "[{tag}] embedded {via:?}:\n{out}");
+        assert_eq!(
+            out.envelope["status"], "noManifest",
+            "[{tag}] {via:?}:\n{out}"
+        );
+        assert_eq!(
+            out.envelope["vex"]["statements"], 1,
+            "[{tag}] {via:?}:\n{out}"
+        );
+        assert_attested(out.doc(), purl, UUID, Marker::Vendored, vulns);
+    }
+    assert_eq!(
+        std::fs::read(fresh.join("composer.lock")).unwrap(),
+        lock_wired,
+        "[{tag}] manifest-less vendor/apply must not touch composer.lock"
+    );
+    assert!(
+        !fresh.join(".socket/manifest.json").exists(),
+        "[{tag}] no VEX leg may write a manifest"
+    );
+
+    // (4) (prepared before the ledgers go) composer.lock reverted to the
+    // registry dist while the ledger + artifact stay committed, then a REAL
+    // re-install: composer now consumes the pristine registry package, so
+    // nothing may attest — --no-verify and --offline included.
+    let reverted = tmp.join(format!("{tag}-reverted"));
+    std::fs::create_dir_all(&reverted).unwrap();
+    std::fs::copy(fresh.join("composer.json"), reverted.join("composer.json")).unwrap();
+    std::fs::write(reverted.join("composer.lock"), registry_lock).unwrap();
+    composer_e2e_common::copy_dir_recursive(&fresh.join(".socket"), &reverted.join(".socket"));
+    let install = composer(
+        &reverted,
+        &["install"],
+        &tmp.join(format!("{tag}-reverted-home")),
+        &tmp.join(format!("{tag}-reverted-cache")),
+    );
+    assert!(
+        install.status.success(),
+        "[{tag}] re-install from the reverted lock:\n{}\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_ne!(
+        std::fs::read(reverted.join("vendor/psr/log/src/LoggerInterface.php")).unwrap(),
+        patched,
+        "[{tag}] the reverted install is the registry package"
+    );
+    assert!(reverted.join(".socket/vendor/state.json").is_file());
+    for (label, run) in [
+        ("online", VexRun::online(&api)),
+        (
+            "online --no-verify",
+            VexRun {
+                no_verify: true,
+                ..VexRun::online(&api)
+            },
+        ),
+        (
+            "offline",
+            VexRun {
+                proxy_url: Some(api.uri()),
+                ..VexRun::offline()
+            },
+        ),
+        (
+            "offline --no-verify",
+            VexRun {
+                proxy_url: Some(api.uri()),
+                no_verify: true,
+                ..VexRun::offline()
+            },
+        ),
+    ] {
+        let out = vex_in(&reverted, run);
+        assert_eq!(out.code, Some(1), "[{tag}] reverted {label}:\n{out}");
+        assert_not_attested(&out.envelope, purl, "vendor_unwired");
+        assert_absent(out.doc.as_ref(), purl);
+    }
+    let out = vex_in(&reverted, VexRun::online(&api).via(VexVia::Apply));
+    assert_eq!(out.code, Some(1), "[{tag}] reverted apply --vex:\n{out}");
+    assert_absent(out.doc.as_ref(), purl);
+
+    // (2) ledgers deleted too: the composer.lock path dist + the API record
+    // are the only evidence left, and still attest.
+    strip_ledgers(fresh);
+    let fetched = api.view_requests(UUID);
+    let out = vex_in(fresh, VexRun::online(&api));
+    assert_eq!(out.code, Some(0), "[{tag}] ledgers deleted:\n{out}");
+    assert_attested(out.doc(), purl, UUID, Marker::Vendored, vulns);
+    assert!(
+        api.view_requests(UUID) > fetched,
+        "[{tag}] with no ledger the record must come from the API: {:?}",
+        api.requests()
+    );
+    let out = vex_in(fresh, VexRun::online(&api).via(VexVia::Vendor));
+    assert_eq!(
+        out.code,
+        Some(0),
+        "[{tag}] ledger-less vendor --vex:\n{out}"
+    );
+    assert_attested(out.doc(), purl, UUID, Marker::Vendored, vulns);
+
+    // (3) --offline with no ledgers: record_unavailable, zero requests.
+    let seen = api.request_count();
+    for no_verify in [false, true] {
+        let out = vex_in(
+            fresh,
+            VexRun {
+                proxy_url: Some(api.uri()),
+                no_verify,
+                ..VexRun::offline()
+            },
+        );
+        assert_eq!(out.code, Some(1), "[{tag}] offline no ledgers:\n{out}");
+        assert_not_attested(&out.envelope, purl, "record_unavailable");
+        assert!(out.doc.is_none(), "[{tag}] offline:\n{out}");
+    }
+    assert_eq!(
+        api.request_count(),
+        seen,
+        "[{tag}] --offline must make zero requests: {:?}",
+        api.requests()
     );
 }
 
@@ -393,10 +577,9 @@ fn assert_fresh_checkout_installs_patched(tmp: &Path, proj: &Path, patched: &[u8
 #[ignore = "host capstone: shells out to a real composer 2; the unpinned `test` job \
             skips it, the e2e job runs it with a pinned toolchain via --ignored"]
 fn composer_vendor_fresh_checkout_install_and_revert() {
-    if !has_command("composer") {
-        println!("SKIP e2e_vendor_composer_build: `composer` not installed");
+    let Some(major) = composer_e2e_common::composer_major("e2e_vendor_composer_build") else {
         return;
-    }
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
@@ -406,7 +589,7 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
     //    packagist (network allowed here only, private home + cache).
     let home = tmp.path().join("composer-home");
     let cache = tmp.path().join("composer-cache");
-    if !setup_composer_project(&proj, &home, &cache, "") {
+    if !setup_composer_project(&proj, &home, &cache, "", major) {
         return;
     }
 
@@ -530,7 +713,10 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
     // 5. FRESH-CHECKOUT PROOF: ONLY the committable files, cold composer
     //    home + cache — the vendored path dist is the only possible source
     //    of psr/log.
-    assert_fresh_checkout_installs_patched(tmp.path(), &proj, &patched);
+    let fresh = assert_fresh_checkout_installs_patched(tmp.path(), &proj, &patched);
+
+    // 5b. Manifest-less VEX legs on the fresh checkout.
+    assert_manifestless_vendored_vex(tmp.path(), &fresh, &purl, &patched, &lock_before, "vendor");
 
     // 6. Idempotency: a re-run exits 0 and leaves the lock byte-stable.
     let lock_wired = std::fs::read(&lock_path).unwrap();
@@ -597,10 +783,9 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
 #[ignore = "host capstone: shells out to a real composer 2; the unpinned `test` job \
             skips it, the e2e job runs it with a pinned toolchain via --ignored"]
 async fn composer_get_uuid_vendored_fresh_checkout_install() {
-    if !has_command("composer") {
-        println!("SKIP e2e_vendor_composer_build(get): `composer` not installed");
+    let Some(major) = composer_e2e_common::composer_major("e2e_vendor_composer_build(get)") else {
         return;
-    }
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
@@ -610,7 +795,7 @@ async fn composer_get_uuid_vendored_fresh_checkout_install() {
     // packagist (network allowed here only, private home + cache).
     let home = tmp.path().join("composer-home");
     let cache = tmp.path().join("composer-cache");
-    if !setup_composer_project(&proj, &home, &cache, "(get)") {
+    if !setup_composer_project(&proj, &home, &cache, "(get)", major) {
         return;
     }
 
@@ -629,6 +814,7 @@ async fn composer_get_uuid_vendored_fresh_checkout_install() {
     let purl = format!("pkg:composer/{DEP}@{version}");
 
     let json_before = std::fs::read(proj.join("composer.json")).unwrap();
+    let lock_before = std::fs::read(&lock_path).unwrap();
 
     // The API serves the record: view/{uuid} with REAL git-blob hashes over
     // the ACTUAL installed bytes + inline blob content.
@@ -737,7 +923,95 @@ async fn composer_get_uuid_vendored_fresh_checkout_install() {
 
     // FRESH-CHECKOUT PROOF: identical committability contract to the
     // capstone — cold home + cache, path dist the only source.
-    assert_fresh_checkout_installs_patched(tmp.path(), &proj, &patched);
+    let fresh = assert_fresh_checkout_installs_patched(tmp.path(), &proj, &patched);
+
+    // Manifest-less VEX legs on the get-produced checkout: `get` wrote the
+    // manifest, so deleting it is exactly the depscan / detached shape.
+    tokio::task::block_in_place(|| {
+        assert_manifestless_vendored_vex(tmp.path(), &fresh, &purl, &patched, &lock_before, "get")
+    });
+}
+
+/// `scan --vendor --detached --vex` twin: batch discovery over the REAL
+/// install → the vendored copy + composer.lock wiring with NO manifest
+/// (detached), the in-run embedded VEX attesting `(vendored)`, then the same
+/// fresh-checkout install and manifest-less VEX legs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real composer; the unpinned `test` job \
+            skips it, the e2e job runs it with a pinned toolchain via --ignored"]
+async fn composer_scan_vendor_detached_vex_fresh_checkout_install() {
+    let Some(major) = composer_e2e_common::composer_major("e2e_vendor_composer_build(scan)") else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let home = tmp.path().join("composer-home");
+    let cache = tmp.path().join("composer-cache");
+    if !setup_composer_project(&proj, &home, &cache, "(scan)", major) {
+        return;
+    }
+    let lock_path = proj.join("composer.lock");
+    let version = locked_composer_version(&lock_path, DEP)
+        .unwrap_or_else(|| panic!("{DEP} not present in composer.lock after update"));
+    let orig = std::fs::read(proj.join("vendor/psr/log/src/LoggerInterface.php")).unwrap();
+    let marker = format!("\n// SOCKET-PATCH-VENDOR-E2E-MARKER patch={UUID}\n");
+    let patched: Vec<u8> = [orig.as_slice(), marker.as_bytes()].concat();
+    let purl = format!("pkg:composer/{DEP}@{version}");
+    let lock_before = std::fs::read(&lock_path).unwrap();
+
+    let server = MockServer::start().await;
+    mount_scan_mocks(&server, &purl).await;
+    mount_view_mock(&server, &purl, "src/LoggerInterface.php", &orig, &patched).await;
+
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "scan",
+            "--vendor",
+            "--detached",
+            "--vendor-source",
+            "build",
+            "--vex",
+            "out.vex.json",
+            "--vex-product",
+            VEX_PRODUCT,
+            "--json",
+            "--yes",
+            "--api-url",
+            &server.uri(),
+            "--api-token",
+            "fake",
+            "--org",
+            ORG,
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        code, 0,
+        "scan --vendor --detached --vex failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let env = parse_envelope(&stdout);
+    assert_eq!(env["vex"]["statements"], 1, "in-run vex block: {env}");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proj.join("out.vex.json")).unwrap()).unwrap();
+    assert_attested(&doc, &purl, UUID, Marker::Vendored, &[(GHSA, &[VEX_CVE])]);
+    assert!(
+        !proj.join(".socket/manifest.json").exists(),
+        "--detached must not write a manifest: {env}"
+    );
+    let copy_rel = format!(".socket/vendor/composer/{UUID}/{DEP}@{version}");
+    let entry = lock_entry(&lock_path, DEP);
+    assert_eq!(entry["dist"]["type"], "path", "dist.type: {entry}");
+    assert_eq!(entry["dist"]["url"], copy_rel, "dist.url: {entry}");
+    assert_eq!(entry["dist"]["reference"], UUID, "dist.reference: {entry}");
+    assert!(entry.get("source").is_none(), "source removed: {entry}");
+
+    let fresh = assert_fresh_checkout_installs_patched(tmp.path(), &proj, &patched);
+    tokio::task::block_in_place(|| {
+        assert_manifestless_vendored_vex(tmp.path(), &fresh, &purl, &patched, &lock_before, "scan")
+    });
 }
 
 // ── revert against ledger state the capstone above never produces ─────

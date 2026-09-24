@@ -31,7 +31,9 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, SetupConfig, VulnerabilityInfo,
 };
-use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState};
+use socket_patch_core::vendor::state::{
+    VendorArtifact, VendorEntry, VendorState, WiringAction, WiringRecord,
+};
 
 /// Canonical-grammar patch UUID — the vendored-artifact verifier validates
 /// the uuid path level, so fixtures must use the real shape.
@@ -114,9 +116,46 @@ fn make_record(
     }
 }
 
+/// The serde artifact every cargo-shaped fixture below vendors.
+fn serde_artifact_rel() -> String {
+    format!(".socket/vendor/cargo/{UUID}/serde-1.0.0")
+}
+
+/// Wire the vendored serde crate the way `vendor`'s cargo backend does
+/// (`.cargo/config.toml` `[patch.crates-io]`) and return the ledger's
+/// record of that edit.
+///
+/// Every vendor-ledger fixture carries live wiring because `vex` now only
+/// honors a ledger entry whose committed artifact some lockfile/config
+/// still references: an entry whose wiring is gone (a reverted lockfile
+/// with the artifact and ledger left behind) is omitted as
+/// `vendor_unwired` — see `unwired_vendor_ledger_entry_is_not_attested`.
+fn write_cargo_wiring(cwd: &Path) -> WiringRecord {
+    let dir = cwd.join(".cargo");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        format!(
+            "[patch.crates-io]\nserde = {{ path = \"{}\" }}\n",
+            serde_artifact_rel()
+        ),
+    )
+    .unwrap();
+    WiringRecord {
+        file: ".cargo/config.toml".to_string(),
+        kind: "cargo_patch_entry".to_string(),
+        action: WiringAction::Added,
+        key: Some("serde".to_string()),
+        original: None,
+        new: None,
+    }
+}
+
 /// Write a `.socket/vendor/state.json` ledger with one cargo-style
-/// (dir-shaped) entry for `purl` whose artifact lives at `rel_path`.
+/// (dir-shaped) entry for `purl` whose artifact lives at `rel_path`, plus
+/// the entry's live `.cargo/config.toml` wiring.
 fn write_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
+    let wiring = write_cargo_wiring(cwd);
     let mut state = VendorState::new();
     state.entries.insert(
         purl.to_string(),
@@ -131,7 +170,7 @@ fn write_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
+            wiring: vec![wiring],
             lock: None,
             took_over_go_patches: false,
             detached: false,
@@ -156,7 +195,7 @@ fn write_vendor_state(cwd: &Path, purl: &str, rel_path: &str) {
 /// Lay down a vendored cargo-style dir artifact containing `src/lib.rs`
 /// with `content`; returns the project-relative artifact path.
 fn write_vendored_dir(cwd: &Path, content: &[u8]) -> String {
-    let rel = format!(".socket/vendor/cargo/{UUID}/serde-1.0.0");
+    let rel = serde_artifact_rel();
     let dir = cwd.join(&rel).join("src");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("lib.rs"), content).unwrap();
@@ -393,7 +432,10 @@ fn property7_vendored_exemption_survives_no_verify() {
     let cwd = tmp.path();
     let vendored_purl = "pkg:cargo/serde@1.0.0";
 
-    // Ledger only — no artifact on disk. `--no-verify` must not care.
+    // Ledger + its live config wiring only — no artifact on disk.
+    // `--no-verify` must not care about the (absent) bytes; it still
+    // requires the WIRING (a gate, not a hash), which write_vendor_state
+    // lays down.
     write_vendor_state(cwd, vendored_purl, ".socket/vendor/cargo/absent");
 
     let mut manifest = PatchManifest::new();
@@ -563,8 +605,10 @@ fn golang_go_patches_redirect_attested_without_module_cache() {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Ledger writer for the detached shape: `detached: true` plus the
-/// embedded record that replaces the manifest as verification source.
+/// embedded record that replaces the manifest as verification source, and
+/// the entry's live `.cargo/config.toml` wiring.
 fn write_detached_vendor_state(cwd: &Path, purl: &str, rel_path: &str, record: PatchRecord) {
+    let wiring = write_cargo_wiring(cwd);
     let mut state = VendorState::new();
     state.entries.insert(
         purl.to_string(),
@@ -579,7 +623,7 @@ fn write_detached_vendor_state(cwd: &Path, purl: &str, rel_path: &str, record: P
                 platform_locked: None,
                 file_inventory: None,
             },
-            wiring: Vec::new(),
+            wiring: vec![wiring],
             lock: None,
             took_over_go_patches: false,
             detached: true,
@@ -818,6 +862,114 @@ fn write_stored_zip(dest: &Path, members: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 
+/// Wire vendored artifact `rel` (`.socket/vendor/<eco>/<uuid>/<leaf>`) for
+/// `purl` into `cwd` in its ecosystem's REAL vendored shape — the lockfile /
+/// config line each vendor backend writes — and return the ledger's record
+/// of that edit. Each ecosystem gets its own file, so every matrix row's
+/// liveness is proven independently (`vex` omits a ledger entry no
+/// lockfile/config references as `vendor_unwired`).
+fn write_matrix_wiring(cwd: &Path, eco: &str, uuid: &str, rel: &str) -> WiringRecord {
+    let (file, kind, text) = match eco {
+        "npm" => (
+            "package-lock.json",
+            "npm_lock_entry",
+            serde_json::json!({
+                "name": "app",
+                "version": "1.0.0",
+                "lockfileVersion": 3,
+                "requires": true,
+                "packages": {
+                    "": { "name": "app", "version": "1.0.0" },
+                    "node_modules/lodash": {
+                        "version": "4.17.21",
+                        "resolved": format!("file:{rel}"),
+                        "integrity": "sha512-cGF0Y2hlZA=="
+                    }
+                }
+            })
+            .to_string(),
+        ),
+        "cargo" => (
+            ".cargo/config.toml",
+            "cargo_patch_entry",
+            format!("[patch.crates-io]\nserde = {{ path = \"{rel}\" }}\n"),
+        ),
+        "golang" => (
+            "go.mod",
+            "go_replace",
+            format!(
+                "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n\n\
+                 replace github.com/foo/bar v1.4.2 => ./{rel}\n"
+            ),
+        ),
+        "composer" => (
+            "composer.lock",
+            "composer_lock_package",
+            serde_json::json!({
+                "packages": [{
+                    "name": "monolog/monolog",
+                    "version": "2.9.1",
+                    "dist": { "type": "path", "url": rel, "reference": uuid },
+                    "transport-options": { "symlink": false }
+                }],
+                "packages-dev": []
+            })
+            .to_string(),
+        ),
+        "gem" => (
+            "Gemfile.lock",
+            "gemfile_lock_spec",
+            format!(
+                "PATH\n  remote: {rel}\n  specs:\n    rack (3.2.6)\n\nGEM\n  remote: \
+                 https://rubygems.org/\n  specs:\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  \
+                 rack (= 3.2.6)!\n"
+            ),
+        ),
+        "pypi" => (
+            "requirements.txt",
+            "requirements_line",
+            format!("./{rel}  # socket-patch vendor: six==1.16.0\n"),
+        ),
+        "nuget" => (
+            "nuget.config",
+            "nuget_config_source",
+            format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  \
+                 <packageSources>\n    <add key=\"socket-patch-{uuid}\" \
+                 value=\".socket/vendor/nuget/{uuid}\" />\n  </packageSources>\n  \
+                 <packageSourceMapping>\n    <packageSource key=\"socket-patch-{uuid}\">\n      \
+                 <package pattern=\"Newtonsoft.Json\" />\n    </packageSource>\n  \
+                 </packageSourceMapping>\n</configuration>\n"
+            ),
+        ),
+        "maven" => (
+            "pom.xml",
+            "maven_pom_repository",
+            format!(
+                "<project>\n  <groupId>com.example</groupId>\n  <artifactId>app</artifactId>\n  \
+                 <version>1.0.0</version>\n  <repositories>\n    <repository>\n      \
+                 <id>socket-patch-vendor-{uuid}</id>\n      \
+                 <url>file://${{project.basedir}}/.socket/vendor/maven/{uuid}</url>\n    \
+                 </repository>\n  </repositories>\n  <dependencies>\n    <dependency>\n      \
+                 <groupId>com.example</groupId>\n      <artifactId>app-lib</artifactId>\n      \
+                 <version>1.0.0</version>\n    </dependency>\n  </dependencies>\n</project>\n"
+            ),
+        ),
+        other => panic!("no wiring shape for {other}"),
+    };
+    let path = cwd.join(file);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, text).unwrap();
+    WiringRecord {
+        file: file.to_string(),
+        kind: kind.to_string(),
+        action: WiringAction::Rewritten,
+        key: None,
+        original: None,
+        new: None,
+    }
+}
+
 /// Write `content` at `rel/inner` under `cwd` (the dir-shaped artifact
 /// ecosystems: cargo / golang / composer / gem).
 fn write_dir_artifact(cwd: &Path, rel: &str, inner: &str, content: &[u8]) {
@@ -836,6 +988,7 @@ fn detached_matrix_entry(
     rel_path: &str,
     sha256: String,
     record: PatchRecord,
+    wiring: WiringRecord,
 ) -> VendorEntry {
     VendorEntry {
         ecosystem: eco.to_string(),
@@ -848,7 +1001,7 @@ fn detached_matrix_entry(
             platform_locked: None,
             file_inventory: None,
         },
-        wiring: Vec::new(),
+        wiring: vec![wiring],
         lock: None,
         took_over_go_patches: false,
         detached: true,
@@ -972,6 +1125,18 @@ fn detached_vendor_matrix_attests_every_vendor_ecosystem() {
                 String::new() // dir-shaped: integrity is per-file afterHashes
             }
         };
+        if case.eco == "maven" {
+            // `vendor_maven` commits the jar's `.sha1` beside it; the
+            // repository is `checksumPolicy=fail`, so a stale/missing one
+            // makes Maven skip the vendored copy (and vex with it).
+            use sha1::{Digest as _, Sha1};
+            let jar = std::fs::read(cwd.join(&rel)).unwrap();
+            std::fs::write(
+                cwd.join(format!("{rel}.sha1")),
+                hex::encode(Sha1::digest(&jar)),
+            )
+            .unwrap();
+        }
         let record = make_record(
             case.uuid,
             case.file_key,
@@ -979,9 +1144,10 @@ fn detached_vendor_matrix_attests_every_vendor_ecosystem() {
             case.ghsa,
             &["CVE-2026-1000"],
         );
+        let wiring = write_matrix_wiring(cwd, case.eco, case.uuid, &rel);
         state.entries.insert(
             case.purl.to_string(),
-            detached_matrix_entry(case.eco, case.purl, case.uuid, &rel, sha256, record),
+            detached_matrix_entry(case.eco, case.purl, case.uuid, &rel, sha256, record, wiring),
         );
     }
     let dir = cwd.join(".socket/vendor");
@@ -1070,10 +1236,11 @@ fn vendored_live_tree_out_of_sync_warns_but_attests() {
         "GHSA-sync-aaaa",
         &["CVE-2026-10"],
     );
+    let wiring = write_matrix_wiring(cwd, "npm", uuid, &rel);
     let mut state = VendorState::new();
     state.entries.insert(
         purl.to_string(),
-        detached_matrix_entry("npm", purl, uuid, &rel, sha256, record),
+        detached_matrix_entry("npm", purl, uuid, &rel, sha256, record, wiring),
     );
     let dir = cwd.join(".socket/vendor");
     std::fs::create_dir_all(&dir).expect("create .socket/vendor");
@@ -1522,4 +1689,620 @@ fn standalone_output_write_failure_names_path_and_exits_2() {
         stderr.contains("Failed to write VEX document") && stderr.contains("no-such-dir"),
         "the error must name the operation and the path; got {stderr:?}"
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// 8. wiring liveness + manifest-less lockfile discovery (vendored)
+//
+// A vendor-ledger entry attests only while some lockfile/config still
+// wires its artifact; a lockfile that wires a `.socket/vendor/` artifact
+// attests even with NO manifest and NO ledger, provided a patch record
+// with the same uuid AND package can be found (ledger, manifest, or the
+// patch API) and the committed artifact hashes to it.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Envelope `skipped` event for `purl`, or panic with the envelope.
+fn skipped_event<'a>(env: &'a Value, purl: &str) -> &'a Value {
+    env["events"]
+        .as_array()
+        .and_then(|events| {
+            events
+                .iter()
+                .find(|e| e["action"] == "skipped" && e["purl"] == purl)
+        })
+        .unwrap_or_else(|| panic!("expected a skipped event for {purl}: {env}"))
+}
+
+/// `vex --json --output` in `cwd` with extra args; returns (exit, envelope).
+fn vex_json(cwd: &Path, extra: &[&str]) -> (Option<i32>, Value) {
+    let vex_path = cwd.join("out.vex.json");
+    let mut args = vec![
+        "vex".to_string(),
+        "--cwd".to_string(),
+        cwd.to_str().unwrap().to_string(),
+        "--json".to_string(),
+        "--output".to_string(),
+        vex_path.to_str().unwrap().to_string(),
+        "--product".to_string(),
+        "pkg:npm/app@1.0.0".to_string(),
+    ];
+    args.extend(extra.iter().map(|s| s.to_string()));
+    let out = cli()
+        .env("SOCKET_TELEMETRY_DISABLED", "1")
+        .env("SOCKET_NO_CONFIG", "1")
+        .env("SOCKET_NO_API_TOKEN", "1")
+        .args(&args)
+        .output()
+        .expect("invoke vex");
+    let env: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "envelope JSON on stdout ({e}). stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code(), env)
+}
+
+/// A leftover vendor-ledger entry + artifact whose lockfile wiring was
+/// reverted must NOT attest — with or without `--no-verify` (the gate is
+/// about wiring, not hashing). Before the liveness gate this attested
+/// `(vendored)` from the stale artifact.
+#[test]
+fn unwired_vendor_ledger_entry_is_not_attested() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let purl = "pkg:cargo/serde@1.0.0";
+    let patched = b"patched vendored source\n";
+    let rel = write_vendored_dir(cwd, patched);
+    write_vendor_state(cwd, purl, &rel);
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        purl.to_string(),
+        make_record(
+            UUID,
+            "src/lib.rs",
+            &compute_git_sha256_from_bytes(patched),
+            "GHSA-unwr-aaaa",
+            &["CVE-2026-20"],
+        ),
+    );
+    write_manifest(cwd, &manifest, true);
+    // The lockfile/config wiring is reverted by hand; the artifact and the
+    // ledger entry stay behind.
+    std::fs::remove_file(cwd.join(".cargo/config.toml")).unwrap();
+
+    for extra in [&[][..], &["--no-verify"][..]] {
+        let (code, env) = vex_json(cwd, extra);
+        assert_eq!(code, Some(1), "{extra:?}: nothing may attest: {env}");
+        assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
+        assert_eq!(
+            skipped_event(&env, purl)["errorCode"],
+            "vendor_unwired",
+            "{extra:?}: {env}"
+        );
+    }
+}
+
+/// Current writers embed the patch record in EVERY vendor-ledger entry
+/// (not only detached ones), so a NON-detached vendoring whose manifest is
+/// gone still attests offline from the ledger + the committed artifact.
+#[test]
+fn nondetached_entry_with_embedded_record_attests_without_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let purl = "pkg:cargo/serde@1.0.0";
+    let patched = b"patched vendored source\n";
+    let rel = write_vendored_dir(cwd, patched);
+    let record = make_record(
+        UUID,
+        "src/lib.rs",
+        &compute_git_sha256_from_bytes(patched),
+        "GHSA-embd-aaaa",
+        &["CVE-2026-21"],
+    );
+    write_detached_vendor_state(cwd, purl, &rel, record);
+    // Flip to the non-detached (manifest-owned) shape the writer now emits.
+    let state_path = cwd.join(".socket/vendor/state.json");
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    state["entries"][purl]
+        .as_object_mut()
+        .unwrap()
+        .remove("detached");
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    assert!(!cwd.join(".socket/manifest.json").exists());
+
+    let (code, env) = vex_json(cwd, &["--offline"]);
+    assert_eq!(code, Some(0), "{env}");
+    let verified: Vec<&Value> = env["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "verified")
+        .collect();
+    assert_eq!(verified.len(), 1, "{env}");
+    assert_eq!(verified[0]["purl"], purl);
+    let doc: Value =
+        serde_json::from_slice(&std::fs::read(cwd.join("out.vex.json")).unwrap()).unwrap();
+    assert_eq!(
+        doc["statements"][0]["impact_statement"],
+        format!("Patched via Socket patch {UUID} (vendored)")
+    );
+}
+
+/// A patch-API stand-in serving `GET /patch/view/<uuid>` — the public-proxy
+/// route an unauthenticated `vex` fetches a missing record from. The
+/// runtime must outlive the CLI invocation.
+fn serve_patch_views(
+    views: Vec<(String, Value)>,
+) -> (tokio::runtime::Runtime, wiremock::MockServer) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        for (uuid, body) in views {
+            Mock::given(method("GET"))
+                .and(path(format!("/patch/view/{uuid}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        }
+        server
+    });
+    (rt, server)
+}
+
+/// The patch view the API returns for `uuid` (`record_from_patch_response`'s
+/// input shape): one file with its afterHash, one GHSA with a CVE alias.
+fn patch_view(uuid: &str, purl: &str, file_key: &str, after_hash: &str, ghsa: &str) -> Value {
+    serde_json::json!({
+        "uuid": uuid,
+        "purl": purl,
+        "publishedAt": "Fri, 27 Mar 2026 00:00:00 GMT",
+        "files": { file_key: { "beforeHash": "a".repeat(64), "afterHash": after_hash } },
+        "vulnerabilities": {
+            ghsa: { "cves": ["CVE-2026-30"], "summary": "s", "severity": "high", "description": "d" }
+        },
+        "description": "lockfile-discovered patch",
+        "license": "MIT",
+        "tier": "free",
+    })
+}
+
+/// A depscan-style vendored checkout: `package-lock.json` wires lodash to a
+/// committed `.socket/vendor/npm/<uuid>/` tarball, and there is NO
+/// `.socket/manifest.json` and NO `.socket/vendor/state.json`.
+fn lockfile_only_vendored_npm(cwd: &Path, uuid: &str, artifact_bytes: &[u8]) -> String {
+    let rel = format!(".socket/vendor/npm/{uuid}/lodash-4.17.21.tgz");
+    write_member_tgz(&cwd.join(&rel), "package/index.js", artifact_bytes);
+    write_matrix_wiring(cwd, "npm", uuid, &rel);
+    assert!(!cwd.join(".socket/manifest.json").exists());
+    assert!(!cwd.join(".socket/vendor/state.json").exists());
+    rel
+}
+
+#[test]
+fn lockfile_vendored_ref_attests_without_manifest_or_ledger() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let uuid = "0a0a0a0a-1111-4111-8111-0a0a0a0a0a0a";
+    let purl = "pkg:npm/lodash@4.17.21";
+    let patched = b"patched npm bytes\n";
+    lockfile_only_vendored_npm(cwd, uuid, patched);
+
+    // Offline: no local record anywhere, and the API is off-limits.
+    let (code, env) = vex_json(cwd, &["--offline"]);
+    assert_eq!(code, Some(1), "{env}");
+    assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
+    assert_eq!(skipped_event(&env, purl)["errorCode"], "record_unavailable");
+
+    // Online: the record comes from the patch API, the artifact is hashed.
+    let (_rt, server) = serve_patch_views(vec![(
+        uuid.to_string(),
+        patch_view(
+            uuid,
+            purl,
+            "package/index.js",
+            &compute_git_sha256_from_bytes(patched),
+            "GHSA-lock-vend",
+        ),
+    )]);
+    let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+    assert_eq!(code, Some(0), "{env}");
+    let doc: Value =
+        serde_json::from_slice(&std::fs::read(cwd.join("out.vex.json")).unwrap()).unwrap();
+    let stmts = doc["statements"].as_array().unwrap();
+    assert_eq!(stmts.len(), 1, "{doc}");
+    assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-lock-vend");
+    assert_eq!(stmts[0]["vulnerability"]["aliases"][0], "CVE-2026-30");
+    assert_eq!(stmts[0]["products"][0]["subcomponents"][0]["@id"], purl);
+    assert_eq!(
+        stmts[0]["impact_statement"],
+        format!("Patched via Socket patch {uuid} (vendored)")
+    );
+    assert!(
+        !cwd.join(".socket/manifest.json").exists(),
+        "vex never writes the manifest"
+    );
+}
+
+/// The committed artifact must still hash to the fetched record — a
+/// tampered member is omitted even though the wiring and record are fine.
+#[test]
+fn lockfile_vendored_ref_with_tampered_artifact_is_omitted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let uuid = "0a0a0a0a-1111-4111-8111-0a0a0a0a0a0a";
+    let purl = "pkg:npm/lodash@4.17.21";
+    lockfile_only_vendored_npm(cwd, uuid, b"tampered bytes\n");
+    let (_rt, server) = serve_patch_views(vec![(
+        uuid.to_string(),
+        patch_view(
+            uuid,
+            purl,
+            "package/index.js",
+            &compute_git_sha256_from_bytes(b"patched npm bytes\n"),
+            "GHSA-lock-tamp",
+        ),
+    )]);
+    let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+    assert_eq!(code, Some(1), "{env}");
+    assert_eq!(
+        skipped_event(&env, purl)["errorCode"],
+        "vendor_hash_mismatch",
+        "{env}"
+    );
+}
+
+/// The API's record for the wired uuid names ANOTHER package: the lockfile
+/// and the record disagree about what was patched → `record_mismatch`,
+/// never attested (a hand-edited lock cannot borrow another patch).
+#[test]
+fn lockfile_vendored_ref_whose_record_names_another_package_is_a_mismatch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let uuid = "0a0a0a0a-1111-4111-8111-0a0a0a0a0a0a";
+    let patched = b"patched npm bytes\n";
+    lockfile_only_vendored_npm(cwd, uuid, patched);
+    let (_rt, server) = serve_patch_views(vec![(
+        uuid.to_string(),
+        patch_view(
+            uuid,
+            "pkg:npm/minimist@1.2.5",
+            "package/index.js",
+            &compute_git_sha256_from_bytes(patched),
+            "GHSA-lock-mism",
+        ),
+    )]);
+    let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+    assert_eq!(code, Some(1), "{env}");
+    assert_eq!(
+        skipped_event(&env, "pkg:npm/lodash@4.17.21")["errorCode"],
+        "record_mismatch",
+        "{env}"
+    );
+}
+
+/// REGRESSION: `repair`'s ledger reconstruction writes entries with
+/// `wiring: []` (every ecosystem but gem) and says VEX attests them. With
+/// no recorded wiring file, liveness must probe the ecosystem's root locks
+/// — here a pnpm lock (a format lockfile discovery does not read yet) that
+/// still wires the committed tarball — instead of calling the entry
+/// `vendor_unwired`. Once that lock is reverted, the entry is unwired.
+#[test]
+fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let uuid = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
+    let purl = "pkg:npm/left-pad@1.3.0";
+    let patched = b"patched left-pad\n";
+    let rel = format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz");
+    write_member_tgz(&cwd.join(&rel), "package/index.js", patched);
+    let pnpm_lock = format!(
+        "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      left-pad:\n        \
+         specifier: file:{rel}\n        version: file:{rel}\n\npackages:\n  left-pad@file:{rel}:\n    \
+         resolution: {{integrity: sha512-xyz==, tarball: file:{rel}}}\n    version: 1.3.0\n"
+    );
+    std::fs::write(cwd.join("pnpm-lock.yaml"), &pnpm_lock).unwrap();
+    std::fs::write(
+        cwd.join("package.json"),
+        format!(r#"{{"name":"app","version":"1.0.0","dependencies":{{"left-pad":"file:{rel}"}}}}"#),
+    )
+    .unwrap();
+    let mut state = VendorState::new();
+    state.entries.insert(
+        purl.to_string(),
+        VendorEntry {
+            ecosystem: "npm".to_string(),
+            base_purl: purl.to_string(),
+            uuid: uuid.to_string(),
+            artifact: VendorArtifact {
+                path: rel.clone(),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            // What `repair`'s reconstruction records for npm.
+            wiring: Vec::new(),
+            lock: None,
+            took_over_go_patches: false,
+            detached: true,
+            record: Some(make_record(
+                uuid,
+                "package/index.js",
+                &compute_git_sha256_from_bytes(patched),
+                "GHSA-rbld-aaaa",
+                &["CVE-2026-31"],
+            )),
+            flavor: Some("pnpm".to_string()),
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        },
+    );
+    std::fs::create_dir_all(cwd.join(".socket/vendor")).unwrap();
+    std::fs::write(
+        cwd.join(".socket/vendor/state.json"),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+
+    for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
+        let (code, env) = vex_json(cwd, extra);
+        assert_eq!(code, Some(0), "{extra:?}: {env}");
+        let doc: Value =
+            serde_json::from_slice(&std::fs::read(cwd.join("out.vex.json")).unwrap()).unwrap();
+        assert_eq!(
+            doc["statements"][0]["impact_statement"],
+            format!("Patched via Socket patch {uuid} (vendored)"),
+            "{extra:?}: {doc}"
+        );
+    }
+
+    // The root lock reverted to the registry: now genuinely unwired.
+    std::fs::write(
+        cwd.join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n\npackages:\n  left-pad@1.3.0:\n    \
+         resolution: {integrity: sha512-ORIG==}\n",
+    )
+    .unwrap();
+    let (code, env) = vex_json(cwd, &["--offline", "--no-verify"]);
+    assert_eq!(code, Some(1), "{env}");
+    assert_eq!(
+        skipped_event(&env, purl)["errorCode"],
+        "vendor_unwired",
+        "{env}"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// 9. REGRESSION (core discover rule 11): a vendor ledger entry whose
+// artifact the lockfiles still MENTION, but only in a shape the package
+// manager does not consume, is dead — the ledger fallback no longer
+// re-derives "live" from the raw text the extractor already rejected.
+// ──────────────────────────────────────────────────────────────────────
+
+/// A detached ledger entry (embedded record) for `purl` → `rel`, recording
+/// `wiring_files` as its edited wiring.
+fn write_rejection_ledger(
+    cwd: &Path,
+    eco: &str,
+    purl: &str,
+    uuid: &str,
+    rel: &str,
+    record: PatchRecord,
+    wiring_files: &[&str],
+) {
+    let wiring = wiring_files
+        .iter()
+        .map(|file| WiringRecord {
+            file: file.to_string(),
+            kind: format!("{eco}_wiring"),
+            action: WiringAction::Rewritten,
+            key: None,
+            original: None,
+            new: None,
+        })
+        .collect();
+    let mut state = VendorState::new();
+    state.entries.insert(
+        purl.to_string(),
+        VendorEntry {
+            wiring,
+            ..detached_matrix_entry(
+                eco,
+                purl,
+                uuid,
+                rel,
+                String::new(),
+                record,
+                WiringRecord {
+                    file: String::new(),
+                    kind: String::new(),
+                    action: WiringAction::Rewritten,
+                    key: None,
+                    original: None,
+                    new: None,
+                },
+            )
+        },
+    );
+    std::fs::create_dir_all(cwd.join(".socket/vendor")).unwrap();
+    std::fs::write(
+        cwd.join(".socket/vendor/state.json"),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Every case: the committed artifact verifies and the ledger records its
+/// wiring files — but in the STALE shape the only wiring left is one the
+/// extractor rejects with a diagnostic, so the entry must be
+/// `vendor_unwired` with AND without `--no-verify` (before rule 11 the
+/// fallback found the artifact path in the same file and attested
+/// `(vendored)`); the LIVE twin restores the consumed wiring and attests,
+/// proving the ledger, record and artifact are sound.
+///
+/// * yarn berry: the `file:` lock entry has no `package.json`
+///   `resolutions` mapping — orphaned, yarn installs the registry package;
+/// * cargo: `[patch.crates-io]` points at the copy, but `Cargo.lock`
+///   builds the crate from crates.io (an unused patch).
+#[test]
+fn rejected_vendored_wiring_never_keeps_a_vendor_ledger_alive() {
+    let berry_uuid = "1b1b1b1b-2222-4333-8444-1b1b1b1b1b1b";
+    let berry_rel = format!(".socket/vendor/npm/{berry_uuid}/left-pad-1.3.0.tgz");
+    let locator = "app%40workspace%3A.";
+    let berry_lock = format!(
+        "# This file is generated by running \"yarn install\" inside your project.\n\
+         # Manual changes might be lost - proceed with caution!\n\n__metadata:\n  version: 8\n  \
+         cacheKey: 10c0\n\n\"left-pad@file:./{berry_rel}::locator={locator}\":\n  version: 1.3.0\n  \
+         resolution: \"left-pad@file:./{berry_rel}#./{berry_rel}::hash=39ea9b&locator={locator}\"\n  \
+         checksum: 10c0/{}\n  languageName: node\n  linkType: hard\n\n\"app@workspace:.\":\n  \
+         version: 0.0.0-use.local\n  resolution: \"app@workspace:.\"\n  languageName: unknown\n  \
+         linkType: soft\n",
+        "7".repeat(128)
+    );
+    let package_json = |resolutions: Value| {
+        serde_json::json!({
+            "name": "app",
+            "version": "1.0.0",
+            "dependencies": { "left-pad": "1.3.0" },
+            "resolutions": resolutions,
+        })
+        .to_string()
+    };
+
+    let cargo_uuid = "2c2c2c2c-2222-4333-8444-2c2c2c2c2c2c";
+    let cargo_rel = format!(".socket/vendor/cargo/{cargo_uuid}/serde-1.0.0");
+    let cargo_lock = |source: &str| {
+        format!(
+            "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n{source}"
+        )
+    };
+    let crates_io = format!(
+        "source = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{}\"\n",
+        "d".repeat(64)
+    );
+
+    struct Case {
+        name: &'static str,
+        eco: &'static str,
+        purl: &'static str,
+        uuid: &'static str,
+        rel: String,
+        member: &'static str,
+        wiring: Vec<&'static str>,
+        stale: Vec<(&'static str, String)>,
+        live: Vec<(&'static str, String)>,
+    }
+    let cases = [
+        Case {
+            name: "yarn berry entry without a resolutions mapping",
+            eco: "npm",
+            purl: "pkg:npm/left-pad@1.3.0",
+            uuid: berry_uuid,
+            rel: berry_rel.clone(),
+            member: "package/index.js",
+            wiring: vec!["yarn.lock", "package.json"],
+            stale: vec![
+                ("yarn.lock", berry_lock.clone()),
+                ("package.json", package_json(serde_json::json!({}))),
+            ],
+            live: vec![
+                ("yarn.lock", berry_lock.clone()),
+                (
+                    "package.json",
+                    package_json(serde_json::json!({ "left-pad": format!("file:./{berry_rel}") })),
+                ),
+            ],
+        },
+        Case {
+            name: "cargo [patch] the lock does not build",
+            eco: "cargo",
+            purl: "pkg:cargo/serde@1.0.0",
+            uuid: cargo_uuid,
+            rel: cargo_rel.clone(),
+            member: "src/lib.rs",
+            wiring: vec![".cargo/config.toml", "Cargo.lock"],
+            stale: vec![
+                (
+                    ".cargo/config.toml",
+                    format!("[patch.crates-io]\nserde = {{ path = \"{cargo_rel}\" }}\n"),
+                ),
+                ("Cargo.lock", cargo_lock(&crates_io)),
+            ],
+            live: vec![
+                (
+                    ".cargo/config.toml",
+                    format!("[patch.crates-io]\nserde = {{ path = \"{cargo_rel}\" }}\n"),
+                ),
+                ("Cargo.lock", cargo_lock("")),
+            ],
+        },
+    ];
+
+    for case in cases {
+        let patched = format!("patched {}\n", case.name).into_bytes();
+        let record = make_record(
+            case.uuid,
+            case.member,
+            &compute_git_sha256_from_bytes(&patched),
+            "GHSA-rjct-vend",
+            &["CVE-2026-50"],
+        );
+        for (live, files) in [(false, &case.stale), (true, &case.live)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let cwd = tmp.path();
+            if case.eco == "npm" {
+                write_member_tgz(&cwd.join(&case.rel), case.member, &patched);
+            } else {
+                write_dir_artifact(cwd, &case.rel, case.member, &patched);
+            }
+            for (file, text) in files {
+                let path = cwd.join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, text).unwrap();
+            }
+            write_rejection_ledger(
+                cwd,
+                case.eco,
+                case.purl,
+                case.uuid,
+                &case.rel,
+                record.clone(),
+                &case.wiring,
+            );
+            for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
+                let (code, env) = vex_json(cwd, extra);
+                if live {
+                    assert_eq!(code, Some(0), "{} (live) {extra:?}: {env}", case.name);
+                } else {
+                    assert_eq!(code, Some(1), "{} {extra:?}: {env}", case.name);
+                    assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
+                    assert_eq!(
+                        skipped_event(&env, case.purl)["errorCode"],
+                        "vendor_unwired",
+                        "{} {extra:?}: {env}",
+                        case.name
+                    );
+                    assert!(
+                        env["warnings"]
+                            .as_array()
+                            .is_some_and(|w| w.iter().any(|w| w["code"] == "patched_ref_invalid")),
+                        "{}: the extractor's rejection must surface as a warning: {env}",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
 }

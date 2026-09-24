@@ -13,7 +13,11 @@ has a public free-tier Socket patch), then for each mode:
 and checks idempotent re-scans, unchanged pyproject, lock-driven installs in a
 FRESH clone of the committed state, tampered-hash rejection, what Poetry's own
 relock does to the patch source, `poetry check --lock`, `vex`, and `rollback`
-restoring every byte.  Extra modes: `agent-oot` (Poetry's default out-of-tree
+restoring every byte.  Hosted and vendored cases also run manifest-less VEX
+over the installed fresh clone: `.socket/manifest.json` deleted (online, and
+offline from the ledger), the ledgers deleted too (lockfile discovery + the
+public patch API), `--offline` without ledgers (`record_unavailable`) and the
+lock reverted with the ledgers kept (never attested, `--no-verify` too).  Extra modes: `agent-oot` (Poetry's default out-of-tree
 venv) and `setup`.  Shapes: `direct` (native lock), `populated` (legacy locks
 with real hashes filled in, as 2020-era locks have), `crlf`, `pep621` (2.x).
 
@@ -298,6 +302,75 @@ def main():
             rec.get("uuid"),
         )
 
+    def manifestless_vex(case, fresh, mode, uuid, pristine_lock, check, info):
+        """Steps (1)-(4) of the manifest-less VEX matrix over `fresh` (an
+        installed clone of the committed state, `.socket/` included)."""
+        marker = "(redirected)" if mode == "hosted" else "(vendored)"
+        unwired = "redirect_unwired" if mode == "hosted" else "vendor_unwired"
+        runs = []
+
+        def vex(*extra):
+            doc = case / f"mlvex-{len(runs)}.vex.json"
+            if doc.exists():
+                doc.unlink()
+            r = Run(
+                [cli, "vex", "--cwd", fresh, "--json", "--no-telemetry", "--output", doc,
+                 "--product", "pkg:pypi/poetry-patch-fixture@0.1.0", *extra],
+                fresh, env, case / f"mlvex-{len(runs)}.log",
+            )
+            envelope = r.json_or_empty()
+            d = json.loads(doc.read_text()) if doc.exists() else None
+            runs.append({"args": list(extra), "exit": r.rc, "error": (envelope.get("error") or {}).get("code"),
+                         "skipped": sorted({e.get("errorCode") for e in envelope.get("events", []) if e.get("action") == "skipped"} - {None}),
+                         "statements": len(d.get("statements", [])) if d else 0})
+            return r.rc, envelope, d
+
+        def attests(rc, d):
+            return rc == 0 and d is not None and any(
+                marker in (st.get("impact_statement") or "")
+                and (uuid or "") in (st.get("impact_statement") or "")
+                and any(
+                    (sub.get("@id") or "").split("?")[0] == PURL_BASE
+                    for prod in st.get("products", [])
+                    for sub in prod.get("subcomponents", [])
+                )
+                for st in d.get("statements", [])
+            )
+
+        def skipped(envelope, code):
+            return any(e.get("action") == "skipped" and e.get("errorCode") == code for e in envelope.get("events", []))
+
+        # (1) manifest deleted: online, and offline from the committed ledger.
+        (fresh / ".socket/manifest.json").unlink(missing_ok=True)
+        rc, _, d = vex()
+        check("vexManifestDeleted", attests(rc, d), runs[-1])
+        rc, _, d = vex("--offline")
+        check("vexLedgerOffline", attests(rc, d), runs[-1])
+        # (2) ledgers deleted too: lockfile discovery + the patch API.
+        ledgers = {}
+        for rel in (".socket/vendor/state.json", ".socket/vendor/redirect-state.json"):
+            path = fresh / rel
+            if path.exists():
+                ledgers[path] = path.read_bytes()
+                path.unlink()
+        rc, _, d = vex()
+        check("vexLedgersDeleted", bool(ledgers) and attests(rc, d), runs[-1])
+        # (3) offline without ledgers: nothing to attest from, no network.
+        rc, e, d = vex("--offline")
+        check("vexOfflineRecordUnavailable", rc == 1 and d is None and skipped(e, "record_unavailable"), runs[-1])
+        # (4) the lock reverted to the registry, ledgers + artifacts kept.
+        for path, data in ledgers.items():
+            path.write_bytes(data)
+        committed_lock = (fresh / "poetry.lock").read_bytes()
+        (fresh / "poetry.lock").write_bytes(pristine_lock)
+        ok = True
+        for extra in ((), ("--no-verify",), ("--offline", "--no-verify")):
+            rc, e, d = vex(*extra)
+            ok = ok and rc == 1 and d is None and skipped(e, unwired)
+        check("vexRevertedUnwired", ok, runs[-3:])
+        (fresh / "poetry.lock").write_bytes(committed_lock)
+        info["manifestlessVex"] = runs
+
     def poetry_install_cmd(version, poetry):
         cmd = [poetry, "install", "-n"]
         if not version.startswith("0."):
@@ -572,6 +645,11 @@ def main():
             finst = Run(poetry_install_cmd(version, poetry), fresh, fenv, case / "fresh-install.log")
             fres = oracle(fresh / ".venv/bin/python", list(after), fresh, case / "fresh-oracle.log")
             check("freshCloneInstallsPatch", finst.ok() and all(fres.get(n) == h for n, h in after.items()), {"exit": finst.rc, "oracle": fres, "tail": (finst.out + finst.err)[-500:]})
+            # Manifest-less VEX over the installed fresh clone (what a hosted /
+            # depscan-vendored checkout has): lockfile discovery + the public
+            # patch API must attest; offline without ledgers must not; a
+            # reverted lock must never keep a leftover ledger alive.
+            manifestless_vex(case, fresh, mode, uuid, pristine_lock, check, info)
             # vex over the installed, redirected/vendored tree
             vx = Run([cli, "vex", "--cwd", project, "--no-telemetry"], project, env, case / "vex.log")
             try:
@@ -775,6 +853,9 @@ def render_table(summary):
             notes.append(f"bare scan sees venv={r['checks'].get('bareScanSeesPoetryVenv')}")
         if "vex" in info:
             notes.append(f"vex exit {info['vex'].get('exit')} stmts={info['vex'].get('statements')}")
+        if "manifestlessVex" in info:
+            ml = [k for k in ("vexManifestDeleted", "vexLedgerOffline", "vexLedgersDeleted", "vexOfflineRecordUnavailable", "vexRevertedUnwired") if r["checks"].get(k)]
+            notes.append(f"manifest-less vex {len(ml)}/5")
         if "poetryLockAfterSetup" in info:
             notes.append(f"poetry lock after setup exit {info['poetryLockAfterSetup']['exit']}")
         lines.append(f"| {r['poetry']} | {r['shape']} | {r['mode']} | {'PASS' if r['passed'] else 'FAIL'} | {failed} | {'; '.join(notes)} |")

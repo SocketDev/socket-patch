@@ -1,8 +1,9 @@
 use std::path::Path;
 
-use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::utils::digest::{sha256_hex, sha256_prefixed};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ArtifactSource<'a> {
@@ -24,6 +25,153 @@ impl ArtifactSource<'_> {
             Self::Path(path) => path.to_string(),
         }
     }
+}
+
+// ── read model shared by the lock inventory and lockfile discovery ────
+
+/// The `[[…]]` array holding a native Python lock's packages, and whether
+/// the lock is PEP 751: `packages` (a `lock-version` pylock), `distribution`
+/// (uv 0.2.x) or `package` (uv ≥ 0.2.35 and PEP 723 script locks). The
+/// lock inventory, lockfile discovery and `lock_inventory::
+/// wired_vendor_integrity` all pick the array with this one rule.
+pub(crate) fn lock_package_collection(doc: &DocumentMut) -> (&'static str, bool) {
+    if doc.contains_key("lock-version") {
+        ("packages", true)
+    } else if doc.contains_key("distribution") {
+        ("distribution", false)
+    } else {
+        ("package", false)
+    }
+}
+
+/// The tables of an array-of-tables, an array of inline tables, or a single
+/// (inline) table item — every shape a lock writes an artifact list in.
+pub(crate) fn table_likes(item: Option<&Item>) -> Vec<&dyn TableLike> {
+    match item {
+        Some(Item::ArrayOfTables(tables)) => tables.iter().map(|t| t as &dyn TableLike).collect(),
+        Some(Item::Value(Value::Array(values))) => values
+            .iter()
+            .filter_map(Value::as_inline_table)
+            .map(|t| t as &dyn TableLike)
+            .collect(),
+        Some(item) => item.as_table_like().into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// One artifact entry (`wheels[]`, `wheel`, `sdist`, `archive`) of a lock
+/// package.
+pub(crate) struct LockArtifact<'t> {
+    pub(crate) url: Option<&'t str>,
+    pub(crate) path: Option<&'t str>,
+    /// uv's local-wheel `filename`.
+    pub(crate) filename: Option<&'t str>,
+    /// The lowercase sha256: `hash = "sha256:<hex>"` (uv), else
+    /// `hashes = { sha256 = "<hex>" }` (PEP 751); only a 64-hex digest.
+    pub(crate) sha256: Option<String>,
+}
+
+impl<'t> LockArtifact<'t> {
+    /// Where the artifact is fetched from: its `url`, else its `path`.
+    pub(crate) fn location(&self) -> Option<&'t str> {
+        self.url.or(self.path)
+    }
+}
+
+/// Read one artifact table (see [`LockArtifact`]).
+pub(crate) fn lock_artifact(table: &dyn TableLike) -> LockArtifact<'_> {
+    let str_of = |key: &str| table.get(key).and_then(Item::as_str);
+    let sha256 = str_of("hash").and_then(sha256_prefixed).or_else(|| {
+        table
+            .get("hashes")
+            .and_then(Item::as_table_like)
+            .and_then(|hashes| hashes.get("sha256"))
+            .and_then(Item::as_str)
+            .and_then(sha256_hex)
+    });
+    LockArtifact {
+        url: str_of("url"),
+        path: str_of("path"),
+        filename: str_of("filename"),
+        sha256,
+    }
+}
+
+/// Every artifact of `package` under `keys`, in key order (singular tables
+/// and arrays alike).
+pub(crate) fn package_artifacts<'t>(
+    package: &'t dyn TableLike,
+    keys: &[&str],
+) -> Vec<LockArtifact<'t>> {
+    keys.iter()
+        .flat_map(|key| table_likes(package.get(key)))
+        .map(lock_artifact)
+        .collect()
+}
+
+/// A uv package's `source`, in either spelling: the uv ≤ 0.2.17 string
+/// grammar `"<kind>+<value>"` or the `{ registry | url | path | … }` table.
+/// The one reader of both; each caller keeps its own precedence between the
+/// kinds — the inventory's [`Self::is_remote`], [`uv_source_location`]
+/// (url before path, registry ignored) and lockfile discovery's
+/// resolved-elsewhere evidence (registry first).
+#[derive(Clone, Copy)]
+pub(crate) enum UvSource<'t> {
+    Str(&'t str),
+    Table(&'t dyn TableLike),
+}
+
+impl<'t> UvSource<'t> {
+    /// `package`'s `source`; `None` when absent or neither a string nor a
+    /// table.
+    pub(crate) fn of(package: &'t dyn TableLike) -> Option<Self> {
+        let source = package.get("source")?;
+        match source.as_str() {
+            Some(s) => Some(Self::Str(s)),
+            None => source.as_table_like().map(Self::Table),
+        }
+    }
+
+    /// The `<prefix>+` value of the string form, or the table's string `key`.
+    fn field(self, prefix: &str, key: &str) -> Option<&'t str> {
+        match self {
+            Self::Str(s) => s.strip_prefix(prefix),
+            Self::Table(table) => table.get(key).and_then(Item::as_str),
+        }
+    }
+
+    /// `registry+<index>` / `registry = "<index>"`.
+    pub(crate) fn registry(self) -> Option<&'t str> {
+        self.field("registry+", "registry")
+    }
+
+    /// `direct+<url>` / `url = "<url>"`.
+    pub(crate) fn url(self) -> Option<&'t str> {
+        self.field("direct+", "url")
+    }
+
+    /// `path+<path>` / `path = "<path>"`.
+    pub(crate) fn path(self) -> Option<&'t str> {
+        self.field("path+", "path")
+    }
+
+    /// Whether the source is a registry or a direct url — a remote the fetch
+    /// layer can resolve. The table form tests key PRESENCE (a non-string
+    /// value still counts).
+    pub(crate) fn is_remote(self) -> bool {
+        match self {
+            Self::Str(s) => s.starts_with("registry+") || s.starts_with("direct+"),
+            Self::Table(table) => table.contains_key("registry") || table.contains_key("url"),
+        }
+    }
+}
+
+/// A uv package's install location: `source = { url | path }`, or the uv
+/// 0.2.x string grammar `direct+<url>` / `path+<path>`. Registry, git,
+/// editable, virtual and directory sources yield `None`.
+pub(crate) fn uv_source_location(package: &dyn TableLike) -> Option<&str> {
+    let source = UvSource::of(package)?;
+    source.url().or_else(|| source.path())
 }
 
 pub fn is_python_lock_name(name: &str) -> bool {
@@ -665,6 +813,45 @@ pub fn rewrite_python_lock(
         rewrite_manifest(&mut document, &name, artifact);
     }
     Ok(Some(preserve_line_endings(text, document.to_string())))
+}
+
+/// Whether `name` is a PEP 723 script lock (`<script>.py.lock`).
+pub fn is_script_lock_name(name: &str) -> bool {
+    name.ends_with(".py.lock")
+}
+
+/// The `<script>.py` a PEP 723 script lock `<script>.py.lock` belongs to;
+/// `None` for any other name (`Some` exactly when [`is_script_lock_name`]).
+pub fn script_of_lock(lock: &str) -> Option<&str> {
+    lock.strip_suffix(".lock").filter(|s| s.ends_with(".py"))
+}
+
+/// The metadata file uv pairs a native lock with: `pyproject.toml` for
+/// `uv.lock`, the `<script>.py` for a `<script>.py.lock`; `None` for any
+/// other lock. Presence is the caller's to check.
+pub fn paired_metadata_rel(lock: &str) -> Option<&str> {
+    if lock == "uv.lock" {
+        return Some("pyproject.toml");
+    }
+    script_of_lock(lock)
+}
+
+#[cfg(test)]
+mod script_lock_name_tests {
+    use super::*;
+
+    #[test]
+    fn script_locks_pair_with_their_script_and_uv_lock_with_pyproject() {
+        assert!(is_script_lock_name("tool.py.lock"));
+        assert!(!is_script_lock_name("uv.lock"));
+        assert!(!is_script_lock_name("tool.lock"));
+        assert_eq!(script_of_lock("tool.py.lock"), Some("tool.py"));
+        assert_eq!(script_of_lock("uv.lock"), None);
+        assert_eq!(script_of_lock("tool.lock"), None);
+        assert_eq!(paired_metadata_rel("uv.lock"), Some("pyproject.toml"));
+        assert_eq!(paired_metadata_rel("tool.py.lock"), Some("tool.py"));
+        assert_eq!(paired_metadata_rel("pylock.toml"), None);
+    }
 }
 
 #[cfg(test)]

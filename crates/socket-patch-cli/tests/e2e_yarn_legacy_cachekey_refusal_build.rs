@@ -50,6 +50,26 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+#[path = "yarn_berry_common/mod.rs"]
+mod yarn_berry_common;
+use vex_e2e_common::{patch_view, run_vex, PatchApi, VexRun, VexVia};
+use yarn_berry_common::{off_runtime, yarn_e2e_required};
+
+/// Print a SKIP line — or, under `SOCKET_PATCH_YARN_E2E_REQUIRED=1` (a leg
+/// that provisioned corepack yarn on purpose), FAIL: a required leg must
+/// never report green on an unexercised toolchain or an unreachable fixture
+/// registry.
+macro_rules! skip {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        if yarn_e2e_required() {
+            panic!("{msg} (SOCKET_PATCH_YARN_E2E_REQUIRED=1 forbids skipping)");
+        }
+        println!("{msg}");
+    }};
+}
 
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
@@ -225,7 +245,7 @@ async fn mount_patch_api(server: &MockServer, orig: &[u8], patched: &[u8]) {
 /// cacheKey pin, then the hosted + vendored refusal contracts.
 async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected_cache_key: &str) {
     if !has_corepack_pm(yarn_pm) {
-        println!(
+        skip!(
             "SKIP e2e_yarn_legacy_cachekey_refusal_build ({tag}): `corepack {yarn_pm}` unavailable"
         );
         return;
@@ -257,7 +277,7 @@ async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected
         &[("YARN_GLOBAL_FOLDER", global.to_str().unwrap())],
     );
     if !install.status.success() {
-        println!(
+        skip!(
             "SKIP e2e_yarn_legacy_cachekey_refusal_build ({tag}): fixture `yarn install` \
              failed (registry unreachable?):\n{}",
             String::from_utf8_lossy(&install.stderr)
@@ -434,6 +454,133 @@ async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected
         "({tag}) vendored refusal must not spill blobs to disk"
     );
     eprintln!("({tag}) VENDORED REFUSAL OK");
+
+    // 5. VEX after both refusals: nothing was wired, so a refused major must
+    //    never yield an attestation — not from the lock, not from a ledger
+    //    (none was written), not from the API (never asked). The mock patch
+    //    host is allowed as a Socket host so a hosted reference, had one
+    //    been written, WOULD be recognized.
+    //
+    //    Vendored mode is manifest-free, so the refusals left no record
+    //    anywhere. A LEGACY checkout still carries one — a pre-5.0 vendored
+    //    scan's download step persisted the record in
+    //    `.socket/manifest.json` before the wiring refused: with it, vex
+    //    omits the unapplied patch (`not_applied`, the installed tree is
+    //    pristine), never attests it; without it (the manifest-less shape),
+    //    nothing is discovered at all.
+    assert!(
+        !proj.join(".socket/manifest.json").exists(),
+        "({tag}) the refused vendored scan must not write a manifest"
+    );
+    std::fs::create_dir_all(proj.join(".socket")).unwrap();
+    std::fs::write(
+        proj.join(".socket/manifest.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({ "patches": { PURL: {
+            "uuid": UUID,
+            "exportedAt": "2026-01-01T00:00:00Z",
+            "files": { "package/index.js": {
+                "beforeHash": compute_git_sha256_from_bytes(&orig),
+                "afterHash": compute_git_sha256_from_bytes(&patched),
+            }},
+            "vulnerabilities": { GHSA: {
+                "cves": ["CVE-2026-2222"], "summary": "yarn legacy refusal vuln",
+                "severity": "high", "description": "d",
+            }},
+            "description": "x", "license": "MIT", "tier": "free",
+        }}}))
+        .unwrap(),
+    )
+    .unwrap();
+    let flow_api = server.uri();
+    off_runtime(|| {
+        let api = PatchApi::start(vec![(
+            UUID.to_string(),
+            patch_view(
+                UUID,
+                PURL,
+                &[("package/index.js", &compute_git_sha256_from_bytes(&patched))],
+                &[(GHSA, &["CVE-2026-2222"])],
+            ),
+        )]);
+        let online = VexRun {
+            patch_server_url: Some(flow_api.clone()),
+            ..VexRun::online(&api)
+        };
+        let out = run_vex(&binary(), &proj, &online);
+        assert_eq!(out.code, Some(1), "({tag}) vex with the manifest: {out}");
+        vex_e2e_common::assert_not_attested(&out.envelope, PURL, "not_applied");
+        assert!(
+            out.doc.is_none(),
+            "({tag}) vex with the manifest: no document"
+        );
+        println!("VEX-MATRIX|{yarn_pm}|legacy-{tag}|refused|vex-with-manifest|PASS");
+        vex_e2e_common::strip_manifest(&proj);
+        for (cell, run) in [
+            ("online", online.clone()),
+            (
+                "offline",
+                VexRun {
+                    offline: true,
+                    ..online.clone()
+                },
+            ),
+        ] {
+            let out = run_vex(&binary(), &proj, &run);
+            assert_eq!(out.code, Some(2), "({tag}) vex {cell}: {out}");
+            assert_eq!(
+                out.envelope["error"]["code"], "manifest_not_found",
+                "({tag}) vex {cell}: nothing is discovered after a refusal: {out}"
+            );
+            assert!(out.doc.is_none(), "({tag}) vex {cell}: no document");
+            println!("VEX-MATRIX|{yarn_pm}|legacy-{tag}|refused|vex-{cell}|PASS");
+        }
+        // Embedded: `apply --vex` keeps the calm no-manifest exit and writes
+        // nothing; the flow's own `scan --mode hosted` with `--vex` refuses
+        // again and attests nothing.
+        let out = run_vex(&binary(), &proj, &online.clone().via(VexVia::Apply));
+        assert_eq!(out.code, Some(0), "({tag}) apply --vex: {out}");
+        assert_eq!(out.envelope["status"], "noManifest", "({tag}): {out}");
+        assert!(out.envelope.get("vex").is_none(), "({tag}): {out}");
+        assert!(out.doc.is_none(), "({tag}) apply --vex: no document");
+        println!("VEX-MATRIX|{yarn_pm}|legacy-{tag}|refused|apply--vex|PASS");
+        api.assert_no_requests();
+        let scan = VexRun {
+            api_url: Some(flow_api.clone()),
+            org: Some(ORG.to_string()),
+            api_token: Some("fake".to_string()),
+            patch_server_url: Some(flow_api.clone()),
+            ..VexRun::default()
+        }
+        .via(VexVia::Scan)
+        .arg("--mode")
+        .arg("hosted")
+        .arg("--yes");
+        // scan's embedded-VEX contract: a requested document with nothing
+        // to attest FAILS the command (exit 1) — unlike apply/vendor, whose
+        // no-manifest path keeps the calm exit.
+        let out = run_vex(&binary(), &proj, &scan);
+        assert_eq!(out.code, Some(1), "({tag}) scan --vex: {out}");
+        assert_eq!(
+            out.envelope["error"]["code"], "manifest_not_found",
+            "({tag}) scan --vex: {out}"
+        );
+        assert_eq!(out.envelope["redirect"]["redirected"], 0, "({tag}): {out}");
+        assert!(
+            out.envelope["redirect"]["warnings"]
+                .as_array()
+                .is_some_and(|w| w
+                    .iter()
+                    .any(|w| w["code"] == "redirect_yarn_berry_cache_unsupported")),
+            "({tag}) scan --vex: still refused: {out}"
+        );
+        assert!(out.doc.is_none(), "({tag}) scan --vex: no document: {out}");
+        println!("VEX-MATRIX|{yarn_pm}|legacy-{tag}|refused|scan--mode-hosted--vex|PASS");
+    });
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        lock_before,
+        "({tag}) no VEX run may touch yarn.lock"
+    );
 }
 
 // ── the version-matrix cells ──────────────────────────────────────────

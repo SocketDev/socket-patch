@@ -59,15 +59,18 @@ pub mod cargo_lock;
 pub(crate) mod common;
 pub mod composer_lock;
 pub mod gem;
+pub(crate) mod gemfile_lock;
 pub mod go_mod_edit;
 pub mod go_sum_edit;
 pub mod golang;
 pub mod lock_inventory;
+pub(crate) mod maven_pom;
 pub mod maven_repo;
-mod npm_common;
+pub(crate) mod npm_common;
 pub mod npm_flavor;
 pub mod npm_lock;
 mod npm_pack;
+pub(crate) mod nuget_config;
 pub mod nuget_feed;
 pub mod pnpm_lock;
 pub mod pnpm_lock_legacy;
@@ -94,6 +97,9 @@ mod yarn_layering_tests;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
 pub(crate) use pypi_lock::restore_document as restore_python_document;
+// `vex::discover` validates lockfile-recorded npm names with the same rule the
+// npm backends apply to their own coordinates.
+pub(crate) use npm_common::is_safe_npm_name;
 pub use pypi_requirements::requirements_include_names;
 pub use state::{
     carry_forward_wiring, load_state, lookup_entry, save_state, VendorEntry, VendorState,

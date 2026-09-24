@@ -12,9 +12,35 @@
 //! panic: every table access here is guarded and degrades to an `Err`, which
 //! callers surface as a refusal warning.
 
-use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, Value};
+use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::utils::python_lock::table_likes;
+
+/// The `{file, hash}` tables Poetry records in `package`'s own
+/// `files = [...]` (lock 2.x; also written into 1.0/1.1 locks). Read by the
+/// lock inventory and lockfile discovery alike.
+pub(crate) fn package_files(package: &Table) -> Vec<&dyn TableLike> {
+    table_likes(package.get("files"))
+}
+
+/// The lock-wide `[metadata.files]` entry for package `name` (lock
+/// 1.0/1.1; keys compared PEP 503-canonical).
+pub(crate) fn metadata_files<'d>(lock: &'d DocumentMut, name: &str) -> Vec<&'d dyn TableLike> {
+    let canon = canonicalize_pypi_name(name);
+    let entry = lock
+        .get("metadata")
+        .and_then(Item::as_table_like)
+        .and_then(|metadata| metadata.get("files"))
+        .and_then(Item::as_table_like)
+        .and_then(|files| {
+            files
+                .iter()
+                .find(|(key, _)| canonicalize_pypi_name(key) == canon)
+                .map(|(_, item)| item)
+        });
+    table_likes(entry)
+}
 
 /// The lock generation: `"0"`, `"1.0"`, `"1.1"`, or any `"2.<minor>"` (Poetry
 /// bumps the minor additively — 2.0 → 2.1 kept every shape we rewrite, and the

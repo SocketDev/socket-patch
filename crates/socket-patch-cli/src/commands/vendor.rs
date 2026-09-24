@@ -43,8 +43,12 @@ use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
 use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::rollback::VendorRevertStep;
-use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
-use crate::ecosystem_dispatch::{find_packages_for_rollback, partition_purls};
+use crate::commands::vex::{
+    generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
+};
+use crate::ecosystem_dispatch::{
+    find_packages_for_rollback, npm_paths_by_identity, partition_purls,
+};
 use crate::json_envelope::{
     Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning, Status, VexSummary,
 };
@@ -629,12 +633,15 @@ pub async fn run(args: VendorArgs) -> i32 {
     // entries and `repair` is what verifies them), where `.socket/` exists.
     // Nothing is locked or written on this path.
     if !args.revert && tokio::fs::metadata(&manifest_path).await.is_err() {
-        if args.common.json {
-            let mut env = Envelope::new(Command::Vendor);
-            env.status = Status::NoManifest;
-            env.dry_run = args.common.dry_run;
-            println!("{}", env.to_pretty_json());
-        } else if !args.common.silent {
+        // Nothing to vendor, but a requested `--vex` still attests what the
+        // `.socket/vendor` ledgers and lockfiles already wire (e.g. a
+        // `scan`/`get --mode vendored` checkout, which has no manifest by
+        // design). Same contract as `apply --vex` with no manifest: nothing
+        // referenced anywhere keeps the calm exit 0; any other VEX failure
+        // flips the exit; a dry run skips generation. The host line prints
+        // first: the VEX run's own stderr warnings follow what the command
+        // did.
+        if !args.common.json && !args.common.silent {
             // An unreadable ledger is not "no entries": say so (stderr)
             // instead of the calm nothing-to-vendor line.
             match load_state(&args.common.cwd).await {
@@ -642,7 +649,69 @@ pub async fn run(args: VendorArgs) -> i32 {
                 Err(e) => eprintln!("{}", no_manifest_ledger_unreadable(&e.to_string())),
             }
         }
-        return 0;
+        let vex_result = match args.vex.vex.as_ref() {
+            Some(_) if !args.common.dry_run => {
+                let params = args.vex.to_build_params();
+                Some(generate_vex_without_manifest(&args.common, &params, &manifest_path).await)
+            }
+            _ => None,
+        };
+        if args.common.json {
+            let mut env = Envelope::new(Command::Vendor);
+            env.status = Status::NoManifest;
+            env.dry_run = args.common.dry_run;
+            match vex_result.as_ref() {
+                Some(ManifestlessVex::Written(summary)) => {
+                    env.vex = Some(VexSummary {
+                        path: args
+                            .vex
+                            .vex
+                            .as_ref()
+                            .expect("vex_result is Some only when --vex was given")
+                            .display()
+                            .to_string(),
+                        statements: summary.statements,
+                        format: "openvex-0.2.0".to_string(),
+                        warnings: summary.warnings.clone(),
+                    });
+                }
+                Some(ManifestlessVex::Failed(e)) => {
+                    env.warnings.extend(e.embedded_warnings());
+                    env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
+                }
+                Some(ManifestlessVex::NothingToAttest(warnings)) => {
+                    env.warnings.extend(warnings.iter().cloned());
+                }
+                None => {}
+            }
+            println!("{}", env.to_pretty_json());
+        } else {
+            match vex_result.as_ref() {
+                Some(ManifestlessVex::Written(summary)) if !args.common.silent => println!(
+                    "{}",
+                    crate::commands::vex::format_vex_written(
+                        summary.statements,
+                        args.vex
+                            .vex
+                            .as_ref()
+                            .expect("vex_result is Some only when --vex was given"),
+                    )
+                ),
+                // Errors print even under --silent ("errors only").
+                Some(ManifestlessVex::Failed(e)) => e.print_embedded(&args.common),
+                Some(ManifestlessVex::NothingToAttest(_)) if !args.common.silent => {
+                    println!("{}", crate::commands::vex::format_vex_nothing_to_attest())
+                }
+                None if !args.common.silent && args.common.dry_run && args.vex.vex.is_some() => {
+                    println!(
+                        "{}",
+                        crate::commands::vex::format_vex_dry_run_skip("vendored")
+                    );
+                }
+                _ => {}
+            }
+        }
+        return i32::from(matches!(vex_result, Some(ManifestlessVex::Failed(_))));
     }
 
     // The API client and the vendoring-service config exist for the
@@ -732,13 +801,14 @@ pub async fn run(args: VendorArgs) -> i32 {
                         });
                     }
                     Err(e) => {
+                        env.warnings.extend(e.embedded_warnings());
                         env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
                         // The envelope only prints under --json; in human mode
                         // this error is the sole explanation for the flipped
                         // exit code, so it prints even under --silent ("errors
                         // only", never "nothing").
                         if !args.common.json {
-                            eprintln!("Error: VEX generation failed: {}", e.message);
+                            e.print_embedded(&args.common);
                         }
                         exit = 1;
                     }
@@ -906,10 +976,11 @@ async fn run_vendor(
     }
 }
 
-/// Persist one backend-returned ledger entry: detached flagging, wiring
-/// `original` carry-forward from the entry being replaced, per-package save
-/// (crash-consistent with what is already wired), and the stale-uuid-dir
-/// sweep on re-vendors. Returns `true` when the save failed (has_errors).
+/// Persist one backend-returned ledger entry: detached flagging, the
+/// embedded patch record, wiring `original` carry-forward from the entry
+/// being replaced, per-package save (crash-consistent with what is already
+/// wired), and the stale-uuid-dir sweep on re-vendors. Returns `true` when
+/// the save failed (has_errors).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist_vendor_entry(
     common: &GlobalArgs,
@@ -923,7 +994,15 @@ pub(crate) async fn persist_vendor_entry(
     let mut has_errors = false;
     let candidate = candidate.to_string();
     entry.detached = detached;
-    entry.record = detached.then(|| record.clone());
+    // EVERY entry embeds its patch record, not only detached (vendored-mode)
+    // ones: the ledger is committed next to the artifacts, so a checkout of
+    // a project the manifest-driven standalone `vendor` wired, whose
+    // manifest is gone or was never committed, can still verify and attest
+    // the vendored patch offline — manifest-less `vex` reads it. `detached`
+    // stays the "no manifest owner" flag: for a non-detached entry the
+    // manifest record remains authoritative wherever both exist (repair,
+    // vex), and the embedded copy is the fallback.
+    entry.record = Some(record.clone());
     // A re-vendor run re-derives the entry from current disk state, where
     // the takeover / earlier wiring already happened. Reconcile the fresh
     // entry with the one it replaces so `--revert` still knows how to undo
@@ -1170,24 +1249,14 @@ pub(crate) async fn vendor_records(
     // package name. The targeted resolver probes canonical paths; before
     // fetching a supposedly missing source, resolve aliases by the installed
     // package.json identity. This also permits offline binary Bun vendoring.
-    let missing_npm: Vec<_> = vendorable_partition
+    let missing_npm: Vec<&String> = vendorable_partition
         .get(&Ecosystem::Npm)
         .into_iter()
         .flatten()
         .filter(|p| !all_packages.contains_key(*p))
-        .cloned()
         .collect();
-    if !missing_npm.is_empty() {
-        let crawler = socket_patch_core::crawlers::npm_crawler::NpmCrawler::new();
-        for package in crawler.crawl_all(&crawler_options).await {
-            for purl in &missing_npm {
-                if canonical_purl(purl) == normalize_purl(&package.purl) {
-                    all_packages
-                        .entry(purl.clone())
-                        .or_insert_with(|| package.path.clone());
-                }
-            }
-        }
+    for (purl, paths) in npm_paths_by_identity(&crawler_options, &missing_npm).await {
+        all_packages.insert(purl, paths[0].clone());
     }
 
     // ── Auto-fetch: lockfile-resolved packages with no installed copy ────
@@ -1592,7 +1661,23 @@ pub(crate) async fn vendor_records(
                     )
                     .await
                     {
-                        Ok(_) => {
+                        Ok(revert) => {
+                            // Advisories from the same transaction (a
+                            // redirect-created `.npmrc` modified since —
+                            // kept, only the `allow-remote=all` line removed).
+                            for (code, detail) in &revert.warnings {
+                                if code == "redirect_npmrc_allow_remote_modified" {
+                                    record_warning(
+                                        env,
+                                        candidate,
+                                        &VendorWarning::new(
+                                            "redirect_npmrc_allow_remote_modified",
+                                            detail.clone(),
+                                        ),
+                                        common,
+                                    );
+                                }
+                            }
                             if let Err(e) =
                                 socket_patch_core::patch::redirect::persist_redirect_state(
                                     &common.cwd,

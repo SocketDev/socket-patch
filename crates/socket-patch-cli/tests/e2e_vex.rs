@@ -884,17 +884,23 @@ fn verify_mode_includes_applied_omits_unapplied() {
          it:\n{stdout}"
     );
 
-    // Both omissions must surface on stderr, each routed with its own
+    // Both omissions must surface on stderr, each with its own human
     // verification reason (the warning format is
     // "Warning: omitting <purl> from VEX: <phrase> (<tag>)").
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("unapplied-pkg") && stderr.contains("file_not_found"),
+        stderr.contains(
+            "Warning: omitting pkg:npm/unapplied-pkg@2.0.0 from VEX: a patched file is missing \
+             (file_not_found)"
+        ),
         "stderr should warn that unapplied-pkg was omitted as file_not_found. \
          got: {stderr}"
     );
     assert!(
-        stderr.contains("tampered-pkg") && stderr.contains("not_applied"),
+        stderr.contains(
+            "Warning: omitting pkg:npm/tampered-pkg@3.0.0 from VEX: the patched files still hold \
+             the original content (not_applied)"
+        ),
         "stderr should warn that tampered-pkg was omitted as not_applied — \
          this is what proves the on-disk hash was actually checked. \
          got: {stderr}"

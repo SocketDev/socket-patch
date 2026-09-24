@@ -70,6 +70,7 @@ use super::common::{
     prune_empty_vendor_levels, refused, service_offline_conflict, stage_dir_for,
     swap_stage_into_place, synthesized_result,
 };
+use super::gemfile_lock::{is_plain_gem_token, split_checksum_entry, split_entry};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::extract_gem_data;
 use super::service_fetch::{
@@ -1619,8 +1620,14 @@ fn plan_gemfile_edit(
         if trimmed.starts_with('#') {
             continue;
         }
-        if let Some((q, rest, paren)) = gem_declaration(trimmed, name) {
-            found.push((i, trimmed.len() == line.len(), paren, q, rest.to_string()));
+        if let Some(d) = gem_declaration(trimmed, name) {
+            found.push((
+                i,
+                trimmed.len() == line.len(),
+                d.paren,
+                d.quote,
+                d.rest.to_string(),
+            ));
         } else if gem_call_mentions_name(trimmed, name) {
             unparsed_mention = true;
         }
@@ -1726,29 +1733,51 @@ fn gem_call_mentions_name(trimmed: &str, name: &str) -> bool {
     rest.contains(&format!("\"{name}\"")) || rest.contains(&format!("'{name}'"))
 }
 
+/// A leading Ruby string literal `"…"` / `'…'` (no escape handling):
+/// `(quote, contents, the text after the closing quote)`.
+pub(crate) fn quoted_literal(s: &str) -> Option<(char, &str, &str)> {
+    let q = s.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let rest = &s[1..];
+    let end = rest.find(q)?;
+    Some((q, &rest[..end], &rest[end + 1..]))
+}
+
+/// One `gem "<name>"` / `gem '<name>'` declaration (see [`gem_declaration_any`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GemDecl<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) quote: char,
+    /// Everything after the name's closing quote.
+    pub(crate) rest: &'a str,
+    /// Whether the call is parenthesized (`gem("x"…`).
+    pub(crate) paren: bool,
+}
+
 /// Match `gem "<name>"` / `gem '<name>'` (or the parenthesized call form) at
-/// the start of a trimmed line. Returns the quote char, everything after the
-/// closing quote, and whether the call was parenthesized. Space OR tab after
-/// the keyword — a tab-separated declaration the grammar cannot see would
-/// fall through to the transitive Append plan, leaving the Gemfile declaring
-/// the gem twice (bundler hard-fails on the duplicate).
-fn gem_declaration<'a>(trimmed: &'a str, name: &str) -> Option<(char, &'a str, bool)> {
+/// the start of a trimmed line, for any gem name. Space OR tab after the
+/// keyword — a tab-separated declaration the grammar cannot see would fall
+/// through to the transitive Append plan, leaving the Gemfile declaring the
+/// gem twice (bundler hard-fails on the duplicate). Never `gemspec` /
+/// `gem_group`. Shared with lockfile discovery's Gemfile `source … do` block
+/// reader (`vex::discover::gem`).
+pub(crate) fn gem_declaration_any(trimmed: &str) -> Option<GemDecl<'_>> {
     let rest = trimmed.strip_prefix("gem")?;
     let (paren, rest) = match rest.strip_prefix([' ', '\t']) {
         Some(r) => (false, r),
         None => (true, rest.strip_prefix('(')?),
     };
-    let rest = rest.trim_start();
-    let q = rest.chars().next()?;
-    if q != '"' && q != '\'' {
-        return None;
-    }
-    let rest = &rest[1..];
-    let end = rest.find(q)?;
-    if &rest[..end] != name {
-        return None;
-    }
-    Some((q, &rest[end + 1..], paren))
+    let (quote, name, rest) = quoted_literal(rest.trim_start())?;
+    Some(GemDecl {
+        name,
+        quote,
+        rest,
+        paren,
+    })
+}
+
+/// [`gem_declaration_any`] for exactly the gem `name`.
+fn gem_declaration<'a>(trimmed: &'a str, name: &str) -> Option<GemDecl<'a>> {
+    gem_declaration_any(trimmed).filter(|d| d.name == name)
 }
 
 /// Why the text after the gem name blocks an in-place rewrite (`None` = safe).
@@ -2171,22 +2200,23 @@ fn find_our_path_section(lines: &[String], name: &str, version: &str) -> Option<
     None
 }
 
+/// `line`'s entry text at exactly `indent` (2 or 4) spaces: non-empty and
+/// not more deeply indented.
+fn at_indent(line: &str, indent: usize) -> Option<&str> {
+    let rest = line.strip_prefix(&"    "[..indent])?;
+    (!rest.is_empty() && !rest.starts_with(' ')).then_some(rest)
+}
+
 /// Name of a 2-space DEPENDENCIES entry (`  rack (~> 3.1)` / `  rack!`).
 fn dep_entry_name(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix("  ")?;
-    if rest.is_empty() || rest.starts_with(' ') {
-        return None;
-    }
+    let rest = at_indent(line, 2)?;
     let end = rest.find([' ', '(', '!']).unwrap_or(rest.len());
     Some(&rest[..end])
 }
 
 /// Name of a 4-space spec entry (`    rack (3.2.6)`).
 fn spec_entry_name(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix("    ")?;
-    if rest.is_empty() || rest.starts_with(' ') {
-        return None;
-    }
+    let rest = at_indent(line, 4)?;
     Some(rest.split(' ').next().unwrap_or(rest))
 }
 
@@ -2195,18 +2225,10 @@ fn spec_entry_name(line: &str) -> Option<&str> {
 /// suffix stays inside the token, mirroring [`checksum_entry`]'s grammar at
 /// specs indentation (`    ffi (1.17.2-aarch64-linux-gnu)`).
 fn spec_entry(line: &str) -> Option<(&str, &str)> {
-    let rest = line.strip_prefix("    ")?;
-    if rest.is_empty() || rest.starts_with(' ') {
-        return None;
+    match split_entry(at_indent(line, 4)?)? {
+        (name, ver, "") => Some((name, ver)),
+        _ => None,
     }
-    let open = rest.find(" (")?;
-    let after = &rest[open + 2..];
-    let close = after.find(')')?;
-    let (name, ver, tail) = (&rest[..open], &after[..close], &after[close + 1..]);
-    if name.is_empty() || ver.is_empty() || !tail.is_empty() {
-        return None;
-    }
-    Some((name, ver))
 }
 
 /// Parse a CHECKSUMS entry line: two-space indent, `<name> (<version>)` or
@@ -2216,17 +2238,7 @@ fn spec_entry(line: &str) -> Option<(&str, &str)> {
 /// because matching must mirror the GEM specs grammar (spike G5: native gems
 /// get one CHECKSUMS line per platform spec, `ffi (1.17.2-aarch64-linux-gnu)`).
 fn checksum_entry(line: &str) -> Option<(&str, &str)> {
-    let rest = line.strip_prefix("  ")?;
-    if rest.is_empty() || rest.starts_with(' ') {
-        return None;
-    }
-    let open = rest.find(" (")?;
-    let after = &rest[open + 2..];
-    let close = after.find(')')?;
-    let (name, ver, tail) = (&rest[..open], &after[..close], &after[close + 1..]);
-    if name.is_empty() || ver.is_empty() || !(tail.is_empty() || tail.starts_with(' ')) {
-        return None;
-    }
+    let (name, ver, _) = split_checksum_entry(at_indent(line, 2)?)?;
     Some((name, ver))
 }
 
@@ -2564,16 +2576,6 @@ fn find_path_section(lines: &[String], remote_line: &str) -> Option<(usize, usiz
 }
 
 // ── shared helpers ───────────────────────────────────────────────────────────
-
-/// Plain gem-token charset (letters, digits, `.`, `_`, `-`). See the SECURITY
-/// note in [`vendor_gem`] — these strings are embedded verbatim into ruby
-/// source and lock line grammar, so this is deliberately stricter than the
-/// path-level `is_safe_single_segment`.
-fn is_plain_gem_token(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
 
 /// The one shared gemspec line-scanner: locate a `.{attr}` mention in `line`
 /// and return what follows it (leading-whitespace-trimmed), or `None`.

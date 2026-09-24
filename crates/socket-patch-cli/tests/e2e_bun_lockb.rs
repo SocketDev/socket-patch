@@ -18,6 +18,8 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "vex_e2e_common/bun.rs"]
+mod bun_vex;
 #[path = "common/cache_env.rs"]
 mod cache_env;
 
@@ -25,6 +27,10 @@ const ORG: &str = "binary-bun-test";
 const PURL: &str = "pkg:npm/minimist@1.2.2";
 const UUID: &str = "80630680-4da6-45f9-bba8-b888e0ffd58c";
 const MARKER: &[u8] = b"/* SOCKET BINARY LOCK PATCH */\n";
+/// The vulnerability the patch record carries (staged manifest and API
+/// view alike) — what manifest-less VEX must attest.
+const GHSA: &str = "GHSA-bunb-lock-0001";
+const CVE: &str = "CVE-2026-4444";
 
 fn command(program: impl AsRef<std::ffi::OsStr>, cwd: &Path) -> Command {
     let mut command = Command::new(program);
@@ -347,7 +353,8 @@ impl Fixture {
         let manifest = json!({"patches":{PURL:{"uuid":UUID,
             "exportedAt":"2026-01-01T00:00:00Z", "files":{"package/index.js":{
                 "beforeHash":compute_git_sha256_from_bytes(&self.original), "afterHash":after}},
-            "vulnerabilities":{}, "description":"binary lock marker", "license":"MIT", "tier":"free"}}});
+            "vulnerabilities":{GHSA:{"cves":[CVE],"summary":"binary lock vuln","severity":"high","description":"d"}},
+            "description":"binary lock marker", "license":"MIT", "tier":"free"}}});
         std::fs::write(
             socket.join("manifest.json"),
             serde_json::to_vec(&manifest).unwrap(),
@@ -463,6 +470,62 @@ impl Fixture {
         checkout
     }
 
+    /// The manifest-less VEX step ([`bun_vex::run_bun_vex_matrix`]) on a
+    /// fresh checkout of the project's CURRENT binary-lock state: manifest
+    /// deleted, a real empty-cache `bun install --frozen-lockfile` by the
+    /// reader, then attested with the `mode` marker from the ledger and —
+    /// ledgers deleted — from `bun.lockb` + the patch API; offline →
+    /// `record_unavailable` with zero requests; the ORIGINAL registry
+    /// `bun.lockb` back (ledgers, artifacts, patched install kept) → NOT
+    /// attested, verified or not. `server` hosts the hosted tarballs.
+    fn manifestless_vex(&self, label: &str, mode: bun_vex::BunMode, server: &str) {
+        let case = bun_vex::BunVexCase {
+            tag: label,
+            mode,
+            purl: PURL,
+            uuid: UUID,
+            files: vec![(
+                "package/index.js".to_string(),
+                compute_git_sha256_from_bytes(&self.patched),
+            )],
+            vulns: &[(GHSA, &[CVE])],
+            lock: "bun.lockb",
+            registry_lock: self.original_lock.clone(),
+            patch_server_url: (mode == bun_vex::BunMode::Hosted).then(|| server.to_string()),
+        };
+        bun_vex::run_bun_vex_matrix(&self.project, self.temp.path(), &case, |checkout| {
+            let output = command(&self.reader, checkout)
+                .args(["install", "--frozen-lockfile", "--ignore-scripts"])
+                .env(
+                    "BUN_INSTALL_CACHE_DIR",
+                    self.temp.path().join(format!("vex-{label}-cache")),
+                )
+                .env(
+                    "BUN_INSTALL",
+                    self.temp.path().join(format!("vex-{label}-home")),
+                )
+                .output()
+                .unwrap();
+            let output = require_success(output, &format!("vex-{label} frozen install"));
+            let target = find_installed_target(checkout).unwrap_or_else(|| {
+                panic!(
+                    "vex-{label}: installed target absent\nstdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            assert_eq!(
+                std::fs::read(target.join("index.js")).unwrap(),
+                self.patched,
+                "vex-{label}: the checkout must hold the patched install"
+            );
+            assert!(
+                !checkout.join("bun.lock").exists(),
+                "vex-{label}: install must remain binary"
+            );
+        });
+    }
+
     fn pristine(&self) {
         assert_eq!(
             self.lock(),
@@ -564,7 +627,8 @@ async fn mock_api(server: &MockServer, fixture: &Fixture, _target: &str) {
                 "beforeHash":compute_git_sha256_from_bytes(&fixture.original),
                 "afterHash":compute_git_sha256_from_bytes(&fixture.patched),
                 "blobContent":base64::engine::general_purpose::STANDARD.encode(&fixture.patched)}},
-            "vulnerabilities":{},"description":"binary lock patch","license":"MIT","tier":"free"})),
+            "vulnerabilities":{GHSA:{"cves":[CVE],"summary":"binary lock vuln","severity":"high","description":"d"}},
+            "description":"binary lock patch","license":"MIT","tier":"free"})),
         )
         .mount(server)
         .await;
@@ -599,6 +663,7 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
     let hosted_lock = fixture.lock();
     assert_ne!(hosted_lock, fixture.original_lock);
     fixture.frozen("hosted", &fixture.patched, "minimist");
+    fixture.manifestless_vex("hosted", bun_vex::BunMode::Hosted, &server.uri());
     let repeat = scan(project, &server, "hosted", &[]);
     assert_eq!(
         repeat["redirect"]["redirected"], 1,
@@ -618,6 +683,7 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
         "hosted -> vendored: {vendored}"
     );
     fixture.frozen("vendored", &fixture.patched, "minimist");
+    fixture.manifestless_vex("vendored", bun_vex::BunMode::Vendored, &server.uri());
     let vendor_lock = fixture.lock();
     let repeat = cli(project, &["vendor", "--offline"]);
     assert_eq!(repeat["summary"]["applied"], 0, "vendor rerun: {repeat}");
@@ -700,6 +766,7 @@ async fn native_binary_hosted_vendored_takeover_roundtrip() {
         "vendored -> hosted: {hosted}"
     );
     fixture.frozen("hosted-again", &fixture.patched, "minimist");
+    fixture.manifestless_vex("hosted-again", bun_vex::BunMode::Hosted, &server.uri());
     let reverted = cli(project, &["rollback", "--yes"]);
     assert_eq!(reverted["status"], "success", "rollback: {reverted}");
     fixture.pristine();
@@ -728,6 +795,15 @@ async fn native_binary_scan_vendored_and_detached() {
             "vendored scan must not write a manifest (detached={detached})"
         );
         fixture.frozen("scan-vendored", &fixture.patched, "minimist");
+        fixture.manifestless_vex(
+            if detached {
+                "scan-vendored-detached"
+            } else {
+                "scan-vendored"
+            },
+            bun_vex::BunMode::Vendored,
+            &server.uri(),
+        );
         let result = cli(&fixture.project, &["vendor", "--revert"]);
         assert_eq!(result["summary"]["removed"], 1, "vendor revert: {result}");
         fixture.pristine();
@@ -766,12 +842,22 @@ async fn native_binary_alias_and_transitive() {
         let result = scan(&fixture.project, &server, "hosted", &[]);
         assert_eq!(result["redirect"]["redirected"], 1, "{shape}: {result}");
         fixture.frozen("shape-hosted", &fixture.patched, target);
+        fixture.manifestless_vex(
+            &format!("{shape}-hosted"),
+            bun_vex::BunMode::Hosted,
+            &server.uri(),
+        );
         cli(&fixture.project, &["rollback", "--yes"]);
         fixture.pristine();
         fixture.stage();
         let result = cli(&fixture.project, &["vendor", "--offline"]);
         assert_eq!(result["summary"]["applied"], 1, "{shape}: {result}");
         fixture.frozen("shape-vendored", &fixture.patched, target);
+        fixture.manifestless_vex(
+            &format!("{shape}-vendored"),
+            bun_vex::BunMode::Vendored,
+            &server.uri(),
+        );
 
         if shape.starts_with("workspace") {
             let mirror = fixture.project.join(format!(

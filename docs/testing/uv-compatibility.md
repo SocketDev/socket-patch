@@ -94,7 +94,10 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   a plain `uv sync` still install the patch; the plain sync rewrites the
   entry back). The CLI cannot tell those binaries apart from the lock, so the
   repoint emits the advisory `pypi_uv_constraints_require_uv_0_5_6`. The
-  project-variant lane below exercises both shapes.
+  project-variant lane below exercises both shapes. Measured with the real
+  0.5.4 and 0.5.5 binaries (`scripts/uv-vex-matrix.sh`): 0.5.4 still rejects
+  the repointed entry under `--locked`, 0.5.5 accepts it — the effective
+  boundary is 0.5.5; the advisory keeps its `0_5_6` name.
 - Transitive targets are wired through `[tool.uv] override-dependencies` plus
   a `[tool.uv.sources]` entry. uv applies sources to overrides only from
   0.5.6: on 0.2.35–0.5.3 `--frozen` installs the patched wheel from the lock,
@@ -102,6 +105,12 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   reinstalls the pristine wheel (and rewrites the lock). The CLI cannot tell
   those binaries apart from the lock, so the override branch emits the
   advisory warning `pypi_uv_override_requires_uv_0_5_6` instead of refusing.
+  Measured with the real binaries: 0.5.4 still re-resolves the override,
+  0.5.5 already keeps it (effective boundary 0.5.5). When the environment
+  already holds the patched install (a `--frozen` sync ran first), 0.2.37 –
+  0.5.4 leave that same-version install in place while rewriting the lock to
+  the registry, so only the NEXT install from the lock is pristine;
+  manifest-less VEX follows the lock and stops attesting either way.
 - Symlinked `uv.lock`, `pyproject.toml`, `pylock*.toml`, `*.py.lock` and
   script files are discovered for inventory and `repair`, but every writer
   refuses before touching anything — hosted
@@ -253,6 +262,42 @@ Keep live download grants out of committed evidence. Published patch UUIDs,
 archive filenames, hashes, uv versions, and redacted command results are enough
 to identify a run. Compare the fresh installed bytes with the patched artifact,
 not just with a URL or a success message.
+
+## Manifest-less VEX
+
+Hosted and vendored checkouts carry no `.socket/manifest.json`; `socket-patch
+vex` discovers the patch from the wiring files (`uv.lock` + `pyproject.toml`,
+`<script>.py.lock` + the script's PEP 723 block, `pylock*.toml`), takes the
+record from the ledgers or the patch API, and verifies the installed tree
+(hosted) or the committed wheel (vendored). Three layers cover it:
+
+- `crates/socket-patch-cli/tests/e2e_vex_lockfile/uv.rs` — hermetic, every OS:
+  every lock shape × hosted / vendored, online / offline / 404, ledger without
+  manifest, reverted and half-reverted pairs (including script pairs),
+  tampered installed trees and wheel members, spoofed hosts and vendor paths,
+  record mismatches, and the embedded `apply --vex` / `vendor --vex` /
+  `scan --redirect|--vendor --vex` paths.
+- `e2e_redirect_uv_build` (hosted, wiremock patch API serving the patched
+  wheel) and `e2e_vendor_pypi_build` (vendored) — the REAL uv under test
+  (`SOCKET_PATCH_UV_E2E_BIN` / `_VERSION` / `_PYTHON` / `_REQUIRED`) builds
+  each lane (project, constraints, transitive override, script lock,
+  `uv export` / `uv pip compile` / `pip lock` pylock), our CLI wires it, a
+  fresh checkout installs from an empty cache and imports the patched bytes,
+  then VEX runs with the manifest deleted, with the ledgers deleted, offline
+  (`record_unavailable`, zero requests), embedded, and after the wiring is
+  reverted with the ledgers left behind (not attested, `--no-verify` too).
+  `scripts/uv-vex-matrix.sh` runs every uv 0.N line (0.1.45, 0.2.37, 0.3.5,
+  0.4.30, 0.5.3–0.5.6, 0.6.17, 0.7.22, 0.8.24, 0.9.30, 0.10.12, 0.11.33,
+  0.12.17) through both suites, plus the live-production uv legs with
+  `UV_VEX_MATRIX_PRODUCTION=1`.
+- This backtest's `vex_matrix` phase (`vex-backtest.json`): the same steps over
+  the installed production cases (`project`, `export-pylock`, `pylock-direct`),
+  recording `vexAttested`, `vexMarkers` and `vexSkip` per row.
+
+Lanes a release lacks are reported `n/a`: uv 0.1.45 writes the
+`[[distribution]]` grammar (hosted only; vendored is refused as above), script
+locks need `uv lock --script` (0.5.17), pylock lanes need `uv pip sync
+pylock.toml` (0.7).
 
 ## Full matrix results
 

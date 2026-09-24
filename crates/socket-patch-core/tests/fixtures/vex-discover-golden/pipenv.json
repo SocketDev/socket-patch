@@ -1,0 +1,15 @@
+{
+  "pipenv/2026.8.0": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "Pipfile.lock"
+      }
+    ],
+    "live_claims": []
+  }
+}

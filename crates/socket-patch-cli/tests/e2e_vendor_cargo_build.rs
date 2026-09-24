@@ -32,8 +32,27 @@
 //! fresh-checkout `--locked --offline` build (the revert half is covered by
 //! the capstone: get rides the identical vendor engine).
 //!
+//! MANIFEST-LESS VEX (both drivers), on the fresh checkout after its
+//! `--locked --offline` build, with the shared `vex_e2e_common` helpers and
+//! a separate patch-API stand-in: (1) `.socket/manifest.json` deleted, the
+//! vendor ledger kept → `(vendored)` from the ledger's embedded record, zero
+//! API calls, embedded `apply --vex` / `vendor --vex` too; (2) the ledgers
+//! deleted → the `[patch.crates-io]` path + detached lock entry + committed
+//! copy still attest with the API's record (embedded runs too); (3)
+//! `--offline` with no ledger → `record_unavailable`, zero requests; (4)
+//! `Cargo.lock` reverted to crates.io with ledger + copy kept — the stale
+//! `[patch]` left behind, and the full revert (`[patch]` dropped) rebuilt
+//! `--locked --offline` by the real cargo — → NOT attested
+//! (`vendor_unwired`), also under `--no-verify`.
+//!
+//! Toolchain / lock format: `cargo_e2e_matrix` (`SOCKET_PATCH_CARGO_E2E_*`)
+//! runs every cargo step under a pinned release and re-encodes the baseline
+//! `Cargo.lock` as v1–v4 before vendoring; the detach must keep that format
+//! and the fresh `--locked` build must accept it.
+//!
 //! Skips (println) when `cargo` is missing or crates.io is unreachable for
-//! the fixture build; all assertions after that are hard.
+//! the fixture build (a failure instead under
+//! `SOCKET_PATCH_CARGO_E2E_REQUIRED=1`); all assertions after that are hard.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -41,6 +60,15 @@ use std::process::{Command, Output};
 use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+#[path = "cargo_e2e_matrix/mod.rs"]
+mod cargo_e2e_matrix;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+use vex_e2e_common::{
+    assert_absent, assert_attested, assert_not_attested, run_vex, strip_ledgers, strip_manifest,
+    Marker, PatchApi, VexRun, VexVia,
+};
 
 const ORG: &str = "test-org";
 const UUID: &str = "2b3c4d5e-6f70-4a1b-8c2d-0123456789ab";
@@ -54,15 +82,6 @@ const PATCH_SUFFIX: &str =
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
-
-fn has_command(cmd: &str) -> bool {
-    Command::new(cmd)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
 }
 
 /// Run socket-patch with ambient `SOCKET_*` vars scrubbed and the fixture's
@@ -86,15 +105,12 @@ fn run_socket(cwd: &Path, args: &[&str], cargo_home: &Path) -> (i32, String, Str
     )
 }
 
+/// Real cargo under the matrix's pinned toolchain (if any), the fixture's
+/// private CARGO_HOME and no ambient CARGO_TARGET_DIR (the assertions read
+/// `<fixture>/target/debug/...`).
 fn cargo(cwd: &Path, args: &[&str], cargo_home: &Path) -> Output {
-    Command::new("cargo")
+    cargo_e2e_matrix::cargo_command(cwd, cargo_home)
         .args(args)
-        .current_dir(cwd)
-        .env("CARGO_HOME", cargo_home)
-        // The assertions read `<fixture>/target/debug/...`; an ambient
-        // CARGO_TARGET_DIR (shared-build-cache setups) would redirect the
-        // child build elsewhere and break them.
-        .env_remove("CARGO_TARGET_DIR")
         .output()
         .expect("failed to run cargo")
 }
@@ -225,13 +241,18 @@ fn stage_fixture(tmp: &Path, tag: &str) -> Option<(PathBuf, PathBuf, String, Pat
 
     let build = cargo(&proj, &["build", "-q"], &cargo_home);
     if !build.status.success() {
-        println!(
-            "SKIP e2e_vendor_cargo_build ({tag}): baseline `cargo build` failed (crates.io \
-             unreachable?):\n{}",
-            String::from_utf8_lossy(&build.stderr)
+        let _ = cargo_e2e_matrix::skip(
+            &format!("e2e_vendor_cargo_build ({tag})"),
+            &format!(
+                "baseline `cargo build` failed (crates.io unreachable?):\n{}",
+                String::from_utf8_lossy(&build.stderr)
+            ),
         );
         return None;
     }
+    // The matrix's lock format (v1–v4), re-encoded from what the toolchain
+    // wrote: the committed-lockfile shape the detach must meet.
+    cargo_e2e_matrix::apply_lock_version(&proj);
 
     let lock_text = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
     let version = locked_version(&lock_text, DEP)
@@ -245,12 +266,185 @@ fn stage_fixture(tmp: &Path, tag: &str) -> Option<(PathBuf, PathBuf, String, Pat
     Some((proj, cargo_home, version, crate_dir))
 }
 
+// ── manifest-less VEX (lockfile discovery) ────────────────────────────
+
+const GHSA: &str = "GHSA-vend-cargo-real";
+const CVE: &str = "CVE-2024-88888";
+
+/// Everything the manifest-less steps need, owned (they run where no async
+/// runtime is entered: the shared `PatchApi` brings its own).
+struct ManifestlessVendored {
+    /// The fresh checkout (its `--locked --offline` build already ran).
+    fresh: PathBuf,
+    fresh_home: PathBuf,
+    /// A CARGO_HOME holding crates.io's pristine copy (the fixture build's),
+    /// for the reverted checkout's offline build.
+    registry_home: PathBuf,
+    scratch: PathBuf,
+    purl: String,
+    patched: Vec<u8>,
+    /// The pre-vendor (crates.io) `Cargo.lock`.
+    baseline_lock: Vec<u8>,
+}
+
+impl ManifestlessVendored {
+    /// Run [`Self::steps`] off the async runtime (and re-raise its panic).
+    async fn run_async(self) {
+        if let Err(e) = tokio::task::spawn_blocking(move || self.steps()).await {
+            std::panic::resume_unwind(e.into_panic());
+        }
+    }
+
+    fn vex_run(&self, api: &PatchApi, cargo_home: &Path) -> VexRun {
+        VexRun {
+            product: Some("pkg:cargo/app@1.0.0".to_string()),
+            ..VexRun::online(api)
+        }
+        .env("CARGO_HOME", cargo_home)
+    }
+
+    fn steps(self) {
+        let bin = binary();
+        let vulns: &[(&str, &[&str])] = &[(GHSA, &[CVE])];
+        let api = PatchApi::start(vec![(
+            UUID.to_string(),
+            vex_e2e_common::patch_view(
+                UUID,
+                &self.purl,
+                &[("src/lib.rs", &vex_e2e_common::git_sha256(&self.patched))],
+                vulns,
+            ),
+        )]);
+        let fresh = self.fresh.as_path();
+        let ledger_path = fresh.join(socket_patch_core::vendor::VENDOR_STATE_REL);
+        let run = self.vex_run(&api, &self.fresh_home);
+        let embedded = [VexVia::Apply, VexVia::Vendor];
+
+        // (1) The manifest deleted (a detached / depscan checkout), the
+        //     vendor ledger kept: its embedded record attests — no API.
+        strip_manifest(fresh);
+        assert!(ledger_path.is_file(), "the vendor ledger travels");
+        let out = run_vex(&bin, fresh, &run);
+        assert_eq!(out.code, Some(0), "(1) ledger-backed:\n{out}");
+        assert_attested(out.doc(), &self.purl, UUID, Marker::Vendored, vulns);
+        for via in embedded {
+            let out = run_vex(&bin, fresh, &run.clone().via(via));
+            assert_eq!(out.code, Some(0), "(1) {via:?} --vex:\n{out}");
+            assert_eq!(out.envelope["status"], "noManifest", "(1) {via:?}:\n{out}");
+            assert_attested(out.doc(), &self.purl, UUID, Marker::Vendored, vulns);
+        }
+        assert_eq!(
+            api.view_requests(UUID),
+            0,
+            "(1) the ledger record needs no API"
+        );
+
+        // (2) Ledgers deleted: the `[patch.crates-io]` path + the detached
+        //     lock entry + the committed copy, with the API's record.
+        let ledger = std::fs::read(&ledger_path).unwrap();
+        strip_ledgers(fresh);
+        let out = run_vex(&bin, fresh, &run);
+        assert_eq!(out.code, Some(0), "(2) lockfile-only:\n{out}");
+        assert_attested(out.doc(), &self.purl, UUID, Marker::Vendored, vulns);
+        assert!(
+            api.view_requests(UUID) >= 1,
+            "(2) the record came from the API"
+        );
+        for via in embedded {
+            let out = run_vex(&bin, fresh, &run.clone().via(via));
+            assert_eq!(out.code, Some(0), "(2) {via:?} --vex:\n{out}");
+            assert_eq!(out.envelope["status"], "noManifest", "(2) {via:?}:\n{out}");
+            assert_attested(out.doc(), &self.purl, UUID, Marker::Vendored, vulns);
+        }
+        assert!(
+            !fresh.join(".socket/manifest.json").exists(),
+            "no VEX step writes the manifest"
+        );
+        assert!(!ledger_path.exists(), "no VEX step writes the ledger");
+
+        // (3) Offline with no ledger: nothing local holds the record.
+        let before = api.request_count();
+        let out = run_vex(
+            &bin,
+            fresh,
+            &VexRun {
+                offline: true,
+                ..run.clone()
+            },
+        );
+        assert_eq!(out.code, Some(1), "(3) offline:\n{out}");
+        assert_not_attested(&out.envelope, &self.purl, "record_unavailable");
+        assert_absent(out.doc.as_ref(), &self.purl);
+        assert_eq!(api.request_count(), before, "(3) --offline made a request");
+
+        // (4a) Cargo.lock reverted to crates.io, ledger + copy + the stale
+        //      `[patch]` kept: the copy is not what the lock builds.
+        std::fs::write(&ledger_path, &ledger).unwrap();
+        std::fs::write(fresh.join("Cargo.lock"), &self.baseline_lock).unwrap();
+        for no_verify in [false, true] {
+            let out = run_vex(
+                &bin,
+                fresh,
+                &VexRun {
+                    no_verify,
+                    ..run.clone()
+                },
+            );
+            assert_eq!(out.code, Some(1), "(4a) no_verify={no_verify}:\n{out}");
+            assert_not_attested(&out.envelope, &self.purl, "vendor_unwired");
+            assert_absent(out.doc.as_ref(), &self.purl);
+        }
+
+        // (4b) The full revert (lock + `[patch]` dropped), ledger + copy
+        //      kept, rebuilt for real from crates.io's copy.
+        let revert = self.scratch.join("reverted");
+        std::fs::create_dir_all(&revert).unwrap();
+        for file in ["Cargo.toml", "Cargo.lock"] {
+            std::fs::copy(fresh.join(file), revert.join(file)).unwrap();
+        }
+        copy_dir_recursive(&fresh.join("src"), &revert.join("src"));
+        copy_dir_recursive(&fresh.join(".socket"), &revert.join(".socket"));
+        std::fs::write(
+            revert.join("src/main.rs"),
+            "fn main() { println!(\"baseline\"); }\n",
+        )
+        .unwrap();
+        let build = cargo(
+            &revert,
+            &["build", "-q", "--locked", "--offline"],
+            &self.registry_home,
+        );
+        assert!(
+            build.status.success(),
+            "(4b) the reverted checkout builds from crates.io's copy:\n{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        assert!(
+            revert.join(format!(".socket/vendor/cargo/{UUID}")).is_dir(),
+            "(4b) the committed copy is still there"
+        );
+        let run = self.vex_run(&api, &self.registry_home);
+        for no_verify in [false, true] {
+            let out = run_vex(
+                &bin,
+                &revert,
+                &VexRun {
+                    no_verify,
+                    ..run.clone()
+                },
+            );
+            assert_eq!(out.code, Some(1), "(4b) no_verify={no_verify}:\n{out}");
+            assert_not_attested(&out.envelope, &self.purl, "vendor_unwired");
+            assert_absent(out.doc.as_ref(), &self.purl);
+        }
+    }
+}
+
 // ── the capstone ──────────────────────────────────────────────────────
 
 #[test]
 fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
-    if !has_command("cargo") {
-        println!("SKIP e2e_vendor_cargo_build: `cargo` not installed");
+    if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (main)") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -381,6 +575,11 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         !block.contains("source = ") && !block.contains("checksum = "),
         "lock entry must be detached from the registry (no source/checksum):\n{block}"
     );
+    assert_eq!(
+        cargo_e2e_matrix::lock_format(&lock_text),
+        cargo_e2e_matrix::lock_format(&String::from_utf8_lossy(&lock_before)),
+        "the detach must keep the lock format:\n{lock_text}"
+    );
 
     // COMPILE ORACLE: the consumer references the patched-only symbol.
     std::fs::write(
@@ -439,6 +638,18 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
         "fresh CARGO_HOME must not gain a registry/ — the vendored path dep \
          is the sole provider"
     );
+
+    // Manifest-less VEX on the fresh checkout.
+    ManifestlessVendored {
+        fresh: fresh.clone(),
+        fresh_home: fresh_home.clone(),
+        registry_home: cargo_home.clone(),
+        scratch: tmp.path().join("manifestless"),
+        purl: purl.clone(),
+        patched: patched.clone(),
+        baseline_lock: lock_before.clone(),
+    }
+    .steps();
 
     // Idempotency: re-vendor leaves the lock byte-stable.
     let lock_wired = std::fs::read(&lock_path).unwrap();
@@ -515,8 +726,7 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
 /// "Vendored 0 package(s); 1 skipped" and `track_patch_vendored` reports 0.
 #[test]
 fn cargo_vendor_reports_applied_event() {
-    if !has_command("cargo") {
-        println!("SKIP: `cargo` not installed");
+    if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (applied-event)") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -576,8 +786,7 @@ fn cargo_vendor_reports_applied_event() {
 /// wiremock keeps serving the view endpoint on the others.
 #[tokio::test(flavor = "multi_thread")]
 async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
-    if !has_command("cargo") {
-        println!("SKIP e2e_vendor_cargo_build (get-uuid): `cargo` not installed");
+    if !cargo_e2e_matrix::cargo_available("e2e_vendor_cargo_build (get-uuid)") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -586,6 +795,7 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
     };
     let purl = format!("pkg:cargo/{DEP}@{version}");
     let copy_rel = format!(".socket/vendor/cargo/{UUID}/{DEP}-{version}");
+    let lock_before = std::fs::read(proj.join("Cargo.lock")).unwrap();
 
     // The view endpoint serves the record with REAL hashes computed from the
     // ACTUAL extracted registry bytes + inline blobContent — no `.socket/`
@@ -775,4 +985,24 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
         "fresh CARGO_HOME must not gain a registry/ — the vendored path dep \
          is the sole provider"
     );
+    let lock_text = std::fs::read_to_string(fresh.join("Cargo.lock")).unwrap();
+    assert_eq!(
+        cargo_e2e_matrix::lock_format(&lock_text),
+        cargo_e2e_matrix::lock_format(&String::from_utf8_lossy(&lock_before)),
+        "the detach must keep the lock format:\n{lock_text}"
+    );
+
+    // Manifest-less VEX on the fresh checkout (get wrote a manifest; the
+    // steps delete it).
+    ManifestlessVendored {
+        fresh,
+        fresh_home,
+        registry_home: cargo_home,
+        scratch: tmp.path().join("manifestless"),
+        purl,
+        patched,
+        baseline_lock: lock_before,
+    }
+    .run_async()
+    .await;
 }

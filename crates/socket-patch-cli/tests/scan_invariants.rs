@@ -1485,7 +1485,7 @@ async fn scan_agent_over_vendored_purl_surfaces_run_level_warning() {
 
 /// Write a hosted redirect ledger + a yarn.lock the ledger claims to have
 /// edited, whose resolved URL still pins the patch server (the live-wiring
-/// proof `hosted_wiring_live` reads).
+/// proof `redirect_record_live` reads).
 fn seed_live_hosted_wiring(root: &Path, purl: &str, uuid: &str, with_record: bool) {
     let hosted_url =
         format!("https://patch.socket.dev/patch/npm/minimist/1.2.2/tok/{uuid}/minimist-1.2.2.tgz");

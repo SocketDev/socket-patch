@@ -297,6 +297,12 @@ jobs:
         # covgap_commands_get masked ~180 binaries that had never run on
         # Windows at all). Run them all and fail at the end instead.
         shell: bash
+        env:
+          # The real-go hosted/vendored suites (`#![cfg(unix)]`) ride the Go
+          # installed above for vexctl: fail instead of skip without `go` /
+          # `zip`, and assert the pinned release.
+          SOCKET_PATCH_GO_E2E_REQUIRED: '1'
+          SOCKET_PATCH_GO_E2E_VERSION: '1.24'
         run: |
           set -euo pipefail
           cargo test --workspace --all-features --no-run
@@ -304,7 +310,13 @@ jobs:
 
   test-release:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Every tests/ target is its own optimized link, and the two cargo
+    # invocations below build the graph twice (--all-features, then the
+    # default features): ~25m on main with ~240 test binaries, so 30m left
+    # no headroom as suites grow. The manifest-less VEX suites share two
+    # multi-module binaries (tests/e2e_vex_lockfile/, tests/e2e_vex_build/)
+    # to keep the count down; the extra 10m covers the rest.
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -534,6 +546,7 @@ jobs:
             gem)      EXTRA="--test docker_e2e_vendor_gem" ;;
             maven)    EXTRA="--test docker_e2e_vendor_maven" ;;
             nuget)    EXTRA="--test docker_e2e_vendor_nuget" ;;
+            pypi)     EXTRA="--test docker_e2e_vendor_pypi_pm" ;;
           esac
           cargo llvm-cov \
             --features docker-e2e \
@@ -667,16 +680,52 @@ jobs:
             test_filter: --include-ignored
           - os: ubuntu-latest
             suite: e2e_nuget
-          # Host vendor build-proof capstones: fresh-checkout install +
-          # revert against the REAL composer/bundler toolchains. `#[ignore]`-
-          # gated (the unpinned `test` job skips them); this job pins the
-          # toolchain (composer 2, bundler 2.5) below and runs them via
-          # `--ignored`. ubuntu-latest only — they need the pinned toolchain,
-          # not per-OS coverage.
-          - os: ubuntu-latest
-            suite: e2e_vendor_composer_build
-          - os: ubuntu-latest
-            suite: e2e_vendor_gem_build
+          # Host build-proof capstones: fresh-checkout install + revert
+          # against the REAL composer/bundler toolchains, each ending in the
+          # manifest-less VEX matrix. `#[ignore]`-gated (the unpinned `test`
+          # job skips them); `composer:` / `bundler:` install that exact
+          # toolchain below, runs them via `--ignored`, and exports the
+          # suites' `_REQUIRED` + `_VERSION` gates so a leg hard-fails
+          # instead of skipping on a missing or wrong toolchain.
+          # ubuntu-latest only — they need the pinned toolchain, not per-OS
+          # coverage.
+          #
+          # composer: 1 (packagist stopped serving composer 1 on 2025-09-01,
+          # so the fixture resolves from an inline repository), 2.2 LTS (the
+          # other release with the git-source download fallback the hosted
+          # redirect must drop) and current 2.
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build, composer: '2'}
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build, composer: '2.2'}
+          - {os: ubuntu-latest, suite: e2e_vendor_composer_build, composer: '1'}
+          - {os: ubuntu-latest, suite: e2e_redirect_composer_build, composer: '2'}
+          - {os: ubuntu-latest, suite: e2e_redirect_composer_build, composer: '2.2'}
+          - {os: ubuntu-latest, suite: e2e_redirect_composer_build, composer: '1'}
+          # setup-e2e host guards run in no other job (test job = default
+          # features; setup-matrix job = shell script).
+          - {os: ubuntu-latest, suite: setup_matrix_composer, test_filter: host_guard}
+          # Real-bundler gem capstones, one leg per bundler era. Boundaries:
+          # 1.17/2.1 merged GEM section, 2.2 separate sections, 2.5 last
+          # pre-CHECKSUMS, 2.6 CHECKSUMS, 4.0.15/4.0.21 before/after the
+          # strict frozen check (rubygems#9750). bundler <= 2.2 needs
+          # Ruby <= 3.3 and 1.17-2.1 need Ruby <= 3.1 (`untaint`).
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.1', bundler: '1.17.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.1', bundler: '2.1.4'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.1', bundler: '2.2.33'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.3', bundler: '2.5.23'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.3', bundler: '2.6.9'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.3', bundler: '2.7.2'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.4', bundler: '4.0.15'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build, ruby: '3.4', bundler: '4.0.21'}
+          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.1', bundler: '1.17.3'}
+          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.1', bundler: '2.1.4'}
+          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.1', bundler: '2.2.33'}
+          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.5.23'}
+          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.6.9'}
+          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.3', bundler: '2.7.2'}
+          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.15'}
+          - {os: ubuntu-latest, suite: e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.21'}
+          # not #[ignore]-gated -> --include-ignored is mandatory
+          - {os: ubuntu-latest, suite: setup_matrix_gem, ruby: '3.3', bundler: '2.7.2', test_filter: --include-ignored}
           # The live-API smoke suites (e2e_npm, e2e_pypi, e2e_gem,
           # e2e_scan) are intentionally NOT in the PR matrix — their
           # `#[ignore]`-gated tests hit the real public proxy at
@@ -731,10 +780,17 @@ jobs:
           # OS, but in parallel off the critical path. They use the runner's
           # default node/corepack, exactly as they did inside `test` — no
           # setup-node step, no version change.
+          #
+          # `npm_required` turns the npm suites' "npm not installed" soft-skip
+          # into a hard failure. Not on Windows: `Command::new("npm")` cannot
+          # resolve `npm.cmd` there, so that leg still skips (a known gap; see
+          # docs/testing/npm-compatibility.md).
           - os: ubuntu-latest
             suite: e2e_redirect_npm_build
+            npm_required: '1'
           - os: macos-latest
             suite: e2e_redirect_npm_build
+            npm_required: '1'
           - os: windows-latest
             suite: e2e_redirect_npm_build
           - os: ubuntu-latest
@@ -823,8 +879,135 @@ jobs:
             suite: mode_migration_bun
             bun: '1.3.14'
             test_filter: --include-ignored
+          # Manifest-less VEX era legs: the last pre-v2 text-lock writer for
+          # the hosted/vendored capstones, the v0/v1 writers for the takeover
+          # suite, and the binary bun.lockb era (1.0 / 1.1 lines) through
+          # e2e_bun_lockb, which reads the SOCKET_PATCH_BUN_LOCKB_* gates
+          # exported for it below.
+          - {os: ubuntu-latest, suite: e2e_redirect_bun_build, bun: '1.3.14', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_bun_build, bun: '1.3.14', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: mode_migration_bun, bun: '1.1.45', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: mode_migration_bun, bun: '1.2.23', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.0.36', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_bun_lockb, bun: '1.1.45', test_filter: --include-ignored}
+          # The named corepack pnpm hosted legs (pnpm 7-11, get-uuid,
+          # zero-touch, --trust-lockfile). `#[ignore]`d and previously run in
+          # no job; the pinned matrix inside the same suite runs in
+          # pnpm-compatibility.yml, hence the skip. Node 24 (step below): the
+          # corepack pnpm@10/11 legs require it.
+          - {os: ubuntu-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
+          - {os: macos-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
+          - {os: windows-latest, suite: e2e_redirect_pnpm_build, test_filter: '--ignored --skip pnpm_pinned_matrix'}
+          # Real-uv hosted/vendored capstones ending in manifest-less VEX:
+          # one leg per uv 0.N line + the 0.5.x boundary (0.5.4 still
+          # re-resolves a transitive override / rejects a repointed
+          # constraint under --locked; 0.5.5 keeps both).
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.1.45'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.2.37'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.3.5'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.4.30'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.4'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.5'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.5.6'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.6.17'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.7.22'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.8.24'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.9.30'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.10.12'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.11.33'}
+          - {os: ubuntu-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
+          - {os: macos-latest, suite: e2e_redirect_uv_build, uv: '0.12.17'}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.1.45', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.2.37', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.3.5', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.4.30', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.3', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.4', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.5', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.5.6', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.6.17', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.7.22', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.8.24', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.9.30', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.10.12', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.11.33', test_filter: --include-ignored}
+          - {os: ubuntu-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
+          - {os: macos-latest, suite: e2e_vendor_pypi_build, uv: '0.12.17', test_filter: --include-ignored}
+          # The Poetry / PDM / Hatch / Pipenv / pip / deno manifest-less VEX
+          # capstones share ONE test binary (`e2e_vex_build`, a module per
+          # tool — one optimized link in test-release instead of six), so
+          # each leg's `test_filter` names its tool's module and keeps
+          # `--ignored`.
+          # Real-Poetry hosted + vendored capstones (#[ignore]-gated,
+          # unix-only). One leg per major / lock format: 1.0 (lock 1.0),
+          # 1.1 (lock 1.1), 1.8 (lock 2.0), 2.x (lock 2.1).
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.0.10'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.1.15'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '1.8.5'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.0.1'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
+          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'poetry:: --ignored', poetry: '2.4.3'}
+          # Real PDM / Hatch capstones (wiremock Socket API that also serves
+          # the hosted wheel; PyPI for the tool bootstrap + six).
+          # PDM: lock 2 (1.4), refused 3.1 (1.15) and 4.2 (2.7), 4.3 (2.8),
+          # the hishel<1 bootstrap window (2.25) and current.
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '1.4.5'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '1.15.5'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.7.4'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.8.2'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.25.9'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.29.2'}
+          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pdm:: --ignored', pdm: '2.29.2'}
+          # Hatch: 1.0 (hatch.toml env vendoring refused, needs >= 1.2),
+          # 1.2, the virtualenv<21 window (1.9, 1.14) and current.
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.0.0'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.2.1'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.9.7'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.14.2'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.18.1'}
+          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'hatch:: --ignored', hatch: '1.18.1'}
+          # Real Pipenv / pip capstones (mock patch server; the tools are
+          # bootstrapped from PyPI). `pipenv:` / `pip:` hold one or more
+          # space-separated releases the suite loops over.
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2022.12.19'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2023.12.1'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2024.4.1'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2025.1.3'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2026.8.0'}
+          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pipenv:: --ignored', pipenv: '2022.12.19 2026.8.0'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'pip:: --ignored', pip: '22 23 24 25 26'}
+          - {os: macos-latest, suite: e2e_vex_build, test_filter: 'pip:: --ignored', pip: '22 26'}
+          # Real-Maven hosted + vendored capstones, one leg per Maven line:
+          # 3.6 (pre http-blocker), 3.8 (resolver 1.6: no trusted checksums),
+          # 3.9 (trusted checksums), 4.0 rc.
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '3.6.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '3.8.9'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '3.9.16'}
+          - {os: ubuntu-latest, suite: e2e_redirect_maven_build, maven: '4.0.0-rc-6'}
+          - {os: macos-latest, suite: e2e_redirect_maven_build, maven: '3.9.16'}
+          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, maven: '3.6.3'}
+          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, maven: '3.8.9'}
+          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, maven: '3.9.16'}
+          - {os: ubuntu-latest, suite: e2e_vendor_maven_build, maven: '4.0.0-rc-6'}
+          - {os: macos-latest, suite: e2e_vendor_maven_build, maven: '3.9.16'}
+          # Real .NET SDK capstones: hosted + vendored nuget, one leg per SDK
+          # major (the suite pins the major through a sandbox global.json).
+          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '6'}
+          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '7'}
+          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '8'}
+          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '9'}
+          - {os: ubuntu-latest, suite: e2e_nuget_dotnet_build, dotnet: '10'}
+          - {os: macos-latest, suite: e2e_nuget_dotnet_build, dotnet: '8'}
+          # Real deno negative capstone (no hosted/vendored wiring exists for
+          # deno; VEX must attest nothing), one leg per major.
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'deno:: --ignored', deno: '1.46.3'}
+          - {os: ubuntu-latest, suite: e2e_vex_build, test_filter: 'deno:: --ignored', deno: '2.9.7'}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    # The real-toolchain capstones loop several releases per leg (pip,
+    # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
+    # hatch), hence more than the 25 minutes the older legs needed.
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -850,9 +1033,10 @@ jobs:
         with:
           # Matrix suites otherwise collide on one key: only one of the ~9
           # same-OS legs wins the cache reserve and the rest fail to save.
-          # The bun suites run several legs of one suite per OS (one per
-          # pinned bun release), so the release is part of the key too.
-          key: ${{ matrix.suite }}-${{ matrix.bun || 'default' }}
+          # Several suites run one leg per pinned toolchain release (bun, uv,
+          # poetry, pdm, hatch, pipenv, pip, bundler, composer, maven, dotnet,
+          # deno), so the release is part of the key too.
+          key: ${{ matrix.suite }}-${{ matrix.bun || matrix.uv || matrix.poetry || matrix.pdm || matrix.hatch || matrix.pipenv || matrix.pip || matrix.bundler || matrix.composer || matrix.maven || matrix.dotnet || matrix.deno || 'default' }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Node.js
@@ -870,14 +1054,62 @@ jobs:
         # actions/setup-node).
         run: npm install -g pnpm@10
 
+      - name: Setup Node.js 24 (named pnpm legs)
+        if: matrix.suite == 'e2e_redirect_pnpm_build'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.x'
+
       - name: Setup Python
-        if: matrix.suite == 'e2e_pypi'
+        if: matrix.suite == 'e2e_pypi' || matrix.uv != '' || matrix.poetry != '' || matrix.pdm != '' || matrix.hatch != ''
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12.x'
 
+      - name: Setup uv (uv legs)
+        if: matrix.uv != ''
+        # The exact uv release the leg pins; the suites assert it through
+        # SOCKET_PATCH_UV_E2E_VERSION.
+        shell: bash
+        env:
+          UV_TEST_VERSION: ${{ matrix.uv }}
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip "uv==$UV_TEST_VERSION"
+          uv --version
+
+      - name: Install uv (PDM / Hatch legs)
+        if: matrix.pdm != '' || matrix.hatch != ''
+        # The suites bootstrap the pinned PDM / Hatch into their own venv
+        # with uv; this uv is tooling, not the release under test.
+        run: python -m pip install uv==0.11.19
+
+      - name: Install pinned Poetry
+        if: matrix.poetry != ''
+        # Poetry 1.0/1.1 need Python 3.8 (their vendored deps predate 3.12);
+        # 1.2.2 needs the cleo pre-release it was published against. pip 24.0
+        # seeds the tool venv (Poetry 1.0 + pip 22.3-23.0 misread the lock-1.0
+        # `#sha256=` fragment, as the CLI's advisory says).
+        shell: bash
+        env:
+          POETRY_TEST_VERSION: ${{ matrix.poetry }}
+        run: |
+          python -m pip install uv==0.11.19
+          case "$POETRY_TEST_VERSION" in 1.0.*|1.1.*) py=3.8.20 ;; *) py=3.12 ;; esac
+          uv venv "$RUNNER_TEMP/poetry" --python "$py"
+          extra=""; [ "$POETRY_TEST_VERSION" = "1.2.2" ] && extra="cleo==1.0.0a5"
+          uv pip install --python "$RUNNER_TEMP/poetry/bin/python" "poetry==$POETRY_TEST_VERSION" pip==24.0 setuptools==69.5.1 $extra
+          echo "SOCKET_PATCH_POETRY_BIN=$RUNNER_TEMP/poetry/bin/poetry" >> "$GITHUB_ENV"
+
+      - name: Setup uv (Pipenv / pip legs)
+        if: matrix.pipenv != '' || matrix.pip != ''
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+
+      - name: Install the Pythons the Pipenv / pip legs run on
+        if: matrix.pipenv != '' || matrix.pip != ''
+        run: uv python install 3.8 3.11 3.12
+
       - name: Setup Ruby
-        if: matrix.suite == 'e2e_gem' || matrix.suite == 'e2e_vendor_gem_build'
+        if: matrix.suite == 'e2e_gem' || matrix.bundler != ''
         uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
         with:
           # setup-ruby does NOT support `3.2.x` wildcard pinning the
@@ -886,22 +1118,71 @@ jobs:
           # that's currently in the catalog. If the action drops this
           # patch in the future, bump to whatever's available — see
           # https://github.com/ruby/setup-ruby for the supported list.
-          ruby-version: '3.2.10'
-          # e2e_vendor_gem_build asserts the pair-edit lock grammar against
-          # the spike-verified bundler 2.5 floor; pin it so the host capstone
-          # does not ride whatever bundler the runner's Ruby happens to ship.
-          bundler: '2.5'
+          # Bundler-era legs pin their own Ruby (`ruby:`): bundler <= 2.2
+          # needs Ruby <= 3.3 and 1.17-2.1 need Ruby <= 3.1 (`untaint`).
+          ruby-version: ${{ matrix.ruby || '3.2.10' }}
+          # The legs pin their bundler (`bundler:`) so a capstone never rides
+          # whatever bundler the runner's Ruby ships; bundler 1.x is not
+          # installable through setup-ruby, see the next step. e2e_gem keeps
+          # the 2.5 floor.
+          bundler: ${{ startsWith(matrix.bundler, '1.') && 'none' || matrix.bundler || '2.5' }}
           bundler-cache: false
 
+      - name: Install Bundler 1.x
+        if: startsWith(matrix.bundler, '1.')
+        shell: bash
+        env:
+          BUNDLER_TEST_VERSION: ${{ matrix.bundler }}
+        run: |
+          gem install bundler -v "$BUNDLER_TEST_VERSION" --no-document
+          echo "BUNDLER_VERSION=$BUNDLER_TEST_VERSION" >> "$GITHUB_ENV"
+
       - name: Setup PHP
-        if: matrix.suite == 'e2e_vendor_composer_build'
-        # e2e_vendor_composer_build shells out to a real composer; pin the
-        # composer 2 major so the composer.lock grammar the pair edit asserts
-        # stays stable across runners.
+        if: matrix.composer != ''
+        # The composer capstones shell out to a real composer; `composer:`
+        # pins the release line (1, 2.2 LTS, 2) so the composer.lock grammar
+        # the edits assert stays stable across runners.
         uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
         with:
           php-version: '8.2'
-          tools: composer:2
+          tools: composer:${{ matrix.composer }}
+
+      - name: Setup Java (Maven legs)
+        if: matrix.maven != ''
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Maven ${{ matrix.maven }}
+        if: matrix.maven != ''
+        # Straight from the Apache archive (sha512-verified), so a leg gets
+        # exactly the release it names rather than the runner's Maven.
+        shell: bash
+        env:
+          MAVEN_VERSION: ${{ matrix.maven }}
+        run: |
+          major="${MAVEN_VERSION%%.*}"
+          url="https://archive.apache.org/dist/maven/maven-${major}/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          curl -fsSL --retry 3 "$url" -o "$RUNNER_TEMP/maven.tgz"
+          sum="$(curl -fsSL --retry 3 "$url.sha512" | cut -d' ' -f1)"
+          echo "$sum  $RUNNER_TEMP/maven.tgz" | shasum -a 512 -c -
+          tar -xzf "$RUNNER_TEMP/maven.tgz" -C "$RUNNER_TEMP"
+          echo "SOCKET_PATCH_MAVEN_E2E_MVN=$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn" >> "$GITHUB_ENV"
+
+      - name: Setup .NET SDK
+        if: matrix.dotnet != ''
+        # Installs next to the runner's preinstalled SDKs; the suite writes
+        # its own global.json to select the pinned major.
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: ${{ matrix.dotnet }}.0.x
+
+      - name: Setup Deno
+        if: matrix.deno != ''
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: ${{ matrix.deno }}
 
       - name: Setup Bun
         if: matrix.bun != ''
@@ -926,6 +1207,39 @@ jobs:
           # which the suites treat as unset.
           SOCKET_PATCH_BUN_E2E_REQUIRED: ${{ matrix.bun != '' && '1' || '' }}
           SOCKET_PATCH_BUN_E2E_VERSION: ${{ matrix.bun }}
+          # e2e_bun_lockb only. SOCKET_PATCH_BUN_LOCKB_VERSION is checked with
+          # `var().is_ok()`, so it must stay EMPTY on every other leg.
+          SOCKET_PATCH_BUN_LOCKB_REQUIRED: ${{ matrix.suite == 'e2e_bun_lockb' && '1' || '' }}
+          SOCKET_PATCH_BUN_LOCKB_VERSION: ${{ matrix.suite == 'e2e_bun_lockb' && matrix.bun || '' }}
+          SOCKET_PATCH_BUN_LOCKB_EXTENDED: ${{ matrix.suite == 'e2e_bun_lockb' && '1' || '' }}
+          SOCKET_PATCH_BUN_LOCKB_PRODUCTION: ${{ matrix.suite == 'e2e_bun_lockb' && '1' || '' }}
+          # The same fail-instead-of-skip + pinned-release gates for every
+          # other real-toolchain capstone. All EMPTY on legs that do not set
+          # the matching matrix key, which the suites treat as unset.
+          SOCKET_PATCH_NPM_E2E_REQUIRED: ${{ matrix.npm_required || '' }}
+          SOCKET_PATCH_CARGO_E2E_REQUIRED: ${{ matrix.suite == 'e2e_safety_cargo_build' && '1' || '' }}
+          SOCKET_PATCH_UV_E2E_REQUIRED: ${{ matrix.uv != '' && '1' || '' }}
+          SOCKET_PATCH_UV_E2E_VERSION: ${{ matrix.uv }}
+          SOCKET_PATCH_POETRY_E2E_REQUIRED: ${{ matrix.poetry != '' && '1' || '' }}
+          SOCKET_PATCH_POETRY_E2E_VERSION: ${{ matrix.poetry }}
+          SOCKET_PATCH_PDM_E2E_REQUIRED: ${{ matrix.pdm != '' && '1' || '' }}
+          SOCKET_PATCH_PDM_E2E_VERSION: ${{ matrix.pdm }}
+          SOCKET_PATCH_HATCH_E2E_REQUIRED: ${{ matrix.hatch != '' && '1' || '' }}
+          SOCKET_PATCH_HATCH_E2E_VERSION: ${{ matrix.hatch }}
+          SOCKET_PATCH_PIPENV_E2E_REQUIRED: ${{ matrix.pipenv != '' && '1' || '' }}
+          SOCKET_PATCH_PIPENV_E2E_VERSIONS: ${{ matrix.pipenv }}
+          SOCKET_PATCH_PIP_E2E_REQUIRED: ${{ matrix.pip != '' && '1' || '' }}
+          SOCKET_PATCH_PIP_E2E_VERSIONS: ${{ matrix.pip }}
+          SOCKET_PATCH_BUNDLER_E2E_REQUIRED: ${{ matrix.bundler != '' && '1' || '' }}
+          SOCKET_PATCH_BUNDLER_E2E_VERSION: ${{ matrix.bundler }}
+          SOCKET_PATCH_COMPOSER_E2E_REQUIRED: ${{ matrix.composer != '' && '1' || '' }}
+          SOCKET_PATCH_COMPOSER_E2E_VERSION: ${{ matrix.composer }}
+          SOCKET_PATCH_MAVEN_E2E_REQUIRED: ${{ matrix.maven != '' && '1' || '' }}
+          SOCKET_PATCH_MAVEN_E2E_VERSION: ${{ matrix.maven }}
+          SOCKET_PATCH_DOTNET_E2E_REQUIRED: ${{ matrix.dotnet != '' && '1' || '' }}
+          SOCKET_PATCH_DOTNET_E2E_VERSION: ${{ matrix.dotnet }}
+          SOCKET_PATCH_DENO_E2E_REQUIRED: ${{ matrix.deno != '' && '1' || '' }}
+          SOCKET_PATCH_DENO_E2E_VERSION: ${{ matrix.deno }}
         run: cargo test -p socket-patch-cli --all-features --test ${{ matrix.suite }} -- ${{ matrix.test_filter || '--ignored' }}
 
   # ----------------------------------------------------------------------
@@ -990,8 +1304,140 @@ jobs:
       - name: Run ${{ matrix.ecosystem }} Docker e2e test
         # Every ecosystem is unconditionally compiled in; only the
         # `docker-e2e` feature is needed to compile the suite itself.
+        # The vendored build-proof capstones (each ending in the
+        # manifest-less VEX stage) ride the same image as their ecosystem's
+        # main suite, as in coverage-docker.
         run: |
-          cargo test -p socket-patch-cli --features docker-e2e --test "docker_e2e_${{ matrix.ecosystem }}"
+          EXTRA=""
+          case "${{ matrix.ecosystem }}" in
+            composer) EXTRA="--test docker_e2e_vendor_composer" ;;
+            nuget)    EXTRA="--test docker_e2e_vendor_nuget" ;;
+            pypi)     EXTRA="--test docker_e2e_vendor_pypi_pm" ;;
+          esac
+          # shellcheck disable=SC2086 # EXTRA is intentionally word-split
+          cargo test -p socket-patch-cli --features docker-e2e --test "docker_e2e_${{ matrix.ecosystem }}" $EXTRA
+
+  # ----------------------------------------------------------------------
+  # Per-release real-toolchain matrices for the manifest-less VEX work that
+  # loop several suites per release through a script (yarn) or need a
+  # toolchain + lock-format axis (cargo). Each leg hard-fails on a skip.
+  # ----------------------------------------------------------------------
+  yarn-classic-matrix:
+    name: yarn-classic ${{ matrix.release }}
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.0.2 oldest 1.x; 1.6.0 last that installs nothing for a `file:`
+        # tarball; 1.7.0 first vendored-capable; 1.9.4 last without the
+        # `integrity` line; 1.10.1 first with it; 1.22.22 current.
+        release: ['1.0.2', '1.6.0', '1.7.0', '1.9.4', '1.10.1', '1.22.22']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: yarn-classic-${{ matrix.release }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.x'
+      - name: Manifest-less VEX over every real yarn classic flow
+        # The script exports SOCKET_PATCH_YARN_E2E_REQUIRED=1 and
+        # SOCKET_PATCH_YARN_CLASSIC_E2E_VERSION itself.
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+          YARN_CLASSIC_RELEASE: ${{ matrix.release }}
+        run: scripts/yarn-classic-vex-matrix.sh "$YARN_CLASSIC_RELEASE"
+
+  yarn-berry-e2e:
+    name: yarn-berry ${{ matrix.yarn }} (${{ matrix.os }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        # 4.0.2 bare-hex checksum writer (4.0.0-4.0.2), 4.1.0 first
+        # `10c0/` writer, then a spread up to current.
+        os: [ubuntu-latest]
+        yarn: ['4.0.2', '4.1.0', '4.6.0', '4.12.0', '4.18.0']
+        include:
+          - {os: macos-latest, yarn: '4.12.0'}
+          - {os: windows-latest, yarn: '4.12.0'}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: yarn-berry-${{ matrix.yarn }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Enable corepack
+        run: corepack enable
+      - name: Yarn berry hosted/vendored + manifest-less VEX
+        shell: bash
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+          SOCKET_PATCH_YARN_E2E_REQUIRED: '1' # the script also exports it
+          YARN_BERRY_RELEASE: ${{ matrix.yarn }}
+        run: scripts/yarn-berry-vex-matrix.sh "$YARN_BERRY_RELEASE"
+
+  cargo-vex-matrix:
+    name: cargo ${{ matrix.toolchain }} lock-v${{ matrix.lock || 'own' }} (${{ matrix.os }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # The toolchain's own lock is re-encoded as v1-v4 before
+        # socket-patch touches it (the committed-lockfile case); '' keeps the
+        # toolchain's own format.
+        os: [ubuntu-latest]
+        toolchain: ['1.82.0', '1.93.1', 'stable']
+        lock: ['', '1', '2', '3', '4']
+        include:
+          - {os: macos-latest, toolchain: stable, lock: '1'}
+          - {os: windows-latest, toolchain: stable, lock: '1'}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show
+      - name: Install the cargo under test
+        env:
+          CARGO_TEST_TOOLCHAIN: ${{ matrix.toolchain }}
+        run: rustup toolchain install "$CARGO_TEST_TOOLCHAIN" --profile minimal
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: cargo-vex-${{ matrix.toolchain }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Real-cargo hosted/vendored + manifest-less VEX
+        shell: bash
+        env:
+          SOCKET_PATCH_CARGO_E2E_REQUIRED: '1'
+          SOCKET_PATCH_CARGO_E2E_TOOLCHAIN: ${{ matrix.toolchain }}
+          SOCKET_PATCH_CARGO_E2E_LOCK_VERSION: ${{ matrix.lock }}
+        run: |
+          set -euo pipefail
+          cargo test -p socket-patch-cli --test e2e_redirect_cargo_build --test e2e_vendor_cargo_build --test mode_migration_cargo
+          cargo test -p socket-patch-cli --test e2e_safety_cargo_build -- --ignored
 
   # ----------------------------------------------------------------------
   # Experimental `setup`-flow matrix (NON-BLOCKING).

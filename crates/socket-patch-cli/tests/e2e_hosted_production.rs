@@ -88,6 +88,18 @@ use socket_patch_cli::args::{GLOBAL_ARG_ENV_VARS, LOCAL_ARG_ENV_VARS};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "npm_e2e_common/manifestless.rs"]
+mod npm_e2e_common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+// yarn classic leg: release selection + the manifest-less VEX matrix.
+#[path = "common/yarn_classic_vex.rs"]
+mod yarn_classic_vex;
+// uv legs: release selection + the manifest-less VEX matrix.
+#[path = "vex_e2e_common/uv.rs"]
+mod uv_vex;
+#[path = "vex_pipenv_pip_steps/mod.rs"]
+mod vex_pipenv_pip_steps;
 
 // ---------------------------------------------------------------------------
 // Production endpoints + required-patch catalog
@@ -994,9 +1006,17 @@ fn npm_package_lock_hosted_install_proof() {
     }
 
     assert_pristine(&minimist_entry(&fx.proj), PATCH_MARKER, LEG);
-
+    let lock_before = std::fs::read(fx.proj.join("package-lock.json")).unwrap();
+    // npm >= 12 refuses non-registry tarball hosts by default (EALLOWREMOTE):
+    // the hosted run itself writes `allow-remote=all` to the project `.npmrc`
+    // (older npm accepts the key too), so the install below needs no flags.
     let env_json = scan_hosted(&fx.proj, &[]);
     assert_redirected(&env_json, "package-lock.json");
+    assert_eq!(
+        read(&fx.proj.join(".npmrc")),
+        "allow-remote=all\n",
+        "{LEG}: the hosted run must auto-configure npm 12's allow-remote"
+    );
 
     let lock = read(&fx.proj.join("package-lock.json"));
     assert_hosted_pin(&lock, &[NPM_UUID], LEG);
@@ -1023,6 +1043,20 @@ fn npm_package_lock_hosted_install_proof() {
         dump(&ci)
     );
     assert_patched(&minimist_entry(&fx.proj), PATCH_MARKER, LEG);
+
+    // MANIFEST-LESS VEX against production: the installed patched tree is
+    // hash-verified against the real patch record — with the ledger, from
+    // lockfile discovery + the public proxy without it, never offline, and
+    // not once the lock is reverted.
+    npm_e2e_common::production_manifestless_vex(
+        LEG,
+        &fx.proj,
+        NPM_PURL,
+        NPM_UUID,
+        vex_e2e_common::Marker::Redirected,
+        "GHSA-xvch-5gv4-984h",
+        &[("package-lock.json", lock_before)],
+    );
 }
 
 #[test]
@@ -1047,7 +1081,13 @@ fn npm_shrinkwrap_hosted_redirect() {
     }
     let shrink = tool(&fx.proj, "npm", &["shrinkwrap"], &env);
     if !ok(&shrink) {
-        soft_skip!(LEG, "`npm shrinkwrap` failed:\n{}", dump(&shrink));
+        // npm 12 removed `npm shrinkwrap`; a shrinkwrap repo there is the
+        // shrinkwrap plus its package-lock.json twin (both redirected).
+        std::fs::copy(
+            fx.proj.join("package-lock.json"),
+            fx.proj.join("npm-shrinkwrap.json"),
+        )
+        .expect("npm 12 shrinkwrap twin");
     }
     assert!(
         fx.proj.join("npm-shrinkwrap.json").exists(),
@@ -1090,6 +1130,7 @@ fn pnpm_hosted_install_proof() {
     // pnpm's node_modules is a symlink farm over .pnpm/; resolve through it.
     let entry = fx.proj.join("node_modules").join(NPM_NAME).join("index.js");
     assert_pristine(&entry, PATCH_MARKER, LEG);
+    let lock_pristine = std::fs::read(fx.proj.join("pnpm-lock.yaml")).expect("pnpm-lock.yaml");
 
     let env_json = scan_hosted(&fx.proj, &[]);
     assert_redirected(&env_json, "pnpm-lock.yaml");
@@ -1110,6 +1151,7 @@ fn pnpm_hosted_install_proof() {
 
     if ok(&reinstall) {
         assert_patched(&entry, PATCH_MARKER, LEG);
+        pnpm_hosted_manifestless_vex(&fx.proj, &lock_pristine, LEG);
         return;
     }
 
@@ -1163,6 +1205,64 @@ fn pnpm_hosted_install_proof() {
         dump(&trusted)
     );
     assert_patched(&entry, PATCH_MARKER, LEG);
+    pnpm_hosted_manifestless_vex(&fx.proj, &lock_pristine, LEG);
+}
+
+/// Manifest-less VEX over the reinstalled pnpm project, against the REAL
+/// public patch proxy: the ledger record attests `(redirected)`; with both
+/// ledgers deleted the production `view/<uuid>` record does; `--offline`
+/// has no record; and with the lock back on the registry (ledger kept)
+/// nothing attests, `--no-verify` included. Only the pinned advisory is
+/// asserted — production may add more to the patch later.
+fn pnpm_hosted_manifestless_vex(proj: &Path, lock_pristine: &[u8], leg: &str) {
+    use vex_e2e_common::{
+        assert_absent, assert_not_attested, run_vex, statements_for, strip_ledgers, strip_manifest,
+        VexRun,
+    };
+    let bin = binary();
+    let attested = |run: &VexRun, cell: &str| {
+        let out = run_vex(&bin, proj, run);
+        assert_eq!(out.code, Some(0), "{leg} [{cell}]: {out}");
+        let marker = format!("Patched via Socket patch {NPM_UUID} (redirected)");
+        assert!(
+            statements_for(out.doc(), NPM_PURL).iter().any(|st| {
+                st["vulnerability"]["name"] == "GHSA-xvch-5gv4-984h"
+                    && st["status"] == "not_affected"
+                    && st["impact_statement"]
+                        .as_str()
+                        .is_some_and(|i| i.contains(&marker))
+            }),
+            "{leg} [{cell}]: minimist must be attested: {out}"
+        );
+    };
+    strip_manifest(proj);
+    let ledger = proj.join(".socket/vendor/redirect-state.json");
+    let ledger_bytes = std::fs::read(&ledger).expect("redirect ledger");
+    attested(&VexRun::default(), "manifest deleted");
+    strip_ledgers(proj);
+    attested(&VexRun::default(), "ledgers deleted");
+    let out = run_vex(&bin, proj, &VexRun::offline());
+    assert_eq!(out.code, Some(1), "{leg} [offline]: {out}");
+    assert_not_attested(&out.envelope, NPM_PURL, "record_unavailable");
+    std::fs::write(&ledger, &ledger_bytes).unwrap();
+    std::fs::write(proj.join("pnpm-lock.yaml"), lock_pristine).unwrap();
+    for no_verify in [false, true] {
+        let out = run_vex(
+            &bin,
+            proj,
+            &VexRun {
+                no_verify,
+                ..VexRun::default()
+            },
+        );
+        assert_ne!(
+            out.code,
+            Some(0),
+            "{leg} [reverted, no_verify={no_verify}]: {out}"
+        );
+        assert_absent(out.doc.as_ref(), NPM_PURL);
+        assert_not_attested(&out.envelope, NPM_PURL, "redirect_unwired");
+    }
 }
 
 #[test]
@@ -1175,11 +1275,14 @@ fn yarn_classic_hosted_install_proof() {
     let fx = npm_fixture("yarn1");
     // Without an explicit `packageManager` pin, corepack resolves a bare
     // `yarn` to the latest berry (4.x) even when a classic yarn is on PATH —
-    // which silently turned this leg into a duplicate of the berry one.
+    // which silently turned this leg into a duplicate of the berry one. The
+    // pin is the release under test (`SOCKET_PATCH_YARN_CLASSIC_E2E_VERSION`,
+    // default 1.22.22).
+    let want = yarn_classic_vex::yarn_classic_version();
     std::fs::write(
         fx.proj.join("package.json"),
         format!(
-            r#"{{"name":"hosted-e2e","version":"0.0.0","private":true,"packageManager":"yarn@1.22.22","dependencies":{{"{NPM_NAME}":"{NPM_VERSION}"}}}}"#
+            r#"{{"name":"hosted-e2e","version":"0.0.0","private":true,"packageManager":"yarn@{want}","dependencies":{{"{NPM_NAME}":"{NPM_VERSION}"}}}}"#
         ),
     )
     .expect("write package.json");
@@ -1192,11 +1295,11 @@ fn yarn_classic_hosted_install_proof() {
 
     let version = tool(&fx.proj, "yarn", &["--version"], &env);
     let major = String::from_utf8_lossy(&version.stdout).trim().to_string();
-    if !ok(&version) || !major.starts_with('1') {
+    if !ok(&version) || major != want {
         soft_skip!(
             LEG,
             "could not resolve yarn classic in this fixture (got version \
-             {major:?}) — corepack may be unable to fetch yarn@1.22.22"
+             {major:?}) — corepack may be unable to fetch yarn@{want}"
         );
     }
 
@@ -1212,6 +1315,7 @@ fn yarn_classic_hosted_install_proof() {
         soft_skip!(LEG, "`yarn install` produced no yarn.lock");
     }
     assert_pristine(&minimist_entry(&fx.proj), PATCH_MARKER, LEG);
+    let lock_before = std::fs::read(fx.proj.join("yarn.lock")).expect("read yarn.lock");
 
     let env_json = scan_hosted(&fx.proj, &[]);
     assert_redirected(&env_json, "yarn.lock");
@@ -1232,6 +1336,53 @@ fn yarn_classic_hosted_install_proof() {
         dump(&reinstall)
     );
     assert_patched(&minimist_entry(&fx.proj), PATCH_MARKER, LEG);
+
+    // Manifest-less VEX against the REAL public proxy: the record for the
+    // production patch comes from `patches-api.socket.dev` once the redirect
+    // ledger is gone; `--offline` is pointed at an empty local stand-in so
+    // its zero-request claim is observable.
+    let empty = vex_e2e_common::PatchApi::empty();
+    let reinstall_env = env;
+    yarn_classic_vex::ManifestlessVex {
+        leg: LEG,
+        wiring: yarn_classic_vex::Wiring::Hosted,
+        purl: NPM_PURL,
+        uuid: NPM_UUID,
+        vulns: &[],
+        api: &empty,
+        proxy_override: Some(PROXY.to_string()),
+        patch_server_url: None,
+        registry_lock: lock_before,
+        reinstall: Some(Box::new(move |dir: &Path| {
+            std::fs::remove_dir_all(dir.join("node_modules")).expect("rm node_modules");
+            let out = tool(
+                dir,
+                "yarn",
+                &["install", "--frozen-lockfile", "--ignore-scripts"],
+                &reinstall_env,
+            );
+            assert!(
+                ok(&out),
+                "{LEG}: reverted-lock install failed:\n{}",
+                dump(&out)
+            );
+            assert_pristine(&minimist_entry(dir), PATCH_MARKER, LEG);
+        })),
+        embedded: vec![
+            ("apply --vex", yarn_classic_vex::via_apply()),
+            // The command the leg itself ran, re-run manifest-less.
+            (
+                "scan --mode hosted --vex",
+                Box::new(|run: vex_e2e_common::VexRun| {
+                    run.via(vex_e2e_common::VexVia::Scan)
+                        .arg("--mode")
+                        .arg("hosted")
+                        .arg("--yes")
+                }),
+            ),
+        ],
+    }
+    .run(&fx.proj);
 }
 
 #[test]
@@ -1281,6 +1432,7 @@ fn yarn_berry_hosted_install_proof() {
         );
     }
     assert_pristine(&minimist_entry(&fx.proj), PATCH_MARKER, LEG);
+    let registry_lock = std::fs::read(fx.proj.join("yarn.lock")).expect("registry yarn.lock");
 
     let env_json = scan_hosted(&fx.proj, &[]);
     assert_redirected(&env_json, "yarn.lock");
@@ -1310,6 +1462,141 @@ fn yarn_berry_hosted_install_proof() {
         dump(&reinstall)
     );
     assert_patched(&minimist_entry(&fx.proj), PATCH_MARKER, LEG);
+
+    yarn_berry_hosted_manifestless_vex(&fx, &registry_lock, &env);
+}
+
+/// One `vex --json --output <tmp>/berry.vex.json` run in `proj` (production
+/// public proxy, hermetic env). Returns (exit, envelope, document).
+fn yarn_berry_vex(
+    proj: &Path,
+    extra: &[&str],
+) -> (i32, serde_json::Value, Option<serde_json::Value>) {
+    let out = proj.parent().unwrap().join("berry.vex.json");
+    let _ = std::fs::remove_file(&out);
+    let out_s = out.to_str().unwrap().to_string();
+    let mut args = vec![
+        "vex",
+        "--json",
+        "--output",
+        out_s.as_str(),
+        "--product",
+        "pkg:npm/hosted-e2e@0.0.0",
+    ];
+    args.extend_from_slice(extra);
+    let (code, stdout, stderr) = run(proj, &args);
+    let env: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("vex --json is not JSON ({e}).\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    let doc = std::fs::read(&out)
+        .ok()
+        .map(|b| serde_json::from_slice(&b).expect("VEX document is JSON"));
+    (code, env, doc)
+}
+
+/// The production patch attested `(redirected)` for [`NPM_PURL`].
+fn assert_berry_redirected_attestation(
+    code: i32,
+    env: &serde_json::Value,
+    doc: Option<serde_json::Value>,
+    cell: &str,
+) {
+    assert_eq!(code, 0, "{cell}: {env:#}");
+    let doc = doc.unwrap_or_else(|| panic!("{cell}: no VEX document: {env:#}"));
+    let stmts: Vec<&serde_json::Value> = doc["statements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|st| {
+            st["products"][0]["subcomponents"]
+                .as_array()
+                .is_some_and(|subs| subs.iter().any(|s| s["@id"] == NPM_PURL))
+        })
+        .collect();
+    assert!(
+        !stmts.is_empty(),
+        "{cell}: {NPM_PURL} not attested: {doc:#}"
+    );
+    for st in stmts {
+        assert_eq!(st["status"], "not_affected", "{cell}: {st:#}");
+        assert!(
+            st["impact_statement"]
+                .as_str()
+                .is_some_and(|s| s.contains(&format!("Socket patch {NPM_UUID} (redirected)"))),
+            "{cell}: {st:#}"
+        );
+    }
+}
+
+/// `errorCode` of the skipped event for [`NPM_PURL`].
+fn berry_skip_code(env: &serde_json::Value) -> String {
+    env["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| e["action"] == "skipped" && e["purl"] == NPM_PURL)
+        .and_then(|e| e["errorCode"].as_str())
+        .unwrap_or_else(|| panic!("no skipped event for {NPM_PURL}: {env:#}"))
+        .to_string()
+}
+
+/// Manifest-less VEX against PRODUCTION for the berry hosted leg (a hosted
+/// checkout carries no `.socket/manifest.json` by design): after the
+/// `--immutable` reinstall served the patched bytes, standalone `vex`
+/// attests the production patch — with the redirect ledger (online and
+/// `--offline`), with the lockfile alone (the record fetched from the
+/// public proxy), not at all `--offline` without a ledger
+/// (`record_unavailable`), and not once the lock is reverted to the
+/// registry and reinstalled (`redirect_unwired`, even with `--no-verify`).
+fn yarn_berry_hosted_manifestless_vex(fx: &NpmFixture, registry_lock: &[u8], env: &[(&str, &str)]) {
+    const LEG: &str = "yarn_berry_hosted_install_proof (manifest-less vex)";
+    let proj = &fx.proj;
+    assert!(
+        !proj.join(".socket/manifest.json").exists(),
+        "{LEG}: hosted mode writes no manifest"
+    );
+    let ledger_path = proj.join(".socket/vendor/redirect-state.json");
+    let ledger = std::fs::read(&ledger_path).expect("redirect ledger");
+
+    let (code, env_json, doc) = yarn_berry_vex(proj, &[]);
+    assert_berry_redirected_attestation(code, &env_json, doc, &format!("{LEG}: ledger, online"));
+    let (code, env_json, doc) = yarn_berry_vex(proj, &["--offline"]);
+    assert_berry_redirected_attestation(code, &env_json, doc, &format!("{LEG}: ledger, offline"));
+
+    std::fs::remove_file(&ledger_path).unwrap();
+    let (code, env_json, doc) = yarn_berry_vex(proj, &[]);
+    assert_berry_redirected_attestation(code, &env_json, doc, &format!("{LEG}: lockfile only"));
+    let (code, env_json, doc) = yarn_berry_vex(proj, &["--offline"]);
+    assert_eq!(code, 1, "{LEG}: lockfile only, offline: {env_json:#}");
+    assert_eq!(berry_skip_code(&env_json), "record_unavailable", "{LEG}");
+    assert!(doc.is_none(), "{LEG}: no document");
+
+    // Revert the lock to the registry (ledger kept) and reinstall.
+    std::fs::write(&ledger_path, &ledger).unwrap();
+    std::fs::write(proj.join("yarn.lock"), registry_lock).unwrap();
+    std::fs::remove_dir_all(proj.join("node_modules")).ok();
+    let reinstall = tool(proj, "yarn", &["install", "--immutable"], env);
+    assert!(
+        ok(&reinstall),
+        "{LEG}: reverted reinstall:\n{}",
+        dump(&reinstall)
+    );
+    assert_pristine(&minimist_entry(proj), PATCH_MARKER, LEG);
+    for extra in [
+        &["--offline"][..],
+        &["--offline", "--no-verify"][..],
+        &[][..],
+    ] {
+        let (code, env_json, doc) = yarn_berry_vex(proj, extra);
+        assert_eq!(code, 1, "{LEG}: reverted {extra:?}: {env_json:#}");
+        assert_eq!(
+            berry_skip_code(&env_json),
+            "redirect_unwired",
+            "{LEG}: reverted {extra:?}"
+        );
+        assert!(doc.is_none(), "{LEG}: reverted {extra:?}: no document");
+    }
+    println!("VEX-MATRIX|yarn@4.6.0|production|hosted|manifest-less+ledgers-deleted+offline+reverted|PASS");
 }
 
 #[test]
@@ -1341,6 +1628,7 @@ fn bun_hosted_install_proof() {
         );
     }
     assert_pristine(&minimist_entry(&fx.proj), PATCH_MARKER, LEG);
+    let lock_before = std::fs::read(fx.proj.join("bun.lock")).unwrap();
 
     let env_json = scan_hosted(&fx.proj, &[]);
     assert_redirected(&env_json, "bun.lock");
@@ -1361,6 +1649,146 @@ fn bun_hosted_install_proof() {
         dump(&reinstall)
     );
     assert_patched(&minimist_entry(&fx.proj), PATCH_MARKER, LEG);
+    let ledger: serde_json::Value =
+        serde_json::from_str(&read(&fx.proj.join(".socket/vendor/redirect-state.json"))).unwrap();
+    let record = ledger["records"][NPM_PURL].clone();
+    bun_manifestless_vex_production(&fx.proj, &record, "redirected", &lock_before, LEG);
+}
+
+/// Manifest-less VEX over a PRODUCTION bun checkout (`checkout` holds the
+/// committed state plus a real frozen install of the patched bytes):
+/// with `.socket/manifest.json` deleted, standalone `vex` against the public
+/// patch API attests minimist under the ledger record's uuid with `marker`
+/// (`redirected` / `vendored`) and exactly the record's vulnerability ids;
+/// with both ledgers deleted as well it still attests (lockfile discovery +
+/// the API); `--offline` then omits it as `record_unavailable`; and with
+/// the ledgers back but `bun.lock` reverted to `registry_lock` it is NOT
+/// attested, verified or not. The hermetic twins (mock API, zero-request
+/// oracle) run in `e2e_redirect_bun_build` / `e2e_vendor_bun_build`.
+fn bun_manifestless_vex_production(
+    checkout: &Path,
+    record: &serde_json::Value,
+    marker: &str,
+    registry_lock: &[u8],
+    leg: &str,
+) {
+    let uuid = record["uuid"].as_str().expect("record uuid").to_string();
+    let mut want: Vec<String> = record["vulnerabilities"]
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    want.sort();
+    assert!(
+        !want.is_empty(),
+        "{leg}: the production record lists no vulnerability: {record}"
+    );
+    let vex = |extra: &[&str]| -> (Option<i32>, serde_json::Value, Option<serde_json::Value>) {
+        let out_path = checkout.join("out.vex.json");
+        let _ = std::fs::remove_file(&out_path);
+        let mut cmd = Command::new(binary());
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("SOCKET_") {
+                cmd.env_remove(key);
+            }
+        }
+        let out = cmd
+            .env("SOCKET_TELEMETRY_DISABLED", "1")
+            .env("SOCKET_NO_CONFIG", "1")
+            .env("SOCKET_NO_API_TOKEN", "1")
+            .current_dir(checkout)
+            .args(["vex", "--json", "--output"])
+            .arg(&out_path)
+            .args(["--product", "pkg:npm/app@1.0.0", "--cwd"])
+            .arg(checkout)
+            .args(extra)
+            .output()
+            .expect("spawn socket-patch vex");
+        let envelope = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "{leg}: vex --json output is not JSON ({e}):\n{}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        });
+        let doc = std::fs::read(&out_path)
+            .ok()
+            .map(|b| serde_json::from_slice(&b).unwrap());
+        (out.status.code(), envelope, doc)
+    };
+    let attested = |doc: &Option<serde_json::Value>| -> Vec<String> {
+        let part = format!("Patched via Socket patch {uuid} ({marker})");
+        let mut ids: Vec<String> = doc
+            .as_ref()
+            .and_then(|d| d["statements"].as_array().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|st| {
+                st["products"][0]["subcomponents"][0]["@id"] == NPM_PURL
+                    && st["status"] == "not_affected"
+                    && st["impact_statement"]
+                        .as_str()
+                        .is_some_and(|s| s.split("; ").any(|p| p == part))
+            })
+            .filter_map(|st| st["vulnerability"]["name"].as_str().map(str::to_string))
+            .collect();
+        ids.sort();
+        ids
+    };
+    let skip = |env: &serde_json::Value| -> Option<String> {
+        env["events"].as_array()?.iter().find_map(|e| {
+            (e["action"] == "skipped" && e["purl"] == NPM_PURL)
+                .then(|| e["errorCode"].as_str().unwrap_or_default().to_string())
+        })
+    };
+    let _ = std::fs::remove_file(checkout.join(".socket/manifest.json"));
+    let (code, env, doc) = vex(&[]);
+    assert_eq!(code, Some(0), "{leg}: manifest-less vex: {env:#}");
+    assert_eq!(attested(&doc), want, "{leg}: manifest-less vex: {env:#}");
+    let ledgers: Vec<(PathBuf, Vec<u8>)> = [
+        ".socket/vendor/state.json",
+        ".socket/vendor/redirect-state.json",
+    ]
+    .iter()
+    .map(|rel| checkout.join(rel))
+    .filter_map(|p| std::fs::read(&p).ok().map(|b| (p, b)))
+    .collect();
+    assert!(!ledgers.is_empty(), "{leg}: the flow left no ledger");
+    for (p, _) in &ledgers {
+        std::fs::remove_file(p).unwrap();
+    }
+    let (code, env, doc) = vex(&[]);
+    assert_eq!(code, Some(0), "{leg}: ledger-less vex: {env:#}");
+    assert_eq!(attested(&doc), want, "{leg}: ledger-less vex: {env:#}");
+    let (code, env, doc) = vex(&["--offline"]);
+    assert_eq!(code, Some(1), "{leg}: offline vex: {env:#}");
+    assert_eq!(
+        skip(&env).as_deref(),
+        Some("record_unavailable"),
+        "{leg}: {env:#}"
+    );
+    assert!(attested(&doc).is_empty(), "{leg}: offline vex: {env:#}");
+    for (p, b) in &ledgers {
+        std::fs::write(p, b).unwrap();
+    }
+    std::fs::write(checkout.join("bun.lock"), registry_lock).unwrap();
+    let unwired = if marker == "redirected" {
+        "redirect_unwired"
+    } else {
+        "vendor_unwired"
+    };
+    for extra in [&[][..], &["--no-verify"][..]] {
+        let (code, env, doc) = vex(extra);
+        assert_eq!(code, Some(1), "{leg}: reverted vex {extra:?}: {env:#}");
+        assert_eq!(
+            skip(&env).as_deref(),
+            Some(unwired),
+            "{leg}: reverted {extra:?}: {env:#}"
+        );
+        assert!(
+            attested(&doc).is_empty(),
+            "{leg}: reverted vex {extra:?}: {env:#}"
+        );
+    }
+    eprintln!("BUN-VEX production {marker} manifest-deleted/ledgers-deleted/offline/reverted ok");
 }
 
 // ===========================================================================
@@ -1403,6 +1831,38 @@ fn urllib3_patched(site: &Path) -> bool {
         }
     }
     false
+}
+
+/// The manifest-less VEX steps over an installed checkout wired to one of
+/// [`PYPI_UUIDS`] (whichever `wiring` names), records from the LIVE public
+/// proxy (vuln ids: whatever production's record carries), `revert`
+/// putting requirements.txt back on the registry pin.
+fn pypi_manifestless_vex(
+    project: &Path,
+    leg: &str,
+    wiring: &str,
+    marker: vex_e2e_common::Marker,
+    revert: &(dyn Fn(&Path) + Sync),
+) {
+    let uuid = PYPI_UUIDS
+        .iter()
+        .find(|u| wiring.contains(**u))
+        .unwrap_or_else(|| panic!("{leg}: no known urllib3 patch uuid is wired:\n{wiring}"));
+    vex_pipenv_pip_steps::run_manifestless_steps(&vex_pipenv_pip_steps::Steps {
+        what: format!("{leg} manifest-less vex"),
+        project,
+        purl: PYPI_PURL,
+        uuid,
+        marker,
+        vulns: None,
+        records: vex_pipenv_pip_steps::Records::Live(PROXY.to_string()),
+        patch_server_url: None,
+        product: "pkg:pypi/app@1.0.0",
+        revert,
+        envs: Vec::new(),
+        on_step: None,
+        expect_verified: true,
+    });
 }
 
 #[test]
@@ -1483,14 +1943,35 @@ fn pypi_requirements_txt_hosted_install_proof() {
         "{LEG}: reinstalled from the redirected requirements.txt, but no urllib3 \
          source file carries `{PATCH_MARKER}`"
     );
+
+    // Manifest-less VEX over the installed, redirected checkout (hosted
+    // writes no manifest; the steps also drop the redirect ledger).
+    let original = format!("{PYPI_NAME}=={PYPI_VERSION}\n");
+    pypi_manifestless_vex(
+        &proj,
+        LEG,
+        &reqs,
+        vex_e2e_common::Marker::Redirected,
+        &|p: &Path| std::fs::write(p.join("requirements.txt"), &original).unwrap(),
+    );
 }
 
 #[test]
 #[ignore = "live production API + real PyPI. Run with --ignored."]
 fn pypi_uv_lock_hosted_install_proof() {
     const LEG: &str = "pypi_uv_lock_hosted_install_proof";
-    if !has_command("uv") {
-        soft_skip!(LEG, "`uv` not on PATH");
+    // The uv under test (`SOCKET_PATCH_UV_E2E_BIN`, default `uv` on PATH).
+    let uv = uv_vex::uv_program();
+    if !has_command(&uv) {
+        soft_skip!(LEG, "`{uv}` not on PATH");
+    }
+    if let Err(why) = uv_vex::production_supported(&uv, uv_vex::Mode::Hosted) {
+        println!(
+            "UV-VEX uv={} mode={} lane=production({LEG}) step=all result=n/a ({why})",
+            uv_vex::version_of(&uv),
+            uv_vex::Mode::Hosted.name()
+        );
+        return;
     }
     let tmp = tempfile::tempdir().expect("tempdir");
     let proj = tmp.path().join("proj");
@@ -1507,10 +1988,10 @@ fn pypi_uv_lock_hosted_install_proof() {
     )
     .expect("write pyproject.toml");
 
-    if !ok(&tool(&proj, "uv", &["lock", "--quiet"], &env)) {
+    if !ok(&tool(&proj, &uv, &["lock", "--quiet"], &env)) {
         soft_skip!(LEG, "`uv lock` failed");
     }
-    let sync = tool(&proj, "uv", &["sync", "--quiet"], &env);
+    let sync = tool(&proj, &uv, &["sync", "--quiet"], &env);
     if !ok(&sync) {
         soft_skip!(LEG, "upstream `uv sync` failed:\n{}", dump(&sync));
     }
@@ -1527,13 +2008,15 @@ fn pypi_uv_lock_hosted_install_proof() {
         "{LEG}: upstream urllib3 already carries `{PATCH_MARKER}` — vacuous"
     );
 
+    let registry = uv_vex::snapshot(&proj, &["pyproject.toml", "uv.lock"]);
+
     let env_json = scan_hosted(&proj, &[]);
     assert_redirected(&env_json, "uv.lock");
     let lock = read(&proj.join("uv.lock"));
     assert_hosted_pin(&lock, PYPI_UUIDS, LEG);
 
     std::fs::remove_dir_all(&venv).expect("rm venv");
-    let resync = tool(&proj, "uv", &["sync", "--frozen", "--quiet"], &env);
+    let resync = tool(&proj, &uv, &["sync", "--frozen", "--quiet"], &env);
     assert!(
         ok(&resync),
         "{LEG}: `uv sync --frozen` from the redirected uv.lock failed:\n{}",
@@ -1545,6 +2028,35 @@ fn pypi_uv_lock_hosted_install_proof() {
         "{LEG}: resynced from the redirected uv.lock, but no urllib3 source \
          file carries `{PATCH_MARKER}`"
     );
+
+    // Manifest-less VEX over a fresh checkout (pyproject + uv.lock + .socket,
+    // reinstalled by uv from an empty cache through patch.socket.dev): the
+    // record comes from the redirect ledger, then — ledger deleted — from a
+    // local stand-in serving the SAME production record (hermetic, so a
+    // proxy 503 cannot flake the matrix); `--offline` makes zero requests;
+    // `apply --vex` and the leg's own `scan --mode hosted --vex` (live) attest;
+    // the reverted pair, ledger kept, reinstalled pristine, does not.
+    uv_vex::production_manifestless(&uv_vex::Production {
+        leg: LEG,
+        proj: &proj,
+        tmp: tmp.path(),
+        mode: uv_vex::Mode::Hosted,
+        purl: PYPI_PURL,
+        uuids: PYPI_UUIDS,
+        registry: &registry,
+        uv: &uv,
+        patched: &|dir: &Path| {
+            site_packages(&dir.join(".venv")).is_some_and(|s| urllib3_patched(&s))
+        },
+        embedded: vec![(
+            "scan --mode hosted --vex",
+            vex_e2e_common::VexRun::default()
+                .via(vex_e2e_common::VexVia::Scan)
+                .arg("--mode")
+                .arg("hosted")
+                .arg("--yes"),
+        )],
+    });
 }
 
 // ===========================================================================
@@ -1599,6 +2111,7 @@ async fn gem_bundler_hosted_install_proof() {
         format!("source \"https://rubygems.org\"\ngem \"{GEM_NAME}\", \"{GEM_VERSION}\"\n"),
     )
     .expect("write Gemfile");
+    let pristine_gemfile = std::fs::read(proj.join("Gemfile")).expect("read Gemfile");
 
     // `--add-checksums` produces the CHECKSUMS section the hosted rewrite pins
     // into; it needs bundler >= 2.6.
@@ -1787,6 +2300,106 @@ async fn gem_bundler_hosted_install_proof() {
         "{LEG}: verified {verified} patched file(s) on disk against the \
          published afterHash ({rewritten} differ from upstream)"
     );
+
+    // Manifest-less VEX (hosted never writes a manifest) over the frozen
+    // reinstall, against the real public patch proxy.
+    gem_manifestless_vex(
+        LEG,
+        &proj,
+        &wired_uuid,
+        "redirected",
+        "redirect_unwired",
+        (&pristine_gemfile, pristine_lock.as_bytes()),
+        &[
+            ("BUNDLE_PATH", bundle_path.as_str()),
+            ("BUNDLE_APP_CONFIG", bundle_path.as_str()),
+        ],
+    );
+}
+
+/// Manifest-less VEX over a gem production leg's installed checkout `dir`
+/// (the real public patch proxy supplies records; `envs` point the crawler
+/// at the leg's BUNDLE_PATH so the installed tree is hash-verified):
+/// attested with the ledger kept → attested from the lockfile wiring alone
+/// once both ledgers are deleted → `record_unavailable` offline (no
+/// ledger) → `unwired` once the Gemfile + lock are reverted to `pristine`
+/// (ledger restored), with and without `--no-verify`. Production's
+/// vulnerability set is not pinned here: every statement for the purl must
+/// be `not_affected` via `uuid` with `marker`.
+fn gem_manifestless_vex(
+    leg: &str,
+    dir: &Path,
+    uuid: &str,
+    marker: &str,
+    unwired: &str,
+    pristine: (&[u8], &[u8]),
+    envs: &[(&str, &str)],
+) {
+    use vex_e2e_common::{
+        assert_not_attested, run_vex, statements_for, strip_ledgers, strip_manifest, VexRun,
+    };
+    let purl = format!("pkg:gem/{GEM_NAME}@{GEM_VERSION}");
+    let mut base = VexRun {
+        product: Some("pkg:gem/app@1.0.0".into()),
+        ..VexRun::default()
+    };
+    for (k, v) in envs {
+        base = base.env(*k, *v);
+    }
+    let attested = |run: &VexRun, cell: &str| {
+        let out = run_vex(&vex_e2e_common::binary(), dir, run);
+        assert_eq!(out.code, Some(0), "{leg} manifest-less vex ({cell}): {out}");
+        let statements = statements_for(out.doc(), &purl);
+        assert!(
+            !statements.is_empty(),
+            "{leg} ({cell}): {purl} not attested: {out}"
+        );
+        let part = format!("Patched via Socket patch {uuid} ({marker})");
+        for st in statements {
+            assert_eq!(st["status"], "not_affected", "{leg} ({cell}): {st:#}");
+            let impact = st["impact_statement"].as_str().unwrap_or_default();
+            // The expected clause embeds the patch uuid: name it, never print
+            // it (CodeQL rust/cleartext-logging).
+            assert!(
+                impact.split("; ").any(|p| p == part),
+                "{leg} ({cell}): impact {impact:?} lacks the wired patch's ({marker}) clause"
+            );
+        }
+    };
+    let ledgers = dir.join(".socket/vendor");
+    let saved: Vec<(std::ffi::OsString, Vec<u8>)> = std::fs::read_dir(&ledgers)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_file())
+                .map(|e| (e.file_name(), std::fs::read(e.path()).unwrap()))
+                .collect()
+        })
+        .unwrap_or_default();
+    strip_manifest(dir);
+    attested(&base, "ledger kept");
+    strip_ledgers(dir);
+    attested(&base, "ledgers deleted");
+    let mut offline = base.clone();
+    offline.offline = true;
+    let out = run_vex(&vex_e2e_common::binary(), dir, &offline);
+    assert_eq!(out.code, Some(1), "{leg} offline, no ledger: {out}");
+    assert_not_attested(&out.envelope, &purl, "record_unavailable");
+    for (name, bytes) in &saved {
+        std::fs::write(ledgers.join(name), bytes).unwrap();
+    }
+    std::fs::write(dir.join("Gemfile"), pristine.0).unwrap();
+    std::fs::write(dir.join("Gemfile.lock"), pristine.1).unwrap();
+    for no_verify in [false, true] {
+        let mut run = base.clone();
+        run.no_verify = no_verify;
+        let out = run_vex(&vex_e2e_common::binary(), dir, &run);
+        assert_eq!(
+            out.code,
+            Some(1),
+            "{leg} reverted no_verify={no_verify}: {out}"
+        );
+        assert_not_attested(&out.envelope, &purl, unwired);
+    }
 }
 
 // ===========================================================================
@@ -1865,6 +2478,25 @@ fn deno_hosted_is_unsupported() {
         "{LEG}: deno hosted mode redirected something, but hosted mode is \
          documented as unsupported for deno:\n{env_json:#}"
     );
+
+    // Manifest-less VEX: nothing was wired for deno, so without a manifest
+    // there is nothing to attest (exit 2, `manifest_not_found`) — offline,
+    // no document written.
+    let _ = std::fs::remove_file(proj.join(".socket/manifest.json"));
+    let out = vex_e2e_common::run_vex(
+        &binary(),
+        &proj,
+        &vex_e2e_common::VexRun {
+            product: Some("pkg:npm/deno-app@1.0.0".to_string()),
+            ..vex_e2e_common::VexRun::offline()
+        },
+    );
+    assert_eq!(out.code, Some(2), "{LEG}: manifest-less vex: {out}");
+    assert_eq!(
+        out.envelope["error"]["code"], "manifest_not_found",
+        "{LEG}: {out}"
+    );
+    assert!(out.doc.is_none(), "{LEG}: no document: {out}");
 }
 
 // ===========================================================================

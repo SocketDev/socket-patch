@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+use crate::utils::requirements::{
+    hash_options, logical_lines, split_comment, strip_comment, vendor_tag,
+};
 
 use super::common::{detect_eol, refuse_symlinked};
 use super::state::{VendorEntry, WiringAction, WiringRecord};
@@ -157,27 +160,34 @@ pub(super) async fn preflight_requirements(
         .map(|_| RequirementsTarget::Fresh)
 }
 
+/// The vendor lines for `canon_name` in one file's content, read as pip's
+/// logical lines: `(wheel-path token's vendor path parts, bare token, code)`
+/// for every line whose comment carries the
+/// `# socket-patch vendor: <name>==<version>` tag ([`vendor_tag`]) and whose
+/// first token is a pypi vendor path — the exact shape [`vendor_line`]
+/// writes, lexed like lockfile discovery reads it.
+fn vendor_lines<'a>(
+    content: &'a str,
+    canon_name: &'a str,
+) -> impl Iterator<Item = (super::path::VendorPathParts, String, String)> + 'a {
+    logical_lines(content).into_iter().filter_map(move |ll| {
+        let (code, comment) = split_comment(&ll.text);
+        let (name, _) = comment.and_then(vendor_tag)?;
+        if name != canon_name {
+            return None;
+        }
+        let token = code.split_whitespace().next()?;
+        let parts = super::path::parse_vendor_path(token).filter(|p| p.eco == "pypi")?;
+        Some((parts, token.to_string(), code.to_string()))
+    })
+}
+
 /// Find a socket vendor line for `canon_name` in one file's content and
-/// return the patch uuid its wheel path names. Matches the exact shape
-/// [`vendor_line`] writes: a wheel-path token plus the
-/// `# socket-patch vendor: <name>==<version>` comment tag.
+/// return the patch uuid its wheel path names ([`vendor_lines`]).
 fn vendored_uuid_for(content: &str, canon_name: &str) -> Option<String> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        let Some((_, tag)) = trimmed.split_once("# socket-patch vendor: ") else {
-            continue;
-        };
-        if !tag.starts_with(canon_name) || !tag[canon_name.len()..].starts_with("==") {
-            continue;
-        }
-        let token = trimmed.split_whitespace().next().unwrap_or("");
-        if let Some(parts) = super::path::parse_vendor_path(token) {
-            if parts.eco == "pypi" {
-                return Some(parts.uuid);
-            }
-        }
-    }
-    None
+    vendor_lines(content, canon_name)
+        .next()
+        .map(|(parts, _, _)| parts.uuid)
 }
 
 /// Extract the (wheel path, sha256) pin the wired vendor line for
@@ -186,34 +196,17 @@ fn vendored_uuid_for(content: &str, canon_name: &str) -> Option<String> {
 /// vendor always writes. Paths are returned bare (no `./` prefix), matching
 /// the ledger's `artifact.path` spelling.
 fn wired_pin_in(content: &str, canon_name: &str, record_uuid: &str) -> Option<(String, String)> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        let Some((_, tag)) = trimmed.split_once("# socket-patch vendor: ") else {
-            continue;
-        };
-        if !tag.starts_with(canon_name) || !tag[canon_name.len()..].starts_with("==") {
-            continue;
+    vendor_lines(content, canon_name).find_map(|(parts, token, code)| {
+        if parts.uuid != record_uuid {
+            return None;
         }
-        let token = trimmed.split_whitespace().next().unwrap_or("");
-        let Some(parts) = super::path::parse_vendor_path(token) else {
-            continue;
-        };
-        if parts.eco != "pypi" || parts.uuid != record_uuid {
-            continue;
-        }
-        let Some(sha) = trimmed
-            .split_whitespace()
-            .find_map(|t| t.strip_prefix("--hash=sha256:"))
-        else {
-            continue;
-        };
+        let sha = hash_options(&code).into_iter().next()?;
         if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
-            continue;
+            return None;
         }
-        let path = token.strip_prefix("./").unwrap_or(token);
-        return Some((path.to_string(), sha.to_string()));
-    }
-    None
+        let path = token.strip_prefix("./").unwrap_or(&token);
+        Some((path.to_string(), sha))
+    })
 }
 
 /// Rewrite every exact pin across the root `requirements.txt` and its `-r`
@@ -773,73 +766,8 @@ fn normalize_rel_path(path: &str) -> String {
     out
 }
 
-// ── logical-line lexer ───────────────────────────────────────────────────
-
-struct LogicalLine {
-    /// 0-based index of the first physical line.
-    start: usize,
-    /// The raw physical lines (no newlines, no `\r`).
-    physical: Vec<String>,
-    /// Continuation-joined text (comments NOT yet stripped).
-    text: String,
-}
-
-fn logical_lines(content: &str) -> Vec<LogicalLine> {
-    let lines: Vec<&str> = content.lines().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let start = i;
-        let mut physical = vec![lines[i].to_string()];
-        // pip's join_lines never continues a comment line: `# ...\` is a
-        // complete comment, not a continuation of the next line.
-        while lines[i].trim_end().ends_with('\\')
-            && !lines[i].trim_start().starts_with('#')
-            && i + 1 < lines.len()
-        {
-            i += 1;
-            physical.push(lines[i].to_string());
-        }
-        let mut text = String::new();
-        for (k, pl) in physical.iter().enumerate() {
-            if k + 1 < physical.len() {
-                // pip's join: the backslash and the newline vanish.
-                text.push_str(pl.trim_end().strip_suffix('\\').unwrap_or(pl));
-            } else {
-                text.push_str(pl);
-            }
-        }
-        // pip decodes the file with utf-8-sig (`auto_decode`) and uv strips
-        // the BOM too: exactly one leading BOM at file start is encoding,
-        // not data. Only `text` (the parse substrate) drops it — `physical`
-        // stays raw, so a rewrite records (and a revert restores) the
-        // original bytes.
-        if start == 0 {
-            if let Some(stripped) = text.strip_prefix('\u{feff}') {
-                text = stripped.to_string();
-            }
-        }
-        out.push(LogicalLine {
-            start,
-            physical,
-            text,
-        });
-        i += 1;
-    }
-    out
-}
-
-/// Cut a trailing comment: `#` at column 0 or preceded by whitespace
-/// (`--hash=sha256:ab#cd` is NOT a comment — no preceding whitespace).
-fn strip_comment(text: &str) -> &str {
-    let bytes = text.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
-            return &text[..i];
-        }
-    }
-    text
-}
+// The logical-line lexer lives in `utils::requirements` (shared with the
+// lockfile inventory and lockfile discovery).
 
 struct ParsedRequirement {
     name: String,
@@ -1017,27 +945,6 @@ mod tests {
             pdm: None,
             pipenv: None,
         }
-    }
-
-    // ── lexer ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn lexer_joins_continuations_and_strips_comments_correctly() {
-        let lines = logical_lines("six==1.16.0 \\\n    --hash=sha256:abc\nrequests\n");
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].start, 0);
-        assert_eq!(lines[0].physical.len(), 2);
-        assert_eq!(lines[0].text, "six==1.16.0     --hash=sha256:abc");
-        assert_eq!(lines[1].start, 2);
-
-        // Comment rules: whitespace-preceded `#` (or column 0) only.
-        assert_eq!(strip_comment("six==1.0  # pinned"), "six==1.0  ");
-        assert_eq!(strip_comment("# whole line"), "");
-        assert_eq!(
-            strip_comment("x --hash=sha256:ab#cd"),
-            "x --hash=sha256:ab#cd",
-            "a # without preceding whitespace is data, not a comment"
-        );
     }
 
     #[test]
@@ -1742,6 +1649,28 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// The vendor-line readers lex pip's LOGICAL lines, like lockfile
+    /// discovery: a vendor line whose `--hash` and tag sit on a `\\`
+    /// continuation is still the wiring (a physical-line scan saw the tag on
+    /// a line whose first token is `--hash=…`, and missed it).
+    #[test]
+    fn vendor_line_readers_join_continuations() {
+        let hex = "a".repeat(64);
+        let wheel = format!("./.socket/vendor/pypi/{UUID}/six-1.16.0-py3-none-any.whl");
+        let content = format!(
+            "{wheel} \\\n    --hash=sha256:{hex}  # socket-patch vendor: six==1.16.0\nattrs==23.1.0\n"
+        );
+        assert_eq!(vendored_uuid_for(&content, "six"), Some(UUID.to_string()));
+        assert_eq!(
+            wired_pin_in(&content, "six", UUID),
+            Some((wheel.trim_start_matches("./").to_string(), hex.clone()))
+        );
+        // Another uuid, or a malformed pin, is not this patch's pin.
+        assert_eq!(wired_pin_in(&content, "six", "not-the-uuid"), None);
+        let short = content.replace(&hex, "abc");
+        assert_eq!(wired_pin_in(&short, "six", UUID), None);
     }
 
     /// Multi-package coexistence: a root already carrying ANOTHER package's

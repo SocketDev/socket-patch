@@ -1,0 +1,1389 @@
+{
+  "redirect/npm/bun/alias/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/alias/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/bun/basic/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/basic/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/bun/custom-registry/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/custom-registry/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/bun/digestless-hosted-already-wired/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/digestless-hosted-already-wired/input": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": null,
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": false
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/digestless-hosted-stale-url-repin/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/digestless-hosted-stale-url-repin/input": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": null,
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/22222222-2222-2222-2222-222222222222/66666666-6666-6666-6666-666666666666/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": false
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/lock-v0/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/lock-v0/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/bun/lock-v0-workspace-refusal/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/bun/lock-v1-workspace/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/lock-v1-workspace/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/bun/lock-v2/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/lock-v2/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/bun/lock-v2-crlf/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/lock-v2-crlf/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/bun/lock-v2-workspace-nested/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.2.0",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/lock-v2-workspace-nested/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.2.0",
+        "file": "bun.lock"
+      },
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/bun/lock-version-unsupported/input": {
+    "refs": [],
+    "diagnostics": [
+      {
+        "code": "lockfile_unparseable",
+        "file": "bun.lock",
+        "detail": "bun.lock has lockfileVersion 3, newer than this socket-patch release supports (0, 1 and 2) — update socket-patch, or re-lock with a Bun release that writes lockfileVersion 0–2"
+      }
+    ],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/bun/lockb-only-refusal/input": {
+    "refs": [],
+    "diagnostics": [
+      {
+        "code": "lockfile_unparseable",
+        "file": "bun.lockb",
+        "detail": "bun.lockb is not a readable Bun binary lockfile: bun.lockb: invalid binary lockfile header"
+      }
+    ],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/bun/missing-sha512/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/bun/nested-entry/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/nested-entry/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/bun/re-redirect-stale-url/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/re-redirect-stale-url/input": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-OLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLDoldOLD==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/22222222-2222-2222-2222-222222222222/66666666-6666-6666-6666-666666666666/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/rerun-noop/input": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "bun.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/bun/scoped-package/expected": {
+    "refs": [],
+    "diagnostics": [
+      {
+        "code": "patched_ref_invalid",
+        "file": "bun.lock",
+        "detail": "bun.lock: @babel/core: \"https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/left-pad-1.3.0.tgz\" is not an artifact of \"@babel/core\" (its leaf must be the package's own <name>-<version>.tgz)"
+      }
+    ],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "bun.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "bun.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/bun/scoped-package/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@babel/core@7.0.0",
+        "file": "bun.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/package-lock-v3/basic/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "mode": "hosted",
+        "source_file": "package-lock.json",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-PATCHEDpatchedPATCHEDpatchedPATCHEDpatched9876543210ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqponmlkjihgfedcba0123456789AB==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/left-pad/1.3.0/11111111-1111-1111-1111-111111111111/22222222-2222-2222-2222-222222222222/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "package-lock.json"
+      },
+      {
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "mode": "hosted",
+        "file": "package-lock.json"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/package-lock-v3/basic/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "package-lock.json"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/pnpm/basic/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "mode": "hosted",
+        "source_file": "pnpm-lock.yaml",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-PATCHEDpatchedPATCHEDpatchedPATCHEDpatched9876543210ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqponmlkjihgfedcba0123456789AB==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/left-pad/1.3.0/11111111-1111-1111-1111-111111111111/22222222-2222-2222-2222-222222222222/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "pnpm-lock.yaml"
+      },
+      {
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "mode": "hosted",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/pnpm/basic/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "pnpm-lock.yaml"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/pnpm/nested-rush-lock/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/pnpm/nested-rush-lock/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/yarn-berry/basic/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "yarn.lock",
+        "artifact_rel": null,
+        "locked_integrity": "BerryChecksum(\"10c0/7785879d9a7dc9bee6730ec55926a0ab9ed6bfe0eaee0cbcbcf00841d42488fddda51265c73eeddd54c5deca87d131e846ff66d27d890ef73f12720b458d7ca3\")",
+        "integrity_required": true,
+        "url": "https%3A%2F%2Fpatch.socket.dev%2Fpatch%2Fnpm%2F11111111-1111-1111-1111-111111111111%2F77777777-7777-7777-7777-777777777777%2Fleft-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/yarn-berry/basic/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/yarn-berry/cachekey-mismatch-refusal/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/yarn-berry/existing-archive-url/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "yarn.lock",
+        "artifact_rel": null,
+        "locked_integrity": "BerryChecksum(\"10c0/7785879d9a7dc9bee6730ec55926a0ab9ed6bfe0eaee0cbcbcf00841d42488fddda51265c73eeddd54c5deca87d131e846ff66d27d890ef73f12720b458d7ca3\")",
+        "integrity_required": true,
+        "url": "https%3A%2F%2Fpatch.socket.dev%2Fpatch%2Fnpm%2F11111111-1111-1111-1111-111111111111%2F77777777-7777-7777-7777-777777777777%2Fleft-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/yarn-berry/existing-archive-url/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/yarn-berry/missing-berry-checksum/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/yarn-berry/multi-descriptor-key/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "yarn.lock",
+        "artifact_rel": null,
+        "locked_integrity": "BerryChecksum(\"10c0/7785879d9a7dc9bee6730ec55926a0ab9ed6bfe0eaee0cbcbcf00841d42488fddda51265c73eeddd54c5deca87d131e846ff66d27d890ef73f12720b458d7ca3\")",
+        "integrity_required": true,
+        "url": "https%3A%2F%2Fpatch.socket.dev%2Fpatch%2Fnpm%2F11111111-1111-1111-1111-111111111111%2F77777777-7777-7777-7777-777777777777%2Fleft-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/yarn-berry/multi-descriptor-key/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/yarn-berry/multiple-versions/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "yarn.lock",
+        "artifact_rel": null,
+        "locked_integrity": "BerryChecksum(\"10c0/7785879d9a7dc9bee6730ec55926a0ab9ed6bfe0eaee0cbcbcf00841d42488fddda51265c73eeddd54c5deca87d131e846ff66d27d890ef73f12720b458d7ca3\")",
+        "integrity_required": true,
+        "url": "https%3A%2F%2Fpatch.socket.dev%2Fpatch%2Fnpm%2F11111111-1111-1111-1111-111111111111%2F77777777-7777-7777-7777-777777777777%2Fleft-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.0.0",
+        "file": "yarn.lock"
+      }
+    ],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/yarn-berry/multiple-versions/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.0.0",
+        "file": "yarn.lock"
+      },
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/yarn-berry/rerun-noop/input": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "yarn.lock",
+        "artifact_rel": null,
+        "locked_integrity": "BerryChecksum(\"10c0/7785879d9a7dc9bee6730ec55926a0ab9ed6bfe0eaee0cbcbcf00841d42488fddda51265c73eeddd54c5deca87d131e846ff66d27d890ef73f12720b458d7ca3\")",
+        "integrity_required": true,
+        "url": "https%3A%2F%2Fpatch.socket.dev%2Fpatch%2Fnpm%2F11111111-1111-1111-1111-111111111111%2F77777777-7777-7777-7777-777777777777%2Fleft-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/yarn-berry/scoped-package/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/@babel/core@7.0.0",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "source_file": "yarn.lock",
+        "artifact_rel": null,
+        "locked_integrity": "BerryChecksum(\"10c0/7785879d9a7dc9bee6730ec55926a0ab9ed6bfe0eaee0cbcbcf00841d42488fddda51265c73eeddd54c5deca87d131e846ff66d27d890ef73f12720b458d7ca3\")",
+        "integrity_required": true,
+        "url": "https%3A%2F%2Fpatch.socket.dev%2Fpatch%2Fnpm%2F11111111-1111-1111-1111-111111111111%2F77777777-7777-7777-7777-777777777777%2Fleft-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      },
+      {
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "77777777-7777-7777-7777-777777777777",
+        "purl": "pkg:npm/@babel/core@7.0.0"
+      }
+    ]
+  },
+  "redirect/npm/yarn-berry/scoped-package/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/@babel/core@7.0.0",
+        "file": "yarn.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/yarn-berry/yarnrc-compression-refusal/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/yarn-classic/alias-guard/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock"
+      },
+      {
+        "purl": "pkg:npm/totally-other@1.3.0",
+        "file": "yarn.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/yarn-classic/basic/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "mode": "hosted",
+        "source_file": "yarn.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-PATCHEDpatchedPATCHEDpatchedPATCHEDpatched9876543210ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqponmlkjihgfedcba0123456789AB==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/left-pad/1.3.0/11111111-1111-1111-1111-111111111111/22222222-2222-2222-2222-222222222222/left-pad-1.3.0.tgz#abcdef0123456789abcdef0123456789abcdef01",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      },
+      {
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/yarn-classic/basic/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/yarn-classic/crlf/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "mode": "hosted",
+        "source_file": "yarn.lock",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-PATCHEDpatchedPATCHEDpatchedPATCHEDpatched9876543210ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqponmlkjihgfedcba0123456789AB==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/left-pad/1.3.0/11111111-1111-1111-1111-111111111111/22222222-2222-2222-2222-222222222222/left-pad-1.3.0.tgz#abcdef0123456789abcdef0123456789abcdef01",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      },
+      {
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "mode": "hosted",
+        "file": "yarn.lock"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/abbrev@1.1.1",
+        "file": "yarn.lock"
+      }
+    ],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/yarn-classic/crlf/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/abbrev@1.1.1",
+        "file": "yarn.lock"
+      },
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "yarn.lock"
+      }
+    ],
+    "live_claims": []
+  }
+}

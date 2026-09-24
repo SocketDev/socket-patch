@@ -1051,15 +1051,16 @@ async fn append_gem_check_entries(
 /// bucket for out-of-scope PURLs absent from the map) cannot be patched yet, and
 /// a degenerate zero-file record (`no_files`) has nothing to hash — neither is
 /// drift, so both are skipped. A missing/empty/unreadable manifest contributes
-/// nothing of its own; the vendor ledger's detached records (vendored mode is
-/// manifest-free) are folded in exactly as `vex` does, so a vendored-only
-/// project is judged too. Read-only: it crawls but never writes.
+/// nothing of its own; the vendor ledger's embedded records (vendored mode is
+/// manifest-free; standalone `vendor`'s fallback copies where the manifest no
+/// longer covers them) are folded in by the rule `vex` applies, so a
+/// vendored-only project is judged too. Read-only: it crawls but never writes.
 async fn append_patch_consistency_entries(
     common: &GlobalArgs,
     manifest: Option<PatchManifest>,
     entries: &mut Vec<(&'static str, String, CheckState, Option<String>)>,
 ) {
-    // ONE ledger read serves both the detached fold and the verifier's
+    // ONE ledger read serves both the record fold and the verifier's
     // VendorContext below. Without the fold a project whose committed
     // `.socket/vendor/**` artifact is missing or corrupt reported
     // `configured` — the exact hooks-present-but-state-drifted case
@@ -1074,7 +1075,7 @@ async fn append_patch_consistency_entries(
     let mut manifest = manifest.unwrap_or_default();
     let ledger = match socket_patch_core::vendor::load_state(&common.cwd).await {
         Ok(state) => {
-            crate::commands::fold_detached_records(&mut manifest, &state.entries);
+            crate::commands::fold_vendor_records(&mut manifest, &state.entries);
             Ok(state)
         }
         Err(e) => {

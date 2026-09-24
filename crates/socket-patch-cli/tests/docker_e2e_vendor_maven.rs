@@ -54,6 +54,8 @@
 
 #[path = "docker_vendor_common/mod.rs"]
 mod docker_vendor_common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
 use docker_vendor_common::{
     assert_stage_markers, bash_prelude, json_assert_fns, run_in_image, run_in_image_network_none,
@@ -402,6 +404,112 @@ fn assert_vex_attested_from_host(host_dir: &std::path::Path) {
     );
 }
 
+/// Host-side MANIFEST-LESS VEX over the stage-2 fresh checkout (the one real
+/// Maven just consumed with the network cut). The bind-mounted tree is
+/// root-owned on Linux, so only its committable files (`pom.xml` +
+/// `.socket/`, never `target/`) are copied into a host-owned dir, where
+/// the host binary runs against a wiremock patch API serving the SAME
+/// record the ledger embedded:
+///
+/// * manifest deleted, ledger kept → attested `(vendored)` offline and online;
+/// * ledgers deleted, online → attested from the pom wiring + the committed
+///   jar + the API record; embedded `vendor --vex` with no manifest too;
+/// * `--offline` without a ledger → `record_unavailable`, zero requests;
+/// * the pom reverted to its pre-vendor bytes (ledger + artifact kept) →
+///   `vendor_unwired`, with and without `--no-verify`.
+fn assert_manifestless_vex_from_host(host_dir: &std::path::Path) {
+    use vex_e2e_common::*;
+    let src = host_dir.join("fresh");
+    let copy = tempfile::tempdir().expect("host copy");
+    let fresh = copy.path().join("fresh");
+    copy_tree(&src.join(".socket"), &fresh.join(".socket"));
+    std::fs::copy(src.join("pom.xml"), fresh.join("pom.xml")).expect("copy pom.xml");
+    strip_manifest(&fresh);
+
+    let ledger_path = fresh.join(".socket/vendor/state.json");
+    let ledger_bytes = std::fs::read(&ledger_path).expect("vendor ledger");
+    let ledger: serde_json::Value = serde_json::from_slice(&ledger_bytes).expect("ledger JSON");
+    let record = &ledger["entries"][PURL]["record"];
+    let after = record["files"]["META-INF/NOTICE.txt"]["afterHash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the ledger embeds the record: {ledger:#}"))
+        .to_string();
+    let vulns: [(&str, &[&str]); 1] = [(GHSA, &["CVE-2024-88888"])];
+    let api = PatchApi::start(vec![(
+        UUID.to_string(),
+        patch_view(UUID, PURL, &[("META-INF/NOTICE.txt", &after)], &vulns),
+    )]);
+    let m2 = tempfile::tempdir().expect("empty maven repo");
+    let run = VexRun {
+        product: Some("pkg:maven/com.example/app@1.0.0".to_string()),
+        ..VexRun::online(&api)
+    }
+    .env("MAVEN_REPO_LOCAL", m2.path().as_os_str());
+    let offline = |no_verify: bool| {
+        let quiet = PatchApi::empty();
+        let out = run_vex(
+            &binary(),
+            &fresh,
+            &VexRun {
+                offline: true,
+                no_verify,
+                proxy_url: Some(quiet.uri()),
+                ..run.clone()
+            },
+        );
+        quiet.assert_no_requests();
+        out
+    };
+
+    let out = offline(false);
+    assert_eq!(out.code, Some(0), "ledger, offline: {out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Vendored, &vulns);
+    let out = run_vex(&binary(), &fresh, &run);
+    assert_eq!(out.code, Some(0), "ledger, online: {out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Vendored, &vulns);
+
+    strip_ledgers(&fresh);
+    let out = run_vex(&binary(), &fresh, &run);
+    assert_eq!(out.code, Some(0), "no ledgers, online: {out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Vendored, &vulns);
+    assert!(api.view_requests(UUID) >= 1, "the record came from the API");
+    let out = run_vex(
+        &binary(),
+        &fresh,
+        &VexRun {
+            via: VexVia::Vendor,
+            ..run.clone()
+        },
+    );
+    assert_eq!(out.code, Some(0), "vendor --vex, no manifest: {out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Vendored, &vulns);
+    let out = offline(false);
+    assert_eq!(out.code, Some(1), "no ledgers, offline: {out}");
+    assert_not_attested(&out.envelope, PURL, "record_unavailable");
+
+    std::fs::copy(host_dir.join("snap/pom.prevendor"), fresh.join("pom.xml"))
+        .expect("restore the pre-vendor pom");
+    std::fs::write(&ledger_path, &ledger_bytes).unwrap();
+    for no_verify in [false, true] {
+        let out = offline(no_verify);
+        assert_eq!(out.code, Some(1), "reverted no_verify={no_verify}: {out}");
+        assert_not_attested(&out.envelope, PURL, "vendor_unwired");
+    }
+}
+
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for entry in std::fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let to = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).unwrap();
+        }
+    }
+}
+
 /// Export `PURL_ENV` into the stage script's shell (the purl carries an `@` the
 /// bash body reads as a variable) — kept out of `render`'s literal replaces.
 fn with_purl_env(body: &str) -> String {
@@ -436,6 +544,8 @@ fn maven_vendor_fresh_checkout_install_and_revert() {
         &out,
         &["RED PROBE", "FRESH INSTALL", "TAMPER CHECKSUM"],
     );
+    // The consumed fresh checkout, attested with no manifest (host side).
+    assert_manifestless_vex_from_host(&host_dir);
 
     // Stage 3 — idempotency, revert, re-vendor (still no network).
     let out = run_in_image_network_none(IMAGE, &host_dir, &with_purl_env(&render(STAGE3)));

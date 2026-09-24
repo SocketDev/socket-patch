@@ -83,6 +83,62 @@ class BunTransportRetryTests(unittest.TestCase):
             self.assertEqual(len(row['networkRetryAttempts']), 2)
 
 
+class BunManifestlessVexHelperTests(unittest.TestCase):
+    UUID = '80630680-4da6-45f9-bba8-b888e0ffd58c'
+    VULNS = {'GHSA-xvch-5gv4-984h': ['CVE-2021-44906']}
+
+    def statement(self, purl=bun.PURL, name='GHSA-xvch-5gv4-984h', aliases=('CVE-2021-44906',),
+                  marker='redirected', status='not_affected'):
+        return {'vulnerability': {'name': name, 'aliases': list(aliases)},
+                'products': [{'@id': bun.VEX_PRODUCT, 'subcomponents': [{'@id': purl}]}],
+                'status': status,
+                'impact_statement': f'Patched via Socket patch {self.UUID} ({marker})'}
+
+    def test_attested_needs_exact_ids_aliases_status_and_marker(self):
+        ok = {'statements': [self.statement()]}
+        self.assertTrue(bun.vex_attested(ok, bun.PURL, self.UUID, 'redirected', self.VULNS))
+        qualified = {'statements': [self.statement(purl=bun.PURL + '?x=1')]}
+        self.assertTrue(bun.vex_attested(qualified, bun.PURL, self.UUID, 'redirected', self.VULNS))
+        for doc, why in [
+                (None, 'no document'),
+                ({'statements': []}, 'no statement'),
+                ({'statements': [self.statement(marker='vendored')]}, 'wrong marker'),
+                ({'statements': [self.statement(aliases=())]}, 'alias missing'),
+                ({'statements': [self.statement(status='affected')]}, 'status'),
+                ({'statements': [self.statement(), self.statement(name='GHSA-extra')]}, 'extra id'),
+                ({'statements': [self.statement(purl='pkg:npm/minimist@1.2.8')]}, 'other purl')]:
+            with self.subTest(why):
+                self.assertFalse(bun.vex_attested(doc, bun.PURL, self.UUID, 'redirected', self.VULNS))
+        self.assertFalse(bun.vex_attested(ok, bun.PURL, self.UUID, 'redirected', {}),
+                         'a record without vulnerabilities can never pass')
+
+    def test_skip_reason_reads_the_purl_event_and_scope_spellings(self):
+        envelope = {'events': [{'action': 'skipped', 'purl': 'pkg:npm/@s/p@1.0.0',
+                                'errorCode': 'record_unavailable'},
+                               {'action': 'skipped', 'purl': bun.PURL, 'errorCode': 'vendor_unwired'}]}
+        self.assertEqual(bun.vex_skip_reason(envelope, bun.PURL), 'vendor_unwired')
+        self.assertEqual(bun.vex_skip_reason(envelope, 'pkg:npm/%40s/p@1.0.0'), 'record_unavailable')
+        verified = {'events': [{'action': 'verified', 'purl': bun.PURL}]}
+        self.assertIsNone(bun.vex_skip_reason(verified, bun.PURL))
+        self.assertIsNone(bun.vex_skip_reason({}, bun.PURL))
+
+    def test_checkout_drops_manifest_node_modules_and_old_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            project, dest = Path(temp) / 'p', Path(temp) / 'c'
+            for rel in ['package.json', 'bun.lock', '.socket/manifest.json', '.socket/apply.lock',
+                        '.socket/vendor/state.json', f'.socket/vendor/npm/{self.UUID}/minimist-1.2.2.tgz',
+                        'node_modules/minimist/index.js', 'packages/c/node_modules/x/index.js',
+                        'packages/c/package.json', bun.VEX_OUTPUT]:
+                (project / rel).parent.mkdir(parents=True, exist_ok=True)
+                (project / rel).write_text(rel)
+            (dest / 'stale').mkdir(parents=True)
+            bun.manifestless_checkout(project, dest)
+            got = sorted(p.relative_to(dest).as_posix() for p in dest.rglob('*') if p.is_file())
+            self.assertEqual(got, ['.socket/vendor/npm/%s/minimist-1.2.2.tgz' % self.UUID,
+                                   '.socket/vendor/state.json', 'bun.lock', 'package.json',
+                                   'packages/c/package.json'])
+
+
 class PipenvShimTests(unittest.TestCase):
     def test_parallel_first_use(self):
         # Force every worker to reach symlink creation before any can create
@@ -134,6 +190,37 @@ class PipenvShimTests(unittest.TestCase):
             (wrapper / "pipenv").write_text("docker wrapper")
             self.assertEqual(pipenv.pipenv_shim_dir(root, "11.10.4", root / "tool"), wrapper)
             self.assertEqual((wrapper / "pipenv").read_text(), "docker wrapper")
+
+
+class PipenvManifestlessVexVerdictTests(unittest.TestCase):
+    UUID = "e828efa5-5c6d-43f3-9909-03f5ac232b98"
+    PURL = "pkg:pypi/urllib3@1.26.18"
+
+    def doc(self, marker="redirected", purl=None, status="not_affected"):
+        return {"statements": [{
+            "status": status,
+            "products": [{"@id": "pkg:pypi/app@0.1.0", "subcomponents": [{"@id": purl or self.PURL + "?artifact_id=x"}]}],
+            "impact_statement": f"Patched via Socket patch {self.UUID} ({marker})",
+        }]}
+
+    def test_attests_needs_exit_zero_marker_uuid_and_status(self):
+        self.assertTrue(pipenv.vex_attests(0, self.doc(), self.PURL, self.UUID, "redirected"))
+        self.assertFalse(pipenv.vex_attests(1, self.doc(), self.PURL, self.UUID, "redirected"))
+        self.assertFalse(pipenv.vex_attests(0, self.doc("vendored"), self.PURL, self.UUID, "redirected"))
+        self.assertFalse(pipenv.vex_attests(0, self.doc(), self.PURL, "0" * 8, "redirected"))
+        self.assertFalse(pipenv.vex_attests(0, self.doc(status="affected"), self.PURL, self.UUID, "redirected"))
+        self.assertFalse(pipenv.vex_attests(0, self.doc(purl="pkg:pypi/six@1.16.0"), self.PURL, self.UUID, "redirected"))
+        self.assertFalse(pipenv.vex_attests(0, None, self.PURL, self.UUID, "redirected"))
+
+    def test_omits_needs_the_reason_no_statement_and_no_verified_event(self):
+        skipped = {"events": [{"action": "skipped", "purl": self.PURL, "errorCode": "redirect_unwired"}]}
+        self.assertTrue(pipenv.vex_omits(1, skipped, None, self.PURL, "redirect_unwired"))
+        self.assertFalse(pipenv.vex_omits(1, skipped, None, self.PURL, "record_unavailable"))
+        self.assertFalse(pipenv.vex_omits(0, skipped, None, self.PURL, "redirect_unwired"))
+        self.assertFalse(pipenv.vex_omits(1, skipped, self.doc(), self.PURL, "redirect_unwired"))
+        verified = {"events": skipped["events"] + [{"action": "verified", "purl": self.PURL}]}
+        self.assertFalse(pipenv.vex_omits(1, verified, None, self.PURL, "redirect_unwired"))
+        self.assertFalse(pipenv.vex_omits(1, {}, None, self.PURL, "redirect_unwired"))
 
 
 class PdmEnvironmentTests(unittest.TestCase):
