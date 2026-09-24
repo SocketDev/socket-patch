@@ -708,4 +708,39 @@ mod tests {
             }
         }
     }
+
+    /// When the splice does not reproduce the serialized document (a mixed
+    /// line-ending lock: the serializer rewrites every line to CRLF, the
+    /// splice leaves the untouched LF lines alone), the rewrite's own edits
+    /// are not kept and `edits()` re-derives them against the output.
+    #[test]
+    fn rewrite_edits_are_rederived_when_the_splice_differs_from_the_document() {
+        for version in ["0.12.17", "1.0.10", "1.2.2", "2.4.3"] {
+            let crlf = fixture(version).replace('\n', "\r\n");
+            // `[metadata] content-hash` is in no fragment of the package.
+            let hash = crlf.find("content-hash").unwrap();
+            let eol = hash + crlf[hash..].find("\r\n").unwrap();
+            let text = format!("{}\n{}", &crlf[..eol], &crlf[eol + 2..]);
+            let rewrite = rewrite_poetry_lock_with_edits(
+                &text,
+                "urllib3",
+                "1.26.18",
+                "file",
+                ".socket/vendor/pypi/x/urllib3-1.26.18-py2.py3-none-any.whl",
+                WHEEL,
+                &sha(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                rewrite.known_edits.is_none(),
+                "{version}: splice must differ"
+            );
+            assert_eq!(
+                rewrite.edits(),
+                poetry_lock_edits(&text, &rewrite.text, "urllib3"),
+                "{version}"
+            );
+        }
+    }
 }

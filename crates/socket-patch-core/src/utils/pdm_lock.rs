@@ -763,4 +763,39 @@ mod tests {
             "the corpus exercises the rewrite ({rewritten})"
         );
     }
+
+    /// When the splice does not reproduce the rendered document (a mixed
+    /// line-ending lock: the renderer keeps no CRLF, the splice leaves the
+    /// untouched CRLF lines alone), the rewrite's own edits are not kept and
+    /// `edits()` re-derives them against the output.
+    #[test]
+    fn rewrite_edits_are_rederived_when_the_splice_differs_from_the_document() {
+        let mut rederived = 0;
+        for name in ["0.12.3", "1.15.5", "2.0.3", "2.8.2", "2.17.3", "2.29.2"] {
+            let crlf = fixture(name).replace("\r\n", "\n").replace('\n', "\r\n");
+            let first = crlf.find("\r\n").unwrap();
+            let text = format!("{}\n{}", &crlf[..first], &crlf[first + 2..]);
+            let Ok(rewrite) = rewrite_pdm_lock_with_edits(
+                &text,
+                "urllib3",
+                "1.26.18",
+                ("path", PATH),
+                WHEEL,
+                &"a".repeat(64),
+            ) else {
+                continue;
+            };
+            rederived += 1;
+            assert!(rewrite.known_edits.is_none(), "{name}: splice must differ");
+            assert_eq!(
+                rewrite.edits(),
+                pdm_lock_edits(&text, &rewrite.text, "urllib3"),
+                "{name}"
+            );
+        }
+        assert!(
+            rederived >= 4,
+            "the corpus exercises the re-derive ({rederived})"
+        );
+    }
 }
