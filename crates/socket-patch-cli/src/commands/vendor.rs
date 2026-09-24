@@ -1511,6 +1511,36 @@ pub(crate) async fn vendor_records_reusing(
     // line prints on a clean line.
     let mut status = StatusLine::stderr(common.json, common.silent);
     let total = all_packages.len();
+    // Service downloads, fetched ahead of this serial loop (the wiring and
+    // every write stay here, in order). The plan is the npm records the
+    // loop is expected to download: in loop order, past the Bun refusal
+    // and the takeover gate below, with no committed artifact the ledger
+    // anchors at the record's uuid (those re-runs reuse it and never ask
+    // the service). It is advisory — the breaker and every outcome are
+    // still decided at the loop's own call (see `VendorPrefetch`).
+    let _service_prefetch = service.filter(|_| !common.dry_run).and_then(|cfg| {
+        let planned: Vec<String> = all_packages
+            .iter()
+            .filter(|(purl, _)| Ecosystem::from_purl(purl) == Some(Ecosystem::Npm))
+            .filter(|(purl, _)| bun_refusal.as_ref().is_none_or(|r| !r.applies_to(purl)))
+            .filter(|(purl, _)| {
+                redirect_ledger_corrupt.is_none()
+                    && redirect_ledger.as_ref().is_none_or(|l| {
+                        !l.records
+                            .keys()
+                            .any(|k| canonical_purl(k) == canonical_purl(purl))
+                    })
+            })
+            .filter_map(|(purl, _)| records.get(purl))
+            .filter(|record| {
+                !state.entries.values().any(|e| {
+                    e.ecosystem == "npm" && e.uuid == record.uuid && !e.artifact.sha256.is_empty()
+                })
+            })
+            .map(|record| record.uuid.clone())
+            .collect();
+        cfg.prefetch_archives(planned)
+    });
     for (index, (purl, pkg_path)) in all_packages.iter().enumerate() {
         let is_variant_eco =
             Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());

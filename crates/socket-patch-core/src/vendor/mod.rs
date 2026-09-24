@@ -280,6 +280,33 @@ impl VendorServiceConfig {
     pub fn service_enabled(&self) -> bool {
         self.source.may_use_service() && !self.offline && self.client.is_some()
     }
+
+    /// Attach a download plan to this config's client: `uuids` are the
+    /// records the vendor loop is expected to download from the service,
+    /// in loop order (see [`crate::api::client::ApiClient::prefetch_vendor_packages`]).
+    /// `None` — nothing attached — when the service is not enabled, when
+    /// fewer than two downloads are planned (nothing to overlap), or under
+    /// a tight descriptor limit (the serial loop held one socket at a time;
+    /// see [`crate::crawlers::walk_pool::fd_limit_is_tight`]).
+    pub fn prefetch_archives(
+        &self,
+        uuids: Vec<String>,
+    ) -> Option<crate::api::client::VendorPrefetchGuard> {
+        if !self.service_enabled()
+            || uuids.len() < 2
+            || crate::crawlers::walk_pool::fd_limit_is_tight()
+        {
+            return None;
+        }
+        let client = self.client.as_ref()?;
+        Some(client.prefetch_vendor_packages(
+            uuids,
+            self.use_public_proxy,
+            self.vendor_url.as_deref(),
+            self.patch_server_url.as_deref(),
+            crate::utils::concurrent::api_concurrency(self.use_public_proxy),
+        ))
+    }
 }
 
 /// One warning per staged file whose pre-patch content matched NEITHER

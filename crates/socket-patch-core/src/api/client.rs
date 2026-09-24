@@ -13,6 +13,8 @@ use serde::Serialize;
 use crate::api::ranking::severity_order as get_severity_order;
 use crate::api::ranking::{cmp_batch_infos, cmp_search_results};
 use crate::api::types::*;
+use crate::api::vendor_prefetch::VendorPrefetch;
+pub use crate::api::vendor_prefetch::VendorPrefetchGuard;
 use crate::constants::USER_AGENT as USER_AGENT_VALUE;
 use crate::utils::env_compat::{is_debug_enabled, is_offline_env, proxy_url_from_env};
 use crate::utils::notice::{notice_once, Notice};
@@ -131,6 +133,15 @@ pub struct HeldBack<T> {
 }
 
 impl<T> HeldBack<T> {
+    pub(crate) fn new(value: T, debug: Vec<String>) -> Self {
+        Self { value, debug }
+    }
+
+    /// The output, without releasing the debug lines.
+    pub(crate) fn peek(&self) -> &T {
+        &self.value
+    }
+
     /// The output, printing the held-back debug lines first.
     pub fn release(self) -> T {
         flush_deferred_debug(self.debug);
@@ -189,6 +200,11 @@ pub struct ApiClient {
     /// [`PROXY_BATCH_PATH_CONCURRENCY`] requests in total: the peak the
     /// serial batch loop reached, never that peak times the window.
     proxy_batch_slots: Arc<tokio::sync::Semaphore>,
+    /// The vendor loop's download plan, while one is attached
+    /// ([`Self::prefetch_vendor_packages`]): [`Self::fetch_vendor_package`]
+    /// takes a planned uuid's outcome from it instead of requesting it.
+    /// Shared by clones, like the breaker it defers to.
+    vendor_prefetch: Arc<std::sync::Mutex<Option<Arc<VendorPrefetch>>>>,
 }
 
 /// Most requests the public proxy's batch path keeps in flight per client:
@@ -257,7 +273,7 @@ impl VendorRetryPolicy {
 /// Consecutive retryable vendor-service failures after which the rest of the
 /// run skips the service without any I/O (`auto` then builds locally,
 /// `service` fails closed — the existing miss policy).
-const VENDOR_BREAKER_THRESHOLD: u32 = 2;
+pub(crate) const VENDOR_BREAKER_THRESHOLD: u32 = 2;
 
 /// A jitter sample in `[0, 1)` from std's randomly keyed hasher (no RNG
 /// dependency; the quality needed here is "not synchronized").
@@ -348,6 +364,7 @@ impl ApiClient {
             vendor_retry: VendorRetryPolicy::default(),
             vendor_outage: Arc::new(AtomicU32::new(0)),
             proxy_batch_slots: Arc::new(tokio::sync::Semaphore::new(PROXY_BATCH_PATH_CONCURRENCY)),
+            vendor_prefetch: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -364,6 +381,12 @@ impl ApiClient {
     pub fn with_vendor_retry(mut self, policy: VendorRetryPolicy) -> Self {
         self.vendor_retry = policy;
         self
+    }
+
+    /// The run-level breaker's consecutive-failure count (tests).
+    #[cfg(test)]
+    pub(crate) fn vendor_outage_count(&self) -> u32 {
+        self.vendor_outage.load(Ordering::Relaxed)
     }
 
     /// Returns the API token, if set.
@@ -938,9 +961,28 @@ impl ApiClient {
                  this run"
             )));
         }
-        let (outcome, retryable_failure) = self
-            .fetch_vendor_package_once(uuid, free_only, vendor_url, patch_server_url)
-            .await;
+        // A download the attached plan already fetched stands in for the
+        // live requests; everything around it (the breaker check above, the
+        // counter update below) runs here, in call order, as before.
+        let plan = self
+            .vendor_prefetch
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        let prefetched = match plan {
+            Some(plan) => {
+                plan.take(self, uuid, free_only, vendor_url, patch_server_url)
+                    .await
+            }
+            None => None,
+        };
+        let (outcome, retryable_failure) = match prefetched {
+            Some(fetched) => fetched.release(),
+            None => {
+                self.fetch_vendor_package_once(uuid, free_only, vendor_url, patch_server_url)
+                    .await
+            }
+        };
         match &outcome {
             VendorServiceOutcome::Failed(_) if retryable_failure => {
                 self.vendor_outage.fetch_add(1, Ordering::Relaxed);
@@ -953,9 +995,33 @@ impl ApiClient {
         outcome
     }
 
+    /// Attach a download plan: `uuids` are the packages the vendor loop is
+    /// expected to download from the service, in loop order, with these
+    /// request parameters. Until the guard drops, the loop's
+    /// [`Self::fetch_vendor_package`] call for a planned uuid takes an
+    /// outcome fetched ahead of it (at most `window` in flight) — see
+    /// [`super::vendor_prefetch`] for why nothing observable changes. The
+    /// plan replaces any plan already attached.
+    pub fn prefetch_vendor_packages(
+        &self,
+        uuids: Vec<String>,
+        free_only: bool,
+        vendor_url: Option<&str>,
+        patch_server_url: Option<&str>,
+        window: usize,
+    ) -> VendorPrefetchGuard {
+        let plan = VendorPrefetch::new(uuids, free_only, vendor_url, patch_server_url, window);
+        if let Ok(mut slot) = self.vendor_prefetch.lock() {
+            *slot = Some(Arc::new(plan));
+        }
+        VendorPrefetchGuard {
+            slot: Arc::clone(&self.vendor_prefetch),
+        }
+    }
+
     /// [`Self::fetch_vendor_package`] without the breaker: the outcome, and
     /// whether a `Failed` one was a retryable (availability) failure.
-    async fn fetch_vendor_package_once(
+    pub(crate) async fn fetch_vendor_package_once(
         &self,
         uuid: &str,
         free_only: bool,
