@@ -234,13 +234,14 @@ impl RubyCrawler {
     /// RubyGems' own precedence order.
     ///
     /// The two `gem env` subprocesses run concurrently (each is one
-    /// ruby boot); their answers are consumed in the fixed order above.
+    /// ruby boot), once per process ([`Self::gem_env_homes`]); their
+    /// answers are consumed in the fixed order above. The directory probes
+    /// are re-run on every call.
     async fn gem_env_gems_dirs() -> Vec<PathBuf> {
         let mut paths = Vec::new();
         let mut seen = HashSet::new();
 
-        let (gemdir, gempath) =
-            tokio::join!(Self::run_gem_env("gemdir"), Self::run_gem_env("gempath"));
+        let (gemdir, gempath) = Self::gem_env_homes().await;
 
         if let Some(gemdir) = gemdir {
             let gems_path = PathBuf::from(gemdir).join("gems");
@@ -521,6 +522,23 @@ impl RubyCrawler {
         paths
     }
 
+    /// `gem env gemdir` and `gem env gempath`, asked once per process
+    /// environment: a scan asks from the project fallback, the global
+    /// paths, the hosted stale probe and rollback lookup — two ruby boots
+    /// (100-400 ms) each time — and the answers are RubyGems configuration
+    /// that nothing in a run changes. The memo is keyed on everything the
+    /// subprocess inherits (the environment and working directory), so a
+    /// caller that swaps `PATH` or `GEM_HOME` still asks afresh.
+    async fn gem_env_homes() -> GemEnvHomes {
+        static MEMO: once_cell::sync::Lazy<GemEnvMemo> =
+            once_cell::sync::Lazy::new(Default::default);
+        let cell = gem_env_cell(&MEMO, gem_env_key());
+        memoize_gem_env_homes(&cell, || async {
+            tokio::join!(Self::run_gem_env("gemdir"), Self::run_gem_env("gempath"))
+        })
+        .await
+    }
+
     /// Run `gem env <key>` (on the blocking pool — it waits on a
     /// subprocess) and return the trimmed stdout.
     async fn run_gem_env(key: &'static str) -> Option<String> {
@@ -748,6 +766,48 @@ pub fn parse_gem_env_output(stdout: &str) -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+/// `(gemdir, gempath)` as [`parse_gem_env_output`] reads each `gem env` answer.
+type GemEnvHomes = (Option<String>, Option<String>);
+
+/// What a `gem env` subprocess inherits: the (sorted) environment and the
+/// working directory.
+type GemEnvKey = (
+    Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    Option<PathBuf>,
+);
+
+type GemEnvMemo =
+    std::sync::Mutex<HashMap<GemEnvKey, std::sync::Arc<tokio::sync::OnceCell<GemEnvHomes>>>>;
+
+fn gem_env_key() -> GemEnvKey {
+    let mut vars: Vec<_> = std::env::vars_os().collect();
+    vars.sort();
+    (vars, std::env::current_dir().ok())
+}
+
+/// The memo cell for `key`, created empty on first sight.
+fn gem_env_cell(
+    memo: &GemEnvMemo,
+    key: GemEnvKey,
+) -> std::sync::Arc<tokio::sync::OnceCell<GemEnvHomes>> {
+    let mut memo = memo.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::sync::Arc::clone(memo.entry(key).or_default())
+}
+
+/// The first caller runs `ask`; concurrent callers wait for its answer and
+/// later ones reuse it. Split from [`RubyCrawler::gem_env_homes`] so tests
+/// can count the asks against a cell of their own.
+async fn memoize_gem_env_homes<F, Fut>(
+    cell: &tokio::sync::OnceCell<GemEnvHomes>,
+    ask: F,
+) -> GemEnvHomes
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = GemEnvHomes>,
+{
+    cell.get_or_init(ask).await.clone()
 }
 
 /// Split a `gem env gempath` value into the `<home>/gems` directories it
@@ -2040,6 +2100,61 @@ mod tests {
         let purls = vec!["pkg:gem/rails@7.1.0".to_string()];
         let result = crawler.find_by_purls(dir.path(), &purls).await.unwrap();
         assert_eq!(result.get("pkg:gem/rails@7.1.0").unwrap().path, exact);
+    }
+
+    // ── gem env memo ──────────────────────────────────────────────
+
+    /// Every caller gets the first answer, however many ask at once, and
+    /// the subprocess pair runs exactly once.
+    #[tokio::test]
+    async fn gem_env_homes_are_asked_once_per_cell() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let cell = Arc::new(tokio::sync::OnceCell::new());
+        let asks = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let (cell, asks) = (Arc::clone(&cell), Arc::clone(&asks));
+            tasks.push(tokio::spawn(async move {
+                memoize_gem_env_homes(&cell, || async {
+                    let n = asks.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    (Some(format!("/gems/home-{n}")), None)
+                })
+                .await
+            }));
+        }
+        for task in tasks {
+            assert_eq!(
+                task.await.expect("memo task"),
+                (Some("/gems/home-0".to_string()), None)
+            );
+        }
+        assert_eq!(asks.load(Ordering::SeqCst), 1);
+        let later = memoize_gem_env_homes(&cell, || async { (None, Some("x".into())) }).await;
+        assert_eq!(later, (Some("/gems/home-0".to_string()), None));
+    }
+
+    /// One cell per inherited environment: the same key shares a cell, a
+    /// swapped `PATH` gets its own.
+    #[test]
+    fn gem_env_cells_are_keyed_on_the_inherited_environment() {
+        let memo = GemEnvMemo::default();
+        let key = |path: &str| -> GemEnvKey {
+            (
+                vec![("PATH".into(), path.into())],
+                Some(PathBuf::from("/work")),
+            )
+        };
+        let a = gem_env_cell(&memo, key("/usr/bin"));
+        let again = gem_env_cell(&memo, key("/usr/bin"));
+        let swapped = gem_env_cell(&memo, key("/tmp/fake-bin"));
+        assert!(std::sync::Arc::ptr_eq(&a, &again));
+        assert!(!std::sync::Arc::ptr_eq(&a, &swapped));
+        let (vars, cwd) = gem_env_key();
+        assert!(vars.windows(2).all(|w| w[0] <= w[1]), "sorted env snapshot");
+        assert_eq!(cwd, std::env::current_dir().ok());
     }
 
     // ── gem env gempath splitting (OS path separator) ─────────────
