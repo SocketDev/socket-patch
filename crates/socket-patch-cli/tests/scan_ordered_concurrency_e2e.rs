@@ -363,6 +363,12 @@ async fn batch_fallback_mid_run_replays_from_the_failing_chunk() {
     let mut tail: Vec<String> = order[3..].iter().map(|&i| purl(NAMES[i])).collect();
     tail.sort();
     assert_eq!(proxied, tail);
+
+    // The authenticated API saw every chunk: chunk 0 alone, then the
+    // whole 1..6 window in flight at once. So the answers for chunks 4-5
+    // really existed (they arrived before chunk 3's 401) and were
+    // dropped — the uuids above prove it — rather than never requested.
+    assert_eq!(batch_requests(&auth, &auth_batch_route()).await.len(), 6);
 }
 
 /// Mixed 500s in chunks 2 and 4 with reversed latencies: the per-batch
