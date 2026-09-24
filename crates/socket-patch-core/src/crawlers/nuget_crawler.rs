@@ -1,9 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
+use super::listing::{list_dir_sync, ListedEntry};
 use super::types::{CrawledPackage, CrawlerOptions};
+use super::walk_pool::run_walk;
 use crate::patch::path_safety;
-use crate::utils::fs::is_dir;
+use crate::utils::fs::{is_dir, is_dir_sync, run_blocking};
+
+#[cfg(test)]
+mod oracle;
 
 /// NuGet/.NET ecosystem crawler for discovering packages in global cache,
 /// legacy `packages/` folders, and `obj/` restore layouts.
@@ -85,250 +92,69 @@ impl NuGetCrawler {
     }
 
     /// Crawl all discovered package paths and return every package found.
+    ///
+    /// The scan runs on the walk pool (the global packages folder holds
+    /// thousands of `<name>/<version>/` dirs, and one runtime hop per
+    /// readdir and stat dominated the crawl): each top-level entry is
+    /// classified in parallel, then the PURL dedup runs serially in listing
+    /// order, so the same first-seen dir wins and packages come out in the
+    /// sequential scan's order.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
-        let mut packages = Vec::new();
-        let mut seen = HashSet::new();
-
         let pkg_paths = self
             .get_nuget_package_paths(options)
             .await
             .unwrap_or_default();
-
-        for pkg_path in &pkg_paths {
-            let found = self.scan_package_dir(pkg_path, &mut seen).await;
-            packages.extend(found);
+        if pkg_paths.is_empty() {
+            return Vec::new();
         }
 
-        packages
+        run_walk(move || {
+            let mut packages = Vec::new();
+            let mut seen = HashSet::new();
+            for pkg_path in &pkg_paths {
+                packages.extend(scan_package_dir(pkg_path, &mut seen));
+            }
+            packages
+        })
+        .await
     }
 
     /// Find specific packages by PURL inside a single package directory.
+    ///
+    /// Runs as one blocking-pool task, and the package root is listed at
+    /// most once per call for the case-insensitive legacy fallback (it used
+    /// to be re-listed for every PURL that missed both exact layouts).
     pub async fn find_by_purls(
         &self,
         pkg_path: &Path,
         purls: &[String],
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
-        let mut result: HashMap<String, CrawledPackage> = HashMap::new();
-
-        for purl in purls {
-            let Some((name, version)) = crate::utils::purl::parse_nuget_purl(purl) else {
-                continue;
-            };
-            let (name, version) = (name.as_ref(), version.as_ref());
-            // SECURITY: the coordinates are untrusted manifest input
-            // joined onto the package root and then patched IN PLACE
-            // (NuGet has no redirect backend). Reject anything that
-            // could traverse out of the root before touching the
-            // filesystem — `verify_nuget_package` only checks for
-            // `lib/` or a `.nuspec`, so it is no defense.
-            if !is_safe_nuget_coordinate(name, version) {
-                continue;
-            }
-
-            // Global cache layout: <lowercase-name>/<lowercase-version>/.
-            // NuGet lowercases BOTH the id and the version when it lays
-            // out the global packages folder, so a prerelease tag like
-            // `2.0.0-RC1` lives on disk as `2.0.0-rc1`. Lowercasing only
-            // the name (but not the version) would miss those packages.
-            let global_dir = pkg_path
-                .join(name.to_lowercase())
-                .join(version.to_lowercase());
-            // Legacy layout: <Name>.<Version>/, tried exact-case first, then
-            // case-insensitively (NuGet names are case-insensitive).
-            let legacy_dir = pkg_path.join(format!("{name}.{version}"));
-
-            let found = if self.verify_nuget_package(&global_dir).await {
-                Some(global_dir)
-            } else if self.verify_nuget_package(&legacy_dir).await {
-                Some(legacy_dir)
-            } else {
-                self.find_legacy_dir_case_insensitive(pkg_path, name, version)
-                    .await
-            };
-
-            if let Some(path) = found {
-                result.insert(
-                    purl.clone(),
-                    CrawledPackage {
-                        name: name.to_string(),
-                        version: version.to_string(),
-                        namespace: None,
-                        purl: purl.clone(),
-                        path,
-                    },
-                );
-            }
+        if purls.is_empty() {
+            return Ok(HashMap::new());
         }
-
-        Ok(result)
+        let pkg_path = pkg_path.to_path_buf();
+        let purls = purls.to_vec();
+        Ok(run_blocking(move || find_by_purls_sync(&pkg_path, &purls)).await)
     }
 
     // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
 
-    /// Scan a package directory and return all valid NuGet packages found.
-    ///
-    /// Handles both layouts:
-    /// - Global cache: `<name>/<version>/` with `.nuspec` inside
-    /// - Legacy packages/: `<Name>.<Version>/` with `.nuspec` inside
+    /// The unit tests' entry point to [`scan_package_dir`].
+    #[cfg(test)]
     async fn scan_package_dir(
         &self,
         pkg_path: &Path,
         seen: &mut HashSet<String>,
     ) -> Vec<CrawledPackage> {
-        let mut results = Vec::new();
-
-        for entry in crate::utils::fs::list_dir_entries(pkg_path).await {
-            if !crate::utils::fs::entry_is_dir(&entry).await {
-                continue;
-            }
-
-            let dir_name = entry.file_name();
-            let dir_name_str = dir_name.to_string_lossy();
-
-            // Skip hidden directories
-            if dir_name_str.starts_with('.') {
-                continue;
-            }
-
-            let entry_path = pkg_path.join(&*dir_name_str);
-
-            // Try global cache layout: this directory is a package name,
-            // containing version subdirectories
-            if let Some(pkgs) = self
-                .scan_global_cache_package(&entry_path, &dir_name_str, seen)
-                .await
-            {
-                results.extend(pkgs);
-                continue;
-            }
-
-            // Try legacy layout: <Name>.<Version>/ directory
-            if let Some((name, version)) = parse_legacy_dir_name(&dir_name_str) {
-                if self.verify_nuget_package(&entry_path).await {
-                    let purl = crate::utils::purl::build_nuget_purl(&name, &version);
-                    if !seen.contains(&purl) {
-                        seen.insert(purl.clone());
-                        results.push(CrawledPackage {
-                            name,
-                            version,
-                            namespace: None,
-                            purl,
-                            path: entry_path,
-                        });
-                    }
-                }
-            }
-        }
-
-        results
+        scan_package_dir(pkg_path, seen)
     }
 
-    /// Scan a global cache package directory (`<name>/`) for version subdirectories.
-    async fn scan_global_cache_package(
-        &self,
-        name_dir: &Path,
-        name: &str,
-        seen: &mut HashSet<String>,
-    ) -> Option<Vec<CrawledPackage>> {
-        let mut found_any = false;
-        let mut results = Vec::new();
-
-        for ver_entry in crate::utils::fs::list_dir_entries(name_dir).await {
-            if !crate::utils::fs::entry_is_dir(&ver_entry).await {
-                continue;
-            }
-
-            let ver_name = ver_entry.file_name();
-            let ver_str = ver_name.to_string_lossy();
-
-            // A global-cache name directory contains only *version*
-            // subdirectories, and a NuGet version always begins with a
-            // numeric major component (SemVer). A legacy
-            // `<Name>.<Version>/` package, by contrast, contains content
-            // folders (`lib/`, `tools/`, `runtimes/`, `build/`, …), none
-            // of which start with a digit. Without this shape check, a
-            // legacy package whose content folder happens to verify (e.g.
-            // a `tools/lib/` tool package missing its top-level `.nuspec`)
-            // would be misread as a global-cache layout and emitted with a
-            // garbage `@<folder>` version (e.g. `pkg:nuget/Foo.1.0.0@tools`)
-            // — masking the real `pkg:nuget/Foo@1.0.0` the legacy branch
-            // would otherwise produce.
-            if !ver_str.starts_with(|c: char| c.is_ascii_digit()) {
-                continue;
-            }
-
-            let ver_path = name_dir.join(&*ver_str);
-
-            if self.verify_nuget_package(&ver_path).await {
-                found_any = true;
-                let purl = crate::utils::purl::build_nuget_purl(name, &ver_str);
-                if !seen.contains(&purl) {
-                    seen.insert(purl.clone());
-                    results.push(CrawledPackage {
-                        name: name.to_string(),
-                        version: ver_str.to_string(),
-                        namespace: None,
-                        purl,
-                        path: ver_path,
-                    });
-                }
-            }
-        }
-
-        if found_any {
-            Some(results)
-        } else {
-            None
-        }
-    }
-
-    /// Verify that a directory looks like an installed NuGet package.
-    /// Checks for a `.nuspec` file or a `lib/` directory.
+    /// The unit tests' entry point to [`verify_nuget_package`].
+    #[cfg(test)]
     async fn verify_nuget_package(&self, path: &Path) -> bool {
-        if !is_dir(path).await {
-            return false;
-        }
-
-        // Check for lib/ directory
-        if is_dir(&path.join("lib")).await {
-            return true;
-        }
-
-        // Check for any .nuspec file
-        for entry in crate::utils::fs::list_dir_entries(path).await {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".nuspec") {
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
-    /// Find a legacy package directory with case-insensitive matching.
-    async fn find_legacy_dir_case_insensitive(
-        &self,
-        pkg_path: &Path,
-        name: &str,
-        version: &str,
-    ) -> Option<PathBuf> {
-        let target = format!("{}.{}", name.to_lowercase(), version.to_lowercase());
-
-        for entry in crate::utils::fs::list_dir_entries(pkg_path).await {
-            let dir_name = entry.file_name();
-            let dir_name_str = dir_name.to_string_lossy();
-            if dir_name_str.to_lowercase() == target {
-                let path = pkg_path.join(&*dir_name_str);
-                if self.verify_nuget_package(&path).await {
-                    return Some(path);
-                }
-            }
-        }
-
-        None
+        verify_nuget_package(path)
     }
 }
 
@@ -336,6 +162,222 @@ impl Default for NuGetCrawler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Blocking body of [`NuGetCrawler::find_by_purls`].
+fn find_by_purls_sync(pkg_path: &Path, purls: &[String]) -> HashMap<String, CrawledPackage> {
+    let mut result: HashMap<String, CrawledPackage> = HashMap::new();
+    // The package root's entry names (lossy, in readdir order), listed on
+    // the first PURL that needs the case-insensitive fallback.
+    let mut root_names: Option<Vec<String>> = None;
+
+    for purl in purls {
+        let Some((name, version)) = crate::utils::purl::parse_nuget_purl(purl) else {
+            continue;
+        };
+        let (name, version) = (name.as_ref(), version.as_ref());
+        // SECURITY: the coordinates are untrusted manifest input
+        // joined onto the package root and then patched IN PLACE
+        // (NuGet has no redirect backend). Reject anything that
+        // could traverse out of the root before touching the
+        // filesystem — `verify_nuget_package` only checks for
+        // `lib/` or a `.nuspec`, so it is no defense.
+        if !is_safe_nuget_coordinate(name, version) {
+            continue;
+        }
+
+        // Global cache layout: <lowercase-name>/<lowercase-version>/.
+        // NuGet lowercases BOTH the id and the version when it lays
+        // out the global packages folder, so a prerelease tag like
+        // `2.0.0-RC1` lives on disk as `2.0.0-rc1`. Lowercasing only
+        // the name (but not the version) would miss those packages.
+        let global_dir = pkg_path
+            .join(name.to_lowercase())
+            .join(version.to_lowercase());
+        // Legacy layout: <Name>.<Version>/, tried exact-case first, then
+        // case-insensitively (NuGet names are case-insensitive).
+        let legacy_dir = pkg_path.join(format!("{name}.{version}"));
+
+        let found = if verify_nuget_package(&global_dir) {
+            Some(global_dir)
+        } else if verify_nuget_package(&legacy_dir) {
+            Some(legacy_dir)
+        } else {
+            let root_names = root_names.get_or_insert_with(|| {
+                list_dir_sync(pkg_path)
+                    .into_iter()
+                    .map(|entry| entry.name.to_string_lossy().into_owned())
+                    .collect()
+            });
+            find_legacy_dir_case_insensitive(pkg_path, root_names, name, version)
+        };
+
+        if let Some(path) = found {
+            result.insert(
+                purl.clone(),
+                CrawledPackage {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    namespace: None,
+                    purl: purl.clone(),
+                    path,
+                },
+            );
+        }
+    }
+
+    result
+}
+
+/// What one top-level entry of a package directory holds, in the order the
+/// sequential scan emitted it: `(name, version, path)` candidates, before
+/// the PURL dedup.
+fn classify_package_entry(pkg_path: &Path, entry: &ListedEntry) -> Vec<(String, String, PathBuf)> {
+    if !entry.is_dir(pkg_path) {
+        return Vec::new();
+    }
+
+    let dir_name_str = entry.name.to_string_lossy();
+
+    // Skip hidden directories
+    if dir_name_str.starts_with('.') {
+        return Vec::new();
+    }
+
+    let entry_path = pkg_path.join(&*dir_name_str);
+
+    // Try global cache layout: this directory is a package name,
+    // containing version subdirectories
+    if let Some(pkgs) = scan_global_cache_package(&entry_path, &dir_name_str) {
+        return pkgs;
+    }
+
+    // Try legacy layout: <Name>.<Version>/ directory
+    if let Some((name, version)) = parse_legacy_dir_name(&dir_name_str) {
+        if verify_nuget_package(&entry_path) {
+            return vec![(name, version, entry_path)];
+        }
+    }
+    Vec::new()
+}
+
+/// Scan a package directory and return all valid NuGet packages found.
+///
+/// Handles both layouts:
+/// - Global cache: `<name>/<version>/` with `.nuspec` inside
+/// - Legacy packages/: `<Name>.<Version>/` with `.nuspec` inside
+fn scan_package_dir(pkg_path: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
+    let entries = list_dir_sync(pkg_path);
+    // Classification is independent per entry; only the dedup is ordered.
+    let classified: Vec<Vec<(String, String, PathBuf)>> = entries
+        .par_iter()
+        .map(|entry| classify_package_entry(pkg_path, entry))
+        .collect();
+
+    let mut results = Vec::new();
+    for (name, version, path) in classified.into_iter().flatten() {
+        let purl = crate::utils::purl::build_nuget_purl(&name, &version);
+        if seen.insert(purl.clone()) {
+            results.push(CrawledPackage {
+                name,
+                version,
+                namespace: None,
+                purl,
+                path,
+            });
+        }
+    }
+    results
+}
+
+/// Scan a global cache package directory (`<name>/`) for version
+/// subdirectories: `Some` (every verified version, in listing order) when
+/// at least one verifies, else `None` — the entry is then tried as a
+/// legacy `<Name>.<Version>/` dir.
+fn scan_global_cache_package(
+    name_dir: &Path,
+    name: &str,
+) -> Option<Vec<(String, String, PathBuf)>> {
+    let mut results = Vec::new();
+
+    for ver_entry in list_dir_sync(name_dir) {
+        if !ver_entry.is_dir(name_dir) {
+            continue;
+        }
+
+        let ver_str = ver_entry.name.to_string_lossy();
+
+        // A global-cache name directory contains only *version*
+        // subdirectories, and a NuGet version always begins with a
+        // numeric major component (SemVer). A legacy
+        // `<Name>.<Version>/` package, by contrast, contains content
+        // folders (`lib/`, `tools/`, `runtimes/`, `build/`, …), none
+        // of which start with a digit. Without this shape check, a
+        // legacy package whose content folder happens to verify (e.g.
+        // a `tools/lib/` tool package missing its top-level `.nuspec`)
+        // would be misread as a global-cache layout and emitted with a
+        // garbage `@<folder>` version (e.g. `pkg:nuget/Foo.1.0.0@tools`)
+        // — masking the real `pkg:nuget/Foo@1.0.0` the legacy branch
+        // would otherwise produce.
+        if !ver_str.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let ver_path = name_dir.join(&*ver_str);
+
+        if verify_nuget_package(&ver_path) {
+            results.push((name.to_string(), ver_str.to_string(), ver_path));
+        }
+    }
+
+    if results.is_empty() {
+        None
+    } else {
+        Some(results)
+    }
+}
+
+/// Verify that a directory looks like an installed NuGet package.
+/// Checks for a `.nuspec` file or a `lib/` directory.
+fn verify_nuget_package(path: &Path) -> bool {
+    if !is_dir_sync(path) {
+        return false;
+    }
+
+    // Check for lib/ directory
+    if is_dir_sync(&path.join("lib")) {
+        return true;
+    }
+
+    // Check for any .nuspec file
+    list_dir_sync(path).iter().any(|entry| {
+        entry
+            .name
+            .to_str()
+            .is_some_and(|name| name.ends_with(".nuspec"))
+    })
+}
+
+/// Find a legacy package directory with case-insensitive matching, over the
+/// package root's (lossy) entry names in readdir order.
+fn find_legacy_dir_case_insensitive(
+    pkg_path: &Path,
+    root_names: &[String],
+    name: &str,
+    version: &str,
+) -> Option<PathBuf> {
+    let target = format!("{}.{}", name.to_lowercase(), version.to_lowercase());
+
+    for dir_name_str in root_names {
+        if dir_name_str.to_lowercase() == target {
+            let path = pkg_path.join(dir_name_str);
+            if verify_nuget_package(&path) {
+                return Some(path);
+            }
+        }
+    }
+
+    None
 }
 
 /// Whether the PURL-derived NuGet coordinates are safe to join onto the
@@ -1257,5 +1299,141 @@ mod tests {
             paths.contains(&pkg_folder),
             "a NuGet.config-only root must be gated in and its sub-project assets discovered, got {paths:?}"
         );
+    }
+
+    // ── Equivalence with the per-call async scan (oracle) ─────────────
+
+    mod equivalence {
+        use super::super::oracle::LegacyNuGetCrawler;
+        use super::*;
+        use crate::crawlers::oracle_support::{
+            map_rows, mkdir, rows, symlink, write, PermGuard, Rng,
+        };
+
+        const IDS: &[&str] = &["Newtonsoft.Json", "xunit", "System.Text.Json", "Dup", "dup"];
+        const VERSIONS: &[&str] = &["13.0.3", "2.0.0-RC1", "8.0.0", "1.0.0"];
+
+        /// Fill a package dir with one of the verify shapes (lib/, a
+        /// .nuspec, a .nuspec DIR, a lib FILE, nothing).
+        fn contents(rng: &mut Rng, dir: &Path, id: &str) {
+            mkdir(dir);
+            match rng.below(6) {
+                0 => mkdir(&dir.join("lib")),
+                1 => write(
+                    &dir.join(format!("{}.nuspec", id.to_lowercase())),
+                    "<package/>",
+                ),
+                2 => mkdir(&dir.join("x.nuspec")),
+                3 => write(&dir.join("lib"), "file"),
+                4 => mkdir(&dir.join("tools").join("lib")),
+                _ => {}
+            }
+        }
+
+        fn tree(rng: &mut Rng, root: &Path, outside: &Path, perms: &mut PermGuard) {
+            mkdir(root);
+            for i in 0..rng.below(20) {
+                let id = rng.pick(IDS);
+                let version = rng.pick(VERSIONS);
+                match rng.below(10) {
+                    // Global cache layout, sometimes with non-version dirs.
+                    0..=3 => {
+                        let name_dir = root.join(id.to_lowercase());
+                        for _ in 0..rng.below(3) + 1 {
+                            let ver = if rng.chance(20) {
+                                "tools"
+                            } else {
+                                rng.pick(VERSIONS)
+                            };
+                            let ver = if rng.chance(50) {
+                                ver.to_lowercase()
+                            } else {
+                                ver.to_string()
+                            };
+                            contents(rng, &name_dir.join(ver), id);
+                        }
+                        if rng.chance(10) {
+                            perms.plan(&name_dir, if rng.chance(50) { 0o000 } else { 0o600 });
+                        }
+                    }
+                    // Legacy layout, in either case.
+                    4..=6 => {
+                        let base = format!("{id}.{version}");
+                        let name = if rng.chance(30) {
+                            base.to_lowercase()
+                        } else {
+                            base
+                        };
+                        contents(rng, &root.join(name), id);
+                    }
+                    7 => {
+                        let target = outside.join(format!("t{i}-{}", rng.next()));
+                        if rng.chance(70) {
+                            contents(rng, &target, id);
+                        }
+                        let name = format!("{id}.{version}");
+                        symlink(&target, &root.join(name));
+                    }
+                    8 => write(&root.join(format!("{id}.{version}")), "file"),
+                    _ => contents(rng, &root.join(format!(".{id}.{version}")), id),
+                }
+            }
+        }
+
+        fn probe_purls(rng: &mut Rng, crawled: &[CrawledPackage]) -> Vec<String> {
+            let mut purls: Vec<String> = crawled.iter().map(|p| p.purl.clone()).collect();
+            for _ in 0..12 {
+                let id = rng.pick(IDS);
+                let version = rng.pick(VERSIONS);
+                let id = match rng.below(3) {
+                    0 => id.to_lowercase(),
+                    1 => id.to_uppercase(),
+                    _ => id.to_string(),
+                };
+                purls.push(format!("pkg:nuget/{id}@{version}"));
+            }
+            purls.push("pkg:nuget/..@1.0.0".to_string());
+            purls.push("pkg:nuget/Foo@../x".to_string());
+            purls
+        }
+
+        #[tokio::test]
+        async fn randomized_package_dirs_match_the_async_oracle() {
+            let (mut crawled, mut found) = (0, 0);
+            for seed in 0..64u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut perms = PermGuard::default();
+                let mut rng = Rng::new(seed);
+                let root = tmp.path().join("packages");
+                tree(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                perms.apply();
+                let options = CrawlerOptions {
+                    cwd: tmp.path().to_path_buf(),
+                    global: false,
+                    global_prefix: Some(root.clone()),
+                };
+                let new = NuGetCrawler::new().crawl_all(&options).await;
+                let old = LegacyNuGetCrawler::crawl_all(&options).await;
+                assert_eq!(rows(&new), rows(&old), "seed {seed}: crawl_all");
+
+                let purls = probe_purls(&mut rng, &old);
+                let new_found = NuGetCrawler::new()
+                    .find_by_purls(&root, &purls)
+                    .await
+                    .unwrap();
+                let old_found = LegacyNuGetCrawler::find_by_purls(&root, &purls).await;
+                assert_eq!(
+                    map_rows(&new_found),
+                    map_rows(&old_found),
+                    "seed {seed}: find_by_purls"
+                );
+                crawled += old.len();
+                found += old_found.len();
+            }
+            assert!(
+                crawled > 100 && found > 100,
+                "vacuous fixtures: {crawled}/{found}"
+            );
+        }
     }
 }
