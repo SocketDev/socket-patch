@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
-use crate::utils::fs::{entry_is_dir, home_dir, is_dir, list_dir_entries, normalize_lexically};
+use crate::utils::fs::{
+    entry_is_dir, home_dir, is_dir, list_dir_entries, normalize_lexically, run_blocking,
+};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
 /// Ruby/RubyGems ecosystem crawler for discovering gems in Bundler vendor
@@ -230,11 +232,17 @@ impl RubyCrawler {
     /// `gempath` (`GEM_PATH`) entry. Non-existent homes and duplicates are
     /// dropped, so the result is the deduped set of installed-gem roots in
     /// RubyGems' own precedence order.
+    ///
+    /// The two `gem env` subprocesses run concurrently (each is one
+    /// ruby boot); their answers are consumed in the fixed order above.
     async fn gem_env_gems_dirs() -> Vec<PathBuf> {
         let mut paths = Vec::new();
         let mut seen = HashSet::new();
 
-        if let Some(gemdir) = Self::run_gem_env("gemdir").await {
+        let (gemdir, gempath) =
+            tokio::join!(Self::run_gem_env("gemdir"), Self::run_gem_env("gempath"));
+
+        if let Some(gemdir) = gemdir {
             let gems_path = PathBuf::from(gemdir).join("gems");
             if is_dir(&gems_path).await && seen.insert(gems_path.clone()) {
                 paths.push(gems_path);
@@ -246,7 +254,7 @@ impl RubyCrawler {
         // `:` shreds Windows drive-letter paths (`C:\Ruby\...;D:\...`) into
         // `["C", "\Ruby\...;D", "\..."]`, so defer to `split_paths`, which
         // honors the platform separator — same as the Go crawler's GOPATH.
-        if let Some(gempath) = Self::run_gem_env("gempath").await {
+        if let Some(gempath) = gempath {
             for gems_path in gem_homes_to_gems_dirs(&gempath) {
                 if is_dir(&gems_path).await && seen.insert(gems_path.clone()) {
                     paths.push(gems_path);
@@ -513,10 +521,14 @@ impl RubyCrawler {
         paths
     }
 
-    /// Run `gem env <key>` and return the trimmed stdout.
-    async fn run_gem_env(key: &str) -> Option<String> {
-        let stdout = SystemCommandRunner.run("gem", &["env", key]);
-        parse_gem_env_output(stdout.as_deref().unwrap_or(""))
+    /// Run `gem env <key>` (on the blocking pool — it waits on a
+    /// subprocess) and return the trimmed stdout.
+    async fn run_gem_env(key: &'static str) -> Option<String> {
+        run_blocking(move || {
+            let stdout = SystemCommandRunner.run("gem", &["env", key]);
+            parse_gem_env_output(stdout.as_deref().unwrap_or(""))
+        })
+        .await
     }
 
     /// Scan a gem directory and return all valid gem packages found.

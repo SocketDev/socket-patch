@@ -521,6 +521,16 @@ pub async fn find_manifest_package_copies(
     find_all_packages_for_rollback(&partitioned, &crawler_options, quiet).await
 }
 
+/// Box the future `make` returns, constructing it inside this (non-async)
+/// frame so the caller's poll frame only ever holds the pointer.
+fn boxed<'a, T, F, Fut>(make: F) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T> + 'a,
+{
+    Box::pin(make())
+}
+
 /// Crawl all ecosystems and return all packages, per-ecosystem counts and
 /// the gem crawl's refused config-sourced `BUNDLE_PATH`
 /// (`BundleStoreDiscovery::skipped_config_path`, local mode only) —
@@ -533,28 +543,41 @@ pub async fn crawl_all_ecosystems(
     HashMap<Ecosystem, usize>,
     Option<String>,
 ) {
+    // The nine crawlers are independent (none prints, none mutates shared
+    // state), so they run concurrently; their blocking walks and
+    // subprocesses sit on the blocking pool. Results are consumed in the
+    // fixed order below, so packages and counts are exactly the serial
+    // run's. Each future is heap-allocated through `boxed` (constructed
+    // in that helper's frame) so joining nine does not grow the caller's
+    // poll frame by their combined size.
+    let (npm, pypi, cargo, (gems, gem_discovery), golang, maven, composer, nuget, deno) = tokio::join!(
+        boxed(|| NpmCrawler.crawl_all(options)),
+        boxed(|| PythonCrawler.crawl_all(options)),
+        boxed(|| CargoCrawler.crawl_all(options)),
+        boxed(|| RubyCrawler.crawl_all_with_discovery(options)),
+        boxed(|| GoCrawler.crawl_all(options)),
+        boxed(|| MavenCrawler.crawl_all(options)),
+        boxed(|| ComposerCrawler.crawl_all(options)),
+        boxed(|| NuGetCrawler.crawl_all(options)),
+        boxed(|| DenoCrawler.crawl_all(options)),
+    );
+
     let mut all_packages = Vec::new();
     let mut counts: HashMap<Ecosystem, usize> = HashMap::new();
-
-    macro_rules! crawl {
-        ($eco:expr, $crawler:expr) => {{
-            let pkgs = $crawler.crawl_all(options).await;
-            counts.insert($eco, pkgs.len());
-            all_packages.extend(pkgs);
-        }};
+    for (eco, pkgs) in [
+        (Ecosystem::Npm, npm),
+        (Ecosystem::Pypi, pypi),
+        (Ecosystem::Cargo, cargo),
+        (Ecosystem::Gem, gems),
+        (Ecosystem::Golang, golang),
+        (Ecosystem::Maven, maven),
+        (Ecosystem::Composer, composer),
+        (Ecosystem::Nuget, nuget),
+        (Ecosystem::Deno, deno),
+    ] {
+        counts.insert(eco, pkgs.len());
+        all_packages.extend(pkgs);
     }
-
-    crawl!(Ecosystem::Npm, NpmCrawler);
-    crawl!(Ecosystem::Pypi, PythonCrawler);
-    crawl!(Ecosystem::Cargo, CargoCrawler);
-    let (gems, gem_discovery) = RubyCrawler.crawl_all_with_discovery(options).await;
-    counts.insert(Ecosystem::Gem, gems.len());
-    all_packages.extend(gems);
-    crawl!(Ecosystem::Golang, GoCrawler);
-    crawl!(Ecosystem::Maven, MavenCrawler);
-    crawl!(Ecosystem::Composer, ComposerCrawler);
-    crawl!(Ecosystem::Nuget, NuGetCrawler);
-    crawl!(Ecosystem::Deno, DenoCrawler);
 
     let skipped_config_path = gem_discovery.and_then(|d| d.skipped_config_path);
     (all_packages, counts, skipped_config_path)
@@ -1335,6 +1358,82 @@ mod tests {
                 "{eco:?} must be crawled unconditionally — no runtime gates"
             );
         }
+    }
+
+    /// The concurrent crawl must yield exactly the serial run's packages,
+    /// in the fixed ecosystem order, with the same counts. A
+    /// `--global-prefix` root is handed to every crawler verbatim, so one
+    /// polyglot dir exercises several ecosystems at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn crawl_all_ecosystems_matches_serial_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for (name, version) in [("zeta", "1.0.0"), ("alpha", "2.0.0"), ("mid", "3.0.0")] {
+            let pkg_dir = root.join(name);
+            std::fs::create_dir_all(&pkg_dir).unwrap();
+            std::fs::write(
+                pkg_dir.join("package.json"),
+                format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+            )
+            .unwrap();
+        }
+        for (name, version) in [("requests", "2.31.0"), ("attrs", "23.1.0")] {
+            let dist = root.join(format!("{name}-{version}.dist-info"));
+            std::fs::create_dir_all(&dist).unwrap();
+            std::fs::write(
+                dist.join("METADATA"),
+                format!("Name: {name}\nVersion: {version}\n"),
+            )
+            .unwrap();
+        }
+        for (name, version) in [("serde", "1.0.0"), ("anyhow", "1.0.75")] {
+            let krate = root.join(format!("{name}-{version}"));
+            std::fs::create_dir_all(&krate).unwrap();
+            std::fs::write(
+                krate.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+            )
+            .unwrap();
+        }
+        let options = CrawlerOptions {
+            cwd: root.to_path_buf(),
+            global: false,
+            global_prefix: Some(root.to_path_buf()),
+        };
+
+        let (packages, counts, _) = crawl_all_ecosystems(&options).await;
+
+        let mut serial: Vec<CrawledPackage> = Vec::new();
+        let mut serial_counts: HashMap<Ecosystem, usize> = HashMap::new();
+        macro_rules! serial {
+            ($eco:expr, $pkgs:expr) => {{
+                let pkgs = $pkgs;
+                serial_counts.insert($eco, pkgs.len());
+                serial.extend(pkgs);
+            }};
+        }
+        serial!(Ecosystem::Npm, NpmCrawler.crawl_all(&options).await);
+        serial!(Ecosystem::Pypi, PythonCrawler.crawl_all(&options).await);
+        serial!(Ecosystem::Cargo, CargoCrawler.crawl_all(&options).await);
+        serial!(Ecosystem::Gem, RubyCrawler.crawl_all(&options).await);
+        serial!(Ecosystem::Golang, GoCrawler.crawl_all(&options).await);
+        serial!(Ecosystem::Maven, MavenCrawler.crawl_all(&options).await);
+        serial!(
+            Ecosystem::Composer,
+            ComposerCrawler.crawl_all(&options).await
+        );
+        serial!(Ecosystem::Nuget, NuGetCrawler.crawl_all(&options).await);
+        serial!(Ecosystem::Deno, DenoCrawler.crawl_all(&options).await);
+
+        let key = |p: &CrawledPackage| (p.purl.clone(), p.path.clone());
+        assert_eq!(
+            packages.iter().map(key).collect::<Vec<_>>(),
+            serial.iter().map(key).collect::<Vec<_>>()
+        );
+        assert_eq!(counts, serial_counts);
+        // Non-vacuous: several ecosystems contributed.
+        assert!(counts[&Ecosystem::Npm] >= 3, "{counts:?}");
+        assert!(counts[&Ecosystem::Pypi] >= 2, "{counts:?}");
     }
 
     /// Deno is the ONE dispatch branch no other test drives end-to-end

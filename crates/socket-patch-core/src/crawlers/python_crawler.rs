@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
-use crate::utils::fs::read_regular_to_string;
+use crate::utils::fs::{read_regular_to_string, run_blocking};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
 // ---------------------------------------------------------------------------
@@ -991,19 +991,22 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
         }
     }
 
-    // 1. Ask Python for site-packages
-    if let Some(python_cmd) = find_python_command() {
+    // 1. Ask Python for site-packages (subprocesses: on the blocking pool)
+    let site_output = run_blocking(|| {
+        let python_cmd = find_python_command()?;
         let runner = SystemCommandRunner;
-        if let Some(stdout) = runner.run(
+        runner.run(
             python_cmd,
             &[
                 "-c",
                 "import site; print('\\n'.join(site.getsitepackages())); print(site.getusersitepackages())",
             ],
-        ) {
-            for p in parse_python_site_packages_output(&stdout) {
-                add_path(p, &mut seen, &mut results);
-            }
+        )
+    })
+    .await;
+    if let Some(stdout) = site_output {
+        for p in parse_python_site_packages_output(&stdout) {
+            add_path(p, &mut seen, &mut results);
         }
     }
 

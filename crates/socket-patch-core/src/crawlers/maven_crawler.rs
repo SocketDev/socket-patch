@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
-use crate::utils::fs::is_dir;
+use crate::utils::fs::{is_dir, run_blocking};
 
 // ---------------------------------------------------------------------------
 // POM XML minimal parser
@@ -397,8 +397,16 @@ impl MavenCrawler {
 
         let repo_paths = self.get_maven_repo_paths(options).await.unwrap_or_default();
 
-        for repo_path in &repo_paths {
-            let found = self.scan_maven_repo(repo_path, &mut seen);
+        for repo_path in repo_paths {
+            // The walkdir walk and POM reads are blocking: run each repo
+            // on the blocking pool so concurrently crawled ecosystems keep
+            // making progress (the dedup set rides along and comes back).
+            let (found, returned_seen) = run_blocking(move || {
+                let found = MavenCrawler.scan_maven_repo(&repo_path, &mut seen);
+                (found, seen)
+            })
+            .await;
+            seen = returned_seen;
             packages.extend(found);
         }
 
