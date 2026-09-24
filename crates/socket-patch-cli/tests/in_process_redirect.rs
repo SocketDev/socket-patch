@@ -18,6 +18,16 @@ use socket_patch_core::manifest::schema::{
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "npm_e2e_common/manifestless.rs"]
+mod npm_e2e_common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+// `bun_vex` re-exports its own copy of `vex_e2e_common` for the bun cells;
+// the npm cells use the top-level one above.
+#[allow(clippy::duplicate_mod)]
+#[path = "vex_e2e_common/bun.rs"]
+mod bun_vex;
+
 const ORG: &str = "test-org";
 const NAME: &str = "in-proc-redirect";
 const VERSION: &str = "1.0.0";
@@ -857,6 +867,27 @@ fn write_bun_project(root: &Path, lock_version: u64) {
     .unwrap();
 }
 
+/// Manifest-less VEX over a bun leg's hosted state ([`bun_vex`]): a
+/// lockfile-only checkout (nothing installed, so the lock's sha512 pin is
+/// the evidence) is attested `(redirected)` from the ledger and — ledgers
+/// deleted — from the lock + patch API; offline → `record_unavailable`;
+/// the registry lock back → NOT attested.
+fn bun_manifestless_vex(root: &Path, registry_lock: &[u8], tag: &str) {
+    let scratch = tempfile::tempdir().unwrap();
+    let case = bun_vex::BunVexCase {
+        tag,
+        mode: bun_vex::BunMode::Hosted,
+        purl: PURL,
+        uuid: UUID,
+        files: vec![("package/index.js".to_string(), "b".repeat(64))],
+        vulns: &[(GHSA, &["CVE-2024-9"])],
+        lock: "bun.lock",
+        registry_lock: registry_lock.to_vec(),
+        patch_server_url: Some("http://patch.test".to_string()),
+    };
+    bun_vex::run_bun_vex_matrix(root, scratch.path(), &case, |_| {});
+}
+
 /// The bun leg: the registry 4-tuple is rewritten to a URL 3-tuple carrying the
 /// hosted URL + patched sha512; the upstream integrity is gone.
 #[tokio::test]
@@ -865,9 +896,11 @@ async fn scan_redirect_rewrites_bun_lock() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
+    mock_view(&server).await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_bun_project(tmp.path(), 1);
+    let lock_before = std::fs::read(tmp.path().join("bun.lock")).unwrap();
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
     assert_eq!(code, 0, "scan --redirect (bun) should succeed");
@@ -891,6 +924,7 @@ async fn scan_redirect_rewrites_bun_lock() {
             .is_file(),
         "a redirect ledger should be written"
     );
+    bun_manifestless_vex(tmp.path(), &lock_before, "bun-v1");
 }
 
 /// The bun 1.4 leg: `"lockfileVersion": 2` is the SAME emitted grammar as 1
@@ -903,9 +937,11 @@ async fn scan_redirect_rewrites_bun_lock_v2() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
+    mock_view(&server).await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_bun_project(tmp.path(), 2);
+    let lock_before = std::fs::read(tmp.path().join("bun.lock")).unwrap();
 
     let code = run(redirect_args(tmp.path(), server.uri())).await;
     assert_eq!(code, 0, "scan --redirect (bun, lock v2) should succeed");
@@ -929,6 +965,7 @@ async fn scan_redirect_rewrites_bun_lock_v2() {
             .is_file(),
         "a redirect ledger should be written"
     );
+    bun_manifestless_vex(tmp.path(), &lock_before, "bun-v2");
 }
 
 /// A future `lockfileVersion` (3) has no byte-exact fixtures: the rewrite
@@ -2696,8 +2733,11 @@ async fn pnpm_warning_strips_userinfo_and_names_only_spliced_hosts() {
 /// along unnoticed: every pnpm/yarn/bun/Rush run shipped a bogus
 /// `redirect_npm_no_lockfile` ("no package-lock.json present") because the
 /// npm rewriter warned whenever ITS lock was absent, with no regard for the
-/// sibling lock that was successfully rewritten. npm success = zero warnings;
-/// pnpm success = exactly the trust-lockfile install caveat.
+/// sibling lock that was successfully rewritten. npm success = exactly the
+/// npm >= 12 `allow-remote` caveat (the run auto-configures `.npmrc` and
+/// says so), and still exactly that one caveat once the project `.npmrc`
+/// already allows it; pnpm success = exactly the trust-lockfile install
+/// caveat.
 #[tokio::test]
 #[serial]
 async fn clean_success_warning_set_is_exact_for_npm_and_pnpm() {
@@ -2706,7 +2746,8 @@ async fn clean_success_warning_set_is_exact_for_npm_and_pnpm() {
     mock_reference(&server).await;
     mock_view(&server).await;
 
-    // npm project (package-lock.json): NO warnings of any kind.
+    // npm project (package-lock.json): EXACTLY the npm >= 12 allow-remote
+    // install caveat...
     let npm = tempfile::tempdir().unwrap();
     write_project(npm.path());
     let env = run_redirect_subprocess(npm.path(), &server.uri());
@@ -2717,8 +2758,26 @@ async fn clean_success_warning_set_is_exact_for_npm_and_pnpm() {
     );
     assert_eq!(
         warning_codes(&env),
-        Vec::<String>::new(),
-        "a clean npm success must emit an EMPTY warning set: {env}"
+        vec!["redirect_npm_allow_remote".to_string()],
+        "a clean npm success must emit EXACTLY the allow-remote caveat: {env}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(npm.path().join(".npmrc")).unwrap(),
+        "allow-remote=all\n",
+        "the npm hosted run auto-configures allow-remote: {env}"
+    );
+    // ...and still EXACTLY that caveat (the already-set variant, carrying
+    // the whole-tree tradeoff) once `.npmrc` already allows it.
+    let npm = tempfile::tempdir().unwrap();
+    write_project(npm.path());
+    std::fs::write(npm.path().join(".npmrc"), "allow-remote=all\n").unwrap();
+    let env = run_redirect_subprocess(npm.path(), &server.uri());
+    assert_eq!(env["status"], "success", "envelope: {env}");
+    assert_eq!(env["redirect"]["redirected"], 1, "anchor: {env}");
+    assert_eq!(
+        warning_codes(&env),
+        vec!["redirect_npm_allow_remote".to_string()],
+        "a clean npm success with allow-remote=all still carries the caveat: {env}"
     );
 
     // pnpm project (pnpm-lock.yaml only — no package-lock.json, by design):
@@ -3826,4 +3885,56 @@ async fn cargo_table_form_without_lock_is_pinned_and_attested() {
     let stmts = doc["statements"].as_array().unwrap();
     assert_eq!(stmts.len(), 1, "the landed redirect is attested: {doc}");
     assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-carg-cccc-dddd");
+}
+
+/// Manifest-less VEX over the committed state of an in-process npm
+/// `scan --mode hosted` (the in-process twin of `e2e_redirect_npm_build`'s
+/// tail): a checkout carrying only package.json, the redirected
+/// package-lock.json and `.socket/` — nothing installed (the hosted host is
+/// fictional), so the lockfile pin is the basis — attests with the ledger,
+/// without it (lockfile discovery + patch API), not `--offline`
+/// (`record_unavailable`, zero requests) and not once the lock is reverted
+/// (`redirect_unwired`, `--no-verify` too); `apply --vex` agrees.
+#[tokio::test]
+#[serial]
+async fn in_process_hosted_scan_state_attests_manifest_less() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let pristine = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    assert_eq!(run(redirect_args(tmp.path(), server.uri())).await, 0);
+
+    let checkout = tmp.path().join("checkout");
+    npm_e2e_common::fresh_checkout(tmp.path(), &checkout, &["package-lock.json"]);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let api = vex_e2e_common::PatchApi::start(vec![(
+                    UUID.to_string(),
+                    vex_e2e_common::patch_view(
+                        UUID,
+                        PURL,
+                        &[("package/index.js", &"b".repeat(64))],
+                        &[(GHSA, &["CVE-2024-9"])],
+                    ),
+                )]);
+                npm_e2e_common::manifestless_vex_matrix(&npm_e2e_common::ManifestlessCase {
+                    label: "in-process hosted scan".to_string(),
+                    project: &checkout,
+                    purl: PURL,
+                    uuid: UUID,
+                    marker: vex_e2e_common::Marker::Redirected,
+                    vulns: &[(GHSA, &["CVE-2024-9"])],
+                    api: &api,
+                    patch_server_url: Some("http://patch.test".to_string()),
+                    registry_locks: vec![("package-lock.json", pristine.clone())],
+                    embedded: &[vex_e2e_common::VexVia::Apply],
+                });
+            })
+            .join()
+            .expect("manifest-less VEX tail panicked");
+    });
 }

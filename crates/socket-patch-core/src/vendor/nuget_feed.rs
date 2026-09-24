@@ -109,7 +109,7 @@ const NUGET_ORG_SOURCE_URL: &str = "https://api.nuget.org/v3/index.json";
 /// two MUST stay in sync so the vendored feed filename, the
 /// `packageSourceMapping` version match, and the server-side registry paths
 /// agree. Mirrors `NuGetVersion.ToNormalizedString().ToLowerInvariant()`.
-fn normalize_nuget_version(version: &str) -> String {
+pub(crate) fn normalize_nuget_version(version: &str) -> String {
     // Build metadata is not part of package identity — drop it first.
     let without_build = match version.find('+') {
         Some(i) => &version[..i],
@@ -147,10 +147,59 @@ fn normalize_nuget_version(version: &str) -> String {
 /// `[A-Za-z0-9._-]` and a version is semver `[A-Za-z0-9.+-]`; anything else
 /// (a quote, angle bracket, ampersand, slash, …) would be an XML/path
 /// injection, so it is rejected fail-closed.
-fn is_plain_nuget_token(s: &str) -> bool {
+pub(crate) fn is_plain_nuget_token(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+}
+
+/// The feed filename NuGet's local folder feed resolves for a package:
+/// `<idLower>.<versionNorm>.nupkg`. The caller lowercases the id (its own
+/// way); the version goes through [`normalize_nuget_version`].
+pub(crate) fn nupkg_leaf(id_lower: &str, version: &str) -> String {
+    format!("{id_lower}.{}.nupkg", normalize_nuget_version(version))
+}
+
+/// One `packages.lock.json` `dependencies.<tfm>.<id>` entry that restores
+/// from a source: its raw id key, `resolved` and `contentHash` strings.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NugetLockEntry<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) resolved: &'a str,
+    pub(crate) content_hash: Option<&'a str>,
+}
+
+/// Every entry of a parsed `packages.lock.json`, target framework by target
+/// framework, in document-key order. Frameworks that are not objects and
+/// entries without a string `resolved` (`type: "Project"` references, which
+/// nothing restores from a source) are skipped; strings are raw (callers
+/// trim / normalize / compare ids as they need).
+pub(crate) fn nuget_lock_entries(doc: &Value) -> impl Iterator<Item = NugetLockEntry<'_>> {
+    doc.get("dependencies")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|frameworks| frameworks.values())
+        .filter_map(Value::as_object)
+        .flatten()
+        .filter_map(|(id, entry)| {
+            Some(NugetLockEntry {
+                id,
+                resolved: entry.get("resolved").and_then(Value::as_str)?,
+                content_hash: entry.get("contentHash").and_then(Value::as_str),
+            })
+        })
+}
+
+/// The lock entries of package `id` (case-insensitive) whose `resolved`
+/// normalizes to `version_norm` — the entries the vendored nupkg replaces.
+fn locked_at<'a>(
+    doc: &'a Value,
+    id: &'a str,
+    version_norm: &'a str,
+) -> impl Iterator<Item = NugetLockEntry<'a>> {
+    nuget_lock_entries(doc).filter(move |e| {
+        e.id.eq_ignore_ascii_case(id) && normalize_nuget_version(e.resolved) == version_norm
+    })
 }
 
 /// Vendor a NuGet package: rebuild a patched `.nupkg` under
@@ -202,7 +251,7 @@ pub async fn vendor_nuget(
 
     let id_lower = name.to_lowercase();
     let version_norm = normalize_nuget_version(version);
-    let leaf = format!("{id_lower}.{version_norm}.nupkg");
+    let leaf = nupkg_leaf(&id_lower, version);
     let copy_rel = format!("{uuid_dir_rel}/{leaf}");
     let uuid_dir = project_root.join(&uuid_dir_rel);
     let nupkg_path = project_root.join(&copy_rel);
@@ -1324,36 +1373,19 @@ fn edit_lock(
 ) -> Result<Option<LockEdit>, String> {
     let value: Value =
         serde_json::from_str(text).map_err(|e| format!("unparseable {PACKAGES_LOCK}: {e}"))?;
-    let Some(deps) = value.get("dependencies").and_then(Value::as_object) else {
-        return Ok(None);
-    };
     // Collect the original hash of every matching (framework, id) entry.
     let mut old_hash: Option<String> = None;
-    for framework in deps.values() {
-        let Some(pkgs) = framework.as_object() else {
-            continue;
-        };
-        for (pkg_name, entry) in pkgs {
-            if !pkg_name.eq_ignore_ascii_case(id) {
-                continue;
+    for h in locked_at(&value, id, version_norm).filter_map(|e| e.content_hash) {
+        match &old_hash {
+            // All matching entries share the same package version, so the
+            // same nupkg and the same contentHash — a divergence means the
+            // lock disagrees with itself; fail closed.
+            Some(prev) if prev != h => {
+                return Err(format!(
+                    "{PACKAGES_LOCK} has conflicting contentHash values for {id} {version_norm}"
+                ));
             }
-            let resolved = entry.get("resolved").and_then(Value::as_str);
-            if resolved.map(normalize_nuget_version).as_deref() != Some(version_norm) {
-                continue;
-            }
-            if let Some(h) = entry.get("contentHash").and_then(Value::as_str) {
-                match &old_hash {
-                    // All matching entries share the same package version, so
-                    // the same nupkg and the same contentHash — a divergence
-                    // means the lock disagrees with itself; fail closed.
-                    Some(prev) if prev != h => {
-                        return Err(format!(
-                            "{PACKAGES_LOCK} has conflicting contentHash values for {id} {version_norm}"
-                        ));
-                    }
-                    _ => old_hash = Some(h.to_string()),
-                }
-            }
+            _ => old_hash = Some(h.to_string()),
         }
     }
     let Some(old_hash) = old_hash else {
@@ -1382,26 +1414,11 @@ fn lock_pinned(text: &str, id: &str, version_norm: &str, expected_hash: &str) ->
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return false;
     };
-    let Some(deps) = value.get("dependencies").and_then(Value::as_object) else {
-        return false;
-    };
     let mut matched = false;
-    for framework in deps.values() {
-        let Some(pkgs) = framework.as_object() else {
-            continue;
-        };
-        for (pkg_name, entry) in pkgs {
-            if !pkg_name.eq_ignore_ascii_case(id) {
-                continue;
-            }
-            let resolved = entry.get("resolved").and_then(Value::as_str);
-            if resolved.map(normalize_nuget_version).as_deref() != Some(version_norm) {
-                continue;
-            }
-            matched = true;
-            if entry.get("contentHash").and_then(Value::as_str) != Some(expected_hash) {
-                return false;
-            }
+    for entry in locked_at(&value, id, version_norm) {
+        matched = true;
+        if entry.content_hash != Some(expected_hash) {
+            return false;
         }
     }
     matched

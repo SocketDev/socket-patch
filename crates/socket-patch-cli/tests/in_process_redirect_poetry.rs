@@ -9,6 +9,9 @@
 
 use std::path::Path;
 
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+
 use serial_test::serial;
 use socket_patch_cli::args::GlobalArgs;
 use socket_patch_cli::commands::rollback::{self, RollbackArgs};
@@ -531,4 +534,139 @@ async fn python_probe_does_not_guess_staleness_or_run_on_dry_run() {
         assert!(out.status.success(), "{json}");
         assert!(!stale_warning(&json), "{json}");
     }
+}
+
+// ── manifest-less VEX over the hosted wiring ──────────────────────────────
+
+/// Standalone `vex` on the redirected checkout `root` (hosted urls live on
+/// the mock's `http://patch.test` origin, which `vex` must be told is the
+/// patch server).
+fn manifestless_vex(
+    root: &Path,
+    api: &vex_e2e_common::PatchApi,
+    offline: bool,
+    extra: &[&str],
+) -> vex_e2e_common::VexOutcome {
+    let _ = std::fs::remove_file(root.join(vex_e2e_common::DEFAULT_OUTPUT));
+    let mut run = vex_e2e_common::VexRun {
+        offline,
+        proxy_url: Some(api.uri()),
+        patch_server_url: Some("http://patch.test".to_string()),
+        product: Some("pkg:pypi/app@0.1.0".to_string()),
+        ..vex_e2e_common::VexRun::default()
+    };
+    for arg in extra {
+        run = run.arg(*arg);
+    }
+    vex_e2e_common::run_vex(&vex_e2e_common::binary(), root, &run)
+}
+
+/// After `scan --mode hosted` wired the lock-only checkout, VEX needs no
+/// manifest (hosted never writes one) and — with the patch API reachable —
+/// no ledger either:
+///   1. manifest absent, ledger kept → attests offline from the ledger;
+///   2. ledger deleted → attests from the lock's sha256 pin + the API
+///      record, and after an install only when the installed tree hashes to
+///      the patch (`not_applied` for the upstream bytes); `apply --vex`
+///      agrees;
+///   3. `--offline` without the ledger → `record_unavailable`, no request;
+///   4. the lock reverted with the ledger kept → `redirect_unwired`, also
+///      under `--no-verify`; and the self-hosted origin only counts when
+///      `--patch-server-url` names it.
+#[test]
+#[serial]
+fn manifestless_vex_after_hosted_redirect() {
+    use vex_e2e_common::{assert_attested, assert_not_attested, Marker, PatchApi, VexVia};
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(MockServer::start());
+    rt.block_on(mock_api(&server));
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+    let root = tmp.path();
+    assert_eq!(rt.block_on(run(hosted_args(root, server.uri(), None))), 0);
+    assert!(!root.join(".socket/manifest.json").exists());
+    let ledger_path = root.join(".socket/vendor/redirect-state.json");
+    let ledger = std::fs::read(&ledger_path).unwrap();
+    let redirected = read(&root.join("poetry.lock"));
+
+    let mut view = vex_e2e_common::patch_view(
+        UUID,
+        RECORD_PURL,
+        &[(
+            "urllib3/response.py",
+            &compute_git_sha256_from_bytes(PATCHED),
+        )],
+        &[(GHSA, &["CVE-2025-66418"])],
+    );
+    view["files"]["urllib3/response.py"]["beforeHash"] =
+        compute_git_sha256_from_bytes(UPSTREAM).into();
+    let api = PatchApi::start(vec![(UUID.into(), view)]);
+    let vulns: &[(&str, &[&str])] = &[(GHSA, &["CVE-2025-66418"])];
+
+    // 1. the ledger alone, offline.
+    let out = manifestless_vex(root, &api, true, &[]);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+    api.assert_no_requests();
+
+    // 2. no ledger: lock pin + API record.
+    vex_e2e_common::strip_ledgers(root);
+    let out = manifestless_vex(root, &api, false, &[]);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+    assert!(api.view_requests(UUID) >= 1);
+    let _ = std::fs::remove_file(root.join(vex_e2e_common::DEFAULT_OUTPUT));
+    let apply = vex_e2e_common::VexRun {
+        proxy_url: Some(api.uri()),
+        patch_server_url: Some("http://patch.test".to_string()),
+        product: Some("pkg:pypi/app@0.1.0".to_string()),
+        ..vex_e2e_common::VexRun::default()
+    }
+    .via(VexVia::Apply);
+    let out = vex_e2e_common::run_vex(&vex_e2e_common::binary(), root, &apply);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_eq!(out.envelope["status"], "noManifest", "{out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+    // Without the origin configured, `http://patch.test` is nobody's patch
+    // server: nothing is referenced at all.
+    let mut run = vex_e2e_common::VexRun::online(&api);
+    run.product = Some("pkg:pypi/app@0.1.0".to_string());
+    let out = vex_e2e_common::run_vex(&vex_e2e_common::binary(), root, &run);
+    assert_eq!(out.code, Some(2), "{out}");
+    assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
+    // Installed: the installed tree decides.
+    let installed = install_package(root, ".venv", PATCHED);
+    let out = manifestless_vex(root, &api, false, &[]);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
+    std::fs::write(&installed, UPSTREAM).unwrap();
+    let out = manifestless_vex(root, &api, false, &[]);
+    assert_eq!(out.code, Some(1), "{out}");
+    assert_not_attested(&out.envelope, PURL, "not_applied");
+    std::fs::write(&installed, PATCHED).unwrap();
+
+    // 3. offline without the ledger.
+    let seen = api.request_count();
+    let out = manifestless_vex(root, &api, true, &[]);
+    assert_eq!(out.code, Some(1), "{out}");
+    assert_not_attested(&out.envelope, PURL, "record_unavailable");
+    assert!(out.doc.is_none());
+    assert_eq!(api.request_count(), seen, "--offline made a request");
+
+    // 4. reverted lock, ledger kept.
+    std::fs::write(&ledger_path, &ledger).unwrap();
+    std::fs::write(root.join("poetry.lock"), LOCK).unwrap();
+    for extra in [&[][..], &["--no-verify"][..]] {
+        for offline in [true, false] {
+            let out = manifestless_vex(root, &api, offline, extra);
+            assert_eq!(out.code, Some(1), "{extra:?} offline={offline}: {out}");
+            assert_not_attested(&out.envelope, PURL, "redirect_unwired");
+            assert!(out.doc.is_none());
+        }
+    }
+    // Re-wired: live again.
+    std::fs::write(root.join("poetry.lock"), &redirected).unwrap();
+    let out = manifestless_vex(root, &api, true, &[]);
+    assert_eq!(out.code, Some(0), "{out}");
+    drop(server);
 }

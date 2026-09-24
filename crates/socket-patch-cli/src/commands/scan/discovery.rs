@@ -355,8 +355,9 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
 /// hosted or vendored project's `updates[]` (the documented CI signal, see
 /// CLI_CONTRACT.md) is structurally empty and a superseding patch is never
 /// reported. Precedence on a collision: manifest > redirect ledger > vendor
-/// ledger (a manifest PURL is manifest-owned, matching VEX's
-/// `augment_with_redirect`). Vendor entries are keyed by their ledger map key
+/// ledger (a manifest PURL is manifest-owned, matching VEX's candidate merge
+/// in `commands::vex_sources` for purls no lockfile wires to another patch).
+/// Vendor entries are keyed by their ledger map key
 /// (the manifest-form purl, qualifiers included — `detect_updates` bridges
 /// the spellings); a legacy entry without an embedded record contributes its
 /// uuid alone, which is all update detection reads. Borrows the manifest
@@ -1027,8 +1028,8 @@ mod tests {
     #[test]
     fn manifest_entry_wins_a_collision_with_a_ledger_record() {
         // A PURL present in every store is manifest-owned (same precedence as
-        // VEX's augment_with_redirect): the manifest's uuid is the "old"
-        // side; between the ledgers, the redirect record wins.
+        // VEX's candidate merge): the manifest's uuid is the "old" side;
+        // between the ledgers, the redirect record wins.
         let manifest =
             crate::commands::scan::tests::manifest_with(&[("pkg:npm/foo@1.0", "uuid-manifest")]);
         let ledger = ledger_with(&[("pkg:npm/foo@1.0", "uuid-ledger")]);

@@ -27,6 +27,9 @@ mod smc;
 #[path = "common/mod.rs"]
 mod common;
 
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+
 /// Documentation/negative-control pass through the shared Docker matrix.
 /// Kept for parity with the other ecosystems and to run the composer
 /// negative controls when Docker + the `composer` image are present.
@@ -217,5 +220,145 @@ mod host_guard {
             status(&parse_obj(&out, "check (post-remove)")).as_deref(),
             Some("needs_configuration")
         );
+    }
+
+    /// The hook `setup` wires into a MANIFEST-LESS hosted / vendored
+    /// checkout (a depscan-opened PR, a `vendor --detached` or `scan
+    /// --redirect` project: the patches live in composer.lock, no
+    /// `.socket/manifest.json`, no ledger). composer runs the hook after
+    /// every install, so it must be a silent, write-free exit 0 there — and
+    /// the same `apply` with `--vex` must attest the lockfile-wired patch
+    /// from the patch API record (and, under the hook's own `--offline`,
+    /// report the record unavailable instead of attesting blind).
+    #[test]
+    fn composer_setup_hook_in_manifestless_hosted_and_vendored_checkouts() {
+        use super::vex_e2e_common::{
+            assert_absent, assert_attested, binary, git_sha256, patch_view, run_vex, Marker,
+            PatchApi, VexRun, VexVia,
+        };
+        const UUID: &str = "5e5e5e5e-1234-4abc-8def-5e5e5e5e5e5e";
+        const PURL: &str = "pkg:composer/monolog/monolog@3.5.0";
+        const PATCHED: &[u8] = b"<?php // patched Logger\n";
+        let vulns: &[(&str, &[&str])] = &[("GHSA-setp-cmps-0001", &["CVE-2026-1212"])];
+
+        for vendored in [false, true] {
+            let tag = if vendored { "vendored" } else { "hosted" };
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let root_s = root.to_str().unwrap();
+            std::fs::write(root.join("composer.json"), COMPOSER_JSON).unwrap();
+            let (code, out, err) = run(root, &["setup", "--cwd", root_s, "--yes", "--json"]);
+            assert_eq!(code, 0, "[{tag}] setup:\n{out}\n{err}");
+
+            // The lockfile wiring each backend writes (no manifest, no ledger).
+            let dist = if vendored {
+                let rel = format!(".socket/vendor/composer/{UUID}/monolog/monolog@3.5.0");
+                let file = root.join(&rel).join("src/Monolog/Logger.php");
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, PATCHED).unwrap();
+                serde_json::json!({ "type": "path", "url": rel, "reference": UUID })
+            } else {
+                serde_json::json!({
+                    "type": "zip",
+                    "url": format!(
+                        "https://patch.socket.dev/patch/composer/monolog/monolog/3.5.0/\
+                         11111111-2222-4333-8444-555555555555/{UUID}/monolog-3.5.0.zip"
+                    ),
+                    "reference": "0123456789abcdef0123456789abcdef01234567",
+                    "shasum": "abcdef0123456789abcdef0123456789abcdef01",
+                })
+            };
+            let lock = serde_json::json!({
+                "content-hash": "abc123def456abc123def456abc123de",
+                "packages": [{ "name": "monolog/monolog", "version": "3.5.0", "dist": dist }],
+                "packages-dev": [],
+            });
+            let lock = serde_json::to_string_pretty(&lock).unwrap();
+            std::fs::write(root.join("composer.lock"), &lock).unwrap();
+
+            // Exactly the command composer runs on post-install-cmd.
+            let cj: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(root.join("composer.json")).unwrap())
+                    .unwrap();
+            let hook = cj["scripts"]["post-install-cmd"][0]
+                .as_str()
+                .expect("hook")
+                .to_string();
+            let mut argv: Vec<&str> = hook.split_whitespace().collect();
+            assert_eq!(argv.remove(0), "socket-patch", "[{tag}] hook: {hook}");
+            argv.extend(["--cwd", root_s]);
+            let (code, out, err) = run(root, &argv);
+            assert_eq!(
+                code, 0,
+                "[{tag}] the hook must not fail the install:\n{out}\n{err}"
+            );
+            assert!(
+                out.trim().is_empty(),
+                "[{tag}] --silent hook prints nothing: {out}"
+            );
+            assert!(
+                !root.join(".socket/manifest.json").exists(),
+                "[{tag}] no manifest written"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("composer.lock")).unwrap(),
+                lock
+            );
+
+            // The hook's apply + --vex, online: the lock-wired patch attests.
+            let api = PatchApi::start(vec![(
+                UUID.to_string(),
+                patch_view(
+                    UUID,
+                    PURL,
+                    &[("src/Monolog/Logger.php", &git_sha256(PATCHED))],
+                    vulns,
+                ),
+            )]);
+            let flags: Vec<String> = argv
+                .iter()
+                .filter(|a| !["apply", "--offline", "--silent", "--cwd", root_s].contains(*a))
+                .map(|a| a.to_string())
+                .collect();
+            assert_eq!(
+                flags,
+                ["--ecosystems", "composer"],
+                "[{tag}] hook flags: {hook}"
+            );
+            let base = VexRun {
+                product: Some("pkg:composer/acme/widget@1.0.0".to_string()),
+                extra_args: flags,
+                ..VexRun::online(&api)
+            }
+            .via(VexVia::Apply);
+            let out = run_vex(&binary(), root, &base);
+            assert_eq!(out.code, Some(0), "[{tag}] apply --vex:\n{out}");
+            assert_eq!(out.envelope["status"], "noManifest", "[{tag}]:\n{out}");
+            let marker = if vendored {
+                Marker::Vendored
+            } else {
+                Marker::Redirected
+            };
+            assert_attested(out.doc(), PURL, UUID, marker, vulns);
+
+            // Under the hook's own --offline there is no record to attest
+            // from: a VEX failure, never a blind attestation.
+            let seen = api.request_count();
+            let out = run_vex(
+                &binary(),
+                root,
+                &VexRun {
+                    offline: true,
+                    ..base.clone()
+                },
+            );
+            assert_eq!(out.code, Some(1), "[{tag}] offline apply --vex:\n{out}");
+            assert_eq!(
+                out.envelope["error"]["code"], "no_applicable_patches",
+                "{out}"
+            );
+            assert_absent(out.doc.as_ref(), PURL);
+            assert_eq!(api.request_count(), seen, "[{tag}] --offline made requests");
+        }
     }
 }

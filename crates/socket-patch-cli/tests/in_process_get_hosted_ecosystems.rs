@@ -22,6 +22,11 @@
 
 use std::path::Path;
 
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+#[path = "vex_pipenv_pip_steps/mod.rs"]
+mod vex_pipenv_pip_steps;
+
 use serial_test::serial;
 use socket_patch_cli::commands::get::GetArgs;
 use socket_patch_cli::commands::scan::ScanMode;
@@ -65,34 +70,39 @@ fn get_hosted_args(identifier: &str, cwd: &Path, api_url: String) -> GetArgs {
     }
 }
 
+/// The `view/{uuid}` body: real git-blob hashes + inline blob content.
+fn view_json(uuid: &str, purl: &str) -> serde_json::Value {
+    serde_json::json!({
+        "uuid": uuid,
+        "purl": purl,
+        "publishedAt": "2024-01-01T00:00:00Z",
+        "files": {
+            "package/payload.txt": {
+                "beforeHash": compute_git_sha256_from_bytes(BEFORE_BYTES),
+                "afterHash": compute_git_sha256_from_bytes(AFTER_BYTES),
+                "blobContent": b64(AFTER_BYTES),
+            }
+        },
+        "vulnerabilities": {
+            "GHSA-hhhh-eeee-xxxx": {
+                "cves": ["CVE-2024-4321"],
+                "summary": "get hosted ecosystems fixture",
+                "severity": "high",
+                "description": "d"
+            }
+        },
+        "description": "get hosted ecosystems fixture",
+        "license": "MIT",
+        "tier": "free",
+    })
+}
+
 /// `view/{uuid}` with real git-blob hashes + inline blob content — the shape
 /// the UUID resolution AND the post-confirmation record fetch both read.
 async fn mock_view(server: &MockServer, uuid: &str, purl: &str) {
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG}/patches/view/{uuid}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "uuid": uuid,
-            "purl": purl,
-            "publishedAt": "2024-01-01T00:00:00Z",
-            "files": {
-                "package/payload.txt": {
-                    "beforeHash": compute_git_sha256_from_bytes(BEFORE_BYTES),
-                    "afterHash": compute_git_sha256_from_bytes(AFTER_BYTES),
-                    "blobContent": b64(AFTER_BYTES),
-                }
-            },
-            "vulnerabilities": {
-                "GHSA-hhhh-eeee-xxxx": {
-                    "cves": ["CVE-2024-4321"],
-                    "summary": "get hosted ecosystems fixture",
-                    "severity": "high",
-                    "description": "d"
-                }
-            },
-            "description": "get hosted ecosystems fixture",
-            "license": "MIT",
-            "tier": "free",
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(view_json(uuid, purl)))
         .mount(server)
         .await;
 }
@@ -242,6 +252,38 @@ async fn pypi_requirements_hosted_rewrites_pinned_line() {
     let bodies = reference_bodies(&server).await;
     assert_eq!(bodies.len(), 1, "exactly one reference request");
     assert!(bodies[0].contains(UUID));
+
+    // Manifest-less VEX over what `get --mode hosted` committed (it never
+    // writes a manifest). An EMPTY in-project venv keeps the crawl hermetic
+    // (nothing installed: the `--hash` pin is the evidence); the grant's
+    // origin is this test's patch server, hence `--patch-server-url`.
+    let site = if cfg!(windows) {
+        tmp.path().join(".venv/Lib/site-packages")
+    } else {
+        tmp.path().join(".venv/lib/python3.12/site-packages")
+    };
+    std::fs::create_dir_all(site).unwrap();
+    vex_pipenv_pip_steps::run_manifestless_steps(&vex_pipenv_pip_steps::Steps {
+        what: "get --mode hosted requirements.txt".into(),
+        project: tmp.path(),
+        purl: PURL,
+        uuid: UUID,
+        marker: vex_e2e_common::Marker::Redirected,
+        vulns: Some(&[("GHSA-hhhh-eeee-xxxx", &["CVE-2024-4321"])]),
+        records: vex_pipenv_pip_steps::Records::Mock(vec![(UUID.into(), view_json(UUID, PURL))]),
+        patch_server_url: Some("http://patch.test".into()),
+        product: "pkg:pypi/app@1.0.0",
+        revert: &|p: &Path| {
+            std::fs::write(
+                p.join("requirements.txt"),
+                "flask==2.0.1\nrequests==2.31.0\n",
+            )
+            .unwrap()
+        },
+        envs: Vec::new(),
+        on_step: None,
+        expect_verified: true,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +356,8 @@ async fn maven_pom_hosted_pins_suffixed_version_fail_closed() {
     )
     .unwrap();
 
+    let pristine_pom = std::fs::read(tmp.path().join("pom.xml")).unwrap();
+
     let code =
         socket_patch_cli::commands::get::run(get_hosted_args(UUID, tmp.path(), server.uri())).await;
     assert_eq!(code, 0, "get <uuid> --mode hosted (maven) should succeed");
@@ -366,6 +410,109 @@ async fn maven_pom_hosted_pins_suffixed_version_fail_closed() {
     let bodies = reference_bodies(&server).await;
     assert_eq!(bodies.len(), 1, "exactly one reference request");
     assert!(bodies[0].contains(UUID));
+
+    // The committed hosted state has no manifest: the standalone vex must
+    // attest it from the pom wiring (the patch server here is the
+    // configured `http://patch.test` origin). Blocking child processes +
+    // the stand-in's own runtime: off the async test's runtime.
+    let project = tmp.path().to_path_buf();
+    std::thread::spawn(move || {
+        maven_hosted_get_state_attests_without_manifest(&project, UUID, PURL, &pristine_pom)
+    })
+    .join()
+    .expect("manifest-less vex leg");
+}
+
+/// Manifest-less VEX over what `get <uuid> --mode hosted` committed for a
+/// maven pom (nothing installed: the fail-closed suffixed pin is the
+/// evidence): the ledger present, the ledgers deleted (pom wiring + API
+/// record), `--offline` without a local record (`record_unavailable`, zero
+/// requests), and the pom reverted with the ledger kept (`redirect_unwired`,
+/// with and without `--no-verify`). Without `--patch-server-url` the
+/// `patch.test` repository is not a Socket reference at all.
+fn maven_hosted_get_state_attests_without_manifest(
+    project: &Path,
+    uuid: &str,
+    purl: &str,
+    pristine_pom: &[u8],
+) {
+    use vex_e2e_common::*;
+    let vulns: [(&str, &[&str]); 1] = [("GHSA-hhhh-eeee-xxxx", &["CVE-2024-4321"])];
+    let api = PatchApi::start(vec![(
+        uuid.to_string(),
+        patch_view(
+            uuid,
+            purl,
+            &[("commons-lang3-3.12.0.jar", &git_sha256(AFTER_BYTES))],
+            &vulns,
+        ),
+    )]);
+    let m2 = tempfile::tempdir().unwrap();
+    let run = VexRun {
+        product: Some("pkg:maven/dev.socket.test/consumer@1.0.0".to_string()),
+        patch_server_url: Some("http://patch.test".to_string()),
+        ..VexRun::online(&api)
+    }
+    .env("MAVEN_REPO_LOCAL", m2.path().as_os_str());
+
+    let out = run_vex(&binary(), project, &run);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(out.doc(), purl, uuid, Marker::Redirected, &vulns);
+
+    let ledger = std::fs::read(project.join(".socket/vendor/redirect-state.json")).unwrap();
+    strip_ledgers(project);
+    let before = api.view_requests(uuid);
+    let out = run_vex(&binary(), project, &run);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(out.doc(), purl, uuid, Marker::Redirected, &vulns);
+    assert!(
+        api.view_requests(uuid) > before,
+        "record fetched from the API"
+    );
+
+    let quiet = PatchApi::empty();
+    let out = run_vex(
+        &binary(),
+        project,
+        &VexRun {
+            offline: true,
+            proxy_url: Some(quiet.uri()),
+            ..run.clone()
+        },
+    );
+    assert_eq!(out.code, Some(1), "{out}");
+    assert_not_attested(&out.envelope, purl, "record_unavailable");
+    quiet.assert_no_requests();
+
+    let out = run_vex(
+        &binary(),
+        project,
+        &VexRun {
+            patch_server_url: None,
+            ..run.clone()
+        },
+    );
+    assert_eq!(
+        out.code,
+        Some(2),
+        "not a Socket host without the override: {out}"
+    );
+
+    std::fs::write(project.join("pom.xml"), pristine_pom).unwrap();
+    std::fs::write(project.join(".socket/vendor/redirect-state.json"), &ledger).unwrap();
+    for no_verify in [false, true] {
+        let out = run_vex(
+            &binary(),
+            project,
+            &VexRun {
+                offline: true,
+                no_verify,
+                ..run.clone()
+            },
+        );
+        assert_eq!(out.code, Some(1), "reverted no_verify={no_verify}: {out}");
+        assert_not_attested(&out.envelope, purl, "redirect_unwired");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -492,6 +639,111 @@ async fn nuget_hosted_wires_source_mapping_and_lock_hash() {
     let bodies = reference_bodies(&server).await;
     assert_eq!(bodies.len(), 1, "exactly one reference request");
     assert!(bodies[0].contains(UUID));
+
+    // Manifest-less VEX over the wiring `get` just committed (hosted mode
+    // never writes a manifest). Off the async runtime: the helper drives
+    // the real binary and its own patch-API stand-in.
+    let root = tmp.path().to_path_buf();
+    tokio::task::spawn_blocking(move || nuget_hosted_manifestless_vex(&root, UUID, PURL))
+        .await
+        .unwrap();
+}
+
+/// The manifest-less VEX steps for a nuget hosted checkout `get` wired
+/// (`http://patch.test` is the configured patch-server origin; nothing is
+/// installed, so the lock's re-pinned `contentHash` is the evidence):
+/// ledger present → attested online and offline; ledger deleted → attested
+/// from nuget.config + packages.lock.json + the API record; `--offline`
+/// with no ledger → `record_unavailable` with zero requests; wiring
+/// reverted with the ledger restored → `redirect_unwired`, with and
+/// without `--no-verify`.
+fn nuget_hosted_manifestless_vex(root: &Path, uuid: &str, purl: &str) {
+    use vex_e2e_common::*;
+    let store = tempfile::tempdir().unwrap();
+    let vulns: &[(&str, &[&str])] = &[("GHSA-hhhh-eeee-xxxx", &["CVE-2024-4321"])];
+    let api = PatchApi::start(vec![(
+        uuid.to_string(),
+        patch_view(
+            uuid,
+            purl,
+            &[("package/payload.txt", &git_sha256(AFTER_BYTES))],
+            vulns,
+        ),
+    )]);
+    let run = |r: VexRun| {
+        let r = VexRun {
+            patch_server_url: Some("http://patch.test".to_string()),
+            product: Some("pkg:nuget/app@1.0.0".to_string()),
+            ..r
+        }
+        // An ambient ~/.nuget/packages copy must never be the evidence.
+        .env("NUGET_PACKAGES", store.path());
+        run_vex(&binary(), root, &r)
+    };
+    let omitted = |out: &VexOutcome, reason: &str| {
+        assert_eq!(out.code, Some(1), "{reason}: {out}");
+        let hit = out.envelope["events"].as_array().is_some_and(|events| {
+            events.iter().any(|e| {
+                e["action"] == "skipped"
+                    && e["errorCode"] == reason
+                    && e["purl"]
+                        .as_str()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(purl))
+            })
+        });
+        assert!(hit, "{purl} skipped with {reason}: {out}");
+        assert_absent(out.doc.as_ref(), purl);
+    };
+    for r in [VexRun::online(&api), VexRun::offline()] {
+        let out = run(r);
+        assert_eq!(out.code, Some(0), "with the ledger: {out}");
+        assert_attested(out.doc(), purl, uuid, Marker::Redirected, vulns);
+    }
+    let ledger = std::fs::read(root.join(".socket/vendor/redirect-state.json")).unwrap();
+    strip_ledgers(root);
+    let out = run(VexRun::online(&api));
+    assert_eq!(out.code, Some(0), "lockfile wiring alone: {out}");
+    assert_attested(out.doc(), purl, uuid, Marker::Redirected, vulns);
+    assert!(api.view_requests(uuid) >= 1, "the record came from the API");
+    let quiet = PatchApi::empty();
+    omitted(
+        &run(VexRun {
+            proxy_url: Some(quiet.uri()),
+            ..VexRun::offline()
+        }),
+        "record_unavailable",
+    );
+    quiet.assert_no_requests();
+
+    std::fs::write(root.join(".socket/vendor/redirect-state.json"), ledger).unwrap();
+    std::fs::write(
+        root.join("nuget.config"),
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    \
+         <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  \
+         </packageSources>\n</configuration>\n",
+    )
+    .unwrap();
+    let lock = std::fs::read_to_string(root.join("packages.lock.json")).unwrap();
+    let re_pinned = lock_content_hash(&lock);
+    std::fs::write(
+        root.join("packages.lock.json"),
+        lock.replace(&re_pinned, "UPSTREAMnugetHASHupstream=="),
+    )
+    .unwrap();
+    for no_verify in [false, true] {
+        let mut r = VexRun::offline();
+        r.no_verify = no_verify;
+        omitted(&run(r), "redirect_unwired");
+    }
+}
+
+/// The `contentHash` value of the (single) lock entry.
+fn lock_content_hash(lock: &str) -> String {
+    let v: serde_json::Value = serde_json::from_str(lock).unwrap();
+    v["dependencies"]["net6.0"]["Newtonsoft.Json"]["contentHash"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -673,5 +925,35 @@ async fn deno_hosted_grant_lands_nothing() {
         let bodies = reference_bodies(&server).await;
         assert_eq!(bodies.len(), 1, "{purl}: exactly one reference request");
         assert!(bodies[0].contains(uuid), "{purl}: grant asked for the uuid");
+
+        // Manifest-less VEX: nothing was wired, so there is nothing to
+        // attest — and nothing is fetched — even with the grant's origin
+        // configured as the patch server.
+        let root = tmp.path().to_path_buf();
+        let (u, p) = (uuid.to_string(), purl.to_string());
+        tokio::task::spawn_blocking(move || {
+            use vex_e2e_common::*;
+            let api = PatchApi::start(vec![(
+                u.clone(),
+                patch_view(
+                    &u,
+                    &p,
+                    &[("package/payload.txt", &git_sha256(AFTER_BYTES))],
+                    &[],
+                ),
+            )]);
+            for no_verify in [false, true] {
+                let mut r = VexRun::online(&api);
+                r.patch_server_url = Some("http://patch.test".to_string());
+                r.no_verify = no_verify;
+                let out = run_vex(&binary(), &root, &r);
+                assert_eq!(out.code, Some(2), "{p}: {out}");
+                assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
+                assert_absent(out.doc.as_ref(), &p);
+            }
+            api.assert_no_requests();
+        })
+        .await
+        .unwrap();
     }
 }

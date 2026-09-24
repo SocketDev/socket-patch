@@ -13,6 +13,11 @@ use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "npm_e2e_common/manifestless.rs"]
+mod npm_e2e_common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+
 fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
 }
@@ -280,6 +285,12 @@ async fn scan_vendor_end_to_end_is_manifest_free() {
     assert_eq!(
         entry["record"]["uuid"], UUID,
         "the embedded record is the verification source: {state}"
+    );
+    assert!(
+        entry["record"]["files"]
+            .as_object()
+            .is_some_and(|f| !f.is_empty()),
+        "the embedded record carries the afterHashes vex verifies against: {state}"
     );
     let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
     assert!(
@@ -1964,4 +1975,175 @@ async fn scan_vendored_bun_silent_human_names_code_on_stderr() {
         "--silent must keep the code-tagged refusal on stderr:\n{stderr}"
     );
     assert!(!tmp.path().join(".socket/vendor").exists());
+}
+
+/// Manifest-less VEX over the committed state `scan --vendor` leaves
+/// (manifest-free since 5.0 — the ledger's `detached` entries embed the
+/// records, and the hidden `--detached` flag is a no-op, so there is one
+/// shape to cover): the checkout attests `(vendored)` from the ledger's
+/// embedded record, then from lockfile discovery + the patch API once the
+/// ledgers are gone too, never `--offline` (`record_unavailable`, zero
+/// requests), and not once the lock is reverted (`vendor_unwired`,
+/// `--no-verify` too). The embedded `scan --vendor --vex` of the producing
+/// run attests as well. The manifest-driven standalone `vendor` shape (a
+/// NON-detached entry with a fallback record) is
+/// `standalone_vendor_state_attests_from_the_embedded_record`.
+#[tokio::test]
+async fn scan_vendor_state_attests_manifest_less() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+    let pristine = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    let (code, stdout, stderr) =
+        run_scan_vendor(tmp.path(), &mock.uri(), &["--vex", "out.vex.json"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(
+        v["vex"]["statements"], 1,
+        "embedded scan --vendor --vex: {v}"
+    );
+    assert!(
+        !tmp.path().join(".socket/manifest.json").exists(),
+        "vendored mode writes no manifest"
+    );
+
+    let checkout = tmp.path().join("checkout");
+    npm_e2e_common::fresh_checkout(tmp.path(), &checkout, &["package-lock.json"]);
+    run_manifestless_tail("scan --vendor", &checkout, pristine);
+}
+
+/// The committed state of the manifest-driven standalone `vendor` — the
+/// one writer of NON-detached ledger entries, which embed the patch record
+/// as a fallback copy — once `.socket/manifest.json` (and its blobs) are
+/// gone, like a checkout that never committed them. The real writer must
+/// embed the record in that non-detached entry; offline `vex` must then
+/// attest from it with no manifest, and `list` must show the same patch
+/// (labeled `vendored`) instead of `manifest_not_found` — one tree never
+/// reads "no patches" while its VEX document attests one. The shared
+/// manifest-less tail then runs over a fresh checkout.
+#[tokio::test]
+async fn standalone_vendor_state_attests_from_the_embedded_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+    let pristine = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+    seed_manifest_and_blob_with_vuln(tmp.path());
+
+    let (code, v, stderr) = run_vendor(tmp.path(), &["--offline"]);
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert_eq!(v["summary"]["applied"], 1, "{v:#}");
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = &state["entries"][PURL];
+    assert_eq!(entry["uuid"], UUID, "{state:#}");
+    assert!(
+        entry["detached"].as_bool() != Some(true),
+        "standalone vendor entries are manifest-owned, never detached: {state:#}"
+    );
+    assert_eq!(
+        entry["record"]["uuid"], UUID,
+        "the real writer embeds the fallback record: {state:#}"
+    );
+    assert_eq!(
+        entry["record"]["files"]["package/index.js"]["afterHash"],
+        git_sha256(AFTER),
+        "the embedded record carries the afterHashes vex verifies against: {state:#}"
+    );
+
+    // Drop the manifest and its blobs: the ledger's copy is all that is left.
+    std::fs::remove_file(tmp.path().join(".socket/manifest.json")).unwrap();
+    std::fs::remove_dir_all(tmp.path().join(".socket/blobs")).unwrap();
+
+    let out = vex_e2e_common::run_vex(
+        &vex_e2e_common::binary(),
+        tmp.path(),
+        &vex_e2e_common::VexRun::offline(),
+    );
+    assert_eq!(
+        out.code,
+        Some(0),
+        "offline vex from the embedded record:\n{out}"
+    );
+    vex_e2e_common::assert_attested(
+        out.doc(),
+        PURL,
+        UUID,
+        vex_e2e_common::Marker::Vendored,
+        &[("GHSA-aaaa-bbbb-cccc", &["CVE-2026-0001"])],
+    );
+
+    let (code, stdout, stderr) = run_cli_env(tmp.path(), &["list", "--json"], &[]);
+    assert_eq!(code, 0, "list sees what vex attests: {stdout}\n{stderr}");
+    let listed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("list JSON");
+    let events = listed["events"].as_array().expect("events");
+    assert_eq!(events.len(), 1, "{listed:#}");
+    assert_eq!(events[0]["purl"], PURL, "{listed:#}");
+    assert_eq!(events[0]["uuid"], UUID, "{listed:#}");
+    assert_eq!(events[0]["details"]["mode"], "vendored", "{listed:#}");
+    assert_eq!(
+        events[0]["details"]["ledger"], ".socket/vendor/state.json",
+        "{listed:#}"
+    );
+    std::fs::remove_file(tmp.path().join("out.vex.json")).unwrap();
+
+    let checkout = tmp.path().join("checkout");
+    npm_e2e_common::fresh_checkout(tmp.path(), &checkout, &["package-lock.json"]);
+    run_manifestless_tail("standalone vendor", &checkout, pristine);
+}
+
+/// `seed_manifest_and_blob` with the advisory the patch API mock serves,
+/// so the record the standalone `vendor` embeds names what vex attests.
+fn seed_manifest_and_blob_with_vuln(root: &Path) {
+    seed_manifest_and_blob(root);
+    let path = root.join(".socket/manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    manifest["patches"][PURL]["vulnerabilities"] = serde_json::json!({
+        "GHSA-aaaa-bbbb-cccc": {
+            "cves": ["CVE-2026-0001"],
+            "summary": "test vuln",
+            "severity": "high",
+            "description": "details"
+        }
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
+/// The shared manifest-less VEX tail over a vendored npm `checkout`
+/// (`manifestless_vex_matrix`, with the embedded `apply` / `vendor --vex`
+/// runs), against a patch API serving `UUID`'s view.
+fn run_manifestless_tail(label: &str, checkout: &Path, pristine: Vec<u8>) {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let api = vex_e2e_common::PatchApi::start(vec![(
+                    UUID.to_string(),
+                    vex_e2e_common::patch_view(
+                        UUID,
+                        PURL,
+                        &[("package/index.js", &git_sha256(AFTER))],
+                        &[("GHSA-aaaa-bbbb-cccc", &["CVE-2026-0001"])],
+                    ),
+                )]);
+                npm_e2e_common::manifestless_vex_matrix(&npm_e2e_common::ManifestlessCase {
+                    label: label.to_string(),
+                    project: checkout,
+                    purl: PURL,
+                    uuid: UUID,
+                    marker: vex_e2e_common::Marker::Vendored,
+                    vulns: &[("GHSA-aaaa-bbbb-cccc", &["CVE-2026-0001"])],
+                    api: &api,
+                    patch_server_url: None,
+                    registry_locks: vec![("package-lock.json", pristine)],
+                    embedded: &[
+                        vex_e2e_common::VexVia::Apply,
+                        vex_e2e_common::VexVia::Vendor,
+                    ],
+                });
+            })
+            .join()
+            .expect("manifest-less VEX tail panicked");
+    });
 }

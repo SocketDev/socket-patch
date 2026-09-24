@@ -16,8 +16,9 @@ use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned};
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::purl::{normalize_purl, purl_name_version, strip_purl_qualifiers};
 use socket_patch_core::vendor::VendorState;
+use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::Path;
@@ -352,8 +353,30 @@ async fn embed_vex_into_json(
                 "code": e.code,
                 "message": e.message,
             });
+            append_vex_error_warnings(result, &e.embedded_warnings());
             1
         }
+    }
+}
+
+/// Fold a failed embedded VEX's run-level advisories (the lockfile
+/// discovery diagnostics — often the only explanation of a
+/// `vendor_unwired` / `redirect_unwired` omission) into the scan JSON's
+/// top-level `warnings[]`, the channel `--json` has once stderr is
+/// silenced. Appends to an existing array (layout refusals) or creates it.
+pub(super) fn append_vex_error_warnings(
+    result: &mut serde_json::Value,
+    warnings: &[crate::json_envelope::RunWarning],
+) {
+    if warnings.is_empty() {
+        return;
+    }
+    let extra = warnings
+        .iter()
+        .map(|w| serde_json::json!({ "code": w.code, "detail": w.detail }));
+    match result.get_mut("warnings").and_then(|w| w.as_array_mut()) {
+        Some(existing) => existing.extend(extra),
+        None => result["warnings"] = serde_json::Value::Array(extra.collect()),
     }
 }
 
@@ -395,9 +418,7 @@ async fn embed_vex_human(
             0
         }
         Err(e) => {
-            // Errors print even under --silent ("errors only", never
-            // "nothing"): exit 1 with no message would be undiagnosable.
-            eprintln!("Error: VEX generation failed: {}", e.message);
+            e.print_embedded(common);
             1
         }
     }
@@ -745,7 +766,7 @@ fn overlap_from_states(
     vendor_purls
         .into_iter()
         .filter(|purl| {
-            let Some((name, version)) = purl_name_version(purl) else {
+            let Some((name, version)) = purl_name_version(strip_purl_qualifiers(purl)) else {
                 return false;
             };
             redirect
@@ -761,23 +782,16 @@ fn overlap_from_states(
         .collect()
 }
 
-/// `pkg:<type>/<name>@<version>` → `(<name>, <version>)`; the name keeps any
-/// namespace slashes (`@scope/pkg`, `vendor/pkg`). `None` when either part
-/// is missing. Input is already canonicalized by the caller.
-fn purl_name_version(purl: &str) -> Option<(&str, &str)> {
-    let rest = strip_purl_qualifiers(purl).strip_prefix("pkg:")?;
-    let (_, coord) = rest.split_once('/')?;
-    let at = coord.rfind('@').filter(|&i| i > 0)?;
-    Some((&coord[..at], &coord[at + 1..]))
-}
-
 /// The overlapping PURLs split by which mode the LIVE lockfile actually wires
 /// them to right now — the truth source for takeover direction.
 ///
-/// `redirect` holds the overlap PURLs the lock currently routes to the hosted
-/// patch server (see [`hosted_wiring_live`] — proved by the record's patch
-/// uuid on any host, not a hardcoded hostname): hosted genuinely won the
-/// lockfile, so the
+/// Both directions are proved by lockfile discovery with the same liveness
+/// rules `vex` gates attestations on (core `Discovery::redirect_record_live`
+/// / `Discovery::vendor_entry_live` — every package manager's lock read
+/// through its extractor, cargo's `Cargo.lock` + `[patch]` shapes included,
+/// with the ledger's recorded files as the fallback for a uuid no read file
+/// mentions). `redirect` holds the overlap PURLs the lock currently routes
+/// to the hosted patch server: hosted genuinely won the lockfile, so the
 /// vendored ledger entry (and its now-orphaned tarball) is the stale one and
 /// `redirect_supersedes_vendored` is truthful. `vendored` holds the PURLs the
 /// lock currently routes to a committed `.socket/vendor/<eco>/<uuid>` artifact:
@@ -798,7 +812,7 @@ pub(super) struct OverlapTakeover {
     pub vendored: Vec<String>,
 }
 
-pub(super) async fn classify_overlap_takeover(cwd: &Path) -> OverlapTakeover {
+pub(super) async fn classify_overlap_takeover(common: &GlobalArgs, cwd: &Path) -> OverlapTakeover {
     // Both ledgers loaded ONCE here. A malformed ledger classifies like a
     // missing one, matching `overlap_from_states` (this path only
     // feeds takeover warnings; corruption is a hard error on the
@@ -808,16 +822,17 @@ pub(super) async fn classify_overlap_takeover(cwd: &Path) -> OverlapTakeover {
         .ok()
         .flatten();
     let vendor = socket_patch_core::vendor::load_state(cwd).await.ok();
-    classify_overlap_takeover_with(cwd, redirect.as_ref(), vendor.as_ref()).await
+    classify_overlap_takeover_with(common, cwd, redirect.as_ref(), vendor.as_ref()).await
 }
 
 /// [`classify_overlap_takeover`] over ALREADY-LOADED ledgers: loads neither
 /// (the hosted engine holds both in memory — its post-merge redirect ledger
 /// and the post-takeover vendor ledger — and must classify against those,
-/// never a pre-takeover snapshot) but still inventories the LIVE lockfiles
-/// in `cwd`, the truth source for direction. `None` for either ledger
-/// yields no overlap.
+/// never a pre-takeover snapshot) but still reads the LIVE lockfiles in
+/// `cwd`, the truth source for direction. `None` for either ledger yields
+/// no overlap.
 pub(super) async fn classify_overlap_takeover_with(
+    common: &GlobalArgs,
     cwd: &Path,
     redirect: Option<&socket_patch_core::patch::redirect::RedirectState>,
     vendor: Option<&VendorState>,
@@ -849,38 +864,23 @@ pub(super) async fn classify_overlap_takeover_with(
     // proves the ledger is `Some`.
     let mut redirect_uuid_by_purl: std::collections::HashMap<String, &str> =
         std::collections::HashMap::new();
-    let mut redirect_files: Vec<&str> = Vec::new();
-    if let Some(redirect) = redirect {
-        for (key, record) in &redirect.records {
-            redirect_uuid_by_purl
-                .entry(canon(key))
-                .or_insert(record.uuid.as_str());
-        }
-        redirect_files = redirect.edits.iter().map(|e| e.path.as_str()).collect();
-        redirect_files.sort();
-        redirect_files.dedup();
+    for (key, record) in redirect.iter().flat_map(|r| &r.records) {
+        redirect_uuid_by_purl
+            .entry(canon(key))
+            .or_insert(record.uuid.as_str());
     }
-    let inventory = socket_patch_core::vendor::lock_inventory::inventory_project(cwd).await;
+    let discovery = crate::commands::discover_wiring(common, cwd).await;
+    let mut liveness = LedgerLiveness::new(cwd, &discovery, redirect);
     for purl in overlap {
-        // Cargo needs its own probe: the scan inventory records `resolved:
-        // None` for every cargo entry (a Cargo.lock `source` is an index URL,
-        // not a tarball URL), so `hosted_wiring_live`'s inventory proof can
-        // never fire for cargo — and the vendored substring scan alone then
-        // INVERTS the direction after a hosted takeover (the
-        // takeover-direction bug, cargo edition). The cargo classifier reads
-        // the lock entry's actual shape instead — the lock is the truth
-        // source both modes rewire, in mutually exclusive ways.
-        let (hosted_live, vendored_live) = if purl.starts_with("pkg:cargo/") {
-            classify_cargo_overlap(cwd, &purl, vendor_by_purl.get(&purl).copied()).await
-        } else {
-            let record_uuid = redirect_uuid_by_purl.get(&purl).copied();
-            let hosted_live =
-                hosted_wiring_live(cwd, &purl, record_uuid, &redirect_files, &inventory).await;
-            let vendored_live = match vendor_by_purl.get(&purl) {
-                Some(entry) => vendored_wiring_live(cwd, entry).await,
-                None => false,
-            };
-            (hosted_live, vendored_live)
+        let hosted_live = match redirect_uuid_by_purl.get(&purl) {
+            Some(uuid) => liveness.redirect_record(&purl, uuid).await,
+            // An edits-only ledger (every record fetch failed) names no
+            // uuid: the lock's own hosted wiring of the package decides.
+            None => discovery.wires_package(&purl, WiringMode::Hosted),
+        };
+        let vendored_live = match vendor_by_purl.get(&purl) {
+            Some(entry) => liveness.vendor_entry(entry).await,
+            None => false,
         };
         match (hosted_live, vendored_live) {
             (true, false) => out.redirect.push(purl),
@@ -893,167 +893,6 @@ pub(super) async fn classify_overlap_takeover_with(
     out.redirect.sort();
     out.vendored.sort();
     out
-}
-
-/// Cargo takeover direction, proven from the `Cargo.lock` entry's shape —
-/// the one file BOTH modes rewire, in mutually exclusive ways:
-///
-/// * `source` = a Socket hosted patch registry index (matched against the
-///   config-declared `[registries.socket-patch-*]` URLs, plus the
-///   `patch.socket.dev` host for configs that were already cleaned up) ⇒
-///   hosted is live;
-/// * entry DETACHED (no `source` — the vendored shape) with the
-///   `[patch.crates-io]` entry pointing into this vendor entry's committed
-///   `.socket/vendor/cargo/<uuid>/` copy ⇒ vendored is live;
-/// * anything else (crates.io / other registry / entry or lock missing) ⇒
-///   neither proven, stay silent.
-async fn classify_cargo_overlap(
-    cwd: &Path,
-    purl: &str,
-    entry: Option<&socket_patch_core::vendor::VendorEntry>,
-) -> (bool, bool) {
-    use socket_patch_core::vendor::{cargo_config, cargo_lock};
-    let Some(rest) = purl.strip_prefix("pkg:cargo/") else {
-        return (false, false);
-    };
-    let Some((name, version)) = rest.rsplit_once('@') else {
-        return (false, false);
-    };
-    match cargo_lock::probe_lock_entry(cwd, name, version).await {
-        cargo_lock::LockEntryProbe::Source(src) => {
-            let hosted = src.contains("patch.socket.dev")
-                || cargo_config::socket_registry_indexes(cwd)
-                    .await
-                    .iter()
-                    .any(|(_, index)| *index == src);
-            (hosted, false)
-        }
-        cargo_lock::LockEntryProbe::Detached => {
-            let vendored = match entry {
-                Some(entry) => {
-                    match socket_patch_core::vendor::path::vendor_uuid_dir_rel(
-                        &entry.ecosystem,
-                        &entry.uuid,
-                    ) {
-                        Some(marker) => cargo_config::read_patch_entries(cwd)
-                            .await
-                            .get(name)
-                            .and_then(|i| i.path.as_deref())
-                            .is_some_and(|p| {
-                                p.replace('\\', "/").starts_with(&format!("{marker}/"))
-                            }),
-                        None => false,
-                    }
-                }
-                None => false,
-            };
-            (false, vendored)
-        }
-        _ => (false, false),
-    }
-}
-
-/// Whether the LIVE lockfile provably wires `purl` to a HOSTED patch
-/// artifact. Two proofs, tried in order:
-///
-/// 1. Inventory: the lock's `resolved` URL for this exact purl carries the
-///    redirect record's patch uuid — every hosted artifact URL embeds it,
-///    on ANY patch-server host (staging, self-hosted `--patch-server-url`
-///    deployments), so this is not pinned to the default `patch.socket.dev`
-///    hostname (kept only as a fallback for a ledger with no record).
-/// 2. Text: the record's patch uuid appears in a lockfile the redirect
-///    ledger recorded editing, OUTSIDE a committed `.socket/vendor/<eco>/`
-///    path. This covers the flavors the inventory structurally cannot see —
-///    yarn-berry (its inventory `resolved` is always `None`; the hosted URL
-///    lives percent-encoded in the `::__archiveUrl=` binding) and bun (the
-///    inventory skips the URL 3-tuples hosted mode writes). The vendored
-///    wiring embeds the SAME uuid in its `.socket/vendor/<eco>/<uuid>/`
-///    path, so a bare containment check would prove the wrong mode — only
-///    non-vendored-path occurrences count.
-///
-/// No record uuid and no default-host inventory match ⇒ `false` (the caller
-/// then stays silent rather than guess).
-async fn hosted_wiring_live(
-    cwd: &Path,
-    purl: &str,
-    record_uuid: Option<&str>,
-    redirect_files: &[&str],
-    inventory: &[socket_patch_core::vendor::lock_inventory::LockfileEntry],
-) -> bool {
-    if let Some(resolved) = socket_patch_core::vendor::lock_inventory::lookup(inventory, purl)
-        .and_then(|e| e.resolved.as_deref())
-    {
-        if resolved.contains("patch.socket.dev")
-            || record_uuid.is_some_and(|uuid| resolved.contains(uuid))
-        {
-            return true;
-        }
-    }
-    let Some(uuid) = record_uuid else {
-        return false;
-    };
-    let Some(eco) = strip_purl_qualifiers(purl)
-        .strip_prefix("pkg:")
-        .and_then(|rest| rest.split_once('/'))
-        .map(|(eco, _)| eco)
-    else {
-        return false;
-    };
-    let vendored_prefix = format!("vendor/{eco}/");
-    for file in redirect_files {
-        if !is_safe_project_rel_file(file) {
-            continue;
-        }
-        let Ok(text) = tokio::fs::read_to_string(cwd.join(file)).await else {
-            continue;
-        };
-        let mut search_from = 0;
-        while let Some(pos) = text[search_from..].find(uuid) {
-            let idx = search_from + pos;
-            if !text[..idx].ends_with(&vendored_prefix) {
-                return true;
-            }
-            search_from = idx + uuid.len();
-        }
-    }
-    false
-}
-
-/// The ledgers are tamper-able: only ever READ a plain in-project relative
-/// lockfile name recorded in them — never one that could climb out of `cwd`.
-fn is_safe_project_rel_file(file: &str) -> bool {
-    !(file.is_empty()
-        || file.starts_with('/')
-        || file.starts_with('\\')
-        || file.split(['/', '\\']).any(|c| c == ".."))
-}
-
-/// Whether the LIVE lockfile still wires `entry` to its committed
-/// `.socket/vendor/<eco>/<uuid>` artifact. Reads the lockfile(s) this entry
-/// recorded editing (the same set `--revert` walks) and looks for that exact
-/// vendored-path marker — the anchor `parse_vendor_path` recovers and the
-/// vendor drift-guards match on. `None`/unreadable/absent ⇒ `false` (the
-/// caller then stays silent rather than assume vendored is live).
-async fn vendored_wiring_live(cwd: &Path, entry: &socket_patch_core::vendor::VendorEntry) -> bool {
-    let Some(marker) =
-        socket_patch_core::vendor::path::vendor_uuid_dir_rel(&entry.ecosystem, &entry.uuid)
-    else {
-        return false;
-    };
-    let mut files: Vec<&str> = entry.wiring.iter().map(|w| w.file.as_str()).collect();
-    files.sort();
-    files.dedup();
-    for file in files {
-        if !is_safe_project_rel_file(file) {
-            continue;
-        }
-        if let Ok(text) = tokio::fs::read_to_string(cwd.join(file)).await {
-            if text.contains(&marker) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Human-readable detail for a mode-takeover warning naming the displaced
@@ -1151,8 +990,25 @@ pub(super) fn mode_takeover_detail(superseded: &[String], current_is_hosted: boo
 /// (envelope contract: codes are additive and stable; only the free-text
 /// detail differs), and it fires exactly once — the reconciled ledger no
 /// longer overlaps, so re-runs stay silent.
-pub(super) fn mode_takeover_reconciled_detail(reconciled: &[String]) -> String {
+pub(super) fn mode_takeover_reconciled_detail(
+    reconciled: &[String],
+    npmrc_unwound: bool,
+) -> String {
     let list = reconciled.join(", ");
+    // The `.npmrc` sentence is conditional: only a run that actually
+    // unwound the hosted npm allow-remote auto-config says so, and then the
+    // "restores the hosted wiring" claim gains its npm >= 12 caveat.
+    let npmrc = if npmrc_unwound {
+        " The hosted redirect's `.npmrc` `allow-remote=all` auto-config was \
+         unwound too (a redirect-created file deleted, an appended line \
+         removed): the vendored `file:` specs do not need it. If you later \
+         restore the hosted lock wiring with `vendor --revert`, npm >=12 \
+         refuses it (EALLOWREMOTE) until `allow-remote=all` is back — re-run \
+         `scan --mode hosted` afterwards to re-establish it and its ledger \
+         record."
+    } else {
+        ""
+    };
     format!(
         "vendored artifacts superseded the hosted redirect ledger for: {list}; \
          reconciled automatically. Both halves of each superseded entry — the \
@@ -1161,9 +1017,9 @@ pub(super) fn mode_takeover_reconciled_detail(reconciled: &[String]) -> String {
          deleted). The lockfile points at the committed `.socket/vendor/` \
          files, and the pre-vendor lock values (including the hosted-spliced \
          fragment) are preserved as the vendor ledger's wiring originals, so \
-         `vendor --revert` still restores the hosted wiring losslessly. \
-         Ledger data for other, still-redirected package(s) was left \
-         untouched. No action needed."
+         `vendor --revert` still restores the hosted lock wiring \
+         byte-for-byte.{npmrc} Ledger data for other, still-redirected \
+         package(s) was left untouched. No action needed."
     )
 }
 
@@ -1174,16 +1030,21 @@ pub(super) fn mode_takeover_reconciled_detail(reconciled: &[String]) -> String {
 /// against the LIVE lockfile: the gate that makes the warning truthful is
 /// the one that makes the drop lossless (the vendor ledger's wiring
 /// `original` embeds the hosted-spliced fragment, so `vendor --revert` needs
-/// nothing from these records). `Ok(false)` when nothing matched (degenerate
-/// — the caller falls back to the manual advisory rather than claiming a
-/// reconciliation that did not happen); `Err` when the ledger could not be
-/// read back or persisted (fail closed: the atomic writer leaves the on-disk
-/// ledger either untouched or fully pre-drop, and the caller surfaces the
-/// failure inside the warning).
-async fn reconcile_superseded_redirect(cwd: &Path, purls: &[String]) -> Result<bool, String> {
+/// nothing from these records). `Ok(Some(npmrc))` — reconciled, with the
+/// outcome of the `.npmrc` allow-remote unwind (whether the file changed,
+/// and its advisories for the caller to surface); `Ok(None)` when nothing
+/// matched (degenerate — the caller falls back to the manual advisory
+/// rather than claiming a reconciliation that did not happen); `Err` when
+/// the ledger could not be read back or persisted (fail closed: the atomic
+/// writer leaves the on-disk ledger either untouched or fully pre-drop, and
+/// the caller surfaces the failure inside the warning).
+async fn reconcile_superseded_redirect(
+    cwd: &Path,
+    purls: &[String],
+) -> Result<Option<socket_patch_core::patch::redirect::npmrc::NpmrcStandaloneUnwind>, String> {
     let mut state = match socket_patch_core::patch::redirect::load_redirect_state(cwd).await {
         Ok(Some(state)) => state,
-        Ok(None) => return Ok(false),
+        Ok(None) => return Ok(None),
         Err(corrupt) => return Err(corrupt.to_string()),
     };
     let mut dropped = false;
@@ -1191,12 +1052,23 @@ async fn reconcile_superseded_redirect(cwd: &Path, purls: &[String]) -> Result<b
         dropped |= socket_patch_core::patch::redirect::drop_superseded_purl(&mut state, purl);
     }
     if !dropped {
-        return Ok(false);
+        return Ok(None);
     }
+    // The dropped npm purls may have been the last package-lock entries the
+    // hosted `.npmrc` `allow-remote=all` auto-config served: unwind it
+    // (created file deleted / appended line removed) before persisting, so
+    // a hosted→vendored migration leaves no loosened install policy behind.
+    // Vendored `file:` specs never needed it (npm gates them by
+    // `allow-file`, default `all`).
+    // Its outcome (and advisories such as
+    // `redirect_npmrc_allow_remote_modified`) goes back to the caller.
+    let npmrc =
+        socket_patch_core::patch::redirect::npmrc::unwind_unneeded_npmrc(cwd, &mut state, false)
+            .await?;
     socket_patch_core::patch::redirect::persist_redirect_state(cwd, &state)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(true)
+    Ok(Some(npmrc))
 }
 
 /// Record a run-level advisory: stderr `Warning (code): detail` in human
@@ -1242,7 +1114,7 @@ pub(super) async fn note_vendor_supersedes_redirect(
     // the fact that this happens to be a vendored flow. A dry-run / no-op
     // over a lock that still points at the hosted patch server stays silent
     // instead of pointing cleanup at the live redirect ledger.
-    let superseded = classify_overlap_takeover(cwd).await.vendored;
+    let superseded = classify_overlap_takeover(common, cwd).await.vendored;
     if superseded.is_empty() {
         return;
     }
@@ -1272,15 +1144,23 @@ pub(super) async fn note_vendor_supersedes_redirect(
         return;
     }
     match reconcile_superseded_redirect(cwd, &reconcilable).await {
-        Ok(true) => push_run_warning(
-            env,
-            common,
-            VENDOR_SUPERSEDES_REDIRECT,
-            mode_takeover_reconciled_detail(&reconcilable),
-        ),
+        Ok(Some(npmrc)) => {
+            push_run_warning(
+                env,
+                common,
+                VENDOR_SUPERSEDES_REDIRECT,
+                mode_takeover_reconciled_detail(&reconcilable, npmrc.file_changed),
+            );
+            // The `.npmrc` unwind's own advisories (a redirect-created file
+            // the user has since added to: kept, only our line removed) —
+            // surfaced like rollback / vendor surface them.
+            for (code, detail) in npmrc.warnings {
+                push_run_warning(env, common, &code, detail);
+            }
+        }
         // Nothing matched to drop — do not claim a reconciliation that did
         // not happen; hand out the manual remediation instead.
-        Ok(false) => push_run_warning(
+        Ok(None) => push_run_warning(
             env,
             common,
             VENDOR_SUPERSEDES_REDIRECT,
@@ -1347,8 +1227,10 @@ pub(super) const HOSTED_WIRING_RETAINED: &str = "hosted_wiring_retained";
 pub(super) const VENDORED_OWNERSHIP_RETAINED: &str = "vendored_ownership_retained";
 
 /// The scanned purls whose HOSTED redirect wiring is still live: the
-/// redirect ledger records the purl AND [`hosted_wiring_live`] proves the
-/// current lockfile still routes it to the hosted artifact.
+/// redirect ledger records the purl AND lockfile discovery proves the
+/// current lockfile still routes it to that hosted patch — core
+/// `Discovery::redirect_record_live`, the same liveness rule `vex` gates
+/// redirect-ledger attestations on.
 ///
 /// Deliberately NOT routed through [`classify_overlap_takeover`]: that
 /// classifier keys on purls present in BOTH ledgers (hosted ∩ vendored),
@@ -1365,16 +1247,10 @@ pub(super) const VENDORED_OWNERSHIP_RETAINED: &str = "vendored_ownership_retaine
 /// * the live lock does not prove hosted wiring (registry-clean lock, an
 ///   ecosystem whose lock we cannot read) — never guess from ledger
 ///   presence alone.
-///
-/// `inventory` is the run's lockfile inventory (`LockfileSupplement::
-/// entries`, parsed once per run) — the same set the inventory proof in
-/// [`hosted_wiring_live`] reads; the text proof reads the recorded lockfiles
-/// directly.
 pub(super) async fn hosted_wiring_retained_purls(
-    cwd: &Path,
+    common: &GlobalArgs,
     redirect_state: Option<&socket_patch_core::patch::redirect::RedirectState>,
     scanned_purls: impl IntoIterator<Item = impl AsRef<str>>,
-    inventory: &[socket_patch_core::vendor::lock_inventory::LockfileEntry],
 ) -> Vec<String> {
     let Some(redirect) = redirect_state else {
         return Vec::new();
@@ -1399,12 +1275,12 @@ pub(super) async fn hosted_wiring_retained_purls(
     if candidates.is_empty() {
         return Vec::new();
     }
-    let mut redirect_files: Vec<&str> = redirect.edits.iter().map(|e| e.path.as_str()).collect();
-    redirect_files.sort();
-    redirect_files.dedup();
+    let cwd = &common.cwd;
+    let discovery = crate::commands::discover_wiring(common, cwd).await;
+    let mut liveness = LedgerLiveness::new(cwd, &discovery, Some(redirect));
     let mut out = Vec::new();
     for (purl, uuid) in candidates {
-        if hosted_wiring_live(cwd, &purl, Some(uuid), &redirect_files, inventory).await {
+        if liveness.redirect_record(&purl, uuid).await {
             out.push(purl);
         }
     }
@@ -2257,19 +2133,13 @@ pub async fn run(mut args: ScanArgs) -> i32 {
         // reason (its takeover reconciliation may retire ledger records
         // mid-run — the `vendor_supersedes_redirect` warning covers it).
         //
-        // The live-wiring probe (over the run's lockfile inventory, behind
-        // its cheap no-I/O gate) runs ONCE here and is shared with the
-        // agent-flow warning in the apply branch below.
+        // The live-wiring probe (lockfile discovery, behind its cheap
+        // no-I/O gate) runs ONCE here and is shared with the agent-flow
+        // warning in the apply branch below.
         let hosted_retained = if vendor {
             Vec::new()
         } else {
-            hosted_wiring_retained_purls(
-                &args.common.cwd,
-                redirect_state.as_ref(),
-                &all_purls,
-                &lockfile_only.entries,
-            )
-            .await
+            hosted_wiring_retained_purls(&args.common, redirect_state.as_ref(), &all_purls).await
         };
         if !vendor {
             if let Some(state) = redirect_state_json(redirect_state.as_ref(), &hosted_retained) {
@@ -3010,13 +2880,8 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     // (The vendored-ownership counterpart is already printed per package
     // by the `[skip] … (vendored …)` lines above.)
     if !vendor && !silent {
-        let hosted_retained = hosted_wiring_retained_purls(
-            &args.common.cwd,
-            redirect_state.as_ref(),
-            &all_purls,
-            &lockfile_only.entries,
-        )
-        .await;
+        let hosted_retained =
+            hosted_wiring_retained_purls(&args.common, redirect_state.as_ref(), &all_purls).await;
         if !hosted_retained.is_empty() {
             eprintln!(
                 "Warning ({HOSTED_WIRING_RETAINED}): {}",
@@ -3260,7 +3125,7 @@ mod tests {
 
     /// Redirect ledger with one record per PURL AND a recorded `yarn.lock`
     /// edit — the shape a real hosted run leaves behind (the edit is what
-    /// lets `hosted_wiring_live`'s text proof scan the lock).
+    /// lets the ledger-file fallback scan the lock).
     async fn write_redirect_ledger_with_edit(root: &Path, purls: &[&str]) {
         use socket_patch_core::patch::redirect::{FileEdit, RedirectState};
         let mut state = RedirectState::new();
@@ -3306,13 +3171,14 @@ mod tests {
             .unwrap()
     }
 
-    /// The run's lockfile inventory (`LockfileSupplement::entries` in
-    /// production): re-taken after every lockfile write, like `run` parses
-    /// it once per run.
-    async fn inventory_of(
-        root: &Path,
-    ) -> Vec<socket_patch_core::vendor::lock_inventory::LockfileEntry> {
-        socket_patch_core::vendor::lock_inventory::inventory_project(root).await
+    /// `GlobalArgs` rooted at `root` (the classifiers read the live
+    /// lockfiles there; `json` keeps stderr quiet).
+    fn common_at(root: &Path) -> GlobalArgs {
+        GlobalArgs {
+            cwd: root.to_path_buf(),
+            json: true,
+            ..GlobalArgs::default()
+        }
     }
 
     #[tokio::test]
@@ -3327,20 +3193,15 @@ mod tests {
         // invisible to the hosted⇄vendored overlap classifier…
         assert!(overlapping_ledger_purls(root).await.is_empty());
         assert_eq!(
-            classify_overlap_takeover(root).await,
+            classify_overlap_takeover(&common_at(root), root).await,
             OverlapTakeover::default()
         );
 
         // …but the agent flow's direct probe sees it for scanned purls.
         let scanned: HashSet<String> = [purl.to_string()].into_iter().collect();
         let ledger = load_ledger(root).await;
-        let retained = hosted_wiring_retained_purls(
-            root,
-            ledger.as_ref(),
-            &scanned,
-            &inventory_of(root).await,
-        )
-        .await;
+        let retained =
+            hosted_wiring_retained_purls(&common_at(root), ledger.as_ref(), &scanned).await;
         assert_eq!(retained, vec![purl.to_string()]);
     }
 
@@ -3359,14 +3220,9 @@ mod tests {
         write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
         let ledger = load_ledger(tmp.path()).await;
         assert!(
-            hosted_wiring_retained_purls(
-                tmp.path(),
-                ledger.as_ref(),
-                &scanned,
-                &inventory_of(tmp.path()).await
-            )
-            .await
-            .is_empty(),
+            hosted_wiring_retained_purls(&common_at(tmp.path()), ledger.as_ref(), &scanned)
+                .await
+                .is_empty(),
             "records gone ⇒ silent (pre-reverted wiring must not re-warn)"
         );
 
@@ -3384,14 +3240,9 @@ mod tests {
         .unwrap();
         let ledger = load_ledger(tmp.path()).await;
         assert!(
-            hosted_wiring_retained_purls(
-                tmp.path(),
-                ledger.as_ref(),
-                &scanned,
-                &inventory_of(tmp.path()).await
-            )
-            .await
-            .is_empty(),
+            hosted_wiring_retained_purls(&common_at(tmp.path()), ledger.as_ref(), &scanned)
+                .await
+                .is_empty(),
             "registry-clean lock ⇒ silent"
         );
 
@@ -3402,14 +3253,9 @@ mod tests {
         let other: HashSet<String> = ["pkg:npm/lodash@4.17.21".to_string()].into_iter().collect();
         let ledger = load_ledger(tmp.path()).await;
         assert!(
-            hosted_wiring_retained_purls(
-                tmp.path(),
-                ledger.as_ref(),
-                &other,
-                &inventory_of(tmp.path()).await
-            )
-            .await
-            .is_empty(),
+            hosted_wiring_retained_purls(&common_at(tmp.path()), ledger.as_ref(), &other)
+                .await
+                .is_empty(),
             "unscanned purl ⇒ silent"
         );
 
@@ -3417,14 +3263,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
         assert!(
-            hosted_wiring_retained_purls(
-                tmp.path(),
-                None,
-                &scanned,
-                &inventory_of(tmp.path()).await
-            )
-            .await
-            .is_empty(),
+            hosted_wiring_retained_purls(&common_at(tmp.path()), None, &scanned)
+                .await
+                .is_empty(),
             "no ledger ⇒ silent"
         );
     }
@@ -3484,13 +3325,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_redirect_ledger_with_edit(tmp.path(), &[purl]).await;
         let ledger = load_ledger(tmp.path()).await;
-        let wiring = hosted_wiring_retained_purls(
-            tmp.path(),
-            ledger.as_ref(),
-            &scanned,
-            &inventory_of(tmp.path()).await,
-        )
-        .await;
+        let wiring =
+            hosted_wiring_retained_purls(&common_at(tmp.path()), ledger.as_ref(), &scanned).await;
         assert_eq!(wiring, Vec::<String>::new());
         let block =
             redirect_state_json(ledger.as_ref(), &wiring).expect("records present ⇒ block present");
@@ -3505,13 +3341,8 @@ mod tests {
         // Live lock present too: the same purl graduates into wiringLive
         // (a fresh run re-parses the inventory, so re-take it here).
         write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
-        let wiring = hosted_wiring_retained_purls(
-            tmp.path(),
-            ledger.as_ref(),
-            &scanned,
-            &inventory_of(tmp.path()).await,
-        )
-        .await;
+        let wiring =
+            hosted_wiring_retained_purls(&common_at(tmp.path()), ledger.as_ref(), &scanned).await;
         let block =
             redirect_state_json(ledger.as_ref(), &wiring).expect("records present ⇒ block present");
         assert_eq!(block["wiringLive"], serde_json::json!([purl]));
@@ -3552,8 +3383,8 @@ mod tests {
             .records
             .insert(scoped_key.to_string(), takeover_record());
         state.records.insert(gem_key.to_string(), takeover_record());
-        // A recorded yarn.lock edit + the uuid in the lock text (outside any
-        // vendored path) — the text proof of live hosted wiring for the
+        // A recorded yarn.lock edit + a lock entry resolving the scoped
+        // package from its hosted artifact — live hosted wiring for the
         // scoped purl.
         state.edits.push(FileEdit {
             path: "yarn.lock".to_string(),
@@ -3571,17 +3402,21 @@ mod tests {
         )
         .await
         .unwrap();
-        write_hosted_yarn_lock(tmp.path(), TAKEOVER_UUID).await;
+        tokio::fs::write(
+            tmp.path().join("yarn.lock"),
+            format!(
+                "# yarn lockfile v1\n\n\n\"@scope/pkg@^1.0.0\":\n  version \"1.0.0\"\n  \
+                 resolved \"https://patch.socket.dev/patch/npm/@scope/pkg/1.0.0/tok/\
+                 {TAKEOVER_UUID}/pkg-1.0.0.tgz#aaaa\"\n  integrity sha512-fake==\n"
+            ),
+        )
+        .await
+        .unwrap();
 
         let scanned: HashSet<String> = [scoped_canon.to_string()].into_iter().collect();
         let ledger = load_ledger(tmp.path()).await;
-        let wiring = hosted_wiring_retained_purls(
-            tmp.path(),
-            ledger.as_ref(),
-            &scanned,
-            &inventory_of(tmp.path()).await,
-        )
-        .await;
+        let wiring =
+            hosted_wiring_retained_purls(&common_at(tmp.path()), ledger.as_ref(), &scanned).await;
         assert_eq!(
             wiring,
             vec![scoped_canon.to_string()],
@@ -3643,7 +3478,19 @@ mod tests {
     // cargo-specific lock-shape classifier.
 
     const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.4";
-    const CARGO_INDEX: &str = "sparse+http://127.0.0.1:5555/index/";
+    /// A self-hosted patch server's sparse index (the probe must not depend
+    /// on the patch.socket.dev host; discovery counts the operator's
+    /// `--patch-server-url` origin, see [`cargo_common_at`]).
+    const CARGO_INDEX: &str =
+        "sparse+http://127.0.0.1:5555/patch-registry/cargo/tok/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/index/";
+
+    /// [`common_at`] with the self-hosted patch server of [`CARGO_INDEX`].
+    fn cargo_common_at(root: &Path) -> GlobalArgs {
+        GlobalArgs {
+            patch_server_url: Some("http://127.0.0.1:5555".to_string()),
+            ..common_at(root)
+        }
+    }
 
     /// A vendored state ledger with one CARGO entry wired the way the cargo
     /// backend records it (.cargo/config.toml patch entry + Cargo.lock edit).
@@ -3726,7 +3573,7 @@ mod tests {
         write_cargo_vendor_ledger(root).await;
         write_cargo_hosted_takeover_files(root).await;
 
-        let takeover = classify_overlap_takeover(root).await;
+        let takeover = classify_overlap_takeover(&cargo_common_at(root), root).await;
         assert_eq!(
             takeover.redirect,
             vec![CARGO_PURL.to_string()],
@@ -3765,7 +3612,7 @@ mod tests {
         .await
         .unwrap();
 
-        let takeover = classify_overlap_takeover(root).await;
+        let takeover = classify_overlap_takeover(&cargo_common_at(root), root).await;
         assert_eq!(
             takeover.vendored,
             vec![CARGO_PURL.to_string()],
@@ -3792,7 +3639,7 @@ mod tests {
         .await
         .unwrap();
 
-        let takeover = classify_overlap_takeover(root).await;
+        let takeover = classify_overlap_takeover(&cargo_common_at(root), root).await;
         assert!(
             takeover.redirect.is_empty() && takeover.vendored.is_empty(),
             "{takeover:?}"
@@ -3807,11 +3654,15 @@ mod tests {
 
     /// Like [`write_vendor_ledger`] but each entry records wiring the
     /// `package-lock.json` — the file the direction check reads to see whether
-    /// the lock still points at the committed `.socket/vendor/` artifact.
+    /// the lock still points at the committed `.socket/vendor/` artifact —
+    /// and names the artifact the npm backend writes for the package
+    /// (`<name>-<version>.tgz`, what [`write_lock_pointing_at_vendored`]
+    /// wires).
     async fn write_vendor_ledger_wired(root: &Path, purls: &[&str]) {
         let entries: serde_json::Map<String, serde_json::Value> = purls
             .iter()
             .map(|purl| {
+                let (name, version) = purl_name_version(purl).expect("pkg:npm/<name>@<version>");
                 (
                     (*purl).to_string(),
                     serde_json::json!({
@@ -3819,7 +3670,9 @@ mod tests {
                         "basePurl": purl,
                         "uuid": TAKEOVER_UUID,
                         "artifact": {
-                            "path": format!(".socket/vendor/npm/{TAKEOVER_UUID}/pkg.tgz"),
+                            "path": format!(
+                                ".socket/vendor/npm/{TAKEOVER_UUID}/{name}-{version}.tgz"
+                            ),
                         },
                         "wiring": [{
                             "file": "package-lock.json",
@@ -3867,7 +3720,8 @@ mod tests {
     }
 
     /// A `package-lock.json` whose single dep resolves to the hosted patch
-    /// server — hosted is what the lock actually wires.
+    /// server — hosted is what the lock actually wires (the artifact url
+    /// carries the patch uuid, like every url the hosted rewriter writes).
     async fn write_lock_pointing_at_hosted(root: &Path, name: &str, version: &str) {
         let lock = serde_json::json!({
             "name": "app",
@@ -3878,7 +3732,8 @@ mod tests {
                 format!("node_modules/{name}"): {
                     "version": version,
                     "resolved": format!(
-                        "https://patch.socket.dev/npm/{name}/-/{name}-{version}.tgz"
+                        "https://patch.socket.dev/patch/npm/{name}/{version}/tok/{TAKEOVER_UUID}/\
+                         {name}-{version}.tgz"
                     ),
                     "integrity": format!("sha512-{}", "a".repeat(86)),
                 },
@@ -3904,7 +3759,7 @@ mod tests {
         write_vendor_ledger_wired(root, &["pkg:npm/minimist@1.2.2"]).await;
         write_lock_pointing_at_vendored(root, "minimist", "1.2.2").await;
 
-        let takeover = classify_overlap_takeover(root).await;
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
         // The hosted flow keys its warning off `.redirect` — empty here, so it
         // stays silent instead of accusing the live vendored ledger.
         assert!(
@@ -3933,7 +3788,7 @@ mod tests {
         write_vendor_ledger_wired(root, &["pkg:npm/minimist@1.2.2"]).await;
         write_lock_pointing_at_hosted(root, "minimist", "1.2.2").await;
 
-        let takeover = classify_overlap_takeover(root).await;
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
         assert!(
             takeover.vendored.is_empty(),
             "vendored flow must not warn when the lock is hosted: {takeover:?}"
@@ -3955,7 +3810,7 @@ mod tests {
         write_redirect_ledger(root, &["pkg:npm/minimist@1.2.2"]).await;
         write_vendor_ledger_wired(root, &["pkg:npm/minimist@1.2.2"]).await;
 
-        let takeover = classify_overlap_takeover(root).await;
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
         assert!(
             takeover.redirect.is_empty() && takeover.vendored.is_empty(),
             "no lock proof ⇒ no directional warning: {takeover:?}"
@@ -4101,7 +3956,7 @@ mod tests {
             vec!["pkg:npm/minimist@1.2.2".to_string()],
             "an edits-only redirect ledger must still count as overlapping"
         );
-        let takeover = classify_overlap_takeover(root).await;
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
         assert_eq!(
             takeover.vendored,
             vec!["pkg:npm/minimist@1.2.2".to_string()],
@@ -4131,7 +3986,7 @@ mod tests {
         write_vendor_ledger_wired(root, &["pkg:npm/minimist@1.2.2"]).await;
         write_lock_pointing_at_vendored(root, "minimist", "1.2.2").await;
 
-        let before = classify_overlap_takeover(root).await;
+        let before = classify_overlap_takeover(&common_at(root), root).await;
         assert_eq!(
             before.vendored,
             vec!["pkg:npm/minimist@1.2.2".to_string()],
@@ -4148,7 +4003,7 @@ mod tests {
         // ledger file itself left in place.
         write_redirect_ledger_with_edits(root, &[], Vec::new()).await;
 
-        let after = classify_overlap_takeover(root).await;
+        let after = classify_overlap_takeover(&common_at(root), root).await;
         assert_eq!(
             after,
             OverlapTakeover::default(),
@@ -4196,7 +4051,7 @@ mod tests {
         .await
         .unwrap();
 
-        let takeover = classify_overlap_takeover(root).await;
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
         assert_eq!(
             takeover.redirect,
             vec!["pkg:npm/minimist@1.2.2".to_string()],
@@ -4230,7 +4085,7 @@ mod tests {
         .await
         .unwrap();
 
-        let takeover = classify_overlap_takeover(root).await;
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
         assert_eq!(
             takeover.redirect,
             vec!["pkg:npm/minimist@1.2.2".to_string()],
@@ -4264,7 +4119,7 @@ mod tests {
         .await
         .unwrap();
 
-        let takeover = classify_overlap_takeover(root).await;
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
         assert_eq!(
             takeover.redirect,
             vec!["pkg:npm/minimist@1.2.2".to_string()],
@@ -4290,7 +4145,7 @@ mod tests {
         write_vendor_ledger_wired(root, &["pkg:npm/minimist@1.2.2"]).await;
         write_lock_pointing_at_vendored(root, "minimist", "1.2.2").await;
 
-        let takeover = classify_overlap_takeover(root).await;
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
         assert!(
             takeover.redirect.is_empty(),
             "a vendored-path uuid must not prove hosted: {takeover:?}"
@@ -4324,7 +4179,7 @@ mod tests {
             "a corrupt vendor ledger must degrade to no-overlap"
         );
         assert_eq!(
-            classify_overlap_takeover(root).await,
+            classify_overlap_takeover(&common_at(root), root).await,
             OverlapTakeover::default(),
             "no overlap ⇒ no directional classification"
         );
@@ -4333,9 +4188,9 @@ mod tests {
     #[tokio::test]
     async fn cargo_overlap_with_no_lock_to_probe_stays_silent() {
         // Both ledgers claim the cargo purl but there is NO Cargo.lock (a
-        // fresh checkout / deleted lock). `classify_cargo_overlap`'s probe
-        // returns NoLockfile, which proves neither direction — the `_` arm
-        // must classify silent rather than guess.
+        // fresh checkout / deleted lock): discovery finds no cargo wiring
+        // either way, which proves neither direction — the classifier must
+        // stay silent rather than guess.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write_redirect_ledger(root, &[CARGO_PURL]).await;
@@ -4349,7 +4204,7 @@ mod tests {
         );
         // …but with no lock to prove a direction, both buckets stay empty.
         assert_eq!(
-            classify_overlap_takeover(root).await,
+            classify_overlap_takeover(&common_at(root), root).await,
             OverlapTakeover::default(),
             "no Cargo.lock ⇒ neither direction proven ⇒ silent"
         );
@@ -4358,7 +4213,9 @@ mod tests {
     // ---- hostile-ledger tamper guards (path traversal) ----------------------
     // The ledgers are committed files an attacker can edit: a recorded
     // lockfile name must never make the wiring probes READ outside the
-    // project root.
+    // project root. The probes are core discovery's ledger-liveness rules
+    // (the ones `vex` gates on); with nothing discovered they fall back to
+    // the ledger's recorded files, which is the path under test.
 
     #[tokio::test]
     async fn hosted_wiring_text_proof_never_reads_outside_the_project() {
@@ -4374,15 +4231,17 @@ mod tests {
         .await
         .unwrap();
 
+        let nothing_discovered = socket_patch_core::vex::discover::Discovery::default();
         assert!(
-            !hosted_wiring_live(
-                &root,
-                "pkg:npm/minimist@1.2.2",
-                Some(TAKEOVER_UUID),
-                &["../escape.lock"],
-                &[],
-            )
-            .await,
+            !nothing_discovered
+                .redirect_record_live(
+                    &root,
+                    "pkg:npm/minimist@1.2.2",
+                    TAKEOVER_UUID,
+                    &["../escape.lock"],
+                    &mut Some(Vec::new()),
+                )
+                .await,
             "a '../'-escaping ledger path must never be read"
         );
 
@@ -4395,14 +4254,15 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            hosted_wiring_live(
-                &root,
-                "pkg:npm/minimist@1.2.2",
-                Some(TAKEOVER_UUID),
-                &["inside.lock"],
-                &[],
-            )
-            .await,
+            nothing_discovered
+                .redirect_record_live(
+                    &root,
+                    "pkg:npm/minimist@1.2.2",
+                    TAKEOVER_UUID,
+                    &["inside.lock"],
+                    &mut Some(Vec::new()),
+                )
+                .await,
             "the identical in-project file must prove hosted wiring"
         );
     }
@@ -4440,8 +4300,9 @@ mod tests {
 
         let escaping: socket_patch_core::vendor::VendorEntry =
             serde_json::from_value(entry_json("../escape.lock")).unwrap();
+        let nothing_discovered = socket_patch_core::vex::discover::Discovery::default();
         assert!(
-            !vendored_wiring_live(&root, &escaping).await,
+            !nothing_discovered.vendor_entry_live(&root, &escaping).await,
             "a '../'-escaping wiring file must never be read"
         );
 
@@ -4455,7 +4316,9 @@ mod tests {
         let in_project: socket_patch_core::vendor::VendorEntry =
             serde_json::from_value(entry_json("inside.lock")).unwrap();
         assert!(
-            vendored_wiring_live(&root, &in_project).await,
+            nothing_discovered
+                .vendor_entry_live(&root, &in_project)
+                .await,
             "the identical in-project wiring file must prove vendored wiring"
         );
     }
@@ -4538,6 +4401,69 @@ mod tests {
         );
     }
 
+    /// Finding: the reconcile unwound the hosted `.npmrc` auto-config but
+    /// threw away the unwind's warnings (a user-edited redirect-created
+    /// `.npmrc` was rewritten with no `redirect_npmrc_allow_remote_modified`)
+    /// and its detail never mentioned `.npmrc` while still promising
+    /// `vendor --revert` restores the hosted wiring (npm 12 then refuses it
+    /// without the line). Both are now surfaced.
+    #[tokio::test]
+    async fn vendored_takeover_reconcile_surfaces_the_npmrc_unwind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_redirect_ledger_with_edits(
+            root,
+            &[NPM_TAKEOVER_PURL],
+            vec![
+                redirect_edit("package-lock.json", "minimist@1.2.2"),
+                socket_patch_core::patch::redirect::FileEdit {
+                    path: ".npmrc".into(),
+                    kind: "redirect_npmrc_allow_remote".into(),
+                    action: "created".into(),
+                    key: Some("allow-remote".into()),
+                    original: None,
+                    new: Some(serde_json::json!("all")),
+                },
+            ],
+        )
+        .await;
+        write_vendor_ledger_wired(root, &[NPM_TAKEOVER_PURL]).await;
+        write_lock_pointing_at_vendored(root, "minimist", "1.2.2").await;
+        // The user added their own setting to the redirect-created file.
+        tokio::fs::write(root.join(".npmrc"), "allow-remote=all\nfund=false\n")
+            .await
+            .unwrap();
+
+        let mut env = vendor_env();
+        note_vendor_supersedes_redirect(&mut env, root, &takeover_common()).await;
+
+        let codes: Vec<&str> = env.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            [
+                VENDOR_SUPERSEDES_REDIRECT,
+                "redirect_npmrc_allow_remote_modified"
+            ],
+            "{:?}",
+            env.warnings
+        );
+        let detail = &env.warnings[0].detail;
+        assert!(detail.contains("reconciled automatically"), "{detail}");
+        assert!(detail.contains("`.npmrc` `allow-remote=all`"), "{detail}");
+        assert!(detail.contains("EALLOWREMOTE"), "{detail}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(".npmrc"))
+                .await
+                .unwrap(),
+            "fund=false\n",
+            "only our line removed"
+        );
+        assert!(load_ledger(root).await.is_none(), "emptied ledger deleted");
+
+        // Without a recorded `.npmrc` edit the detail stays silent on it.
+        assert!(!mode_takeover_reconciled_detail(&["p".into()], false).contains(".npmrc"));
+    }
+
     #[tokio::test]
     async fn vendored_takeover_dry_run_warns_manual_and_leaves_the_ledger() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4602,7 +4528,7 @@ mod tests {
         assert_eq!(
             env.warnings[0].detail,
             mode_takeover_detail(&[NPM_TAKEOVER_PURL.to_string()], false),
-            "an Ok(false) reconcile must fall back to the manual detail verbatim"
+            "an Ok(None) reconcile must fall back to the manual detail verbatim"
         );
         let after = tokio::fs::read(&ledger_path).await.unwrap();
         assert_eq!(
@@ -4661,5 +4587,31 @@ mod tests {
             before, after,
             "a failed persist must leave the ledger untouched"
         );
+    }
+
+    /// A failed embedded VEX's discovery diagnostics reach the scan JSON:
+    /// appended after existing `warnings[]` (layout refusals), or creating
+    /// the array; an empty list leaves the object untouched.
+    #[test]
+    fn vex_error_warnings_append_to_scan_json() {
+        let w = crate::json_envelope::RunWarning {
+            code: "lockfile_unparseable".to_string(),
+            detail: "pnpm-lock.yaml: bad".to_string(),
+        };
+        let mut fresh = serde_json::json!({ "status": "error" });
+        append_vex_error_warnings(&mut fresh, &[]);
+        assert!(fresh.get("warnings").is_none());
+        append_vex_error_warnings(&mut fresh, std::slice::from_ref(&w));
+        assert_eq!(fresh["warnings"][0]["code"], "lockfile_unparseable");
+
+        let mut existing = serde_json::json!({ "warnings": [{ "code": "pnp", "detail": "d" }] });
+        append_vex_error_warnings(&mut existing, &[w]);
+        let codes: Vec<&str> = existing["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["code"].as_str().unwrap())
+            .collect();
+        assert_eq!(codes, ["pnp", "lockfile_unparseable"]);
     }
 }

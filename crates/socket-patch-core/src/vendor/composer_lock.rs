@@ -47,6 +47,7 @@ use super::common::{
     prune_empty_vendor_levels, refused, serialize_json, service_offline_conflict, stage_dir_for,
     swap_stage_into_place, synthesized_result,
 };
+use super::lock_inventory::{composer_lock_packages, ComposerLockPackage};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::extract_zip;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
@@ -739,26 +740,33 @@ async fn composer_service_copy(
 /// Names are compared case-insensitively, versions through the `v`-prefix
 /// normalization (see module doc).
 fn find_lock_entry(lock: &Value, pkg_lc: &str, version: &str) -> Option<(&'static str, usize)> {
-    for section in ["packages", "packages-dev"] {
-        let Some(arr) = lock.get(section).and_then(Value::as_array) else {
-            continue;
-        };
-        for (i, e) in arr.iter().enumerate() {
-            let Some(name) = e.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            if !name.eq_ignore_ascii_case(pkg_lc) {
-                continue;
-            }
-            let Some(v) = e.get("version").and_then(Value::as_str) else {
-                continue;
-            };
-            if normalize_version(v) == normalize_version(version) {
-                return Some((section, i));
-            }
-        }
-    }
-    None
+    composer_lock_packages(lock)
+        .into_iter()
+        .find(|p| {
+            p.name.is_some_and(|n| n.eq_ignore_ascii_case(pkg_lc))
+                && p.version
+                    .is_some_and(|v| normalize_version(v) == normalize_version(version))
+        })
+        .map(|p| (p.section, p.index))
+}
+
+/// The index in `lock[section]` of the FIRST entry named `pkg` (any case),
+/// if its dist is still [`wired_to`] `uuid`. The ownership gate of a restore:
+/// a registry dist (composer update reverted it) or a different uuid (a
+/// newer vendor run owns the entry) is third-party state — never clobber it.
+fn wired_entry_index(lock: &Value, section: &str, pkg: &str, uuid: &str) -> Option<usize> {
+    composer_lock_packages(lock)
+        .into_iter()
+        .find(|p| p.section == section && p.name.is_some_and(|n| n.eq_ignore_ascii_case(pkg)))
+        .filter(|p| wired_to(p, uuid))
+        .map(|p| p.index)
+}
+
+/// Whether the entry's `dist.url` points into patch `uuid`'s vendored
+/// composer copy — the ownership gate every restore / strand check applies.
+fn wired_to(pkg: &ComposerLockPackage<'_>, uuid: &str) -> bool {
+    pkg.dist_vendor_path()
+        .is_some_and(|p| p.eco == "composer" && p.uuid == uuid)
 }
 
 /// True when the live entry already carries our path dist.
@@ -773,7 +781,9 @@ fn entry_is_wired(entry: &Value, dist_url: &str) -> bool {
 /// original slot with `transport-options` inserted right after it. A
 /// pre-existing `transport-options` is superseded by ours (never duplicated).
 /// A source-only entry without `dist` gets both appended at the end.
-fn rewrite_lock_entry(
+/// `pub(crate)` so `vex::discover::composer`'s tests derive their vendored
+/// fixture from the writer itself (the reader cannot drift from it).
+pub(crate) fn rewrite_lock_entry(
     original: &Map<String, Value>,
     dist_url: &str,
     patch_uuid: &str,
@@ -848,31 +858,22 @@ async fn stranded_wired_packages(
     let Ok(lock) = serde_json::from_str::<Value>(&text) else {
         return Vec::new();
     };
+    stranded_in(&lock, uuid, restorable)
+}
+
+/// [`stranded_wired_packages`] over a parsed lock.
+fn stranded_in(lock: &Value, uuid: &str, restorable: &HashSet<String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for section in ["packages", "packages-dev"] {
-        let Some(arr) = lock.get(section).and_then(Value::as_array) else {
+    for pkg in composer_lock_packages(lock) {
+        let Some(name) = pkg.name.filter(|_| wired_to(&pkg, uuid)) else {
             continue;
         };
-        for e in arr {
-            let wired_to_us = e
-                .get("dist")
-                .and_then(|d| d.get("url"))
-                .and_then(Value::as_str)
-                .and_then(parse_vendor_path)
-                .is_some_and(|p| p.eco == "composer" && p.uuid == uuid);
-            if !wired_to_us {
-                continue;
-            }
-            let Some(name) = e.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let name = name.to_lowercase();
-            // Section-qualified: `restore_lock_entry` only searches the
-            // section the wiring recorded, so an entry that moved between
-            // packages[] and packages-dev[] is unrestorable too.
-            if !restorable.contains(&format!("{section}:{name}")) && !out.contains(&name) {
-                out.push(name);
-            }
+        let name = name.to_lowercase();
+        // Section-qualified: `restore_lock_entry` only searches the
+        // section the wiring recorded, so an entry that moved between
+        // packages[] and packages-dev[] is unrestorable too.
+        if !restorable.contains(&format!("{}:{name}", pkg.section)) && !out.contains(&name) {
+            out.push(name);
         }
     }
     out
@@ -908,31 +909,9 @@ async fn restore_lock_entry(
     let mut lock: Value =
         serde_json::from_str(&lock_text).map_err(|e| format!("unparseable composer.lock: {e}"))?;
 
-    let Some(arr) = lock.get(section).and_then(Value::as_array) else {
+    let Some(idx) = wired_entry_index(&lock, section, pkg, uuid) else {
         return Ok(false);
     };
-    let Some(idx) = arr.iter().position(|e| {
-        e.get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|n| n.eq_ignore_ascii_case(pkg))
-    }) else {
-        return Ok(false);
-    };
-
-    // Ownership gate: only restore when the live dist still points into OUR
-    // uuid dir. A registry dist (composer update reverted it) or a different
-    // uuid (a newer vendor run owns the entry) is third-party state — never
-    // clobber it.
-    let live = &lock[section][idx];
-    let wired_to_us = live
-        .get("dist")
-        .and_then(|d| d.get("url"))
-        .and_then(Value::as_str)
-        .and_then(parse_vendor_path)
-        .is_some_and(|p| p.eco == "composer" && p.uuid == uuid);
-    if !wired_to_us {
-        return Ok(false);
-    }
 
     if !dry_run {
         lock[section][idx] = original;

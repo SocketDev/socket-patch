@@ -32,7 +32,7 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_strin
 use crate::utils::python_lock::preserve_line_endings;
 
 use super::common::{
-    ensure_unchanged, item_get, pep508_name, pep621_declared_names, record, refuse_symlinked,
+    ensure_unchanged, item_get, pep508_name, pyproject_dependency_specs, record, refuse_symlinked,
 };
 use super::state::{UvMeta, VendorEntry, WiringAction, WiringRecord};
 use super::toml_surgery::{
@@ -248,25 +248,12 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
 /// would take the override branch and leave that entry's `specifier` in
 /// place — `uv lock --check` / `uv sync --locked` red on every uv >= 0.2.37.
 fn classify_dependency(p: &UvProject, canon_name: &str) -> UvDepClass {
-    let mut declared: Vec<String> = Vec::new();
-    pep621_declared_names(&p.pyproject, &mut declared);
-    if let Some(groups) = p
-        .pyproject
-        .get("dependency-groups")
-        .and_then(Item::as_table_like)
-    {
-        for (_, item) in groups.iter() {
-            if let Some(arr) = item.as_array() {
-                // Non-string members are `{include-group = "..."}` includes;
-                // the included group's own array is already scanned above.
-                declared.extend(
-                    arr.iter()
-                        .filter_map(Value::as_str)
-                        .map(|s| pep508_name(s).to_string()),
-                );
-            }
-        }
-    }
+    // A group's non-string `{include-group = "..."}` members are skipped:
+    // the included group's own array is scanned too.
+    let mut declared: Vec<&str> = pyproject_dependency_specs(&p.pyproject)
+        .into_iter()
+        .map(|(_, spec)| pep508_name(spec))
+        .collect();
     if let Some(dev) = p
         .pyproject
         .get("tool")
@@ -274,11 +261,7 @@ fn classify_dependency(p: &UvProject, canon_name: &str) -> UvDepClass {
         .and_then(|u| item_get(u, "dev-dependencies"))
         .and_then(Item::as_array)
     {
-        declared.extend(
-            dev.iter()
-                .filter_map(Value::as_str)
-                .map(|s| pep508_name(s).to_string()),
-        );
+        declared.extend(dev.iter().filter_map(Value::as_str).map(pep508_name));
     }
     if declared
         .iter()

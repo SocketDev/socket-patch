@@ -24,7 +24,9 @@ use std::time::Duration;
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome, StagedSources};
 use crate::commands::lock_cli::acquire_or_emit;
-use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
+use crate::commands::vex::{
+    generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
+};
 use crate::ecosystem_dispatch::{find_all_packages_for_purls, partition_purls};
 use crate::json_envelope::{
     AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile,
@@ -792,18 +794,90 @@ pub async fn run(args: ApplyArgs) -> i32 {
         {
             return refuse_yarn_pnp(&args);
         }
-        if args.common.json {
-            let mut env = Envelope::new(Command::Apply);
-            env.status = Status::NoManifest;
-            env.dry_run = args.common.dry_run;
-            println!("{}", env.to_pretty_json());
-        } else if !args.common.silent {
+        // Nothing to apply — but `--vex` may still have something to
+        // attest: hosted / vendored patches are wired by the lockfiles (and
+        // the `.socket/vendor` ledgers), not the manifest, and a
+        // `scan --mode hosted|vendored` or depscan checkout (both modes are
+        // manifest-free) has none. Before, this branch returned before VEX
+        // generation, so `apply --vex` exited 0 having written NO document
+        // (and left a previous run's at the path). Nothing referenced
+        // anywhere keeps the historical calm exit 0 (a stale document is
+        // still removed); any other VEX failure flips the exit like the
+        // with-manifest path. A dry run applies nothing, so it skips
+        // generation (main-path parity), and so does `--check`: it is
+        // read-only, lock-free and offline-safe — it never crawls, fetches
+        // or writes — and the with-manifest path returns from it before any
+        // VEX work (an ambient `SOCKET_VEX` must not turn an audit job's
+        // `apply --check` into a VEX run).
+        // The host line first: the VEX run below prints its own warnings to
+        // stderr as it goes, and they read as part of the `--vex` side
+        // effect only after the command has said what it did.
+        if !args.common.json && !args.common.silent {
             // Names the manifest, not the folder: hosted- and vendored-mode
             // projects have a `.socket/` (their ledgers live under
             // `.socket/vendor/`) and still nothing for `apply` to do.
             println!("No patch manifest found; nothing to apply.");
         }
-        return 0;
+        let vex_result = if !args.common.dry_run && !args.check && args.vex.vex.is_some() {
+            let params = args.vex.to_build_params();
+            Some(generate_vex_without_manifest(&args.common, &params, &manifest_path).await)
+        } else {
+            None
+        };
+        let vex_path = || {
+            args.vex
+                .vex
+                .as_ref()
+                .expect("vex_result is Some only when --vex was given")
+        };
+        if args.common.json {
+            let mut env = Envelope::new(Command::Apply);
+            env.status = Status::NoManifest;
+            env.dry_run = args.common.dry_run;
+            match &vex_result {
+                Some(ManifestlessVex::Written(summary)) => {
+                    env.vex = Some(VexSummary {
+                        path: vex_path().display().to_string(),
+                        statements: summary.statements,
+                        format: "openvex-0.2.0".to_string(),
+                        warnings: summary.warnings.clone(),
+                    });
+                }
+                Some(ManifestlessVex::Failed(e)) => {
+                    // The discovery diagnostics and the omitted patches are
+                    // the only explanation of the failure (why a lockfile
+                    // mention is not live wiring, which gate refused what):
+                    // same channel as the success path's advisories.
+                    env.warnings.extend(e.embedded_warnings());
+                    env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
+                }
+                Some(ManifestlessVex::NothingToAttest(warnings)) => {
+                    env.warnings.extend(warnings.iter().cloned());
+                }
+                None => {}
+            }
+            println!("{}", env.to_pretty_json());
+        } else {
+            match &vex_result {
+                Some(ManifestlessVex::Written(summary)) if !args.common.silent => println!(
+                    "{}",
+                    crate::commands::vex::format_vex_written(summary.statements, vex_path())
+                ),
+                // Errors print even under --silent (same as the main path).
+                Some(ManifestlessVex::Failed(e)) => e.print_embedded(&args.common),
+                Some(ManifestlessVex::NothingToAttest(_)) if !args.common.silent => {
+                    println!("{}", crate::commands::vex::format_vex_nothing_to_attest())
+                }
+                None if !args.common.silent && args.common.dry_run && args.vex.vex.is_some() => {
+                    println!(
+                        "{}",
+                        crate::commands::vex::format_vex_dry_run_skip("applied")
+                    );
+                }
+                _ => {}
+            }
+        }
+        return i32::from(matches!(vex_result, Some(ManifestlessVex::Failed(_))));
     }
 
     // Read-only Go `replace`-redirect verification for CI / GitHub-App auditing.
@@ -1095,6 +1169,7 @@ pub(crate) async fn run_locked(
                         });
                     }
                     Some(Err(e)) => {
+                        env.warnings.extend(e.embedded_warnings());
                         env.mark_error(EnvelopeError::new(e.code, e.message.clone()));
                     }
                     None => {}
@@ -1120,12 +1195,7 @@ pub(crate) async fn run_locked(
                             );
                         }
                     }
-                    Some(Err(e)) => {
-                        // Errors print even under --silent ("errors only",
-                        // never "nothing"): exit 1 with no message would be
-                        // undiagnosable.
-                        eprintln!("Error: VEX generation failed: {}", e.message);
-                    }
+                    Some(Err(e)) => e.print_embedded(&args.common),
                     None => {
                         // Only a dry run that itself succeeded skips VEX
                         // *because* of --dry-run; a failed one would have

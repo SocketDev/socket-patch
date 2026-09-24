@@ -34,8 +34,11 @@
 //! version) is silently ignored and the build links the UNPATCHED module —
 //! hence the version cross-check in [`crate::patch::redirect::golang_local`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use crate::patch::path_safety::is_canonical_uuid;
 
 use crate::utils::fs::read_regular_to_string;
 
@@ -96,14 +99,12 @@ pub(crate) fn detect_owner(path: &str) -> Option<ReplaceOwner> {
     None
 }
 
-/// True iff `module` is exactly a Socket-hosted patched module,
-/// `patch.socket.dev/gopatch/<canonical lowercase uuid>` — the only shape the
-/// server publishes (`gopatchModulePath`). A deeper path or a non-uuid leaf
-/// under the namespace is not ours.
+/// True iff `module` is exactly a Socket-hosted patched module in a shape
+/// [`hosted_module_uuid`] accepts: `patch.socket.dev/gopatch/<canonical
+/// lowercase uuid>`, optionally with a `/v<N>` (`N >= 2`) major suffix. Any
+/// other path under the namespace is not ours.
 pub fn is_hosted_module_path(module: &str) -> bool {
-    module
-        .strip_prefix(HOSTED_GO_MODULE_PREFIX)
-        .is_some_and(crate::patch::path_safety::is_canonical_uuid)
+    hosted_module_uuid(module).is_some()
 }
 
 /// The (project-root-relative) `replace` target path for a copy that lives at
@@ -236,11 +237,15 @@ async fn edit_go_mod(
     }
 }
 
-// ── parsing ────────────────────────────────────────────────────────────────
+// ── pure reader ────────────────────────────────────────────────────────────
+// The directive parsers the writers and lockfile discovery
+// (`vex::discover::golang`) share, plus discovery's strict read-side checks.
 
 /// Strip a trailing `// …` line comment. Module paths and our `./…` targets
-/// never contain `//`, so the first occurrence is the comment.
-fn strip_comment(line: &str) -> &str {
+/// never contain `//`, so the first occurrence is the comment. Lockfile
+/// discovery (`vex::discover::golang`) reads go.mod / go.work with the same
+/// rule.
+pub(crate) fn strip_comment(line: &str) -> &str {
     match line.find("//") {
         Some(idx) => &line[..idx],
         None => line,
@@ -365,6 +370,104 @@ pub fn parse_required_versions(content: &str) -> HashMap<String, String> {
         Ok(())
     });
     out
+}
+
+/// A go.mod-grammar file (go.mod / go.work) as the go command tokenizes it,
+/// for the read-only parsers: a leading UTF-8 BOM dropped and every Go
+/// string literal whose contents need no unescaping (no `\`, no whitespace
+/// — `"github.com/foo/bar"`, `` `v1.2.3` ``) replaced with its bare token.
+/// Anything else is left verbatim (and so never parses as ours). Writers
+/// edit the raw text instead.
+pub(crate) fn normalize_for_read(text: &str) -> String {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    unquote_tokens(text)
+}
+
+fn unquote_tokens(text: &str) -> String {
+    text.split_inclusive('\n').map(unquote_line).collect()
+}
+
+fn unquote_line(line: &str) -> Cow<'_, str> {
+    let is_quote = |c: char| c == '"' || c == '`';
+    if !line.contains(is_quote) {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(i) = rest.find(is_quote) {
+        // A quote inside a trailing comment stays as it is.
+        if rest[..i].contains("//") {
+            break;
+        }
+        let quote = rest[i..].chars().next().unwrap_or('"');
+        let body = &rest[i + 1..];
+        let Some(j) = body.find(quote) else {
+            break;
+        };
+        let inner = &body[..j];
+        if inner.is_empty() || inner.contains(|c: char| c == '\\' || c.is_whitespace()) {
+            break;
+        }
+        out.push_str(&rest[..i]);
+        out.push_str(inner);
+        rest = &body[j + 1..];
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// Why go would reject the file's `( … )` block structure, if it would: a
+/// block opened inside another, a stray `)`, or a block never closed make
+/// the whole file unparseable to go. Strict on purpose — the writers keep
+/// [`for_each_directive_body`]'s tolerant walk so they can still edit (and
+/// repair) such a file.
+pub(crate) fn block_structure_error(text: &str) -> Option<String> {
+    let mut open: Option<usize> = None;
+    for (i, raw) in text.lines().enumerate() {
+        let line = strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let opens = line
+            .strip_suffix('(')
+            .map(str::trim_end)
+            .is_some_and(|kw| !kw.is_empty() && !kw.contains(char::is_whitespace));
+        match (open, line == ")", opens) {
+            (Some(start), _, true) => {
+                return Some(format!(
+                    "line {}: block opened inside the block of line {}",
+                    i + 1,
+                    start + 1
+                ))
+            }
+            (Some(_), true, _) => open = None,
+            (None, true, _) => return Some(format!("line {}: `)` outside a block", i + 1)),
+            (None, false, true) => open = Some(i),
+            _ => {}
+        }
+    }
+    open.map(|start| format!("line {}: block is never closed", start + 1))
+}
+
+/// The patch uuid of a Socket hosted module path, strictly as the hosted
+/// rewriter writes it: [`HOSTED_GO_MODULE_PREFIX`]`<uuid>` or `…/<uuid>/v<N>`
+/// (`N >= 2`). Any other shape under the prefix (a grant-token segment, an
+/// uppercase uuid, a placeholder) is `None`.
+pub(crate) fn hosted_module_uuid(module: &str) -> Option<String> {
+    let rest = module.strip_prefix(HOSTED_GO_MODULE_PREFIX)?;
+    let (uuid, suffix) = match rest.split_once('/') {
+        Some((uuid, suffix)) => (uuid, Some(suffix)),
+        None => (rest, None),
+    };
+    let suffix_ok = suffix.is_none_or(|s| {
+        s.strip_prefix('v').is_some_and(|n| {
+            !n.is_empty()
+                && !n.starts_with('0')
+                && n.bytes().all(|b| b.is_ascii_digit())
+                && n != "1"
+        })
+    });
+    (suffix_ok && is_canonical_uuid(uuid)).then(|| uuid.to_string())
 }
 
 // ── pure transforms ──────────────────────────────────────────────────────────
@@ -685,6 +788,21 @@ mod tests {
         assert_eq!(
             replace_target_path(GO_PATCHES_DIR, "github.com/foo/bar", "v1.4.2"),
             "./.socket/go-patches/github.com/foo/bar@v1.4.2"
+        );
+    }
+
+    #[test]
+    fn unquote_only_touches_plain_literals() {
+        assert_eq!(
+            super::unquote_tokens("replace \"a/b\" v1 => `c` v2\n"),
+            "replace a/b v1 => c v2\n"
+        );
+        assert_eq!(super::unquote_tokens("x \"a b\" y\n"), "x \"a b\" y\n");
+        assert_eq!(super::unquote_tokens("x \"a\\tb\" y\n"), "x \"a\\tb\" y\n");
+        assert_eq!(super::unquote_tokens("x // \"c\"\n"), "x // \"c\"\n");
+        assert_eq!(
+            super::unquote_tokens("x \"unterminated\n"),
+            "x \"unterminated\n"
         );
     }
 

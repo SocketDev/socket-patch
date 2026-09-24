@@ -17,19 +17,22 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Compile CLI and pnpm integration test once
+      - name: Compile CLI and pnpm integration tests once
         run: |
-          cargo test --locked -p socket-patch-cli --test e2e_redirect_pnpm_build --no-run --message-format=json > target-build.json
+          cargo test --locked -p socket-patch-cli --test e2e_redirect_pnpm_build --test e2e_vendor_pnpm_build --no-run --message-format=json > target-build.json
           python3 - <<'PY'
           import json, pathlib, shutil
           dest = pathlib.Path('target/pnpm-e2e')
           dest.mkdir(parents=True, exist_ok=True)
           shutil.copy2('target/debug/socket-patch', dest / 'socket-patch')
+          names = {'e2e_redirect_pnpm_build': 'pnpm-e2e', 'e2e_vendor_pnpm_build': 'pnpm-vendor-e2e'}
           for line in pathlib.Path('target-build.json').read_text().splitlines():
               item = json.loads(line)
-              if item.get('target', {}).get('name') == 'e2e_redirect_pnpm_build' and item.get('executable'):
-                  shutil.copy2(item['executable'], dest / 'pnpm-e2e')
-          assert (dest / 'pnpm-e2e').is_file()
+              name = item.get('target', {}).get('name')
+              if name in names and item.get('executable'):
+                  shutil.copy2(item['executable'], dest / names[name])
+          for n in names.values():
+              assert (dest / n).is_file(), n
           PY
       - uses: ./.github/actions/upload-artifact
         with:
@@ -41,7 +44,7 @@ jobs:
   install-proof:
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -100,3 +103,15 @@ jobs:
           chmod +x bin/socket-patch bin/pnpm-e2e
           export SOCKET_PATCH_PNPM_E2E_SOCKET_BIN="$PWD/bin/socket-patch"
           bin/pnpm-e2e pnpm_pinned_matrix --ignored --nocapture
+      - name: Require vendored lifecycle and manifest-less VEX
+        # pnpm >= 9: full vendored capstone (vendor + get --mode vendored);
+        # 7-8: the legacy lifecycle; 1-6: vendoring refused, nothing attested.
+        env:
+          SOCKET_PATCH_PNPM_E2E_VERSION: ${{ matrix.pnpm }}
+          SOCKET_PATCH_PNPM_E2E_REQUIRED: '1'
+          SOCKET_NO_CONFIG: '1'
+          SOCKET_NO_UPDATE_CHECK: '1'
+        run: |
+          chmod +x bin/socket-patch bin/pnpm-vendor-e2e
+          export SOCKET_PATCH_PNPM_E2E_SOCKET_BIN="$PWD/bin/socket-patch"
+          bin/pnpm-vendor-e2e pnpm_pinned_matrix --ignored --nocapture

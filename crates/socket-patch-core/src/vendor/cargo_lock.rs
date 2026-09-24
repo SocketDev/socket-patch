@@ -23,6 +23,17 @@
 //! `version = 4` line keep their exact bytes — zero formatting churn in the
 //! committed diff.
 //!
+//! Lock format v1 (cargo < 1.41, still read by every cargo and never
+//! rewritten under `--locked`) spells the pair differently: the entry holds
+//! only `source`, the checksum sits in the trailing `[metadata]` table as
+//! `"checksum <name> <version> (<source>)"`, and dependents reference the
+//! crate by that full `"<name> <version> (<source>)"` id. Detaching there
+//! also drops the `[metadata]` key and rewrites the references to the
+//! sourceless `"<name> <version>"` form cargo v1 uses for path packages —
+//! otherwise they name a package the lock no longer has and cargo refuses
+//! the lock under `--locked` (real cargo 1.93: "cannot update the lock
+//! file … because --locked was passed"). Restore reverses all three.
+//!
 //! The removed `source`/`checksum` pair is not recoverable offline (the
 //! checksum is the sha256 of the registry `.crate` tarball, not of the
 //! extracted tree), so [`detach_lock_entry`] returns it as the vendor ledger's
@@ -66,8 +77,9 @@ impl std::fmt::Display for LockEditError {
     }
 }
 
-/// Read + parse `<root>/Cargo.lock`, mapping errors to [`LockEditError`].
-async fn read_lock(
+/// Read + parse `<root>/Cargo.lock`, mapping errors to [`LockEditError`]
+/// (the lock inventory reads the lock through it too).
+pub(crate) async fn read_lock(
     project_root: &Path,
 ) -> Result<(std::path::PathBuf, DocumentMut), LockEditError> {
     let path = project_root.join("Cargo.lock");
@@ -97,6 +109,129 @@ fn find_package_mut<'a>(
             t.get("name").and_then(Item::as_str) == Some(name)
                 && t.get("version").and_then(Item::as_str) == Some(version)
         })
+}
+
+/// The `[metadata]` key a v1 lock files `name`+`version`'s checksum under.
+fn metadata_checksum_key(name: &str, version: &str, source: &str) -> String {
+    format!("checksum {name} {version} ({source})")
+}
+
+/// One `[[package]]` of a parsed `Cargo.lock`, as cargo resolves it — the
+/// read model every Cargo.lock reader shares (the lock inventory, the vendor
+/// probes below, lockfile discovery), so a v1 lock's `[metadata]` checksums
+/// and a missing `source` read the same everywhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LockedPackage {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    /// `None` for a workspace member, a path dependency, or a `[patch]` path
+    /// copy (the vendored "detached" shape).
+    pub(crate) source: Option<String>,
+    /// The inline `checksum` (v2+), else a v1 lock's `[metadata]`
+    /// `"checksum <name> <version> (<source>)"` entry — the same pin.
+    pub(crate) checksum: Option<String>,
+}
+
+/// Every `[[package]]` of `doc` (lock formats v1–v4), in lock order; an
+/// entry without a string `name` and `version` is skipped. A lock with no
+/// packages has no `package` key and yields nothing.
+pub(crate) fn locked_packages(doc: &DocumentMut) -> Vec<LockedPackage> {
+    let metadata = doc.get("metadata").and_then(Item::as_table_like);
+    let metadata_checksum = |name: &str, version: &str, source: Option<&str>| {
+        let key = metadata_checksum_key(name, version, source?);
+        metadata?.get(&key)?.as_str().map(str::to_string)
+    };
+    doc.get("package")
+        .and_then(Item::as_array_of_tables)
+        .map(|pkgs| {
+            pkgs.iter()
+                .filter_map(|t| {
+                    let name = t.get("name")?.as_str()?.to_string();
+                    let version = t.get("version")?.as_str()?.to_string();
+                    let source = t.get("source").and_then(Item::as_str).map(str::to_string);
+                    let checksum = t
+                        .get("checksum")
+                        .and_then(Item::as_str)
+                        .map(str::to_string)
+                        .or_else(|| metadata_checksum(&name, &version, source.as_deref()));
+                    Some(LockedPackage {
+                        name,
+                        version,
+                        source,
+                        checksum,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `(name, version)` of every `[[patch.unused]]` entry: a `[patch]` cargo
+/// resolved and then did NOT use in the crate graph — the lock's own record
+/// that a patch (e.g. a vendored copy) is not what builds.
+pub(crate) fn unused_patches(doc: &DocumentMut) -> Vec<(String, String)> {
+    doc.get("patch")
+        .and_then(|patch| patch.get("unused"))
+        .and_then(Item::as_array_of_tables)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|t| {
+                    Some((
+                        t.get("name")?.as_str()?.to_string(),
+                        t.get("version")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the lock BUILDS a `[patch]` path copy of `name`@`version`: it
+/// holds a SOURCELESS `[[package]]` for that name + version (the detached
+/// shape) and no `[[patch.unused]]` entry for it. A sourceless entry alone
+/// does not prove the copy builds — a path dependency on the user's own
+/// checkout of the crate is sourceless too, and cargo records the `[patch]`
+/// it resolved but left out of the graph as `[[patch.unused]]` (real cargo
+/// 1.97: `serde = { path = "my-serde" }` beside a stale `[patch]` locks a
+/// sourceless serde AND `[[patch.unused]] serde`).
+pub(crate) fn vendored_copy_consumed(
+    pkgs: &[LockedPackage],
+    unused: &[(String, String)],
+    name: &str,
+    version: &str,
+) -> bool {
+    pkgs.iter()
+        .any(|p| p.name == name && p.version == version && p.source.is_none())
+        && !unused.iter().any(|(n, v)| n == name && v == version)
+}
+
+/// A v1 lock: no top-level `version` key and a `[metadata]` table (kept,
+/// even emptied, by [`detach_lock_entry`] — so a detached v1 lock still
+/// reads as v1 on restore).
+fn is_v1_lock(doc: &DocumentMut) -> bool {
+    doc.get("version").is_none() && doc.get("metadata").is_some_and(Item::is_table_like)
+}
+
+/// Rewrite every `dependencies` entry spelled exactly `from` to `to`,
+/// keeping each entry's formatting.
+fn rewrite_dependency_refs(doc: &mut DocumentMut, from: &str, to: &str) {
+    let Some(pkgs) = doc
+        .get_mut("package")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        return;
+    };
+    for pkg in pkgs.iter_mut() {
+        let Some(deps) = pkg.get_mut("dependencies").and_then(Item::as_array_mut) else {
+            continue;
+        };
+        for i in 0..deps.len() {
+            if deps.get(i).and_then(toml_edit::Value::as_str) == Some(from) {
+                deps.replace(i, to);
+            }
+        }
+    }
 }
 
 /// Commit the edited lock atomically (stage + fsync + rename). The lock is a
@@ -132,13 +267,27 @@ pub async fn detach_lock_entry(
         Some(s) => s.to_string(),
         None => return Err(LockEditError::NotRegistry),
     };
-    let checksum = table
+    let mut checksum = table
         .get("checksum")
         .and_then(Item::as_str)
         .map(str::to_string);
 
     table.remove("source");
     table.remove("checksum");
+
+    // v1: the checksum lives in `[metadata]`, and dependents name the crate
+    // by its full id (any format may spell an ambiguous ref that way).
+    let key = metadata_checksum_key(name, version, &source);
+    if let Some(meta) = doc.get_mut("metadata").and_then(Item::as_table_like_mut) {
+        if let Some(sum) = meta.remove(&key) {
+            checksum = checksum.or_else(|| sum.as_str().map(str::to_string));
+        }
+    }
+    rewrite_dependency_refs(
+        &mut doc,
+        &format!("{name} {version} ({source})"),
+        &format!("{name} {version}"),
+    );
 
     if !dry_run {
         write_lock(&path, &doc).await?;
@@ -159,6 +308,7 @@ pub async fn restore_lock_entry(
     dry_run: bool,
 ) -> Result<bool, LockEditError> {
     let (path, mut doc) = read_lock(project_root).await?;
+    let v1 = is_v1_lock(&doc);
     let Some(table) = find_package_mut(&mut doc, name, version) else {
         return Ok(false);
     };
@@ -167,7 +317,7 @@ pub async fn restore_lock_entry(
     }
 
     table.insert("source", toml_edit::value(original.source.as_str()));
-    if let Some(checksum) = &original.checksum {
+    if let (Some(checksum), false) = (&original.checksum, v1) {
         table.insert("checksum", toml_edit::value(checksum.as_str()));
     }
     // `insert` appends, but cargo's canonical key order is
@@ -183,6 +333,26 @@ pub async fn restore_lock_entry(
     };
     table.sort_values_by(|k1, _, k2, _| rank(k1.get()).cmp(&rank(k2.get())));
 
+    if v1 {
+        // Back into `[metadata]` (cargo writes its keys sorted) and the
+        // dependents' references back to the full id.
+        if let (Some(checksum), Some(meta)) = (
+            &original.checksum,
+            doc.get_mut("metadata").and_then(Item::as_table_mut),
+        ) {
+            meta.insert(
+                &metadata_checksum_key(name, version, &original.source),
+                toml_edit::value(checksum.as_str()),
+            );
+            meta.sort_values();
+        }
+        rewrite_dependency_refs(
+            &mut doc,
+            &format!("{name} {version}"),
+            &format!("{name} {version} ({})", original.source),
+        );
+    }
+
     if !dry_run {
         write_lock(&path, &doc).await?;
     }
@@ -197,14 +367,10 @@ pub async fn restore_lock_entry(
 /// versions. Reads only the project lockfile: no registry, no network.
 pub async fn read_locked_versions(project_root: &Path) -> Option<HashMap<String, HashSet<String>>> {
     let (_path, doc) = read_lock(project_root).await.ok()?;
-    let pkgs = doc.get("package")?.as_array_of_tables()?;
+    doc.get("package")?.as_array_of_tables()?;
     let mut map: HashMap<String, HashSet<String>> = HashMap::new();
-    for t in pkgs.iter() {
-        let name = t.get("name").and_then(Item::as_str);
-        let ver = t.get("version").and_then(Item::as_str);
-        if let (Some(n), Some(v)) = (name, ver) {
-            map.entry(n.to_string()).or_default().insert(v.to_string());
-        }
+    for pkg in locked_packages(&doc) {
+        map.entry(pkg.name).or_default().insert(pkg.version);
     }
     Some(map)
 }
@@ -230,15 +396,19 @@ pub enum LockEntryProbe {
 /// anything. Unreadable/unparseable locks read as [`LockEntryProbe::NoLockfile`]
 /// so callers stay fail-safe (cannot determine ⇒ keep / stay silent).
 pub async fn probe_lock_entry(project_root: &Path, name: &str, version: &str) -> LockEntryProbe {
-    let Ok((_path, mut doc)) = read_lock(project_root).await else {
+    let Ok((_path, doc)) = read_lock(project_root).await else {
         return LockEntryProbe::NoLockfile;
     };
-    let Some(table) = find_package_mut(&mut doc, name, version) else {
-        return LockEntryProbe::EntryMissing;
-    };
-    match table.get("source").and_then(Item::as_str) {
-        Some(s) => LockEntryProbe::Source(s.to_string()),
-        None => LockEntryProbe::Detached,
+    match locked_packages(&doc)
+        .into_iter()
+        .find(|p| p.name == name && p.version == version)
+    {
+        None => LockEntryProbe::EntryMissing,
+        Some(LockedPackage {
+            source: Some(source),
+            ..
+        }) => LockEntryProbe::Source(source),
+        Some(_) => LockEntryProbe::Detached,
     }
 }
 
@@ -253,14 +423,9 @@ pub async fn count_lock_entries(project_root: &Path, name: &str, version: &str) 
     let Ok((_path, doc)) = read_lock(project_root).await else {
         return 0;
     };
-    let Some(pkgs) = doc.get("package").and_then(Item::as_array_of_tables) else {
-        return 0;
-    };
-    pkgs.iter()
-        .filter(|t| {
-            t.get("name").and_then(Item::as_str) == Some(name)
-                && t.get("version").and_then(Item::as_str) == Some(version)
-        })
+    locked_packages(&doc)
+        .iter()
+        .filter(|p| p.name == name && p.version == version)
         .count()
 }
 
@@ -298,6 +463,61 @@ mod tests {
             .await
             .unwrap();
         dir
+    }
+
+    /// Cargo.lock v1: checksum in `[metadata]`, dependents referencing the
+    /// crate by full id. REGRESSION: detach removed only the entry's
+    /// `source`, leaving `"cfg-if 1.0.4 (registry+…)"` references (and the
+    /// `[metadata]` checksum) naming a package the lock no longer has —
+    /// real cargo then refuses the vendored lock under `--locked`.
+    #[tokio::test]
+    async fn detach_and_restore_a_v1_lock_follow_metadata_and_full_id_refs() {
+        let other = "a".repeat(64);
+        let v1 = format!(
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"cfg-if 1.0.4 ({SOURCE})\",\n \"log 0.4.20 ({SOURCE})\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{SOURCE}\"\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{SOURCE}\"\n\
+             dependencies = [\n \"cfg-if 1.0.4 ({SOURCE})\",\n]\n\n\
+             [metadata]\n\"checksum cfg-if 1.0.4 ({SOURCE})\" = \"{CHECKSUM}\"\n\
+             \"checksum log 0.4.20 ({SOURCE})\" = \"{other}\"\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        tokio::fs::write(&lock, &v1).await.unwrap();
+
+        let orig = detach_lock_entry(dir.path(), "cfg-if", "1.0.4", false)
+            .await
+            .unwrap();
+        assert_eq!(orig.source, SOURCE);
+        assert_eq!(
+            orig.checksum.as_deref(),
+            Some(CHECKSUM),
+            "read from [metadata]"
+        );
+        let detached = tokio::fs::read_to_string(&lock).await.unwrap();
+        assert_eq!(
+            detached,
+            format!(
+                "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+                 \"cfg-if 1.0.4\",\n \"log 0.4.20 ({SOURCE})\",\n]\n\n\
+                 [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\n\
+                 [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{SOURCE}\"\n\
+                 dependencies = [\n \"cfg-if 1.0.4\",\n]\n\n\
+                 [metadata]\n\"checksum log 0.4.20 ({SOURCE})\" = \"{other}\"\n"
+            )
+        );
+        assert_eq!(
+            probe_lock_entry(dir.path(), "cfg-if", "1.0.4").await,
+            LockEntryProbe::Detached
+        );
+
+        assert!(
+            restore_lock_entry(dir.path(), "cfg-if", "1.0.4", &orig, false)
+                .await
+                .unwrap()
+        );
+        assert_eq!(tokio::fs::read_to_string(&lock).await.unwrap(), v1);
     }
 
     #[tokio::test]

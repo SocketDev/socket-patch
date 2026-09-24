@@ -321,6 +321,23 @@ cat /tmp/out.vex.json
 echo ""
 echo "===VEX DOC END==="
 
+# Manifest-less leg: an AGENT-mode patch lives only in the manifest (no
+# packages.lock.json / nuget.config wiring), so with the manifest gone vex
+# has nothing to attest (exit 2, manifest_not_found) although the patched
+# bytes are still installed — it must never guess from the installed tree.
+mv .socket/manifest.json /tmp/manifest.keep
+socket-patch vex --offline --json --cwd "$PWD" --output /tmp/nomanifest.vex.json \
+  --product 'pkg:nuget/e2e-app@1.0.0' >/tmp/vex-nm.out 2>/tmp/vex-nm.err
+NM_RC=$?
+mv /tmp/manifest.keep .socket/manifest.json
+if [ "$NM_RC" -ne 2 ] || ! grep -q '"manifest_not_found"' /tmp/vex-nm.out; then
+  echo "FAIL: manifest-less vex of an agent-mode patch exited $NM_RC (expected 2, manifest_not_found)" >&2
+  cat /tmp/vex-nm.out /tmp/vex-nm.err >&2
+  exit 1
+fi
+[ ! -e /tmp/nomanifest.vex.json ] || {{ echo "FAIL: manifest-less vex wrote a document" >&2; exit 1; }}
+echo "===MANIFESTLESS VEX VERIFIED===" >&2
+
 echo "===E2E PASS==="
 exit 0
 "#
@@ -579,6 +596,10 @@ async fn nuget_local_install_full_apply_chain() {
         "agent-mode VEX leg did not run/pass (===VEX VERIFIED=== missing).\nstderr=\n{stderr}"
     );
     assert_vex_agent_attested(&stdout, PURL);
+    assert!(
+        stderr.contains("===MANIFESTLESS VEX VERIFIED==="),
+        "manifest-less agent-mode VEX leg did not run/pass.\nstderr=\n{stderr}"
+    );
     assert_api_path_exercised(&server).await;
 }
 

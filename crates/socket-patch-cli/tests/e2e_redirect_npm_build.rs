@@ -32,8 +32,28 @@
 //! ledger is the persistence), and `get <GHSA> --mode hosted` must narrow a
 //! two-version fan-out to the installed version BEFORE the grant request.
 //!
-//! Skips (with a println) when `npm`/`tar` are missing or the fixture install
-//! cannot reach the registry; every assertion after that is hard.
+//! v5 adds the MANIFEST-LESS VEX tail to every flow that installs
+//! (`npm_e2e_common::manifestless_vex_matrix`): with the fresh checkout's
+//! ledger present, then deleted (lockfile discovery + a mock patch API),
+//! then `--offline` (`record_unavailable`, zero requests), then with the
+//! lock reverted to its registry bytes (`redirect_unwired`, `--no-verify`
+//! too) — plus the embedded `apply --vex` twin. And it runs against EVERY
+//! npm major: `SOCKET_PATCH_NPM_E2E_BIN` / `_VERSION` / `_REQUIRED` select
+//! and pin the npm (see `npm_e2e_common`), npm 6's lockfileVersion 1
+//! included, and the shrinkwrap flavor (`npm shrinkwrap` on <= 11, npm 12's
+//! shrinkwrap + package-lock twin) has its own capstone. npm >= 12 refuses
+//! the redirected lock (EALLOWREMOTE) unless `.npmrc` sets
+//! `allow-remote=all`, so the hosted run AUTO-CONFIGURES it: every flow
+//! asserts the run wrote `allow-remote=all` to a new project `.npmrc`
+//! (ledger-recorded, `redirect_npm_allow_remote` warned), the fresh checkout
+//! carries that committed `.npmrc` and installs with a PLAIN `npm ci` on
+//! every major — npm >= 12 additionally proves the setting is load-bearing
+//! (a checkout WITHOUT it is refused EALLOWREMOTE) — and the main capstone
+//! ends with `rollback` removing exactly the `.npmrc` it created.
+//!
+//! Skips (with a println) when `npm` is missing or the fixture install
+//! cannot reach the registry — unless `SOCKET_PATCH_NPM_E2E_REQUIRED` is set;
+//! every assertion after that is hard.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -43,8 +63,13 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-#[path = "common/cache_env.rs"]
-mod cache_env;
+#[path = "npm_e2e_common/mod.rs"]
+mod npm_e2e_common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+
+use npm_e2e_common::{LockFlavor, ManifestlessCase};
+use vex_e2e_common::{git_sha256, patch_view, Marker, PatchApi, VexVia};
 
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
@@ -76,17 +101,6 @@ fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
 }
 
-fn has_command(cmd: &str) -> bool {
-    let mut probe = Command::new(cmd);
-    probe.arg("--version");
-    cache_env::isolate(&mut probe);
-    probe
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-}
-
 /// Run the socket-patch binary with a scrubbed environment: every ambient
 /// `SOCKET_*` var is removed (so a developer's `SOCKET_DRY_RUN=1` etc. can't
 /// flip behavior) along with `VIRTUAL_ENV` (crawler discovery input).
@@ -107,13 +121,6 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
-fn npm(cwd: &Path, args: &[&str]) -> Output {
-    let mut cmd = Command::new("npm");
-    cmd.args(args).current_dir(cwd);
-    cache_env::isolate(&mut cmd);
-    cmd.output().expect("failed to run npm")
-}
-
 /// Standard-base64-encoded sha512 of `bytes` — the body of the npm-family
 /// `sha512-…` SRI integrity string.
 fn sha512_sri_b64(bytes: &[u8]) -> String {
@@ -123,16 +130,7 @@ fn sha512_sri_b64(bytes: &[u8]) -> String {
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
+    npm_e2e_common::copy_dir_recursive(src, dst)
 }
 
 /// Everything the post-redirect legs need. `tmp` owns the whole tree;
@@ -143,6 +141,12 @@ struct RedirectFixture {
     proj: PathBuf,
     patched: Vec<u8>,
     server: MockServer,
+    /// The npm under test (major) and the committed lock files, with their
+    /// pre-redirect (registry) bytes for the manifest-less revert cell.
+    major: u32,
+    flavor: LockFlavor,
+    locks: Vec<&'static str>,
+    pristine_locks: Vec<(&'static str, Vec<u8>)>,
 }
 
 /// Which CLI invocation drives step 3 (the redirect itself). The scan
@@ -172,15 +176,13 @@ async fn redirect_scanned_project(
     tag: &str,
     tamper_served_tarball: bool,
     cli: RedirectCli,
+    flavor: LockFlavor,
 ) -> Option<RedirectFixture> {
-    if !has_command("npm") {
-        println!("SKIP e2e_redirect_npm_build ({tag}): `npm` not installed");
+    let suite = format!("e2e_redirect_npm_build ({tag})");
+    let Some(major) = npm_e2e_common::npm_major() else {
+        npm_e2e_common::skip(&suite, "`npm` not installed");
         return None;
-    }
-    if !has_command("tar") {
-        println!("SKIP e2e_redirect_npm_build ({tag}): `tar` not installed");
-        return None;
-    }
+    };
 
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
@@ -193,25 +195,24 @@ async fn redirect_scanned_project(
 
     // 1. REAL fixture: npm install (network allowed here, private cache).
     let cache = tmp.path().join("npm-cache");
-    let install = npm(
-        &proj,
-        &[
-            "install",
-            &format!("{DEP}@{DEP_VERSION}"),
-            "--no-audit",
-            "--no-fund",
-            "--cache",
-            cache.to_str().unwrap(),
-        ],
-    );
-    if !install.status.success() {
-        println!(
-            "SKIP e2e_redirect_npm_build ({tag}): `npm install {DEP}@{DEP_VERSION}` failed \
-             (registry unreachable?):\n{}",
-            String::from_utf8_lossy(&install.stderr)
-        );
+    if !npm_e2e_common::install_fixture(&suite, &proj, &cache, &format!("{DEP}@{DEP_VERSION}")) {
         return None;
     }
+    let expected_lock_version = match major {
+        ..=6 => 1,
+        7 | 8 => 2,
+        _ => 3,
+    };
+    assert_eq!(
+        npm_e2e_common::lockfile_version(&proj),
+        Some(expected_lock_version),
+        "npm {major} writes lockfileVersion {expected_lock_version}"
+    );
+    let locks = npm_e2e_common::commit_lock_flavor(&proj, flavor, major);
+    let pristine_locks: Vec<(&'static str, Vec<u8>)> = locks
+        .iter()
+        .map(|lock| (*lock, std::fs::read(proj.join(lock)).unwrap()))
+        .collect();
 
     let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js"))
         .expect("installed index.js");
@@ -230,18 +231,9 @@ async fn redirect_scanned_project(
     let stage = tmp.path().join("tarstage");
     copy_dir_recursive(&proj.join("node_modules").join(DEP), &stage.join("package"));
     std::fs::write(stage.join("package").join("index.js"), &patched).unwrap();
-    let tgz_path = tmp.path().join(format!("{DEP}-{DEP_VERSION}.tgz"));
-    let tar = Command::new("tar")
-        .args(["-czf", tgz_path.to_str().unwrap(), "package"])
-        .current_dir(&stage)
-        .output()
-        .expect("failed to run tar");
-    assert!(
-        tar.status.success(),
-        "tar failed: {}",
-        String::from_utf8_lossy(&tar.stderr)
-    );
-    let tgz = std::fs::read(&tgz_path).unwrap();
+    // Packed like `npm pack` (regular-file members only): npm 7.0.x's
+    // extractor fails ENOTDIR on the directory entries system tar adds.
+    let tgz = npm_e2e_common::npm_pack_like(&stage.join("package"));
     let sri = format!("sha512-{}", sha512_sri_b64(&tgz));
     let served: Vec<u8> = if tamper_served_tarball {
         [tgz.as_slice(), &[0u8][..]].concat()
@@ -505,15 +497,55 @@ async fn redirect_scanned_project(
         );
     }
 
-    // Lockfile pin: hosted URL + the PATCHED tarball's sha512.
-    let lock = std::fs::read_to_string(proj.join("package-lock.json")).unwrap();
-    assert!(
-        lock.contains(&hosted_url),
-        "lockfile resolved must point at the hosted patch tarball; got:\n{lock}"
+    // Lockfile pin: hosted URL + the PATCHED tarball's sha512, in EVERY
+    // committed npm lock (npm 12 installs from the package-lock.json twin of
+    // a shrinkwrap).
+    for lock_name in &locks {
+        let lock = std::fs::read_to_string(proj.join(lock_name)).unwrap();
+        assert!(
+            lock.contains(&hosted_url),
+            "{lock_name} resolved must point at the hosted patch tarball; got:\n{lock}"
+        );
+        assert!(
+            lock.contains(&sri),
+            "{lock_name} integrity must be the patched tarball's sha512 ({sri}); got:\n{lock}"
+        );
+    }
+    // A lockfileVersion 1 lock (npm <= 6) gets the npm 6 install caveat.
+    let legacy_warned = env["redirect"]["warnings"]
+        .as_array()
+        .is_some_and(|w| w.iter().any(|w| w["code"] == "redirect_npm_legacy_client"));
+    assert_eq!(
+        legacy_warned,
+        major <= 6,
+        "redirect_npm_legacy_client iff the lock is v1: {env}"
     );
+    // Every npm major gets the npm >= 12 install caveat (the run cannot know
+    // which npm the project's CI uses).
     assert!(
-        lock.contains(&sri),
-        "lockfile integrity must be the patched tarball's sha512 ({sri}); got:\n{lock}"
+        env["redirect"]["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w["code"] == "redirect_npm_allow_remote")),
+        "the npm >= 12 allow-remote caveat must be emitted: {env}"
+    );
+
+    // ...and the run AUTO-CONFIGURED it: a new project `.npmrc` holding
+    // exactly `allow-remote=all`, said so in the warning, ledger-recorded
+    // (so `rollback` can remove exactly what it added).
+    let allow_remote = env["redirect"]["warnings"]
+        .as_array()
+        .and_then(|w| w.iter().find(|w| w["code"] == "redirect_npm_allow_remote"))
+        .and_then(|w| w["detail"].as_str())
+        .unwrap_or_default();
+    assert!(
+        allow_remote.contains("`allow-remote=all` was written to a new project .npmrc")
+            && allow_remote.contains("lets npm install ANY url-resolved"),
+        "the allow-remote auto-config must be reported with its tradeoff: {env}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join(".npmrc")).unwrap(),
+        "allow-remote=all\n",
+        "the hosted run must write allow-remote=all to the project .npmrc"
     );
 
     // Ledger embeds the patch record so a post-install `vex` can verify.
@@ -522,65 +554,119 @@ async fn redirect_scanned_project(
         ledger.contains("\"records\"") && ledger.contains(GHSA),
         "redirect ledger must embed the patch record + vulnerability: {ledger}"
     );
+    assert!(
+        ledger.contains("\"redirect_npmrc_allow_remote\""),
+        "the .npmrc auto-config must be ledger-recorded: {ledger}"
+    );
 
     Some(RedirectFixture {
         tmp,
         proj,
         patched,
         server,
+        major,
+        flavor,
+        locks,
+        pristine_locks,
     })
 }
 
-/// New dir holding ONLY what a git checkout would carry — package.json,
-/// package-lock.json, `.socket/` — then `npm ci` against an empty cache.
-/// Returns the fresh dir and the `npm ci` output (asserted by each test:
-/// success for the real tarball, integrity failure for the tampered one).
+/// New dir holding ONLY what a git checkout would carry — package.json, the
+/// committed npm lock(s), the committed `.npmrc` the hosted run wrote,
+/// `.socket/` — then a PLAIN `npm ci` (no `--allow-remote` flag) against an
+/// empty cache. Returns the fresh dir and the `npm ci` output (asserted by
+/// each test: success for the real tarball, integrity failure for the
+/// tampered one).
+///
+/// npm >= 12 first proves the auto-configured `.npmrc` is LOAD-BEARING: a
+/// twin checkout without it is refused EALLOWREMOTE and installs nothing.
 fn fresh_checkout_npm_ci(fx: &RedirectFixture) -> (PathBuf, Output) {
     let fresh = fx.tmp.path().join("fresh");
-    std::fs::create_dir_all(&fresh).unwrap();
-    std::fs::copy(fx.proj.join("package.json"), fresh.join("package.json")).unwrap();
-    std::fs::copy(
-        fx.proj.join("package-lock.json"),
-        fresh.join("package-lock.json"),
-    )
-    .unwrap();
-    copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
-    let fresh_cache = fx.tmp.path().join("fresh-npm-cache");
-    let ci = npm(
-        &fresh,
-        &[
-            "ci",
-            "--cache",
-            fresh_cache.to_str().unwrap(),
-            "--no-audit",
-            "--no-fund",
-        ],
+    npm_e2e_common::fresh_checkout(&fx.proj, &fresh, &fx.locks);
+    assert_eq!(
+        std::fs::read_to_string(fresh.join(".npmrc")).unwrap(),
+        "allow-remote=all\n",
+        "the fresh checkout carries the committed, auto-configured .npmrc"
     );
+    if npm_e2e_common::needs_allow_remote(fx.major) {
+        let bare = fx.tmp.path().join("fresh-without-npmrc");
+        npm_e2e_common::fresh_checkout(&fx.proj, &bare, &fx.locks);
+        std::fs::remove_file(bare.join(".npmrc")).unwrap();
+        let refused = npm_e2e_common::npm_ci(&bare, &fx.tmp.path().join("refused-npm-cache"));
+        let text = npm_e2e_common::output_text(&refused);
+        assert!(
+            !refused.status.success() && text.contains("EALLOWREMOTE"),
+            "npm {} must refuse the redirected lock without allow-remote=all:\n{text}",
+            fx.major
+        );
+        assert!(
+            !bare.join("node_modules").join(DEP).exists(),
+            "the refused install must not have installed anything"
+        );
+    }
+    let fresh_cache = fx.tmp.path().join("fresh-npm-cache");
+    let ci = npm_e2e_common::npm_ci(&fresh, &fresh_cache);
     (fresh, ci)
 }
 
-// ── the capstone ──────────────────────────────────────────────────────
+/// The capstone's last step: `rollback` in the redirected project unwinds
+/// the lock redirect AND removes exactly the `.npmrc` the hosted run created
+/// (the ledger's `redirect_npmrc_allow_remote` `created` edit), leaving the
+/// committed lock(s) at their registry resolution and no ledger behind.
+fn rollback_removes_npmrc(fx: &RedirectFixture) {
+    let proj = fx.proj.to_str().unwrap();
+    let (code, stdout, stderr) = run_socket(&fx.proj, &["rollback", "--json", "--cwd", proj]);
+    assert_eq!(
+        code, 0,
+        "rollback failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !fx.proj.join(".npmrc").exists(),
+        "rollback must remove the .npmrc the hosted run created:\n{stdout}"
+    );
+    let json = |b: &[u8]| serde_json::from_slice::<serde_json::Value>(b).unwrap();
+    for (lock, pristine) in &fx.pristine_locks {
+        let now = std::fs::read(fx.proj.join(lock)).unwrap();
+        assert_eq!(
+            json(&now),
+            json(pristine),
+            "rollback must restore {lock} to its registry resolution"
+        );
+    }
+    assert!(
+        !fx.proj.join(".socket/vendor/redirect-state.json").exists(),
+        "the emptied redirect ledger is deleted"
+    );
+}
 
-// multi_thread: the CLI/npm subprocesses block a worker thread while wiremock
-// keeps serving the API + tarball routes on the others.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
-async fn npm_redirect_fresh_checkout_npm_ci_installs_patched_bytes_and_vex_verifies() {
-    let Some(fx) = redirect_scanned_project("main", false, RedirectCli::ScanRedirectVex).await
-    else {
-        return;
-    };
-
-    // 4. FRESH-CHECKOUT PROOF: npm pulls the patched bytes from the hosted
-    //    patch server because the committed lockfile says so.
-    let (fresh, ci) = fresh_checkout_npm_ci(&fx);
+/// [`fresh_checkout_npm_ci`] + the install oracle every non-tampered flow
+/// shares: npm >= 7 must install the PATCHED bytes byte-for-byte. npm <= 6
+/// ignores `resolved` for a registry dependency (it fetches the registry
+/// tarball — verified against 6.14.18), so its install must FAIL CLOSED with
+/// EINTEGRITY against the patched sha512 pin and leave nothing installed
+/// (the tail then exercises the lockfile basis). Returns `(fresh, installed)`.
+fn fresh_install_patched(fx: &RedirectFixture) -> (PathBuf, bool) {
+    let (fresh, ci) = fresh_checkout_npm_ci(fx);
+    let text = npm_e2e_common::output_text(&ci);
+    let index = fresh.join("node_modules").join(DEP).join("index.js");
+    if fx.major <= 6 {
+        assert!(
+            !ci.status.success() && text.contains("EINTEGRITY"),
+            "npm {} must refuse (EINTEGRITY) the registry bytes it fetches instead:\n{text}",
+            fx.major
+        );
+        assert!(
+            std::fs::read(&index).map_or(true, |b| b != fx.patched),
+            "npm <= 6 cannot have installed the patched bytes"
+        );
+        let _ = std::fs::remove_dir_all(fresh.join("node_modules"));
+        return (fresh, false);
+    }
     assert!(
         ci.status.success(),
-        "fresh-checkout `npm ci` must succeed from the hosted patch tarball.\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&ci.stdout),
-        String::from_utf8_lossy(&ci.stderr),
+        "fresh-checkout `npm ci` must succeed from the hosted patch tarball.\n{text}"
     );
-    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
+    let installed = std::fs::read(&index).unwrap();
     assert!(
         installed.starts_with(MARKER.as_bytes()),
         "npm ci must install the PATCHED bytes from the hosted patch; got:\n{}",
@@ -590,12 +676,98 @@ async fn npm_redirect_fresh_checkout_npm_ci_installs_patched_bytes_and_vex_verif
         installed, fx.patched,
         "fresh install must be byte-identical to the patched content"
     );
+    (fresh, true)
+}
+
+/// A patch API (public-proxy view route) serving the capstone's record
+/// with the REAL patched hash — what manifest-less VEX fetches once the
+/// ledger is gone. Built on its own runtime thread (the test's own runtime
+/// cannot host a nested one).
+fn manifestless_tail(fx: &RedirectFixture, fresh: &Path, installed: bool, embedded: &[VexVia]) {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let api = PatchApi::start(vec![(
+                    UUID.to_string(),
+                    patch_view(
+                        UUID,
+                        PURL,
+                        &[("package/index.js", &git_sha256(&fx.patched))],
+                        &[(GHSA, &["CVE-2026-1111"])],
+                    ),
+                )]);
+                let case = ManifestlessCase {
+                    label: format!("npm {} hosted {}", fx.major, fx.flavor.tag()),
+                    project: fresh,
+                    purl: PURL,
+                    uuid: UUID,
+                    marker: Marker::Redirected,
+                    vulns: &[(GHSA, &["CVE-2026-1111"])],
+                    api: &api,
+                    patch_server_url: Some(fx.server.uri()),
+                    registry_locks: fx.pristine_locks.clone(),
+                    embedded,
+                };
+                let report = npm_e2e_common::manifestless_vex_matrix(&case);
+                npm_e2e_common::record_results(&format!(
+                    "npm={} mode=hosted flavor={} install={} {report}",
+                    npm_e2e_common::npm_version().unwrap_or_default(),
+                    fx.flavor.tag(),
+                    if installed {
+                        "patched"
+                    } else {
+                        "refused-EINTEGRITY"
+                    }
+                ));
+            })
+            .join()
+            .expect("manifest-less VEX tail panicked");
+    });
+}
+
+// ── the capstone ──────────────────────────────────────────────────────
+
+// multi_thread: the CLI/npm subprocesses block a worker thread while wiremock
+// keeps serving the API + tarball routes on the others.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn npm_redirect_fresh_checkout_npm_ci_installs_patched_bytes_and_vex_verifies() {
+    let Some(fx) = redirect_scanned_project(
+        "main",
+        false,
+        RedirectCli::ScanRedirectVex,
+        LockFlavor::PackageLock,
+    )
+    .await
+    else {
+        return;
+    };
+
+    // 4. FRESH-CHECKOUT PROOF: npm pulls the patched bytes from the hosted
+    //    patch server because the committed lockfile says so.
+    let (fresh, installed) = fresh_install_patched(&fx);
 
     // 5. POST-INSTALL VERIFIED VEX: default verify mode hash-verifies the
-    //    installed tree against the ledger's patch record.
+    //    installed tree against the ledger's patch record (npm <= 6 installed
+    //    nothing — the manifest-less tail below covers its lockfile basis).
+    if installed {
+        post_install_ledger_vex(&fresh);
+    }
+
+    // 6. MANIFEST-LESS VEX over the fresh checkout: ledger present, ledger
+    //    deleted (lockfile + API), offline, reverted — standalone and via
+    //    the embedded `apply --vex`.
+    manifestless_tail(&fx, &fresh, installed, &[VexVia::Apply]);
+
+    // 7. ROLLBACK: the lock redirect AND the auto-configured .npmrc go.
+    rollback_removes_npmrc(&fx);
+}
+
+/// Step 5 of the capstone: the ledger-backed, hash-verified `vex`.
+fn post_install_ledger_vex(fresh: &Path) {
     let doc_path = fresh.join("doc.json");
     let (code, stdout, stderr) = run_socket(
-        &fresh,
+        fresh,
         &[
             "vex",
             "--output",
@@ -628,6 +800,30 @@ async fn npm_redirect_fresh_checkout_npm_ci_installs_patched_bytes_and_vex_verif
     );
 }
 
+/// Shrinkwrap flavor of the capstone: the committed lock is
+/// npm-shrinkwrap.json — npm <= 11's `npm shrinkwrap` output (the lock is
+/// renamed), npm 12's shrinkwrap + package-lock.json twin (the command is
+/// gone and installs read the twin). The redirect must land in EVERY
+/// committed lock, the fresh `npm ci` must install the patched bytes, and
+/// the manifest-less VEX tail must attest them (and stop once reverted).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
+async fn npm_redirect_shrinkwrap_fresh_checkout_and_manifestless_vex() {
+    let Some(fx) = redirect_scanned_project(
+        "shrinkwrap",
+        false,
+        RedirectCli::ScanRedirectVex,
+        LockFlavor::Shrinkwrap,
+    )
+    .await
+    else {
+        return;
+    };
+    assert!(fx.locks.contains(&"npm-shrinkwrap.json"), "{:?}", fx.locks);
+    let (fresh, installed) = fresh_install_patched(&fx);
+    manifestless_tail(&fx, &fresh, installed, &[VexVia::Apply]);
+}
+
 /// Negative twin: the hosted route serves TAMPERED bytes while the lockfile
 /// pins the REAL tarball's sha512 — the fresh `npm ci` must refuse to
 /// install. This is what makes the redirect safe to commit: a compromised or
@@ -635,7 +831,13 @@ async fn npm_redirect_fresh_checkout_npm_ci_installs_patched_bytes_and_vex_verif
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn npm_redirect_tampered_hosted_tarball_fails_fresh_npm_ci() {
-    let Some(fx) = redirect_scanned_project("tampered", true, RedirectCli::ScanRedirectVex).await
+    let Some(fx) = redirect_scanned_project(
+        "tampered",
+        true,
+        RedirectCli::ScanRedirectVex,
+        LockFlavor::PackageLock,
+    )
+    .await
     else {
         return;
     };
@@ -668,28 +870,19 @@ async fn npm_redirect_tampered_hosted_tarball_fails_fresh_npm_ci() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn npm_get_uuid_hosted_fresh_checkout_npm_ci_installs_patched_bytes() {
-    let Some(fx) = redirect_scanned_project("get-uuid", false, RedirectCli::GetUuidHosted).await
+    let Some(fx) = redirect_scanned_project(
+        "get-uuid",
+        false,
+        RedirectCli::GetUuidHosted,
+        LockFlavor::PackageLock,
+    )
+    .await
     else {
         return;
     };
 
-    let (fresh, ci) = fresh_checkout_npm_ci(&fx);
-    assert!(
-        ci.status.success(),
-        "fresh-checkout `npm ci` must succeed from the hosted patch tarball.\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&ci.stdout),
-        String::from_utf8_lossy(&ci.stderr),
-    );
-    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
-    assert!(
-        installed.starts_with(MARKER.as_bytes()),
-        "npm ci must install the PATCHED bytes from the hosted patch; got:\n{}",
-        String::from_utf8_lossy(&installed[..installed.len().min(120)])
-    );
-    assert_eq!(
-        installed, fx.patched,
-        "fresh install must be byte-identical to the patched content"
-    );
+    let (fresh, installed) = fresh_install_patched(&fx);
+    manifestless_tail(&fx, &fresh, installed, &[VexVia::Apply]);
 }
 
 /// `get <GHSA> --mode hosted` narrowing twin: the by-ghsa fan-out returns
@@ -702,7 +895,13 @@ async fn npm_get_uuid_hosted_fresh_checkout_npm_ci_installs_patched_bytes() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "wall-bound real-npm install (~150s); runs on all 3 OSes as an e2e CI matrix leg"]
 async fn npm_get_ghsa_hosted_narrows_and_installs() {
-    let Some(fx) = redirect_scanned_project("get-ghsa", false, RedirectCli::GetGhsaHosted).await
+    let Some(fx) = redirect_scanned_project(
+        "get-ghsa",
+        false,
+        RedirectCli::GetGhsaHosted,
+        LockFlavor::PackageLock,
+    )
+    .await
     else {
         return;
     };
@@ -757,21 +956,6 @@ async fn npm_get_ghsa_hosted_narrows_and_installs() {
 
     // Fresh-checkout proof: the narrowed redirect still installs the
     // patched bytes.
-    let (fresh, ci) = fresh_checkout_npm_ci(&fx);
-    assert!(
-        ci.status.success(),
-        "fresh-checkout `npm ci` must succeed from the hosted patch tarball.\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&ci.stdout),
-        String::from_utf8_lossy(&ci.stderr),
-    );
-    let installed = std::fs::read(fresh.join("node_modules").join(DEP).join("index.js")).unwrap();
-    assert!(
-        installed.starts_with(MARKER.as_bytes()),
-        "npm ci must install the PATCHED bytes from the hosted patch; got:\n{}",
-        String::from_utf8_lossy(&installed[..installed.len().min(120)])
-    );
-    assert_eq!(
-        installed, fx.patched,
-        "fresh install must be byte-identical to the patched content"
-    );
+    let (fresh, installed) = fresh_install_patched(&fx);
+    manifestless_tail(&fx, &fresh, installed, &[]);
 }

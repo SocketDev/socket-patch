@@ -36,6 +36,8 @@ enum Source {
     /// `scan`/`get --mode vendored` patch lives ONLY in
     /// `.socket/vendor/state.json`, as a `detached` entry's embedded record
     /// (the hosted rule again — a vendored-only project lists and exits 0).
+    /// A standalone `vendor` entry's fallback copy lists here too once no
+    /// manifest entry covers it — the checkout `vex` attests from it.
     Vendored,
 }
 
@@ -62,10 +64,14 @@ struct ListEntry<'a> {
 /// PURL, then manifest < hosted < vendored when one purl appears in more
 /// than one. The record maps (`HashMap` manifest and vendor ledger /
 /// `BTreeMap` redirect ledger) never impose an order shared consumers could
-/// diff, so the sort here is the contract. Only vendor entries that carry
-/// an embedded record fold in — a legacy manifest-tracked entry has no
-/// record of its own (the manifest's IS the record) and would otherwise
-/// double-list its purl.
+/// diff, so the sort here is the contract. Only vendor entries whose
+/// embedded record stands on its own fold in
+/// ([`crate::commands::vendor_record_is_unowned`], the rule `vex` attests
+/// by): a `detached` entry always (coexisting with a manifest entry is real
+/// state, shown labeled apart), a standalone `vendor` entry's fallback copy
+/// only when the manifest does not cover it — while it does, the manifest's
+/// record IS that entry's record and listing the copy would double-list the
+/// purl. A legacy entry with no embedded record never folds in.
 fn combined_entries<'a>(
     manifest: Option<&'a PatchManifest>,
     redirect: Option<&'a RedirectState>,
@@ -88,7 +94,10 @@ fn combined_entries<'a>(
     }
     if let Some(vendor) = vendor {
         entries.extend(vendor.iter().filter_map(|(purl, entry)| {
-            let record = entry.record.as_ref().filter(|_| entry.detached)?;
+            let record = entry
+                .record
+                .as_ref()
+                .filter(|_| crate::commands::vendor_record_is_unowned(purl, entry, manifest))?;
             Some(ListEntry {
                 purl,
                 record,
@@ -815,6 +824,89 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&only.to_pretty_json()).unwrap();
         assert_eq!(v["status"], "success", "{v}");
         assert_eq!(v["summary"]["discovered"], 2, "{v}");
+    }
+
+    /// The ledger entry the manifest-driven standalone `vendor` writes: NOT
+    /// detached, with the record embedded as a fallback copy.
+    fn standalone_vendor_entry(base_purl: &str, record: PatchRecord) -> VendorEntry {
+        let mut entry = vendor_entry(base_purl, Some(record));
+        entry.detached = false;
+        entry
+    }
+
+    /// A standalone `vendor` entry's embedded fallback record lists exactly
+    /// when `vex` would attest from it — no manifest entry covers the entry
+    /// (by ledger key or base purl). With no manifest at all it lists
+    /// labeled `vendored`, so a manifest-less checkout never reads "no
+    /// patches" while its VEX document attests the patch; while the manifest
+    /// covers it, the manifest's record IS its record (no double listing).
+    #[test]
+    fn standalone_vendor_fallback_record_lists_only_when_the_manifest_does_not_cover_it() {
+        let manifest = sample_manifest();
+        let record = manifest.patches["pkg:npm/minimist@1.2.2"].clone();
+        let mut other = record.clone();
+        other.uuid = "55555555-5555-4555-8555-555555555555".to_string();
+        let mut vendor = HashMap::new();
+        // Covered by the manifest's exact key.
+        vendor.insert(
+            "pkg:npm/minimist@1.2.2".to_string(),
+            standalone_vendor_entry("pkg:npm/minimist@1.2.2", record.clone()),
+        );
+        // Covered through its base purl (a qualified ledger key).
+        vendor.insert(
+            "pkg:npm/minimist@1.2.2?variant=x".to_string(),
+            standalone_vendor_entry("pkg:npm/minimist@1.2.2", record.clone()),
+        );
+        // Dropped from the manifest while the ledger still holds it.
+        vendor.insert(
+            "pkg:npm/left-pad@1.3.0".to_string(),
+            standalone_vendor_entry("pkg:npm/left-pad@1.3.0", other),
+        );
+
+        let listed = |entries: &[ListEntry<'_>]| -> Vec<(String, String, String)> {
+            let env = build_list_envelope(entries);
+            let v: serde_json::Value = serde_json::from_str(&env.to_pretty_json()).unwrap();
+            v["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| {
+                    (
+                        e["purl"].as_str().unwrap().to_string(),
+                        e["details"]["mode"]
+                            .as_str()
+                            .unwrap_or("manifest")
+                            .to_string(),
+                        e["uuid"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            listed(&combined_entries(Some(&manifest), None, Some(&vendor))),
+            vec![
+                (
+                    "pkg:npm/left-pad@1.3.0".to_string(),
+                    "vendored".to_string(),
+                    "55555555-5555-4555-8555-555555555555".to_string(),
+                ),
+                (
+                    "pkg:npm/minimist@1.2.2".to_string(),
+                    "manifest".to_string(),
+                    "11111111-1111-4111-8111-111111111111".to_string(),
+                ),
+            ],
+            "covered fallback copies stay behind the manifest record; the uncovered one lists"
+        );
+
+        // No manifest at all: every fallback copy stands on its own.
+        let only = listed(&combined_entries(None, None, Some(&vendor)));
+        assert_eq!(only.len(), 3, "{only:?}");
+        assert!(
+            only.iter().all(|(_, mode, _)| mode == "vendored"),
+            "{only:?}"
+        );
     }
 
     #[test]

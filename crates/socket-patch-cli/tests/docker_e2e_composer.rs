@@ -280,6 +280,23 @@ if [ "$VEX_RC" -ne 0 ]; then
 fi
 [ -s /tmp/out.vex.json ] || {{ echo "FAIL: vex did not write out.vex.json" >&2; exit 1; }}
 echo "===VEX VERIFIED===" >&2
+
+# Manifest-less negative control: an agent-mode patch is applied IN PLACE —
+# composer.lock still resolves monolog from packagist, so once the manifest
+# is gone the patched vendor/ bytes are no evidence at all: nothing is
+# discovered and vex reports manifest_not_found (exit 2) instead of attesting.
+mv .socket/manifest.json /tmp/manifest.keep
+socket-patch vex --offline --json --cwd "$PWD" --output /tmp/nomanifest.vex.json \
+  --product 'pkg:composer/e2e-app@1.0.0' > /tmp/vex-nomanifest.json 2>/tmp/vex-nomanifest.err
+NM_RC=$?
+if [ "$NM_RC" -ne 2 ] || ! grep -qF '"code": "manifest_not_found"' /tmp/vex-nomanifest.json \
+   || [ -e /tmp/nomanifest.vex.json ]; then
+  echo "FAIL: manifest-less agent-mode vex exited $NM_RC (expected 2, manifest_not_found, no doc)" >&2
+  cat /tmp/vex-nomanifest.json /tmp/vex-nomanifest.err >&2
+  exit 1
+fi
+mv /tmp/manifest.keep .socket/manifest.json
+echo "===MANIFESTLESS AGENT VEX VERIFIED===" >&2
 echo "===VEX DOC BEGIN==="
 cat /tmp/out.vex.json
 echo ""
@@ -455,6 +472,10 @@ async fn composer_local_install_full_apply_chain() {
         "agent-mode VEX leg did not run/pass (===VEX VERIFIED=== missing).\nstderr=\n{stderr}"
     );
     assert_vex_agent_attested(&stdout, PURL);
+    assert!(
+        stderr.contains("===MANIFESTLESS AGENT VEX VERIFIED==="),
+        "manifest-less agent-mode negative control did not run/pass.\nstderr=\n{stderr}"
+    );
     assert_real_pipeline_hit_the_api(&server).await;
 }
 

@@ -90,6 +90,8 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "vex_e2e_common/bun.rs"]
+mod bun_vex;
 #[path = "common/cache_env.rs"]
 mod cache_env;
 
@@ -98,6 +100,10 @@ const ORG: &str = "test-org";
 const TOKEN: &str = "33333333-3333-4333-8333-333333333333";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const GHSA: &str = "GHSA-migr-bun-test";
+/// CVE alias of the staged manifest record (the `uuid_v` vendored patch).
+const CVE_MANIFEST: &str = "CVE-2026-99999";
+/// CVE alias of the API view record (the `uuid_h` hosted patch).
+const CVE_VIEW: &str = "CVE-2026-3333";
 
 /// A fixture dependency and the two patch identities the legs use for it.
 struct Dep {
@@ -840,7 +846,7 @@ fn stage_manifest(fx: &Fixture, proj: &Path, dep: &Dep) {
                 "afterHash": compute_git_sha256_from_bytes(&bytes.patched),
             }},
             "vulnerabilities": { GHSA: {
-                "cves": ["CVE-2026-99999"],
+                "cves": [CVE_MANIFEST],
                 "summary": "migration vuln", "severity": "high", "description": "d",
             }},
             "description": "migration patch", "license": "MIT", "tier": "free",
@@ -966,7 +972,7 @@ async fn mount_hosted_api(
                 },
                 "vulnerabilities": {
                     GHSA: {
-                        "cves": ["CVE-2026-3333"],
+                        "cves": [CVE_VIEW],
                         "summary": "migration vuln", "severity": "high", "description": "d"
                     }
                 },
@@ -1201,6 +1207,54 @@ fn assert_unscoped_rollback_restores_pristine(fx: &Fixture, proj: &Path, tag: &s
     eprintln!("ROLLBACK OK ({tag}, bun {})", fx.bun_raw);
 }
 
+/// The manifest-less VEX step ([`bun_vex::run_bun_vex_matrix`]) on a fresh
+/// checkout of the migrated `proj` (manifest deleted, real frozen install):
+/// DEP_A attested under `uuid` with `mode`'s marker from the ledger, then
+/// from the lock + patch API with both ledgers deleted; offline →
+/// `record_unavailable` with zero requests; the pristine lock back (ledgers,
+/// artifacts, patched install kept) → NOT attested, verified or not.
+#[allow(clippy::too_many_arguments)]
+fn manifestless_vex(
+    fx: &Fixture,
+    proj: &Path,
+    mode: bun_vex::BunMode,
+    uuid: &str,
+    cve: &str,
+    api: &str,
+    tag: &str,
+) {
+    let cves = [cve];
+    let case = bun_vex::BunVexCase {
+        tag,
+        mode,
+        purl: DEP_A.purl,
+        uuid,
+        files: vec![(
+            "package/index.js".to_string(),
+            compute_git_sha256_from_bytes(&fx.a.patched),
+        )],
+        vulns: &[(GHSA, &cves)],
+        lock: "bun.lock",
+        registry_lock: fx.lock_pristine.clone(),
+        patch_server_url: (mode == bun_vex::BunMode::Hosted).then(|| api.to_string()),
+    };
+    bun_vex::run_bun_vex_matrix(proj, fx.tmp.path(), &case, |checkout| {
+        let ci = bun(
+            checkout,
+            &["install", "--frozen-lockfile", "--ignore-scripts"],
+            &fx.tmp.path().join(format!("vex-{tag}-bun-home")),
+        );
+        assert!(
+            ci.status.success(),
+            "vex checkout frozen install ({tag}).\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&ci.stdout),
+            String::from_utf8_lossy(&ci.stderr)
+        );
+        assert_installed(checkout, &DEP_A, &fx.a.patched, "vex checkout");
+        assert_installed(checkout, &DEP_B, &fx.b.orig, "vex checkout (bystander)");
+    });
+}
+
 /// The vendored → hosted takeover on `proj` (already vendored for DEP_A at
 /// `uuid_v`): `scan --mode hosted` must announce the takeover, leave the
 /// project purely hosted, and a fresh frozen install from an empty cache
@@ -1232,6 +1286,63 @@ fn take_over_to_hosted(fx: &Fixture, proj: &Path, api: &str, hp: &HostedPatch, t
         "hosted fresh install (bystander)",
     );
     eprintln!("VENDORED→HOSTED OK ({tag}, bun {})", fx.bun_raw);
+    // The takeover leaves the vendored-era manifest record (uuid_v) in
+    // place; the lock wires uuid_h (checked on the fresh checkout, whose
+    // install is the patched tree). With that stale manifest present, VEX
+    // must attest what is WIRED (uuid_h, redirected), never the manifest's
+    // uuid_v.
+    let uri = api.to_string();
+    let patched = compute_git_sha256_from_bytes(&fx.a.patched);
+    let stale = proj.join(".socket/manifest.json");
+    if stale.is_file() {
+        bun_vex::outside_runtime(|| {
+            let api = bun_vex::PatchApi::start(vec![(
+                DEP_A.uuid_h.to_string(),
+                bun_vex::patch_view(
+                    DEP_A.uuid_h,
+                    DEP_A.purl,
+                    &[("package/index.js", &patched)],
+                    &[(GHSA, &[CVE_VIEW])],
+                ),
+            )]);
+            // `fresh`: the committable files (stale manifest included) plus
+            // the patched frozen install from above.
+            assert!(fresh.join(".socket/manifest.json").is_file());
+            let out = bun_vex::run_vex(
+                &bun_vex::binary(),
+                &fresh,
+                &bun_vex::VexRun {
+                    patch_server_url: Some(uri.clone()),
+                    ..bun_vex::VexRun::online(&api)
+                },
+            );
+            assert_eq!(out.code, Some(0), "stale manifest ({tag}): {out}");
+            bun_vex::assert_attested(
+                out.doc(),
+                DEP_A.purl,
+                DEP_A.uuid_h,
+                bun_vex::Marker::Redirected,
+                &[(GHSA, &[CVE_VIEW])],
+            );
+            assert!(
+                !out.stdout.contains(DEP_A.uuid_v)
+                    && !std::fs::read_to_string(&out.output)
+                        .unwrap()
+                        .contains(DEP_A.uuid_v),
+                "the stale manifest uuid must not be attested ({tag}): {out}"
+            );
+        });
+        eprintln!("BUN-VEX stale-manifest-{tag} hosted wired-uuid-wins ok");
+    }
+    manifestless_vex(
+        fx,
+        proj,
+        bun_vex::BunMode::Hosted,
+        DEP_A.uuid_h,
+        CVE_VIEW,
+        api,
+        &format!("hosted-{tag}"),
+    );
 }
 
 /// The hosted → vendored takeover on `proj` (already hosted for DEP_A),
@@ -1342,6 +1453,19 @@ fn take_over_to_vendored(
         "vendored fresh install (bystander)",
     );
     eprintln!("HOSTED→VENDORED OK ({tag}, {driver:?}, bun {})", fx.bun_raw);
+    let cve = match driver {
+        VendoredDriver::VendorOffline => CVE_MANIFEST,
+        VendoredDriver::ScanVendored => CVE_VIEW,
+    };
+    manifestless_vex(
+        fx,
+        proj,
+        bun_vex::BunMode::Vendored,
+        uuid,
+        cve,
+        api,
+        &format!("vendored-{tag}"),
+    );
     uuid
 }
 
@@ -1429,6 +1553,15 @@ async fn bun_hosted_then_vendored_takeover_round_trips_to_registry() {
     assert_pure_hosted(&fx, &proj, hp);
     let fresh = fresh_frozen_install(&fx, &proj, "fresh-hosted");
     assert_installed(&fresh, &DEP_A, &fx.a.patched, "hosted fresh install");
+    manifestless_vex(
+        &fx,
+        &proj,
+        bun_vex::BunMode::Hosted,
+        DEP_A.uuid_h,
+        CVE_VIEW,
+        &server.uri(),
+        "hosted",
+    );
 
     // B: BOTH vendored drivers, each on its own copy of the hosted project.
     let by_vendor = fx.dir("hosted-copy-vendor");

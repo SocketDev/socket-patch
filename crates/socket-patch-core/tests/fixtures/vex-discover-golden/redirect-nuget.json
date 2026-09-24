@@ -1,0 +1,182 @@
+{
+  "redirect/nuget/packages-lock/basic/expected": {
+    "refs": [
+      {
+        "purl": "pkg:nuget/newtonsoft.json@13.0.3",
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "mode": "hosted",
+        "source_file": "nuget.config",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch-registry/nuget/11111111-1111-1111-1111-111111111111/66666666-6666-6666-6666-666666666666/index.json",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "nuget.config"
+      },
+      {
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "mode": "hosted",
+        "file": "nuget.config"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "purl": "pkg:nuget/newtonsoft.json@13.0.3"
+      }
+    ]
+  },
+  "redirect/nuget/packages-lock/basic/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/nuget/packages-lock/empty-sources/expected": {
+    "refs": [
+      {
+        "purl": "pkg:nuget/newtonsoft.json@13.0.3",
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "mode": "hosted",
+        "source_file": "nuget.config",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch-registry/nuget/11111111-1111-1111-1111-111111111111/66666666-6666-6666-6666-666666666666/index.json",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "nuget.config"
+      },
+      {
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "mode": "hosted",
+        "file": "nuget.config"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "purl": "pkg:nuget/newtonsoft.json@13.0.3"
+      }
+    ]
+  },
+  "redirect/nuget/packages-lock/empty-sources/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/nuget/packages-lock/empty-sources-selfclosing/expected": {
+    "refs": [
+      {
+        "purl": "pkg:nuget/newtonsoft.json@13.0.3",
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "mode": "hosted",
+        "source_file": "nuget.config",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch-registry/nuget/11111111-1111-1111-1111-111111111111/66666666-6666-6666-6666-666666666666/index.json",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "nuget.config"
+      },
+      {
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "mode": "hosted",
+        "file": "nuget.config"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "purl": "pkg:nuget/newtonsoft.json@13.0.3"
+      }
+    ]
+  },
+  "redirect/nuget/packages-lock/empty-sources-selfclosing/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/nuget/packages-lock/no-preexisting-mapping/expected": {
+    "refs": [
+      {
+        "purl": "pkg:nuget/newtonsoft.json@13.0.3",
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "mode": "hosted",
+        "source_file": "nuget.config",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashbase64PATCHEDcontenthashAA==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch-registry/nuget/11111111-1111-1111-1111-111111111111/66666666-6666-6666-6666-666666666666/index.json",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "nuget.config"
+      },
+      {
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "mode": "hosted",
+        "file": "nuget.config"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "66666666-6666-6666-6666-666666666666",
+        "purl": "pkg:nuget/newtonsoft.json@13.0.3"
+      }
+    ]
+  },
+  "redirect/nuget/packages-lock/no-preexisting-mapping/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  }
+}

@@ -9,6 +9,7 @@ use std::time::Duration;
 use socket_patch_core::api::types::BatchPackagePatches;
 use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::redirect::DepOverride;
+use socket_patch_core::utils::purl::purl_parts;
 
 use crate::commands::vex::generate_vex_from_manifest_path;
 
@@ -82,25 +83,6 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     // redirect rewriter edits its integrity entries today — recording the
     // decision here so the omission reads as deliberate, not forgotten.
 ];
-
-/// `pkg:<type>/<coordinate>@<version>` → `(type, coordinate, version)`. The
-/// coordinate keeps its full slash-bearing form (npm `@scope/name`, composer
-/// `vendor/pkg`, golang module path) — the rewriters treat that as the `name`
-/// (their `full_name()` is `name` when `namespace` is `None`).
-fn parse_purl_simple(purl: &str) -> Option<(String, String, String)> {
-    let stripped = socket_patch_core::utils::purl::strip_purl_qualifiers(purl);
-    let rest = stripped.strip_prefix("pkg:")?;
-    let (typ, after) = rest.split_once('/')?;
-    let (coord, version) = after.rsplit_once('@')?;
-    let name = socket_patch_core::utils::purl::percent_decode_purl_component(coord).into_owned();
-    // The API serves canonical percent-encoded purls, so the version needs
-    // decoding just like the coordinate — npm build metadata arrives as
-    // `1.2.3%2Bbuild` while lockfiles store `1.2.3+build`; an undecoded
-    // version would silently match no lock entry.
-    let version =
-        socket_patch_core::utils::purl::percent_decode_purl_component(version).into_owned();
-    Some((typ.to_string(), name, version))
-}
 
 /// `scheme://[user[:pass]@]host[:port]/…` → `host[:port]`, NEVER userinfo.
 /// For user-facing messages that name where a lockfile now points — the
@@ -368,6 +350,154 @@ fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
         .unwrap_or(lines.len());
     lines.insert(anchor, "trustLockfile: true".to_string());
     TrustPlan::Append(lines.join("\n"))
+}
+
+/// The root npm locks the hosted rewriter edits (`rewrite_npm_lock` rewrites
+/// every one present — npm 12 installs from package-lock.json beside a
+/// committed shrinkwrap).
+const NPM_LOCKS: [&str; 2] = ["npm-shrinkwrap.json", "package-lock.json"];
+
+/// The honest-tradeoff + opt-out tail shared by every `allow-remote`
+/// warning variant. The tradeoff sentence is a security disclosure, not
+/// prose garnish: `allow-remote=all` lifts npm 12's remote-tarball refusal
+/// for the WHOLE dependency tree, so it must be stated wherever the setting
+/// is written or recommended (the pnpm `trustLockfile` precedent).
+const NPM_ALLOW_REMOTE_TRADEOFF: &str =
+    "Note: allow-remote=all lets npm install ANY url-resolved (remote tarball) \
+     dependency, not just the patched ones Socket serves — the per-entry sha512 \
+     integrity pins are still enforced. `allow-remote=root` only admits direct \
+     dependencies. npm <=11 installs work unchanged (npm 11 already defaults to \
+     `all`; npm <=10 has no such setting)";
+
+/// The policy preamble shared by every `allow-remote` warning variant: what
+/// was repointed, and how npm >= 12 fails without the setting.
+fn npm_allow_remote_preamble(hosts: &[&str]) -> String {
+    format!(
+        "the npm lockfile now resolves patched dependencies from the hosted patch server ({}); \
+         npm >=12 refuses tarballs from any host other than the configured registry by \
+         default (`allow-remote=none`, error EALLOWREMOTE)",
+        hosts.join(", ")
+    )
+}
+
+/// The auto-config variant: `allow-remote=all` was (or, on `--dry-run`,
+/// would be) written to the project `.npmrc`, so installs need no flags.
+fn npm_allow_remote_configured_detail(hosts: &[&str], created: bool, dry_run: bool) -> String {
+    let how = match (created, dry_run) {
+        (true, false) => "`allow-remote=all` was written to a new",
+        (false, false) => "`allow-remote=all` was appended to the existing",
+        (true, true) => "`allow-remote=all` would be written to a new",
+        (false, true) => "`allow-remote=all` would be appended to the existing",
+    };
+    format!(
+        "{}, so {how} project .npmrc — commit it alongside the lock; `npm ci` needs no \
+         extra flags. {NPM_ALLOW_REMOTE_TRADEOFF}. To keep npm's default instead, re-run \
+         with --no-npm-allow-remote-config (SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG) and install \
+         with `npm ci --allow-remote=all`",
+        npm_allow_remote_preamble(hosts),
+    )
+}
+
+/// The project `.npmrc` already resolves to `allow-remote=all`.
+fn npm_allow_remote_already_detail(hosts: &[&str]) -> String {
+    format!(
+        "{}, and the project .npmrc already sets `allow-remote=all` — keep it committed \
+         alongside the lock; `npm ci` needs no extra flags. {NPM_ALLOW_REMOTE_TRADEOFF}",
+        npm_allow_remote_preamble(hosts),
+    )
+}
+
+/// The user explicitly set another value: respected, never flipped (the
+/// pnpm `trustLockfile: false` precedent) — the warning names the manual
+/// recoveries instead.
+fn npm_allow_remote_user_set_detail(hosts: &[&str], value: &str) -> String {
+    format!(
+        "{}. The project .npmrc explicitly sets `allow-remote={value}`, which was respected \
+         and left untouched — set `allow-remote=all` there yourself (or install with \
+         `npm ci --allow-remote=all`) so npm >=12 installs the patched artifacts. \
+         {NPM_ALLOW_REMOTE_TRADEOFF}",
+        npm_allow_remote_preamble(hosts),
+    )
+}
+
+/// An `npm_config_allow_remote` environment variable sets another value.
+/// npm's env layer beats every `.npmrc`, so a project write could not take
+/// effect in this environment — and an explicit setting is respected.
+fn npm_allow_remote_env_set_detail(hosts: &[&str], var: &str, value: &str) -> String {
+    format!(
+        "{}. The environment variable {var}={value} explicitly sets `allow-remote`, which \
+         was respected: npm's environment layer overrides every .npmrc, so a project \
+         `allow-remote=all` would not take effect here and the project .npmrc was left \
+         untouched — unset {var} (or install with `npm ci --allow-remote=all`) so npm >=12 \
+         installs the patched artifacts. {NPM_ALLOW_REMOTE_TRADEOFF}",
+        npm_allow_remote_preamble(hosts),
+    )
+}
+
+/// A lower npm config layer (user / global / builtin file) explicitly sets
+/// another value. A committed project `allow-remote=all` would silently
+/// override that machine / org policy on every checkout, so it is
+/// respected like a project value and the override is left to the user.
+fn npm_allow_remote_outer_set_detail(
+    hosts: &[&str],
+    layer: &str,
+    path: &std::path::Path,
+    value: &str,
+) -> String {
+    format!(
+        "{}. The {layer} npm config ({}) explicitly sets `allow-remote={value}`, which was \
+         respected: socket-patch does not commit a project .npmrc that overrides it, and \
+         the project .npmrc was left untouched — to accept the patched artifacts in this \
+         project anyway, set `allow-remote=all` in the project .npmrc yourself (it outranks \
+         the {layer} config) or install with `npm ci --allow-remote=all`. \
+         {NPM_ALLOW_REMOTE_TRADEOFF}",
+        npm_allow_remote_preamble(hosts),
+        path.display(),
+    )
+}
+
+/// The opt-out (`--no-npm-allow-remote-config`) variant: nothing written,
+/// both manual recoveries spelled out.
+fn npm_allow_remote_manual_detail(hosts: &[&str]) -> String {
+    format!(
+        "{}. Commit `allow-remote=all` in the project .npmrc (or install with \
+         `npm ci --allow-remote=all`) so npm >=12 installs the patched artifacts. \
+         {NPM_ALLOW_REMOTE_TRADEOFF}",
+        npm_allow_remote_preamble(hosts),
+    )
+}
+
+/// The unreadable/unsafe `.npmrc` fallback: the file exists but could not
+/// be read, or is a symlink / non-regular file the atomic writer would
+/// replace. Planning a Create here would OVERWRITE the user's registry /
+/// auth config, so the auto-config stands down and names the problem.
+fn npm_allow_remote_unreadable_detail(hosts: &[&str], why: &str) -> String {
+    format!(
+        "{}. The project .npmrc exists but {why}; it was left untouched. Add \
+         `allow-remote=all` to it yourself (or install with `npm ci --allow-remote=all`) \
+         so npm >=12 installs the patched artifacts. {NPM_ALLOW_REMOTE_TRADEOFF}",
+        npm_allow_remote_preamble(hosts),
+    )
+}
+
+/// The project `.npmrc` read, classified for the allow-remote auto-config:
+/// `Ok(Some(text))` — a regular file read fine; `Ok(None)` — ABSENT (the
+/// only state where planning a Create is safe); `Err(why)` — present but
+/// unreadable, a symlink (the atomic stage+rename writer would replace the
+/// link with a detached copy — and the whole-run symlink guard would refuse
+/// the redirect), or not a regular file (FIFO-safe: never opened blocking).
+fn read_npmrc_for_allow_remote(path: &std::path::Path) -> Result<Option<String>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not be inspected ({e})")),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err("is a symbolic link (socket-patch never writes through one)".into())
+        }
+        Ok(_) => {}
+    }
+    socket_patch_core::utils::fs::read_regular_to_string_sync(path)
+        .map(Some)
+        .map_err(|e| format!("could not be read ({e})"))
 }
 
 /// The hosted-mode JSON error envelope, for bail-outs that return before the
@@ -812,7 +942,7 @@ async fn gem_stale_install_warnings(
         let Some(want_sha) = gem_artifact_shas.get(&gem_sha_key(purl)) else {
             continue;
         };
-        let Some((_, name, version)) = parse_purl_simple(purl) else {
+        let Some((_, name, version)) = purl_parts(purl) else {
             continue;
         };
         let cache_path = cwd
@@ -840,7 +970,7 @@ async fn gem_stale_install_warnings(
 /// the purl so overrides (which carry no purl) and confirmed purls meet on
 /// neutral ground.
 fn gem_sha_key(purl: &str) -> (String, String) {
-    parse_purl_simple(purl)
+    purl_parts(purl)
         .map(|(_, name, version)| (name, version))
         .unwrap_or_default()
 }
@@ -910,7 +1040,8 @@ pub(super) async fn run_redirect(
 /// The hosted-redirect engine over an ALREADY-SELECTED `(purl, uuid)` set:
 /// reference grants → DepOverride build → apply lock (wet runs with a grant)
 /// → ledger load → vendored→hosted takeover pre-revert (symlink-checked
-/// first) → candidate-file read → rewrite → pnpm trust config →
+/// first) → candidate-file read → rewrite → pnpm trust config → npm `.npmrc`
+/// allow-remote config →
 /// confirmation probe → ledger merge-then-persist → file writes → gem stale
 /// probe → warnings → optional VEX. Shared VERBATIM by `scan --mode hosted`
 /// — its `--json` arm through the `run_redirect` wrapper (which selects via
@@ -992,7 +1123,7 @@ pub(crate) async fn run_redirect_selected(
                 continue;
             }
             let purl = reference.purl.as_deref().unwrap_or(sel_purl);
-            let Some((ecosystem, name, version)) = parse_purl_simple(purl) else {
+            let Some((ecosystem, name, version)) = purl_parts(purl) else {
                 skipped.push(
                     serde_json::json!({ "purl": purl, "uuid": sel_uuid, "reason": "bad_purl" }),
                 );
@@ -1211,6 +1342,16 @@ pub(crate) async fn run_redirect_selected(
     // hosted rewriter does not also rewrite (a Gemfile line, a uv source).
     let mut takeover_migrated: Vec<String> = Vec::new();
     let mut takeover_files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // Which root locks each dry-run takeover purl is vendored into (from
+    // its vendor ledger wiring): the wet run reverts that wiring and then
+    // splices the hosted URL there, so the install-policy auto-configs
+    // (npm `.npmrc` allow-remote, pnpm `trustLockfile`) must be PREVIEWED
+    // for those locks even though the rewriters never see these purls.
+    let mut dry_run_takeover_locks: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    // `(artifact_url, wired root locks)` of the withheld dry-run takeover
+    // candidates — filled when they leave the rewrite set below.
+    let mut dry_run_takeover_urls: Vec<(String, Vec<String>)> = Vec::new();
     if !candidates.iter().any(|c| takeover_capable(&c.purl)) {
         // No takeover-capable candidates — nothing to reconcile.
     } else {
@@ -1352,6 +1493,10 @@ pub(crate) async fn run_redirect_selected(
                     dry_run_takeover.push((purl.clone(), uuid.clone()));
                     takeover_migrated.push(purl.clone());
                     takeover_files.extend(entry.wiring.iter().map(|w| w.file.clone()));
+                    dry_run_takeover_locks.insert(
+                        purl.clone(),
+                        entry.wiring.iter().map(|w| w.file.clone()).collect(),
+                    );
                     continue;
                 }
                 let outcome =
@@ -1415,7 +1560,7 @@ pub(crate) async fn run_redirect_selected(
                 // own per-flavor diagnostics.)
                 let name = purl
                     .starts_with("pkg:cargo/")
-                    .then(|| parse_purl_simple(purl).map(|(_, name, _)| name))
+                    .then(|| purl_parts(purl).map(|(_, name, _)| name))
                     .flatten();
                 let wired = name
                     .as_deref()
@@ -1455,6 +1600,17 @@ pub(crate) async fn run_redirect_selected(
             .chain(dry_run_takeover.iter().map(|(p, _)| p.as_str()))
             .collect();
         if !withheld.is_empty() {
+            // Keep the dry-run takeover candidates' URLs (and the root locks
+            // their purl is vendored into) for the install-policy previews.
+            for (purl, _) in &dry_run_takeover {
+                let locks = dry_run_takeover_locks
+                    .get(purl)
+                    .cloned()
+                    .unwrap_or_default();
+                for c in candidates.iter().filter(|c| &c.purl == purl) {
+                    dry_run_takeover_urls.push((c.dep.artifact_url.clone(), locks.clone()));
+                }
+            }
             candidates.retain(|c| !withheld.contains(c.purl.as_str()));
         }
     }
@@ -1469,12 +1625,14 @@ pub(crate) async fn run_redirect_selected(
     // writer. A non-regular file now reads as "unreadable" and is skipped
     // exactly like a missing one.
     //
-    // Skipped entirely when no candidate survived (every reference skipped,
-    // refused or withheld as a dry-run takeover preview): the rewriters
+    // Skipped entirely when no candidate survived (every reference skipped
+    // or refused) and no dry-run takeover preview is pending: the rewriters
     // place nothing and warn about nothing without a dep, so the ~45 reads
     // would only feed an empty rewrite. Everything after the rewrite still
-    // runs — the previews are counted, the skips and warnings reported, a
-    // requested VEX still attempted.
+    // runs — the skips and warnings reported, a requested VEX still
+    // attempted. A dry-run takeover preview still needs the root locks: the
+    // install-policy previews below (pnpm `trustLockfile`, npm `.npmrc`)
+    // judge the lock the wet run splices after its revert.
     use socket_patch_core::utils::fs::read_regular_to_string;
     let mut files: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     // Rush monorepos have no root package.json/lock pair: the single pnpm
@@ -1485,7 +1643,7 @@ pub(crate) async fn run_redirect_selected(
     // rewritten in place, and the write-back below is already path-generic.
     let mut rush_warnings: Vec<serde_json::Value> = Vec::new();
     let mut rush_lock_keys: Vec<String> = Vec::new();
-    if !candidates.is_empty() {
+    if !candidates.is_empty() || !dry_run_takeover_urls.is_empty() {
         for name in REDIRECT_CANDIDATE_FILES {
             if *name == "bun.lockb" {
                 continue;
@@ -1497,9 +1655,8 @@ pub(crate) async fn run_redirect_selected(
 
         if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(&common.cwd) {
             for path in paths {
-                if let Some(script_path) = path
-                    .strip_suffix(".py.lock")
-                    .map(|prefix| format!("{prefix}.py"))
+                if let Some(script_path) =
+                    socket_patch_core::utils::python_lock::script_of_lock(&path).map(str::to_string)
                 {
                     if let Ok(content) =
                         read_regular_to_string(&common.cwd.join(&script_path)).await
@@ -1565,7 +1722,10 @@ pub(crate) async fn run_redirect_selected(
         }
         let native_target = files
             .iter()
-            .filter(|(path, _)| *path == "uv.lock" || path.ends_with(".py.lock"))
+            .filter(|(path, _)| {
+                *path == "uv.lock"
+                    || socket_patch_core::utils::python_lock::is_script_lock_name(path)
+            })
             .any(|(_, text)| {
                 socket_patch_core::utils::python_lock::rewrite_python_lock(
                     text,
@@ -1781,6 +1941,26 @@ pub(crate) async fn run_redirect_selected(
         if let Some(text) = heal_root {
             pnpm_lock_texts.push(text);
         }
+        // A dry-run vendored→hosted takeover of a purl vendored into the
+        // root pnpm lock: the wet run reverts that wiring and splices the
+        // hosted URL into it, so the trust config is previewed against the
+        // root lock (the vendored text carries the same lockfileVersion).
+        let takeover_pnpm_urls: Vec<&str> = dry_run_takeover_urls
+            .iter()
+            .filter(|(_, locks)| locks.iter().any(|l| l == "pnpm-lock.yaml"))
+            .map(|(url, _)| url.as_str())
+            .collect();
+        let takeover_root: Option<&String> = if takeover_pnpm_urls.is_empty()
+            || heal_root.is_some()
+            || rewrite.files.contains_key("pnpm-lock.yaml")
+        {
+            None
+        } else {
+            files.get("pnpm-lock.yaml")
+        };
+        if let Some(text) = takeover_root {
+            pnpm_lock_texts.push(text);
+        }
         if !pnpm_lock_texts.is_empty() {
             // Name only the hosts whose artifact URL actually landed in a
             // touched pnpm lock's final text (spliced this run, or the
@@ -1805,6 +1985,8 @@ pub(crate) async fn run_redirect_selected(
                     })
                 })
                 .filter_map(|o| url_host(&o.artifact_url))
+                // Dry-run takeover purls land in the root lock on the wet run.
+                .chain(takeover_pnpm_urls.iter().filter_map(|url| url_host(url)))
                 .collect();
             hosts.sort_unstable();
             hosts.dedup();
@@ -1816,7 +1998,10 @@ pub(crate) async fn run_redirect_selected(
             // Root-lock gate (see the block comment above): only the plain
             // project lock at lockfileVersion >= 9 gets the auto-config —
             // spliced this run, or detected already-redirected (heal path).
-            let root_lock_v9 = heal_root.is_some()
+            let root_lock_v9 = heal_root
+                .or(takeover_root)
+                .and_then(|text| pnpm_lock_version_major(text))
+                .is_some_and(|major| major >= 9)
                 || rewrite
                     .files
                     .get("pnpm-lock.yaml")
@@ -1919,10 +2104,141 @@ pub(crate) async fn run_redirect_selected(
             }));
         }
     }
+    // npm >= 12 ships `allow-remote=none`: it refuses (EALLOWREMOTE) every
+    // tarball whose `resolved` origin is not the configured registry — which
+    // is exactly what a hosted redirect writes. Verified against real
+    // installs (npm 12.0.0 / 12.1.0): a fresh `npm ci` of the redirected lock
+    // fails before fetching anything, while npm <= 11 (11.x ships
+    // `allow-remote=all`; <= 10 has no such setting) installs it unchanged,
+    // and `allow-remote=all` in the project `.npmrc` makes npm 12 install
+    // the patched bytes with the sha512 pins still enforced. `root` is not
+    // enough in general: it only admits DIRECT dependencies of the project.
+    //
+    // ZERO-TOUCH DEFAULT (the npm twin of the pnpm trustLockfile auto-config
+    // above): whenever a root npm lock ends this run carrying a granted
+    // hosted artifact URL (spliced now, or already redirected by an earlier
+    // run — so a missed config heals on re-run), the run ensures
+    // `allow-remote=all` in the project `.npmrc` — created when absent
+    // (`action: "created"`), one line appended otherwise (`"added"`), every
+    // other byte preserved — and records it in the ledger
+    // (`redirect_npmrc_allow_remote`) so rollback / remove / the vendored
+    // takeover remove exactly that once no package-lock entry needs it. An
+    // explicit user `allow-remote=<other>` is RESPECTED (never flipped), an
+    // unreadable / symlinked `.npmrc` is left alone, and
+    // `--no-npm-allow-remote-config` opts out entirely; every variant still
+    // WARNS (`redirect_npm_allow_remote`) with the whole-tree tradeoff.
+    // Vendored mode is unaffected: its `file:.socket/vendor/…` specs are npm
+    // `file` specs, gated by `allow-file` (default `all`), not
+    // `allow-remote`.
+    let mut npm_warnings: Vec<serde_json::Value> = Vec::new();
+    let mut npmrc_config_write: Option<(String, socket_patch_core::patch::redirect::FileEdit)> =
+        None;
+    {
+        let npm_hosts: Vec<&str> = {
+            let mut hosts: Vec<&str> = overrides
+                .iter()
+                .filter(|o| o.ecosystem == "npm")
+                .filter(|o| {
+                    NPM_LOCKS.iter().any(|lock| {
+                        rewrite
+                            .files
+                            .get(*lock)
+                            .or_else(|| files.get(*lock))
+                            .is_some_and(|text| {
+                                socket_patch_core::patch::redirect::artifact_url_present(
+                                    text,
+                                    &o.artifact_url,
+                                )
+                            })
+                    })
+                })
+                .filter_map(|o| url_host(&o.artifact_url))
+                // A dry-run vendored→hosted takeover: the wet run reverts
+                // the vendored wiring in a root npm lock and splices the
+                // hosted URL there, so preview the `.npmrc` write too.
+                .chain(
+                    dry_run_takeover_urls
+                        .iter()
+                        .filter(|(_, locks)| locks.iter().any(|l| NPM_LOCKS.contains(&l.as_str())))
+                        .filter_map(|(url, _)| url_host(url)),
+                )
+                .collect();
+            hosts.sort_unstable();
+            hosts.dedup();
+            hosts
+        };
+        if !npm_hosts.is_empty() {
+            use socket_patch_core::patch::redirect::npmrc::{
+                plan_npmrc_allow_remote_with, resolve_outer_allow_remote, NpmConfigEnv, NpmrcPlan,
+                NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
+            };
+            let edit = |action: &str| socket_patch_core::patch::redirect::FileEdit {
+                path: NPMRC_REL.into(),
+                kind: NPMRC_ALLOW_REMOTE_EDIT_KIND.into(),
+                action: action.into(),
+                key: Some("allow-remote".into()),
+                original: None,
+                new: Some(serde_json::json!("all")),
+            };
+            let npmrc = read_npmrc_for_allow_remote(&common.cwd.join(NPMRC_REL));
+            // The npm config layers OUTSIDE the project file, located the
+            // way npm does: an env `npm_config_allow_remote` beats the
+            // project file, and an explicit user / global / builtin value is
+            // a machine / org policy a committed project line would silently
+            // override — both are respected like a project value.
+            let outer = resolve_outer_allow_remote(&NpmConfigEnv::from_process(), |path| {
+                socket_patch_core::utils::fs::read_regular_to_string_sync(path).ok()
+            });
+            let detail = match npmrc {
+                // Opt-out still reports an explicit / already-set value
+                // truthfully; only the WRITE is suppressed.
+                Ok(existing) => match plan_npmrc_allow_remote_with(existing.as_deref(), &outer) {
+                    NpmrcPlan::AlreadyAll => npm_allow_remote_already_detail(&npm_hosts),
+                    NpmrcPlan::UserSet(value) => {
+                        npm_allow_remote_user_set_detail(&npm_hosts, &value)
+                    }
+                    NpmrcPlan::EnvSet { var, value } => {
+                        npm_allow_remote_env_set_detail(&npm_hosts, &var, &value)
+                    }
+                    NpmrcPlan::OuterSet { layer, path, value } => {
+                        npm_allow_remote_outer_set_detail(&npm_hosts, layer, &path, &value)
+                    }
+                    NpmrcPlan::Unsupported(why) => {
+                        npm_allow_remote_unreadable_detail(&npm_hosts, &why)
+                    }
+                    _ if common.no_npm_allow_remote_config => {
+                        npm_allow_remote_manual_detail(&npm_hosts)
+                    }
+                    NpmrcPlan::Create(text) => {
+                        npmrc_config_write = Some((text, edit("created")));
+                        npm_allow_remote_configured_detail(&npm_hosts, true, common.dry_run)
+                    }
+                    NpmrcPlan::Append(text) => {
+                        npmrc_config_write = Some((text, edit("added")));
+                        npm_allow_remote_configured_detail(&npm_hosts, false, common.dry_run)
+                    }
+                },
+                Err(why) => npm_allow_remote_unreadable_detail(&npm_hosts, &why),
+            };
+            npm_warnings.push(serde_json::json!({
+                "code": "redirect_npm_allow_remote",
+                "detail": detail,
+            }));
+        }
+    }
     if let Some((text, edit)) = trust_config_write {
         rewrite.files.insert(PNPM_WORKSPACE_REL.to_string(), text);
         // Appended last: `--revert` walks edits in reverse, so the trust key
         // is unwound before the lock originals are restored.
+        rewrite.edits.push(edit);
+    }
+    if let Some((text, edit)) = npmrc_config_write {
+        rewrite.files.insert(
+            socket_patch_core::patch::redirect::npmrc::NPMRC_REL.to_string(),
+            text,
+        );
+        // Appended after the lock edits for the same reason: a whole-ledger
+        // replay unwinds the setting before the lock originals it served.
         rewrite.edits.push(edit);
     }
     let rewritten: Vec<String> = rewrite
@@ -2326,6 +2642,7 @@ pub(crate) async fn run_redirect_selected(
     // it — so a non-dry-run reflects this run without re-reading either file.
     let mut takeover_warnings: Vec<serde_json::Value> = Vec::new();
     let superseded = super::classify_overlap_takeover_with(
+        common,
         &common.cwd,
         Some(&ledger),
         vendor_state.as_ref().ok(),
@@ -2357,14 +2674,16 @@ pub(crate) async fn run_redirect_selected(
     // manifest patches (previously applied / vendored — and any stale ledger
     // records this run did not confirm) still verify normally. A post-install
     // `socket-patch vex` hash-verifies the redirected patches against the
-    // installed tree (it reads the records back from the redirect ledger via
-    // augment_with_redirect). Requested-but-failed VEX (including "nothing to
-    // attest") flips the exit code, matching `scan --vex`.
+    // installed tree (it reads the records back from the redirect ledger and
+    // re-proves their lockfile wiring — see `commands::vex_sources`), or,
+    // with no install yet, attests from the pinned hosted wiring it finds in
+    // the lockfile. Requested-but-failed VEX (including "nothing to attest")
+    // flips the exit code, matching `scan --vex`.
     let mut vex_statements: Option<usize> = None;
     // VEX run-level advisories: `note_warning` keeps them off stderr under
     // --json, so the envelope's `vex.warnings` is their only channel there.
     let mut vex_warnings: Vec<crate::json_envelope::RunWarning> = Vec::new();
-    let mut vex_error: Option<(&'static str, String)> = None;
+    let mut vex_error: Option<crate::commands::vex::VexGenError> = None;
     let mut vex_code = 0;
     if vex.vex.is_some() && !common.dry_run {
         let mut params = vex.to_build_params();
@@ -2394,7 +2713,8 @@ pub(crate) async fn run_redirect_selected(
             }
             Err(e) => {
                 vex_code = 1;
-                vex_error = Some((e.code, e.message));
+                vex_warnings = e.embedded_warnings();
+                vex_error = Some(e);
             }
         }
     }
@@ -2414,6 +2734,7 @@ pub(crate) async fn run_redirect_selected(
     warnings.extend(record_warnings.iter().cloned());
     warnings.extend(rush_warnings.iter().cloned());
     warnings.extend(pnpm_warnings.iter().cloned());
+    warnings.extend(npm_warnings.iter().cloned());
     warnings.extend(gem_stale.warnings.iter().cloned());
     warnings.extend(python_stale.warnings.iter().cloned());
     warnings.extend(takeover_pre_warnings.iter().cloned());
@@ -2448,9 +2769,10 @@ pub(crate) async fn run_redirect_selected(
                 result["vex"]["warnings"] = serde_json::to_value(&vex_warnings)
                     .expect("RunWarning is a plain string struct: serialization cannot fail");
             }
-        } else if let Some((code, message)) = &vex_error {
+        } else if let Some(e) = &vex_error {
             result["status"] = serde_json::json!("error");
-            result["error"] = serde_json::json!({ "code": code, "message": message });
+            result["error"] = serde_json::json!({ "code": e.code, "message": e.message });
+            super::append_vex_error_warnings(&mut result, &vex_warnings);
         }
         println!(
             "{}",
@@ -2571,8 +2893,8 @@ pub(crate) async fn run_redirect_selected(
         }
         // Errors print even under --silent ("errors only", never
         // "nothing"): exit 1 with no message would be undiagnosable.
-        if let Some((_, message)) = &vex_error {
-            eprintln!("Error: VEX generation failed: {message}");
+        if let Some(e) = &vex_error {
+            e.print_embedded(common);
         }
     }
     vex_code
@@ -2923,10 +3245,14 @@ pub(crate) fn boxed_run_redirect_selected<'a>(
 mod tests {
     use super::{
         build_redirect_json_envelope, gem_stale_cache_warning, gem_stale_install_warning,
-        gem_stale_install_warnings, installed_stale_positive_evidence, parse_purl_simple,
-        plan_workspace_trust, pnpm_heal_root, pnpm_lock_carries_hosted_redirect,
-        pnpm_lock_version_major, pnpm_trust_configured_detail, pnpm_trust_legacy_detail,
-        pnpm_trust_manual_guidance, pnpm_trust_workspace_unreadable_detail, prune_ignored_warning,
+        gem_stale_install_warnings, installed_stale_positive_evidence,
+        npm_allow_remote_already_detail, npm_allow_remote_configured_detail,
+        npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
+        npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
+        npm_allow_remote_user_set_detail, plan_workspace_trust, pnpm_heal_root,
+        pnpm_lock_carries_hosted_redirect, pnpm_lock_version_major, pnpm_trust_configured_detail,
+        pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
+        pnpm_trust_workspace_unreadable_detail, prune_ignored_warning, read_npmrc_for_allow_remote,
         read_workspace_for_trust, redirect_json_block, TrustPlan, REDIRECT_CANDIDATE_FILES,
     };
     use super::{
@@ -3301,39 +3627,6 @@ mod tests {
 
         // No root lock at all (e.g. Rush): nothing to heal.
         assert!(pnpm_heal_root(false, None, &overrides).is_none());
-    }
-
-    #[test]
-    fn parse_purl_simple_percent_decodes_name_and_version() {
-        // The API serves canonical percent-encoded purls: npm build metadata
-        // `1.2.3+build` arrives as `1.2.3%2Bbuild`. Lock entries store the
-        // decoded form, so an undecoded version silently matches nothing.
-        assert_eq!(
-            parse_purl_simple("pkg:npm/foo@1.2.3%2Bbuild"),
-            Some((
-                "npm".to_string(),
-                "foo".to_string(),
-                "1.2.3+build".to_string()
-            ))
-        );
-        // The coordinate keeps decoding too (scoped npm name).
-        assert_eq!(
-            parse_purl_simple("pkg:npm/%40scope/name@1.0.0"),
-            Some((
-                "npm".to_string(),
-                "@scope/name".to_string(),
-                "1.0.0".to_string()
-            ))
-        );
-        // Plain versions pass through unchanged.
-        assert_eq!(
-            parse_purl_simple("pkg:npm/left-pad@1.3.0"),
-            Some((
-                "npm".to_string(),
-                "left-pad".to_string(),
-                "1.3.0".to_string()
-            ))
-        );
     }
 
     /// The classic scan object `run` builds for the `--json` path with ≥1
@@ -4461,5 +4754,141 @@ mod tests {
             "Commit .socket/vendor/ (the removed vendored ledger entries and artifacts) and \
              pnpm-lock.yaml to keep the redirect."
         );
+    }
+
+    /// REGRESSION (npm 12): every hosted npm redirect variant tells the user
+    /// that npm >= 12 refuses the redirected lock (EALLOWREMOTE) without
+    /// `allow-remote=all`, and carries the whole-tree tradeoff disclosure —
+    /// the auto-configured, already-set, explicit-other, opted-out and
+    /// unreadable variants alike.
+    #[test]
+    fn npm_allow_remote_warning_variants_carry_the_load_bearing_sentences() {
+        let hosts = ["patch.socket.dev"];
+        let variants = [
+            npm_allow_remote_configured_detail(&hosts, true, false),
+            npm_allow_remote_configured_detail(&hosts, false, false),
+            npm_allow_remote_configured_detail(&hosts, true, true),
+            npm_allow_remote_configured_detail(&hosts, false, true),
+            npm_allow_remote_already_detail(&hosts),
+            npm_allow_remote_user_set_detail(&hosts, "root"),
+            npm_allow_remote_manual_detail(&hosts),
+            npm_allow_remote_unreadable_detail(&hosts, "could not be read (denied)"),
+            npm_allow_remote_env_set_detail(&hosts, "npm_config_allow_remote", "none"),
+            npm_allow_remote_outer_set_detail(
+                &hosts,
+                "user",
+                std::path::Path::new("/home/u/.npmrc"),
+                "none",
+            ),
+        ];
+        for d in &variants {
+            for needle in [
+                "patch.socket.dev",
+                "npm >=12",
+                "EALLOWREMOTE",
+                "lets npm install ANY url-resolved",
+                "sha512 integrity pins are still enforced",
+                "npm <=11 installs work unchanged",
+            ] {
+                assert!(d.contains(needle), "{needle:?} missing: {d}");
+            }
+        }
+        let [created, appended, dry_created, dry_appended, already, user_set, manual, unreadable, env_set, outer_set] =
+            &variants;
+        assert!(
+            env_set.contains("npm_config_allow_remote=none")
+                && env_set.contains("overrides every .npmrc")
+                && env_set.contains("would not take effect")
+                && env_set.contains("left untouched"),
+            "{env_set}"
+        );
+        assert!(
+            outer_set.contains("The user npm config (/home/u/.npmrc)")
+                && outer_set.contains("explicitly sets `allow-remote=none`")
+                && outer_set.contains("does not commit a project .npmrc that overrides it"),
+            "{outer_set}"
+        );
+        assert!(
+            created.contains("was written to a new project .npmrc"),
+            "{created}"
+        );
+        assert!(
+            appended.contains("was appended to the existing project .npmrc"),
+            "{appended}"
+        );
+        // The summary line already says it is a dry run (the pnpm
+        // trustLockfile twin's rule): no marker inside the noun phrase.
+        assert!(
+            dry_created.contains("would be written to a new project .npmrc")
+                && !dry_created.contains("(--dry-run)"),
+            "{dry_created}"
+        );
+        assert!(
+            dry_appended.contains("would be appended to the existing project .npmrc")
+                && !dry_appended.contains("(--dry-run)"),
+            "{dry_appended}"
+        );
+        for d in [created, appended, dry_created, dry_appended] {
+            assert!(
+                d.contains("--no-npm-allow-remote-config"),
+                "opt-out named: {d}"
+            );
+            assert!(d.contains("SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG"), "{d}");
+        }
+        assert!(
+            already.contains("already sets `allow-remote=all`"),
+            "{already}"
+        );
+        assert!(
+            user_set.contains("explicitly sets `allow-remote=root`"),
+            "{user_set}"
+        );
+        assert!(
+            user_set.contains("respected and left untouched"),
+            "{user_set}"
+        );
+        assert!(
+            user_set.contains("only admits direct dependencies"),
+            "{user_set}"
+        );
+        for d in [user_set, manual, unreadable, env_set, outer_set] {
+            assert!(
+                d.contains("npm ci --allow-remote=all"),
+                "manual remedy: {d}"
+            );
+        }
+        assert!(
+            unreadable.contains("could not be read (denied)"),
+            "{unreadable}"
+        );
+    }
+
+    /// The `.npmrc` read classifier: absent → plan a Create; readable →
+    /// plan against the text; a symlink or unreadable file → hands off
+    /// (never planned — a Create would clobber the user's config, and the
+    /// atomic writer would replace a link).
+    #[test]
+    fn read_npmrc_for_allow_remote_classifies_absent_readable_and_unsafe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".npmrc");
+        assert_eq!(read_npmrc_for_allow_remote(&path), Ok(None));
+        std::fs::write(&path, "fund=false\n").unwrap();
+        assert_eq!(
+            read_npmrc_for_allow_remote(&path),
+            Ok(Some("fund=false\n".into()))
+        );
+        std::fs::write(&path, [0xff_u8, 0xfe]).unwrap();
+        assert!(read_npmrc_for_allow_remote(&path)
+            .unwrap_err()
+            .contains("could not be read"));
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(tmp.path().join("real"), "fund=false\n").unwrap();
+            std::os::unix::fs::symlink(tmp.path().join("real"), &path).unwrap();
+            assert!(read_npmrc_for_allow_remote(&path)
+                .unwrap_err()
+                .contains("symbolic link"));
+        }
     }
 }

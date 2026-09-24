@@ -259,9 +259,14 @@ pub struct VendorEntry {
     /// readers keep the same exemption.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub detached: bool,
-    /// The embedded patch record for detached entries (afterHashes,
-    /// vulnerabilities, description, tier) — present iff `detached`, and the
-    /// ONLY verification source for such an entry. Trust class: the same
+    /// The embedded patch record (afterHashes, vulnerabilities, description,
+    /// tier). Current writers embed it in EVERY entry: it is the ONLY
+    /// verification source for a `detached` entry, and for a non-detached
+    /// one (the manifest-driven standalone `vendor`) a fallback copy — the
+    /// manifest record stays authoritative wherever both exist — so a
+    /// checkout whose manifest is gone can still verify and attest offline.
+    /// `record.is_some()` therefore does NOT imply `detached`; entries the
+    /// standalone `vendor` wrote before 5.0 carry none. Trust class: the same
     /// committed-file trust as `.socket/manifest.json`; the artifact is still
     /// re-verified against these afterHashes and `checked_artifact_path`'s
     /// uuid cross-checks before any disk access.
@@ -474,9 +479,17 @@ pub fn lookup_entry<'a>(
     entries: &'a HashMap<String, VendorEntry>,
     purl: &str,
 ) -> Option<&'a VendorEntry> {
+    lookup_entry_kv(entries, purl).map(|(_, entry)| entry)
+}
+
+/// [`lookup_entry`], keeping the ledger key the entry is filed under.
+pub fn lookup_entry_kv<'a>(
+    entries: &'a HashMap<String, VendorEntry>,
+    purl: &str,
+) -> Option<(&'a String, &'a VendorEntry)> {
     entries
-        .get(purl)
-        .or_else(|| entries.values().find(|e| e.base_purl == purl))
+        .get_key_value(purl)
+        .or_else(|| entries.iter().find(|(_, e)| e.base_purl == purl))
 }
 
 fn state_path(project_root: &Path) -> PathBuf {

@@ -24,6 +24,12 @@
 //!     dir; `bundle install` exits 0 cold+offline with a byte-stable lock,
 //!     and `bundle exec ruby -e 'require "rack"'` resolves the probe
 //!     constant AND loads rack from the vendored path.
+//!   stage 2b (`--network none`, same fresh checkout): MANIFEST-LESS VEX —
+//!     manifest deleted → `vex --offline` attests from the lock + vendor
+//!     ledger; ledger deleted → an in-container loopback patch API supplies
+//!     the record to `vex` and `apply --vex`; `--offline` without a ledger
+//!     → `record_unavailable`, zero requests; pair reverted → `vendor_unwired`
+//!     (also `--no-verify`). Both flavors; documents re-asserted host-side.
 //!   stage 3 (`--network none`): re-vendor idempotent (already_vendored,
 //!     Gemfile + lock byte-stable) → `vendor --revert` byte-restores BOTH
 //!     Gemfile and Gemfile.lock and removes `.socket/vendor` entirely →
@@ -244,6 +250,150 @@ echo "$OUT" | grep -qF ".socket/vendor/gem/__UUID__/rack-$RACK_VER/lib/rack.rb" 
 echo "===RUNTIME MARKER VERIFIED==="
 exit 0
 "#;
+
+/// Stage 2b (`--network none`, the fresh checkout stage 2 just installed):
+/// MANIFEST-LESS VEX, the depscan / `vendor --detached` shape. Shared by
+/// both flavors.
+///
+///   1. `.socket/manifest.json` deleted → `vex --offline` attests from the
+///      lock's PATH wiring + the vendor ledger's embedded record;
+///   2. the ledger deleted too → a loopback patch API inside the container
+///      (a TCPServer stub serving the staged record on
+///      `/patch/view/<uuid>`) supplies the record: standalone `vex` and the
+///      embedded `apply --vex` both attest;
+///   3. `--offline` with no ledger → `record_unavailable`, zero requests;
+///   4. the Gemfile + lock reverted to the pre-vendor pair (ledger and
+///      artifact kept) → `vendor_unwired`, with and without `--no-verify`.
+///
+/// The three documents land in `/workspace/snap/` for the host oracle.
+const STAGE2_VEX: &str = r#"
+cd /workspace/fresh
+export BUNDLE_APP_CONFIG="$PWD/.bundle"
+export SOCKET_TELEMETRY_DISABLED=1
+# Only the loopback stub may answer: no ambient socket-cli login/token.
+export SOCKET_NO_CONFIG=1 SOCKET_NO_API_TOKEN=1
+RACK_VER=$(cat /workspace/snap/rack-ver)
+PURL="pkg:gem/rack@$RACK_VER"
+PRODUCT="pkg:gem/app@1.0.0"
+[ -f .socket/manifest.json ] || fail "fresh checkout has no manifest to delete (test bug)"
+[ -f .socket/vendor/state.json ] || fail "fresh checkout has no vendor ledger (test bug)"
+cp .socket/vendor/state.json /tmp/state.json
+
+# The patch API's view of the staged record (built BEFORE the manifest goes).
+ruby -rjson -e '
+  purl, uuid = ARGV
+  rec = JSON.parse(File.read(".socket/manifest.json"))["patches"].fetch(purl)
+  rec["uuid"] = uuid; rec["purl"] = purl
+  rec["publishedAt"] = "Fri, 27 Mar 2026 00:00:00 GMT"
+  File.write("/tmp/view.json", JSON.generate(rec))
+' "$PURL" "__UUID__" || fail "could not build the patch view from the staged manifest"
+
+# 1. manifest-less, ledger kept, offline.
+rm .socket/manifest.json
+socket-patch vex --json --offline --cwd "$PWD" --output /workspace/snap/ml-ledger.vex.json \
+  --product "$PRODUCT" > /tmp/v1.json 2>/tmp/v1.err
+RC=$?; cat /tmp/v1.err >&2
+[ "$RC" -eq 0 ] || { cat /tmp/v1.json >&2; fail "manifest-less vex (ledger kept) exited $RC"; }
+assert_json_field /tmp/v1.json '"action": "verified"'
+echo "===ML LEDGER VEX VERIFIED==="
+
+# 2. ledger-less: a loopback patch API (--network none keeps loopback).
+rm .socket/vendor/state.json
+cat > /tmp/api.rb <<'RUBY'
+require "socket"
+body = File.binread(ARGV[0])
+srv = TCPServer.new("127.0.0.1", 0)
+File.write(ARGV[2] + ".tmp", srv.addr[1].to_s)
+File.rename(ARGV[2] + ".tmp", ARGV[2])
+loop do
+  c = srv.accept
+  path = c.gets.to_s.split(" ")[1].to_s
+  while (h = c.gets) && h != "\r\n"; end
+  File.open(ARGV[1], "a") { |f| f.puts path }
+  if path.end_with?("/view/#{ARGV[3]}")
+    c.write "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n#{body}"
+  else
+    c.write "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+  end
+  c.close
+end
+RUBY
+: > /tmp/api.log
+rm -f /tmp/api.port
+ruby /tmp/api.rb /tmp/view.json /tmp/api.log /tmp/api.port "__UUID__" > /tmp/api.out 2>&1 &
+API_PID=$!
+trap 'kill "$API_PID" 2>/dev/null' EXIT
+for _ in $(seq 100); do [ -s /tmp/api.port ] && break; sleep 0.1; done
+[ -s /tmp/api.port ] || fail "loopback patch API did not start"
+API="http://127.0.0.1:$(cat /tmp/api.port)"
+socket-patch vex --json --cwd "$PWD" --proxy-url "$API" --output /workspace/snap/ml-api.vex.json \
+  --product "$PRODUCT" > /tmp/v2.json 2>/tmp/v2.err
+RC=$?; cat /tmp/v2.err >&2
+[ "$RC" -eq 0 ] || { cat /tmp/v2.json /tmp/api.log >&2; fail "ledger-less vex exited $RC"; }
+grep -q "/view/__UUID__\$" /tmp/api.log || { cat /tmp/api.log >&2; fail "the record was not fetched from the patch API"; }
+socket-patch apply --json --cwd "$PWD" --proxy-url "$API" --vex /workspace/snap/ml-apply.vex.json \
+  --vex-product "$PRODUCT" > /tmp/v3.json 2>/tmp/v3.err
+RC=$?; cat /tmp/v3.err >&2
+[ "$RC" -eq 0 ] || { cat /tmp/v3.json >&2; fail "ledger-less apply --vex exited $RC"; }
+assert_json_field /tmp/v3.json '"status": "noManifest"'
+[ ! -e .socket/manifest.json ] || fail "vex / apply --vex wrote a manifest"
+echo "===ML API VEX VERIFIED==="
+
+# 3. offline, no ledger: record_unavailable, no request.
+N=$(wc -l < /tmp/api.log)
+socket-patch vex --json --offline --cwd "$PWD" --output /tmp/ml-off.vex.json \
+  --product "$PRODUCT" > /tmp/v4.json 2>/tmp/v4.err
+RC=$?
+[ "$RC" -eq 1 ] || { cat /tmp/v4.json /tmp/v4.err >&2; fail "offline ledger-less vex exited $RC (expected 1)"; }
+assert_json_field /tmp/v4.json '"errorCode": "record_unavailable"'
+[ "$N" -eq "$(wc -l < /tmp/api.log)" ] || fail "--offline made patch-API requests"
+kill "$API_PID" 2>/dev/null
+echo "===ML OFFLINE VERIFIED==="
+
+# 4. the pair reverted to the registry version; ledger + artifact kept.
+cp /tmp/state.json .socket/vendor/state.json
+cp /workspace/snap/Gemfile.prevendor Gemfile
+cp /workspace/snap/Gemfile.lock.prevendor Gemfile.lock
+for NV in "" "--no-verify"; do
+  socket-patch vex --json --offline $NV --cwd "$PWD" --output /tmp/ml-rev.vex.json \
+    --product "$PRODUCT" > /tmp/v5.json 2>/tmp/v5.err
+  RC=$?
+  [ "$RC" -eq 1 ] || { cat /tmp/v5.json /tmp/v5.err >&2; fail "reverted vex $NV exited $RC (expected 1)"; }
+  assert_json_field /tmp/v5.json '"errorCode": "vendor_unwired"'
+done
+echo "===ML REVERTED VERIFIED==="
+exit 0
+"#;
+
+/// Host-side oracle for stage 2b: each manifest-less document attests the
+/// vendored rack patch `(vendored)` for `ghsa` via `uuid`.
+fn assert_manifestless_vex_from_host(host_dir: &std::path::Path, uuid: &str, ghsa: &str) {
+    let rack_ver = std::fs::read_to_string(host_dir.join("snap/rack-ver"))
+        .expect("snap/rack-ver")
+        .trim()
+        .to_string();
+    for doc_name in ["ml-ledger.vex.json", "ml-api.vex.json", "ml-apply.vex.json"] {
+        let doc: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(host_dir.join("snap").join(doc_name))
+                .unwrap_or_else(|e| panic!("read mounted {doc_name}: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("{doc_name} parses: {e}"));
+        let stmts = doc["statements"].as_array().expect("statements[]");
+        assert_eq!(stmts.len(), 1, "{doc_name}: {doc}");
+        assert_eq!(stmts[0]["vulnerability"]["name"], ghsa, "{doc_name}");
+        assert_eq!(stmts[0]["status"], "not_affected", "{doc_name}");
+        assert_eq!(
+            stmts[0]["products"][0]["subcomponents"][0]["@id"],
+            format!("pkg:gem/rack@{rack_ver}"),
+            "{doc_name}"
+        );
+        assert_eq!(
+            stmts[0]["impact_statement"],
+            format!("Patched via Socket patch {uuid} (vendored)"),
+            "{doc_name}"
+        );
+    }
+}
 
 /// Stage 3 (`--network none`): idempotent re-vendor → revert byte-restores
 /// the Gemfile + lock pair and removes `.socket/vendor` → re-vendor again.
@@ -612,6 +762,15 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
         &["FRESH INSTALL", "RUNTIME MARKER"],
     );
 
+    // Stage 2b — manifest-less VEX over the installed fresh checkout.
+    let out = run_in_image_network_none(IMAGE, &host_dir, &render(STAGE2_VEX));
+    assert_stage_markers(
+        "gem stage 2b (manifest-less vex, --network none)",
+        &out,
+        &["ML LEDGER VEX", "ML API VEX", "ML OFFLINE", "ML REVERTED"],
+    );
+    assert_manifestless_vex_from_host(&host_dir, UUID, GHSA);
+
     // Stage 3 — idempotency, revert, re-vendor (still no network).
     let out = run_in_image_network_none(IMAGE, &host_dir, &render(STAGE3));
     assert_stage_markers(
@@ -655,6 +814,16 @@ fn gem_vendor_lockfile_checksums_fresh_checkout_and_revert() {
         &out,
         &["FRESH INSTALL", "RUNTIME MARKER"],
     );
+
+    // Stage 2b — manifest-less VEX over the CHECKSUMS-lock checkout.
+    let out =
+        run_in_image_network_none(IMAGE, &host_dir, &render_with(STAGE2_VEX, CK_UUID, CK_GHSA));
+    assert_stage_markers(
+        "gem ck stage 2b (manifest-less vex, --network none)",
+        &out,
+        &["ML LEDGER VEX", "ML API VEX", "ML OFFLINE", "ML REVERTED"],
+    );
+    assert_manifestless_vex_from_host(&host_dir, CK_UUID, CK_GHSA);
 
     // Stage 3 — idempotency, revert (verbatim sha256= restore), re-vendor.
     let out =

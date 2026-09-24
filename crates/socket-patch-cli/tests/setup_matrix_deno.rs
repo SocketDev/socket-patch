@@ -39,6 +39,8 @@
 
 #[path = "setup_matrix_common/mod.rs"]
 mod smc;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
 /// Documentation/negative-control pass through the shared Docker matrix.
 /// Kept for parity with the other ecosystems and to run the deno negative
@@ -172,6 +174,35 @@ mod host_guard {
         ("SOCKET_SETUP_EXCLUDE", "decoy-member"),
     ];
 
+    /// Manifest-less VEX over a setup-only Deno project: `setup` wires only
+    /// the agent-mode `postinstall` hook — Deno has no hosted rewriter and
+    /// no vendored backend — so there is nothing to attest (exit 2,
+    /// `manifest_not_found`), no document, no patch-API request, and
+    /// `deno.json` stays untouched.
+    fn assert_manifestless_vex_has_nothing(root: &Path, who: &str) {
+        use crate::vex_e2e_common::{run_vex, PatchApi, VexRun};
+        let out_dir = tempfile::tempdir().unwrap();
+        let api = PatchApi::empty();
+        for no_verify in [false, true] {
+            let mut r = VexRun::online(&api);
+            r.output = Some(out_dir.path().join("out.vex.json"));
+            r.product = Some("pkg:npm/deno-app@1.0.0".to_string());
+            r.no_verify = no_verify;
+            let out = run_vex(&binary(), root, &r);
+            assert_eq!(out.code, Some(2), "{who} (no_verify={no_verify}): {out}");
+            assert_eq!(
+                out.envelope["error"]["code"], "manifest_not_found",
+                "{who}: {out}"
+            );
+            assert!(
+                out.doc.is_none(),
+                "{who}: no document may be written: {out}"
+            );
+        }
+        api.assert_no_requests();
+        assert_deno_json_pristine(root, who);
+    }
+
     #[test]
     #[serial_test::serial]
     fn deno_setup_roundtrip_host() {
@@ -281,6 +312,9 @@ mod host_guard {
             Some(0),
             "no manifest may still need configuration after a successful setup.\n{out}"
         );
+
+        // ── manifest-less VEX: the configured hook is not attestable ────────
+        assert_manifestless_vex_has_nothing(root, "vex (configured)");
 
         // ── remove: must delete the hook and succeed ────────────────────────
         let (code, out, err) = run(

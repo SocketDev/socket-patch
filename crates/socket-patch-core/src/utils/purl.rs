@@ -1,5 +1,8 @@
 use std::borrow::Cow;
 
+use crate::crawlers::python_crawler::canonicalize_pypi_name;
+use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
+
 /// Strip the trailing `?qualifiers` and `#subpath` components from a PURL,
 /// leaving the canonical `pkg:type/namespace/name@version` base.
 ///
@@ -144,11 +147,28 @@ pub fn canonical_purl(purl: &str) -> String {
 /// is missing. Input must already be canonicalized (qualifiers stripped,
 /// percent-decoded) — the redirect ledger's version-exact matcher feeds it
 /// [`canonical_purl`] output.
-pub(crate) fn purl_name_version(purl: &str) -> Option<(&str, &str)> {
+pub fn purl_name_version(purl: &str) -> Option<(&str, &str)> {
     let rest = purl.strip_prefix("pkg:")?;
     let (_, coord) = rest.split_once('/')?;
     let at = coord.rfind('@').filter(|&i| i > 0)?;
     Some((&coord[..at], &coord[at + 1..]))
+}
+
+/// `pkg:<type>/<coordinate>@<version>` → `(type, coordinate, version)`, for
+/// API / ledger spellings: qualifiers and subpath stripped first, the
+/// version split off at the LAST `@`, and coordinate and version each
+/// percent-decoded (the API serves `1.2.3%2Bbuild` and `%40scope/name`;
+/// lockfiles and install dirs store the literal forms). The coordinate keeps
+/// its slashes (npm `@scope/name`, maven `group/artifact`, a go module path).
+pub fn purl_parts(purl: &str) -> Option<(String, String, String)> {
+    let rest = strip_purl_qualifiers(purl).strip_prefix("pkg:")?;
+    let (ty, tail) = rest.split_once('/')?;
+    let (name, version) = tail.rsplit_once('@')?;
+    Some((
+        ty.to_string(),
+        percent_decode_purl_component(name).into_owned(),
+        percent_decode_purl_component(version).into_owned(),
+    ))
 }
 
 /// Shared split for `pkg:<type>/<name>@<version>` purls: strip
@@ -353,6 +373,118 @@ pub fn patch_matches(purl: &str, uuid: &str, identifier: &str) -> bool {
         purl_matches_identifier(purl, identifier)
     } else {
         uuid == identifier
+    }
+}
+
+// ── validating builders ─────────────────────────────────────────────────
+// The purl builders lockfile discovery (`vex::discover`, which re-exports
+// them under the same names) and the lock inventory's registry views share:
+// each validates the coordinates fail-closed — lockfiles are committed,
+// tamper-able input whose names and versions later feed filesystem paths
+// and download urls — and returns `None` rather than a purl it would have
+// to trust.
+
+/// `pkg:npm/<name>@<version>` for lock-recorded coordinates, or `None` when
+/// the name fails the npm backends' own shape rule (at most one `/`, only
+/// under an `@scope`, traversal-safe) or the version is not a single safe
+/// segment.
+pub fn npm_purl(name: &str, version: &str) -> Option<String> {
+    (crate::vendor::is_safe_npm_name(name) && is_safe_single_segment(version))
+        .then(|| format!("pkg:npm/{name}@{version}"))
+}
+
+/// `pkg:pypi/<canonical name>@<version>`.
+pub fn pypi_purl(name: &str, version: &str) -> Option<String> {
+    let name = canonicalize_pypi_name(name);
+    (is_safe_single_segment(&name) && is_safe_single_segment(version))
+        .then(|| format!("pkg:pypi/{name}@{version}"))
+}
+
+/// `pkg:<ty>/<name>@<version>` for the single-segment-name ecosystems
+/// (`cargo`, `gem`, `nuget`).
+pub fn simple_purl(ty: &str, name: &str, version: &str) -> Option<String> {
+    (matches!(ty, "cargo" | "gem" | "nuget")
+        && is_safe_single_segment(name)
+        && is_safe_single_segment(version))
+    .then(|| format!("pkg:{ty}/{name}@{version}"))
+}
+
+/// `pkg:golang/<module>@<version>` (module path multi-segment, version one
+/// segment).
+pub fn golang_purl(module: &str, version: &str) -> Option<String> {
+    (is_safe_multi_segment(module) && is_safe_single_segment(version))
+        .then(|| build_golang_purl(module, version))
+}
+
+/// `pkg:composer/<vendor>/<name>@<version>` from a composer `vendor/name`
+/// (exactly two safe segments; lowercased like composer itself).
+pub fn composer_purl(name: &str, version: &str) -> Option<String> {
+    let name = name.to_lowercase();
+    let (vendor, pkg) = name.split_once('/')?;
+    (is_safe_single_segment(vendor)
+        && is_safe_single_segment(pkg)
+        && is_safe_single_segment(version))
+    .then(|| format!("pkg:composer/{vendor}/{pkg}@{version}"))
+}
+
+/// `pkg:maven/<groupId>/<artifactId>@<version>`, validated by the maven
+/// crawler's own coordinate guard (every dot-split group segment, the
+/// artifact and the version each a safe single segment — an empty group
+/// fails as one empty segment).
+pub fn maven_purl(group: &str, artifact: &str, version: &str) -> Option<String> {
+    crate::crawlers::maven_crawler::is_safe_maven_coordinate(group, artifact, version)
+        .then(|| build_maven_purl(group, artifact, version))
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+
+    #[test]
+    fn purl_builders_validate_coordinates() {
+        assert_eq!(
+            npm_purl("left-pad", "1.3.0").as_deref(),
+            Some("pkg:npm/left-pad@1.3.0")
+        );
+        assert_eq!(
+            npm_purl("@s/x", "1.0.0").as_deref(),
+            Some("pkg:npm/@s/x@1.0.0")
+        );
+        assert_eq!(npm_purl("a/b", "1.0.0"), None, "unscoped slash");
+        assert_eq!(npm_purl("@s/x/y", "1.0.0"), None, "extra level");
+        assert_eq!(npm_purl("x", "../1"), None);
+        assert_eq!(npm_purl("..", "1.0.0"), None);
+        assert_eq!(
+            pypi_purl("Foo.Bar", "1.0").as_deref(),
+            Some("pkg:pypi/foo-bar@1.0")
+        );
+        assert_eq!(pypi_purl("a/b", "1.0"), None);
+        assert_eq!(
+            simple_purl("cargo", "serde", "1.0.0").as_deref(),
+            Some("pkg:cargo/serde@1.0.0")
+        );
+        assert_eq!(
+            simple_purl("npm", "x", "1"),
+            None,
+            "not a single-segment ecosystem"
+        );
+        assert_eq!(simple_purl("gem", "a:b", "1"), None);
+        assert_eq!(
+            golang_purl("github.com/foo/bar", "v1.2.3").as_deref(),
+            Some("pkg:golang/github.com/foo/bar@v1.2.3")
+        );
+        assert_eq!(golang_purl("github.com/../x", "v1"), None);
+        assert_eq!(
+            composer_purl("Monolog/Monolog", "2.0.0").as_deref(),
+            Some("pkg:composer/monolog/monolog@2.0.0")
+        );
+        assert_eq!(composer_purl("monolog", "2.0.0"), None);
+        assert_eq!(
+            maven_purl("org.slf4j", "slf4j-api", "1.7.36").as_deref(),
+            Some("pkg:maven/org.slf4j/slf4j-api@1.7.36")
+        );
+        assert_eq!(maven_purl("org..x", "a", "1"), None);
+        assert_eq!(maven_purl("", "a", "1"), None, "empty group");
     }
 }
 
@@ -1000,6 +1132,61 @@ mod tests {
         assert_eq!(
             parse_pypi_purl("pkg:pypi/weird@name@1.0.0"),
             Some(("weird@name", "1.0.0"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::*;
+
+    #[test]
+    fn purl_parts_strip_qualifiers_and_decode() {
+        assert_eq!(
+            purl_parts("pkg:maven/org.example/lib@1.0.0?classifier=native&ext=jar"),
+            Some(("maven".into(), "org.example/lib".into(), "1.0.0".into()))
+        );
+        assert_eq!(
+            purl_parts("pkg:golang/github.com/foo/bar@v1.4.2"),
+            Some((
+                "golang".into(),
+                "github.com/foo/bar".into(),
+                "v1.4.2".into()
+            ))
+        );
+        assert_eq!(purl_parts("not a purl"), None);
+    }
+
+    #[test]
+    fn purl_parts_percent_decodes_name_and_version() {
+        // The API serves canonical percent-encoded purls: npm build metadata
+        // `1.2.3+build` arrives as `1.2.3%2Bbuild`. Lock entries store the
+        // decoded form, so an undecoded version silently matches nothing.
+        assert_eq!(
+            purl_parts("pkg:npm/foo@1.2.3%2Bbuild"),
+            Some((
+                "npm".to_string(),
+                "foo".to_string(),
+                "1.2.3+build".to_string()
+            ))
+        );
+        // The coordinate keeps decoding too (scoped npm name).
+        assert_eq!(
+            purl_parts("pkg:npm/%40scope/name@1.0.0"),
+            Some((
+                "npm".to_string(),
+                "@scope/name".to_string(),
+                "1.0.0".to_string()
+            ))
+        );
+        // Plain versions pass through unchanged.
+        assert_eq!(
+            purl_parts("pkg:npm/left-pad@1.3.0"),
+            Some((
+                "npm".to_string(),
+                "left-pad".to_string(),
+                "1.3.0".to_string()
+            ))
         );
     }
 }

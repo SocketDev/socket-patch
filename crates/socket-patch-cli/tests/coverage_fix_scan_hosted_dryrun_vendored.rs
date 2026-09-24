@@ -193,6 +193,20 @@ fn run_cli(cwd: &Path, args: &[&str]) -> (i32, String, String) {
         }
     }
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    // Isolate the npm config layers the hosted `.npmrc` auto-config
+    // consults (an ambient explicit `allow-remote` would change the plan).
+    let absent = cwd.join(".absent-npm-config");
+    for var in [
+        "NPM_CONFIG_USERCONFIG",
+        "npm_config_userconfig",
+        "NPM_CONFIG_GLOBALCONFIG",
+        "npm_config_globalconfig",
+        "PREFIX",
+    ] {
+        cmd.env(var, &absent);
+    }
+    cmd.env("NPM_CONFIG_ALLOW_REMOTE", "")
+        .env("npm_config_allow_remote", "");
     let out = cmd.output().expect("spawn socket-patch binary");
     (
         out.status.code().unwrap_or(-1),
@@ -264,6 +278,21 @@ fn vendored_project(root: &Path) {
     );
 }
 
+fn warning_detail<'a>(doc: &'a Value, code: &str) -> Option<&'a str> {
+    doc["redirect"]["warnings"]
+        .as_array()?
+        .iter()
+        .find(|w| w["code"] == code)
+        .and_then(|w| w["detail"].as_str())
+}
+
+fn rewritten_files(doc: &Value) -> Vec<&str> {
+    doc["redirect"]["rewrittenFiles"]
+        .as_array()
+        .map(|f| f.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
 fn warning_codes(doc: &Value) -> Vec<&str> {
     doc["redirect"]["warnings"]
         .as_array()
@@ -316,6 +345,29 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
         Some(0),
         "a revertable vendored purl is not skipped: {doc:#}"
     );
+    // Review finding: the pnpm trustLockfile auto-config the wet run
+    // writes (the takeover splices the root v9 lock) must be previewed too.
+    let trust = warning_detail(&doc, "redirect_pnpm_trust_lockfile")
+        .unwrap_or_else(|| panic!("the trust config must be previewed: {doc:#}"));
+    // (The vendor run already created pnpm-workspace.yaml for its own
+    // wiring, so the wet run MERGES the key into it.)
+    assert!(
+        trust.contains("would be merged into the existing pnpm-workspace.yaml"),
+        "{trust}"
+    );
+    assert!(
+        rewritten_files(&doc).contains(&"pnpm-workspace.yaml"),
+        "the preview must list the workspace file the wet run writes: {doc:#}"
+    );
+    let workspace = |root: &Path| std::fs::read_to_string(root.join("pnpm-workspace.yaml")).ok();
+    let vendored_workspace = workspace(root);
+    assert!(
+        !vendored_workspace
+            .as_deref()
+            .unwrap_or_default()
+            .contains("trustLockfile"),
+        "dry run writes nothing"
+    );
 
     // Dry-run invariants: nothing on disk moved.
     assert_eq!(
@@ -346,6 +398,10 @@ async fn dry_run_over_vendored_project_previews_the_wet_takeover() {
     assert!(
         lock.contains(&format!("tarball: {HOSTED_URL}")),
         "the wet run must leave the lock hosted:\n{lock}"
+    );
+    assert!(
+        workspace(root).is_some_and(|w| w.contains("trustLockfile: true")),
+        "the wet run writes what the preview promised: {wet:#}"
     );
 }
 
@@ -496,5 +552,91 @@ async fn human_takeover_prints_migration_lines_and_matching_file_counts() {
              to keep the redirect."
         ),
         "stdout=\n{wet_out}"
+    );
+}
+
+/// The package-lock twin of [`write_pnpm_project`]: a lockfileVersion 3
+/// root lock resolving the package from the registry.
+fn write_package_lock_project(root: &Path) {
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let pkg = root.join("node_modules").join(NAME);
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        format!(r#"{{ "name": "{NAME}", "version": "{VERSION}" }}"#),
+    )
+    .unwrap();
+    std::fs::write(pkg.join("index.js"), ORIG_INDEX).unwrap();
+    let lock = json!({
+        "name": "consumer", "version": "0.0.0", "lockfileVersion": 3, "requires": true,
+        "packages": {
+            "": { "name": "consumer", "version": "0.0.0", "dependencies": { NAME: VERSION } },
+            format!("node_modules/{NAME}"): {
+                "version": VERSION,
+                "resolved": format!("https://registry.npmjs.org/{NAME}/-/{NAME}-{VERSION}.tgz"),
+                "integrity": UPSTREAM_SHA512,
+            }
+        }
+    });
+    std::fs::write(
+        root.join("package-lock.json"),
+        serde_json::to_string_pretty(&lock).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Review finding: a dry-run vendored→hosted takeover of a package-lock
+/// purl withheld the purl from the rewriters, so the npm 12 `.npmrc`
+/// `allow-remote=all` write the wet run makes was neither warned about
+/// ("would be written to a new project .npmrc") nor listed in `rewrittenFiles`.
+#[tokio::test]
+#[serial]
+async fn dry_run_package_lock_takeover_previews_the_npmrc_write() {
+    let server = MockServer::start().await;
+    mock_hosted_api(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_package_lock_project(root);
+    seed_manifest_and_blob(root);
+    let (code, env) = vendor_cli(root);
+    assert_eq!(code, 0, "fixture vendor run must succeed: {env:#}");
+    let vendored_lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
+    assert!(vendored_lock.contains(".socket/vendor/"), "{vendored_lock}");
+
+    let (code, doc) = scan_hosted_json(root, &server.uri(), /*dry_run=*/ true);
+    assert_eq!(code, 0, "{doc:#}");
+    assert!(
+        warning_codes(&doc).contains(&"redirect_would_revert_vendored"),
+        "{doc:#}"
+    );
+    assert_eq!(doc["redirect"]["redirected"], 1, "{doc:#}");
+    let detail = warning_detail(&doc, "redirect_npm_allow_remote")
+        .unwrap_or_else(|| panic!("the .npmrc write must be previewed: {doc:#}"));
+    assert!(
+        detail.contains("would be written to a new project .npmrc")
+            && detail.contains("patch.test"),
+        "{detail}"
+    );
+    assert!(rewritten_files(&doc).contains(&".npmrc"), "{doc:#}");
+    assert!(!root.join(".npmrc").exists(), "dry run writes nothing");
+    assert_eq!(
+        std::fs::read_to_string(root.join("package-lock.json")).unwrap(),
+        vendored_lock
+    );
+
+    let (code, wet) = scan_hosted_json(root, &server.uri(), /*dry_run=*/ false);
+    assert_eq!(code, 0, "{wet:#}");
+    assert_eq!(wet["redirect"]["redirected"], 1, "{wet:#}");
+    assert_eq!(
+        std::fs::read_to_string(root.join(".npmrc")).unwrap(),
+        "allow-remote=all\n",
+        "the wet run writes what the preview promised"
     );
 }

@@ -52,6 +52,8 @@
 
 #[path = "setup_matrix_common/mod.rs"]
 mod smc;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
 /// Documentation/negative-control pass through the shared Docker matrix.
 /// Kept for parity with the other ecosystems and to run the gem negative
@@ -1541,6 +1543,109 @@ mod plugin_runtime {
             }
         }
         out
+    }
+
+    /// MANIFEST-LESS vendored checkout (the depscan / `vendor --detached`
+    /// shape: a committed `.socket/vendor/gem/<uuid>/` artifact wired by a
+    /// Gemfile `path:`, NO `.socket/manifest.json`) with the setup plugin
+    /// wired, driven with the REAL binary as the plugin's apply under
+    /// `SOCKET_PATCH_STRICT=1`: the plugin's `apply` finds no manifest and
+    /// must exit 0, so a strict `bundle install` still succeeds (and the
+    /// real bundler locks the PATH section); the embedded `apply --vex` of
+    /// the installed checkout then attests the vendored patch from the lock
+    /// and the patch API. Offline, with no ledger, the patch is
+    /// `record_unavailable` — never attested from the `path:` alone.
+    #[test]
+    fn manifest_less_vendored_checkout_installs_strict_and_apply_vex_attests() {
+        use crate::vex_e2e_common::{
+            assert_attested, assert_not_attested, patch_view, run_vex, Marker, PatchApi, VexRun,
+            VexVia,
+        };
+        if !have("bundle") {
+            eprintln!("skip plugin_runtime: bundler not on PATH");
+            return;
+        }
+        const UUID: &str = "6a7b8c9d-0e1f-4a2b-8c3d-4e5f6a7b8c9d";
+        const PURL: &str = "pkg:gem/vexgem@1.0.0";
+        const PATCHED: &[u8] = b"module Vexgem\n  STATUS = \"PATCHED\"\nend\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/gem/{UUID}/vexgem-1.0.0");
+        let art = root.join(&rel);
+        std::fs::create_dir_all(art.join("lib")).unwrap();
+        std::fs::write(art.join("lib/vexgem.rb"), PATCHED).unwrap();
+        std::fs::write(
+            art.join("vexgem.gemspec"),
+            "Gem::Specification.new do |s|\n  s.name = \"vexgem\"\n  s.version = \"1.0.0\"\n  \
+             s.summary = \"vex fixture\"\n  s.authors = [\"socket-patch e2e\"]\n  \
+             s.files = [\"lib/vexgem.rb\"]\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Gemfile"),
+            format!("gem \"vexgem\", \"1.0.0\", path: \"{rel}\"\n"),
+        )
+        .unwrap();
+        let mut cmd = Command::new(binary());
+        cmd.args(["setup", "--yes", "--json"]).current_dir(root);
+        scrub(&mut cmd);
+        let (code, out, err) = run(cmd);
+        assert_eq!(code, 0, "setup --yes must wire the plugin.\n{out}\n{err}");
+        assert!(
+            !root.join(".socket/manifest.json").exists(),
+            "setup wrote a manifest"
+        );
+
+        let (code, out, err) = bundle_install(root, &binary(), &[("SOCKET_PATCH_STRICT", "1")]);
+        assert_eq!(
+            code, 0,
+            "a STRICT install of a manifest-less vendored checkout must succeed: the \
+             plugin's apply has nothing to apply.\n{out}\n{err}"
+        );
+        let lock = std::fs::read_to_string(root.join("Gemfile.lock")).unwrap();
+        assert!(
+            lock.contains(&format!(
+                "PATH\n  remote: {rel}\n  specs:\n    vexgem (1.0.0)"
+            )),
+            "bundler must lock the vendored PATH source:\n{lock}"
+        );
+        assert!(
+            !root.join(".socket/manifest.json").exists(),
+            "the plugin wrote a manifest"
+        );
+
+        let api = PatchApi::start(vec![(
+            UUID.into(),
+            patch_view(
+                UUID,
+                PURL,
+                &[("lib/vexgem.rb", &crate::vex_e2e_common::git_sha256(PATCHED))],
+                &[("GHSA-vexg-setu-0001", &["CVE-2026-9191"])],
+            ),
+        )]);
+        let base = VexRun {
+            product: Some("pkg:gem/app@1.0.0".into()),
+            ..VexRun::online(&api)
+        };
+        let out = run_vex(&binary(), root, &base.clone().via(VexVia::Apply));
+        assert_eq!(out.code, Some(0), "apply --vex: {out}\n{lock}");
+        assert_eq!(out.envelope["status"], "noManifest", "{out}");
+        assert_attested(
+            out.doc(),
+            PURL,
+            UUID,
+            Marker::Vendored,
+            &[("GHSA-vexg-setu-0001", &["CVE-2026-9191"])],
+        );
+        let offline = VexRun {
+            offline: true,
+            ..base
+        };
+        let before = api.request_count();
+        let out = run_vex(&binary(), root, &offline);
+        assert_eq!(out.code, Some(1), "offline, no ledger: {out}");
+        assert_not_attested(&out.envelope, PURL, "record_unavailable");
+        assert_eq!(api.request_count(), before, "--offline made requests");
     }
 }
 

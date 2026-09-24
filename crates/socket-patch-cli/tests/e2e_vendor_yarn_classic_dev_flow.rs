@@ -23,12 +23,25 @@
 //!      --frozen-lockfile` must pass — the re-saved lockfile and our wiring
 //!      agree, so CI-style installs keep working downstream of dev installs.
 //!
+//!   5. **Manifest-less VEX survives the dev flow**: over the re-saved (and
+//!      `yarn add`-re-serialized) checkout, `ManifestlessVex` proves the
+//!      vendored patch is attested from the lock yarn itself rewrote, with
+//!      no manifest and then no ledger (record from the patch API),
+//!      `record_unavailable` `--offline` with zero API requests, and NOT
+//!      attested once the dep's block is reverted to the registry.
+//!
+//! The yarn release is `yarn@1.22.22` unless
+//! `SOCKET_PATCH_YARN_CLASSIC_E2E_VERSION` names another 1.x (see
+//! `common/yarn_classic_vex.rs`); releases before 1.7 cannot install a
+//! vendored `file:` tarball at all, so there these flows are not applicable.
+//!
 //! LOCAL capstone (not behind docker-e2e): skips with a `println` + return
 //! when `corepack` (yarn classic) is unavailable or the fixture install
-//! cannot reach the registry; every assertion after that is HARD.
+//! cannot reach the registry — unless `SOCKET_PATCH_YARN_E2E_REQUIRED=1`;
+//! every assertion after that is HARD.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use sha2::{Digest, Sha256};
 
@@ -45,32 +58,57 @@ const DEP_VERSION: &str = "1.3.0";
 /// Pure JS, no install scripts, tiny.
 const NEIGHBOR: &str = "resolve";
 const NEIGHBOR_VERSION: &str = "1.20.0";
-/// Pinned yarn classic via corepack (matches the fresh-checkout capstone).
-const YARN_CLASSIC: &str = "yarn@1.22.22";
+const GHSA: &str = "GHSA-vend-yarn-dev";
+const CVE: &str = "CVE-2024-99999";
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+#[path = "common/yarn_classic_vex.rs"]
+mod yarn_classic_vex;
+
+use yarn_classic_vex::{
+    installs_file_tarballs, require_yarn_classic, via_apply, via_vendor, yarn_classic,
+    yarn_classic_version, ManifestlessVex, Wiring,
+};
+
+/// The yarn gate every leg opens with: the release under test must run,
+/// and must be able to install a vendored `file:` tarball at all.
+fn yarn_ready(leg: &str) -> bool {
+    if !require_yarn_classic(leg, |c| {
+        cache_env::isolate(c);
+    }) {
+        return false;
+    }
+    if !installs_file_tarballs(&yarn_classic_version()) {
+        println!(
+            "N/A {leg}: {} cannot install vendored `file:` tarball entries (see \
+             installs_file_tarballs)",
+            yarn_classic()
+        );
+        return false;
+    }
+    true
+}
+
+/// A patch-API stand-in serving the dev-flow patch view.
+fn patch_api(purl: &str, patched: &[u8]) -> vex_e2e_common::PatchApi {
+    vex_e2e_common::PatchApi::start(vec![(
+        UUID.to_string(),
+        vex_e2e_common::patch_view(
+            UUID,
+            purl,
+            &[("package/index.js", &vex_e2e_common::git_sha256(patched))],
+            &[(GHSA, &[CVE])],
+        ),
+    )])
+}
 
 // ── self-contained helpers (convention: e2e test files stay standalone) ─
 
 fn binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_socket-patch"))
-}
-
-/// `corepack <pm> --version` succeeds — the only liveness probe that
-/// distinguishes "corepack present" from "this yarn flavor is fetchable".
-fn has_corepack_pm(pm: &str) -> bool {
-    // Isolated too: this probe is what actually downloads the package manager
-    // the first time, and corepack stores it under `COREPACK_HOME`.
-    let mut cmd = Command::new("corepack");
-    cmd.args([pm, "--version"])
-        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
-    cache_env::isolate(&mut cmd);
-    cmd.stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 /// Run `corepack <pm> <args>` in `cwd` with the given extra env, the download
@@ -140,8 +178,8 @@ fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[
                 "beforeHash": git_sha256(before),
                 "afterHash": git_sha256(after),
             }},
-            "vulnerabilities": { "GHSA-vend-yarn-dev": {
-                "cves": ["CVE-2024-99999"],
+            "vulnerabilities": { GHSA: {
+                "cves": [CVE],
                 "summary": "dev-flow capstone vuln",
                 "severity": "high",
                 "description": "d",
@@ -206,11 +244,7 @@ fn lock_block<'a>(lock: &'a str, name: &str) -> &'a str {
 
 #[test]
 fn yarn_classic_vendored_lock_survives_dev_install_resave() {
-    if !has_corepack_pm(YARN_CLASSIC) {
-        println!(
-            "SKIP e2e_vendor_yarn_classic_dev_flow: `corepack {YARN_CLASSIC}` unavailable \
-             (corepack not installed or yarn classic not fetchable)"
-        );
+    if !yarn_ready("e2e_vendor_yarn_classic_dev_flow") {
         return;
     }
 
@@ -230,15 +264,17 @@ fn yarn_classic_vendored_lock_survives_dev_install_resave() {
     let cache = tmp.path().join("yarn-cache");
     let install = corepack(
         &proj,
-        YARN_CLASSIC,
+        &yarn_classic(),
         &["install", "--no-progress"],
         &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
     );
     if !install.status.success() {
-        println!(
-            "SKIP e2e_vendor_yarn_classic_dev_flow: fixture `yarn install` failed (registry \
-             unreachable?):\n{}",
-            String::from_utf8_lossy(&install.stderr)
+        yarn_classic_vex::skip(
+            "e2e_vendor_yarn_classic_dev_flow",
+            &format!(
+                "fixture `yarn install` failed (registry unreachable?):\n{}",
+                String::from_utf8_lossy(&install.stderr)
+            ),
         );
         return;
     }
@@ -334,7 +370,7 @@ fn yarn_classic_vendored_lock_survives_dev_install_resave() {
     let fresh_cache = tmp.path().join("fresh-yarn-cache");
     let dev = corepack(
         &fresh,
-        YARN_CLASSIC,
+        &yarn_classic(),
         &["install", "--no-progress"],
         &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
     );
@@ -381,7 +417,7 @@ fn yarn_classic_vendored_lock_survives_dev_install_resave() {
     //    really was rewritten rather than left untouched.
     let add = corepack(
         &fresh,
-        YARN_CLASSIC,
+        &yarn_classic(),
         &["add", "isarray@2.0.5", "--no-progress"],
         &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
     );
@@ -397,9 +433,21 @@ fn yarn_classic_vendored_lock_survives_dev_install_resave() {
         String::from_utf8_lossy(&add.stdout),
     );
     let lock_readded = std::fs::read_to_string(fresh.join("yarn.lock")).unwrap();
+    // yarn < 1.10 has no `integrity` field: its full re-serialization drops
+    // that line (the `#sha1` fragment of `resolved` stays the pin). Every
+    // other byte of the vendored block must survive.
+    let dep_block_readded = if yarn_classic_vex::writes_integrity(&yarn_classic_version()) {
+        dep_block_wired.clone()
+    } else {
+        dep_block_wired
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("integrity "))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
     assert_eq!(
         lock_block(&lock_readded, DEP),
-        dep_block_wired,
+        dep_block_readded,
         "a full lockfile re-serialization (`yarn add`) must round-trip the vendored block \
          byte-intact"
     );
@@ -424,7 +472,7 @@ fn yarn_classic_vendored_lock_survives_dev_install_resave() {
     //    the wiring never oscillates under repeated dev installs.
     let dev2 = corepack(
         &fresh,
-        YARN_CLASSIC,
+        &yarn_classic(),
         &["install", "--no-progress"],
         &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
     );
@@ -444,7 +492,7 @@ fn yarn_classic_vendored_lock_survives_dev_install_resave() {
     //    (online) — dev installs don't wedge the CI flow downstream.
     let frozen = corepack(
         &fresh,
-        YARN_CLASSIC,
+        &yarn_classic(),
         &["install", "--frozen-lockfile", "--no-progress"],
         &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
     );
@@ -455,6 +503,48 @@ fn yarn_classic_vendored_lock_survives_dev_install_resave() {
         String::from_utf8_lossy(&frozen.stderr),
     );
     eprintln!("FROZEN RE-ENTRY OK");
+
+    // 8. MANIFEST-LESS VEX over the lock YARN re-serialized: the vendored
+    //    block yarn rewrote is what discovery must read. Reverting = the
+    //    dep's block back to its registry resolution (the rest of the
+    //    re-saved lock, incl. the `yarn add`ed isarray, stays).
+    let registry_block = lock_block(&lock_before, DEP).to_owned();
+    let registry_lock = lock_readded.replace(&dep_block_readded, &registry_block);
+    assert_ne!(registry_lock, lock_readded, "the dep block revert must hit");
+    let api = patch_api(&purl, &patched);
+    ManifestlessVex {
+        leg: "vendor-dev-flow",
+        wiring: Wiring::Vendored,
+        purl: &purl,
+        uuid: UUID,
+        vulns: &[(GHSA, &[CVE])],
+        api: &api,
+        proxy_override: None,
+        patch_server_url: None,
+        registry_lock: registry_lock.into_bytes(),
+        reinstall: Some(Box::new(|dir: &Path| {
+            std::fs::remove_dir_all(dir.join("node_modules")).expect("rm node_modules");
+            let out = corepack(
+                dir,
+                &yarn_classic(),
+                &["install", "--frozen-lockfile", "--no-progress"],
+                &[("YARN_CACHE_FOLDER", fresh_cache.to_str().unwrap())],
+            );
+            assert!(
+                out.status.success(),
+                "reverted-lock `yarn install --frozen-lockfile` failed:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                std::fs::read(dir.join("node_modules").join(DEP).join("index.js")).unwrap(),
+                orig,
+                "the reverted block installs pristine bytes"
+            );
+        })),
+        embedded: vec![("apply --vex", via_apply()), ("vendor --vex", via_vendor())],
+    }
+    .run(&fresh);
+    eprintln!("MANIFEST-LESS VEX OK");
 }
 
 // ── drift-skipped revert keeps artifacts (residual #131, E1 flow) ─────
@@ -477,11 +567,7 @@ fn yarn_classic_vendored_lock_survives_dev_install_resave() {
 /// the pristine registry lock installs again.
 #[test]
 fn yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers() {
-    if !has_corepack_pm(YARN_CLASSIC) {
-        println!(
-            "SKIP yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers: \
-             `corepack {YARN_CLASSIC}` unavailable"
-        );
+    if !yarn_ready("yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers") {
         return;
     }
 
@@ -500,15 +586,17 @@ fn yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers() {
     let cache = tmp.path().join("yarn-cache");
     let install = corepack(
         &proj,
-        YARN_CLASSIC,
+        &yarn_classic(),
         &["install", "--no-progress"],
         &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
     );
     if !install.status.success() {
-        println!(
-            "SKIP yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers: fixture \
-             `yarn install` failed (registry unreachable?):\n{}",
-            String::from_utf8_lossy(&install.stderr)
+        yarn_classic_vex::skip(
+            "yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers",
+            &format!(
+                "fixture `yarn install` failed (registry unreachable?):\n{}",
+                String::from_utf8_lossy(&install.stderr)
+            ),
         );
         return;
     }
@@ -611,6 +699,43 @@ fn yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers() {
     );
     eprintln!("DRIFT-SKIP KEEP OK");
 
+    // 4b. Manifest-less VEX over the drift-kept state: the lock now names
+    //     the uuid on Socket's hosted host with the VENDORED integrity pin,
+    //     the installed tree is the pristine registry install, and the
+    //     ledger + tarball were kept. Nothing may be attested: the hosted
+    //     reference's installed evidence is pristine, and the kept ledger
+    //     entry is no longer wired.
+    let api = patch_api(&purl, &patched);
+    let drift = tmp.path().join("drift-vex");
+    copy_dir_recursive(&proj, &drift);
+    vex_e2e_common::strip_manifest(&drift);
+    let out = vex_e2e_common::run_vex(
+        &vex_e2e_common::binary(),
+        &drift,
+        &vex_e2e_common::VexRun::online(&api),
+    );
+    assert_eq!(
+        out.code,
+        Some(1),
+        "drift-kept state must attest nothing:\n{out}"
+    );
+    vex_e2e_common::assert_absent(out.doc.as_ref(), &purl);
+    let mut reasons: Vec<&str> = out.envelope["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["action"] == "skipped" && e["purl"] == purl.as_str())
+        .filter_map(|e| e["errorCode"].as_str())
+        .collect();
+    reasons.sort_unstable();
+    // The live (hosted-shaped) wiring owns the purl; its installed evidence
+    // is the pristine registry tree.
+    assert_eq!(reasons, ["not_applied"], "drift-kept omission:\n{out}");
+    println!(
+        "VEXCELL leg=vendor-drift yarn={} mode=vendored cell=drift-kept-not-attested PASS",
+        yarn_classic_version()
+    );
+
     // 5. Remediation A: undo the drift (restore the vendored lock) — a
     //    fresh install must deliver the patched bytes from the KEPT tarball.
     std::fs::write(&lock_path, &lock_wired).unwrap();
@@ -618,7 +743,7 @@ fn yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers() {
     std::fs::remove_dir_all(&nm).unwrap();
     let reinstall = corepack(
         &proj,
-        YARN_CLASSIC,
+        &yarn_classic(),
         &["install", "--no-progress"],
         &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
     );
@@ -634,6 +759,30 @@ fn yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers() {
         "the kept tarball must still deliver the patched bytes"
     );
     eprintln!("KEPT-TARBALL INSTALL OK");
+
+    // 5b. The recovered (re-wired, re-installed) state attests again with no
+    //     manifest and no ledger — lockfile + kept tarball + patch API.
+    let recovered = tmp.path().join("recovered-vex");
+    copy_dir_recursive(&proj, &recovered);
+    vex_e2e_common::strip_manifest(&recovered);
+    vex_e2e_common::strip_ledgers(&recovered);
+    let out = vex_e2e_common::run_vex(
+        &vex_e2e_common::binary(),
+        &recovered,
+        &vex_e2e_common::VexRun::online(&api),
+    );
+    assert_eq!(out.code, Some(0), "recovered state must attest:\n{out}");
+    vex_e2e_common::assert_attested(
+        out.doc(),
+        &purl,
+        UUID,
+        vex_e2e_common::Marker::Vendored,
+        &[(GHSA, &[CVE])],
+    );
+    println!(
+        "VEXCELL leg=vendor-drift yarn={} mode=vendored cell=recovered-attested PASS",
+        yarn_classic_version()
+    );
 
     // 6. Remediation B: the same `vendor --revert` now completes fully.
     let (code, stdout, stderr) = run_socket(
@@ -667,7 +816,7 @@ fn yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers() {
     std::fs::remove_dir_all(&nm).unwrap();
     let final_install = corepack(
         &proj,
-        YARN_CLASSIC,
+        &yarn_classic(),
         &["install", "--no-progress"],
         &[("YARN_CACHE_FOLDER", cache.to_str().unwrap())],
     );

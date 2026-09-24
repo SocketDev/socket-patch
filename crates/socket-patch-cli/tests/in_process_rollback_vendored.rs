@@ -33,6 +33,9 @@ use socket_patch_cli::commands::rollback::{run as rollback_run, RollbackArgs};
 use socket_patch_cli::commands::vendor::{run as vendor_run, VendorArgs};
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+
 /// Canonical-grammar patch UUID — the vendor path layer validates the uuid
 /// path level fail-closed, so fixtures must use the real shape.
 const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
@@ -608,4 +611,87 @@ async fn detached_entries_reverted_by_unscoped_default() {
         ORIG_INDEX,
         "the installed tree is never touched by a vendored revert"
     );
+}
+
+/// Manifest-less VEX across the vendored npm rollbacks. With the manifest
+/// deleted, the vendored state attests `(vendored)`; after
+/// `rollback --preserve-state` (lock unwired, artifact + ledger entry KEPT)
+/// the leftover ledger and artifact must not keep attesting —
+/// `vendor_unwired`, `--no-verify` too; after the bare rollback (artifact and
+/// ledger entry gone) nothing names the patch at all.
+#[tokio::test]
+async fn rollbacks_stop_manifest_less_attestation() {
+    use vex_e2e_common::{
+        assert_absent, assert_attested, assert_not_attested, patch_view, run_vex, strip_manifest,
+        Marker, PatchApi, VexRun,
+    };
+    const GHSA: &str = "GHSA-rbvd-vend-npm0";
+    for preserve in [true, false] {
+        let fx = npm_fixture();
+        let mut manifest: Value =
+            serde_json::from_slice(&std::fs::read(fx.manifest_path()).unwrap()).unwrap();
+        manifest["patches"][PURL]["vulnerabilities"] = json!({ GHSA: {
+            "cves": ["CVE-2026-7002"], "summary": "s", "severity": "high", "description": "d"
+        }});
+        std::fs::write(
+            fx.manifest_path(),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(vendor_run(vendor_args(fx.root())).await, 0, "vendor");
+
+        let vex = |no_verify: bool| {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let api = PatchApi::start(vec![(
+                            UUID.to_string(),
+                            patch_view(
+                                UUID,
+                                PURL,
+                                &[("package/index.js", &fx.after_hash)],
+                                &[(GHSA, &["CVE-2026-7002"])],
+                            ),
+                        )]);
+                        let mut run = VexRun::online(&api);
+                        run.no_verify = no_verify;
+                        run_vex(&vex_e2e_common::binary(), fx.root(), &run)
+                    })
+                    .join()
+                    .expect("vex run panicked")
+            })
+        };
+        let out = vex(false);
+        assert_eq!(out.code, Some(0), "vendored:\n{out}");
+        // The manifest owns the record here; the manifest-less cells start now.
+        let manifest_bytes = std::fs::read(fx.manifest_path()).unwrap();
+        strip_manifest(fx.root());
+        let out = vex(false);
+        assert_eq!(out.code, Some(0), "vendored, no manifest:\n{out}");
+        assert_attested(
+            out.doc(),
+            PURL,
+            UUID,
+            Marker::Vendored,
+            &[(GHSA, &["CVE-2026-7002"])],
+        );
+        // Rollback reads the manifest: put it back for the rollback itself.
+        std::fs::write(fx.manifest_path(), &manifest_bytes).unwrap();
+        assert_eq!(
+            rollback_run(rollback_args(fx.root(), preserve)).await,
+            0,
+            "rollback preserve={preserve}"
+        );
+        assert_eq!(fx.lock_bytes(), fx.original_lock, "lock restored");
+        strip_manifest(fx.root());
+        for no_verify in [false, true] {
+            let out = vex(no_verify);
+            assert_ne!(out.code, Some(0), "preserve={preserve} rolled back:\n{out}");
+            assert_absent(out.doc.as_ref(), PURL);
+            if preserve {
+                assert!(fx.tgz_path().is_file() && fx.state_path().is_file());
+                assert_not_attested(&out.envelope, PURL, "vendor_unwired");
+            }
+        }
+    }
 }

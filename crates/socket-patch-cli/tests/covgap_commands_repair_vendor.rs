@@ -480,6 +480,32 @@ fn to_legacy_manifest_mode(root: &Path) -> PathBuf {
     manifest_path
 }
 
+/// Rewrite a vendored-mode project into what the manifest-driven standalone
+/// `vendor` writes: the ledger entries lose `detached` but KEEP their
+/// embedded `record` (a fallback copy since manifest-less VEX), and the
+/// records move into `.socket/manifest.json`. Returns the manifest path.
+fn to_standalone_vendor_mode(root: &Path) -> PathBuf {
+    let mut state = read_state(root);
+    let mut patches = serde_json::Map::new();
+    for (key, entry) in state["entries"].as_object_mut().unwrap() {
+        let entry = entry.as_object_mut().unwrap();
+        let record = entry
+            .get("record")
+            .cloned()
+            .expect("a vendored ledger entry embeds its record");
+        entry.remove("detached");
+        patches.insert(key.clone(), record);
+    }
+    write_state(root, &state);
+    let manifest_path = root.join(".socket/manifest.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&serde_json::json!({ "patches": patches })).unwrap(),
+    )
+    .unwrap();
+    manifest_path
+}
+
 // ───────────────────────── pass-1 record resolution ─────────────────────────
 
 /// Corrupt `.socket/vendor/state.json` (unparseable JSON) → the vendored
@@ -607,6 +633,102 @@ async fn repair_skips_when_manifest_uuid_moved_on() {
         std::fs::read(&tgz).unwrap(),
         tgz_bytes,
         "a pending re-vendor must leave the old-uuid artifact alone"
+    );
+}
+
+/// The standalone-`vendor` twin of the test above: the non-detached entry
+/// still EMBEDS its (old-uuid) record, and the manifest's record moved on.
+/// The manifest stays authoritative for a manifest-owned entry — repair
+/// must surface `vendor_uuid_mismatch`, never rebuild the stale artifact
+/// from the embedded copy.
+#[tokio::test]
+async fn repair_prefers_the_moved_on_manifest_over_an_embedded_record() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    mount_blob(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(
+        tmp.path(),
+        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        "sha512-orig==",
+    );
+    let tgz = vendor_project(tmp.path(), &mock.uri());
+    let tgz_bytes = std::fs::read(&tgz).unwrap();
+
+    let manifest_path = to_standalone_vendor_mode(tmp.path());
+    assert_eq!(
+        read_state(tmp.path())["entries"][PURL]["record"]["uuid"],
+        UUID,
+        "the non-detached entry embeds its record"
+    );
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["patches"][PURL]["uuid"] = serde_json::json!("99999999-9999-4999-8999-999999999999");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_cli(
+        tmp.path(),
+        &mock.uri(),
+        &["repair", "--download-mode", "file"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v).iter().any(|e| e["action"] == "skipped"
+            && e["purl"] == PURL
+            && e["errorCode"] == "vendor_uuid_mismatch"),
+        "envelope={v}"
+    );
+    assert_eq!(
+        std::fs::read(&tgz).unwrap(),
+        tgz_bytes,
+        "the embedded copy must not stand in for a manifest that moved on"
+    );
+}
+
+/// A standalone-`vendor` ledger embeds the record in its non-detached
+/// entries too, so with the manifest gone repair recovers the record
+/// OFFLINE from the ledger itself (no API round-trip). What it still cannot
+/// conjure offline is the patch CONTENT for a rebuild, so this fails closed
+/// — but on the precise reason (`vendor_artifact_missing`, no local source),
+/// never on a missing record.
+#[tokio::test]
+async fn repair_uses_the_embedded_record_without_manifest() {
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(
+        tmp.path(),
+        "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+        "sha512-orig==",
+    );
+    let tgz = vendor_project(tmp.path(), &mock.uri());
+    std::fs::remove_file(to_standalone_vendor_mode(tmp.path())).unwrap();
+    std::fs::remove_file(&tgz).unwrap();
+
+    let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), &["repair", "--offline"]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    let v = parse_env(&stdout);
+    assert!(
+        events_of(&v).iter().any(|e| e["action"] == "failed"
+            && e["purl"] == PURL
+            && e["errorCode"] == "vendor_artifact_missing"
+            && e["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no local source")),
+        "envelope={v}"
+    );
+    assert!(
+        !events_of(&v).iter().any(|e| e["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("no manifest record")),
+        "the embedded record must stand in for the missing manifest: {v}"
     );
 }
 

@@ -313,7 +313,7 @@ fn parse_path_coordinates(
 /// The delegation also rejects `:` everywhere — a Windows drive-relative
 /// coordinate (`C:evil`) joins as an absolute path. Mirrors the `go_crawler`
 /// / `deno_crawler` coordinate guards.
-fn is_safe_maven_coordinate(group_id: &str, artifact_id: &str, version: &str) -> bool {
+pub(crate) fn is_safe_maven_coordinate(group_id: &str, artifact_id: &str, version: &str) -> bool {
     group_id.split('.').all(path_safety::is_safe_single_segment)
         && path_safety::is_safe_single_segment(artifact_id)
         && path_safety::is_safe_single_segment(version)

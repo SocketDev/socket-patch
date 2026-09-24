@@ -296,14 +296,7 @@ async fn stage_and_vendor(
 /// The ledger key addressable as `purl`: the exact key, else the entry
 /// whose resolved `base_purl` equals it (see [`lookup_entry`]).
 fn ledger_key_for(state: &VendorState, purl: &str) -> Option<String> {
-    if state.entries.contains_key(purl) {
-        return Some(purl.to_string());
-    }
-    state
-        .entries
-        .iter()
-        .find(|(_, e)| e.base_purl == purl)
-        .map(|(k, _)| k.clone())
+    socket_patch_core::vendor::state::lookup_entry_kv(&state.entries, purl).map(|(k, _)| k.clone())
 }
 
 /// Migrate a project vendored by an older, manifest-mode CLI: the ledger

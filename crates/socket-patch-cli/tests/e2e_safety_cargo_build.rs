@@ -35,16 +35,31 @@
 //!    unchanged (cargo doesn't verify it at build time, but we
 //!    don't want to silently regress).
 //!
-//! Network: no. Toolchain: cargo (already on every e2e CI runner).
+//! 5. **Manifest-less VEX** (headline test): an agent-mode patch in a
+//!    `cargo vendor` directory source is NOT hosted or vendored wiring —
+//!    with `.socket/manifest.json` deleted, `vex` finds nothing to attest
+//!    (`manifest_not_found`, exit 2, zero API requests, no document),
+//!    offline or online, and `apply --vex` stays the calm `noManifest`
+//!    exit 0 without a document. (With the manifest the patch is still
+//!    omitted, `ecosystem_not_setup`: cargo has no install hook, so an
+//!    agent-mode cargo patch attests only when `setup.manual` declares it.)
+//!    The patched bytes on disk never attest by themselves.
+//!
+//! Network: no. Toolchain: cargo (already on every e2e CI runner); the
+//! `cargo_e2e_matrix` knobs (`SOCKET_PATCH_CARGO_E2E_TOOLCHAIN` /
+//! `_LOCK_VERSION`) apply to the headline test.
 //! `#[ignore]` gated because it shells out to `cargo`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
+#[path = "cargo_e2e_matrix/mod.rs"]
+mod cargo_e2e_matrix;
 #[path = "common/mod.rs"]
 mod common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
 use common::{
     assert_run_ok, cargo_run, has_command, parse_json_envelope, run, sha256_hex, write_blob,
@@ -148,10 +163,8 @@ fn write_checksum_json(vendor_fixture: &Path) {
 /// network access is needed. Sets a sandboxed CARGO_HOME so the
 /// test never touches the user's real cargo cache.
 fn generate_lockfile(consumer: &Path, cargo_home: &Path) {
-    let out = Command::new("cargo")
+    let out = cargo_e2e_matrix::cargo_command(consumer, cargo_home)
         .args(["generate-lockfile", "--offline"])
-        .current_dir(consumer)
-        .env("CARGO_HOME", cargo_home)
         .output()
         .expect("cargo generate-lockfile");
     assert!(
@@ -178,14 +191,15 @@ fn cargo_check(consumer: &Path, cargo_home: &Path) -> std::process::Output {
     // control red and the positive round trips vacuous.
     let target = consumer.join("target");
     let _ = std::fs::remove_dir_all(&target);
-    cargo_run(
-        consumer,
-        &["check", "--offline", "--frozen"],
-        &[
-            ("CARGO_HOME", cargo_home.to_str().unwrap()),
-            ("CARGO_TARGET_DIR", target.to_str().unwrap()),
-        ],
-    )
+    let toolchain = cargo_e2e_matrix::toolchain();
+    let mut env = vec![
+        ("CARGO_HOME", cargo_home.to_str().unwrap()),
+        ("CARGO_TARGET_DIR", target.to_str().unwrap()),
+    ];
+    if let Some(tc) = toolchain.as_deref() {
+        env.push(("RUSTUP_TOOLCHAIN", tc));
+    }
+    cargo_run(consumer, &["check", "--offline", "--frozen"], &env)
 }
 
 /// Compute the apply manifest entries for "patch lib.rs from
@@ -302,14 +316,14 @@ fn cargo_check_fails_without_sidecar_fixup() {
 #[test]
 #[ignore]
 fn apply_then_cargo_check_succeeds() {
-    if !has_command("cargo") {
-        eprintln!("SKIP: cargo not on PATH");
+    if !cargo_e2e_matrix::cargo_available("e2e_safety_cargo_build") {
         return;
     }
     let root = tempfile::tempdir().unwrap();
     let consumer = stage_consumer(root.path());
     let cargo_home = root.path().join(".cargo-home");
     generate_lockfile(&consumer, &cargo_home);
+    cargo_e2e_matrix::apply_lock_version(&consumer);
 
     // Baseline must build.
     assert!(cargo_check(&consumer, &cargo_home).status.success());
@@ -375,6 +389,59 @@ fn apply_then_cargo_check_succeeds() {
     // Touch `after` to silence unused-warnings; it's the
     // ground-truth hash the manifest pinned.
     let _ = after;
+
+    manifestless_agent_patch_is_not_attested(&consumer, &cargo_home);
+}
+
+/// Step 5 of the module doc: the agent-mode patch attests only through the
+/// manifest; with it deleted nothing in the lockfile / config wires a
+/// Socket patch (the `[source.crates-io] replace-with` directory source is
+/// the user's own), so VEX has nothing to attest and makes no request.
+fn manifestless_agent_patch_is_not_attested(consumer: &Path, cargo_home: &Path) {
+    use vex_e2e_common::{
+        assert_not_attested, run_vex, strip_ledgers, strip_manifest, PatchApi, VexRun, VexVia,
+    };
+
+    let bin = vex_e2e_common::binary();
+    let api = PatchApi::empty();
+    let run = VexRun::online(&api).env("CARGO_HOME", cargo_home);
+
+    // Baseline, manifest present: cargo has no install hook, so the
+    // agent-mode patch is omitted until `setup.manual` declares it.
+    let out = run_vex(&bin, consumer, &run);
+    assert_eq!(out.code, Some(1), "manifest-backed vex:\n{out}");
+    assert_not_attested(&out.envelope, FIXTURE_PURL, "ecosystem_not_setup");
+
+    strip_manifest(consumer);
+    strip_ledgers(consumer);
+    for offline in [false, true] {
+        let out = run_vex(
+            &bin,
+            consumer,
+            &VexRun {
+                offline,
+                ..run.clone()
+            },
+        );
+        assert_eq!(
+            out.code,
+            Some(2),
+            "manifest-less vex (offline={offline}):\n{out}"
+        );
+        assert_eq!(
+            out.envelope["error"]["code"], "manifest_not_found",
+            "(offline={offline}):\n{out}"
+        );
+        assert!(
+            out.doc.is_none(),
+            "(offline={offline}): no document:\n{out}"
+        );
+    }
+    let out = run_vex(&bin, consumer, &run.clone().via(VexVia::Apply));
+    assert_eq!(out.code, Some(0), "manifest-less apply --vex:\n{out}");
+    assert_eq!(out.envelope["status"], "noManifest", "{out}");
+    assert!(out.doc.is_none(), "apply --vex writes no document:\n{out}");
+    api.assert_no_requests();
 }
 
 /// Rollback twin of the headline test: after apply rewrote both the

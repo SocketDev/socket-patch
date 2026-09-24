@@ -713,7 +713,7 @@ pub(super) async fn read_yarn_lock(project_root: &Path) -> Result<String, Box<Ve
 }
 
 /// One key-line block of a yarn lockfile (classic or berry).
-pub(super) struct LockBlock {
+pub(crate) struct LockBlock {
     /// Byte offset of the key line's first byte.
     pub start: usize,
     /// Byte offset one past the last body line (incl. its terminator).
@@ -728,7 +728,7 @@ pub(super) struct LockBlock {
 
 /// Scan a lockfile into blocks, CRLF-aware. Comments, blank lines, and
 /// anything else outside blocks are left to the splicer untouched.
-pub(super) fn scan_blocks(text: &str) -> Vec<LockBlock> {
+pub(crate) fn scan_blocks(text: &str) -> Vec<LockBlock> {
     // (start, end-incl-terminator, content-without-terminator, terminated)
     let mut lines: Vec<(usize, usize, &str, bool)> = Vec::new();
     let mut pos = 0;
@@ -806,7 +806,7 @@ pub(super) fn body_field_line(line: &str) -> Option<&str> {
 }
 
 /// Read a classic scalar field (`<name> "<value>"`, integrity unquoted).
-pub(super) fn classic_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
+pub(crate) fn classic_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
     for line in lines.iter().skip(1) {
         let Some(rest) = body_field_line(line) else {
             continue;
@@ -848,6 +848,31 @@ pub(crate) fn split_key_patterns(key: &str) -> Vec<String> {
     out
 }
 
+/// Split a berry lock key into its comma-joined descriptor patterns. yarn
+/// wraps a multi-descriptor key in ONE outer quote pair (`"a@npm:^1,
+/// a@npm:^2"`), so strip a single wrapping pair first, THEN split on `, ` —
+/// that surfaces every descriptor (letting a genuinely mixed-name key be
+/// detected as ambiguous) while a single quoted descriptor stays intact.
+/// Twin of the TS `splitKeyPatterns`. The ONE berry key splitter: the
+/// vendored and hosted berry backends and the lock inventory's
+/// `berry_entries` (lockfile discovery's entry model) all read berry keys
+/// with it — [`split_key_patterns`] is the classic grammar's, and treats
+/// the outer pair as one quoted pattern.
+pub(crate) fn split_berry_key_patterns(key: &str) -> Vec<String> {
+    let trimmed = key.trim();
+    let inner = if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    inner
+        .split(", ")
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Split `name@range` at the first `@` past a leading `@scope/` marker.
 pub(crate) fn split_pattern(pattern: &str) -> Option<(&str, &str)> {
     let from = usize::from(pattern.starts_with('@'));
@@ -870,6 +895,35 @@ pub(crate) fn pattern_real_name(pattern: &str) -> Option<&str> {
         };
     }
     Some(name)
+}
+
+/// Which blocks yarn actually keeps, by block index: a block survives while
+/// at least one of its key patterns is not re-keyed by a LATER block (yarn
+/// parses the lock into an object, so duplicate keys are last-wins). A
+/// block with no patterns is never live.
+pub(crate) fn live_blocks(patterns: &[Vec<String>]) -> Vec<bool> {
+    let mut last: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, pats) in patterns.iter().enumerate() {
+        for p in pats {
+            last.insert(p.as_str(), i);
+        }
+    }
+    patterns
+        .iter()
+        .enumerate()
+        .map(|(i, pats)| pats.iter().any(|p| last.get(p.as_str()) == Some(&i)))
+        .collect()
+}
+
+/// A classic `resolved` value split at its first `#`: the url before it,
+/// and the fragment as a lowercase sha1 when it is 40 hex digits (either
+/// case) — the legacy tarball verifier yarn v1 enforces when no
+/// `integrity` line is present.
+pub(crate) fn split_resolved_sha1(raw: &str) -> (&str, Option<String>) {
+    match raw.split_once('#') {
+        Some((url, frag)) => (url, crate::utils::digest::sha1_hex(frag)),
+        None => (raw, None),
+    }
 }
 
 /// yarn v1's lockfile key quoting (stringify.js `shouldWrapKey`): wrap when

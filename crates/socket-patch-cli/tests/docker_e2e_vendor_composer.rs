@@ -23,6 +23,18 @@
 //!     `vendor/psr/log` as a REAL directory (not a symlink) whose patched
 //!     file is byte-identical to the blob, and propagate the patch uuid
 //!     into `vendor/composer/installed.json` (`dist.reference`).
+//!   stage 2 also runs the in-container MANIFEST-LESS VEX legs (still
+//!     `--network none`, so every leg is `--offline`): with
+//!     `.socket/manifest.json` deleted the ledger record attests
+//!     `(vendored)`; with `.socket/vendor/state.json` deleted too the lock
+//!     path dist is still discovered but its record is `record_unavailable`;
+//!     and a copy whose composer.lock is reverted to the pre-vendor registry
+//!     dist (ledger + artifact kept) is `vendor_unwired`, `--no-verify`
+//!     included.
+//!   host side (after stage 2): the HOST binary runs the online legs over a
+//!     host-owned copy of that really-installed fresh checkout against a mock
+//!     patch API — manifest deleted, then both ledgers deleted (the lock path
+//!     dist + the API record attest), then `--offline` (zero requests).
 //!   stage 3 (`--network none`): re-vendor is idempotent (already_vendored,
 //!     lock sha256-stable) → `vendor --revert` restores composer.lock
 //!     byte-identical to the pre-vendor snapshot and removes `.socket/vendor`
@@ -34,8 +46,14 @@
 
 #![cfg(feature = "docker-e2e")]
 
+#[path = "common/cache_env.rs"]
+mod cache_env;
+#[path = "composer_e2e_common/mod.rs"]
+mod composer_e2e_common;
 #[path = "docker_vendor_common/mod.rs"]
 mod docker_vendor_common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
 use docker_vendor_common::{
     assert_stage_markers, bash_prelude, json_assert_fns, run_in_image, run_in_image_network_none,
@@ -235,6 +253,51 @@ php -r '
   fwrite(STDERR, "psr/log not found in vendor/composer/installed.json\n"); exit(1);
 ' "__UUID__" || fail "installed.json must carry dist.reference == patch uuid"
 echo "===INSTALLED JSON VERIFIED==="
+
+# Manifest-less VEX legs (in-container, offline: the network is cut). The
+# ledger + committed artifact travelled with the checkout; the manifest is
+# what a depscan PR / detached checkout lacks.
+PSR_VER=$(cat /workspace/snap/psr-ver)
+PURL="pkg:composer/psr/log@$PSR_VER"
+PRODUCT="pkg:composer/app@1.0.0"
+rm -f .socket/manifest.json
+socket-patch vex --offline --json --cwd "$PWD" --output nomanifest.vex.json \
+  --product "$PRODUCT" > /tmp/vex-nomanifest.json 2>/tmp/vex-nomanifest.err
+RC=$?; cat /tmp/vex-nomanifest.err >&2
+[ "$RC" -eq 0 ] || { cat /tmp/vex-nomanifest.json >&2; fail "manifest-less vex exited $RC (expected 0)"; }
+assert_json_field nomanifest.vex.json "Patched via Socket patch __UUID__ (vendored)"
+assert_json_field nomanifest.vex.json "__GHSA__"
+[ ! -e .socket/manifest.json ] || fail "vex must never write a manifest"
+echo "===MANIFESTLESS LEDGER VEX VERIFIED==="
+
+# Ledger gone too: the composer.lock path dist is still a reference, but
+# offline there is no record to attest it from.
+cp .socket/vendor/state.json /tmp/state.json.keep
+rm -f .socket/vendor/state.json .socket/vendor/redirect-state.json
+socket-patch vex --offline --json --cwd "$PWD" --output noledger.vex.json \
+  --product "$PRODUCT" > /tmp/vex-noledger.json 2>/tmp/vex-noledger.err
+RC=$?
+[ "$RC" -eq 1 ] || { cat /tmp/vex-noledger.json /tmp/vex-noledger.err >&2; fail "ledger-less offline vex exited $RC (expected 1)"; }
+assert_json_field /tmp/vex-noledger.json '"errorCode": "record_unavailable"'
+[ ! -e noledger.vex.json ] || fail "an unattested run must not leave a document"
+cp /tmp/state.json.keep .socket/vendor/state.json
+echo "===MANIFESTLESS NOLEDGER VEX VERIFIED==="
+
+# composer.lock reverted to the registry dist while the ledger + artifact
+# stay: nothing the install consumes is patched any more.
+rm -rf /workspace/fresh-reverted && mkdir -p /workspace/fresh-reverted
+cp composer.json /workspace/fresh-reverted/
+cp /workspace/snap/composer.lock.prevendor /workspace/fresh-reverted/composer.lock
+cp -R .socket /workspace/fresh-reverted/.socket
+for NV in "" "--no-verify"; do
+  socket-patch vex --offline --json $NV --cwd /workspace/fresh-reverted \
+    --output /workspace/fresh-reverted/out.vex.json --product "$PRODUCT" \
+    > /tmp/vex-reverted.json 2>/tmp/vex-reverted.err
+  RC=$?
+  [ "$RC" -eq 1 ] || { cat /tmp/vex-reverted.json /tmp/vex-reverted.err >&2; fail "reverted vex $NV exited $RC (expected 1)"; }
+  assert_json_field /tmp/vex-reverted.json '"errorCode": "vendor_unwired"'
+done
+echo "===MANIFESTLESS REVERTED VEX VERIFIED==="
 exit 0
 "#;
 
@@ -358,6 +421,67 @@ fn assert_vex_attested_from_host(host_dir: &std::path::Path) {
     );
 }
 
+/// Host-side online manifest-less legs over the fresh checkout stage 2
+/// installed with the REAL composer. The mount is copied to a host-owned dir
+/// first: on Linux the container writes it as root, and the legs delete
+/// files.
+fn assert_manifestless_vex_from_host(host_dir: &std::path::Path) {
+    use vex_e2e_common::{
+        assert_attested, assert_not_attested, binary, git_sha256, patch_view, run_vex,
+        strip_ledgers, strip_manifest, Marker, PatchApi, VexRun,
+    };
+    let psr_ver = std::fs::read_to_string(host_dir.join("snap/psr-ver"))
+        .expect("snap/psr-ver")
+        .trim()
+        .to_string();
+    let purl = format!("pkg:composer/psr/log@{psr_ver}");
+    let copy = tempfile::tempdir().expect("tempdir");
+    let fresh = copy.path().join("fresh");
+    composer_e2e_common::copy_dir_recursive(&host_dir.join("fresh"), &fresh);
+    let patched = std::fs::read(fresh.join("vendor/psr/log/src/LoggerInterface.php"))
+        .expect("the container-installed patched file");
+    let vulns: &[(&str, &[&str])] = &[(GHSA, &["CVE-2024-66666"])];
+    let api = PatchApi::start(vec![(
+        UUID.to_string(),
+        patch_view(
+            UUID,
+            &purl,
+            &[("src/LoggerInterface.php", &git_sha256(&patched))],
+            vulns,
+        ),
+    )]);
+    let run = |base: VexRun| {
+        run_vex(
+            &binary(),
+            &fresh,
+            &VexRun {
+                product: Some("pkg:composer/app@1.0.0".to_string()),
+                ..base
+            },
+        )
+    };
+
+    strip_manifest(&fresh);
+    let out = run(VexRun::online(&api));
+    assert_eq!(out.code, Some(0), "manifest deleted:\n{out}");
+    assert_attested(out.doc(), &purl, UUID, Marker::Vendored, vulns);
+
+    strip_ledgers(&fresh);
+    let out = run(VexRun::online(&api));
+    assert_eq!(out.code, Some(0), "ledgers deleted:\n{out}");
+    assert_attested(out.doc(), &purl, UUID, Marker::Vendored, vulns);
+    assert!(api.view_requests(UUID) >= 1, "{:?}", api.requests());
+
+    let seen = api.request_count();
+    let out = run(VexRun {
+        proxy_url: Some(api.uri()),
+        ..VexRun::offline()
+    });
+    assert_eq!(out.code, Some(1), "offline, no ledgers:\n{out}");
+    assert_not_attested(&out.envelope, &purl, "record_unavailable");
+    assert_eq!(api.request_count(), seen, "--offline makes zero requests");
+}
+
 #[test]
 fn composer_vendor_fresh_checkout_install_and_revert() {
     if skip_if_no_image(IMAGE) {
@@ -384,8 +508,15 @@ fn composer_vendor_fresh_checkout_install_and_revert() {
     assert_stage_markers(
         "composer stage 2 (fresh checkout, --network none)",
         &out,
-        &["FRESH INSTALL", "INSTALLED JSON"],
+        &[
+            "FRESH INSTALL",
+            "INSTALLED JSON",
+            "MANIFESTLESS LEDGER VEX",
+            "MANIFESTLESS NOLEDGER VEX",
+            "MANIFESTLESS REVERTED VEX",
+        ],
     );
+    assert_manifestless_vex_from_host(&host_dir);
 
     // Stage 3 — idempotency, revert, re-vendor (still no network).
     let out = run_in_image_network_none(IMAGE, &host_dir, &render(STAGE3));

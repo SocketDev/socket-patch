@@ -40,6 +40,8 @@
 
 #[path = "setup_matrix_common/mod.rs"]
 mod smc;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
 /// Documentation/negative-control pass through the shared Docker matrix.
 /// Kept for parity with the other ecosystems and to run the nuget negative
@@ -192,6 +194,34 @@ mod host_guard {
         v
     }
 
+    /// Manifest-less VEX over a setup-only project: `setup` wires only the
+    /// agent-mode install hook (or nothing) — never a hosted/vendored
+    /// lockfile reference — so there is nothing to attest (exit 2,
+    /// `manifest_not_found`), no document, no patch-API request, and nothing
+    /// written into the project (the document path is outside it).
+    fn assert_manifestless_vex_has_nothing(root: &Path, product: &str, who: &str) {
+        use crate::vex_e2e_common::{run_vex, PatchApi, VexRun};
+        let out_dir = tempfile::tempdir().unwrap();
+        let api = PatchApi::empty();
+        for no_verify in [false, true] {
+            let mut r = VexRun::online(&api);
+            r.output = Some(out_dir.path().join("out.vex.json"));
+            r.product = Some(product.to_string());
+            r.no_verify = no_verify;
+            let out = run_vex(&binary(), root, &r);
+            assert_eq!(out.code, Some(2), "{who} (no_verify={no_verify}): {out}");
+            assert_eq!(
+                out.envelope["error"]["code"], "manifest_not_found",
+                "{who}: {out}"
+            );
+            assert!(
+                out.doc.is_none(),
+                "{who}: no document may be written: {out}"
+            );
+        }
+        api.assert_no_requests();
+    }
+
     /// setup / setup --check / setup --remove against a real dotnet project,
     /// asserting REAL on-disk + JSON state at every stage. This is the
     /// assertion the Docker matrix can never make for nuget.
@@ -271,6 +301,9 @@ mod host_guard {
             &["setup", "--remove", "--cwd", root_s, "--yes", "--json"],
             "remove",
         );
+
+        // ── manifest-less VEX: nothing setup did is attestable ─────────────
+        assert_manifestless_vex_has_nothing(root, "pkg:nuget/app@1.0.0", "vex (after remove)");
 
         // ── final: directory still holds exactly the one file we created ────
         // A stray sidecar/hook artifact left behind by any stage would betray

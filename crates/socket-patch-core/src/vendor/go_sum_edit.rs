@@ -251,6 +251,58 @@ pub fn remove_lines(content: &str, added: &str) -> Option<String> {
     Some(joined)
 }
 
+// ── pure reader ──────────────────────────────────────────────────────────────
+// The line reader lockfile discovery (`vex::discover::golang`) and the lock
+// inventory share, and the `h1:` shape the hosted rewriter and discovery
+// both require.
+
+/// One `go.sum` line of at least three whitespace-separated tokens,
+/// `<module> <version>[/go.mod] <hash>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GoSumLine<'a> {
+    pub(crate) module: &'a str,
+    /// The version, without the `/go.mod` suffix of a manifest line.
+    pub(crate) version: &'a str,
+    /// A `/go.mod` line (hashes only the module's go.mod), not the zip line.
+    pub(crate) go_mod: bool,
+    pub(crate) hash: &'a str,
+    /// The line carries more than three tokens (not a line go writes).
+    pub(crate) extra_tokens: bool,
+}
+
+/// Every line of `text` with at least three tokens, in file order; shorter
+/// lines are skipped. Each caller keeps its own token rule
+/// ([`GoSumLine::extra_tokens`]) and hash filter.
+pub(crate) fn go_sum_lines(text: &str) -> impl Iterator<Item = GoSumLine<'_>> {
+    text.lines().filter_map(|line| {
+        let mut tokens = line.split_whitespace();
+        let (module, version, hash) = (tokens.next()?, tokens.next()?, tokens.next()?);
+        let (version, go_mod) = match version.strip_suffix("/go.mod") {
+            Some(version) => (version, true),
+            None => (version, false),
+        };
+        Some(GoSumLine {
+            module,
+            version,
+            go_mod,
+            hash,
+            extra_tokens: tokens.next().is_some(),
+        })
+    })
+}
+
+/// Strict `h1:` dirhash shape: exactly `h1:` + the 44-char standard base64
+/// of a sha256 — the only shape the hosted rewriter writes. Anything else
+/// (wrong algorithm, embedded whitespace, truncation) must not reach go.sum:
+/// a malformed line poisons the whole file.
+pub(crate) fn is_h1_dirhash(s: &str) -> bool {
+    s.strip_prefix("h1:").is_some_and(|b| {
+        b.len() == 44
+            && b.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/' || c == b'=')
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

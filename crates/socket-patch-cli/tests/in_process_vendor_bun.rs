@@ -39,6 +39,8 @@ use std::time::{Duration, Instant};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "vex_e2e_common/bun.rs"]
+mod bun_vex;
 #[path = "common/mod.rs"]
 mod common;
 
@@ -261,6 +263,27 @@ fn seed_other_manifest_record(root: &Path) -> Vec<u8> {
     let bytes = serde_json::to_vec(&manifest).unwrap();
     std::fs::write(socket.join("manifest.json"), &bytes).unwrap();
     bytes
+}
+
+/// The manifest-less VEX step ([`bun_vex::run_bun_vex_matrix`]) on a
+/// lockfile-only checkout of the vendored `root` (no bun: the committed
+/// artifact is the evidence): attested `(vendored)` from the ledger and,
+/// ledgers deleted, from the lock's `.socket/vendor/` wiring + the patch
+/// API; offline → `record_unavailable`; `pristine` lock back → NOT attested.
+fn manifestless_vex(root: &Path, pristine: &[u8], tag: &str) {
+    let scratch = tempfile::tempdir().unwrap();
+    let case = bun_vex::BunVexCase {
+        tag,
+        mode: bun_vex::BunMode::Vendored,
+        purl: PURL,
+        uuid: UUID,
+        files: vec![("package/index.js".to_string(), common::git_sha256(AFTER))],
+        vulns: &[("GHSA-aaaa-bbbb-cccc", &["CVE-2026-0001"])],
+        lock: "bun.lock",
+        registry_lock: pristine.to_vec(),
+        patch_server_url: None,
+    };
+    bun_vex::run_bun_vex_matrix(root, scratch.path(), &case, |_| {});
 }
 
 // ---------------------------------------------------------------------------
@@ -924,6 +947,7 @@ async fn scan_vendored_v2_workspace_lock_vendors() {
     mount_patch_api(&mock).await;
     let tmp = tempfile::tempdir().unwrap();
     write_bun_project(tmp.path(), LockShape::V2Workspace);
+    let lock_before = lock_bytes(tmp.path());
 
     let (exit, stdout, stderr) = scan_vendored(tmp.path(), &mock.uri(), &["--json"]);
     assert_eq!(exit, 0, "stdout={stdout}\nstderr={stderr}");
@@ -961,6 +985,7 @@ async fn scan_vendored_v2_workspace_lock_vendors() {
     assert_eq!(state["entries"][PURL]["flavor"], "bun", "{state}");
     assert_eq!(state["entries"][PURL]["detached"], true, "{state}");
     assert_eq!(state["entries"][PURL]["record"]["uuid"], UUID, "{state}");
+    manifestless_vex(tmp.path(), &lock_before, "v2-workspace");
 }
 
 /// A lockfileVersion-0 single-package lock (bun 1.1.39–1.1.45 opt-in text
@@ -989,6 +1014,7 @@ async fn get_uuid_vendored_v0_direct_lock_vendors_and_rollback_restores_bytes() 
     assert!(lock.contains(&format!("\"left-pad@{tgz_rel}\"")), "{lock}");
     assert!(lock.starts_with("{\n  \"lockfileVersion\": 0,\n"), "{lock}");
     assert!(tmp.path().join(&tgz_rel).is_file());
+    manifestless_vex(tmp.path(), &lock_before, "v0-direct");
 
     let (exit, stdout, stderr) = run(tmp.path(), &with_api(&["rollback", "--json"], &mock.uri()));
     assert_eq!(exit, 0, "rollback: stdout={stdout}\nstderr={stderr}");

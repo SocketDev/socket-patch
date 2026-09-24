@@ -297,6 +297,32 @@ if [ "$PRE_APPLY_SHA" = "$POST_APPLY_SHA" ]; then
 fi
 
 echo "===PATCH VERIFIED===" >&2
+
+# 6. Manifest-less VEX: Deno has no hosted rewriter and no vendored
+#    backend, and deno.lock names no patch — so with the manifest gone vex
+#    has nothing to attest (exit 2, manifest_not_found), with and without
+#    --no-verify, although the patched bytes are installed. deno.lock is
+#    left exactly as `deno install` wrote it.
+[ -f deno.lock ] || {{ echo "FAIL: deno install wrote no deno.lock" >&2; exit 1; }}
+LOCK_SHA=$(sha256sum deno.lock | cut -d' ' -f1)
+mv .socket/manifest.json /tmp/manifest.keep
+for NV in "" "--no-verify"; do
+  rm -f /tmp/nm.vex.json
+  socket-patch vex --offline --json --cwd "$PWD" --output /tmp/nm.vex.json \
+    --product 'pkg:npm/e2e-deno-npm@0.0.0' $NV >/tmp/vex-nm.out 2>/tmp/vex-nm.err
+  NM_RC=$?
+  if [ "$NM_RC" -ne 2 ] || ! grep -q '"manifest_not_found"' /tmp/vex-nm.out; then
+    echo "FAIL: manifest-less vex ($NV) exited $NM_RC (expected 2, manifest_not_found)" >&2
+    cat /tmp/vex-nm.out /tmp/vex-nm.err >&2
+    exit 1
+  fi
+  [ ! -e /tmp/nm.vex.json ] || {{ echo "FAIL: manifest-less vex ($NV) wrote a document" >&2; exit 1; }}
+done
+mv /tmp/manifest.keep .socket/manifest.json
+[ "$LOCK_SHA" = "$(sha256sum deno.lock | cut -d' ' -f1)" ] \
+  || {{ echo "FAIL: deno.lock changed" >&2; exit 1; }}
+echo "===MANIFESTLESS VEX VERIFIED===" >&2
+
 echo "===E2E PASS==="
 exit 0
 "#
@@ -551,6 +577,11 @@ async fn deno_install_node_modules_full_apply_chain() {
     );
     // The byte-for-byte + sha-changed checks in the script gate this marker.
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
+    // Manifest-less VEX never attests the Deno-installed patch.
+    assert!(
+        stderr.contains("===MANIFESTLESS VEX VERIFIED==="),
+        "manifest-less deno VEX leg did not run/pass.\nstderr=\n{stderr}"
+    );
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
 }
 

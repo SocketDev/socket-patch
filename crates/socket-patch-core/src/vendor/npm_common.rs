@@ -699,7 +699,7 @@ pub(super) fn parse_npm_purl(purl: &str) -> Option<(String, String)> {
 /// npm-name shape on top of the generic traversal guard: at most one `/`,
 /// and only with an `@scope` first segment (so a smuggled `a/b/c` can't
 /// create surprise directory levels under the uuid dir).
-pub(super) fn is_safe_npm_name(name: &str) -> bool {
+pub(crate) fn is_safe_npm_name(name: &str) -> bool {
     if !path_safety::is_safe_multi_segment(name) {
         return false;
     }
@@ -716,6 +716,16 @@ pub(super) fn tgz_rel_leaf(name: &str, version: &str) -> String {
         Some((scope, bare)) => format!("{scope}/{bare}-{version}.tgz"),
         None => format!("{name}-{version}.tgz"),
     }
+}
+
+/// The inverse of [`tgz_rel_leaf`] for a known `name`: the `<version>` of a
+/// `[@scope/]<bare>-<version>.tgz` leaf (i.e. `<name>-<version>.tgz`), not
+/// validated further. The split is anchored on `name`, never guessed from
+/// the leaf alone, so prerelease versions such as `1.0.0-2` survive.
+pub(crate) fn tgz_leaf_version<'l>(name: &str, leaf: &'l str) -> Option<&'l str> {
+    leaf.strip_prefix(name)?
+        .strip_prefix('-')?
+        .strip_suffix(".tgz")
 }
 
 /// `bundleDependencies` (npm) / `bundledDependencies` (legacy alias):

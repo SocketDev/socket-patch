@@ -1,9 +1,12 @@
 //! `socket-patch vex` — generate an OpenVEX 0.2.0 document.
 //!
-//! Reads the local manifest, optionally verifies each patch's on-disk
-//! state, and emits a VEX document describing the vulnerabilities that
-//! have been mitigated. Designed to be piped into vexctl, Grype, Trivy,
-//! and the like.
+//! Gathers every patch the project can prove — the local manifest, the
+//! `.socket/vendor` ledgers, and (manifest-less VEX) the hosted / vendored
+//! patch references its lockfiles wire (see [`crate::commands::vex_sources`]
+//! for the merge, record-resolution and wiring-liveness rules) — optionally
+//! verifies each patch's on-disk state, and emits a VEX document describing
+//! the vulnerabilities that have been mitigated. Designed to be piped into
+//! vexctl, Grype, Trivy, and the like.
 //!
 //! Output channels:
 //! * Default (`--output` unset, `--json` unset): VEX JSON to stdout,
@@ -28,7 +31,11 @@ use socket_patch_core::vex::{
 };
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
-use crate::ecosystem_dispatch::find_manifest_package_paths;
+use crate::commands::vex_sources::{
+    self, Plan, Sources, RECORD_MISMATCH, RECORD_UNAVAILABLE, REDIRECT_UNWIRED, VENDOR_UNWIRED,
+    WIRING_CONFLICT,
+};
+use crate::ecosystem_dispatch::{collapse_to_first, find_manifest_package_copies};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning};
 use crate::ui::plural;
 
@@ -60,16 +67,23 @@ pub struct VexArgs {
     ///   2. package.json:   pkg:npm/<name>@<version>
     ///   3. pyproject.toml: pkg:pypi/<name>@<version>
     ///   4. Cargo.toml:     pkg:cargo/<name>@<version>
+    ///   5. go.mod:         pkg:golang/<module>
+    ///   6. composer.json:  pkg:composer/<vendor>/<name>[@<version>]
+    ///   7. pom.xml:        pkg:maven/<groupId>/<artifactId>[@<version>]
+    ///   8. *.csproj:       pkg:nuget/<id>[@<version>] (a single one at the root)
+    ///   9. *.gemspec:      pkg:gem/<name>[@<version>] (a single one at the root)
     // `verbatim_doc_comment`: clap otherwise joins the numbered list into
     // one run-on line.
     #[arg(long = "product", env = "SOCKET_VEX_PRODUCT", verbatim_doc_comment)]
     pub product: Option<String>,
 
-    /// Skip the on-disk file-hash check and trust the manifest.
-    /// By default every manifest entry is verified before being
-    /// emitted; this flag flips that off — useful when generating a
-    /// VEX doc on a build machine that doesn't have the patched files
-    /// laid out yet.
+    /// Skip the on-disk file-hash check and trust the patch records.
+    /// By default every patch is verified before being emitted; this flag
+    /// flips that off — useful when generating a VEX doc on a build machine
+    /// that doesn't have the patched files laid out yet. The wiring checks
+    /// still apply: a hosted or vendored ledger record the lockfile no
+    /// longer wires, or a lockfile reference whose record is unavailable or
+    /// names another package, is omitted either way.
     //
     // `value_parser = parse_bool_flag` matches the `GlobalArgs` bool flags:
     // clap's default bool parser accepts only the literal strings
@@ -123,7 +137,8 @@ pub struct VexEmbedArgs {
     pub vex_product: Option<String>,
 
     /// Skip the on-disk file-hash check when building the VEX document and
-    /// trust the manifest. See `socket-patch vex --no-verify`.
+    /// trust the patch records (the lockfile wiring checks still apply). See
+    /// `socket-patch vex --no-verify`.
     //
     // `value_parser = parse_bool_flag`: these embedded flags share their
     // env vars with the standalone `vex` flags, so without it an ambient
@@ -229,8 +244,48 @@ pub(crate) struct VexGenError {
     /// `no_applicable_patches` case (so callers can list them).
     pub failed: Vec<FailedPatch>,
     /// Advisories raised before the failure (already printed in human
-    /// mode); the standalone `vex --json` error envelope carries them.
+    /// mode) — for `no_applicable_patches` often the only explanation of a
+    /// `vendor_unwired` / `redirect_unwired` omission (the lockfile-discovery
+    /// diagnostics say why a lockfile's mention is not live wiring). The
+    /// `--json` error envelopes carry them.
     pub warnings: Vec<RunWarning>,
+}
+
+impl VexGenError {
+    /// What an EMBEDDED `--vex` failure folds into its host command's
+    /// `warnings[]` (`apply`, `vendor`, `scan`): the run's advisories, then
+    /// one `vex_omitted` per omitted patch (`<purl>: <why> (<errorCode>)`).
+    /// The standalone `vex` envelope lists those omissions as `skipped`
+    /// events; a host envelope's events are its own command's, so the
+    /// omissions ride `warnings[]` there — otherwise `--json` would say only
+    /// `no_applicable_patches`, never which patch the gates refused or why.
+    pub(crate) fn embedded_warnings(&self) -> Vec<RunWarning> {
+        let mut out = self.warnings.clone();
+        out.extend(self.failed.iter().map(|f| RunWarning {
+            code: "vex_omitted".to_string(),
+            detail: format!(
+                "{}: {} ({})",
+                f.purl,
+                omission_reason_message(&f.reason),
+                f.reason
+            ),
+        }));
+        out
+    }
+
+    /// Human stderr for an embedded `--vex` failure: the error line — even
+    /// under `--silent` ("errors only", never "nothing": exit 1 with no
+    /// message would be undiagnosable) — and, under `--silent`, each omitted
+    /// patch, as standalone `vex --silent` lists them (a louder run already
+    /// printed a `Warning: omitting …` line per omission).
+    pub(crate) fn print_embedded(&self, common: &GlobalArgs) {
+        eprintln!("Error: VEX generation failed: {}", self.message);
+        if common.silent {
+            for f in &self.failed {
+                eprintln!("  omitted: {} ({})", f.purl, f.reason);
+            }
+        }
+    }
 }
 
 pub async fn run(args: VexArgs) -> i32 {
@@ -313,8 +368,10 @@ pub async fn run(args: VexArgs) -> i32 {
                 // circular, so the shared path keeps the bare message and
                 // it is appended here.
                 "no_patches" => (
-                    "Manifest is empty — nothing to attest. Run `socket-patch get` \
-                     or `socket-patch scan --sync` first."
+                    "Manifest is empty, and no hosted or vendored patch references were found \
+                     in the lockfiles or .socket/vendor ledgers — nothing to attest. Run \
+                     `socket-patch get` or `socket-patch scan` (agent, hosted or vendored mode) \
+                     first."
                         .to_string(),
                     1,
                 ),
@@ -360,6 +417,16 @@ pub(crate) fn format_vex_written(statements: usize, path: &Path) -> String {
 /// "redirected", "vendored").
 pub(crate) fn format_vex_dry_run_skip(done: &str) -> String {
     format!("Skipping VEX generation (--dry-run: nothing was {done}).")
+}
+
+/// The note an embedded `--vex` on a manifest-less command prints when
+/// nothing anywhere references a patch
+/// ([`ManifestlessVex::NothingToAttest`]): the requested document was not
+/// written (the command still exits 0).
+pub(crate) fn format_vex_nothing_to_attest() -> String {
+    "No VEX document written: no manifest, .socket/vendor ledger record or lockfile \
+     references a patch."
+        .to_string()
 }
 
 /// The `--dry-run` twin of [`format_vex_written`]: nothing was written.
@@ -414,19 +481,21 @@ fn ecosystem_from_manual_name(name: &str) -> Option<Ecosystem> {
 
 /// Core VEX pipeline shared by the standalone `vex` command and the
 /// embedded `apply`/`scan` `--vex` paths: resolve the product, verify the
-/// manifest against disk (unless `no_verify`), build the OpenVEX document,
-/// serialize, write (or print to stdout when `output` is `None`), and fire
-/// telemetry. Returns a [`VexWriteSummary`] on success or a structured
-/// [`VexGenError`] (with a stable code) on failure. All `track_vex_*`
-/// telemetry is fired here so every caller reports consistently.
+/// plan's record view against disk (unless `no_verify`), build the OpenVEX
+/// document, serialize, write (or print to stdout when `output` is `None`),
+/// and fire telemetry. Returns a [`VexWriteSummary`] on success or a
+/// structured [`VexGenError`] (with a stable code) on failure. All
+/// `track_vex_*` telemetry is fired here so every caller reports
+/// consistently. Run advisories join `warnings` (the caller already added
+/// the lockfile-discovery diagnostics).
 async fn generate_vex(
     common: &GlobalArgs,
     params: &VexBuildParams,
-    manifest: &PatchManifest,
-    redirected: &[String],
-    ledger: std::io::Result<VendorState>,
+    plan: Plan,
     warnings: &mut Vec<RunWarning>,
 ) -> Result<VexWriteSummary, VexGenError> {
+    let manifest = &plan.view;
+    let redirected: &[String] = &plan.redirected;
     // Resolve product.
     let product_id = match resolve_product_id(common, params.product.as_deref(), warnings).await {
         Ok(id) => id,
@@ -460,33 +529,35 @@ async fn generate_vex(
         }
     }
 
-    // Partition manifest into applied / failed.
+    // The plan's advisories (fetch failures, wiring conflicts, superseded
+    // or dead records) are run warnings like any other: human mode prints
+    // them, and the `--json` envelopes — standalone and embedded, success
+    // and failure — carry them in `warnings[]`, the only place their detail
+    // survives (a skip carries just its code). Some are gathered in
+    // patch-fetch completion order: sorted.
+    let mut notes: Vec<&crate::commands::vex_sources::PlanNote> = plan.notes.iter().collect();
+    notes.sort();
+    notes.dedup();
+    for note in notes {
+        note_warning(warnings, common, note.code, note.detail.clone());
+    }
+
+    // Partition the record view into applied / failed. The plan already
+    // applied every gate hashing cannot stand in for (wiring liveness, the
+    // wired-uuid rule, record match), so `--no-verify` skips ONLY the
+    // hashing below — a stale ledger no lockfile wires stays omitted.
     let mut outcome = if params.no_verify {
-        // Trust-the-manifest mode still needs the vendored classification:
+        // Trust-the-records mode still needs the vendored classification:
         // the property-7 exemption and the "(vendored)" phrasing key off
-        // `outcome.vendored`, and both are about how the patch persists,
-        // not whether this run hashed it. The committed ledger is as
-        // trustworthy as the manifest beside it, and reading it hashes
-        // nothing. An unreadable ledger degrades to "nothing vendored"
-        // (and says so).
-        let entries = match ledger {
-            Ok(state) => state.entries,
-            Err(e) => {
-                note_warning(
-                    warnings,
-                    common,
-                    "vendor_state_unreadable",
-                    vendor_state_unreadable_message(&e.to_string()),
-                );
-                HashMap::new()
-            }
-        };
-        let vendored = manifest
-            .patches
+        // `outcome.vendored`, and both are about how the patch persists (a
+        // LIVE vendor wiring, per the plan), not whether this run hashed it.
+        let mut vendored: Vec<String> = plan
+            .vendor_entries
             .keys()
-            .filter(|purl| socket_patch_core::vendor::lookup_entry(&entries, purl).is_some())
+            .filter(|purl| manifest.patches.contains_key(*purl))
             .cloned()
             .collect();
+        vendored.sort();
         VerifyOutcome {
             applied: manifest.patches.keys().cloned().collect(),
             vendored,
@@ -499,17 +570,63 @@ async fn generate_vex(
         // mirroring apply/rollback's `silent || json` gating.
         let quiet = common.silent || common.json || params.output.is_none();
         let purls: Vec<String> = manifest.patches.keys().cloned().collect();
-        let package_paths = find_manifest_package_paths(&purls, common, quiet).await;
-        let (vendor, vendor_warning) = vendor_context_from(common, manifest, ledger).await;
-        if let Some(detail) = vendor_warning {
-            note_warning(warnings, common, "vendor_state_unreadable", detail);
-        }
-        socket_patch_core::vex::applied_patches_with_vendor(
+        // ONE installed-tree lookup: the first copy of every purl for the
+        // record check, every copy of the hosted ones below.
+        let copies = find_manifest_package_copies(&purls, common, quiet).await;
+        let package_paths = collapse_to_first(copies.clone());
+        let go_patches = synthesize_go_patches(common, manifest, &plan.vendor_entries).await;
+        // Hosted-basis purls are judged by the copies their build CONSUMES
+        // (the Go replacement module, the Socket registry's cargo src dir,
+        // maven's suffixed version; every copy where hosted and registry
+        // bytes share a location) — never by a pristine sibling the
+        // crawler's first match may be. See `vex_consumed`.
+        let hosted =
+            crate::commands::vex_consumed::hosted_consumed_copies(common, &plan.hosted, &copies)
+                .await;
+        let vendor = VendorContext {
+            project_root: common.cwd.clone(),
+            entries: plan.vendor_entries.clone(),
+            go_patches,
+            hosted,
+        };
+        let mut outcome = socket_patch_core::vex::applied_patches_with_vendor(
             manifest,
             &package_paths,
-            vendor.as_ref(),
+            Some(&vendor),
         )
-        .await
+        .await;
+        // Hosted lockfile basis: a DISCOVERED Socket-host reference whose
+        // lock pins the artifact attests from that wiring when no installed
+        // tree exists yet (a lockfile-only CI checkout) — the evidence the
+        // in-run `scan --mode hosted --vex` uses. An installed tree that
+        // does not verify still wins (hash_mismatch / not_applied stay
+        // failures): only the absence of any installed copy is excused.
+        //
+        // "Absent" must mean the crawler LOOKED: `--ecosystems` /
+        // `SOCKET_ECOSYSTEMS` keeps out-of-scope purls from being crawled at
+        // all, and they come back `package_not_found` too. Excusing those
+        // would attest a lockfile-basis patch over an installed tree that
+        // was never inspected (and may be unpatched), so they stay omitted
+        // like every other out-of-scope purl.
+        let crawled = |purl: &str| {
+            !crate::ecosystem_dispatch::partition_purls(
+                std::slice::from_ref(&purl.to_string()),
+                common.ecosystems.as_deref(),
+            )
+            .is_empty()
+        };
+        let mut lockfile_attested = Vec::new();
+        outcome.failed.retain(|f| {
+            let excused = f.reason == "package_not_found"
+                && plan.lockfile_basis.contains(&f.purl)
+                && crawled(&f.purl);
+            if excused {
+                lockfile_attested.push(f.purl.clone());
+            }
+            !excused
+        });
+        outcome.applied.extend(lockfile_attested);
+        outcome
     };
 
     // In-run `scan --redirect --vex`: the bytes of deps THAT RUN confirmed
@@ -564,6 +681,12 @@ async fn generate_vex(
                 }),
         );
     }
+
+    // The plan's gate omissions (record_unavailable / record_mismatch /
+    // vendor_unwired / redirect_unwired / wiring_conflict) join the omission
+    // channel so they surface as per-purl `skipped` events like any
+    // verification failure.
+    outcome.failed.extend(plan.gated.iter().cloned());
 
     // Vendored disclosure: the committed artifact verified (the attestation
     // stands — the committables are what the lockfile consumes) but the LIVE
@@ -631,9 +754,9 @@ async fn generate_vex(
             purl,
             reason: ECOSYSTEM_NOT_SETUP.to_string(),
         }));
-    // `manifest.patches` is a HashMap: without a sort the omission order
-    // (stderr, the error list and the JSON `skipped` events) changes run
-    // to run.
+    // `failed` is built by iterating the record view's HashMap: without a
+    // sort the omission order (stderr, the error list and the JSON
+    // `skipped` events) changes run to run.
     outcome
         .failed
         .sort_by(|a, b| (&a.purl, &a.reason).cmp(&(&b.purl, &b.reason)));
@@ -807,9 +930,66 @@ pub(crate) async fn generate_vex_from_manifest_path(
     params: &VexBuildParams,
     manifest_path: &Path,
 ) -> Result<VexWriteSummary, VexGenError> {
+    generate_vex_with_cleanup(common, params, manifest_path, false).await
+}
+
+/// Outcome of [`generate_vex_without_manifest`].
+pub(crate) enum ManifestlessVex {
+    /// Nothing references a patch anywhere (no manifest, no ledger record,
+    /// no lockfile reference): the caller keeps its historical calm
+    /// no-manifest exit 0. Carries the run's advisories (the lockfile-
+    /// discovery diagnostics — an unparseable lock may be WHY nothing was
+    /// found — and a removed stale document) for the `--json` envelope's
+    /// `warnings[]`; human mode already printed them.
+    NothingToAttest(Vec<RunWarning>),
+    /// The document was written.
+    Written(VexWriteSummary),
+    /// Generation failed: the caller fails the command.
+    Failed(VexGenError),
+}
+
+/// Embedded `--vex` for a command that found NO manifest (`apply`,
+/// `vendor`): hosted and vendored patches are wired by the lockfiles and
+/// the `.socket/vendor` ledgers, not the manifest, so a manifest-less
+/// checkout can still have patches to attest and a requested document must
+/// be written (or the command must fail). "Nothing to attest anywhere" is
+/// [`ManifestlessVex::NothingToAttest`], not a failure: an ambient
+/// `SOCKET_VEX` on a project that never used socket-patch must not start
+/// failing installs, so it sends no failure telemetry. A stale document at
+/// the output path is removed in that case too (same contract as
+/// [`generate_vex_from_manifest_path`]: this run attested nothing, so
+/// yesterday's `not_affected` must not survive at the path).
+pub(crate) async fn generate_vex_without_manifest(
+    common: &GlobalArgs,
+    params: &VexBuildParams,
+    manifest_path: &Path,
+) -> ManifestlessVex {
+    match generate_vex_with_cleanup(common, params, manifest_path, true).await {
+        Ok(summary) => ManifestlessVex::Written(summary),
+        Err(e) if e.code == "manifest_not_found" => ManifestlessVex::NothingToAttest(e.warnings),
+        Err(e) => ManifestlessVex::Failed(e),
+    }
+}
+
+/// [`generate_vex_from_manifest_path`]'s failure-cleanup wrapper, shared
+/// with [`generate_vex_without_manifest`] (`calm_when_nothing`: see
+/// [`generate_vex_from_manifest_path_inner`]). The run's advisories land on
+/// the summary or the error either way.
+async fn generate_vex_with_cleanup(
+    common: &GlobalArgs,
+    params: &VexBuildParams,
+    manifest_path: &Path,
+    calm_when_nothing: bool,
+) -> Result<VexWriteSummary, VexGenError> {
     let mut warnings = Vec::new();
-    let result =
-        generate_vex_from_manifest_path_inner(common, params, manifest_path, &mut warnings).await;
+    let result = generate_vex_from_manifest_path_inner(
+        common,
+        params,
+        manifest_path,
+        calm_when_nothing,
+        &mut warnings,
+    )
+    .await;
     match result {
         Ok(mut summary) => {
             summary.warnings = warnings;
@@ -861,10 +1041,18 @@ async fn remove_stale_vex_doc(path: &Path) -> bool {
 }
 
 /// [`generate_vex_from_manifest_path`] without the failure-cleanup wrapper.
+///
+/// Loads every attestation source — the manifest (a missing file is fine),
+/// both `.socket/vendor` ledgers, and the project's lockfile references —
+/// merges them into a [`Plan`] ([`vex_sources::plan`]), and hands that to
+/// [`generate_vex`].
 async fn generate_vex_from_manifest_path_inner(
     common: &GlobalArgs,
     params: &VexBuildParams,
     manifest_path: &Path,
+    // `manifest_not_found` is the caller's calm no-op, not a failure: skip
+    // the failure telemetry for it (see [`generate_vex_without_manifest`]).
+    calm_when_nothing: bool,
     warnings: &mut Vec<RunWarning>,
 ) -> Result<VexWriteSummary, VexGenError> {
     let manifest_file = match read_manifest(manifest_path).await {
@@ -877,27 +1065,13 @@ async fn generate_vex_from_manifest_path_inner(
         }
     };
     let had_manifest_file = manifest_file.is_some();
-    // ONE read of the committed vendor ledger for the whole run: the
-    // detached fold here, then either the `--no-verify` classification or
-    // the verify-path `VendorContext` (where a read error is surfaced; an
-    // unreadable ledger leaves the manifest view unchanged here and
-    // verification fails closed per entry downstream). When that unreadable
-    // ledger was the ONLY possible source — a manifest-free vendored
-    // project, the D2 posture — the empty view below fails before any
-    // downstream report, so the read error is disclosed right there: the
-    // operator must learn the ledger is broken, not that a manifest they
-    // never had is missing.
-    let ledger = socket_patch_core::vendor::load_state(&common.cwd).await;
-    // Vendored patches (manifest-free by design: every `scan`/`get --mode
-    // vendored` entry is detached with its embedded record) and redirected
-    // patches (`scan --redirect`) have no manifest record; the vendor and
-    // redirect ledgers' embedded copies must still attest.
-    let mut manifest = manifest_file.unwrap_or_else(PatchManifest::new);
-    if let Ok(state) = &ledger {
-        crate::commands::fold_detached_records(&mut manifest, &state.entries);
-    }
-    let (manifest, redirected) = match augment_with_redirect(common, manifest).await {
-        Ok(augmented) => augmented,
+    // Both ledgers are attestation inputs (records, and the entries whose
+    // wiring liveness gates them), so a MALFORMED one is a hard error:
+    // attesting with its contents silently dropped would produce a false —
+    // or silently partial — document. A missing ledger is simply empty.
+    let redirect = match socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await
+    {
+        Ok(state) => state,
         Err(corrupt) => {
             // Not core's Display: that text ("... so it will not be
             // overwritten") is written for the `scan --redirect` writer, and
@@ -911,64 +1085,64 @@ async fn generate_vex_from_manifest_path_inner(
             return Err(fail(common, "redirect_ledger_corrupt", message).await);
         }
     };
-    if manifest.patches.is_empty() {
-        let ledger_note = match &ledger {
-            Err(e) => {
-                note_warning(
-                    warnings,
-                    common,
-                    "vendor_state_unreadable",
-                    vendor_state_unreadable_message(&e.to_string()),
-                );
-                format!("; the vendor ledger is also unreadable ({e})")
-            }
-            Ok(_) => String::new(),
-        };
+    let vendor = match socket_patch_core::vendor::load_state(&common.cwd).await {
+        Ok(state) => state,
+        Err(e) => {
+            let message = format!(
+                "The vendor ledger {} is unreadable ({e}); refusing to attest from a partial \
+                 view. Restore it from version control or re-run `socket-patch vendor`.",
+                socket_patch_core::vendor::VENDOR_STATE_REL
+            );
+            return Err(fail(common, "vendor_ledger_corrupt", message).await);
+        }
+    };
+    // Rooted where the ledgers are (`--cwd`). It runs under `--global` /
+    // `--global-prefix` too: the redirect and vendor ledgers are still read
+    // from `--cwd`, and discovery is what gates them (core discover rule
+    // 11). Skipping it handed every ledger claim to the raw-text fallbacks,
+    // which must never decide a uuid a lockfile mentions — so a
+    // commented-out or rejected pin attested again under `--global`.
+    let discovery = crate::commands::discover_wiring(common, &common.cwd).await;
+    for diag in &discovery.diagnostics {
+        note_warning(warnings, common, diag.code, diag.detail.clone());
+    }
+    let sources = Sources {
+        manifest: manifest_file.unwrap_or_else(PatchManifest::new),
+        vendor,
+        redirect,
+        discovery,
+    };
+    if sources.is_empty() {
+        // A discovery diagnostic (an unparseable lock, a rejected reference)
+        // may be the only clue why nothing was found: the wrapper keeps the
+        // run's warnings on the error.
         if !had_manifest_file {
-            return Err(fail(
-                common,
-                "manifest_not_found",
-                format!(
-                    "Manifest not found at {}{ledger_note}",
-                    manifest_path.display()
-                ),
-            )
-            .await);
+            let message = format!(
+                "Manifest not found at {}, and no hosted or vendored patch references were \
+                 found in the project's lockfiles or .socket/vendor ledgers — nothing to \
+                 attest.",
+                manifest_path.display()
+            );
+            return Err(if calm_when_nothing {
+                VexGenError {
+                    code: "manifest_not_found",
+                    message,
+                    failed: Vec::new(),
+                    warnings: Vec::new(),
+                }
+            } else {
+                fail(common, "manifest_not_found", message).await
+            });
         }
         return Err(fail(
             common,
             "no_patches",
-            format!("Manifest is empty — nothing to attest.{ledger_note}"),
+            "Manifest is empty — nothing to attest.".to_string(),
         )
         .await);
     }
-    generate_vex(common, params, &manifest, &redirected, ledger, warnings).await
-}
-
-/// Fold the `scan --redirect` ledger's embedded records into a manifest view
-/// and return the set of redirected PURLs (so the builder can mark them
-/// `(redirected)`). Redirected patches have no `.socket/manifest.json` record
-/// by design — the lockfile rewrite + this ledger IS the persistence — so,
-/// like detached vendored patches, they must still be attestable. An existing
-/// manifest entry wins a collision (that PURL is manifest-owned). A missing
-/// ledger leaves the manifest unchanged and returns no redirected PURLs; a
-/// MALFORMED ledger is a hard error — attesting with its records silently
-/// dropped would produce a false document.
-async fn augment_with_redirect(
-    common: &GlobalArgs,
-    mut manifest: PatchManifest,
-) -> Result<(PatchManifest, Vec<String>), socket_patch_core::patch::redirect::CorruptRedirectState>
-{
-    let mut redirected = Vec::new();
-    if let Some(state) =
-        socket_patch_core::patch::redirect::load_redirect_state(&common.cwd).await?
-    {
-        for (purl, record) in state.records {
-            redirected.push(purl.clone());
-            manifest.patches.entry(purl).or_insert(record);
-        }
-    }
-    Ok((manifest, redirected))
+    let plan = vex_sources::plan(common, sources, &params.assume_applied).await;
+    generate_vex(common, params, plan, warnings).await
 }
 
 /// Fire `vex_failed` telemetry and build the matching [`VexGenError`].
@@ -1023,7 +1197,14 @@ async fn resolve_product_id(
 
 /// The project manifests product auto-detection reads (after the git
 /// remote), in its probe order.
-const PRODUCT_MANIFESTS: &[&str] = &["package.json", "pyproject.toml", "Cargo.toml"];
+const PRODUCT_MANIFESTS: &[&str] = &[
+    "package.json",
+    "pyproject.toml",
+    "Cargo.toml",
+    "go.mod",
+    "composer.json",
+    "pom.xml",
+];
 
 /// The `product_undetected` message. `found` names the manifests that exist
 /// but yielded no PURL (no name/version), so the user knows which file to
@@ -1054,12 +1235,11 @@ fn join_and(items: &[&str]) -> String {
 }
 
 /// The one `unreadable vendor state` advisory (contract: `setup --check`
-/// and `vex` surface a ledger they cannot read or parse as this line, muted
-/// by `--silent`): a read-only consumer degrades to "nothing vendored" and
-/// says so, on stderr, so the operator learns why nothing attests. `vex`
-/// routes the same [`vendor_state_unreadable_message`] through its
-/// warnings channel instead (stderr in human mode, `warnings[]` under
-/// `--json`); this direct form is `setup --check`'s.
+/// surfaces a ledger it cannot read or parse as this line, muted by
+/// `--silent`): a read-only consumer degrades to "nothing vendored" and says
+/// so, on stderr, so the operator learns why nothing verifies. (`vex` itself
+/// refuses an unreadable ledger outright — `vendor_ledger_corrupt` — since
+/// the ledger's entries gate what attests.)
 pub(crate) fn warn_unreadable_vendor_state(common: &GlobalArgs, e: &std::io::Error) {
     if !common.silent {
         eprintln!(
@@ -1069,12 +1249,14 @@ pub(crate) fn warn_unreadable_vendor_state(common: &GlobalArgs, e: &std::io::Err
     }
 }
 
-/// Build the [`VendorContext`] for verification from `ledger` — the
-/// caller's ONE `load_state` of `.socket/vendor/state.json` (it also fed
-/// the detached-record fold) — plus synthesized entries for the legacy
-/// `.socket/go-patches/` redirect backend. Shared by `vex` and `setup
-/// --check`'s patch-consistency pass — both must judge a vendored patch by
-/// the committed artifact, never the installed tree.
+/// Build the [`VendorContext`] for `setup --check`'s patch-consistency pass
+/// from `ledger` — the caller's ONE `load_state` of
+/// `.socket/vendor/state.json` (it also fed the vendor-record fold) — plus
+/// synthesized entries for the legacy `.socket/go-patches/` redirect
+/// backend: a vendored patch is judged by the committed artifact, never the
+/// installed tree. (`vex` itself builds its context from the gated plan
+/// instead, so a ledger entry no lockfile wires never routes its
+/// verification.)
 ///
 /// The go-patches synthesis fixes a latent bug: an apply-redirected Go
 /// patch leaves the module cache pristine (the `replace` directive routes
@@ -1111,6 +1293,7 @@ pub(crate) async fn vendor_context_from(
         project_root: common.cwd.clone(),
         entries,
         go_patches,
+        hosted: HashMap::new(),
     };
     (Some(context), warning)
 }
@@ -1124,10 +1307,13 @@ pub(crate) fn vendor_state_unreadable_message(cause: &str) -> String {
     )
 }
 
-/// Synthesize go-patches redirect targets for [`vendor_context_from`]: for
-/// every socket-owned (`.socket/go-patches/`) `replace` in `go.mod` whose
-/// module+version maps to a manifest golang PURL with no explicit vendor
-/// entry, record the absolute redirect copy dir for dir-hash verification.
+/// Synthesize go-patches redirect targets for [`vendor_context_from`] and
+/// `vex`: for every socket-owned (`.socket/go-patches/`) `replace` in
+/// `go.mod` whose module+version maps to a golang PURL of the record view
+/// (`manifest` — for `vex` the merged manifest + ledger + lockfile view, so
+/// a manifest-less project's ledger-recorded Go patch verifies too) with no
+/// explicit vendor entry, record the absolute redirect copy dir for
+/// dir-hash verification.
 async fn synthesize_go_patches(
     common: &GlobalArgs,
     manifest: &PatchManifest,
@@ -1176,7 +1362,8 @@ async fn synthesize_go_patches(
 /// Emit a `vex` error to the active output channel: an error envelope on
 /// stdout in `--json` mode, a stderr message otherwise. `failures` lists
 /// patches omitted by verification (populated for `no_applicable_patches`,
-/// empty everywhere else).
+/// empty everywhere else); `warnings` are the run's advisories, already on
+/// stderr in human mode, folded into the envelope's `warnings[]` here.
 fn emit_envelope_error(
     args: &VexArgs,
     code: &str,
@@ -1222,7 +1409,34 @@ fn omission_phrase(reason: &str) -> &'static str {
         "file_not_found" => "a patched file is missing",
         "no_files" => "the patch record lists no files",
         "vendor_hash_mismatch" => "the vendored artifact does not match the patch",
+        "vendor_artifact_missing" => "the vendored artifact is missing",
+        "vendor_artifact_unreadable" => "the vendored artifact cannot be read",
+        "vendor_path_unsafe" => "the vendored artifact path is unsafe",
+        "vendor_uuid_mismatch" => "the vendored artifact belongs to a different patch",
+        "vendor_inventory_mismatch" => {
+            "the vendored artifact's contents do not match its ledger inventory"
+        }
         "stale_install" => "the installed copy is not patched",
+        RECORD_UNAVAILABLE => {
+            "a lockfile wires the patch, but no local record exists and the patch API could not \
+             supply one (offline, a network error, not found, or a paid patch without an API \
+             token)"
+        }
+        RECORD_MISMATCH => {
+            "the patch record names a different package or patch than the lockfile wires"
+        }
+        VENDOR_UNWIRED => {
+            "the vendor ledger records its artifact, but no lockfile or config wires it to this \
+             package any more"
+        }
+        REDIRECT_UNWIRED => {
+            "the redirect ledger records it, but no lockfile wires its hosted patch to this \
+             package any more"
+        }
+        WIRING_CONFLICT => {
+            "the lockfiles wire this package to different patches, so which one the build \
+             installs cannot be determined"
+        }
         _ => "the patch could not be verified",
     }
 }
@@ -1484,7 +1698,13 @@ mod tests {
             "file_not_found",
             "no_files",
             "vendor_hash_mismatch",
+            "vendor_artifact_missing",
             "stale_install",
+            RECORD_UNAVAILABLE,
+            RECORD_MISMATCH,
+            VENDOR_UNWIRED,
+            REDIRECT_UNWIRED,
+            WIRING_CONFLICT,
         ] {
             assert_ne!(
                 omission_phrase(tag),

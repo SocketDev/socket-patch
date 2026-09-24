@@ -11,19 +11,38 @@
 //!
 //! Hermetic + offline: a tiny upstream module is served from a local file
 //! GOPROXY into a temp GOMODCACHE, so no network and no pre-cached module are
-//! needed. Skips when `go`/`zip` aren't installed.
+//! needed. Skips when `go`/`zip` aren't installed (a failure under
+//! `SOCKET_PATCH_GO_E2E_REQUIRED`; the Go release is whatever `go` is on
+//! `PATH` — see `golang_e2e_matrix`).
+//!
+//! VEX tail: the committed go-patches redirect attests (manifest record) on
+//! a fresh checkout built fully offline; with the manifest deleted it is NOT
+//! attestable — `./.socket/go-patches/M@v` carries no patch uuid, so there
+//! is no record to resolve (documented limitation of `apply`'s agent-mode
+//! redirect; hosted/vendored wiring carries the uuid and is covered by
+//! `e2e_golang_hosted_build` / `e2e_vendor_golang_build`).
 
 use std::path::Path;
 use std::process::Command;
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "golang_e2e_matrix/mod.rs"]
+mod golang_e2e_matrix;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
-use common::{binary, cache_env, git_sha256, has_command};
+use common::{binary, cache_env, git_sha256};
+use vex_e2e_common::{
+    assert_absent, assert_attested, run_vex, strip_manifest, Marker, VexRun, VexVia,
+};
 
 const UMOD: &str = "example.com/upstream";
 const UVER: &str = "v1.0.0";
 const UPURL: &str = "pkg:golang/example.com/upstream@v1.0.0";
+const UUID: &str = "4d5e6f70-8192-4a1b-8c2d-0123456789ab";
+const GHSA: &str = "GHSA-gogo-patc-hes1";
+const CVE: &str = "CVE-2026-5151";
 const PRISTINE_LIB: &str = "package upstream\n\nfunc Greeting() string { return \"PRISTINE\" }\n";
 const PATCHED_LIB: &str = "package upstream\n\nfunc Greeting() string { return \"PATCHED\" }\n";
 
@@ -155,7 +174,7 @@ fn write_patch(consumer: &Path) {
     let before = git_sha256(PRISTINE_LIB.as_bytes());
     let after = git_sha256(PATCHED_LIB.as_bytes());
     let manifest = format!(
-        "{{\"patches\":{{\"{UPURL}\":{{\"uuid\":\"u\",\"exportedAt\":\"t\",\"files\":{{\"lib.go\":{{\"beforeHash\":\"{before}\",\"afterHash\":\"{after}\"}}}},\"vulnerabilities\":{{}},\"description\":\"\",\"license\":\"\",\"tier\":\"\"}}}}}}"
+        "{{\"patches\":{{\"{UPURL}\":{{\"uuid\":\"{UUID}\",\"exportedAt\":\"t\",\"files\":{{\"lib.go\":{{\"beforeHash\":\"{before}\",\"afterHash\":\"{after}\"}}}},\"vulnerabilities\":{{\"{GHSA}\":{{\"cves\":[\"{CVE}\"],\"summary\":\"s\",\"severity\":\"high\",\"description\":\"d\"}}}},\"description\":\"\",\"license\":\"\",\"tier\":\"\"}}}},\"setup\":{{\"manual\":[\"golang\"]}}}}"
     );
     std::fs::write(socket.join("manifest.json"), manifest).unwrap();
     std::fs::write(socket.join("blobs").join(&after), PATCHED_LIB).unwrap();
@@ -184,8 +203,7 @@ fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
 
 #[test]
 fn go_build_links_patch_via_replace_redirect() {
-    if !has_command("go") || !has_command("zip") {
-        eprintln!("skipping e2e_golang_build: `go`/`zip` not installed");
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_build") {
         return;
     }
     // RED guards for the hermeticity pins: bake the hostile ambient values in
@@ -280,6 +298,58 @@ fn go_build_links_patch_via_replace_redirect() {
         "re-apply should restore the patched bytes: {}",
         String::from_utf8_lossy(&healed.stdout)
     );
+
+    // ── VEX over a fresh checkout of the committed redirect ─────────────
+    let fresh = tmp.path().join("fresh");
+    golang_e2e_matrix::checkout(&consumer, &fresh);
+    let fresh_mc = tmp.path().join("fresh-modcache");
+    std::fs::create_dir_all(&fresh_mc).unwrap();
+    let offline = go_env(fresh_mc.to_str().unwrap(), "off");
+    let run = go(&fresh, &["run", "."], &offline);
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("OUT: PATCHED"),
+        "fresh checkout (GOPROXY=off) must link the committed copy: {}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    // `vex` reads the committed copy only (empty cache); `apply` needs the
+    // pristine module the redirect copies from, so it runs after the
+    // checkout's `go mod download` (the stage's populated cache).
+    let vex = |via: VexVia, offline: bool| {
+        let cache = if via == VexVia::Apply {
+            &modcache
+        } else {
+            &fresh_mc
+        };
+        let r = VexRun {
+            offline,
+            product: Some("pkg:golang/example.com/consumer@v0.0.1".into()),
+            ..VexRun::default()
+        }
+        .via(via)
+        .env("GOMODCACHE", cache)
+        .env("GOFLAGS", "");
+        run_vex(&vex_e2e_common::binary(), &fresh, &r)
+    };
+    // With the manifest (the record owner in agent mode): attested.
+    let out = vex(VexVia::Vex, true);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(out.doc(), UPURL, UUID, Marker::Applied, &[(GHSA, &[CVE])]);
+    let out = vex(VexVia::Apply, true);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_attested(out.doc(), UPURL, UUID, Marker::Applied, &[(GHSA, &[CVE])]);
+    // Manifest deleted: the go-patches path names no patch uuid, so there is
+    // nothing to attest (not a false attestation: exit 2, no document), and
+    // an embedded `apply --vex` keeps its calm no-manifest exit 0.
+    strip_manifest(&fresh);
+    let out = vex(VexVia::Vex, false);
+    assert_eq!(out.code, Some(2), "{out}");
+    assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
+    assert_absent(out.doc.as_ref(), UPURL);
+    let out = vex(VexVia::Apply, false);
+    assert_eq!(out.code, Some(0), "{out}");
+    assert_eq!(out.envelope["status"], "noManifest", "{out}");
+    assert!(out.doc.is_none(), "{out}");
 
     // Best-effort: relax perms so the temp cache cleans up.
     chmod_writable(tmp.path());

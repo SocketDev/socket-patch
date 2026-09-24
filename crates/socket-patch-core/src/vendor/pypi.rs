@@ -1250,7 +1250,7 @@ async fn unwired_pypi_reference_clause(project_root: &Path, uuid: &str) -> Optio
         {
             continue;
         }
-        if let Some(script) = name.strip_suffix(".lock").filter(|s| s.ends_with(".py")) {
+        if let Some(script) = crate::utils::python_lock::script_of_lock(&name) {
             names.push(script.to_string());
         }
         if !names.contains(&name) {

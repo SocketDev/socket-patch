@@ -30,14 +30,28 @@
 //! `rewrite_registry_redirect` engine in-process, and the `get`-driven twin
 //! drives the full CLI (`get <uuid> --mode hosted`) against a wiremock API,
 //! proving the advisory-selector path lands the identical go.mod/go.sum.
+//!
+//! Both end in the manifest-less VEX tail
+//! ([`golang_e2e_matrix::manifestless_vex`]): a fresh checkout on a fresh
+//! machine (real `go run`, patched module in its cache) attests the patch
+//! `(redirected)` from go.mod/go.sum + the patch API alone — with and
+//! without the redirect ledger, never offline without a record, never once
+//! the replace is reverted. The Go release is whatever `go` is on `PATH`
+//! (see `golang_e2e_matrix` for the version matrix knobs).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "golang_e2e_matrix/mod.rs"]
+mod golang_e2e_matrix;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
 
-use common::{cache_env, has_command};
+use common::cache_env;
+use golang_e2e_matrix::{manifestless_vex, ManifestlessGo};
+use vex_e2e_common::{git_sha256, patch_view, Marker, VexVia};
 
 use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use socket_patch_core::patch::redirect::{
@@ -170,7 +184,10 @@ fn harvest_sums(tmp: &Path, proxy_url: &str, mod_path: &str, ver: &str) -> (Stri
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("go.mod"),
-        "module example.com/harvest\n\ngo 1.21\n",
+        format!(
+            "module example.com/harvest\n\ngo {}\n",
+            golang_e2e_matrix::go_directive()
+        ),
     )
     .unwrap();
     let machine = Machine::new(tmp, &format!("harvest-{}", mod_path.replace('/', "_")));
@@ -205,6 +222,10 @@ struct HostedGoProject {
     /// The socket module's go.sum pair: zip dirhash + served-`.mod` hash.
     zip_h1: String,
     gomod_h1: String,
+    /// The pre-redirect go.mod / go.sum (the registry wiring a revert
+    /// restores).
+    pristine_gomod: String,
+    pristine_gosum: String,
 }
 
 /// Shared fixture for the rewriter capstone and the `get`-driven twin — the
@@ -224,7 +245,8 @@ fn stage_hosted_project(tmp: &Path) -> HostedGoProject {
     let proxy_url = format!("file://{}", tmp.join("proxy").display());
     let smod = socket_module();
 
-    let upstream_gomod = format!("module {UMOD}\n\ngo 1.21\n");
+    let go_directive = golang_e2e_matrix::go_directive();
+    let upstream_gomod = format!("module {UMOD}\n\ngo {go_directive}\n");
     publish(tmp, UMOD, UVER, &upstream_gomod, PRISTINE_LIB);
     publish(tmp, &smod, SVER, &upstream_gomod, PATCHED_LIB);
     let (zip_h1, gomod_h1) = harvest_sums(tmp, &proxy_url, &smod, SVER);
@@ -234,7 +256,7 @@ fn stage_hosted_project(tmp: &Path) -> HostedGoProject {
     std::fs::create_dir_all(&consumer).unwrap();
     std::fs::write(
         consumer.join("go.mod"),
-        format!("module example.com/consumer\n\ngo 1.21\n\nrequire {UMOD} {UVER}\n"),
+        format!("module example.com/consumer\n\ngo {go_directive}\n\nrequire {UMOD} {UVER}\n"),
     )
     .unwrap();
     std::fs::write(
@@ -261,6 +283,8 @@ fn stage_hosted_project(tmp: &Path) -> HostedGoProject {
     assert!(String::from_utf8_lossy(&base.stdout).contains("OUT: PRISTINE"));
 
     HostedGoProject {
+        pristine_gomod: std::fs::read_to_string(consumer.join("go.mod")).unwrap(),
+        pristine_gosum: std::fs::read_to_string(consumer.join("go.sum")).unwrap(),
         consumer,
         proxy_url,
         smod,
@@ -269,14 +293,80 @@ fn stage_hosted_project(tmp: &Path) -> HostedGoProject {
     }
 }
 
+/// The manifest-less VEX tail over a hosted project's committed state: each
+/// fresh checkout gets its own fresh "machine" and a REAL day-2 `go run`
+/// (which must link PATCHED from the committed go.mod/go.sum alone); the
+/// revert restores the pre-redirect go.mod/go.sum and must link PRISTINE.
+fn hosted_vex_tail(tmp: &Path, fx: &HostedGoProject, label: &str, vulns: &[(&str, &[&str])]) {
+    let env = day2_env(&fx.proxy_url);
+    let n = std::cell::Cell::new(0);
+    let machine = |what: &str| {
+        n.set(n.get() + 1);
+        Machine::new(
+            tmp,
+            &format!("vex-{}-{what}-{}", label.replace('/', "-"), n.get()),
+        )
+    };
+    let install = |dir: &Path| {
+        let m = machine("install");
+        let out = go(dir, &m, &["run", "."], &as_pairs(&env));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("OUT: PATCHED"),
+            "[{label}] fresh checkout must link PATCHED: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        m.modcache
+    };
+    let revert = |dir: &Path| {
+        std::fs::write(dir.join("go.mod"), &fx.pristine_gomod).unwrap();
+        std::fs::write(dir.join("go.sum"), &fx.pristine_gosum).unwrap();
+        let m = machine("revert");
+        let out = go(dir, &m, &["run", "."], &as_pairs(&env));
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("OUT: PRISTINE"),
+            "[{label}] reverted checkout must link PRISTINE: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        m.modcache
+    };
+    let purl = format!("pkg:golang/{UMOD}@{UVER}");
+    manifestless_vex(&ManifestlessGo {
+        label,
+        committed: &fx.consumer,
+        scratch: tmp,
+        purl: &purl,
+        uuid: UUID,
+        marker: Marker::Redirected,
+        vulns,
+        view: patch_view(
+            UUID,
+            &purl,
+            &[("lib.go", &git_sha256(PATCHED_LIB.as_bytes()))],
+            vulns,
+        ),
+        install: &install,
+        revert: &revert,
+        tamper: &|_dir, modcache| {
+            golang_e2e_matrix::overwrite(
+                &modcache.join(format!("{}@{SVER}/lib.go", fx.smod)),
+                b"package upstream // tampered\n",
+            )
+        },
+        tamper_reason: "hash_mismatch",
+        unwired_reason: "redirect_unwired",
+        embedded: &[VexVia::Apply],
+    });
+}
+
 // #[serial]: this test mutates process env (GOTOOLCHAIN/GOFLAGS/GONOSUMDB
 // set_var) while its sibling below iterates env for the subprocess spawn —
 // unserialized, the two race on the process-global environment.
 #[test]
 #[serial_test::serial]
 fn day2_machine_builds_patched_module_from_committed_files_alone() {
-    if !has_command("go") || !has_command("zip") {
-        eprintln!("skipping e2e_golang_hosted_build: `go`/`zip` not installed");
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_hosted_build") {
         return;
     }
     // RED guards: hostile ambient values every pinned env below must defeat.
@@ -441,6 +531,14 @@ fn day2_machine_builds_patched_module_from_committed_files_alone() {
         "failure must come from the bogus checksum DB (tripwire armed), got: {dl_err}"
     );
     std::fs::write(consumer.join("go.sum"), &before_sum).unwrap();
+
+    // ── manifest-less VEX over the committed state ───────────────────────
+    hosted_vex_tail(
+        tmp.path(),
+        &fx,
+        "hosted/rewriter",
+        &[(GHSA, &["CVE-2026-4242"])],
+    );
 }
 
 /// `get <uuid> --mode hosted` twin of the capstone above: the CLI's
@@ -457,8 +555,7 @@ fn day2_machine_builds_patched_module_from_committed_files_alone() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn golang_get_uuid_hosted_day2_machine_builds() {
-    if !has_command("go") || !has_command("zip") {
-        eprintln!("skipping e2e_golang_hosted_build: `go`/`zip` not installed");
+    if !golang_e2e_matrix::toolchain_ready("e2e_golang_hosted_build") {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -655,4 +752,14 @@ async fn golang_get_uuid_hosted_day2_machine_builds() {
         "day-2 build must link the PATCHED module: {}",
         String::from_utf8_lossy(&patched.stdout)
     );
+
+    // ── manifest-less VEX over the committed state (ledger included) ─────
+    // The API stand-in owns its own runtime, so the tail runs off this
+    // test's async runtime.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| hosted_vex_tail(tmp.path(), &fx, "hosted/get", &[(GHSA, &["CVE-2026-4242"])]))
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e))
+    });
 }

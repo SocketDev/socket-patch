@@ -223,7 +223,12 @@ fn split_nuget_leaf(stem: &str) -> Option<(&str, &str)> {
 /// Reconstruct the base PURL from a vendored leaf. This is the orphan-sweep
 /// FALLBACK identification (state.json is the ledger of record); `None` means
 /// "unrecognisable — report, never delete by guess".
-fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
+///
+/// The leaf must be CLEAN (no lock-format suffix such as yarn's `#<sha1>` or
+/// berry's `::locator=…`) and pypi dist names come back un-canonicalized;
+/// `vex::discover::vendored_leaf_purl` strips the former and canonicalizes
+/// the latter for lockfile-discovered references.
+pub(crate) fn leaf_to_purl(eco: &str, leaf: &str) -> Option<String> {
     match eco {
         "npm" => {
             let stem = leaf.strip_suffix(".tgz")?;

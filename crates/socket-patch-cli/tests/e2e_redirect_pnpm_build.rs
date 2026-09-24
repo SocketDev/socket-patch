@@ -33,6 +33,15 @@
 //! second fixture covers scoped aliases and peer variants in workspaces on
 //! pnpm >=6. The older named corepack capstones remain opt-in conveniences.
 //!
+//! MANIFEST-LESS VEX: every positive leg (matrix and named) ends in
+//! `assert_manifestless_hosted_vex` over its real fresh install — the
+//! ledger record, then the lockfile alone + the patch API record, then
+//! `--offline` (`record_unavailable`, zero requests), then embedded
+//! `scan --mode hosted --vex`, then the lock reverted with the ledger kept
+//! (`redirect_unwired`, `--no-verify` too). The hermetic evidence edges
+//! (tampered / pristine installs, spoofed hosts, record mismatches) live in
+//! `e2e_vex_lockfile/pnpm.rs`.
+//!
 //! TRUST AUTO-CONFIG: a scan that rewrites a ROOT v9 lock also ensures
 //! `trustLockfile: true` in pnpm-workspace.yaml (ledger edit kind
 //! `redirect_pnpm_workspace_trust`; the workspace file joins
@@ -64,6 +73,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+use vex_e2e_common::{
+    assert_absent, assert_attested, assert_not_attested, patch_view, run_vex, strip_ledgers,
+    strip_manifest, Marker, PatchApi, VexRun, VexVia,
+};
 
 const ORG: &str = "test-org";
 const DEP: &str = "left-pad";
@@ -597,6 +612,23 @@ async fn redirect_scanned_pnpm_project(
         );
         assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), lock_before);
         assert!(!proj.join(".socket/vendor/redirect-state.json").exists());
+        // Nothing was wired, so a manifest-less VEX finds nothing to attest
+        // (the pristine lock names no Socket patch) and never goes online.
+        off_runtime(|| {
+            let api = hosted_patch_api(PURL, &patched);
+            let out = run_vex(
+                &binary(),
+                &proj,
+                &VexRun {
+                    patch_server_url: Some(server.uri()),
+                    ..VexRun::online(&api)
+                },
+            );
+            assert_eq!(out.code, Some(2), "refused legacy lock vex: {out}");
+            assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
+            assert_absent(out.doc.as_ref(), PURL);
+            api.assert_no_requests();
+        });
         println!(
             "EXPECTED REFUSAL: pnpm 1.0.0 discards hosted URLs; lock unchanged, no patch confirmed"
         );
@@ -868,6 +900,176 @@ fn assert_marker_landed(fresh: &Path, patched: &[u8], ci: &Output, tag: &str) {
     );
 }
 
+// ── manifest-less VEX (lockfile discovery) ─────────────────────────────
+
+/// Run `f` on a scoped OS thread outside the test's tokio runtime:
+/// [`PatchApi`] owns its own runtime, which can be neither started nor
+/// dropped from inside an async context. A panic in `f` fails the test
+/// with its original message.
+fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        s.spawn(f)
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
+}
+
+/// The vulnerability set every hosted fixture's view record carries.
+const HOSTED_VULNS: &[(&str, &[&str])] = &[(GHSA, &["CVE-2026-2222"])];
+
+/// A patch API stand-in serving `purl`'s patch view with the REAL patched
+/// bytes' hash — the record a manifest-less, ledger-less checkout recovers
+/// from the API.
+fn hosted_patch_api(purl: &str, patched: &[u8]) -> PatchApi {
+    PatchApi::start(vec![(
+        UUID.to_string(),
+        patch_view(
+            UUID,
+            purl,
+            &[("package/index.js", &compute_git_sha256_from_bytes(patched))],
+            HOSTED_VULNS,
+        ),
+    )])
+}
+
+/// Manifest-less VEX over a checkout `fresh` that the real pnpm installed
+/// from the redirected lock (the marker bytes have landed). `patch_server`
+/// is the wiremock origin the lock's hosted URLs point at (a Socket host in
+/// production; here it must be named via `--patch-server-url`). Proves, in
+/// order:
+///
+/// 1. no `.socket/manifest.json` (hosted mode never writes one): the ledger
+///    record + the hash-verified installed tree attest `(redirected)`;
+/// 2. ledgers deleted too: the lockfile reference alone, with the record
+///    fetched from the patch API, still attests;
+/// 3. `--offline` with no ledgers: `record_unavailable`, zero API traffic;
+/// 4. the lock reverted to the registry resolution while the ledger (and
+///    the patched installed bytes) stay: NOT attested, `--no-verify` too;
+/// 5. embedded `scan --mode hosted --vex` over the ledger-less checkout
+///    (`api_url` = the flow's discovery/reference mock) attests as well.
+///
+/// `lock_name` / `lock_before` are the committed lock and its pristine
+/// registry bytes.
+fn assert_manifestless_hosted_vex(
+    fresh: &Path,
+    patch_server: &str,
+    lock_name: &str,
+    lock_before: &str,
+    patched: &[u8],
+    purl: &str,
+    tag: &str,
+) {
+    off_runtime(|| {
+        let bin = binary();
+        let api = hosted_patch_api(purl, patched);
+        let with_origin = |run: VexRun| VexRun {
+            patch_server_url: Some(patch_server.to_string()),
+            ..run
+        };
+        let ledger = fresh.join(".socket/vendor/redirect-state.json");
+        let lock = fresh.join(lock_name);
+        let lock_wired = std::fs::read(&lock).expect("fresh checkout lock");
+
+        // 1. Manifest deleted (hosted checkouts carry none): ledger record.
+        strip_manifest(fresh);
+        if ledger.exists() {
+            let out = run_vex(&bin, fresh, &with_origin(VexRun::online(&api)));
+            assert_eq!(out.code, Some(0), "[{tag}] manifest-less vex: {out}");
+            assert_attested(out.doc(), purl, UUID, Marker::Redirected, HOSTED_VULNS);
+            eprintln!("VEX-CELL hosted [{tag}] manifest-deleted: attested");
+        }
+        let ledger_bytes = std::fs::read(&ledger).ok();
+
+        // 2. Ledgers deleted: lockfile discovery + the API record.
+        strip_ledgers(fresh);
+        let views = api.view_requests(UUID);
+        let out = run_vex(&bin, fresh, &with_origin(VexRun::online(&api)));
+        assert_eq!(out.code, Some(0), "[{tag}] ledger-less vex: {out}");
+        assert_attested(out.doc(), purl, UUID, Marker::Redirected, HOSTED_VULNS);
+        assert!(
+            api.view_requests(UUID) > views,
+            "[{tag}] the record must come from the patch API: {:?}",
+            api.requests()
+        );
+        eprintln!("VEX-CELL hosted [{tag}] ledgers-deleted: attested");
+
+        // 3. Offline, no ledgers: the record is unavailable, zero network.
+        let seen = api.request_count();
+        let out = run_vex(&bin, fresh, &with_origin(VexRun::offline()));
+        assert_eq!(out.code, Some(1), "[{tag}] offline ledger-less vex: {out}");
+        assert_not_attested(&out.envelope, purl, "record_unavailable");
+        assert_absent(out.doc.as_ref(), purl);
+        assert_eq!(api.request_count(), seen, "[{tag}] --offline hit the API");
+        eprintln!("VEX-CELL hosted [{tag}] offline: record_unavailable");
+
+        // 5. Embedded: `scan --mode hosted --vex`, manifest- and ledger-less.
+        let scan = VexRun {
+            via: VexVia::Scan,
+            api_url: Some(patch_server.to_string()),
+            api_token: Some("fake".to_string()),
+            org: Some(ORG.to_string()),
+            patch_server_url: Some(patch_server.to_string()),
+            extra_args: vec!["--mode".into(), "hosted".into(), "--yes".into()],
+            ..VexRun::default()
+        };
+        let out = run_vex(&bin, fresh, &scan);
+        assert_eq!(out.code, Some(0), "[{tag}] scan --mode hosted --vex: {out}");
+        assert_attested(out.doc(), purl, UUID, Marker::Redirected, HOSTED_VULNS);
+        assert_eq!(
+            std::fs::read(&lock).unwrap(),
+            lock_wired,
+            "[{tag}] the embedded re-scan must leave the redirected lock byte-stable"
+        );
+        eprintln!("VEX-CELL hosted [{tag}] embedded-scan: attested");
+        strip_ledgers(fresh);
+
+        // 4. Lock reverted to the registry resolution, ledger restored, the
+        //    patched bytes still installed: nothing wires the patch any more.
+        if let Some(bytes) = &ledger_bytes {
+            std::fs::write(&ledger, bytes).unwrap();
+        }
+        std::fs::write(&lock, lock_before).unwrap();
+        for no_verify in [false, true] {
+            let out = run_vex(
+                &bin,
+                fresh,
+                &with_origin(VexRun {
+                    no_verify,
+                    ..VexRun::online(&api)
+                }),
+            );
+            assert_ne!(
+                out.code,
+                Some(0),
+                "[{tag}] reverted lock (no_verify={no_verify}): {out}"
+            );
+            assert_absent(out.doc.as_ref(), purl);
+            if ledger_bytes.is_some() {
+                assert_not_attested(&out.envelope, purl, "redirect_unwired");
+            }
+            eprintln!("VEX-CELL hosted [{tag}] reverted(no_verify={no_verify}): not attested");
+        }
+        std::fs::write(&lock, &lock_wired).unwrap();
+        if let Some(bytes) = &ledger_bytes {
+            std::fs::write(&ledger, bytes).unwrap();
+        }
+    });
+    eprintln!("MANIFEST-LESS HOSTED VEX OK ({tag})");
+}
+
+/// [`assert_manifestless_hosted_vex`] over a fixture's fresh checkout.
+fn assert_fixture_manifestless_vex(fx: &PnpmRedirectFixture, fresh: &Path, tag: &str) {
+    assert_manifestless_hosted_vex(
+        fresh,
+        &fx._server.uri(),
+        &fx.lock_name,
+        &fx.lock_before,
+        &fx.patched,
+        PURL,
+        tag,
+    );
+}
+
 // ── corepack legs (gating mirrors e2e_redirect_rush_sim.rs) ───────────
 
 // multi_thread: the CLI/pnpm subprocesses block a worker thread while
@@ -887,6 +1089,7 @@ async fn pnpm10_redirect_fresh_checkout_frozen_install_lands_patched_bytes() {
     //    patch server because the committed lockfile says so.
     let (fresh, ci) = fresh_checkout_install(&fx, PNPM_PRIMARY, "pnpm10", &[], false);
     assert_marker_landed(&fresh, &fx.patched, &ci, "pnpm10");
+    assert_fixture_manifestless_vex(&fx, &fresh, "pnpm10");
 }
 
 /// Negative twin: the hosted route serves TAMPERED bytes while the lockfile
@@ -965,6 +1168,7 @@ async fn pnpm_get_uuid_hosted_fresh_checkout_frozen_install() {
 
     let (fresh, ci) = fresh_checkout_install(&fx, PNPM_PRIMARY, "pnpm10-get", &[], false);
     assert_marker_landed(&fresh, &fx.patched, &ci, "pnpm10 get-uuid");
+    assert_fixture_manifestless_vex(&fx, &fresh, "pnpm10 get-uuid");
 }
 
 /// Opportunistic pnpm@9 leg (the vendor capstone's secondary convention):
@@ -981,6 +1185,7 @@ async fn pnpm9_redirect_fresh_checkout_frozen_install_lands_patched_bytes() {
     };
     let (fresh, ci) = fresh_checkout_install(&fx, PNPM_SECONDARY, "pnpm9", &[], false);
     assert_marker_landed(&fresh, &fx.patched, &ci, "pnpm9");
+    assert_fixture_manifestless_vex(&fx, &fresh, "pnpm9");
 }
 
 /// pnpm@11 ZERO-TOUCH leg: pnpm 11's lockfile supply-chain policy verifies
@@ -1002,6 +1207,7 @@ async fn pnpm11_zero_touch_frozen_install_lands_patched_bytes_via_auto_trust_con
     };
     let (fresh, ci) = fresh_checkout_install(&fx, PNPM_TERTIARY, "pnpm11-zero-touch", &[], true);
     assert_marker_landed(&fresh, &fx.patched, &ci, "pnpm11 zero-touch");
+    assert_fixture_manifestless_vex(&fx, &fresh, "pnpm11 zero-touch");
 }
 
 /// `--no-trust-lockfile-config` control: pins the opt-out (the scan writes
@@ -1057,6 +1263,7 @@ async fn pnpm11_no_trust_config_opt_out_frozen_install_needs_manual_trust_lockfi
         false,
     );
     assert_marker_landed(&fresh, &fx.patched, &trusted, "pnpm11 --trust-lockfile");
+    assert_fixture_manifestless_vex(&fx, &fresh, "pnpm11 --trust-lockfile");
 }
 
 /// Legacy pnpm@7 leg: the fixture install emits a lockfileVersion 5.4 lock
@@ -1082,6 +1289,7 @@ async fn pnpm7_v5_lock_redirect_fresh_checkout_frozen_install_lands_patched_byte
     );
     let (fresh, ci) = fresh_checkout_install(&fx, PNPM_LEGACY_V5, "pnpm7", &[], false);
     assert_marker_landed(&fresh, &fx.patched, &ci, "pnpm7");
+    assert_fixture_manifestless_vex(&fx, &fresh, "pnpm7");
 }
 
 /// Legacy pnpm@8 leg: same chain over the lockfileVersion 6.0 grammar
@@ -1105,6 +1313,7 @@ async fn pnpm8_v6_lock_redirect_fresh_checkout_frozen_install_lands_patched_byte
     );
     let (fresh, ci) = fresh_checkout_install(&fx, PNPM_LEGACY_V6, "pnpm8", &[], false);
     assert_marker_landed(&fresh, &fx.patched, &ci, "pnpm8");
+    assert_fixture_manifestless_vex(&fx, &fresh, "pnpm8");
 }
 
 // ── synthetic legs (hermetic — no pnpm binary, never ignored) ─────────
@@ -1175,6 +1384,9 @@ async fn pnpm_pinned_matrix_install_verify_revert_and_tamper() {
     let vex: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(vex["statements"][0]["status"], "not_affected", "{vex}");
     assert_eq!(vex["statements"][0]["vulnerability"]["name"], GHSA, "{vex}");
+    // Manifest-less VEX: ledger kept / ledgers deleted / offline / reverted
+    // lock / embedded `scan --mode hosted --vex`, over this real install.
+    assert_fixture_manifestless_vex(&fx, &fresh, &version);
 
     // An ordinary install must also preserve the patch. Use a new store so
     // a warm cache cannot disguise an upstream re-resolution.
@@ -1673,6 +1885,18 @@ async fn pnpm_pinned_matrix_workspace_peer_instances() {
             "{version}: {app}/{target} must install the patched peer instance"
         );
     }
+    // Manifest-less VEX over the fresh workspace: both peer instances are
+    // hash-verified, from the ledger and then from the lockfile alone.
+    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    assert_manifestless_hosted_vex(
+        &fresh,
+        &server.uri(),
+        "pnpm-lock.yaml",
+        &lock_before,
+        &patched,
+        TARGET_PURL,
+        &format!("{version} workspace"),
+    );
     let (code, stdout, stderr) = run_hosted(HostedDriver::Scan, &proj, &server.uri(), &[]);
     assert_eq!(code, 0, "workspace rerun: {stdout}\n{stderr}");
     assert_eq!(

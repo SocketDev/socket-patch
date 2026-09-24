@@ -17,6 +17,11 @@ use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "npm_e2e_common/manifestless.rs"]
+mod npm_e2e_common;
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+
 fn binary() -> PathBuf {
     env!("CARGO_BIN_EXE_socket-patch").into()
 }
@@ -2016,4 +2021,73 @@ async fn repair_offline_without_sources_fails_loudly() {
         "the failure names the purl and the offline cause: {v}"
     );
     assert!(!tgz.exists());
+}
+
+/// Manifest-less VEX over what `repair` restores for npm: (a) a deleted
+/// tarball rebuilt byte-identically, (b) a WHOLESALE-deleted `.socket/vendor`
+/// (ledger reconstructed from the lockfile reference, empty wiring). Either
+/// way the checkout attests `(vendored)` with the manifest deleted, with the
+/// ledgers deleted (lockfile discovery + patch API), never `--offline`
+/// (`record_unavailable`, zero requests), and not once the lock is reverted
+/// (`vendor_unwired` — the reconstructed entry's empty wiring probes the
+/// root locks, which no longer mention it — `--no-verify` too).
+#[tokio::test]
+async fn repaired_vendored_state_attests_manifest_less() {
+    for wholesale in [false, true] {
+        let mock = MockServer::start().await;
+        mount_patch_api(&mock).await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+            "sha512-orig==",
+        );
+        let pristine = std::fs::read(tmp.path().join("package-lock.json")).unwrap();
+        let tgz = vendor_project(tmp.path(), &mock.uri(), &[]);
+        let argv: &[&str] = if wholesale {
+            std::fs::remove_dir_all(tmp.path().join(".socket/vendor")).unwrap();
+            mount_blob(&mock).await;
+            &["repair", "--download-mode", "file"]
+        } else {
+            std::fs::remove_file(&tgz).unwrap();
+            &["repair"]
+        };
+        let (code, stdout, stderr) = run_cli(tmp.path(), &mock.uri(), argv);
+        assert_eq!(
+            code, 0,
+            "wholesale={wholesale} stdout={stdout} stderr={stderr}"
+        );
+        assert!(tgz.is_file(), "repair rebuilt the artifact");
+
+        let checkout = tmp.path().join("checkout");
+        npm_e2e_common::fresh_checkout(tmp.path(), &checkout, &["package-lock.json"]);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let api = vex_e2e_common::PatchApi::start(vec![(
+                        UUID.to_string(),
+                        vex_e2e_common::patch_view(
+                            UUID,
+                            PURL,
+                            &[("package/index.js", &git_sha256(AFTER))],
+                            &[("GHSA-aaaa-bbbb-cccc", &["CVE-2026-0001"])],
+                        ),
+                    )]);
+                    npm_e2e_common::manifestless_vex_matrix(&npm_e2e_common::ManifestlessCase {
+                        label: format!("repair wholesale={wholesale}"),
+                        project: &checkout,
+                        purl: PURL,
+                        uuid: UUID,
+                        marker: vex_e2e_common::Marker::Vendored,
+                        vulns: &[("GHSA-aaaa-bbbb-cccc", &["CVE-2026-0001"])],
+                        api: &api,
+                        patch_server_url: None,
+                        registry_locks: vec![("package-lock.json", pristine.clone())],
+                        embedded: &[vex_e2e_common::VexVia::Apply],
+                    });
+                })
+                .join()
+                .expect("manifest-less VEX tail panicked");
+        });
+    }
 }

@@ -1,0 +1,454 @@
+{
+  "bun-lockb/0.1.1": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/0.1.6": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/0.1.7": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/0.5.9": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/0.6.7": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/0.6.8": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/0.8.1": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/0.8.1-production": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.8",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/0.8.1-production-complex": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@0.0.8",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.8",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/mkdirp@0.5.0",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.0.0": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.0.0-production": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.8",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.0.36": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.1.0": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.1.38": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.1.45": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.1.45-extensions": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.1.45-extensions/packages/helper": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "bun-lockb/1.2.0": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.2.23": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.2.23-extensions": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.2.23-extensions/packages/helper": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "bun-lockb/1.3.0": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.3.14": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.4.2": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.4.2-extensions": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  },
+  "bun-lockb/1.4.2-extensions/packages/helper": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "bun-lockb/two-versions": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/is-number@7.0.0",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.2",
+        "file": "bun.lockb"
+      },
+      {
+        "purl": "pkg:npm/minimist@1.2.8",
+        "file": "bun.lockb"
+      }
+    ],
+    "live_claims": []
+  }
+}

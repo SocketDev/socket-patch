@@ -4,7 +4,7 @@ use toml_edit::{DocumentMut, Item, Value};
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::python_lock::preserve_line_endings;
-use crate::vendor::common::pep508_name;
+use crate::vendor::common::{pep508_name, pyproject_dependency_specs, DeclTable};
 
 /// The two documents the hatch planner reads and rewrites, in the order
 /// [`plan`] parses them. The redirect overlay (`redirect/mod.rs`) clones
@@ -28,40 +28,87 @@ pub fn is_hatch(files: &BTreeMap<String, String>) -> bool {
         })
 }
 
-pub fn has_environment_dependency(files: &BTreeMap<String, String>, name: &str) -> bool {
-    let external = files
-        .get("hatch.toml")
-        .and_then(|text| text.parse::<DocumentMut>().ok());
-    let project = files
-        .get("pyproject.toml")
-        .and_then(|text| text.parse::<DocumentMut>().ok());
-    let environments = external
-        .as_ref()
-        .and_then(|document| document.get("envs"))
-        .or_else(|| {
-            project
-                .as_ref()
-                .and_then(|document| document.get("tool"))
-                .and_then(|tool| tool.get("hatch"))
-                .and_then(|hatch| hatch.get("envs"))
-        });
-    environments
-        .and_then(Item::as_table_like)
-        .is_some_and(|environments| {
-            environments.iter().any(|(_, environment)| {
-                ["dependencies", "extra-dependencies"].iter().any(|key| {
-                    environment
-                        .get(key)
-                        .and_then(Item::as_array)
-                        .is_some_and(|dependencies| {
-                            dependencies.iter().filter_map(Value::as_str).any(|spec| {
-                                canonicalize_pypi_name(pep508_name(spec))
-                                    == canonicalize_pypi_name(name)
-                            })
-                        })
-                })
-            })
+/// One PEP 508 dependency string Hatch installs.
+pub(crate) struct HatchSpec<'d> {
+    /// `pyproject.toml` or `hatch.toml` (a [`HATCH_FILES`] entry).
+    pub(crate) file: &'static str,
+    pub(crate) table: DeclTable,
+    pub(crate) spec: &'d str,
+}
+
+/// Every dependency string Hatch reads, in this order: pyproject's
+/// [`pyproject_dependency_specs`] (`[project]` dependencies, extras, PEP 735
+/// groups), then the environments' `dependencies` / `extra-dependencies` —
+/// pyproject's `[tool.hatch.envs.*]` unless hatch.toml carries an `envs` key,
+/// in which case hatch.toml's `[envs.*]`. Each caller parses the documents
+/// its own way and passes `None` for one that is absent or not TOML. Shared
+/// by the planner's predicates below and lockfile discovery
+/// (`vex::discover::pypi_other`), which walk the same tables.
+pub(crate) fn dependency_specs<'d>(
+    pyproject: Option<&'d DocumentMut>,
+    hatch_toml: Option<&'d DocumentMut>,
+) -> Vec<HatchSpec<'d>> {
+    let mut specs: Vec<HatchSpec<'d>> = pyproject
+        .into_iter()
+        .flat_map(pyproject_dependency_specs)
+        .map(|(table, spec)| HatchSpec {
+            file: HATCH_FILES[0],
+            table,
+            spec,
         })
+        .collect();
+    specs.extend(environment_specs(pyproject, hatch_toml));
+    specs
+}
+
+/// The Hatch environment tables: `envs` of the hatch.toml document, else of
+/// pyproject's `[tool.hatch]` (Hatch merges an external config by TOP-LEVEL
+/// key, so a hatch.toml `envs` key — whatever its value — replaces
+/// pyproject's whole table).
+fn environment_specs<'d>(
+    pyproject: Option<&'d DocumentMut>,
+    hatch_toml: Option<&'d DocumentMut>,
+) -> Vec<HatchSpec<'d>> {
+    let (file, hatch) = match hatch_toml.filter(|d| d.contains_key("envs")) {
+        Some(doc) => (HATCH_FILES[1], Some(doc.as_item())),
+        None => (
+            HATCH_FILES[0],
+            pyproject
+                .and_then(|d| d.get("tool"))
+                .and_then(|t| t.get("hatch")),
+        ),
+    };
+    hatch
+        .and_then(|h| h.get("envs"))
+        .and_then(Item::as_table_like)
+        .into_iter()
+        .flat_map(|envs| envs.iter())
+        .flat_map(|(_, env)| {
+            ["dependencies", "extra-dependencies"]
+                .into_iter()
+                .filter_map(move |key| env.get(key))
+        })
+        .filter_map(Item::as_array)
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|spec| HatchSpec {
+            file,
+            table: DeclTable::Env,
+            spec,
+        })
+        .collect()
+}
+
+fn parsed(files: &BTreeMap<String, String>, file: &str) -> Option<DocumentMut> {
+    files.get(file).and_then(|text| text.parse().ok())
+}
+
+pub fn has_environment_dependency(files: &BTreeMap<String, String>, name: &str) -> bool {
+    let external = parsed(files, HATCH_FILES[1]);
+    let project = parsed(files, HATCH_FILES[0]);
+    environment_specs(project.as_ref(), external.as_ref())
+        .iter()
+        .any(|s| canonicalize_pypi_name(pep508_name(s.spec)) == canonicalize_pypi_name(name))
 }
 
 fn replacement(spec: &str, name: &str, version: &str, url: &str) -> Result<Option<String>, String> {
@@ -282,35 +329,16 @@ fn enable_permission(document: &mut DocumentMut, external: bool) -> Result<(), S
 }
 
 pub fn has_project_direct_references(files: &BTreeMap<String, String>) -> bool {
-    let Some(document) = files
-        .get("pyproject.toml")
-        .and_then(|text| text.parse::<DocumentMut>().ok())
-    else {
+    let Some(document) = parsed(files, HATCH_FILES[0]) else {
         return false;
     };
-    let project = document.get("project");
-    let mut arrays = Vec::new();
-    if let Some(dependencies) = project
-        .and_then(|project| project.get("dependencies"))
-        .and_then(Item::as_array)
-    {
-        arrays.push(dependencies);
-    }
-    for groups in [
-        project.and_then(|project| project.get("optional-dependencies")),
-        document.get("dependency-groups"),
-    ] {
-        if let Some(groups) = groups.and_then(Item::as_table_like) {
-            arrays.extend(groups.iter().filter_map(|(_, value)| value.as_array()));
-        }
-    }
-    arrays.iter().any(|array| {
-        array.iter().filter_map(Value::as_str).any(|spec| {
+    pyproject_dependency_specs(&document)
+        .into_iter()
+        .any(|(_, spec)| {
             spec.split(';')
                 .next()
                 .is_some_and(|requirement| requirement.contains('@'))
         })
-    })
 }
 
 pub fn plan(
@@ -528,6 +556,74 @@ mod tests {
             .unwrap_err()
             .contains("pip installer"));
         }
+    }
+
+    fn both(pyproject: &str, hatch: Option<&str>) -> BTreeMap<String, String> {
+        let mut inputs = files(pyproject);
+        if let Some(hatch) = hatch {
+            inputs.insert("hatch.toml".into(), hatch.into());
+        }
+        inputs
+    }
+
+    #[test]
+    fn environment_dependency_follows_the_effective_envs_table() {
+        let inline = "[tool.hatch.envs.default]\ndependencies=[\"Urllib3 >=1\"]\n\
+                      [tool.hatch.envs.test]\nextra-dependencies=[\"idna==3.6\"]\n";
+        assert!(has_environment_dependency(&both(inline, None), "urllib3"));
+        assert!(has_environment_dependency(&both(inline, None), "IDNA"));
+        assert!(!has_environment_dependency(&both(inline, None), "six"));
+        // A hatch.toml `envs` table replaces pyproject's (top-level merge).
+        let external = "[envs.default]\ndependencies=[\"six==1.16.0\"]\n";
+        assert!(!has_environment_dependency(
+            &both(inline, Some(external)),
+            "urllib3"
+        ));
+        assert!(has_environment_dependency(
+            &both(inline, Some(external)),
+            "six"
+        ));
+        // …even a non-table one; a hatch.toml without `envs`, or one that is
+        // not TOML, leaves pyproject's in force.
+        assert!(!has_environment_dependency(
+            &both(inline, Some("envs = 1\n")),
+            "urllib3"
+        ));
+        for hatch in ["[metadata]\nx = 1\n", "not = [toml"] {
+            assert!(
+                has_environment_dependency(&both(inline, Some(hatch)), "urllib3"),
+                "{hatch}"
+            );
+        }
+        // Project tables are not environments; non-string members are skipped.
+        let project = "[project]\ndependencies=[\"urllib3==1\"]\n\
+                       [tool.hatch.envs.default]\ndependencies=[1, {x=1}]\n";
+        assert!(!has_environment_dependency(&both(project, None), "urllib3"));
+        assert!(!has_environment_dependency(
+            &both("not = [toml", None),
+            "urllib3"
+        ));
+    }
+
+    #[test]
+    fn project_direct_references_cover_every_project_table() {
+        for text in [
+            "[project]\ndependencies=[\"a @ https://x.test/a.whl\"]",
+            "[project.optional-dependencies]\nx=[\"b\", \"a @ file:///a.whl\"]",
+            "[dependency-groups]\nqa=[{include-group=\"x\"}, \"a@https://x.test/a.whl\"]",
+        ] {
+            assert!(has_project_direct_references(&files(text)), "{text}");
+        }
+        for text in [
+            "not = [toml",
+            "[project]\ndependencies=[\"a ; python_version >= '3' and extra == 'x@y'\"]",
+            "[project.optional-dependencies]\nx=\"a @ https://x.test/a.whl\"",
+            "[dependency-groups]\nqa=\"a @ https://x.test/a.whl\"",
+            "[tool.hatch.envs.default]\ndependencies=[\"a @ https://x.test/a.whl\"]",
+        ] {
+            assert!(!has_project_direct_references(&files(text)), "{text}");
+        }
+        assert!(!has_project_direct_references(&BTreeMap::new()));
     }
 
     #[test]

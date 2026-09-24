@@ -85,8 +85,8 @@ fn properties(text: &str, offset: usize) -> Result<Vec<Property>, String> {
 fn entries(text: &str) -> Result<Vec<(String, Property)>, String> {
     // A UTF-8 BOM (Windows editors) is not JSON; parse past it. Offsets
     // below come from `text.find('{')`, so they stay byte-accurate.
-    let value: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
-        .map_err(|e| e.to_string())?;
+    let value =
+        crate::vendor::lock_inventory::pypi::parse_pipfile_lock(text).map_err(|e| e.to_string())?;
     if !value.is_object() {
         return Err("Pipfile.lock is not an object".into());
     }
@@ -334,7 +334,8 @@ fn owned_url(value: &str, dep: &DepOverride) -> bool {
         && url.host_str() == ours.host_str()
         && url.port_or_known_default() == ours.port_or_known_default();
     let parts: Vec<_> = url.path().split('/').collect();
-    (same_origin || (url.scheme() == "https" && url.host_str() == Some("patch.socket.dev")))
+    (same_origin
+        || (url.scheme() == "https" && url.host_str() == Some(super::SOCKET_PATCH_SERVER_HOST)))
         && url.username().is_empty()
         && url.password().is_none()
         && url.query().is_none()

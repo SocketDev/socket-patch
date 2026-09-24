@@ -65,6 +65,9 @@ use super::FileEdit;
 pub struct RedirectRevert {
     /// Repo-relative files this revert actually rewrote or removed.
     pub reverted_files: Vec<String>,
+    /// Advisory (code, detail) pairs — e.g. a redirect-created `.npmrc`
+    /// that was modified since (`redirect_npmrc_allow_remote_modified`).
+    pub warnings: Vec<(String, String)>,
 }
 
 /// Does [`revert_redirect_purl`] have an implementation for this purl's
@@ -424,6 +427,7 @@ pub async fn revert_golang_redirect_purl(
     drop_claimed(state, mine, &record_key);
     Ok(RedirectRevert {
         reverted_files: replay.reverted_files.into_iter().collect(),
+        warnings: replay.warnings,
     })
 }
 
@@ -535,7 +539,7 @@ fn bun_spec_names(spec: &str, name: &str, version: &str) -> bool {
 /// to parse fails the match (closed). The exact-leaf comparison is the
 /// version discriminator: `pkg-1.3.0.tgz` never equals `pkg-11.3.0.tgz`
 /// or `pkg-1.3.0-rc1.tgz`.
-pub(super) fn hosted_url_names(url: &str, name: &str, version: &str) -> bool {
+pub(crate) fn hosted_url_names(url: &str, name: &str, version: &str) -> bool {
     if !url.starts_with("https://") && !url.starts_with("http://") {
         return false;
     }
@@ -549,6 +553,23 @@ pub(super) fn hosted_url_names(url: &str, name: &str, version: &str) -> bool {
     let leaf = url[path_start..].rsplit('/').next().unwrap_or_default();
     let bare = name.rsplit('/').next().unwrap_or(name);
     !leaf.is_empty() && leaf == format!("{bare}-{version}.tgz")
+}
+
+/// The version a hosted artifact `url` names for `name`: its last path
+/// segment is `<bare>-<version>.tgz` with a semver `<version>`, confirmed by
+/// [`hosted_url_names`]. How a hosted bun binary redirect's version is
+/// recovered (`bun_binary::names`) and how lockfile discovery reads a bun
+/// hosted ref's version.
+pub(crate) fn hosted_url_version<'u>(url: &'u str, name: &str) -> Option<&'u str> {
+    let bare = name.rsplit('/').next().unwrap_or(name);
+    let version = url
+        .rsplit('/')
+        .next()?
+        .strip_prefix(bare)?
+        .strip_prefix('-')?
+        .strip_suffix(".tgz")?;
+    (semver::Version::parse(version).is_ok() && hosted_url_names(url, name, version))
+        .then_some(version)
 }
 
 /// Revert every hosted-redirect edit the ledger records for `purl` (an npm
@@ -812,6 +833,37 @@ pub async fn revert_npm_redirect_purl(
         }
     }
 
+    // LAST ONE OUT: the `.npmrc` `allow-remote=all` auto-config exists only
+    // for package-lock / shrinkwrap hosted entries (npm >= 12 refuses them
+    // without it). When this purl's revert leaves no such entry in the
+    // ledger, unwind the recorded `.npmrc` edit(s) in the SAME transaction —
+    // scoped rollback / remove of the last npm purl and the vendored
+    // takeover then leave no loosened install policy behind. An ambiguous
+    // `.npmrc` refuses the whole revert (nothing written), like any drift.
+    let mut npmrc_staged: Option<Option<String>> = None;
+    {
+        let dropping: HashSet<usize> = mine.iter().copied().collect();
+        // Checked BEFORE the read: the read refuses a symlinked / non-regular
+        // `.npmrc` here, at plan time — so the whole revert refuses with
+        // nothing written (flush_npmrc refusing it after flush_staged had
+        // already written the lock would strand a reverted lock behind a
+        // ledger that still records the redirect) — but only when the
+        // unwind is actually due.
+        if super::npmrc::npmrc_unwind_due(&state.edits, &dropping) {
+            let current = super::npmrc::read_project_npmrc(project_root)?;
+            if let Some(plan) =
+                super::npmrc::plan_unneeded_npmrc_unwind(&state.edits, &dropping, current)?
+            {
+                if plan.staged.is_some() {
+                    out.reverted_files.push(super::npmrc::NPMRC_REL.to_string());
+                }
+                npmrc_staged = plan.staged;
+                out.warnings.extend(plan.warnings);
+                mine.extend(plan.indices);
+            }
+        }
+    }
+
     // Every inverse resolved — only now does any of it reach disk, so a
     // refusal above left the project exactly as it was found. A dry run
     // skips ONLY the disk flush: the in-memory ledger mutation below still
@@ -821,6 +873,12 @@ pub async fn revert_npm_redirect_purl(
     // persists it on a dry run, so nothing durable changes.
     if !dry_run {
         flush_staged(project_root, &staged, &staged_bytes).await?;
+        // After the lock: an I/O fault here leaves the (reverted) lock plus
+        // a still-present `allow-remote=all` — never a hosted lock entry
+        // whose `.npmrc` setting was already taken away.
+        if let Some(npmrc) = &npmrc_staged {
+            super::npmrc::flush_npmrc(project_root, npmrc).await?;
+        }
     }
 
     drop_claimed(state, mine, &record_key);
@@ -1663,6 +1721,210 @@ mod tests {
         );
         assert!(state.records.is_empty(), "record dropped");
         assert!(state.edits.is_empty(), "edits dropped");
+    }
+
+    fn npmrc_edit(action: &str) -> FileEdit {
+        FileEdit {
+            path: ".npmrc".into(),
+            kind: super::super::npmrc::NPMRC_ALLOW_REMOTE_EDIT_KIND.into(),
+            action: action.into(),
+            key: Some("allow-remote".into()),
+            original: None,
+            new: Some(serde_json::json!("all")),
+        }
+    }
+
+    /// Pristine lockfileVersion 3 package-lock holding two registry deps.
+    fn two_dep_package_lock() -> String {
+        let entry = |name: &str, version: &str| {
+            serde_json::json!({
+                "version": version,
+                "resolved": format!("https://registry.npmjs.org/{name}/-/{name}-{version}.tgz"),
+                "integrity": "sha512-pristine=="
+            })
+        };
+        let lock = serde_json::json!({
+            "name": "app", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+            "packages": {
+                "": { "name": "app", "version": "1.0.0" },
+                "node_modules/left-pad": entry("left-pad", "1.3.0"),
+                "node_modules/other": entry("other", "2.0.0"),
+            }
+        });
+        format!("{}\n", serde_json::to_string_pretty(&lock).unwrap())
+    }
+
+    /// The `.npmrc` `allow-remote=all` auto-config is unwound in the SAME
+    /// transaction as the LAST package-lock purl's revert (created file
+    /// deleted), and never while another package-lock entry still needs it.
+    #[tokio::test]
+    async fn npm_revert_unwinds_npmrc_only_when_the_last_lock_entry_goes() {
+        let (tmp, mut state) = npm_redirected_fixture_multi(
+            "package-lock.json",
+            &two_dep_package_lock(),
+            &[
+                (NPM_PURL, npm_dep()),
+                ("pkg:npm/other@2.0.0", npm_dep_for("other", "2.0.0")),
+            ],
+        )
+        .await;
+        let root = tmp.path();
+        tokio::fs::write(root.join(".npmrc"), "allow-remote=all\n")
+            .await
+            .unwrap();
+        state.edits.push(npmrc_edit("created"));
+
+        // The last-but-one lock entry goes: .npmrc stays.
+        let out = revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("first revert");
+        assert!(!out.reverted_files.iter().any(|f| f == ".npmrc"), "{out:?}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(".npmrc"))
+                .await
+                .unwrap(),
+            "allow-remote=all\n",
+            "still needed by the other package-lock entry"
+        );
+        assert!(state
+            .edits
+            .iter()
+            .any(|e| e.kind == "redirect_npmrc_allow_remote"));
+
+        // Dry run of the last one: previews the removal, writes nothing.
+        let mut probe = state.clone();
+        let out = revert_npm_redirect_purl(root, &mut probe, "pkg:npm/other@2.0.0", true)
+            .await
+            .expect("dry-run revert");
+        assert!(out.reverted_files.iter().any(|f| f == ".npmrc"), "{out:?}");
+        assert!(root.join(".npmrc").exists(), "dry run writes nothing");
+
+        let out = revert_npm_redirect_purl(root, &mut state, "pkg:npm/other@2.0.0", false)
+            .await
+            .expect("last revert");
+        assert!(out.reverted_files.iter().any(|f| f == ".npmrc"), "{out:?}");
+        assert!(
+            !root.join(".npmrc").exists(),
+            "the created .npmrc is deleted"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("package-lock.json"))
+                .await
+                .unwrap(),
+            two_dep_package_lock()
+        );
+        assert!(
+            state.edits.is_empty() && state.records.is_empty(),
+            "{state:?}"
+        );
+    }
+
+    /// An APPENDED line is removed exactly (user bytes, BOM and CRLF kept);
+    /// an ambiguous duplicate refuses the whole revert byte-untouched.
+    #[tokio::test]
+    async fn npm_revert_removes_only_the_appended_npmrc_line() {
+        let (tmp, mut state) =
+            npm_redirected_fixture("package-lock.json", &package_lock_pristine()).await;
+        let root = tmp.path();
+        let wired = tokio::fs::read_to_string(root.join("package-lock.json"))
+            .await
+            .unwrap();
+        state.edits.push(npmrc_edit("added"));
+
+        tokio::fs::write(
+            root.join(".npmrc"),
+            "allow-remote=all\r\n; mine\r\nallow-remote=all\r\n",
+        )
+        .await
+        .unwrap();
+        let err = revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect_err("ambiguous .npmrc refuses");
+        assert!(err.contains("more than once"), "{err}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("package-lock.json"))
+                .await
+                .unwrap(),
+            wired,
+            "a refusal leaves the lock untouched"
+        );
+
+        tokio::fs::write(
+            root.join(".npmrc"),
+            "\u{feff}registry=https://r.example/\r\nallow-remote=all\r\n",
+        )
+        .await
+        .unwrap();
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("revert succeeds");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(".npmrc"))
+                .await
+                .unwrap(),
+            "\u{feff}registry=https://r.example/\r\n"
+        );
+        assert!(state.edits.is_empty(), "{state:?}");
+    }
+
+    /// Finding: a symlinked `.npmrc` passed planning (the read followed
+    /// the link), `flush_staged` wrote the reverted lock, and only then did
+    /// `flush_npmrc` refuse the link — leaving the lock un-hosted while the
+    /// ledger still recorded the redirect. The refusal now happens while
+    /// planning: lock byte-identical, ledger untouched. While another
+    /// package-lock entry still needs the setting, the odd `.npmrc` shape
+    /// does not block the revert at all (the file is never read).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn npm_revert_refuses_a_symlinked_npmrc_before_writing_anything() {
+        let (tmp, mut state) = npm_redirected_fixture_multi(
+            "package-lock.json",
+            &two_dep_package_lock(),
+            &[
+                (NPM_PURL, npm_dep()),
+                ("pkg:npm/other@2.0.0", npm_dep_for("other", "2.0.0")),
+            ],
+        )
+        .await;
+        let root = tmp.path();
+        tokio::fs::write(root.join("shared.npmrc"), "allow-remote=all\n")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("shared.npmrc", root.join(".npmrc")).unwrap();
+        state.edits.push(npmrc_edit("created"));
+
+        // Not the last lock entry: the unwind is not due, the link is fine.
+        revert_npm_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("first revert is not blocked by the .npmrc shape");
+
+        let wired = tokio::fs::read_to_string(root.join("package-lock.json"))
+            .await
+            .unwrap();
+        let before = state.clone();
+        let err = revert_npm_redirect_purl(root, &mut state, "pkg:npm/other@2.0.0", false)
+            .await
+            .expect_err("symlinked .npmrc refuses the last revert");
+        assert!(err.contains("not a regular file"), "{err}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("package-lock.json"))
+                .await
+                .unwrap(),
+            wired,
+            "the lock must not be reverted behind the refusal"
+        );
+        assert_eq!(state.edits.len(), before.edits.len(), "ledger untouched");
+        assert_eq!(
+            state.records.len(),
+            before.records.len(),
+            "ledger untouched"
+        );
+        assert!(root
+            .join(".npmrc")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     /// Pristine pnpm v6 lock holding a PLAIN instance and a resolved-peer

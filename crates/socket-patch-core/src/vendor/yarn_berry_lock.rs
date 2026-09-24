@@ -53,7 +53,7 @@ use super::state::{
 };
 use super::yarn_classic_lock::{
     body_field_line, lines_to_json, pattern_real_name, read_yarn_lock, replace_block,
-    revert_recorded_block, scan_blocks, split_key_patterns, split_pattern, LockBlock,
+    revert_recorded_block, scan_blocks, split_berry_key_patterns, split_pattern, LockBlock,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -104,7 +104,7 @@ pub async fn vendor_yarn_berry(
         Err(outcome) => return *outcome,
     };
     let blocks = scan_blocks(&lock_text);
-    let Some(meta) = blocks.iter().find(|b| b.key == "__metadata") else {
+    let Some(meta) = berry_metadata(&blocks) else {
         return refused(
             "vendor_lockfile_version_unsupported",
             "yarn.lock has no `__metadata:` entry — not a yarn berry lockfile".to_string(),
@@ -345,7 +345,7 @@ pub async fn vendor_yarn_berry(
     // tamper guard on the tarball itself (spike B3, flips on any byte edit).
     let hash6 = &tgz_sha512[..6];
     let checksum = match berry_cache_checksum_10c0(&tgz_bytes, name) {
-        Ok(c) => c,
+        Ok(c) => checksum_in_lock_spelling(&lock_text, &c),
         Err(e) => {
             return done_failure_unstage(
                 purl,
@@ -888,7 +888,7 @@ fn scan_berry_target(
         if block.key == "__metadata" {
             continue;
         }
-        let patterns = split_key_patterns(&block.key);
+        let patterns = split_berry_key_patterns(&block.key);
         let parsed: Vec<(&str, &str)> = patterns.iter().filter_map(|p| split_pattern(p)).collect();
         if parsed.len() != patterns.len() || parsed.is_empty() {
             continue; // not a descriptor key we understand; not ours to touch
@@ -997,8 +997,42 @@ fn carried_sections(lines: &[String]) -> Vec<String> {
     out
 }
 
+/// Whether `lock_text` spells its entries' `checksum:` values as BARE hex.
+///
+/// yarn 4.0.x writes the bare sha512 hex even at cacheKey `10c0`; yarn 4.1+
+/// prefixes the cache key (`10c0/<hex>`). Both are the digest of the same
+/// cache zip, but a `--immutable` install treats a respelled checksum as a
+/// lockfile modification (YN0028: "The lockfile would have been modified by
+/// this install") — so an entry Socket writes (the vendored `file:` entry,
+/// the hosted `__archiveUrl` rewrite) must follow the lock's own spelling or
+/// every CI install of a yarn 4.0.x project fails. A lock with no checksum
+/// at all keeps the prefixed form (every yarn since 4.1).
+pub(crate) fn lock_spells_bare_checksums(lock_text: &str) -> bool {
+    let mut saw_bare = false;
+    for line in lock_text.lines() {
+        let Some(value) = line.strip_prefix("  checksum:") else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"');
+        if value.contains('/') {
+            return false;
+        }
+        saw_bare |= !value.is_empty();
+    }
+    saw_bare
+}
+
+/// `checksum` (the recipe's `10c0/<hex>`) spelled the way `lock_text`
+/// spells its checksums (see [`lock_spells_bare_checksums`]).
+pub(crate) fn checksum_in_lock_spelling(lock_text: &str, checksum: &str) -> String {
+    match checksum.split_once('/') {
+        Some((_, hex)) if lock_spells_bare_checksums(lock_text) => hex.to_string(),
+        _ => checksum.to_string(),
+    }
+}
+
 /// Read a berry scalar field (`<name>: <value>`, value possibly quoted).
-pub(super) fn berry_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
+pub(crate) fn berry_field<'a>(lines: &'a [String], field: &str) -> Option<&'a str> {
     for line in lines.iter().skip(1) {
         let Some(rest) = body_field_line(line) else {
             continue;
@@ -1018,7 +1052,7 @@ pub(super) fn berry_field<'a>(lines: &'a [String], field: &str) -> Option<&'a st
 /// entry (the key + resolution of our file: entry embed it).
 fn root_workspace_name(blocks: &[LockBlock]) -> Option<String> {
     for block in blocks {
-        if let [single] = split_key_patterns(&block.key).as_slice() {
+        if let [single] = split_berry_key_patterns(&block.key).as_slice() {
             if let Some(name) = single.strip_suffix("@workspace:.") {
                 if !name.is_empty() {
                     return Some(name.to_string());
@@ -1038,6 +1072,65 @@ pub(crate) fn yarnrc_compression_level(rc: &str) -> Option<&str> {
         let rest = line.strip_prefix("compressionLevel:")?;
         Some(rest.trim().trim_matches(['\'', '"']))
     })
+}
+
+/// The lock's exact `__metadata` block (its `version` / `cacheKey` header).
+pub(crate) fn berry_metadata(blocks: &[LockBlock]) -> Option<&LockBlock> {
+    blocks.iter().find(|b| b.key == "__metadata")
+}
+
+/// A berry `resolution:` locator `name@<reference>`, split at the first `@`
+/// past a leading `@scope/` marker ([`split_pattern`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BerryLocator<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) reference: &'a str,
+}
+
+impl<'a> BerryLocator<'a> {
+    /// `(version, bindings)` of a registry locator `npm:<version>[::<bindings>]`
+    /// (`bindings` is `""` without a `::`); `None` for any other protocol.
+    pub(crate) fn npm(&self) -> Option<(&'a str, &'a str)> {
+        let npm = self.reference.strip_prefix("npm:")?;
+        Some(npm.split_once("::").unwrap_or((npm, "")))
+    }
+
+    /// The `__archiveUrl=` binding of a registry locator (bindings are
+    /// `&`-joined), still percent-encoded — what the hosted redirect writes.
+    pub(crate) fn archive_url(&self) -> Option<&'a str> {
+        self.npm()?
+            .1
+            .split('&')
+            .find_map(|b| b.strip_prefix("__archiveUrl="))
+    }
+}
+
+/// Parse a berry `resolution:` value into its locator.
+pub(crate) fn parse_berry_locator(resolution: &str) -> Option<BerryLocator<'_>> {
+    split_pattern(resolution).map(|(name, reference)| BerryLocator { name, reference })
+}
+
+/// The package a berry `resolutions` selector overrides: its LAST
+/// descriptor's ident (`name`, `name@range`, `**/name`, `parent/name`,
+/// `@scope/name`, `parent/@scope/name@range`), or `None` when it has none.
+pub(crate) fn resolution_selector_target(selector: &str) -> Option<&str> {
+    let s = selector.trim();
+    // The last descriptor starts after the last `/` that is not a scope's
+    // own separator (the segment before it starts with `@`).
+    let mut start = 0;
+    let bytes = s.as_bytes();
+    let mut seg_start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'/' {
+            if !s[seg_start..i].starts_with('@') {
+                start = i + 1;
+            }
+            seg_start = i + 1;
+        }
+    }
+    let last = &s[start..];
+    let name = split_pattern(last).map(|(n, _)| n).unwrap_or(last);
+    (!name.is_empty() && name != "**").then_some(name)
 }
 
 #[cfg(test)]
@@ -3075,6 +3168,50 @@ __metadata:
         );
     }
 
+    /// REGRESSION: the vendored backend splits berry keys with the ONE
+    /// berry splitter (`split_berry_key_patterns`, which the redirect and
+    /// the lock inventory's `berry_entries` use). The classic splitter read
+    /// berry's single outer quote pair as one pattern, so a multi-descriptor
+    /// key looked like a single `left-pad` / `a` descriptor: the mixed-name
+    /// refusal never fired, and an alias sharing the real package's block
+    /// was not seen.
+    #[test]
+    fn multi_descriptor_berry_keys_split_like_every_other_reader() {
+        let block = |key: &str, version: &str| {
+            format!(
+                "{key}:\n  version: {version}\n  resolution: \"left-pad@npm:{version}\"\n  \
+                 checksum: 10c0/abc\n  languageName: node\n  linkType: hard\n"
+            )
+        };
+        // Real name + alias in one block: mixed descriptors, refused.
+        let lock = block("\"left-pad@npm:1.3.0, lp@npm:left-pad@1.3.0\"", "1.3.0");
+        let err = scan_berry_target(&scan_blocks(&lock), "left-pad", "1.3.0")
+            .err()
+            .expect("mixed key refused");
+        assert_eq!(err.0, "vendor_override_conflict");
+        assert!(err.1.contains("mixes `left-pad`"), "{}", err.1);
+        let lock = block("\"a@npm:^1.0.0, b@npm:^1.0.0\"", "1.0.0");
+        assert!(scan_berry_target(&scan_blocks(&lock), "b", "1.0.0").is_err());
+        // Two ranges of one name in one quoted key: the single target.
+        let lock = block("\"left-pad@npm:^1.3.0, left-pad@npm:~1.3.0\"", "1.3.0");
+        let scan = scan_berry_target(&scan_blocks(&lock), "left-pad", "1.3.0").unwrap();
+        assert_eq!(scan.target, Some((0, false)));
+        assert!(scan.alias_keys.is_empty());
+        // The splitters agree with the entry model discovery reads.
+        let entries = crate::vendor::lock_inventory::yarn::berry_entries(&lock).entries;
+        assert_eq!(
+            entries[0].patterns,
+            split_berry_key_patterns(&scan_blocks(&lock)[0].key)
+        );
+        // A quoted single-pattern root workspace key still names the root.
+        let root = "\"app@workspace:.\":\n  version: 0.0.0-use.local\n  \
+                    resolution: \"app@workspace:.\"\n";
+        assert_eq!(
+            root_workspace_name(&scan_blocks(root)).as_deref(),
+            Some("app")
+        );
+    }
+
     /// An EMPTY workspace ident (`"@workspace:."` — a root package.json with
     /// no `name`) must never satisfy the root-workspace probe: the extracted
     /// name is embedded verbatim in the vendored `file:` locator, and an
@@ -3154,6 +3291,82 @@ __metadata:
                 pkg_vendored,
                 "package.json untouched"
             );
+        }
+    }
+
+    /// REGRESSION (yarn 4.0.x): a lock whose checksums are spelled bare
+    /// (yarn 4.0.0–4.0.2 at cacheKey `10c0`) gets the vendored entry's
+    /// checksum spelled bare too — byte-exact against the spike after-lock
+    /// with every checksum de-prefixed. The prefixed spelling made the
+    /// fresh-checkout `yarn install --immutable` fail with YN0028.
+    #[tokio::test]
+    async fn yarn40_bare_checksum_lock_gets_a_bare_vendored_checksum() {
+        let bare_before = B3_BEFORE_LOCK.replace("checksum: 10c0/", "checksum: ");
+        let fx = fixture_with(B3_BEFORE_PKG, &bare_before).await;
+        let (result, _entry, _warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let (hash6, checksum) = fx.packed_berry_facts().await;
+        let written = tokio::fs::read_to_string(fx.lock_path()).await.unwrap();
+        assert_eq!(
+            written,
+            spike_after_lock(&hash6, &checksum).replace("checksum: 10c0/", "checksum: ")
+        );
+        // Idempotent: the re-run sees its own (bare) entry as in sync.
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "in-sync re-run writes nothing");
+        assert_eq!(
+            tokio::fs::read_to_string(fx.lock_path()).await.unwrap(),
+            written
+        );
+    }
+
+    /// yarn 4.0.x spells `10c0` checksums bare, 4.1+ prefixed: a written
+    /// entry follows the lock (an `--immutable` install rejects a respelled
+    /// checksum with YN0028). A lock with no checksum keeps the prefix.
+    #[test]
+    fn checksum_spelling_follows_the_lock() {
+        let prefixed = "10c0/abcdef";
+        let entry = |c: &str| format!("\"x@npm:1.0.0\":\n  version: 1.0.0\n  checksum: {c}\n");
+        let bare_lock = format!(
+            "__metadata:\n  version: 8\n  cacheKey: 10c0\n\n{}",
+            entry("0123")
+        );
+        let prefixed_lock = bare_lock.replace("checksum: 0123", "checksum: 10c0/0123");
+        assert!(lock_spells_bare_checksums(&bare_lock));
+        assert!(lock_spells_bare_checksums(&bare_lock.replace('\n', "\r\n")));
+        assert_eq!(checksum_in_lock_spelling(&bare_lock, prefixed), "abcdef");
+        assert!(!lock_spells_bare_checksums(&prefixed_lock));
+        assert_eq!(
+            checksum_in_lock_spelling(&prefixed_lock, prefixed),
+            prefixed
+        );
+        // Any prefixed entry means a 4.1+ lock.
+        let mixed = format!("{bare_lock}\n{}", entry("10c0/9999"));
+        assert!(!lock_spells_bare_checksums(&mixed));
+        // No checksum at all: the modern prefixed form.
+        let none = "__metadata:\n  version: 8\n  cacheKey: 10c0\n";
+        assert_eq!(checksum_in_lock_spelling(none, prefixed), prefixed);
+        // Deeper-indented `checksum:` text (a dependency named `checksum`)
+        // is not an entry field.
+        let nested = format!("{none}\n\"x@npm:1.0.0\":\n  dependencies:\n    checksum: 1.0.0\n");
+        assert!(!lock_spells_bare_checksums(&nested));
+    }
+
+    #[test]
+    fn resolution_selector_targets() {
+        for (sel, want) in [
+            ("left-pad", Some("left-pad")),
+            ("left-pad@npm:1.3.0", Some("left-pad")),
+            ("**/left-pad", Some("left-pad")),
+            ("parent/left-pad", Some("left-pad")),
+            ("@scope/pkg", Some("@scope/pkg")),
+            ("@p/parent/@scope/pkg@^2", Some("@scope/pkg")),
+            ("@scope/parent/left-pad", Some("left-pad")),
+            ("**", None),
+            ("", None),
+        ] {
+            assert_eq!(resolution_selector_target(sel), want, "{sel}");
         }
     }
 }

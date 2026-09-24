@@ -6,7 +6,7 @@ use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, first_symlink, read_regular_to_string};
 use crate::utils::python_lock::{
-    is_python_lock_name, python_lock_paths, rewrite_python_lock, ArtifactSource,
+    is_python_lock_name, python_lock_paths, rewrite_python_lock, script_of_lock, ArtifactSource,
 };
 use crate::utils::python_script::{
     replace_script_metadata, rewrite_script_metadata, script_metadata,
@@ -196,10 +196,7 @@ pub(super) async fn load_python_locks(
         } else {
             in_sync = false;
         }
-        let script = if let Some(script_name) = path
-            .strip_suffix(".lock")
-            .filter(|name| name.ends_with(".py"))
-        {
+        let script = if let Some(script_name) = script_of_lock(&path) {
             if document
                 .get("package")
                 .and_then(Item::as_array_of_tables)
@@ -271,7 +268,7 @@ pub(super) async fn wire_python_locks(
             continue;
         };
         if let Some(script) = &file.script {
-            let script_name = file.name.strip_suffix(".lock").expect("script lock suffix");
+            let script_name = script_of_lock(&file.name).expect("script lock name");
             if let Some(script_output) =
                 rewrite_script_metadata(script, name, version, ArtifactSource::Path(wheel))
                     .map_err(|error| ("pypi_script_metadata_invalid", error))?

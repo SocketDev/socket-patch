@@ -903,12 +903,16 @@ cat > .socket/manifest.json <<MANIFEST
   "uuid": "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab",
   "exportedAt": "2026-01-01T00:00:00Z",
   "files": { "package/index.js": { "beforeHash": "$BEFORE_HASH", "afterHash": "$AFTER_HASH" } },
-  "vulnerabilities": {}, "description": "berry vendor docker fixture",
+  "vulnerabilities": { "GHSA-berry-docker-vex": { "cves": ["CVE-2026-5151"],
+    "summary": "s", "severity": "high", "description": "d" } },
+  "description": "berry vendor docker fixture",
   "license": "MIT", "tier": "free"
 } } }
 MANIFEST
 
 LOCK_BEFORE=$(sha256sum yarn.lock | cut -d' ' -f1)
+cp yarn.lock /tmp/registry-yarn.lock
+cp package.json /tmp/registry-package.json
 
 # 3. Vendor (offline: builds the tarball + rewrites yarn.lock + package.json).
 socket-patch vendor --json --offline --cwd "$PWD" >/tmp/vendor.out 2>/tmp/vendor.err
@@ -938,6 +942,36 @@ if ! head -1 "$FRESH" | grep -q 'SOCKET-PATCHED'; then
   echo "FAIL: fresh berry install did not land the patched bytes" >&2; head -3 "$FRESH" >&2; exit 1
 fi
 echo "===FRESH INSTALL VERIFIED===" >&2
+
+# 5. MANIFEST-LESS VEX on the fresh checkout (offline: this leg has no API).
+#    Manifest deleted -> the vendor ledger's record attests `(vendored)`;
+#    ledger deleted too -> no record anywhere (`record_unavailable`, exit 1);
+#    lock + package.json reverted to the registry with the ledger and the
+#    artifact restored -> `vendor_unwired` even under --no-verify.
+VEX_ARGS=(vex --json --offline --product pkg:npm/e2e-berry-vendor@0.0.0 --output /tmp/berry.vex.json)
+cp .socket/vendor/state.json /tmp/berry-state.json
+rm .socket/manifest.json
+socket-patch "${VEX_ARGS[@]}" >/tmp/vex1.out 2>/tmp/vex1.err
+VRC=$?
+if [ "$VRC" -ne 0 ] || ! grep -q '1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab (vendored)' /tmp/berry.vex.json; then
+  echo "FAIL: manifest-less vex (ledger) exit=$VRC" >&2; cat /tmp/vex1.out >&2; exit 1
+fi
+rm .socket/vendor/state.json
+rm -f /tmp/berry.vex.json
+socket-patch "${VEX_ARGS[@]}" >/tmp/vex2.out 2>/tmp/vex2.err
+VRC=$?
+if [ "$VRC" -ne 1 ] || ! grep -q '"errorCode": *"record_unavailable"' /tmp/vex2.out || [ -e /tmp/berry.vex.json ]; then
+  echo "FAIL: ledger-less offline vex must be record_unavailable exit=$VRC" >&2; cat /tmp/vex2.out >&2; exit 1
+fi
+cp /tmp/berry-state.json .socket/vendor/state.json
+cp /tmp/registry-yarn.lock yarn.lock
+cp /tmp/registry-package.json package.json
+socket-patch "${VEX_ARGS[@]}" --no-verify >/tmp/vex3.out 2>/tmp/vex3.err
+VRC=$?
+if [ "$VRC" -ne 1 ] || ! grep -q '"errorCode": *"vendor_unwired"' /tmp/vex3.out; then
+  echo "FAIL: reverted-lock vex must be vendor_unwired exit=$VRC" >&2; cat /tmp/vex3.out >&2; exit 1
+fi
+echo "===MANIFESTLESS VEX VERIFIED===" >&2
 echo "===E2E PASS==="
 exit 0
 "#
@@ -994,6 +1028,10 @@ async fn npm_berry_vendor_frozen_install_chain() {
     );
     assert!(
         stderr.contains("===FRESH INSTALL VERIFIED==="),
+        "stderr=\n{stderr}"
+    );
+    assert!(
+        stderr.contains("===MANIFESTLESS VEX VERIFIED==="),
         "stderr=\n{stderr}"
     );
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");

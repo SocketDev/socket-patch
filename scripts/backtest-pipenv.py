@@ -18,7 +18,9 @@ and checks --dry-run parity, idempotent re-scans, an untouched Pipfile, the
 lock-driven install of a FRESH clone of the committed state, whether a WARM
 venv (upstream urllib3 already installed) gets the patched wheel, tampered
 hashes, `pipenv verify`, what `pipenv lock` does to the patched entry, `vex`,
-and `rollback` restoring every byte.  Pre-2018 releases are expected to be
+the manifest-less `vex` of the fresh clone (manifest deleted; ledgers deleted
+too; `--offline`; the lock reverted to the registry, `--no-verify` too), and
+`rollback` restoring every byte.  Pre-2018 releases are expected to be
 REFUSED (old lock spec for 0–6, vendored for 7–11) without touching the lock.
 
 Shapes mirror the depscan capture harness: direct, dev, category (2022+),
@@ -213,6 +215,39 @@ def urllib3_entries(lock_bytes):
     semantic (key-order- and whitespace-insensitive) comparison."""
     data = json.loads(lock_bytes.decode("utf-8-sig"))
     return {cat: entries["urllib3"] for cat, entries in data.items() if cat != "_meta" and isinstance(entries, dict) and "urllib3" in entries}
+
+
+def vex_statements_for(doc, purl_base):
+    """The statements of an OpenVEX document naming `purl_base` (qualifiers
+    ignored) as a subcomponent."""
+    out = []
+    for st in (doc or {}).get("statements") or []:
+        ids = [c.get("@id") or "" for p in st.get("products") or [] for c in p.get("subcomponents") or []]
+        if any(i.split("?")[0] == purl_base for i in ids):
+            out.append(st)
+    return out
+
+
+def vex_attests(rc, doc, purl_base, uuid, marker):
+    """A standalone `vex` run attested `purl_base` not_affected via patch
+    `uuid` with the `(redirected)` / `(vendored)` provenance marker."""
+    part = f"Patched via Socket patch {uuid} ({marker})"
+    statements = vex_statements_for(doc, purl_base)
+    return rc == 0 and bool(statements) and all(
+        st.get("status") == "not_affected" and part in (st.get("impact_statement") or "") for st in statements
+    )
+
+
+def vex_omits(rc, envelope, doc, purl_base, reason):
+    """A standalone `vex --json` run did NOT attest `purl_base` and reported
+    it skipped with `reason` (exit 1: nothing else to attest)."""
+    events = [e for e in (envelope or {}).get("events") or [] if (e.get("purl") or "").split("?")[0] == purl_base]
+    return (
+        rc == 1
+        and not vex_statements_for(doc, purl_base)
+        and not any(e.get("action") == "verified" for e in events)
+        and any(e.get("action") == "skipped" and e.get("errorCode") == reason for e in events)
+    )
 
 
 def require(r, what):
@@ -1012,6 +1047,14 @@ def main():
         vx = Run([cli_bin, "vex", "--product", "pkg:pypi/pipenv-backtest-fixture@0.1.0", *cli_args, "--no-telemetry"], cwd, penv, case / "vex.log")
         info["vex"] = vex_info(vx)
 
+        # Manifest-less vex over the installed fresh clone (the depscan / CI
+        # shape): a marker-excluded install has nothing installed to attest.
+        if shape != "marker-excluded" and finst.ok():
+            ml = manifestless_vex(case, fresh, penv, mode, uuid, pristine_lock, pristine_pipfile)
+            info["vexManifestless"] = ml
+            for step, v in ml.items():
+                check("vexManifestless" + step[0].upper() + step[1:], v["ok"], v)
+
         # Tamper: corrupt every recorded sha; the install must fail where the installer verifies.
         if shape in ("direct", "crlf") and shape != "marker-excluded":
             uninstall_urllib3(version, python, project, penv, case / "tamper-uninstall.log")
@@ -1086,6 +1129,56 @@ def main():
             informational.add("dryRunParity")
         row["passed"] = all(val for k, val in checks.items() if k not in informational)
         return row
+
+    def manifestless_vex(case, fresh, penv, mode, uuid, pristine_lock, pristine_pipfile):
+        """Manifest-less VEX over the installed fresh clone, each step on its
+        own copy: the manifest deleted (ledgers kept) attests; the ledgers
+        deleted too still attest (lockfile discovery + the public proxy's
+        record); `--offline` without a local record is `record_unavailable`;
+        the lock reverted to the registry (ledgers + artifacts kept) is not
+        attested, `--no-verify` included."""
+        marker = "redirected" if mode == "hosted" else "vendored"
+        unwired = "redirect_unwired" if mode == "hosted" else "vendor_unwired"
+        out = {}
+
+        def copy(name, strip_ledgers=False):
+            d = case / f"vex-ml-{name}"
+            if d.exists():
+                shutil.rmtree(d)
+            shutil.copytree(fresh, d, symlinks=True)
+            (d / ".socket/manifest.json").unlink(missing_ok=True)
+            if strip_ledgers:
+                for rel in (".socket/vendor/state.json", ".socket/vendor/redirect-state.json"):
+                    (d / rel).unlink(missing_ok=True)
+            return d
+
+        def vex(d, name, *flags):
+            doc_path = case / f"vex-ml-{name}.json"
+            doc_path.unlink(missing_ok=True)
+            r = Run([cli_path, "vex", "--cwd", d, "--json", "--output", doc_path, "--product", "pkg:pypi/pipenv-backtest-fixture@0.1.0", "--no-telemetry", *flags], d, penv, case / f"vex-ml-{name}.log")
+            doc = json.loads(doc_path.read_text()) if doc_path.exists() else None
+            return r.rc, r.json_or_empty(), doc, r.tail(300)
+
+        def verdict(ok, rc, env, tail):
+            codes = sorted({e.get("errorCode") for e in env.get("events") or [] if e.get("errorCode")})
+            return {"ok": bool(ok), "exit": rc, "codes": codes, "tail": None if ok else tail}
+
+        d = copy("manifest")
+        rc, env_, doc, tail = vex(d, "manifest")
+        out["manifestDeleted"] = verdict(vex_attests(rc, doc, PURL_BASE, uuid, marker) and not (d / ".socket/manifest.json").exists(), rc, env_, tail)
+        d = copy("ledgers", strip_ledgers=True)
+        rc, env_, doc, tail = vex(d, "ledgers")
+        out["ledgersDeleted"] = verdict(vex_attests(rc, doc, PURL_BASE, uuid, marker), rc, env_, tail)
+        d = copy("offline", strip_ledgers=True)
+        rc, env_, doc, tail = vex(d, "offline", "--offline")
+        out["offline"] = verdict(vex_omits(rc, env_, doc, PURL_BASE, "record_unavailable"), rc, env_, tail)
+        d = copy("reverted")
+        (d / "Pipfile.lock").write_bytes(pristine_lock)
+        (d / "Pipfile").write_bytes(pristine_pipfile)
+        for label, flags in (("reverted", ()), ("revertedNoVerify", ("--no-verify",))):
+            rc, env_, doc, tail = vex(d, label, *flags)
+            out[label] = verdict(vex_omits(rc, env_, doc, PURL_BASE, unwired), rc, env_, tail)
+        return out
 
     def vex_info(vx):
         try:

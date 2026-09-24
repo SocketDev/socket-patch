@@ -33,6 +33,16 @@
 //! `vendor` — manifest + vendor artifacts, NO blobs — ending at the
 //! `--immutable --check-cache` install proof (idempotency/revert stay the
 //! `vendor` front door's own contract).
+//!
+//! Every capstone ends with the manifest-less VEX matrix
+//! (`yarn_berry_common::run_manifestless_vex_matrix`): fresh checkouts of the
+//! wired state without the manifest, without the ledgers, `--offline`,
+//! tampered, reverted to the registry and installed under PnP — each
+//! installed by the REAL yarn and attested (or refused) by standalone and
+//! embedded VEX against a mock patch API. The yarn 4 release is
+//! `SOCKET_PATCH_YARN_BERRY_VERSION` (default 4.12.0; loop:
+//! `scripts/yarn-berry-vex-matrix.sh`); `SOCKET_PATCH_YARN_E2E_REQUIRED=1`
+//! turns every soft-skip into a failure.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -46,8 +56,30 @@ const UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
 const MARKER: &str = "/* SOCKET-PATCHED */\n";
 const DEP: &str = "left-pad";
 const DEP_VERSION: &str = "1.3.0";
-/// Pinned yarn berry via corepack (matches the spike's 4.x).
-const YARN_BERRY: &str = "yarn@4.12.0";
+/// The advisory the patch record carries (manifest-less VEX attests it).
+const GHSA: &str = "GHSA-vendor-berry-real";
+const CVE: &str = "CVE-2026-2222";
+// The yarn 4 release under test is `yarn_berry()` (`yarn@4.12.0` unless
+// `SOCKET_PATCH_YARN_BERRY_VERSION` pins another 4.x — see yarn_berry_common).
+#[path = "vex_e2e_common/mod.rs"]
+mod vex_e2e_common;
+#[path = "yarn_berry_common/mod.rs"]
+mod yarn_berry_common;
+use yarn_berry_common::{yarn_berry, yarn_e2e_required};
+
+/// Print a SKIP line — or, under `SOCKET_PATCH_YARN_E2E_REQUIRED=1` (a leg
+/// that provisioned corepack yarn on purpose), FAIL: a required leg must
+/// never report green on an unexercised toolchain or an unreachable fixture
+/// registry.
+macro_rules! skip {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        if yarn_e2e_required() {
+            panic!("{msg} (SOCKET_PATCH_YARN_E2E_REQUIRED=1 forbids skipping)");
+        }
+        println!("{msg}");
+    }};
+}
 
 #[path = "common/cache_env.rs"]
 mod cache_env;
@@ -138,7 +170,10 @@ fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[
                 "beforeHash": git_sha256(before),
                 "afterHash": git_sha256(after),
             }},
-            "vulnerabilities": {},
+            "vulnerabilities": { GHSA: {
+                "cves": [CVE], "summary": "vendor berry capstone vuln",
+                "severity": "high", "description": "d",
+            }},
             "description": "capstone marker patch",
             "license": "MIT",
             "tier": "free",
@@ -175,7 +210,10 @@ async fn mock_view(server: &MockServer, purl: &str, before: &[u8], after: &[u8])
                     "blobContent": b64(after),
                 }
             },
-            "vulnerabilities": {},
+            "vulnerabilities": { GHSA: {
+                "cves": [CVE], "summary": "vendor berry capstone vuln",
+                "severity": "high", "description": "d",
+            }},
             "description": "capstone marker patch",
             "license": "MIT",
             "tier": "free",
@@ -234,10 +272,11 @@ async fn berry_get_uuid_vendored_fresh_checkout_immutable() {
 }
 
 async fn run_berry_capstone(driver: VendorDriver) {
-    if !has_corepack_pm(YARN_BERRY) {
-        println!(
-            "SKIP e2e_vendor_yarn_berry_build ({driver:?}): `corepack {YARN_BERRY}` unavailable \
-             (corepack not installed or yarn berry not fetchable)"
+    if !has_corepack_pm(yarn_berry()) {
+        skip!(
+            "SKIP e2e_vendor_yarn_berry_build ({driver:?}): `corepack {}` unavailable \
+             (corepack not installed or yarn berry not fetchable)",
+            yarn_berry()
         );
         return;
     }
@@ -269,7 +308,7 @@ async fn run_berry_capstone(driver: VendorDriver) {
     // install below quietly uses the developer's real `~/.yarn/berry`.
     let probe = corepack(
         &proj,
-        YARN_BERRY,
+        yarn_berry(),
         &["config", "get", "globalFolder"],
         &[("YARN_GLOBAL_FOLDER", global.to_str().unwrap())],
     );
@@ -282,12 +321,12 @@ async fn run_berry_capstone(driver: VendorDriver) {
     );
     let install = corepack(
         &proj,
-        YARN_BERRY,
+        yarn_berry(),
         &["install"],
         &[("YARN_GLOBAL_FOLDER", global.to_str().unwrap())],
     );
     if !install.status.success() {
-        println!(
+        skip!(
             "SKIP e2e_vendor_yarn_berry_build: fixture `yarn install` failed (registry \
              unreachable?):\n{}",
             String::from_utf8_lossy(&install.stderr)
@@ -465,21 +504,32 @@ async fn run_berry_capstone(driver: VendorDriver) {
         "the dependency range must stay registry-form"
     );
 
-    // yarn.lock has the file: resolution entry with a `checksum: 10c0/<hex>`
-    // (the reproduced cache-zip sha512) and the registry `npm:` entry gone.
+    // yarn.lock has the file: resolution entry with the reproduced cache-zip
+    // sha512 as its checksum — spelled the way THIS yarn spells checksums
+    // (`10c0/<hex>`; bare hex on yarn 4.0.x, whose `--immutable` rejects a
+    // respelled one) — and the registry `npm:` entry gone.
     let lock_after = std::fs::read_to_string(&lock_path).unwrap();
     assert!(
         lock_after.contains(&format!("left-pad@file:./{tgz_rel}::locator=")),
         "yarn.lock must carry the file: locator entry; got:\n{lock_after}"
     );
+    let bare = !lock_before_str.contains("  checksum: 10c0/");
+    let prefix = if bare {
+        "checksum: "
+    } else {
+        "checksum: 10c0/"
+    };
     let checksum_line = lock_after
         .lines()
         .map(str::trim)
-        .find(|l| l.starts_with("checksum: 10c0/"))
-        .unwrap_or_else(|| {
-            panic!("yarn.lock must carry a `checksum: 10c0/<hex>` line:\n{lock_after}")
-        });
-    let checksum_hex = checksum_line.trim_start_matches("checksum: 10c0/");
+        .find(|l| l.starts_with("checksum: "))
+        .unwrap_or_else(|| panic!("yarn.lock must carry a `checksum:` line:\n{lock_after}"));
+    assert!(
+        checksum_line.starts_with(prefix) && (!bare || !checksum_line.contains('/')),
+        "the vendored checksum must follow the lock's own spelling (bare: {bare}): \
+         {checksum_line}\n{lock_before_str}"
+    );
+    let checksum_hex = checksum_line.trim_start_matches(prefix);
     assert_eq!(
         checksum_hex.len(),
         128,
@@ -507,7 +557,7 @@ async fn run_berry_capstone(driver: VendorDriver) {
     let fresh_global = tmp.path().join("fresh-yarn-global");
     let ci = corepack(
         &fresh,
-        YARN_BERRY,
+        yarn_berry(),
         &["install", "--immutable", "--check-cache"],
         &[
             ("YARN_GLOBAL_FOLDER", fresh_global.to_str().unwrap()),
@@ -540,6 +590,45 @@ async fn run_berry_capstone(driver: VendorDriver) {
         "--immutable install must leave yarn.lock byte-identical"
     );
     eprintln!("FRESH INSTALL OK ({driver:?})");
+
+    // 4b. MANIFEST-LESS VEX (see `yarn_berry_common`): fresh checkouts with
+    //     no manifest, then no ledgers, offline, a tampered artifact, the
+    //     lock reverted to the registry (with and without the `resolutions`
+    //     mapping) and a PnP install of the same wiring — each installed by
+    //     the REAL yarn, attested (or refused) against a mock patch API.
+    let registry_state = [
+        ("yarn.lock", lock_before.clone()),
+        ("package.json", pkg_before.clone()),
+    ];
+    let yarn =
+        |cwd: &Path, args: &[&str], env: &[(&str, &str)]| corepack(cwd, yarn_berry(), args, env);
+    let yarnrc = std::fs::read_to_string(proj.join(".yarnrc.yml")).unwrap();
+    let flow = yarn_berry_common::BerryVexFlow {
+        yarn_spec: yarn_berry(),
+        flow: match driver {
+            VendorDriver::VendorCli => "node-modules(vendor)",
+            VendorDriver::GetUuid => "node-modules(get)",
+        },
+        wiring: yarn_berry_common::BerryWiring::Vendored {
+            artifact_rel: tgz_rel.clone(),
+        },
+        proj: &proj,
+        scratch: tmp.path(),
+        committable: &["package.json", "yarn.lock"],
+        yarnrc: &yarnrc,
+        registry_state: &registry_state,
+        purl: &purl,
+        uuid: UUID,
+        vulns: &[(GHSA, &[CVE])],
+        patched: &patched,
+        pristine: &orig,
+        installed: "node_modules/left-pad/index.js",
+        registry_cache: proj.join(".yarn/cache"),
+        yarn: &yarn,
+        flow_api: None,
+        pnp_cell: true,
+    };
+    yarn_berry_common::off_runtime(|| yarn_berry_common::run_manifestless_vex_matrix(&flow));
 
     if driver == VendorDriver::GetUuid {
         // The lifecycle's latter half (idempotent re-vendor + revert) is the

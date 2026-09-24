@@ -9,6 +9,20 @@
 //!   2. `package.json` (npm)        → `pkg:npm/<name>@<version>`
 //!   3. `pyproject.toml` (PyPI)     → `pkg:pypi/<name>@<version>`
 //!   4. `Cargo.toml` (Cargo)        → `pkg:cargo/<name>@<version>`
+//!   5. `go.mod` (Go)               → `pkg:golang/<module>` (go.mod
+//!      records no version)
+//!   6. `composer.json` (Composer)  → `pkg:composer/<vendor>/<name>[@<version>]`
+//!   7. `pom.xml` (Maven)           → `pkg:maven/<groupId>/<artifactId>[@<version>]`
+//!      (groupId/version inherited from `<parent>` when absent)
+//!   8. the root's single `*.csproj` (NuGet) → `pkg:nuget/<PackageId>[@<Version>]`
+//!   9. the root's single `*.gemspec` (RubyGems) → `pkg:gem/<name>[@<version>]`
+//!
+//! Probes 5-9 exist for the ecosystems whose projects have no
+//! package.json/pyproject.toml/Cargo.toml — manifest-less VEX attests Go,
+//! Composer, Maven, NuGet and gem projects straight from their lockfiles,
+//! and those projects must not dead-end on `product_undetected`. They run
+//! strictly AFTER probes 2-4 (the documented precedence of those is stable)
+//! and only yield a version when the file records a literal one.
 //!
 //! Returns `None` only when none of these sources yield a usable
 //! identifier. Multiple-package-manifest case: we pick the highest
@@ -28,6 +42,10 @@ use crate::package_json::detect::strip_bom;
 /// Version-extracting parser for one manifest flavor, keyed by file name in
 /// the priority table inside [`detect_product`].
 type ManifestParser = fn(&str) -> Option<String>;
+
+/// Parser for a project file NAMED after the project (`<stem><ext>`); the
+/// stem is the fallback product name.
+type NamedManifestParser = fn(&str, &str) -> Option<String>;
 
 /// Outcome of [`detect_product`].
 #[derive(Debug, Clone, Default)]
@@ -55,24 +73,54 @@ pub async fn detect_product(cwd: &Path) -> DetectResult {
     // one may fail to parse (invalid JSON, missing version, workspace
     // inheritance) and fall through to a lower-priority manifest. The
     // warning must name what we used, otherwise it misreports the source.
-    let manifests: [(&str, ManifestParser); 3] = [
+    //
+    // Probes 5-9 (go.mod … *.gemspec) come strictly after the original three,
+    // so a project that has always resolved to its package.json keeps doing so.
+    let manifests: [(&str, ManifestParser); 6] = [
         ("package.json", parse_package_json),
         ("pyproject.toml", parse_pyproject),
         ("Cargo.toml", parse_cargo_toml),
+        ("go.mod", parse_go_mod),
+        ("composer.json", parse_composer_json),
+        ("pom.xml", parse_pom_xml),
     ];
-    let mut present = Vec::new();
-    let mut selected: Option<&str> = None;
+    let mut present: Vec<String> = Vec::new();
+    let mut selected: Option<String> = None;
     for (name, parse) in manifests {
         let path = cwd.join(name);
         if tokio::fs::metadata(&path).await.is_err() {
             continue;
         }
-        present.push(name);
+        present.push(name.to_string());
         if result.purl.is_none() {
-            if let Ok(content) = tokio::fs::read_to_string(&path).await {
+            // Guarded read: a FIFO squatting a manifest name must fail fast,
+            // not wedge the run in open(2) waiting for a writer.
+            if let Ok(content) = crate::utils::fs::read_regular_to_string(&path).await {
                 if let Some(purl) = parse(&content) {
                     result.purl = Some(purl);
-                    selected = Some(name);
+                    selected = Some(name.to_string());
+                }
+            }
+        }
+    }
+    // Project files named after the project (`<Name>.csproj`,
+    // `<name>.gemspec`): only an UNAMBIGUOUS root file counts — with several
+    // there is no single top-level product to name.
+    let named: [(&str, NamedManifestParser); 2] =
+        [(".csproj", parse_csproj), (".gemspec", parse_gemspec)];
+    for (ext, parse) in named {
+        let Some(file_name) = single_root_file_with_extension(cwd, ext).await else {
+            continue;
+        };
+        present.push(file_name.clone());
+        if result.purl.is_none() {
+            let stem = &file_name[..file_name.len() - ext.len()];
+            if let Ok(content) =
+                crate::utils::fs::read_regular_to_string(&cwd.join(&file_name)).await
+            {
+                if let Some(purl) = parse(&content, stem) {
+                    result.purl = Some(purl);
+                    selected = Some(file_name.clone());
                 }
             }
         }
@@ -81,7 +129,7 @@ pub async fn detect_product(cwd: &Path) -> DetectResult {
     // Warn only when more than one manifest is present AND we actually
     // settled on one — naming the manifest we used.
     if present.len() > 1 {
-        if let Some(used) = selected {
+        if let Some(used) = selected.as_deref() {
             result.warnings.push(format!(
                 "Multiple project manifests detected ({}); using {} for the top-level product",
                 present.join(", "),
@@ -119,6 +167,204 @@ fn parse_pyproject(content: &str) -> Option<String> {
 fn parse_cargo_toml(content: &str) -> Option<String> {
     let (name, version) = scan_toml_section(strip_bom(content), "package")?;
     Some(format!("pkg:cargo/{name}@{version}"))
+}
+
+/// `go.mod` → `pkg:golang/<module>` from the `module` directive (quoted or
+/// bare, trailing `//` comment allowed). go.mod records no version, so the
+/// purl carries none.
+fn parse_go_mod(content: &str) -> Option<String> {
+    for raw in strip_bom(content).lines() {
+        let line = raw.split("//").next().unwrap_or("").trim();
+        let Some(rest) = line.strip_prefix("module") else {
+            continue;
+        };
+        if !rest.starts_with([' ', '\t']) {
+            continue;
+        }
+        let module = rest.trim().trim_matches('"');
+        let plausible = !module.is_empty()
+            && !module.contains(char::is_whitespace)
+            && crate::patch::path_safety::is_safe_multi_segment(module);
+        return plausible.then(|| format!("pkg:golang/{module}"));
+    }
+    None
+}
+
+/// `composer.json` → `pkg:composer/<vendor>/<name>[@<version>]` (composer
+/// names are lowercase `vendor/name`; `version` is optional and usually
+/// absent — composer derives it from VCS tags).
+fn parse_composer_json(content: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(strip_bom(content)).ok()?;
+    let name = v.get("name")?.as_str()?.trim().to_lowercase();
+    let (vendor, pkg) = name.split_once('/')?;
+    if vendor.is_empty() || pkg.is_empty() || pkg.contains('/') {
+        return None;
+    }
+    Some(
+        match v.get("version").and_then(|v| v.as_str()).map(str::trim) {
+            Some(version) if !version.is_empty() => {
+                format!("pkg:composer/{vendor}/{pkg}@{version}")
+            }
+            _ => format!("pkg:composer/{vendor}/{pkg}"),
+        },
+    )
+}
+
+/// `pom.xml` → `pkg:maven/<groupId>/<artifactId>[@<version>]` from the
+/// PROJECT's own coordinates (direct children of `<project>`), inheriting
+/// groupId/version from `<parent>` when the project omits them. A version
+/// that is an unresolved property (`${revision}`) is dropped rather than
+/// emitted verbatim.
+fn parse_pom_xml(content: &str) -> Option<String> {
+    let [group, artifact, version, parent_group, parent_version] = xml_element_texts(
+        strip_bom(content),
+        [
+            &["project", "groupId"],
+            &["project", "artifactId"],
+            &["project", "version"],
+            &["project", "parent", "groupId"],
+            &["project", "parent", "version"],
+        ],
+    );
+    let artifact = artifact?;
+    let group = group.or(parent_group)?;
+    let version = version.or(parent_version).filter(|v| !v.contains("${"));
+    Some(match version {
+        Some(v) => format!("pkg:maven/{group}/{artifact}@{v}"),
+        None => format!("pkg:maven/{group}/{artifact}"),
+    })
+}
+
+/// `<Name>.csproj` → `pkg:nuget/<id>[@<version>]` from the project's
+/// `<PropertyGroup>` properties: `PackageId`, else `AssemblyName`, else the
+/// file stem; `Version` / `PackageVersion` when literal (MSBuild `$(…)`
+/// expressions are dropped). Only `Project/PropertyGroup/*` counts — a
+/// `<PackageReference>`'s child `<Version>` names a DEPENDENCY's version.
+fn parse_csproj(content: &str, stem: &str) -> Option<String> {
+    let [package_id, assembly_name, version, package_version] = xml_element_texts(
+        strip_bom(content),
+        [
+            &["Project", "PropertyGroup", "PackageId"],
+            &["Project", "PropertyGroup", "AssemblyName"],
+            &["Project", "PropertyGroup", "Version"],
+            &["Project", "PropertyGroup", "PackageVersion"],
+        ],
+    );
+    let id = package_id
+        .or(assembly_name)
+        .unwrap_or_else(|| stem.to_string());
+    if id.is_empty() || id.contains(['/', '\\', '$', ' ']) {
+        return None;
+    }
+    let version = version.or(package_version).filter(|v| !v.contains("$("));
+    Some(match version {
+        Some(v) => format!("pkg:nuget/{id}@{v}"),
+        None => format!("pkg:nuget/{id}"),
+    })
+}
+
+/// Minimal element-path scanner for the handful of XML fields product
+/// detection needs: tracks the open-element stack (comments, processing
+/// instructions, CDATA and declarations skipped; self-closing tags ignored;
+/// a mismatched close tag is ignored rather than popping) and returns the
+/// trimmed text of the FIRST element at each of `paths` (element names
+/// compared exactly, root first). Not a general XML parser — a file it
+/// cannot follow simply yields no product.
+fn xml_element_texts<const N: usize>(xml: &str, paths: [&[&str]; N]) -> [Option<String>; N] {
+    let mut found: [Option<String>; N] = std::array::from_fn(|_| None);
+    let mut stack: Vec<&str> = Vec::new();
+    let mut rest = xml;
+    while let Some(open) = rest.find('<') {
+        let text = &rest[..open];
+        let after = &rest[open..];
+        let skip_past = |end_pat: &str| after.find(end_pat).map(|i| i + end_pat.len());
+        let consumed = if after.starts_with("<!--") {
+            skip_past("-->")
+        } else if after.starts_with("<![CDATA[") {
+            skip_past("]]>")
+        } else if after.starts_with("<?") {
+            skip_past("?>")
+        } else if after.starts_with("<!") {
+            skip_past(">")
+        } else if let Some(close) = after.strip_prefix("</") {
+            close.find('>').map(|end| {
+                let name = close[..end].trim();
+                if stack.last() == Some(&name) {
+                    if let Some(i) = paths.iter().position(|p| *p == stack.as_slice()) {
+                        let value = text.trim();
+                        if found[i].is_none() && !value.is_empty() {
+                            found[i] = Some(value.to_string());
+                        }
+                    }
+                    stack.pop();
+                }
+                end + 3
+            })
+        } else {
+            after.find('>').map(|end| {
+                let tag = &after[1..end];
+                if !tag.ends_with('/') {
+                    stack.push(tag.split(char::is_whitespace).next().unwrap_or(""));
+                }
+                end + 1
+            })
+        };
+        let Some(consumed) = consumed else { break };
+        rest = &after[consumed..];
+    }
+    found
+}
+
+/// `<name>.gemspec` → `pkg:gem/<name>[@<version>]` from literal
+/// `<spec>.name = "…"` / `<spec>.version = "…"` assignments; a version
+/// computed from a constant (`Foo::VERSION`) is dropped, and the name falls
+/// back to the file stem.
+fn parse_gemspec(content: &str, stem: &str) -> Option<String> {
+    let literal = |attr: &str| -> Option<String> {
+        strip_bom(content).lines().find_map(|raw| {
+            let line = raw.trim();
+            let (lhs, rhs) = line.split_once('=')?;
+            let lhs = lhs.trim();
+            if !lhs.ends_with(&format!(".{attr}")) || rhs.starts_with('=') {
+                return None;
+            }
+            let rhs = rhs.trim();
+            let quote = rhs.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let inner = &rhs[1..];
+            let end = inner.find(quote)?;
+            let value = inner[..end].trim();
+            (!value.is_empty() && !value.contains("#{")).then(|| value.to_string())
+        })
+    };
+    let name = literal("name").unwrap_or_else(|| stem.to_string());
+    if name.is_empty() || name.contains(['/', '\\', ' ']) {
+        return None;
+    }
+    Some(match literal("version") {
+        Some(v) => format!("pkg:gem/{name}@{v}"),
+        None => format!("pkg:gem/{name}"),
+    })
+}
+
+/// The one regular file directly under `cwd` named `*<ext>`, or `None` when
+/// there are zero or several (sorted names, so the answer is stable).
+async fn single_root_file_with_extension(cwd: &Path, ext: &str) -> Option<String> {
+    let mut found: Vec<String> = Vec::new();
+    for entry in crate::utils::fs::list_dir_entries(cwd).await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.len() > ext.len() && name.ends_with(ext) {
+            let is_file = entry
+                .file_type()
+                .await
+                .map(|t| t.is_file())
+                .unwrap_or(false);
+            if is_file {
+                found.push(name);
+            }
+        }
+    }
+    found.sort();
+    (found.len() == 1).then(|| found.remove(0))
 }
 
 /// Minimal line-based TOML scanner for `[<section>]` blocks. Reads
@@ -1865,5 +2111,139 @@ mod tests {
             scan_remote_origin_url(cfg).as_deref(),
             Some(r"git@github.com:foo/b\ar.git")
         );
+    }
+
+    // ── D10: manifest-less-VEX ecosystems (go / composer / maven / nuget /
+    // gem). Probes 5-9 run AFTER package.json / pyproject.toml / Cargo.toml.
+
+    async fn detect_in(files: &[(&str, &str)]) -> DetectResult {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in files {
+            tokio::fs::write(dir.path().join(name), content)
+                .await
+                .unwrap();
+        }
+        detect_product(dir.path()).await
+    }
+
+    #[tokio::test]
+    async fn detect_go_mod_module_without_version() {
+        let r = detect_in(&[(
+            "go.mod",
+            "// comment\nmodule \"github.com/acme/svc\" // trailing\n\ngo 1.22\n",
+        )])
+        .await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:golang/github.com/acme/svc"));
+        let r = detect_in(&[("go.mod", "module example.com/m/v2\n")]).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:golang/example.com/m/v2"));
+        // `modulefoo` is not the directive; traversal-shaped paths refused.
+        assert!(detect_in(&[("go.mod", "modulefoo x\n")])
+            .await
+            .purl
+            .is_none());
+        assert!(detect_in(&[("go.mod", "module ../x\n")])
+            .await
+            .purl
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn detect_composer_json_name_and_optional_version() {
+        let r = detect_in(&[("composer.json", r#"{"name":"Acme/App","version":"1.2.0"}"#)]).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:composer/acme/app@1.2.0"));
+        let r = detect_in(&[("composer.json", r#"{"name":"acme/app"}"#)]).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:composer/acme/app"));
+        assert!(detect_in(&[("composer.json", r#"{"name":"noslash"}"#)])
+            .await
+            .purl
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn detect_pom_project_coordinates_not_dependencies() {
+        let pom = r#"<?xml version="1.0"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <!-- <groupId>commented.out</groupId> -->
+  <parent><groupId>org.parent</groupId><artifactId>p</artifactId><version>9</version></parent>
+  <artifactId>app</artifactId>
+  <dependencies>
+    <dependency><groupId>dep.g</groupId><artifactId>dep</artifactId><version>1.0</version></dependency>
+  </dependencies>
+</project>"#;
+        let r = detect_in(&[("pom.xml", pom)]).await;
+        assert_eq!(
+            r.purl.as_deref(),
+            Some("pkg:maven/org.parent/app@9"),
+            "groupId/version inherit from <parent>; dependency coordinates never leak"
+        );
+        let own = "<project><groupId>g</groupId><artifactId>a</artifactId>\
+                   <version>${revision}</version></project>";
+        assert_eq!(
+            detect_in(&[("pom.xml", own)]).await.purl.as_deref(),
+            Some("pkg:maven/g/a"),
+            "an unresolved property version is dropped, not emitted"
+        );
+        assert!(
+            detect_in(&[("pom.xml", "<project><groupId>g</groupId></project>")])
+                .await
+                .purl
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_single_csproj_package_id_and_version() {
+        let csproj = r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><PackageId>Acme.Lib</PackageId><Version>2.1.0</Version></PropertyGroup>
+  <ItemGroup><PackageReference Include="X"><Version>9.9.9</Version></PackageReference></ItemGroup>
+</Project>"#;
+        let r = detect_in(&[("Acme.csproj", csproj)]).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:nuget/Acme.Lib@2.1.0"));
+        // No PackageId → the file stem; a $(…) version is dropped.
+        let r = detect_in(&[(
+            "Tool.csproj",
+            "<Project><PropertyGroup><Version>$(Ver)</Version></PropertyGroup></Project>",
+        )])
+        .await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:nuget/Tool"));
+        // Two root projects: ambiguous, no product.
+        let r = detect_in(&[("A.csproj", "<Project/>"), ("B.csproj", "<Project/>")]).await;
+        assert!(r.purl.is_none());
+    }
+
+    #[tokio::test]
+    async fn detect_single_gemspec_literal_name_and_version() {
+        let gemspec = "Gem::Specification.new do |spec|\n  spec.name = \"acme\"\n  \
+                       spec.version = '1.4.0'\nend\n";
+        let r = detect_in(&[("acme.gemspec", gemspec)]).await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:gem/acme@1.4.0"));
+        let computed = "Gem::Specification.new do |s|\n  s.name = \"acme\"\n  \
+                        s.version = Acme::VERSION\nend\n";
+        let r = detect_in(&[("acme.gemspec", computed)]).await;
+        assert_eq!(
+            r.purl.as_deref(),
+            Some("pkg:gem/acme"),
+            "computed version dropped"
+        );
+    }
+
+    /// The new probes never outrank the original three, and coexisting
+    /// manifests still produce the (accurate) multi-manifest warning.
+    #[tokio::test]
+    async fn new_probes_run_after_the_original_manifests() {
+        let r = detect_in(&[
+            ("package.json", r#"{"name":"web","version":"1.0.0"}"#),
+            ("go.mod", "module github.com/acme/svc\n"),
+        ])
+        .await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:npm/web@1.0.0"));
+        assert_eq!(r.warnings.len(), 1);
+        assert!(r.warnings[0].contains("go.mod") && r.warnings[0].contains("using package.json"));
+        let r = detect_in(&[
+            ("go.mod", "module github.com/acme/svc\n"),
+            ("composer.json", r#"{"name":"acme/app"}"#),
+        ])
+        .await;
+        assert_eq!(r.purl.as_deref(), Some("pkg:golang/github.com/acme/svc"));
     }
 }
