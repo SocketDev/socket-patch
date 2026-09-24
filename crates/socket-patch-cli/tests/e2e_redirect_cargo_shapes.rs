@@ -16,8 +16,8 @@
 //! patched `.crate`s rebuilt from the ACTUAL crates.io bytes and served by a
 //! wiremock sparse registry per patch, `scan --mode hosted`, then a FRESH
 //! checkout (only the committed files travel) where `cargo fetch --locked`
-//! and an offline `cargo build --locked` must link each patched-only symbol,
-//! and finally `remove <purl>` for every patch, which must leave the project
+//! and an offline `cargo build --locked` must link each patched-only symbol
+//! and a post-install `vex` must attest exactly the patches, and finally `remove <purl>` for every patch, which must leave the project
 //! byte-identical to its pre-scan state.
 //!
 //! Skips (with a println) when `cargo` is missing or crates.io is
@@ -216,7 +216,7 @@ fn router(origin: String, served: Vec<Served>) -> impl Fn(&Request) -> ResponseT
                         "purl": s.patch.purl(),
                         "patches": [{
                             "uuid": s.patch.uuid, "purl": s.patch.purl(), "tier": "free",
-                            "cveIds": [], "ghsaIds": [format!("GHSA-shape-{}", &s.patch.uuid[..4])],
+                            "cveIds": [], "ghsaIds": [format!("GHSA-shape-{}", &s.patch.uuid[..8])],
                             "severity": "high", "title": "cargo shape fixture"
                         }]
                     })
@@ -285,7 +285,7 @@ fn router(origin: String, served: Vec<Served>) -> impl Fn(&Request) -> ResponseT
                         "beforeHash": compute_git_sha256_from_bytes(&s.orig),
                         "afterHash": compute_git_sha256_from_bytes(&s.patched),
                     }},
-                    "vulnerabilities": { format!("GHSA-shape-{}", &uuid[..4]): {
+                    "vulnerabilities": { format!("GHSA-shape-{}", &uuid[..8]): {
                         "cves": [], "summary": "s", "severity": "high", "description": "d"
                     }},
                     "description": "x", "license": "MIT", "tier": "free"
@@ -450,6 +450,9 @@ async fn run_shape(shape: Shape) -> Option<()> {
         std::fs::create_dir_all(to.parent().unwrap()).unwrap();
         std::fs::copy(proj.join(&rel), to).unwrap();
     }
+    if proj.join(".socket").is_dir() {
+        copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    }
     let fresh_home = tmp.path().join("fresh-home");
     std::fs::create_dir_all(&fresh_home).unwrap();
     let fetch = cargo(&fresh, &["fetch", "--locked"], &fresh_home);
@@ -469,6 +472,46 @@ async fn run_shape(shape: Shape) -> Option<()> {
         shape.tag,
         stderr(&build)
     );
+
+    // Post-install VEX over the fresh checkout: every patch is attested,
+    // hash-verified against the extracted (patched) registry sources.
+    let doc_path = fresh.join("doc.vex.json");
+    let fresh_s = fresh.to_str().unwrap().to_string();
+    let (code, stdout, err) = run_socket(
+        &fresh,
+        &[
+            "vex",
+            "--output",
+            doc_path.to_str().unwrap(),
+            "--product",
+            "pkg:cargo/consumer@0.1.0",
+            "--patch-server-url",
+            &uri,
+            "--cwd",
+            &fresh_s,
+        ],
+        &fresh_home,
+    );
+    assert_eq!(
+        code, 0,
+        "{}: vex\nstdout:\n{stdout}\nstderr:\n{err}",
+        shape.tag
+    );
+    let doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&doc_path).unwrap()).unwrap();
+    let mut attested: Vec<String> = doc["statements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|st| st["products"].as_array().unwrap().clone())
+        .flat_map(|p| p["subcomponents"].as_array().unwrap().clone())
+        .map(|c| c["@id"].as_str().unwrap().to_string())
+        .collect();
+    attested.sort();
+    attested.dedup();
+    let mut expected: Vec<String> = shape.patches.iter().map(Patch::purl).collect();
+    expected.sort();
+    assert_eq!(attested, expected, "{}: attested purls: {doc}", shape.tag);
 
     // Rollback: removing every purl restores the pre-scan project exactly.
     for patch in &shape.patches {
