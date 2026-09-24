@@ -9,10 +9,10 @@ use serde::Deserialize;
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, read_dir_entries_sync, run_blocking};
+use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
 #[cfg(test)]
 mod oracle;
-use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
 /// Directories to skip when searching for workspace node_modules.
 const SKIP_DIRS: &[&str] = &[
