@@ -2081,11 +2081,12 @@ fn cargo_vendored_manifest_patch_builds_on_old_toolchains() {
 /// crates.io index to tell two same-named `[patch]` entries apart. Cargo
 /// 1.56 builds the committed two-version wiring under `--offline` from an
 /// empty CARGO_HOME (what the docs require there); older cargo (1.41) needs
-/// the index itself — it fails even under `--offline` with no registry
-/// cache, the same for tagged and untagged locks — so below 1.56 only that
-/// documented failure is accepted. Without `--offline` the outcome is only
-/// reported (current stable needs neither — see
-/// `cargo_vendor_two_versions_of_one_crate_locked_build`).
+/// the index itself — it fails under `--offline` with no registry cache
+/// (only that failure is accepted from an empty CARGO_HOME), and the
+/// documented remedy, a populated crates.io index in `$CARGO_HOME`, must
+/// then build (and run) both patched copies with no network. Without
+/// `--offline` the outcome is only reported (current stable needs neither
+/// — see `cargo_vendor_two_versions_of_one_crate_locked_build`).
 #[test]
 fn cargo_vendored_two_versions_on_old_toolchains_need_offline() {
     const SUITE: &str = "e2e_vendor_cargo_build (old-toolchain multi-version)";
@@ -2120,7 +2121,7 @@ fn cargo_vendored_two_versions_on_old_toolchains_need_offline() {
                 "needs --offline (registry index unreachable)"
             }
         );
-        let run = old_cargo_run(&old, &fresh, &["--offline"]);
+        let mut run = old_cargo_run(&old, &fresh, &["--offline"]);
         if old.minor() < 56 && !run.out.status.success() {
             let stderr = String::from_utf8_lossy(&run.out.stderr);
             assert!(
@@ -2129,8 +2130,8 @@ fn cargo_vendored_two_versions_on_old_toolchains_need_offline() {
                  index:\n{stderr}"
             );
             println!("old-toolchain multi-version {name}: needs a registry index (documented)");
-            let _ = std::fs::remove_dir_all(&fresh);
-            continue;
+            seed_old_crates_io_index(&fresh.join(".old-cargo-home"), &[&fx.new_v, &fx.old_v]);
+            run = old_cargo_run(&old, &fresh, &["--offline"]);
         }
         assert!(
             run.out.status.success(),
@@ -2146,6 +2147,61 @@ fn cargo_vendored_two_versions_on_old_toolchains_need_offline() {
         }
         let _ = std::fs::remove_dir_all(&fresh);
     }
+}
+
+/// The documented remedy for two vendored versions on cargo older than
+/// 1.56: a populated crates.io index in `$CARGO_HOME`. Writes the minimal
+/// one an old cargo reads offline — the git index at the pre-1.85
+/// `registry/index/github.com-1ecc6299db9ec823` path (`origin/HEAD` names
+/// the tree cargo loads), listing `versions` of the patched crate. No
+/// `.crate` is cached: every listed version is patched to a path copy, so
+/// nothing is downloaded.
+fn seed_old_crates_io_index(cargo_home: &Path, versions: &[&str]) {
+    let index = cargo_home.join("registry/index/github.com-1ecc6299db9ec823");
+    let file = index.join(&DEP[..2]).join(&DEP[2..4]).join(DEP);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        index.join("config.json"),
+        "{\"dl\":\"https://crates.io/api/v1/crates\",\"api\":\"https://crates.io\"}\n",
+    )
+    .unwrap();
+    let lines: String = versions
+        .iter()
+        .map(|v| {
+            format!(
+                "{{\"name\":\"{DEP}\",\"vers\":\"{v}\",\"deps\":[],\"cksum\":\"{}\",\
+                 \"features\":{{}},\"yanked\":false}}\n",
+                "0".repeat(64)
+            )
+        })
+        .collect();
+    std::fs::write(&file, lines).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args([
+                "-c",
+                "user.name=socket-patch-e2e",
+                "-c",
+                "user.email=e2e@invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .current_dir(&index)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q", "."]);
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "index"]);
+    git(&["update-ref", "refs/remotes/origin/HEAD", "HEAD"]);
 }
 
 /// A root manifest that spells crates.io by URL in `[patch]` (cargo lets

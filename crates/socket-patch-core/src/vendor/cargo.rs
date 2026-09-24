@@ -5546,6 +5546,94 @@ mod tests {
         }
     }
 
+    /// `repair`'s migration over a wired copy whose `Cargo.toml` cannot
+    /// take the tag (no literal version) is the `cargo_version_untagged`
+    /// warning — dry run and wet run alike — and nothing is written: the
+    /// lock keeps its untagged entry, so copy and lock still agree.
+    #[tokio::test]
+    async fn repair_migration_over_an_untaggable_copy_warns_untagged() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let (_, entry, _) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        let entry = entry.unwrap();
+        untag_project(root).await;
+        let untaggable = "[package]\nname = \"cfg-if\"\nversion.workspace = true\n";
+        tokio::fs::write(root.join(copy_rel()).join("Cargo.toml"), untaggable)
+            .await
+            .unwrap();
+        let lock = lock_text(root).await;
+        for dry_run in [true, false] {
+            let (_, warnings) = migrate_legacy_wiring(&entry, root, dry_run)
+                .await
+                .unwrap()
+                .expect("the untaggable copy is reported");
+            let codes: Vec<&str> = warnings.iter().map(|w| w.code).collect();
+            assert_eq!(codes, ["cargo_version_untagged"], "dry_run={dry_run}");
+            assert!(
+                warnings[0].detail.contains(COPY_UNTAGGABLE),
+                "{:?}",
+                warnings[0]
+            );
+            assert_eq!(lock_text(root).await, lock, "dry_run={dry_run}");
+            assert_eq!(copy_toml(root).await, untaggable, "dry_run={dry_run}");
+        }
+    }
+
+    /// A lock retag that passes its read-only proof but whose WRITE fails
+    /// (the project root is read-only, so the atomic rewrite cannot stage
+    /// its sibling, while the copy under `.socket/` stays writable) untags
+    /// the copy again: copy and lock never disagree. Both callers — the
+    /// vendor re-run's hot path and `repair`'s migration — report it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_lock_retag_write_untags_the_copy_again() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores directory permission bits
+        }
+        for via_repair in [false, true] {
+            let (dir, blobs, pristine, record) = fixture().await;
+            let root = dir.path();
+            let (_, entry, _) =
+                expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+            let entry = entry.unwrap();
+            untag_project(root).await;
+            let lock = lock_text(root).await;
+            let copy = copy_toml(root).await;
+
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let error = if via_repair {
+                let outcome = migrate_legacy_wiring(&entry, root, false).await;
+                std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let (_, warnings) = outcome.unwrap().expect("the failed tag is reported");
+                assert_eq!(warnings.len(), 1, "{warnings:?}");
+                assert_eq!(warnings[0].code, "cargo_version_untagged");
+                warnings[0].detail.clone()
+            } else {
+                let outcome = run_vendor(PURL, root, &blobs, &pristine, &record, false).await;
+                std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let (result, again, _) = expect_done(outcome);
+                assert!(!result.success && again.is_none());
+                result.error.unwrap_or_default()
+            };
+            assert!(
+                error.contains(LOCK_UNTAGGABLE),
+                "via_repair={via_repair}: {error}"
+            );
+            assert_eq!(lock_text(root).await, lock, "via_repair={via_repair}");
+            assert_eq!(
+                copy_toml(root).await,
+                copy,
+                "via_repair={via_repair}: the copy is untagged again"
+            );
+            assert_eq!(
+                cargo_tag::copy_manifest_tag(&root.join(copy_rel())).await,
+                None
+            );
+        }
+    }
+
     /// A lock whose detached entry is tagged for ANOTHER uuid while the
     /// wiring points at this copy (a lock checked out from another patch
     /// generation) is only stale: cargo re-locks an unlocked build to the
