@@ -64,13 +64,37 @@ fn build_cmd(
     extra_args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Command {
+    build_cmd_with_token(
+        "fake-token-for-test",
+        cwd,
+        api_url,
+        subcommand,
+        extra_args,
+        extra_env,
+    )
+}
+
+/// A `sktsec_<44 chars>_api`-shaped token: the client's token-shape check
+/// stays quiet, so a run's stderr carries only what the command under test
+/// writes (the default fake token draws a warning before anything runs).
+const WELL_SHAPED_TOKEN: &str = "sktsec_00000000000000000000000000000000000000000000_api";
+
+/// [`build_cmd`] with an explicit `--api-token`.
+fn build_cmd_with_token(
+    api_token: &str,
+    cwd: &Path,
+    api_url: &str,
+    subcommand: &str,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Command {
     let mut args = vec![
         subcommand,
         "--json",
         "--api-url",
         api_url,
         "--api-token",
-        "fake-token-for-test",
+        api_token,
         "--org",
         ORG_SLUG,
     ];
@@ -941,6 +965,109 @@ async fn scan_delivers_telemetry_before_writing_to_a_closed_stdout() {
             1,
             "{}: no other telemetry event",
             case.label
+        );
+    }
+}
+
+/// The stderr twin of the closed-stdout test above: a malformed hosted
+/// redirect ledger makes a non-hosted scan warn on stderr (the lenient
+/// read-only consult) right after the scan event fires, BEFORE any stdout
+/// write — so with stderr closed that warning is the run's first
+/// SIGPIPE-raising write, and the background send must be flushed ahead of
+/// it, as the inline send it replaced always was. The plain envelope does
+/// no network work between the event and the warning, so without the flush
+/// the delayed send deterministically loses the race; the vendored arm is
+/// covered too (its warning also precedes `discover_selected`'s flush).
+#[tokio::test]
+async fn scan_delivers_telemetry_before_writing_to_a_closed_stderr() {
+    const TELEMETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
+
+    let cases: [(&str, &[&str]); 2] = [
+        ("plain envelope", &[]),
+        ("vendored", &["--mode", "vendored", "--dry-run"]),
+    ];
+    for (label, extra_args) in cases {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "packages": [], "canAccessPaidPatches": false }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/telemetry")))
+            .respond_with(ResponseTemplate::new(201).set_delay(TELEMETRY_DELAY))
+            .mount(&mock)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_root_package_json(tmp.path());
+        write_npm_package(tmp.path(), "minimist", "1.2.2");
+        let ledger_dir = tmp.path().join(".socket").join("vendor");
+        std::fs::create_dir_all(&ledger_dir).expect("mkdir .socket/vendor");
+        std::fs::write(ledger_dir.join("redirect-state.json"), "{ not json")
+            .expect("write malformed redirect ledger");
+
+        // Sanity: with stderr open the run does warn about the ledger, so
+        // the closed-stderr run below really has a write to die on.
+        let out = build_cmd_with_token(
+            WELL_SHAPED_TOKEN,
+            tmp.path(),
+            &mock.uri(),
+            "scan",
+            extra_args,
+            &[],
+        )
+        .output()
+        .expect("run socket-patch");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with("Warning: ") && stderr.contains("redirect-state.json"),
+            "{label}: the malformed redirect ledger's warning must be the \
+             run's first stderr write; got: {stderr}"
+        );
+        mock.reset().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "packages": [], "canAccessPaidPatches": false }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/telemetry")))
+            .respond_with(ResponseTemplate::new(201).set_delay(TELEMETRY_DELAY))
+            .mount(&mock)
+            .await;
+
+        let mut child = build_cmd_with_token(
+            WELL_SHAPED_TOKEN,
+            tmp.path(),
+            &mock.uri(),
+            "scan",
+            extra_args,
+            &[],
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn socket-patch");
+        // Close the read end before the child can write anything: its
+        // first stderr write now raises SIGPIPE.
+        drop(child.stderr.take());
+        let status = child.wait().expect("wait socket-patch");
+
+        assert_eq!(
+            telemetry_post_count(&mock, Some("patch_scanned")).await,
+            1,
+            "{label}: the patch_scanned event must be delivered before stderr \
+             is written (exit status {status:?})"
+        );
+        assert_eq!(
+            telemetry_post_count(&mock, None).await,
+            1,
+            "{label}: no other telemetry event"
         );
     }
 }

@@ -2114,11 +2114,20 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             Err(corrupt) => (None, Some(corrupt.to_string())),
         }
     } else {
-        (
-            crate::commands::load_redirect_state_lenient(&args.common.cwd, args.common.silent)
-                .await,
-            None,
-        )
+        // `load_redirect_state_lenient`, with the scan event's send flushed
+        // before its warning: that line can be this run's first write since
+        // the event fired, and a closed stderr's SIGPIPE must find the event
+        // delivered, as the inline send it replaced was.
+        match socket_patch_core::patch::redirect::load_redirect_state(&args.common.cwd).await {
+            Ok(state) => (state, None),
+            Err(corrupt) => {
+                if !args.common.silent {
+                    telemetry.flush().await;
+                    eprintln!("Warning: {corrupt}");
+                }
+                (None, None)
+            }
+        }
     };
     let update_manifest = merge_ledger_records_for_updates(
         existing_manifest.as_ref(),
@@ -2384,6 +2393,11 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             .await;
         }
 
+        // The GC and the VEX build below can write to stderr; the report-
+        // only arm has not flushed the scan event yet (the `--apply` arm
+        // did, in `discover_selected`).
+        telemetry.flush().await;
+
         // --- GC (post-apply, or standalone --prune GC-sweep) -------------
         if prune {
             result["gc"] = gc_json(
@@ -2405,7 +2419,6 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             &mut result,
         )
         .await;
-        telemetry.flush().await;
         print_json(&result);
         return final_code;
     }
