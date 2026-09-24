@@ -1277,6 +1277,8 @@ mod tests {
         purls.push("pkg:npm/%40s/a@1.0.0".to_string());
         purls.push("pkg:npm/foo@1.0.0?vcs_url=git@x".to_string());
         purls.push("pkg:npm/absent@1.0.0".to_string());
+        purls.push("pkg:npm/casedir@1.0.0".to_string());
+        purls.push("pkg:npm/@cs/x@1.0.0".to_string());
         purls.push("pkg:npm/../evil@1.0.0".to_string());
         purls.sort();
         purls.dedup();
@@ -1446,6 +1448,11 @@ mod tests {
             "l",
             "1.0.0",
         );
+        // A dir whose spelling differs from its package's name only by case
+        // (resolves under the lowercase name on case-insensitive volumes),
+        // and a scope spelled likewise.
+        write(&nm.join("CaseDir"), "casedir", "1.0.0");
+        write(&nm.join("@Cs").join("x"), "@cs/x", "1.0.0");
         // Broken / BOM'd package.json.
         std::fs::create_dir_all(nm.join("broken")).unwrap();
         std::fs::write(nm.join("broken").join("package.json"), "{").unwrap();

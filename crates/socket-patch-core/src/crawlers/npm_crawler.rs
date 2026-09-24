@@ -296,6 +296,52 @@ fn may_alias_ascii_name(name: &OsStr, target: &str) -> bool {
     }
 }
 
+/// Which first path components a `nm_path.join(dir_key)` lookup could
+/// resolve through, given `nm_path`'s listing — lets the resolver skip the
+/// package.json probes that could only fail, instead of opening
+/// `<nm>/<target>/package.json` for every pending target in every visited
+/// `node_modules`.
+///
+/// A superset by construction: filtering is on only for a complete listing
+/// whose names are all plain ASCII, and then matches
+/// ASCII-case-insensitively (so APFS/NTFS case-insensitive lookups are
+/// covered). Components a filesystem may resolve to a differently spelled
+/// entry — non-ASCII (Unicode folding / normalization), `~` (Windows 8.3
+/// short-name aliases) or a trailing `.`/space (stripped by Win32 path
+/// normalization) — are always probed.
+struct ProbeFilter {
+    /// `None` = the listing cannot prove absence; probe everything.
+    lower_names: Option<HashSet<String>>,
+}
+
+impl ProbeFilter {
+    fn new(listing: &Listing) -> Self {
+        let exhaustive = listing.complete
+            && listing
+                .entries
+                .iter()
+                .all(|e| e.name.to_str().is_some_and(|name| name.is_ascii()));
+        let lower_names = exhaustive.then(|| {
+            listing
+                .entries
+                .iter()
+                .map(|e| e.name_str.to_ascii_lowercase())
+                .collect()
+        });
+        Self { lower_names }
+    }
+
+    fn may_resolve(&self, component: &str) -> bool {
+        let Some(lower_names) = &self.lower_names else {
+            return true;
+        };
+        if !component.is_ascii() || component.contains('~') || component.ends_with(['.', ' ']) {
+            return true;
+        }
+        lower_names.contains(&component.to_ascii_lowercase())
+    }
+}
+
 /// What the blocking-pool scan of one `node_modules` tree records, in the
 /// exact order the sequential walk visits it;
 /// [`NpmCrawler::merge_scan_events`] then replays the order-dependent
@@ -612,8 +658,6 @@ impl NpmCrawler {
         node_modules_path: &Path,
         purls: &[String],
     ) -> Result<HashMap<String, Vec<CrawledPackage>>, std::io::Error> {
-        let mut result: HashMap<String, Vec<CrawledPackage>> = HashMap::new();
-
         let mut pending: Vec<Target> = Vec::new();
         for purl in purls {
             let Some((namespace, name, version)) = Self::parse_purl_components(purl) else {
@@ -647,29 +691,39 @@ impl NpmCrawler {
             });
         }
 
-        // Pass 1 — filtered: `.pnpm` virtual-store entries are enqueued
-        // only when their dir name decodes to a still-pending target's
-        // name (a manifest routinely lists packages that simply aren't
-        // installed here, and probing every entry of a large monorepo
-        // store for them would add a readdir+stat storm to every
-        // apply/rollback run).
-        let pending =
-            Self::resolve_pending_targets(node_modules_path, pending, &mut result, true).await;
+        // Both passes run as one blocking-pool task: each visited dir is
+        // listed once, and that listing both bounds which targets are
+        // probed there and drives the descent (see
+        // `resolve_pending_targets`).
+        let node_modules_path = node_modules_path.to_path_buf();
+        Ok(run_blocking(move || {
+            let mut result: HashMap<String, Vec<CrawledPackage>> = HashMap::new();
 
-        // Pass 2 — unfiltered fallback, only for targets pass 1 could not
-        // resolve: a target can physically exist ONLY inside another
-        // package's store entry (a bundled dependency at
-        // `.pnpm/host@1.0.0/node_modules/host/node_modules/<target>`),
-        // whose entry name decodes to the HOST's name — the pass-1 filter
-        // skips it, leaving an installed, scan-visible package invisible
-        // to apply (fail-open: apply reported it not installed). Probe
-        // every store entry for just the leftovers; the common all-
-        // resolved case never reaches this pass, so its perf is intact.
-        if !pending.is_empty() {
-            Self::resolve_pending_targets(node_modules_path, pending, &mut result, false).await;
-        }
+            // Pass 1 — filtered: `.pnpm` virtual-store entries are enqueued
+            // only when their dir name decodes to a still-pending target's
+            // name (a manifest routinely lists packages that simply aren't
+            // installed here, and probing every entry of a large monorepo
+            // store for them would add a readdir+stat storm to every
+            // apply/rollback run).
+            let pending =
+                Self::resolve_pending_targets(&node_modules_path, pending, &mut result, true);
 
-        Ok(result)
+            // Pass 2 — unfiltered fallback, only for targets pass 1 could not
+            // resolve: a target can physically exist ONLY inside another
+            // package's store entry (a bundled dependency at
+            // `.pnpm/host@1.0.0/node_modules/host/node_modules/<target>`),
+            // whose entry name decodes to the HOST's name — the pass-1 filter
+            // skips it, leaving an installed, scan-visible package invisible
+            // to apply (fail-open: apply reported it not installed). Probe
+            // every store entry for just the leftovers; the common all-
+            // resolved case never reaches this pass, so its perf is intact.
+            if !pending.is_empty() {
+                Self::resolve_pending_targets(&node_modules_path, pending, &mut result, false);
+            }
+
+            result
+        })
+        .await)
     }
 
     /// One breadth-first resolution pass over the tree rooted at
@@ -691,7 +745,13 @@ impl NpmCrawler {
     /// `filter_store_entries` selects whether pnpm virtual-store entries are
     /// bounded by the still-unmatched-name filter (pass 1) or all probed
     /// (the pass-2 fallback) — see `find_by_purls`.
-    async fn resolve_pending_targets(
+    ///
+    /// Each dequeued dir is listed ONCE: a target is probed there only if
+    /// the listing could hold its first path component (see
+    /// [`ProbeFilter`]; a skipped probe could only have failed), the
+    /// surviving package.json probes run in parallel and are folded back
+    /// in target order, and the same listing drives the descent.
+    fn resolve_pending_targets(
         node_modules_path: &Path,
         mut pending: Vec<Target>,
         result: &mut HashMap<String, Vec<CrawledPackage>>,
@@ -702,11 +762,22 @@ impl NpmCrawler {
         }
         let mut queue: VecDeque<PathBuf> = VecDeque::from([node_modules_path.to_path_buf()]);
         while let Some(nm_path) = queue.pop_front() {
-            for target in &pending {
+            let listing = list_dir_sync(&nm_path);
+            let probe_filter = ProbeFilter::new(&listing);
+            let probes: Vec<Option<(String, String)>> = pending
+                .par_iter()
+                .map(|target| {
+                    let first_component = target.namespace.as_deref().unwrap_or(&target.name);
+                    if !probe_filter.may_resolve(first_component) {
+                        return None;
+                    }
+                    read_package_json_sync(&nm_path.join(&target.dir_key).join("package.json"))
+                })
+                .collect();
+            for (target, probe) in pending.iter().zip(probes) {
                 let pkg_path = nm_path.join(&target.dir_key);
-                let pkg_json_path = pkg_path.join("package.json");
 
-                match read_package_json(&pkg_json_path).await {
+                match probe {
                     // The on-disk *name* must match too: an alias install
                     // (`npm i foo@npm:bar@1.0.0`) puts a different package
                     // in `node_modules/foo`, so matching on version alone
@@ -745,7 +816,7 @@ impl NpmCrawler {
                 .map(|t| t.dir_key.as_str())
                 .collect();
             let filter = filter_store_entries.then_some(&unmatched_names);
-            Self::collect_nested_node_modules(&nm_path, filter, &mut queue).await;
+            Self::collect_nested_node_modules(&nm_path, listing, filter, &mut queue);
         }
         // Only the targets with zero copies remain "pending" for pass 2.
         pending.retain(|t| !result.contains_key(&t.purl));
@@ -753,103 +824,105 @@ impl NpmCrawler {
     }
 
     /// Append the `node_modules` dirs living one level below `nm_path`
-    /// (inside each of its package dirs, scoped or not) to `queue`.
-    /// Mirrors `scan_node_modules`' traversal policy: hidden entries are
-    /// skipped and symlinked packages are never traversed — a symlink here
-    /// points into pnpm's content-addressed store or an `npm link` target
-    /// outside the project. The one exception is pnpm's `.pnpm` virtual
-    /// store (see below); `pending_names` — `Some(the still-unresolved
-    /// targets' full package names)` — bounds which store entries get
-    /// enqueued, while `None` (the pass-2 fallback of `find_by_purls`)
-    /// enqueues every store entry.
-    async fn collect_nested_node_modules(
+    /// (inside each of its package dirs, scoped or not) to `queue`, given
+    /// `nm_path`'s listing. Mirrors the scan's traversal policy: hidden
+    /// entries are skipped and symlinked packages are never traversed — a
+    /// symlink here points into pnpm's content-addressed store or an `npm
+    /// link` target outside the project. The one exception is pnpm's
+    /// `.pnpm` virtual store (see below); `pending_names` — `Some(the
+    /// still-unresolved targets' full package names)` — bounds which store
+    /// entries get enqueued, while `None` (the pass-2 fallback of
+    /// `find_by_purls`) enqueues every store entry.
+    ///
+    /// Entries are examined in parallel; their contributions are appended
+    /// in listing order, so the breadth-first queue is unchanged.
+    fn collect_nested_node_modules(
         nm_path: &Path,
+        listing: Listing,
         pending_names: Option<&HashSet<&str>>,
         queue: &mut VecDeque<PathBuf>,
     ) {
-        for entry in crate::utils::fs::list_dir_entries(nm_path).await {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            // pnpm's virtual store. Under the isolated linker the store is
-            // the ONLY physical home of transitive dependencies: the
-            // importer's node_modules holds symlinks for direct deps only,
-            // so a transitive-only target (installed at
-            // `.pnpm/<x>/node_modules/<name>`, runtime-loaded) is
-            // unreachable through the symlink-free walk above — invisible
-            // to apply despite being importable. Probe REAL store entries'
-            // `node_modules`; the name+version match in `find_by_purls`
-            // keeps aliases and multi-version store entries distinct, and
-            // BFS order guarantees a root-linked install has already been
-            // probed (and removed from `pending`) before these are
-            // dequeued, so a package is never resolved twice.
-            if name_str == ".pnpm" {
-                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
-                    continue;
-                };
-                if !file_type.is_dir() {
-                    continue;
-                }
-                let store_path = nm_path.join(&name);
-                let entries = Self::list_pnpm_store_entries(&store_path).await;
-                Self::enqueue_pending_store_entries(entries, pending_names, queue);
-                continue;
-            }
-            // pnpm <=3: the virtual store is a hidden `.<registry-host>` dir
-            // (there is no `.pnpm` at all) with the same
-            // transitive-only-deps property, so it gets the same probing.
-            // Must run before the generic hidden-entry skip below, which
-            // would otherwise swallow it — leaving every transitive-only
-            // install unpatchable on those layouts.
-            if is_legacy_pnpm_store_dir_name(&name_str) {
-                let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
-                    continue;
-                };
-                if !file_type.is_dir() {
-                    continue;
-                }
-                let mut entries = Vec::new();
-                Self::collect_nested_store_entries(&nm_path.join(&name), &mut entries).await;
-                Self::enqueue_pending_store_entries(entries, pending_names, queue);
-                continue;
-            }
-            if name_str.starts_with('.') || name_str == "node_modules" {
-                continue;
-            }
-            let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let entry_path = nm_path.join(&name);
+        let found: Vec<Vec<PathBuf>> = listing
+            .entries
+            .into_par_iter()
+            .map(|entry| Self::nested_node_modules_of(nm_path, entry, pending_names))
+            .collect();
+        queue.extend(found.into_iter().flatten());
+    }
 
-            if name_str.starts_with('@') {
-                for scoped in crate::utils::fs::list_dir_entries(&entry_path).await {
-                    let scoped_name = scoped.file_name();
-                    if scoped_name.to_string_lossy().starts_with('.') {
-                        continue;
-                    }
-                    let Some(scoped_type) = crate::utils::fs::entry_file_type(&scoped).await else {
-                        continue;
-                    };
-                    if !scoped_type.is_dir() {
-                        continue;
-                    }
-                    let nested = entry_path.join(&scoped_name).join("node_modules");
-                    if is_dir(&nested).await {
-                        queue.push_back(nested);
-                    }
-                }
+    /// The `node_modules` dirs one listing entry of `nm_path` contributes
+    /// to the resolver's queue (see [`Self::collect_nested_node_modules`]).
+    fn nested_node_modules_of(
+        nm_path: &Path,
+        entry: ListedEntry,
+        pending_names: Option<&HashSet<&str>>,
+    ) -> Vec<PathBuf> {
+        let name_str = entry.name_str.as_str();
+        // pnpm's virtual store. Under the isolated linker the store is
+        // the ONLY physical home of transitive dependencies: the
+        // importer's node_modules holds symlinks for direct deps only,
+        // so a transitive-only target (installed at
+        // `.pnpm/<x>/node_modules/<name>`, runtime-loaded) is
+        // unreachable through the symlink-free walk above — invisible
+        // to apply despite being importable. Probe REAL store entries'
+        // `node_modules`; the name+version match in `find_by_purls`
+        // keeps aliases and multi-version store entries distinct, and
+        // BFS order guarantees a root-linked install has already been
+        // probed (and removed from `pending`) before these are
+        // dequeued, so a package is never resolved twice.
+        if name_str == ".pnpm" {
+            if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
+                return Vec::new();
+            }
+            let entries = Self::list_pnpm_store_entries_sync(&nm_path.join(&entry.name), false)
+                .into_iter()
+                .map(|e| (e.name, e.node_modules))
+                .collect();
+            return Self::pending_store_entries(entries, pending_names);
+        }
+        // pnpm <=3: the virtual store is a hidden `.<registry-host>` dir
+        // (there is no `.pnpm` at all) with the same
+        // transitive-only-deps property, so it gets the same probing.
+        // Must run before the generic hidden-entry skip below, which
+        // would otherwise swallow it — leaving every transitive-only
+        // install unpatchable on those layouts.
+        if is_legacy_pnpm_store_dir_name(name_str) {
+            if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
+                return Vec::new();
+            }
+            let entries = Self::collect_nested_store_entries_sync(&nm_path.join(&entry.name));
+            return Self::pending_store_entries(entries, pending_names);
+        }
+        if name_str.starts_with('.') || name_str == "node_modules" {
+            return Vec::new();
+        }
+        if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
+            return Vec::new();
+        }
+        let entry_path = nm_path.join(&entry.name);
+
+        if name_str.starts_with('@') {
+            list_dir_sync(&entry_path)
+                .entries
+                .into_iter()
+                .filter(|scoped| {
+                    !scoped.name_str.starts_with('.')
+                        && scoped.file_type.is_some_and(|ft| ft.is_dir())
+                })
+                .map(|scoped| entry_path.join(&scoped.name).join("node_modules"))
+                .filter(|nested| is_dir_sync(nested))
+                .collect()
+        } else {
+            let nested = entry_path.join("node_modules");
+            if is_dir_sync(&nested) {
+                vec![nested]
             } else {
-                let nested = entry_path.join("node_modules");
-                if is_dir(&nested).await {
-                    queue.push_back(nested);
-                }
+                Vec::new()
             }
         }
     }
 
-    /// Enqueue virtual-store entries that can still hold a pending target.
+    /// The virtual-store entries that can still hold a pending target.
     /// A manifest routinely lists packages that simply aren't installed
     /// here, and probing every entry of a large monorepo store for them
     /// would add a readdir+stat storm to every apply/rollback run. The
@@ -866,11 +939,11 @@ impl NpmCrawler {
     /// a non-matching name — `find_by_purls`' pass-2 fallback probes every
     /// entry for exactly those. Both enumerators only yield entries whose
     /// `node_modules` exists, so no re-stat here.
-    fn enqueue_pending_store_entries(
+    fn pending_store_entries(
         entries: Vec<(String, PathBuf)>,
         pending_names: Option<&HashSet<&str>>,
-        queue: &mut VecDeque<PathBuf>,
-    ) {
+    ) -> Vec<PathBuf> {
+        let mut out = Vec::new();
         for (entry_name, entry_nm) in entries {
             if let Some(filter) = pending_names {
                 if let Some((entry_pkg, _version)) = decode_pnpm_store_entry_name(&entry_name) {
@@ -879,8 +952,9 @@ impl NpmCrawler {
                     }
                 }
             }
-            queue.push_back(entry_nm);
+            out.push(entry_nm);
         }
+        out
     }
 
     // ------------------------------------------------------------------
@@ -1445,6 +1519,7 @@ impl NpmCrawler {
 
     /// Async view of [`Self::collect_nested_store_entries_sync`], appending
     /// to `entries`.
+    #[cfg(test)]
     async fn collect_nested_store_entries(host_path: &Path, entries: &mut Vec<(String, PathBuf)>) {
         let host_path = host_path.to_path_buf();
         entries.extend(
