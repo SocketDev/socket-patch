@@ -639,6 +639,59 @@ into the new version's section — see docs/releasing.md.
   contract; previously the entry was deleted, stranding a live ledger
   entry with no backing record. An all-kept run exits 1 `partialFailure`
   with `summary.removed: 0` (never `not_found` — the identifier matched).
+- **Rebuilding a missing gem, maven or nuget vendored artifact now updates
+  the ledger.** When `vendor` / `scan --vendor` found a wired project whose
+  committed artifact was missing or broken, it rebuilt the artifact but kept
+  the old fingerprint in `.socket/vendor/state.json` (the gem file
+  inventory, the maven/nuget `sha256`, and the nuget `packages.lock.json`
+  pin). If the rebuild came from the other source (the patch service instead
+  of a local build, or the reverse), the new bytes no longer matched the
+  ledger. VEX and verification then reported the artifact as tampered,
+  `repair` could fail, and `vendor --revert` left `packages.lock.json`
+  pinned to the patched `contentHash`. A rebuild from the patch service was
+  also reported as `already_vendored` instead of `applied`. The rebuild now
+  records the new fingerprint and keeps the entry's original wiring records,
+  so revert still restores the pre-vendor files. If `state.json` has no
+  entry for the package, or only an entry from another patch uuid, the
+  rebuild still runs but the ledger is left as it is, because the run has no
+  pre-vendor originals to record.
+- **A prebuilt maven `.jar`, nuget `.nupkg`, pypi wheel or npm tarball from
+  the patch service must now contain the patched files.** Checking its integrity hash only showed that
+  the download was intact, not that the archive carried the patch. The
+  archive was still written as-is and every file was reported as already
+  patched, so an unpatched archive could be committed and then rebuilt on
+  every run. Each patched file inside the archive is now checked against the
+  patch's expected hash before the archive is used. On a mismatch, `auto`
+  builds the archive locally and warns `vendor_prebuilt_layout_mismatch`,
+  and `--vendor-source=service` refuses with `vendor_prebuilt_required` (npm
+  fails the package with the detail).
+- **A prebuilt artifact that fails its integrity check is always refused.**
+  Under the default `--vendor-source=auto`, npm, pypi, golang, composer and
+  gem (both the `.gem` and its stub gemspec) printed a warning and built the
+  package locally when the downloaded bytes did not match the integrity the
+  patch service reported. Bytes that fail verification may have been
+  tampered with, so these ecosystems now refuse the package in every mode,
+  as cargo, maven and nuget already did. The refusal code is
+  `vendor_prebuilt_integrity_mismatch` (npm fails the package with the
+  integrity detail). Under `--vendor-source=service`, golang, composer, gem
+  and pypi now report `vendor_prebuilt_integrity_mismatch` instead of
+  `vendor_prebuilt_required`.
+- **`service` vendor source without an API client is refused.** This affects
+  `socket-patch-core` callers that pass a `VendorServiceConfig` with
+  `source: Service` and no `client` (the CLI always configures a client).
+  Every backend used to build the artifact locally in that case, even though
+  `service` promises that only the patch service's artifact is used. They now
+  refuse with `vendor_prebuilt_required` before doing any work, the same way
+  `--offline` is already refused.
+- **Rebuilding a missing cargo vendored copy now honours
+  `--vendor-source`.** When a wired project's committed crate copy was
+  missing or stale, `vendor` always rebuilt it locally from the installed
+  source. Under `--vendor-source=service` it did so even with `--offline`
+  or without an API client, and reported success. The rebuild now uses the
+  patch service's prebuilt crate like a fresh vendor does, so `service`
+  mode refuses (`vendor_service_offline_conflict` / `vendor_prebuilt_required`)
+  when the service cannot be used, and `auto` still builds locally when it
+  has no prebuilt crate.
 
 ### Changed
 

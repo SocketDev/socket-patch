@@ -374,16 +374,31 @@ pub async fn vendor_gem(
                     Ok(result) => result,
                     Err(outcome) => return *outcome,
                 };
-                if result.success {
-                    warnings.push(VendorWarning::new(
-                        "vendor_artifact_rebuilt",
-                        format!(
-                            "the committed vendored copy for {name}@{version} was missing or \
-                             stale; rebuilt at {copy_rel} (Gemfile and Gemfile.lock untouched)"
-                        ),
-                    ));
+                if !result.success {
+                    return done(result, None, warnings);
                 }
-                return done(result, None, warnings);
+                warnings.push(VendorWarning::new(
+                    "vendor_artifact_rebuilt",
+                    format!(
+                        "the committed vendored copy for {name}@{version} was missing or \
+                         stale; rebuilt at {copy_rel} (Gemfile and Gemfile.lock untouched)"
+                    ),
+                ));
+                // The rebuilt tree may differ from the one the ledger
+                // inventoried (a service ↔ local flip swaps the stub gemspec):
+                // hand back a refreshed entry. Its wiring is empty ON PURPOSE —
+                // the caller's `carry_forward_wiring` (same uuid) re-attaches the
+                // first run's records, the only copy of the pre-vendor originals.
+                let file_inventory =
+                    gem_inventory_or_warn(&copy_dir, name, version, &mut warnings).await;
+                let entry = gem_entry(
+                    build_gem_purl(name, version),
+                    record,
+                    copy_rel,
+                    file_inventory,
+                    Vec::new(),
+                );
+                return done(result, Some(entry), warnings);
             }
             // Dry runs fall through to the verify-only preview below.
         } else {
@@ -626,13 +641,25 @@ pub async fn vendor_gem(
         }
     }
 
-    // Whole-tree inventory of the committed copy (stub gemspec included):
-    // no lockfile integrity covers a path source's bytes, so this is the
-    // only whole-artifact drift/tamper anchor verify/VEX/repair have for a
-    // dir-shaped artifact. Fail-soft: an uninventoriable copy (symlink,
-    // non-UTF-8 name) vendors like a pre-inventory entry, with the gap
-    // surfaced here and again at repair time.
-    let file_inventory = match super::verify::compute_dir_inventory(&copy_dir).await {
+    let file_inventory = gem_inventory_or_warn(&copy_dir, name, version, &mut warnings).await;
+    let entry = gem_entry(base_purl, record, copy_rel, file_inventory, wiring);
+
+    done(result, Some(entry), warnings)
+}
+
+/// Whole-tree inventory of the committed copy (stub gemspec included): no
+/// lockfile integrity covers a path source's bytes, so this is the only
+/// whole-artifact drift/tamper anchor verify/VEX/repair have for a
+/// dir-shaped artifact. Fail-soft: an uninventoriable copy (symlink,
+/// non-UTF-8 name) vendors like a pre-inventory entry, with the gap
+/// surfaced here and again at repair time.
+async fn gem_inventory_or_warn(
+    copy_dir: &Path,
+    name: &str,
+    version: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    match super::verify::compute_dir_inventory(copy_dir).await {
         Ok(inv) => Some(inv),
         Err(detail) => {
             warnings.push(VendorWarning::new(
@@ -644,9 +671,20 @@ pub async fn vendor_gem(
             ));
             None
         }
-    };
+    }
+}
 
-    let entry = VendorEntry {
+/// The ledger entry for a vendored gem copy: `wiring` is the Gemfile + lock
+/// records on a full vendor, empty on an artifact-only rebuild (see the hot
+/// path).
+fn gem_entry(
+    base_purl: String,
+    record: &PatchRecord,
+    copy_rel: String,
+    file_inventory: Option<std::collections::BTreeMap<String, String>>,
+    wiring: Vec<WiringRecord>,
+) -> VendorEntry {
+    VendorEntry {
         ecosystem: "gem".to_string(),
         base_purl,
         uuid: record.uuid.clone(),
@@ -668,9 +706,7 @@ pub async fn vendor_gem(
         poetry: None,
         pdm: None,
         pipenv: None,
-    };
-
-    done(result, Some(entry), warnings)
+    }
 }
 
 // ── materialisation (service download / local build) ──────────────────────────
@@ -777,13 +813,16 @@ async fn gem_service_copy(
     // Step 1: the prebuilt `.gem` (sha512-verified against the reference).
     let archive = match fetch_verified_archive(cfg, &record.uuid).await {
         ServiceArtifact::Ready(archive) => archive,
+        // Bytes that fail integrity verification are an active tamper signal:
+        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
+        // quiet local-build fallback (`ServiceArtifact`'s documented contract).
         ServiceArtifact::IntegrityMismatch(reason) => {
-            return miss(
-                warnings,
+            return hard(
                 "vendor_prebuilt_integrity_mismatch",
-                ("vendor_prebuilt_required", ""),
-                format!("prebuilt .gem failed integrity ({reason})"),
-                false,
+                format!(
+                    "prebuilt .gem for {name} failed integrity verification ({reason}); \
+                     refusing to fall back to a local build on tampered bytes"
+                ),
             );
         }
         ServiceArtifact::Pending => {
@@ -830,12 +869,12 @@ async fn gem_service_copy(
             );
         }
         SecondaryArtifactResult::IntegrityMismatch(reason) => {
-            return miss(
-                warnings,
+            return hard(
                 "vendor_prebuilt_integrity_mismatch",
-                ("vendor_prebuilt_required", ""),
-                format!("prebuilt stub gemspec failed integrity ({reason})"),
-                false,
+                format!(
+                    "prebuilt stub gemspec for {name} failed integrity verification ({reason}); \
+                     refusing to fall back to a local build on tampered bytes"
+                ),
             );
         }
         SecondaryArtifactResult::Failed(reason) => {
@@ -3368,9 +3407,18 @@ mod tests {
 
         let (r2, e2, w2) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert!(r2.success, "{:?}", r2.error);
+        // Artifact-only rebuild: a refreshed fingerprint with NO wiring of
+        // its own (re-recording the live pair edit as `original` would
+        // break --revert; the caller carries the first run's records).
+        let e2 = e2.expect("the rebuild refreshes the ledger fingerprint");
         assert!(
-            e2.is_none(),
-            "artifact-only rebuild must not re-record the ledger entry"
+            e2.wiring.is_empty(),
+            "no re-recorded wiring: {:?}",
+            e2.wiring
+        );
+        assert!(
+            e2.artifact.file_inventory.is_some(),
+            "rebuilt tree inventoried"
         );
         assert!(
             w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
@@ -4810,7 +4858,7 @@ mod tests {
         )
         .await;
         let (code, _) = unwrap_refused(outcome);
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
         assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
         // The lock is untouched.
         assert_eq!(
@@ -4849,7 +4897,7 @@ mod tests {
         )
         .await;
         let (code, _) = unwrap_refused(outcome);
-        assert_eq!(code, "vendor_prebuilt_required");
+        assert_eq!(code, "vendor_prebuilt_integrity_mismatch");
         assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
     }
 
@@ -5206,9 +5254,11 @@ mod tests {
         let (result2, entry2, warnings2) =
             unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
         assert!(result2.success, "{:?}", result2.error);
+        let entry2 = entry2.expect("the rebuild refreshes the ledger fingerprint");
         assert!(
-            entry2.is_none(),
-            "artifact-only rebuild must not re-record a ledger entry"
+            entry2.wiring.is_empty(),
+            "artifact-only rebuild must not re-record wiring: {:?}",
+            entry2.wiring
         );
         assert!(
             warnings2
@@ -8067,5 +8117,124 @@ mod tests {
             !root.join(format!(".socket/vendor/gem/{UUID}")).exists(),
             "the freshly-built uuid dir is unwound"
         );
+    }
+
+    /// Vendored from the service (served stub gemspec), the
+    /// committed copy is lost and rebuilt LOCALLY (local gemspec → different
+    /// tree). The ledger the CLI persists must carry the rebuilt tree's
+    /// inventory, and its carried-forward wiring must still revert cleanly.
+    #[tokio::test]
+    async fn wired_rebuild_refreshes_ledger_inventory() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        let server = wiremock::MockServer::start().await;
+        mount_gem_granted(
+            &server,
+            &gem,
+            &sri_sha512(&gem),
+            Some((SERVICE_STUB, &sri_sha512(SERVICE_STUB))),
+        )
+        .await;
+        let cfg = gem_service_cfg(&server.uri(), VendorSource::Service, false);
+        let (r1, e1, _) =
+            unwrap_done(run_vendor_service(&root, &blobs, &installed, &record, &cfg).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let e1 = e1.expect("first vendor records an entry");
+        assert_eq!(
+            crate::vendor::check_vendored_artifact(&root, &e1, &record).await,
+            crate::vendor::ArtifactHealth::Healthy
+        );
+
+        tokio::fs::remove_file(copy_lib(&root)).await.unwrap();
+        let (r2, e2, w2) = unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{w2:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(copy_gemspec(&root))
+                .await
+                .unwrap(),
+            GEMSPEC,
+            "precondition: the local rebuild used the local stub"
+        );
+
+        let ledger = match e2 {
+            Some(mut fresh) => {
+                crate::vendor::carry_forward_wiring(&e1, &mut fresh);
+                fresh
+            }
+            None => e1.clone(),
+        };
+        assert_eq!(
+            crate::vendor::check_vendored_artifact(&root, &ledger, &record).await,
+            crate::vendor::ArtifactHealth::Healthy,
+            "the ledger inventory must describe the rebuilt copy"
+        );
+        assert_eq!(
+            ledger.wiring, e1.wiring,
+            "Gemfile/lock revert records preserved"
+        );
+        let rv = revert_gem(&ledger, &root, false).await;
+        assert!(rv.success, "{:?}", rv.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            GEMFILE_DIRECT
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+    }
+
+    /// A `.gem` or stub that fails integrity verification is a hard
+    /// failure under `auto` too — never a quiet local-build fallback.
+    #[tokio::test]
+    async fn integrity_mismatch_hard_fails_under_auto() {
+        let gem = make_gem(&[("lib/rack.rb", PATCHED)]);
+        for bad_stub in [false, true] {
+            let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+            let server = wiremock::MockServer::start().await;
+            let (gem_sri, stub_sri) = if bad_stub {
+                (sri_sha512(&gem), sri_sha512(b"not the stub"))
+            } else {
+                (sri_sha512(b"different bytes"), sri_sha512(SERVICE_STUB))
+            };
+            mount_gem_granted(&server, &gem, &gem_sri, Some((SERVICE_STUB, &stub_sri))).await;
+            let cfg = gem_service_cfg(&server.uri(), VendorSource::Auto, false);
+            let outcome = run_vendor_service(&root, &blobs, &installed, &record, &cfg).await;
+            let VendorOutcome::Refused { code, .. } = outcome else {
+                panic!("bad_stub={bad_stub}: tampered bytes fell back: {outcome:?}");
+            };
+            assert_eq!(
+                code, "vendor_prebuilt_integrity_mismatch",
+                "bad_stub={bad_stub}"
+            );
+            assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                    .await
+                    .unwrap(),
+                LOCK_DIRECT
+            );
+        }
+    }
+
+    /// `--vendor-source=service` with no configured client must
+    /// fail closed, never quietly build locally.
+    #[tokio::test]
+    async fn service_mode_without_client_refuses() {
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let mut cfg = gem_service_cfg("http://127.0.0.1:1", VendorSource::Service, false);
+        cfg.client = None;
+        let outcome = run_vendor_service(&root, &blobs, &installed, &record, &cfg).await;
+        let VendorOutcome::Refused { code, .. } = outcome else {
+            panic!("service mode without a client built locally: {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(".socket").exists(), "nothing written");
     }
 }

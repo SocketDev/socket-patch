@@ -3386,43 +3386,6 @@ mod tests {
         );
     }
 
-    /// `auto` + integrity mismatch falls back to a local build (loudly): the
-    /// lock ends up rewired to the LOCALLY-recomputed integrity, not the bad
-    /// service value.
-    #[tokio::test]
-    async fn service_integrity_mismatch_auto_falls_back_to_build() {
-        let (served, _) = locally_built_artifact().await;
-        let wrong = sri_sha512(b"not the real tarball");
-        let server = wiremock::MockServer::start().await;
-        mount_granted(&server, &wrong, &served).await;
-
-        let fx = fixture().await;
-        let (result, entry, warnings) = expect_done(
-            vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await,
-        );
-        assert!(
-            result.success,
-            "auto must fall back to a successful build: {:?}",
-            result.error
-        );
-        assert!(entry.is_some());
-        let on_disk = tokio::fs::read(fx.root().join(fx.expected_rel_tgz()))
-            .await
-            .unwrap();
-        let local_sri = sri_sha512(&on_disk);
-        assert_eq!(
-            lock_integrity(&fx.read_lock().await, "node_modules/left-pad"),
-            local_sri,
-            "fallback build's integrity, not the bad service value"
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.code == "vendor_prebuilt_integrity_mismatch"),
-            "expected a vendor_prebuilt_integrity_mismatch advisory, got {warnings:?}"
-        );
-    }
-
     /// `auto` + pending_build falls back to a local build (with an advisory).
     #[tokio::test]
     async fn service_pending_build_auto_falls_back() {
@@ -3568,5 +3531,52 @@ mod tests {
                 "empty wiring replays nothing"
             );
         }
+    }
+
+    /// An integrity mismatch is a hard failure under `auto` too —
+    /// never a quiet local-build fallback (service_fetch's contract);
+    /// the project is byte-untouched.
+    #[tokio::test]
+    async fn service_integrity_mismatch_auto_hard_fails() {
+        let (served, _) = locally_built_artifact().await;
+        let wrong = sri_sha512(b"not the real tarball");
+        let server = wiremock::MockServer::start().await;
+        mount_granted(&server, &wrong, &served).await;
+        let fx = fixture().await;
+        let before = tokio::fs::read(fx.lock_path()).await.unwrap();
+        let (result, entry, _) = expect_done(
+            vendor_service(&fx, &service_cfg(&server.uri(), VendorSource::Auto, false)).await,
+        );
+        assert!(
+            !result.success,
+            "tampered bytes must not fall back to a build"
+        );
+        assert!(entry.is_none());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("integrity")),
+            "{:?}",
+            result.error
+        );
+        assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), before);
+        assert!(!fx.root().join(fx.expected_rel_tgz()).exists());
+    }
+
+    /// `--vendor-source=service` with no configured client must fail
+    /// closed, never quietly build locally.
+    #[tokio::test]
+    async fn service_mode_without_client_refuses() {
+        let fx = fixture().await;
+        let before = tokio::fs::read(fx.lock_path()).await.unwrap();
+        let mut cfg = service_cfg("http://127.0.0.1:1", VendorSource::Service, false);
+        cfg.client = None;
+        match vendor_service(&fx, &cfg).await {
+            VendorOutcome::Refused { code, .. } => assert_eq!(code, "vendor_prebuilt_required"),
+            other => panic!("service mode without a client built locally: {other:?}"),
+        }
+        assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), before);
+        assert!(!fx.root().join(fx.expected_rel_tgz()).exists());
     }
 }
