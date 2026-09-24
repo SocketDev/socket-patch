@@ -30,6 +30,8 @@ use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
 mod bun_binary;
 pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
 pub mod golang_local;
+#[cfg(test)]
+mod lock_index_equivalence_tests;
 pub mod npmrc;
 mod pdm;
 mod pipenv;
@@ -510,6 +512,40 @@ fn rewrite_one_npm_lock(
         });
         return;
     };
+    // The (package, version) each `packages` entry stands for, by map
+    // position, computed once: the per-dep scan below compares against it
+    // instead of re-deriving it for every entry for every dep. Sound
+    // because a rewrite only ever touches an entry's `resolved`/`integrity`
+    // (never a key, `name` or `version`), so positions and identities hold.
+    let package_ids: Vec<Option<(String, Option<String>)>> = lock
+        .get("packages")
+        .and_then(Value::as_object)
+        .map(|packages| {
+            packages
+                .iter()
+                .map(|(key, entry)| {
+                    // Only `node_modules/` keys are installable dependencies:
+                    // "" is the project root and other bare keys are workspace
+                    // members — SOURCE dirs a resolved/integrity insert would
+                    // corrupt.
+                    let (_, key_name) = key.rsplit_once("node_modules/")?;
+                    // The package a lock entry stands for: the explicit `name`
+                    // field when present (npm writes it for aliases — `npm i
+                    // alias@npm:real` keys the entry by the ALIAS), else the
+                    // key's trailing path. Mirrors `vendor::npm_lock`'s
+                    // `entry_name`, so an alias install of the patched package
+                    // redirects and an entry that merely SHARES the key name
+                    // (`npm i <fname>@npm:other`) is never hijacked.
+                    let entry_nm = entry
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(key_name);
+                    let version = entry.get("version").and_then(Value::as_str);
+                    Some((entry_nm.to_string(), version.map(str::to_string)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut changed = false;
     for dep in npm {
         let fname = full_name(dep);
@@ -522,28 +558,11 @@ fn rewrite_one_npm_lock(
         };
         let mut matched_any = false;
         if let Some(packages) = lock.get_mut("packages").and_then(Value::as_object_mut) {
-            for (key, entry) in packages.iter_mut() {
-                // Only `node_modules/` keys are installable dependencies:
-                // "" is the project root and other bare keys are workspace
-                // members — SOURCE dirs a resolved/integrity insert would
-                // corrupt.
-                let Some((_, key_name)) = key.rsplit_once("node_modules/") else {
+            for ((key, entry), id) in packages.iter_mut().zip(&package_ids) {
+                let Some((entry_nm, version)) = id else {
                     continue;
                 };
-                // The package a lock entry stands for: the explicit `name`
-                // field when present (npm writes it for aliases — `npm i
-                // alias@npm:real` keys the entry by the ALIAS), else the
-                // key's trailing path. Mirrors `vendor::npm_lock`'s
-                // `entry_name`, so an alias install of the patched package
-                // redirects and an entry that merely SHARES the key name
-                // (`npm i <fname>@npm:other`) is never hijacked.
-                let entry_nm = entry
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or(key_name);
-                let matches_ver =
-                    entry.get("version").and_then(Value::as_str) == Some(dep.version.as_str());
-                if entry_nm != fname || !matches_ver {
+                if *entry_nm != fname || version.as_deref() != Some(dep.version.as_str()) {
                     continue;
                 }
                 if entry.get("link").and_then(Value::as_bool) == Some(true) {
@@ -3048,7 +3067,7 @@ fn rewrite_yarn_classic(
     overrides: &[DepOverride],
     result: &mut RewriteResult,
 ) {
-    use crate::vendor::yarn_classic_lock::{pattern_real_name, split_key_patterns, split_pattern};
+    use crate::vendor::yarn_classic_lock::{split_key_patterns, split_pattern};
 
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     if npm.is_empty() || !files.contains_key("yarn.lock") {
@@ -3087,6 +3106,11 @@ fn rewrite_yarn_classic(
         Regex::new(r#"\n {2}resolved "[^"]*""#).expect("static resolved-line regex is valid");
     let integrity_re =
         Regex::new(r"\n {2}integrity [^\n]*").expect("static integrity-line regex is valid");
+    // Each block's key and the one real package all its patterns stand for
+    // (see `yarn_classic_block_head`), computed once per block and redone
+    // only for a block this run rewrites — not re-split per block per dep.
+    let mut heads: Vec<Option<(String, Option<String>)>> =
+        blocks.iter().map(|b| yarn_classic_block_head(b)).collect();
     let mut changed = false;
     for dep in &npm {
         let fname = full_name(dep);
@@ -3102,33 +3126,23 @@ fn rewrite_yarn_classic(
                 .expect("version regex from the escaped version is valid");
         let mut matched_any = false;
         let mut alias_skipped = false;
-        for block in blocks.iter_mut() {
+        for (i, block) in blocks.iter_mut().enumerate() {
             // The block's key line names its consumers; resolve every
             // comma-joined pattern to the REAL package it stands for
             // (`alias@npm:target@range` → target). A key like
             // `<fname>@npm:<other-pkg>@…` — yarn v1's fork-substitution
             // idiom — resolves to <other-pkg>, so it is NOT ours to touch:
             // matching on the alias name alone would hijack the fork.
-            let Some(key_line) = block
-                .lines()
-                .find(|l| !l.is_empty() && !l.starts_with([' ', '\t', '#']))
-            else {
+            let Some((key, real_name)) = &heads[i] else {
                 continue;
             };
-            let Some(key) = key_line.strip_suffix(':') else {
-                continue;
-            };
-            let patterns = split_key_patterns(key);
-            if patterns.is_empty()
-                || !patterns
-                    .iter()
-                    .all(|p| pattern_real_name(p) == Some(fname.as_str()))
-            {
+            if real_name.as_deref() != Some(fname.as_str()) {
                 continue;
             }
             if !version_re.is_match(block) {
                 continue;
             }
+            let patterns = split_key_patterns(key);
             // A block reached only through `alias@npm:<fname>@range`
             // descriptors is left byte-identical (mirroring the berry
             // rewriter), but never silently: that copy keeps installing the
@@ -3196,6 +3210,7 @@ fn rewrite_yarn_classic(
                     new: Some(Value::String(edit_new)),
                 });
                 *block = rewritten;
+                heads[i] = yarn_classic_block_head(block);
                 changed = true;
             }
         }
@@ -3213,6 +3228,26 @@ fn rewrite_yarn_classic(
         }
         result.files.insert("yarn.lock".into(), out);
     }
+}
+
+/// A classic yarn.lock block's key (its first non-indented, non-comment
+/// line, minus the trailing `:`) and the real package EVERY comma-joined
+/// pattern of that key resolves to — `None` when the key has no pattern,
+/// one does not parse, or they name different packages. `None` overall
+/// when the block has no key line.
+fn yarn_classic_block_head(block: &str) -> Option<(String, Option<String>)> {
+    use crate::vendor::yarn_classic_lock::{pattern_real_name, split_key_patterns};
+    let key_line = block
+        .lines()
+        .find(|l| !l.is_empty() && !l.starts_with([' ', '\t', '#']))?;
+    let key = key_line.strip_suffix(':')?;
+    let patterns = split_key_patterns(key);
+    let mut names = patterns.iter().map(|p| pattern_real_name(p));
+    let real_name = match names.next() {
+        Some(Some(first)) => names.all(|n| n == Some(first)).then(|| first.to_string()),
+        _ => None,
+    };
+    Some((key.to_string(), real_name))
 }
 
 // ── yarn.lock (berry / v2+) ──────────────────────────────────────────────────
