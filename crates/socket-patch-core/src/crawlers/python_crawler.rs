@@ -1,11 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rayon::prelude::*;
-
 use super::listing::list_dir_sync;
 use super::types::{CrawledPackage, CrawlerOptions};
-use super::walk_pool::run_walk;
 use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync, run_blocking};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
@@ -1483,12 +1480,12 @@ impl PythonCrawler {
 
 /// Scan a `site-packages` directory for `.dist-info` entries, returning
 /// `(canonicalized name, version)` for each package that yields metadata,
-/// in listing order. Runs on the walk pool: the listing is read once and
-/// the METADATA files are read and parsed in parallel (one runtime hop per
-/// file used to set the scan's pace).
+/// in listing order. One blocking-pool task for the listing and every
+/// METADATA read (one runtime hop per open, read and stat used to set the
+/// scan's pace).
 async fn list_dist_info_packages(site_packages_path: &Path) -> Vec<(String, String)> {
     let site_packages_path = site_packages_path.to_path_buf();
-    run_walk(move || list_dist_info_packages_sync(&site_packages_path)).await
+    run_blocking(move || list_dist_info_packages_sync(&site_packages_path)).await
 }
 
 /// Blocking body of [`list_dist_info_packages`].
@@ -1503,7 +1500,7 @@ fn list_dist_info_packages_sync(site_packages_path: &Path) -> Vec<(String, Strin
         })
         .collect();
     dist_infos
-        .par_iter()
+        .iter()
         .filter_map(|dist_info_path| {
             read_python_metadata_sync(dist_info_path)
                 .map(|(raw_name, version)| (canonicalize_pypi_name(&raw_name), version))

@@ -1,11 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rayon::prelude::*;
-
 use super::listing::{list_dir_sync, ListedEntry};
 use super::types::{CrawledPackage, CrawlerOptions};
-use super::walk_pool::run_walk;
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, run_blocking};
 
@@ -93,12 +90,12 @@ impl NuGetCrawler {
 
     /// Crawl all discovered package paths and return every package found.
     ///
-    /// The scan runs on the walk pool (the global packages folder holds
-    /// thousands of `<name>/<version>/` dirs, and one runtime hop per
-    /// readdir and stat dominated the crawl): each top-level entry is
-    /// classified in parallel, then the PURL dedup runs serially in listing
-    /// order, so the same first-seen dir wins and packages come out in the
-    /// sequential scan's order.
+    /// The scan runs as one blocking-pool task (the global packages folder
+    /// holds thousands of `<name>/<version>/` dirs, and one runtime hop per
+    /// readdir and stat dominated the crawl), in listing order, so the same
+    /// first-seen dir wins and packages come out in the same order. (A
+    /// parallel classification on the walk pool measured no faster and
+    /// cost the pool's thread start-up in system time.)
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
         let pkg_paths = self
             .get_nuget_package_paths(options)
@@ -108,7 +105,7 @@ impl NuGetCrawler {
             return Vec::new();
         }
 
-        run_walk(move || {
+        run_blocking(move || {
             let mut packages = Vec::new();
             let mut seen = HashSet::new();
             for pkg_path in &pkg_paths {
@@ -267,15 +264,11 @@ fn classify_package_entry(pkg_path: &Path, entry: &ListedEntry) -> Vec<(String, 
 /// - Global cache: `<name>/<version>/` with `.nuspec` inside
 /// - Legacy packages/: `<Name>.<Version>/` with `.nuspec` inside
 fn scan_package_dir(pkg_path: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
-    let entries = list_dir_sync(pkg_path);
-    // Classification is independent per entry; only the dedup is ordered.
-    let classified: Vec<Vec<(String, String, PathBuf)>> = entries
-        .par_iter()
-        .map(|entry| classify_package_entry(pkg_path, entry))
-        .collect();
-
     let mut results = Vec::new();
-    for (name, version, path) in classified.into_iter().flatten() {
+    for (name, version, path) in list_dir_sync(pkg_path)
+        .iter()
+        .flat_map(|entry| classify_package_entry(pkg_path, entry))
+    {
         let purl = crate::utils::purl::build_nuget_purl(&name, &version);
         if seen.insert(purl.clone()) {
             results.push(CrawledPackage {

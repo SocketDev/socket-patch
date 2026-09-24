@@ -1,13 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rayon::prelude::*;
-
 use super::listing::list_dir_sync;
 use super::types::{CrawledPackage, CrawlerOptions};
-use super::walk_pool::run_walk;
 use crate::patch::path_safety;
-use crate::utils::fs::is_dir;
+use crate::utils::fs::{is_dir, run_blocking};
 
 #[cfg(test)]
 mod oracle;
@@ -188,11 +185,12 @@ impl CargoCrawler {
     /// Crawl all discovered crate source directories and return every
     /// package found.
     ///
-    /// The scan runs on the walk pool (a registry cache holds thousands of
-    /// crates, and one runtime hop per stat and `Cargo.toml` read dominated
-    /// the crawl): each source dir's `Cargo.toml`s are read and parsed in
-    /// parallel, then deduplicated serially in listing order, so the
-    /// first-seen PURL keeps winning exactly as in the sequential scan.
+    /// The scan runs as one blocking-pool task (a registry cache holds
+    /// thousands of crates, and one runtime hop per stat and `Cargo.toml`
+    /// read dominated the crawl), in listing order, so the first-seen PURL
+    /// keeps winning exactly as before. (Reading the manifests in parallel
+    /// on the walk pool measured no faster and cost the pool's thread
+    /// start-up in system time.)
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
         let src_paths = self
             .get_crate_source_paths(options)
@@ -202,7 +200,7 @@ impl CargoCrawler {
             return Vec::new();
         }
 
-        run_walk(move || {
+        run_blocking(move || {
             let mut packages = Vec::new();
             let mut seen = HashSet::new();
             for src_path in &src_paths {
@@ -363,30 +361,23 @@ impl CargoCrawler {
 /// Scan a crate source directory (either a registry index directory or
 /// a vendor directory) and return all valid crate packages found.
 fn scan_crate_source(src_path: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
-    let entries = list_dir_sync(src_path);
-    // Read + parse is independent per entry; only the dedup is ordered.
-    let parsed: Vec<Option<(String, String, PathBuf)>> = entries
-        .par_iter()
-        .map(|entry| {
-            if !entry.is_dir(src_path) {
-                return None;
-            }
-
-            let dir_name_str = entry.name.to_string_lossy();
-
-            // Skip hidden directories
-            if dir_name_str.starts_with('.') {
-                return None;
-            }
-
-            let crate_path = src_path.join(&*dir_name_str);
-            let (name, version) = read_crate_cargo_toml(&crate_path, &dir_name_str)?;
-            Some((name, version, crate_path))
-        })
-        .collect();
-
     let mut results = Vec::new();
-    for (name, version, crate_path) in parsed.into_iter().flatten() {
+    for entry in list_dir_sync(src_path) {
+        if !entry.is_dir(src_path) {
+            continue;
+        }
+
+        let dir_name_str = entry.name.to_string_lossy();
+
+        // Skip hidden directories
+        if dir_name_str.starts_with('.') {
+            continue;
+        }
+
+        let crate_path = src_path.join(&*dir_name_str);
+        let Some((name, version)) = read_crate_cargo_toml(&crate_path, &dir_name_str) else {
+            continue;
+        };
         let purl = crate::utils::purl::build_cargo_purl(&name, &version);
         if !seen.insert(purl.clone()) {
             continue;
