@@ -230,6 +230,21 @@ fn run_cli(cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, Strin
             cmd.env_remove(key);
         }
     }
+    // The in-process tests in this binary run `apply_env_toggles`, which
+    // `std::env::set_var`s these on the shared test process. A toggle set
+    // by a parallel test after the scan above but before the spawn would
+    // be inherited, so remove them unconditionally: `Command` applies the
+    // removals to the environment captured at spawn time. Seen on
+    // test-release: a hosted scan here inherited SOCKET_OFFLINE=1 and
+    // refused to run ("cannot run with --offline/SOCKET_OFFLINE").
+    for key in [
+        "SOCKET_OFFLINE",
+        "SOCKET_DEBUG",
+        "SOCKET_API_URL",
+        "SOCKET_PROXY_URL",
+    ] {
+        cmd.env_remove(key);
+    }
     cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
     for (k, v) in extra_env {
         cmd.env(k, v);

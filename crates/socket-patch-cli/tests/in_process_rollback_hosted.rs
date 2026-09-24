@@ -131,6 +131,18 @@ fn scrubbed_cli() -> std::process::Command {
             cmd.env_remove(&key);
         }
     }
+    // In-process tests in this binary `std::env::set_var` these via
+    // `apply_env_toggles`; one set by a parallel test between the scan
+    // above and the spawn would be inherited, so remove them
+    // unconditionally (see in_process_vendor.rs `run_cli`).
+    for key in [
+        "SOCKET_OFFLINE",
+        "SOCKET_DEBUG",
+        "SOCKET_API_URL",
+        "SOCKET_PROXY_URL",
+    ] {
+        cmd.env_remove(key);
+    }
     cmd
 }
 
