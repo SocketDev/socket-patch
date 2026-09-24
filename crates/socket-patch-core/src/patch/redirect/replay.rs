@@ -435,6 +435,19 @@ pub async fn revert_remaining_redirect_edits(
         groups.entry(group).or_default().push(idx);
     }
 
+    // Where a cargo `[registries.…]` block can still be referenced from:
+    // the root manifest and lock, plus every manifest the ledger pinned.
+    let mut cargo_probes: Vec<String> = vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()];
+    for edit in state
+        .edits
+        .iter()
+        .filter(|e| e.kind == "redirect_cargo_toml_dep")
+    {
+        if !cargo_probes.contains(&edit.path) {
+            cargo_probes.push(edit.path.clone());
+        }
+    }
+
     let mut drop_indices: BTreeSet<usize> = BTreeSet::new();
     let mut refused_groups: BTreeSet<&'static str> = BTreeSet::new();
     let mut pending_warnings: Vec<(String, String)> = Vec::new();
@@ -744,6 +757,27 @@ pub async fn revert_remaining_redirect_edits(
                         refused_groups.insert(group);
                         continue 'group;
                     };
+                    // A block something still references (a hand-pinned dep)
+                    // stays: removing it would leave that pin naming an
+                    // undefined registry. The reverse walk has already
+                    // unwound this ledger's own references.
+                    let reg = edit.key.as_deref().unwrap_or_default();
+                    let index = new.split('"').nth(1).unwrap_or_default();
+                    let mut referenced = false;
+                    for probe in &cargo_probes {
+                        if let Ok(Some(text)) = staged_read(&staged, project_root, probe).await {
+                            if (!reg.is_empty() && text.contains(reg))
+                                || (!index.is_empty() && text.contains(index))
+                            {
+                                referenced = true;
+                                break;
+                            }
+                        }
+                    }
+                    if referenced {
+                        group_drops.insert(idx);
+                        continue;
+                    }
                     match staged_read(&staged, project_root, &edit.path).await {
                         Ok(Some(content)) => {
                             // Absent fragment == already clean. A config the

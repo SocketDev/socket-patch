@@ -1560,7 +1560,7 @@ static CARGO_TOML_VERSION_VAL_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// pinning every same-named declaration to one registry leaves the other
 /// requirement unsatisfiable there.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum CargoReqMatch {
+pub(crate) enum CargoReqMatch {
     Ours,
     NotOurs,
     /// The requirement also matches another locked version (or cannot be
@@ -1569,7 +1569,11 @@ enum CargoReqMatch {
     Ambiguous,
 }
 
-fn cargo_req_selects(req: Option<&str>, version: &str, other_versions: &[String]) -> CargoReqMatch {
+pub(crate) fn cargo_req_selects(
+    req: Option<&str>,
+    version: &str,
+    other_versions: &[String],
+) -> CargoReqMatch {
     let unknown = if other_versions.is_empty() {
         CargoReqMatch::Ours
     } else {
