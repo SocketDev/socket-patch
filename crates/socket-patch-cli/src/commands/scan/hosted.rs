@@ -991,6 +991,9 @@ pub(super) async fn run_redirect(
     // it so the hosted `--json` envelope stays schema-consistent with every
     // other scan; `.take()` at each terminal (error or success) folds it in.
     mut scan_result: Option<serde_json::Value>,
+    // Scan's pending telemetry, flushed by `discover_selected` before
+    // anything below writes to stdout.
+    telemetry: &mut socket_patch_core::telemetry::PendingTelemetry,
 ) -> i32 {
     // Same discovery/selection as `--apply`/`--vendor`.
     let selected = match discover_selected(
@@ -1000,6 +1003,7 @@ pub(super) async fn run_redirect(
         &args.common,
         false,
         false,
+        telemetry,
     )
     .await
     {

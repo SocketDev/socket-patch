@@ -454,9 +454,14 @@ async fn discover_selected(
     common: &GlobalArgs,
     show_progress: bool,
     warn: bool,
+    telemetry: &mut PendingTelemetry,
 ) -> Result<Vec<PatchSearchResult>, (i32, String)> {
     let (all_search_results, failures) =
         fetch_patch_details(api_client, packages, show_progress, warn).await;
+    // The scan event's send overlapped the detail fetches; every caller's
+    // next output (the error line below, a `--json` envelope, a prompt)
+    // must find it delivered.
+    telemetry.flush().await;
     let error_count = failures.len();
     if error_count > 0 && error_count == packages.len() {
         let err = failures
@@ -1451,9 +1456,11 @@ fn print_zero_error_envelope(err: &str, paths: &[String]) {
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
-    // Scan's telemetry sends run off the critical path (spawned where each
-    // event fires) and are all awaited here, before the command returns —
-    // so every event is still delivered before the process exits.
+    // Scan's telemetry sends run off the critical path: each is spawned
+    // where its event fires and flushed before the first stdout write that
+    // follows it (so a closed pipe's SIGPIPE, or a Ctrl-C at a prompt, still
+    // finds it delivered, as with an inline send). The flush here is the
+    // backstop that keeps every event ahead of the process exit.
     let mut telemetry = PendingTelemetry::new();
     let code = Box::pin(run_scan(args, &mut telemetry)).await;
     telemetry.flush().await;
@@ -1746,6 +1753,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
         );
+        // The result prints right away: nothing to overlap the send with.
+        telemetry.flush().await;
         if args.common.json {
             // When the crawler finds nothing, GC is intentionally skipped
             // — pruning every manifest entry on the assumption that the
@@ -1995,6 +2004,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
         );
+        // The failure prints right away: nothing to overlap the send with.
+        telemetry.flush().await;
 
         // A scan in which *every* batch failed produced no trustworthy
         // patch data. Surfacing `status: "success"` / exit 0 here would be
@@ -2180,6 +2191,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 &all_packages_with_patches,
                 can_access_paid_patches,
                 Some(result),
+                telemetry,
             )
             .await;
         }
@@ -2224,6 +2236,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 &args.common,
                 false,
                 false,
+                telemetry,
             )
             .await
             {
@@ -2366,6 +2379,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 prune,
                 telemetry_token.as_deref(),
                 telemetry_org.as_deref(),
+                telemetry,
             )
             .await;
         }
@@ -2391,9 +2405,13 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             &mut result,
         )
         .await;
+        telemetry.flush().await;
         print_json(&result);
         return final_code;
     }
+
+    // Every human exit below prints first; the scan event goes out before.
+    telemetry.flush().await;
 
     let use_color = ui::stdout_color();
     let verbose = args.common.verbose;
@@ -2610,6 +2628,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             &args.common,
             human,
             !silent,
+            telemetry,
         )
         .await
         {

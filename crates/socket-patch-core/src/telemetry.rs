@@ -339,9 +339,11 @@ async fn send_telemetry_event(prepared: PreparedSend) {
 /// Telemetry sends a command started off its critical path. Each send is
 /// spawned where its event fires (the event is built right there, so its
 /// body and timestamp are what an inline send would have posted) and the
-/// command awaits [`Self::flush`] before it returns, so every event is
-/// still delivered — or given up on within the same 2 s connect / 5 s
-/// request budget — before the process exits.
+/// command awaits [`Self::flush`] before its first stdout write after that
+/// point — the send overlaps only the work in between, and is delivered (or
+/// given up on within the same 2 s connect / 5 s request budget) before
+/// any output that could raise SIGPIPE, and before any prompt a Ctrl-C
+/// could interrupt, exactly as an inline send was.
 #[derive(Debug, Default)]
 pub struct PendingTelemetry {
     sends: Vec<tokio::task::JoinHandle<()>>,
@@ -352,9 +354,10 @@ impl PendingTelemetry {
         Self::default()
     }
 
-    /// Await every send started so far, in start order.
-    pub async fn flush(self) {
-        for send in self.sends {
+    /// Await every send started so far, in start order. Idempotent: a
+    /// second flush with nothing started since returns at once.
+    pub async fn flush(&mut self) {
+        for send in std::mem::take(&mut self.sends) {
             // A send never panics on its own; a JoinError here can only be
             // a runtime shutting down, which leaves nothing to deliver.
             let _ = send.await;
@@ -949,6 +952,34 @@ mod tests {
     #[tokio::test]
     async fn flushing_nothing_returns() {
         PendingTelemetry::new().flush().await;
+    }
+
+    /// Scan flushes at each output point after a send fires, so `flush`
+    /// drains: a later flush waits only for sends started since, and the
+    /// exit backstop after an early flush has nothing left to wait for.
+    #[tokio::test]
+    async fn flush_drains_and_later_sends_join_the_next_flush() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let mut pending = PendingTelemetry::new();
+        pending.spawn(prepared_for(&server));
+        pending.flush().await;
+        assert!(pending.sends.is_empty());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        pending.flush().await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        pending.spawn(prepared_for(&server));
+        pending.flush().await;
+        assert!(pending.sends.is_empty());
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     /// Combined into a single test to avoid env-var races across parallel tests.

@@ -21,7 +21,7 @@ use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSearchResult};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::telemetry::track_patch_vendor_failed;
+use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
@@ -457,6 +457,9 @@ async fn run_vendor_json_path(
     prune: bool,
     telemetry_token: Option<&str>,
     telemetry_org: Option<&str>,
+    // Scan's pending telemetry, flushed by `discover_selected` before
+    // anything below writes to stdout.
+    telemetry: &mut PendingTelemetry,
 ) -> i32 {
     // Same discovery as `--apply`. Vendored purls are NOT filtered here —
     // re-vendoring a stale uuid is the point of the flag (same-uuid re-runs
@@ -468,6 +471,7 @@ async fn run_vendor_json_path(
         &args.common,
         false,
         false,
+        telemetry,
     )
     .await
     {
@@ -818,6 +822,7 @@ pub(super) fn boxed_vendor_json_path<'a>(
     prune: bool,
     telemetry_token: Option<&'a str>,
     telemetry_org: Option<&'a str>,
+    telemetry: &'a mut PendingTelemetry,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_vendor_json_path(
         args,
@@ -833,6 +838,7 @@ pub(super) fn boxed_vendor_json_path<'a>(
         prune,
         telemetry_token,
         telemetry_org,
+        telemetry,
     ))
 }
 

@@ -46,6 +46,24 @@ fn run_cmd(
     extra_args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> (i32, String, String) {
+    let out = build_cmd(cwd, api_url, subcommand, extra_args, extra_env)
+        .output()
+        .expect("run socket-patch");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// The [`run_cmd`] invocation, unstarted (for tests that wire its stdio).
+fn build_cmd(
+    cwd: &Path,
+    api_url: &str,
+    subcommand: &str,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Command {
     let mut args = vec![
         subcommand,
         "--json",
@@ -109,12 +127,7 @@ fn run_cmd(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    let out = cmd.output().expect("run socket-patch");
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    )
+    cmd
 }
 
 /// Count POSTs the wiremock server received against the telemetry
@@ -819,6 +832,114 @@ async fn scan_flushes_background_telemetry_before_exit() {
         assert!(
             elapsed >= TELEMETRY_DELAY,
             "{}: scan exited after {elapsed:?}, before its telemetry send completed",
+            case.label
+        );
+    }
+}
+
+/// A consumer that exits early (`scan | head`, `scan | true`) closes
+/// stdout, and the CLI dies of SIGPIPE on its first result write (main
+/// restores SIG_DFL). The background send must already be delivered by
+/// then — flushed before that write, as the inline send it replaced was —
+/// not lost with the process. Covers each JSON flush point: the empty-crawl
+/// and all-batches-failed terminals, the plain envelope, and the hosted and
+/// vendored arms (flushed at `discover_selected`). The first three print
+/// right after the event fires, so they fail deterministically without the
+/// flush; the hosted/vendored arms do enough work before printing that an
+/// unflushed send usually wins the race anyway, so for them this is a
+/// delivery check rather than a pin on the flush point.
+#[tokio::test]
+async fn scan_delivers_telemetry_before_writing_to_a_closed_stdout() {
+    const TELEMETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
+
+    struct Case {
+        label: &'static str,
+        batch_status: u16,
+        install_package: bool,
+        extra_args: &'static [&'static str],
+        want_event: &'static str,
+    }
+    let cases = [
+        Case {
+            label: "plain envelope",
+            batch_status: 200,
+            install_package: true,
+            extra_args: &[],
+            want_event: "patch_scanned",
+        },
+        Case {
+            label: "empty crawl",
+            batch_status: 200,
+            install_package: false,
+            extra_args: &[],
+            want_event: "patch_scanned",
+        },
+        Case {
+            label: "all batches failed",
+            batch_status: 500,
+            install_package: true,
+            extra_args: &[],
+            want_event: "patch_scan_failed",
+        },
+        Case {
+            label: "hosted",
+            batch_status: 200,
+            install_package: true,
+            extra_args: &["--mode", "hosted", "--dry-run"],
+            want_event: "patch_scanned",
+        },
+        Case {
+            label: "vendored",
+            batch_status: 200,
+            install_package: true,
+            extra_args: &["--mode", "vendored", "--dry-run"],
+            want_event: "patch_scanned",
+        },
+    ];
+
+    for case in cases {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
+            .respond_with(ResponseTemplate::new(case.batch_status).set_body_json(
+                serde_json::json!({ "packages": [], "canAccessPaidPatches": false }),
+            ))
+            .mount(&mock)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/telemetry")))
+            .respond_with(ResponseTemplate::new(201).set_delay(TELEMETRY_DELAY))
+            .mount(&mock)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_root_package_json(tmp.path());
+        if case.install_package {
+            write_npm_package(tmp.path(), "minimist", "1.2.2");
+        }
+
+        let mut child = build_cmd(tmp.path(), &mock.uri(), "scan", case.extra_args, &[])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn socket-patch");
+        // Close the read end before the child can write anything: its
+        // first stdout write now raises SIGPIPE.
+        drop(child.stdout.take());
+        let status = child.wait().expect("wait socket-patch");
+
+        assert_eq!(
+            telemetry_post_count(&mock, Some(case.want_event)).await,
+            1,
+            "{}: the {} event must be delivered before stdout is written \
+             (exit status {status:?})",
+            case.label,
+            case.want_event
+        );
+        assert_eq!(
+            telemetry_post_count(&mock, None).await,
+            1,
+            "{}: no other telemetry event",
             case.label
         );
     }
