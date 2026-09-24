@@ -2651,9 +2651,11 @@ fn plan_cargo_config(
 
 // ── pnpm-lock.yaml ───────────────────────────────────────────────────────────
 
-/// Audit every matching package instance after planning edits. A malformed
-/// resolution or unsupported suffix refuses this dependency across all locks;
-/// snapshots and other versions do not participate in resolution.
+/// Test-only reference for the residual gate: every instance of this exact
+/// name@version in `content` that does not resolve to `artifact_url`.
+/// Production judges the same predicate inline, per instance, on each
+/// indexed hit's post-splice body in `rewrite_pnpm_lock`; snapshots and
+/// other versions do not participate in resolution.
 #[cfg(test)]
 fn pnpm_unrewritten_instances(
     content: &str,
@@ -12866,6 +12868,114 @@ packages:
             pnpm_unrewritten_instances(v5, "left-pad", "1.3.0", url),
             vec!["/left-pad/1.3.0_react@18.2.0"],
             "a v5 `_`-suffixed instance still on the registry is a residual"
+        );
+    }
+
+    /// The same boundaries, judged by the PRODUCTION inline residual gate
+    /// (`rewrite_pnpm_lock` over indexed hits), not the reference probe: an
+    /// instance already on the hosted artifact, a longer version sharing
+    /// the prefix, a different quoted scoped package and resolution-less
+    /// `snapshots:` keys never count as residuals, v6 nested-paren and v5
+    /// `_` instances are repointed rather than refused, and the one
+    /// instance whose suffix the grammar cannot parse is the only key the
+    /// refusal names.
+    #[test]
+    fn pnpm_residual_gate_respects_version_and_section_boundaries() {
+        let url = "http://patch.test/left-pad-1.3.0.tgz";
+        let overrides = vec![npm_override("left-pad", "1.3.0", url, "sha512-PATCHED==")];
+        let residual_warnings = |r: &RewriteResult| -> Vec<String> {
+            r.warnings
+                .iter()
+                .filter(|w| w.code == "redirect_pnpm_unsupported_lock_key")
+                .map(|w| w.detail.clone())
+                .collect()
+        };
+        let boundaries = format!(
+            "lockfileVersion: '9.0'
+
+packages:
+  left-pad@1.3.0:
+    resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}
+  left-pad@1.3.01:
+    resolution: {{integrity: sha512-OTHERVERSION==}}
+  '@scope/left-pad@1.3.0':
+    resolution: {{integrity: sha512-OTHERPACKAGE==}}
+
+snapshots:
+  left-pad@1.3.0(react@18.2.0):
+    dependencies:
+      react: 18.2.0
+"
+        );
+        let files = BTreeMap::from([("pnpm-lock.yaml".to_string(), boundaries.clone())]);
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(
+            residual_warnings(&r).is_empty() && r.refused_pnpm_uuids.is_empty(),
+            "rewritten instances, other versions/packages, and resolution-less \
+             snapshots keys must not count: {:?}",
+            r.warnings
+        );
+        let out = r.files.get("pnpm-lock.yaml").unwrap_or(&boundaries);
+        assert!(
+            out.contains("sha512-OTHERVERSION==") && out.contains("sha512-OTHERPACKAGE=="),
+            "{out}"
+        );
+
+        for lock in [
+            "lockfileVersion: '6.0'
+
+packages:
+
+  /left-pad@1.3.0(react@18.2.0(scheduler@0.23.2)):
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+",
+            "lockfileVersion: 5.4
+
+packages:
+
+  /left-pad/1.3.0_react@18.2.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+    dev: false
+",
+        ] {
+            let files = BTreeMap::from([("pnpm-lock.yaml".to_string(), lock.to_string())]);
+            let r = rewrite_registry_redirect(&files, &overrides);
+            assert!(
+                residual_warnings(&r).is_empty() && r.refused_pnpm_uuids.is_empty(),
+                "a spliceable suffixed instance is repointed, not refused: {:?}",
+                r.warnings
+            );
+            assert!(
+                r.files["pnpm-lock.yaml"].contains(url) && r.edits.len() == 1,
+                "{:?}",
+                r.edits
+            );
+        }
+
+        let with_unparseable = boundaries.replace(
+            "\nsnapshots:",
+            "  left-pad@1.3.0(react@18.2.0:
+    resolution: {integrity: sha512-UPSTREAM==}
+
+snapshots:",
+        );
+        assert_ne!(with_unparseable, boundaries);
+        let files = BTreeMap::from([("pnpm-lock.yaml".to_string(), with_unparseable)]);
+        let r = rewrite_registry_redirect(&files, &overrides);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.edits);
+        assert_eq!(
+            r.refused_pnpm_uuids.len(),
+            1,
+            "the dep is refused: {:?}",
+            r.warnings
+        );
+        let details = residual_warnings(&r);
+        assert_eq!(details.len(), 1, "{details:?}");
+        assert!(
+            details[0].contains("cannot repoint: left-pad@1.3.0(react@18.2.0 in pnpm-lock.yaml;"),
+            "only the unparseable instance is named: {}",
+            details[0]
         );
     }
 
