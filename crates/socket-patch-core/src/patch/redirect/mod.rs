@@ -32,6 +32,8 @@ pub use bun_binary::{preflight_bun_binary, rewrite_bun_binary};
 #[cfg(test)]
 mod cargo_lock_equivalence_tests;
 #[cfg(test)]
+mod composer_equivalence_tests;
+#[cfg(test)]
 mod golang_equivalence_tests;
 pub mod golang_local;
 #[cfg(test)]
@@ -4248,25 +4250,29 @@ pub fn artifact_url_present(text: &str, artifact_url: &str) -> bool {
 /// Byte offset of the `}` closing the JSON object that CONTAINS `from`, which
 /// must be a position inside that object. Brace counting skips string literals,
 /// so a brace inside a description or URL cannot move the boundary.
+///
+/// Walks bytes, not chars: every byte it acts on is ASCII, and no byte of a
+/// multi-byte UTF-8 sequence is, so the offsets are the char walk's (an
+/// escaped multi-byte char clears `escaped` on its lead byte).
 fn json_object_end_from(text: &str, from: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
-    for (offset, ch) in text[from..].char_indices() {
+    for (offset, &byte) in text.as_bytes()[from..].iter().enumerate() {
         if in_string {
-            match ch {
+            match byte {
                 _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => in_string = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
                 _ => {}
             }
             continue;
         }
-        match ch {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' if depth == 0 => return Some(from + offset),
-            '}' => depth -= 1,
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' if depth == 0 => return Some(from + offset),
+            b'}' => depth -= 1,
             _ => {}
         }
     }
@@ -4307,13 +4313,19 @@ enum ComposerEntry {
 fn find_composer_entry(content: &str, pkg: &str, version: &str) -> ComposerEntry {
     let mut mismatched: Option<String> = None;
     for (name_idx, _) in content.match_indices("\"name\": \"") {
+        // The name is the value at `name_idx` — the entry's first field —
+        // and its closing quote precedes any `}` the object walk can stop
+        // at, so test it before walking to the end of the object: most
+        // occurrences name some other package.
+        if !json_string_field(&content[name_idx..], "name")
+            .is_some_and(|n| n.eq_ignore_ascii_case(pkg))
+        {
+            continue;
+        }
         let Some(end) = json_object_end_from(content, name_idx) else {
             continue;
         };
         let entry = &content[name_idx..=end];
-        if !json_string_field(entry, "name").is_some_and(|n| n.eq_ignore_ascii_case(pkg)) {
-            continue;
-        }
         // Every package entry carries `version`; an `authors[]`/`support`
         // object that happens to have a matching `name` does not.
         let Some(locked) = json_string_field(entry, "version") else {
@@ -4516,12 +4528,9 @@ fn rewrite_composer_lock(
                 }
             };
         if rewritten != original {
-            content = format!(
-                "{}{}{}",
-                &content[..edit_start],
-                rewritten,
-                &content[dist_end + 1..]
-            );
+            // In place: a fresh whole-lock copy per edit left the allocator
+            // holding one lock-sized buffer per redirected dep.
+            content.replace_range(edit_start..=dist_end, &rewritten);
             changed = true;
             result.edits.push(FileEdit {
                 path: "composer.lock".into(),
