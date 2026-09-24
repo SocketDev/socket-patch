@@ -1459,6 +1459,16 @@ pub(crate) async fn vendor_records(
             Err(corrupt) => (None, Some(corrupt)),
         };
 
+    // Yarn berry takeover preflight (see
+    // `socket_patch_core::vendor::yarn_berry_vendor_preflight`): the berry
+    // backend's project-level refusals (mixed line endings in yarn.lock or
+    // package.json, cacheKey, `.yarnrc.yml` compressionLevel), computed at
+    // most once per run and only when a hosted-claimed npm purl reaches the
+    // takeover below — which must refuse such a purl BEFORE reverting its
+    // hosted edits: a hosted revert keeps a mixed lock mixed, so the backend
+    // then refused it with the redirect already gone.
+    let berry_takeover_refusal: tokio::sync::OnceCell<Option<(&'static str, String)>> =
+        tokio::sync::OnceCell::new();
     let pipenv_version = tokio::sync::OnceCell::new();
     let mut dry_in_sync: u32 = 0;
     // Sorted, so per-package lines print in the same order every run.
@@ -1575,6 +1585,26 @@ pub(crate) async fn vendor_records(
                         .keys()
                         .any(|k| canonical_purl(k) == canonical_purl(candidate))
                 });
+                // The refusal the berry backend would raise after the
+                // revert, raised HERE instead — the same `failed` event,
+                // code and detail, in the dry run and the wet run alike —
+                // so the hosted wiring and redirect ledger stay untouched.
+                if claimed && candidate.starts_with("pkg:npm/") {
+                    let refusal = berry_takeover_refusal
+                        .get_or_init(|| {
+                            socket_patch_core::vendor::yarn_berry_vendor_preflight(&common.cwd)
+                        })
+                        .await;
+                    if let Some((code, detail)) = refusal {
+                        has_errors = true;
+                        env.record(
+                            PatchEvent::new(PatchAction::Failed, candidate.clone())
+                                .with_error(*code, detail.clone()),
+                        );
+                        report_vendor_failure(common, candidate, detail);
+                        continue;
+                    }
+                }
                 if claimed && common.dry_run {
                     // Probe the takeover exactly as the wet run would — the
                     // per-purl revert's dry run resolves every inverse and

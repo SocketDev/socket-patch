@@ -1207,6 +1207,209 @@ async fn berry_crlf_takeovers_round_trip_both_directions() {
     );
 }
 
+/// `scan --mode hosted --json --yes <extra...>` through the binary.
+fn hosted_scan_cli_with(root: &Path, api_url: &str, extra: &[&str]) -> (i32, Value) {
+    let mut args = vec![
+        "scan",
+        "--mode",
+        "hosted",
+        "--json",
+        "--yes",
+        "--cwd",
+        root.to_str().unwrap(),
+        "--api-url",
+        api_url,
+        "--org",
+        "test-org",
+        "--api-token",
+        "fake-token",
+    ];
+    args.extend_from_slice(extra);
+    let (code, stdout, stderr) = run_cli(root, &args, &[]);
+    let env: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "scan --mode hosted --json must emit JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )
+    });
+    (code, env)
+}
+
+/// The mode wiring a takeover would touch: the berry pair, `.yarnrc.yml`,
+/// and everything under `.socket/vendor/` (vendor ledger, artifact, marker,
+/// redirect ledger), as `(relative path, bytes)`.
+fn berry_wiring_snapshot(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.insert(rel, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for rel in ["package.json", "yarn.lock", ".yarnrc.yml"] {
+        out.insert(rel.to_string(), std::fs::read(root.join(rel)).unwrap());
+    }
+    walk(root, &root.join(".socket/vendor"), &mut out);
+    out
+}
+
+/// Mode takeovers must refuse a berry project the NEW mode would refuse
+/// BEFORE reverting the OLD mode's wiring. The reverts keep line endings as
+/// they are (a mixed lock stays mixed), while the forward hosted rewriter
+/// and vendored backend refuse a mixed file (and an unsupported
+/// `.yarnrc.yml` compressionLevel) — so reverting first left the package
+/// unpatched in BOTH modes: `scan --mode hosted` reported
+/// `redirect_takeover_reverted_vendored` ("now fully hosted") then
+/// `redirected: 0`; `vendor` reported `vendor_takeover_reverted_redirect`
+/// then failed. Each leg (wet and --dry-run) asserts the old mode's wiring
+/// stays byte-identical, the refusal carries the new mode's code, and no
+/// takeover is announced.
+#[tokio::test]
+async fn berry_takeovers_refuse_before_reverting_the_old_mode() {
+    let server = wiremock::MockServer::start().await;
+    mount_berry_hosted_api(&server).await;
+    let (pkg, lock) = (
+        windows_shape(BERRY_WIN_PKG, true),
+        windows_shape(&berry_win_lock(), false),
+    );
+    // Each breakage lands AFTER the old mode is wired. `mix`: an editor
+    // saves one header line of `rel` with LF. `compression`: the project
+    // opts into a compressionLevel neither mode can reproduce.
+    type Break = fn(&Path, &str);
+    let mix: Break = |root, rel| {
+        let text = std::fs::read_to_string(root.join(rel)).unwrap();
+        std::fs::write(root.join(rel), text.replacen("\r\n", "\n", 1)).unwrap();
+    };
+    let compression: Break = |root, _| {
+        std::fs::write(
+            root.join(".yarnrc.yml"),
+            "nodeLinker: node-modules\r\nenableGlobalCache: false\r\ncompressionLevel: 9\r\n",
+        )
+        .unwrap();
+    };
+
+    // ── vendored → hosted ──
+    for (label, breakage, rel, code) in [
+        (
+            "mixed lock",
+            mix,
+            "yarn.lock",
+            "redirect_yarn_berry_mixed_line_endings",
+        ),
+        (
+            "compressionLevel",
+            compression,
+            "",
+            "redirect_yarn_berry_cache_unsupported",
+        ),
+    ] {
+        for dry in [true, false] {
+            let ctx = format!("vendored→hosted {label} dry={dry}");
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            stage_berry_project(root, &pkg, &lock);
+            let (exit, env) = vendor_cli(root, &[]);
+            assert_eq!(exit, 0, "{ctx}: vendor: {env:#}");
+            breakage(root, rel);
+            let before = berry_wiring_snapshot(root);
+            let extra: &[&str] = if dry { &["--dry-run"] } else { &[] };
+            let (_, env) = hosted_scan_cli_with(root, &server.uri(), extra);
+            let text = env.to_string();
+            assert!(text.contains(code), "{ctx}: refused with {code}: {env:#}");
+            for announced in [
+                "redirect_takeover_reverted_vendored",
+                "redirect_would_revert_vendored",
+            ] {
+                assert!(
+                    !text.contains(announced),
+                    "{ctx}: no takeover ({announced}): {env:#}"
+                );
+            }
+            assert_eq!(env["redirect"]["redirected"], 0, "{ctx}: {env:#}");
+            let skipped = env["redirect"]["skipped"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                skipped
+                    .iter()
+                    .any(|s| s["purl"] == PURL && s["reason"] == code),
+                "{ctx}: the purl is skipped with the refusal's code: {env:#}"
+            );
+            assert_eq!(
+                berry_wiring_snapshot(root),
+                before,
+                "{ctx}: the vendored wiring, ledger and artifact stay byte-identical"
+            );
+        }
+    }
+
+    // ── hosted → vendored ──
+    for (label, breakage, rel, code) in [
+        (
+            "mixed lock",
+            mix,
+            "yarn.lock",
+            "vendor_yarn_berry_mixed_line_endings",
+        ),
+        (
+            "mixed package.json",
+            mix,
+            "package.json",
+            "vendor_yarn_berry_mixed_line_endings",
+        ),
+        (
+            "compressionLevel",
+            compression,
+            "",
+            "vendor_yarn_berry_cache_unsupported",
+        ),
+    ] {
+        for dry in [true, false] {
+            let ctx = format!("hosted→vendored {label} dry={dry}");
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            stage_berry_project(root, &pkg, &lock);
+            let (exit, env) = hosted_scan_cli_with(root, &server.uri(), &[]);
+            assert_eq!(exit, 0, "{ctx}: hosted scan: {env:#}");
+            assert_eq!(env["redirect"]["redirected"], 1, "{ctx}: {env:#}");
+            breakage(root, rel);
+            let before = berry_wiring_snapshot(root);
+            let extra: &[&str] = if dry { &["--dry-run"] } else { &[] };
+            let (exit, env) = vendor_cli(root, extra);
+            assert_eq!(exit, 1, "{ctx}: the refusal fails the run: {env:#}");
+            let failed = find_event(&env, "failed", Some(code));
+            assert_eq!(failed["purl"], PURL, "{ctx}: {failed}");
+            let text = env.to_string();
+            for announced in [
+                "vendor_takeover_reverted_redirect",
+                "vendor_would_revert_redirect",
+            ] {
+                assert!(
+                    !text.contains(announced),
+                    "{ctx}: no takeover ({announced}): {env:#}"
+                );
+            }
+            assert_eq!(
+                berry_wiring_snapshot(root),
+                before,
+                "{ctx}: the hosted lock edits and redirect ledger stay byte-identical"
+            );
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 9. offline with no local source
 // ─────────────────────────────────────────────────────────────────────

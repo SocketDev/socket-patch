@@ -121,51 +121,13 @@ pub async fn vendor_yarn_berry(
         return outcome;
     }
     let blocks = scan_blocks(&lock_text);
-    let Some(meta) = berry_metadata(&blocks) else {
-        return refused(
-            "vendor_lockfile_version_unsupported",
-            "yarn.lock has no `__metadata:` entry — not a yarn berry lockfile".to_string(),
-        );
-    };
-    let cache_key = berry_field(&meta.lines, "cacheKey").unwrap_or("");
-    if cache_key != SUPPORTED_CACHE_KEY {
-        // The checksum is sha512 of the cache archive, whose bytes depend on
-        // the cache format version + compression; only 10c0 (stored entries)
-        // is reproducible offline. Emitting a guess would brick installs
-        // with YN0018, so refuse.
-        return refused(
-            "vendor_yarn_berry_cache_unsupported",
-            format!(
-                "yarn.lock cacheKey is `{cache_key}`; only `{SUPPORTED_CACHE_KEY}` (yarn 4 \
-                 with compressionLevel 0, the default) has an offline-reproducible cache \
-                 checksum — remove custom compression settings and re-run `yarn install`"
-            ),
-        );
+    if let Some(outcome) = refuse_unsupported_cache(&blocks) {
+        return outcome;
     }
 
     // ── 3. .yarnrc.yml knobs that change the checksum (spike B4) ─────────
-    match read_regular_to_string(&project_root.join(YARNRC)).await {
-        Ok(rc) => {
-            if let Some(level) = yarnrc_compression_level(&rc) {
-                if level != "0" {
-                    return refused(
-                        "vendor_yarn_berry_cache_unsupported",
-                        format!(
-                            "{YARNRC} sets `compressionLevel: {level}`, which changes berry's \
-                             cache checksums; only compressionLevel 0 (the yarn 4 default) is \
-                             supported"
-                        ),
-                    );
-                }
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return refused(
-                "vendor_yarn_berry_cache_unsupported",
-                format!("cannot read {YARNRC} to verify the cache configuration: {e}"),
-            );
-        }
+    if let Some(outcome) = refuse_unsupported_compression(project_root).await {
+        return outcome;
     }
 
     // ── 4. Root workspace name (the lock key/resolution embed it) ────────
@@ -882,6 +844,97 @@ fn refuse_mixed_line_endings(file: &str, text: &str) -> Option<VendorOutcome> {
             ),
         )
     })
+}
+
+/// The `__metadata` / `cacheKey` gate: the checksum is sha512 of the cache
+/// archive, whose bytes depend on the cache format version + compression;
+/// only 10c0 (stored entries) is reproducible offline. Emitting a guess would
+/// brick installs with YN0018, so refuse.
+fn refuse_unsupported_cache(blocks: &[LockBlock]) -> Option<VendorOutcome> {
+    let Some(meta) = berry_metadata(blocks) else {
+        return Some(refused(
+            "vendor_lockfile_version_unsupported",
+            "yarn.lock has no `__metadata:` entry — not a yarn berry lockfile".to_string(),
+        ));
+    };
+    let cache_key = berry_field(&meta.lines, "cacheKey").unwrap_or("");
+    (cache_key != SUPPORTED_CACHE_KEY).then(|| {
+        refused(
+            "vendor_yarn_berry_cache_unsupported",
+            format!(
+                "yarn.lock cacheKey is `{cache_key}`; only `{SUPPORTED_CACHE_KEY}` (yarn 4 \
+                 with compressionLevel 0, the default) has an offline-reproducible cache \
+                 checksum — remove custom compression settings and re-run `yarn install`"
+            ),
+        )
+    })
+}
+
+/// The `.yarnrc.yml` `compressionLevel` gate (spike B4): any level but 0
+/// changes berry's cache checksums.
+async fn refuse_unsupported_compression(project_root: &Path) -> Option<VendorOutcome> {
+    match read_regular_to_string(&project_root.join(YARNRC)).await {
+        Ok(rc) => yarnrc_compression_level(&rc)
+            .filter(|level| *level != "0")
+            .map(|level| {
+                refused(
+                    "vendor_yarn_berry_cache_unsupported",
+                    format!(
+                        "{YARNRC} sets `compressionLevel: {level}`, which changes berry's \
+                         cache checksums; only compressionLevel 0 (the yarn 4 default) is \
+                         supported"
+                    ),
+                )
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(refused(
+            "vendor_yarn_berry_cache_unsupported",
+            format!("cannot read {YARNRC} to verify the cache configuration: {e}"),
+        )),
+    }
+}
+
+/// The project-level refusals [`vendor_yarn_berry`] raises before any
+/// write, whatever the purl: mixed line endings in yarn.lock or
+/// package.json, an unsupported `cacheKey`, a non-zero `.yarnrc.yml`
+/// `compressionLevel`. `None` unless the project's npm flavor is yarn berry
+/// (the probe `vendor_npm_any` routes on) and every gate passes.
+///
+/// For the hosted→vendored mode takeover (`vendor`, `scan`/`get --mode
+/// vendored` over a hosted-redirected purl): the takeover reverts the
+/// hosted lock edits and drops the redirect-ledger record BEFORE this
+/// backend runs, and a hosted revert keeps a mixed lock mixed — so without
+/// this preflight a refusal here landed after the hosted redirect was gone,
+/// leaving the package unpatched in both modes. Returns `(code, detail)`,
+/// exactly the refusal the backend would raise.
+pub async fn yarn_berry_vendor_preflight(project_root: &Path) -> Option<(&'static str, String)> {
+    use super::npm_flavor::{detect_npm_lock_flavor, NpmLockFlavor};
+    if !matches!(
+        detect_npm_lock_flavor(project_root).await,
+        Ok((NpmLockFlavor::YarnBerry, _))
+    ) {
+        return None;
+    }
+    let into_pair = |outcome: VendorOutcome| match outcome {
+        VendorOutcome::Refused { code, detail } => Some((code, detail)),
+        _ => None,
+    };
+    // An unreadable file is left to the backend's own refusal.
+    let lock_text = read_yarn_lock(project_root).await.ok()?;
+    if let Some(outcome) = refuse_mixed_line_endings(YARN_LOCK, &lock_text) {
+        return into_pair(outcome);
+    }
+    if let Some(outcome) = refuse_unsupported_cache(&scan_blocks(&lock_text)) {
+        return into_pair(outcome);
+    }
+    if let Some(outcome) = refuse_unsupported_compression(project_root).await {
+        return into_pair(outcome);
+    }
+    let pkg_bytes = read_regular_to_bytes(&project_root.join(PACKAGE_JSON))
+        .await
+        .ok()?;
+    refuse_mixed_line_endings(PACKAGE_JSON, &String::from_utf8_lossy(&pkg_bytes))
+        .and_then(into_pair)
 }
 
 /// Commit the pair in contract order — package.json first, yarn.lock second
@@ -3511,6 +3564,67 @@ __metadata:
                 "{file}: {detail}"
             );
             fx.assert_untouched().await;
+        }
+    }
+
+    /// The takeover preflight raises exactly the project-level refusal the
+    /// backend raises (same code, same detail) — the hosted→vendored
+    /// takeover relies on it to refuse BEFORE reverting the hosted redirect
+    /// — and stays silent on a supported pair (CRLF included) and on a
+    /// project whose npm flavor is not yarn berry.
+    #[tokio::test]
+    async fn takeover_preflight_raises_the_backends_project_refusals() {
+        let half = |t: &str| {
+            let c = crlf(t);
+            let at = c.rfind("\r\n").unwrap();
+            format!("{}\n{}", &c[..at], &c[at + 2..])
+        };
+        for (label, pkg, lock, yarnrc) in [
+            (
+                "mixed lock",
+                crlf(B3_BEFORE_PKG),
+                half(B3_BEFORE_LOCK),
+                None,
+            ),
+            (
+                "mixed package.json",
+                half(B3_BEFORE_PKG),
+                crlf(B3_BEFORE_LOCK),
+                None,
+            ),
+            (
+                "compressionLevel",
+                crlf(B3_BEFORE_PKG),
+                crlf(B3_BEFORE_LOCK),
+                Some("compressionLevel: 9\r\n"),
+            ),
+        ] {
+            let fx = fixture_with(&pkg, &lock).await;
+            if let Some(rc) = yarnrc {
+                tokio::fs::write(fx.root().join(YARNRC), rc).await.unwrap();
+            }
+            let (code, detail) = yarn_berry_vendor_preflight(fx.root())
+                .await
+                .unwrap_or_else(|| panic!("{label}: the preflight must refuse"));
+            let backend = expect_refused(fx.vendor(false).await, code);
+            assert_eq!(detail, backend, "{label}: the backend's own detail");
+            fx.assert_untouched().await;
+        }
+        for (label, pkg, lock) in [
+            ("lf", B3_BEFORE_PKG.to_string(), B3_BEFORE_LOCK.to_string()),
+            ("crlf", crlf(B3_BEFORE_PKG), crlf(B3_BEFORE_LOCK)),
+            (
+                "classic",
+                B3_BEFORE_PKG.to_string(),
+                "# yarn lockfile v1\n\n\n\"left-pad@1.3.0\":\n  version \"1.3.0\"\n".to_string(),
+            ),
+        ] {
+            let fx = fixture_with(&pkg, &lock).await;
+            assert_eq!(
+                yarn_berry_vendor_preflight(fx.root()).await,
+                None,
+                "{label}: nothing to refuse"
+            );
         }
     }
 

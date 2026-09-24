@@ -595,6 +595,18 @@ into the new version's section — see docs/releasing.md.
   4.12.0 (hosted, vendored, workspaces, pnpm linker, both mode takeovers)
   with the fixtures re-spelled CRLF, and on yarn 2.4.3 / 3.8.7 (still
   refused for their cacheKey, never for their endings).
+- **A yarn berry mode takeover no longer strips the old mode's patch before
+  the new mode refuses the project.** `scan` / `get --mode hosted` over a
+  vendored berry purl reverted its vendored wiring, ledger entry and
+  artifact (`redirect_takeover_reverted_vendored`: "now fully hosted") and
+  only then ran the rewriter, which refused a lock with mixed line endings
+  (or an unsupported `cacheKey` / `.yarnrc.yml` `compressionLevel`) —
+  `redirected: 0`, and the next `yarn install` pulled the unpatched registry
+  package. `vendor` / `scan --mode vendored` over a hosted berry purl did the
+  same in reverse (`vendor_takeover_reverted_redirect`, then `failed`
+  `vendor_yarn_berry_mixed_line_endings`). Both takeovers now run the new
+  mode's berry gates first — wet and `--dry-run` alike — and a refused purl
+  keeps the old mode's wiring byte-identical.
 - **`setup` keeps a CRLF `package.json` CRLF.** `setup` and `setup --remove`
   re-serialized `package.json` with bare LF and dropped a leading BOM, so on
   a Windows yarn berry project (yarn pretty-prints the manifest with CRLF) a

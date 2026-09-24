@@ -2302,6 +2302,72 @@ fn berry_cache_key(content: &str) -> Option<String> {
     None
 }
 
+/// The project-level refusals of the yarn berry hosted rewriter — the gates
+/// that hold for every dep of the lock, whatever the overrides: a MIXED
+/// line-ending lock, an unsupported `cacheKey`, and a `.yarnrc.yml`
+/// `compressionLevel` other than 0. `Ok` for a lock that is not berry (the
+/// classic rewriter owns those).
+///
+/// Exposed so the vendored→hosted mode takeover (`scan`/`get --mode hosted`
+/// over a vendored berry purl) can refuse BEFORE it reverts the vendored
+/// wiring: the vendored revert never refuses on line endings (it keeps a
+/// mixed lock mixed), so without this preflight the takeover stripped the
+/// live vendored patch and then this rewriter refused the lock, leaving the
+/// package unpatched in both modes — the bun twin is
+/// [`preflight_bun_hosted`].
+///
+/// Line endings: yarn berry writes a NEW lockfile with the OS line ending
+/// (`os.EOL`: CRLF on Windows) and keeps an existing file's majority ending
+/// on every later write (`normalizeLineEndings` in yarnpkg-fslib
+/// `FakeFS.ts`, called by `Project.persistLockfile`); a `core.autocrlf`
+/// checkout turns an LF lock into CRLF on any OS. A uniform CRLF lock is
+/// supported (rewritten LF-normalized and re-expanded). A MIXED lock has no
+/// single style to restore, and yarn cannot keep one either: `--immutable`
+/// compares the file with its own majority-normalized re-render and fails
+/// (YN0028), while a plain install rewrites every minority line — so it is
+/// refused untouched, `yarn install` normalizes it first.
+pub fn preflight_yarn_berry_hosted(lock: &str, yarnrc: Option<&str>) -> Result<(), RewriteWarning> {
+    if !is_berry_lock(lock) {
+        return Ok(());
+    }
+    let body = lock.strip_prefix('\u{feff}').unwrap_or(lock);
+    if LineEndings::of(body) == LineEndings::Mixed {
+        return Err(RewriteWarning {
+            code: "redirect_yarn_berry_mixed_line_endings".into(),
+            detail: "yarn.lock mixes CRLF and LF line endings (or holds a bare carriage \
+                     return), so no single line ending can be kept, and yarn itself \
+                     rejects it under `--immutable` (YN0028) — run `yarn install` once to \
+                     normalize the lock, then re-run; leaving it untouched"
+                .into(),
+        });
+    }
+    // Refuse any lock whose cache checksum we can't reproduce
+    // offline. A guessed `checksum:` bricks installs (YN0018).
+    let key = berry_cache_key(&to_lf(body));
+    if key.as_deref() != Some(YARN_BERRY_SUPPORTED_CACHE_KEY) {
+        return Err(RewriteWarning {
+            code: "redirect_yarn_berry_cache_unsupported".into(),
+            detail: format!(
+                "yarn.lock cacheKey is `{}`; only `{YARN_BERRY_SUPPORTED_CACHE_KEY}` \
+                 (yarn 4, compressionLevel 0 default) has an offline-reproducible cache checksum",
+                key.as_deref().unwrap_or("(missing)")
+            ),
+        });
+    }
+    if let Some(level) = yarnrc.and_then(yarnrc_compression_level) {
+        if level != "0" {
+            return Err(RewriteWarning {
+                code: "redirect_yarn_berry_cache_unsupported".into(),
+                detail: format!(
+                    ".yarnrc.yml sets `compressionLevel: {level}`, which changes berry's \
+                     cache checksums; only compressionLevel 0 (the yarn 4 default) is supported"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn rewrite_yarn_berry(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
@@ -2319,65 +2385,28 @@ fn rewrite_yarn_berry(
         return;
     }
 
-    // Line endings. yarn berry writes a NEW lockfile with the OS line ending
-    // (`os.EOL`: CRLF on Windows) and keeps an existing file's majority
-    // ending on every later write (`normalizeLineEndings` in yarnpkg-fslib
-    // `FakeFS.ts`, called by `Project.persistLockfile`); a `core.autocrlf`
-    // checkout turns an LF lock into CRLF on any OS. A CRLF lock is
-    // rewritten LF-normalized (the `\n\n` block grammar never splits a
-    // `\r\n\r\n` file) and re-expanded, so every untouched byte round-trips
-    // and the ledger records the lock's on-disk CRLF fragments. A leading
-    // BOM rides outside the blocks. A MIXED lock has no single style to
-    // restore, and yarn cannot keep one either: `--immutable` compares the
-    // file with its own majority-normalized re-render and fails (YN0028),
-    // while a plain install rewrites every minority line — so refuse it
-    // untouched and let `yarn install` normalize it first.
+    // Line endings (see [`preflight_yarn_berry_hosted`] for when yarn writes
+    // CRLF): a CRLF lock is rewritten LF-normalized (the `\n\n` block
+    // grammar never splits a `\r\n\r\n` file) and re-expanded, so every
+    // untouched byte round-trips and the ledger records the lock's on-disk
+    // CRLF fragments. A leading BOM rides outside the blocks; a mixed lock
+    // is refused by the preflight.
     let (bom, body) = match raw.strip_prefix('\u{feff}') {
         Some(rest) => ("\u{feff}", rest),
         None => ("", raw.as_str()),
     };
-    let eol = LineEndings::of(body);
-    if eol == LineEndings::Mixed {
-        result.warnings.push(RewriteWarning {
-            code: "redirect_yarn_berry_mixed_line_endings".into(),
-            detail: "yarn.lock mixes CRLF and LF line endings (or holds a bare carriage \
-                     return), so no single line ending can be kept, and yarn itself \
-                     rejects it under `--immutable` (YN0028) — run `yarn install` once to \
-                     normalize the lock, then re-run; leaving it untouched"
-                .into(),
-        });
+    // Project-level gates (line endings, cacheKey, compressionLevel), shared
+    // with the vendored→hosted takeover preflight so a takeover never
+    // reverts vendored wiring this rewriter then refuses.
+    if let Err(warning) =
+        preflight_yarn_berry_hosted(raw, files.get(".yarnrc.yml").map(String::as_str))
+    {
+        result.warnings.push(warning);
         return;
     }
+    let eol = LineEndings::of(body);
     let normalized = to_lf(body);
     let content: &str = &normalized;
-    // Refuse any lock whose cache checksum we can't reproduce
-    // offline. A guessed `checksum:` bricks installs (YN0018).
-    let key = berry_cache_key(content);
-    if key.as_deref() != Some(YARN_BERRY_SUPPORTED_CACHE_KEY) {
-        result.warnings.push(RewriteWarning {
-            code: "redirect_yarn_berry_cache_unsupported".into(),
-            detail: format!(
-                "yarn.lock cacheKey is `{}`; only `{YARN_BERRY_SUPPORTED_CACHE_KEY}` \
-                 (yarn 4, compressionLevel 0 default) has an offline-reproducible cache checksum",
-                key.as_deref().unwrap_or("(missing)")
-            ),
-        });
-        return;
-    }
-    if let Some(rc) = files.get(".yarnrc.yml") {
-        if let Some(level) = yarnrc_compression_level(rc) {
-            if level != "0" {
-                result.warnings.push(RewriteWarning {
-                    code: "redirect_yarn_berry_cache_unsupported".into(),
-                    detail: format!(
-                        ".yarnrc.yml sets `compressionLevel: {level}`, which changes berry's \
-                         cache checksums; only compressionLevel 0 (the yarn 4 default) is supported"
-                    ),
-                });
-                return;
-            }
-        }
-    }
 
     let mut blocks: Vec<String> = content.split("\n\n").map(String::from).collect();
     let resolution_re =
@@ -12141,6 +12170,44 @@ packages:
                 "{label}: detail names the cause and the remedy: {detail}"
             );
         }
+    }
+
+    /// The public takeover preflight is the rewriter's own project gate:
+    /// the same codes for a mixed lock, an unsupported cacheKey (CRLF lock
+    /// included) and a non-zero compressionLevel; `Ok` for a supported LF /
+    /// CRLF / BOM'd berry lock and for any classic lock.
+    #[test]
+    fn berry_hosted_preflight_mirrors_the_rewriter_gates() {
+        let lf = berry_lock_two_entries();
+        let crlf = lf.replace('\n', "\r\n");
+        for ok in [
+            lf.clone(),
+            crlf.clone(),
+            format!("\u{feff}{crlf}"),
+            classic_lock_two_entries().replacen("\n", "\r\n", 1),
+        ] {
+            assert_eq!(
+                preflight_yarn_berry_hosted(&ok, None).map_err(|w| w.code),
+                Ok(()),
+                "{ok:?}"
+            );
+        }
+        let code = |lock: &str, rc: Option<&str>| {
+            preflight_yarn_berry_hosted(lock, rc).map_err(|w| w.code)
+        };
+        assert_eq!(
+            code(&crlf.replacen("\r\n", "\n", 1), None),
+            Err("redirect_yarn_berry_mixed_line_endings".to_string())
+        );
+        assert_eq!(
+            code(&crlf.replace("cacheKey: 10c0", "cacheKey: 8"), None),
+            Err("redirect_yarn_berry_cache_unsupported".to_string())
+        );
+        assert_eq!(
+            code(&crlf, Some("compressionLevel: 9\r\n")),
+            Err("redirect_yarn_berry_cache_unsupported".to_string())
+        );
+        assert_eq!(code(&crlf, Some("compressionLevel: 0\n")), Ok(()));
     }
 
     /// The whole-file gates read the NORMALIZED lock: a CRLF lock at an

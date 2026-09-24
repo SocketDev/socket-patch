@@ -105,10 +105,13 @@ pub use state::{
     carry_forward_wiring, load_state, lookup_entry, save_state, VendorEntry, VendorState,
     VENDOR_STATE_REL,
 };
+// The hosted→vendored takeover refuses a berry project the backend would
+// refuse BEFORE it reverts the hosted redirect.
 pub use verify::{
     artifact_is_file_shaped, check_vendored_artifact, compute_dir_inventory, file_sha256_hex,
     ArtifactHealth,
 };
+pub use yarn_berry_lock::yarn_berry_vendor_preflight;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

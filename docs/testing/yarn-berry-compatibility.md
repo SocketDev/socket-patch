@@ -77,6 +77,7 @@ What socket-patch does with those files:
 | leading BOM | kept | kept, both files |
 | mixed CRLF / LF, or a bare CR | refused untouched: `redirect_yarn_berry_mixed_line_endings` | refused before any write: `vendor_yarn_berry_mixed_line_endings` |
 | revert (`rollback`, `remove`, takeovers) | byte-exact; a ledger recorded before a uniform LF ↔ CRLF checkout flip is replayed respelled; a mixed lock refuses as drift | byte-exact; a lock mixed after vendoring gets the restored entry in the terminator of the entry it replaces |
+| mode takeover into this mode | the berry gates (line endings, `cacheKey`, `compressionLevel`) run BEFORE the vendored wiring is reverted; a refused purl stays vendored, byte-identical | the backend's project gates (both files' line endings, `cacheKey`, `compressionLevel`) run BEFORE the hosted redirect is reverted; a refused purl stays hosted, byte-identical |
 
 `setup` / `setup --remove` write `package.json` in the same layout-keeping
 way (BOM, indent, ending, trailing newline), so the pair round-trips
