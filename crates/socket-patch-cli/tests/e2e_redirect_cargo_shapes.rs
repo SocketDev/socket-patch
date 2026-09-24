@@ -7,6 +7,9 @@
 //!   own version's registry, and removing both purls restores every byte.
 //! * `legacy_config` — an existing legacy `.cargo/config`: the registry
 //!   block lands there, and `remove` restores the file byte-for-byte.
+//! * `workspace_direct_member` — a virtual workspace whose root pins
+//!   `[workspace.dependencies]`, one member inheriting and one declaring the
+//!   crate itself: both members build against the patched copy.
 //!
 //! Every shape runs the same chain against the real cargo: a baseline build
 //! with a private CARGO_HOME (network to crates.io for fixture setup only),
@@ -591,6 +594,42 @@ async fn cargo_hosted_legacy_config_is_restored_byte_for_byte() {
             "src/main.rs",
             "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
         )],
+    };
+    let _ = run_shape(shape).await;
+}
+
+/// Bug F: a workspace member's own declaration must be pinned too.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_workspace_member_declaration_is_pinned() {
+    let member = |name: &str, dep: &str| {
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2018\"\n\n\
+             [dependencies]\n{dep}\n"
+        )
+    };
+    let oracle = "pub fn marker() -> u32 { cfg_if::socket_patched() }\n".to_string();
+    let shape = Shape {
+        tag: "workspace-direct-member",
+        files: vec![
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"inherits\", \"direct\"]\n\n\
+                 [workspace.dependencies]\ncfg-if = \"1.0.4\"\n"
+                    .to_string(),
+            ),
+            (
+                "inherits/Cargo.toml",
+                member("inherits", "cfg-if = { workspace = true }"),
+            ),
+            ("inherits/src/lib.rs", String::new()),
+            ("direct/Cargo.toml", member("direct", "cfg-if = \"1.0.4\"")),
+            ("direct/src/lib.rs", String::new()),
+        ],
+        patches: vec![CFG_IF_1],
+        oracle: vec![
+            ("inherits/src/lib.rs", oracle.clone()),
+            ("direct/src/lib.rs", oracle),
+        ],
     };
     let _ = run_shape(shape).await;
 }

@@ -273,6 +273,19 @@ pub async fn revert_cargo_redirect_purl(
         .map(|(i, _)| i)
         .collect();
 
+    // Every manifest the ledger ever pinned (workspace members included),
+    // plus the lock: where a registry block can still be referenced from.
+    let mut probes: Vec<String> = vec!["Cargo.toml".to_string(), "Cargo.lock".to_string()];
+    for e in state
+        .edits
+        .iter()
+        .filter(|e| e.kind == "redirect_cargo_toml_dep")
+    {
+        if !probes.contains(&e.path) {
+            probes.push(e.path.clone());
+        }
+    }
+
     let mut out = RedirectRevert::default();
     let mut staged: Staged = Staged::new();
     // Newest-first: the hosted flow appends edits, so reverse index order
@@ -337,7 +350,7 @@ pub async fn revert_cargo_redirect_purl(
                     .map(str::to_string)
                     .unwrap_or_default();
                 let mut referenced = false;
-                for probe in ["Cargo.toml", "Cargo.lock"] {
+                for probe in &probes {
                     if let Some(text) = staged_read(&staged, project_root, probe).await? {
                         if (!reg.is_empty() && text.contains(reg))
                             || (!index.is_empty() && text.contains(&index))

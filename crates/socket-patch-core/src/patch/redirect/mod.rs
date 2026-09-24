@@ -733,7 +733,23 @@ fn rewrite_cargo(
     if cargo.is_empty() {
         return;
     }
-    let mut cargo_toml = files.get("Cargo.toml").cloned();
+    // The root manifest first, then every workspace-member manifest the
+    // caller supplied (`<dir>/Cargo.toml`): a member's own declaration of the
+    // crate resolves exactly like the root's, so it must be pinned too, or
+    // the lock's repointed entry is unsatisfiable (`--locked` fails) while
+    // the dep is reported redirected.
+    let mut manifests: Vec<(String, String)> = files
+        .iter()
+        .filter(|(k, _)| k.as_str() == "Cargo.toml")
+        .chain(
+            files
+                .iter()
+                .filter(|(k, _)| is_cargo_member_manifest_key(k)),
+        )
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let mut changed_manifests: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     let mut cargo_lock = files.get("Cargo.lock").cloned();
     // Cargo reads the LEGACY extensionless `.cargo/config` in preference to
     // `config.toml` when both exist (it warns about the duplicate), so a
@@ -747,7 +763,7 @@ fn rewrite_cargo(
         ".cargo/config.toml"
     };
     let mut cargo_config = files.get(cargo_config_key).cloned().unwrap_or_default();
-    let (mut toml_changed, mut lock_changed, mut config_changed) = (false, false, false);
+    let (mut lock_changed, mut config_changed) = (false, false);
 
     for dep in &cargo {
         let Some(ov) = registry_override_of_kind(dep, "cargo-sparse") else {
@@ -816,7 +832,7 @@ fn rewrite_cargo(
         // 1. Plan the Cargo.toml pin FIRST — it is the gate for everything
         // else. Without a manifest pin nothing forces resolution through the
         // managed registry, so no other file may be touched for this dep.
-        let Some(toml_text) = cargo_toml.as_ref() else {
+        if !manifests.iter().any(|(k, _)| k == "Cargo.toml") {
             result.warnings.push(RewriteWarning {
                 code: "redirect_cargo_toml_dep_not_found".into(),
                 detail: format!(
@@ -825,35 +841,56 @@ fn rewrite_cargo(
                 ),
             });
             continue;
-        };
+        }
         let other_versions =
             cargo_lock_other_versions(cargo_lock.as_deref(), &dep.name, &dep.version);
-        let toml_plan =
-            match plan_cargo_toml(toml_text, &dep.name, &dep.version, &other_versions, &reg) {
-                Ok(plan) => plan,
-                Err(CargoTomlPlanError::NotFound) => {
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_cargo_toml_dep_not_found".into(),
-                        detail: format!(
-                            "no [dependencies] entry for {} in Cargo.toml; dependency skipped \
-                         (nothing rewritten)",
-                            dep.name
-                        ),
-                    });
-                    continue;
+        // The root manifest's `[workspace.dependencies]` verdicts feed its
+        // members' `workspace = true` inheritors.
+        let mut root_workspace: BTreeMap<String, CargoWorkspaceEntry> = BTreeMap::new();
+        let mut toml_plans: Vec<(usize, CargoTomlPlan)> = Vec::new();
+        let mut refused: Option<(String, String)> = None;
+        for (i, (path, text)) in manifests.iter().enumerate() {
+            match plan_cargo_toml(
+                text,
+                path,
+                &dep.name,
+                &dep.version,
+                &other_versions,
+                &reg,
+                &root_workspace,
+            ) {
+                Ok(plan) => {
+                    if path == "Cargo.toml" {
+                        root_workspace = plan.workspace.clone();
+                    }
+                    if plan.found {
+                        toml_plans.push((i, plan));
+                    }
                 }
-                Err(CargoTomlPlanError::Refused(reason)) => {
-                    result.warnings.push(RewriteWarning {
-                        code: "redirect_cargo_toml_dep_unrewritable".into(),
-                        detail: format!(
-                            "{} in Cargo.toml cannot be pinned ({reason}); dependency skipped \
-                         (nothing rewritten)",
-                            dep.name
-                        ),
-                    });
-                    continue;
+                Err(reason) => {
+                    refused = Some((path.clone(), reason));
+                    break;
                 }
-            };
+            }
+        }
+        if let Some((path, reason)) = refused {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_cargo_toml_dep_unrewritable".into(),
+                detail: format!(
+                    "{} in {path} cannot be pinned ({reason}); dependency skipped \
+                     (nothing rewritten)",
+                    dep.name
+                ),
+            });
+            continue;
+        }
+        if toml_plans.is_empty() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_cargo_toml_dep_not_found".into(),
+                detail: cargo_not_declared_detail(&dep.name, manifests.len()),
+            });
+            continue;
+        }
 
         // 2. Plan the Cargo.lock repoint. A lock that exists but has no
         // [[package]] for the dep means the project does not actually resolve
@@ -911,10 +948,12 @@ fn rewrite_cargo(
             result.edits.push(plan.edit);
             config_changed = true;
         }
-        if toml_plan.changed {
-            cargo_toml = Some(toml_plan.content);
-            result.edits.extend(toml_plan.edits);
-            toml_changed = true;
+        for (i, plan) in toml_plans {
+            if plan.changed {
+                changed_manifests.insert(manifests[i].0.clone());
+                manifests[i].1 = plan.content;
+                result.edits.extend(plan.edits);
+            }
         }
         match lock_commit {
             LockCommit::Write(content, edits) => {
@@ -927,9 +966,9 @@ fn rewrite_cargo(
         result.confirmed_cargo_uuids.insert(dep.patch_uuid.clone());
     }
 
-    if toml_changed {
-        if let Some(t) = cargo_toml {
-            result.files.insert("Cargo.toml".into(), t);
+    for (path, text) in manifests {
+        if changed_manifests.contains(&path) {
+            result.files.insert(path, text);
         }
     }
     if lock_changed {
@@ -940,6 +979,36 @@ fn rewrite_cargo(
     if config_changed {
         result.files.insert(cargo_config_key.into(), cargo_config);
     }
+}
+
+/// A workspace-member manifest key the caller supplied: `<dir>/Cargo.toml`,
+/// a plain repo-relative path (never absolute, never `..`, never under the
+/// ledger's `.socket/` or a build `target/`).
+fn is_cargo_member_manifest_key(key: &str) -> bool {
+    let Some(dir) = key.strip_suffix("/Cargo.toml") else {
+        return false;
+    };
+    !dir.is_empty()
+        && !key.starts_with('/')
+        && !key.contains('\\')
+        && !key.contains(':')
+        && dir
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && seg != ".socket")
+}
+
+/// The not-declared warning for a crate no manifest names at the patched
+/// version.
+fn cargo_not_declared_detail(crate_name: &str, manifests: usize) -> String {
+    let scope = if manifests > 1 {
+        format!("any of the {manifests} workspace manifests")
+    } else {
+        "Cargo.toml".to_string()
+    };
+    format!(
+        "no [dependencies] entry for {crate_name} in {scope}; dependency skipped \
+         (nothing rewritten)"
+    )
 }
 
 /// Sparse index URLs land verbatim inside quoted TOML strings in both
@@ -1221,15 +1290,13 @@ struct CargoTomlPlan {
     /// `false` when every occurrence already carried our registry (idempotent
     /// re-run) — the pin is in place, nothing to write.
     changed: bool,
-}
-
-enum CargoTomlPlanError {
-    /// The crate is not declared anywhere in this manifest (rename-aware:
-    /// a key that matches but has `package = "<other>"` is NOT the crate).
-    NotFound,
-    /// At least one occurrence exists that cannot be pinned to the managed
-    /// registry — the whole dep must be skipped.
-    Refused(String),
+    /// Whether this manifest declares the crate at the patched version at
+    /// all (rename-aware: a key that matches but has `package = "<other>"`
+    /// is NOT the crate). `false` plans nothing.
+    found: bool,
+    /// This manifest's `[workspace.dependencies]` verdicts, per key — what
+    /// its members' `workspace = true` inheritors resolve against.
+    workspace: BTreeMap<String, CargoWorkspaceEntry>,
 }
 
 /// How one occurrence of the dep will be handled.
@@ -1353,13 +1420,18 @@ fn cargo_lock_other_versions(lock: Option<&str>, crate_name: &str, version: &str
     versions
 }
 
+/// `Err` carries the refusal reason: an occurrence exists that cannot be
+/// pinned to the managed registry, so the whole dep must be skipped.
+/// `inherited` is the workspace root's verdicts when planning a member.
 fn plan_cargo_toml(
     content: &str,
+    path: &str,
     crate_name: &str,
     version: &str,
     other_versions: &[String],
     reg: &str,
-) -> Result<CargoTomlPlan, CargoTomlPlanError> {
+    inherited: &BTreeMap<String, CargoWorkspaceEntry>,
+) -> Result<CargoTomlPlan, String> {
     let lines: Vec<&str> = content.split('\n').collect();
     let header_re: &Regex = &CARGO_TOML_HEADER_RE;
     let package_re: &Regex = &CARGO_TOML_PACKAGE_RE;
@@ -1699,8 +1771,15 @@ fn plan_cargo_toml(
         }
     }
 
+    let not_found = |ws_entries: BTreeMap<String, CargoWorkspaceEntry>| CargoTomlPlan {
+        content: content.to_string(),
+        edits: Vec::new(),
+        changed: false,
+        found: false,
+        workspace: ws_entries,
+    };
     if pending.is_empty() {
-        return Err(CargoTomlPlanError::NotFound);
+        return Ok(not_found(ws_entries));
     }
     // Resolve: any refusal (including an unsatisfiable `workspace = true`
     // inheritor) refuses the WHOLE dep — no partial pin is ever applied.
@@ -1708,26 +1787,24 @@ fn plan_cargo_toml(
     for p in pending {
         match p {
             Pending::Action(a) => actions.push(a),
-            Pending::NeedsWorkspacePin(key) => match ws_entries.get(&key) {
+            Pending::NeedsWorkspacePin(key) => match ws_entries.get(&key).or(inherited.get(&key)) {
                 Some(CargoWorkspaceEntry::Pinned) => {
                     actions.push(CargoTomlAction::InheritsWorkspace);
                 }
                 // Inherits another version of the crate: not this dep.
                 Some(CargoWorkspaceEntry::OtherVersion) => {}
                 None => {
-                    return Err(CargoTomlPlanError::Refused(
-                        "inherits from [workspace.dependencies] with no rewritable entry \
-                         in this manifest"
-                            .to_string(),
-                    ));
+                    return Err("inherits from [workspace.dependencies] with no rewritable \
+                                entry for it"
+                        .to_string());
                 }
             },
-            Pending::Refuse(reason) => return Err(CargoTomlPlanError::Refused(reason)),
+            Pending::Refuse(reason) => return Err(reason),
         }
     }
     // Every occurrence named another version (inheritors included).
     if actions.is_empty() {
-        return Err(CargoTomlPlanError::NotFound);
+        return Ok(not_found(ws_entries));
     }
 
     // Apply bottom-up so line indices stay valid; record edits top-down.
@@ -1746,7 +1823,7 @@ fn plan_cargo_toml(
         match action {
             CargoTomlAction::ReplaceLine { new_text, .. } => {
                 edits.push(FileEdit {
-                    path: "Cargo.toml".into(),
+                    path: path.into(),
                     kind: "redirect_cargo_toml_dep".into(),
                     action: "rewritten".into(),
                     key: Some(crate_name.into()),
@@ -1756,7 +1833,7 @@ fn plan_cargo_toml(
             }
             CargoTomlAction::InsertAfterHeader { inserted, .. } => {
                 edits.push(FileEdit {
-                    path: "Cargo.toml".into(),
+                    path: path.into(),
                     kind: "redirect_cargo_toml_dep".into(),
                     action: "rewritten".into(),
                     key: Some(crate_name.into()),
@@ -1783,6 +1860,8 @@ fn plan_cargo_toml(
         content: new_lines.join("\n"),
         edits,
         changed,
+        found: true,
+        workspace: ws_entries,
     })
 }
 
@@ -8985,6 +9064,124 @@ mod tests {
             "{toml}"
         );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    }
+
+    /// A virtual workspace: the root pins `[workspace.dependencies]`, member
+    /// `a` inherits, member `b` declares serde itself.
+    fn cargo_workspace_files(b_manifest: &str) -> BTreeMap<String, String> {
+        let mut files = cargo_files(
+            "[workspace]\nmembers = [\"a\", \"b\"]\n\n\
+             [workspace.dependencies]\nserde = \"1.0.190\"\n",
+        );
+        files.insert(
+            "a/Cargo.toml".to_string(),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+             serde.workspace = true\n"
+                .to_string(),
+        );
+        files.insert("b/Cargo.toml".to_string(), b_manifest.to_string());
+        files
+    }
+
+    /// Bug F: only the root's `[workspace.dependencies]` was pinned; member
+    /// `b`'s own `serde = "1.0.190"` stayed on crates.io, so `--locked`
+    /// failed against the repointed lock while the dep was reported
+    /// redirected. Every member manifest the caller supplies is planned in
+    /// the same transaction; inheritors are satisfied by the root's pin.
+    #[test]
+    fn cargo_workspace_member_direct_declaration_is_pinned() {
+        let files = cargo_workspace_files(
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let pin = format!(
+            "serde = {{ version = \"1.0.190\", registry = \"{}\" }}",
+            cargo_reg()
+        );
+        assert!(r.files["Cargo.toml"].contains(&pin), "{:?}", r.files);
+        assert!(r.files["b/Cargo.toml"].contains(&pin), "{:?}", r.files);
+        assert!(
+            !r.files.contains_key("a/Cargo.toml"),
+            "the inheriting member needs no edit"
+        );
+        assert!(r
+            .edits
+            .iter()
+            .any(|e| e.path == "b/Cargo.toml" && e.kind == "redirect_cargo_toml_dep"));
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// A member that cannot be pinned (a path dependency here) refuses the
+    /// WHOLE dep: the root stays untouched too.
+    #[test]
+    fn cargo_workspace_member_refusal_refuses_every_manifest() {
+        let files = cargo_workspace_files(
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+             serde = { path = \"../serde\" }\n",
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.files.is_empty() && r.edits.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
+        assert!(
+            r.warnings[0].detail.contains("b/Cargo.toml"),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    /// Only a member declares the crate (the root has no workspace entry):
+    /// that member is pinned, and a member inheriting an entry the root
+    /// does not have refuses.
+    #[test]
+    fn cargo_member_only_declaration_and_unsatisfied_inheritor() {
+        let mut files = cargo_files("[workspace]\nmembers = [\"b\"]\n");
+        files.insert(
+            "b/Cargo.toml".to_string(),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert_eq!(
+            r.files.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![".cargo/config.toml", "Cargo.lock", "b/Cargo.toml"]
+        );
+        files.insert(
+            "b/Cargo.toml".to_string(),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+             serde = { workspace = true }\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.files.is_empty(), "{:?}", r.files);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
+    }
+
+    /// Manifest keys outside a plain repo-relative `<dir>/Cargo.toml` are
+    /// never treated as members.
+    #[test]
+    fn cargo_member_manifest_keys() {
+        for ok in ["a/Cargo.toml", "crates/x-y/Cargo.toml"] {
+            assert!(is_cargo_member_manifest_key(ok), "{ok}");
+        }
+        for bad in [
+            "Cargo.toml",
+            "/abs/Cargo.toml",
+            "../up/Cargo.toml",
+            "a/../b/Cargo.toml",
+            "./a/Cargo.toml",
+            ".socket/vendor/cargo/x/Cargo.toml",
+            "a//Cargo.toml",
+            "a/Cargo.toml.orig",
+        ] {
+            assert!(!is_cargo_member_manifest_key(bad), "{bad}");
+        }
     }
 
     /// A cargo dep whose override kind is not `cargo-sparse` warns (the TS
