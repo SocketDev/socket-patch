@@ -149,7 +149,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     // set the hermetic flags so they survive.
     scrub_socket_env(&mut cmd);
     cache_env::isolate(&mut cmd);
-    yarn_berry_common::pin_berry_ci_defaults(&mut cmd);
+    yarn_berry_common::pin_berry_ci_defaults(&mut cmd, pm);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
         // Hermetic: no global mirror/cache. Without this, yarn's persistent
         // `~/.yarn/berry` global cache serves a previously-fetched archive

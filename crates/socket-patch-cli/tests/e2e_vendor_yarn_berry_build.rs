@@ -111,7 +111,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     // seed the hermetic flags so they survive (Command: last env call wins).
     scrub_socket_env(&mut cmd);
     cache_env::isolate(&mut cmd);
-    yarn_berry_common::pin_berry_ci_defaults(&mut cmd);
+    yarn_berry_common::pin_berry_ci_defaults(&mut cmd, pm);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     for (k, v) in extra_env {
         cmd.env(k, v);

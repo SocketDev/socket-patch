@@ -152,45 +152,77 @@ pub fn yarn_output(out: &Output) -> String {
 /// * sets `YARN_ENABLE_IMMUTABLE_INSTALLS=false`, so a plain `install` may
 ///   write the lock. The fresh-checkout installs are unaffected because they
 ///   pass `--immutable` explicitly, and yarn's flag outranks the setting;
-/// * sets `YARN_ENABLE_HARDENED_MODE=false`. yarn 4 turns hardened mode on
-///   when it detects a GitHub Actions run for a public pull request, and then
-///   re-resolves every lock entry against the registry. The fresh-checkout
-///   installs point the registry at an unreachable address on purpose (they
-///   must install from the committed lock and the hosted tarball alone), so
-///   hardened mode failed them with ECONNREFUSED 127.0.0.1:1 on PR runs
-///   only. Hardened mode guards against untrusted lockfiles; these suites
-///   exercise socket-patch's own rewrites, and `--immutable --check-cache`
-///   still verifies every checksum.
-pub fn pin_berry_ci_defaults(cmd: &mut std::process::Command) -> &mut std::process::Command {
+/// * sets `YARN_ENABLE_HARDENED_MODE=false` for yarn 4 (`yarn_spec`'s
+///   major). yarn 4 turns hardened mode on when it detects a GitHub Actions
+///   run for a public pull request, and then re-resolves every lock entry
+///   against the registry. The fresh-checkout installs point the registry at
+///   an unreachable address on purpose (they must install from the committed
+///   lock and the hosted tarball alone), so hardened mode failed them with
+///   ECONNREFUSED 127.0.0.1:1 on PR runs only. Hardened mode guards against
+///   untrusted lockfiles; these suites exercise socket-patch's own rewrites,
+///   and `--immutable --check-cache` still verifies every checksum. yarn 2
+///   and 3 predate the setting and refuse every command while it is set
+///   ("Usage Error: Unrecognized or legacy configuration settings found:
+///   enableHardenedMode"), so for them it is removed instead.
+pub fn pin_berry_ci_defaults<'c>(
+    cmd: &'c mut std::process::Command,
+    yarn_spec: &str,
+) -> &'c mut std::process::Command {
     cmd.env("CI", "true")
-        .env("YARN_ENABLE_IMMUTABLE_INSTALLS", "false")
-        .env("YARN_ENABLE_HARDENED_MODE", "false")
+        .env("YARN_ENABLE_IMMUTABLE_INSTALLS", "false");
+    if yarn_major(yarn_spec).is_none_or(|major| major >= 4) {
+        cmd.env("YARN_ENABLE_HARDENED_MODE", "false")
+    } else {
+        cmd.env_remove("YARN_ENABLE_HARDENED_MODE")
+    }
 }
 
-/// [`pin_berry_ci_defaults`] wins over an earlier value for either variable
-/// (`get_envs` reports the last value set for each key).
+/// The major version of a corepack yarn spec (`yarn@3.8.7` → 3).
+fn yarn_major(yarn_spec: &str) -> Option<u32> {
+    yarn_spec
+        .strip_prefix("yarn@")
+        .unwrap_or(yarn_spec)
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// [`pin_berry_ci_defaults`] wins over an earlier value for every variable
+/// (`get_envs` reports the last value set for each key), and only yarn 4+
+/// gets the hardened-mode pin — yarn 2/3 reject the unknown setting.
 #[test]
 fn pin_berry_ci_defaults_sets_ci_and_disables_implicit_immutable() {
-    let mut cmd = corepack_command();
-    cmd.env("YARN_ENABLE_IMMUTABLE_INSTALLS", "true")
-        .env("YARN_ENABLE_HARDENED_MODE", "true");
-    pin_berry_ci_defaults(&mut cmd);
-    let envs: std::collections::HashMap<_, _> = cmd
-        .get_envs()
-        .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
-        .collect();
-    assert_eq!(
-        envs.get(std::ffi::OsStr::new("CI")),
-        Some(&Some("true".into()))
-    );
-    assert_eq!(
-        envs.get(std::ffi::OsStr::new("YARN_ENABLE_IMMUTABLE_INSTALLS")),
-        Some(&Some("false".into()))
-    );
-    assert_eq!(
-        envs.get(std::ffi::OsStr::new("YARN_ENABLE_HARDENED_MODE")),
-        Some(&Some("false".into()))
-    );
+    for (spec, hardened) in [
+        ("yarn@4.12.0", Some(Some("false".into()))),
+        ("yarn@4.0.2", Some(Some("false".into()))),
+        ("yarn@3.8.7", Some(None)),
+        ("yarn@2.4.3", Some(None)),
+    ] {
+        let mut cmd = corepack_command();
+        cmd.env("YARN_ENABLE_IMMUTABLE_INSTALLS", "true")
+            .env("YARN_ENABLE_HARDENED_MODE", "true");
+        pin_berry_ci_defaults(&mut cmd, spec);
+        let envs: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CI")),
+            Some(&Some("true".into())),
+            "{spec}"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("YARN_ENABLE_IMMUTABLE_INSTALLS")),
+            Some(&Some("false".into())),
+            "{spec}"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("YARN_ENABLE_HARDENED_MODE")),
+            hardened.as_ref(),
+            "{spec}: removed (None) for yarn 2/3, pinned off for yarn 4"
+        );
+    }
 }
 
 /// The cache-zip checksum a real yarn wrote into `lock` (the first entry
