@@ -70,6 +70,47 @@ pub(crate) async fn compute_git_sha256_from_reader<R: tokio::io::AsyncRead + Unp
     Ok(hex::encode(hasher.finalize()))
 }
 
+/// Blocking twin of [`compute_git_sha256_from_reader`]: the same header,
+/// the same streaming, and the same short/long-stream refusals.
+pub(crate) fn compute_git_sha256_from_std_reader<R: std::io::Read>(
+    size: u64,
+    mut reader: R,
+) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    let header = format!("blob {}\0", size);
+    hasher.update(header.as_bytes());
+
+    let mut buf = [0u8; 8192];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+        if total > size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "git sha256: declared size {size} is smaller than the stream (read at least {total} bytes)"
+                ),
+            ));
+        }
+    }
+
+    if total != size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "git sha256: declared size {size} does not match {total} bytes read from stream"
+            ),
+        ));
+    }
+
+    Ok(hex::encode(hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

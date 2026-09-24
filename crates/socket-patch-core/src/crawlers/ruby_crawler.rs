@@ -707,6 +707,94 @@ impl Default for RubyCrawler {
     }
 }
 
+impl RubyCrawler {
+    /// [`Self::find_by_purls`] for each of `purls` ON ITS OWN — element `i`
+    /// is what `find_by_purls(gem_path, &[purls[i]])` returns for that PURL
+    /// — as one blocking-pool task that lists `gem_path` at most once for
+    /// the platform-suffix fallback (instead of once per PURL whose exact
+    /// `<name>-<version>` dir does not verify).
+    pub async fn find_each_by_purl(
+        &self,
+        gem_path: &Path,
+        purls: &[String],
+    ) -> Vec<Option<CrawledPackage>> {
+        let gem_path = gem_path.to_path_buf();
+        let purls = purls.to_vec();
+        crate::utils::fs::run_blocking(move || {
+            // `gem_path`'s entry names (lossy, readdir order), listed on
+            // the first PURL that needs the prefix scan.
+            let mut names: Option<Vec<String>> = None;
+            purls
+                .iter()
+                .map(|purl| {
+                    let (name, version) = crate::utils::purl::parse_gem_purl(purl)?;
+                    let (name, version) = (name.as_ref(), version.as_ref());
+                    if !is_safe_gem_coordinate(name, version) {
+                        return None;
+                    }
+                    let gem_dir = locate_gem_dir_sync(&gem_path, name, version, &mut names)?;
+                    Some(CrawledPackage {
+                        name: name.to_string(),
+                        version: version.to_string(),
+                        namespace: None,
+                        purl: purl.clone(),
+                        path: gem_dir,
+                    })
+                })
+                .collect()
+        })
+        .await
+    }
+}
+
+/// Blocking twin of `RubyCrawler::locate_gem_dir` over a lazily listed,
+/// reused `gem_path` listing.
+fn locate_gem_dir_sync(
+    gem_path: &Path,
+    name: &str,
+    version: &str,
+    names: &mut Option<Vec<String>>,
+) -> Option<PathBuf> {
+    let exact = gem_path.join(format!("{name}-{version}"));
+    if verify_gem_at_path_sync(&exact) {
+        return Some(exact);
+    }
+    let prefix = format!("{name}-{version}-");
+    let names = names.get_or_insert_with(|| {
+        super::listing::list_dir_sync(gem_path)
+            .into_iter()
+            .map(|entry| entry.name.to_string_lossy().into_owned())
+            .collect()
+    });
+    for dir_name in names.iter() {
+        if dir_name.starts_with(&prefix) {
+            let dir = gem_path.join(dir_name);
+            if verify_gem_at_path_sync(&dir) {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
+
+/// Blocking twin of `RubyCrawler::verify_gem_at_path`: a directory holding
+/// `lib/` or a `.gemspec`.
+fn verify_gem_at_path_sync(path: &Path) -> bool {
+    use crate::utils::fs::is_dir_sync;
+    if !is_dir_sync(path) {
+        return false;
+    }
+    if is_dir_sync(&path.join("lib")) {
+        return true;
+    }
+    super::listing::list_dir_sync(path).iter().any(|entry| {
+        entry
+            .name
+            .to_str()
+            .is_some_and(|name| name.ends_with(".gemspec"))
+    })
+}
+
 /// Result of probing the Bundler install roots.
 ///
 /// Public so CLI consumers (apply's store-class split, scan/apply's
@@ -2714,5 +2802,78 @@ mod tests {
         // Bare `~` → home itself (PathBuf equality is components-based,
         // tolerating join("")'s trailing-separator artifact).
         assert_eq!(expand_tilde(Path::new("~"), Some(home)), home.to_path_buf());
+    }
+
+    // ── find_each_by_purl ≡ per-PURL find_by_purls ─────────────────────
+
+    #[tokio::test]
+    async fn find_each_by_purl_matches_per_purl_find_by_purls() {
+        use crate::crawlers::oracle_support::{mkdir, symlink, write, PermGuard, Rng};
+
+        const GEMS: &[&str] = &["rails", "nokogiri", "rack", "rails-html"];
+        const VERSIONS: &[&str] = &["7.1.0", "1.16.5", "3.0.0"];
+        const SUFFIXES: &[&str] = &["", "-x86_64-linux", "-arm64-darwin", "-java"];
+        let mut found = 0;
+        for seed in 0..48u64 {
+            let mut rng = Rng::new(seed);
+            let tmp = tempfile::tempdir().unwrap();
+            let mut perms = PermGuard::default();
+            let root = tmp.path().join("gems");
+            mkdir(&root);
+            for i in 0..rng.below(16) {
+                let dir = root.join(format!(
+                    "{}-{}{}",
+                    rng.pick(GEMS),
+                    rng.pick(VERSIONS),
+                    rng.pick(SUFFIXES)
+                ));
+                match rng.below(8) {
+                    0 => write(&dir, "file"),
+                    1 => write(&dir.join("x.gemspec"), ""),
+                    2 => mkdir(&dir.join("x.gemspec")),
+                    3 => {
+                        let target = tmp.path().join(format!("t{i}"));
+                        if rng.chance(70) {
+                            mkdir(&target.join("lib"));
+                        }
+                        symlink(&target, &dir);
+                    }
+                    4 => {
+                        mkdir(&dir.join("lib"));
+                        perms.plan(&dir, 0o000);
+                    }
+                    5 => mkdir(&dir),
+                    _ => mkdir(&dir.join("lib")),
+                }
+            }
+            perms.apply();
+            let mut purls: Vec<String> = Vec::new();
+            for gem in GEMS {
+                for version in VERSIONS {
+                    purls.push(format!("pkg:gem/{gem}@{version}"));
+                }
+            }
+            purls.push("pkg:gem/..@1.0.0".to_string());
+            purls.push("pkg:npm/rails@7.1.0".to_string());
+
+            let crawler = RubyCrawler::new();
+            let each = crawler.find_each_by_purl(&root, &purls).await;
+            assert_eq!(each.len(), purls.len());
+            for (purl, got) in purls.iter().zip(each) {
+                let single = crawler
+                    .find_by_purls(&root, std::slice::from_ref(purl))
+                    .await
+                    .unwrap();
+                let want = single.get(purl);
+                assert_eq!(
+                    got.as_ref()
+                        .map(|p| (&p.name, &p.version, &p.namespace, &p.purl, &p.path)),
+                    want.map(|p| (&p.name, &p.version, &p.namespace, &p.purl, &p.path)),
+                    "seed {seed}: {purl}"
+                );
+                found += usize::from(got.is_some());
+            }
+        }
+        assert!(found > 50, "vacuous fixtures: {found}");
     }
 }

@@ -771,22 +771,18 @@ fn gem_stale_cache_warning(purl: &str, cache_path: &Path) -> serde_json::Value {
 /// already-patched install must not produce a delete prescription.
 /// (`current_hash` is `Some` only when the bytes were really hashed, which
 /// also excludes the absent-new-file `Ready`.)
+///
+/// The probes take this from the same one-pass
+/// [`socket_patch_core::vex::verify::judge_installed_record`] that decides
+/// PATCHED (`stale_evidence`); this view of it is what the unit tests pin.
+#[cfg(test)]
 async fn installed_stale_positive_evidence(
     package_dir: &Path,
     record: &socket_patch_core::manifest::schema::PatchRecord,
 ) -> bool {
-    use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
-    for (file_name, info) in &record.files {
-        let result = verify_file_patch(package_dir, file_name, info).await;
-        if matches!(
-            result.status,
-            VerifyStatus::Ready | VerifyStatus::HashMismatch
-        ) && result.current_hash.is_some()
-        {
-            return true;
-        }
-    }
-    false
+    socket_patch_core::vex::verify::judge_installed_record(package_dir, record)
+        .await
+        .stale_evidence
 }
 
 /// Post-rewrite stale-materialization probe for gem redirects — the guard
@@ -807,12 +803,14 @@ async fn installed_stale_positive_evidence(
 ///   itself). Record availability is part of the candidate filter, and the
 ///   probe returns before any crawler work (or `gem env` subprocess spawn)
 ///   when no judgment is possible.
-/// * PATCHED means [`verify_patch_record`] `Ok` — the one shared oracle.
+/// * PATCHED means [`verify_patch_record`] `Ok` — the one shared oracle
+///   (decided, with STALE, by one pass of
+///   [`socket_patch_core::vex::verify::judge_installed_record`]).
 ///   Judgments are grouped BY INSTALLED DIR: platform-variant purls of one
 ///   gem resolve to the same dir, and if ANY variant's record proves the
 ///   dir patched, the dir is patched — never warned.
-/// * STALE requires [`installed_stale_positive_evidence`] — never inferred from
-///   missing/unreadable files.
+/// * STALE requires positive evidence (the `installed_stale_positive_evidence`
+///   rule) — never inferred from missing/unreadable files.
 /// * A committed `vendor/cache/<leaf>.gem` whose sha256 differs from the
 ///   patched artifact's is stale too (bundler installs from it first, fresh
 ///   checkouts included): folded into a project-local install warning's
@@ -837,7 +835,7 @@ async fn gem_stale_install_warnings(
     use socket_patch_core::crawlers::RubyCrawler;
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::vendor::file_sha256_hex;
-    use socket_patch_core::vex::verify::verify_patch_record;
+    use socket_patch_core::vex::verify::judge_installed_record;
 
     let mut out = StaleInstallOutcome::default();
     let find_record =
@@ -871,16 +869,22 @@ async fn gem_stale_install_warnings(
         global_prefix,
     };
     let gem_paths = crawler.get_gem_paths(&options).await.unwrap_or_default();
+    // Every candidate's installed dir in every gem home, one blocking pass
+    // (and at most one listing) per home — the per-candidate lookups the
+    // loop below consumes, in the same (candidate, home) order.
+    let stripped: Vec<String> = candidates
+        .iter()
+        .map(|(purl, _)| socket_patch_core::utils::purl::strip_purl_qualifiers(purl).to_string())
+        .collect();
+    let mut found_per_home = Vec::with_capacity(gem_paths.len());
+    for gems_dir in &gem_paths {
+        found_per_home.push(crawler.find_each_by_purl(gems_dir, &stripped).await);
+    }
     let mut dir_state: std::collections::BTreeMap<std::path::PathBuf, DirJudgment> =
         std::collections::BTreeMap::new();
-    for (purl, record) in &candidates {
-        let stripped = socket_patch_core::utils::purl::strip_purl_qualifiers(purl).to_string();
-        for gems_dir in &gem_paths {
-            let found = crawler
-                .find_by_purls(gems_dir, std::slice::from_ref(&stripped))
-                .await
-                .unwrap_or_default();
-            let Some(pkg) = found.get(&stripped) else {
+    for (index, (purl, record)) in candidates.iter().enumerate() {
+        for found in &found_per_home {
+            let Some(pkg) = &found[index] else {
                 continue;
             };
             // A dir whose leaf isn't clean UTF-8 cannot be a real crawler
@@ -897,10 +901,10 @@ async fn gem_stale_install_warnings(
                     patched: false,
                     positive: false,
                 });
-            if verify_patch_record(&pkg.path, record).await.is_ok() {
+            let judged = judge_installed_record(&pkg.path, record).await;
+            if judged.patched {
                 entry.patched = true;
-            } else if !entry.positive && installed_stale_positive_evidence(&pkg.path, record).await
-            {
+            } else if !entry.positive && judged.stale_evidence {
                 entry.positive = true;
                 entry.purl = (*purl).to_string();
             }

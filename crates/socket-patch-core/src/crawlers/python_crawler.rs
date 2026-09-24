@@ -1435,6 +1435,52 @@ impl PythonCrawler {
     }
 }
 
+impl PythonCrawler {
+    /// [`Self::find_by_purls`] for each of `purls` ON ITS OWN — element `i`
+    /// is what `find_by_purls(site, &[purls[i]])` returns for that PURL —
+    /// from ONE listing of `site_packages_path` instead of one per PURL.
+    /// (A batched `find_by_purls` is not the same thing: two PURLs whose
+    /// canonical `name@version` coincide share one lookup slot there, and
+    /// only the last one is found.)
+    pub async fn find_each_by_purl(
+        &self,
+        site_packages_path: &Path,
+        purls: &[String],
+    ) -> Vec<Option<CrawledPackage>> {
+        let keys: Vec<Option<String>> = purls
+            .iter()
+            .map(|purl| {
+                let (name, version) = crate::utils::purl::parse_pypi_purl(purl)?;
+                Some(format!("{}@{}", canonicalize_pypi_name(&name), version))
+            })
+            .collect();
+        // A lookup with no parseable PURL never lists the directory.
+        if keys.iter().all(Option::is_none) {
+            return vec![None; purls.len()];
+        }
+
+        // key -> the LAST listed entry with that key (find_by_purls's
+        // insert-overwrites order).
+        let mut installed: HashMap<String, (String, String)> = HashMap::new();
+        for (name, version) in list_dist_info_packages(site_packages_path).await {
+            installed.insert(format!("{name}@{version}"), (name, version));
+        }
+        keys.into_iter()
+            .zip(purls)
+            .map(|(key, purl)| {
+                let (name, version) = installed.get(key.as_ref()?)?.clone();
+                Some(CrawledPackage {
+                    name,
+                    version,
+                    namespace: None,
+                    purl: purl.clone(),
+                    path: site_packages_path.to_path_buf(),
+                })
+            })
+            .collect()
+    }
+}
+
 /// Scan a `site-packages` directory for `.dist-info` entries, returning
 /// `(canonicalized name, version)` for each package that yields metadata,
 /// in listing order. Runs on the walk pool: the listing is read once and
@@ -2686,12 +2732,26 @@ mod tests {
                 let mut purls: Vec<String> = old.iter().map(|p| p.purl.clone()).collect();
                 purls.push("pkg:pypi/Flask-Cors@1.0".to_string());
                 purls.push("pkg:pypi/requests@1.0%2Blocal".to_string());
+                purls.push("pkg:pypi/DUP@1.0".to_string());
+                purls.push("pkg:pypi/dup@1.0".to_string());
+                purls.push("pkg:npm/dup@1.0".to_string());
                 let found_new = PythonCrawler::new()
                     .find_by_purls(&root, &purls)
                     .await
                     .unwrap();
                 let found_old = LegacyPythonCrawler::find_by_purls(&root, &purls).await;
                 assert_eq!(map_rows(&found_new), map_rows(&found_old));
+                // Each PURL on its own, from one listing.
+                let each = PythonCrawler::new().find_each_by_purl(&root, &purls).await;
+                for (purl, got) in purls.iter().zip(&each) {
+                    let single =
+                        LegacyPythonCrawler::find_by_purls(&root, std::slice::from_ref(purl)).await;
+                    assert_eq!(
+                        got.as_ref().map(|p| rows(std::slice::from_ref(p))),
+                        single.get(purl).map(|p| rows(std::slice::from_ref(p))),
+                        "seed {seed}: find_each_by_purl {purl}"
+                    );
+                }
                 crawled += old.len();
                 found += found_new.len();
             }

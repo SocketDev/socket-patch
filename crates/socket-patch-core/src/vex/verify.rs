@@ -228,6 +228,67 @@ pub async fn verify_patch_record(pkg_path: &Path, record: &PatchRecord) -> Resul
     Ok(())
 }
 
+/// What one pass over an installed copy's record files proves: the
+/// [`verify_patch_record`] verdict plus the stale-install probes' POSITIVE
+/// staleness evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InstalledRecordJudgment {
+    /// [`verify_patch_record`] would return `Ok`: the record has files and
+    /// every one hashes to its `afterHash`.
+    pub patched: bool,
+    /// At least one record file was actually read and hashed to something
+    /// other than its `afterHash` (`verify_file_patch`'s `Ready` or
+    /// `HashMismatch` WITH a `current_hash`). Missing, unreadable and
+    /// unsafe-path files are never evidence.
+    pub stale_evidence: bool,
+}
+
+/// [`verify_patch_record`] and the stale-evidence scan in ONE blocking-pool
+/// task, hashing each record file at most once (the pair used to hash the
+/// same files twice, each 8 KiB read its own runtime hop). Stops at the
+/// first file that proves staleness — which also settles `patched` —
+/// exactly where both scans agree.
+pub async fn judge_installed_record(
+    pkg_path: &Path,
+    record: &PatchRecord,
+) -> InstalledRecordJudgment {
+    let pkg_path = pkg_path.to_path_buf();
+    let files: Vec<(String, String)> = record
+        .files
+        .iter()
+        .map(|(name, info)| (name.clone(), info.after_hash.clone()))
+        .collect();
+    crate::utils::fs::run_blocking(move || judge_installed_files(&pkg_path, &files)).await
+}
+
+fn judge_installed_files(pkg_path: &Path, files: &[(String, String)]) -> InstalledRecordJudgment {
+    use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path};
+    use crate::patch::file_hash::compute_file_git_sha256_sync;
+
+    let mut all_patched = !files.is_empty();
+    for (file_name, after_hash) in files {
+        let normalized = normalize_file_path(file_name);
+        // An unsafe key never resolves (verify_file_patch's NotFound).
+        let hashed = is_safe_relative_subpath(normalized)
+            .then(|| compute_file_git_sha256_sync(&pkg_path.join(normalized)).ok())
+            .flatten();
+        match hashed {
+            Some(hash) if &hash == after_hash => {}
+            Some(_) => {
+                return InstalledRecordJudgment {
+                    patched: false,
+                    stale_evidence: true,
+                }
+            }
+            None => all_patched = false,
+        }
+    }
+    InstalledRecordJudgment {
+        patched: all_patched,
+        stale_evidence: false,
+    }
+}
+
 /// [`HostedCopies`] verdict: no consumed copy is `package_not_found`; every
 /// listed copy must pass [`verify_patch_record`] (under the maven file
 /// rename, when set), the first failure's tag wins.
@@ -1581,5 +1642,94 @@ mod tests {
             renamed.files.contains_key("lib-1.0.1.jar"),
             "not a whole component"
         );
+    }
+
+    // ── judge_installed_record ≡ verify_patch_record + evidence scan ──
+
+    /// The CLI stale-install probes' positive-evidence scan as it was
+    /// (per-file `verify_file_patch`), the oracle for the one-pass judge.
+    async fn stale_positive_evidence_oracle(pkg_path: &Path, record: &PatchRecord) -> bool {
+        for (file_name, info) in &record.files {
+            let result = verify_file_patch(pkg_path, file_name, info).await;
+            if matches!(
+                result.status,
+                VerifyStatus::Ready | VerifyStatus::HashMismatch
+            ) && result.current_hash.is_some()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn judge_installed_record_matches_verify_and_evidence_scan() {
+        use crate::crawlers::oracle_support::{fifo, mkdir, write, Rng};
+
+        let patched = compute_git_sha256_from_bytes(b"patched");
+        let upstream = compute_git_sha256_from_bytes(b"upstream");
+        let (mut seen_patched, mut seen_stale) = (0, 0);
+        for seed in 0..200u64 {
+            let mut rng = Rng::new(seed);
+            let dir = tempfile::tempdir().unwrap();
+            let mut files = HashMap::new();
+            for i in 0..rng.below(4) {
+                let name = match rng.below(10) {
+                    0 => "../escape.js".to_string(),
+                    1 => format!("./lib/f{i}.js"),
+                    2 => format!("/abs{i}.js"),
+                    _ => format!("lib/f{i}.js"),
+                };
+                let path = dir.path().join(normalize_file_path_for_test(&name));
+                match rng.below(8) {
+                    0 => {}
+                    1 => mkdir(&path),
+                    2 => fifo(&path),
+                    3 => write(&path, "upstream"),
+                    4 => write(&path, "something else"),
+                    _ => write(&path, "patched"),
+                }
+                let before_hash = if rng.chance(20) {
+                    String::new()
+                } else {
+                    upstream.clone()
+                };
+                files.insert(
+                    name,
+                    PatchFileInfo {
+                        before_hash,
+                        after_hash: patched.clone(),
+                    },
+                );
+            }
+            let record = PatchRecord {
+                files,
+                ..record_with_one_file(&patched)
+            };
+            let judged = judge_installed_record(dir.path(), &record).await;
+            let verified = verify_patch_record(dir.path(), &record).await.is_ok();
+            assert_eq!(judged.patched, verified, "seed {seed}: patched");
+            if !verified {
+                assert_eq!(
+                    judged.stale_evidence,
+                    stale_positive_evidence_oracle(dir.path(), &record).await,
+                    "seed {seed}: evidence"
+                );
+            }
+            seen_patched += usize::from(judged.patched);
+            seen_stale += usize::from(judged.stale_evidence);
+        }
+        assert!(
+            seen_patched > 10 && seen_stale > 10,
+            "{seen_patched}/{seen_stale}"
+        );
+    }
+
+    /// Where a (safe) record key lands under the package dir; unsafe keys
+    /// land somewhere harmless inside the tempdir.
+    fn normalize_file_path_for_test(name: &str) -> String {
+        crate::patch::apply::normalize_file_path(name)
+            .trim_start_matches(['/', '.'])
+            .to_string()
     }
 }
