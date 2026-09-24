@@ -271,7 +271,7 @@ pub async fn vendor_maven(
         // re-record the live vendored pom.xml as `original`, breaking revert.
         if !dry_run {
             let mut warnings: Vec<VendorWarning> = vec![shadow_warning];
-            let (_bytes, mut result) = match materialise_and_write(
+            let (jar_bytes, mut result) = match materialise_and_write(
                 purl,
                 installed_dir,
                 &uuid_dir,
@@ -305,7 +305,19 @@ pub async fn vendor_maven(
                      stale; rebuilt at {leaf_rel} (pom.xml untouched)"
                 ),
             ));
-            return done(result, None, warnings);
+            // The rebuilt jar may differ byte-wise from the one the ledger
+            // fingerprinted (a service ↔ local flip): hand back a refreshed
+            // entry. Its wiring is empty ON PURPOSE — the caller's
+            // `carry_forward_wiring` (same uuid) re-attaches the first run's
+            // records, the only copy of the verbatim pre-vendor pom.xml.
+            let entry = maven_entry(
+                build_maven_purl(group_id, artifact_id, version),
+                record,
+                jar_copy_rel,
+                &jar_bytes,
+                Vec::new(),
+            );
+            return done(result, Some(entry), warnings);
         }
         // Dry runs fall through to the verify-only preview below.
     }
@@ -390,7 +402,34 @@ pub async fn vendor_maven(
     // <repository> (the pom.xml itself always pre-existed — a gradle-only /
     // pom-less project is refused above); revert restores the `original` bytes
     // when the live pom.xml still carries our repo id.
-    let entry = VendorEntry {
+    let entry = maven_entry(
+        base_purl,
+        record,
+        jar_copy_rel,
+        &jar_bytes,
+        vec![WiringRecord {
+            file: PROJECT_POM.to_string(),
+            kind: REPO_WIRING_KIND.to_string(),
+            action: WiringAction::Added,
+            key: Some(repo_id),
+            original: Some(Value::String(pom_xml_text)),
+            new: Some(Value::String(new_pom_xml)),
+        }],
+    );
+
+    done(result, Some(entry), warnings)
+}
+
+/// The ledger entry for a vendored jar: `wiring` is the pom.xml record on a
+/// full vendor, empty on an artifact-only rebuild (see the hot path).
+fn maven_entry(
+    base_purl: String,
+    record: &PatchRecord,
+    jar_copy_rel: String,
+    jar_bytes: &[u8],
+    wiring: Vec<WiringRecord>,
+) -> VendorEntry {
+    VendorEntry {
         ecosystem: "maven".to_string(),
         base_purl,
         uuid: record.uuid.clone(),
@@ -399,19 +438,12 @@ pub async fn vendor_maven(
             // tooling (harvest re-derives per-entry git hashes from the zip, so
             // the vendored copy is self-describing without a network).
             path: jar_copy_rel,
-            sha256: hex::encode(Sha256::digest(&jar_bytes)),
+            sha256: hex::encode(Sha256::digest(jar_bytes)),
             size: Some(jar_bytes.len() as u64),
             platform_locked: None,
             file_inventory: None,
         },
-        wiring: vec![WiringRecord {
-            file: PROJECT_POM.to_string(),
-            kind: REPO_WIRING_KIND.to_string(),
-            action: WiringAction::Added,
-            key: Some(repo_id),
-            original: Some(Value::String(pom_xml_text)),
-            new: Some(Value::String(new_pom_xml)),
-        }],
+        wiring,
         lock: None,
         took_over_go_patches: false,
         detached: false,
@@ -422,9 +454,7 @@ pub async fn vendor_maven(
         poetry: None,
         pdm: None,
         pipenv: None,
-    };
-
-    done(result, Some(entry), warnings)
+    }
 }
 
 /// Revert a Maven vendor entry: surgically remove our `<repository>` from
@@ -570,7 +600,7 @@ async fn materialise_and_write(
     // The patched jar first (service Tier A, else local rebuild). A non-fatal
     // failure returns an un-successful ApplyResult with nothing written.
     let (jar_bytes, result) =
-        match service_archive_copy(service, &record.uuid, artifact_id, ".jar", warnings).await {
+        match service_archive_copy(service, record, artifact_id, ".jar", warnings).await {
             ServiceCopy::Used(bytes) => {
                 (bytes, already_patched_result(purl, jar_path, &record.files))
             }
@@ -1556,9 +1586,13 @@ mod tests {
 
         let (r2, e2, w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(r2.success, "{:?}", r2.error);
+        // A refreshed fingerprint with NO wiring of its own: re-recording
+        // would clobber the pre-vendor pom.xml (the caller carries it).
+        let e2 = e2.expect("the rebuild refreshes the ledger fingerprint");
         assert!(
-            e2.is_none(),
-            "artifact-only rebuild must not re-record (would clobber the pre-vendor pom.xml)"
+            e2.wiring.is_empty(),
+            "no re-recorded wiring: {:?}",
+            e2.wiring
         );
         assert!(
             w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
@@ -2256,7 +2290,10 @@ mod tests {
         .await;
         let (r2, e2, w2) = unwrap_done(outcome);
         assert!(r2.success, "{:?}", r2.error);
-        assert!(e2.is_none(), "artifact-only rebuild must not re-record");
+        assert!(
+            e2.is_some_and(|e| e.wiring.is_empty()),
+            "artifact-only rebuild refreshes the fingerprint, never the wiring"
+        );
         assert!(
             w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
             "FIFO pom must read as stale and trigger the rebuild: {w2:?}"
@@ -3432,7 +3469,10 @@ mod tests {
 
         let (r2, e2, w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(r2.success, "{:?}", r2.error);
-        assert!(e2.is_none(), "artifact-only rebuild must not re-record");
+        assert!(
+            e2.is_some_and(|e| e.wiring.is_empty()),
+            "artifact-only rebuild refreshes the fingerprint, never the wiring"
+        );
         assert!(
             w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
             "a missing sidecar must read as stale and rebuild: {w2:?}"
@@ -3693,5 +3733,197 @@ mod tests {
         assert!(e2.is_none());
         assert_eq!(before, ts::tree_snapshot(root));
         assert_eq!(ts::request_count(&down).await, 0);
+    }
+
+    /// Mount a granted service response serving `body` as the prebuilt jar.
+    async fn mount_granted_jar(body: &[u8]) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let sri = crate::vendor::npm_pack::PackedTarball::from_bytes(body).integrity;
+        let serve_path = "/patch/maven/commons-text/1.10.0/tok/uuid/commons-text-1.10.0.jar";
+        let server = MockServer::start().await;
+        let serve_url = format!("{}{serve_path}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": { UUID: {
+                    "status": "granted",
+                    "url": serve_url,
+                    "artifacts": [{ "kind": "tarball", "url": serve_url,
+                                    "integrity": { "sha512": sri } }]
+                }}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(serve_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The wired-but-missing rebuild must hand back a refreshed
+    /// ledger entry. Vendored from the service, the committed jar is lost and
+    /// rebuilt LOCALLY (different bytes); the ledger the CLI persists (the
+    /// refreshed entry carried forward over the first, or the first when the
+    /// backend returns None) must describe the rebuilt jar.
+    #[tokio::test]
+    async fn wired_rebuild_refreshes_ledger_sha256() {
+        // A service build: same members, STORED (uncompressed), so its bytes
+        // differ from the local deflate re-zip as a real service jar's would.
+        let served = {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, bytes) in [
+                ("META-INF/MANIFEST.MF", &b"Manifest-Version: 1.0\n"[..]),
+                (JAR_FILE, PATCHED),
+                (
+                    "org/apache/commons/text/StringSubstitutor.class",
+                    &b"\xca\xfe\xba\xbe-fake-class"[..],
+                ),
+            ] {
+                zw.start_file(name, opts).unwrap();
+                zw.write_all(bytes).unwrap();
+            }
+            zw.finish().unwrap().into_inner()
+        };
+        let server = mount_granted_jar(&served).await;
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let cfg = service_cfg(
+            Some(&server.uri()),
+            crate::vendor::VendorSource::Service,
+            false,
+        );
+        let (r1, e1, _w1) =
+            unwrap_done(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let e1 = e1.expect("first vendor records an entry");
+        assert_eq!(
+            crate::vendor::check_vendored_artifact(root, &e1, &record).await,
+            crate::vendor::ArtifactHealth::Healthy
+        );
+
+        tokio::fs::remove_file(root.join(jar_rel())).await.unwrap();
+        // Local rebuild (no service).
+        let (r2, e2, w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{w2:?}"
+        );
+        let rebuilt = tokio::fs::read(root.join(jar_rel())).await.unwrap();
+        assert!(
+            rebuilt != served,
+            "precondition: the two sources differ byte-wise"
+        );
+
+        let ledger = match e2 {
+            Some(mut fresh) => {
+                crate::vendor::carry_forward_wiring(&e1, &mut fresh);
+                fresh
+            }
+            None => e1.clone(),
+        };
+        assert_eq!(
+            ledger.artifact.sha256,
+            hex::encode(Sha256::digest(&rebuilt)),
+            "the ledger fingerprint must describe the rebuilt jar"
+        );
+        assert_eq!(
+            crate::vendor::check_vendored_artifact(root, &ledger, &record).await,
+            crate::vendor::ArtifactHealth::Healthy
+        );
+        // The carried-forward pom.xml wiring still reverts cleanly.
+        assert_eq!(ledger.wiring, e1.wiring, "pom.xml revert record preserved");
+        let rv = revert_maven(&ledger, root, false).await;
+        assert!(rv.success, "{:?}", rv.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PROJECT_POM))
+                .await
+                .unwrap(),
+            project_pom()
+        );
+    }
+
+    /// A served jar that passes the SRI floor but whose patched
+    /// member does NOT carry the record's afterHash must never be accepted.
+    /// Under `service` it is a refusal with nothing written.
+    #[tokio::test]
+    async fn service_jar_failing_after_hashes_refused_under_service() {
+        let server = mount_granted_jar(&make_jar(PRISTINE)).await;
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let cfg = service_cfg(
+            Some(&server.uri()),
+            crate::vendor::VendorSource::Service,
+            false,
+        );
+        let outcome = run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await;
+        let VendorOutcome::Refused { code, .. } = outcome else {
+            panic!("an unpatched service jar was accepted: {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(".socket").exists(), "nothing written");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PROJECT_POM))
+                .await
+                .unwrap(),
+            project_pom()
+        );
+    }
+
+    /// Under `auto`: the bad served jar falls back (loudly) to the
+    /// local rebuild, so the committed jar really carries the patch and a
+    /// re-run is in sync (no perpetual rebuild).
+    #[tokio::test]
+    async fn service_jar_failing_after_hashes_falls_back_under_auto() {
+        let server = mount_granted_jar(&make_jar(PRISTINE)).await;
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let cfg = service_cfg(
+            Some(&server.uri()),
+            crate::vendor::VendorSource::Auto,
+            false,
+        );
+        let (r1, e1, w1) =
+            unwrap_done(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
+        assert!(r1.success, "{:?}", r1.error);
+        assert!(
+            w1.iter()
+                .any(|w| w.code == "vendor_prebuilt_layout_mismatch"),
+            "the rejected service jar is surfaced: {w1:?}"
+        );
+        let e1 = e1.expect("entry");
+        assert_eq!(
+            crate::vendor::check_vendored_artifact(root, &e1, &record).await,
+            crate::vendor::ArtifactHealth::Healthy,
+            "the committed jar must carry the afterHash"
+        );
+        let (r2, e2, w2) =
+            unwrap_done(run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await);
+        assert!(r2.success);
+        assert!(e2.is_none(), "re-run is in sync");
+        assert!(
+            !w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{w2:?}"
+        );
+    }
+
+    /// `--vendor-source=service` with no configured client must
+    /// fail closed, never quietly build locally.
+    #[tokio::test]
+    async fn service_mode_without_client_refuses() {
+        let (dir, blobs, installed, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let cfg = service_cfg(None, crate::vendor::VendorSource::Service, false);
+        let outcome = run_vendor_with_service(root, &blobs, &installed, &record, &cfg).await;
+        let VendorOutcome::Refused { code, .. } = outcome else {
+            panic!("service mode without a client built locally: {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(".socket").exists(), "nothing written");
     }
 }

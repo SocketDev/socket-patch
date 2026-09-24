@@ -592,10 +592,15 @@ async fn go_service_redirect(
             ));
             GoServiceRedirect::Used
         }
-        ServiceArtifact::IntegrityMismatch(reason) => miss(
-            warnings,
+        // Bytes that fail integrity verification are an active tamper signal:
+        // ALWAYS a hard error, in `auto` exactly as in `service` — never a
+        // quiet local-build fallback (`ServiceArtifact`'s documented contract).
+        ServiceArtifact::IntegrityMismatch(reason) => hard(
             "vendor_prebuilt_integrity_mismatch",
-            format!("prebuilt module zip failed integrity ({reason})"),
+            format!(
+                "prebuilt module zip for {module} failed integrity verification ({reason}); \
+                 refusing to fall back to a local build on tampered bytes"
+            ),
         ),
         ServiceArtifact::Pending => miss(
             warnings,
@@ -1711,7 +1716,7 @@ mod tests {
             Some(&go_service_cfg(&server.uri(), VendorSource::Service, false)),
         )
         .await;
-        expect_refused(outcome, "vendor_prebuilt_required");
+        expect_refused(outcome, "vendor_prebuilt_integrity_mismatch");
         assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
     }
 
@@ -2762,5 +2767,70 @@ mod tests {
         assert!(r2.success && e2.is_none() && w2.is_empty());
         assert_eq!(ts::tree_snapshot(root), before);
         assert_eq!(ts::request_count(&down).await, 0);
+    }
+
+    /// An integrity mismatch is a hard failure under `auto` too —
+    /// never a quiet local-build fallback (service_fetch's contract).
+    #[tokio::test]
+    async fn service_integrity_mismatch_auto_hard_fails() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let gomod_before = tokio::fs::read(root.join("go.mod")).await.unwrap();
+        let zip = make_module_zip(&[
+            ("go.mod", b"module github.com/foo/bar\n\ngo 1.21\n"),
+            ("bar.go", PATCHED),
+        ]);
+        let wrong = sri_sha512(b"different bytes");
+        let server = wiremock::MockServer::start().await;
+        mount_go_granted(&server, &wrong, None, &zip).await;
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&go_service_cfg(&server.uri(), VendorSource::Auto, false)),
+        )
+        .await;
+        expect_refused(outcome, "vendor_prebuilt_integrity_mismatch");
+        assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
+        assert_eq!(
+            tokio::fs::read(root.join("go.mod")).await.unwrap(),
+            gomod_before
+        );
+    }
+
+    /// `--vendor-source=service` with no configured client must fail
+    /// closed, never quietly build locally.
+    #[tokio::test]
+    async fn service_mode_without_client_refuses() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let gomod_before = tokio::fs::read(root.join("go.mod")).await.unwrap();
+        let mut cfg = go_service_cfg("http://127.0.0.1:1", VendorSource::Service, false);
+        cfg.client = None;
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_go_module(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cfg),
+        )
+        .await;
+        expect_refused(outcome, "vendor_prebuilt_required");
+        assert!(!root.join(format!(".socket/vendor/golang/{UUID}")).exists());
+        assert_eq!(
+            tokio::fs::read(root.join("go.mod")).await.unwrap(),
+            gomod_before
+        );
     }
 }

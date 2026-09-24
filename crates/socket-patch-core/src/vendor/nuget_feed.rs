@@ -315,6 +315,12 @@ pub async fn vendor_nuget(
             // first run) is still wired at this feed, so deleting the uuid dir
             // would leave a wired config pointing at nothing and brick every
             // restore.
+            // The refreshed entry's only wiring: the re-pinned lock record,
+            // `original: None` like any re-vendor of our own pin — the
+            // caller's `carry_forward_wiring` (same uuid) fills the true
+            // pre-vendor contentHash from the entry being replaced and
+            // re-attaches the untouched config records.
+            let mut wiring: Vec<WiringRecord> = Vec::new();
             if let Some(text) = &lock_text {
                 let new_hash = content_hash(&bytes);
                 match edit_lock(text, name, &version_norm, &new_hash) {
@@ -327,6 +333,14 @@ pub async fn vendor_nuget(
                             result.error = Some(format!("failed to rewrite {PACKAGES_LOCK}: {e}"));
                             return done(result, None, warnings);
                         }
+                        wiring.push(WiringRecord {
+                            file: PACKAGES_LOCK.to_string(),
+                            kind: LOCK_WIRING_KIND.to_string(),
+                            action: WiringAction::Rewritten,
+                            key: Some(name.to_string()),
+                            original: None,
+                            new: Some(Value::String(new_hash)),
+                        });
                     }
                     Ok(None) => {}
                     Err(detail) => {
@@ -343,7 +357,17 @@ pub async fn vendor_nuget(
                      rebuilt at {copy_rel} (nuget.config untouched)"
                 ),
             ));
-            return done(result, None, warnings);
+            // The rebuilt nupkg may differ byte-wise from the one the ledger
+            // fingerprinted (a service ↔ local flip): hand back a refreshed
+            // entry so the ledger sha256 and lock pin describe these bytes.
+            let entry = nuget_entry(
+                build_nuget_purl(name, version),
+                record,
+                copy_rel,
+                &bytes,
+                wiring,
+            );
+            return done(result, Some(entry), warnings);
         }
         // Dry runs fall through to the verify-only preview below.
     }
@@ -515,7 +539,22 @@ pub async fn vendor_nuget(
         wiring.push(rec);
     }
 
-    let entry = VendorEntry {
+    let entry = nuget_entry(base_purl, record, copy_rel, &nupkg_bytes, wiring);
+
+    done(result, Some(entry), warnings)
+}
+
+/// The ledger entry for a vendored nupkg: `wiring` is the config + lock
+/// records on a full vendor, only the re-pinned lock record on an
+/// artifact-only rebuild (see the hot path).
+fn nuget_entry(
+    base_purl: String,
+    record: &PatchRecord,
+    copy_rel: String,
+    nupkg_bytes: &[u8],
+    wiring: Vec<WiringRecord>,
+) -> VendorEntry {
+    VendorEntry {
         ecosystem: "nuget".to_string(),
         base_purl,
         uuid: record.uuid.clone(),
@@ -524,7 +563,7 @@ pub async fn vendor_nuget(
             // for tooling (harvest re-derives per-entry git hashes from the
             // zip, so the vendored copy is self-describing without a network).
             path: copy_rel,
-            sha256: hex::encode(sha2::Sha256::digest(&nupkg_bytes)),
+            sha256: hex::encode(sha2::Sha256::digest(nupkg_bytes)),
             size: Some(nupkg_bytes.len() as u64),
             platform_locked: None,
             file_inventory: None,
@@ -540,9 +579,7 @@ pub async fn vendor_nuget(
         poetry: None,
         pdm: None,
         pipenv: None,
-    };
-
-    done(result, Some(entry), warnings)
+    }
 }
 
 /// Revert a NuGet vendor entry: undo the lock pin, restore/delete the
@@ -703,7 +740,7 @@ async fn materialise_patched_nupkg(
     config_wired: bool,
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<(Vec<u8>, ApplyResult), Box<VendorOutcome>> {
-    match service_archive_copy(service, &record.uuid, name, ".nupkg", warnings).await {
+    match service_archive_copy(service, record, name, ".nupkg", warnings).await {
         ServiceCopy::Used(bytes) => {
             if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &bytes).await {
                 if !config_wired {
@@ -2533,7 +2570,14 @@ mod tests {
 
         let (r2, e2, w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(r2.success, "{:?}", r2.error);
-        assert!(e2.is_none());
+        // A refreshed fingerprint whose only wiring is the re-pinned lock:
+        // the config records stay with the first run's entry.
+        let e2 = e2.expect("the rebuild refreshes the ledger fingerprint");
+        assert!(
+            e2.wiring.iter().all(|w| w.kind == LOCK_WIRING_KIND),
+            "{:?}",
+            e2.wiring
+        );
         assert!(w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"));
         assert_eq!(
             r2.package_path,
@@ -3064,7 +3108,10 @@ mod tests {
         .await;
         let (r2, e2, w2) = unwrap_done(outcome);
         assert!(r2.success, "{:?}", r2.error);
-        assert!(e2.is_none(), "artifact-only rebuild must not re-record");
+        assert!(
+            e2.is_some_and(|e| e.wiring.iter().all(|w| w.kind == LOCK_WIRING_KIND)),
+            "artifact-only rebuild never re-records the config wiring"
+        );
         assert!(
             w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
             "FIFO nupkg must read as stale and trigger the rebuild: {w2:?}"
@@ -3282,7 +3329,10 @@ mod tests {
 
         let (r2, e2, w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(r2.success, "{:?}", r2.error);
-        assert!(e2.is_none(), "artifact-only rebuild must not re-record");
+        assert!(
+            e2.is_some_and(|e| e.wiring.is_empty()),
+            "no lock to re-pin: a refreshed fingerprint with no wiring"
+        );
         assert!(
             w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
             "{w2:?}"
@@ -3383,7 +3433,10 @@ mod tests {
 
         let (r2, e2, w2) = unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
         assert!(r2.success, "{:?}", r2.error);
-        assert!(e2.is_none());
+        assert!(
+            e2.is_some_and(|e| e.wiring.is_empty()),
+            "nothing re-pinned: a refreshed fingerprint with no wiring"
+        );
         assert!(
             w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
             "{w2:?}"
@@ -4775,5 +4828,185 @@ mod tests {
         assert!(e2.is_none());
         assert_eq!(before, ts::tree_snapshot(root));
         assert_eq!(ts::request_count(&down).await, 0);
+    }
+
+    fn integrity_cfg(
+        server: Option<&wiremock::MockServer>,
+        source: crate::vendor::VendorSource,
+    ) -> VendorServiceConfig {
+        use crate::api::client::{ApiClient, ApiClientOptions};
+        VendorServiceConfig {
+            source,
+            client: server.map(|s| {
+                ApiClient::new(ApiClientOptions {
+                    api_url: s.uri(),
+                    api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+                    use_public_proxy: false,
+                    org_slug: Some("acme".into()),
+                })
+            }),
+            use_public_proxy: false,
+            vendor_url: None,
+            patch_server_url: None,
+            offline: false,
+        }
+    }
+
+    /// Mount a granted service response serving `served` as the prebuilt nupkg.
+    async fn mount_granted_nupkg(served: &[u8]) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let sri = crate::vendor::npm_pack::PackedTarball::from_bytes(served).integrity;
+        let serve_path =
+            "/patch/nuget/newtonsoft.json/13.0.3/tok/uuid/newtonsoft.json.13.0.3.nupkg";
+        let serve_url = format!("{}{serve_path}", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/package"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "results": { UUID: {
+                    "status": "granted", "url": serve_url,
+                    "artifacts": [{ "kind": "tarball", "url": serve_url,
+                                    "integrity": { "sha512": sri } }]
+                }}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(serve_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(served.to_vec()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn run_vendor_cfg(
+        root: &Path,
+        blobs: &Path,
+        installed: &Path,
+        record: &PatchRecord,
+        cfg: Option<&VendorServiceConfig>,
+    ) -> VendorOutcome {
+        let sources = PatchSources::blobs_only(blobs);
+        vendor_nuget(
+            PURL,
+            installed,
+            root,
+            record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            cfg,
+        )
+        .await
+    }
+
+    /// Vendored from the service, the committed nupkg is lost and
+    /// rebuilt LOCALLY (signature dropped → different bytes, lock re-pinned).
+    /// The ledger the CLI persists must describe the rebuilt nupkg AND the
+    /// re-pinned lock, so `--revert` restores the pristine contentHash.
+    #[tokio::test]
+    async fn wired_rebuild_refreshes_ledger_and_revert_restores_lock() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let served = make_nupkg(PATCHED);
+        let server = mount_granted_nupkg(&served).await;
+        let cfg = integrity_cfg(Some(&server), crate::vendor::VendorSource::Service);
+        let (r1, e1, _) =
+            unwrap_done(run_vendor_cfg(root, &blobs, &installed, &record, Some(&cfg)).await);
+        assert!(r1.success, "{:?}", r1.error);
+        let e1 = e1.expect("first vendor records an entry");
+
+        tokio::fs::remove_file(root.join(copy_rel())).await.unwrap();
+        let (r2, e2, w2) =
+            unwrap_done(run_vendor_cfg(root, &blobs, &installed, &record, None).await);
+        assert!(r2.success, "{:?}", r2.error);
+        assert!(
+            w2.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{w2:?}"
+        );
+        let rebuilt = tokio::fs::read(root.join(copy_rel())).await.unwrap();
+        assert!(
+            rebuilt != served,
+            "precondition: the two sources differ byte-wise"
+        );
+        let lock = tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+            .await
+            .unwrap();
+        assert!(
+            lock.contains(&content_hash(&rebuilt)),
+            "lock re-pinned at the rebuild"
+        );
+
+        let ledger = match e2 {
+            Some(mut fresh) => {
+                crate::vendor::carry_forward_wiring(&e1, &mut fresh);
+                fresh
+            }
+            None => e1.clone(),
+        };
+        assert_eq!(
+            ledger.artifact.sha256,
+            hex::encode(sha2::Sha256::digest(&rebuilt)),
+            "the ledger fingerprint must describe the rebuilt nupkg"
+        );
+        assert_eq!(
+            crate::vendor::check_vendored_artifact(root, &ledger, &record).await,
+            crate::vendor::ArtifactHealth::Healthy
+        );
+        let rv = revert_nuget(&ledger, root, false).await;
+        assert!(rv.success, "{:?}", rv.error);
+        assert!(
+            !rv.warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            rv.warnings
+        );
+        let lock = tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+            .await
+            .unwrap();
+        assert_eq!(
+            lock,
+            lock_json("ORIGINALcachedhash=="),
+            "revert restores the pristine contentHash"
+        );
+        assert!(
+            !root.join("nuget.config").exists(),
+            "created config removed"
+        );
+    }
+
+    /// A served nupkg that passes the SRI floor but whose patched
+    /// member does NOT carry the afterHash is refused under `service`.
+    #[tokio::test]
+    async fn service_nupkg_failing_after_hashes_refused_under_service() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let server = mount_granted_nupkg(&make_nupkg(PRISTINE)).await;
+        let cfg = integrity_cfg(Some(&server), crate::vendor::VendorSource::Service);
+        let outcome = run_vendor_cfg(root, &blobs, &installed, &record, Some(&cfg)).await;
+        let VendorOutcome::Refused { code, .. } = outcome else {
+            panic!("an unpatched service nupkg was accepted: {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(".socket").exists(), "nothing written");
+        assert!(!root.join("nuget.config").exists());
+    }
+
+    /// `--vendor-source=service` with no configured client must
+    /// fail closed, never quietly build locally.
+    #[tokio::test]
+    async fn service_mode_without_client_refuses() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let root = dir.path();
+        let cfg = integrity_cfg(None, crate::vendor::VendorSource::Service);
+        let outcome = run_vendor_cfg(root, &blobs, &installed, &record, Some(&cfg)).await;
+        let VendorOutcome::Refused { code, .. } = outcome else {
+            panic!("service mode without a client built locally: {outcome:?}");
+        };
+        assert_eq!(code, "vendor_prebuilt_required");
+        assert!(!root.join(".socket").exists(), "nothing written");
     }
 }

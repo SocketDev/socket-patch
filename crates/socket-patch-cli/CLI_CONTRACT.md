@@ -472,12 +472,14 @@ per service outcome:
 | Service outcome | `auto` | `service` |
 |---|---|---|
 | granted/reused, integrity ok | **use service** | **use service** |
-| integrity mismatch | cargo/maven/nuget: **refuse** (`vendor_prebuilt_integrity_mismatch`) — tampered bytes never fall back; other ecosystems (to be aligned): local build + `vendor_prebuilt_integrity_mismatch` | refuse (cargo/maven/nuget: `vendor_prebuilt_integrity_mismatch`; others: `vendor_prebuilt_required`) |
+| integrity mismatch (including the gem stub gemspec) | **refuse** (`vendor_prebuilt_integrity_mismatch`; npm: the package fails with the integrity detail). Tampered bytes never fall back to a local build | refuse (same) |
+| integrity ok, but the archive does not carry the patched files (a member at a recorded path fails its `afterHash`; checked for cargo/golang/composer/gem after extraction, and for maven/nuget/pypi/npm before the archive is written; npm under `service` fails the package with the detail) | local build + `vendor_prebuilt_layout_mismatch` | refuse (`vendor_prebuilt_required`) |
 | still building (`pending_build` / serve 408) | local build + `vendor_prebuilt_pending` | refuse |
 | not built / withdrawn / not found / no usable artifact | local build (quiet) | refuse |
 | gem stub gemspec missing / invalid | local build + `vendor_prebuilt_stub_missing` / `vendor_prebuilt_stub_invalid` (invalid + gem not installed: refuse `vendor_prebuilt_stub_invalid` — no stub source exists) | refuse (`vendor_prebuilt_required` / `vendor_prebuilt_stub_invalid`) |
 | 401 / 403 grant / 5xx / network error | local build + `vendor_prebuilt_unavailable` | refuse |
 | `--offline` | local build | refuse (`vendor_service_offline_conflict`) |
+| no API client configured (library callers of the vendor engine; the CLI always configures one) | local build | refuse (`vendor_prebuilt_required`) |
 
 `--vendor-source` governs ACQUISITION, not reuse: a re-run whose committed artifact the ledger
 vouches for (npm tarball / pypi wheel: path under this patch uuid, no symlink, whole-file sha256 and
@@ -1139,7 +1141,7 @@ Every `--json` invocation emits a single JSON object that follows the **unified 
 | `vendor_artifact_missing` | `skipped` (warning) / `failed` | vendor: the committed artifact is gone — the registry resolution is recovered from the ledger and the artifact rebuilt (warning); repair `--offline` with no local source surfaces it as the per-entry failure instead. |
 | `vendor_artifact_corrupt` | `failed` | repair `--offline`: the committed artifact fails verification (member afterHashes or the ledger's whole-file sha256) and no local source can rebuild it. Online repairs rebuild instead. |
 | `vendor_artifact_reused` | `skipped` (verbose note) | vendor / scan `--vendor` (pypi): the wiring was dropped by a relock but the committed wheel the ledger vouches for verified, so it was re-wired as-is — no service download, no rebuild; the lock pins the first run's sha again. |
-| `vendor_artifact_rebuilt` | `skipped` (warning) | vendor / scan `--vendor`: a wired-but-missing/stale artifact was rebuilt in place; lockfiles and the ledger entry untouched. (Under `repair` the `rebuilt` event carries this signal.) |
+| `vendor_artifact_rebuilt` | `skipped` (warning) | vendor / scan `--vendor`: a wired-but-missing/stale artifact was rebuilt in place. The lockfiles are untouched, except that nuget re-pins `packages.lock.json` to the rebuilt bytes. gem/maven/nuget: the package's event is `applied` (also for a rebuild from the patch service), and the ledger entry's artifact fingerprint (gem `fileInventory`, maven/nuget `sha256` + `size`, and the nuget lock pin) is refreshed to the rebuilt bytes, and its wiring records are kept unchanged, so `--revert` still restores the pre-vendor files. A rebuild whose ledger has no entry for the package, or only one from another patch uuid, records none. cargo/composer/gem rebuilds honour `--vendor-source` like a fresh vendor (`service` downloads the prebuilt artifact and refuses when it cannot). Other ecosystems leave the ledger entry untouched. (Under `repair` the `rebuilt` event carries this signal.) |
 | `vendor_artifact_rebuild_failed` | `failed` | repair: the rebuild ran but the result failed verification against the recorded fingerprint (e.g. an edited state.json sha); the unverifiable artifact was removed. |
 | `vendor_artifact_unrepairable` | `failed` | repair: no verifiable pristine source exists (not installed + lockfile rewired + no recoverable ledger fragment), the wheel is platform-locked with no installed copy, or the ledger entry itself cannot be trusted. |
 | `vendor_uuid_mismatch` | `skipped` | repair: the manifest's patch uuid moved past the vendored artifact — a re-vendor (`vendor` / `scan --vendor`) is pending; repair does not cross patch generations. |

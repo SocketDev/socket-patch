@@ -553,26 +553,39 @@ pub async fn vendor_cargo_crate(
         // first run's unrecoverable lock originals. The rebuild is staged: a
         // failure must leave the previous (drifted-but-buildable) copy and
         // the live wiring exactly as they were, never a deleted copy under a
-        // still-pointing `[patch]` entry.
+        // still-pointing `[patch]` entry. Service-preferred like the full
+        // path, so `--vendor-source=service` never quietly builds locally.
+        if let Some(refusal) = service_offline_conflict(service) {
+            return refusal;
+        }
         let mut warnings: Vec<VendorWarning> = Vec::new();
-        let result = match copy_and_patch(
-            purl,
-            pristine_src,
-            &copy_dir,
-            &uuid_dir,
-            record,
-            sources,
-            force,
-            false, // live-wired: never unwind the uuid dir on failure
-            name,
-            version,
-            &mut warnings,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(result) => return done(result, None, warnings),
-        };
+        let result =
+            match cargo_service_copy(service, record, name, &copy_dir, &uuid_dir, &mut warnings)
+                .await
+            {
+                CargoServiceCopy::Used => already_patched_result(purl, &copy_dir, &record.files),
+                CargoServiceCopy::HardFail(outcome) => return *outcome,
+                CargoServiceCopy::FallBack => {
+                    match copy_and_patch(
+                        purl,
+                        pristine_src,
+                        &copy_dir,
+                        &uuid_dir,
+                        record,
+                        sources,
+                        force,
+                        false, // live-wired: never unwind the uuid dir on failure
+                        name,
+                        version,
+                        &mut warnings,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(result) => return done(result, None, warnings),
+                    }
+                }
+            };
         warnings.push(VendorWarning::new(
             "vendor_artifact_rebuilt",
             format!(
@@ -3232,5 +3245,128 @@ mod tests {
         assert!(r2.success && e2.is_none() && w2.is_empty());
         assert_eq!(ts::tree_snapshot(root), before);
         assert_eq!(ts::request_count(&down).await, 0);
+    }
+
+    /// `--vendor-source=service` with no configured client must fail
+    /// closed, never quietly build locally.
+    #[tokio::test]
+    async fn service_mode_without_client_refuses() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        let mut cfg = cargo_service_cfg("http://127.0.0.1:1", VendorSource::Service, false);
+        cfg.client = None;
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &pristine,
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cfg),
+        )
+        .await;
+        expect_refused(outcome, "vendor_prebuilt_required");
+        assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
+    }
+
+    /// Vendor locally, then delete the committed copy so the next run takes
+    /// the wired-copy rebuild path.
+    async fn wired_with_missing_copy() -> (tempfile::TempDir, PathBuf, PathBuf, PatchRecord) {
+        let (dir, blobs, pristine, record) = fixture().await;
+        expect_done(run_vendor(PURL, dir.path(), &blobs, &pristine, &record, false).await);
+        crate::patch::copy_tree::remove_tree(&dir.path().join(copy_rel()))
+            .await
+            .unwrap();
+        (dir, blobs, pristine, record)
+    }
+
+    /// The wired-copy rebuild honours `--vendor-source=service` like the
+    /// fresh path: no API client or `--offline` refuses instead of quietly
+    /// rebuilding locally, and the copy is not recreated.
+    #[tokio::test]
+    async fn wired_rebuild_service_mode_unreachable_refuses() {
+        for (offline, want) in [
+            (false, "vendor_prebuilt_required"),
+            (true, "vendor_service_offline_conflict"),
+        ] {
+            let (dir, blobs, pristine, record) = wired_with_missing_copy().await;
+            let root = dir.path();
+            let mut cfg = cargo_service_cfg("http://127.0.0.1:1", VendorSource::Service, offline);
+            if !offline {
+                cfg.client = None;
+            }
+            let sources = PatchSources::blobs_only(&blobs);
+            let outcome = vendor_cargo_crate(
+                PURL,
+                &pristine,
+                root,
+                &record,
+                &sources,
+                "2026-06-09T00:00:00Z",
+                false,
+                false,
+                Some(&cfg),
+            )
+            .await;
+            expect_refused(outcome, want);
+            assert!(
+                !root.join(copy_rel()).exists(),
+                "service mode must not rebuild the copy locally (offline={offline})"
+            );
+        }
+    }
+
+    /// Online `service` mode rebuilds the wired copy from the prebuilt crate,
+    /// not from the pristine source (a deliberately-missing path here).
+    #[tokio::test]
+    async fn wired_rebuild_service_mode_uses_prebuilt_crate() {
+        let (dir, blobs, _pristine, record) = wired_with_missing_copy().await;
+        let root = dir.path();
+        let crate_tgz = make_crate_tgz(
+            "cfg-if-1.0.4",
+            &[
+                ("src/lib.rs", PATCHED),
+                (
+                    "Cargo.toml",
+                    b"[package]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n",
+                ),
+            ],
+        );
+        let server = wiremock::MockServer::start().await;
+        mount_cargo_granted(&server, &sri_sha512(&crate_tgz), &crate_tgz).await;
+        let sources = PatchSources::blobs_only(&blobs);
+        let outcome = vendor_cargo_crate(
+            PURL,
+            &root.join("no-such-pristine"),
+            root,
+            &record,
+            &sources,
+            "2026-06-09T00:00:00Z",
+            false,
+            false,
+            Some(&cargo_service_cfg(
+                &server.uri(),
+                VendorSource::Service,
+                false,
+            )),
+        )
+        .await;
+        let (result, entry, warnings) = expect_done(outcome);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_none(), "artifact-only rebuild records no entry");
+        assert!(
+            warnings.iter().any(|w| w.code == "vendor_artifact_rebuilt"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
+        assert_eq!(tokio::fs::read(copy_lib(root)).await.unwrap(), PATCHED);
     }
 }
