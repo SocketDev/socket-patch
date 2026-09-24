@@ -1,9 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
+use super::listing::list_dir_sync;
 use super::types::{CrawledPackage, CrawlerOptions};
+use super::walk_pool::run_walk;
 use crate::patch::path_safety;
 use crate::utils::fs::is_dir;
+
+#[cfg(test)]
+mod oracle;
 
 // ---------------------------------------------------------------------------
 // Cargo.toml minimal parser
@@ -180,21 +187,30 @@ impl CargoCrawler {
 
     /// Crawl all discovered crate source directories and return every
     /// package found.
+    ///
+    /// The scan runs on the walk pool (a registry cache holds thousands of
+    /// crates, and one runtime hop per stat and `Cargo.toml` read dominated
+    /// the crawl): each source dir's `Cargo.toml`s are read and parsed in
+    /// parallel, then deduplicated serially in listing order, so the
+    /// first-seen PURL keeps winning exactly as in the sequential scan.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
-        let mut packages = Vec::new();
-        let mut seen = HashSet::new();
-
         let src_paths = self
             .get_crate_source_paths(options)
             .await
             .unwrap_or_default();
-
-        for src_path in &src_paths {
-            let found = self.scan_crate_source(src_path, &mut seen).await;
-            packages.extend(found);
+        if src_paths.is_empty() {
+            return Vec::new();
         }
 
-        packages
+        run_walk(move || {
+            let mut packages = Vec::new();
+            let mut seen = HashSet::new();
+            for src_path in &src_paths {
+                packages.extend(scan_crate_source(src_path, &mut seen));
+            }
+            packages
+        })
+        .await
     }
 
     /// Find specific packages by PURL inside a single crate source directory.
@@ -266,70 +282,6 @@ impl CargoCrawler {
             }
         }
         paths
-    }
-
-    /// Scan a crate source directory (either a registry index directory or
-    /// a vendor directory) and return all valid crate packages found.
-    async fn scan_crate_source(
-        &self,
-        src_path: &Path,
-        seen: &mut HashSet<String>,
-    ) -> Vec<CrawledPackage> {
-        let mut results = Vec::new();
-
-        for entry in crate::utils::fs::list_dir_entries(src_path).await {
-            if !crate::utils::fs::entry_is_dir(&entry).await {
-                continue;
-            }
-
-            let dir_name = entry.file_name();
-            let dir_name_str = dir_name.to_string_lossy();
-
-            // Skip hidden directories
-            if dir_name_str.starts_with('.') {
-                continue;
-            }
-
-            let crate_path = src_path.join(&*dir_name_str);
-            if let Some(pkg) = self
-                .read_crate_cargo_toml(&crate_path, &dir_name_str, seen)
-                .await
-            {
-                results.push(pkg);
-            }
-        }
-
-        results
-    }
-
-    /// Read `Cargo.toml` from a crate directory, returning a `CrawledPackage`
-    /// if valid. Falls back to parsing name+version from the directory name
-    /// when the Cargo.toml has `version.workspace = true`.
-    async fn read_crate_cargo_toml(
-        &self,
-        crate_path: &Path,
-        dir_name: &str,
-        seen: &mut HashSet<String>,
-    ) -> Option<CrawledPackage> {
-        let cargo_toml_path = crate_path.join("Cargo.toml");
-        let content = tokio::fs::read_to_string(&cargo_toml_path).await.ok()?;
-
-        // Fallback: parse directory name as <name>-<version>
-        let (name, version) = parse_cargo_toml_name_version(&content)
-            .or_else(|| Self::parse_dir_name_version(dir_name))?;
-
-        let purl = crate::utils::purl::build_cargo_purl(&name, &version);
-        if !seen.insert(purl.clone()) {
-            return None;
-        }
-
-        Some(CrawledPackage {
-            name,
-            version,
-            namespace: None,
-            purl,
-            path: crate_path.to_path_buf(),
-        })
     }
 
     /// Verify that a crate directory contains a Cargo.toml with the expected
@@ -406,6 +358,60 @@ impl CargoCrawler {
             _ => crate::utils::fs::home_dir().join(".cargo"),
         }
     }
+}
+
+/// Scan a crate source directory (either a registry index directory or
+/// a vendor directory) and return all valid crate packages found.
+fn scan_crate_source(src_path: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
+    let entries = list_dir_sync(src_path);
+    // Read + parse is independent per entry; only the dedup is ordered.
+    let parsed: Vec<Option<(String, String, PathBuf)>> = entries
+        .par_iter()
+        .map(|entry| {
+            if !entry.is_dir(src_path) {
+                return None;
+            }
+
+            let dir_name_str = entry.name.to_string_lossy();
+
+            // Skip hidden directories
+            if dir_name_str.starts_with('.') {
+                return None;
+            }
+
+            let crate_path = src_path.join(&*dir_name_str);
+            let (name, version) = read_crate_cargo_toml(&crate_path, &dir_name_str)?;
+            Some((name, version, crate_path))
+        })
+        .collect();
+
+    let mut results = Vec::new();
+    for (name, version, crate_path) in parsed.into_iter().flatten() {
+        let purl = crate::utils::purl::build_cargo_purl(&name, &version);
+        if !seen.insert(purl.clone()) {
+            continue;
+        }
+        results.push(CrawledPackage {
+            name,
+            version,
+            namespace: None,
+            purl,
+            path: crate_path,
+        });
+    }
+    results
+}
+
+/// Read `Cargo.toml` from a crate directory and return its name and
+/// version. Falls back to parsing name+version from the directory name
+/// when the Cargo.toml has `version.workspace = true`.
+fn read_crate_cargo_toml(crate_path: &Path, dir_name: &str) -> Option<(String, String)> {
+    let cargo_toml_path = crate_path.join("Cargo.toml");
+    let content = std::fs::read_to_string(&cargo_toml_path).ok()?;
+
+    // Fallback: parse directory name as <name>-<version>
+    parse_cargo_toml_name_version(&content)
+        .or_else(|| CargoCrawler::parse_dir_name_version(dir_name))
 }
 
 /// SECURITY: `find_by_purls` formats name/version into a `<name>-<version>`
@@ -1127,5 +1133,111 @@ version = "fake"
         let packages = crawler.crawl_all(&options).await;
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].purl, "pkg:cargo/serde@1.0.200");
+    }
+
+    // ── Equivalence with the per-call async scan (oracle) ─────────────
+
+    mod equivalence {
+        use super::super::oracle::LegacyCargoCrawler;
+        use super::*;
+        use crate::crawlers::oracle_support::{mkdir, rows, symlink, write, PermGuard, Rng};
+
+        const NAMES: &[&str] = &["serde", "serde-json", "sha-1", "tokio", "dup", "a_b"];
+        const VERSIONS: &[&str] = &["1.0.0", "1.0.0-rc.1", "0.2.3", "5", "1.0.0+build"];
+
+        fn manifest(rng: &mut Rng, name: &str, version: &str) -> String {
+            match rng.below(8) {
+                0 => format!("[package]\nname = \"{name}\"\nversion.workspace = true\n"),
+                1 => format!("[package]\nname = '{name}'\nversion = '{version}'\n"),
+                2 => "[dependencies]\nfoo = \"1\"\n".to_string(),
+                3 => format!("[ package ] # c\nname = \"{name}\"\n\n[lib]\nversion = \"9\"\n"),
+                4 => format!("[package]\nversion = \"{version}\"\nname = \"other\"\n"),
+                _ => format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+            }
+        }
+
+        fn tree(rng: &mut Rng, root: &Path, outside: &Path, perms: &mut PermGuard) {
+            mkdir(root);
+            for i in 0..rng.below(24) {
+                let name = rng.pick(NAMES);
+                let version = rng.pick(VERSIONS);
+                let dir_name = match rng.below(4) {
+                    0 => name.to_string(),
+                    1 => format!(".{name}-{version}"),
+                    _ => format!("{name}-{version}"),
+                };
+                let dir = root.join(&dir_name);
+                match rng.below(14) {
+                    0 => write(&dir, "not a dir"),
+                    1 => {
+                        let target = outside.join(format!("t{i}-{}", rng.next()));
+                        if rng.chance(70) {
+                            write(&target.join("Cargo.toml"), &manifest(rng, name, version));
+                        }
+                        symlink(&target, &dir);
+                    }
+                    2 => mkdir(&dir.join("Cargo.toml")),
+                    3 => {
+                        mkdir(&dir);
+                        let _ =
+                            std::fs::write(dir.join("Cargo.toml"), b"[package]\nname = \"\xff\"\n");
+                    }
+                    4 => {
+                        write(&dir.join("Cargo.toml"), &manifest(rng, name, version));
+                        perms.plan(&dir, 0o000);
+                    }
+                    5 => mkdir(&dir),
+                    _ => write(&dir.join("Cargo.toml"), &manifest(rng, name, version)),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn randomized_sources_match_the_async_oracle() {
+            let mut total = 0;
+            for seed in 0..64u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut perms = PermGuard::default();
+                let mut rng = Rng::new(seed);
+                let root = tmp.path().join("src");
+                tree(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                perms.apply();
+                let options = CrawlerOptions {
+                    cwd: tmp.path().to_path_buf(),
+                    global: false,
+                    global_prefix: Some(root.clone()),
+                };
+                let new = CargoCrawler::new().crawl_all(&options).await;
+                let old = LegacyCargoCrawler::crawl_all(&options).await;
+                assert_eq!(rows(&new), rows(&old), "seed {seed}");
+                total += old.len();
+            }
+            assert!(total > 200, "vacuous fixtures: {total}");
+        }
+
+        /// Local mode: a Cargo project with a `vendor/` tree.
+        #[tokio::test]
+        async fn vendor_tree_matches_the_async_oracle() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut perms = PermGuard::default();
+            let mut rng = Rng::new(7);
+            write(&tmp.path().join("Cargo.toml"), "[workspace]\n");
+            tree(
+                &mut rng,
+                &tmp.path().join("vendor"),
+                &tmp.path().join("outside"),
+                &mut perms,
+            );
+            perms.apply();
+            let options = CrawlerOptions {
+                cwd: tmp.path().to_path_buf(),
+                global: false,
+                global_prefix: None,
+            };
+            let new = CargoCrawler::new().crawl_all(&options).await;
+            let old = LegacyCargoCrawler::crawl_all(&options).await;
+            assert!(!old.is_empty());
+            assert_eq!(rows(&new), rows(&old));
+        }
     }
 }

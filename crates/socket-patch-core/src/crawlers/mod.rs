@@ -3,6 +3,7 @@ pub mod composer_crawler;
 pub mod deno_crawler;
 pub mod fuzzy_match;
 pub mod go_crawler;
+mod listing;
 pub mod maven_crawler;
 #[cfg(test)]
 mod maven_pom_equivalence_tests;

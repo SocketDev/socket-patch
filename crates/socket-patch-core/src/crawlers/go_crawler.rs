@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use super::listing::{list_dir_sync, ListedEntry};
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
-use crate::utils::fs::{is_dir_sync, read_dir_entries_sync, run_blocking};
+use crate::utils::fs::{is_dir_sync, run_blocking};
 
 #[cfg(test)]
 mod oracle;
@@ -304,41 +305,6 @@ fn find_by_purls_sync(cache_path: &Path, purls: &[String]) -> HashMap<String, Cr
     result
 }
 
-/// One listed entry of a directory being walked: its raw name plus the
-/// `DirEntry`'s own (symlink-aware) file type, read while listing so the
-/// directory stream is closed before the walk descends.
-struct ListedEntry {
-    name: std::ffi::OsString,
-    file_type: Option<std::fs::FileType>,
-}
-
-/// List `path` (empty when it cannot be read; iteration stops at the first
-/// entry error — the tolerate-and-truncate contract of the crawlers).
-fn list_dir_sync(path: &Path) -> Vec<ListedEntry> {
-    read_dir_entries_sync(path)
-        .map(|(entries, _)| {
-            entries
-                .into_iter()
-                .map(|entry| ListedEntry {
-                    name: entry.file_name(),
-                    file_type: entry.file_type().ok(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Whether a listed entry is a directory, following symlinks: a symlinked
-/// entry is resolved through a stat, and a failed `file_type`/stat means
-/// "not a dir" (`utils::fs::entry_is_dir`'s rule).
-fn listed_is_dir(dir: &Path, entry: &ListedEntry) -> bool {
-    match entry.file_type {
-        Some(kind) if kind.is_symlink() => is_dir_sync(&dir.join(&entry.name)),
-        Some(kind) => kind.is_dir(),
-        None => false,
-    }
-}
-
 /// Walk one module cache root.
 ///
 /// Go module cache has a hierarchical structure:
@@ -362,7 +328,7 @@ fn scan_cache_sync(
             continue;
         };
         *next += 1;
-        if !listed_is_dir(current_path, entry) {
+        if !entry.is_dir(current_path) {
             continue;
         }
 
