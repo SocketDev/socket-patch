@@ -342,6 +342,22 @@ impl ProbeFilter {
     }
 }
 
+/// The read-only result of one `find_by_purls` resolver visit (see
+/// [`NpmCrawler::visit_resolver_dir`]).
+struct ResolverVisit {
+    nm_path: PathBuf,
+    probes: Vec<Option<(String, String)>>,
+    nested: Vec<NestedNodeModules>,
+}
+
+/// One contribution to the resolver's next BFS level: a nested importer
+/// `node_modules`, or a virtual store's entries, still to be narrowed by
+/// the pending-name filter when the visit is replayed.
+enum NestedNodeModules {
+    Dir(PathBuf),
+    StoreEntries(Vec<(String, PathBuf)>),
+}
+
 /// What the blocking-pool scan of one `node_modules` tree records, in the
 /// exact order the sequential walk visits it;
 /// [`NpmCrawler::merge_scan_events`] then replays the order-dependent
@@ -746,11 +762,18 @@ impl NpmCrawler {
     /// bounded by the still-unmatched-name filter (pass 1) or all probed
     /// (the pass-2 fallback) — see `find_by_purls`.
     ///
-    /// Each dequeued dir is listed ONCE: a target is probed there only if
+    /// Each visited dir is listed ONCE: a target is probed there only if
     /// the listing could hold its first path component (see
-    /// [`ProbeFilter`]; a skipped probe could only have failed), the
-    /// surviving package.json probes run in parallel and are folded back
-    /// in target order, and the same listing drives the descent.
+    /// [`ProbeFilter`]; a skipped probe could only have failed), and the
+    /// same listing drives the descent.
+    ///
+    /// The walk runs level by level — exactly the FIFO queue's order, since
+    /// everything a dir enqueues lands behind the rest of its level. What a
+    /// visit READS depends only on the dir and the (fixed) target list, not
+    /// on what earlier dirs resolved, so each level's visits are gathered
+    /// in parallel ([`Self::visit_resolver_dir`]); the order-dependent part
+    /// — folding matches into `result` and the unmatched-name store filter
+    /// — is then replayed sequentially in queue order.
     fn resolve_pending_targets(
         node_modules_path: &Path,
         mut pending: Vec<Target>,
@@ -760,103 +783,122 @@ impl NpmCrawler {
         if pending.is_empty() {
             return pending;
         }
-        let mut queue: VecDeque<PathBuf> = VecDeque::from([node_modules_path.to_path_buf()]);
-        while let Some(nm_path) = queue.pop_front() {
-            let listing = list_dir_sync(&nm_path);
-            let probe_filter = ProbeFilter::new(&listing);
-            let probes: Vec<Option<(String, String)>> = pending
-                .par_iter()
-                .map(|target| {
-                    let first_component = target.namespace.as_deref().unwrap_or(&target.name);
-                    if !probe_filter.may_resolve(first_component) {
-                        return None;
-                    }
-                    read_package_json_sync(&nm_path.join(&target.dir_key).join("package.json"))
-                })
+        let mut level: Vec<PathBuf> = vec![node_modules_path.to_path_buf()];
+        while !level.is_empty() {
+            let visits: Vec<ResolverVisit> = level
+                .into_par_iter()
+                .map(|nm_path| Self::visit_resolver_dir(nm_path, &pending))
                 .collect();
-            for (target, probe) in pending.iter().zip(probes) {
-                let pkg_path = nm_path.join(&target.dir_key);
+            let mut next_level: Vec<PathBuf> = Vec::new();
+            for visit in visits {
+                let nm_path = visit.nm_path;
+                for (target, probe) in pending.iter().zip(visit.probes) {
+                    let pkg_path = nm_path.join(&target.dir_key);
 
-                match probe {
-                    // The on-disk *name* must match too: an alias install
-                    // (`npm i foo@npm:bar@1.0.0`) puts a different package
-                    // in `node_modules/foo`, so matching on version alone
-                    // would misidentify it and patch the wrong package's
-                    // files.
-                    Some((found_name, found_version))
-                        if found_name == target.dir_key && found_version == target.version =>
-                    {
-                        let copies = result.entry(target.purl.clone()).or_default();
-                        // Record each physical copy once — a path reached
-                        // twice (defensive against overlapping walks) is not
-                        // double-counted.
-                        if !copies.iter().any(|c| c.path == pkg_path) {
-                            copies.push(CrawledPackage {
-                                name: target.name.clone(),
-                                version: found_version,
-                                namespace: target.namespace.clone(),
-                                purl: target.purl.clone(),
-                                path: pkg_path,
-                            });
+                    match probe {
+                        // The on-disk *name* must match too: an alias install
+                        // (`npm i foo@npm:bar@1.0.0`) puts a different package
+                        // in `node_modules/foo`, so matching on version alone
+                        // would misidentify it and patch the wrong package's
+                        // files.
+                        Some((found_name, found_version))
+                            if found_name == target.dir_key && found_version == target.version =>
+                        {
+                            let copies = result.entry(target.purl.clone()).or_default();
+                            // Record each physical copy once — a path reached
+                            // twice (defensive against overlapping walks) is not
+                            // double-counted.
+                            if !copies.iter().any(|c| c.path == pkg_path) {
+                                copies.push(CrawledPackage {
+                                    name: target.name.clone(),
+                                    version: found_version,
+                                    namespace: target.namespace.clone(),
+                                    purl: target.purl.clone(),
+                                    path: pkg_path,
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                // Descend importer-tree nested `node_modules` for ALL targets
+                // (a duplicate copy lives at an unknown depth), but probe the
+                // pnpm virtual store only for targets NOT YET found anywhere: a
+                // matched direct dep's store peer-variants are the apply
+                // engine's fan-out job, and re-probing the store for it would
+                // add a readdir storm. A target with no importer-tree copy
+                // (transitive-only) still gets its store entries probed.
+                let unmatched_names: HashSet<&str> = pending
+                    .iter()
+                    .filter(|t| !result.contains_key(&t.purl))
+                    .map(|t| t.dir_key.as_str())
+                    .collect();
+                let filter = filter_store_entries.then_some(&unmatched_names);
+                for nested in visit.nested {
+                    match nested {
+                        NestedNodeModules::Dir(dir) => next_level.push(dir),
+                        NestedNodeModules::StoreEntries(entries) => {
+                            next_level.extend(Self::pending_store_entries(entries, filter))
                         }
                     }
-                    _ => {}
                 }
             }
-            // Descend importer-tree nested `node_modules` for ALL targets
-            // (a duplicate copy lives at an unknown depth), but probe the
-            // pnpm virtual store only for targets NOT YET found anywhere: a
-            // matched direct dep's store peer-variants are the apply
-            // engine's fan-out job, and re-probing the store for it would
-            // add a readdir storm. A target with no importer-tree copy
-            // (transitive-only) still gets its store entries probed.
-            let unmatched_names: HashSet<&str> = pending
-                .iter()
-                .filter(|t| !result.contains_key(&t.purl))
-                .map(|t| t.dir_key.as_str())
-                .collect();
-            let filter = filter_store_entries.then_some(&unmatched_names);
-            Self::collect_nested_node_modules(&nm_path, listing, filter, &mut queue);
+            level = next_level;
         }
         // Only the targets with zero copies remain "pending" for pass 2.
         pending.retain(|t| !result.contains_key(&t.purl));
         pending
     }
 
-    /// Append the `node_modules` dirs living one level below `nm_path`
-    /// (inside each of its package dirs, scoped or not) to `queue`, given
-    /// `nm_path`'s listing. Mirrors the scan's traversal policy: hidden
-    /// entries are skipped and symlinked packages are never traversed — a
-    /// symlink here points into pnpm's content-addressed store or an `npm
-    /// link` target outside the project. The one exception is pnpm's
-    /// `.pnpm` virtual store (see below); `pending_names` — `Some(the
-    /// still-unresolved targets' full package names)` — bounds which store
-    /// entries get enqueued, while `None` (the pass-2 fallback of
-    /// `find_by_purls`) enqueues every store entry.
-    ///
-    /// Entries are examined in parallel; their contributions are appended
-    /// in listing order, so the breadth-first queue is unchanged.
-    fn collect_nested_node_modules(
-        nm_path: &Path,
-        listing: Listing,
-        pending_names: Option<&HashSet<&str>>,
-        queue: &mut VecDeque<PathBuf>,
-    ) {
-        let found: Vec<Vec<PathBuf>> = listing
-            .entries
-            .into_par_iter()
-            .map(|entry| Self::nested_node_modules_of(nm_path, entry, pending_names))
+    /// The read-only half of one resolver visit to `nm_path`: its listing,
+    /// each target's package.json probe (in target order; `None` for a
+    /// probe the listing proves would fail), and the nested `node_modules`
+    /// the dir contributes, in listing order.
+    fn visit_resolver_dir(nm_path: PathBuf, pending: &[Target]) -> ResolverVisit {
+        let listing = list_dir_sync(&nm_path);
+        let probe_filter = ProbeFilter::new(&listing);
+        let probes = pending
+            .iter()
+            .map(|target| {
+                let first_component = target.namespace.as_deref().unwrap_or(&target.name);
+                if !probe_filter.may_resolve(first_component) {
+                    return None;
+                }
+                read_package_json_sync(&nm_path.join(&target.dir_key).join("package.json"))
+            })
             .collect();
-        queue.extend(found.into_iter().flatten());
+        let nested = Self::collect_nested_node_modules(&nm_path, listing);
+        ResolverVisit {
+            nm_path,
+            probes,
+            nested,
+        }
     }
 
-    /// The `node_modules` dirs one listing entry of `nm_path` contributes
-    /// to the resolver's queue (see [`Self::collect_nested_node_modules`]).
-    fn nested_node_modules_of(
-        nm_path: &Path,
-        entry: ListedEntry,
-        pending_names: Option<&HashSet<&str>>,
-    ) -> Vec<PathBuf> {
+    /// The `node_modules` dirs living one level below `nm_path` (inside each
+    /// of its package dirs, scoped or not), given `nm_path`'s listing.
+    /// Mirrors the scan's traversal policy: hidden entries are skipped and
+    /// symlinked packages are never traversed — a symlink here points into
+    /// pnpm's content-addressed store or an `npm link` target outside the
+    /// project. The one exception is pnpm's virtual store (see below),
+    /// whose entries are returned whole: which of them get enqueued is
+    /// decided by the caller's pending-name filter
+    /// ([`Self::pending_store_entries`]) at replay time.
+    ///
+    /// Entries are examined in parallel; their contributions keep listing
+    /// order.
+    fn collect_nested_node_modules(nm_path: &Path, listing: Listing) -> Vec<NestedNodeModules> {
+        let found: Vec<Vec<NestedNodeModules>> = listing
+            .entries
+            .into_par_iter()
+            .map(|entry| Self::nested_node_modules_of(nm_path, entry))
+            .collect();
+        found.into_iter().flatten().collect()
+    }
+
+    /// What one listing entry of `nm_path` contributes to the resolver's
+    /// next level (see [`Self::collect_nested_node_modules`]).
+    fn nested_node_modules_of(nm_path: &Path, entry: ListedEntry) -> Vec<NestedNodeModules> {
         let name_str = entry.name_str.as_str();
         // pnpm's virtual store. Under the isolated linker the store is
         // the ONLY physical home of transitive dependencies: the
@@ -878,7 +920,7 @@ impl NpmCrawler {
                 .into_iter()
                 .map(|e| (e.name, e.node_modules))
                 .collect();
-            return Self::pending_store_entries(entries, pending_names);
+            return vec![NestedNodeModules::StoreEntries(entries)];
         }
         // pnpm <=3: the virtual store is a hidden `.<registry-host>` dir
         // (there is no `.pnpm` at all) with the same
@@ -891,7 +933,7 @@ impl NpmCrawler {
                 return Vec::new();
             }
             let entries = Self::collect_nested_store_entries_sync(&nm_path.join(&entry.name));
-            return Self::pending_store_entries(entries, pending_names);
+            return vec![NestedNodeModules::StoreEntries(entries)];
         }
         if name_str.starts_with('.') || name_str == "node_modules" {
             return Vec::new();
@@ -911,11 +953,12 @@ impl NpmCrawler {
                 })
                 .map(|scoped| entry_path.join(&scoped.name).join("node_modules"))
                 .filter(|nested| is_dir_sync(nested))
+                .map(NestedNodeModules::Dir)
                 .collect()
         } else {
             let nested = entry_path.join("node_modules");
             if is_dir_sync(&nested) {
-                vec![nested]
+                vec![NestedNodeModules::Dir(nested)]
             } else {
                 Vec::new()
             }
