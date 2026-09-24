@@ -980,7 +980,11 @@ into the new version's section — see docs/releasing.md.
   `redirect_cargo_transitive_dependents` and is skipped instead of being
   reported redirected while that package compiled the unpatched copy; a
   transitive-only crate's `redirect_cargo_toml_dep_not_found` detail now
-  says so and points to `--mode vendored`.
+  says so and points to `--mode vendored`. A crate declared only with
+  requirements the patched version does not satisfy (cargo resolves those
+  declarations to another version) is refused
+  `redirect_cargo_toml_dep_unrewritable`, the Socket backend's code for the
+  same shape, instead of `redirect_cargo_toml_dep_not_found`.
 - **CRLF cargo projects redirect in hosted mode.** All-CRLF `Cargo.toml`,
   `Cargo.lock` and cargo configs are rewritten with their endings kept
   (they were refused), and `remove` / rollback still find the recorded

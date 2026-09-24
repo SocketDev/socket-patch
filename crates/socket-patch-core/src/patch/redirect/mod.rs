@@ -879,6 +879,7 @@ fn rewrite_cargo(
         // members' `workspace = true` inheritors.
         let mut root_workspace: BTreeMap<String, CargoWorkspaceEntry> = BTreeMap::new();
         let mut toml_plans: Vec<(usize, CargoTomlPlan)> = Vec::new();
+        let mut excluded: Vec<(String, String)> = Vec::new();
         let mut refused: Option<(String, String)> = None;
         for (i, (path, text)) in manifests.iter().enumerate() {
             match plan_cargo_toml(
@@ -894,6 +895,7 @@ fn rewrite_cargo(
                     if path == "Cargo.toml" {
                         root_workspace = plan.workspace.clone();
                     }
+                    excluded.extend(plan.excluded.iter().map(|req| (path.clone(), req.clone())));
                     if plan.found {
                         toml_plans.push((i, plan));
                     }
@@ -911,6 +913,21 @@ fn rewrite_cargo(
                     "{} in {path} cannot be pinned ({reason}); dependency skipped \
                      (nothing rewritten)",
                     dep.name
+                ),
+            });
+            continue;
+        }
+        // Declared, but no declaration's requirement accepts the patched
+        // version: cargo resolves each to another version, so a pin cannot
+        // reach the locked one (the TS twin's requirement-coverage refusal).
+        if toml_plans.is_empty() && !excluded.is_empty() {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_cargo_toml_dep_unrewritable".into(),
+                detail: cargo_requirement_excludes_detail(
+                    &dep.name,
+                    &dep.version,
+                    &excluded,
+                    cargo_lock.as_deref(),
                 ),
             });
             continue;
@@ -1117,6 +1134,37 @@ fn cargo_not_declared_detail(
              (nothing rewritten)"
         )
     }
+}
+
+/// The refusal for a crate every declaration of which requires another
+/// version (`excluded`: each declaring manifest and its requirement).
+fn cargo_requirement_excludes_detail(
+    crate_name: &str,
+    version: &str,
+    excluded: &[(String, String)],
+    lock: Option<&str>,
+) -> String {
+    let declared = excluded
+        .iter()
+        .map(|(path, req)| format!("\"{req}\" in {path}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let head = format!("[[package]]\nname = \"{crate_name}\"\nversion = \"{version}\"\n");
+    let locked = lock.is_some_and(|lock| {
+        lock.match_indices(head.as_str())
+            .any(|(at, _)| at == 0 || lock.as_bytes()[at - 1] == b'\n')
+    });
+    let remedy = if locked {
+        "; Cargo.lock resolves it for another package, which a pin cannot reach — patch it \
+         with `socket-patch scan --mode vendored`"
+    } else {
+        ""
+    };
+    format!(
+        "{crate_name} is declared as {declared}, which {version} does not satisfy (cargo \
+         resolves that declaration to another version){remedy}; dependency skipped (nothing \
+         rewritten)"
+    )
 }
 
 /// The `[package] name` a manifest declares (`None` for a virtual workspace
@@ -1501,6 +1549,10 @@ struct CargoTomlPlan {
     /// This manifest's `[workspace.dependencies]` verdicts, per key — what
     /// its members' `workspace = true` inheritors resolve against.
     workspace: BTreeMap<String, CargoWorkspaceEntry>,
+    /// The requirements of this manifest's declarations of the crate that
+    /// do NOT accept the patched version (cargo resolves each to another
+    /// version).
+    excluded: Vec<String>,
 }
 
 /// How one occurrence of the dep will be handled.
@@ -1665,6 +1717,7 @@ fn plan_cargo_toml(
     // entry lands (or already carries) the pin — satisfies `workspace =
     // true` inheritors of the same key — or names another version.
     let mut ws_entries: BTreeMap<String, CargoWorkspaceEntry> = BTreeMap::new();
+    let mut excluded: Vec<String> = Vec::new();
 
     let mut section = CargoTomlSection::Other;
     for (idx, raw) in lines.iter().enumerate() {
@@ -1728,13 +1781,14 @@ fn plan_cargo_toml(
                         })
                     })
                 };
+                let req = find_value("version").map(|(_, v)| v);
                 let selects = if has("workspace") {
                     CargoReqMatch::Ours
                 } else {
-                    let req = find_value("version").map(|(_, v)| v);
                     cargo_req_selects(req.as_deref(), version, other_versions)
                 };
                 if selects == CargoReqMatch::NotOurs {
+                    excluded.extend(req);
                     if ws {
                         ws_entries.insert(key.clone(), CargoWorkspaceEntry::OtherVersion);
                     }
@@ -1851,6 +1905,7 @@ fn plan_cargo_toml(
             let req = version_val_re.captures(inner).map(|c| c[1].to_string());
             match cargo_req_selects(req.as_deref(), version, other_versions) {
                 CargoReqMatch::NotOurs => {
+                    excluded.extend(req);
                     if workspace {
                         ws_entries.insert(key.clone(), CargoWorkspaceEntry::OtherVersion);
                     }
@@ -1942,6 +1997,7 @@ fn plan_cargo_toml(
                 .as_str();
             match cargo_req_selects(Some(req), version, other_versions) {
                 CargoReqMatch::NotOurs => {
+                    excluded.push(req.to_string());
                     if workspace {
                         ws_entries.insert(key.clone(), CargoWorkspaceEntry::OtherVersion);
                     }
@@ -1985,6 +2041,7 @@ fn plan_cargo_toml(
         changed: false,
         found: false,
         workspace: ws_entries,
+        excluded: excluded.clone(),
     };
     if pending.is_empty() {
         return Ok(not_found(ws_entries));
@@ -2070,6 +2127,7 @@ fn plan_cargo_toml(
         changed,
         found: true,
         workspace: ws_entries,
+        excluded,
     })
 }
 
@@ -9233,9 +9291,10 @@ mod tests {
     }
 
     /// A declaration whose requirement excludes the patched version is not
-    /// the patched crate: nothing to pin.
+    /// the patched crate, and a pin there cannot reach the locked one: the
+    /// requirement-coverage refusal (the TS twin's code), nothing written.
     #[test]
-    fn cargo_requirement_excluding_the_patched_version_is_not_found() {
+    fn cargo_requirement_excluding_the_patched_version_is_unrewritable() {
         let mut files = BTreeMap::new();
         files.insert(
             "Cargo.toml".to_string(),
@@ -9244,7 +9303,16 @@ mod tests {
         );
         let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
         assert!(r.files.is_empty(), "{:?}", r.files);
-        assert_eq!(warning_codes(&r), vec!["redirect_cargo_toml_dep_not_found"]);
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_toml_dep_unrewritable"]
+        );
+        assert!(
+            r.warnings[0].detail.contains("\"2\" in Cargo.toml"),
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.confirmed_cargo_uuids.is_empty());
     }
 
     /// A `workspace = true` inheritor of the entry that names ANOTHER

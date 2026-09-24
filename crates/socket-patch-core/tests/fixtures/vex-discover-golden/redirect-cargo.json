@@ -266,6 +266,14 @@
     "elsewhere": [],
     "live_claims": []
   },
+  "redirect/cargo/cargo/path-dependency/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
   "redirect/cargo/cargo/renamed/expected": {
     "refs": [
       {
@@ -314,6 +322,14 @@
     ]
   },
   "redirect/cargo/cargo/renamed/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/cargo/cargo/requirement-excludes-patched-version/input": {
     "refs": [],
     "diagnostics": [],
     "recognized": [],
@@ -523,6 +539,14 @@
     ]
   },
   "redirect/cargo/cargo/table-form/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/cargo/cargo/transitive-dependents-git/input": {
     "refs": [],
     "diagnostics": [],
     "recognized": [],
