@@ -10,8 +10,9 @@ use clap::Args;
 use futures_util::StreamExt;
 use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate, ApiClient,
+    ApiError,
 };
-use socket_patch_core::api::types::{BatchPackagePatches, PatchSearchResult};
+use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
 use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::read_manifest;
@@ -1867,63 +1868,98 @@ pub async fn run(mut args: ScanArgs) -> i32 {
     let mut batch_error_count = 0usize;
     let mut last_batch_error: Option<String> = None;
 
-    for (batch_idx, chunk) in all_purls.chunks(batch_size).enumerate() {
-        status.set(format!(
-            "Querying API for patches... (batch {}/{total_batches})",
-            batch_idx + 1
-        ));
-
-        let mut result = api_client.search_patches_batch(chunk).await;
-
-        // Fallback: a 401/403 against the authenticated endpoint can
-        // mean a stale/revoked token. Retry against the public proxy
-        // (free patches only) once, then continue the rest of the
-        // loop with the downgraded client. Only triggers on the
-        // first authenticated batch; subsequent iterations are
-        // already on the proxy.
-        if !use_public_proxy {
-            if let Err(ref e) = result {
-                if is_fallback_candidate(e) {
-                    // Errors-only under --silent; --json keeps it on stderr
-                    // (the envelope has no slot for a mid-run downgrade).
-                    if !args.common.silent {
-                        status.println(format!(
-                            "Warning: authenticated API returned {e}; \
-                             falling back to public patch API proxy (free patches only)."
-                        ));
-                    }
-                    api_client = build_proxy_fallback_client(&overrides);
-                    use_public_proxy = true;
-                    fallback_to_proxy = true;
-                    result = api_client.search_patches_batch(chunk).await;
+    // Fold one batch outcome, in chunk order. Every caller below consumes
+    // outcomes strictly by chunk index, so the per-batch warnings,
+    // `batch_error_count` and `last_batch_error` come out exactly as the
+    // serial loop produced them.
+    let mut fold = |batch_idx: usize,
+                    result: Result<BatchSearchResponse, ApiError>,
+                    status: &mut StatusLine<_>| match result {
+        Ok(response) => {
+            if response.can_access_paid_patches {
+                can_access_paid_patches = true;
+            }
+            for pkg in response.packages {
+                if !pkg.patches.is_empty() {
+                    all_packages_with_patches.push(pkg);
                 }
             }
         }
+        Err(e) => {
+            batch_error_count += 1;
+            last_batch_error = Some(e.to_string());
+            // Not fatal by itself: the scan goes on with the other
+            // batches. A one-batch scan says it once, below.
+            if !args.common.json && !args.common.silent && total_batches > 1 {
+                status.println(render::batch_failed_warning(
+                    batch_idx + 1,
+                    total_batches,
+                    &e.to_string(),
+                ));
+            }
+        }
+    };
 
-        match result {
-            Ok(response) => {
-                if response.can_access_paid_patches {
-                    can_access_paid_patches = true;
-                }
-                for pkg in response.packages {
-                    if !pkg.patches.is_empty() {
-                        all_packages_with_patches.push(pkg);
+    // The batches run concurrently (at most `api_concurrency` in flight)
+    // but are CONSUMED in chunk order, one window at a time:
+    //
+    // - The first chunk goes alone, so a stale token costs the
+    //   authenticated API one request before the downgrade, as it always
+    //   did.
+    // - Fallback: a 401/403 against the authenticated endpoint can mean a
+    //   stale/revoked token. At the first consumed chunk `k` whose error is
+    //   a fallback candidate (any index, not just the first), the window is
+    //   dropped — in-flight requests for chunks past `k` are cancelled and
+    //   any responses already received for them are discarded, never
+    //   folded — then chunk `k` is retried against the public proxy (free
+    //   patches only) and the rest continues on the downgraded client.
+    //   That is exactly the serial loop's sequence; on the proxy no further
+    //   fallback applies.
+    let chunks: Vec<&[String]> = all_purls.chunks(batch_size).collect();
+    let mut next = 0usize;
+    while next < total_batches {
+        let end = if next == 0 { 1 } else { total_batches };
+        let mut fallback_error = None;
+        {
+            let client = &api_client;
+            let mut results = std::pin::pin!(ordered_concurrent(
+                &chunks[next..end],
+                api_concurrency(use_public_proxy),
+                |chunk| client.search_patches_batch(chunk),
+            ));
+            while next < end {
+                status.set(format!(
+                    "Querying API for patches... (batch {}/{total_batches})",
+                    next + 1
+                ));
+                let Some(result) = results.next().await else {
+                    break;
+                };
+                match result {
+                    Err(e) if !use_public_proxy && is_fallback_candidate(&e) => {
+                        fallback_error = Some(e);
+                        break;
                     }
+                    result => fold(next, result, &mut status),
                 }
+                next += 1;
             }
-            Err(e) => {
-                batch_error_count += 1;
-                last_batch_error = Some(e.to_string());
-                // Not fatal by itself: the scan goes on with the other
-                // batches. A one-batch scan says it once, below.
-                if !args.common.json && !args.common.silent && total_batches > 1 {
-                    status.println(render::batch_failed_warning(
-                        batch_idx + 1,
-                        total_batches,
-                        &e.to_string(),
-                    ));
-                }
+        }
+        if let Some(e) = fallback_error {
+            // Errors-only under --silent; --json keeps it on stderr
+            // (the envelope has no slot for a mid-run downgrade).
+            if !args.common.silent {
+                status.println(format!(
+                    "Warning: authenticated API returned {e}; \
+                     falling back to public patch API proxy (free patches only)."
+                ));
             }
+            api_client = build_proxy_fallback_client(&overrides);
+            use_public_proxy = true;
+            fallback_to_proxy = true;
+            let result = api_client.search_patches_batch(chunks[next]).await;
+            fold(next, result, &mut status);
+            next += 1;
         }
     }
 
