@@ -43,6 +43,8 @@ pub(crate) mod pnpm;
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
+#[cfg(test)]
+mod python_lock_equivalence_tests;
 mod replay;
 mod requirements;
 #[cfg(test)]
@@ -3993,6 +3995,7 @@ struct PythonMetadataEdit {
     script: bool,
 }
 
+#[cfg(test)]
 fn plan_python_metadata(
     path: &str,
     lock: &str,
@@ -4000,9 +4003,28 @@ fn plan_python_metadata(
     dep: &DepOverride,
     result: &RewriteResult,
 ) -> Result<(Option<PythonMetadataEdit>, Option<String>), RewriteWarning> {
-    use crate::utils::python_lock::{
-        check_python_lock_source_scope, is_script_lock_name, paired_metadata_rel, ArtifactSource,
-    };
+    plan_python_metadata_with(
+        path,
+        || crate::utils::python_lock::check_python_lock_source_scope(lock, &dep.name, &dep.version),
+        files,
+        dep,
+        result,
+    )
+}
+
+/// Pair `path` with its metadata file and plan that file's rewrite.
+/// `source_scope` is the lock's [`check_python_lock_source_scope`] verdict
+/// for `dep`, asked only once the metadata file is known to be present.
+///
+/// [`check_python_lock_source_scope`]: crate::utils::python_lock::check_python_lock_source_scope
+fn plan_python_metadata_with(
+    path: &str,
+    source_scope: impl FnOnce() -> Result<(), String>,
+    files: &BTreeMap<String, String>,
+    dep: &DepOverride,
+    result: &RewriteResult,
+) -> Result<(Option<PythonMetadataEdit>, Option<String>), RewriteWarning> {
+    use crate::utils::python_lock::{is_script_lock_name, paired_metadata_rel, ArtifactSource};
     use crate::utils::python_script::{rewrite_project_metadata, rewrite_script_metadata};
 
     // A script lock always needs its script; uv.lock is edited alone in a
@@ -4034,7 +4056,7 @@ fn plan_python_metadata(
         .into(),
         detail: format!("{metadata_path}: {detail}"),
     };
-    check_python_lock_source_scope(lock, &dep.name, &dep.version).map_err(unsupported)?;
+    source_scope().map_err(unsupported)?;
     let rewritten = if script {
         rewrite_script_metadata(
             &original,
@@ -4091,15 +4113,19 @@ fn record_python_metadata_edit(
     result.files.insert(edit.path, edit.rewritten);
 }
 
+/// Each lock is parsed once ([`PythonLockSession`]) and every dep is
+/// planned, refused or applied against that one document. The lock is still
+/// rendered after every rewritten dep: each dep's FileEdit fragments are
+/// diffed against the text the previous deps left.
+///
+/// [`PythonLockSession`]: crate::utils::python_lock::PythonLockSession
 fn rewrite_uv_lock(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     python_metadata: &BTreeMap<String, String>,
     result: &mut RewriteResult,
 ) {
-    use crate::utils::python_lock::{
-        complete_python_lock_metadata, is_python_lock_name, rewrite_python_lock, ArtifactSource,
-    };
+    use crate::utils::python_lock::{is_python_lock_name, ArtifactSource, PythonLockSession};
 
     let locks: Vec<(&String, &String)> = files
         .iter()
@@ -4124,15 +4150,11 @@ fn rewrite_uv_lock(
     }
     for (path, original) in locks {
         let mut content = original.clone();
+        let mut session = PythonLockSession::new(original);
         for &(dep, sha256) in &usable {
-            let rewritten = match rewrite_python_lock(
-                &content,
-                &dep.name,
-                &dep.version,
-                ArtifactSource::Url(&dep.artifact_url),
-                sha256,
-            ) {
-                Ok(Some(rewritten)) => rewritten,
+            let artifact = ArtifactSource::Url(&dep.artifact_url);
+            let plan = match session.plan(&content, &dep.name, &dep.version, artifact) {
+                Ok(Some(plan)) => plan,
                 Ok(None) => {
                     result.warnings.push(RewriteWarning {
                         code: "redirect_uv_entry_not_found".into(),
@@ -4151,23 +4173,30 @@ fn rewrite_uv_lock(
                     continue;
                 }
             };
-            let (metadata_edit, project) =
-                match plan_python_metadata(path, &content, files, dep, result) {
-                    Ok(plan) => plan,
-                    Err(warning) => {
-                        result
-                            .refused_python_lock_uuids
-                            .insert(dep.patch_uuid.clone());
-                        result.warnings.push(warning);
-                        continue;
-                    }
-                };
-            let rewritten = match complete_python_lock_metadata(
-                &rewritten,
-                project.as_deref(),
+            let (metadata_edit, project) = match plan_python_metadata_with(
+                path,
+                || session.source_scope(&dep.name, &dep.version),
+                files,
+                dep,
+                result,
+            ) {
+                Ok(plan) => plan,
+                Err(warning) => {
+                    result
+                        .refused_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
+                    result.warnings.push(warning);
+                    continue;
+                }
+            };
+            let rewritten = match session.rewrite(
+                &content,
+                plan,
                 &dep.name,
                 &dep.version,
-                ArtifactSource::Url(&dep.artifact_url),
+                artifact,
+                sha256,
+                project.as_deref(),
                 python_metadata.get(&dep.artifact_url).map(String::as_str),
             ) {
                 Ok(rewritten) => rewritten,
