@@ -21,6 +21,7 @@ sha1 = "=0.10.6"
 hex = "=0.4.3"
 reqwest = { version = "=0.12.28", features = ["rustls-tls", "json"], default-features = false }
 tokio = { version = "=1.50.0", features = ["full"] }
+futures-util = { version = "=0.3.32", default-features = false, features = ["std"] }
 thiserror = "=2.0.18"
 walkdir = "=2.5.0"
 uuid = { version = "=1.21.0", features = ["v4"] }

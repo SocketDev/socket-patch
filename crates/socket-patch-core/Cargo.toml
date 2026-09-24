@@ -15,6 +15,7 @@ sha1 = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
+futures-util = { workspace = true }
 thiserror = { workspace = true }
 walkdir = { workspace = true }
 uuid = { workspace = true }

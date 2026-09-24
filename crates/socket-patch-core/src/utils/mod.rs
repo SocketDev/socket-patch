@@ -1,4 +1,5 @@
 pub mod cargo_workspace;
+pub mod concurrent;
 pub(crate) mod digest;
 pub mod env_compat;
 pub mod fs;
