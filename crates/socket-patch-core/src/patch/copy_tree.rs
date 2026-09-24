@@ -318,6 +318,68 @@ mod tests {
         assert_eq!(tree_snapshot(&d), tree_snapshot(&reference));
     }
 
+    /// A skip-named directory holding only plain files: nothing the walk
+    /// yields creates it, so each file must create it on demand, whatever
+    /// the readdir order.
+    #[test]
+    fn skipped_name_directory_with_only_files_is_created_on_demand() {
+        let src = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        fs::create_dir_all(src.path().join("c").join(SKIP)).unwrap();
+        for i in 0..8 {
+            fs::write(
+                src.path().join("c").join(SKIP).join(format!("f{i}.txt")),
+                [i],
+            )
+            .unwrap();
+        }
+        let d = out.path().join("copy");
+        copy_tree_blocking(src.path(), &d, Some(SKIP)).unwrap();
+        for i in 0..8u8 {
+            assert_eq!(
+                fs::read(d.join("c").join(SKIP).join(format!("f{i}.txt"))).unwrap(),
+                [i]
+            );
+        }
+        let reference = out.path().join("reference");
+        copy_tree_blocking_reference(src.path(), &reference, Some(SKIP)).unwrap();
+        assert_eq!(tree_snapshot(&d), tree_snapshot(&reference));
+    }
+
+    /// A skip-named directory nested in another keeps the OUTER depth: were
+    /// the inner one to take over, leaving it (at a sibling file of the
+    /// outer's contents) would end the on-demand parent creation while
+    /// still inside the outer. Many small trees with different sibling
+    /// names, so some readdir order yields the inner directory first.
+    #[test]
+    fn nested_skipped_name_directory_keeps_the_outer_depth() {
+        let out = tempfile::tempdir().unwrap();
+        for variant in 0..64 {
+            let files = 1 + variant % 3;
+            let src = tempfile::tempdir().unwrap();
+            let outer = src.path().join(SKIP);
+            fs::create_dir_all(outer.join(SKIP)).unwrap();
+            for i in 0..files {
+                fs::write(outer.join(format!("v{variant}-{i}")), format!("{i}")).unwrap();
+            }
+            let (want, got) = (out.path().join("want"), out.path().join("got"));
+            let want_result = copy_tree_blocking_reference(src.path(), &want, Some(SKIP));
+            let got_result = copy_tree_blocking(src.path(), &got, Some(SKIP));
+            assert_eq!(
+                got_result.as_ref().map_err(|e| e.kind()),
+                want_result.as_ref().map_err(|e| e.kind()),
+                "variant {variant}: result"
+            );
+            assert!(want_result.is_ok(), "variant {variant}");
+            assert_eq!(
+                tree_snapshot(&got),
+                tree_snapshot(&want),
+                "variant {variant}"
+            );
+            assert_eq!(fs::read_dir(got.join(SKIP)).unwrap().count(), files);
+        }
+    }
+
     #[tokio::test]
     async fn copies_nested_and_empty_dirs() {
         let src = tempfile::tempdir().unwrap();
