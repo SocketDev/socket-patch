@@ -658,9 +658,10 @@ async fn materialise_and_write(
 }
 
 /// Local rebuild: locate the cached pristine `<a>-<v>.jar` in `installed_dir`,
-/// extract it to a private stage, force-apply the patch, and re-zip
-/// deterministically. Returns `(bytes, ApplyResult)`; a failure surfaces as an
-/// un-successful `ApplyResult`, or a refusal to bubble.
+/// read it for a private stage — only the paths the apply pipeline resolves
+/// are materialised there, see [`stage_local_jar`] — force-apply the patch,
+/// and re-zip deterministically. Returns `(bytes, ApplyResult)`; a failure
+/// surfaces as an un-successful `ApplyResult`, or a refusal to bubble.
 #[allow(clippy::too_many_arguments)]
 async fn local_rebuild_jar(
     purl: &str,

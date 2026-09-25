@@ -835,12 +835,14 @@ async fn materialise_patched_nupkg(
     }
 }
 
-/// Local rebuild: locate the cached pristine `.nupkg` in `installed_dir`,
-/// extract it to a private stage, force-apply the patch, and re-zip
-/// deterministically. The `.signature.p7s` part is dropped (see the module
-/// doc). Returns `(bytes, ApplyResult)`; a failure surfaces as an un-successful
-/// `ApplyResult` (partial uuid dir cleaned up — unless `config_wired`, see
-/// [`materialise_patched_nupkg`]), or a refusal to bubble.
+/// Local rebuild: locate the cached pristine `.nupkg` in `installed_dir`, read
+/// it for a private stage — only the paths the apply pipeline and the sidecar
+/// fixup resolve are materialised there, see [`prepare_memory_repack`] —
+/// force-apply the patch, and re-zip deterministically. The `.signature.p7s`
+/// part is dropped (see the module doc). Returns `(bytes, ApplyResult)`; a
+/// failure surfaces as an un-successful `ApplyResult` (partial uuid dir cleaned
+/// up — unless `config_wired`, see [`materialise_patched_nupkg`]), or a refusal
+/// to bubble.
 #[allow(clippy::too_many_arguments)]
 async fn local_rebuild(
     purl: &str,
