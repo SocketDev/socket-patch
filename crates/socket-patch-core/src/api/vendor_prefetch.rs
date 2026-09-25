@@ -32,8 +32,9 @@
 //! The plan is built from the gates the CLI can see, so a package each
 //! backend refuses in its own pre-flight (an unsupported lockfile entry,
 //! an override conflict) can still be planned, and the loop then never
-//! asks for it. That is a real request against the service, so the task
-//! is bounded in requests, not just in time:
+//! asks for it. That is a real request against the service — on a
+//! depscan vendored run, 74 download grants where the serial loop made
+//! 71 — so the task is bounded in requests, not just in time:
 //!
 //! * It only ever requests plan positions in `[at, at + reach)`, where
 //!   `at` is the position the loop has reached and `reach` is one until
@@ -686,6 +687,40 @@ mod tests {
             .filter(|r| r.starts_with("POST"))
             .count();
         assert!(posts <= window, "{posts} grants for one consumed package");
+    }
+
+    /// What a package the loop refuses before the service costs, pinned:
+    /// the loop consults the plan at position 0 and then again at 5, so
+    /// the task may request `[0, 1)`, then `[0, window)` once the service
+    /// has answered, then `[5, 5 + window)` — four grants for a plan of
+    /// seven, and never a retry ladder for a passed-over one. Without a
+    /// bound it would work through the whole plan.
+    #[tokio::test]
+    async fn a_package_the_loop_refuses_costs_at_most_one_grant() {
+        let window = 2;
+        let scripts: Vec<Script> = (0..7).map(|_| Script::Granted(0)).collect();
+        let server = serve(&scripts).await;
+        let c = client(&server.uri());
+        let plain = client(&server.uri());
+        let _guard =
+            c.prefetch_vendor_packages((0..7).map(uuid).collect(), false, None, None, window);
+        for i in [0, 5] {
+            assert_eq!(
+                summary(&c.fetch_vendor_package(&uuid(i), false, None, None).await),
+                summary(
+                    &plain
+                        .fetch_vendor_package(&uuid(i), false, None, None)
+                        .await
+                ),
+            );
+        }
+        let posts = request_log(&server)
+            .await
+            .iter()
+            .filter(|r| r.starts_with("POST"))
+            .count();
+        // Two of them are the plain client's own comparison calls.
+        assert!(posts <= 2 + 2 * window, "{posts} grants for two packages");
     }
 
     /// A call with other request parameters than the plan's never takes a
