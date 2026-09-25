@@ -45,6 +45,7 @@
 //! the wired config pointing at nothing.)
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use base64::Engine as _;
 use serde_json::Value;
@@ -78,6 +79,7 @@ use super::common::{
     prune_empty_vendor_levels, read_zip_artifact, rebuild_zip, refused, synthesized_result,
     write_zip_entries, zip_bytes_match_after_hashes, MemoryRepack, Stage,
 };
+use super::parse_memo::ParseMemo;
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
 use super::service_fetch::{service_archive_copy, ServiceCopy};
@@ -386,6 +388,7 @@ pub async fn vendor_nuget(
                 let new_hash = content_hash(&bytes);
                 match edit_lock(text, name, &version_norm, &new_hash) {
                     Ok(Some(edit)) => {
+                        LOCK_VALUE_MEMO.invalidate();
                         if let Err(e) =
                             atomic_write_bytes_preserving_mode(&lock_path, edit.text.as_bytes())
                                 .await
@@ -511,6 +514,7 @@ pub async fn vendor_nuget(
     if let Some(text) = &lock_text {
         match edit_lock(text, name, &version_norm, &new_hash) {
             Ok(Some(edit)) => {
+                LOCK_VALUE_MEMO.invalidate();
                 if let Err(e) =
                     atomic_write_bytes_preserving_mode(&lock_path, edit.text.as_bytes()).await
                 {
@@ -1418,6 +1422,19 @@ struct LockEdit {
 }
 
 /// Rewrite `contentHash` to `new_hash` for every framework entry of `id`
+/// The run's `packages.lock.json` parse. Each patched package asks the lock
+/// the same two questions — is it already pinned at our bytes, and what
+/// does it pin today — and an idempotent re-run asks them of bytes nothing
+/// has changed; see [`ParseMemo`]. Both readers below are pure functions of
+/// the text (the rewrite itself is string surgery on the old hash value).
+static LOCK_VALUE_MEMO: ParseMemo<Value> = ParseMemo::new();
+
+/// [`PACKAGES_LOCK`] as JSON, reusing the run's parse while `text` is the
+/// text it came from.
+fn lock_value(text: &str) -> Result<Arc<Value>, serde_json::Error> {
+    LOCK_VALUE_MEMO.parse(text.as_bytes(), || serde_json::from_str::<Value>(text))
+}
+
 /// (case-insensitive) whose `resolved` equals `version_norm`. Returns
 /// `Ok(Some(edit))` when a rewrite happened, `Ok(None)` when the lock has no
 /// matching resolved entry (nothing to pin), `Err` on parse failure.
@@ -1431,8 +1448,7 @@ fn edit_lock(
     version_norm: &str,
     new_hash: &str,
 ) -> Result<Option<LockEdit>, String> {
-    let value: Value =
-        serde_json::from_str(text).map_err(|e| format!("unparseable {PACKAGES_LOCK}: {e}"))?;
+    let value = lock_value(text).map_err(|e| format!("unparseable {PACKAGES_LOCK}: {e}"))?;
     // Collect the original hash of every matching (framework, id) entry.
     let mut old_hash: Option<String> = None;
     for h in locked_at(&value, id, version_norm).filter_map(|e| e.content_hash) {
@@ -1471,7 +1487,7 @@ fn edit_lock(
 /// True when the lock already pins `id` at `expected_hash` for the matching
 /// resolved version (the hot-path in-sync check).
 fn lock_pinned(text: &str, id: &str, version_norm: &str, expected_hash: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<Value>(text) else {
+    let Ok(value) = lock_value(text) else {
         return false;
     };
     let mut matched = false;
@@ -1513,6 +1529,7 @@ async fn revert_lock_record(
         return Ok(true);
     }
     let restored = text.replace(&ours_q, &format!("\"{orig}\""));
+    LOCK_VALUE_MEMO.invalidate();
     atomic_write_bytes_preserving_mode(lock_path, restored.as_bytes())
         .await
         .map_err(|e| format!("failed to restore {}: {e}", lock_path.display()))?;
