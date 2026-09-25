@@ -1377,14 +1377,30 @@ pub(crate) async fn vendor_records(
                 // real remedy. The backend keeps its own refusal as the
                 // backstop for every other route into it.
                 //
-                // Scoped to the purls a fetch would actually be attempted
-                // for (what `fetch_pristine_package` resolves from the
-                // lockfile or the ledger): a gem that resolves from nowhere
-                // has nothing to say about gemspecs and keeps the calm
-                // `package_not_installed` skip below.
+                // Scoped to the purls a DOWNLOAD would actually happen for,
+                // since a wasted download is the whole point — mirroring
+                // `fetch_pristine_package`'s own `fetchable` filter:
+                //
+                //  * a gem the lock cannot VERIFY (no `CHECKSUMS` section —
+                //    every bundler < 2.6 lock) is never fetched at all
+                //    (`registry_fetch::fetch_and_stage` refuses a
+                //    `LockIntegrity::None` entry before any network I/O), so
+                //    it keeps its documented `vendor_fetch_unverifiable`
+                //    warning + calm `package_not_installed` skip — all the
+                //    more so because the remedy below cannot help it: the
+                //    purl never reaches the gem backend in ANY mode.
+                //  * a gem the ledger already holds is the already-vendored
+                //    fresh-clone case the ladder exists for: its committed
+                //    copy is re-confirmed by the backend's idempotent hot
+                //    path, which needs no stub gemspec of its own, and the
+                //    run is green. Never refuse it.
+                //  * a gem that resolves from nowhere has nothing to say
+                //    about gemspecs and keeps the calm skip below.
                 if purl.starts_with("pkg:gem/")
                     && !service.is_some_and(VendorServiceConfig::service_enabled)
-                    && (lock_inventory::lookup(inv, purl).is_some() || ledger_entry.is_some())
+                    && ledger_entry.is_none()
+                    && lock_inventory::lookup(inv, purl)
+                        .is_some_and(|e| e.integrity != lock_inventory::LockIntegrity::None)
                 {
                     fetch_failed.insert(purl.clone());
                     let detail = format!(

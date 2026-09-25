@@ -121,6 +121,31 @@ fn write_fixture(root: &Path, remote: &str, gem_sha256: &str) {
     std::fs::write(socket.join("blobs").join(git_sha256(PATCHED)), PATCHED).unwrap();
 }
 
+/// Install the gem the way a `bundle install --path vendor/bundle`
+/// deployment does: the unpacked gem under `vendor/bundle/gems/<leaf>/` and
+/// the eval-able stub rubygems writes beside it in
+/// `vendor/bundle/specifications/<leaf>.gemspec` (with the `summary` +
+/// `authors` rubygems requires, which the local-build write choke point
+/// re-validates).
+fn install_gem(root: &Path) {
+    let leaf = format!("{NAME}-{VERSION}");
+    let bundle = root.join("vendor").join("bundle");
+    let gem_dir = bundle.join("gems").join(&leaf);
+    std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+    std::fs::write(gem_dir.join(LIB), PRISTINE).unwrap();
+    let specs = bundle.join("specifications");
+    std::fs::create_dir_all(&specs).unwrap();
+    std::fs::write(
+        specs.join(format!("{leaf}.gemspec")),
+        format!(
+            "Gem::Specification.new do |s|\n  s.name = \"{NAME}\"\n  \
+             s.version = \"{VERSION}\"\n  s.summary = \"a synthetic fixture gem\"\n  \
+             s.authors = [\"Socket\"]\n  s.require_paths = [\"lib\"]\nend\n"
+        ),
+    )
+    .unwrap();
+}
+
 async fn mount_gem_download(mock: &MockServer, gem: Vec<u8>) {
     Mock::given(method("GET"))
         .and(wm_path(format!("/downloads/{NAME}-{VERSION}.gem")))
@@ -272,4 +297,138 @@ async fn a_gem_that_resolves_from_nowhere_still_reports_not_installed() {
         .unwrap_or_else(|| panic!("expected an event for {PURL} in:\n{v:#}"));
     assert_eq!(event["action"], "skipped", "{v:#}");
     assert_eq!(event["errorCode"], "package_not_installed", "{v:#}");
+}
+
+// ── scope guards ────────────────────────────────────────────────────────
+//
+// The refusal must fire ONLY where the wasted download it replaces would
+// really have happened: a gem the lock resolves WITH a verifier, and that
+// the run is not already vendoring from its committed artifact. Two cases
+// where a fetch never happens on `main` must keep `main`'s outcome.
+
+/// A bundler < 2.6 `Gemfile.lock` (no `CHECKSUMS` section — the majority of
+/// real locks) resolves the gem but cannot VERIFY it, and
+/// `registry_fetch::fetch_and_stage` refuses such an entry before any
+/// network I/O. CLI_CONTRACT: "Entries the lock cannot verify are NEVER
+/// fetched (`vendor_fetch_unverifiable` warning + the calm
+/// `package_not_installed` skip)". There is no download to save here, so
+/// the gemspec refusal must not replace that documented pair — all the more
+/// so because its remedy (`--vendor-source=auto`) cannot work either: the
+/// purl never reaches the gem backend in any mode.
+#[tokio::test]
+async fn an_unverifiable_lock_entry_keeps_the_documented_skip_pair() {
+    let mock = MockServer::start().await;
+    mount_gem_download(&mock, make_gem()).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path(), &mock.uri(), &"0".repeat(64));
+    // Re-write the lock the way bundler < 2.6 does: no CHECKSUMS section.
+    std::fs::write(
+        tmp.path().join("Gemfile.lock"),
+        format!(
+            "GEM\n  remote: {}\n  specs:\n    {NAME} ({VERSION})\n\n\
+             PLATFORMS\n  ruby\n\n\
+             DEPENDENCIES\n  {NAME}\n\n\
+             BUNDLED WITH\n   2.4.10\n",
+            mock.uri()
+        ),
+    )
+    .unwrap();
+
+    let (code, v, stderr) = run_vendor(tmp.path(), "build", &dead_endpoint());
+
+    assert_eq!(code, 1, "{v:#}\n{stderr}");
+    assert!(
+        mock.received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "an unverifiable entry is never fetched: {v:#}"
+    );
+    let codes: Vec<(&str, &str)> = v["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["purl"] == PURL)
+        .map(|e| {
+            (
+                e["action"].as_str().unwrap_or_default(),
+                e["errorCode"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            ("skipped", "vendor_fetch_unverifiable"),
+            ("skipped", "package_not_installed"),
+        ],
+        "an unverifiable lock entry keeps its documented warning + calm \
+         skip, not a gemspec refusal: {v:#}"
+    );
+}
+
+/// An ALREADY-VENDORED gem on a fresh clone (the committed
+/// `.socket/vendor/gem/<uuid>` copy is the dependency; no installed gem,
+/// because `bundle install` has not run yet) must re-scan green in build
+/// mode: the gem backend's idempotent hot path re-confirms the wired lock
+/// and returns `already_vendored` without ever needing a stub gemspec of
+/// its own. `fetch_pristine_package` exists precisely for this case — its
+/// ledger-recovery rung is commented "an already-vendored lock-only
+/// checkout re-scans green".
+#[tokio::test]
+async fn an_already_vendored_gem_re_runs_green_on_a_fresh_clone() {
+    let mock = MockServer::start().await;
+    let gem = make_gem();
+    let sha = hex::encode(Sha256::digest(&gem));
+    mount_gem_download(&mock, gem).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_fixture(root, &mock.uri(), &sha);
+    install_gem(root);
+
+    // Run 1: the gem is installed, so the local build vendors it.
+    let (code, v, stderr) = run_vendor(root, "build", &dead_endpoint());
+    assert_eq!(
+        code, 0,
+        "run 1 must vendor the installed gem: {v:#}\n{stderr}"
+    );
+    assert!(
+        root.join(format!(".socket/vendor/gem/{UUID}")).is_dir(),
+        "run 1 must commit the vendored copy: {v:#}"
+    );
+
+    // Fresh clone: the committed artifact and the wired lock are checked
+    // in, the installed gem is not.
+    std::fs::remove_dir_all(root.join("vendor")).unwrap();
+
+    let (code, v, stderr) = run_vendor(root, "build", &dead_endpoint());
+
+    assert_eq!(
+        code, 0,
+        "an in-sync re-run of an already-vendored gem is green: {v:#}\n{stderr}"
+    );
+    assert_eq!(v["status"], "success", "{v:#}\n{stderr}");
+    let codes: Vec<(&str, &str)> = v["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["purl"] == PURL)
+        .map(|e| {
+            (
+                e["action"].as_str().unwrap_or_default(),
+                e["errorCode"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            ("skipped", "vendor_fetched_missing"),
+            ("skipped", "already_vendored"),
+        ],
+        "the ledger-recovered fetch re-confirms the committed copy and the \
+         hot path reports it in sync: {v:#}"
+    );
 }
