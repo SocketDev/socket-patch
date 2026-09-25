@@ -757,7 +757,12 @@ pub enum Recovery {
 /// What a set-aside replay did to the files the journal covers.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SetAsideOutcome {
-    /// Nothing was written.
+    /// Nothing was written: the journal is unreadable, or names a path it
+    /// must never write (outside the lockfiles and ledgers, or through a
+    /// symbolic link).
+    Refused,
+    /// Nothing was written: a file changed since the crash, and its edit
+    /// does not say which side of the commit it was made on.
     LeftAsIs,
     /// Every file changed since the crash still carries the commit's own
     /// edit, so the rest of the commit was finished around them (the ledger
@@ -885,10 +890,10 @@ pub fn recover(project_root: &Path) -> std::io::Result<Recovery> {
         })
     };
     let Ok(journal) = serde_json::from_slice::<Journal>(&raw) else {
-        return set_aside(SetAsideOutcome::LeftAsIs);
+        return set_aside(SetAsideOutcome::Refused);
     };
     if journal.version != JOURNAL_VERSION {
-        return set_aside(SetAsideOutcome::LeftAsIs);
+        return set_aside(SetAsideOutcome::Refused);
     }
     let decode = |b64: &Option<String>| -> Result<Option<Vec<u8>>, ()> {
         match b64 {
@@ -906,10 +911,10 @@ pub fn recover(project_root: &Path) -> std::io::Result<Recovery> {
             || !is_captured(rel)
             || crosses_symlink(project_root, rel)?
         {
-            return set_aside(SetAsideOutcome::LeftAsIs);
+            return set_aside(SetAsideOutcome::Refused);
         }
         let (Ok(after), Ok(original)) = (decode(&file.after), decode(&file.original)) else {
-            return set_aside(SetAsideOutcome::LeftAsIs);
+            return set_aside(SetAsideOutcome::Refused);
         };
         // A recorded original must be the bytes the hash names.
         if original
@@ -917,7 +922,7 @@ pub fn recover(project_root: &Path) -> std::io::Result<Recovery> {
             .map(sha256_hex)
             .is_some_and(|h| Some(h) != file.before)
         {
-            return set_aside(SetAsideOutcome::LeftAsIs);
+            return set_aside(SetAsideOutcome::Refused);
         }
         let path = project_root.join(rel);
         let current = match super::fs::read_regular_to_bytes_sync(&path) {
@@ -1239,7 +1244,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 set_aside_outcome(recover(root).unwrap()),
-                SetAsideOutcome::LeftAsIs,
+                SetAsideOutcome::Refused,
                 "{bad}"
             );
         }
@@ -1356,7 +1361,7 @@ mod tests {
             write_journal(&root, &changes);
             assert_eq!(
                 set_aside_outcome(recover(&root).unwrap()),
-                SetAsideOutcome::LeftAsIs,
+                SetAsideOutcome::Refused,
                 "{rel}"
             );
             assert!(!outside.join("pwned.txt").exists(), "{rel}");

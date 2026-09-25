@@ -236,6 +236,11 @@ fn recover_group_commit(socket_dir: &Path) -> Result<(), LockError> {
     match recover(project_root) {
         Ok(Recovery::SetAside { journal, outcome }) => {
             let done = match outcome {
+                SetAsideOutcome::Refused => {
+                    "nothing of it was applied (it is unreadable, or names a path it must \
+                     not write)"
+                        .to_string()
+                }
                 SetAsideOutcome::LeftAsIs => {
                     "nothing of it was applied (a file it covers changed since)".to_string()
                 }
