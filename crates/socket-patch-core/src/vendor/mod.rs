@@ -426,6 +426,12 @@ pub async fn harvest_artifact_blobs(
     harvest_artifact_blobs_from(project_root, &state.entries, manifest_patches).await
 }
 
+/// Hard cap on a committed artifact's own bytes, and on any one member
+/// harvested out of it. Shared by [`harvest_artifact_blobs_from`] and the
+/// zip reader it hands the work to.
+const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// [`harvest_artifact_blobs`] over an already-loaded ledger (`entries`),
 /// for callers that hold the run's single `load_state` result.
 pub async fn harvest_artifact_blobs_from(
@@ -434,9 +440,6 @@ pub async fn harvest_artifact_blobs_from(
     manifest_patches: &HashMap<String, PatchRecord>,
 ) -> HashMap<String, Vec<u8>> {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-
-    const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
-    const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
     let mut out: HashMap<String, Vec<u8>> = HashMap::new();
     if entries.is_empty() {
@@ -510,42 +513,22 @@ pub async fn harvest_artifact_blobs_from(
             {
                 continue;
             }
-            let Ok(bytes) = tokio::fs::read(&artifact).await else {
-                continue;
-            };
-            let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
-                continue;
-            };
-            for i in 0..archive.len() {
-                use std::io::Read as _;
-                let Ok(mut file) = archive.by_index(i) else {
-                    continue;
-                };
-                if file.is_dir() || file.size() > MAX_FILE_BYTES {
-                    continue;
-                }
-                // SECURITY: `file.size()` above is only the archive-DECLARED
-                // uncompressed size; the entry reader is bounded solely by the
-                // COMPRESSED size, so a zip bomb can declare a tiny size (past
-                // the gate) yet decompress far beyond the cap. Bound the
-                // decompressed read itself and drop any entry that overflows,
-                // before its bytes are all in memory.
-                let mut content = Vec::with_capacity(file.size() as usize);
-                if file
-                    .by_ref()
-                    .take(MAX_FILE_BYTES + 1)
-                    .read_to_end(&mut content)
-                    .is_err()
-                {
-                    continue;
-                }
-                if content.len() as u64 > MAX_FILE_BYTES {
-                    continue;
-                }
-                let h = compute_git_sha256_from_bytes(&content);
-                if needed.contains(h.as_str()) {
-                    out.insert(h, content);
-                }
+            // The record's own keys name the members carrying the
+            // afterHashes, so the reader below can seek straight to them.
+            let wanted: Vec<(String, String)> = record
+                .files
+                .iter()
+                .filter(|(_, info)| needed.contains(info.after_hash.as_str()))
+                .map(|(file_name, info)| (file_name.clone(), info.after_hash.clone()))
+                .collect();
+            let zip_path = artifact.clone();
+            // Read + inflate are synchronous: run them off the async thread
+            // like the tarball branch above, so a large committed artifact
+            // never stalls the runtime.
+            let read =
+                tokio::task::spawn_blocking(move || harvest_zip_blobs(&zip_path, &wanted)).await;
+            if let Ok(found) = read {
+                out.extend(found);
             }
             continue;
         }
@@ -580,6 +563,111 @@ pub async fn harvest_artifact_blobs_from(
                     }
                 }
             }
+        }
+    }
+    out
+}
+
+/// One zip-shaped committed artifact's contribution to the harvest: the
+/// blobs whose git-sha256 is one of the `(record key, afterHash)` pairs in
+/// `wanted`. Synchronous — the caller runs it on the blocking pool.
+///
+/// A zip is addressable by member name and `wanted`'s keys ARE the member
+/// names (modulo the `package/` prefix a manifest key may carry), so the
+/// common case costs one seek and one inflate per needed hash instead of
+/// inflating the whole archive. Everything the name lookup does not settle —
+/// a member renamed since the patch was exported, a duplicate name, an
+/// entry the caps reject — falls back to the exhaustive index scan the
+/// harvest always did, which is what keeps the result identical to reading
+/// every entry: the name path only ever admits an entry whose hash IS one of
+/// the wanted ones, and the scan then supplies every hash still outstanding.
+fn harvest_zip_blobs(path: &Path, wanted: &[(String, String)]) -> HashMap<String, Vec<u8>> {
+    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+    /// The entry's bytes, or `None` when either cap rejects it.
+    ///
+    /// SECURITY: `size` is only the archive-DECLARED uncompressed size; the
+    /// entry reader is bounded solely by the COMPRESSED size, so a zip bomb
+    /// can declare a tiny size (past the gate) yet decompress far beyond the
+    /// cap. Bound the decompressed read itself and drop any entry that
+    /// overflows, before its bytes are all in memory.
+    fn capped(size: u64, entry: &mut impl std::io::Read) -> Option<Vec<u8>> {
+        use std::io::Read as _;
+
+        if size > MAX_FILE_BYTES {
+            return None;
+        }
+        let mut content = Vec::with_capacity(size as usize);
+        entry
+            .by_ref()
+            .take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut content)
+            .ok()?;
+        (content.len() as u64 <= MAX_FILE_BYTES).then_some(content)
+    }
+
+    let mut out: HashMap<String, Vec<u8>> = HashMap::new();
+    // The caller's metadata gate already refused a non-regular path; the
+    // guarded opener refuses one swapped in since, so a FIFO planted between
+    // the two can never wedge the blocking pool in `open(2)`.
+    let Ok(bytes) = crate::utils::fs::read_regular_to_bytes_sync(path) else {
+        return out;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+        return out;
+    };
+
+    let mut remaining: HashSet<&str> = wanted.iter().map(|(_, hash)| hash.as_str()).collect();
+    for (file_name, hash) in wanted {
+        if !remaining.contains(hash.as_str()) {
+            continue;
+        }
+        // The same two spellings `verify_member_map` looks a member up by:
+        // the normalized key first, then the raw manifest key.
+        let normalized = normalize_file_path(file_name);
+        let names = [normalized, file_name.as_str()];
+        for (i, name) in names.iter().enumerate() {
+            if names[..i].contains(name) {
+                continue;
+            }
+            let Ok(mut entry) = archive.by_name(name) else {
+                continue;
+            };
+            if entry.is_dir() {
+                continue;
+            }
+            let size = entry.size();
+            let Some(content) = capped(size, &mut entry) else {
+                continue;
+            };
+            let h = compute_git_sha256_from_bytes(&content);
+            if h == *hash {
+                remaining.remove(hash.as_str());
+                out.insert(h, content);
+                break;
+            }
+        }
+    }
+    if remaining.is_empty() {
+        return out;
+    }
+
+    // Fallback: the member names disagree with the record's keys (or an
+    // entry was rejected above). Scan every entry, exactly as before.
+    for i in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(i) else {
+            continue;
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        let size = entry.size();
+        let Some(content) = capped(size, &mut entry) else {
+            continue;
+        };
+        let h = compute_git_sha256_from_bytes(&content);
+        if remaining.contains(h.as_str()) {
+            out.insert(h, content);
         }
     }
     out
@@ -1296,6 +1384,99 @@ mod harvest_tests {
             mem.get(&hash).map(|b| b.as_slice()),
             Some(PATCHED),
             "an in-bounds zip entry must still yield its afterHash blob"
+        );
+    }
+
+    /// The record's key names the member the blob normally lives in, so the
+    /// harvest looks it up by name — but the archive is free to spell it
+    /// differently (a wheel repacked under a renamed member, a `.nupkg`
+    /// whose OPC path was rewritten). The blob is keyed by HASH, not by
+    /// name, so a name miss must fall back to the exhaustive scan and still
+    /// find it.
+    #[tokio::test]
+    async fn renamed_zip_member_still_yields_its_after_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:pypi/lib@1.0.0";
+        let rel = format!(".socket/vendor/pypi/{UUID}/lib-1.0.0-py3-none-any.whl");
+        // Member name ≠ the record key below.
+        write_zip(&tmp.path().join(&rel), "lib/renamed.py", PATCHED);
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "lib/__init__.py", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        let hash = compute_git_sha256_from_bytes(PATCHED);
+        assert_eq!(
+            mem.get(&hash).map(|b| b.as_slice()),
+            Some(PATCHED),
+            "a member the record's key does not name must still be harvested"
+        );
+    }
+
+    /// A manifest key may carry the npm `package/` prefix while the archive
+    /// spells the member without it — the same two spellings the member-map
+    /// verify accepts. The name lookup must try both before falling back.
+    #[tokio::test]
+    async fn package_prefixed_key_matches_the_bare_zip_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:npm/lib@1.0.0";
+        let rel = format!(".socket/vendor/npm/{UUID}/lib-1.0.0.zip");
+        write_zip(&tmp.path().join(&rel), "index.js", PATCHED);
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, r) = record(purl, UUID, "package/index.js", PATCHED);
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        let hash = compute_git_sha256_from_bytes(PATCHED);
+        assert_eq!(
+            mem.get(&hash).map(|b| b.as_slice()),
+            Some(PATCHED),
+            "the normalized key must resolve the bare member"
+        );
+    }
+
+    /// Two record files, one whose key names its member and one whose does
+    /// not: the name path settles the first, the scan supplies the second,
+    /// and BOTH blobs land — the whole-archive scan's result.
+    #[tokio::test]
+    async fn mixed_named_and_renamed_members_yield_every_after_blob() {
+        const OTHER: &[u8] = b"module.exports = also_patched;\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let purl = "pkg:nuget/Lib@1.0.0";
+        let rel = format!(".socket/vendor/nuget/{UUID}/lib.1.0.0.nupkg");
+        let path = tmp.path().join(&rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("lib/net8.0/Lib.dll", opts).unwrap();
+        writer.write_all(PATCHED).unwrap();
+        writer.start_file("lib/net8.0/Renamed.xml", opts).unwrap();
+        writer.write_all(OTHER).unwrap();
+        std::fs::write(&path, writer.finish().unwrap().into_inner()).unwrap();
+        write_ledger(tmp.path(), purl, UUID, &rel);
+
+        let (k, mut r) = record(purl, UUID, "lib/net8.0/Lib.dll", PATCHED);
+        r.files.insert(
+            "lib/net8.0/Lib.xml".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(b"original"),
+                after_hash: compute_git_sha256_from_bytes(OTHER),
+            },
+        );
+        let patches = HashMap::from([(k, r)]);
+        let mem = harvest_artifact_blobs(tmp.path(), &patches).await;
+        assert_eq!(
+            mem.get(&compute_git_sha256_from_bytes(PATCHED))
+                .map(|b| b.as_slice()),
+            Some(PATCHED),
+            "the named member must be harvested"
+        );
+        assert_eq!(
+            mem.get(&compute_git_sha256_from_bytes(OTHER))
+                .map(|b| b.as_slice()),
+            Some(OTHER),
+            "the renamed member must be harvested by the fallback scan"
         );
     }
 
