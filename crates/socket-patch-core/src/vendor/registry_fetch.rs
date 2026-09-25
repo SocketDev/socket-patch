@@ -326,10 +326,7 @@ async fn resolve_pypi_url_by_hash(
         entry.version
     );
     let resp = client.get(&api).send().await.map_err(|e| {
-        FetchError::Failed(format!(
-            "PyPI JSON API request for {} failed: {e}",
-            entry.purl
-        ))
+        FetchError::Failed(format!("PyPI JSON API request for {} failed: {e}", entry.purl))
     })?;
     if !resp.status().is_success() {
         return Err(FetchError::Failed(format!(
@@ -339,10 +336,7 @@ async fn resolve_pypi_url_by_hash(
         )));
     }
     let body: serde_json::Value = resp.json().await.map_err(|e| {
-        FetchError::Failed(format!(
-            "PyPI JSON API response for {} is not JSON: {e}",
-            entry.purl
-        ))
+        FetchError::Failed(format!("PyPI JSON API response for {} is not JSON: {e}", entry.purl))
     })?;
     let digest_matches = |file: &serde_json::Value| {
         file.get("digests")
@@ -1940,6 +1934,7 @@ mod tests {
             .dir()
             .join("requests-2.28.0.dist-info/RECORD")
             .is_file());
+
     }
 
     /// poetry.lock records wheel hashes but no URLs: the fetcher resolves the
@@ -1949,10 +1944,7 @@ mod tests {
     async fn pypi_hash_only_entry_is_resolved_through_the_json_api() {
         let wheel = make_zip(&[
             ("requests/__init__.py", b"__version__ = '2.28.0'\n"),
-            (
-                "requests-2.28.0.dist-info/RECORD",
-                b"requests/__init__.py,sha256=abc,24\n",
-            ),
+            ("requests-2.28.0.dist-info/RECORD", b"requests/__init__.py,sha256=abc,24\n"),
         ]);
         let sha = hex::encode(Sha256::digest(&wheel));
         let mock = MockServer::start().await;
@@ -2022,10 +2014,7 @@ mod tests {
     async fn pypi_digest_set_entry_picks_the_pure_wheel_by_hash() {
         let wheel = make_zip(&[
             ("requests/__init__.py", b"__version__ = '2.28.0'\n"),
-            (
-                "requests-2.28.0.dist-info/RECORD",
-                b"requests/__init__.py,sha256=abc,24\n",
-            ),
+            ("requests-2.28.0.dist-info/RECORD", b"requests/__init__.py,sha256=abc,24\n"),
         ]);
         let wheel_sha = hex::encode(Sha256::digest(&wheel));
         let sdist_sha = "0".repeat(64);
@@ -2090,21 +2079,11 @@ mod tests {
         restore();
         let fetched = fetched.unwrap();
         assert!(fetched.dir().join("requests/__init__.py").is_file());
-        assert!(
-            fetched.url.ends_with("requests-2.28.0-py3-none-any.whl"),
-            "{}",
-            fetched.url
-        );
-        for (label, result) in [
-            ("no pure wheel", no_pure_result),
-            ("unknown", unknown_result),
-        ] {
+        assert!(fetched.url.ends_with("requests-2.28.0-py3-none-any.whl"), "{}", fetched.url);
+        for (label, result) in [("no pure wheel", no_pure_result), ("unknown", unknown_result)] {
             match result {
                 Err(FetchError::Unverifiable(msg)) => {
-                    assert!(
-                        msg.contains("none-any.whl") && msg.contains("digests"),
-                        "{label}: {msg}"
-                    )
+                    assert!(msg.contains("none-any.whl") && msg.contains("digests"), "{label}: {msg}")
                 }
                 other => panic!("{label}: expected Unverifiable, got {other:?}"),
             }
@@ -2812,10 +2791,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         extract_zip(&bytes, tmp.path(), /*strip_first=*/ false).unwrap();
         assert!(tmp.path().join("m@v1/go.mod").is_file());
-        assert!(
-            !tmp.path().join("m@v1/d").exists(),
-            "dir entry must not materialize"
-        );
+        assert!(!tmp.path().join("m@v1/d").exists(), "dir entry must not materialize");
 
         // The dirhash covers FILES only — the dir entry must not add a line.
         assert_eq!(
@@ -3035,11 +3011,8 @@ mod tests {
         let zip_bytes = make_module_zip("m@v1/", &[("go.mod", b"module m\n")]);
         let h1 = go_h1_of_zip(&zip_bytes).unwrap();
         verify_go_h1(&zip_bytes, &h1).expect("a matching dirhash must verify");
-        let err = verify_go_h1(
-            &zip_bytes,
-            "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-        )
-        .unwrap_err();
+        let err = verify_go_h1(&zip_bytes, "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .unwrap_err();
         assert!(err.contains("mismatch"), "{err}");
     }
 
@@ -3071,8 +3044,9 @@ mod tests {
 
         // GoH1 has a dedicated fetch-path verifier; None is reachable from a
         // repair against an npm-era lock recording no integrity. Both refuse.
-        let err = artifact_matches_integrity(b"x", "pkg", &LockIntegrity::GoH1("h1:x".into()))
-            .unwrap_err();
+        let err =
+            artifact_matches_integrity(b"x", "pkg", &LockIntegrity::GoH1("h1:x".into()))
+                .unwrap_err();
         assert!(err.contains("dedicated ecosystem fetcher"), "{err}");
         let err = artifact_matches_integrity(b"x", "pkg", &LockIntegrity::None).unwrap_err();
         assert!(err.contains("no integrity recorded"), "{err}");
