@@ -344,6 +344,13 @@ async fn send_telemetry_event(prepared: PreparedSend) {
 /// given up on within the same 2 s connect / 5 s request budget) before
 /// any output that could raise SIGPIPE, and before any prompt a Ctrl-C
 /// could interrupt, exactly as an inline send was.
+///
+/// One `--debug`-only difference is inherent to the overlap and accepted:
+/// the "Sending telemetry to …" line still prints where the event fires,
+/// but its "Telemetry sent successfully" twin now prints where the send
+/// finishes (by [`Self::flush`] at the latest), so the two are no longer
+/// adjacent — whatever the run did in between sits between them. Each
+/// line is still one atomic `eprintln!`, and no other stream is affected.
 #[derive(Debug, Default)]
 pub struct PendingTelemetry {
     sends: Vec<tokio::task::JoinHandle<()>>,
@@ -367,6 +374,14 @@ impl PendingTelemetry {
     fn spawn(&mut self, prepared: PreparedSend) {
         self.sends
             .push(tokio::spawn(send_telemetry_event(prepared)));
+    }
+
+    /// [`Self::spawn`] a prepared event, or do nothing when telemetry is
+    /// disabled (`prepare` returned `None`).
+    fn spawn_prepared(&mut self, prepared: Option<PreparedSend>) {
+        if let Some(prepared) = prepared {
+            self.spawn(prepared);
+        }
     }
 }
 
@@ -416,7 +431,16 @@ async fn fire(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    if let Some(prepared) = prepare(event_type, command, metadata, error, api_token, org_slug) {
+    fire_prepared(prepare(
+        event_type, command, metadata, error, api_token, org_slug,
+    ))
+    .await;
+}
+
+/// Send a prepared event inline, or return at once when telemetry is
+/// disabled (`prepare` returned `None`).
+async fn fire_prepared(prepared: Option<PreparedSend>) {
+    if let Some(prepared) = prepared {
         send_telemetry_event(prepared).await;
     }
 }
@@ -568,25 +592,36 @@ pub async fn track_patch_rollback_failed(
 // Read-side trackers: scan + get
 // ---------------------------------------------------------------------------
 
-/// The `patch_scanned` metadata: per-tier patch counts and whether the
-/// call was downgraded to the public proxy after an auth-endpoint 401/403
-/// (`fallback_to_proxy`).
-fn patch_scanned_metadata(
+/// The whole `patch_scanned` event — type, command and metadata (per-tier
+/// patch counts and whether the call was downgraded to the public proxy
+/// after an auth-endpoint 401/403). Both wrappers below build their event
+/// here, so the inline and background paths can never drift apart.
+#[allow(clippy::too_many_arguments)]
+fn prepare_patch_scanned(
     packages_scanned: usize,
     free_patches: usize,
     paid_patches: usize,
     can_access_paid: bool,
     ecosystems: &[String],
     fallback_to_proxy: bool,
-) -> serde_json::Value {
-    serde_json::json!({
-        "packages_scanned": packages_scanned,
-        "free_patches": free_patches,
-        "paid_patches": paid_patches,
-        "can_access_paid": can_access_paid,
-        "ecosystems": ecosystems,
-        "fallback_to_proxy": fallback_to_proxy,
-    })
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) -> Option<PreparedSend> {
+    prepare(
+        PatchTelemetryEventType::PatchScanned,
+        "scan",
+        serde_json::json!({
+            "packages_scanned": packages_scanned,
+            "free_patches": free_patches,
+            "paid_patches": paid_patches,
+            "can_access_paid": can_access_paid,
+            "ecosystems": ecosystems,
+            "fallback_to_proxy": fallback_to_proxy,
+        }),
+        None::<&str>,
+        api_token,
+        org_slug,
+    )
 }
 
 /// Track a successful `scan`. Reports per-tier patch counts and whether
@@ -600,7 +635,8 @@ fn patch_scanned_metadata(
 ///
 /// The CLI's `scan` sends this event through [`spawn_patch_scanned`]; the
 /// inline tracker stays as this published crate's public API, alongside
-/// the inline tracker every other event has.
+/// the inline tracker every other event has. Both build the event with
+/// [`prepare_patch_scanned`], so neither can describe it differently.
 #[allow(clippy::too_many_arguments)]
 pub async fn track_patch_scanned(
     packages_scanned: usize,
@@ -612,21 +648,16 @@ pub async fn track_patch_scanned(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    fire(
-        PatchTelemetryEventType::PatchScanned,
-        "scan",
-        patch_scanned_metadata(
-            packages_scanned,
-            free_patches,
-            paid_patches,
-            can_access_paid,
-            ecosystems,
-            fallback_to_proxy,
-        ),
-        None::<&str>,
+    fire_prepared(prepare_patch_scanned(
+        packages_scanned,
+        free_patches,
+        paid_patches,
+        can_access_paid,
+        ecosystems,
+        fallback_to_proxy,
         api_token,
         org_slug,
-    )
+    ))
     .await;
 }
 
@@ -645,28 +676,33 @@ pub fn spawn_patch_scanned(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    if let Some(prepared) = prepare(
-        PatchTelemetryEventType::PatchScanned,
-        "scan",
-        patch_scanned_metadata(
-            packages_scanned,
-            free_patches,
-            paid_patches,
-            can_access_paid,
-            ecosystems,
-            fallback_to_proxy,
-        ),
-        None::<&str>,
+    pending.spawn_prepared(prepare_patch_scanned(
+        packages_scanned,
+        free_patches,
+        paid_patches,
+        can_access_paid,
+        ecosystems,
+        fallback_to_proxy,
         api_token,
         org_slug,
-    ) {
-        pending.spawn(prepared);
-    }
+    ));
 }
 
-/// The `patch_scan_failed` metadata (see [`patch_scanned_metadata`]).
-fn patch_scan_failed_metadata(fallback_to_proxy: bool) -> serde_json::Value {
-    serde_json::json!({ "fallback_to_proxy": fallback_to_proxy })
+/// The whole `patch_scan_failed` event (see [`prepare_patch_scanned`]).
+fn prepare_patch_scan_failed(
+    error: impl std::fmt::Display,
+    fallback_to_proxy: bool,
+    api_token: Option<&str>,
+    org_slug: Option<&str>,
+) -> Option<PreparedSend> {
+    prepare(
+        PatchTelemetryEventType::PatchScanFailed,
+        "scan",
+        serde_json::json!({ "fallback_to_proxy": fallback_to_proxy }),
+        Some(error),
+        api_token,
+        org_slug,
+    )
 }
 
 /// Track a failed `scan`. The CLI sends it through
@@ -678,14 +714,12 @@ pub async fn track_patch_scan_failed(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    fire(
-        PatchTelemetryEventType::PatchScanFailed,
-        "scan",
-        patch_scan_failed_metadata(fallback_to_proxy),
-        Some(error),
+    fire_prepared(prepare_patch_scan_failed(
+        error,
+        fallback_to_proxy,
         api_token,
         org_slug,
-    )
+    ))
     .await;
 }
 
@@ -698,16 +732,12 @@ pub fn spawn_patch_scan_failed(
     api_token: Option<&str>,
     org_slug: Option<&str>,
 ) {
-    if let Some(prepared) = prepare(
-        PatchTelemetryEventType::PatchScanFailed,
-        "scan",
-        patch_scan_failed_metadata(fallback_to_proxy),
-        Some(error),
+    pending.spawn_prepared(prepare_patch_scan_failed(
+        error,
+        fallback_to_proxy,
         api_token,
         org_slug,
-    ) {
-        pending.spawn(prepared);
-    }
+    ));
 }
 
 /// Track a successful `get`. Reports patch identity + delivery mode and
@@ -991,6 +1021,88 @@ mod tests {
         pending.flush().await;
         assert!(pending.sends.is_empty());
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// `scan`'s two events each have an inline tracker (this crate's public
+    /// API) and a background twin the CLI calls. Both must describe the
+    /// event identically — same event type, command and metadata — or a
+    /// rename would silently reach only one of them. Serialized: the
+    /// endpoint and the disable gate are read from process-global env.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn inline_and_background_scan_trackers_post_the_same_event() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// The request body with only its timestamp dropped (the session
+        /// id is process-global, so it matches).
+        fn descriptor(body: &[u8]) -> serde_json::Value {
+            let mut v: serde_json::Value = serde_json::from_slice(body).expect("event json");
+            v.as_object_mut()
+                .expect("event object")
+                .remove("event_sender_created_at")
+                .expect("every event is timestamped");
+            v
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/patch/telemetry"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let saved: Vec<(&str, Option<String>)> = [
+            "SOCKET_PROXY_URL",
+            "SOCKET_TELEMETRY_DISABLED",
+            "SOCKET_PATCH_TELEMETRY_DISABLED",
+            "SOCKET_OFFLINE",
+            "VITEST",
+        ]
+        .iter()
+        .map(|&k| (k, std::env::var(k).ok()))
+        .collect();
+        for (key, _) in &saved {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("SOCKET_PROXY_URL", server.uri());
+
+        // No token / org: both events go to the proxy endpoint above.
+        let ecosystems = vec!["npm".to_string(), "pypi".to_string()];
+        let mut pending = PendingTelemetry::new();
+        track_patch_scanned(5, 3, 2, true, &ecosystems, true, None, None).await;
+        spawn_patch_scanned(&mut pending, 5, 3, 2, true, &ecosystems, true, None, None);
+        pending.flush().await;
+        track_patch_scan_failed("all batches failed", true, None, None).await;
+        spawn_patch_scan_failed(&mut pending, "all batches failed", true, None, None);
+        pending.flush().await;
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        let bodies: Vec<serde_json::Value> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| descriptor(&r.body))
+            .collect();
+        assert_eq!(bodies.len(), 4, "two events, two paths each");
+        assert_eq!(bodies[0], bodies[1], "patch_scanned inline vs background");
+        assert_eq!(
+            bodies[2], bodies[3],
+            "patch_scan_failed inline vs background"
+        );
+        assert_eq!(bodies[0]["event_type"], "patch_scanned");
+        assert_eq!(bodies[0]["context"]["command"], "scan");
+        assert_eq!(bodies[0]["metadata"]["free_patches"], 3);
+        assert_eq!(bodies[2]["event_type"], "patch_scan_failed");
+        assert_eq!(bodies[2]["context"]["command"], "scan");
+        assert_eq!(bodies[2]["error"]["message"], "all batches failed");
     }
 
     /// Combined into a single test to avoid env-var races across parallel tests.
