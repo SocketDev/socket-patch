@@ -274,6 +274,14 @@ pub struct VendorServiceConfig {
     pub offline: bool,
 }
 
+/// Most prebuilt archives the vendor prefetch keeps outstanding, below the
+/// patch API's own in-flight cap. An archive is a whole tarball in memory
+/// where the serial loop held exactly one, so the window is bounded by
+/// what it costs, not only by what it saves: the wiring loop is fsync-
+/// bound between packages, so four downloads ahead already keep it fed,
+/// and one more only raises peak memory by another artifact.
+const ARCHIVE_PREFETCH_WINDOW: usize = 4;
+
 impl VendorServiceConfig {
     /// Whether this run may actually attempt a service download right now:
     /// the mode permits it, we're online, and a client is configured.
@@ -311,7 +319,8 @@ impl VendorServiceConfig {
             self.use_public_proxy,
             self.vendor_url.as_deref(),
             self.patch_server_url.as_deref(),
-            crate::utils::concurrent::api_concurrency(self.use_public_proxy),
+            crate::utils::concurrent::api_concurrency(self.use_public_proxy)
+                .min(ARCHIVE_PREFETCH_WINDOW),
         ))
     }
 }

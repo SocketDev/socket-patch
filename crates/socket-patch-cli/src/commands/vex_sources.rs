@@ -908,6 +908,13 @@ async fn fetch_records(
         // A sliding window of at most FETCH_CONCURRENCY views in flight
         // (it used to wait for each whole chunk of that size to drain
         // before starting the next), consumed in `pending` order.
+        //
+        // That IS an observable change, the one in this area: the chunked
+        // JoinSet folded each chunk in COMPLETION order, so which refusal
+        // was reported as `auth_error` (printed in the fallback note) and
+        // the order of the retried `pending` list were a race. They now
+        // follow `pending` order — deterministic, and the same order the
+        // notes above already came out in.
         {
             let client = &client;
             let mut views = std::pin::pin!(ordered_concurrent(
@@ -1030,6 +1037,74 @@ mod tests {
             offline: true,
             ..GlobalArgs::default()
         }
+    }
+
+    /// The record fetch folds in `pending` order, not in the order the
+    /// server happens to answer: the FIRST refusal in `pending` is the one
+    /// reported in the fallback note, even when it answers last, and the
+    /// refused uuids are retried against the proxy in that same order.
+    /// (The chunked JoinSet this replaced folded by completion, so which
+    /// refusal was reported was a race.)
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn refused_records_fold_in_pending_order_not_completion_order() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let api = MockServer::start().await;
+        let proxy = MockServer::start().await;
+        // U1 is first in `pending` and answers LAST; the two refusals are
+        // different statuses, so the reported one is identifiable.
+        for (uuid, status, delay) in [(U1, 401, 300u64), (U2, 403, 0)] {
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/v0/orgs/acme/patches/view/{uuid}")))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_delay(std::time::Duration::from_millis(delay)),
+                )
+                .mount(&api)
+                .await;
+            // The proxy retry serves both, so the run still ends with both
+            // records: only the ORDER of the refusal report is at stake.
+            Mock::given(method("GET"))
+                .and(wm_path(format!("/patch/view/{uuid}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "uuid": uuid,
+                    "purl": "pkg:npm/vexorder@1.0.0",
+                    "publishedAt": "2026-01-01T00:00:00Z",
+                    "files": {},
+                    "vulnerabilities": {},
+                    "description": "",
+                    "license": "MIT",
+                    "tier": "free",
+                })))
+                .mount(&proxy)
+                .await;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let common = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            json: true,
+            api_url: Some(api.uri()),
+            api_token: Some("sktsec_placeholder_value_for_tests_api".into()),
+            org: Some("acme".into()),
+            proxy_url: Some(proxy.uri()),
+            ..GlobalArgs::default()
+        };
+        let mut notes: Vec<PlanNote> = Vec::new();
+        let out = fetch_records(&common, &[U1.to_string(), U2.to_string()], &mut notes).await;
+
+        let fallback = notes
+            .iter()
+            .find(|n| n.code == NOTE_API_AUTH_FALLBACK)
+            .unwrap_or_else(|| panic!("no fallback note: {notes:?}"));
+        assert!(
+            fallback.detail.contains("Unauthorized") && !fallback.detail.contains("Forbidden"),
+            "the first refusal in `pending` order must be the reported one: {}",
+            fallback.detail
+        );
+        assert!(out.contains_key(U1) && out.contains_key(U2), "{out:?}");
     }
 
     fn discovery(refs: Vec<PatchedRef>) -> Discovery {
