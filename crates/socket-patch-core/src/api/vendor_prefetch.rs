@@ -43,12 +43,24 @@
 //!   consulting the plan (every remaining package refused, or the loop
 //!   finishing) leaves at most `window` requests outstanding, and a plan
 //!   the loop never consults makes no request at all.
-//! * It never requests a position the loop has already passed, and stops
-//!   entirely once it has seen
+//! * It never requests a position the loop has already passed, and starts
+//!   nothing more once it has seen
 //!   [`super::client::VENDOR_BREAKER_THRESHOLD`] consecutive availability
 //!   failures of its own — so a service that is down from the first
 //!   package costs exactly the retry ladders the serial loop paid before
-//!   its own breaker opened, not a window of them.
+//!   its own breaker opened, not a window of them. What is already in
+//!   flight when it stops is still drained and delivered: the loop needs
+//!   those packages, and abandoning them would make it re-issue requests
+//!   the plan has already paid for.
+//! * It never requests PAST a position whose own fetch was an
+//!   availability failure until the loop has consumed that position. So
+//!   an outage part-way down a list the window has already widened over
+//!   costs what the serial loop paid, as long as the task is running
+//!   ahead of the loop (the usual case: the loop stops to write between
+//!   packages). Only when the loop has caught up with the window — every
+//!   package up to it granted, and the first failure the whole window's —
+//!   can it spend up to `window - 1` retry ladders the serial loop, one
+//!   failure from opening its own breaker, would not have spent.
 //!
 //! Outcomes are delivered as they finish, not in plan order: a passed-over
 //! download must never hold up the package the loop is actually waiting
@@ -58,7 +70,7 @@
 //! task.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -88,13 +100,16 @@ pub(crate) struct VendorPrefetch {
     state: tokio::sync::Mutex<PrefetchState>,
 }
 
-/// The window of plan positions the task may request: `[at, at + reach)`.
-/// Both ends move — `at` as the loop consumes, `reach` once the service has
-/// answered — so the speculation is bounded in REQUESTS by what the loop
-/// has actually reached (see the module docs). Gating on the position
-/// rather than on a count of permits keeps the order deterministic: the
-/// futures are polled in whatever order the unordered pool likes, so a
-/// counter would hand the opening request to an arbitrary position.
+/// The window of plan positions the task may request: `[at, at + reach)`,
+/// and never past `barrier`. All three move — `at` as the loop consumes,
+/// `reach` once the service has answered, `barrier` as the service fails
+/// and as the loop consumes the failure — so the speculation is bounded in
+/// REQUESTS both by what the loop has actually reached and by what the
+/// service is actually answering (see the module docs). Gating on the
+/// position rather than on a count of permits keeps the order
+/// deterministic: the futures are polled in whatever order the unordered
+/// pool likes, so a counter would hand the opening request to an arbitrary
+/// position.
 #[derive(Debug)]
 struct Lookahead {
     /// The plan position the loop is at; everything below it was passed
@@ -103,11 +118,20 @@ struct Lookahead {
     /// How far past `at` the task may run: one until the service has
     /// answered once, then the whole window.
     reach: AtomicUsize,
+    /// Lowest position whose own fetch was an availability failure and
+    /// that the loop has not consumed yet; nothing past it is started
+    /// (see [`Self::failed`]). `usize::MAX` while the service is healthy.
+    barrier: AtomicUsize,
     /// Consecutive retryable failures the TASK has seen, in the order its
     /// own requests answered. Purely a stop signal for the speculation —
     /// the observable breaker is the client's, folded at consumption time.
     failures: AtomicU32,
-    /// Woken whenever `at` or `reach` moves.
+    /// Set once `failures` reached the threshold: nothing more is STARTED.
+    /// Sticky, unlike `failures` itself — a success draining out from
+    /// behind the failures resets the count, and must not let the
+    /// speculation resume against a service the loop is giving up on.
+    stopped: AtomicBool,
+    /// Woken whenever any of the four above moves.
     moved: tokio::sync::Notify,
 }
 
@@ -118,13 +142,23 @@ impl Lookahead {
             // Opens at one request: a service that is down from the first
             // package then costs what the serial loop cost.
             reach: AtomicUsize::new(1),
+            barrier: AtomicUsize::new(usize::MAX),
             failures: AtomicU32::new(0),
+            stopped: AtomicBool::new(false),
             moved: tokio::sync::Notify::new(),
         }
     }
 
     /// The loop has reached plan position `position`.
     fn arrive(&self, position: usize) {
+        // Past the failure the barrier stands at: the loop consumed that
+        // package and went on, so its breaker did not end the run and the
+        // task may speculate again. (A failure landing concurrently just
+        // re-sets the line; all of this is advisory, and every outcome is
+        // still decided at the loop's own call.)
+        if position > self.barrier.load(Ordering::Relaxed) {
+            self.barrier.store(usize::MAX, Ordering::Relaxed);
+        }
         self.at.store(position, Ordering::Relaxed);
         self.moved.notify_waiters();
     }
@@ -132,6 +166,26 @@ impl Lookahead {
     /// The service answered: the task may now run the full window ahead.
     fn widen(&self, window: usize) {
         self.reach.store(window, Ordering::Relaxed);
+        self.moved.notify_waiters();
+    }
+
+    /// Plan position `index` failed to reach the service: nothing past it
+    /// is started until the loop has consumed it. The loop is about to
+    /// meet a failing service at that package and one more failure stops
+    /// the task, so speculating past it aims retry ladders at a struggling
+    /// host for packages the serial loop — one failure from opening its
+    /// own breaker — asked nothing for.
+    ///
+    /// Lowest failure wins: a later position's failure must not move the
+    /// line past an earlier one the loop has yet to reach.
+    fn failed(&self, index: usize) {
+        self.barrier.fetch_min(index, Ordering::Relaxed);
+        self.moved.notify_waiters();
+    }
+
+    /// The task's own breaker opened: start nothing more, for good.
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
         self.moved.notify_waiters();
     }
 
@@ -143,12 +197,12 @@ impl Lookahead {
             tokio::pin!(notified);
             // Armed before the check, so a move between the two is not lost.
             notified.as_mut().enable();
-            if index < self.at.load(Ordering::Relaxed)
-                || self.failures.load(Ordering::Relaxed) >= VENDOR_BREAKER_THRESHOLD
-            {
+            if index < self.at.load(Ordering::Relaxed) || self.stopped.load(Ordering::Relaxed) {
                 return false;
             }
-            if index < self.at.load(Ordering::Relaxed) + self.reach.load(Ordering::Relaxed) {
+            if index <= self.barrier.load(Ordering::Relaxed)
+                && index < self.at.load(Ordering::Relaxed) + self.reach.load(Ordering::Relaxed)
+            {
                 return true;
             }
             notified.await;
@@ -298,20 +352,31 @@ impl VendorPrefetch {
                     matches!(held.peek(), (VendorServiceOutcome::Failed(_), true));
                 if availability_failure {
                     look.failures.fetch_add(1, Ordering::Relaxed);
-                } else if !matches!(held.peek(), (VendorServiceOutcome::Failed(_), false)) {
-                    // Anything but a failure proves the service is up. A
-                    // NON-retryable failure (auth, parse) says nothing
-                    // about availability either way, so it neither counts
-                    // nor resets — exactly the client breaker's rule.
-                    look.failures.store(0, Ordering::Relaxed);
-                }
-                if !availability_failure {
+                    // Set BEFORE the send below, which can yield: the next
+                    // poll of the stream is what pulls a new position in,
+                    // and it must already see the line.
+                    look.failed(index);
+                } else {
+                    if !matches!(held.peek(), (VendorServiceOutcome::Failed(_), false)) {
+                        // Anything but a failure proves the service is up. A
+                        // NON-retryable failure (auth, parse) says nothing
+                        // about availability either way, so it neither counts
+                        // nor resets — exactly the client breaker's rule.
+                        look.failures.store(0, Ordering::Relaxed);
+                    }
                     look.widen(window);
                 }
-                if tx.send((index, held)).await.is_err() {
-                    return;
-                }
                 if look.failures.load(Ordering::Relaxed) >= VENDOR_BREAKER_THRESHOLD {
+                    // Start nothing more — but keep draining. The requests
+                    // already in flight are for packages BEHIND the
+                    // failures, which the loop has yet to reach and will
+                    // otherwise re-issue live; dropping the stream here
+                    // would make the outage cost the service each of them
+                    // twice. Positions not yet started cost nothing:
+                    // `admits` refuses them without a request.
+                    look.stop();
+                }
+                if tx.send((index, held)).await.is_err() {
                     return;
                 }
             }
@@ -512,6 +577,12 @@ mod tests {
     /// failures at consumption time, so every later package reports the
     /// same "not attempted" failure the serial loop does, even the ones
     /// whose download the prefetch had already started.
+    ///
+    /// And it costs the service the same REQUESTS, not only the same
+    /// outcomes. The task here is running ahead of a loop still on the
+    /// granted packages, so nothing past the failure is ever started, and
+    /// what was in flight when the task stopped is delivered instead of
+    /// being dropped and re-issued live by the loop.
     #[tokio::test]
     async fn an_outage_mid_list_opens_the_breaker_at_the_same_package() {
         use Script::*;
@@ -528,12 +599,58 @@ mod tests {
             Granted(0),
         ];
         let all: Vec<usize> = (0..scripts.len()).collect();
+        // One server for both runs — the outcomes carry its address — so
+        // the request counts are read as deltas of its cumulative log.
         let server = serve(&scripts).await;
         let (serial, count) = run(&server, None, &all).await;
         assert!(serial[5].contains("not attempted"), "{serial:?}");
         assert!(serial[9].contains("not attempted"), "{serial:?}");
         assert_eq!(count, 2);
+        let serial_requests = request_log(&server).await.len();
+
         assert_eq!(run(&server, Some(&all), &all).await, (serial, count));
+        assert_eq!(
+            request_log(&server).await.len() - serial_requests,
+            serial_requests,
+            "a mid-list outage must not be amplified by the plan either"
+        );
+    }
+
+    /// The one case the plan cannot make free: the loop has caught up with
+    /// the window (every package so far granted instantly, so `at` is at
+    /// the window's own edge) and the whole window then fails at once.
+    /// Those positions were started before any failure landed, so the
+    /// barrier cannot hold them back and they cost retry ladders the
+    /// serial loop — one failure from opening its breaker — never paid.
+    /// The cost is bounded by the window, and the outcomes are unchanged;
+    /// pinned here so the bound is measured rather than reasoned about.
+    #[tokio::test]
+    async fn a_window_the_loop_caught_up_with_costs_at_most_a_window_of_ladders() {
+        use Script::*;
+        let scripts = [
+            Granted(0),
+            Granted(0),
+            Granted(0),
+            Down,
+            Down,
+            Down,
+            Down,
+            Down,
+        ];
+        let all: Vec<usize> = (0..scripts.len()).collect();
+        let server = serve(&scripts).await;
+        let (serial, count) = run(&server, None, &all).await;
+        let serial_requests = request_log(&server).await.len();
+
+        assert_eq!(run(&server, Some(&all), &all).await, (serial, count));
+        let planned_requests = request_log(&server).await.len() - serial_requests;
+        // `window` (4) ladders at most, where serial paid two: the two the
+        // loop consumes plus at most `window - 1` started alongside them.
+        let ladder = (serial_requests - 3 * 2) / 2;
+        assert!(
+            planned_requests <= serial_requests + (4 - 1) * ladder,
+            "planned {planned_requests} vs serial {serial_requests} (ladder {ladder})"
+        );
     }
 
     /// A service that is down from the first package costs the plan
