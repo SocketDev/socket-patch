@@ -281,21 +281,28 @@ impl VendorServiceConfig {
         self.source.may_use_service() && !self.offline && self.client.is_some()
     }
 
+    /// Whether a run through this config would prefetch service downloads
+    /// at all — false when the service is not enabled, and false whenever
+    /// the in-flight cap is one, which is
+    /// [`crate::utils::concurrent::API_CONCURRENCY_ENV`]'s documented
+    /// promise (and what a tight descriptor limit forces): one request at
+    /// a time, the strictly serial loop, nothing fetched ahead. Callers
+    /// ask before doing the work of naming the plan.
+    pub fn wants_prefetch(&self) -> bool {
+        self.service_enabled()
+            && crate::utils::concurrent::api_concurrency(self.use_public_proxy) > 1
+    }
+
     /// Attach a download plan to this config's client: `uuids` are the
     /// records the vendor loop is expected to download from the service,
     /// in loop order (see [`crate::api::client::ApiClient::prefetch_vendor_packages`]).
-    /// `None` — nothing attached — when the service is not enabled, when
-    /// fewer than two downloads are planned (nothing to overlap), or under
-    /// a tight descriptor limit (the serial loop held one socket at a time;
-    /// see [`crate::crawlers::walk_pool::fd_limit_is_tight`]).
+    /// `None` — nothing attached — when [`Self::wants_prefetch`] is false,
+    /// or when fewer than two downloads are planned (nothing to overlap).
     pub fn prefetch_archives(
         &self,
         uuids: Vec<String>,
     ) -> Option<crate::api::client::VendorPrefetchGuard> {
-        if !self.service_enabled()
-            || uuids.len() < 2
-            || crate::crawlers::walk_pool::fd_limit_is_tight()
-        {
+        if !self.wants_prefetch() || uuids.len() < 2 {
             return None;
         }
         let client = self.client.as_ref()?;
