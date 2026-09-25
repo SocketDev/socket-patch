@@ -28,7 +28,12 @@ use super::{
     SidecarPayload, SidecarSeverity,
 };
 
-const METADATA_FILE: &str = ".nupkg.metadata";
+/// `pub(crate)`: the NuGet vendor backend materialises exactly these two
+/// package-root paths when a local rebuild keeps the package's parts in
+/// memory, so the fixup sees the same root a full extraction gave it. One
+/// definition, so the two cannot drift apart.
+pub(crate) const METADATA_FILE: &str = ".nupkg.metadata";
+pub(crate) const SIGNATURE_MARKER_SUFFIX: &str = ".nupkg.sha512";
 
 /// Delete `.nupkg.metadata` if present, and surface an advisory if
 /// the package also carries a `.nupkg.sha512` signature sidecar
@@ -121,7 +126,7 @@ async fn has_signed_marker(pkg_path: &Path) -> bool {
         if entry
             .file_name()
             .as_encoded_bytes()
-            .ends_with(b".nupkg.sha512")
+            .ends_with(SIGNATURE_MARKER_SUFFIX.as_bytes())
             && is_file(&entry.path()).await
         {
             return true;

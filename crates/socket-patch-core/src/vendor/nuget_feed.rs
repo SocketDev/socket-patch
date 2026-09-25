@@ -55,6 +55,17 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
+// The two package-root paths the NuGet sidecar fixup reads while the apply
+// runs over the stage: it deletes the first and reports an advisory when a
+// file matching the second sits beside it. A local rebuild that keeps the
+// package's parts in memory materialises both, so the fixup sees the same
+// package root a full extraction would have given it. (Neither normally rides
+// INSIDE a `.nupkg` — they are install-dir bookkeeping — but a crafted package
+// can carry them, and the staging decision must not turn on that.)
+use crate::patch::sidecars::nuget::{
+    METADATA_FILE as SIDECAR_METADATA_PART,
+    SIGNATURE_MARKER_SUFFIX as SIDECAR_SIGNATURE_MARKER_SUFFIX,
+};
 use crate::utils::fs::{
     atomic_write_bytes, atomic_write_bytes_preserving_mode, list_dir_entries,
     read_regular_to_bytes, read_regular_to_string,
@@ -93,16 +104,6 @@ const LOCK_WIRING_KIND: &str = "nuget_lock_entry";
 /// patched (content-changed) package reads as unsigned rather than
 /// invalid-signed.
 const SIGNATURE_PART: &str = ".signature.p7s";
-
-/// The two package-root paths `patch::sidecars::nuget`'s fixup reads while the
-/// apply runs over the stage — it deletes the first and reports an advisory
-/// when a file matching the second sits beside it. A rebuild that keeps the
-/// package's parts in memory still materialises both, so the fixup sees the
-/// same package root a full extraction would have given it. (Neither normally
-/// rides INSIDE a `.nupkg` — they are install-dir bookkeeping — but a crafted
-/// package can carry them, and the decision must not turn on that.)
-const SIDECAR_METADATA_PART: &str = ".nupkg.metadata";
-const SIDECAR_SIGNATURE_MARKER_SUFFIX: &str = ".nupkg.sha512";
 
 /// The implicit default public NuGet source, seeded as the catch-all target
 /// when a from-scratch `<packageSourceMapping>` would otherwise have no
