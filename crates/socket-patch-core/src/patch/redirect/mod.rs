@@ -765,11 +765,13 @@ fn rewrite_cargo(
     for (path, text) in manifests.iter_mut() {
         *text = to_lf(path, std::mem::take(text));
     }
-    // Each manifest's own `[package] name` — how Cargo.lock names the
-    // source-less (workspace / path) package it declares.
-    let manifest_packages: Vec<Option<String>> = manifests
+    let workspace_version = files
+        .get("Cargo.toml")
+        .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        .and_then(|doc| cargo_workspace_package_version(&doc).map(str::to_string));
+    let manifest_packages: Vec<Option<(String, String)>> = manifests
         .iter()
-        .map(|(_, text)| cargo_manifest_package_name(text))
+        .map(|(path, text)| cargo_manifest_package_id(text, path, workspace_version.as_deref()))
         .collect();
     let edits_before = result.edits.len();
     let mut changed_manifests: std::collections::BTreeSet<String> =
@@ -950,9 +952,10 @@ fn rewrite_cargo(
         // a symlink) — keeps resolving it from crates.io, so the repointed
         // lock is unsatisfiable and that consumer compiles the unpatched copy.
         if let Some(lock_text) = cargo_lock.as_deref() {
-            let pinned_packages: std::collections::BTreeSet<&str> = toml_plans
+            let pinned_packages: std::collections::BTreeSet<(&str, &str)> = toml_plans
                 .iter()
-                .filter_map(|(i, _)| manifest_packages[*i].as_deref())
+                .filter_map(|(i, _)| manifest_packages[*i].as_ref())
+                .map(|(name, version)| (name.as_str(), version.as_str()))
                 .collect();
             let blocking =
                 cargo_unpinnable_dependents(lock_text, &dep.name, &dep.version, &pinned_packages);
@@ -1187,14 +1190,44 @@ fn cargo_requirement_excludes_detail(
     )
 }
 
-/// The `[package] name` a manifest declares (`None` for a virtual workspace
-/// root or an unparseable file).
-fn cargo_manifest_package_name(text: &str) -> Option<String> {
-    let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
-    doc.get("package")?
-        .get("name")?
+fn cargo_workspace_package_version(doc: &toml_edit::DocumentMut) -> Option<&str> {
+    doc.get("workspace")?
+        .get("package")?
+        .get("version")?
         .as_str()
-        .map(str::to_string)
+}
+
+fn cargo_manifest_package_id(
+    text: &str,
+    path: &str,
+    workspace_version: Option<&str>,
+) -> Option<(String, String)> {
+    let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+    let package = doc.get("package")?;
+    let name = package.get("name")?.as_str()?;
+    let version = match package.get("version") {
+        None => "0.0.0",
+        Some(version) => match version.as_str() {
+            Some(version) => version,
+            None if version.get("workspace").and_then(toml_edit::Item::as_bool) == Some(true) => {
+                if doc.get("workspace").is_some() {
+                    cargo_workspace_package_version(&doc)?
+                } else {
+                    if let Some(workspace) = package.get("workspace") {
+                        let dir = path.strip_suffix("/Cargo.toml").unwrap_or("");
+                        if crate::utils::cargo_workspace::normalize_rel(dir, workspace.as_str()?)
+                            .is_none_or(|workspace| !workspace.is_empty())
+                        {
+                            return None;
+                        }
+                    }
+                    workspace_version?
+                }
+            }
+            None => return None,
+        },
+    };
+    Some((name.to_string(), version.to_string()))
 }
 
 /// The Cargo.lock packages that depend on `crate_name@version` and that a
@@ -1208,7 +1241,7 @@ fn cargo_unpinnable_dependents(
     lock: &str,
     crate_name: &str,
     version: &str,
-    pinned_packages: &std::collections::BTreeSet<&str>,
+    pinned_packages: &std::collections::BTreeSet<(&str, &str)>,
 ) -> Vec<String> {
     let Ok(doc) = lock.parse::<toml_edit::DocumentMut>() else {
         return vec!["Cargo.lock (it does not parse as TOML)".to_string()];
@@ -1246,7 +1279,7 @@ fn cargo_unpinnable_dependents(
                 };
                 out.push(format!("{name} {pkg_version} ({kind})"));
             }
-            None if !pinned_packages.contains(name) => {
+            None if !pinned_packages.contains(&(name, pkg_version)) => {
                 out.push(format!(
                     "{name} {pkg_version} (a path package whose Cargo.toml is outside the \
                      project or not rewritable)"
@@ -1477,12 +1510,6 @@ fn is_socket_patch_registry_name(value: &str) -> bool {
 /// the inline spelling and read the other three as "not redirected".
 pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Option<String> {
     let lines: Vec<&str> = content.split('\n').collect();
-    let socket_value = |text: &str| -> Option<String> {
-        CARGO_TOML_REGISTRY_VAL_RE
-            .captures(text)
-            .map(|c| c[1].to_string())
-            .filter(|v| is_socket_patch_registry_name(v))
-    };
     let mut section = CargoTomlSection::Other;
     for (idx, raw) in lines.iter().enumerate() {
         let trimmed = raw.trim_start();
@@ -1517,13 +1544,7 @@ pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Opti
                     if k != name {
                         return None;
                     }
-                    let v = rest.trim_start().strip_prefix('=')?.trim();
-                    Some(
-                        v.strip_prefix('"')
-                            .and_then(|s| s.split('"').next())
-                            .unwrap_or(v)
-                            .to_string(),
-                    )
+                    cargo_toml_string(rest.trim_start().strip_prefix('=')?)
                 })
             };
             let is_ours = match value_of("package") {
@@ -1548,11 +1569,14 @@ pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Opti
         if let Some(dotted) = rest_trim.strip_prefix('.') {
             // `<crate>.registry = "socket-patch-…"`: a spelling this rewriter
             // refuses to write, but a hand edit can leave one behind.
-            if key == crate_name
-                && parse_cargo_entry_key(dotted).is_some_and(|(k, _)| k == "registry")
-            {
-                if let Some(reg) = socket_value(trimmed) {
-                    return Some(reg);
+            if key == crate_name {
+                let registry = parse_cargo_entry_key(dotted)
+                    .filter(|(key, _)| key == "registry")
+                    .and_then(|(_, rest)| rest.trim_start().strip_prefix('='))
+                    .and_then(cargo_toml_string)
+                    .filter(|registry| is_socket_patch_registry_name(registry));
+                if registry.is_some() {
+                    return registry;
                 }
             }
             continue;
@@ -1567,12 +1591,14 @@ pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Opti
             continue;
         };
         let inner = &value[1..close];
-        let is_ours = match CARGO_TOML_PACKAGE_RE.captures(inner) {
-            Some(c) => c[1] == *crate_name,
+        let is_ours = match cargo_toml_inline_string(inner, "package") {
+            Some(package) => package == crate_name,
             None => key == crate_name,
         };
         if is_ours {
-            if let Some(reg) = socket_value(inner) {
+            if let Some(reg) = cargo_toml_inline_string(inner, "registry")
+                .filter(|registry| is_socket_patch_registry_name(registry))
+            {
                 return Some(reg);
             }
         }
@@ -1695,6 +1721,25 @@ fn parse_cargo_entry_key(line: &str) -> Option<(String, &str)> {
     }
 }
 
+fn cargo_toml_string(value: &str) -> Option<String> {
+    let document = format!("value = {value}")
+        .parse::<toml_edit::DocumentMut>()
+        .ok()?;
+    document.get("value")?.as_str().map(str::to_string)
+}
+
+fn cargo_toml_inline_string(inner: &str, key: &str) -> Option<String> {
+    let document = format!("dependency = {{{inner}}}")
+        .parse::<toml_edit::DocumentMut>()
+        .ok()?;
+    document
+        .get("dependency")?
+        .as_inline_table()?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
+}
+
 struct CargoTomlPlan {
     content: String,
     edits: Vec<FileEdit>,
@@ -1740,11 +1785,9 @@ enum CargoTomlAction {
 static CARGO_TOML_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\[([^\]]+)\]\s*(?:#.*)?$").expect("static section-header regex is valid")
 });
-static CARGO_TOML_PACKAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\bpackage\s*=\s*"([^"]*)""#).expect("static package-key regex is valid")
-});
 static CARGO_TOML_REGISTRY_VAL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\bregistry\s*=\s*"([^"]*)""#).expect("static registry-value regex is valid")
+    Regex::new(r#"(?:\bregistry|"registry"|'registry')\s*=\s*(?:"[^"]*"|'[^']*')"#)
+        .expect("static registry-value regex is valid")
 });
 static CARGO_TOML_REGISTRY_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\bregistry\s*=").expect("static registry-key probe regex is valid")
@@ -1757,10 +1800,6 @@ static CARGO_TOML_WORKSPACE_KEY_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static CARGO_TOML_PATH_GIT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(?:path|git)\s*=").expect("static path/git probe regex is valid")
-});
-
-static CARGO_TOML_VERSION_VAL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\bversion\s*=\s*"([^"]*)""#).expect("static version-value regex is valid")
 });
 
 /// Whether one declaration's version requirement selects the patched
@@ -1817,6 +1856,7 @@ enum CargoWorkspaceEntry {
     Pinned,
     /// The entry names the crate at another version.
     OtherVersion,
+    OtherPackage,
 }
 
 /// Every version of `crate_name` a Cargo.lock holds other than `version`.
@@ -1853,13 +1893,11 @@ fn plan_cargo_toml(
 ) -> Result<CargoTomlPlan, String> {
     let lines: Vec<&str> = content.split('\n').collect();
     let header_re: &Regex = &CARGO_TOML_HEADER_RE;
-    let package_re: &Regex = &CARGO_TOML_PACKAGE_RE;
     let registry_val_re: &Regex = &CARGO_TOML_REGISTRY_VAL_RE;
     let registry_key_re: &Regex = &CARGO_TOML_REGISTRY_KEY_RE;
     let registry_index_re: &Regex = &CARGO_TOML_REGISTRY_INDEX_RE;
     let workspace_key_re: &Regex = &CARGO_TOML_WORKSPACE_KEY_RE;
     let path_git_re: &Regex = &CARGO_TOML_PATH_GIT_RE;
-    let version_val_re: &Regex = &CARGO_TOML_VERSION_VAL_RE;
     let ambiguous =
         || format!("its version requirement also matches another locked version of {crate_name}");
 
@@ -1913,26 +1951,13 @@ fn plan_cargo_toml(
                             if k == key_name {
                                 let rest = rest.trim_start();
                                 if let Some(v) = rest.strip_prefix('=') {
-                                    let v = v.trim();
-                                    let v = v
-                                        .strip_prefix('"')
-                                        .and_then(|s| s.split('"').next())
-                                        .unwrap_or(v);
-                                    return Some((*j, v.to_string()));
+                                    return cargo_toml_string(v).map(|value| (*j, value));
                                 }
                             }
                         }
                     }
                     None
                 };
-                let package_val = find_value("package").map(|(_, v)| v);
-                let is_ours = match &package_val {
-                    Some(p) => p == crate_name,
-                    None => key == crate_name,
-                };
-                if !is_ours {
-                    continue;
-                }
                 let has = |name: &str| {
                     block.iter().any(|(_, t)| {
                         parse_cargo_entry_key(t).is_some_and(|(k, rest)| {
@@ -1940,12 +1965,23 @@ fn plan_cargo_toml(
                         })
                     })
                 };
-                let req = find_value("version").map(|(_, v)| v);
-                let selects = if has("workspace") {
-                    CargoReqMatch::Ours
-                } else {
-                    cargo_req_selects(req.as_deref(), version, other_versions)
+                if has("workspace") {
+                    pending.push(Pending::NeedsWorkspacePin(key.clone()));
+                    continue;
+                }
+                let package_val = find_value("package").map(|(_, v)| v);
+                let is_ours = match &package_val {
+                    Some(p) => p == crate_name,
+                    None => key == crate_name,
                 };
+                if !is_ours {
+                    if ws {
+                        ws_entries.insert(key.clone(), CargoWorkspaceEntry::OtherPackage);
+                    }
+                    continue;
+                }
+                let req = find_value("version").map(|(_, v)| v);
+                let selects = cargo_req_selects(req.as_deref(), version, other_versions);
                 if selects == CargoReqMatch::NotOurs {
                     excluded.extend(req);
                     if ws {
@@ -1953,9 +1989,7 @@ fn plan_cargo_toml(
                     }
                     continue;
                 }
-                if has("workspace") {
-                    pending.push(Pending::NeedsWorkspacePin(key.clone()));
-                } else if selects == CargoReqMatch::Ambiguous {
+                if selects == CargoReqMatch::Ambiguous {
                     pending.push(Pending::Refuse(ambiguous()));
                 } else if has("path") || has("git") {
                     pending.push(Pending::Refuse(
@@ -2012,19 +2046,19 @@ fn plan_cargo_toml(
         if let Some(dotted) = rest_trim.strip_prefix('.') {
             // Dotted entry (`serde.workspace = true`, `serde.version = "1"`,
             // `alias.package = "serde"`, …).
-            let sub = parse_cargo_entry_key(dotted).map(|(k, _)| k);
-            if key == crate_name {
-                if sub.as_deref() == Some("workspace") {
-                    pending.push(Pending::NeedsWorkspacePin(key.clone()));
-                } else {
-                    pending.push(Pending::Refuse(
-                        "declared with dotted keys this rewriter does not edit".to_string(),
-                    ));
-                }
-            } else if sub.as_deref() == Some("package")
-                && package_re
-                    .captures(trimmed)
-                    .is_some_and(|c| &c[1] == crate_name)
+            let sub = parse_cargo_entry_key(dotted);
+            if sub.as_ref().is_some_and(|(key, _)| key == "workspace") {
+                pending.push(Pending::NeedsWorkspacePin(key.clone()));
+            } else if key == crate_name {
+                pending.push(Pending::Refuse(
+                    "declared with dotted keys this rewriter does not edit".to_string(),
+                ));
+            } else if sub
+                .filter(|(key, _)| key == "package")
+                .and_then(|(_, rest)| rest.trim_start().strip_prefix('='))
+                .and_then(cargo_toml_string)
+                .as_deref()
+                == Some(crate_name)
             {
                 pending.push(Pending::Refuse(
                     "declared with dotted keys this rewriter does not edit".to_string(),
@@ -2049,19 +2083,22 @@ fn plan_cargo_toml(
                 continue;
             };
             let inner = &value[1..close];
-            let package_val = package_re.captures(inner).map(|c| c[1].to_string());
+            if workspace_key_re.is_match(inner) {
+                pending.push(Pending::NeedsWorkspacePin(key.clone()));
+                continue;
+            }
+            let package_val = cargo_toml_inline_string(inner, "package");
             let is_ours = match &package_val {
                 Some(p) => p == crate_name,
                 None => key == crate_name,
             };
             if !is_ours {
+                if workspace {
+                    ws_entries.insert(key.clone(), CargoWorkspaceEntry::OtherPackage);
+                }
                 continue;
             }
-            if workspace_key_re.is_match(inner) {
-                pending.push(Pending::NeedsWorkspacePin(key.clone()));
-                continue;
-            }
-            let req = version_val_re.captures(inner).map(|c| c[1].to_string());
+            let req = cargo_toml_inline_string(inner, "version");
             match cargo_req_selects(req.as_deref(), version, other_versions) {
                 CargoReqMatch::NotOurs => {
                     excluded.extend(req);
@@ -2080,8 +2117,7 @@ fn plan_cargo_toml(
                 pending.push(Pending::Refuse(
                     "declared as a path/git dependency".to_string(),
                 ));
-            } else if let Some(c) = registry_val_re.captures(inner) {
-                let value = c[1].to_string();
+            } else if let Some(value) = cargo_toml_inline_string(inner, "registry") {
                 if value == reg {
                     pending.push(Pending::Action(CargoTomlAction::Already));
                     if workspace {
@@ -2216,12 +2252,13 @@ fn plan_cargo_toml(
                     actions.push(CargoTomlAction::InheritsWorkspace);
                 }
                 // Inherits another version of the crate: not this dep.
-                Some(CargoWorkspaceEntry::OtherVersion) => {}
-                None => {
+                Some(CargoWorkspaceEntry::OtherVersion | CargoWorkspaceEntry::OtherPackage) => {}
+                None if key == crate_name => {
                     return Err("inherits from [workspace.dependencies] with no rewritable \
                                 entry for it"
                         .to_string());
                 }
+                None => {}
             },
             Pending::Refuse(reason) => return Err(reason),
         }
@@ -2570,7 +2607,19 @@ fn plan_cargo_config(
     let header = format!("[registries.{reg}]");
     let index_line = format!("index = \"{index_url}\"");
     let lines: Vec<&str> = config.split('\n').collect();
-    let header_idx = lines.iter().position(|l| l.trim() == header);
+    let header_idx = lines.iter().position(|line| {
+        if !line.trim_start().starts_with('[') {
+            return false;
+        }
+        let Ok(document) = line.parse::<toml_edit::DocumentMut>() else {
+            return false;
+        };
+        document
+            .get("registries")
+            .and_then(|registries| registries.get(reg))
+            .and_then(toml_edit::Item::as_table)
+            .is_some_and(|table| !table.is_implicit())
+    });
     if let Some(i) = header_idx {
         let mut end = lines.len();
         for (j, l) in lines.iter().enumerate().skip(i + 1) {
@@ -2583,7 +2632,17 @@ fn plan_cargo_config(
         while end > i + 1 && lines[end - 1].trim().is_empty() {
             end -= 1;
         }
-        let healthy = lines[i + 1..end].iter().any(|l| l.trim() == index_line);
+        let healthy = lines[i + 1..end]
+            .join("\n")
+            .parse::<toml_edit::DocumentMut>()
+            .ok()
+            .and_then(|document| {
+                document
+                    .get("index")
+                    .and_then(toml_edit::Item::as_str)
+                    .map(|index| index == index_url)
+            })
+            .unwrap_or(false);
         if healthy {
             return None;
         }
@@ -9011,6 +9070,83 @@ mod tests {
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
     }
 
+    #[test]
+    fn cargo_dotted_literal_renames_refuse_every_declaration() {
+        for alias in ["alias", "\"alias\"", "'alias'"] {
+            for package_key in ["package", "\"package\"", "'package'"] {
+                let manifest = format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                     [dependencies]\nserde = \"1.0.190\"\n\
+                     {alias}.{package_key} = 'serde'\n{alias}.version = '1.0.190'\n"
+                );
+                assert!(manifest.parse::<toml_edit::DocumentMut>().is_ok());
+                let result =
+                    rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+                assert!(result.files.is_empty(), "{manifest}");
+                assert!(result.edits.is_empty(), "{manifest}");
+                assert!(result.confirmed_cargo_uuids.is_empty(), "{manifest}");
+                assert!(result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.code == "redirect_cargo_toml_dep_unrewritable"));
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_literal_renames_pin_inline_and_table_forms() {
+        for declaration in [
+            "[dependencies]\nalias = { package = 'serde', version = '1.0.190' }\n",
+            "[dependencies.alias]\npackage = 'serde'\nversion = '1.0.190'\n",
+            "[dependencies]\nalias = { 'package' = 'serde', 'version' = '1.0.190' }\n",
+            "[dependencies.'alias']\n'package' = 'serde'\n'version' = '1.0.190'\n",
+        ] {
+            let manifest =
+                format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n{declaration}");
+            let files = cargo_files(&manifest);
+            let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+            let updated = &result.files["Cargo.toml"];
+            let document = updated.parse::<toml_edit::DocumentMut>().unwrap();
+            assert_eq!(
+                document["dependencies"]["alias"]["registry"].as_str(),
+                Some(cargo_reg().as_str())
+            );
+            assert_eq!(
+                cargo_socket_registry_pin(updated, "serde"),
+                Some(cargo_reg())
+            );
+            let mut rerun_files = files;
+            rerun_files.extend(result.files);
+            let rerun = rewrite_registry_redirect(&rerun_files, &[cargo_sparse_override()]);
+            assert!(rerun.files.is_empty());
+            assert!(rerun.warnings.is_empty(), "{:?}", rerun.warnings);
+            assert!(rerun.confirmed_cargo_uuids.contains(CARGO_UUID));
+        }
+    }
+
+    #[test]
+    fn cargo_literal_registry_pins_are_superseded() {
+        let previous = "socket-patch-11111111-1111-1111-1111-111111111111";
+        for declaration in [
+            format!("[dependencies]\nalias = {{ package = 'serde', version = '1.0.190', registry = '{previous}' }}\n"),
+            format!("[dependencies.alias]\npackage = 'serde'\nversion = '1.0.190'\nregistry = '{previous}' # previous pin\n"),
+            format!("[dependencies.alias]\npackage = 'serde'\nversion = '1.0.190'\n'registry' = '{previous}'\n"),
+        ] {
+            let manifest = format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n{declaration}"
+            );
+            let result = rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            let updated = &result.files["Cargo.toml"];
+            let document = updated.parse::<toml_edit::DocumentMut>().unwrap();
+            assert_eq!(document["dependencies"]["alias"]["registry"].as_str(), Some(cargo_reg().as_str()));
+            assert_eq!(cargo_socket_registry_pin(updated, "serde"), Some(cargo_reg()));
+            assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+        }
+    }
+
     /// AUDIT A5(a) alone: when the ONLY key match renames a different crate,
     /// the dep is genuinely not declared → not-found, and NOTHING is written
     /// (no config block, no lock repoint).
@@ -9265,6 +9401,54 @@ mod tests {
             "the user's commented lines are preserved: {cfg}"
         );
         assert!(second.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    #[test]
+    fn cargo_config_quoted_commented_headers_are_reused() {
+        for header in [
+            format!("[registries.{}] # managed registry", cargo_reg()),
+            format!("[registries.\"{}\"]", cargo_reg()),
+            format!("['registries'.'{}'] # managed registry", cargo_reg()),
+            format!("[ \"registries\" . '{}' ]", cargo_reg()),
+        ] {
+            for index in [
+                format!("index = \"{}\" # current", cargo_index_url()),
+                format!("index = '{}'", cargo_index_url()),
+                format!("'index' = '{}' # current", cargo_index_url()),
+            ] {
+                let config = format!("{header}\n{index}\n\n[build]\njobs = 4\n");
+                assert!(config.parse::<toml_edit::DocumentMut>().is_ok());
+                assert!(
+                    plan_cargo_config(
+                        &config,
+                        ".cargo/config.toml",
+                        &cargo_reg(),
+                        &cargo_index_url()
+                    )
+                    .is_none(),
+                    "{config}"
+                );
+            }
+            let config =
+                format!("{header}\nindex = 'sparse+https://old.example/'\n\n[build]\njobs = 4\n");
+            let plan = plan_cargo_config(
+                &config,
+                ".cargo/config.toml",
+                &cargo_reg(),
+                &cargo_index_url(),
+            )
+            .expect("stale registry repaired");
+            let document = plan
+                .content
+                .parse::<toml_edit::DocumentMut>()
+                .expect("no duplicate tables");
+            assert_eq!(
+                document["registries"][&cargo_reg()]["index"].as_str(),
+                Some(cargo_index_url().as_str())
+            );
+            assert_eq!(document["build"]["jobs"].as_integer(), Some(4));
+            assert_eq!(plan.edit.action, "rewritten");
+        }
     }
 
     /// A degraded managed block (header intact, index line commented or
@@ -9708,6 +9892,96 @@ mod tests {
             .any(|e| e.path == "b/Cargo.toml" && e.kind == "redirect_cargo_toml_dep"));
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    #[test]
+    fn cargo_workspace_member_inherits_renamed_dependency() {
+        for workspace_entry in [
+            "[workspace.dependencies]\nserial = { package = \"serde\", version = \"=1.0.190\", features = [\"std\"] }\n",
+            "[workspace.dependencies.serial]\npackage = \"serde\"\nversion = \"=1.0.190\"\nfeatures = [\"std\"]\n",
+        ] {
+            for declaration in [
+                "[dependencies]\nserial.workspace = true\n",
+                "[dependencies]\nserial = { workspace = true, features = [\"derive\"] }\n",
+                "[dependencies.serial]\nworkspace = true\n",
+                "[dev-dependencies]\nserial.workspace = true\n",
+                "[build-dependencies]\nserial = { workspace = true }\n",
+                "[target.'cfg(unix)'.dependencies.serial]\nworkspace = true\n",
+            ] {
+                let mut files = cargo_files(&format!(
+                    "[workspace]\nmembers = [\"consumer\"]\n\n{workspace_entry}"
+                ));
+                files.insert(
+                    "consumer/Cargo.toml".into(),
+                    format!(
+                        "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n\n{declaration}"
+                    ),
+                );
+                files.get_mut("Cargo.lock").unwrap().push_str(
+                    "\n[[package]]\nname = \"consumer\"\nversion = \"0.1.0\"\ndependencies = [\"serde\"]\n",
+                );
+
+                let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+                assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+                assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+                assert!(result.files["Cargo.toml"]
+                    .contains(&format!("registry = \"{}\"", cargo_reg())));
+                assert!(!result.files.contains_key("consumer/Cargo.toml"));
+                assert!(result.files["Cargo.lock"].contains(&cargo_index_url()));
+
+                files.extend(result.files);
+                let repeated = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+                assert!(repeated.warnings.is_empty(), "{:?}", repeated.warnings);
+                assert!(repeated.edits.is_empty() && repeated.files.is_empty());
+                assert!(repeated.confirmed_cargo_uuids.contains(CARGO_UUID));
+            }
+        }
+    }
+
+    #[test]
+    fn cargo_root_inherits_renamed_dependency_before_workspace_declaration() {
+        let files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserial.workspace = true\n\n\
+             [workspace.dependencies]\nserial = { package = \"serde\", version = \"=1.0.190\" }\n",
+        );
+        let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+        assert!(result.files["Cargo.toml"].contains("serial.workspace = true"));
+        assert!(result.files["Cargo.toml"].contains(&format!(
+            "serial = {{ package = \"serde\", version = \"=1.0.190\", registry = \"{}\" }}",
+            cargo_reg()
+        )));
+    }
+
+    #[test]
+    fn cargo_workspace_inherited_key_renaming_another_package_is_ignored() {
+        for other_entry in [
+            "[workspace.dependencies]\nserde = { package = \"unrelated\", version = \"1\" }\n",
+            "[workspace.dependencies.serde]\npackage = \"unrelated\"\nversion = \"1\"\n",
+        ] {
+            let root = format!(
+                "[workspace]\nmembers = [\"consumer\"]\n\n\
+                 {other_entry}\n\
+                 [workspace.dependencies.serial]\npackage = \"serde\"\nversion = \"=1.0.190\"\n"
+            );
+            let mut files = cargo_files(&root);
+            files.insert(
+                "consumer/Cargo.toml".into(),
+                "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\n\n\
+                 [dependencies]\nserde.workspace = true\nserial.workspace = true\n"
+                    .into(),
+            );
+            files.get_mut("Cargo.lock").unwrap().push_str(
+                "\n[[package]]\nname = \"consumer\"\nversion = \"0.1.0\"\ndependencies = [\"serde\"]\n",
+            );
+            let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+            assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+            assert!(result.files["Cargo.toml"].contains(other_entry));
+            assert!(!result.files.contains_key("consumer/Cargo.toml"));
+        }
     }
 
     /// A member that cannot be pinned (a path dependency here) refuses the
@@ -15069,6 +15343,111 @@ packages:
             r.files["extra/Cargo.toml"].contains(&format!("registry = \"{}\"", cargo_reg())),
             "{:?}",
             r.files
+        );
+    }
+
+    #[test]
+    fn cargo_source_less_dependents_match_both_name_and_version() {
+        let root = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                    [dependencies]\ninside = { package = \"foo\", path = \"inside\" }\n\
+                    outside = { package = \"foo\", path = \"../outside\" }\n";
+        let mut files = cargo_files(root);
+        files.insert(
+            "inside/Cargo.toml".into(),
+            "[package]\nname = \"foo\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = \"1.0.190\"\n"
+                .into(),
+        );
+        files.get_mut("Cargo.lock").unwrap().push_str(
+            "\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+             dependencies = [\"foo 0.1.0\", \"foo 0.2.0\"]\n\n\
+             [[package]]\nname = \"foo\"\nversion = \"0.1.0\"\ndependencies = [\"serde\"]\n\n\
+             [[package]]\nname = \"foo\"\nversion = \"0.2.0\"\ndependencies = [\"serde\"]\n",
+        );
+        let refused = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(refused.files.is_empty() && refused.edits.is_empty());
+        assert!(refused.confirmed_cargo_uuids.is_empty());
+        assert_eq!(
+            warning_codes(&refused),
+            vec!["redirect_cargo_transitive_dependents"]
+        );
+        assert!(refused.warnings[0]
+            .detail
+            .contains("foo 0.2.0 (a path package"));
+
+        files.insert("Cargo.toml".into(), root.replace("../outside", "outside"));
+        files.insert(
+            "outside/Cargo.toml".into(),
+            "[package]\nname = \"foo\"\nversion = \"0.2.0\"\n\n\
+             [dependencies]\nserde = \"1.0.190\"\n"
+                .into(),
+        );
+        let accepted = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(accepted.warnings.is_empty(), "{:?}", accepted.warnings);
+        assert!(accepted.confirmed_cargo_uuids.contains(CARGO_UUID));
+        assert!(accepted.files.contains_key("inside/Cargo.toml"));
+        assert!(accepted.files.contains_key("outside/Cargo.toml"));
+    }
+
+    #[test]
+    fn cargo_source_less_dependents_resolve_workspace_and_default_versions() {
+        for (version_field, locked_version) in [
+            ("version.workspace = true\n", "0.2.0"),
+            ("version = { workspace = true }\n", "0.2.0"),
+            ("version.workspace = true\nworkspace = \"..\"\n", "0.2.0"),
+            ("", "0.0.0"),
+        ] {
+            let mut files = cargo_files(
+                "[workspace]\nmembers = [\"consumer\"]\n\n\
+                 [workspace.package]\nversion = \"0.2.0\"\n",
+            );
+            files.insert(
+                "consumer/Cargo.toml".into(),
+                format!(
+                    "[package]\nname = \"consumer\"\n{version_field}\n\
+                     [dependencies]\nserde = \"1.0.190\"\n"
+                ),
+            );
+            files.get_mut("Cargo.lock").unwrap().push_str(&format!(
+                "\n[[package]]\nname = \"consumer\"\nversion = \"{locked_version}\"\n\
+                 dependencies = [\"serde\"]\n"
+            ));
+            let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(
+                result.warnings.is_empty(),
+                "{version_field}: {:?}",
+                result.warnings
+            );
+            assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+        }
+    }
+
+    #[test]
+    fn cargo_package_identity_keeps_workspace_version_ownership() {
+        let manifest = "[package]\nname = \"consumer\"\nversion.workspace = true\n";
+        assert_eq!(
+            cargo_manifest_package_id(
+                &format!("{manifest}\n[workspace.package]\nversion = \"0.3.0\"\n"),
+                "consumer/Cargo.toml",
+                Some("0.2.0"),
+            ),
+            Some(("consumer".into(), "0.3.0".into())),
+        );
+        assert_eq!(
+            cargo_manifest_package_id(
+                &format!("{manifest}\n[workspace]\n"),
+                "consumer/Cargo.toml",
+                Some("0.2.0"),
+            ),
+            None,
+        );
+        assert_eq!(
+            cargo_manifest_package_id(
+                &format!("{manifest}workspace = \"../../other\"\n"),
+                "consumer/Cargo.toml",
+                Some("0.2.0"),
+            ),
+            None,
         );
     }
 
