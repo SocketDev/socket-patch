@@ -77,7 +77,7 @@ use socket_patch_core::api::client::{
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::redirect::RedirectState;
-use socket_patch_core::utils::concurrent::ordered_concurrent;
+use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::state::{lookup_entry_kv, VendorArtifact, VendorEntry, VendorState};
 use socket_patch_core::vex::discover::{
@@ -107,9 +107,21 @@ pub(crate) const REDIRECT_UNWIRED: &str = "redirect_unwired";
 /// candidate for that package attests.
 pub(crate) const WIRING_CONFLICT: &str = "wiring_conflict";
 
-/// Bound on concurrent patch-view fetches (one GET per uuid; the view
-/// carries blob content, so it is heavy) — the batch fallback's limit.
+/// Ceiling on concurrent patch-view fetches (one GET per uuid; the view
+/// carries blob content, so it is heavy).
 const FETCH_CONCURRENCY: usize = 10;
+
+/// The in-flight cap for the record fetch.
+///
+/// These are patch-API requests — `scan --vex` makes them too — so the
+/// documented escape hatch has to reach them like it reaches every other
+/// window: an operator behind something that caps in-flight requests per
+/// client sets `SOCKET_API_CONCURRENCY=1` and gets one view at a time.
+/// [`FETCH_CONCURRENCY`] is this window's own ceiling on top of that, for
+/// the size of a view.
+fn fetch_concurrency(use_public_proxy: bool) -> usize {
+    api_concurrency(use_public_proxy).min(FETCH_CONCURRENCY)
+}
 
 /// Everything `vex` reads, loaded once by the caller (which owns the
 /// corrupt-ledger hard errors).
@@ -920,7 +932,7 @@ async fn fetch_records(
             let client = &client;
             let mut views = std::pin::pin!(ordered_concurrent(
                 pending.iter(),
-                FETCH_CONCURRENCY,
+                fetch_concurrency(use_public_proxy),
                 |uuid| async move { (uuid, hold_back_debug(client.fetch_patch(uuid)).await) },
             ));
             loop {
@@ -1037,6 +1049,33 @@ mod tests {
             cwd: root.to_path_buf(),
             offline: true,
             ..GlobalArgs::default()
+        }
+    }
+
+    /// `scan --vex` reaches this window, so the documented escape hatch
+    /// has to reach it too: `SOCKET_API_CONCURRENCY=1` means one view at a
+    /// time here as well. Serial: `SOCKET_*` is process-global.
+    #[test]
+    #[serial_test::serial]
+    fn socket_api_concurrency_paces_the_record_fetch() {
+        use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
+        let orig = std::env::var(API_CONCURRENCY_ENV).ok();
+        std::env::remove_var(API_CONCURRENCY_ENV);
+        // A view is heavy, so the API's own cap is what binds by default.
+        assert_eq!(fetch_concurrency(false), 8);
+        assert_eq!(fetch_concurrency(true), 4);
+
+        std::env::set_var(API_CONCURRENCY_ENV, "1");
+        assert_eq!(fetch_concurrency(false), 1);
+        assert_eq!(fetch_concurrency(true), 1);
+
+        // Turned up past this window's own ceiling, the ceiling holds.
+        std::env::set_var(API_CONCURRENCY_ENV, "32");
+        assert_eq!(fetch_concurrency(false), FETCH_CONCURRENCY);
+
+        match orig {
+            Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),
+            None => std::env::remove_var(API_CONCURRENCY_ENV),
         }
     }
 
