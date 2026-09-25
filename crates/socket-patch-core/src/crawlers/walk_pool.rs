@@ -29,7 +29,11 @@
 //! one. Real trees barely notice — package.json files are kilobytes — but
 //! one outsized file in an untrusted tree now costs [`walk_threads`]
 //! copies instead of one. Capping the read would change what the crawler
-//! inventories, so the trade is deliberate, not an oversight.
+//! inventories, so the trade is deliberate, not an oversight. What the
+//! thread count itself costs — those buffers and a [`WALK_STACK_SIZE`]
+//! stack each — is why it has a ceiling ([`MAX_WALK_THREADS`]) as well as
+//! a floor: the walk is I/O-bound and flat well below it, so a bigger
+//! machine would buy nothing and reserve hundreds of megabytes for it.
 
 use std::sync::OnceLock;
 
@@ -50,6 +54,16 @@ const TIGHT_NOFILE_LIMIT: u64 = 128;
 /// the tight limit; each walk thread holds at most one descriptor, and
 /// the pool takes at most half of what remains.
 const RESERVED_FDS: u64 = 64;
+
+/// Ceiling on the pool, whatever the machine's parallelism. The walk is
+/// descriptor- and page-cache-bound, not CPU-bound: it flattens well below
+/// this, while every thread costs a [`WALK_STACK_SIZE`] stack and another
+/// package.json buffer (see the module docs). Without it a 96-core CI
+/// runner built 96 threads and 768 MiB of reserved stack to walk one
+/// project's node_modules. The descriptor budget below can only lower it —
+/// above [`TIGHT_NOFILE_LIMIT`] the budget is never the binding term, and
+/// below it the pool is one thread.
+const MAX_WALK_THREADS: usize = 16;
 
 /// The process's soft `RLIMIT_NOFILE`, read once. `None` when unlimited
 /// or unknown (and on Windows, whose handle table has no comparable
@@ -92,8 +106,15 @@ fn is_tight(soft_limit: Option<u64>) -> bool {
     soft_limit.is_some_and(|limit| limit < TIGHT_NOFILE_LIMIT)
 }
 
-/// Walk threads for `cpus` logical CPUs under `soft_limit`.
+/// Walk threads for `cpus` logical CPUs under `soft_limit`: what the
+/// descriptors leave room for, under the I/O-bound ceiling.
 fn walk_threads(cpus: usize, soft_limit: Option<u64>) -> usize {
+    descriptor_budget(cpus, soft_limit).min(MAX_WALK_THREADS)
+}
+
+/// The most walk threads `soft_limit` leaves room for, before
+/// [`MAX_WALK_THREADS`] applies.
+fn descriptor_budget(cpus: usize, soft_limit: Option<u64>) -> usize {
     if is_tight(soft_limit) {
         return 1;
     }
@@ -242,22 +263,44 @@ mod tests {
         assert!(!is_tight(None));
         for limit in [0, 1, 20, 64, TIGHT_NOFILE_LIMIT - 1] {
             assert_eq!(walk_threads(64, Some(limit)), 1, "limit {limit}");
+            assert_eq!(descriptor_budget(64, Some(limit)), 1, "limit {limit}");
         }
     }
 
     #[test]
     fn thread_count_stays_inside_the_descriptor_budget() {
-        assert_eq!(walk_threads(14, Some(256)), 14);
-        assert_eq!(walk_threads(14, Some(1024)), 14);
-        assert_eq!(walk_threads(14, None), 14);
-        assert_eq!(walk_threads(0, None), 1);
-        assert_eq!(walk_threads(256, Some(TIGHT_NOFILE_LIMIT)), 32);
-        assert_eq!(walk_threads(256, Some(1024)), 256);
-        assert_eq!(walk_threads(1024, Some(1024)), 480);
+        assert_eq!(descriptor_budget(14, Some(256)), 14);
+        assert_eq!(descriptor_budget(14, Some(1024)), 14);
+        assert_eq!(descriptor_budget(14, None), 14);
+        assert_eq!(descriptor_budget(0, None), 1);
+        assert_eq!(descriptor_budget(256, Some(TIGHT_NOFILE_LIMIT)), 32);
+        assert_eq!(descriptor_budget(256, Some(1024)), 256);
+        assert_eq!(descriptor_budget(1024, Some(1024)), 480);
         for limit in [TIGHT_NOFILE_LIMIT, 200, 256, 1024, 4096] {
             let threads = walk_threads(1024, Some(limit)) as u64;
             assert!(threads >= 1 && threads + RESERVED_FDS <= limit, "{limit}");
         }
+    }
+
+    /// The walk is I/O-bound, so a bigger machine stops buying threads:
+    /// the pool is capped however many CPUs and descriptors there are.
+    /// Below the cap, the machine and the descriptor budget still decide.
+    #[test]
+    fn thread_count_is_capped_however_big_the_machine_is() {
+        assert_eq!(walk_threads(96, Some(1024)), MAX_WALK_THREADS);
+        assert_eq!(walk_threads(1024, Some(1024)), MAX_WALK_THREADS);
+        assert_eq!(walk_threads(1024, None), MAX_WALK_THREADS);
+        assert_eq!(
+            walk_threads(256, Some(TIGHT_NOFILE_LIMIT)),
+            MAX_WALK_THREADS
+        );
+        // Under the cap nothing changed: the CPU count still binds.
+        assert_eq!(walk_threads(4, Some(1024)), 4);
+        assert_eq!(walk_threads(MAX_WALK_THREADS, None), MAX_WALK_THREADS);
+        assert_eq!(
+            walk_threads(MAX_WALK_THREADS - 1, None),
+            MAX_WALK_THREADS - 1
+        );
     }
 
     #[test]

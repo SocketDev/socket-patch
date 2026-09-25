@@ -15,7 +15,8 @@
 //!
 //! Descriptors are the only resource with a budget here. Peak memory also
 //! scales with the walk thread count now (one package.json read per
-//! thread, uncapped); nothing pins that — see the `walk_pool` module docs.
+//! thread, uncapped); nothing pins that beyond the thread count's own
+//! ceiling — see the `walk_pool` module docs.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
