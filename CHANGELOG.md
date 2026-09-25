@@ -97,10 +97,12 @@ into the new version's section — see docs/releasing.md.
   of `.cargo/config.toml` / `.cargo/config`, so Socket scanners can recover
   the patch uuid from the manifest alone and single-version wiring builds
   on cargo older than 1.56 (the floor of config-file `[patch]`; proven on
-  cargo 1.41 with no network); two vendored versions of one crate need
-  `--offline` on cargo 1.56, and a populated registry index (the crates.io
-  index in `$CARGO_HOME`, or network access) on older cargo such as 1.41,
-  which loads it to tell the two entries apart. The edit is
+  cargo 1.41 with no network); two vendored versions of one crate make older cargo
+  load the crates.io index to tell the two entries apart: `--offline` from
+  an empty `$CARGO_HOME` is enough on cargo 1.56, while older cargo such as
+  1.41 needs the index itself (the crates.io index in `$CARGO_HOME`, or
+  network access), and without `--offline` either one first tries to update
+  the index and fails when it is unreachable. The edit is
   format-preserving (comments, ordering, CRLF / mixed line endings, a
   UTF-8 BOM and the trailing-newline state survive; a revert restores the
   manifest byte for byte and keeps a user's own `[patch]` /

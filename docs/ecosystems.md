@@ -260,10 +260,14 @@ version = "1.0.4+socket.<uuid>"
   the patched copy with no network on the cargo 1.41 and 1.56 docker
   images — the CI `cargo-old-toolchains` leg; without the images a local
   run falls back to type-checking on rustup toolchains).
-  Two vendored versions of ONE crate need `cargo build --offline` on 1.56,
-  and on older cargo (1.41) a populated crates.io index in `$CARGO_HOME`
-  (or network access) — it loads the index to tell the two entries apart.
-  Current stable needs neither.
+  Two vendored versions of ONE crate make older cargo load the crates.io
+  index to tell the two `[patch]` entries apart: on 1.56 `cargo build
+  --offline` from an empty `$CARGO_HOME` is enough, while older cargo
+  (1.41) needs the index itself — a populated crates.io index in
+  `$CARGO_HOME`, or network access. Without `--offline` either one tries to
+  update the index first and fails when it is unreachable. Current stable
+  needs neither. Each clause is asserted by the old-toolchain e2e test, in
+  both directions.
 - **Keys.** Always the Socket-owned `<name>-socket-<first 8 hex of the
   uuid>` with `package = "<name>"` (the full uuid hex if that key is
   taken), never the bare crate name: cargo lets a config-file `[patch]`

@@ -2078,15 +2078,23 @@ fn cargo_vendored_manifest_patch_builds_on_old_toolchains() {
 }
 
 /// OLD TOOLCHAIN, TWO VERSIONS of one crate: older cargo loads the
-/// crates.io index to tell two same-named `[patch]` entries apart. Cargo
-/// 1.56 builds the committed two-version wiring under `--offline` from an
-/// empty CARGO_HOME (what the docs require there); older cargo (1.41) needs
-/// the index itself — it fails under `--offline` with no registry cache
-/// (only that failure is accepted from an empty CARGO_HOME), and the
-/// documented remedy, a populated crates.io index in `$CARGO_HOME`, must
-/// then build (and run) both patched copies with no network. Without
-/// `--offline` the outcome is only reported (current stable needs neither
-/// — see `cargo_vendor_two_versions_of_one_crate_locked_build`).
+/// crates.io index to tell two same-named `[patch]` entries apart. Every
+/// clause of the documented constraint is ASSERTED here, in both
+/// directions, because both arms run with no network (docker `--network
+/// none`, rustup pointed at a dead proxy):
+///
+/// * without `--offline` the build MUST fail, and fail on the unreachable
+///   index — the negative control for "pass `--offline`";
+/// * cargo 1.56 then builds under `--offline` from an EMPTY CARGO_HOME;
+/// * older cargo (1.41) MUST first fail even under `--offline` (no registry
+///   cache to read), and the documented remedy — a populated crates.io
+///   index in `$CARGO_HOME` — must then build (and run) both patched
+///   copies with no network. That step is unconditional below 1.56, so a
+///   cargo that stops needing it fails this test instead of silently
+///   skipping the remedy.
+///
+/// Current stable needs neither — see
+/// `cargo_vendor_two_versions_of_one_crate_locked_build`.
 #[test]
 fn cargo_vendored_two_versions_on_old_toolchains_need_offline() {
     const SUITE: &str = "e2e_vendor_cargo_build (old-toolchain multi-version)";
@@ -2112,18 +2120,33 @@ fn cargo_vendored_two_versions_on_old_toolchains_need_offline() {
         let name = old.name();
         let (fresh, _) = fresh_checkout(&fx.proj, tmp.path(), &format!("mv-{}", old.minor()));
         std::fs::write(fresh.join("Cargo.lock"), lock_for_minor(&lock, old.minor())).unwrap();
+        // What an old cargo says when it must load the crates.io index and
+        // cannot reach it: 1.56 fails to update the registry, 1.41 fails to
+        // resolve the index host. Both name the index or its host, which is
+        // what distinguishes this from a wiring failure.
+        const INDEX_UNREACHABLE: [&str; 3] = ["crates.io-index", "crates-io", "github.com"];
         let online = old_cargo_run(&old, &fresh, &[]);
-        println!(
-            "old-toolchain multi-version {name} without --offline: {}",
-            if online.out.status.success() {
-                "ok"
-            } else {
-                "needs --offline (registry index unreachable)"
-            }
+        let online_stderr = String::from_utf8_lossy(&online.out.stderr).into_owned();
+        assert!(
+            !online.out.status.success(),
+            "{name}: with no network and no --offline the two-version wiring must NOT \
+             build — the constraint the docs state:\n{online_stderr}"
         );
+        assert!(
+            INDEX_UNREACHABLE.iter().any(|m| online_stderr.contains(m)),
+            "{name}: it must fail on the unreachable crates.io index, not on the \
+             wiring:\n{online_stderr}"
+        );
+        println!("old-toolchain multi-version {name} without --offline: needs the index");
         let mut run = old_cargo_run(&old, &fresh, &["--offline"]);
-        if old.minor() < 56 && !run.out.status.success() {
-            let stderr = String::from_utf8_lossy(&run.out.stderr);
+        if old.minor() < 56 {
+            let stderr = String::from_utf8_lossy(&run.out.stderr).into_owned();
+            assert!(
+                !run.out.status.success(),
+                "{name}: below 1.56 an EMPTY CARGO_HOME cannot tell the two [patch] \
+                 entries apart offline — the reason the index remedy is documented:\n\
+                 {stderr}"
+            );
             assert!(
                 stderr.contains("unable to fetch registry") && stderr.contains("in offline mode"),
                 "{name}: the only accepted failure below 1.56 is the missing registry \
