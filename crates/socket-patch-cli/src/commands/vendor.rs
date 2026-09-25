@@ -40,7 +40,9 @@ use std::time::Duration;
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::apply::{representative_file, result_to_event, variant_matches_installed};
 use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
-use crate::commands::fetch_stage::{stage_vendor_sources_in_memory, MemStageOutcome};
+use crate::commands::fetch_stage::{
+    drop_unstageable, stage_vendor_sources_in_memory, MemStageOutcome,
+};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::rollback::VendorRevertStep;
 use crate::commands::vex::{
@@ -945,13 +947,19 @@ async fn run_vendor(
         }
     };
     let sources = staged.as_patch_sources();
+    // A patch whose content this run could not obtain is an unsatisfiable
+    // PACKAGE, reported per-package and left out of the engine run — the
+    // rest of the manifest still vendors (the stager reserves its
+    // whole-run `no_local_source` bail for "nothing is stageable").
+    let (records, staging_errors) = drop_unstageable(env, &manifest.patches, staged.unavailable());
+    has_errors |= staging_errors;
 
     if manifest.patches.is_empty() && !common.json && !common.silent {
         println!("The manifest has no patches; nothing to vendor.");
     }
     has_errors |= vendor_records(
         common,
-        &manifest.patches,
+        &records,
         &sources,
         false,
         args.force,

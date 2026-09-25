@@ -7,6 +7,7 @@
 //! cache is `repair`'s job, keeping these commands read-only against
 //! `.socket/`).
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -22,6 +23,7 @@ use tempfile::TempDir;
 use super::get::base64_decode;
 use crate::args::GlobalArgs;
 use crate::commands::bun_preflight::LedgerLoad;
+use crate::json_envelope::{Envelope, PatchAction, PatchEvent};
 use crate::ui::{plural, StatusLine};
 
 /// Resolved artifact locations for the patch pipeline. Holds the overlay
@@ -439,6 +441,12 @@ pub(crate) struct MemStagedSources {
     diffs: PathBuf,
     packages: PathBuf,
     mem: HashMap<String, Vec<u8>>,
+    /// The purls this staging could NOT obtain patch content for, while at
+    /// least one other patch staged fine. Each is an unsatisfiable package
+    /// the caller reports per-package (and leaves out of the engine run) —
+    /// see [`stage_vendor_sources_in_memory`]. Sorted, so the per-package
+    /// reports come out in the same order every run.
+    unavailable: Vec<String>,
 }
 
 impl MemStagedSources {
@@ -451,6 +459,11 @@ impl MemStagedSources {
             diffs_path: Some(&self.diffs),
             mem_blobs: Some(&self.mem),
         }
+    }
+
+    /// See [`MemStagedSources::unavailable`].
+    pub(crate) fn unavailable(&self) -> &[String] {
+        &self.unavailable
     }
 }
 
@@ -471,6 +484,16 @@ pub(crate) enum MemStageOutcome {
 /// disk stager there is no hard-failure mode (no download-mode parse, no
 /// tempdir), so this returns the outcome directly — every failure is the
 /// soft `Unavailable`.
+///
+/// A patch whose content the VIEW cannot supply (a 404, a transport error,
+/// or a file the server serves with no `blobContent` — which is how it
+/// serves a zero-delta file, `beforeHash == afterHash`) is an unsatisfiable
+/// PACKAGE, not a broken run: its purl comes back in
+/// [`MemStagedSources::unavailable`] for the caller to report per-package,
+/// and the patches that did stage still run. `Unavailable` is reserved for
+/// the case it was written for — NOTHING in the manifest can be staged, so
+/// there are no per-package events to report and the caller's pre-event
+/// `no_local_source` error is the whole story.
 ///
 /// `ledger` is the caller's single `load_state` outcome (the harvest reads
 /// the committed artifacts it names; an unreadable ledger harvests
@@ -498,6 +521,7 @@ pub(crate) async fn stage_vendor_sources_in_memory(
     let missing_blobs = get_missing_blobs(manifest, &blobs).await;
     let missing_package_archives = get_missing_archives(manifest, &packages).await;
     let mut mem = seed;
+    let mut unavailable: Vec<String> = Vec::new();
 
     // A diff archive alone is NOT a sufficient source here, unlike the disk
     // stager: vendoring runs the auto-force policy, where a beforeHash
@@ -619,7 +643,9 @@ pub(crate) async fn stage_vendor_sources_in_memory(
             // the envelope (printed exclusively under --json), so muting
             // this under --silent meant exit 1 with zero output — the
             // CLI_CONTRACT violation ("errors only", NEVER nothing) fixed
-            // for the disk stager's arms above.
+            // for the disk stager's arms above. It stays the ONE human
+            // channel for these purls in both arms below: the per-package
+            // arm only records events.
             if !common.json {
                 eprintln!(
                     "Error: Could not fetch patch content for {}:",
@@ -629,7 +655,15 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                     eprintln!("{line}");
                 }
             }
-            return MemStageOutcome::Unavailable;
+            // Nothing in the manifest is usable ⇒ the pre-event bail (no
+            // events to report). Otherwise these purls are unsatisfiable
+            // packages the caller reports one by one, and the rest of the
+            // run continues.
+            if failed.len() == manifest.patches.len() {
+                return MemStageOutcome::Unavailable;
+            }
+            unavailable = failed.into_iter().map(str::to_string).collect();
+            unavailable.sort();
         }
     }
 
@@ -638,7 +672,34 @@ pub(crate) async fn stage_vendor_sources_in_memory(
         diffs,
         packages,
         mem,
+        unavailable,
     })
+}
+
+/// Record the per-package `failed` event for every purl
+/// [`stage_vendor_sources_in_memory`] could not obtain patch content for,
+/// and hand back the records the run can still vendor. `true` when at least
+/// one purl was dropped (the run has errors). Borrows `records` untouched
+/// on the overwhelmingly common empty path.
+pub(crate) fn drop_unstageable<'a>(
+    env: &mut Envelope,
+    records: &'a HashMap<String, PatchRecord>,
+    unavailable: &[String],
+) -> (Cow<'a, HashMap<String, PatchRecord>>, bool) {
+    if unavailable.is_empty() {
+        return (Cow::Borrowed(records), false);
+    }
+    for purl in unavailable {
+        env.record(
+            PatchEvent::new(PatchAction::Failed, purl.clone()).with_error(
+                "no_local_source",
+                "patch artifacts unavailable (offline or download failure)",
+            ),
+        );
+    }
+    let mut kept = records.clone();
+    kept.retain(|purl, _| !unavailable.contains(purl));
+    (Cow::Owned(kept), true)
 }
 
 #[cfg(test)]
