@@ -25,6 +25,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +36,7 @@ use crate::utils::purl::{patch_matches, strip_purl_qualifiers};
 use crate::utils::serde::serialize_sorted;
 use crate::utils::socket_dir::{prune_empty_dirs, remove_file_and_prune, write_json_ledger};
 
+use super::parse_memo::ParseMemo;
 use super::path::VENDOR_DIR;
 
 /// Project-relative path of the ledger.
@@ -537,18 +539,48 @@ fn state_path(project_root: &Path) -> PathBuf {
 pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
     let path = state_path(project_root);
     match read_regular_to_bytes(&path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).or_else(|e| {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if value.get("mode").is_some() && value.get("entries").is_none() {
-                    return Ok(VendorState::new());
-                }
-            }
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("corrupt {}: {e}", path.display()),
-            ))
-        }),
+        Ok(bytes) => parse_state(&bytes, &path),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(VendorState::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The ledger bytes as a [`VendorState`]; see [`load_state`] for the
+/// `mode`-tagged exception.
+fn parse_state(bytes: &[u8], path: &Path) -> std::io::Result<VendorState> {
+    serde_json::from_slice(bytes).or_else(|e| {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            if value.get("mode").is_some() && value.get("entries").is_none() {
+                return Ok(VendorState::new());
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("corrupt {}: {e}", path.display()),
+        ))
+    })
+}
+
+/// The run's ledger parse. The hatch backend asks the ledger the same two
+/// questions for every patched package — which entry carries this uuid, and
+/// which wiring record already allows direct references — and a ledger
+/// holding a whole-file snapshot per wired file runs to megabytes, so an
+/// idempotent re-run (which writes no ledger at all) parsed the same bytes
+/// once per package. See [`ParseMemo`]: the read still happens every time,
+/// and a ledger something else rewrote between two packages differs in its
+/// bytes and is re-parsed.
+static STATE_MEMO: ParseMemo<VendorState> = ParseMemo::new();
+
+/// [`load_state`], reusing the run's parse while the ledger's bytes are the
+/// ones that produced it — for the read-only callers that ask the same
+/// ledger about every patched package. The state comes back shared: nobody
+/// on this path mutates it (the writers go through [`save_state`], which
+/// drops the slot).
+pub(crate) async fn load_state_shared(project_root: &Path) -> std::io::Result<Arc<VendorState>> {
+    let path = state_path(project_root);
+    match read_regular_to_bytes(&path).await {
+        Ok(bytes) => STATE_MEMO.parse(&bytes, || parse_state(&bytes, &path)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Arc::new(VendorState::new())),
         Err(e) => Err(e),
     }
 }
@@ -561,6 +593,11 @@ pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
 /// level). A failed unlink propagates before any prune.
 pub async fn save_state(project_root: &Path, state: &VendorState) -> std::io::Result<()> {
     let path = state_path(project_root);
+    // Dropped before the write, so a torn one leaves nothing behind either.
+    // Never needed for correctness — [`load_state_shared`] keys on the bytes
+    // it just read — this is how the run stops holding a ledger nothing will
+    // hit again.
+    STATE_MEMO.invalidate();
     if !state.entries.is_empty() {
         return write_json_ledger(&path, state).await;
     }
@@ -1323,6 +1360,106 @@ mod tests {
             .unwrap();
         let err = load_state(root).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// The shared ledger read answers exactly what [`load_state`] answers,
+    /// for every shape the loader distinguishes — a present ledger, a
+    /// missing one, the foreign mode-tagged file, and a corrupt one (whose
+    /// failure is never cached, so the next read reports it again).
+    #[tokio::test]
+    async fn the_shared_ledger_read_matches_the_unshared_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert_eq!(
+            *load_state_shared(root).await.unwrap(),
+            load_state(root).await.unwrap(),
+            "a missing ledger"
+        );
+
+        tokio::fs::create_dir_all(root.join(".socket/vendor"))
+            .await
+            .unwrap();
+        let mut state = VendorState::new();
+        state
+            .entries
+            .insert("pkg:npm/lodash@4.17.21".into(), sample_entry());
+        save_state(root, &state).await.unwrap();
+        assert_eq!(
+            *load_state_shared(root).await.unwrap(),
+            load_state(root).await.unwrap(),
+            "a wired ledger"
+        );
+        // Twice, so the second read is the one the memo answers.
+        assert_eq!(
+            *load_state_shared(root).await.unwrap(),
+            load_state(root).await.unwrap(),
+            "the memoized read of a wired ledger"
+        );
+
+        tokio::fs::write(
+            root.join(VENDOR_STATE_REL),
+            br#"{ "version": 1, "mode": "registry", "edits": [] }"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *load_state_shared(root).await.unwrap(),
+            load_state(root).await.unwrap(),
+            "a foreign mode-tagged ledger"
+        );
+
+        tokio::fs::write(root.join(VENDOR_STATE_REL), b"{not json")
+            .await
+            .unwrap();
+        for attempt in 0..2 {
+            assert_eq!(
+                load_state_shared(root).await.unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData,
+                "a corrupt ledger must fail closed on attempt {attempt}"
+            );
+        }
+    }
+
+    /// The ledger memo skips the parse, never the read: a ledger something
+    /// else rewrote between two packages of a run — a concurrent
+    /// `socket-patch` on the same project, a hand edit — must be seen by the
+    /// second, without anyone invalidating anything.
+    #[tokio::test]
+    async fn an_external_ledger_edit_between_reads_is_not_memoized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::create_dir_all(root.join(".socket/vendor"))
+            .await
+            .unwrap();
+        let mut state = VendorState::new();
+        state
+            .entries
+            .insert("pkg:npm/lodash@4.17.21".into(), sample_entry());
+        save_state(root, &state).await.unwrap();
+        assert_eq!(load_state_shared(root).await.unwrap().entries.len(), 1);
+
+        // Written behind the loader's back: no save_state, no invalidate.
+        let mut other = VendorState::new();
+        other
+            .entries
+            .insert("pkg:npm/left-pad@1.3.0".into(), sample_entry());
+        tokio::fs::write(
+            root.join(VENDOR_STATE_REL),
+            serde_json::to_vec(&other).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            load_state_shared(root)
+                .await
+                .unwrap()
+                .entries
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["pkg:npm/left-pad@1.3.0".to_string()],
+            "the second read must build on the bytes on disk"
+        );
     }
 
     /// A mode-tagged NON-vendor ledger squatting on this path (an early
