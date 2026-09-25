@@ -1421,7 +1421,6 @@ struct LockEdit {
     original_hash: String,
 }
 
-/// Rewrite `contentHash` to `new_hash` for every framework entry of `id`
 /// The run's `packages.lock.json` parse. Each patched package asks the lock
 /// the same two questions — is it already pinned at our bytes, and what
 /// does it pin today — and an idempotent re-run asks them of bytes nothing
@@ -1435,6 +1434,7 @@ fn lock_value(text: &str) -> Result<Arc<Value>, serde_json::Error> {
     LOCK_VALUE_MEMO.parse(text.as_bytes(), || serde_json::from_str::<Value>(text))
 }
 
+/// Rewrite `contentHash` to `new_hash` for every framework entry of `id`
 /// (case-insensitive) whose `resolved` equals `version_norm`. Returns
 /// `Ok(Some(edit))` when a rewrite happened, `Ok(None)` when the lock has no
 /// matching resolved entry (nothing to pin), `Err` on parse failure.
