@@ -22,6 +22,14 @@
 //!   ([`fd_limit_is_tight`]) the pool gets ONE thread and the crawlers run
 //!   serially (the old descriptor profile); otherwise the thread count is
 //!   capped so the extra descriptors stay well inside the limit.
+//!
+//! Peak MEMORY has no such budget, and does not survive the move: the walk
+//! holds up to one package.json per walk thread at once (each read sizes
+//! its buffer from the file, with no cap), where the sequential walk held
+//! one. Real trees barely notice — package.json files are kilobytes — but
+//! one outsized file in an untrusted tree now costs [`walk_threads`]
+//! copies instead of one. Capping the read would change what the crawler
+//! inventories, so the trade is deliberate, not an oversight.
 
 use std::sync::OnceLock;
 
