@@ -1232,6 +1232,72 @@ mod tests {
         assert_eq!(w.new.as_ref().unwrap(), e);
     }
 
+    /// The memo hands the second package of a run the document the FIRST
+    /// one mutated in memory, re-seeded against the bytes it wrote — not a
+    /// fresh parse of those bytes. Pin that the two paths agree: the same
+    /// two-package run, warm and cold, must leave the same composer.lock
+    /// bytes and raise the same warnings in the same order.
+    #[tokio::test]
+    async fn a_memoized_run_writes_the_same_lock_as_an_always_reparsing_one() {
+        const DEV_UUID: &str = "3c1d5e7f-9a2b-4c6d-8e0f-1a2b3c4d5e6f";
+        const DEV_PURL: &str = "pkg:composer/phpunit/phpunit@10.0.0";
+
+        async fn two_packages(cold: bool) -> (String, Vec<String>) {
+            let lock = lock_value("psr/log", "3.0.2", false);
+            let (dir, blobs, installed, record) = fixture(&lock).await;
+            let root = dir.path();
+            let cool = || {
+                if cold {
+                    LOCK_MEMO.invalidate();
+                }
+            };
+            cool();
+            let (first, _entry, first_warnings) =
+                unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+            assert!(first.success, "{:?}", first.error);
+            cool();
+
+            let dev_installed = root.join("vendor/phpunit/phpunit");
+            tokio::fs::create_dir_all(dev_installed.join("src"))
+                .await
+                .unwrap();
+            tokio::fs::write(dev_installed.join("src/LoggerInterface.php"), PRISTINE)
+                .await
+                .unwrap();
+            let dev_record = PatchRecord {
+                uuid: DEV_UUID.to_string(),
+                ..record.clone()
+            };
+            let (second, _entry, second_warnings) = unwrap_done(
+                run_vendor(root, &blobs, &dev_installed, &dev_record, DEV_PURL, false).await,
+            );
+            assert!(second.success, "{:?}", second.error);
+
+            let warnings = first_warnings
+                .iter()
+                .chain(second_warnings.iter())
+                .map(|w| format!("{}|{}", w.code, w.detail))
+                .collect();
+            (
+                tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                    .await
+                    .unwrap(),
+                warnings,
+            )
+        }
+
+        let (warm_lock, warm_warnings) = two_packages(false).await;
+        let (cold_lock, cold_warnings) = two_packages(true).await;
+        assert_eq!(
+            warm_lock, cold_lock,
+            "composer.lock differs between the memoized and the always-reparse path"
+        );
+        assert_eq!(
+            warm_warnings, cold_warnings,
+            "the warnings differ between the memoized and the always-reparse path"
+        );
+    }
+
     /// Two packages in one run with a hand edit to composer.lock between
     /// them: the second package must wire against the bytes on DISK, not the
     /// parse the first one left in the memo. The memo only ever skips the

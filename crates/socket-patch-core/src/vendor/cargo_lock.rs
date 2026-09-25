@@ -1139,6 +1139,108 @@ mod tests {
         assert_eq!(tokio::fs::read_to_string(&lock).await.unwrap(), v1);
     }
 
+    /// The lock shapes a run can meet, for the warm/cold comparison below:
+    /// a v4 lock, a v1 lock with `[metadata]` checksums, a heavily
+    /// commented one, its CRLF twin, and one with unusual spacing.
+    fn lock_shapes() -> Vec<(&'static str, String)> {
+        let other = "a".repeat(64);
+        let v1 = format!(
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"cfg-if 1.0.4 ({SOURCE})\",\n \"log 0.4.20 ({SOURCE})\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{SOURCE}\"\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{SOURCE}\"\n\
+             dependencies = [\n \"cfg-if 1.0.4 ({SOURCE})\",\n]\n\n\
+             [metadata]\n\"checksum cfg-if 1.0.4 ({SOURCE})\" = \"{CHECKSUM}\"\n\
+             \"checksum log 0.4.20 ({SOURCE})\" = \"{other}\"\n"
+        );
+        let v4 = format!(
+            "{}\n[[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{SOURCE}\"\n\
+             checksum = \"{other}\"\n",
+            lock_body()
+        );
+        let commented = format!(
+            "# header\nversion = 4\n\n# about app\n[[package]]\nname = \"app\"\n\
+             version = \"0.1.0\"\ndependencies = [\n \"cfg-if\",\n \"log\",\n]\n\n\
+             # about cfg-if\n[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+             # the source line\nsource = \"{SOURCE}\"\nchecksum = \"{CHECKSUM}\" # trailing\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{SOURCE}\"\n\
+             checksum = \"{other}\"\n# tail comment\n"
+        );
+        let crlf = commented.replace('\n', "\r\n");
+        let spaced = format!(
+            "version  =  4\n\n[[package]]\nname   = \"app\"\nversion = \"0.1.0\"\n\
+             dependencies = [ \"cfg-if\" , \"log\" ]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{SOURCE}\"\n\
+             checksum = \"{CHECKSUM}\"\n\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\n\
+             source = \"{SOURCE}\"\nchecksum = \"{other}\"\n"
+        );
+        vec![
+            ("v4", v4),
+            ("v1-metadata", v1),
+            ("commented", commented),
+            ("crlf", crlf),
+            ("odd-spacing", spaced),
+        ]
+    }
+
+    /// Detach both crates, then restore both — the shape of a two-crate
+    /// vendor run and its revert. `cold` drops the memo before every call,
+    /// which is the pre-change path (parse the bytes on disk, every time).
+    async fn detach_then_restore_both(body: &str, cold: bool) -> (String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("Cargo.lock");
+        tokio::fs::write(&lock, body).await.unwrap();
+        let cool = || {
+            if cold {
+                LOCK_MEMO.invalidate();
+            }
+        };
+        cool();
+        let first = detach_lock_entry(dir.path(), "cfg-if", "1.0.4", UUID, false)
+            .await
+            .unwrap();
+        cool();
+        let second = detach_lock_entry(dir.path(), "log", "0.4.20", UUID2, false)
+            .await
+            .unwrap();
+        cool();
+        let detached = tokio::fs::read_to_string(&lock).await.unwrap();
+        restore_lock_entry(dir.path(), "log", "0.4.20", UUID2, &second, false)
+            .await
+            .unwrap();
+        cool();
+        restore_lock_entry(dir.path(), "cfg-if", "1.0.4", UUID, &first, false)
+            .await
+            .unwrap();
+        (detached, tokio::fs::read_to_string(&lock).await.unwrap())
+    }
+
+    /// The memo hands the second crate of a run the document the FIRST one
+    /// mutated in memory, re-seeded by `write_lock` against the bytes it
+    /// wrote — not a fresh parse of those bytes. That is only safe while a
+    /// mutated document and a re-parse of its own output emit the same
+    /// text, which for `toml_edit` is a statement about decor, not a
+    /// tautology. Pin it: the same run, warm and cold, must leave
+    /// byte-identical locks behind at both the detach and the restore.
+    #[tokio::test]
+    async fn a_memoized_run_writes_the_same_lock_as_an_always_reparsing_one() {
+        for (label, body) in lock_shapes() {
+            let warm = detach_then_restore_both(&body, false).await;
+            let cold = detach_then_restore_both(&body, true).await;
+            assert_eq!(
+                warm.0, cold.0,
+                "[{label}] the detached lock differs between the memoized and the \
+                 always-reparse path"
+            );
+            assert_eq!(
+                warm.1, cold.1,
+                "[{label}] the restored lock differs between the memoized and the \
+                 always-reparse path"
+            );
+        }
+    }
+
     /// Two crates detached in one run with a hand edit to Cargo.lock
     /// between them: the second detach must edit the bytes on DISK, not the
     /// document the first one left in the memo. The memo skips the parse,
