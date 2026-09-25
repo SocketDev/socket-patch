@@ -9,6 +9,10 @@
 //!   via the `/STACK` link flag in `.cargo/config.toml`). Rayon's and
 //!   tokio's worker threads default to 2 MiB, so the recursive gather runs
 //!   on pool threads built with the same 8 MiB ([`WALK_STACK_SIZE`]).
+//!   When not even one walk thread could be spawned the walk falls back to
+//!   the blocking-pool thread and its 2 MiB: only `node_modules` nesting
+//!   depth is exposed there, since the workspace-roots walk (the one that
+//!   sees arbitrary project trees) is iterative.
 //! - **Descriptor headroom.** The sequential walk held at most one
 //!   directory stream (or package.json) open at a time, and the nine
 //!   ecosystem crawlers ran one after another. Every walker treats a failed
@@ -311,8 +315,18 @@ mod tests {
 
     /// The walk runs on a pool thread with the main thread's stack, not
     /// the 2 MiB default of rayon/tokio workers: a 4 MiB stack frame fits.
+    ///
+    /// The 8 MiB belongs to the POOL's threads. With no pool [`run_walk`]
+    /// falls back to the blocking-pool thread, whose stack is the
+    /// runtime's 2 MiB default — the frame below would overflow it, and a
+    /// stack overflow aborts the whole test binary rather than failing one
+    /// test. So there is nothing to pin on a machine that could not spawn
+    /// a walk thread; skip instead of aborting 4,000 other tests.
     #[tokio::test]
     async fn walk_runs_on_a_main_sized_stack() {
+        if walk_pool().is_none() {
+            return;
+        }
         #[inline(never)]
         fn big_frame() -> u8 {
             let mut buf = [0u8; 4 << 20];
