@@ -763,6 +763,122 @@ mod rebuild_tests {
 
     ts::npm_flip_suite!(flip_suite, Fixture, flip_fixture, flip_run);
 
+    // ── download-plan pre-flight parity ───────────────────────────────────
+
+    /// `(the plan's verdict, the loop's own outcome)` for `purl` with
+    /// `record`, both through the text backend's router — which hands a
+    /// `bun.lockb`-only project to this backend exactly as the vendoring is
+    /// routed — the pre-flight first, since a successful vendor rewrites
+    /// the lock it would then read.
+    async fn preflight_then_vendor(
+        fx: &Fixture,
+        purl: &str,
+        record: &PatchRecord,
+    ) -> (Result<(), &'static str>, Result<(), &'static str>) {
+        let planned = super::super::bun_lock::preflight_packages(fx.root(), &[(purl, record)])
+            .await
+            .remove(0);
+        let blobs = fx.root().join(".socket/blobs");
+        let looped = match super::super::bun_lock::vendor_bun(
+            purl,
+            &fx.installed(),
+            fx.root(),
+            record,
+            &PatchSources::blobs_only(&blobs),
+            "",
+            false,
+            false,
+            None,
+        )
+        .await
+        {
+            VendorOutcome::Refused { code, .. } => Err(code),
+            VendorOutcome::Done { .. } => Ok(()),
+        };
+        (planned, looped)
+    }
+
+    /// The vendor loop's download plan gates each package with this
+    /// backend's own pre-flight (`preflight_packages`, reached through the
+    /// text backend's `bun.lockb` routing): the lock read, parsed and
+    /// validated once, then the record and workspace-mirror gates per
+    /// package. Same code wherever the loop refuses, admitted wherever it
+    /// vendors — and the coordinates guarded first, ahead of the read, as
+    /// the loop guards them.
+    #[tokio::test]
+    async fn preflight_agrees_with_the_loop_on_every_pre_service_refusal() {
+        let fx = flip_fixture().await;
+        let (planned, looped) = preflight_then_vendor(&fx, PURL, &fx.record).await;
+        assert_eq!(
+            (planned, looped),
+            (Ok(()), Ok(())),
+            "the plain fixture vendors"
+        );
+
+        // The name is in the lock (at 1.2.2), this version is not.
+        let fx = flip_fixture().await;
+        let (planned, looped) =
+            preflight_then_vendor(&fx, "pkg:npm/minimist@9.9.9", &fx.record).await;
+        assert_eq!(looped, Err("vendor_lock_entry_not_found"), "absent entry");
+        assert_eq!(
+            planned, looped,
+            "absent entry: the plan refuses as the loop does"
+        );
+
+        let unparseable: Vec<(&str, Vec<u8>)> = vec![
+            ("not a binary lock", b"not a bun.lockb".to_vec()),
+            ("truncated lock", ORIGINAL[..ORIGINAL.len() / 2].to_vec()),
+        ];
+        for (label, bytes) in unparseable {
+            let fx = flip_fixture().await;
+            std::fs::write(fx.root().join(LOCK), &bytes).unwrap();
+            let (planned, looped) = preflight_then_vendor(&fx, PURL, &fx.record).await;
+            assert_eq!(looped, Err("vendor_bun_lockb_invalid"), "{label}");
+            assert_eq!(
+                planned, looped,
+                "{label}: the plan refuses as the loop does"
+            );
+
+            // A malformed record refuses on its coordinates before the lock
+            // is read, in the plan as in the loop.
+            let bad_uuid = PatchRecord {
+                uuid: "not-a-uuid".to_string(),
+                ..fx.record.clone()
+            };
+            let (planned, looped) = preflight_then_vendor(&fx, PURL, &bad_uuid).await;
+            assert_eq!(
+                looped,
+                Err("unsafe_coordinates"),
+                "{label}, malformed record"
+            );
+            assert_eq!(
+                planned, looped,
+                "{label}, malformed record: guarded before the read"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let fx = flip_fixture().await;
+            std::fs::rename(fx.root().join(LOCK), fx.root().join("shared.lockb")).unwrap();
+            std::os::unix::fs::symlink("shared.lockb", fx.root().join(LOCK)).unwrap();
+            let (planned, looped) = preflight_then_vendor(&fx, PURL, &fx.record).await;
+            assert_eq!(looped, Err("vendor_bun_lockb_invalid"), "symlinked lock");
+            assert_eq!(
+                planned, looped,
+                "symlinked lock: the plan refuses as the loop does"
+            );
+        }
+
+        // No binary lock at all: the router hands both the plan and the
+        // vendoring to the text backend, which finds no lock either.
+        let fx = flip_fixture().await;
+        std::fs::remove_file(fx.root().join(LOCK)).unwrap();
+        let (planned, looped) = preflight_then_vendor(&fx, PURL, &fx.record).await;
+        assert_eq!(looped, Err("vendor_lockfile_missing"), "no lock");
+        assert_eq!(planned, looped, "no lock: routed alike");
+    }
+
     /// A prebuilt archive whose tar headers deliberately differ from the
     /// local packer's (so its bytes never equal a local build's).
     fn prebuilt_archive() -> Vec<u8> {
