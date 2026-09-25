@@ -27,6 +27,7 @@ use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
 use socket_patch_core::utils::concurrent::{ordered_concurrent, registry_concurrency};
+use socket_patch_core::utils::group_commit::GroupCommit;
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::{
@@ -1020,11 +1021,40 @@ pub(crate) async fn persist_vendor_entry(
     env: &mut Envelope,
     state: &mut VendorState,
     candidate: &str,
-    mut entry: VendorEntry,
+    entry: VendorEntry,
     detached: bool,
     record: &PatchRecord,
 ) -> bool {
-    let mut has_errors = false;
+    let (has_errors, stale) =
+        record_vendor_entry(common, env, state, candidate, entry, detached, record).await;
+    if let Some(stale) = stale {
+        sweep_stale_artifact(common, env, state, stale).await;
+    }
+    has_errors
+}
+
+/// The entry a re-vendor under a newer patch uuid replaced, whose uuid dir
+/// is an orphan once the new wiring and ledger are committed.
+pub(crate) struct StaleArtifact {
+    candidate: String,
+    prev: VendorEntry,
+}
+
+/// [`persist_vendor_entry`]'s bookkeeping half: everything but the sweep of
+/// the replaced uuid's dir, which is handed back so a group-committed run
+/// can hold it until its commit (deleting it earlier would leave the
+/// committed, pre-run wiring pointing at a dir that is gone if the run
+/// never commits).
+#[allow(clippy::too_many_arguments)]
+async fn record_vendor_entry(
+    common: &GlobalArgs,
+    env: &mut Envelope,
+    state: &mut VendorState,
+    candidate: &str,
+    mut entry: VendorEntry,
+    detached: bool,
+    record: &PatchRecord,
+) -> (bool, Option<StaleArtifact>) {
     let candidate = candidate.to_string();
     entry.detached = detached;
     // EVERY entry embeds its patch record, not only detached (vendored-mode)
@@ -1052,59 +1082,66 @@ pub(crate) async fn persist_vendor_entry(
     }
     let new_uuid = entry.uuid.clone();
     state.entries.insert(candidate.clone(), entry);
-    // Persist per-package so a crash mid-run leaves a
-    // ledger that matches what's already wired.
+    // Persist per-package so a crash mid-run leaves a ledger that matches
+    // what's already wired (under a group commit this lands in the run's
+    // captured state, committed with the wiring it describes).
     if let Err(e) = save_state(&common.cwd, state).await {
-        has_errors = true;
         env.record(
             PatchEvent::new(PatchAction::Failed, candidate.clone())
                 .with_error("vendor_state_write_failed", e.to_string()),
         );
-    } else if let Some(prev) = prev.filter(|p| p.uuid != new_uuid) {
-        // Re-vendor under a newer patch uuid: the old
-        // uuid's dir is an orphan now — the wiring and
-        // ledger both point at the new uuid — unless
-        // another entry still shares it (the same
-        // `(eco, uuid)` ownership test as `--revert`'s
-        // orphan sweep). Only the live entry would
-        // otherwise reclaim it, and that never happens.
-        let still_referenced = state
-            .entries
-            .values()
-            .any(|e| e.ecosystem == prev.ecosystem && e.uuid == prev.uuid);
-        let stale_rel = vendor::path::vendor_uuid_dir_rel(&prev.ecosystem, &prev.uuid);
-        if let Some(rel) = stale_rel.filter(|_| !still_referenced) {
-            if let Err(detail) = vendor::bun_lock::cleanup_binary_workspace_artifacts(
-                &common.cwd,
-                &prev,
-                common.dry_run,
-            )
-            .await
-            {
-                record_warning(
-                    env,
-                    &candidate,
-                    &VendorWarning::new("vendor_stale_artifact_kept", detail),
-                    common,
-                );
-                return has_errors;
-            }
-            if !common.dry_run {
-                // Prunes the emptied `<eco>/` level too (a uuid change
-                // within one ecosystem never empties it, but a re-vendor
-                // that moved ecosystems would otherwise leave a husk).
-                let _ = remove_tree_and_prune(&common.cwd.join(rel), &common.cwd.join(SOCKET_DIR))
-                    .await;
-            }
-            env.record(
-                PatchEvent::new(PatchAction::Removed, candidate.clone()).with_reason(
-                    "vendor_stale_artifact_removed",
-                    "previous patch uuid's vendored artifact removed",
-                ),
-            );
-        }
+        return (true, None);
     }
-    has_errors
+    let stale = prev
+        .filter(|p| p.uuid != new_uuid)
+        .map(|prev| StaleArtifact { candidate, prev });
+    (false, stale)
+}
+
+/// Re-vendor under a newer patch uuid: the old uuid's dir is an orphan now —
+/// the wiring and ledger both point at the new uuid — unless another entry
+/// still shares it (the same `(eco, uuid)` ownership test as `--revert`'s
+/// orphan sweep). Only the live entry would otherwise reclaim it, and that
+/// never happens.
+async fn sweep_stale_artifact(
+    common: &GlobalArgs,
+    env: &mut Envelope,
+    state: &VendorState,
+    stale: StaleArtifact,
+) {
+    let StaleArtifact { candidate, prev } = stale;
+    let still_referenced = state
+        .entries
+        .values()
+        .any(|e| e.ecosystem == prev.ecosystem && e.uuid == prev.uuid);
+    let stale_rel = vendor::path::vendor_uuid_dir_rel(&prev.ecosystem, &prev.uuid);
+    let Some(rel) = stale_rel.filter(|_| !still_referenced) else {
+        return;
+    };
+    if let Err(detail) =
+        vendor::bun_lock::cleanup_binary_workspace_artifacts(&common.cwd, &prev, common.dry_run)
+            .await
+    {
+        record_warning(
+            env,
+            &candidate,
+            &VendorWarning::new("vendor_stale_artifact_kept", detail),
+            common,
+        );
+        return;
+    }
+    if !common.dry_run {
+        // Prunes the emptied `<eco>/` level too (a uuid change
+        // within one ecosystem never empties it, but a re-vendor
+        // that moved ecosystems would otherwise leave a husk).
+        let _ = remove_tree_and_prune(&common.cwd.join(rel), &common.cwd.join(SOCKET_DIR)).await;
+    }
+    env.record(
+        PatchEvent::new(PatchAction::Removed, candidate).with_reason(
+            "vendor_stale_artifact_removed",
+            "previous patch uuid's vendored artifact removed",
+        ),
+    );
 }
 
 /// One registry-fetch attempt through the pristine-source ladder's network
@@ -1975,6 +2012,20 @@ pub(crate) async fn vendor_records_reusing(
     let mut spent: Option<PackageSource<'_>> = None;
     // Deferred sources whose fetch the loop has already reported.
     let mut deferred_fetch_reported: HashSet<String> = HashSet::new();
+    // Group commit: from here until the loop ends, every backend's
+    // lockfile / manifest / config edits, the takeover's hosted reverts and
+    // the per-package ledger saves are captured in memory — every read in
+    // the loop sees them — and written to disk ONCE, after the loop (see
+    // `socket_patch_core::utils::group_commit`). A run that never reaches
+    // the commit (a crash, a panic) leaves the pre-run lockfiles and ledgers
+    // on disk; the artifacts it wrote are orphans the next run re-vendors
+    // over. The replaced uuid dirs of re-vendored packages are swept only
+    // after the commit, since until then the committed wiring still names
+    // them. Dry runs write nothing and capture nothing.
+    let group = (!common.dry_run
+        && !socket_patch_core::utils::failpoint::switched_off("group_commit"))
+    .then(|| GroupCommit::begin(&common.cwd));
+    let mut stale_artifacts: Vec<StaleArtifact> = Vec::new();
     for (index, (purl, staged)) in all_packages.iter().enumerate() {
         if let Some(done) = spent.take() {
             done.release();
@@ -2491,10 +2542,19 @@ pub(crate) async fn vendor_records_reusing(
                         if let Some(flavor) = entry.flavor.as_deref() {
                             wired_flavors.insert(flavor.to_string());
                         }
-                        has_errors |= persist_vendor_entry(
+                        let (save_failed, stale) = record_vendor_entry(
                             common, env, &mut state, candidate, entry, detached, record,
                         )
                         .await;
+                        has_errors |= save_failed;
+                        socket_patch_core::utils::failpoint::hit("vendor_package_recorded");
+                        if let Some(stale) = stale {
+                            if group.is_some() {
+                                stale_artifacts.push(stale);
+                            } else {
+                                sweep_stale_artifact(common, env, &state, stale).await;
+                            }
+                        }
                     }
                 }
             }
@@ -2507,6 +2567,33 @@ pub(crate) async fn vendor_records_reusing(
     if !fetched_holders.is_empty() || !deferred_holders.is_empty() {
         let _ =
             tokio::task::spawn_blocking(move || drop((fetched_holders, deferred_holders))).await;
+    }
+
+    // The run's one commit of every lockfile, manifest, config and ledger
+    // the loop changed. The packages that succeeded are committed even when
+    // others failed — a failed package's backend already put back what it
+    // had touched, in the captured state — so a completed run ends exactly
+    // where committing after every package would have left it.
+    if let Some(group) = group {
+        socket_patch_core::utils::failpoint::hit("vendor_group_commit");
+        match group.commit().await {
+            Ok(_) => {
+                for stale in stale_artifacts {
+                    sweep_stale_artifact(common, env, &state, stale).await;
+                }
+            }
+            Err(e) => {
+                has_errors = true;
+                let detail = format!(
+                    "could not commit the vendored lockfile, manifest and ledger edits: {e}; \
+                     the project's lockfiles and .socket/vendor/state.json are unchanged"
+                );
+                if !common.json {
+                    eprintln!("Error: {detail}");
+                }
+                env.mark_error(EnvelopeError::new("vendor_commit_failed", detail));
+            }
+        }
     }
 
     // Manifest entries that targeted in-scope ecosystems but had no
