@@ -963,15 +963,35 @@ fn rewrite_cargo(
                 });
                 continue;
             }
+        } else {
+            // NO Cargo.lock: the resolved graph the check above reads does
+            // not exist, so nothing here can say whether some other
+            // dependency's own graph also pulls in the crate. Any other
+            // declared dependency might, and the pin reaches only the
+            // declarations it sits on — that consumer would compile the
+            // unpatched crates.io copy while the scan reports the crate
+            // redirected and VEX attests it. Fail closed, exactly as the
+            // locked path does for a dependent it CAN see; a project whose
+            // only dependency is the patched crate has nothing that could
+            // pull it in, and still redirects.
+            let others = cargo_lockless_other_dependencies(&manifests, &dep.name);
+            if !others.is_empty() {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_cargo_lockless_dependents".into(),
+                    detail: cargo_lockless_dependents_detail(&dep.name, &dep.version, &others),
+                });
+                continue;
+            }
         }
 
         // 2. Plan the Cargo.lock repoint. A lock that exists but has no
         // [[package]] for the dep means the project does not actually resolve
         // it — rewriting the manifest anyway would desync manifest and lock.
         // Skip the dep entirely (discarding the manifest plan). A project
-        // with NO lockfile is fine: the manifest pin alone forces the next
-        // resolution through the managed registry, which serves the patched
-        // checksum.
+        // with NO lockfile reaches here only when the patched crate is its
+        // one declared dependency (the dependents gate above): the manifest
+        // pin alone then forces the next resolution through the managed
+        // registry, which serves the patched checksum.
         enum LockCommit {
             Write(String, Vec<FileEdit>),
             InPlace,
@@ -1236,6 +1256,145 @@ fn cargo_unpinnable_dependents(
         }
     }
     out
+}
+
+/// Dependencies OTHER than `crate_name` declared across the manifests this
+/// rewriter can pin, as `<name> (in <manifest>)`. This is the question a
+/// Cargo.lock answers outright; without one, every such dependency is a
+/// possible second consumer of the patched crate. A path dependency on a
+/// manifest in this same list is NOT one of them — that package's own
+/// declarations are listed here too — and a `workspace = true` inheritor
+/// resolves to the root's `[workspace.dependencies]` entry, which is.
+/// A manifest that does not parse is itself blocking (fail closed).
+fn cargo_lockless_other_dependencies(
+    manifests: &[(String, String)],
+    crate_name: &str,
+) -> Vec<String> {
+    fn field<'a>(entry: &'a toml_edit::Item, key: &str) -> Option<&'a str> {
+        match entry {
+            toml_edit::Item::Table(t) => t.get(key).and_then(toml_edit::Item::as_str),
+            toml_edit::Item::Value(v) => v
+                .as_inline_table()
+                .and_then(|t| t.get(key))
+                .and_then(toml_edit::Value::as_str),
+            _ => None,
+        }
+    }
+    fn flag(entry: &toml_edit::Item, key: &str) -> bool {
+        match entry {
+            toml_edit::Item::Table(t) => t.get(key).and_then(toml_edit::Item::as_bool),
+            toml_edit::Item::Value(v) => v
+                .as_inline_table()
+                .and_then(|t| t.get(key))
+                .and_then(toml_edit::Value::as_bool),
+            _ => None,
+        }
+        .unwrap_or(false)
+    }
+    const KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let known: std::collections::BTreeSet<&str> =
+        manifests.iter().map(|(k, _)| k.as_str()).collect();
+    let mut out: Vec<String> = Vec::new();
+    for (path, text) in manifests {
+        let dir = path.strip_suffix("/Cargo.toml").unwrap_or("");
+        let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+            out.push(format!("{path} (it does not parse as TOML)"));
+            continue;
+        };
+        let scan = |item: Option<&toml_edit::Item>, out: &mut Vec<String>| {
+            let Some(table) = item.and_then(toml_edit::Item::as_table_like) else {
+                return;
+            };
+            for (key, entry) in table.iter() {
+                let name = field(entry, "package").unwrap_or(key);
+                if name == crate_name || flag(entry, "workspace") {
+                    continue;
+                }
+                if let Some(rel) = field(entry, "path") {
+                    let inside = crate::utils::cargo_workspace::normalize_rel(dir, rel)
+                        .is_some_and(|d| {
+                            d.is_empty() || known.contains(format!("{d}/Cargo.toml").as_str())
+                        });
+                    if inside {
+                        continue;
+                    }
+                }
+                let named = if path == "Cargo.toml" {
+                    name.to_string()
+                } else {
+                    format!("{name} (in {path})")
+                };
+                if !out.contains(&named) {
+                    out.push(named);
+                }
+            }
+        };
+        for kind in KINDS {
+            scan(doc.get(kind), &mut out);
+        }
+        if let Some(targets) = doc.get("target").and_then(toml_edit::Item::as_table) {
+            for (_, target) in targets.iter() {
+                let Some(target) = target.as_table() else {
+                    continue;
+                };
+                for kind in KINDS {
+                    scan(target.get(kind), &mut out);
+                }
+            }
+        }
+        if let Some(ws) = doc.get("workspace").and_then(toml_edit::Item::as_table) {
+            scan(ws.get("dependencies"), &mut out);
+            // A member manifest this run did not read is a second consumer
+            // nothing can rule out: it may declare the crate itself (a pin
+            // never reaches it) or a dependency that pulls it in. Member
+            // discovery drops what it must not follow — a symbolic link, a
+            // path outside the project — and a glob's expansion is not
+            // visible here at all, so only a literal member whose manifest
+            // IS in this run's set is accounted for.
+            let members = ws
+                .get("members")
+                .and_then(toml_edit::Item::as_array)
+                .into_iter()
+                .flat_map(|a| a.iter().filter_map(toml_edit::Value::as_str));
+            for member in members {
+                let named = if member.contains(['*', '?']) {
+                    format!("the workspace members pattern `{member}`")
+                } else if crate::utils::cargo_workspace::normalize_rel(dir, member)
+                    .is_some_and(|d| known.contains(format!("{d}/Cargo.toml").as_str()))
+                {
+                    continue;
+                } else {
+                    format!("the workspace member `{member}`")
+                };
+                if !out.contains(&named) {
+                    out.push(named);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The refusal for a lockless project that declares other dependencies.
+fn cargo_lockless_dependents_detail(crate_name: &str, version: &str, others: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let mut names = others
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if others.len() > SHOWN {
+        names.push_str(&format!(" and {} more", others.len() - SHOWN));
+    }
+    format!(
+        "this project has no Cargo.lock, so nothing says whether {names} also pull in \
+         {crate_name}@{version}; a `registry = …` pin reaches only the declarations it sits \
+         on, so such a consumer would compile the unpatched crates.io copy while \
+         {crate_name} is reported redirected — commit a lockfile (`cargo generate-lockfile`) \
+         and re-run, or patch it with `socket-patch scan --mode vendored`, whose \
+         `[patch.crates-io]` covers the whole graph (nothing rewritten)"
+    )
 }
 
 /// The refusal for a crate other lock packages also depend on.
@@ -8604,6 +8763,120 @@ mod tests {
             cargo_reg()
         );
         assert_eq!(cargo_socket_registry_pin(&renamed_other, "serde"), None);
+    }
+
+    /// NO Cargo.lock: the transitive-dependents refusal reads the resolved
+    /// graph, and without one nothing says whether another dependency also
+    /// pulls in the patched crate — a pin reaches only the declarations it
+    /// sits on, so that consumer would compile the unpatched crates.io copy
+    /// while the scan reported the crate redirected and VEX attested it.
+    /// Every OTHER declared dependency is therefore blocking; a path
+    /// dependency on a manifest this run pins is not (its own declarations
+    /// are pinned too), and neither is a `workspace = true` inheritor of the
+    /// root table this run scans.
+    #[test]
+    fn cargo_lockless_other_dependencies_are_refused() {
+        let head = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n";
+        let refused = |files: BTreeMap<String, String>| {
+            let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+            assert!(r.files.is_empty(), "nothing rewritten: {:?}", r.files);
+            assert!(r.edits.is_empty(), "{:?}", r.edits);
+            assert!(r.confirmed_cargo_uuids.is_empty(), "never confirmed");
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_cargo_lockless_dependents"]
+            );
+            r.warnings[0].detail.clone()
+        };
+        let one = |toml: &str| {
+            let mut files = BTreeMap::new();
+            files.insert("Cargo.toml".to_string(), toml.to_string());
+            files
+        };
+
+        // A registry dependency beside the patched crate.
+        let detail = refused(one(&format!(
+            "{head}[dependencies]\nserde = \"1.0.190\"\ntokio = \"1\"\n"
+        )));
+        assert!(detail.contains("tokio"), "{detail}");
+        assert!(detail.contains("cargo generate-lockfile"), "{detail}");
+        assert!(detail.contains("--mode vendored"), "{detail}");
+        // A dev-dependency counts (it is linked into the test build too).
+        refused(one(&format!(
+            "{head}[dependencies]\nserde = \"1.0.190\"\n\n\
+             [dev-dependencies]\ntokio = \"1\"\n"
+        )));
+        // A path dependency this run cannot pin (outside the project).
+        let detail = refused(one(&format!(
+            "{head}[dependencies]\nserde = \"1.0.190\"\n\
+             shared = {{ path = \"../shared\" }}\n"
+        )));
+        assert!(detail.contains("shared"), "{detail}");
+        // A member's own other dependency blocks as well.
+        let mut files = one(&format!(
+            "[workspace]\nmembers = [\"b\"]\n\n{head}\
+             [dependencies]\nserde = \"1.0.190\"\n"
+        ));
+        files.insert(
+            "b/Cargo.toml".to_string(),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nrand = \"0.8\"\n"
+                .to_string(),
+        );
+        let detail = refused(files);
+        assert!(detail.contains("rand (in b/Cargo.toml)"), "{detail}");
+
+        // A member manifest this run did NOT read — dropped by member
+        // discovery (a symbolic link, a path outside the project) or hidden
+        // behind a glob it cannot expand — may declare the crate itself or
+        // pull it in, and nothing here can tell.
+        let detail = refused(one(
+            "[workspace]\nmembers = [\"b\"]\n\n[package]\nname = \"app\"\n\
+             version = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        ));
+        assert!(detail.contains("the workspace member `b`"), "{detail}");
+        let detail = refused(one(
+            "[workspace]\nmembers = [\"crates/*\"]\n\n[package]\nname = \"app\"\n\
+             version = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.190\"\n",
+        ));
+        assert!(
+            detail.contains("the workspace members pattern `crates/*`"),
+            "{detail}"
+        );
+    }
+
+    /// The lockless shapes that stay redirectable: the patched crate alone,
+    /// the same crate declared again by a member this run pins, and a path
+    /// dependency on that member (whose own declarations are pinned too).
+    #[test]
+    fn cargo_lockless_self_contained_workspace_still_redirects() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "Cargo.toml".to_string(),
+            "[workspace]\nmembers = [\"b\"]\n\n\
+             [package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = \"1.0.190\"\nb = { path = \"b\" }\n"
+                .to_string(),
+        );
+        files.insert(
+            "b/Cargo.toml".to_string(),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\nserde = \"1.0.190\"\n"
+                .to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+        for key in ["Cargo.toml", "b/Cargo.toml"] {
+            assert!(
+                r.files
+                    .get(key)
+                    .is_some_and(|t| t.contains(&format!("registry = \"{}\"", cargo_reg()))),
+                "{key} must be pinned: {:?}",
+                r.files.get(key)
+            );
+        }
+        assert!(!r.files.contains_key("Cargo.lock"));
     }
 
     fn cargo_lock_with(name: &str, version: &str) -> String {

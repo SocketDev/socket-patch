@@ -175,6 +175,14 @@
     "elsewhere": [],
     "live_claims": []
   },
+  "redirect/cargo/cargo/lockless-dependents/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
   "redirect/cargo/cargo/multi-version/expected": {
     "refs": [
       {

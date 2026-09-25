@@ -17,6 +17,9 @@
 //!   `[dev-dependencies]`: both pins revert on `remove`.
 //! * `direct_and_transitive` — the crate is also a dependency of another
 //!   crates.io crate: hosted mode refuses it loudly and rewrites nothing.
+//! * `lockless_other_dependencies` — the same project with no committed
+//!   `Cargo.lock`: with no resolved graph to read, a crate declared beside
+//!   any other dependency is refused just as loudly.
 //!
 //! Every shape runs the same chain against the real cargo: a baseline build
 //! with a private CARGO_HOME (network to crates.io for fixture setup only),
@@ -91,6 +94,9 @@ struct Shape {
     /// Re-encode every `Cargo.toml` and the generated `Cargo.lock` with CRLF
     /// line endings (a Windows checkout) before the scan.
     crlf: bool,
+    /// Delete `Cargo.lock` after the baseline build, before the scan: the
+    /// shape a Rust library that gitignores its lock presents.
+    lockless: bool,
     /// A shape hosted mode must REFUSE: the rewriter warning code every
     /// patch is skipped with. The scan must leave every file untouched.
     refused: Option<&'static str>,
@@ -416,6 +422,9 @@ async fn run_shape(shape: Shape) -> Option<()> {
         );
         let _ = std::fs::remove_dir_all(proj.join("target"));
     }
+    if shape.lockless {
+        std::fs::remove_file(proj.join("Cargo.lock")).unwrap();
+    }
     let before = snapshot(&proj);
 
     let mut served = Vec::new();
@@ -488,13 +497,15 @@ async fn run_shape(shape: Shape) -> Option<()> {
             shape.tag
         );
         assert!(!proj.join(".socket").exists(), "{}", shape.tag);
-        let fetch = cargo(&proj, &["fetch", "--locked"], &home);
-        assert!(
-            fetch.status.success(),
-            "{}: the untouched project still fetches --locked:\n{}",
-            shape.tag,
-            stderr(&fetch)
-        );
+        if !shape.lockless {
+            let fetch = cargo(&proj, &["fetch", "--locked"], &home);
+            assert!(
+                fetch.status.success(),
+                "{}: the untouched project still fetches --locked:\n{}",
+                shape.tag,
+                stderr(&fetch)
+            );
+        }
         return Some(());
     }
     assert_eq!(
@@ -713,6 +724,7 @@ async fn cargo_hosted_multi_version_pins_each_declaration_and_removes_cleanly() 
                 .to_string(),
         )],
         crlf: false,
+        lockless: false,
         refused: None,
     };
     let _ = run_shape(shape).await;
@@ -735,6 +747,7 @@ async fn cargo_hosted_legacy_config_is_restored_byte_for_byte() {
             "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
         )],
         crlf: false,
+        lockless: false,
         refused: None,
     };
     let _ = run_shape(shape).await;
@@ -770,6 +783,7 @@ async fn cargo_hosted_config_trailing_bytes_are_restored() {
                 "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
             )],
             crlf: false,
+            lockless: false,
             refused: None,
         };
         if run_shape(shape).await.is_none() {
@@ -802,6 +816,7 @@ async fn cargo_hosted_same_line_in_two_sections_removes_cleanly() {
             "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
         )],
         crlf: false,
+        lockless: false,
         refused: None,
     };
     let _ = run_shape(shape).await;
@@ -840,6 +855,7 @@ async fn cargo_hosted_workspace_member_declaration_is_pinned() {
             ("direct/src/lib.rs", oracle),
         ],
         crlf: false,
+        lockless: false,
         refused: None,
     };
     let _ = run_shape(shape).await;
@@ -861,6 +877,7 @@ async fn cargo_hosted_crlf_project_keeps_its_line_endings() {
             "fn main() { println!(\"{}\", cfg_if::socket_patched()); }\n".to_string(),
         )],
         crlf: true,
+        lockless: false,
         refused: None,
     };
     let _ = run_shape(shape).await;
@@ -885,7 +902,34 @@ async fn cargo_hosted_refuses_a_crate_another_crate_depends_on() {
         patches: vec![CFG_IF_1],
         oracle: Vec::new(),
         crlf: false,
+        lockless: false,
         refused: Some("redirect_cargo_transitive_dependents"),
+    };
+    let _ = run_shape(shape).await;
+}
+
+/// The SAME project with its `Cargo.lock` gitignored (the common shape for
+/// a Rust library): with no resolved graph the dependents check above has
+/// nothing to read, so the manifests answer instead — cfg-if is declared
+/// beside crc32fast, which may well pull it in, and the redirect is refused
+/// rather than reported as one while the build links an unpatched copy
+/// through crc32fast.
+#[tokio::test(flavor = "multi_thread")]
+async fn cargo_hosted_refuses_a_lockless_project_with_other_dependencies() {
+    let shape = Shape {
+        tag: "lockless-other-dependencies",
+        files: vec![
+            (
+                "Cargo.toml",
+                consumer_manifest("cfg-if = \"1.0.4\"\ncrc32fast = \"=1.5.0\"\n"),
+            ),
+            ("src/main.rs", "fn main() {}\n".to_string()),
+        ],
+        patches: vec![CFG_IF_1],
+        oracle: Vec::new(),
+        crlf: false,
+        lockless: true,
+        refused: Some("redirect_cargo_lockless_dependents"),
     };
     let _ = run_shape(shape).await;
 }

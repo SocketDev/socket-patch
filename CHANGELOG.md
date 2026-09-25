@@ -984,7 +984,14 @@ into the new version's section — see docs/releasing.md.
   requirements the patched version does not satisfy (cargo resolves those
   declarations to another version) is refused
   `redirect_cargo_toml_dep_unrewritable`, the Socket backend's code for the
-  same shape, instead of `redirect_cargo_toml_dep_not_found`.
+  same shape, instead of `redirect_cargo_toml_dep_not_found`. A project with
+  NO `Cargo.lock` has no resolved graph to ask, so a crate declared beside
+  any other dependency — anything but a path dependency on a manifest the
+  same run pins — or beside a workspace member this run did not read (a
+  glob, a member outside the project or behind a symbolic link) is refused
+  `redirect_cargo_lockless_dependents` (commit a lockfile, or use `--mode
+  vendored`); a project whose only dependency is the patched crate has
+  nothing that could pull it in and still redirects.
 - **CRLF cargo projects redirect in hosted mode.** All-CRLF `Cargo.toml`,
   `Cargo.lock` and cargo configs are rewritten with their endings kept
   (they were refused), and `remove` / rollback still find the recorded
