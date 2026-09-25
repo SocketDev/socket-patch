@@ -1937,10 +1937,13 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     //   folded — then chunk `k` is retried against the public proxy (free
     //   patches only) and the rest continues on the downgraded client.
     //   That is exactly the serial loop's sequence; on the proxy no further
-    //   fallback applies.
+    //   fallback applies. A token revoked mid-run does cost the auth
+    //   endpoint the requests the window had already dispatched past `k`
+    //   (up to the in-flight cap, instead of one): their answers are
+    //   discarded, and under `--debug` their request lines still print.
     let chunks: Vec<&[String]> = all_purls.chunks(batch_size).collect();
     let mut next = 0usize;
-    while next < total_batches {
+    'windows: while next < total_batches {
         let end = if next == 0 { 1 } else { total_batches };
         let mut fallback_error = None;
         {
@@ -1955,8 +1958,14 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                     "Querying API for patches... (batch {}/{total_batches})",
                     next + 1
                 ));
+                // `ordered_concurrent` yields exactly one item per chunk,
+                // so the window never runs dry early. Should a future
+                // variant make it, stop the scan here: re-entering the
+                // outer loop with `next` unchanged would rebuild the very
+                // same window and re-POST every chunk in it, forever.
                 let Some(result) = results.next().await else {
-                    break;
+                    debug_assert!(false, "batch window yields one result per chunk");
+                    break 'windows;
                 };
                 match result {
                     Err(e) if !use_public_proxy && is_fallback_candidate(&e) => {
