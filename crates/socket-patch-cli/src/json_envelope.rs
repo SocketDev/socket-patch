@@ -201,6 +201,14 @@ pub struct PatchEvent {
     /// Stable, lowercase, snake_case reason tag for programmatic routing.
     /// Examples: `already_patched`, `package_not_installed`,
     /// `hash_mismatch`, `no_local_source`, `paid_required`.
+    ///
+    /// A code may be reported at either level: `no_local_source` arrives
+    /// HERE (per package, envelope `partialFailure`, no top-level `error`)
+    /// when vendored staging could not obtain one patch's content while
+    /// another staged, and as the top-level `error.code` (`status:
+    /// "error"`, empty `events[]`) when NOTHING in the manifest can be
+    /// staged — including a one-patch manifest. See CLI_CONTRACT.md's
+    /// error-code table.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     /// Underlying error message for `Failed` events.

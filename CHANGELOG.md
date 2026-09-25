@@ -514,6 +514,53 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **A patch file the patch never changes no longer blocks vendoring.** The
+  patch view serves `blobContent` only for the files a patch CHANGES, so a
+  zero-delta file (`beforeHash == afterHash`) comes back with hashes and no
+  content — and needs none: the pristine copy already carries the patched
+  bytes. The vendor stager counted such a view as a failed fetch, which made
+  any patch carrying a zero-delta file permanently unvendorable (live
+  example: `pkg:npm/tar-fs@2.1.1`).
+- **One unstageable patch no longer kills a whole vendored run.** A package
+  whose patch content cannot be obtained now gets its own `failed` event
+  with `errorCode: "no_local_source"` and the rest of the run still vendors,
+  in `vendor`, `scan`/`get --mode vendored` and `repair` alike. The event's
+  `error` names the real reason (which file the view served without content,
+  a malformed blob, or the fetch error) instead of the generic run-level
+  "patch artifacts unavailable (offline or download failure)".
+  **JSON consumers:** for a partial staging failure the vendor envelope is
+  now `status: "partialFailure"` with `error: null` and per-package events,
+  where it used to be `status: "error"` with a top-level
+  `error.code: "no_local_source"` and an empty `events[]`. The run-level
+  shape is unchanged when NOTHING in the manifest can be staged (including
+  a one-patch manifest) — `no_local_source` can therefore arrive run-level
+  or event-level, and both shapes are documented in CLI_CONTRACT.md.
+- **`get` emits its patch lists in a stable order.** The release-variant
+  narrowing drained a `HashMap`, so `download.patches`, `apply.patches` and
+  the per-patch stderr lines came out in bucket order: two identical runs of
+  the same project emitted the same records in different orders. All of them
+  are purl-ordered now, matching every sibling collection in the envelope.
+- **A requirements.txt this CLI already rewired stays in the lockfile
+  inventory.** Both shapes we write — the hosted `name @ <patch-server url>`
+  direct reference and the vendored bare `./.socket/vendor/pypi/…` wheel
+  path tagged `# socket-patch vendor: <name>==<ver>` — are read back as the
+  package they replace (discovery-only, exactly like the `==` pin they
+  replaced). A second hosted run over a wet requirements.txt reported
+  `packagesWithPatches: 1` instead of 12; a vendored one under-reported the
+  same way.
+- **`vendor --vendor-source build` no longer downloads a gem it cannot use.**
+  A gem the lockfile resolves and verifies, with no installed copy, is
+  refused with `failed`/`gem_spec_missing` BEFORE the registry round trip:
+  the bundler path source needs the stub gemspec rubygems writes at install
+  time, which a downloaded `.gem` does not carry, so the local build refused
+  it after paying for the download on every run. The refusal names the real
+  remedy (`bundle install`, or `--vendor-source=auto`).
+  **JSON consumers:** that run no longer carries the
+  `vendor_fetched_missing` warning event it used to emit before failing.
+  Unaffected: a gem the lock cannot verify keeps its documented
+  `vendor_fetch_unverifiable` + `package_not_installed` pair, an
+  already-vendored gem still re-runs green, and `auto`/`service` still
+  fetch.
 - **Hosted Go redirects no longer claim patches that did not land.**
   `scan`/`get --mode hosted` counted a Go module as redirected (recorded
   it in the redirect ledger, so `vex` attested it) whenever any project
