@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use super::listing::list_dir_sync;
 use super::types::{CrawledPackage, CrawlerOptions};
-use crate::utils::fs::{read_regular_to_string, read_regular_to_string_sync, run_blocking};
+use crate::utils::fs::{
+    is_dir, is_dir_sync, read_regular_to_string, read_regular_to_string_sync, run_blocking,
+};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
 #[cfg(test)]
@@ -76,16 +78,7 @@ pub async fn read_python_metadata(dist_info_path: &Path) -> Option<(String, Stri
     if let Some(found) = parse_metadata_headers(dist_info_path).await {
         return Some(found);
     }
-
-    let is_dir = tokio::fs::metadata(dist_info_path)
-        .await
-        .map(|m| m.is_dir())
-        .unwrap_or(false);
-    if !is_dir {
-        return None;
-    }
-    let dir_name = dist_info_path.file_name()?.to_string_lossy();
-    parse_dist_info_dir_name(&dir_name)
+    dist_info_dir_name_fallback(dist_info_path, is_dir(dist_info_path).await)
 }
 
 /// Parse the `Name`/`Version` headers from `<dist-info>/METADATA`.
@@ -113,10 +106,16 @@ fn read_python_metadata_sync(dist_info_path: &Path) -> Option<(String, String)> 
     {
         return Some(found);
     }
+    dist_info_dir_name_fallback(dist_info_path, is_dir_sync(dist_info_path))
+}
 
-    let is_dir = std::fs::metadata(dist_info_path)
-        .map(|m| m.is_dir())
-        .unwrap_or(false);
+/// The `<name>-<version>.dist-info` directory-name fallback both readers
+/// take once METADATA has yielded nothing — written once so a change to
+/// the rule cannot split the wheel-verification path from the crawl path.
+/// `is_dir` is the caller's own (symlink-following) stat of
+/// `dist_info_path`: the fallback fires only for an actual directory, so
+/// a stray `*.dist-info` FILE cannot masquerade as an install.
+fn dist_info_dir_name_fallback(dist_info_path: &Path, is_dir: bool) -> Option<(String, String)> {
     if !is_dir {
         return None;
     }
