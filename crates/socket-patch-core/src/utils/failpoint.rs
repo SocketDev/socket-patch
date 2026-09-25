@@ -6,7 +6,8 @@
 //! (default: the first) it reaches [`hit`] with that name — the observable
 //! effect of a crash at that point: whatever was written before is on disk,
 //! nothing after it is. Release builds compile [`hit`] to nothing, so no
-//! environment variable can make a shipped binary stop half-way.
+//! environment variable can make a shipped binary stop half-way; the same
+//! goes for [`switched_off`].
 
 /// A named crash point (see the module docs).
 pub fn hit(name: &str) {
@@ -42,3 +43,19 @@ pub fn hit(name: &str) {
     let _ = name;
 }
 
+/// Whether a debug build was asked to switch the named mechanism off
+/// (`SOCKET_PATCH_SWITCH_OFF=<name>[,…]`) — how the equivalence tests run
+/// the pre-change code path as their oracle. Always `false` in release
+/// builds.
+pub fn switched_off(name: &str) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("SOCKET_PATCH_SWITCH_OFF")
+            .is_ok_and(|spec| spec.split(',').any(|p| p.trim() == name))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = name;
+        false
+    }
+}

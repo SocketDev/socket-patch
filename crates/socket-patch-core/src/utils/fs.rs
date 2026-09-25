@@ -182,6 +182,9 @@ pub(crate) async fn open_regular_file(
 /// blocking-pool hop (like tokio's own `fs::read_to_string`). `pub` so the
 /// CLI crate's raw `read_to_string` sites can share it.
 pub async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
+    if let Some(captured) = super::group_commit::read(path) {
+        return captured.and_then(utf8);
+    }
     let path = path.to_path_buf();
     asyncify(move || read_regular_to_string_sync(&path)).await
 }
@@ -189,8 +192,38 @@ pub async fn read_regular_to_string(path: &Path) -> std::io::Result<String> {
 /// Read a binary regular file through the same FIFO-safe opener as text
 /// lockfiles. A malformed or non-regular lockfile never blocks discovery.
 pub async fn read_regular_to_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    if let Some(captured) = super::group_commit::read(path) {
+        return captured;
+    }
     let path = path.to_path_buf();
     asyncify(move || read_regular_to_bytes_sync(&path)).await
+}
+
+/// Captured bytes as text, failing like `read_to_string` on invalid UTF-8.
+fn utf8(bytes: Vec<u8>) -> std::io::Result<String> {
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// `remove_file` for a file the vendored run may have captured (a
+/// pnpm-workspace.yaml, `nuget.config` or `.cargo/config.toml` it created,
+/// a redirect ledger it emptied): inside an open
+/// [`super::group_commit::GroupCommit`] the removal is captured with the
+/// same `NotFound` semantics, otherwise it is a plain unlink.
+pub async fn remove_file(path: &Path) -> std::io::Result<()> {
+    match super::group_commit::capture_remove(path) {
+        Some(result) => result,
+        None => tokio::fs::remove_file(path).await,
+    }
+}
+
+/// Whether `path` exists (following symlinks) as the running command sees
+/// it: a file an open [`super::group_commit::GroupCommit`] captured answers
+/// from the capture.
+pub async fn file_exists(path: &Path) -> bool {
+    match super::group_commit::exists(path) {
+        Some(exists) => exists,
+        None => tokio::fs::metadata(path).await.is_ok(),
+    }
 }
 
 /// Run one blocking filesystem operation on tokio's blocking pool — the
@@ -228,6 +261,10 @@ pub async fn is_symlink(path: &Path) -> bool {
 pub fn read_regular_to_string_sync(path: &Path) -> std::io::Result<String> {
     use std::io::Read as _;
 
+    if let Some(captured) = super::group_commit::read(path) {
+        return captured.and_then(utf8);
+    }
+
     let (mut file, metadata) = open_regular_file_sync(path)?;
     let mut content = String::with_capacity(metadata.len() as usize);
     file.read_to_string(&mut content)?;
@@ -243,6 +280,10 @@ pub fn read_regular_to_string_sync(path: &Path) -> std::io::Result<String> {
 /// never fails with `InvalidData`; every other error keeps its kind.
 pub fn read_regular_to_bytes_sync(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
+
+    if let Some(captured) = super::group_commit::read(path) {
+        return captured;
+    }
 
     let (mut file, metadata) = open_regular_file_sync(path)?;
     let mut content = Vec::with_capacity(metadata.len() as usize);
@@ -384,7 +425,13 @@ pub(crate) fn normalize_lexically(path: &Path) -> Option<PathBuf> {
 /// destination is replaced *as a link* by a private regular file, never
 /// written through to its target. No separate hardlink-break step is needed;
 /// the write path is CoW-safe by construction.
+///
+/// Inside an open [`super::group_commit::GroupCommit`] a commit point under
+/// its root is captured instead of written (see that module).
 pub(crate) async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    if super::group_commit::capture_write(path, content, false) {
+        return Ok(());
+    }
     atomic_write_bytes_as(path, content, None).await
 }
 
@@ -403,6 +450,9 @@ pub async fn atomic_write_bytes_preserving_mode(
     path: &Path,
     content: &[u8],
 ) -> std::io::Result<()> {
+    if super::group_commit::capture_write(path, content, true) {
+        return Ok(());
+    }
     let perms = tokio::fs::metadata(path)
         .await
         .ok()
@@ -488,6 +538,73 @@ pub(crate) async fn atomic_write_artifact_preserving_mode(
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     stage_and_rename(path, parent, content, perms, false).await?;
     super::durability::record(path);
+    Ok(())
+}
+
+/// A group commit's file replacement (see [`super::group_commit`]): stage +
+/// rename like the durable writers, keeping the destination's mode when
+/// `preserve_mode`, but without the fsync — the commit's barrier syncs every
+/// replaced file at once, and its journal already holds the bytes.
+pub(crate) async fn atomic_write_unsynced(
+    path: &Path,
+    content: &[u8],
+    preserve_mode: bool,
+) -> std::io::Result<()> {
+    let perms = if preserve_mode {
+        tokio::fs::metadata(path)
+            .await
+            .ok()
+            .map(|m| m.permissions())
+    } else {
+        None
+    };
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    stage_and_rename(path, parent, content, perms, false).await
+}
+
+/// The blocking durable writer the group-commit replay runs under the apply
+/// lock: stage (with the destination's mode when `preserve_mode`) + fsync +
+/// rename + directory fsync.
+pub(crate) fn atomic_write_sync(
+    path: &Path,
+    content: &[u8],
+    preserve_mode: bool,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let perms = preserve_mode
+        .then(|| std::fs::metadata(path).ok().map(|m| m.permissions()))
+        .flatten();
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(p) = perms.as_ref() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(p.mode() & 0o777);
+    }
+    let mut file = options.open(&stage)?;
+    let written = (|| {
+        file.write_all(content)?;
+        file.sync_all()?;
+        if let Some(p) = perms {
+            file.set_permissions(p)?;
+        }
+        drop(file);
+        std::fs::rename(&stage, path)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&stage);
+        return Err(e);
+    }
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 

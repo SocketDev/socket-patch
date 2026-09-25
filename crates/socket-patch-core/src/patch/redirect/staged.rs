@@ -79,7 +79,7 @@ pub(super) async fn flush_staged(
                     .map_err(|e| format!("write {rel}: {e}"))?;
             }
             None => {
-                match tokio::fs::remove_file(&path).await {
+                match crate::utils::fs::remove_file(&path).await {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(format!("remove {rel}: {e}")),

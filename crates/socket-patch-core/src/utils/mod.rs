@@ -5,6 +5,7 @@ pub(crate) mod durability;
 pub mod env_compat;
 pub mod failpoint;
 pub mod fs;
+pub mod group_commit;
 pub mod notice;
 pub(crate) mod http;
 pub(crate) mod line_endings;

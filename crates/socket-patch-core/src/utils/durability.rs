@@ -134,6 +134,12 @@ pub(crate) fn record(path: &Path) {
     pending().record(path);
 }
 
+/// Record a directory whose entries changed without an fsync (a removed
+/// file): the barrier syncs it.
+pub(crate) fn record_dir(dir: &Path) {
+    pending().dirs.insert(dir.to_path_buf());
+}
+
 /// A staged tree was renamed from `from` to `to` (the vendor stage swapped
 /// into its copy dir): the artifacts recorded inside it now live under
 /// `to`, and the rename itself is an entry in `to`'s parent that the

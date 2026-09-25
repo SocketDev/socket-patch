@@ -372,7 +372,7 @@ async fn edit_config(
                     // behind. A file with surviving user content never trims
                     // to empty, so this only fires for a config that was
                     // entirely socket's.
-                    match fs::remove_file(&path).await {
+                    match crate::utils::fs::remove_file(&path).await {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => return Err(format!("remove {}: {e}", path.display())),

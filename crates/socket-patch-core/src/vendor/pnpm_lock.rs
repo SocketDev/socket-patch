@@ -918,7 +918,7 @@ async fn revert_workspace(
             _ => None,
         };
         if scaffold.as_deref() == Some(text.as_str()) {
-            return tokio::fs::remove_file(&path)
+            return crate::utils::fs::remove_file(&path)
                 .await
                 .map_err(|e| format!("cannot remove {PNPM_WORKSPACE}: {e}"));
         }
@@ -2597,7 +2597,7 @@ async fn unwind_override_surfaces(
     if ws_written {
         let ws_path = project_root.join(PNPM_WORKSPACE);
         if ws_created {
-            let _ = tokio::fs::remove_file(&ws_path).await;
+            let _ = crate::utils::fs::remove_file(&ws_path).await;
         } else if let Some(orig) = original_ws {
             let _ = atomic_write_bytes_preserving_mode(&ws_path, orig).await;
         }

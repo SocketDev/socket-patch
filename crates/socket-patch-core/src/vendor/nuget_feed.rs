@@ -1047,7 +1047,9 @@ struct ConfigEdit {
 async fn existing_config_path(project_root: &Path) -> Option<PathBuf> {
     for name in ["nuget.config", "NuGet.Config"] {
         let p = project_root.join(name);
-        if tokio::fs::metadata(&p).await.is_ok() {
+        // Answers from a group-committed run's capture: a config an earlier
+        // package of this run created is not on disk yet.
+        if crate::utils::fs::file_exists(&p).await {
             return Some(p);
         }
     }
@@ -1362,7 +1364,7 @@ async fn revert_config_record(
                     .map_err(|e| format!("failed to restore {}: {e}", config_path.display()))?;
             }
             // Created by us → delete the file.
-            _ => match tokio::fs::remove_file(&config_path).await {
+            _ => match crate::utils::fs::remove_file(&config_path).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("failed to remove {}: {e}", config_path.display())),
@@ -1544,7 +1546,7 @@ async fn unwind_config(config_target: &Path, original: Option<&str>, uuid_dir: &
             let _ = atomic_write_bytes_preserving_mode(config_target, orig.as_bytes()).await;
         }
         None => {
-            let _ = tokio::fs::remove_file(config_target).await;
+            let _ = crate::utils::fs::remove_file(config_target).await;
         }
     }
     let _ = remove_tree(uuid_dir).await;

@@ -208,6 +208,29 @@ fn prune_empty_socket_dir(socket_dir: &Path) {
     }
 }
 
+/// Finish the group commit a crashed vendored run left half-written (see
+/// [`crate::utils::group_commit`]), now that no other command can be
+/// writing the files it covers. Every locked command runs it before reading
+/// any of them, so the lockfiles and ledgers are never observed half-new.
+/// A replay that cannot run (a file edited by hand since the crash) sets
+/// the journal aside and says so; an I/O failure leaves it for the next
+/// locked command.
+fn recover_group_commit(socket_dir: &Path) {
+    let Some(project_root) = socket_dir.parent() else {
+        return;
+    };
+    if let Ok(crate::utils::group_commit::Recovery::SetAside(path)) =
+        crate::utils::group_commit::recover(project_root)
+    {
+        eprintln!(
+            "Warning: an interrupted vendored run's commit could not be finished (a file it \
+             covers changed since); it was set aside at {} — run `socket-patch repair` to \
+             check the vendored wiring",
+            path.display()
+        );
+    }
+}
+
 /// Try to acquire the apply lock at `<socket_dir>/apply.lock`.
 ///
 /// `timeout = Duration::ZERO` makes this a non-blocking try-once. Any
@@ -245,7 +268,10 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
         // a waiter parked with the file open would prolong a Windows
         // delete-pending window for everyone.
         match attempt(&path, socket_dir) {
-            Attempt::Acquired(guard) => return Ok(guard),
+            Attempt::Acquired(guard) => {
+                recover_group_commit(socket_dir);
+                return Ok(guard);
+            }
             Attempt::Contended => {
                 // A live holder was observed, so whatever vanished /
                 // delete-pending streak preceded it has ended: the bounds
