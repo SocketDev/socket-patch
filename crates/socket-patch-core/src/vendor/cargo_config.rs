@@ -39,8 +39,11 @@ use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_strin
 
 /// The run's cargo-config parse. A wet vendor run probes the `[patch]`
 /// entries and then edits them once per patched crate, against a file that
-/// grows by an entry per crate; see [`ParseMemo`].
-static CONFIG_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
+/// grows by an entry per crate; see [`ParseMemo`]. One slot per config
+/// spelling: [`socket_registry_indexes`] reads BOTH in one pass, so a
+/// single slot would make the two evict each other on every call in the
+/// mixed/legacy state that loop exists for.
+static CONFIG_MEMO: ParseMemo<DocumentMut, 2> = ParseMemo::new();
 
 /// Parse a cargo config, reusing the run's parse while `content` is the
 /// text that produced it. Read-only callers take the shared document; the
