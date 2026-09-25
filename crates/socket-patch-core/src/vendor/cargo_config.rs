@@ -29,11 +29,25 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::fs;
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
+use super::parse_memo::ParseMemo;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
+
+/// The run's cargo-config parse. A wet vendor run probes the `[patch]`
+/// entries and then edits them once per patched crate, against a file that
+/// grows by an entry per crate; see [`ParseMemo`].
+static CONFIG_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
+
+/// Parse a cargo config, reusing the run's parse while `content` is the
+/// text that produced it. Read-only callers take the shared document; the
+/// two transforms below clone it before mutating.
+fn config_doc(content: &str) -> Result<Arc<DocumentMut>, toml_edit::TomlError> {
+    CONFIG_MEMO.parse(content.as_bytes(), || content.parse::<DocumentMut>())
+}
 
 /// Project-relative root of the vendor backend's committed crate copies. An
 /// entry whose `path` is under this prefix is socket-owned.
@@ -228,7 +242,7 @@ pub async fn socket_registry_indexes(project_root: &Path) -> Vec<(String, String
         let Ok(content) = read_regular_to_string(&project_root.join(file)).await else {
             continue;
         };
-        let Ok(doc) = content.parse::<DocumentMut>() else {
+        let Ok(doc) = config_doc(&content) else {
             continue;
         };
         out.extend(registry_definitions(&doc));
@@ -456,9 +470,8 @@ pub(crate) fn ensure_table_like<'a>(
 #[cfg(test)]
 fn upsert_patch_entry(content: &str, name: &str, rel_path: &str) -> Result<Option<String>, String> {
     use toml_edit::{InlineTable, Value};
-    let mut doc = content
-        .parse::<DocumentMut>()
-        .map_err(|e| format!("Invalid .cargo/config.toml: {e}"))?;
+    let mut doc =
+        (*config_doc(content).map_err(|e| format!("Invalid .cargo/config.toml: {e}"))?).clone();
 
     let root = doc.as_table_mut();
     // `[patch]` is a parent table that only ever holds `[patch.crates-io]`, so
@@ -489,9 +502,8 @@ fn remove_patch_entries(
     name: &str,
     version: &str,
 ) -> Result<Option<String>, String> {
-    let mut doc = content
-        .parse::<DocumentMut>()
-        .map_err(|e| format!("Invalid .cargo/config.toml: {e}"))?;
+    let mut doc =
+        (*config_doc(content).map_err(|e| format!("Invalid .cargo/config.toml: {e}"))?).clone();
     let keys: Vec<String> = patch_entries(&doc)
         .into_iter()
         .filter(|e| {
@@ -533,7 +545,7 @@ fn remove_patch_entries(
 
 /// Every `[patch.crates-io]` item keyed by its table key ([`patch_entries`]).
 fn parse_patch_entries(content: &str) -> HashMap<String, PatchEntryInfo> {
-    let Ok(doc) = content.parse::<DocumentMut>() else {
+    let Ok(doc) = config_doc(content) else {
         return HashMap::new();
     };
     patch_entries(&doc)

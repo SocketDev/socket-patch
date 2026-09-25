@@ -151,7 +151,7 @@ pub async fn vendor_composer<'a>(
         }
     };
     // An unparseable lock is as unusable as a missing one — same refusal code.
-    let lock = match LOCK_MEMO.parse(&lock_path, lock_text.as_bytes(), || {
+    let lock = match LOCK_MEMO.parse(lock_text.as_bytes(), || {
         serde_json::from_str::<Value>(&lock_text)
     }) {
         Ok(v) => v,
@@ -341,7 +341,7 @@ pub async fn vendor_composer<'a>(
             // The bytes now on disk and the doc they came from: the next
             // package in this run reads them back and skips the parse.
             Ok(()) => {
-                LOCK_MEMO.store(&lock_path, bytes, lock);
+                LOCK_MEMO.store(bytes, lock);
                 Ok(())
             }
             Err(e) => Err(e),
@@ -904,9 +904,7 @@ async fn stranded_wired_packages(
     let Ok(text) = read_regular_to_string(lock_path).await else {
         return Vec::new();
     };
-    let Ok(lock) = LOCK_MEMO.parse(lock_path, text.as_bytes(), || {
-        serde_json::from_str::<Value>(&text)
-    }) else {
+    let Ok(lock) = LOCK_MEMO.parse(text.as_bytes(), || serde_json::from_str::<Value>(&text)) else {
         return Vec::new();
     };
     stranded_in(&lock, uuid, restorable)
@@ -958,7 +956,7 @@ async fn restore_lock_entry(
         Err(e) => return Err(format!("unreadable composer.lock: {e}")),
     };
     let lock = LOCK_MEMO
-        .parse(lock_path, lock_text.as_bytes(), || {
+        .parse(lock_text.as_bytes(), || {
             serde_json::from_str::<Value>(&lock_text)
         })
         .map_err(|e| format!("unparseable composer.lock: {e}"))?;
@@ -976,7 +974,7 @@ async fn restore_lock_entry(
             .map_err(|e| format!("failed to write composer.lock: {e}"))?;
         // Re-seeded the same way the vendor path does, so the next record's
         // restore reads back its own write for free.
-        LOCK_MEMO.store(lock_path, bytes, lock);
+        LOCK_MEMO.store(bytes, lock);
     }
     Ok(true)
 }
