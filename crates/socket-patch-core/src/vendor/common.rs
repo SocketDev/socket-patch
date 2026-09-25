@@ -940,6 +940,7 @@ pub(crate) async fn swap_stage_into_place(stage: &Path, copy_dir: &Path) -> std:
     };
     match tokio::fs::rename(stage, copy_dir).await {
         Ok(()) => {
+            crate::utils::durability::moved(stage, copy_dir);
             if had_old {
                 let _ = remove_tree(&backup).await;
             }

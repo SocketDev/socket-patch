@@ -16,7 +16,7 @@ use crate::constants::SOCKET_DIR;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
-use crate::utils::fs::{atomic_write_bytes, read_regular_to_string};
+use crate::utils::fs::{atomic_write_artifact, read_regular_to_string};
 use crate::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::utils::toml_edit_ext::has_table;
@@ -1861,7 +1861,7 @@ async fn try_pypi_service_wheel(
                     );
                 }
             }
-            if let Err(e) = atomic_write_bytes(&dest, &archive.bytes).await {
+            if let Err(e) = atomic_write_artifact(&dest, &archive.bytes).await {
                 return hard_fail(
                     "vendor_prebuilt_write_failed",
                     format!("cannot write the vendored wheel: {e}"),

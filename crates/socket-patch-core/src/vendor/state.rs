@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
-use crate::utils::fs::{atomic_write_bytes, read_regular_to_bytes};
+use crate::utils::fs::{atomic_write_artifact, read_regular_to_bytes};
 use crate::utils::purl::{patch_matches, strip_purl_qualifiers};
 use crate::utils::serde::serialize_sorted;
 use crate::utils::socket_dir::{prune_empty_dirs, remove_file_and_prune, write_json_ledger};
@@ -663,7 +663,8 @@ pub(crate) const VENDOR_MARKER_FILE: &str = "socket-patch.vendor.json";
 pub(crate) async fn write_marker(uuid_dir: &Path, marker: &VendorMarker) -> std::io::Result<()> {
     let mut bytes = serde_json::to_vec_pretty(marker).map_err(std::io::Error::other)?;
     bytes.push(b'\n');
-    atomic_write_bytes(&uuid_dir.join(VENDOR_MARKER_FILE), &bytes).await
+    // Never a trust input, so an artifact write (no fsync of its own).
+    atomic_write_artifact(&uuid_dir.join(VENDOR_MARKER_FILE), &bytes).await
 }
 
 /// [`write_marker`], downgrading a failure to ONE `vendor_marker_write_failed`

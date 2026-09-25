@@ -22,7 +22,7 @@ use crate::patch::apply::{
     is_safe_relative_subpath, normalize_file_path, ApplyResult, PatchSources,
 };
 use crate::utils::fs::{
-    atomic_write_bytes, list_dir_entries, read_regular_to_bytes, read_regular_to_string,
+    atomic_write_artifact, list_dir_entries, read_regular_to_bytes, read_regular_to_string,
 };
 
 use super::common::{
@@ -550,7 +550,7 @@ pub async fn build_patched_wheel(
             return Ok((result, None));
         }
     }
-    if let Err(e) = atomic_write_bytes(dest, &zip_bytes).await {
+    if let Err(e) = atomic_write_artifact(dest, &zip_bytes).await {
         result.success = false;
         result.error = Some(format!("cannot write {}: {e}", dest.display()));
         return Ok((result, None));

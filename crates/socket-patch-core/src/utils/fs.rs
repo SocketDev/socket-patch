@@ -474,6 +474,23 @@ pub(crate) async fn atomic_write_artifact(path: &Path, content: &[u8]) -> std::i
     Ok(())
 }
 
+/// [`atomic_write_artifact`] keeping the destination's permission bits — a
+/// vendored copy's own files (the cargo copy's `Cargo.toml` the version tag
+/// rewrites) keep the mode the copy was built with.
+pub(crate) async fn atomic_write_artifact_preserving_mode(
+    path: &Path,
+    content: &[u8],
+) -> std::io::Result<()> {
+    let perms = tokio::fs::metadata(path)
+        .await
+        .ok()
+        .map(|m| m.permissions());
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    stage_and_rename(path, parent, content, perms, false).await?;
+    super::durability::record(path);
+    Ok(())
+}
+
 /// Stage `content` next to `path` and rename it over `path`; `durable`
 /// fsyncs the stage before the rename.
 async fn stage_and_rename(

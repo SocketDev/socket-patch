@@ -69,7 +69,7 @@ use crate::manifest::schema::{PatchFileInfo, PatchRecord};
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::utils::fs::{
-    atomic_write_bytes, atomic_write_bytes_preserving_mode, read_regular_to_bytes,
+    atomic_write_artifact, atomic_write_bytes_preserving_mode, read_regular_to_bytes,
     read_regular_to_string,
 };
 use crate::utils::purl::{build_maven_purl, parse_maven_purl};
@@ -916,11 +916,11 @@ async fn write_maven_artifact(
         .map_err(|e| format!("cannot create {}: {e}", leaf_dir.display()))?;
     for (leaf, bytes) in [(jar_leaf, jar_bytes), (pom_leaf, pom_bytes)] {
         let path = leaf_dir.join(leaf);
-        atomic_write_bytes(&path, bytes)
+        atomic_write_artifact(&path, bytes)
             .await
             .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
         let sha1_path = leaf_dir.join(format!("{leaf}.sha1"));
-        atomic_write_bytes(&sha1_path, sha1_hex(bytes).as_bytes())
+        atomic_write_artifact(&sha1_path, sha1_hex(bytes).as_bytes())
             .await
             .map_err(|e| format!("cannot write {}: {e}", sha1_path.display()))?;
     }

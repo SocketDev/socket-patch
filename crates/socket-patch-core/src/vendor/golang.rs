@@ -244,8 +244,10 @@ pub async fn vendor_go_module<'a>(
             }
             // The engine does the heavy lifting: fresh copy → hardened apply
             // pipeline → `replace` upsert (refuses a user-authored same-version
-            // pin).
-            let result = apply_go_redirect(
+            // pin). The copy is a content-verified artifact, so its patched
+            // files are written without an fsync; the `go.mod` edit stays a
+            // durable commit point (see `crate::utils::durability`).
+            let result = crate::utils::durability::artifact_writes(apply_go_redirect(
                 purl,
                 module,
                 version,
@@ -257,7 +259,7 @@ pub async fn vendor_go_module<'a>(
                 Some(&record.uuid),
                 dry_run,
                 MismatchPolicy::Force,
-            )
+            ))
             .await;
             if result.success {
                 warnings.extend(super::mismatch_overwrite_warnings(&result, module, version));

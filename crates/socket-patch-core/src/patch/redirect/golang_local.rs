@@ -657,7 +657,12 @@ pub(crate) async fn ensure_module_go_mod(copy_dir: &Path, module: &str) -> std::
     if tokio::fs::metadata(&go_mod).await.is_ok() {
         return Ok(());
     }
-    crate::utils::fs::atomic_write_bytes(&go_mod, format!("module {module}\n").as_bytes()).await
+    let body = format!("module {module}\n");
+    if crate::utils::durability::in_artifact_scope() {
+        crate::utils::fs::atomic_write_artifact(&go_mod, body.as_bytes()).await
+    } else {
+        crate::utils::fs::atomic_write_bytes(&go_mod, body.as_bytes()).await
+    }
 }
 
 /// Recursively find every patched-copy module dir under `go_patches_root`,

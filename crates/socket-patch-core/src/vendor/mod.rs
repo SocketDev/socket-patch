@@ -732,7 +732,9 @@ pub(crate) async fn force_apply_staged(
             );
         }
     }
-    let result = apply_package_patch(
+    // The stage becomes a content-verified artifact: its patched files are
+    // written without an fsync (see `crate::utils::durability`).
+    let result = crate::utils::durability::artifact_writes(apply_package_patch(
         purl,
         staged_dir,
         &record.files,
@@ -743,7 +745,7 @@ pub(crate) async fn force_apply_staged(
         // Force additionally covers the caller's --force NotFound-skip
         // (the missing-file pre-check above handles the default case).
         crate::patch::apply::MismatchPolicy::Force,
-    )
+    ))
     .await;
     if result.success {
         warnings.extend(mismatch_overwrite_warnings(&result, name, version));

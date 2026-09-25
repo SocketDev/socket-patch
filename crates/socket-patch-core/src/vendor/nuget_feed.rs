@@ -68,7 +68,7 @@ use crate::patch::sidecars::nuget::{
     SIGNATURE_MARKER_SUFFIX as SIDECAR_SIGNATURE_MARKER_SUFFIX,
 };
 use crate::utils::fs::{
-    atomic_write_bytes, atomic_write_bytes_preserving_mode, list_dir_entries,
+    atomic_write_artifact, atomic_write_bytes_preserving_mode, list_dir_entries,
     read_regular_to_bytes, read_regular_to_string,
 };
 use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
@@ -1008,7 +1008,7 @@ async fn write_nupkg(uuid_dir: &Path, nupkg_path: &Path, bytes: &[u8]) -> Result
     tokio::fs::create_dir_all(uuid_dir)
         .await
         .map_err(|e| format!("cannot create {}: {e}", uuid_dir.display()))?;
-    atomic_write_bytes(nupkg_path, bytes)
+    atomic_write_artifact(nupkg_path, bytes)
         .await
         .map_err(|e| format!("cannot write {}: {e}", nupkg_path.display()))
 }

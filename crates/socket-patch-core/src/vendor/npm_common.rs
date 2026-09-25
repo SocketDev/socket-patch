@@ -21,7 +21,7 @@ use crate::patch::apply::{normalize_file_path, ApplyResult, PatchSources};
 use crate::patch::copy_tree::remove_tree;
 use crate::patch::package::read_archive_to_map;
 use crate::patch::path_safety;
-use crate::utils::fs::atomic_write_bytes;
+use crate::utils::fs::atomic_write_artifact;
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
 
 use super::common::{
@@ -604,7 +604,7 @@ async fn staged_pack_from_service_bytes(
         .await
         .is_ok();
     let (rel_tgz, dest) = prepare_tgz_dest(purl, project_root, coords).await?;
-    if let Err(e) = atomic_write_bytes(&dest, bytes).await {
+    if let Err(e) = atomic_write_artifact(&dest, bytes).await {
         return Err(Box::new(
             done_failure_unstage(
                 purl,
