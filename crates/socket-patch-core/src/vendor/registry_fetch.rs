@@ -409,6 +409,23 @@ pub(crate) fn validate_zip(
     )
 }
 
+/// The zip walk, in two passes.
+///
+/// Pass one reads the central directory alone — no entry is inflated — and
+/// answers everything the one-entry-at-a-time walk decided from headers, in
+/// the same order over the same running total: the traversal guard, the
+/// per-entry and total DECLARED caps, and each entry's destination (with
+/// every parent directory created once, where the old walk re-created them
+/// per entry). It stops at the first refusal, exactly where the single walk
+/// stopped accumulating.
+///
+/// Pass two inflates the planned entries on a bounded pool of threads, each
+/// with its own reader over the shared bytes. Inflating is the whole cost of
+/// a big dist zip and it is per-entry independent, so the only thing the
+/// pass has to serialise is the ANSWER: a repeated name is written by its
+/// last spelling, as an in-order extraction left it, and the refusal
+/// reported is the one at the lowest entry index — which, against pass one's
+/// own index, reproduces the single walk's verdict entry for entry.
 fn walk_zip(
     bytes: &[u8],
     dest: &Path,
@@ -417,19 +434,77 @@ fn walk_zip(
     watch: Option<&str>,
     skip_file_name: Option<&str>,
 ) -> Result<bool, String> {
-    use std::io::Read as _;
+    let plan = plan_zip(bytes, dest, strip_first, sink, watch, skip_file_name)?;
+    let body_refusal = inflate_planned_entries(bytes, &plan.entries);
+    match (body_refusal, plan.header_refusal) {
+        // Both passes refused: the walk stopped at whichever entry came
+        // first, and within one entry the header checks ran first.
+        (Some((body_at, body)), Some((header_at, header))) => {
+            Err(if body_at < header_at { body } else { header })
+        }
+        (Some((_, body)), None) => Err(body),
+        (None, Some((_, header))) => Err(header),
+        (None, None) => Ok(plan.seen_watched),
+    }
+}
+
+/// One entry pass one decided to read.
+struct PlannedEntry {
+    index: usize,
+    /// The extraction-relative name, for the refusal messages.
+    rel_str: String,
+    declared: u64,
+    exec: bool,
+    /// Where the bytes go — `None` when the entry is read but not written:
+    /// validating, skipped by name, or an earlier spelling of a repeated
+    /// name that a later entry overwrites.
+    target: Option<PathBuf>,
+}
+
+struct ZipPlan {
+    entries: Vec<PlannedEntry>,
+    /// The first header-shaped refusal and the entry index it fired at.
+    header_refusal: Option<(usize, String)>,
+    seen_watched: bool,
+}
+
+fn plan_zip(
+    bytes: &[u8],
+    dest: &Path,
+    strip_first: bool,
+    sink: Sink,
+    watch: Option<&str>,
+    skip_file_name: Option<&str>,
+) -> Result<ZipPlan, String> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("unreadable zip: {e}"))?;
     if archive.len() > MAX_ENTRIES {
         return Err(format!("zip exceeds {MAX_ENTRIES} entries"));
     }
     let mut out = EntrySink::new(dest, sink).skipping(skip_file_name);
-    let mut seen_watched = false;
+    let mut plan = ZipPlan {
+        entries: Vec::new(),
+        header_refusal: None,
+        seen_watched: false,
+    };
+    // Where each destination path was last planned, so a repeated name is
+    // written only by its final spelling — what an in-order extraction that
+    // overwrote it left behind.
+    let mut written_at: std::collections::HashMap<PathBuf, usize> =
+        std::collections::HashMap::new();
     let mut total: u64 = 0;
     for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| format!("unreadable zip entry: {e}"))?;
+        // `by_index`, not the raw reader: an entry the decompressor refuses
+        // (an unsupported method, an encrypted member) must be refused HERE,
+        // at the index and with the words the one-pass walk used, rather
+        // than falling through to a later check.
+        let file = match archive.by_index(i) {
+            Ok(file) => file,
+            Err(e) => {
+                plan.header_refusal = Some((i, format!("unreadable zip entry: {e}")));
+                break;
+            }
+        };
         if file.is_dir() {
             continue;
         }
@@ -444,43 +519,168 @@ fn walk_zip(
         };
         let rel_str = rel.to_string_lossy().into_owned();
         if !is_safe_relative_subpath(&rel_str) {
-            return Err(format!(
-                "zip entry `{}` escapes the extraction dir — refusing the artifact",
-                raw.display()
+            plan.header_refusal = Some((
+                i,
+                format!(
+                    "zip entry `{}` escapes the extraction dir — refusing the artifact",
+                    raw.display()
+                ),
             ));
+            break;
         }
         let declared = file.size();
         if declared > MAX_ENTRY_BYTES {
-            return Err(format!(
-                "zip entry `{rel_str}` is {declared} bytes (cap {MAX_ENTRY_BYTES})"
+            plan.header_refusal = Some((
+                i,
+                format!("zip entry `{rel_str}` is {declared} bytes (cap {MAX_ENTRY_BYTES})"),
             ));
+            break;
         }
         total += declared;
         if total > MAX_TOTAL_DECOMPRESSED_BYTES {
-            return Err(format!(
-                "zip decompresses past the {MAX_TOTAL_DECOMPRESSED_BYTES}-byte cap"
+            plan.header_refusal = Some((
+                i,
+                format!("zip decompresses past the {MAX_TOTAL_DECOMPRESSED_BYTES}-byte cap"),
             ));
+            break;
         }
-        let mut target = out.open(&rel)?;
-        // The declared size is header data a crafted zip can understate (the
-        // zip crate does not bound an entry's read by it), so hold the caps
-        // against the ACTUAL decompressed bytes too: read at most declared+1
-        // and refuse on any mismatch.
-        let copied = drain_entry(&mut (&mut file).take(declared + 1), target.as_mut())
-            .map_err(|e| format!("cannot extract `{rel_str}`: {e}"))?;
-        if copied != declared {
-            return Err(format!(
+        let target = match out.destination(&rel) {
+            Ok(target) => target,
+            Err(detail) => {
+                plan.header_refusal = Some((i, detail));
+                break;
+            }
+        };
+        if let Some(target) = target.as_ref() {
+            if let Some(earlier) = written_at.insert(target.clone(), plan.entries.len()) {
+                plan.entries[earlier].target = None;
+            }
+        }
+        plan.seen_watched |= watch.is_some_and(|name| lands_at_root(&rel, name));
+        plan.entries.push(PlannedEntry {
+            index: i,
+            rel_str,
+            declared,
+            exec: file.unix_mode().is_some_and(|m| m & 0o111 != 0),
+            target,
+        });
+    }
+    Ok(plan)
+}
+
+/// Most entries one thread takes at a time, and the pool's ceiling. Small
+/// files dominate a package archive, so handing them out in runs keeps the
+/// cursor off the hot path without letting one thread hold a long tail.
+const ZIP_CHUNK: usize = 16;
+const ZIP_THREADS: usize = 8;
+
+/// Inflate the planned entries, writing each one that has a destination.
+/// Returns the refusal at the LOWEST entry index, which is where the
+/// one-at-a-time walk would have stopped.
+fn inflate_planned_entries(bytes: &[u8], entries: &[PlannedEntry]) -> Option<(usize, String)> {
+    let threads = (entries.len() / ZIP_CHUNK).clamp(1, ZIP_THREADS);
+    if threads == 1 {
+        let mut archive = match zip::ZipArchive::new(std::io::Cursor::new(bytes)) {
+            Ok(archive) => archive,
+            // Pass one already opened it; an archive that fails here would
+            // have failed there.
+            Err(e) => return Some((0, format!("unreadable zip: {e}"))),
+        };
+        let mut refusal: Option<(usize, String)> = None;
+        for entry in entries {
+            if let Some(hit) = inflate_one(&mut archive, entry) {
+                refusal.get_or_insert(hit);
+                break;
+            }
+        }
+        return refusal;
+    }
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let refusal = std::sync::Mutex::new(None::<(usize, String)>);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let mut archive = match zip::ZipArchive::new(std::io::Cursor::new(bytes)) {
+                    Ok(archive) => archive,
+                    Err(e) => {
+                        keep_lowest(&refusal, (0, format!("unreadable zip: {e}")));
+                        return;
+                    }
+                };
+                loop {
+                    let at = cursor.fetch_add(ZIP_CHUNK, std::sync::atomic::Ordering::Relaxed);
+                    if at >= entries.len() {
+                        return;
+                    }
+                    let upto = (at + ZIP_CHUNK).min(entries.len());
+                    for entry in &entries[at..upto] {
+                        if let Some(hit) = inflate_one(&mut archive, entry) {
+                            keep_lowest(&refusal, hit);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    refusal
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn keep_lowest(slot: &std::sync::Mutex<Option<(usize, String)>>, hit: (usize, String)) {
+    let mut slot = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.as_ref().is_none_or(|(at, _)| hit.0 < *at) {
+        *slot = Some(hit);
+    }
+}
+
+/// Read one planned entry, writing it when it has a destination.
+fn inflate_one<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    entry: &PlannedEntry,
+) -> Option<(usize, String)> {
+    use std::io::Read as _;
+    let PlannedEntry {
+        index,
+        rel_str,
+        declared,
+        exec,
+        target,
+    } = entry;
+    let mut out = match target {
+        None => None,
+        Some(path) => match std::fs::File::create(path) {
+            Ok(file) => Some(file),
+            Err(e) => {
+                return Some((*index, format!("cannot create {}: {e}", path.display())));
+            }
+        },
+    };
+    let mut file = match archive.by_index(*index) {
+        Ok(file) => file,
+        Err(e) => return Some((*index, format!("unreadable zip entry: {e}"))),
+    };
+    // The declared size is header data a crafted zip can understate (the zip
+    // crate does not bound an entry's read by it), so hold the caps against
+    // the ACTUAL decompressed bytes too: read at most declared+1 and refuse
+    // on any mismatch.
+    let copied = match drain_entry(&mut (&mut file).take(declared + 1), out.as_mut()) {
+        Ok(copied) => copied,
+        Err(e) => return Some((*index, format!("cannot extract `{rel_str}`: {e}"))),
+    };
+    if copied != *declared {
+        return Some((
+            *index,
+            format!(
                 "zip entry `{rel_str}` decompresses to {copied} bytes but declares {declared} \
                  — refusing the artifact"
-            ));
-        }
-        set_entry_mode(
-            target.as_ref(),
-            file.unix_mode().is_some_and(|m| m & 0o111 != 0),
-        );
-        seen_watched |= watch.is_some_and(|name| lands_at_root(&rel, name));
+            ),
+        ));
     }
-    Ok(seen_watched)
+    set_entry_mode(out.as_ref(), *exec);
+    None
 }
 
 /// Whether extracting `rel` puts `name` at the root of the destination —
@@ -3755,6 +3955,136 @@ mod tests {
         }
         // A second read is the same answer, not a second extraction.
         assert_eq!(fetched.dir().await.unwrap(), dir);
+    }
+
+    /// A zip with a unix mode per entry, so the parallel walk's `fchmod`
+    /// can be checked against what the archive declares.
+    fn make_zip_with_modes(files: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes, mode) in files {
+            writer
+                .start_file(
+                    name.to_string(),
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated)
+                        .unix_permissions(*mode),
+                )
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    /// Every member of a zip, read strictly in archive order with the mode
+    /// the extractor gives it — the one-at-a-time oracle for the pool.
+    fn in_order_members(archive: &[u8]) -> Vec<(String, Vec<u8>, u32)> {
+        use std::io::Read as _;
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive)).unwrap();
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut out: Vec<(String, Vec<u8>, u32)> = Vec::new();
+        for i in 0..zip.len() {
+            let mut file = zip.by_index(i).unwrap();
+            if file.is_dir() {
+                continue;
+            }
+            let name = file.name().to_string();
+            let mode = if file.unix_mode().is_some_and(|m| m & 0o111 != 0) {
+                0o755
+            } else {
+                0o644
+            };
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            match seen.get(&name) {
+                Some(&at) => out[at] = (name, bytes, mode),
+                None => {
+                    seen.insert(name.clone(), out.len());
+                    out.push((name, bytes, mode));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// An archive big enough to run on the pool must land exactly what the
+    /// one-at-a-time walk landed: every member, its bytes, and its mode.
+    /// The in-memory reader — which walks entries strictly in order — is the
+    /// oracle.
+    #[test]
+    fn parallel_zip_extraction_matches_the_in_order_reader() {
+        let payloads: Vec<(String, Vec<u8>, u32)> = (0..200)
+            .map(|i| {
+                (
+                    format!("pkg/dir{}/file{i}.txt", i % 7),
+                    format!("contents of {i}\n").repeat(1 + i % 5).into_bytes(),
+                    if i % 3 == 0 { 0o755 } else { 0o644 },
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, &[u8], u32)> = payloads
+            .iter()
+            .map(|(n, b, m)| (n.as_str(), b.as_slice(), *m))
+            .collect();
+        let archive = make_zip_with_modes(&refs);
+
+        let dest = tempfile::tempdir().unwrap();
+        extract_zip(&archive, dest.path(), /*strip_first=*/ false).unwrap();
+
+        assert_eq!(tree_of(dest.path()), in_order_members(&archive));
+    }
+
+    /// A repeated destination — two entries that strip down to the same
+    /// name — must end up with the LAST one's bytes however many threads
+    /// wrote it.
+    #[test]
+    fn parallel_zip_resolves_repeated_destinations_last_wins() {
+        let mut files: Vec<(String, Vec<u8>)> = (0..100)
+            .map(|i| (format!("a/pad{i}.txt"), vec![b'p'; 32]))
+            .collect();
+        files.push(("a/dup.txt".to_string(), b"first".to_vec()));
+        files.push(("b/dup.txt".to_string(), b"second".to_vec()));
+        let refs: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_slice()))
+            .collect();
+        let archive = make_zip(&refs);
+        let dest = tempfile::tempdir().unwrap();
+        extract_zip(&archive, dest.path(), /*strip_first=*/ true).unwrap();
+        assert_eq!(
+            std::fs::read(dest.path().join("dup.txt")).unwrap(),
+            b"second",
+            "the last spelling of a repeated name wins, as an in-order extraction left it"
+        );
+    }
+
+    /// A refusal deep in a pool-sized archive still reads as the one the
+    /// one-at-a-time walk raised at that entry.
+    #[test]
+    fn parallel_zip_reports_a_late_refusal_verbatim() {
+        let mut files: Vec<(String, Vec<u8>)> = (0..80)
+            .map(|i| (format!("pkg/ok{i}.txt"), vec![b'x'; 16]))
+            .collect();
+        files.push(("../evil.txt".to_string(), b"evil".to_vec()));
+        files.extend((0..80).map(|i| (format!("pkg/after{i}.txt"), vec![b'y'; 16])));
+        let refs: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_slice()))
+            .collect();
+        let archive = make_zip(&refs);
+        let dest = tempfile::tempdir().unwrap();
+        let err = extract_zip(&archive, dest.path(), /*strip_first=*/ false).unwrap_err();
+        assert_eq!(
+            err,
+            "zip entry `../evil.txt` escapes the extraction dir — refusing the artifact"
+        );
+        assert!(
+            !dest.path().join("pkg/after0.txt").exists(),
+            "the walk stopped at the refusal; nothing past it is planned"
+        );
+        // And the validation pass, which never writes, says the same.
+        assert_eq!(validate_zip(&archive, false, None).unwrap_err(), err);
     }
 
     /// Staging a pending source straight into the vendor stage must leave
