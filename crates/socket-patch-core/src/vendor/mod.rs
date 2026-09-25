@@ -317,16 +317,14 @@ impl VendorServiceConfig {
             return None;
         }
         let client = self.client.as_ref()?;
-        Some(
-            client.prefetch_vendor_packages(
-                uuids,
-                self.use_public_proxy,
-                self.vendor_url.as_deref(),
-                self.patch_server_url.as_deref(),
-                crate::utils::concurrent::api_concurrency(self.use_public_proxy)
-                    .min(ARCHIVE_PREFETCH_WINDOW),
-            ),
-        )
+        Some(client.prefetch_vendor_packages(
+            uuids,
+            self.use_public_proxy,
+            self.vendor_url.as_deref(),
+            self.patch_server_url.as_deref(),
+            crate::utils::concurrent::api_concurrency(self.use_public_proxy)
+                .min(ARCHIVE_PREFETCH_WINDOW),
+        ))
     }
 }
 
