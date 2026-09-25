@@ -1290,6 +1290,27 @@ into the new version's section — see docs/releasing.md.
   downloading it: a local build can never vendor a downloaded `.gem` (no
   eval-able stub gemspec), so the download was pure waste.
 
+- **The vendor ledger stores whole-file wiring snapshots once.** Several
+  backends record an entire file as a wiring record's `original` / `new`
+  (maven's `pom.xml`, nuget's config, `pylock*.toml` and PEP 723 script
+  locks), so a ledger held two near-identical copies of that file per
+  vendored package (tens of MB on a hundred-package maven or pylock
+  project). `.socket/vendor/state.json` now moves every such string of 1 KiB
+  or more into a top-level `snapshots` table keyed by its sha256 — the
+  pre-vendor file in full, every later version as a line-level edit (byte
+  ranges copied from the version it was derived from, plus inserted text) —
+  with the
+  records pointing at it as `{"snapshot": "<sha256>"}`, and writes
+  `"version": 2`. A ledger with no such string keeps its version-1 bytes.
+  Every command reads both versions: version-1 ledgers (inline snapshots)
+  load and revert exactly as before, and a version-2 table is resolved back
+  to full text with every text checked against its hash (a table that does
+  not reproduce its texts is `vendor_state_unreadable`). Revert, repair,
+  `vex`, rollback and the re-vendor carry-forward see the same full texts
+  as before. An older socket-patch reading a version-2 ledger leaves those
+  fragments alone with its drift warning. No consumer outside socket-patch
+  reads `state.json` wiring.
+
 - **A vendored run commits its lockfile and ledger edits once, not per
   package.** `vendor`, `scan --mode vendored` and `get --mode vendored` used
   to rewrite every touched lockfile / `package.json` / `pnpm-workspace.yaml`
