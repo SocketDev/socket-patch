@@ -72,7 +72,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use futures_util::StreamExt;
 
 use socket_patch_core::api::client::{
-    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate,
+    build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
+    is_fallback_candidate,
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::redirect::RedirectState;
@@ -920,7 +921,7 @@ async fn fetch_records(
             let mut views = std::pin::pin!(ordered_concurrent(
                 pending.iter(),
                 FETCH_CONCURRENCY,
-                |uuid| async move { (uuid, client.fetch_patch(uuid).await) },
+                |uuid| async move { (uuid, hold_back_debug(client.fetch_patch(uuid)).await) },
             ));
             loop {
                 status.set(format!(
@@ -936,7 +937,7 @@ async fn fetch_records(
                 };
                 let uuid = uuid.clone();
                 done += 1;
-                match result {
+                match result.release() {
                     Ok(Some(view)) => {
                         out.insert(
                             uuid,

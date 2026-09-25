@@ -658,12 +658,14 @@ impl ApiClient {
         purls: &[String],
     ) -> Result<Option<BatchSearchResponse>, ApiError> {
         let url = format!("{}/patch/batch", self.api_url);
-        debug_log(&format!("POST {}", url));
-
         let body = BatchSearchBody::new(purls);
 
         // Held until this call returns, response body read.
         let _slot = self.proxy_batch_slot().await;
+        // Logged AFTER the permit, not before: the line announces a request
+        // that is about to go out, and a caller queued behind the proxy's
+        // in-flight limit would otherwise print it and then wait.
+        debug_log(&format!("POST {}", url));
         let resp = self
             .client
             .post(&url)

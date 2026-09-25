@@ -371,6 +371,56 @@ async fn batch_fallback_mid_run_replays_from_the_failing_chunk() {
     assert_eq!(batch_requests(&auth, &auth_batch_route()).await.len(), 6);
 }
 
+/// The same mid-run downgrade under `--debug`: the window really does
+/// dispatch chunks past the failing one to the authenticated endpoint, but
+/// the chunks it then drops announce nothing. Each chunk's debug lines are
+/// held back until it is folded, so the stream reads exactly as the
+/// one-at-a-time loop's did — four authenticated POSTs (chunks 0-3, the
+/// last being the 401) and three proxy POSTs (the replayed 3-5) — while
+/// the authenticated server saw six requests.
+#[tokio::test]
+async fn a_dropped_batch_window_holds_back_its_debug_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path(), &NAMES);
+    let order = crawl_order(tmp.path()).await;
+
+    let auth = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    for (pos, &idx) in order.iter().enumerate() {
+        let status = if pos == 3 { 401 } else { 200 };
+        mount_batch_for(&auth, &auth_batch_route(), idx, AUTH, status, reversed(pos)).await;
+        mount_batch_for(&proxy, PROXY_BATCH_ROUTE, idx, PROXY, 200, reversed(pos)).await;
+    }
+
+    let (code, stdout, stderr) = run_scan(
+        tmp.path(),
+        &auth.uri(),
+        &proxy.uri(),
+        &["--json", "--batch-size", "1", "--debug"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+    let posted = |host: &str, route: &str| {
+        let needle = format!("[socket-patch debug] POST {host}{route}");
+        stderr.matches(needle.as_str()).count()
+    };
+    assert_eq!(
+        posted(&auth.uri(), &auth_batch_route()),
+        4,
+        "chunks 0-3 announce themselves, the dropped 4-5 do not: {stderr}"
+    );
+    assert_eq!(
+        posted(&proxy.uri(), PROXY_BATCH_ROUTE),
+        3,
+        "the replayed tail announces itself once per chunk: {stderr}"
+    );
+    assert_eq!(
+        batch_requests(&auth, &auth_batch_route()).await.len(),
+        6,
+        "the window did dispatch the chunks whose lines were held back"
+    );
+}
+
 /// Mixed 500s in chunks 2 and 4 with reversed latencies: the per-batch
 /// warnings print in chunk order, and the run still succeeds with the
 /// other chunks' patches.

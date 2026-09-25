@@ -12,6 +12,14 @@
 //!
 //! Everything runs on the caller's task (no `spawn`), so the futures may
 //! borrow (`&ApiClient`) and need not be `Send`.
+//!
+//! `--debug` is part of that output. Every window here wraps its request in
+//! [`crate::api::client::hold_back_debug`] and releases it at the fold, so
+//! each request's lines print where the serial loop's would have and a
+//! window the caller drops (the batch fallback) announces nothing the
+//! serial loop would not have announced. Relying on the order the futures
+//! happen to be first-polled in would work today and is exactly what
+//! `hold_back_debug` exists to stop depending on.
 
 use std::future::Future;
 

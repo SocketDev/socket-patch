@@ -7,6 +7,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use socket_patch_core::api::client::hold_back_debug;
 use socket_patch_core::api::types::BatchPackagePatches;
 use socket_patch_core::patch::apply_lock::LockGuard;
 use socket_patch_core::patch::redirect::DepOverride;
@@ -2571,13 +2572,17 @@ pub(crate) async fn run_redirect_selected(
         // `blobContent`, so buffering whole responses would hold the cap's
         // worth of patch payloads in memory at once, where the loop only
         // ever needed the hashes. `record_from_patch_response` is pure, so
-        // folding it early changes nothing downstream.
+        // folding it early changes nothing downstream. Each fetch's
+        // `--debug` lines are held back and printed at its fold, where the
+        // serial loop would have made the request.
         let mut views = std::pin::pin!(ordered_concurrent(
             confirmed.iter(),
             api_concurrency(api_client.uses_public_proxy()),
-            |(_, uuid)| async move {
-                api_client.fetch_patch(uuid).await.map(|resp| {
-                    resp.map(|resp| crate::commands::get::record_from_patch_response(&resp))
+            |(_, uuid)| {
+                hold_back_debug(async move {
+                    api_client.fetch_patch(uuid).await.map(|resp| {
+                        resp.map(|resp| crate::commands::get::record_from_patch_response(&resp))
+                    })
                 })
             },
         ));
@@ -2586,7 +2591,7 @@ pub(crate) async fn run_redirect_selected(
             let Some(view) = views.next().await else {
                 break;
             };
-            match view {
+            match view.release() {
                 Ok(Some((rec_purl, record))) => {
                     records.insert(rec_purl, record);
                 }

@@ -9,8 +9,8 @@
 use clap::Args;
 use futures_util::StreamExt;
 use socket_patch_core::api::client::{
-    build_proxy_fallback_client, get_api_client_with_overrides, is_fallback_candidate, ApiClient,
-    ApiError,
+    build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
+    is_fallback_candidate, ApiClient, ApiError,
 };
 use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
 use socket_patch_core::crawlers::ruby_crawler::config_path_ignored_warning;
@@ -542,11 +542,18 @@ async fn fetch_patch_details(
     let mut status = StatusLine::stderr(!show_progress, false);
     // The queries run concurrently but come back in `packages` order, so
     // `results` and `failures` fold exactly as the serial loop's did. The
-    // counter names the next result awaited.
+    // counter names the next result awaited, and each query's `--debug`
+    // lines are held back and printed at its fold, where the serial loop
+    // would have made the request.
     let mut responses = std::pin::pin!(ordered_concurrent(
         packages,
         api_concurrency(api_client.uses_public_proxy()),
-        |pkg| async move { (pkg, api_client.search_patches_by_package(&pkg.purl).await) },
+        |pkg| async move {
+            (
+                pkg,
+                hold_back_debug(api_client.search_patches_by_package(&pkg.purl)).await,
+            )
+        },
     ));
     for i in 0..packages.len() {
         status.set(format!(
@@ -557,7 +564,7 @@ async fn fetch_patch_details(
         let Some((pkg, response)) = responses.next().await else {
             break;
         };
-        match response {
+        match response.release() {
             Ok(response) => results.extend(response.patches),
             Err(e) => failures.push((pkg.purl.clone(), e.to_string())),
         }
@@ -1948,8 +1955,10 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     //   That is exactly the serial loop's sequence; on the proxy no further
     //   fallback applies. A token revoked mid-run does cost the auth
     //   endpoint the requests the window had already dispatched past `k`
-    //   (up to the in-flight cap, instead of one): their answers are
-    //   discarded, and under `--debug` their request lines still print.
+    //   (up to the in-flight cap, instead of one). Their answers are
+    //   discarded, and so are their `--debug` lines: each chunk's are held
+    //   back until it is folded, so a chunk the window drops announces
+    //   nothing the serial loop would not have announced.
     let chunks: Vec<&[String]> = all_purls.chunks(batch_size).collect();
     let mut next = 0usize;
     'windows: while next < total_batches {
@@ -1964,7 +1973,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             let mut results = std::pin::pin!(ordered_concurrent(
                 &chunks[next..end],
                 api_concurrency(use_public_proxy),
-                |chunk| client.search_patches_batch(chunk),
+                |chunk| hold_back_debug(client.search_patches_batch(chunk)),
             ));
             while next < end {
                 status.set(format!(
@@ -1980,7 +1989,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                     debug_assert!(false, "batch window yields one result per chunk");
                     break 'windows;
                 };
-                match result {
+                match result.release() {
                     Err(e) if !use_public_proxy && is_fallback_candidate(&e) => {
                         fallback_error = Some(e);
                         break;
