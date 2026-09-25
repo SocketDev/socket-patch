@@ -574,9 +574,9 @@ pub(crate) async fn stage_vendor_sources_in_memory(
         let mut views = std::pin::pin!(ordered_concurrent(
             to_fetch.iter(),
             api_concurrency(client.uses_public_proxy()),
-            |(_, uuid)| hold_back_debug(client.fetch_patch(uuid)),
+            |(_, uuid)| async move { (*uuid, hold_back_debug(client.fetch_patch(uuid)).await) },
         ));
-        for (i, (purl, _)) in to_fetch.iter().enumerate() {
+        for (i, (purl, uuid)) in to_fetch.iter().enumerate() {
             if to_fetch.len() > 1 {
                 status.set(format!(
                     "{} ({}/{})",
@@ -585,10 +585,19 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                     to_fetch.len()
                 ));
             }
-            let Some(view) = views.next().await else {
-                break;
+            let view = match views.next().await {
+                Some((planned, view)) if planned == *uuid => view.release(),
+                // Unreachable: the plan IS this list. Falling back to the
+                // live request keeps the staging COMPLETE if the two ever
+                // fall out of step — running dry here would otherwise
+                // return `Ready` with blobs missing and nothing in
+                // `failed`.
+                _ => {
+                    debug_assert!(false, "view prefetch plan out of step at {uuid}");
+                    client.fetch_patch(uuid).await
+                }
             };
-            match view.release() {
+            match view {
                 Ok(Some(patch)) => {
                     let mut complete = true;
                     for (file, info) in &patch.files {
