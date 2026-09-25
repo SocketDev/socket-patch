@@ -377,7 +377,9 @@ type Shape = dyn Fn(&Fx);
 
 /// Exactly one statement: `purl` fixed by `uuid`'s GHSA (CVE alias), with the
 /// provenance `marker`; exit 0; a `verified` event carrying the vuln; the
-/// manifest is never written.
+/// manifest is never written. `what` is a shape label, never a tagged
+/// version: CodeQL classifies every `uuid`-derived string as sensitive and
+/// flags it in panic messages (`rust/cleartext-logging`).
 fn assert_attested(fx: &Fx, run: &Run, purl: &str, uuid: &str, marker: &str, what: &str) {
     assert_eq!(run.code, Some(0), "{what}: {}", run.env);
     assert_eq!(run.env["status"], "success", "{what}: {}", run.env);
@@ -1178,12 +1180,12 @@ fn cargo_vendored_a_attests_in_every_lock_version() {
         write_cargo_vendored(&fx, U, CargoVendored::Inline, PATCHED_RS);
         // The tagged copy + tagged lock (v5), and the pre-tag shape: an
         // untagged copy with its untagged lock entry.
-        for (copy, locked) in [
-            (tagged_version(U), tagged_version(U)),
-            (CRATE_VERSION.to_string(), CRATE_VERSION.to_string()),
+        for (shape, at) in [
+            ("tagged", tagged_version(U)),
+            ("untagged", CRATE_VERSION.to_string()),
         ] {
-            fx.put(&copy_toml, copy_at(&copy));
-            fx.put("Cargo.lock", cargo_lock_at(version, &locked, ""));
+            fx.put(&copy_toml, copy_at(&at));
+            fx.put("Cargo.lock", cargo_lock_at(version, &at, ""));
             let run = fx.vex(&["--proxy-url", &api.uri()]);
             assert_attested(
                 &fx,
@@ -1191,7 +1193,7 @@ fn cargo_vendored_a_attests_in_every_lock_version() {
                 CARGO_PURL,
                 U,
                 "vendored",
-                &format!("lock v{version} at {locked}, copy at {copy}"),
+                &format!("lock v{version}, {shape} copy and lock entry"),
             );
             assert!(warning_codes(&run).is_empty(), "v{version}: {}", run.env);
         }
