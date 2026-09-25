@@ -317,14 +317,16 @@ impl VendorServiceConfig {
             return None;
         }
         let client = self.client.as_ref()?;
-        Some(client.prefetch_vendor_packages(
-            uuids,
-            self.use_public_proxy,
-            self.vendor_url.as_deref(),
-            self.patch_server_url.as_deref(),
-            crate::utils::concurrent::api_concurrency(self.use_public_proxy)
-                .min(ARCHIVE_PREFETCH_WINDOW),
-        ))
+        Some(
+            client.prefetch_vendor_packages(
+                uuids,
+                self.use_public_proxy,
+                self.vendor_url.as_deref(),
+                self.patch_server_url.as_deref(),
+                crate::utils::concurrent::api_concurrency(self.use_public_proxy)
+                    .min(ARCHIVE_PREFETCH_WINDOW),
+            ),
+        )
     }
 }
 
@@ -569,6 +571,24 @@ pub async fn harvest_artifact_blobs_from(
     out
 }
 
+// Test-only: how many times `harvest_zip_blobs`'s fallback scan ran on THIS
+// thread. The name path and the scan return the same blobs by construction,
+// so which one produced them is otherwise unobservable — and it is the whole
+// point of the item. Thread-local, so the tests that read it call
+// `harvest_zip_blobs` directly rather than through the blocking pool.
+#[cfg(test)]
+thread_local! {
+    static FALLBACK_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: run `f` and report how many fallback scans it took.
+#[cfg(test)]
+fn fallback_scans_of<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    FALLBACK_SCANS.with(|n| n.set(0));
+    let out = f();
+    (out, FALLBACK_SCANS.with(std::cell::Cell::get))
+}
+
 /// One zip-shaped committed artifact's contribution to the harvest: the
 /// blobs whose git-sha256 is one of the `(record key, afterHash)` pairs in
 /// `wanted`. Synchronous — the caller runs it on the blocking pool.
@@ -655,6 +675,8 @@ fn harvest_zip_blobs(path: &Path, wanted: &[(String, String)]) -> HashMap<String
 
     // Fallback: the member names disagree with the record's keys (or an
     // entry was rejected above). Scan every entry, exactly as before.
+    #[cfg(test)]
+    FALLBACK_SCANS.with(|n| n.set(n.get() + 1));
     for i in 0..archive.len() {
         let Ok(mut entry) = archive.by_index(i) else {
             continue;
@@ -1388,6 +1410,236 @@ mod harvest_tests {
         );
     }
 
+    // ── The name-seeking harvest against the scan it replaced ───────────
+    // `harvest_zip_blobs` returns the same blobs whichever path produced
+    // them, which is what makes it safe and also what makes a scenario test
+    // blind to the path: every test below still passes with the name lookup
+    // deleted. The oracle pins the RESULT against the pre-change scan, and
+    // `fallback_scans_of` pins the PATH.
+
+    /// The whole-archive scan `harvest_zip_blobs` replaced, verbatim, over
+    /// the hashes a record needs.
+    fn exhaustive_scan(path: &Path, needed: &HashSet<&str>) -> HashMap<String, Vec<u8>> {
+        use std::io::Read as _;
+
+        let mut out: HashMap<String, Vec<u8>> = HashMap::new();
+        let Ok(bytes) = std::fs::read(path) else {
+            return out;
+        };
+        let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) else {
+            return out;
+        };
+        for i in 0..archive.len() {
+            let Ok(mut file) = archive.by_index(i) else {
+                continue;
+            };
+            if file.is_dir() || file.size() > MAX_FILE_BYTES {
+                continue;
+            }
+            let mut content = Vec::with_capacity(file.size() as usize);
+            if file
+                .by_ref()
+                .take(MAX_FILE_BYTES + 1)
+                .read_to_end(&mut content)
+                .is_err()
+            {
+                continue;
+            }
+            if content.len() as u64 > MAX_FILE_BYTES {
+                continue;
+            }
+            let h = compute_git_sha256_from_bytes(&content);
+            if needed.contains(h.as_str()) {
+                out.insert(h, content);
+            }
+        }
+        out
+    }
+
+    /// A zip holding `entries` in order, member names verbatim.
+    fn write_zip_members(path: &Path, entries: &[(&str, &[u8])]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in entries {
+            writer.start_file(*name, opts).unwrap();
+            writer.write_all(content).unwrap();
+        }
+        std::fs::write(path, writer.finish().unwrap().into_inner()).unwrap();
+    }
+
+    /// A zip carrying the SAME member name twice: written under two
+    /// distinct names, then renamed in place (all three names are five
+    /// bytes, so every header offset is preserved).
+    fn write_duplicate_name_zip(path: &Path, name: &str, first: &[u8], second: &[u8]) {
+        write_zip_members(path, &[("x1.py", first), ("x2.py", second)]);
+        let mut bytes = std::fs::read(path).unwrap();
+        for old in [b"x1.py".as_slice(), b"x2.py".as_slice()] {
+            while let Some(at) = bytes.windows(5).position(|w| w == old) {
+                bytes[at..at + 5].copy_from_slice(name.as_bytes());
+            }
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn wanted_pairs(keys: &[(&str, &[u8])]) -> Vec<(String, String)> {
+        keys.iter()
+            .map(|(k, c)| (k.to_string(), compute_git_sha256_from_bytes(c)))
+            .collect()
+    }
+
+    /// Whatever the archive's member names turn out to be, the harvest must
+    /// return exactly the blob SET the exhaustive scan returns — that is
+    /// the equivalence the by-name seek rests on, and the shapes below are
+    /// the ways a name can disagree with a record key.
+    #[test]
+    fn name_seeking_harvest_matches_the_exhaustive_scan() {
+        const A: &[u8] = b"alpha\n";
+        const B: &[u8] = b"beta\n";
+        const C: &[u8] = b"gamma\n";
+
+        // The zip's members, and the record keys naming the bytes the
+        // record claims live behind them.
+        type Members<'a> = Vec<(&'a str, &'a [u8])>;
+        let cases: Vec<(&str, Members, Members)> = vec![
+            (
+                "exact-names",
+                vec![("a.py", A), ("b.py", B)],
+                vec![("a.py", A), ("b.py", B)],
+            ),
+            ("renamed", vec![("renamed.py", A)], vec![("a.py", A)]),
+            (
+                "package-prefix",
+                vec![("index.js", A)],
+                vec![("package/index.js", A)],
+            ),
+            (
+                "reverse-prefix",
+                vec![("package/index.js", A)],
+                vec![("index.js", A)],
+            ),
+            // Each key names the other's bytes.
+            (
+                "swapped",
+                vec![("a.py", B), ("b.py", A)],
+                vec![("a.py", A), ("b.py", B)],
+            ),
+            // A key naming a directory-shaped member, beside the real file.
+            (
+                "dir-entry",
+                vec![("d/", b""), ("d/a.py", A)],
+                vec![("d", A), ("d/a.py", A)],
+            ),
+            (
+                "same-hash-twice",
+                vec![("a.py", A), ("b.py", A)],
+                vec![("a.py", A), ("b.py", A)],
+            ),
+            (
+                "absent-member",
+                vec![("a.py", A)],
+                vec![("a.py", A), ("ghost.py", C)],
+            ),
+            // A windows-packed archive spells its separators the other way.
+            (
+                "backslashes",
+                vec![("lib\\mod.py", A)],
+                vec![("lib/mod.py", A)],
+            ),
+            (
+                "case-skew",
+                vec![("Lib/Mod.py", A)],
+                vec![("lib/mod.py", A)],
+            ),
+            (
+                "mixed",
+                vec![("a.py", A), ("renamed", B), ("c.py", C)],
+                vec![("a.py", A), ("b.py", B), ("c.py", C)],
+            ),
+        ];
+
+        for (label, members, keys) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let zip_path = tmp.path().join("artifact.zip");
+            write_zip_members(&zip_path, &members);
+
+            let wanted = wanted_pairs(&keys);
+            let needed: HashSet<&str> = wanted.iter().map(|(_, h)| h.as_str()).collect();
+            let got = harvest_zip_blobs(&zip_path, &wanted);
+            let want = exhaustive_scan(&zip_path, &needed);
+
+            let mut got_keys: Vec<&String> = got.keys().collect();
+            let mut want_keys: Vec<&String> = want.keys().collect();
+            got_keys.sort();
+            want_keys.sort();
+            assert_eq!(
+                got_keys, want_keys,
+                "[{label}] the name-seeking harvest returned a different blob set \
+                 than the scan it replaced"
+            );
+            for k in got_keys {
+                assert_eq!(
+                    got[k], want[k],
+                    "[{label}] blob {k} differs from the scan's"
+                );
+            }
+        }
+    }
+
+    /// A zip may carry one member name twice (`by_name` resolves exactly one
+    /// of them), and the blob the record wants may be in either. Both ways
+    /// round, the harvest must still agree with the scan.
+    #[test]
+    fn duplicate_member_names_match_the_exhaustive_scan() {
+        const A: &[u8] = b"alpha\n";
+        const B: &[u8] = b"beta\n";
+        for (label, want) in [("wanted-is-first", A), ("wanted-is-second", B)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let zip_path = tmp.path().join("dup.zip");
+            write_duplicate_name_zip(&zip_path, "xx.py", A, B);
+
+            let wanted = wanted_pairs(&[("xx.py", want)]);
+            let needed: HashSet<&str> = wanted.iter().map(|(_, h)| h.as_str()).collect();
+            let got = harvest_zip_blobs(&zip_path, &wanted);
+            let scan = exhaustive_scan(&zip_path, &needed);
+            assert_eq!(
+                got, scan,
+                "[{label}] a duplicate member name must not change what is harvested"
+            );
+        }
+    }
+
+    /// The point of the item: a record whose keys name the archive's members
+    /// costs no whole-archive scan, and one whose keys do not still gets its
+    /// blob from the scan. This is the only test that can see the
+    /// difference — the assertions above pass either way.
+    #[test]
+    fn the_scan_runs_only_for_what_the_names_do_not_settle() {
+        const A: &[u8] = b"alpha\n";
+        const B: &[u8] = b"beta\n";
+        let tmp = tempfile::tempdir().unwrap();
+
+        let named = tmp.path().join("named.zip");
+        write_zip_members(&named, &[("a.py", A), ("index.js", B)]);
+        // The bare member under a `package/`-prefixed key: the second
+        // spelling the name lookup tries.
+        let wanted = wanted_pairs(&[("a.py", A), ("package/index.js", B)]);
+        let (got, scans) = fallback_scans_of(|| harvest_zip_blobs(&named, &wanted));
+        assert_eq!(got.len(), 2, "both blobs must come back");
+        assert_eq!(
+            scans, 0,
+            "keys that name their members must not fall back to the archive scan"
+        );
+
+        let renamed = tmp.path().join("renamed.zip");
+        write_zip_members(&renamed, &[("renamed.py", A)]);
+        let wanted = wanted_pairs(&[("a.py", A)]);
+        let (got, scans) = fallback_scans_of(|| harvest_zip_blobs(&renamed, &wanted));
+        assert_eq!(got.len(), 1, "the renamed member's blob must come back");
+        assert_eq!(scans, 1, "a name the archive does not carry needs the scan");
+    }
+
     /// The record's key names the member the blob normally lives in, so the
     /// harvest looks it up by name — but the archive is free to spell it
     /// differently (a wheel repacked under a renamed member, a `.nupkg`
@@ -1416,7 +1668,9 @@ mod harvest_tests {
 
     /// A manifest key may carry the npm `package/` prefix while the archive
     /// spells the member without it — the same two spellings the member-map
-    /// verify accepts. The name lookup must try both before falling back.
+    /// verify accepts. Both must yield the blob; that the second spelling is
+    /// what settled it (rather than the fallback scan) is pinned by
+    /// [`the_scan_runs_only_for_what_the_names_do_not_settle`].
     #[tokio::test]
     async fn package_prefixed_key_matches_the_bare_zip_member() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1437,8 +1691,9 @@ mod harvest_tests {
     }
 
     /// Two record files, one whose key names its member and one whose does
-    /// not: the name path settles the first, the scan supplies the second,
-    /// and BOTH blobs land — the whole-archive scan's result.
+    /// not: BOTH blobs must land, which is the whole-archive scan's result.
+    /// (Which path produced each one is pinned by
+    /// [`the_scan_runs_only_for_what_the_names_do_not_settle`].)
     #[tokio::test]
     async fn mixed_named_and_renamed_members_yield_every_after_blob() {
         const OTHER: &[u8] = b"module.exports = also_patched;\n";
