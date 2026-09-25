@@ -30,7 +30,7 @@ use std::path::Path;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
-use crate::ecosystem_dispatch::crawl_all_ecosystems_with_npm;
+use crate::ecosystem_dispatch::{crawl_all_ecosystems, crawl_all_ecosystems_with_npm};
 use crate::ui::{self, plural, print_json, StatusLine};
 
 use super::get::{download_and_apply_patches_with, select_patches, DownloadParams, DownloadRun};
@@ -1577,11 +1577,18 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     let mut status = StatusLine::stderr(args.common.json, args.common.silent);
     status.set(format!("Scanning {scan_target}..."));
 
-    // Crawl packages. The npm half is kept for the vendored path: its
-    // engine resolves the same untouched tree and reuses this crawl
-    // instead of walking `node_modules` again.
-    let (mut all_crawled, mut eco_counts, skipped_bundle_config_path, npm_crawl) =
-        crawl_all_ecosystems_with_npm(&crawler_options).await;
+    // Crawl packages. Vendored mode keeps the npm half: its engine
+    // resolves the same untouched tree and reuses this crawl instead of
+    // walking `node_modules` again. No other mode reads the snapshot, so
+    // no other mode pays for copying it.
+    let (mut all_crawled, mut eco_counts, skipped_bundle_config_path, npm_crawl) = if vendor {
+        let (packages, counts, skipped, snapshot) =
+            crawl_all_ecosystems_with_npm(&crawler_options).await;
+        (packages, counts, skipped, Some(snapshot))
+    } else {
+        let (packages, counts, skipped) = crawl_all_ecosystems(&crawler_options).await;
+        (packages, counts, skipped, None)
+    };
 
     // Lockfile supplement: dependencies the project's lockfile resolves
     // that have NO installed copy (fresh clone, partial install). They join
@@ -2406,7 +2413,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                 telemetry_token.as_deref(),
                 telemetry_org.as_deref(),
                 telemetry,
-                Some(&npm_crawl),
+                npm_crawl.as_ref(),
             )
             .await;
         }
@@ -2979,7 +2986,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             prune,
             telemetry_token.as_deref(),
             telemetry_org.as_deref(),
-            (!prompt_waits).then_some(&npm_crawl),
+            npm_crawl.as_ref().filter(|_| !prompt_waits),
         )
         .await
     } else {
