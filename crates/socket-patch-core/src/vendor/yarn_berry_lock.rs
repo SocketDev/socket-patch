@@ -70,16 +70,16 @@ use super::yarn_classic_lock::{
     read_yarn_lock, replace_block, revert_recorded_block, scan_blocks, scan_blocks_shared,
     split_berry_key_patterns, split_pattern, LockBlock,
 };
-
-/// The run's project-`package.json` parse: berry re-read AND re-parsed the
-/// manifest for every patched package to check the `resolutions` gate. See
-/// [`ParseMemo`].
-static PKG_JSON_MEMO: ParseMemo<Value> = ParseMemo::new();
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
 const YARN_LOCK: &str = "yarn.lock";
 const PACKAGE_JSON: &str = "package.json";
 const YARNRC: &str = ".yarnrc.yml";
+
+/// The run's project-`package.json` parse: berry re-read AND re-parsed the
+/// manifest for every patched package to check the `resolutions` gate. See
+/// [`ParseMemo`].
+static PKG_JSON_MEMO: ParseMemo<Value> = ParseMemo::new();
 
 /// Wiring kinds this backend owns.
 const KIND_RESOLUTION: &str = "yarn_berry_resolution";
