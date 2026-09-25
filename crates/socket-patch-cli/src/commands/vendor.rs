@@ -1754,19 +1754,18 @@ pub(crate) async fn vendor_records_reusing(
                         // variant that does not match would file the purl
                         // under `package_not_installed` ("no installed
                         // package found on disk") and lose the cause.
+                        // One failure for the SOURCE, keyed on the purl the
+                        // fetch was issued for — the eager fetch raised it
+                        // once, before the variants were ever fanned out.
                         Err(detail) => {
-                            has_errors = true;
-                            fetch_failed.insert(candidate.clone());
                             env.record(
-                                PatchEvent::new(PatchAction::Failed, candidate.clone())
+                                PatchEvent::new(PatchAction::Failed, purl.clone())
                                     .with_error("vendor_fetch_failed", detail.clone()),
                             );
-                            report_vendor_failure(
-                                common,
-                                candidate,
-                                &format!("fetch failed: {detail}"),
-                            );
-                            continue;
+                            report_vendor_failure(common, purl, &format!("fetch failed: {detail}"));
+                            fetch_failed.insert(purl.clone());
+                            fetch_failed.extend(candidates.iter().cloned());
+                            break;
                         }
                     },
                     None => None,
