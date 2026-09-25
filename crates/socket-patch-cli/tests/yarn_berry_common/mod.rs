@@ -29,6 +29,20 @@
 //! unreachable" soft-skip into a failure, for a CI leg that provisioned
 //! corepack on purpose.
 //!
+//! # Line endings ([`EOL_ENV`])
+//!
+//! yarn berry writes a file it CREATES with the OS line ending (`os.EOL`)
+//! and keeps an existing file's majority ending on every later write
+//! (`normalizeLineEndings` in yarnpkg-fslib's `FakeFS.ts`, used by
+//! `Project.persistLockfile` and `Workspace.persistManifest`). On Windows
+//! every fixture here therefore runs on CRLF files: the first `yarn install`
+//! writes a CRLF `yarn.lock` and re-renders the compact fixture
+//! `package.json` pretty — with CRLF. [`EOL_ENV`]`=crlf` reproduces that on
+//! macOS / Linux: [`adopt_yarn_line_endings`] re-spells the files the
+//! fixture install wrote CRLF, and every later yarn run keeps them CRLF.
+//! Either way it prints one `BERRY-EOL|<yarn>|<flow>|<file>|yarn=<ending>|flow=<ending>`
+//! line per file: the ending yarn itself wrote, and the one the flow runs on.
+//!
 //! # The manifest-less VEX matrix ([`run_manifestless_vex_matrix`])
 //!
 //! A hosted (`scan --mode hosted`) or vendored (`vendor`, `get --mode
@@ -78,6 +92,70 @@ pub fn yarn_e2e_required() -> bool {
     std::env::var(REQUIRED_ENV).is_ok_and(|v| v == "1")
 }
 
+/// `=crlf`: run the real-yarn flows on CRLF files on every OS, the way
+/// yarn berry writes them on Windows (module docs, "Line endings").
+pub const EOL_ENV: &str = "SOCKET_PATCH_YARN_BERRY_EOL";
+
+/// Whether the flows run on CRLF files: always on Windows (yarn writes them
+/// that way there), elsewhere when [`EOL_ENV`] is `crlf`.
+pub fn windows_line_endings() -> bool {
+    cfg!(windows) || std::env::var(EOL_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("crlf"))
+}
+
+/// The line-ending style of `bytes`, for the `BERRY-EOL` report.
+fn eol_style(bytes: &[u8]) -> &'static str {
+    let crlf = bytes.windows(2).filter(|w| w == b"\r\n").count();
+    let lf = bytes.iter().filter(|&&b| b == b'\n').count() - crlf;
+    match (crlf, lf) {
+        (0, 0) => "none",
+        (_, 0) => "crlf",
+        (0, _) => "lf",
+        _ => "mixed",
+    }
+}
+
+/// Call right after a fixture's first `yarn install`: under
+/// [`windows_line_endings`], re-spell each of `files` (relative to `dir`)
+/// CRLF, as yarn itself writes them on Windows, and report each file as a
+/// `BERRY-EOL|<yarn>|<flow>|<file>|yarn=<ending>|flow=<ending>` line (the
+/// ending yarn wrote, the one the flow runs on). yarn keeps the majority
+/// ending on every later write,
+/// so the rest of the flow (socket-patch's rewrites, the fresh-checkout
+/// installs, the VEX matrix) runs on CRLF files. On Windows the files are
+/// CRLF already and the re-spelling is a no-op. Returns whether it
+/// converted anything.
+pub fn adopt_yarn_line_endings(dir: &Path, yarn_spec: &str, flow: &str, files: &[&str]) -> bool {
+    let crlf = windows_line_endings();
+    let mut converted = false;
+    for rel in files {
+        let path = dir.join(rel);
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let written = eol_style(&bytes);
+        let mut flow_style = written;
+        if crlf {
+            let text = String::from_utf8(bytes).expect("yarn writes UTF-8");
+            let respelled = text.replace("\r\n", "\n").replace('\n', "\r\n");
+            if respelled != text {
+                std::fs::write(&path, &respelled).unwrap();
+                converted = true;
+            }
+            flow_style = eol_style(respelled.as_bytes());
+        }
+        println!("BERRY-EOL|{yarn_spec}|{flow}|{rel}|yarn={written}|flow={flow_style}");
+    }
+    let _ = std::io::stdout().flush();
+    converted
+}
+
+/// [`eol_style`] classifies each file by its line breaks.
+#[test]
+fn eol_style_classifies_line_breaks() {
+    assert_eq!(eol_style(b"{}"), "none");
+    assert_eq!(eol_style(b"a\nb\n"), "lf");
+    assert_eq!(eol_style(b"a\r\nb\r\n"), "crlf");
+    assert_eq!(eol_style(b"a\r\nb\n"), "mixed");
+}
+
 /// The corepack spec (`yarn@<X>`) of the yarn 4 release under test.
 ///
 /// Panics on a non-4.x [`VERSION_ENV`]: these suites prove the SUPPORTED
@@ -107,6 +185,141 @@ pub fn yarn_berry() -> &'static str {
         format!("yarn@{version}")
     })
     .as_str()
+}
+
+/// A `Command` for `corepack`. On Windows Node installs corepack as the
+/// `corepack.cmd` batch shim, and `Command::new("corepack")` resolves only
+/// `corepack.exe`, so every berry suite's availability probe reported
+/// "`corepack yarn@4.12.0` unavailable" on the windows-latest yarn-berry leg
+/// although corepack was on PATH.
+pub fn corepack_command() -> std::process::Command {
+    std::process::Command::new(if cfg!(windows) {
+        "corepack.cmd"
+    } else {
+        "corepack"
+    })
+}
+
+/// Serializes yarn berry spawns on Windows. The suites' parallel tests share
+/// one yarn cache folder (`cache_env::isolate` points `YARN_CACHE_FOLDER` at
+/// a single per-run root), and two yarn processes fetching the same package
+/// both write `<pkg>.zip-<rand>.tmp` then rename it over the cache zip. On
+/// Windows the loser's rename fails with `EPERM` while the winner holds the
+/// file (seen on the windows-latest yarn-berry 4.12.0 leg:
+/// `EPERM: operation not permitted, rename '...left-pad-npm-1.3.0-....zip-....tmp'`).
+/// Unix rename-over is atomic, so other platforms stay parallel. Only the
+/// yarn processes serialize; the socket-patch runs between them do not.
+static BERRY_SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run a yarn/corepack `Command`, one at a time on Windows (see
+/// [`BERRY_SPAWN`]).
+pub fn berry_spawn_output(cmd: &mut std::process::Command) -> std::io::Result<Output> {
+    let _one_at_a_time =
+        cfg!(windows).then(|| BERRY_SPAWN.lock().unwrap_or_else(|p| p.into_inner()));
+    cmd.output()
+}
+
+/// Both output streams of a finished yarn run, for a failure message. yarn
+/// berry reports its errors (YN0028, YN0018, …) on stdout and usually writes
+/// nothing to stderr, so a stderr-only message hides the reason.
+pub fn yarn_output(out: &Output) -> String {
+    format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// Pin the yarn berry defaults that depend on whether yarn thinks it is
+/// running under CI. Apply it after the `YARN_*` scrub and `cache_env::isolate`,
+/// and before the call site's own env.
+///
+/// yarn 3+ turns `enableImmutableInstalls` on by default when it detects CI
+/// (ci-info: `CI`, `GITHUB_ACTIONS`, …). Under that default, the plain
+/// `yarn install` that creates each fixture's lockfile fails with YN0028 ("The
+/// lockfile would have been created by this install, which is explicitly
+/// forbidden"), exit 1 and nothing on stderr. That broke every hosted,
+/// vendored, pnpm-linker, workspaces and yarn 3 refusal fixture on the
+/// ubuntu/macOS yarn-berry legs. yarn 2 keeps the default off, which is why
+/// its refusal legs stayed green. The pin:
+///
+/// * forces `CI=true`, so a developer's local run gets the same defaults as
+///   the CI leg. Without the second pin, every suite fails locally too,
+///   instead of only on a runner;
+/// * sets `YARN_ENABLE_IMMUTABLE_INSTALLS=false`, so a plain `install` may
+///   write the lock. The fresh-checkout installs are unaffected because they
+///   pass `--immutable` explicitly, and yarn's flag outranks the setting;
+/// * sets `YARN_ENABLE_HARDENED_MODE=false` for yarn 4 (`yarn_spec`'s
+///   major). yarn 4 turns hardened mode on when it detects a GitHub Actions
+///   run for a public pull request, and then re-resolves every lock entry
+///   against the registry. The fresh-checkout installs point the registry at
+///   an unreachable address on purpose (they must install from the committed
+///   lock and the hosted tarball alone), so hardened mode failed them with
+///   ECONNREFUSED 127.0.0.1:1 on PR runs only. Hardened mode guards against
+///   untrusted lockfiles; these suites exercise socket-patch's own rewrites,
+///   and `--immutable --check-cache` still verifies every checksum. yarn 2
+///   and 3 predate the setting and refuse every command while it is set
+///   ("Usage Error: Unrecognized or legacy configuration settings found:
+///   enableHardenedMode"), so for them it is removed instead.
+pub fn pin_berry_ci_defaults<'c>(
+    cmd: &'c mut std::process::Command,
+    yarn_spec: &str,
+) -> &'c mut std::process::Command {
+    cmd.env("CI", "true")
+        .env("YARN_ENABLE_IMMUTABLE_INSTALLS", "false");
+    if yarn_major(yarn_spec).is_none_or(|major| major >= 4) {
+        cmd.env("YARN_ENABLE_HARDENED_MODE", "false")
+    } else {
+        cmd.env_remove("YARN_ENABLE_HARDENED_MODE")
+    }
+}
+
+/// The major version of a corepack yarn spec (`yarn@3.8.7` → 3).
+fn yarn_major(yarn_spec: &str) -> Option<u32> {
+    yarn_spec
+        .strip_prefix("yarn@")
+        .unwrap_or(yarn_spec)
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// [`pin_berry_ci_defaults`] wins over an earlier value for every variable
+/// (`get_envs` reports the last value set for each key), and only yarn 4+
+/// gets the hardened-mode pin — yarn 2/3 reject the unknown setting.
+#[test]
+fn pin_berry_ci_defaults_sets_ci_and_disables_implicit_immutable() {
+    for (spec, hardened) in [
+        ("yarn@4.12.0", Some(Some("false".into()))),
+        ("yarn@4.0.2", Some(Some("false".into()))),
+        ("yarn@3.8.7", Some(None)),
+        ("yarn@2.4.3", Some(None)),
+    ] {
+        let mut cmd = corepack_command();
+        cmd.env("YARN_ENABLE_IMMUTABLE_INSTALLS", "true")
+            .env("YARN_ENABLE_HARDENED_MODE", "true");
+        pin_berry_ci_defaults(&mut cmd, spec);
+        let envs: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
+            .collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("CI")),
+            Some(&Some("true".into())),
+            "{spec}"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("YARN_ENABLE_IMMUTABLE_INSTALLS")),
+            Some(&Some("false".into())),
+            "{spec}"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("YARN_ENABLE_HARDENED_MODE")),
+            hardened.as_ref(),
+            "{spec}: removed (None) for yarn 2/3, pinned off for yarn 4"
+        );
+    }
 }
 
 /// The cache-zip checksum a real yarn wrote into `lock` (the first entry
@@ -140,7 +353,7 @@ pub fn expected_checksum_line(yarn_lock: &str, checksum_10c0: &str) -> String {
     }
 }
 
-/// Run `f` on a fresh OS thread and return its result (re-raising a panic)./// Run `f` on a fresh OS thread and return its result (re-raising a panic).
+/// Run `f` on a fresh OS thread and return its result (re-raising a panic).
 ///
 /// [`PatchApi`] owns its own tokio runtime; creating, blocking on or
 /// dropping one from inside a `#[tokio::test]` body panics ("Cannot start

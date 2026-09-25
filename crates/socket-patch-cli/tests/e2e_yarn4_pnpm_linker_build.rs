@@ -95,7 +95,7 @@ fn has_corepack_pm(pm: &str) -> bool {
     let Ok(probe) = tempfile::tempdir() else {
         return false;
     };
-    let mut cmd = Command::new("corepack");
+    let mut cmd = yarn_berry_common::corepack_command();
     cmd.args([pm, "--version"])
         .current_dir(probe.path())
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
@@ -136,17 +136,18 @@ fn scrub_socket_env(cmd: &mut Command) {
 }
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new("corepack");
+    let mut cmd = yarn_berry_common::corepack_command();
     cmd.arg(pm).args(args).current_dir(cwd);
     // Scrub FIRST, then the hermetic flags so they survive (last env wins).
     scrub_socket_env(&mut cmd);
     cache_env::isolate(&mut cmd);
+    yarn_berry_common::pin_berry_ci_defaults(&mut cmd, pm);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
         .env("YARN_ENABLE_GLOBAL_CACHE", "false");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.output().expect("failed to run corepack")
+    yarn_berry_common::berry_spawn_output(&mut cmd).expect("failed to run corepack")
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
@@ -308,7 +309,7 @@ fn bootstrap_berry_checksum(tmp: &Path, patched_tgz: &Path) -> Option<String> {
     if !out.status.success() {
         skip!(
             "SKIP e2e_yarn4_pnpm_linker_build: bootstrap yarn install failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
+            yarn_berry_common::yarn_output(&out)
         );
         return None;
     }
@@ -347,10 +348,17 @@ fn install_pnpm_fixture(tag: &str, tmp: &Path, proj: &Path) -> Option<Vec<u8>> {
         skip!(
             "SKIP e2e_yarn4_pnpm_linker_build ({tag}): fixture `yarn install` failed \
              (registry unreachable?):\n{}",
-            String::from_utf8_lossy(&install.stderr)
+            yarn_berry_common::yarn_output(&install)
         );
         return None;
     }
+    // Windows line endings (yarn writes CRLF there): see yarn_berry_common.
+    yarn_berry_common::adopt_yarn_line_endings(
+        proj,
+        yarn_berry(),
+        &format!("pnpm-linker-{tag}"),
+        &["package.json", "yarn.lock"],
+    );
     assert_pnpm_store_layout(proj, tag);
     // Read THROUGH the symlink — the same path discovery crawls.
     let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js"))

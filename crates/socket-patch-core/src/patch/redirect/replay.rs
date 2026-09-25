@@ -487,6 +487,22 @@ pub async fn revert_remaining_redirect_edits(
                         }
                         continue;
                     }
+                    // yarn lock fragments are whole blocks recorded in the
+                    // lock's on-disk line endings, and a `core.autocrlf`
+                    // checkout on another OS re-spells the lock (never the
+                    // committed ledger): when neither fragment matches
+                    // verbatim, try both in the live file's uniform ending.
+                    let respelled = (super::yarn_lock_fragment_kind(&edit.kind)
+                        && !content.contains(new)
+                        && !content.contains(original))
+                    .then(|| {
+                        crate::utils::line_endings::fragments_in_eol_of(&content, original, new)
+                    })
+                    .flatten();
+                    let (original, new) = match &respelled {
+                        Some((original, new)) => (original.as_str(), new.as_str()),
+                        None => (original, new),
+                    };
                     // `new` before `original`: original may be a substring
                     // of new (Cargo.toml insert, maven version suffix).
                     if content.contains(new) {
@@ -923,6 +939,106 @@ mod tests {
                 assert!(state.edits.is_empty());
             }
         }
+    }
+
+    /// yarn lock edits replay across a `core.autocrlf` checkout switch: the
+    /// ledger's fragments are the lock's on-disk bytes at redirect time (the
+    /// berry and classic rewriters record CRLF blocks for a CRLF lock), the
+    /// live lock may since be in the OTHER uniform ending — the revert lands
+    /// on the original block in the live file's ending. A mixed live file
+    /// proves nothing and refuses; a non-yarn kind keeps the verbatim-only
+    /// contract.
+    #[tokio::test]
+    async fn yarn_edits_revert_across_a_checkout_line_ending_switch() {
+        let head = "# yarn\n\n__metadata:\n  version: 8\n  cacheKey: 10c0\n\n";
+        let original = "\"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
+                        resolution: \"left-pad@npm:1.3.0\"\n  checksum: 10c0/aaaa\n  \
+                        languageName: node\n  linkType: hard";
+        let new = "\"left-pad@npm:^1.3.0\":\n  version: 1.3.0\n  \
+                   resolution: \"left-pad@npm:1.3.0::__archiveUrl=http%3A%2F%2Fp.test%2Flp.tgz\"\n  \
+                   checksum: 10c0/bbbb\n  languageName: node\n  linkType: hard";
+        let spell = |text: &str, crlf: bool| {
+            if crlf {
+                text.replace('\n', "\r\n")
+            } else {
+                text.to_string()
+            }
+        };
+        for kind in ["redirect_yarn_berry_entry", "redirect_yarn_classic_entry"] {
+            for (recorded_crlf, live_crlf) in
+                [(true, true), (true, false), (false, true), (false, false)]
+            {
+                let label = format!("{kind} recorded_crlf={recorded_crlf} live_crlf={live_crlf}");
+                let dir = TempDir::new().unwrap();
+                write(
+                    dir.path(),
+                    "yarn.lock",
+                    &spell(&format!("{head}{new}\n"), live_crlf),
+                )
+                .await;
+                let mut state = state_with(
+                    vec![edit(
+                        "yarn.lock",
+                        kind,
+                        "rewritten",
+                        Some(&spell(original, recorded_crlf)),
+                        Some(&spell(new, recorded_crlf)),
+                    )],
+                    &["pkg:npm/left-pad@1.3.0"],
+                );
+                let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+                assert!(out.fully_reverted(), "{label}: {:?}", out.refusals);
+                assert_eq!(
+                    read(dir.path(), "yarn.lock").await,
+                    spell(&format!("{head}{original}\n"), live_crlf),
+                    "{label}"
+                );
+                assert!(state.edits.is_empty(), "{label}");
+            }
+        }
+
+        // A mixed live lock: refused whole, byte-untouched, edit kept.
+        let dir = TempDir::new().unwrap();
+        let mixed = format!("{}{}\n", spell(head, true), new);
+        write(dir.path(), "yarn.lock", &mixed).await;
+        let mut state = state_with(
+            vec![edit(
+                "yarn.lock",
+                "redirect_yarn_berry_entry",
+                "rewritten",
+                Some(&spell(original, true)),
+                Some(&spell(new, true)),
+            )],
+            &["pkg:npm/left-pad@1.3.0"],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(!out.fully_reverted(), "a mixed lock must refuse");
+        assert_eq!(read(dir.path(), "yarn.lock").await, mixed);
+        assert_eq!(state.edits.len(), 1);
+
+        // A non-yarn line-oriented kind keeps the verbatim-only contract.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "requirements.txt",
+            "a==1\r\nleft-pad @ https://patch.example/x.whl\r\n",
+        )
+        .await;
+        let mut state = state_with(
+            vec![edit(
+                "requirements.txt",
+                "redirect_requirements_line",
+                "rewritten",
+                Some("a==1\nleft-pad==1.3.0"),
+                Some("a==1\nleft-pad @ https://patch.example/x.whl"),
+            )],
+            &["pkg:pypi/left-pad@1.3.0"],
+        );
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(
+            !out.fully_reverted(),
+            "only yarn blocks are respelled across line endings"
+        );
     }
 
     // ---------- ReplaceFragment ----------

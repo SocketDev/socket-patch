@@ -99,7 +99,7 @@ fn has_corepack_pm(pm: &str) -> bool {
     };
     // Isolated too: this probe is what actually downloads the package manager
     // the first time, and corepack stores it under `COREPACK_HOME`.
-    let mut cmd = Command::new("corepack");
+    let mut cmd = yarn_berry_common::corepack_command();
     cmd.args([pm, "--version"])
         .current_dir(probe.path())
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
@@ -143,12 +143,13 @@ fn scrub_socket_env(cmd: &mut Command) {
 }
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new("corepack");
+    let mut cmd = yarn_berry_common::corepack_command();
     cmd.arg(pm).args(args).current_dir(cwd);
     // Scrub FIRST (it removes YARN_* / SOCKET_* from the inherited env), then
     // set the hermetic flags so they survive.
     scrub_socket_env(&mut cmd);
     cache_env::isolate(&mut cmd);
+    yarn_berry_common::pin_berry_ci_defaults(&mut cmd, pm);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
         // Hermetic: no global mirror/cache. Without this, yarn's persistent
         // `~/.yarn/berry` global cache serves a previously-fetched archive
@@ -158,7 +159,7 @@ fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> 
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.output().expect("failed to run corepack")
+    yarn_berry_common::berry_spawn_output(&mut cmd).expect("failed to run corepack")
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
@@ -237,7 +238,7 @@ fn bootstrap_berry_checksum(tmp: &Path, patched_tgz: &Path) -> Option<String> {
     if !out.status.success() {
         skip!(
             "SKIP e2e_redirect_yarn_berry_build: bootstrap yarn install failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
+            yarn_berry_common::yarn_output(&out)
         );
         return None;
     }
@@ -331,10 +332,17 @@ async fn berry_hosted_project(
         skip!(
             "SKIP e2e_redirect_yarn_berry_build ({tag}): fixture `yarn install` failed \
              (registry unreachable?):\n{}",
-            String::from_utf8_lossy(&install.stderr)
+            yarn_berry_common::yarn_output(&install)
         );
         return None;
     }
+    // Windows line endings (yarn writes CRLF there): see yarn_berry_common.
+    yarn_berry_common::adopt_yarn_line_endings(
+        &proj,
+        yarn_berry(),
+        &format!("redirect-{tag}"),
+        &["package.json", "yarn.lock"],
+    );
     let installed_dir = proj.join("node_modules").join(DEP);
     let orig = std::fs::read(installed_dir.join("index.js")).expect("installed index.js");
     let registry_lock = std::fs::read(proj.join("yarn.lock")).expect("registry yarn.lock");

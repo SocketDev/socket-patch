@@ -96,7 +96,7 @@ fn has_corepack_pm(pm: &str) -> bool {
     let Ok(probe) = tempfile::tempdir() else {
         return false;
     };
-    let mut cmd = Command::new("corepack");
+    let mut cmd = yarn_berry_common::corepack_command();
     cmd.args([pm, "--version"])
         .current_dir(probe.path())
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
@@ -127,18 +127,19 @@ fn scrub_socket_env(cmd: &mut Command) {
 }
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new("corepack");
+    let mut cmd = yarn_berry_common::corepack_command();
     cmd.arg(pm).args(args).current_dir(cwd);
     // Scrub FIRST (it removes YARN_* / SOCKET_* from the inherited env), then
     // set the hermetic flags so they survive (Command: last env call wins).
     scrub_socket_env(&mut cmd);
     cache_env::isolate(&mut cmd);
+    yarn_berry_common::pin_berry_ci_defaults(&mut cmd, pm);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
         .env("YARN_ENABLE_GLOBAL_CACHE", "false");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.output().expect("failed to run corepack")
+    yarn_berry_common::berry_spawn_output(&mut cmd).expect("failed to run corepack")
 }
 
 fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
@@ -280,10 +281,18 @@ async fn refusal_case(tag: &str, yarn_pm: &str, compression_zero: bool, expected
         skip!(
             "SKIP e2e_yarn_legacy_cachekey_refusal_build ({tag}): fixture `yarn install` \
              failed (registry unreachable?):\n{}",
-            String::from_utf8_lossy(&install.stderr)
+            yarn_berry_common::yarn_output(&install)
         );
         return;
     }
+    // Windows line endings (yarn 2/3 write CRLF there too): a CRLF legacy
+    // lock must still be refused for its cacheKey, never for its endings.
+    yarn_berry_common::adopt_yarn_line_endings(
+        &proj,
+        yarn_pm,
+        &format!("legacy-{tag}"),
+        &["package.json", "yarn.lock"],
+    );
 
     // 2. The cacheKey pin — the empirical fact the refusal contract below is
     //    conditioned on. Fails FIRST, with a self-describing message, if a

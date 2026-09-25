@@ -150,6 +150,18 @@ into the new version's section — see docs/releasing.md.
 
 ### Added
 
+- **`redirect_yarn_berry_mixed_line_endings` and
+  `vendor_yarn_berry_mixed_line_endings`.** A `yarn.lock` (or, vendored, a
+  root `package.json`) that mixes CRLF and LF line endings — or holds a bare
+  CR — has no single ending to keep, and yarn itself rejects such a lock
+  under `--immutable` (YN0028) and rewrites it wholesale on its next plain
+  install. Both modes now refuse it before any write with a code naming the
+  line endings and the `yarn install` remedy; a revert never refuses on line
+  endings (a restored lock entry takes the terminator of the entry it
+  replaces). The real-yarn berry suites gained `SOCKET_PATCH_YARN_BERRY_EOL=crlf`
+  to run on CRLF files on macOS / Linux as yarn writes them on Windows, and
+  print a `BERRY-EOL|<yarn>|<flow>|<file>|yarn=…|flow=…` line per fixture
+  file — see [yarn berry compatibility](docs/testing/yarn-berry-compatibility.md).
 - **Hosted npm redirects configure npm 12's `allow-remote` for you.** npm 12
   defaults to `allow-remote=none` and refuses (EALLOWREMOTE) a lock that
   resolves patched packages from the Socket patch host. When `scan --mode
@@ -559,6 +571,49 @@ into the new version's section — see docs/releasing.md.
   proxy, sending private module paths off the machine. It is now refused
   (`vendor_fetch_unverifiable`, then the usual `package_not_installed`
   skip) unless `SOCKET_GOPROXY` names a proxy.
+- **yarn berry projects on Windows (CRLF files) are redirected and vendored
+  instead of refused.** yarn berry (2.x–4.x) writes a file it creates with
+  the OS line ending (`os.EOL`) and keeps an existing file's majority ending
+  on every later write (`normalizeLineEndings` in yarnpkg-fslib's
+  `FakeFS.ts`, used by `Project.persistLockfile` and
+  `Workspace.persistManifest`) — so on Windows a fresh `yarn.lock` and the
+  `package.json` yarn first pretty-prints are CRLF, and a `core.autocrlf`
+  checkout makes them CRLF on any OS. `scan --mode hosted` / `get --mode
+  hosted` refused every such lock (`redirect_yarn_berry_crlf_unsupported`,
+  redirected 0); a CRLF lock is now rewritten in its own line ending — every
+  untouched byte, a leading BOM included, round-trips — and the ledger records
+  the lock's on-disk CRLF fragments, so `rollback`, `remove` and the hosted →
+  vendored takeover restore it byte-for-byte (they also replay a ledger
+  recorded on a checkout whose uniform line ending has since flipped, LF ↔
+  CRLF). `vendor` / `scan --mode vendored` now keep `package.json`'s layout
+  (BOM, indent, line ending, trailing-newline shape) on both the wiring and
+  the revert: `vendor --revert` wrote a CRLF manifest back LF, never
+  byte-identical to the pre-vendor file. A BOM'd `package.json` (and a
+  BOM'd `.yarnrc.yml`, whose first-line `compressionLevel` was read as
+  unset) no longer fails the vendored backend, and every berry reader skips
+  a BOM in front of a header-less `__metadata:`. Verified on real yarn
+  4.12.0 (hosted, vendored, workspaces, pnpm linker, both mode takeovers)
+  with the fixtures re-spelled CRLF, and on yarn 2.4.3 / 3.8.7 (still
+  refused for their cacheKey, never for their endings).
+- **A yarn berry mode takeover no longer strips the old mode's patch before
+  the new mode refuses the project.** `scan` / `get --mode hosted` over a
+  vendored berry purl reverted its vendored wiring, ledger entry and
+  artifact (`redirect_takeover_reverted_vendored`: "now fully hosted") and
+  only then ran the rewriter, which refused a lock with mixed line endings
+  (or an unsupported `cacheKey` / `.yarnrc.yml` `compressionLevel`) —
+  `redirected: 0`, and the next `yarn install` pulled the unpatched registry
+  package. `vendor` / `scan --mode vendored` over a hosted berry purl did the
+  same in reverse (`vendor_takeover_reverted_redirect`, then `failed`
+  `vendor_yarn_berry_mixed_line_endings`). Both takeovers now run the new
+  mode's berry gates first — wet and `--dry-run` alike — and a refused purl
+  keeps the old mode's wiring byte-identical.
+- **`setup` keeps a CRLF `package.json` CRLF.** `setup` and `setup --remove`
+  re-serialized `package.json` with bare LF and dropped a leading BOM, so on
+  a Windows yarn berry project (yarn pretty-prints the manifest with CRLF) a
+  two-key script edit became a whole-file diff that yarn then kept, and
+  `setup --remove` could not land byte-identical on the pre-setup file.
+  `package.json` is now written in its own layout (BOM, indent, line ending,
+  trailing-newline shape), the same helper the vendored backends use.
 - **A vendoring-service outage no longer re-vendors packages.** An npm
   re-run (every lock flavor, `bun.lockb` included) re-acquired its tarball
   from whichever source answered — the service's prebuilt, or a local pack

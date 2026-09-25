@@ -2,8 +2,10 @@
 //! (`e2e_redirect_gem_build`, `e2e_vendor_gem_build`).
 //!
 //! The suites shell out to whatever `bundle` is first on `PATH` — in CI the
-//! one `ruby/setup-ruby`'s `bundler:` input installed; locally the host's,
-//! or a per-version wrapper dir prepended to `PATH`:
+//! one `ruby/setup-ruby`'s `bundler:` input installed, selected by exporting
+//! `BUNDLER_VERSION` (without it RubyGems' binstub runs the highest installed
+//! bundler, i.e. the Ruby's newer default gem on a leg pinned below it);
+//! locally the host's, or a per-version wrapper dir prepended to `PATH`:
 //!
 //! ```text
 //! gem install bundler -v 2.4.22 --install-dir "$D/2.4.22" --no-document
@@ -143,7 +145,8 @@ pub fn gate(
         assert!(
             want.is_empty() || version_matches(&bundler.version, want),
             "{suite} ({tag}): {VERSION_ENV}={want} but `bundle` on PATH is {} — the matrix \
-             leg is not running the bundler it is named after",
+             leg is not running the bundler it is named after (a bundler older than the \
+             Ruby's default gem is only selected with BUNDLER_VERSION={want})",
             bundler.version
         );
     }

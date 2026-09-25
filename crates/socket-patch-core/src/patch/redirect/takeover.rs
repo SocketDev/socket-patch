@@ -783,6 +783,19 @@ pub async fn revert_npm_redirect_purl(
                     edit.path
                 ));
             };
+            // A yarn block recorded on a CRLF checkout, replayed on an LF
+            // one (or the reverse — `core.autocrlf` re-spells the lock on
+            // every OS switch, never the committed ledger): when neither
+            // fragment matches verbatim, try both in the file's ending.
+            let respelled = (super::yarn_lock_fragment_kind(&edit.kind)
+                && !content.contains(new)
+                && !content.contains(orig))
+            .then(|| crate::utils::line_endings::fragments_in_eol_of(&content, orig, new))
+            .flatten();
+            let (orig, new) = match &respelled {
+                Some((orig, new)) => (orig.as_str(), new.as_str()),
+                None => (orig, new),
+            };
             if content.contains(new) {
                 staged.insert(edit.path.clone(), Some(content.replacen(new, orig, 1)));
                 out.reverted_files.push(edit.path.clone());
@@ -1696,6 +1709,92 @@ mod tests {
         );
         assert!(state.records.is_empty(), "record dropped");
         assert!(state.edits.is_empty(), "edits dropped");
+    }
+
+    /// A CRLF (and BOM'd) berry lock — yarn's own output on Windows —
+    /// round-trips through the takeover byte-exactly: the rewriter records
+    /// the CRLF fragments, the revert replays them. Across checkouts too: a
+    /// ledger written on a CRLF checkout reverts an LF checkout of the same
+    /// commit and vice versa (`core.autocrlf` re-spells the lock, never the
+    /// committed ledger), landing on the pristine lock in the LIVE file's
+    /// endings. A lock whose endings are mixed proves nothing: it refuses
+    /// as drift, byte-untouched, ledger intact.
+    #[tokio::test]
+    async fn npm_berry_crlf_lock_round_trips_across_checkouts() {
+        let respell = |text: &str, crlf: bool| {
+            let lf = text.replace("\r\n", "\n");
+            if crlf {
+                lf.replace('\n', "\r\n")
+            } else {
+                lf
+            }
+        };
+        for (label, bom, recorded_crlf, live_crlf) in [
+            ("crlf", "", true, true),
+            ("bom+crlf", "\u{feff}", true, true),
+            ("recorded crlf, reverted lf", "", true, false),
+            ("recorded lf, reverted crlf", "\u{feff}", false, true),
+        ] {
+            let pristine = format!("{bom}{}", respell(&berry_pristine(), recorded_crlf));
+            let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &pristine).await;
+            let root = tmp.path();
+            let edit = state
+                .edits
+                .iter()
+                .find(|e| e.kind == "redirect_yarn_berry_entry")
+                .expect("berry edit");
+            let recorded = edit.original.as_ref().and_then(Value::as_str).unwrap();
+            assert_eq!(
+                recorded.contains("\r\n"),
+                recorded_crlf,
+                "{label}: the ledger records the on-disk endings: {recorded:?}"
+            );
+            let wired = tokio::fs::read_to_string(root.join("yarn.lock"))
+                .await
+                .unwrap();
+            tokio::fs::write(root.join("yarn.lock"), respell(&wired, live_crlf))
+                .await
+                .unwrap();
+
+            revert_redirect_purl(root, &mut state, NPM_PURL, false)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: revert must succeed: {e}"));
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("yarn.lock"))
+                    .await
+                    .unwrap(),
+                format!("{bom}{}", respell(&berry_pristine(), live_crlf)),
+                "{label}: the pristine lock, in the live file's endings"
+            );
+            assert!(state.edits.is_empty(), "{label}: edits dropped");
+        }
+
+        // Mixed live endings: neither the verbatim nor a respelled fragment
+        // is provable — refuse, touch nothing, keep the ledger.
+        let pristine = respell(&berry_pristine(), true);
+        let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &pristine).await;
+        let root = tmp.path();
+        let wired = tokio::fs::read_to_string(root.join("yarn.lock"))
+            .await
+            .unwrap();
+        let mixed = wired.replacen("  languageName: node\r\n", "  languageName: node\n", 1);
+        assert_ne!(mixed, wired, "the fixture edit must hit");
+        tokio::fs::write(root.join("yarn.lock"), &mixed)
+            .await
+            .unwrap();
+        let edits_before = state.edits.len();
+        let err = revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect_err("a mixed lock must refuse");
+        assert!(err.contains("drifted"), "{err}");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("yarn.lock"))
+                .await
+                .unwrap(),
+            mixed,
+            "byte-untouched"
+        );
+        assert_eq!(state.edits.len(), edits_before, "ledger intact");
     }
 
     #[tokio::test]

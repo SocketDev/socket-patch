@@ -16,10 +16,11 @@
 //!    `manifest_not_found`) and makes ZERO patch-API requests, with and
 //!    without `--no-verify`;
 //! 3. VENDORED: `scan --mode vendored --vendor-source build` likewise
-//!    commits no wiring Deno would consume, and `vex` again has nothing to
-//!    attest;
-//! 4. AGENT (manifest) mode, unchanged: a staged manifest + blob →
-//!    `apply --vex` patches the installed file in place and attests it with
+//!    commits no wiring Deno would consume and (vendored mode being
+//!    manifest-free) leaves no manifest or ledger record, so `vex` again has
+//!    nothing to attest;
+//! 4. AGENT (manifest) mode, unchanged: a staged manifest + blob attests
+//!    nothing until applied; `apply --vex` patches the installed file in place and attests it with
 //!    the plain (no `(redirected)` / `(vendored)`) provenance; `deno run`
 //!    now prints `PATCHED` (Deno consumes the patched bytes); the standalone
 //!    `vex` with the manifest attests the same; with the manifest deleted it
@@ -448,27 +449,18 @@ fn deno_hosted_and_vendored_never_attest_manifest_mode_unchanged() {
         "deno {v}: vendored scan edited committed files"
     );
     assert_eq!(std::fs::read(&installed).unwrap(), pristine);
-    // The vendored scan's download phase left a manifest for the patch it
-    // could not wire. Nothing applied it, so even WITH that manifest the
-    // pristine installed tree attests nothing …
-    assert!(project.join(".socket/manifest.json").is_file());
-    let out = run_vex(
-        &binary(),
-        &project,
-        &VexRun {
-            product: Some(PRODUCT.to_string()),
-            ..VexRun::offline()
-        }
-        .env("DENO_DIR", &deno_dir),
-    );
-    assert_eq!(
-        out.code,
-        Some(1),
-        "deno {v}: unapplied manifest patch: {out}"
-    );
-    assert_absent(out.doc.as_ref(), PURL);
-    // … and without it there is nothing to attest at all.
-    strip_manifest(&project);
+    // Vendored mode is manifest-free: its download phase is detached (the
+    // vendor ledger alone carries the records), and the refused vendor step
+    // recorded nothing in that ledger either — so the failed run left no
+    // record anywhere for `vex` to attest from.
+    assert_eq!(env["download"]["detached"], true, "deno {v}: {env:#}");
+    let ledger = project.join(".socket/vendor/state.json");
+    if let Ok(state) = std::fs::read_to_string(&ledger) {
+        assert!(
+            !state.contains(NAME),
+            "deno {v}: a refused vendor step recorded {NAME} in the ledger:\n{state}"
+        );
+    }
     assert_nothing_to_attest(&project, &deno_dir, &uri, &format!("deno {v} vendored"));
     let _ = std::fs::remove_dir_all(project.join(".socket"));
     assert_eq!(deno.run_main(&project, &deno_dir), "PRISTINE");
@@ -498,6 +490,23 @@ fn deno_hosted_and_vendored_never_attest_manifest_mode_unchanged() {
         .unwrap(),
     )
     .unwrap();
+    // Nothing applied the staged manifest yet, so even WITH it the pristine
+    // installed tree attests nothing.
+    let unapplied = run_vex(
+        &binary(),
+        &project,
+        &VexRun {
+            product: Some(PRODUCT.to_string()),
+            ..VexRun::offline()
+        }
+        .env("DENO_DIR", &deno_dir),
+    );
+    assert_eq!(
+        unapplied.code,
+        Some(1),
+        "deno {v}: unapplied manifest patch: {unapplied}"
+    );
+    assert_absent(unapplied.doc.as_ref(), PURL);
     let quiet = PatchApi::empty();
     let apply = VexRun {
         proxy_url: Some(quiet.uri()),

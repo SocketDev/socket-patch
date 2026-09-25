@@ -1414,10 +1414,62 @@ pub(crate) async fn run_redirect_selected(
         } else {
             None
         };
-        // A bun-refused npm purl is never dispatched (see the loop), so its
-        // wiring is not a write target here.
-        let bun_refused =
-            |c: &Candidate| bun_takeover_refusal.is_some() && c.purl.starts_with("pkg:npm/");
+        // Yarn berry twin of the bun gate: the berry rewriter's project-level
+        // refusals (mixed line endings, cacheKey, `.yarnrc.yml`
+        // compressionLevel) must be known before the takeover reverts a
+        // vendored berry purl — the vendored revert keeps a mixed lock mixed
+        // (it never refuses on line endings), so reverting first stripped
+        // the live vendored patch and then the rewriter refused the lock,
+        // leaving the package unpatched in both modes. Only entries the
+        // vendor ledger wired through the yarn-berry backend are gated (the
+        // lock is read only when one exists); an unreadable lock is left to
+        // the revert's own diagnostics.
+        let berry_entry = |entry: &socket_patch_core::vendor::VendorEntry| {
+            entry.ecosystem == "npm" && entry.flavor.as_deref() == Some("yarn-berry")
+        };
+        let berry_takeover_refusal = if takeover
+            .iter()
+            .any(|(_, entry)| entry.as_ref().is_some_and(berry_entry))
+        {
+            match socket_patch_core::utils::fs::read_regular_to_string(
+                &common.cwd.join("yarn.lock"),
+            )
+            .await
+            {
+                Ok(lock) => {
+                    let yarnrc = socket_patch_core::utils::fs::read_regular_to_string(
+                        &common.cwd.join(".yarnrc.yml"),
+                    )
+                    .await
+                    .ok();
+                    socket_patch_core::patch::redirect::preflight_yarn_berry_hosted(
+                        &lock,
+                        yarnrc.as_deref(),
+                    )
+                    .err()
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        // The takeover refusal (if any) for one candidate: bun gates every
+        // npm purl, berry only its vendored-berry entries. A refused purl is
+        // never dispatched (see the loop), so its wiring is not a write
+        // target here.
+        let takeover_refusal =
+            |c: &Candidate,
+             entry: Option<&socket_patch_core::vendor::VendorEntry>|
+             -> Option<&socket_patch_core::patch::redirect::RewriteWarning> {
+                if !c.purl.starts_with("pkg:npm/") {
+                    return None;
+                }
+                bun_takeover_refusal.as_ref().or_else(|| {
+                    berry_takeover_refusal
+                        .as_ref()
+                        .filter(|_| entry.is_some_and(berry_entry))
+                })
+            };
         // SYMLINK PRE-CHECK for the takeover reverts — the same rule as the
         // SYMLINK GUARD below, applied to the files the reverts rewrite
         // (each ledger entry's recorded wiring): the revert backends stage
@@ -1428,7 +1480,11 @@ pub(crate) async fn run_redirect_selected(
         // (and under --dry-run too) so "nothing was written" stays true.
         let revert_targets = takeover
             .iter()
-            .filter_map(|(c, entry)| entry.as_ref().filter(|_| !bun_refused(c)))
+            .filter_map(|(c, entry)| {
+                entry
+                    .as_ref()
+                    .filter(|e| takeover_refusal(c, Some(e)).is_none())
+            })
             .flat_map(|entry| entry.wiring.iter().map(|w| w.file.as_str()));
         if let Some(linked) =
             socket_patch_core::utils::fs::first_symlink(&common.cwd, revert_targets).await
@@ -1442,10 +1498,7 @@ pub(crate) async fn run_redirect_selected(
             let purl = &candidate.purl;
             let uuid = &candidate.dep.patch_uuid;
             if let Some(entry) = ledger_entry {
-                if let Some(warning) = bun_takeover_refusal
-                    .as_ref()
-                    .filter(|_| bun_refused(candidate))
-                {
+                if let Some(warning) = takeover_refusal(candidate, Some(entry)) {
                     refused.push(purl.clone());
                     if !takeover_pre_warnings
                         .iter()
@@ -1581,10 +1634,8 @@ pub(crate) async fn run_redirect_selected(
             }
         }
         for purl in &refused {
-            if let Some(c) = candidates.iter().find(|c| &c.purl == purl) {
-                let reason = bun_takeover_refusal
-                    .as_ref()
-                    .filter(|_| bun_refused(c))
+            if let Some((c, entry)) = takeover.iter().find(|(c, _)| &c.purl == purl) {
+                let reason = takeover_refusal(c, entry.as_ref())
                     .map_or("vendored_revert_failed", |w| w.code.as_str());
                 skipped.push(serde_json::json!({
                     "purl": purl, "uuid": c.dep.patch_uuid, "reason": reason,

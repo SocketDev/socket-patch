@@ -3,6 +3,7 @@ pub mod env_compat;
 pub mod fs;
 pub mod notice;
 pub(crate) mod http;
+pub(crate) mod line_endings;
 pub mod pdm_lock;
 pub mod pipenv;
 pub mod poetry_lock;

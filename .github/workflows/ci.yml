@@ -1123,7 +1123,7 @@ jobs:
           ruby-version: ${{ matrix.ruby || '3.2.10' }}
           # The legs pin their bundler (`bundler:`) so a capstone never rides
           # whatever bundler the runner's Ruby ships; bundler 1.x is not
-          # installable through setup-ruby, see the next step. e2e_gem keeps
+          # installable through setup-ruby, see the next steps. e2e_gem keeps
           # the 2.5 floor.
           bundler: ${{ startsWith(matrix.bundler, '1.') && 'none' || matrix.bundler || '2.5' }}
           bundler-cache: false
@@ -1133,9 +1133,24 @@ jobs:
         shell: bash
         env:
           BUNDLER_TEST_VERSION: ${{ matrix.bundler }}
+        run: gem install bundler -v "$BUNDLER_TEST_VERSION" --no-document
+
+      # Installing a bundler does not make `bundle` run it: with no lockfile
+      # to read, RubyGems' binstub activates the HIGHEST installed bundler,
+      # so a leg pinned BELOW its Ruby's default gem (2.1.4 / 2.2.33 on Ruby
+      # 3.1, whose default is 2.3.27) silently runs the default instead and
+      # tests/common/bundler_e2e.rs rightly panics. BUNDLER_VERSION makes
+      # the binstub select exactly the pinned release in every process (and
+      # turns off bundler >= 2.3's lockfile-driven self-switch), the same
+      # knob tests/docker/Dockerfile.gem-b1 sets.
+      - name: Select the pinned Bundler
+        if: matrix.bundler != ''
+        shell: bash
+        env:
+          BUNDLER_TEST_VERSION: ${{ matrix.bundler }}
         run: |
-          gem install bundler -v "$BUNDLER_TEST_VERSION" --no-document
           echo "BUNDLER_VERSION=$BUNDLER_TEST_VERSION" >> "$GITHUB_ENV"
+          BUNDLER_VERSION="$BUNDLER_TEST_VERSION" bundle --version
 
       - name: Setup PHP
         if: matrix.composer != ''
@@ -1420,6 +1435,10 @@ jobs:
       - name: Install Rust
         run: rustup show
       - name: Install the cargo under test
+        # bash, not the Windows default pwsh: in PowerShell
+        # "$CARGO_TEST_TOOLCHAIN" is an (unset) PowerShell variable, so the
+        # windows-latest leg ran `rustup toolchain install ""`.
+        shell: bash
         env:
           CARGO_TEST_TOOLCHAIN: ${{ matrix.toolchain }}
         run: rustup toolchain install "$CARGO_TEST_TOOLCHAIN" --profile minimal

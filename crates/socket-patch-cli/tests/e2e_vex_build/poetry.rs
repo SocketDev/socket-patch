@@ -9,8 +9,9 @@
 //!    written, the same-run VEX attests from the lock's sha256 pin); vendored
 //!    = `scan --vendor --vendor-source build --vex` over the pristine
 //!    install (the patched wheel is committed under
-//!    `.socket/vendor/pypi/<uuid>/`, the lock is rewired to it, manifest +
-//!    ledger are written);
+//!    `.socket/vendor/pypi/<uuid>/`, the lock is rewired to it, and only the
+//!    ledger is written — vendored mode is manifest-free, so the ledger
+//!    entry is detached and embeds the patch record);
 //! 3. a FRESH checkout of only the committable files (`pyproject.toml`,
 //!    `poetry.lock`, `.socket/`) is installed by the real `poetry install`
 //!    and the imported `six` is proven to be the PATCHED bytes (vendored
@@ -924,8 +925,25 @@ fn poetry_vendored_fresh_install_then_manifestless_vex() {
         lock.contains(&wheel_sha),
         "the lock pins the committed wheel:\n{lock}"
     );
-    assert!(project.join(".socket/manifest.json").is_file());
-    assert!(project.join(".socket/vendor/state.json").is_file());
+    // Vendored mode is manifest-free (v5.0, CLI_CONTRACT `scan --vendor`):
+    // the ledger entry is detached and embeds the patch record, and
+    // `.socket/manifest.json` is never written.
+    assert!(
+        !project.join(".socket/manifest.json").exists(),
+        "vendored scan wrote a manifest: {env}"
+    );
+    let ledger: Value = serde_json::from_slice(
+        &std::fs::read(project.join(".socket/vendor/state.json")).expect("vendor ledger written"),
+    )
+    .unwrap();
+    let entry = ledger["entries"]
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.values())
+        .find(|e| e["uuid"] == VENDORED_UUID)
+        .unwrap_or_else(|| panic!("no ledger entry for {VENDORED_UUID}: {ledger:#}"));
+    assert_eq!(entry["detached"], true, "{ledger:#}");
+    assert_eq!(entry["record"]["uuid"], VENDORED_UUID, "{ledger:#}");
     let doc: Value = serde_json::from_slice(&std::fs::read(&embedded).unwrap()).unwrap();
     assert_attested(
         &doc,

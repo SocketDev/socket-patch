@@ -93,7 +93,7 @@ fn binary() -> PathBuf {
 fn has_corepack_pm(pm: &str) -> bool {
     // Isolated too: this probe is what actually downloads the package manager
     // the first time, and corepack stores it under `COREPACK_HOME`.
-    let mut cmd = Command::new("corepack");
+    let mut cmd = yarn_berry_common::corepack_command();
     cmd.args([pm, "--version"])
         .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     cache_env::isolate(&mut cmd);
@@ -105,17 +105,18 @@ fn has_corepack_pm(pm: &str) -> bool {
 }
 
 fn corepack(cwd: &Path, pm: &str, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new("corepack");
+    let mut cmd = yarn_berry_common::corepack_command();
     cmd.arg(pm).args(args).current_dir(cwd);
     // Scrub FIRST (it removes YARN_* / SOCKET_* from the inherited env), then
     // seed the hermetic flags so they survive (Command: last env call wins).
     scrub_socket_env(&mut cmd);
     cache_env::isolate(&mut cmd);
+    yarn_berry_common::pin_berry_ci_defaults(&mut cmd, pm);
     cmd.env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.output().expect("failed to run corepack")
+    yarn_berry_common::berry_spawn_output(&mut cmd).expect("failed to run corepack")
 }
 
 /// Remove ambient `SOCKET_*` and `YARN_*` vars (so a developer's settings
@@ -329,10 +330,17 @@ async fn run_berry_capstone(driver: VendorDriver) {
         skip!(
             "SKIP e2e_vendor_yarn_berry_build: fixture `yarn install` failed (registry \
              unreachable?):\n{}",
-            String::from_utf8_lossy(&install.stderr)
+            yarn_berry_common::yarn_output(&install)
         );
         return;
     }
+    // Windows line endings (yarn writes CRLF there): see yarn_berry_common.
+    yarn_berry_common::adopt_yarn_line_endings(
+        &proj,
+        yarn_berry(),
+        &format!("vendor-{driver:?}"),
+        &["package.json", "yarn.lock"],
+    );
 
     let installed_index = proj.join("node_modules").join(DEP).join("index.js");
     let orig = std::fs::read(&installed_index).expect("installed index.js");

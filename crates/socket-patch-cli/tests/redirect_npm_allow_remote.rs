@@ -714,9 +714,15 @@ async fn outer_npm_config_layers_are_respected() {
         &[("npm_config_allow_remote", "none")],
     );
     assert_eq!(code, 0, "{stderr}");
+    // The warning names the variable as the OS reports it. Windows env names
+    // are case-insensitive, and `scan_hosted_env`'s blanking of
+    // `NPM_CONFIG_ALLOW_REMOTE` makes the child see that spelling there, so
+    // match the name case-insensitively.
     assert!(
         stderr.contains(&format!("Warning ({CODE}): "))
-            && stderr.contains("npm_config_allow_remote=none")
+            && stderr
+                .to_ascii_lowercase()
+                .contains("npm_config_allow_remote=none")
             && stderr.contains("would not take effect"),
         "{stderr}"
     );

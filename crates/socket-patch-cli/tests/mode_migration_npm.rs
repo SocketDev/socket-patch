@@ -464,6 +464,16 @@ fn stage_yarn_fixture(tag: &str, pm: &str, berry: bool) -> Option<YarnFixture> {
         );
         return None;
     }
+    if berry {
+        // Windows line endings (yarn writes CRLF there; `EOL_ENV=crlf`
+        // reproduces it here): the takeovers must round-trip CRLF files.
+        yarn_berry_common::adopt_yarn_line_endings(
+            &proj,
+            pm,
+            &format!("mode-migration-{tag}"),
+            &["package.json", "yarn.lock"],
+        );
+    }
     let orig = std::fs::read(proj.join("node_modules").join(DEP).join("index.js"))
         .expect("installed index.js");
     assert!(

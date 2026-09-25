@@ -546,7 +546,10 @@ pub(super) fn revert_recorded_block(
             ));
             return false;
         };
-        replace_block(text, block, &original, detect_eol(text))
+        // The recorded lines carry no terminators: the restored block takes
+        // the one the live block is written in, so a lock whose endings
+        // were mixed since vendoring keeps every other line as it is.
+        replace_block(text, block, &original, block_eol(text, block))
     };
     *text = edit;
     true
@@ -727,20 +730,29 @@ pub(crate) struct LockBlock {
 }
 
 /// Scan a lockfile into blocks, CRLF-aware. Comments, blank lines, and
-/// anything else outside blocks are left to the splicer untouched.
+/// anything else outside blocks are left to the splicer untouched. A
+/// leading UTF-8 BOM is encoding, not text (yarn's parsers drop it): it is
+/// stripped from the first line and kept OUT of that line's span, so a
+/// header-less lock still yields its first key and a splice keeps the BOM.
 pub(crate) fn scan_blocks(text: &str) -> Vec<LockBlock> {
     // (start, end-incl-terminator, content-without-terminator, terminated)
     let mut lines: Vec<(usize, usize, &str, bool)> = Vec::new();
     let mut pos = 0;
     for seg in text.split_inclusive('\n') {
-        let start = pos;
+        let mut start = pos;
         pos += seg.len();
         let terminated = seg.ends_with('\n');
         let mut content = seg;
         if terminated {
             content = &content[..content.len() - 1];
         }
-        let content = content.strip_suffix('\r').unwrap_or(content);
+        let mut content = content.strip_suffix('\r').unwrap_or(content);
+        if start == 0 {
+            if let Some(rest) = content.strip_prefix('\u{feff}') {
+                start = '\u{feff}'.len_utf8();
+                content = rest;
+            }
+        }
         lines.push((start, pos, content, terminated));
     }
     let mut blocks = Vec::new();
@@ -773,6 +785,20 @@ fn is_key_line(s: &str) -> bool {
 
 fn is_body_line(s: &str) -> bool {
     s.starts_with(' ') || s.starts_with('\t')
+}
+
+/// The line terminator `block` is written in: its first line's (`\r\n` or
+/// `\n`), else — a block that is one unterminated last line — the file's
+/// dominant one ([`detect_eol`]). For a uniformly-ended lock this is the
+/// file's own terminator; in a lock whose endings were mixed after the
+/// fact it keeps a restored block in the style of the block it replaces.
+pub(super) fn block_eol(text: &str, block: &LockBlock) -> &'static str {
+    let span = &text[block.start..block.end];
+    match span.find('\n') {
+        Some(i) if span[..i].ends_with('\r') => "\r\n",
+        Some(_) => "\n",
+        None => detect_eol(text),
+    }
 }
 
 /// Splice `new_lines` over `block`'s byte range, preserving every byte
@@ -2159,6 +2185,33 @@ left-pad@^1.3.0:
         // Field reads.
         assert_eq!(classic_field(&blocks[0].lines, "version"), Some("1.3.0"));
         assert!(classic_field(&blocks[1].lines, "resolved").is_none());
+    }
+
+    /// A leading BOM is not key text: a header-less lock still yields its
+    /// first key (without the BOM), and a splice of that first block keeps
+    /// the BOM in place. Each block reports its own terminator, so a
+    /// restore into a lock mixed after the fact keeps the block's style.
+    #[test]
+    fn scan_blocks_skip_a_bom_and_report_each_block_terminator() {
+        let text = "\u{feff}__metadata:\r\n  version: 8\r\n\r\n\"a@npm:1\":\n  version: 1\n";
+        let blocks = scan_blocks(text);
+        let keys: Vec<&str> = blocks.iter().map(|b| b.key.as_str()).collect();
+        assert_eq!(keys, vec!["__metadata", "\"a@npm:1\""]);
+        assert_eq!(blocks[0].lines[0], "__metadata:");
+        for b in &blocks {
+            assert_eq!(
+                replace_block(text, b, &b.lines, block_eol(text, b)),
+                text,
+                "{}",
+                b.key
+            );
+        }
+        assert_eq!(block_eol(text, &blocks[0]), "\r\n");
+        assert_eq!(block_eol(text, &blocks[1]), "\n");
+        // An unterminated one-line block falls back to the file's ending.
+        let last = "x:\r\n  v: 1\r\n\r\ny:";
+        let blocks = scan_blocks(last);
+        assert_eq!(block_eol(last, &blocks[1]), "\r\n");
     }
 
     /// A second canonical uuid, distinct from [`UUID`], for re-vendor tests.

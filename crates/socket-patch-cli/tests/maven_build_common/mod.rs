@@ -17,7 +17,9 @@
 //! Every Maven run is hermetic: a per-test local repository
 //! (`-Dmaven.repo.local`), a per-test user `settings.xml` (`-s`, so the
 //! developer's `~/.m2/settings.xml` mirrors/proxies never apply), batch
-//! mode, and `MAVEN_ARGS` / `MAVEN_OPTS` / `MAVEN_CONFIG` scrubbed. The
+//! mode, `MAVEN_ARGS` / `MAVEN_OPTS` / `MAVEN_CONFIG` scrubbed, and the CI
+//! markers Maven 4 sniffs ([`CI_DETECTOR_ENV`]) removed, so a leg logs
+//! exactly what a developer's terminal run logs. The
 //! dependency plugin is pinned so every Maven line resolves with the same
 //! plugin (the default bound version differs per Maven release).
 
@@ -31,6 +33,43 @@ use std::process::{Command, Output};
 pub const MVN_ENV: &str = "SOCKET_PATCH_MAVEN_E2E_MVN";
 pub const VERSION_ENV: &str = "SOCKET_PATCH_MAVEN_E2E_VERSION";
 pub const REQUIRED_ENV: &str = "SOCKET_PATCH_MAVEN_E2E_REQUIRED";
+
+/// What Maven 4's `CIDetector`s key on (4.0.0-rc-6 `cisupport`: generic
+/// `CI`, GitHub `GITHUB_ACTIONS`, CircleCI, Jenkins `WORKSPACE`, TeamCity,
+/// Travis). When one is set, Maven 4 swaps in the `QuietMavenTransferListener`
+/// even under `-B` — no "Downloading from …" lines and, crucially, no
+/// "Checksum validation failed" warning for a rejected `checksumPolicy=fail`
+/// download, which is the evidence the vendored TAMPER probe asserts. On a
+/// GitHub runner every Maven 4 leg would otherwise log differently from the
+/// same run on a laptop. Maven 3 reads none of these, so scrubbing them is a
+/// no-op there. (`--force-interactive` also disables the detection, but it
+/// flips the run interactive and Maven 3 rejects the flag.)
+pub const CI_DETECTOR_ENV: &[&str] = &[
+    "CI",
+    "GITHUB_ACTIONS",
+    "CIRCLECI",
+    "WORKSPACE",
+    "TEAMCITY_VERSION",
+    "TRAVIS",
+];
+
+/// `mvn` with the ambient Maven configuration and CI markers scrubbed.
+fn mvn_command(program: &OsString) -> Command {
+    let mut cmd = Command::new(program);
+    for key in [
+        "MAVEN_ARGS",
+        "MAVEN_OPTS",
+        "MAVEN_CONFIG",
+        "M2_HOME",
+        "MAVEN_REPO_LOCAL",
+    ]
+    .into_iter()
+    .chain(CI_DETECTOR_ENV.iter().copied())
+    {
+        cmd.env_remove(key);
+    }
+    cmd
+}
 
 /// Pinned so 3.6 → 4.x all run the same goal implementation (3.6.1 still
 /// supports Maven 3.2.5+, so the oldest line in the matrix can load it).
@@ -83,12 +122,7 @@ impl Mvn {
         let program: OsString = std::env::var_os(MVN_ENV)
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| if cfg!(windows) { "mvn.cmd" } else { "mvn" }.into());
-        let out = match Command::new(&program)
-            .args(["-v", "-B"])
-            .env_remove("MAVEN_ARGS")
-            .env_remove("MAVEN_OPTS")
-            .output()
-        {
+        let out = match mvn_command(&program).args(["-v", "-B"]).output() {
             Ok(out) => out,
             Err(e) => {
                 skip(
@@ -157,8 +191,8 @@ impl Mvn {
     /// `mvn -B <args>` in `cwd` against the local repository `m2`, with the
     /// user settings file `settings`.
     pub fn run(&self, cwd: &Path, m2: &Path, settings: &Path, args: &[&str]) -> Output {
-        let mut cmd = Command::new(&self.program);
-        cmd.current_dir(cwd)
+        mvn_command(&self.program)
+            .current_dir(cwd)
             .arg("-B")
             .arg("-s")
             .arg(settings)
@@ -166,12 +200,8 @@ impl Mvn {
             .arg("-Dstyle.color=never")
             .arg("-Dmaven.test.skip=true")
             .args(args)
-            .env_remove("MAVEN_ARGS")
-            .env_remove("MAVEN_OPTS")
-            .env_remove("MAVEN_CONFIG")
-            .env_remove("M2_HOME")
-            .env_remove("MAVEN_REPO_LOCAL");
-        cmd.output().expect("spawn mvn")
+            .output()
+            .expect("spawn mvn")
     }
 
     /// Resolve the project's dependencies into `<cwd>/<out_rel>` (the
