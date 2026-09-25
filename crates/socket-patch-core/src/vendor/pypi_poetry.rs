@@ -1,6 +1,7 @@
 //! Poetry lock wiring preserves the pyproject content hash and records reversible edits.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use toml_edit::{DocumentMut, Item};
 
@@ -11,6 +12,7 @@ use super::common::{
     ensure_unchanged, item_get, lock_units_named, pep621_declared_names, record, refuse_symlinked,
     revert_lock_fragment_splice_atomic, unit_has_canon_name,
 };
+use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::state::{PoetryMeta, VendorEntry, WiringAction, WiringRecord};
 use super::toml_surgery::{find_unit_span, package_unit_lines, replace_files_array};
@@ -27,8 +29,8 @@ const KIND_LOCK_PACKAGE: &str = "poetry_lock_package";
 pub(super) struct PoetryProject {
     /// Verbatim poetry.lock text (the surgery substrate).
     pub lock_text: String,
-    /// Parsed lock (guard checks only — every edit is text surgery).
-    pub lock: DocumentMut,
+    /// Parsed lock, shared (guard checks only — every edit is text surgery).
+    pub lock: Arc<DocumentMut>,
     /// pyproject.toml content when present. NEVER written; read only to
     /// classify the dependency for [`PoetryMeta::dep_class`] diagnostics.
     pub pyproject_text: Option<String>,
@@ -37,6 +39,15 @@ pub(super) struct PoetryProject {
     /// Non-fatal advisories raised during load (untested lock version).
     pub warnings: Vec<VendorWarning>,
 }
+
+/// The run's poetry parses. `load_poetry_project` runs once per patched
+/// package and re-parsed the whole lock each time; `classify_dependency`
+/// re-parsed the pyproject beside it. Neither document is mutated (every
+/// lock edit is text surgery), so both are handed out shared. Not re-seeded
+/// after a write: the rewrite produces text, not a document — the next
+/// package pays one parse, as before.
+static LOCK_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
+static PYPROJECT_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
 
 /// What the target `[[package]]` unit already looks like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,12 +74,14 @@ pub(super) async fn load_poetry_project(
                 format!("cannot read {LOCK_FILE}: {e}"),
             )
         })?;
-    let lock: DocumentMut = lock_text.parse().map_err(|e| {
-        (
-            "pypi_poetry_lock_parse_failed",
-            format!("{LOCK_FILE} does not parse: {e}"),
-        )
-    })?;
+    let lock = LOCK_MEMO
+        .parse(lock_text.as_bytes(), || lock_text.parse::<DocumentMut>())
+        .map_err(|e| {
+            (
+                "pypi_poetry_lock_parse_failed",
+                format!("{LOCK_FILE} does not parse: {e}"),
+            )
+        })?;
 
     let lock_version = lock
         .get("metadata")
@@ -158,7 +171,7 @@ fn classify_dependency(p: &PoetryProject, canon_name: &str) -> &'static str {
     let Some(text) = p.pyproject_text.as_deref() else {
         return "transitive";
     };
-    let Ok(doc) = text.parse::<DocumentMut>() else {
+    let Ok(doc) = PYPROJECT_MEMO.parse(text.as_bytes(), || text.parse::<DocumentMut>()) else {
         return "transitive";
     };
     let mut declared: Vec<String> = Vec::new();
@@ -342,6 +355,8 @@ pub(super) async fn wire_poetry(
     // Mode-preserving: the lock is a user-owned file we merely edit, so the
     // swapped-in inode must keep its permission bits rather than reset them
     // to umask defaults (same class as the revert leg in common.rs).
+    // Dropped before the write, so a torn one leaves nothing behind either.
+    LOCK_MEMO.invalidate();
     atomic_write_bytes_preserving_mode(&root.join(LOCK_FILE), new_lock.as_bytes())
         .await
         .map_err(|e| {
@@ -1493,7 +1508,7 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
     async fn classify_dependency_covers_every_declaration_surface() {
         let p = |pyproject: Option<&str>| PoetryProject {
             lock_text: String::new(),
-            lock: DocumentMut::new(),
+            lock: Arc::new(DocumentMut::new()),
             pyproject_text: pyproject.map(str::to_string),
             lock_version: "2.1".into(),
             warnings: Vec::new(),

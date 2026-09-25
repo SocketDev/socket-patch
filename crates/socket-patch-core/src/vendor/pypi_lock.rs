@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
@@ -13,6 +14,7 @@ use crate::utils::python_script::{
 };
 
 use super::common::record;
+use super::parse_memo::ParseMemo;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorWarning};
 
@@ -73,6 +75,19 @@ async fn refuse_symlinked(root: &Path, files: impl Iterator<Item = &String>) -> 
         .map(symlink_refusal)
 }
 
+/// The run's PEP 751 / script-lock parses. Both readers below re-read AND
+/// re-parsed every one of the project's locks for every patched package;
+/// the lock set is small but the documents are not. Four slots so a project
+/// with a handful of locks does not evict its own parses between packages;
+/// see [`ParseMemo`].
+static LOCK_MEMO: ParseMemo<DocumentMut, 4> = ParseMemo::new();
+
+/// `text` parsed as a python lockfile, reusing the run's parse while it is
+/// the text that produced it.
+fn lock_document(text: &str) -> Result<Arc<DocumentMut>, toml_edit::TomlError> {
+    LOCK_MEMO.parse(text.as_bytes(), || text.parse::<DocumentMut>())
+}
+
 fn package<'a>(document: &'a DocumentMut, name: &str, version: &str) -> Option<&'a Table> {
     let collection = if document.contains_key("lock-version") {
         "packages"
@@ -130,8 +145,7 @@ pub(super) async fn contains_target(
 ) -> Result<bool, Failure> {
     for path in paths {
         let text = read_file(&root.join(path)).await?;
-        let document: DocumentMut = text
-            .parse()
+        let document = lock_document(&text)
             .map_err(|error| ("pypi_lock_parse_failed", format!("{path}: {error}")))?;
         if package(&document, name, version).is_some() {
             return Ok(true);
@@ -166,8 +180,7 @@ pub(super) async fn load_python_locks(
         if rewritten.is_none() {
             continue;
         }
-        let document: DocumentMut = text
-            .parse()
+        let document = lock_document(&text)
             .map_err(|error| ("pypi_lock_parse_failed", format!("{path}: {error}")))?;
         let Some(package) = package(&document, name, version) else {
             continue;
@@ -327,11 +340,13 @@ pub(super) async fn wire_python_locks(
     }
     let mut written: Vec<(&String, &String)> = Vec::new();
     for (file, original, new, _) in &edits {
+        LOCK_MEMO.invalidate();
         if let Err(error) =
             atomic_write_bytes_preserving_mode(&root.join(file), new.as_bytes()).await
         {
             let mut rollback_errors = Vec::new();
             for (file, original) in written.into_iter().rev() {
+                LOCK_MEMO.invalidate();
                 if let Err(error) =
                     atomic_write_bytes_preserving_mode(&root.join(file), original.as_bytes()).await
                 {
@@ -614,11 +629,13 @@ pub(super) async fn revert_python_locks(
         }
         let mut written: Vec<(&String, &String)> = Vec::new();
         for (file, original, restored) in &edits {
+            LOCK_MEMO.invalidate();
             if let Err(error) =
                 atomic_write_bytes_preserving_mode(&root.join(file), restored.as_bytes()).await
             {
                 let mut rollback_errors = Vec::new();
                 for (file, original) in written.into_iter().rev() {
+                    LOCK_MEMO.invalidate();
                     if let Err(error) =
                         atomic_write_bytes_preserving_mode(&root.join(file), original.as_bytes())
                             .await
