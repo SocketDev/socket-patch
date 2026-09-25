@@ -1,7 +1,9 @@
 pub mod cargo_workspace;
 pub mod concurrent;
 pub(crate) mod digest;
+pub(crate) mod durability;
 pub mod env_compat;
+pub mod failpoint;
 pub mod fs;
 pub mod notice;
 pub(crate) mod http;

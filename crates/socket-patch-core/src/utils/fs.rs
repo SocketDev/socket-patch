@@ -442,20 +442,12 @@ async fn atomic_write_bytes_as(
     content: &[u8],
     perms: Option<std::fs::Permissions>,
 ) -> std::io::Result<()> {
+    // A durable commit point: every artifact written without an fsync so
+    // far is made durable first, so this file never names bytes that could
+    // still be lost (see `super::durability`).
+    super::durability::barrier().await?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string());
-    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
-
-    // `create_new` failing leaves no stage to clean up; every step after it
-    // does, so they share one error arm.
-    let file = create_stage(&stage, perms.as_ref()).await?;
-    if let Err(e) = commit_stage(file, content, perms, &stage, path).await {
-        let _ = tokio::fs::remove_file(&stage).await;
-        return Err(e);
-    }
+    stage_and_rename(path, parent, content, perms, true).await?;
 
     // The rename only updated the parent directory entry; fsync the directory
     // so the rename itself survives a crash. Best-effort, Unix only.
@@ -469,16 +461,55 @@ async fn atomic_write_bytes_as(
     Ok(())
 }
 
-/// Write, flush, fsync, (re-mode) and close the stage, then rename it over
-/// `path`. Takes the handle by value so it is closed before the rename
-/// (Windows refuses to rename an open file) and before the caller's
-/// error-path unlink of the stage.
+/// Atomically write a CONTENT-VERIFIED artifact (a vendored `.tgz`, wheel,
+/// jar, marker, …) via stage + rename, without an fsync: the next durable
+/// commit point's [`super::durability::barrier`] makes it durable before
+/// anything that names it is, and every later run re-verifies its bytes
+/// (see `super::durability` for the crash-safety argument). Readers still
+/// only ever see the complete old or the complete new bytes.
+pub(crate) async fn atomic_write_artifact(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    stage_and_rename(path, parent, content, None, false).await?;
+    super::durability::record(path);
+    Ok(())
+}
+
+/// Stage `content` next to `path` and rename it over `path`; `durable`
+/// fsyncs the stage before the rename.
+async fn stage_and_rename(
+    path: &Path,
+    parent: &Path,
+    content: &[u8],
+    perms: Option<std::fs::Permissions>,
+    durable: bool,
+) -> std::io::Result<()> {
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let stage = parent.join(format!(".socket-stage-{}-{}", stem, uuid::Uuid::new_v4()));
+
+    // `create_new` failing leaves no stage to clean up; every step after it
+    // does, so they share one error arm.
+    let file = create_stage(&stage, perms.as_ref()).await?;
+    if let Err(e) = commit_stage(file, content, perms, &stage, path, durable).await {
+        let _ = tokio::fs::remove_file(&stage).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Write, flush, fsync (when `durable`), (re-mode) and close the stage, then
+/// rename it over `path`. Takes the handle by value so it is closed before
+/// the rename (Windows refuses to rename an open file) and before the
+/// caller's error-path unlink of the stage.
 async fn commit_stage(
     mut file: tokio::fs::File,
     content: &[u8],
     perms: Option<std::fs::Permissions>,
     stage: &Path,
     path: &Path,
+    durable: bool,
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     file.write_all(content).await?;
@@ -488,7 +519,9 @@ async fn commit_stage(
     // failed stage write (ENOSPC, EIO, quota) actually surfaces. Without
     // it the truncated stage would be renamed over the intact target.
     file.flush().await?;
-    file.sync_all().await?;
+    if durable {
+        file.sync_all().await?;
+    }
     // Set the preserved mode on the stage *before* the rename so the file
     // never appears at the destination with the wrong bits, even briefly.
     // The content is already written through the open handle, so a
