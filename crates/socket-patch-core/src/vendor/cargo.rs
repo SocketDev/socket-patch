@@ -232,8 +232,9 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
 }
 
 /// A LIVE hosted-redirect wiring for `name`+`version`: the lock resolves it
-/// from a Socket hosted patch registry, or Cargo.toml pins it to a
-/// `socket-patch-<uuid>` registry (the shapes `scan --mode hosted` writes).
+/// from a Socket hosted patch registry, or a manifest — the root or any
+/// workspace member — pins it to a `socket-patch-<uuid>` registry in any
+/// declaration shape (the shapes `scan --mode hosted` writes).
 /// Registry indexes are matched against the config-declared
 /// `[registries.socket-patch-*]` URLs, not a hardcoded host, so test
 /// registries are recognised too. `Some(description)` when residue is found.
@@ -250,11 +251,23 @@ async fn hosted_redirect_residue(project_root: &Path, name: &str, version: &str)
             ));
         }
     }
-    // Guarded read (`open_regular_file`: O_NONBLOCK + regular-file check) —
-    // a FIFO planted as `Cargo.toml` would otherwise wedge every wet vendor
-    // run in an open(2) that waits for a writer; an unreadable manifest has
-    // no readable residue, matching the read_to_string Err arm this guards.
-    if let Ok(toml) = read_regular_to_string(&project_root.join("Cargo.toml")).await {
+    // The root manifest AND every workspace-member manifest: the hosted
+    // rewriter pins the crate in each one that declares it, so a member's
+    // surviving pin is residue just as much as the root's.
+    let root = project_root.to_path_buf();
+    let members =
+        tokio::task::spawn_blocking(move || crate::utils::cargo_workspace::member_manifests(&root))
+            .await
+            .unwrap_or_default();
+    for rel in std::iter::once("Cargo.toml".to_string()).chain(members) {
+        // Guarded read (`open_regular_file`: O_NONBLOCK + regular-file
+        // check) — a FIFO planted as `Cargo.toml` would otherwise wedge
+        // every wet vendor run in an open(2) that waits for a writer; an
+        // unreadable manifest has no readable residue, matching the
+        // read_to_string Err arm this guards.
+        let Ok(toml) = read_regular_to_string(&project_root.join(&rel)).await else {
+            continue;
+        };
         // The rewriter's own reader, not a single-line regex: the hosted pin
         // is just as often a standalone `registry = …` line under a
         // `[dependencies.<crate>]` header, or sits under a renamed key
@@ -263,7 +276,7 @@ async fn hosted_redirect_residue(project_root: &Path, name: &str, version: &str)
         // the half-reverted state this guard exists for.
         if let Some(reg) = crate::patch::redirect::cargo_socket_registry_pin(&toml, name) {
             return Some(format!(
-                "Cargo.toml pins `{name}` to the socket-patch hosted registry `{reg}`"
+                "{rel} pins `{name}` to the socket-patch hosted registry `{reg}`"
             ));
         }
     }
@@ -3969,6 +3982,51 @@ mod tests {
                 "{shape}: the manifest is untouched"
             );
         }
+    }
+
+    /// A pin that survives only in a WORKSPACE MEMBER's manifest is residue
+    /// too: the hosted rewriter pins every member that declares the crate,
+    /// so a root-only probe misses exactly the projects it was extended to
+    /// cover.
+    #[tokio::test]
+    async fn test_refuses_live_hosted_redirect_pinned_in_a_member() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        tokio::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"b\"]\n\n\
+             [package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.join("b")).await.unwrap();
+        tokio::fs::write(
+            root.join("b/Cargo.toml"),
+            format!(
+                "[package]\nname = \"b\"\nversion = \"0.1.0\"\n\n\
+                 [dependencies.cfg-if]\nversion = \"1\"\n\
+                 registry = \"socket-patch-{UUID}\"\n"
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::create_dir_all(root.join(".cargo"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join(".cargo/config.toml"),
+            format!(
+                "[registries.socket-patch-{UUID}]\nindex = \"sparse+http://127.0.0.1:5555/index/\"\n"
+            ),
+        )
+        .await
+        .unwrap();
+        let detail = expect_refused(
+            run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
+            "hosted_redirect_live",
+        );
+        assert!(detail.contains("b/Cargo.toml"), "{detail}");
+        assert!(!root.join(format!(".socket/vendor/cargo/{UUID}")).exists());
     }
 
     /// A dependency pinned to a registry that is NOT ours, and an unpinned

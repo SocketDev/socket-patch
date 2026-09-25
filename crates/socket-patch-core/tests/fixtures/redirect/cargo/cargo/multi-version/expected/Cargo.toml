@@ -1,0 +1,8 @@
+[package]
+name = "myapp"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+cfg-if = { version = "1.0.4", registry = "socket-patch-55555555-5555-5555-5555-555555555555" }
+cfg-if-legacy = { package = "cfg-if", version = "0.1.10", registry = "socket-patch-66666666-6666-6666-6666-666666666666" }

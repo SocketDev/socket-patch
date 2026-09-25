@@ -1709,6 +1709,19 @@ pub(crate) async fn run_redirect_selected(
             }
         }
 
+        // Cargo workspace members (and in-root path dependencies) declare
+        // dependencies of their own: a member's direct `cfg-if = "1"` must
+        // be pinned alongside the root's, or the redirected lock entry is
+        // unsatisfiable. Keyed `<dir>/Cargo.toml` for the cargo rewriter.
+        if files.contains_key("Cargo.toml") && candidates.iter().any(|c| c.dep.ecosystem == "cargo")
+        {
+            for rel in socket_patch_core::utils::cargo_workspace::member_manifests(&common.cwd) {
+                if let Ok(content) = read_regular_to_string(&common.cwd.join(&rel)).await {
+                    files.insert(rel, content);
+                }
+            }
+        }
+
         if let Ok(paths) = socket_patch_core::utils::python_lock::python_lock_paths(&common.cwd) {
             for path in paths {
                 if let Some(script_path) =
@@ -2579,6 +2592,13 @@ pub(crate) async fn run_redirect_selected(
                     }
                 }
             }
+            // Dedup against the ledger as this run found it, never within
+            // this run: one run legitimately records identical edits (a
+            // Cargo.toml declaring the crate with the same line in two
+            // sections), and each one reverts one occurrence — collapsing
+            // them made `remove` leave the second pin (and its registry
+            // block) in place while reporting success.
+            let recorded = ledger.edits.len();
             for edit in &rewrite.edits {
                 let is_rebased = REBASE_KINDS.contains(&edit.kind.as_str())
                     && rebased.iter().any(|&t| {
@@ -2588,7 +2608,7 @@ pub(crate) async fn run_redirect_selected(
                             && old.key == edit.key
                             && old.new == edit.new
                     });
-                if !is_rebased && !ledger.edits.contains(edit) {
+                if !is_rebased && !ledger.edits[..recorded].contains(edit) {
                     ledger.edits.push(edit.clone());
                 }
             }

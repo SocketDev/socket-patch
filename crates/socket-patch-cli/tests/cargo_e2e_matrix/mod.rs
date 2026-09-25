@@ -1,6 +1,7 @@
 //! Toolchain / Cargo.lock-format knobs shared by the real-cargo e2e suites
-//! (`e2e_redirect_cargo_build`, `e2e_vendor_cargo_build`,
-//! `mode_migration_cargo`, `e2e_safety_cargo_build`), so one local loop (or
+//! (`e2e_redirect_cargo_build`, `e2e_redirect_cargo_shapes`,
+//! `e2e_vendor_cargo_build`, `mode_migration_cargo`,
+//! `e2e_safety_cargo_build`), so one local loop (or
 //! one CI matrix leg per cell) drives every hosted + vendored flow through a
 //! given cargo release and lock format:
 //!
@@ -28,6 +29,7 @@
 //!   SOCKET_PATCH_CARGO_E2E_REQUIRED=1 SOCKET_PATCH_CARGO_E2E_TOOLCHAIN=$tc \
 //!   SOCKET_PATCH_CARGO_E2E_LOCK_VERSION=$lv \
 //!   cargo test -p socket-patch-cli --test e2e_redirect_cargo_build \
+//!     --test e2e_redirect_cargo_shapes \
 //!     --test e2e_vendor_cargo_build --test mode_migration_cargo
 //! done; done
 //! ```
@@ -145,8 +147,19 @@ pub struct LockPackage {
     pub version: String,
     pub source: Option<String>,
     pub checksum: Option<String>,
-    /// Dependency NAMES (the fixtures never lock two versions of a crate).
+    /// Dependency package ids (`name version`, plus ` (source)` for a
+    /// sourced package), resolved from whichever short form the lock used —
+    /// so two locked versions of one crate stay distinct across formats.
     pub dependencies: Vec<String>,
+}
+
+impl LockPackage {
+    fn id(&self) -> String {
+        match &self.source {
+            Some(src) => format!("{} {} ({src})", self.name, self.version),
+            None => format!("{} {}", self.name, self.version),
+        }
+    }
 }
 
 /// The lock format of `text`: `version = N` (3 / 4), else v1 when it has
@@ -208,8 +221,7 @@ pub fn parse_lock(text: &str) -> Vec<LockPackage> {
                     if t == "]" {
                         in_deps = false;
                     } else if let Some(dep) = quoted(t.trim_end_matches(',')) {
-                        let name = dep.split(' ').next().unwrap_or_default().to_string();
-                        pkg.dependencies.push(name);
+                        pkg.dependencies.push(dep);
                     }
                     continue;
                 }
@@ -233,6 +245,38 @@ pub fn parse_lock(text: &str) -> Vec<LockPackage> {
                 }
             }
             _ => {}
+        }
+    }
+    // A dependency is written as `name`, `name version` or the full
+    // `name version (source)`, whichever is unambiguous in its lock.
+    let ids: Vec<(String, String, Option<String>, String)> = pkgs
+        .iter()
+        .map(|p| (p.name.clone(), p.version.clone(), p.source.clone(), p.id()))
+        .collect();
+    for pkg in &mut pkgs {
+        for dep in &mut pkg.dependencies {
+            let (head, source) = match dep.split_once(" (") {
+                Some((head, rest)) => (head, rest.strip_suffix(')').map(str::to_string)),
+                None => (dep.as_str(), None),
+            };
+            let mut parts = head.split(' ');
+            let name = parts.next().unwrap_or_default();
+            let version = parts.next();
+            let matches: Vec<&String> = ids
+                .iter()
+                .filter(|(n, v, s, _)| {
+                    n == name
+                        && version.is_none_or(|want| want == v)
+                        && (source.is_none() || *s == source)
+                })
+                .map(|(_, _, _, id)| id)
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "lock dependency {dep:?} must name exactly one locked package"
+            );
+            *dep = matches[0].clone();
         }
     }
     for pkg in &mut pkgs {
@@ -265,17 +309,26 @@ pub fn write_lock(pkgs: &[LockPackage], version: u8) -> String {
     if version >= 3 {
         out.push_str(&format!("version = {version}\n\n"));
     }
-    let dep_ref = |name: &str| -> String {
-        if version >= 2 {
-            return name.to_string();
-        }
+    // v1 always writes the full id; v2+ the shortest unambiguous form.
+    let dep_ref = |id: &str| -> String {
         let dep = sorted
             .iter()
-            .find(|p| p.name == name)
-            .unwrap_or_else(|| panic!("lock dependency {name} is not a locked package"));
-        match &dep.source {
-            Some(src) => format!("{} {} ({src})", dep.name, dep.version),
-            None => format!("{} {}", dep.name, dep.version),
+            .find(|p| p.id() == id)
+            .unwrap_or_else(|| panic!("lock dependency {id} is not a locked package"));
+        if version == 1 {
+            return dep.id();
+        }
+        let same_name = sorted.iter().filter(|p| p.name == dep.name).count();
+        let same_version = sorted
+            .iter()
+            .filter(|p| p.name == dep.name && p.version == dep.version)
+            .count();
+        if same_name == 1 {
+            dep.name.clone()
+        } else if same_version == 1 {
+            format!("{} {}", dep.name, dep.version)
+        } else {
+            dep.id()
         }
     };
     let blocks: Vec<String> = sorted

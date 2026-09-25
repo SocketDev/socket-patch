@@ -1,0 +1,42 @@
+[
+  {
+    "ecosystem": "cargo",
+    "name": "cfg-if",
+    "version": "1.0.4",
+    "token": "11111111-1111-1111-1111-111111111111",
+    "patchUuid": "55555555-5555-5555-5555-555555555555",
+    "artifactUrl": "https://patch.socket.dev/patch/cargo/cfg-if/1.0.4/11111111-1111-1111-1111-111111111111/55555555-5555-5555-5555-555555555555/cfg-if-1.0.4.crate",
+    "registryOverride": {
+      "kind": "cargo-sparse",
+      "indexUrl": "sparse+https://patch.socket.dev/patch-registry/cargo/11111111-1111-1111-1111-111111111111/55555555-5555-5555-5555-555555555555/index/",
+      "identifiers": {
+        "name": "cfg-if",
+        "version": "1.0.4",
+        "cargoCksumSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "integrity": {
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  {
+    "ecosystem": "cargo",
+    "name": "cfg-if",
+    "version": "0.1.10",
+    "token": "22222222-2222-2222-2222-222222222222",
+    "patchUuid": "66666666-6666-6666-6666-666666666666",
+    "artifactUrl": "https://patch.socket.dev/patch/cargo/cfg-if/0.1.10/22222222-2222-2222-2222-222222222222/66666666-6666-6666-6666-666666666666/cfg-if-0.1.10.crate",
+    "registryOverride": {
+      "kind": "cargo-sparse",
+      "indexUrl": "sparse+https://patch.socket.dev/patch-registry/cargo/22222222-2222-2222-2222-222222222222/66666666-6666-6666-6666-666666666666/index/",
+      "identifiers": {
+        "name": "cfg-if",
+        "version": "0.1.10",
+        "cargoCksumSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    "integrity": {
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  }
+]
