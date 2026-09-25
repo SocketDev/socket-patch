@@ -1694,8 +1694,18 @@ pub(crate) async fn vendor_records_reusing(
                 .collect();
             cfg.prefetch_archives(planned)
         });
+    // The source of the purl the loop has just left. Its archive is what a
+    // fetched source holds to be able to write its tree, and `all_packages`
+    // gives each holder to exactly one purl — so once the loop moves on,
+    // nothing reads it again, and a run that fetched 110 artifacts need not
+    // carry all 110 to the end of the loop.
+    let mut spent: Option<PackageSource<'_>> = None;
     for (index, (purl, staged)) in all_packages.iter().enumerate() {
+        if let Some(done) = spent.take() {
+            done.release();
+        }
         let pkg_source = staged.as_source(&fetched_holders);
+        spent = Some(pkg_source);
         let is_variant_eco =
             Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
         let candidates: Vec<String> = if is_variant_eco {

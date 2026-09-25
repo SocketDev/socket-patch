@@ -146,6 +146,12 @@ impl FetchedPackage {
         }
     }
 
+    /// Let the verified archive go, for a run that has moved past the purl
+    /// this source belongs to. The tree, if one was written, stays.
+    pub fn release(&self) {
+        drop(self.take_extractor());
+    }
+
     /// Take the extractor out, freeing the archive bytes with the last
     /// handle. Returns `None` once it is gone.
     fn take_extractor(&self) -> Option<std::sync::Arc<Extractor>> {
@@ -4732,6 +4738,41 @@ mod tests {
         let stage = stage_root.path().join("stage");
         fetched.stage_into(&stage, None).await.unwrap();
         assert_eq!(tree_of(&stage), tree_of(fetched.dir().await.unwrap()));
+    }
+
+    /// And the source nothing ever reads — the case the deferral exists
+    /// for — is let go when the loop moves past its purl, so a run holds
+    /// one archive rather than every one it fetched.
+    #[test]
+    fn releasing_an_unread_source_frees_the_archive_bytes() {
+        struct Tattle {
+            bytes: Vec<u8>,
+            freed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for Tattle {
+            fn drop(&mut self) {
+                self.freed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let freed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tattle = Tattle {
+            bytes: make_tgz(&[("pkg/a.txt", b"hello", false)]),
+            freed: std::sync::Arc::clone(&freed),
+        };
+        let holder = tempfile::tempdir().unwrap();
+        let fetched = FetchedPackage::pending(
+            holder.path().join("pkg"),
+            "https://example.invalid/x.tgz".to_string(),
+            holder,
+            move |dest, skip| extract_tgz_skipping(&tattle.bytes, dest, skip),
+        );
+        crate::vendor::source::PackageSource::Pending(&fetched).release();
+        assert!(
+            freed.load(std::sync::atomic::Ordering::SeqCst),
+            "a released source is still holding its archive"
+        );
+        // Releasing twice is the same nothing.
+        fetched.release();
     }
 
     /// A stage that cannot be cleared or created reports what the copy out

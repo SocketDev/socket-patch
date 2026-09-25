@@ -49,6 +49,18 @@ impl<'a> PackageSource<'a> {
         }
     }
 
+    /// Let go of whatever a fetched source is still holding to be able to
+    /// produce its tree — called once the loop has moved past the purl it
+    /// belongs to, so a run does not carry every artifact it fetched to the
+    /// end. An installed tree holds nothing. Reading through a released
+    /// source is a bug the caller has to avoid; what has already been
+    /// materialised stays readable.
+    pub fn release(&self) {
+        if let Self::Pending(fetched) = self {
+            fetched.release();
+        }
+    }
+
     /// Stage the source freshly at `dst` — the vendor stage the local build
     /// patches and then swaps into the copy dir.
     ///
