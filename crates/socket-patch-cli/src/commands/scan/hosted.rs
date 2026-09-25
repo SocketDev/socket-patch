@@ -86,6 +86,25 @@ const REDIRECT_CANDIDATE_FILES: &[&str] = &[
     // decision here so the omission reads as deliberate, not forgotten.
 ];
 
+/// Most hosted wheel-metadata downloads in flight at once, below the patch
+/// API's own in-flight cap: each one buffers a whole wheel (up to
+/// `MAX_VENDOR_PACKAGE_BYTES`) where the serial loop held one, so the
+/// window is bounded by what it costs as well as by what it saves.
+const WHEEL_METADATA_CONCURRENCY: usize = 4;
+
+/// The in-flight cap for the hosted wheel-metadata window.
+///
+/// These GETs go to the patch server, so they are paced by the same knob as
+/// every other patch-API window ([`api_concurrency`], and with it
+/// `SOCKET_API_CONCURRENCY`) — an operator who caps in-flight requests per
+/// client must be able to cap this one too, or a `uv.lock` project's wheels
+/// land in `skipped` as `python_metadata_unavailable`. `api_concurrency`
+/// already returns 1 under a tight descriptor limit, which is what the
+/// serial loop's one-socket-at-a-time profile needs.
+fn wheel_metadata_concurrency(use_public_proxy: bool) -> usize {
+    api_concurrency(use_public_proxy).min(WHEEL_METADATA_CONCURRENCY)
+}
+
 /// `scheme://[user[:pass]@]host[:port]/…` → `host[:port]`, NEVER userinfo.
 /// For user-facing messages that name where a lockfile now points — the
 /// hosted artifact host follows `--api-url`, so hardcoding `patch.socket.dev`
@@ -1845,19 +1864,9 @@ pub(crate) async fn run_redirect_selected(
         // status the serial loop would not have seen. The first such answer
         // is what closes the window.
         //
-        // Kept small on purpose: each in-flight download buffers a whole
-        // wheel, so the peak is `wheel_metadata_concurrency` ×
-        // MAX_VENDOR_PACKAGE_BYTES (4 × 256 MiB), each under its own body
-        // timeout. Raising it raises that ceiling in step. Under a tight
-        // descriptor limit it is 1, like the API loops (see
-        // `api_concurrency`): the serial loop held one socket at a time.
-        const WHEEL_METADATA_CONCURRENCY: usize = 4;
-        let wheel_metadata_concurrency =
-            if socket_patch_core::crawlers::walk_pool::fd_limit_is_tight() {
-                1
-            } else {
-                WHEEL_METADATA_CONCURRENCY
-            };
+        // Kept small on purpose, and paced by `SOCKET_API_CONCURRENCY` like
+        // every other patch-API window — see `wheel_metadata_concurrency`.
+        let wheel_metadata_concurrency = wheel_metadata_concurrency(api_client.uses_public_proxy());
         use futures_util::StreamExt as _;
         use socket_patch_core::vendor::pypi::{
             finish_hosted_wheel_metadata, try_fetch_hosted_wheel_metadata_once,
@@ -3434,8 +3443,50 @@ mod tests {
         pnpm_lock_may_need_store_flag, pnpm_trust_rerun_reminder, sentence_case, split_sentences,
         wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
     };
+    use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
     use socket_patch_core::constants::npm_family;
     use socket_patch_core::patch::redirect::DepOverride;
+    use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
+
+    /// The wheel window is a patch-API window, so the documented escape
+    /// hatch has to reach it: an operator behind something that caps
+    /// in-flight requests per client sets `SOCKET_API_CONCURRENCY=1` and
+    /// gets one artifact GET at a time here too — otherwise the capping
+    /// endpoint rejects the extras and those deps land in `skipped` as
+    /// `python_metadata_unavailable`. Serial: `SOCKET_*` is process-global.
+    #[test]
+    #[serial_test::serial]
+    fn socket_api_concurrency_paces_the_wheel_metadata_window() {
+        let orig = std::env::var(API_CONCURRENCY_ENV).ok();
+        std::env::remove_var(API_CONCURRENCY_ENV);
+        // The window's own ceiling still binds: the authenticated cap is 8,
+        // but a whole wheel per in-flight request is what sizes this one.
+        assert_eq!(
+            wheel_metadata_concurrency(false),
+            WHEEL_METADATA_CONCURRENCY
+        );
+        assert_eq!(wheel_metadata_concurrency(true), WHEEL_METADATA_CONCURRENCY);
+
+        std::env::set_var(API_CONCURRENCY_ENV, "1");
+        assert_eq!(wheel_metadata_concurrency(false), 1);
+        assert_eq!(wheel_metadata_concurrency(true), 1);
+
+        // A value between 1 and the ceiling lowers the window to it.
+        std::env::set_var(API_CONCURRENCY_ENV, "2");
+        assert_eq!(wheel_metadata_concurrency(false), 2);
+
+        // Raising the API cap never raises this one past its own ceiling.
+        std::env::set_var(API_CONCURRENCY_ENV, "32");
+        assert_eq!(
+            wheel_metadata_concurrency(false),
+            WHEEL_METADATA_CONCURRENCY
+        );
+
+        match orig {
+            Some(v) => std::env::set_var(API_CONCURRENCY_ENV, v),
+            None => std::env::remove_var(API_CONCURRENCY_ENV),
+        }
+    }
 
     /// Lock-head version sniff against the byte-real heads the 2026-08-18
     /// matrix captured from pnpm 7/8/9-12: quoted `'9.0'` and `'6.0'`,
