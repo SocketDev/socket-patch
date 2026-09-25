@@ -1233,6 +1233,16 @@ into the new version's section — see docs/releasing.md.
 
 ### Changed
 
+- **Maven discovery takes coordinates from the `~/.m2` path.** A POM at its
+  canonical `<group path>/<artifactId>/<version>/<artifactId>-<version>.pom`
+  location is no longer opened: its groupId / artifactId / version come from
+  the directory names, which is where Maven itself writes every POM, so on a
+  real local repository every purl is unchanged and the crawl skips reading
+  and parsing tens of thousands of files. Other `.pom` files (timestamped
+  SNAPSHOT POMs, hand-placed extras, a dotted group directory) are parsed as
+  before. One semantic change: a hand-placed POM at a canonical path whose
+  contents disagree with its directory now reports the directory's
+  coordinates instead of the ones in the file.
 - **Release publishing decomposed into per-registry workflows.** The
   crates.io, npm, PyPI, and RubyGems legs of the `Release` workflow now live
   in their own workflows

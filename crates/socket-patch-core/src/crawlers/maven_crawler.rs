@@ -366,6 +366,55 @@ fn parse_path_coordinates(
     Some((group_id, artifact_id, version))
 }
 
+/// The coordinates a canonical repository layout spells out for one `.pom`
+/// file: `<group path>/<artifactId>/<version>/<artifactId>-<version>.pom`,
+/// relative to the repository root. `None` when the path is not that shape
+/// and the POM has to be read instead:
+///
+/// - fewer than four components (no group segment at all, or a stray
+///   `.pom` in the root) — nothing to take the coordinates from;
+/// - a file name that is not exactly `<artifactId>-<version>.pom` for the
+///   two directories above it (a SNAPSHOT dir's timestamped
+///   `a-1.0-20240101.120000-1.pom`, a hand-placed `extra.pom`);
+/// - a component that is not UTF-8 or not a plain name;
+/// - a group segment that itself holds a `.` (`org.acme/lib/1.0/...`),
+///   which reads the same as a nested `org/acme/` group but is not the
+///   layout Maven writes, so its content decides.
+///
+/// Maven itself writes every POM it resolves at exactly this path, so on a
+/// real `~/.m2` the answer equals what the POM's own coordinates say — the
+/// scan takes it without opening the file. The one case where the two
+/// differ is a POM placed by hand whose contents disagree with its
+/// directory: it reports the directory's coordinates.
+fn canonical_layout_coordinates(pom: &Path, repo_root: &Path) -> Option<(String, String, String)> {
+    let rel = pom.strip_prefix(repo_root).ok()?;
+    let mut components: Vec<&str> = Vec::new();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(name) => components.push(name.to_str()?),
+            _ => return None,
+        }
+    }
+    let [group @ .., artifact_id, version, file] = components.as_slice() else {
+        return None;
+    };
+    if group.is_empty() || group.iter().any(|segment| segment.contains('.')) {
+        return None;
+    }
+    let spelled = file
+        .strip_suffix(".pom")?
+        .strip_prefix(artifact_id)?
+        .strip_prefix('-')?;
+    if spelled != *version {
+        return None;
+    }
+    Some((
+        group.join("."),
+        artifact_id.to_string(),
+        version.to_string(),
+    ))
+}
+
 /// Whether the PURL-derived Maven coordinates are safe to join onto the
 /// repository root in [`MavenCrawler::find_by_purls`].
 ///
@@ -580,8 +629,11 @@ impl MavenCrawler {
 
     /// Scan a Maven repository directory and return all valid packages found.
     ///
-    /// Uses `walkdir` to recursively find `.pom` files, then extracts
-    /// coordinates from the POM content or falls back to directory path parsing.
+    /// Uses `walkdir` to recursively find `.pom` files, then takes the
+    /// coordinates from the canonical `<group>/<a>/<v>/<a>-<v>.pom` path
+    /// ([`canonical_layout_coordinates`]) without reading the file, and only
+    /// otherwise extracts them from the POM content, falling back to
+    /// directory path parsing.
     ///
     /// Three phases per chunk of the walk: the (serial) walk collects
     /// `.pom` paths in walk order, the reads and parses run through
@@ -633,11 +685,15 @@ impl MavenCrawler {
 
             let parsed: Vec<Option<(String, String, String)>> = par_map(&poms, |path| {
                 let version_dir = path.parent()?;
-                // Try POM parsing first, fall back to directory path parsing
-                std::fs::read_to_string(path)
-                    .ok()
-                    .and_then(|content| parse_pom_group_artifact_version(&content))
-                    .or_else(|| parse_path_coordinates(version_dir, repo_path))
+                // The canonical layout names the coordinates outright; any
+                // other path parses the POM, then falls back to the
+                // directory path.
+                canonical_layout_coordinates(path, repo_path).or_else(|| {
+                    std::fs::read_to_string(path)
+                        .ok()
+                        .and_then(|content| parse_pom_group_artifact_version(&content))
+                        .or_else(|| parse_path_coordinates(version_dir, repo_path))
+                })
             });
 
             for (path, coords) in poms.iter().zip(parsed) {
@@ -1054,8 +1110,10 @@ mod tests {
         // the entry must be skipped rather than emit a garbage package.
         // (b) Two DIFFERENT .pom files that resolve to the SAME purl — one
         // from correct content in its own version dir, one elsewhere whose
-        // CONTENT declares the first's coordinates (content wins over the
-        // path): the seen-set must dedupe them to a single package.
+        // CONTENT declares the first's coordinates (its file name is not
+        // the canonical `<a>-<v>.pom` of its own dir, so the content is
+        // read and wins over the path): the seen-set must dedupe them to a
+        // single package.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("stray.pom"), "<project/>").unwrap();
 
@@ -1077,7 +1135,8 @@ mod tests {
         .unwrap();
 
         // Lives at com/other/shadow/9.9.9 but its content claims the same
-        // coordinates as the package above.
+        // coordinates as the package above. Named for those coordinates,
+        // not its own directory's, so the path does not decide it.
         let shadow_dir = dir
             .path()
             .join("com")
@@ -1086,7 +1145,7 @@ mod tests {
             .join("9.9.9");
         std::fs::create_dir_all(&shadow_dir).unwrap();
         std::fs::write(
-            shadow_dir.join("shadow-9.9.9.pom"),
+            shadow_dir.join("dup-1.0.0.pom"),
             r#"<project>
   <groupId>com.example</groupId>
   <artifactId>dup</artifactId>
@@ -1107,6 +1166,138 @@ mod tests {
         assert_eq!(pkgs[0].name, "dup");
         assert_eq!(pkgs[0].version, "1.0.0");
         assert_eq!(pkgs[0].namespace, Some("com.example".to_string()));
+    }
+
+    #[test]
+    fn test_canonical_layout_coordinates() {
+        let root = Path::new("/repo");
+        let coords = |rel: &str| canonical_layout_coordinates(&root.join(rel), root);
+        let gav = |g: &str, a: &str, v: &str| Some((g.to_string(), a.to_string(), v.to_string()));
+
+        assert_eq!(
+            coords("org/apache/commons/commons-lang3/3.12.0/commons-lang3-3.12.0.pom"),
+            gav("org.apache.commons", "commons-lang3", "3.12.0")
+        );
+        // Hyphens inside the artifact or the version are no ambiguity: the
+        // file name is compared against the two directory names.
+        assert_eq!(
+            coords("com/google/guava/guava/32.1.3-jre/guava-32.1.3-jre.pom"),
+            gav("com.google.guava", "guava", "32.1.3-jre")
+        );
+        assert_eq!(
+            coords("io/x/my-lib/1.0-SNAPSHOT/my-lib-1.0-SNAPSHOT.pom"),
+            gav("io.x", "my-lib", "1.0-SNAPSHOT")
+        );
+        // A single-segment group is still a group.
+        assert_eq!(
+            coords("junit/junit/4.13/junit-4.13.pom"),
+            gav("junit", "junit", "4.13")
+        );
+
+        // Not the canonical shape: the POM must be read.
+        for rel in [
+            // SNAPSHOT dir's timestamped POM.
+            "io/x/my-lib/1.0-SNAPSHOT/my-lib-1.0-20240101.120000-1.pom",
+            // Hand-placed extra POM, or one named for other coordinates.
+            "com/example/app/1.0/extra.pom",
+            "com/example/app/1.0/other-1.0.pom",
+            "com/example/app/1.0/app-1.0.1.pom",
+            "com/example/app/1.0/app1.0.pom",
+            "com/example/app/1.0/app-1.0.xml",
+            // No group segment, or a stray POM near the root.
+            "app/1.0/app-1.0.pom",
+            "stray.pom",
+            // A dotted group segment is not the layout Maven writes.
+            "org.acme/lib/1.0/lib-1.0.pom",
+            "org/acme.tools/lib/1.0/lib-1.0.pom",
+        ] {
+            assert_eq!(coords(rel), None, "{rel}");
+        }
+        // Outside the repository root.
+        assert_eq!(
+            canonical_layout_coordinates(Path::new("/elsewhere/a/b/1/b-1.pom"), root),
+            None
+        );
+    }
+
+    #[test]
+    fn test_scan_canonical_path_wins_over_disagreeing_pom() {
+        // MVN-1: a POM at its canonical `<group>/<a>/<v>/<a>-<v>.pom` path
+        // reports the directory's coordinates without being read — even a
+        // hand-placed one whose contents name something else.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = dir
+            .path()
+            .join("com")
+            .join("example")
+            .join("real")
+            .join("2.0.0");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("real-2.0.0.pom"),
+            r#"<project>
+  <groupId>org.claimed</groupId>
+  <artifactId>claimed</artifactId>
+  <version>9.9.9</version>
+</project>"#,
+        )
+        .unwrap();
+
+        let mut seen = HashSet::new();
+        let pkgs = MavenCrawler::new().scan_maven_repo(dir.path(), &mut seen);
+        assert_eq!(pkgs.len(), 1, "{pkgs:?}");
+        assert_eq!(pkgs[0].purl, "pkg:maven/com.example/real@2.0.0");
+        assert_eq!(pkgs[0].name, "real");
+        assert_eq!(pkgs[0].version, "2.0.0");
+        assert_eq!(pkgs[0].namespace, Some("com.example".to_string()));
+        assert_eq!(pkgs[0].path, pkg_dir);
+    }
+
+    #[test]
+    fn test_scan_non_canonical_pom_name_still_parses_content() {
+        // Off the canonical shape the content still decides (and the path
+        // still rescues an unparseable one): a SNAPSHOT dir's timestamped
+        // POM and a POM under a dotted group directory.
+        let dir = tempfile::tempdir().unwrap();
+        let snap_dir = dir
+            .path()
+            .join("io")
+            .join("x")
+            .join("snap")
+            .join("1.0-SNAPSHOT");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        std::fs::write(
+            snap_dir.join("snap-1.0-20240101.120000-1.pom"),
+            r#"<project>
+  <groupId>io.x</groupId>
+  <artifactId>snap</artifactId>
+  <version>1.0-SNAPSHOT</version>
+</project>"#,
+        )
+        .unwrap();
+        let dotted_dir = dir.path().join("org.acme").join("lib").join("1.0");
+        std::fs::create_dir_all(&dotted_dir).unwrap();
+        std::fs::write(
+            dotted_dir.join("lib-1.0.pom"),
+            r#"<project>
+  <groupId>org.acme.content</groupId>
+  <artifactId>lib</artifactId>
+  <version>1.0</version>
+</project>"#,
+        )
+        .unwrap();
+
+        let mut seen = HashSet::new();
+        let pkgs = MavenCrawler::new().scan_maven_repo(dir.path(), &mut seen);
+        let purls: HashSet<_> = pkgs.iter().map(|p| p.purl.as_str()).collect();
+        assert_eq!(
+            purls,
+            HashSet::from([
+                "pkg:maven/io.x/snap@1.0-SNAPSHOT",
+                "pkg:maven/org.acme.content/lib@1.0",
+            ]),
+            "{pkgs:?}"
+        );
     }
 
     #[test]
@@ -1745,9 +1936,18 @@ mod tests {
         const ARTIFACTS: &[&str] = &["commons-lang3", "guava", "netty-all", "dup"];
         const VERSIONS: &[&str] = &["3.12.0", "31.1-jre", "4.1.100.Final", "1.0-SNAPSHOT"];
 
-        fn pom(rng: &mut Rng, group: &str, artifact: &str, version: &str) -> String {
+        /// A POM for `group/artifact/version`. `consistent` never writes
+        /// one whose content names other coordinates than its directory.
+        fn pom(
+            rng: &mut Rng,
+            group: &str,
+            artifact: &str,
+            version: &str,
+            consistent: bool,
+        ) -> String {
             let g = group.replace('/', ".");
             match rng.below(6) {
+                2 if consistent => format!("<project><groupId>{g}</groupId><artifactId>{artifact}</artifactId><version>{version}</version></project>"),
                 0 => format!("<project><parent><groupId>{g}</groupId><artifactId>parent</artifactId><version>{version}</version></parent><artifactId>{artifact}</artifactId></project>"),
                 1 => "<project><!-- <groupId>x</groupId> --></project>".to_string(),
                 2 => "<project>\n<groupId>dup.group</groupId>\n<artifactId>dup</artifactId>\n<version>1.0</version>\n</project>".to_string(),
@@ -1757,6 +1957,16 @@ mod tests {
         }
 
         fn repo(rng: &mut Rng, root: &Path, outside: &Path, perms: &mut PermGuard) {
+            repo_with(rng, root, outside, perms, false);
+        }
+
+        fn repo_with(
+            rng: &mut Rng,
+            root: &Path,
+            outside: &Path,
+            perms: &mut PermGuard,
+            consistent: bool,
+        ) {
             mkdir(root);
             for i in 0..rng.below(30) {
                 let (group, artifact, version) =
@@ -1771,17 +1981,20 @@ mod tests {
                         let target = outside.join(format!("t{i}"));
                         write(
                             &target.join("linked-1.0.pom"),
-                            &pom(rng, group, artifact, version),
+                            &pom(rng, group, artifact, version, consistent),
                         );
                         symlink(&target, &dir.join("linked"));
                         symlink(&target.join("linked-1.0.pom"), &dir.join("link.pom"));
                     }
                     4 => {
-                        write(&file, &pom(rng, group, artifact, version));
+                        write(&file, &pom(rng, group, artifact, version, consistent));
                         perms.plan(&dir, 0o000);
                     }
-                    5 => write(&dir.join("extra.pom"), &pom(rng, group, artifact, version)),
-                    _ => write(&file, &pom(rng, group, artifact, version)),
+                    5 => write(
+                        &dir.join("extra.pom"),
+                        &pom(rng, group, artifact, version, consistent),
+                    ),
+                    _ => write(&file, &pom(rng, group, artifact, version, consistent)),
                 }
             }
         }
@@ -1845,6 +2058,41 @@ mod tests {
                 total += old.len();
             }
             assert!(total > 50, "vacuous fixtures: {total}");
+        }
+
+        /// MVN-1 changes nothing on a repository whose canonically placed
+        /// POMs agree with their directories — the shape Maven itself
+        /// writes: the path-first scan reports exactly what the scan that
+        /// read every POM reported, the parse and path-rescue arms
+        /// included (`extra.pom`, unreadable and non-UTF-8 files, parent-only
+        /// and comment-only POMs).
+        #[tokio::test]
+        async fn consistent_repos_match_the_content_first_scan() {
+            let mut total = 0;
+            for seed in 0..64u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut perms = PermGuard::default();
+                let mut rng = Rng::new(seed);
+                let root = tmp.path().join("repository");
+                repo_with(
+                    &mut rng,
+                    &root,
+                    &tmp.path().join("outside"),
+                    &mut perms,
+                    true,
+                );
+                perms.apply();
+                let options = CrawlerOptions {
+                    cwd: tmp.path().to_path_buf(),
+                    global: false,
+                    global_prefix: Some(root.clone()),
+                };
+                let new = MavenCrawler::new().crawl_all(&options).await;
+                let old = super::super::oracle::crawl_all_content_first(&options).await;
+                assert_eq!(rows(&new), rows(&old), "seed {seed}");
+                total += old.len();
+            }
+            assert!(total > 200, "vacuous fixtures: {total}");
         }
 
         #[tokio::test]
