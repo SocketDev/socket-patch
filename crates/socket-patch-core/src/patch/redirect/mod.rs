@@ -2280,8 +2280,21 @@ fn plan_cargo_lock(
     if let Some(old) = old_source.filter(|old| old != index_url) {
         let from = format!("\"{crate_name} {version} ({old})\"");
         let to = format!("\"{crate_name} {version} ({index_url})\"");
-        let mut cursor = 0;
         let mut repointed_any = false;
+        // The oldest v1 locks keep the ROOT package in a standalone `[root]`
+        // table instead of the `[[package]]` array, with its own full-id
+        // `dependencies`. It precedes the array, so the block walk below
+        // never reaches it and the lock would keep naming a package it no
+        // longer contains (`--locked` fails; an unlocked build silently
+        // re-resolves).
+        if let Some((start, end)) = lock_root_table(&new_content) {
+            if new_content[start..end].contains(&from) {
+                let repointed = new_content[start..end].replace(&from, &to);
+                new_content.replace_range(start..end, &repointed);
+                repointed_any = true;
+            }
+        }
+        let mut cursor = 0;
         while let Some((start, end)) = next_lock_block(&new_content, cursor) {
             if new_content[start..end].contains(&from) {
                 let repointed = new_content[start..end].replace(&from, &to);
@@ -2308,6 +2321,19 @@ fn plan_cargo_lock(
         content: new_content,
         edits,
     }
+}
+
+/// The v1 `[root]` table's span, when the lock has one: cargo before the
+/// `[root]` removal recorded the root package there rather than in the
+/// `[[package]]` array, and its `dependencies` spell full package ids the
+/// same way. Bounded by [`lock_block_end`], like a package block.
+fn lock_root_table(content: &str) -> Option<(usize, usize)> {
+    const HEADER: &str = "[root]\n";
+    let at = content
+        .match_indices(HEADER)
+        .map(|(at, _)| at)
+        .find(|&at| at == 0 || content.as_bytes()[at - 1] == b'\n')?;
+    Some((at, lock_block_end(content, at + HEADER.len())))
 }
 
 /// The next `[[package]]` block starting at or after `from`, as
@@ -14570,6 +14596,102 @@ packages:
             "{:?}",
             again.edits
         );
+    }
+
+    /// The OLDEST v1 locks (cargo before the `[root]` removal) record the
+    /// root package in a standalone `[root]` table — not in the
+    /// `[[package]]` array — and its `dependencies` spell full package ids
+    /// the same way. REGRESSION: the reference walk searched `[[package]]`
+    /// blocks only, so `[root]` kept naming the crates.io id of a package
+    /// the repointed lock no longer contained: `cargo build --locked` fails
+    /// and an unlocked build silently discards the lock, while the scan
+    /// reports the crate redirected. The vendored twin has handled this
+    /// table since `dependency_tables_mut`.
+    #[test]
+    fn cargo_lock_v1_root_table_references_are_repointed() {
+        const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = \"1.0.190\"\nlog = \"0.4\"\n";
+        let cksum = "e".repeat(64);
+        let lock = format!(
+            "[root]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"log 0.4.20 ({CRATES_IO})\",\n \"serde 1.0.190 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{CRATES_IO}\"\n\n\
+             [metadata]\n\"checksum log 0.4.20 ({CRATES_IO})\" = \"{a}\"\n\
+             \"checksum serde 1.0.190 ({CRATES_IO})\" = \"{b}\"\n",
+            a = "a".repeat(64),
+            b = "b".repeat(64),
+        );
+        let mut files = BTreeMap::new();
+        files.insert("Cargo.toml".to_string(), manifest.to_string());
+        files.insert("Cargo.lock".to_string(), lock.clone());
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        let out = r.files.get("Cargo.lock").expect("lock rewritten");
+        let idx = cargo_index_url();
+        let want = format!(
+            "[root]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"log 0.4.20 ({CRATES_IO})\",\n \"serde 1.0.190 ({idx})\",\n]\n\n\
+             [[package]]\nname = \"log\"\nversion = \"0.4.20\"\nsource = \"{CRATES_IO}\"\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{idx}\"\n\n\
+             [metadata]\n\"checksum log 0.4.20 ({CRATES_IO})\" = \"{a}\"\n\
+             \"checksum serde 1.0.190 ({idx})\" = \"{cksum}\"\n",
+            a = "a".repeat(64),
+        );
+        assert_eq!(out, &want, "the [root] table is repointed with the rest");
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+
+        // The reference edit's inverse puts back EVERY occurrence, so the
+        // recorded fragments restore the lock byte for byte whether the id
+        // sat in `[root]`, in a package block, or in both.
+        let mut reverted = out.clone();
+        for e in r
+            .edits
+            .iter()
+            .filter(|e| {
+                e.kind == "redirect_cargo_lock_entry" || e.kind == CARGO_LOCK_REFERENCE_KIND
+            })
+            .rev()
+        {
+            let new = e.new.as_ref().and_then(Value::as_str).unwrap();
+            let orig = e.original.as_ref().and_then(Value::as_str).unwrap();
+            reverted = if e.kind == CARGO_LOCK_REFERENCE_KIND {
+                reverted.replace(new, orig)
+            } else {
+                reverted.replacen(new, orig, 1)
+            };
+        }
+        assert_eq!(reverted, lock);
+    }
+
+    /// Both places at once: a `[root]` table AND a package block reference
+    /// the patched crate by full id, and one reference edit repoints both.
+    #[test]
+    fn cargo_lock_v1_root_and_package_references_share_one_edit() {
+        const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
+        let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dependencies]\nserde = \"1.0.190\"\n";
+        let lock = format!(
+            "[root]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"serde 1.0.190 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"helper\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"serde 1.0.190 ({CRATES_IO})\",\n]\n\n\
+             [[package]]\nname = \"serde\"\nversion = \"1.0.190\"\nsource = \"{CRATES_IO}\"\n\n\
+             [metadata]\n\"checksum serde 1.0.190 ({CRATES_IO})\" = \"{b}\"\n",
+            b = "b".repeat(64),
+        );
+        let mut files = BTreeMap::new();
+        files.insert("Cargo.toml".to_string(), manifest.to_string());
+        files.insert("Cargo.lock".to_string(), lock.clone());
+        let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        // `helper` is a source-less path package that no manifest pins, so
+        // the dependents refusal owns this shape: nothing is rewritten.
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_cargo_transitive_dependents"]
+        );
+        assert!(r.files.is_empty(), "{:?}", r.files);
     }
 
     /// A lock of `app` (source-less, declares serde + `extra`) where `extra`
