@@ -1,0 +1,121 @@
+{
+  "version": 1,
+  "entries": {
+    "pkg:nuget/Fx.Alpha@1.0.0": {
+      "ecosystem": "nuget",
+      "basePurl": "pkg:nuget/Fx.Alpha@1.0.0",
+      "uuid": "11111111-1111-4111-8111-000000000001",
+      "artifact": {
+        "path": ".socket/vendor/nuget/11111111-1111-4111-8111-000000000001/fx.alpha.1.0.0.nupkg",
+        "sha256": "7775dcdcad772d88a77852489b5c6790d22d9d1383638da6888fd67e35e15130",
+        "size": 450
+      },
+      "wiring": [
+        {
+          "file": "nuget.config",
+          "kind": "nuget_config_source",
+          "action": "rewritten",
+          "key": "socket-patch-11111111-1111-4111-8111-000000000001",
+          "original": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n  </packageSources>\n  <config>\n    <add key=\"fixtureSetting00\" value=\"value-00\" />\n    <add key=\"fixtureSetting01\" value=\"value-01\" />\n    <add key=\"fixtureSetting02\" value=\"value-02\" />\n    <add key=\"fixtureSetting03\" value=\"value-03\" />\n    <add key=\"fixtureSetting04\" value=\"value-04\" />\n    <add key=\"fixtureSetting05\" value=\"value-05\" />\n    <add key=\"fixtureSetting06\" value=\"value-06\" />\n    <add key=\"fixtureSetting07\" value=\"value-07\" />\n    <add key=\"fixtureSetting08\" value=\"value-08\" />\n    <add key=\"fixtureSetting09\" value=\"value-09\" />\n    <add key=\"fixtureSetting10\" value=\"value-10\" />\n    <add key=\"fixtureSetting11\" value=\"value-11\" />\n    <add key=\"fixtureSetting12\" value=\"value-12\" />\n    <add key=\"fixtureSetting13\" value=\"value-13\" />\n    <add key=\"fixtureSetting14\" value=\"value-14\" />\n    <add key=\"fixtureSetting15\" value=\"value-15\" />\n    <add key=\"fixtureSetting16\" value=\"value-16\" />\n    <add key=\"fixtureSetting17\" value=\"value-17\" />\n    <add key=\"fixtureSetting18\" value=\"value-18\" />\n    <add key=\"fixtureSetting19\" value=\"value-19\" />\n    <add key=\"fixtureSetting20\" value=\"value-20\" />\n    <add key=\"fixtureSetting21\" value=\"value-21\" />\n    <add key=\"fixtureSetting22\" value=\"value-22\" />\n    <add key=\"fixtureSetting23\" value=\"value-23\" />\n    <add key=\"fixtureSetting24\" value=\"value-24\" />\n    <add key=\"fixtureSetting25\" value=\"value-25\" />\n    <add key=\"fixtureSetting26\" value=\"value-26\" />\n    <add key=\"fixtureSetting27\" value=\"value-27\" />\n    <add key=\"fixtureSetting28\" value=\"value-28\" />\n    <add key=\"fixtureSetting29\" value=\"value-29\" />\n    <add key=\"fixtureSetting30\" value=\"value-30\" />\n    <add key=\"fixtureSetting31\" value=\"value-31\" />\n    <add key=\"fixtureSetting32\" value=\"value-32\" />\n    <add key=\"fixtureSetting33\" value=\"value-33\" />\n    <add key=\"fixtureSetting34\" value=\"value-34\" />\n    <add key=\"fixtureSetting35\" value=\"value-35\" />\n    <add key=\"fixtureSetting36\" value=\"value-36\" />\n    <add key=\"fixtureSetting37\" value=\"value-37\" />\n    <add key=\"fixtureSetting38\" value=\"value-38\" />\n    <add key=\"fixtureSetting39\" value=\"value-39\" />\n  </config>\n</configuration>\n",
+          "new": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n    <add key=\"socket-patch-11111111-1111-4111-8111-000000000001\" value=\".socket/vendor/nuget/11111111-1111-4111-8111-000000000001\" />\n  </packageSources>\n  <config>\n    <add key=\"fixtureSetting00\" value=\"value-00\" />\n    <add key=\"fixtureSetting01\" value=\"value-01\" />\n    <add key=\"fixtureSetting02\" value=\"value-02\" />\n    <add key=\"fixtureSetting03\" value=\"value-03\" />\n    <add key=\"fixtureSetting04\" value=\"value-04\" />\n    <add key=\"fixtureSetting05\" value=\"value-05\" />\n    <add key=\"fixtureSetting06\" value=\"value-06\" />\n    <add key=\"fixtureSetting07\" value=\"value-07\" />\n    <add key=\"fixtureSetting08\" value=\"value-08\" />\n    <add key=\"fixtureSetting09\" value=\"value-09\" />\n    <add key=\"fixtureSetting10\" value=\"value-10\" />\n    <add key=\"fixtureSetting11\" value=\"value-11\" />\n    <add key=\"fixtureSetting12\" value=\"value-12\" />\n    <add key=\"fixtureSetting13\" value=\"value-13\" />\n    <add key=\"fixtureSetting14\" value=\"value-14\" />\n    <add key=\"fixtureSetting15\" value=\"value-15\" />\n    <add key=\"fixtureSetting16\" value=\"value-16\" />\n    <add key=\"fixtureSetting17\" value=\"value-17\" />\n    <add key=\"fixtureSetting18\" value=\"value-18\" />\n    <add key=\"fixtureSetting19\" value=\"value-19\" />\n    <add key=\"fixtureSetting20\" value=\"value-20\" />\n    <add key=\"fixtureSetting21\" value=\"value-21\" />\n    <add key=\"fixtureSetting22\" value=\"value-22\" />\n    <add key=\"fixtureSetting23\" value=\"value-23\" />\n    <add key=\"fixtureSetting24\" value=\"value-24\" />\n    <add key=\"fixtureSetting25\" value=\"value-25\" />\n    <add key=\"fixtureSetting26\" value=\"value-26\" />\n    <add key=\"fixtureSetting27\" value=\"value-27\" />\n    <add key=\"fixtureSetting28\" value=\"value-28\" />\n    <add key=\"fixtureSetting29\" value=\"value-29\" />\n    <add key=\"fixtureSetting30\" value=\"value-30\" />\n    <add key=\"fixtureSetting31\" value=\"value-31\" />\n    <add key=\"fixtureSetting32\" value=\"value-32\" />\n    <add key=\"fixtureSetting33\" value=\"value-33\" />\n    <add key=\"fixtureSetting34\" value=\"value-34\" />\n    <add key=\"fixtureSetting35\" value=\"value-35\" />\n    <add key=\"fixtureSetting36\" value=\"value-36\" />\n    <add key=\"fixtureSetting37\" value=\"value-37\" />\n    <add key=\"fixtureSetting38\" value=\"value-38\" />\n    <add key=\"fixtureSetting39\" value=\"value-39\" />\n  </config>\n  <packageSourceMapping>\n    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>\n    <packageSource key=\"socket-patch-11111111-1111-4111-8111-000000000001\">\n      <package pattern=\"Fx.Alpha\" />\n    </packageSource>\n  </packageSourceMapping>\n</configuration>\n"
+        },
+        {
+          "file": "nuget.config",
+          "kind": "nuget_config_mapping",
+          "action": "added",
+          "key": "Fx.Alpha",
+          "new": "    <packageSource key=\"socket-patch-11111111-1111-4111-8111-000000000001\">\n      <package pattern=\"Fx.Alpha\" />\n    </packageSource>\n"
+        },
+        {
+          "file": "packages.lock.json",
+          "kind": "nuget_lock_entry",
+          "action": "rewritten",
+          "key": "Fx.Alpha",
+          "original": "WvjSxPwHWUhuw5uHwuU7DSaI2iD+KAAhc1wgPJmhUIWcEPgSQgjgeJ0mbK3DGdBCayS4j3g4bX3xVxsfBUQimw==",
+          "new": "oJs+8+IeSAWWoJLiUglQ9cM9oZFqEwgcROMfvL3UCIpfxatepCF6wpasspgir9k59m6mUnhEfhwpIZAVGyGl1A=="
+        }
+      ],
+      "record": {
+        "uuid": "11111111-1111-4111-8111-000000000001",
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+          "LICENSE.md": {
+            "beforeHash": "a113315d903cb8d12abebf88dca65557dde6f7e67f8bab1be0f3339e37dbb56b",
+            "afterHash": "c09bd2fa258994ecf531a17c2eb77b4a25ee0af90174dd66b53735a2fbf95260"
+          }
+        },
+        "vulnerabilities": {
+          "GHSA-aaaa-bbbb-cccc": {
+            "cves": [
+              "CVE-2026-0001"
+            ],
+            "summary": "s",
+            "severity": "high",
+            "description": "d"
+          }
+        },
+        "description": "fixture patch",
+        "license": "MIT",
+        "tier": "free"
+      }
+    },
+    "pkg:nuget/Fx.Beta@1.0.0": {
+      "ecosystem": "nuget",
+      "basePurl": "pkg:nuget/Fx.Beta@1.0.0",
+      "uuid": "11111111-1111-4111-8111-000000000002",
+      "artifact": {
+        "path": ".socket/vendor/nuget/11111111-1111-4111-8111-000000000002/fx.beta.1.0.0.nupkg",
+        "sha256": "bc06ab471673ab4369b56f94ca99212a4aa0a578eb062f811d4bb0efcc6fdcef",
+        "size": 446
+      },
+      "wiring": [
+        {
+          "file": "nuget.config",
+          "kind": "nuget_config_source",
+          "action": "rewritten",
+          "key": "socket-patch-11111111-1111-4111-8111-000000000002",
+          "original": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n    <add key=\"socket-patch-11111111-1111-4111-8111-000000000001\" value=\".socket/vendor/nuget/11111111-1111-4111-8111-000000000001\" />\n  </packageSources>\n  <config>\n    <add key=\"fixtureSetting00\" value=\"value-00\" />\n    <add key=\"fixtureSetting01\" value=\"value-01\" />\n    <add key=\"fixtureSetting02\" value=\"value-02\" />\n    <add key=\"fixtureSetting03\" value=\"value-03\" />\n    <add key=\"fixtureSetting04\" value=\"value-04\" />\n    <add key=\"fixtureSetting05\" value=\"value-05\" />\n    <add key=\"fixtureSetting06\" value=\"value-06\" />\n    <add key=\"fixtureSetting07\" value=\"value-07\" />\n    <add key=\"fixtureSetting08\" value=\"value-08\" />\n    <add key=\"fixtureSetting09\" value=\"value-09\" />\n    <add key=\"fixtureSetting10\" value=\"value-10\" />\n    <add key=\"fixtureSetting11\" value=\"value-11\" />\n    <add key=\"fixtureSetting12\" value=\"value-12\" />\n    <add key=\"fixtureSetting13\" value=\"value-13\" />\n    <add key=\"fixtureSetting14\" value=\"value-14\" />\n    <add key=\"fixtureSetting15\" value=\"value-15\" />\n    <add key=\"fixtureSetting16\" value=\"value-16\" />\n    <add key=\"fixtureSetting17\" value=\"value-17\" />\n    <add key=\"fixtureSetting18\" value=\"value-18\" />\n    <add key=\"fixtureSetting19\" value=\"value-19\" />\n    <add key=\"fixtureSetting20\" value=\"value-20\" />\n    <add key=\"fixtureSetting21\" value=\"value-21\" />\n    <add key=\"fixtureSetting22\" value=\"value-22\" />\n    <add key=\"fixtureSetting23\" value=\"value-23\" />\n    <add key=\"fixtureSetting24\" value=\"value-24\" />\n    <add key=\"fixtureSetting25\" value=\"value-25\" />\n    <add key=\"fixtureSetting26\" value=\"value-26\" />\n    <add key=\"fixtureSetting27\" value=\"value-27\" />\n    <add key=\"fixtureSetting28\" value=\"value-28\" />\n    <add key=\"fixtureSetting29\" value=\"value-29\" />\n    <add key=\"fixtureSetting30\" value=\"value-30\" />\n    <add key=\"fixtureSetting31\" value=\"value-31\" />\n    <add key=\"fixtureSetting32\" value=\"value-32\" />\n    <add key=\"fixtureSetting33\" value=\"value-33\" />\n    <add key=\"fixtureSetting34\" value=\"value-34\" />\n    <add key=\"fixtureSetting35\" value=\"value-35\" />\n    <add key=\"fixtureSetting36\" value=\"value-36\" />\n    <add key=\"fixtureSetting37\" value=\"value-37\" />\n    <add key=\"fixtureSetting38\" value=\"value-38\" />\n    <add key=\"fixtureSetting39\" value=\"value-39\" />\n  </config>\n  <packageSourceMapping>\n    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>\n    <packageSource key=\"socket-patch-11111111-1111-4111-8111-000000000001\">\n      <package pattern=\"Fx.Alpha\" />\n    </packageSource>\n  </packageSourceMapping>\n</configuration>\n",
+          "new": "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n    <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n    <add key=\"socket-patch-11111111-1111-4111-8111-000000000001\" value=\".socket/vendor/nuget/11111111-1111-4111-8111-000000000001\" />\n    <add key=\"socket-patch-11111111-1111-4111-8111-000000000002\" value=\".socket/vendor/nuget/11111111-1111-4111-8111-000000000002\" />\n  </packageSources>\n  <config>\n    <add key=\"fixtureSetting00\" value=\"value-00\" />\n    <add key=\"fixtureSetting01\" value=\"value-01\" />\n    <add key=\"fixtureSetting02\" value=\"value-02\" />\n    <add key=\"fixtureSetting03\" value=\"value-03\" />\n    <add key=\"fixtureSetting04\" value=\"value-04\" />\n    <add key=\"fixtureSetting05\" value=\"value-05\" />\n    <add key=\"fixtureSetting06\" value=\"value-06\" />\n    <add key=\"fixtureSetting07\" value=\"value-07\" />\n    <add key=\"fixtureSetting08\" value=\"value-08\" />\n    <add key=\"fixtureSetting09\" value=\"value-09\" />\n    <add key=\"fixtureSetting10\" value=\"value-10\" />\n    <add key=\"fixtureSetting11\" value=\"value-11\" />\n    <add key=\"fixtureSetting12\" value=\"value-12\" />\n    <add key=\"fixtureSetting13\" value=\"value-13\" />\n    <add key=\"fixtureSetting14\" value=\"value-14\" />\n    <add key=\"fixtureSetting15\" value=\"value-15\" />\n    <add key=\"fixtureSetting16\" value=\"value-16\" />\n    <add key=\"fixtureSetting17\" value=\"value-17\" />\n    <add key=\"fixtureSetting18\" value=\"value-18\" />\n    <add key=\"fixtureSetting19\" value=\"value-19\" />\n    <add key=\"fixtureSetting20\" value=\"value-20\" />\n    <add key=\"fixtureSetting21\" value=\"value-21\" />\n    <add key=\"fixtureSetting22\" value=\"value-22\" />\n    <add key=\"fixtureSetting23\" value=\"value-23\" />\n    <add key=\"fixtureSetting24\" value=\"value-24\" />\n    <add key=\"fixtureSetting25\" value=\"value-25\" />\n    <add key=\"fixtureSetting26\" value=\"value-26\" />\n    <add key=\"fixtureSetting27\" value=\"value-27\" />\n    <add key=\"fixtureSetting28\" value=\"value-28\" />\n    <add key=\"fixtureSetting29\" value=\"value-29\" />\n    <add key=\"fixtureSetting30\" value=\"value-30\" />\n    <add key=\"fixtureSetting31\" value=\"value-31\" />\n    <add key=\"fixtureSetting32\" value=\"value-32\" />\n    <add key=\"fixtureSetting33\" value=\"value-33\" />\n    <add key=\"fixtureSetting34\" value=\"value-34\" />\n    <add key=\"fixtureSetting35\" value=\"value-35\" />\n    <add key=\"fixtureSetting36\" value=\"value-36\" />\n    <add key=\"fixtureSetting37\" value=\"value-37\" />\n    <add key=\"fixtureSetting38\" value=\"value-38\" />\n    <add key=\"fixtureSetting39\" value=\"value-39\" />\n  </config>\n  <packageSourceMapping>\n    <packageSource key=\"nuget.org\">\n      <package pattern=\"*\" />\n    </packageSource>\n    <packageSource key=\"socket-patch-11111111-1111-4111-8111-000000000001\">\n      <package pattern=\"Fx.Alpha\" />\n    </packageSource>\n    <packageSource key=\"socket-patch-11111111-1111-4111-8111-000000000002\">\n      <package pattern=\"Fx.Beta\" />\n    </packageSource>\n  </packageSourceMapping>\n</configuration>\n"
+        },
+        {
+          "file": "nuget.config",
+          "kind": "nuget_config_mapping",
+          "action": "added",
+          "key": "Fx.Beta",
+          "new": "    <packageSource key=\"socket-patch-11111111-1111-4111-8111-000000000002\">\n      <package pattern=\"Fx.Beta\" />\n    </packageSource>\n"
+        },
+        {
+          "file": "packages.lock.json",
+          "kind": "nuget_lock_entry",
+          "action": "rewritten",
+          "key": "Fx.Beta",
+          "original": "LRYXwnxkETVJsNm6fm1wKrIroTJHlGqiGeSY8/kyIRecUE/SoEfQ6aBadCT7N7NK/m3dvNTfZJQcaSs7oAXgVQ==",
+          "new": "ocZmaRMoSfAmYajxMOZrx5xeCA/igWX0A/QbKOBcR9QTI6tP/H0cWUrYIyVzSY5SVgqzVkyCbZiqhisZtrcNVw=="
+        }
+      ],
+      "record": {
+        "uuid": "11111111-1111-4111-8111-000000000002",
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+          "LICENSE.md": {
+            "beforeHash": "6911ab6df108f90ead8d7182f2d1112c913023a02cd438c7fbf581938bffef3e",
+            "afterHash": "867fe755204c3c2fa125f706d8e882f74f90ab2f5e5879ac36ce6464d5c8d691"
+          }
+        },
+        "vulnerabilities": {
+          "GHSA-aaaa-bbbb-cccc": {
+            "cves": [
+              "CVE-2026-0001"
+            ],
+            "summary": "s",
+            "severity": "high",
+            "description": "d"
+          }
+        },
+        "description": "fixture patch",
+        "license": "MIT",
+        "tier": "free"
+      }
+    }
+  }
+}

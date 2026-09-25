@@ -1,0 +1,129 @@
+{
+  "version": 1,
+  "entries": {
+    "pkg:gem/alpha@1.0.0": {
+      "ecosystem": "gem",
+      "basePurl": "pkg:gem/alpha@1.0.0",
+      "uuid": "11111111-1111-4111-8111-000000000001",
+      "artifact": {
+        "path": ".socket/vendor/gem/11111111-1111-4111-8111-000000000001/alpha-1.0.0",
+        "fileInventory": {
+          "alpha.gemspec": "95d0c65ffb7f1901607b734359ba09358be57261f3e9edf54cfd5f9a2ba05c60",
+          "lib/alpha.rb": "044fcb19093086b3d8167fd2dc1e1f6a969863d0e1bc90b62c0636782c2dd989"
+        }
+      },
+      "wiring": [
+        {
+          "file": "Gemfile",
+          "kind": "gemfile_line",
+          "action": "rewritten",
+          "key": "alpha",
+          "original": "gem \"alpha\"",
+          "new": "gem \"alpha\", \"1.0.0\", path: \".socket/vendor/gem/11111111-1111-4111-8111-000000000001/alpha-1.0.0\""
+        },
+        {
+          "file": "Gemfile.lock",
+          "kind": "gemfile_lock_spec",
+          "action": "rewritten",
+          "key": "alpha",
+          "original": [
+            "    alpha (1.0.0)",
+            "  alpha"
+          ],
+          "new": [
+            "PATH",
+            "  remote: .socket/vendor/gem/11111111-1111-4111-8111-000000000001/alpha-1.0.0",
+            "  specs:",
+            "    alpha (1.0.0)",
+            "  alpha (= 1.0.0)!"
+          ]
+        }
+      ],
+      "record": {
+        "uuid": "11111111-1111-4111-8111-000000000001",
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+          "lib/alpha.rb": {
+            "beforeHash": "c9f4439e663855223be4f07be1641fecea39b5bf0bd0bd2036e8e80f996b3055",
+            "afterHash": "dad65038aa044e65110b925b244f15d3853e478a35630ea37642448d0dcd20dc"
+          }
+        },
+        "vulnerabilities": {
+          "GHSA-aaaa-bbbb-cccc": {
+            "cves": [
+              "CVE-2026-0001"
+            ],
+            "summary": "s",
+            "severity": "high",
+            "description": "d"
+          }
+        },
+        "description": "fixture patch",
+        "license": "MIT",
+        "tier": "free"
+      }
+    },
+    "pkg:gem/beta@1.0.0": {
+      "ecosystem": "gem",
+      "basePurl": "pkg:gem/beta@1.0.0",
+      "uuid": "11111111-1111-4111-8111-000000000002",
+      "artifact": {
+        "path": ".socket/vendor/gem/11111111-1111-4111-8111-000000000002/beta-1.0.0",
+        "fileInventory": {
+          "beta.gemspec": "39927495c69e36646adfb3e5848e636eea6b7ba4ed21d0eec15b7267391f8d93",
+          "lib/beta.rb": "7294d9f6fb1a5bdd7fd6cec972d3c89a1212b9f233a0e12703077e7cd8e62ae4"
+        }
+      },
+      "wiring": [
+        {
+          "file": "Gemfile",
+          "kind": "gemfile_line",
+          "action": "rewritten",
+          "key": "beta",
+          "original": "gem \"beta\"",
+          "new": "gem \"beta\", \"1.0.0\", path: \".socket/vendor/gem/11111111-1111-4111-8111-000000000002/beta-1.0.0\""
+        },
+        {
+          "file": "Gemfile.lock",
+          "kind": "gemfile_lock_spec",
+          "action": "rewritten",
+          "key": "beta",
+          "original": [
+            "    beta (1.0.0)",
+            "  beta"
+          ],
+          "new": [
+            "PATH",
+            "  remote: .socket/vendor/gem/11111111-1111-4111-8111-000000000002/beta-1.0.0",
+            "  specs:",
+            "    beta (1.0.0)",
+            "  beta (= 1.0.0)!"
+          ]
+        }
+      ],
+      "record": {
+        "uuid": "11111111-1111-4111-8111-000000000002",
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+          "lib/beta.rb": {
+            "beforeHash": "a2167bcd355f6c9559c1d1703ddb866512c5f559a4e2e7c7081534ff0c9c81b7",
+            "afterHash": "7ca15e52fd628b0423d45383462380154be6979f8084e7aa3153e251591867f5"
+          }
+        },
+        "vulnerabilities": {
+          "GHSA-aaaa-bbbb-cccc": {
+            "cves": [
+              "CVE-2026-0001"
+            ],
+            "summary": "s",
+            "severity": "high",
+            "description": "d"
+          }
+        },
+        "description": "fixture patch",
+        "license": "MIT",
+        "tier": "free"
+      }
+    }
+  }
+}

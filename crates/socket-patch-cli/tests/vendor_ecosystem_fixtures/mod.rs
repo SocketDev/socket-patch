@@ -100,7 +100,18 @@ impl Fixture {
     /// every ambient `SOCKET_*` scrubbed and `extra_env` on top. Returns
     /// the exit code, stdout and stderr.
     pub fn run(&self, args: &[&str], extra_env: &[(&str, &str)]) -> (i32, String, String) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+        self.run_bin(env!("CARGO_BIN_EXE_socket-patch"), args, extra_env)
+    }
+
+    /// [`Self::run`] with another build of the binary (the legacy-fixture
+    /// generator runs the integrated base through it).
+    pub fn run_bin(
+        &self,
+        bin: &str,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> (i32, String, String) {
+        let mut cmd = Command::new(bin);
         cmd.args(args).current_dir(&self.root);
         for (key, _) in std::env::vars() {
             if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {

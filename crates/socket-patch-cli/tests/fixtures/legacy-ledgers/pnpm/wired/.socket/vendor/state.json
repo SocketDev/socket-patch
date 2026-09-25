@@ -1,0 +1,207 @@
+{
+  "version": 1,
+  "entries": {
+    "pkg:npm/alpha@1.0.0": {
+      "ecosystem": "npm",
+      "basePurl": "pkg:npm/alpha@1.0.0",
+      "uuid": "11111111-1111-4111-8111-000000000001",
+      "artifact": {
+        "path": ".socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz",
+        "sha256": "9750489c2d19b3ada3dde4a408b894e0f63cc73b9e0c0bcd80a8abef5e4f82c4",
+        "size": 178
+      },
+      "wiring": [
+        {
+          "file": "package.json",
+          "kind": "pnpm_pkg_override",
+          "action": "added",
+          "key": "alpha@1.0.0",
+          "new": "file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz"
+        },
+        {
+          "file": "pnpm-lock.yaml",
+          "kind": "pnpm_lock_overrides",
+          "action": "added",
+          "key": "alpha@1.0.0",
+          "new": "file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz"
+        },
+        {
+          "file": "pnpm-lock.yaml",
+          "kind": "pnpm_lock_importer_dep",
+          "action": "rewritten",
+          "key": ".|alpha",
+          "original": {
+            "specifier": "1.0.0",
+            "version": "1.0.0"
+          },
+          "new": {
+            "specifier": "file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz",
+            "version": "file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz"
+          }
+        },
+        {
+          "file": "pnpm-lock.yaml",
+          "kind": "pnpm_lock_package",
+          "action": "rewritten",
+          "key": "alpha@1.0.0",
+          "original": [
+            "  alpha@1.0.0:",
+            "    resolution: {integrity: sha512-orig==}"
+          ],
+          "new": [
+            "  alpha@file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz:",
+            "    resolution: {integrity: sha512-kmYLZ8QKvcFKA3NQaxXFnIwOjKLrsfUVj5XeSUIOlaYzy5VKZ+ZbIaRpwvt7crrAd5x6llAVcTVLvWt+QAdZnA==, tarball: file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz}",
+            "    version: 1.0.0"
+          ]
+        },
+        {
+          "file": "pnpm-lock.yaml",
+          "kind": "pnpm_lock_snapshot",
+          "action": "rewritten",
+          "key": "alpha@1.0.0",
+          "original": [
+            "  alpha@1.0.0: {}"
+          ],
+          "new": [
+            "  alpha@file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz: {}"
+          ]
+        },
+        {
+          "file": "pnpm-workspace.yaml",
+          "kind": "pnpm_ws_override",
+          "action": "added",
+          "key": "alpha@1.0.0",
+          "new": "file:.socket/vendor/npm/11111111-1111-4111-8111-000000000001/alpha-1.0.0.tgz"
+        }
+      ],
+      "flavor": "pnpm",
+      "pnpm": {
+        "createdOverridesTable": true,
+        "createdPnpmTable": true,
+        "createdWorkspaceFile": true
+      },
+      "record": {
+        "uuid": "11111111-1111-4111-8111-000000000001",
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+          "package/index.js": {
+            "beforeHash": "4717263f295eed420954cedf06613ed753d8ed50ab048a60aea61c43d3b9ad9d",
+            "afterHash": "bc15782a928574cb0d3864cfa343d525c642e845a470e3e64aafeba864635284"
+          }
+        },
+        "vulnerabilities": {
+          "GHSA-aaaa-bbbb-cccc": {
+            "cves": [
+              "CVE-2026-0001"
+            ],
+            "summary": "s",
+            "severity": "high",
+            "description": "d"
+          }
+        },
+        "description": "fixture patch",
+        "license": "MIT",
+        "tier": "free"
+      }
+    },
+    "pkg:npm/beta@1.0.0": {
+      "ecosystem": "npm",
+      "basePurl": "pkg:npm/beta@1.0.0",
+      "uuid": "11111111-1111-4111-8111-000000000002",
+      "artifact": {
+        "path": ".socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz",
+        "sha256": "15a787bf25ccefc1d643efe9b157a0703dad1837d3d6fef1dad2177738ca0aac",
+        "size": 177
+      },
+      "wiring": [
+        {
+          "file": "package.json",
+          "kind": "pnpm_pkg_override",
+          "action": "added",
+          "key": "beta@1.0.0",
+          "new": "file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz"
+        },
+        {
+          "file": "pnpm-lock.yaml",
+          "kind": "pnpm_lock_overrides",
+          "action": "added",
+          "key": "beta@1.0.0",
+          "new": "file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz"
+        },
+        {
+          "file": "pnpm-lock.yaml",
+          "kind": "pnpm_lock_importer_dep",
+          "action": "rewritten",
+          "key": ".|beta",
+          "original": {
+            "specifier": "1.0.0",
+            "version": "1.0.0"
+          },
+          "new": {
+            "specifier": "file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz",
+            "version": "file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz"
+          }
+        },
+        {
+          "file": "pnpm-lock.yaml",
+          "kind": "pnpm_lock_package",
+          "action": "rewritten",
+          "key": "beta@1.0.0",
+          "original": [
+            "  beta@1.0.0:",
+            "    resolution: {integrity: sha512-orig==}"
+          ],
+          "new": [
+            "  beta@file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz:",
+            "    resolution: {integrity: sha512-qdpYNuREio4Ne2pCoWYKEfqDrKR7gNVvJEi6UhkognzwSBA9PvcgPrVhGDFWlMeerfGwZzVfmHd8p6zabtkO2A==, tarball: file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz}",
+            "    version: 1.0.0"
+          ]
+        },
+        {
+          "file": "pnpm-lock.yaml",
+          "kind": "pnpm_lock_snapshot",
+          "action": "rewritten",
+          "key": "beta@1.0.0",
+          "original": [
+            "  beta@1.0.0: {}"
+          ],
+          "new": [
+            "  beta@file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz: {}"
+          ]
+        },
+        {
+          "file": "pnpm-workspace.yaml",
+          "kind": "pnpm_ws_override",
+          "action": "added",
+          "key": "beta@1.0.0",
+          "new": "file:.socket/vendor/npm/11111111-1111-4111-8111-000000000002/beta-1.0.0.tgz"
+        }
+      ],
+      "flavor": "pnpm",
+      "pnpm": {},
+      "record": {
+        "uuid": "11111111-1111-4111-8111-000000000002",
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": {
+          "package/index.js": {
+            "beforeHash": "64e197dfafd58f0f80310669f32563a0bd078317decf19152868b6a5d20ede42",
+            "afterHash": "0c82d6e011aad77f6178863228991fb143135c15123ce7e17d7c6d700614b273"
+          }
+        },
+        "vulnerabilities": {
+          "GHSA-aaaa-bbbb-cccc": {
+            "cves": [
+              "CVE-2026-0001"
+            ],
+            "summary": "s",
+            "severity": "high",
+            "description": "d"
+          }
+        },
+        "description": "fixture patch",
+        "license": "MIT",
+        "tier": "free"
+      }
+    }
+  }
+}

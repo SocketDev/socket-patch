@@ -538,6 +538,9 @@ fn state_path(project_root: &Path) -> PathBuf {
 /// for a writer; same guard as the sibling redirect ledger.
 pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
     let path = state_path(project_root);
+    if let Some(state) = crate::utils::group_commit::read_value::<VendorState>(&path) {
+        return Ok((*state).clone());
+    }
     match read_regular_to_bytes(&path).await {
         Ok(bytes) => parse_state(&bytes, &path),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(VendorState::new()),
@@ -548,6 +551,9 @@ pub async fn load_state(project_root: &Path) -> std::io::Result<VendorState> {
 /// The ledger bytes as a [`VendorState`]; see [`load_state`] for the
 /// `mode`-tagged exception.
 fn parse_state(bytes: &[u8], path: &Path) -> std::io::Result<VendorState> {
+    if super::ledger_snapshots::may_have_snapshots(bytes) {
+        return parse_snapshot_state(bytes, path);
+    }
     serde_json::from_slice(bytes).or_else(|e| {
         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
             if value.get("mode").is_some() && value.get("entries").is_none() {
@@ -559,6 +565,25 @@ fn parse_state(bytes: &[u8], path: &Path) -> std::io::Result<VendorState> {
             format!("corrupt {}: {e}", path.display()),
         ))
     })
+}
+
+/// A ledger that may carry the version-2 snapshot table (see
+/// [`super::ledger_snapshots`]): resolved back to full strings, every one
+/// checked against its hash, before the typed parse.
+fn parse_snapshot_state(bytes: &[u8], path: &Path) -> std::io::Result<VendorState> {
+    let corrupt = |detail: String| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("corrupt {}: {detail}", path.display()),
+        )
+    };
+    let mut value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| corrupt(e.to_string()))?;
+    if value.get("mode").is_some() && value.get("entries").is_none() {
+        return Ok(VendorState::new());
+    }
+    super::ledger_snapshots::decode(&mut value).map_err(corrupt)?;
+    serde_json::from_value(value).map_err(|e| corrupt(e.to_string()))
 }
 
 /// The run's ledger parse. The hatch backend asks the ledger the same two
@@ -578,6 +603,9 @@ static STATE_MEMO: ParseMemo<VendorState> = ParseMemo::new();
 /// drops the slot).
 pub(crate) async fn load_state_shared(project_root: &Path) -> std::io::Result<Arc<VendorState>> {
     let path = state_path(project_root);
+    if let Some(state) = crate::utils::group_commit::read_value::<VendorState>(&path) {
+        return Ok(state);
+    }
     match read_regular_to_bytes(&path).await {
         Ok(bytes) => STATE_MEMO.parse(&bytes, || parse_state(&bytes, &path)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Arc::new(VendorState::new())),
@@ -599,7 +627,12 @@ pub async fn save_state(project_root: &Path, state: &VendorState) -> std::io::Re
     // hit again.
     STATE_MEMO.invalidate();
     if !state.entries.is_empty() {
-        return write_json_ledger(&path, state).await;
+        // Inside a group-committed run the ledger is held as a value and
+        // rendered once, at the commit (or when something reads its bytes).
+        if crate::utils::group_commit::capture_value(&path, Arc::new(state.clone()), render_state) {
+            return Ok(());
+        }
+        return write_json_ledger(&path, &ledger_value(state)?).await;
     }
     let socket_dir = project_root.join(SOCKET_DIR);
     // Delete the ledger; a read-only parent surfaces here, before anything
@@ -614,6 +647,26 @@ pub async fn save_state(project_root: &Path, state: &VendorState) -> std::io::Re
         prune_empty_dirs(&vendor_root.join(eco), &socket_dir).await;
     }
     Ok(())
+}
+
+/// The ledger's on-disk JSON: whole-file wiring snapshots move into the
+/// version-2 snapshot table (see `super::ledger_snapshots`); a ledger
+/// without any keeps its version-1 form.
+fn ledger_value(state: &VendorState) -> std::io::Result<serde_json::Value> {
+    let mut ledger = serde_json::to_value(state).map_err(std::io::Error::other)?;
+    super::ledger_snapshots::encode(&mut ledger);
+    Ok(ledger)
+}
+
+/// The bytes [`write_json_ledger`] writes for a captured ledger.
+fn render_state(value: &(dyn std::any::Any + Send + Sync)) -> std::io::Result<Vec<u8>> {
+    let state = value
+        .downcast_ref::<VendorState>()
+        .ok_or_else(|| std::io::Error::other("captured ledger is not a VendorState"))?;
+    let mut bytes =
+        serde_json::to_vec_pretty(&ledger_value(state)?).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 /// The informational marker written inside each vendored unit
@@ -909,6 +962,99 @@ mod tests {
         assert!(entry.covers_purl(key, "pkg:npm/@scope/pkg@1.0.0?artifact_id=y"));
         assert!(!entry.covers_purl(key, "pkg:npm/@scope/pkg@1.0.1"));
         assert!(!entry.covers_purl(key, "pkg:npm/other@1.0.0"));
+    }
+
+    /// A maven-shaped entry: the wiring record holds the whole pom before
+    /// and after the vendored `<repository>` was added.
+    fn whole_file_entry(purl: &str, uuid: &str, before: &str, after: &str) -> VendorEntry {
+        let mut entry = sample_entry();
+        entry.ecosystem = "maven".into();
+        entry.base_purl = purl.into();
+        entry.uuid = uuid.into();
+        entry.wiring = vec![WiringRecord {
+            file: "pom.xml".into(),
+            kind: "maven_pom_repository".into(),
+            action: WiringAction::Added,
+            key: Some(format!("socket-patch-vendor-{uuid}")),
+            original: Some(serde_json::Value::String(before.into())),
+            new: Some(serde_json::Value::String(after.into())),
+        }];
+        entry
+    }
+
+    /// Whole-file snapshots are stored once plus one small edit per
+    /// package (version 2) and load back to exactly the in-memory state.
+    #[tokio::test]
+    async fn whole_file_snapshots_are_stored_as_edits_and_load_back_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pom0 = format!(
+            "<project>\n{}</project>\n",
+            "  <dependency><artifactId>filler</artifactId></dependency>\n".repeat(400)
+        );
+        let pom1 = pom0.replace(
+            "</project>",
+            "  <repositories>one</repositories>\n</project>",
+        );
+        let pom2 = pom1.replace("</repositories>", "two</repositories>");
+        let mut state = VendorState::new();
+        state.entries.insert(
+            "pkg:maven/g/a@1".into(),
+            whole_file_entry("pkg:maven/g/a@1", UUID, &pom0, &pom1),
+        );
+        state.entries.insert(
+            "pkg:maven/g/b@1".into(),
+            whole_file_entry(
+                "pkg:maven/g/b@1",
+                "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d",
+                &pom1,
+                &pom2,
+            ),
+        );
+        save_state(tmp.path(), &state).await.unwrap();
+        let bytes = std::fs::read(tmp.path().join(VENDOR_STATE_REL)).unwrap();
+        let on_disk: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(on_disk["version"], 2);
+        assert_eq!(on_disk["snapshots"].as_object().unwrap().len(), 3);
+        assert!(
+            bytes.len() < pom0.len() + 4096,
+            "one full pom plus two edits, not four poms: {} bytes",
+            bytes.len()
+        );
+        let mut back = load_state(tmp.path()).await.unwrap();
+        back.version = state.version;
+        assert_eq!(back, state);
+    }
+
+    /// A ledger with no snapshot-sized string keeps its version-1 bytes,
+    /// exactly what the plain serializer writes; a version-1 ledger with
+    /// inline whole-file snapshots (every ledger before version 2) loads
+    /// as it always did.
+    #[tokio::test]
+    async fn version_one_ledgers_keep_their_bytes_and_still_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = VendorState::new();
+        state
+            .entries
+            .insert("pkg:npm/lodash@4.17.21".into(), sample_entry());
+        save_state(tmp.path(), &state).await.unwrap();
+        let mut expected = serde_json::to_vec_pretty(&state).unwrap();
+        expected.push(b'\n');
+        assert_eq!(
+            std::fs::read(tmp.path().join(VENDOR_STATE_REL)).unwrap(),
+            expected
+        );
+
+        let pom0 = "x".repeat(5000);
+        let pom1 = format!("{pom0}<repo/>");
+        let mut legacy = VendorState::new();
+        legacy.entries.insert(
+            "pkg:maven/g/a@1".into(),
+            whole_file_entry("pkg:maven/g/a@1", UUID, &pom0, &pom1),
+        );
+        let mut bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(tmp.path().join(VENDOR_STATE_REL), &bytes).unwrap();
+        assert_eq!(load_state(tmp.path()).await.unwrap(), legacy);
     }
 
     #[tokio::test]

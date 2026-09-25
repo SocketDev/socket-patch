@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net8.0": {
+      "Fx.Alpha": {
+        "type": "Direct",
+        "requested": "[1.0.0, )",
+        "resolved": "1.0.0",
+        "contentHash": "oJs+8+IeSAWWoJLiUglQ9cM9oZFqEwgcROMfvL3UCIpfxatepCF6wpasspgir9k59m6mUnhEfhwpIZAVGyGl1A=="
+      },
+      "Fx.Beta": {
+        "type": "Direct",
+        "requested": "[1.0.0, )",
+        "resolved": "1.0.0",
+        "contentHash": "ocZmaRMoSfAmYajxMOZrx5xeCA/igWX0A/QbKOBcR9QTI6tP/H0cWUrYIyVzSY5SVgqzVkyCbZiqhisZtrcNVw=="
+      }
+    }
+  }
+}
