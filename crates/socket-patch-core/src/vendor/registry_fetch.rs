@@ -75,7 +75,14 @@ pub struct FetchedPackage {
     /// wherever it is first wanted: the private tempdir
     /// ([`FetchedPackage::dir`]), or a vendor stage directly
     /// ([`FetchedPackage::stage_into`]).
-    extract: std::sync::Arc<Extractor>,
+    ///
+    /// Dropped as soon as the tempdir holds the tree: from there on every
+    /// caller copies out of it, so the archive is dead weight and a run
+    /// that materialises its sources holds no more of them than the eager
+    /// fetch did. A source NOTHING reads — the case this deferral exists
+    /// for — keeps its bytes until the holder is dropped, which is the
+    /// trade: the eager fetch spent a whole extracted tree on disk instead.
+    extract: std::sync::Mutex<Option<std::sync::Arc<Extractor>>>,
     /// The tempdir materialisation's outcome, shared by every later caller
     /// so a failure reads the same each time.
     extracted: tokio::sync::OnceCell<Result<(), String>>,
@@ -109,7 +116,7 @@ impl FetchedPackage {
         Self {
             dir,
             url,
-            extract: std::sync::Arc::new(extract),
+            extract: std::sync::Mutex::new(Some(std::sync::Arc::new(extract))),
             extracted: tokio::sync::OnceCell::new(),
             _tmp: tmp,
         }
@@ -130,9 +137,33 @@ impl FetchedPackage {
             .get_or_init(|| self.write_tree(self.dir.clone(), None))
             .await;
         match done {
-            Ok(()) => Ok(&self.dir),
+            Ok(()) => {
+                // The tree is on disk; nothing reads the archive again.
+                drop(self.take_extractor());
+                Ok(&self.dir)
+            }
             Err(detail) => Err(detail.clone()),
         }
+    }
+
+    /// Take the extractor out, freeing the archive bytes with the last
+    /// handle. Returns `None` once it is gone.
+    fn take_extractor(&self) -> Option<std::sync::Arc<Extractor>> {
+        self.extract
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// A handle on the extractor, or the failure a caller that needs it
+    /// after the tree is already on disk would see (which no caller does —
+    /// every one of them prefers the tree).
+    fn extractor(&self) -> Result<std::sync::Arc<Extractor>, String> {
+        self.extract
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| format!("the fetched archive for {} is no longer held", self.url))
     }
 
     /// Write the tree at `dst` instead of the tempdir: the vendor stage the
@@ -164,7 +195,7 @@ impl FetchedPackage {
     /// Extraction is sync CPU + disk work; keep it off the runtime thread so
     /// the concurrent fetches around it keep moving.
     async fn write_tree(&self, dst: PathBuf, skip_file_name: Option<String>) -> Result<(), String> {
-        let extract = std::sync::Arc::clone(&self.extract);
+        let extract = self.extractor()?;
         match tokio::task::spawn_blocking(move || extract(&dst, skip_file_name.as_deref())).await {
             Ok(outcome) => outcome,
             Err(e) => Err(format!("extraction task failed: {e}")),
@@ -4660,6 +4691,45 @@ mod tests {
         fetched.stage_into(&staged, None).await.unwrap();
         assert_eq!(tree_of(&staged), tree_of(&materialized));
         assert_eq!(dirs_of(&staged), dirs_of(&materialized));
+    }
+
+    /// Once the tree is on disk the archive is dead weight: a run that
+    /// materialises its sources must not carry every one of them to the end
+    /// of the vendor loop, which is more than the eager fetch ever held.
+    #[tokio::test]
+    async fn materializing_frees_the_archive_bytes() {
+        struct Tattle {
+            bytes: Vec<u8>,
+            freed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for Tattle {
+            fn drop(&mut self) {
+                self.freed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let freed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tattle = Tattle {
+            bytes: make_tgz(&[("pkg/a.txt", b"hello", false)]),
+            freed: std::sync::Arc::clone(&freed),
+        };
+        let holder = tempfile::tempdir().unwrap();
+        let fetched = FetchedPackage::pending(
+            holder.path().join("pkg"),
+            "https://example.invalid/x.tgz".to_string(),
+            holder,
+            move |dest, skip| extract_tgz_skipping(&tattle.bytes, dest, skip),
+        );
+        assert!(!freed.load(std::sync::atomic::Ordering::SeqCst));
+        fetched.dir().await.unwrap();
+        assert!(
+            freed.load(std::sync::atomic::Ordering::SeqCst),
+            "the archive is still held after its tree reached the tempdir"
+        );
+        // And the tree is still the one thing every later caller reads.
+        let stage_root = tempfile::tempdir().unwrap();
+        let stage = stage_root.path().join("stage");
+        fetched.stage_into(&stage, None).await.unwrap();
+        assert_eq!(tree_of(&stage), tree_of(fetched.dir().await.unwrap()));
     }
 
     /// Every DIRECTORY under `root`, relative. `tree_of` lists files, so it
