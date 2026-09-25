@@ -34,10 +34,21 @@ pub(crate) fn confirm(prompt: &str, default_yes: bool, common: &GlobalArgs) -> b
         Ask {
             default_yes,
             non_interactive_answer: default_yes,
-            interactive: io::stdin().is_terminal(),
+            // The same question [`confirm_waits`] answers — asked through
+            // it, so the two cannot drift.
+            interactive: confirm_waits(common),
             silent: common.silent,
         },
     )
+}
+
+/// Whether [`confirm`] would stop and wait for a person to answer — a
+/// caller's clue that the world may change while it does (`scan` reuses a
+/// crawl across the prompt only when it does not wait). Derived from
+/// `confirm` itself rather than hand-copied at the call site: the drift
+/// that matters is the unsafe direction, a wait nobody accounted for.
+pub(crate) fn confirm_waits(common: &GlobalArgs) -> bool {
+    !(common.yes || common.json) && io::stdin().is_terminal()
 }
 
 /// A default-**no** confirmation that still proceeds when nobody can be
@@ -530,5 +541,52 @@ mod tests {
             select_one("pick", &[], &GlobalArgs::default()),
             Err(SelectError::Cancelled)
         ));
+    }
+
+    /// `confirm_waits` is what `scan` plans its crawl reuse around, so it
+    /// must never say "no wait" for a case `confirm` would stop on. Over
+    /// the whole `{yes, json}` cube with this process's stdin (a pipe
+    /// under the test harness, so never a terminal), it says no wait —
+    /// and `confirm` indeed answers from its default without reading a
+    /// byte, whatever is on stdin.
+    #[test]
+    fn confirm_waits_agrees_with_confirm_over_the_flag_cube() {
+        for (yes, json) in [(false, false), (true, false), (false, true), (true, true)] {
+            let common = GlobalArgs {
+                yes,
+                json,
+                silent: true,
+                ..GlobalArgs::default()
+            };
+            assert!(!confirm_waits(&common), "yes={yes} json={json}");
+            for default_yes in [true, false] {
+                assert_eq!(
+                    confirm("go?", default_yes, &common),
+                    default_yes,
+                    "yes={yes} json={json} default={default_yes}"
+                );
+            }
+        }
+    }
+
+    /// The other half of the same contract, on the one input `confirm`
+    /// takes that a test can vary: when nobody is waiting, the answer is
+    /// the caller's default, never whatever happens to be on stdin.
+    #[test]
+    fn a_prompt_nobody_waits_on_never_reads_the_answer() {
+        let mut out = Vec::new();
+        let answered = confirm_with(
+            &mut &b"n\n"[..],
+            &mut out,
+            "go?",
+            Ask {
+                default_yes: true,
+                non_interactive_answer: true,
+                interactive: false,
+                silent: true,
+            },
+        );
+        assert!(answered);
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
     }
 }

@@ -2939,7 +2939,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // Whether the prompt below waits on a person: the tree may change while
     // it does, so the vendor step then crawls afresh instead of reusing the
     // pre-prompt crawl (`--yes` / `--json` / non-terminal answer at once).
-    let prompt_waits = !(args.common.yes || args.common.json) && std::io::stdin().is_terminal();
+    let prompt_waits = ui::confirm_waits(&args.common);
     if !ui::confirm(&render::confirm_prompt(plan), true, &args.common) {
         if !silent {
             println!();
