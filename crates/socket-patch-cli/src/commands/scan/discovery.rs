@@ -89,9 +89,15 @@ pub(crate) fn unsupported_layout_warnings(
 /// path (hash verify → NotFound, apply → partitioned skip, vendor →
 /// auto-fetch). Global scans target the machine's global tree, not this
 /// project's lockfile, so they get no supplement.
+///
+/// `only` is the crawl's ecosystem scope (`None`: every ecosystem was
+/// crawled): an entry of an ecosystem the crawl skipped is never counted
+/// lockfile-only, since there is no crawl to tell whether it is installed.
+/// `entries` still holds the full inventory.
 pub(super) async fn lockfile_supplement(
     common: &GlobalArgs,
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
+    only: Option<&[String]>,
 ) -> LockfileSupplement {
     use socket_patch_core::vendor::lock_inventory;
 
@@ -105,8 +111,14 @@ pub(super) async fn lockfile_supplement(
         return out;
     }
     let crawled_purls: HashSet<&str> = crawled.iter().map(|p| p.purl.as_str()).collect();
+    let in_scope = |purl: &str| {
+        only.is_none_or(|list| {
+            socket_patch_core::crawlers::Ecosystem::from_purl(purl)
+                .is_some_and(|eco| list.iter().any(|name| name == eco.cli_name()))
+        })
+    };
     for entry in &entries {
-        if crawled_purls.contains(entry.purl.as_str()) {
+        if crawled_purls.contains(entry.purl.as_str()) || !in_scope(&entry.purl) {
             continue;
         }
         let Some(pkg) = crawled_from_purl(&entry.purl, &common.cwd) else {
@@ -2038,7 +2050,11 @@ mod tests {
                 "pkg:npm/lockonly@1.0.0",
                 std::path::PathBuf::from("/nonexistent"),
             ),
-            crawled_pkg("alpha", "pkg:npm/alpha@1.0.0", installed("alpha", "alpha.js")),
+            crawled_pkg(
+                "alpha",
+                "pkg:npm/alpha@1.0.0",
+                installed("alpha", "alpha.js"),
+            ),
             crawled_pkg(
                 "embedded",
                 "pkg:npm/embedded@1.0.0",

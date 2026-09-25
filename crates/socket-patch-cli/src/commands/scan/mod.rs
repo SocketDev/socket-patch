@@ -30,7 +30,7 @@ use std::path::Path;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::vex::{generate_vex_from_manifest_path, VexEmbedArgs};
-use crate::ecosystem_dispatch::{crawl_all_ecosystems, crawl_all_ecosystems_with_npm};
+use crate::ecosystem_dispatch::{crawl_ecosystems, crawl_ecosystems_with_npm};
 use crate::ui::{self, plural, print_json, StatusLine};
 
 use super::get::{download_and_apply_patches_with, select_patches, DownloadParams, DownloadRun};
@@ -188,7 +188,11 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
         return Err(format!(
             "{} cannot be used with --mode hosted: global installs have no project \
              lockfile to redirect",
-            if args.common.global { "--global" } else { "--global-prefix" },
+            if args.common.global {
+                "--global"
+            } else {
+                "--global-prefix"
+            },
         ));
     }
     if args.detached && args.mode != Some(ScanMode::Vendored) {
@@ -401,7 +405,10 @@ async fn embed_vex_human(
     // Dry-run twin of the JSON guard above: no generation, no file write.
     if common.dry_run {
         if !common.silent {
-            println!("{}", crate::commands::vex::format_vex_dry_run_skip("applied"));
+            println!(
+                "{}",
+                crate::commands::vex::format_vex_dry_run_skip("applied")
+            );
         }
         return base_code;
     }
@@ -1584,16 +1591,27 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     let mut status = StatusLine::stderr(args.common.json, args.common.silent);
     status.set(format!("Scanning {scan_target}..."));
 
+    // Which ecosystems to crawl. `--ecosystems` narrows everything this
+    // run counts, queries and shows to the named ecosystems, so without a
+    // GC the other crawlers' output would only be filtered away below: they
+    // are not run at all. `--prune` / `--sync` still crawl everything — the
+    // GC judges every manifest entry against the FULL installed set (see
+    // `scanned_purls`), and a skipped ecosystem would read as uninstalled.
+    let crawl_scope = if prune {
+        None
+    } else {
+        args.common.ecosystems.as_deref()
+    };
+
     // Crawl packages. Vendored mode keeps the npm half: its engine
     // resolves the same untouched tree and reuses this crawl instead of
-    // walking `node_modules` again. No other mode reads the snapshot, so
-    // no other mode pays for copying it.
+    // walking `node_modules` again (no snapshot when npm was not crawled).
+    // No other mode reads the snapshot, so no other mode pays for copying
+    // it.
     let (mut all_crawled, mut eco_counts, skipped_bundle_config_path, npm_crawl) = if vendor {
-        let (packages, counts, skipped, snapshot) =
-            crawl_all_ecosystems_with_npm(&crawler_options).await;
-        (packages, counts, skipped, Some(snapshot))
+        crawl_ecosystems_with_npm(&crawler_options, crawl_scope).await
     } else {
-        let (packages, counts, skipped) = crawl_all_ecosystems(&crawler_options).await;
+        let (packages, counts, skipped) = crawl_ecosystems(&crawler_options, crawl_scope).await;
         (packages, counts, skipped, None)
     };
 
@@ -1601,7 +1619,10 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // that have NO installed copy (fresh clone, partial install). They join
     // discovery — counts, API lookup, table, the prune "scanned" set — and
     // are flagged "not yet installed" everywhere a user could act on them.
-    let lockfile_only = lockfile_supplement(&args.common, &all_crawled).await;
+    // Scoped to the crawled ecosystems: a skipped ecosystem's lockfile
+    // entries have no crawl to be measured against, and `--ecosystems`
+    // filters them out of this run anyway.
+    let lockfile_only = lockfile_supplement(&args.common, &all_crawled, crawl_scope).await;
     // Discovery diagnoses unsupported installation layouts and malformed
     // binary Bun locks. Preserve these on empty scans too: an unreadable
     // graph is not evidence that a fresh checkout has no dependencies.
@@ -1668,7 +1689,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // and delete it (plus its blobs) — silent cross-ecosystem data loss.
     // Lockfile-only purls are deliberately included: a dependency the
     // lockfile still resolves must not be pruned just because node_modules
-    // is wiped or partially installed.
+    // is wiped or partially installed. (This is why a GC run never scopes
+    // the crawl — see `crawl_scope`; a scoped run reads this set nowhere.)
     let scanned_purls: HashSet<String> = all_crawled.iter().map(|p| p.purl.clone()).collect();
 
     // Vendor-ledger purl keys (from the single load above), shared by the
@@ -1720,7 +1742,11 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                     } else {
                         format!("{excluded_supplements} lockfile-only/vendor-ledger packages have")
                     },
-                    if excluded_supplements == 1 { "was" } else { "were" },
+                    if excluded_supplements == 1 {
+                        "was"
+                    } else {
+                        "were"
+                    },
                 ),
             ));
         }
@@ -2591,9 +2617,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
 
         // The rule is as wide as the table, but never wraps a terminal.
         let header = render::table_header(purl_w);
-        let cap = std::io::stdout()
-            .is_terminal()
-            .then(ui::stdout_width);
+        let cap = std::io::stdout().is_terminal().then(ui::stdout_width);
         let rule = render::ruler(
             std::iter::once(header.as_str()).chain(rows.iter().map(String::as_str)),
             cap,
@@ -2835,8 +2859,10 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             println!("\nPatches to apply:\n");
         }
         for patch in &selected {
-            let severity =
-                ui::severity(render::highest_severity(patch).unwrap_or("unknown"), use_color);
+            let severity = ui::severity(
+                render::highest_severity(patch).unwrap_or("unknown"),
+                use_color,
+            );
             // The manifest already records a different patch for this
             // package: say so, and warn when the new one fixes less. Agent
             // mode only: vendored mode never writes the manifest.
@@ -2972,10 +2998,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // Download, then apply in place — or vendor (vendored mode, where the
     // download only saves and the vendor step below does the rest).
     let params = download_params(
-        &args,
-        /*save_only=*/ vendor,
-        /*json=*/ false,
-        silent,
+        &args, /*save_only=*/ vendor, /*json=*/ false, silent,
     );
 
     let code = if vendor {

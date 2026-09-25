@@ -1243,6 +1243,16 @@ into the new version's section — see docs/releasing.md.
   before. One semantic change: a hand-placed POM at a canonical path whose
   contents disagree with its directory now reports the directory's
   coordinates instead of the ones in the file.
+- **`scan --ecosystems` crawls only the named ecosystems.** Without
+  `--prune`/`--sync`, a `scan -e npm` no longer walks `~/.m2`, the cargo
+  registry, the Go module cache and the rest only to filter their packages
+  away. What the run counts, queries and shows is unchanged
+  (`scannedPackages` already counted only the selected ecosystems), with
+  one exception: `lockfileOnlyPackages` and the human "not yet installed"
+  note now count only the selected ecosystems' lockfile-only entries
+  instead of every ecosystem's. A GC run (`--prune`/`--sync`) still crawls
+  every ecosystem — the prune needs the full installed set — and reports
+  exactly what it did before.
 - **Release publishing decomposed into per-registry workflows.** The
   crates.io, npm, PyPI, and RubyGems legs of the `Release` workflow now live
   in their own workflows

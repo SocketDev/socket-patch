@@ -639,13 +639,31 @@ pub async fn crawl_all_ecosystems(
     HashMap<Ecosystem, usize>,
     Option<String>,
 ) {
-    let (packages, counts, skipped_config_path, _) = crawl_every_ecosystem(options).await;
+    crawl_ecosystems(options, None).await
+}
+
+/// [`crawl_all_ecosystems`] over only the ecosystems `only` names
+/// (`--ecosystems` spellings; `None` crawls every one). A crawler that is
+/// not selected never runs: it contributes no packages and no `counts`
+/// entry. Each crawler reports only its own ecosystem's purls, so the
+/// selected ecosystems' packages, their order and their counts are exactly
+/// the full crawl's.
+pub async fn crawl_ecosystems(
+    options: &CrawlerOptions,
+    only: Option<&[String]>,
+) -> (
+    Vec<CrawledPackage>,
+    HashMap<Ecosystem, usize>,
+    Option<String>,
+) {
+    let (packages, counts, skipped_config_path, _) = crawl_every_ecosystem(options, only).await;
     (packages, counts, skipped_config_path)
 }
 
 /// [`crawl_all_ecosystems`], also handing back the npm half of the crawl as
 /// an [`NpmCrawlSnapshot`] (its packages are the leading `counts[Npm]`
 /// entries of the package list).
+#[cfg(test)]
 pub async fn crawl_all_ecosystems_with_npm(
     options: &CrawlerOptions,
 ) -> (
@@ -654,22 +672,48 @@ pub async fn crawl_all_ecosystems_with_npm(
     Option<String>,
     NpmCrawlSnapshot,
 ) {
-    let (packages, counts, skipped_config_path, npm_roots) = crawl_every_ecosystem(options).await;
-    let npm_count = counts.get(&Ecosystem::Npm).copied().unwrap_or(0);
-    let snapshot = NpmCrawlSnapshot {
-        cwd: options.cwd.clone(),
-        global: options.global,
-        global_prefix: options.global_prefix.clone(),
-        roots: npm_roots,
-        packages: packages[..npm_count].to_vec(),
-    };
+    let (packages, counts, skipped_config_path, snapshot) =
+        crawl_ecosystems_with_npm(options, None).await;
+    let snapshot = snapshot.expect("a crawl of every ecosystem crawls npm");
     (packages, counts, skipped_config_path, snapshot)
 }
 
-/// The crawl behind both entry points above; the fourth element is the npm
-/// crawler's `node_modules` roots.
+/// [`crawl_ecosystems`], also handing back the npm half of the crawl as an
+/// [`NpmCrawlSnapshot`] — `None` when `only` leaves npm out, so nothing
+/// mistakes the skipped crawl for an empty `node_modules`.
+pub async fn crawl_ecosystems_with_npm(
+    options: &CrawlerOptions,
+    only: Option<&[String]>,
+) -> (
+    Vec<CrawledPackage>,
+    HashMap<Ecosystem, usize>,
+    Option<String>,
+    Option<NpmCrawlSnapshot>,
+) {
+    let (packages, counts, skipped_config_path, npm_roots) =
+        crawl_every_ecosystem(options, only).await;
+    let snapshot = counts
+        .get(&Ecosystem::Npm)
+        .map(|&npm_count| NpmCrawlSnapshot {
+            cwd: options.cwd.clone(),
+            global: options.global,
+            global_prefix: options.global_prefix.clone(),
+            roots: npm_roots,
+            packages: packages[..npm_count].to_vec(),
+        });
+    (packages, counts, skipped_config_path, snapshot)
+}
+
+/// Whether a crawl limited to `only` visits `eco` (`None`: every one).
+fn crawl_selects(only: Option<&[String]>, eco: Ecosystem) -> bool {
+    only.is_none_or(|list| list.iter().any(|name| name == eco.cli_name()))
+}
+
+/// The crawl behind the entry points above; the fourth element is the npm
+/// crawler's `node_modules` roots (empty when npm was not selected).
 async fn crawl_every_ecosystem(
     options: &CrawlerOptions,
+    only: Option<&[String]>,
 ) -> (
     Vec<CrawledPackage>,
     HashMap<Ecosystem, usize>,
@@ -686,41 +730,59 @@ async fn crawl_every_ecosystem(
     // they run one at a time instead, keeping the serial run's descriptor
     // profile (see `walk_pool`): a crawler treats a failed open as an
     // absent dir, so extra concurrent descriptors could silently drop
-    // packages there.
-    let (
-        (npm, npm_roots),
-        pypi,
-        cargo,
-        (gems, gem_discovery),
-        golang,
-        maven,
-        composer,
-        nuget,
-        deno,
-    ) = if walk_pool::fd_limit_is_tight() {
-        (
-            boxed(|| NpmCrawler.crawl_all_with_roots(options)).await,
-            boxed(|| PythonCrawler.crawl_all(options)).await,
-            boxed(|| CargoCrawler.crawl_all(options)).await,
-            boxed(|| RubyCrawler.crawl_all_with_discovery(options)).await,
-            boxed(|| GoCrawler.crawl_all(options)).await,
-            boxed(|| MavenCrawler.crawl_all(options)).await,
-            boxed(|| ComposerCrawler.crawl_all(options)).await,
-            boxed(|| NuGetCrawler.crawl_all(options)).await,
-            boxed(|| DenoCrawler.crawl_all(options)).await,
-        )
-    } else {
-        tokio::join!(
-            boxed(|| NpmCrawler.crawl_all_with_roots(options)),
-            boxed(|| PythonCrawler.crawl_all(options)),
-            boxed(|| CargoCrawler.crawl_all(options)),
-            boxed(|| RubyCrawler.crawl_all_with_discovery(options)),
-            boxed(|| GoCrawler.crawl_all(options)),
-            boxed(|| MavenCrawler.crawl_all(options)),
-            boxed(|| ComposerCrawler.crawl_all(options)),
-            boxed(|| NuGetCrawler.crawl_all(options)),
-            boxed(|| DenoCrawler.crawl_all(options)),
-        )
+    // packages there. A crawler `only` leaves out resolves to its empty
+    // result without running.
+    macro_rules! crawl {
+        ($eco:expr, $crawl:expr) => {
+            boxed(move || async move {
+                if crawl_selects(only, $eco) {
+                    Some($crawl.await)
+                } else {
+                    None
+                }
+            })
+        };
+    }
+    let (npm, pypi, cargo, gems, golang, maven, composer, nuget, deno) =
+        if walk_pool::fd_limit_is_tight() {
+            (
+                crawl!(Ecosystem::Npm, NpmCrawler.crawl_all_with_roots(options)).await,
+                crawl!(Ecosystem::Pypi, PythonCrawler.crawl_all(options)).await,
+                crawl!(Ecosystem::Cargo, CargoCrawler.crawl_all(options)).await,
+                crawl!(
+                    Ecosystem::Gem,
+                    RubyCrawler.crawl_all_with_discovery(options)
+                )
+                .await,
+                crawl!(Ecosystem::Golang, GoCrawler.crawl_all(options)).await,
+                crawl!(Ecosystem::Maven, MavenCrawler.crawl_all(options)).await,
+                crawl!(Ecosystem::Composer, ComposerCrawler.crawl_all(options)).await,
+                crawl!(Ecosystem::Nuget, NuGetCrawler.crawl_all(options)).await,
+                crawl!(Ecosystem::Deno, DenoCrawler.crawl_all(options)).await,
+            )
+        } else {
+            tokio::join!(
+                crawl!(Ecosystem::Npm, NpmCrawler.crawl_all_with_roots(options)),
+                crawl!(Ecosystem::Pypi, PythonCrawler.crawl_all(options)),
+                crawl!(Ecosystem::Cargo, CargoCrawler.crawl_all(options)),
+                crawl!(
+                    Ecosystem::Gem,
+                    RubyCrawler.crawl_all_with_discovery(options)
+                ),
+                crawl!(Ecosystem::Golang, GoCrawler.crawl_all(options)),
+                crawl!(Ecosystem::Maven, MavenCrawler.crawl_all(options)),
+                crawl!(Ecosystem::Composer, ComposerCrawler.crawl_all(options)),
+                crawl!(Ecosystem::Nuget, NuGetCrawler.crawl_all(options)),
+                crawl!(Ecosystem::Deno, DenoCrawler.crawl_all(options)),
+            )
+        };
+    let (npm, npm_roots) = match npm {
+        Some((packages, roots)) => (Some(packages), roots),
+        None => (None, Vec::new()),
+    };
+    let (gems, gem_discovery) = match gems {
+        Some((packages, discovery)) => (Some(packages), discovery),
+        None => (None, None),
     };
 
     let mut all_packages = Vec::new();
@@ -736,6 +798,9 @@ async fn crawl_every_ecosystem(
         (Ecosystem::Nuget, nuget),
         (Ecosystem::Deno, deno),
     ] {
+        let Some(pkgs) = pkgs else {
+            continue;
+        };
         counts.insert(eco, pkgs.len());
         all_packages.extend(pkgs);
     }
@@ -1690,6 +1755,77 @@ mod tests {
         dir(root.join("nugetlib").join("5.0.0").join("lib"));
         // deno (jsr): <root>/@<scope>/<name>/<version>/
         dir(root.join("@denoscope").join("jsrlib").join("6.0.0"));
+    }
+
+    /// A crawl scoped to some ecosystems runs only their crawlers — a
+    /// skipped one leaves no `counts` entry, the pin that it never ran —
+    /// and yields exactly the full crawl's packages of those ecosystems,
+    /// in the full crawl's order, with the full crawl's counts. Scoped to
+    /// every ecosystem (or `None`) it IS the full crawl. The npm snapshot
+    /// exists exactly when npm was crawled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scoped_crawl_is_the_full_crawl_filtered_to_its_ecosystems() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        stage_every_ecosystem(root);
+        let options = CrawlerOptions {
+            cwd: root.to_path_buf(),
+            global: false,
+            global_prefix: Some(root.to_path_buf()),
+        };
+        let key = |p: &CrawledPackage| (p.purl.clone(), p.path.clone());
+        let (full, full_counts, _, full_snapshot) = crawl_all_ecosystems_with_npm(&options).await;
+        assert_eq!(full_counts.len(), Ecosystem::all().len());
+
+        let every: Vec<String> = Ecosystem::all()
+            .iter()
+            .map(|e| e.cli_name().to_string())
+            .collect();
+        let mut scopes: Vec<Vec<String>> = every.iter().map(|e| vec![e.clone()]).collect();
+        scopes.push(vec!["maven".into(), "npm".into()]);
+        scopes.push(vec!["pypi".into(), "deno".into(), "gem".into()]);
+        scopes.push(every.clone());
+        for scope in &scopes {
+            let selected = |eco: &Ecosystem| scope.iter().any(|name| name == eco.cli_name());
+            let (packages, counts, _, snapshot) =
+                crawl_ecosystems_with_npm(&options, Some(scope)).await;
+            let expected: Vec<_> = full
+                .iter()
+                .filter(|p| Ecosystem::from_purl(&p.purl).is_some_and(|e| selected(&e)))
+                .map(key)
+                .collect();
+            assert_eq!(
+                packages.iter().map(key).collect::<Vec<_>>(),
+                expected,
+                "{scope:?}"
+            );
+            let expected_counts: HashMap<Ecosystem, usize> = full_counts
+                .iter()
+                .filter(|(eco, _)| selected(eco))
+                .map(|(eco, n)| (*eco, *n))
+                .collect();
+            assert_eq!(counts, expected_counts, "{scope:?}");
+            assert_eq!(
+                snapshot.is_some(),
+                scope.iter().any(|name| name == "npm"),
+                "{scope:?}"
+            );
+            if let Some(snapshot) = snapshot {
+                assert_eq!(snapshot.roots, full_snapshot.roots, "{scope:?}");
+                assert_eq!(
+                    snapshot.packages.iter().map(key).collect::<Vec<_>>(),
+                    full_snapshot.packages.iter().map(key).collect::<Vec<_>>(),
+                    "{scope:?}"
+                );
+            }
+        }
+
+        let (unscoped, unscoped_counts, _) = crawl_ecosystems(&options, None).await;
+        assert_eq!(
+            unscoped.iter().map(key).collect::<Vec<_>>(),
+            full.iter().map(key).collect::<Vec<_>>()
+        );
+        assert_eq!(unscoped_counts, full_counts);
     }
 
     /// The concurrent crawl must yield exactly the serial run's packages,
