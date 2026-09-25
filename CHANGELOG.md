@@ -624,6 +624,15 @@ into the new version's section — see docs/releasing.md.
   `hosted_revert_unsupported` before the manifest mutation), and remove's
   default GC extends from blobs-only to blobs + diff + package archives
   (parity with rollback/repair/`scan --prune`).
+- **`SOCKET_API_CONCURRENCY` paces `scan`'s patch-API requests.** `scan`
+  now keeps several patch-API requests in flight (8 authenticated, 4 on the
+  public proxy) instead of one at a time. Set this variable — clamped to
+  `1`-`32`, and on the public proxy only downward — when something in front
+  of the API caps in-flight requests per client (a self-hosted `--api-url`,
+  a corporate reverse proxy, a WAF, a CDN) and a scan starts losing
+  requests to it. `SOCKET_API_CONCURRENCY=1` restores one request at a
+  time. Unset, empty or non-numeric values keep the defaults. Results,
+  warnings and their order never depend on the setting.
 
 ### Fixed
 

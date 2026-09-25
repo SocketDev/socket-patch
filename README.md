@@ -531,6 +531,16 @@ warning — it never breaks a command or pollutes `--json` output. `socket-patch
 cloned repo must never be able to redirect where patches come from or spend your token.
 (Full rationale: [docs/design/configuration.md](docs/design/configuration.md).)
 
+One more env-only knob tunes *pacing* rather than routing. `scan` queries the patch API
+with several requests in flight (8 against the authenticated endpoint, 4 against the
+public proxy, which shares one server-side limit across anonymous callers).
+`SOCKET_API_CONCURRENCY=<n>` overrides that, clamped to `1`-`32`; on the public proxy it
+can only lower it. Set it when an endpoint in front of the API caps in-flight requests
+per client — a self-hosted `--api-url`, a corporate reverse proxy, a WAF or a CDN — and
+a scan starts reporting fewer patches than it should because some requests are being
+rejected. `SOCKET_API_CONCURRENCY=1` sends one request at a time, the slowest and most
+conservative setting. An unset, empty or non-numeric value leaves the defaults in place.
+
 The sections below list only each command's **command-specific** flags.
 
 ### `scan`
