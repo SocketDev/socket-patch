@@ -645,7 +645,29 @@ pub async fn revert_remaining_redirect_edits(
                     if *group == "cargo" {
                         let every = inverse == Inverse::ReplaceEveryFragment;
                         let lf = |t: &str| t.replace("\r\n", "\n");
-                        if !every && lf(&content).matches(&lf(new)).count() > 1 {
+                        // ONE scan legitimately records identical cargo
+                        // edits (a manifest declaring the crate with the
+                        // same line in two sections), and each one unwinds
+                        // one occurrence — what `revert_cargo_redirect_purl`
+                        // does over this same ledger. So the file may hold
+                        // as many occurrences as there are identical edits
+                        // left to spend on them; only a surplus is
+                        // ambiguous.
+                        let twins = indices
+                            .iter()
+                            .filter(|&&i| {
+                                let other = &state.edits[i];
+                                !group_drops.contains(&i)
+                                    && other.path == edit.path
+                                    && other.kind == edit.kind
+                                    && other.action == edit.action
+                                    && other.key == edit.key
+                                    && other.original == edit.original
+                                    && other.new == edit.new
+                            })
+                            .count()
+                            .max(1);
+                        if !every && lf(&content).matches(&lf(new)).count() > twins {
                             refuse(
                                 format!(
                                     "{}: the redirected fragment appears more than once — \
@@ -1845,6 +1867,52 @@ mod tests {
         assert_eq!(out.refusals.len(), 1, "{out:?}");
         assert!(out.refusals[0].reason.contains("drifted"));
         assert_eq!(state.edits.len(), 1, "the edit must survive for a retry");
+    }
+
+    /// ONE scan records one cargo edit per OCCURRENCE, so a manifest that
+    /// declares the crate with the same line in two sections leaves two
+    /// IDENTICAL edits in the ledger. The whole-ledger replay — the
+    /// records-empty path a degraded (record-fetch-failed) run leaves
+    /// behind — must spend one edit per occurrence, exactly as the per-purl
+    /// `revert_cargo_redirect_purl` does over the same ledger. An
+    /// occurrence no edit accounts for is still ambiguous and refuses.
+    #[tokio::test]
+    async fn identical_cargo_edits_each_unwind_one_occurrence() {
+        let plain = "cfg-if = \"1\"";
+        let pinned = "cfg-if = { version = \"1\", registry = \"socket-patch-u\" }";
+        let two = |line: &str| format!("[dependencies]\n{line}\n\n[dev-dependencies]\n{line}\n");
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "Cargo.toml", &two(pinned)).await;
+        let cargo_edit = || {
+            edit(
+                "Cargo.toml",
+                "redirect_cargo_toml_dep",
+                "rewritten",
+                Some(plain),
+                Some(pinned),
+            )
+        };
+        let mut state = state_with(vec![cargo_edit(), cargo_edit()], &[]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{:?}", out.refusals);
+        assert_eq!(read(dir.path(), "Cargo.toml").await, two(plain));
+        assert!(state.edits.is_empty(), "{:?}", state.edits);
+
+        // A THIRD occurrence with only two edits to spend: nothing says
+        // which one the ledger owns, so the group refuses byte-untouched.
+        let dir = TempDir::new().unwrap();
+        let surplus = format!("{}\n[build-dependencies]\n{pinned}\n", two(pinned));
+        write(dir.path(), "Cargo.toml", &surplus).await;
+        let mut state = state_with(vec![cargo_edit(), cargo_edit()], &[]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert!(
+            out.refusals[0].reason.contains("more than once"),
+            "{:?}",
+            out.refusals[0]
+        );
+        assert_eq!(read(dir.path(), "Cargo.toml").await, surplus);
+        assert_eq!(state.edits.len(), 2);
     }
 
     #[tokio::test]
