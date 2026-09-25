@@ -388,7 +388,13 @@ pub(crate) fn read_zip_members(bytes: &[u8]) -> Result<Vec<ArchiveMember>, Strin
         }
         let exec = file.unix_mode().is_some_and(|m| m & 0o111 != 0);
         match at.get(&rel_str) {
-            // A repeated name overwrote the earlier extraction in place.
+            // A repeated name overwrote the earlier extraction in place. Two
+            // entries whose RAW name bytes are identical never get this far —
+            // `ZipArchive` keys its central directory on them in an `IndexMap`
+            // and already collapsed the pair, last-wins, at the first index —
+            // so what lands here is two raw spellings that DECODE to one name
+            // (`String::from_utf8_lossy` folds distinct invalid bytes onto
+            // U+FFFD), which `extract_zip` writes to one path just the same.
             Some(&i) => {
                 members[i].bytes = content;
                 members[i].exec = exec;
@@ -2489,12 +2495,87 @@ mod tests {
         // and rename the second in place (local header + central directory).
         let mut archive = build_zip(&[entry("dup.txt", b"first"), entry("dup2txt", b"second")]);
         rename_zip_entry(&mut archive, b"dup2txt", b"dup.txt");
+        // WHERE the pair collapses is the zip crate's business: it keys the
+        // central directory on the RAW name bytes in an `IndexMap`, so
+        // `ZipArchive` hands out one entry, at the first one's index, before
+        // `read_zip_members` sees it. Pinned here so a crate bump that stops
+        // doing it is caught rather than silently changing what the rebuild
+        // carries.
+        assert_eq!(
+            zip::ZipArchive::new(std::io::Cursor::new(archive.clone()))
+                .unwrap()
+                .len(),
+            1,
+            "the zip crate collapses identical raw names itself"
+        );
         let members = read_zip_members(&archive).unwrap();
         assert_eq!(members.len(), 1, "the repeat collapses, as on disk");
         assert_eq!(members[0].bytes, b"second");
         let bytes = assert_repacks_agree(&archive, &["dup.txt"], &[], None, async |_| {}).await;
         assert_eq!(zip_entry_names(&bytes), ["dup.txt"]);
         assert_eq!(zip_member(&bytes, "dup.txt"), b"second");
+    }
+
+    /// The collapse `read_zip_members` does itself: two DIFFERENT raw names
+    /// that decode to one (`from_utf8_lossy` folds distinct invalid bytes onto
+    /// U+FFFD), which the zip crate keeps apart and `extract_zip` writes to a
+    /// single path — last one wins, exactly as the reader's `at` map does.
+    #[tokio::test]
+    async fn raw_names_decoding_to_one_name_collapse_last_one_wins() {
+        let mut archive = build_zip(&[entry("dupA.txt", b"first"), entry("dupB.txt", b"second")]);
+        rename_zip_entry(&mut archive, b"dupA.txt", b"dup\xff.txt");
+        rename_zip_entry(&mut archive, b"dupB.txt", b"dup\xfe.txt");
+        // Without the language-encoding flag the names decode through CP437,
+        // which is a bijection — the lossy fold needs the UTF-8 flag set.
+        set_utf8_name_flag(&mut archive);
+        let decoded = "dup\u{fffd}.txt";
+        assert_eq!(
+            zip::ZipArchive::new(std::io::Cursor::new(archive.clone()))
+                .unwrap()
+                .len(),
+            2,
+            "the raw names differ, so the zip crate keeps both entries"
+        );
+        let members = read_zip_members(&archive).unwrap();
+        assert_eq!(members.len(), 1, "but they name one file");
+        assert_eq!(members[0].name, decoded);
+        assert_eq!(members[0].bytes, b"second");
+        // And that is what an extraction leaves behind.
+        let stage = tempfile::tempdir().unwrap();
+        super::super::registry_fetch::extract_zip(&archive, stage.path(), false).unwrap();
+        assert_eq!(
+            tokio::fs::read(stage.path().join(decoded)).await.unwrap(),
+            b"second"
+        );
+        // The name is not plain ASCII, so the rebuild itself takes the
+        // extract-to-disk path — the reader still has to agree about it,
+        // because it runs before the gate does.
+        assert!(
+            prepare_memory_repack(&archive, &target_files(&["dup.txt"]), &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Set the general-purpose "language encoding" bit (bit 11) on every local
+    /// file header and central directory header, so the reader decodes entry
+    /// names as UTF-8 instead of CP437.
+    fn set_utf8_name_flag(archive: &mut [u8]) {
+        for (signature, flags_at) in [(b"PK\x03\x04".as_slice(), 6), (b"PK\x01\x02".as_slice(), 8)]
+        {
+            let mut at = 0;
+            let mut hits = 0;
+            while at + flags_at + 2 <= archive.len() {
+                if archive[at..].starts_with(signature) {
+                    archive[at + flags_at + 1] |= 0b0000_1000;
+                    hits += 1;
+                    at += signature.len();
+                } else {
+                    at += 1;
+                }
+            }
+            assert_eq!(hits, 2, "two entries, one header of each kind apiece");
+        }
     }
 
     /// A member no filesystem can create: the extraction fails the whole
