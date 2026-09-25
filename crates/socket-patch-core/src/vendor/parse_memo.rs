@@ -15,7 +15,8 @@
 //! write the memo never heard about changes the bytes, the next read sees
 //! them differ, and the slot is refilled. Backends still re-seed the slot
 //! with what they themselves wrote ([`ParseMemo::store`]) so the next
-//! package hits, and drop it ([`ParseMemo::invalidate`]) where a write
+//! package hits, and drop it ([`ParseMemo::invalidate`], or
+//! [`ParseMemo::forget`] for one file of a multi-slot site) where a write
 //! leaves bytes nobody holds.
 //!
 //! **Contract:** the parse handed to a memo must be a pure function of the
@@ -111,6 +112,17 @@ impl<T, const N: usize> ParseMemo<T, N> {
             .clear();
     }
 
+    /// [`Self::invalidate`] for ONE file of a multi-slot site: forget the
+    /// slot holding `bytes` and leave the others alone. A site that writes
+    /// one of the files it memoized uses this so the ones it did not write
+    /// keep hitting.
+    pub(crate) fn forget(&self, bytes: &[u8]) {
+        self.slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(cached, _)| cached != bytes);
+    }
+
     fn put(&self, bytes: Vec<u8>, doc: Arc<T>) {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         slots.retain(|(cached, _)| cached != &bytes);
@@ -182,6 +194,22 @@ mod tests {
         assert!(memo.get(b"a").is_some());
         memo.invalidate();
         assert!(memo.get(b"a").is_none());
+    }
+
+    /// A site that writes ONE of the files it memoized drops that slot and
+    /// keeps the others: npm 12's dual-lock state rewrites the lock that
+    /// holds the match and leaves the other exactly as parsed.
+    #[test]
+    fn forget_drops_one_slot_and_leaves_the_rest() {
+        let memo: ParseMemo<String, 2> = ParseMemo::new();
+        memo.store(b"primary".to_vec(), "P".to_string());
+        memo.store(b"sibling".to_vec(), "S".to_string());
+        memo.forget(b"sibling");
+        assert!(memo.get(b"sibling").is_none());
+        assert_eq!(memo.get(b"primary").as_deref(), Some(&"P".to_string()));
+        // Bytes no slot holds: a no-op, not a clear.
+        memo.forget(b"neither");
+        assert!(memo.get(b"primary").is_some());
     }
 
     /// A one-slot memo holds only the newest bytes; the site that reads a

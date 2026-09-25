@@ -382,8 +382,17 @@ pub async fn vendor_npm<'a>(
     // left resolving through an artifact the unstage removes.
     let mut written: Vec<(&str, &[u8])> = Vec::new();
     let mut write_err: Option<String> = None;
-    // Dropped before the first write, so a torn one leaves nothing behind.
-    LOCK_MEMO.invalidate();
+    // Dropped before the first write, so a torn one leaves nothing behind —
+    // but only for the locks about to be written. In npm 12's dual-lock
+    // state only one of the two may hold a match, and the one nobody writes
+    // is still on disk exactly as parsed: dropping it too would make every
+    // later package re-parse a lock this run never touched.
+    for (_, original, _) in &sibling_writes {
+        LOCK_MEMO.forget(original);
+    }
+    if primary_changed {
+        LOCK_MEMO.forget(&lock_bytes);
+    }
     for (sib_name, original, out) in &sibling_writes {
         if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(sib_name), out).await
         {
