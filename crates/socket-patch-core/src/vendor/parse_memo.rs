@@ -24,25 +24,30 @@
 //! parse that also consulted its path, the environment or the clock would
 //! be memoized against the wrong input.
 //!
-//! One slot per call site: a run wires one lock per backend, so a single
-//! `(bytes, doc)` pair is all any run reaches for and the memo can never
-//! grow. The document is handed out behind an `Arc`, so the read-only
-//! probes — the idempotent hot path a re-run is made of — never copy it,
-//! and the callers that mutate clone it exactly as a parse would have
-//! allocated it.
+//! One slot per call site by default: a run wires one lock per backend, so
+//! a single `(bytes, doc)` pair is all most runs reach for and the memo can
+//! never grow. A site that reads a SET of files in one pass (a project's
+//! PEP 751 locks, the two cargo config spellings) asks for as many slots as
+//! that set can hold, which is the only reason the count is a parameter —
+//! more slots mean more retained documents.
+//!
+//! The document is handed out behind an `Arc`, so the read-only probes —
+//! the idempotent hot path a re-run is made of — never copy it, and the
+//! callers that mutate clone it exactly as a parse would have allocated
+//! it.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// One memoized `bytes -> document` slot. Declared as a `static` next to
-/// the read it serves; see the module docs.
-pub(crate) struct ParseMemo<T> {
-    slot: Mutex<Option<(Vec<u8>, Arc<T>)>>,
+/// Up to `N` memoized `bytes -> document` slots, most recent first.
+/// Declared as a `static` next to the read it serves; see the module docs.
+pub(crate) struct ParseMemo<T, const N: usize = 1> {
+    slots: Mutex<Vec<(Vec<u8>, Arc<T>)>>,
 }
 
-impl<T> ParseMemo<T> {
+impl<T, const N: usize> ParseMemo<T, N> {
     pub(crate) const fn new() -> Self {
         Self {
-            slot: Mutex::new(None),
+            slots: Mutex::new(Vec::new()),
         }
     }
 
@@ -73,11 +78,12 @@ impl<T> ParseMemo<T> {
         doc
     }
 
-    /// The cached document, but only when the slot holds exactly `bytes`.
+    /// The cached document, but only when a slot holds exactly `bytes`.
     pub(crate) fn get(&self, bytes: &[u8]) -> Option<Arc<T>> {
-        let slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
-        slot.as_ref()
-            .filter(|(cached, _)| cached == bytes)
+        let slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        slots
+            .iter()
+            .find(|(cached, _)| cached == bytes)
             .map(|(_, doc)| Arc::clone(doc))
     }
 
@@ -99,11 +105,17 @@ impl<T> ParseMemo<T> {
     /// file, a revert that restores the pre-vendor original) stops the memo
     /// from holding a document nothing will hit again.
     pub(crate) fn invalidate(&self) {
-        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     fn put(&self, bytes: Vec<u8>, doc: Arc<T>) {
-        *self.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some((bytes, doc));
+        let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        slots.retain(|(cached, _)| cached != &bytes);
+        slots.insert(0, (bytes, doc));
+        slots.truncate(N);
     }
 }
 
@@ -164,12 +176,46 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_drops_the_slot() {
+    fn invalidate_drops_every_slot() {
         let memo = memo();
         memo.store(b"a".to_vec(), "A".to_string());
         assert!(memo.get(b"a").is_some());
         memo.invalidate();
         assert!(memo.get(b"a").is_none());
+    }
+
+    /// A one-slot memo holds only the newest bytes; the site that reads a
+    /// SET of files in one pass asks for a slot per file so alternating
+    /// reads do not evict each other.
+    #[test]
+    fn slot_count_bounds_what_is_remembered() {
+        let one: ParseMemo<String> = ParseMemo::new();
+        one.store(b"a".to_vec(), "A".to_string());
+        one.store(b"b".to_vec(), "B".to_string());
+        assert!(one.get(b"a").is_none());
+        assert!(one.get(b"b").is_some());
+
+        let two: ParseMemo<String, 2> = ParseMemo::new();
+        two.store(b"a".to_vec(), "A".to_string());
+        two.store(b"b".to_vec(), "B".to_string());
+        assert!(two.get(b"a").is_some());
+        assert!(two.get(b"b").is_some());
+        two.store(b"c".to_vec(), "C".to_string());
+        assert!(two.get(b"a").is_none(), "the oldest slot is evicted");
+        assert!(two.get(b"b").is_some());
+        assert!(two.get(b"c").is_some());
+    }
+
+    /// Re-storing bytes a slot already holds must refresh, not duplicate:
+    /// a two-slot memo that saw `a, b, a` still remembers `b`.
+    #[test]
+    fn re_storing_the_same_bytes_does_not_consume_a_second_slot() {
+        let memo: ParseMemo<String, 2> = ParseMemo::new();
+        memo.store(b"a".to_vec(), "A".to_string());
+        memo.store(b"b".to_vec(), "B".to_string());
+        memo.store(b"a".to_vec(), "A".to_string());
+        assert!(memo.get(b"a").is_some());
+        assert!(memo.get(b"b").is_some());
     }
 
     #[test]

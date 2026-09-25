@@ -374,6 +374,7 @@ async fn edit_config(
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => return Err(format!("remove {}: {e}", path.display())),
                     }
+                    CONFIG_MEMO.invalidate();
                     if let Some(parent) = path.parent() {
                         // Best-effort: `remove_dir` only succeeds when the dir
                         // is empty, so a `.cargo/` holding other files (e.g.
@@ -397,6 +398,7 @@ async fn edit_config(
                     atomic_write_bytes_preserving_mode(&path, new.as_bytes())
                         .await
                         .map_err(|e| format!("write {}: {e}", path.display()))?;
+                    CONFIG_MEMO.invalidate();
                 }
             }
             Ok(true)
