@@ -583,8 +583,11 @@ pub(crate) fn can_repack_in_memory<'a>(
 pub(crate) struct MemoryRepack {
     members: Vec<ArchiveMember>,
     at: HashMap<String, usize>,
-    /// The paths materialised in the stage, in sorted order: everything the
-    /// apply pipeline can read, write, create or delete.
+    /// The paths materialised in the stage — everything the apply pipeline
+    /// can read, write, create or delete — in a deterministic order: the
+    /// sorted patch targets, then the extras the caller adds, each once.
+    /// [`Self::stage_into`] and [`Self::into_entries`] both return on the
+    /// first I/O failure, so the order decides which path a failure names.
     wanted: Vec<String>,
 }
 
@@ -632,12 +635,21 @@ pub(crate) fn prepare_memory_repack(
 /// The in-package paths the apply pipeline resolves for `files`: each key
 /// normalized, with the escaping keys the pipeline itself refuses dropped (it
 /// never joins them, so nothing has to be materialised for them either).
+///
+/// SORTED, because `files` is a `HashMap` with a per-process random hasher and
+/// every caller walks this list until the first I/O error: without the sort,
+/// two runs over one package under ENOSPC or EACCES name a different file in
+/// the failure. That is the invariant `patch::apply::files_in_order` states for
+/// the apply itself, and the reason `PatchRecord::files` serializes sorted.
 pub(crate) fn patch_target_paths(files: &HashMap<String, PatchFileInfo>) -> Vec<&str> {
-    files
+    let mut paths: Vec<&str> = files
         .keys()
         .map(|key| normalize_file_path(key))
         .filter(|path| is_safe_relative_subpath(path))
-        .collect()
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    paths
 }
 
 impl MemoryRepack {
@@ -2365,6 +2377,58 @@ mod tests {
                 "{label} must fall back to the on-disk repack"
             );
         }
+    }
+
+    /// `record.files` is a `HashMap` with a per-process random hasher, and
+    /// every walk over the staged paths returns on the FIRST I/O error — so
+    /// without a sort, two runs over one package under ENOSPC or EACCES name a
+    /// different file in the failure that reaches stdout.
+    #[test]
+    fn staged_paths_are_walked_in_a_deterministic_order() {
+        let files = target_files(&[
+            "z.txt",
+            "a/b.txt",
+            "m.txt",
+            "package/m.txt",
+            "d.txt",
+            "q/r.txt",
+            "../escapes.txt",
+        ]);
+        assert_eq!(
+            patch_target_paths(&files),
+            ["a/b.txt", "d.txt", "m.txt", "q/r.txt", "z.txt"],
+            "sorted, deduplicated past `package/`, and without the keys the \
+             apply pipeline refuses to join"
+        );
+    }
+
+    /// And the order survives into the stage, ahead of the extras the caller
+    /// adds for its sidecar fixup.
+    #[tokio::test]
+    async fn the_repack_stages_the_sorted_targets_then_the_extras() {
+        let archive = build_zip(&[
+            entry("z.txt", b"z"),
+            entry("m.txt", b"m"),
+            entry("d.txt", b"d"),
+            entry("a/b.txt", b"b"),
+            entry("q/r.txt", b"r"),
+            entry(".nupkg.metadata", b"{}"),
+        ]);
+        let files = target_files(&["z.txt", "m.txt", "d.txt", "a/b.txt", "q/r.txt"]);
+        let repack = prepare_memory_repack(&archive, &files, &[".nupkg.metadata"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repack.wanted,
+            [
+                "a/b.txt",
+                "d.txt",
+                "m.txt",
+                "q/r.txt",
+                "z.txt",
+                ".nupkg.metadata"
+            ]
+        );
     }
 
     /// A member folding onto one of the sidecar fixup's fixed paths must fall

@@ -386,9 +386,14 @@ pub async fn build_patched_wheel(
     // names can fold into one another on the staging filesystem (a
     // case-insensitive or Unicode-normalising volume) — for anything else the
     // whole member set is staged and read back from there, as before.
-    let targets: HashSet<&str> = patch_target_paths(&record.files).into_iter().collect();
-    let held_in_memory =
-        can_repack_in_memory(members.iter().map(String::as_str), targets.iter().copied());
+    // `patch_target_paths` is sorted, so the directory pass below — which
+    // returns on its first failure — names the same target on every run.
+    let target_paths = patch_target_paths(&record.files);
+    let targets: HashSet<&str> = target_paths.iter().copied().collect();
+    let held_in_memory = can_repack_in_memory(
+        members.iter().map(String::as_str),
+        target_paths.iter().copied(),
+    );
     let mut held: HashMap<String, Vec<u8>> = HashMap::new();
     let mut exec_bits: HashMap<String, bool> = HashMap::new();
     for member in &members {
@@ -431,7 +436,7 @@ pub async fn build_patched_wheel(
     // tree carried one wherever a member lived under it, and the verify reads
     // "cannot hash" there rather than "not found". Recreate exactly those.
     if held_in_memory {
-        for target in &targets {
+        for target in &target_paths {
             let prefix = format!("{target}/");
             if members.iter().any(|m| m == target)
                 || !members.iter().any(|m| m.starts_with(&prefix))
