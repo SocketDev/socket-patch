@@ -17,7 +17,11 @@
 //! with what they themselves wrote ([`ParseMemo::store`]) so the next
 //! package hits, and drop it ([`ParseMemo::invalidate`], or
 //! [`ParseMemo::forget`] for one file of a multi-slot site) where a write
-//! leaves bytes nobody holds.
+//! leaves bytes nobody holds. The one write path that drops nothing is a
+//! poetry/pdm revert, which goes through the shared splice helpers in
+//! `common.rs` and cannot reach a backend's private static; it leaves its
+//! slot to be evicted by the next read, at the cost of holding one document
+//! until then.
 //!
 //! **Contract:** the parse handed to a memo must be a pure function of the
 //! bytes. The key is the bytes alone — deliberately, since two reads with
@@ -31,6 +35,16 @@
 //! PEP 751 locks, the two cargo config spellings) asks for as many slots as
 //! that set can hold, which is the only reason the count is a parameter —
 //! more slots mean more retained documents.
+//!
+//! **Cost:** a filled slot holds a parsed document AND a copy of the bytes
+//! it came from, in a `static`, until a write drops it or the process
+//! exits — and a parsed document is itself several times its own source
+//! text. Measured against the pre-memo build on a 2.5 MB `composer.lock`,
+//! peak RSS moved by +3 MB on an idempotent re-run and +15-21 MB on the
+//! fresh and revert paths, so the sites whose file runs to megabytes
+//! (uv.lock, a package-lock.json, the vendor ledger) are the ones that
+//! decide a run's peak. Keying a slot on an `Arc<[u8]>` the reader already
+//! holds would remove the bytes half.
 //!
 //! The document is handed out behind an `Arc`, so the read-only probes —
 //! the idempotent hot path a re-run is made of — never copy it, and the

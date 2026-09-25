@@ -558,6 +558,13 @@ pub async fn vendor_pypi<'a>(
 /// `.dist-info` scan plus a METADATA read per installed package) to answer
 /// one question about one purl. A vendor run never writes into a venv, so
 /// one listing per site answers for every package that asks.
+///
+/// The ONE thing this gives up, deliberately (plan §2.1 row 11): an
+/// EXTERNAL installer landing mid-run — `pip install -U`, `pipenv sync` in
+/// another terminal — is no longer seen by the packages judged after the
+/// first ask for that site, where re-listing per package would have seen
+/// it. Only the `(canonicalized name, version)` SET is frozen: which files
+/// are stale is still read live, per package, through `verify_file_patch`.
 #[derive(Default)]
 pub struct InstalledSiteListings(tokio::sync::Mutex<SiteListings>);
 
@@ -604,6 +611,8 @@ async fn pipenv_stale_install_warning(
     // Judged over the PROJECT'S venvs (VIRTUAL_ENV, ./.venv, ./venv, Pipenv's
     // WORKON_HOME venv) — never the staging dir a lock-only vendor fetched
     // the pristine wheel into, and never the global interpreters.
+    // The caller refused an unparseable purl long before this probe, so the
+    // lookup below is never the empty one `find_by_purls` short-circuits on.
     let base = strip_purl_qualifiers(purl).to_string();
     let crawler = PythonCrawler::new();
     let mut stale_dirs: Vec<std::path::PathBuf> = Vec::new();

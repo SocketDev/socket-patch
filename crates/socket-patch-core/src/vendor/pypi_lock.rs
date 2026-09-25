@@ -80,6 +80,15 @@ async fn refuse_symlinked(root: &Path, files: impl Iterator<Item = &String>) -> 
 /// the lock set is small but the documents are not. Four slots so a project
 /// with a handful of locks does not evict its own parses between packages;
 /// see [`ParseMemo`].
+///
+/// Four is a bound, not a guarantee: `python_lock_paths` admits every
+/// `pylock.*.toml` and `*.py.lock` in the root, so a project carrying more
+/// locks than that reads them in a fixed order and each pass evicts the
+/// slots the next pass wants — the memo then costs a copy of each lock's
+/// text per package and returns nothing. That shape (five-plus PEP 751
+/// locks, or one `.py.lock` per PEP 723 script) is the case to size this
+/// against if it ever shows up; sizing it from the caller's path list means
+/// a per-run memo handed down rather than a static.
 static LOCK_MEMO: ParseMemo<DocumentMut, 4> = ParseMemo::new();
 
 /// `text` parsed as a python lockfile, reusing the run's parse while it is
