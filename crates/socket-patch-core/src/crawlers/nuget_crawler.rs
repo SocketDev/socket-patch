@@ -1386,6 +1386,95 @@ mod tests {
             purls
         }
 
+        /// Whether `dir`'s filesystem distinguishes case. macOS's default
+        /// APFS volume does not; Linux CI's does.
+        fn filesystem_is_case_sensitive(dir: &Path) -> bool {
+            mkdir(&dir.join("CaseProbe"));
+            !dir.join("caseprobe").is_dir()
+        }
+
+        /// The case-insensitive legacy fallback — the only reader of the
+        /// package root's memoized listing — over several PURLs in one
+        /// call: the listing is built on the first PURL that needs it and
+        /// reused by the rest, matching the per-PURL oracle either way.
+        ///
+        /// The fallback can only MATCH on a case-sensitive filesystem:
+        /// where `Foo.1.0` and `foo.1.0` are one directory, the exact-case
+        /// probe above it already resolves every case variant, so nothing
+        /// reaches the fallback with a name to find (the randomized oracle
+        /// test has the same blind spot locally — it distinguishes the two
+        /// layouts by case alone). The on-disk spelling below is therefore
+        /// asserted only where the filesystem can tell them apart, and CI
+        /// is where that happens.
+        #[tokio::test]
+        async fn legacy_fallback_reuses_one_listing_across_purls() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("packages");
+            for dir in ["newtonsoft.json.13.0.3", "serilog.2.12.0"] {
+                mkdir(&root.join(dir).join("lib"));
+            }
+            // Verifies for no one: the fallback must answer "absent" for
+            // it, and for a package that is not there at all, without
+            // spoiling the listing the PURLs after them reuse.
+            mkdir(&root.join("hollow.1.0.0"));
+
+            let purls: Vec<String> = [
+                "pkg:nuget/NEWTONSOFT.JSON@13.0.3",
+                "pkg:nuget/Hollow@1.0.0",
+                "pkg:nuget/Missing@9.9.9",
+                "pkg:nuget/SeriLog@2.12.0",
+            ]
+            .iter()
+            .map(|p| p.to_string())
+            .collect();
+
+            let new = NuGetCrawler::new()
+                .find_by_purls(&root, &purls)
+                .await
+                .unwrap();
+            let old = LegacyNuGetCrawler::find_by_purls(&root, &purls).await;
+            assert_eq!(map_rows(&new), map_rows(&old));
+            assert_eq!(new.len(), 2, "{new:?}");
+            for purl in [
+                "pkg:nuget/NEWTONSOFT.JSON@13.0.3",
+                "pkg:nuget/SeriLog@2.12.0",
+            ] {
+                assert!(new[purl].path.is_dir(), "{purl}");
+            }
+
+            // The fallback itself, over an explicit listing: matched
+            // case-insensitively, verified, and handed back with the
+            // on-disk spelling — pinned on every filesystem.
+            let names = [
+                "newtonsoft.json.13.0.3".to_string(),
+                "hollow.1.0.0".to_string(),
+            ];
+            assert_eq!(
+                find_legacy_dir_case_insensitive(&root, &names, "NEWTONSOFT.JSON", "13.0.3"),
+                Some(root.join("newtonsoft.json.13.0.3"))
+            );
+            assert_eq!(
+                find_legacy_dir_case_insensitive(&root, &names, "Hollow", "1.0.0"),
+                None
+            );
+            assert_eq!(
+                find_legacy_dir_case_insensitive(&root, &names, "Missing", "9.9.9"),
+                None
+            );
+
+            if filesystem_is_case_sensitive(tmp.path()) {
+                // Only the fallback can hand back the ON-DISK spelling.
+                assert_eq!(
+                    new["pkg:nuget/NEWTONSOFT.JSON@13.0.3"].path,
+                    root.join("newtonsoft.json.13.0.3")
+                );
+                assert_eq!(
+                    new["pkg:nuget/SeriLog@2.12.0"].path,
+                    root.join("serilog.2.12.0")
+                );
+            }
+        }
+
         #[tokio::test]
         async fn randomized_package_dirs_match_the_async_oracle() {
             let (mut crawled, mut found) = (0, 0);
