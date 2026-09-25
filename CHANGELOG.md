@@ -87,7 +87,10 @@ into the new version's section — see docs/releasing.md.
   diagnosed unattributable; an untagged detached entry counts only beside
   an untagged copy (the pre-tag vendored shape) — beside a tagged copy it
   is some other crate cargo built, not attested. A patch that edits the
-  crate's own `Cargo.toml` verifies with the tag dropped.
+  crate's own `Cargo.toml` verifies with the tag dropped — the tag being
+  this copy's own uuid, the same pin the inventory check applies, so a copy
+  tagged for another patch stays a mismatch instead of verifying clean
+  while VEX refuses it.
 - **Vendored cargo wiring moved to `Cargo.toml`.** `vendor` / `scan` /
   `get --mode vendored` write the `[patch.crates-io]` path entry into the
   workspace-root `Cargo.toml` (beside the `Cargo.lock` it detaches) instead
