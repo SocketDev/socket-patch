@@ -1002,6 +1002,13 @@ fn pipenv_probe_certain<'a>(
     candidates: impl Iterator<Item = &'a DepOverride>,
     fetched_wheel_urls: impl Iterator<Item = &'a str>,
 ) -> bool {
+    // `pipenv_lock_targets` answers false on its first line when there is
+    // no Pipfile.lock, and EVERY hosted redirect run reaches this — an
+    // npm-only one with hundreds of candidates included. Ask that question
+    // before building the list to ask it with.
+    if !files.contains_key("Pipfile.lock") {
+        return false;
+    }
     let droppable: std::collections::BTreeSet<&str> = fetched_wheel_urls.collect();
     let kept: Vec<DepOverride> = candidates
         .filter(|dep| !droppable.contains(dep.artifact_url.as_str()))
@@ -3857,6 +3864,34 @@ mod tests {
             }
         }
         assert!(fired > 100 && held > 100, "{fired}/{held}");
+    }
+
+    /// Without a Pipfile.lock the gate is false whatever the candidates
+    /// are, exactly as `pipenv_lock_targets` answers it — so the early
+    /// return skips only the list the question would have been asked with.
+    #[test]
+    fn pipenv_probe_certain_is_false_without_a_pipfile_lock() {
+        use super::pipenv_probe_certain;
+        use socket_patch_core::patch::redirect::pipenv_lock_targets;
+
+        let files =
+            std::collections::BTreeMap::from([("package-lock.json".to_string(), "{}".to_string())]);
+        let mut pypi = npm_override("u1");
+        pypi.ecosystem = "pypi".to_string();
+        pypi.name = "urllib3".to_string();
+        let candidates = [npm_override("u0"), pypi];
+
+        assert!(!pipenv_probe_certain(
+            &files,
+            candidates.iter(),
+            std::iter::empty()
+        ));
+        assert!(!pipenv_lock_targets(&files, &candidates));
+        assert!(!pipenv_probe_certain(
+            &std::collections::BTreeMap::new(),
+            candidates.iter(),
+            std::iter::empty()
+        ));
     }
 
     fn npm_override(artifact_url: &str) -> DepOverride {
