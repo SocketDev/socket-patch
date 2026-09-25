@@ -472,7 +472,7 @@ pub async fn find_packages_for_rollback_reusing(
     collapse_to_first(dispatch_find(partitioned, options, silent, merge_qualified, npm_roots).await)
 }
 
-/// The npm half of one [`crawl_all_ecosystems_with_npm`] run: the packages
+/// The npm half of one [`crawl_ecosystems_with_npm`] run: the packages
 /// the npm crawler found (its whole output, in crawl order) and the
 /// `node_modules` roots it walked, with the options they were taken with.
 /// Handed from `scan`'s crawl to its vendor step so the vendor engine does
