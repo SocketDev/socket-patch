@@ -343,10 +343,12 @@ impl ProbeFilter {
 }
 
 /// The read-only result of one `find_by_purls` resolver visit (see
-/// [`NpmCrawler::visit_resolver_dir`]).
+/// [`NpmCrawler::visit_resolver_dir`]). `matched` indexes the pending
+/// targets this dir holds a copy of, in target order — sparse, because
+/// every dir of a BFS level carries one of these at once.
 struct ResolverVisit {
     nm_path: PathBuf,
-    probes: Vec<Option<(String, String)>>,
+    matched: Vec<usize>,
     nested: Vec<NestedNodeModules>,
 }
 
@@ -802,33 +804,23 @@ impl NpmCrawler {
             let mut next_level: Vec<PathBuf> = Vec::new();
             for visit in visits {
                 let nm_path = visit.nm_path;
-                for (target, probe) in pending.iter().zip(visit.probes) {
+                for index in visit.matched {
+                    let target = &pending[index];
                     let pkg_path = nm_path.join(&target.dir_key);
-
-                    match probe {
-                        // The on-disk *name* must match too: an alias install
-                        // (`npm i foo@npm:bar@1.0.0`) puts a different package
-                        // in `node_modules/foo`, so matching on version alone
-                        // would misidentify it and patch the wrong package's
-                        // files.
-                        Some((found_name, found_version))
-                            if found_name == target.dir_key && found_version == target.version =>
-                        {
-                            let copies = result.entry(target.purl.clone()).or_default();
-                            // Record each physical copy once — a path reached
-                            // twice (defensive against overlapping walks) is not
-                            // double-counted.
-                            if !copies.iter().any(|c| c.path == pkg_path) {
-                                copies.push(CrawledPackage {
-                                    name: target.name.clone(),
-                                    version: found_version,
-                                    namespace: target.namespace.clone(),
-                                    purl: target.purl.clone(),
-                                    path: pkg_path,
-                                });
-                            }
-                        }
-                        _ => {}
+                    let copies = result.entry(target.purl.clone()).or_default();
+                    // Record each physical copy once — a path reached twice
+                    // (defensive against overlapping walks) is not
+                    // double-counted.
+                    if !copies.iter().any(|c| c.path == pkg_path) {
+                        copies.push(CrawledPackage {
+                            name: target.name.clone(),
+                            // The probe matched it verbatim (see
+                            // `visit_resolver_dir`).
+                            version: target.version.clone(),
+                            namespace: target.namespace.clone(),
+                            purl: target.purl.clone(),
+                            path: pkg_path,
+                        });
                     }
                 }
                 // Descend importer-tree nested `node_modules` for ALL targets
@@ -860,27 +852,43 @@ impl NpmCrawler {
         pending
     }
 
-    /// The read-only half of one resolver visit to `nm_path`: its listing,
-    /// each target's package.json probe (in target order; `None` for a
-    /// probe the listing proves would fail), and the nested `node_modules`
-    /// the dir contributes, in listing order.
+    /// The read-only half of one resolver visit to `nm_path`: which of
+    /// `pending` this dir holds a copy of (indices, in target order), and
+    /// the nested `node_modules` the dir contributes, in listing order.
+    ///
+    /// Whether a probe matches depends only on the dir and the target, so
+    /// it is decided HERE rather than handed to the sequential fold: a
+    /// visit then carries one `usize` per MATCH instead of one probe slot
+    /// per target. Every level's visits are live at once, so per-target
+    /// slots made the resolver's peak memory
+    /// `level_dirs × pending_targets` — hundreds of megabytes on a big
+    /// pnpm store probed by pass 2, which enqueues every entry.
     fn visit_resolver_dir(nm_path: PathBuf, pending: &[Target]) -> ResolverVisit {
         let listing = list_dir_sync(&nm_path);
         let probe_filter = ProbeFilter::new(&listing);
-        let probes = pending
+        let matched = pending
             .iter()
-            .map(|target| {
+            .enumerate()
+            .filter(|(_, target)| {
                 let first_component = target.namespace.as_deref().unwrap_or(&target.name);
                 if !probe_filter.may_resolve(first_component) {
-                    return None;
+                    return false;
                 }
+                // The on-disk *name* must match too: an alias install
+                // (`npm i foo@npm:bar@1.0.0`) puts a different package in
+                // `node_modules/foo`, so matching on version alone would
+                // misidentify it and patch the wrong package's files.
                 read_package_json_sync(&nm_path.join(&target.dir_key).join("package.json"))
+                    .is_some_and(|(found_name, found_version)| {
+                        found_name == target.dir_key && found_version == target.version
+                    })
             })
+            .map(|(index, _)| index)
             .collect();
         let nested = Self::collect_nested_node_modules(&nm_path, listing);
         ResolverVisit {
             nm_path,
-            probes,
+            matched,
             nested,
         }
     }
@@ -1837,6 +1845,53 @@ mod tests {
         assert!(partial.may_resolve("absent"));
         let unicode = ProbeFilter::new(&listing_of(&["foo", "caf\u{e9}"], true));
         assert!(unicode.may_resolve("absent"));
+    }
+
+    fn target_of(dir_key: &str, version: &str) -> Target {
+        let (namespace, name) = parse_package_name(dir_key);
+        Target {
+            purl: build_npm_purl(namespace.as_deref(), &name, version),
+            namespace,
+            name,
+            version: version.to_string(),
+            dir_key: dir_key.to_string(),
+        }
+    }
+
+    /// A resolver visit records one entry per MATCH, not one probe slot
+    /// per pending target: every dir of a BFS level holds its visit at
+    /// once, so per-target slots made peak memory `dirs × targets` —
+    /// hundreds of megabytes on a large pnpm store, which pass 2 enqueues
+    /// whole. The match itself is unchanged: the dir name, the
+    /// package.json `name` and the version must all agree.
+    #[test]
+    fn a_resolver_visit_records_only_the_targets_it_matched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nm = tmp.path().join("node_modules");
+        for (dir, name, version) in [
+            ("present", "present", "1.0.0"),
+            ("other-version", "other-version", "1.0.0"),
+            // An alias install: a different package under this dir name.
+            ("aliased", "underlying", "1.0.0"),
+        ] {
+            std::fs::create_dir_all(nm.join(dir)).unwrap();
+            std::fs::write(
+                nm.join(dir).join("package.json"),
+                format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+            )
+            .unwrap();
+        }
+
+        let mut pending: Vec<Target> = (0..200)
+            .map(|i| target_of(&format!("absent{i}"), "1.0.0"))
+            .collect();
+        pending.push(target_of("other-version", "2.0.0"));
+        pending.push(target_of("aliased", "1.0.0"));
+        pending.push(target_of("present", "1.0.0"));
+        let matched_index = pending.len() - 1;
+
+        let visit = NpmCrawler::visit_resolver_dir(nm, &pending);
+        assert_eq!(visit.matched, vec![matched_index]);
     }
 
     #[test]
