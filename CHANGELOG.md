@@ -1268,10 +1268,18 @@ into the new version's section — see docs/releasing.md.
   artifact alone. That download is now deferred to the backend branch that
   actually reads the pristine tree, whenever the vendor ledger already
   covers the purl (its entry records the record's patch uuid and the
-  committed artifact is on disk; `--force` keeps the eager fetch), and for
-  every lockfile-only cargo crate while the patch service is enabled (the
-  cargo backend reads the pristine source only once `cargo_service_copy`
-  falls back to the local build). Visible effects: an idempotent re-run
+  committed artifact is on disk — a file artifact such as a wheel or
+  tarball only while it still hashes to the ledger's `sha256`; `--force`
+  keeps the eager fetch), and for every lockfile-only cargo crate the
+  registry could fetch and verify (a crates.io `Cargo.lock` entry with a
+  checksum, or the pre-vendor resolution the ledger recovers) while the
+  patch service is enabled (the cargo backend reads the pristine source
+  only once `cargo_service_copy` falls back to the local build). A git,
+  path or custom-registry crate is never deferred: it keeps the eager
+  ladder's `vendor_fetch_unverifiable` + `package_not_installed` refusal
+  and is not vendored from the service's crates.io build, and a committed
+  file artifact that no longer matches its pin keeps the eager ladder's
+  outcome too. Visible effects: an idempotent re-run
   makes no registry requests and no longer reports `vendor_fetched_missing`
   for fetches it never needed; with no network (or under `--offline`) the
   re-run of an already-vendored pypi, cargo, go or lockfile-only gem
@@ -1288,28 +1296,36 @@ into the new version's section — see docs/releasing.md.
   (or no service config) now refuses a not-installed gem that the lock can
   verify and no ledger entry covers with `gem_spec_missing` BEFORE
   downloading it: a local build can never vendor a downloaded `.gem` (no
-  eval-able stub gemspec), so the download was pure waste.
+  eval-able stub gemspec), so the download was pure waste. The refusal
+  keeps the backend's detail text and drops the `vendor_fetched_missing`
+  warning that used to precede it; since it now comes first, a gem the
+  backend would have refused for another reason after the download (an
+  uneditable Gemfile declaration, a Gemfile.lock it cannot edit) also
+  reports `gem_spec_missing`. `--dry-run` is unchanged: it still fetches
+  the gem and previews it (`vendor_fetched_missing` + `verified`).
 
-- **The vendor ledger stores whole-file wiring snapshots once.** Several
-  backends record an entire file as a wiring record's `original` / `new`
-  (maven's `pom.xml`, nuget's config, `pylock*.toml` and PEP 723 script
-  locks), so a ledger held two near-identical copies of that file per
-  vendored package (tens of MB on a hundred-package maven or pylock
-  project). `.socket/vendor/state.json` now moves every such string of 1 KiB
-  or more into a top-level `snapshots` table keyed by its sha256 — the
-  pre-vendor file in full, every later version as a line-level edit (byte
-  ranges copied from the version it was derived from, plus inserted text) —
-  with the
-  records pointing at it as `{"snapshot": "<sha256>"}`, and writes
-  `"version": 2`. A ledger with no such string keeps its version-1 bytes.
-  Every command reads both versions: version-1 ledgers (inline snapshots)
-  load and revert exactly as before, and a version-2 table is resolved back
-  to full text with every text checked against its hash (a table that does
-  not reproduce its texts is `vendor_state_unreadable`). Revert, repair,
-  `vex`, rollback and the re-vendor carry-forward see the same full texts
-  as before. An older socket-patch reading a version-2 ledger leaves those
-  fragments alone with its drift warning. No consumer outside socket-patch
-  reads `state.json` wiring.
+- **The vendor ledger stores a whole-file snapshot's new text as an edit.**
+  Several backends record an entire file as a wiring record's `original` /
+  `new` (maven's `pom.xml`, nuget's config, `pylock*.toml`, PEP 723 scripts
+  and hatch's project files), so a ledger held two near-identical copies of
+  that file per vendored package. In `.socket/vendor/state.json` such a
+  record's `new` text of 1 KiB or more is now written as a line-level edit
+  of the same record's `original`: `{"snapshot": "<sha256 of the text>",
+  "ops": [[start, len] | "inserted text", …]}` (a `[start, len]` pair copies
+  that byte range of the `original`, a string inserts itself), and the
+  ledger's `"version"` is `2`. The `original` stays the plain string it
+  always was, every lockfile fragment record (poetry, composer, npm, …) is
+  untouched, and a ledger without such a record keeps its version-1 bytes.
+  Every command reads both versions: version-1 ledgers load and revert
+  exactly as before, and a version-2 edit is rebuilt and checked against its
+  hash (an edit that does not reproduce its text, has no `original` to
+  apply to, or any other `{"snapshot": …}` value, is
+  `vendor_state_unreadable`). Revert, repair, `vex`, rollback and the
+  re-vendor carry-forward see the same full texts as before. Each record is
+  self-contained, so an older socket-patch that re-saves the ledger (it
+  keeps `original` / `new` verbatim) loses nothing; reading a version-2
+  record it leaves that fragment alone with its drift warning. No consumer
+  outside socket-patch reads `state.json` wiring.
 
 - **A vendored run commits its lockfile and ledger edits once, not per
   package.** `vendor`, `scan --mode vendored` and `get --mode vendored` used
@@ -1325,16 +1341,28 @@ into the new version's section — see docs/releasing.md.
   the commit leaves the project's lockfiles and ledgers as they were before
   the run (the artifacts it wrote are orphans the next run re-vendors over);
   a crash during the commit is finished by the next command that takes the
-  apply lock, before it reads any of those files — or, when a file the
-  journal covers was edited since, the journal is set aside
-  (`.commit-journal.set-aside-<uuid>.json`, with a stderr warning naming
-  `repair`) and nothing of it is applied. A re-vendor under a newer patch
-  uuid now removes the replaced uuid's artifact dir after the commit, so its
-  `vendor_stale_artifact_removed` event comes after the run's per-package
-  events instead of right after the package's own. A commit that cannot be
+  apply lock, before it reads any of those files. When a file the journal
+  covers was edited since, that file is never written over and the journal
+  is set aside (`.commit-journal.set-aside-<uuid>.json`, which keeps every
+  file's pre-commit bytes; a stderr warning names `repair`): if the edited
+  files still carry the commit's own lines the rest of the commit is
+  finished around them (so the ledger records the wiring on disk), if none
+  of them does the files the crash had already replaced are put back to
+  their pre-commit bytes, and otherwise nothing is applied. A journal that
+  would write through a symbolic link, or outside the lockfiles and
+  ledgers, is set aside unapplied. A replay that fails on I/O keeps the
+  journal and fails the command's lock acquire (`lock_io`) rather than
+  letting it work over a half-committed project. A re-vendor under a newer
+  patch uuid now removes the replaced uuid's artifact dir after the commit,
+  so its `vendor_stale_artifact_removed` event comes after the run's
+  per-package events instead of right after the package's own; a golang
+  takeover likewise deletes the `.socket/go-patches/` copy only after the
+  commit that repoints `go.mod` away from it. A commit that cannot be
   written fails the run with the new top-level error `vendor_commit_failed`
-  (exit 1), leaving the pre-run lockfiles and ledger in place. `repair`,
-  `vendor --revert` and `rollback` keep their per-entry saves.
+  (exit 1), leaving the pre-run lockfiles and ledger in place — or, when
+  putting back the files already replaced failed too, keeping the journal
+  (the message says so) for the next locked command to finish the commit.
+  `repair`, `vendor --revert` and `rollback` keep their per-entry saves.
 
 - **Vendored artifacts are no longer fsynced one by one.** The files a
   vendored run produces under `.socket/vendor/<eco>/<uuid>/` — patched copy
@@ -1346,11 +1374,15 @@ into the new version's section — see docs/releasing.md.
   commit point — a lockfile, `go.mod`/`go.sum`, `pom.xml`, `nuget.config`,
   `package.json`, `pnpm-workspace.yaml`, the vendor ledger or the redirect
   ledger — is written, so nothing durable ever names an artifact that could
-  still be lost. A crash can at worst leave an artifact the next run
-  re-verifies against the ledger and rebuilds (see
-  `socket_patch_core::utils::durability` for the full argument). The
+  still be lost. An artifact rebuilt in place that no commit point follows
+  (a drifted committed artifact healed with the lockfiles and ledger
+  unchanged) is synced by the same barrier at the end of the vendored run's
+  commit and when the command releases the apply lock, so no command
+  returns with an unsynced artifact the committed state names; a failed
+  barrier keeps its files pending for the next one. A crash can at worst
+  lose an artifact nothing durable names yet, which the next run rebuilds
+  (see `socket_patch_core::utils::durability` for the full argument). The
   in-place `apply` of an installed tree keeps its per-file durable writes.
-  Commit granularity is unchanged.
 
 - **Release publishing decomposed into per-registry workflows.** The
   crates.io, npm, PyPI, and RubyGems legs of the `Release` workflow now live
