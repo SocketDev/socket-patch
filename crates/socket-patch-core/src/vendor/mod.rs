@@ -101,7 +101,7 @@ mod yarn_layering_tests;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
 pub(crate) use pypi_lock::restore_document as restore_python_document;
-pub use source::PackageSource;
+pub use source::{DeferredFetchFn, DeferredMiss, DeferredPackage, PackageSource};
 // `vex::discover` validates lockfile-recorded npm names with the same rule the
 // npm backends apply to their own coordinates.
 pub(crate) use npm_common::is_safe_npm_name;

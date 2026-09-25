@@ -252,6 +252,25 @@ pub fn npm_tarball_url(base: &str, name: &str, version: &str) -> String {
     format!("{base}/{name}/-/{leaf}-{version}.tgz")
 }
 
+/// The package-root leaf [`fetch_and_stage`] would stage `purl` under — the
+/// name a [`super::source::DeferredPackage`] answers naming questions with
+/// before (or without) fetching: the canonical `<name>-<version>` for a gem
+/// (the gem backend refuses any other leaf), the fixed per-ecosystem name
+/// otherwise.
+pub fn staged_leaf_for_purl(purl: &str) -> String {
+    let base = crate::utils::purl::strip_purl_qualifiers(purl);
+    match base.strip_prefix("pkg:").and_then(|r| r.split_once('/')) {
+        Some(("gem", rest)) => match rest.rsplit_once('@') {
+            Some((name, version)) => format!("{name}-{version}"),
+            None => "gem".to_string(),
+        },
+        Some(("pypi", _)) => "site-packages".to_string(),
+        Some(("cargo", _)) => "crate".to_string(),
+        Some(("golang", _)) => "module".to_string(),
+        _ => "package".to_string(),
+    }
+}
+
 /// Fetch + verify + extract one lockfile entry. Ecosystems without a
 /// fetcher yet return [`FetchError::Unverifiable`] (callers keep their
 /// not-installed outcome).
