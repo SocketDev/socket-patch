@@ -36,7 +36,7 @@ use crate::constants::SOCKET_DIR;
 use crate::crawlers::composer_crawler::normalize_version;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
-use crate::patch::copy_tree::{fresh_copy, remove_tree};
+use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
@@ -590,24 +590,11 @@ async fn copy_and_patch(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<ApplyResult, ApplyResult> {
     let stage = stage_dir_for(copy_dir);
-    // The local build is the first branch that reads the installed tree: a
-    // lazily-fetched source is extracted here, and a failure reads as the
-    // copy failure it stands in for.
-    let installed_dir = match installed_dir.materialize().await {
-        Ok(dir) => dir,
-        Err(e) => {
-            cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-            return Err(synthesized_result(
-                purl,
-                copy_dir,
-                Vec::new(),
-                false,
-                Some(format!("failed to copy installed package: {e}")),
-            ));
-        }
-    };
-    // `fresh_copy` removes + recreates the stage itself.
-    if let Err(e) = fresh_copy(installed_dir, &stage, None).await {
+    // The local build is the first branch that reads the source. An
+    // installed package is copied out of `vendor/`; a fetched one is
+    // written straight here from the verified dist zip. `stage_into`
+    // removes + recreates the stage itself.
+    if let Err(e) = installed_dir.stage_into(&stage, None).await {
         cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return Err(synthesized_result(
             purl,

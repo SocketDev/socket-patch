@@ -203,23 +203,6 @@ pub async fn vendor_go_module<'a>(
         }
         GoServiceRedirect::HardFail(outcome) => return *outcome,
         GoServiceRedirect::FallBack => {
-            // The local build (and the dry-run verify it previews) is the
-            // only branch that reads the pristine tree: a lazily-fetched
-            // source is extracted here.
-            let pristine_src = match pristine_src.materialize().await {
-                Ok(dir) => dir,
-                Err(e) => {
-                    return done(
-                        failed_result(
-                            purl,
-                            Path::new(""),
-                            format!("failed to copy pristine source: {e}"),
-                        ),
-                        None,
-                        warnings,
-                    )
-                }
-            };
             // Vendor auto-force policy (the engine's copy is staged from the
             // pristine source, never the user's tree — see `force_apply_staged`):
             // missing patch targets still fail closed unless the caller's own
@@ -229,8 +212,24 @@ pub async fn vendor_go_module<'a>(
             // patched content. The engine is shared with the in-place `apply`
             // redirect path, whose strict semantics stay unchanged.
             if !force {
-                let missing =
-                    super::missing_existing_patch_files(pristine_src, &record.files).await;
+                // The pre-check reads the pristine tree, so a lazily-fetched
+                // source materialises here; the engine's own copy below then
+                // comes from that tree rather than a second inflate.
+                let probe = match pristine_src.materialize().await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        return done(
+                            failed_result(
+                                purl,
+                                Path::new(""),
+                                format!("failed to copy pristine source: {e}"),
+                            ),
+                            None,
+                            warnings,
+                        )
+                    }
+                };
+                let missing = super::missing_existing_patch_files(probe, &record.files).await;
                 if let Some(first) = missing.first() {
                     return done(
                         failed_result(

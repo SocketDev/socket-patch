@@ -59,24 +59,32 @@ pub(crate) const MAX_ENTRIES: usize = 60_000;
 /// never read the tree, so an idempotent re-run on a lockfile-only checkout
 /// no longer creates and deletes one.
 ///
+/// Better still, most of the tree never reaches the tempdir at all: a local
+/// build asks for the vendor stage directly ([`FetchedPackage::stage_into`]),
+/// which the verified bytes write in one pass instead of an extraction and a
+/// whole-tree copy out of it.
+///
 /// The tempdir lives exactly as long as this value — callers must hold it
 /// until the vendor pipeline has finished staging from [`FetchedPackage::dir`].
 pub struct FetchedPackage {
     dir: PathBuf,
     /// Where the bytes came from (surfaced in the fetch warning event).
     pub url: String,
-    /// The verified bytes and the extractor that turns them into `dir` —
-    /// the same function an eager fetch called. Taken by the first
-    /// [`FetchedPackage::dir`].
-    pending: std::sync::Mutex<Option<PendingExtract>>,
-    /// The first materialisation's outcome, shared by every later caller so
-    /// a failure reads the same both times.
+    /// The verified bytes and the extractor that writes them — the same
+    /// function an eager fetch called, kept so the tree can be produced
+    /// wherever it is first wanted: the private tempdir
+    /// ([`FetchedPackage::dir`]), or a vendor stage directly
+    /// ([`FetchedPackage::stage_into`]).
+    extract: std::sync::Arc<Extractor>,
+    /// The tempdir materialisation's outcome, shared by every later caller
+    /// so a failure reads the same each time.
     extracted: tokio::sync::OnceCell<Result<(), String>>,
     _tmp: tempfile::TempDir,
 }
 
-/// The deferred half of a fetch: bytes plus the extractor that writes them.
-type PendingExtract = Box<dyn FnOnce(&Path) -> Result<(), String> + Send>;
+/// Writes a verified archive out under a destination, skipping any entry
+/// whose final path component matches (`fresh_copy`'s `skip_file_name`).
+type Extractor = dyn Fn(&Path, Option<&str>) -> Result<(), String> + Send + Sync;
 
 impl std::fmt::Debug for FetchedPackage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -92,11 +100,16 @@ impl std::fmt::Debug for FetchedPackage {
 }
 
 impl FetchedPackage {
-    fn pending(dir: PathBuf, url: String, tmp: tempfile::TempDir, extract: PendingExtract) -> Self {
+    fn pending(
+        dir: PathBuf,
+        url: String,
+        tmp: tempfile::TempDir,
+        extract: impl Fn(&Path, Option<&str>) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             dir,
             url,
-            pending: std::sync::Mutex::new(Some(extract)),
+            extract: std::sync::Arc::new(extract),
             extracted: tokio::sync::OnceCell::new(),
             _tmp: tmp,
         }
@@ -114,27 +127,47 @@ impl FetchedPackage {
     pub async fn dir(&self) -> Result<&Path, String> {
         let done = self
             .extracted
-            .get_or_init(|| async {
-                let Some(extract) = self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                else {
-                    return Ok(());
-                };
-                // Extraction is sync CPU + disk work; keep it off the runtime
-                // thread so the concurrent fetches around it keep moving.
-                let dir = self.dir.clone();
-                match tokio::task::spawn_blocking(move || extract(&dir)).await {
-                    Ok(outcome) => outcome,
-                    Err(e) => Err(format!("extraction task failed: {e}")),
-                }
-            })
+            .get_or_init(|| self.write_tree(self.dir.clone(), None))
             .await;
         match done {
             Ok(()) => Ok(&self.dir),
             Err(detail) => Err(detail.clone()),
+        }
+    }
+
+    /// Write the tree at `dst` instead of the tempdir: the vendor stage the
+    /// local build patches, which a fetched source used to reach by
+    /// extracting into the tempdir and copying the whole tree out of it
+    /// again. `dst` is removed and recreated first, exactly as `fresh_copy`
+    /// does, and `skip_file_name` drops the same entries it dropped.
+    pub async fn stage_into(&self, dst: &Path, skip_file_name: Option<&str>) -> Result<(), String> {
+        // An earlier branch already wrote the tempdir out (a dry-run
+        // preview, or the release-variant probe the vendor loop runs for
+        // pypi and gem). Copying it is cheaper than inflating the archive a
+        // second time, and it is what this path did before the fetch went
+        // lazy.
+        if self.extracted.get().is_some_and(Result::is_ok) {
+            return crate::patch::copy_tree::fresh_copy(&self.dir, dst, skip_file_name)
+                .await
+                .map_err(|e| e.to_string());
+        }
+        crate::patch::copy_tree::remove_tree(dst)
+            .await
+            .map_err(|e| format!("cannot clear {}: {e}", dst.display()))?;
+        tokio::fs::create_dir_all(dst)
+            .await
+            .map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
+        self.write_tree(dst.to_path_buf(), skip_file_name.map(str::to_string))
+            .await
+    }
+
+    /// Extraction is sync CPU + disk work; keep it off the runtime thread so
+    /// the concurrent fetches around it keep moving.
+    async fn write_tree(&self, dst: PathBuf, skip_file_name: Option<String>) -> Result<(), String> {
+        let extract = std::sync::Arc::clone(&self.extract);
+        match tokio::task::spawn_blocking(move || extract(&dst, skip_file_name.as_deref())).await {
+            Ok(outcome) => outcome,
+            Err(e) => Err(format!("extraction task failed: {e}")),
         }
     }
 }
@@ -253,6 +286,10 @@ pub(crate) enum Sink {
 struct EntrySink<'a> {
     dest: &'a Path,
     sink: Sink,
+    /// Entries whose final path component is this are not written — the
+    /// `fresh_copy` skip the vendor stage asks for (cargo's
+    /// `.cargo-checksum.json`, which must never reach a path-dep copy).
+    skip_file_name: Option<&'a str>,
     made: std::collections::HashSet<PathBuf>,
 }
 
@@ -261,13 +298,24 @@ impl<'a> EntrySink<'a> {
         Self {
             dest,
             sink,
+            skip_file_name: None,
             made: std::collections::HashSet::new(),
         }
     }
 
-    /// The open destination file for `rel`, or `None` when validating.
-    fn open(&mut self, rel: &Path) -> Result<Option<std::fs::File>, String> {
-        if self.sink == Sink::Validate {
+    fn skipping(mut self, skip_file_name: Option<&'a str>) -> Self {
+        self.skip_file_name = skip_file_name;
+        self
+    }
+
+    /// Where `rel` is written, with its parent directory created, or `None`
+    /// when the entry is not written (validating, or skipped by name).
+    fn destination(&mut self, rel: &Path) -> Result<Option<PathBuf>, String> {
+        if self.sink == Sink::Validate
+            || self
+                .skip_file_name
+                .is_some_and(|skip| rel.file_name().is_some_and(|n| n == skip))
+        {
             return Ok(None);
         }
         let target = self.dest.join(rel);
@@ -278,6 +326,16 @@ impl<'a> EntrySink<'a> {
                 self.made.insert(parent.to_path_buf());
             }
         }
+        Ok(Some(target))
+    }
+
+    /// The open destination file for `rel`, or `None` when the entry is not
+    /// written. The tar walk stays one pass: a tar entry is only reachable
+    /// by reading the one before it.
+    fn open(&mut self, rel: &Path) -> Result<Option<std::fs::File>, String> {
+        let Some(target) = self.destination(rel)? else {
+            return Ok(None);
+        };
         std::fs::File::create(&target)
             .map(Some)
             .map_err(|e| format!("cannot create {}: {e}", target.display()))
@@ -318,7 +376,18 @@ fn set_entry_mode(file: Option<&std::fs::File>, exec: bool) {
 /// `pub(crate)` so the composer service-download path can extract a downloaded
 /// dist zip into the vendor copy dir (`strip_first` = drop the top-level dir).
 pub(crate) fn extract_zip(bytes: &[u8], dest: &Path, strip_first: bool) -> Result<(), String> {
-    walk_zip(bytes, dest, strip_first, Sink::Write, None).map(|_| ())
+    extract_zip_skipping(bytes, dest, strip_first, None)
+}
+
+/// [`extract_zip`], dropping any entry whose final path component is
+/// `skip_file_name` (the `fresh_copy` skip a vendor stage asks for).
+pub(crate) fn extract_zip_skipping(
+    bytes: &[u8],
+    dest: &Path,
+    strip_first: bool,
+    skip_file_name: Option<&str>,
+) -> Result<(), String> {
+    walk_zip(bytes, dest, strip_first, Sink::Write, None, skip_file_name).map(|_| ())
 }
 
 /// [`extract_zip`]'s write-free twin: every refusal, nothing created.
@@ -330,7 +399,14 @@ pub(crate) fn validate_zip(
     strip_first: bool,
     watch: Option<&str>,
 ) -> Result<bool, String> {
-    walk_zip(bytes, Path::new(""), strip_first, Sink::Validate, watch)
+    walk_zip(
+        bytes,
+        Path::new(""),
+        strip_first,
+        Sink::Validate,
+        watch,
+        None,
+    )
 }
 
 fn walk_zip(
@@ -339,6 +415,7 @@ fn walk_zip(
     strip_first: bool,
     sink: Sink,
     watch: Option<&str>,
+    skip_file_name: Option<&str>,
 ) -> Result<bool, String> {
     use std::io::Read as _;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
@@ -346,7 +423,7 @@ fn walk_zip(
     if archive.len() > MAX_ENTRIES {
         return Err(format!("zip exceeds {MAX_ENTRIES} entries"));
     }
-    let mut out = EntrySink::new(dest, sink);
+    let mut out = EntrySink::new(dest, sink).skipping(skip_file_name);
     let mut seen_watched = false;
     let mut total: u64 = 0;
     for i in 0..archive.len() {
@@ -446,12 +523,9 @@ async fn fetch_composer(
             entry.name, entry.version
         )));
     }
-    Ok(FetchedPackage::pending(
-        dir,
-        url,
-        tmp,
-        Box::new(move |dest| extract_zip(&bytes, dest, strip_first)),
-    ))
+    Ok(FetchedPackage::pending(dir, url, tmp, move |dest, skip| {
+        extract_zip_skipping(&bytes, dest, strip_first, skip)
+    }))
 }
 
 /// `.gem` files are plain tar containers holding `data.tar.gz` (the
@@ -486,12 +560,9 @@ async fn fetch_gem(
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
     let dir = tmp.path().join(format!("{}-{}", entry.name, entry.version));
     validate_gem_data(&bytes).map_err(FetchError::Failed)?;
-    Ok(FetchedPackage::pending(
-        dir,
-        url,
-        tmp,
-        Box::new(move |dest| extract_gem_data(&bytes, dest)),
-    ))
+    Ok(FetchedPackage::pending(dir, url, tmp, move |dest, skip| {
+        extract_gem_data_skipping(&bytes, dest, skip)
+    }))
 }
 
 /// Pure-python wheels recorded by uv.lock (URL + sha256): the unzipped
@@ -631,12 +702,9 @@ async fn fetch_pypi(
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
     let dir = tmp.path().join("site-packages");
     validate_zip(&bytes, /*strip_first=*/ false, None).map_err(FetchError::Failed)?;
-    Ok(FetchedPackage::pending(
-        dir,
-        url,
-        tmp,
-        Box::new(move |dest| extract_zip(&bytes, dest, /*strip_first=*/ false)),
-    ))
+    Ok(FetchedPackage::pending(dir, url, tmp, move |dest, skip| {
+        extract_zip_skipping(&bytes, dest, /*strip_first=*/ false, skip)
+    }))
 }
 
 /// crates.io static download host; override with `SOCKET_CRATES_REGISTRY`.
@@ -678,12 +746,9 @@ async fn fetch_cargo(
             entry.name, entry.version
         )));
     }
-    Ok(FetchedPackage::pending(
-        dir,
-        url,
-        tmp,
-        Box::new(move |dest| extract_tgz(&bytes, dest)),
-    ))
+    Ok(FetchedPackage::pending(dir, url, tmp, move |dest, skip| {
+        extract_tgz_skipping(&bytes, dest, skip)
+    }))
 }
 
 /// go's default module proxy (the first element of go's default
@@ -953,7 +1018,18 @@ pub(crate) fn extract_zip_with_prefix(
     dest: &Path,
     prefix: &str,
 ) -> Result<(), String> {
-    walk_zip_with_prefix(bytes, dest, prefix, Sink::Write)
+    extract_zip_with_prefix_skipping(bytes, dest, prefix, None)
+}
+
+/// [`extract_zip_with_prefix`], dropping any entry whose final path
+/// component is `skip_file_name`.
+pub(crate) fn extract_zip_with_prefix_skipping(
+    bytes: &[u8],
+    dest: &Path,
+    prefix: &str,
+    skip_file_name: Option<&str>,
+) -> Result<(), String> {
+    walk_zip_with_prefix(bytes, dest, prefix, Sink::Write, skip_file_name)
 }
 
 /// [`extract_zip_with_prefix`]'s write-free twin: every refusal, nothing
@@ -961,17 +1037,23 @@ pub(crate) fn extract_zip_with_prefix(
 /// ([`walk_module_zip`]); this is the oracle that pins the two together.
 #[cfg(test)]
 pub(crate) fn validate_zip_with_prefix(bytes: &[u8], prefix: &str) -> Result<(), String> {
-    walk_zip_with_prefix(bytes, Path::new(""), prefix, Sink::Validate)
+    walk_zip_with_prefix(bytes, Path::new(""), prefix, Sink::Validate, None)
 }
 
-fn walk_zip_with_prefix(bytes: &[u8], dest: &Path, prefix: &str, sink: Sink) -> Result<(), String> {
+fn walk_zip_with_prefix(
+    bytes: &[u8],
+    dest: &Path,
+    prefix: &str,
+    sink: Sink,
+    skip_file_name: Option<&str>,
+) -> Result<(), String> {
     use std::io::Read as _;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("unreadable module zip: {e}"))?;
     if archive.len() > MAX_ENTRIES {
         return Err(format!("module zip exceeds {MAX_ENTRIES} entries"));
     }
-    let mut out = EntrySink::new(dest, sink);
+    let mut out = EntrySink::new(dest, sink).skipping(skip_file_name);
     let mut total: u64 = 0;
     for i in 0..archive.len() {
         let mut file = archive
@@ -1062,12 +1144,9 @@ async fn fetch_golang(
     let tmp = tempfile::tempdir()
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
     let dir = tmp.path().join("module");
-    Ok(FetchedPackage::pending(
-        dir,
-        url,
-        tmp,
-        Box::new(move |dest| extract_zip_with_prefix(&bytes, dest, &prefix)),
-    ))
+    Ok(FetchedPackage::pending(dir, url, tmp, move |dest, skip| {
+        extract_zip_with_prefix_skipping(&bytes, dest, &prefix, skip)
+    }))
 }
 
 async fn fetch_npm(
@@ -1132,12 +1211,9 @@ async fn fetch_npm_inner(
             entry.name, entry.version
         )));
     }
-    Ok(FetchedPackage::pending(
-        dir,
-        url,
-        tmp,
-        Box::new(move |dest| extract_tgz(&bytes, dest)),
-    ))
+    Ok(FetchedPackage::pending(dir, url, tmp, move |dest, skip| {
+        extract_tgz_skipping(&bytes, dest, skip)
+    }))
 }
 
 /// Stage a package from an on-disk vendored tarball (the fresh-clone
@@ -1206,7 +1282,7 @@ pub async fn stage_local_artifact(
         dir,
         format!("file:{}", tgz_path.display()),
         tmp,
-        Box::new(move |dest| extract_tgz(&bytes, dest)),
+        move |dest, skip| extract_tgz_skipping(&bytes, dest, skip),
     ))
 }
 
@@ -1445,7 +1521,25 @@ fn strip_first_component(path: &Path) -> Option<PathBuf> {
 /// `.crate` (tar.gz, single top-level `{name}-{version}/` prefix) into the
 /// vendor copy dir — the same content the local `fresh_copy` produces.
 pub(crate) fn extract_tgz(bytes: &[u8], dest: &Path) -> Result<(), String> {
-    extract_tar_gz(bytes, dest, /*strip_first=*/ true)
+    extract_tgz_skipping(bytes, dest, None)
+}
+
+/// [`extract_tgz`], dropping any entry whose final path component is
+/// `skip_file_name` (the `fresh_copy` skip a vendor stage asks for).
+pub(crate) fn extract_tgz_skipping(
+    bytes: &[u8],
+    dest: &Path,
+    skip_file_name: Option<&str>,
+) -> Result<(), String> {
+    walk_tar_gz(
+        bytes,
+        dest,
+        /*strip_first=*/ true,
+        Sink::Write,
+        None,
+        skip_file_name,
+    )
+    .map(|_| ())
 }
 
 /// [`extract_tgz`]'s write-free twin: every refusal, nothing created.
@@ -1457,6 +1551,7 @@ pub(crate) fn validate_tgz(bytes: &[u8], watch: Option<&str>) -> Result<bool, St
         /*strip_first=*/ true,
         Sink::Validate,
         watch,
+        None,
     )
 }
 
@@ -1471,15 +1566,30 @@ pub(crate) fn validate_tgz(bytes: &[u8], watch: Option<&str>) -> Result<bool, St
 /// integrity-verified `.gem` into the vendor copy dir — the same content the
 /// local `fresh_copy(installed_dir)` produces.
 pub(crate) fn extract_gem_data(gem_bytes: &[u8], dest: &Path) -> Result<(), String> {
-    walk_gem_data(gem_bytes, dest, Sink::Write)
+    extract_gem_data_skipping(gem_bytes, dest, None)
+}
+
+/// [`extract_gem_data`], dropping any entry whose final path component is
+/// `skip_file_name`.
+pub(crate) fn extract_gem_data_skipping(
+    gem_bytes: &[u8],
+    dest: &Path,
+    skip_file_name: Option<&str>,
+) -> Result<(), String> {
+    walk_gem_data(gem_bytes, dest, Sink::Write, skip_file_name)
 }
 
 /// [`extract_gem_data`]'s write-free twin: every refusal, nothing created.
 pub(crate) fn validate_gem_data(gem_bytes: &[u8]) -> Result<(), String> {
-    walk_gem_data(gem_bytes, Path::new(""), Sink::Validate)
+    walk_gem_data(gem_bytes, Path::new(""), Sink::Validate, None)
 }
 
-fn walk_gem_data(gem_bytes: &[u8], dest: &Path, sink: Sink) -> Result<(), String> {
+fn walk_gem_data(
+    gem_bytes: &[u8],
+    dest: &Path,
+    sink: Sink,
+    skip_file_name: Option<&str>,
+) -> Result<(), String> {
     use std::io::Read as _;
     let mut archive = tar::Archive::new(gem_bytes);
     for e in archive
@@ -1500,13 +1610,17 @@ fn walk_gem_data(gem_bytes: &[u8], dest: &Path, sink: Sink) -> Result<(), String
         let mut buf = Vec::new();
         e.read_to_end(&mut buf)
             .map_err(|err| format!("cannot read data.tar.gz: {err}"))?;
-        return walk_tar_gz(&buf, dest, /*strip_first=*/ false, sink, None).map(|_| ());
+        return walk_tar_gz(
+            &buf,
+            dest,
+            /*strip_first=*/ false,
+            sink,
+            None,
+            skip_file_name,
+        )
+        .map(|_| ());
     }
     Err("the .gem carries no data.tar.gz".to_string())
-}
-
-fn extract_tar_gz(bytes: &[u8], dest: &Path, strip_first: bool) -> Result<(), String> {
-    walk_tar_gz(bytes, dest, strip_first, Sink::Write, None).map(|_| ())
 }
 
 fn walk_tar_gz(
@@ -1515,11 +1629,12 @@ fn walk_tar_gz(
     strip_first: bool,
     sink: Sink,
     watch: Option<&str>,
+    skip_file_name: Option<&str>,
 ) -> Result<bool, String> {
     use std::io::Read as _;
     let gz = flate2::read::GzDecoder::new(bytes).take(MAX_TOTAL_DECOMPRESSED_BYTES);
     let mut archive = tar::Archive::new(gz);
-    let mut out = EntrySink::new(dest, sink);
+    let mut out = EntrySink::new(dest, sink).skipping(skip_file_name);
     let mut seen_watched = false;
     let mut count = 0usize;
     for entry in archive
@@ -3607,7 +3722,7 @@ mod tests {
             dir.clone(),
             "https://example.invalid/left-pad.tgz".to_string(),
             tmp,
-            Box::new(move |dest| extract_tgz(&bytes, dest)),
+            move |dest, skip| extract_tgz_skipping(&bytes, dest, skip),
         );
         // The path is known before anything is written, and nothing is.
         assert_eq!(fetched.dir_path(), dir);
@@ -3642,6 +3757,99 @@ mod tests {
         assert_eq!(fetched.dir().await.unwrap(), dir);
     }
 
+    /// Staging a pending source straight into the vendor stage must leave
+    /// exactly what extracting it and copying the tree out left: same
+    /// files, same bytes, same modes, same skip.
+    #[tokio::test]
+    async fn staging_a_pending_source_equals_extract_then_copy() {
+        let tgz = make_tgz(&[
+            ("crate/Cargo.toml", b"[package]\nname=\"x\"\n", false),
+            ("crate/src/lib.rs", b"pub fn x() {}\n", false),
+            ("crate/build.sh", b"#!/bin/sh\n", true),
+            ("crate/.cargo-checksum.json", b"{}", false),
+            ("crate/vendor/.cargo-checksum.json", b"{}", false),
+        ]);
+        for skip in [None, Some(".cargo-checksum.json")] {
+            // The oracle: what the eager fetch + `fresh_copy` produced.
+            let tmp = tempfile::tempdir().unwrap();
+            let extracted = tmp.path().join("crate");
+            extract_tgz(&tgz, &extracted).unwrap();
+            let oracle = tempfile::tempdir().unwrap();
+            let oracle_stage = oracle.path().join("stage");
+            crate::patch::copy_tree::fresh_copy(&extracted, &oracle_stage, skip)
+                .await
+                .unwrap();
+
+            let holder = tempfile::tempdir().unwrap();
+            let bytes = tgz.clone();
+            let fetched = FetchedPackage::pending(
+                holder.path().join("crate"),
+                "https://example.invalid/x.crate".to_string(),
+                holder,
+                move |dest, skip| extract_tgz_skipping(&bytes, dest, skip),
+            );
+            let staged_root = tempfile::tempdir().unwrap();
+            let staged = staged_root.path().join("stage");
+            fetched.stage_into(&staged, skip).await.unwrap();
+            assert!(
+                !fetched.dir_path().exists(),
+                "a direct stage writes no tempdir tree"
+            );
+            assert_eq!(tree_of(&staged), tree_of(&oracle_stage), "skip: {skip:?}");
+        }
+    }
+
+    /// And when something read the tree first, the stage is still the same
+    /// — it just comes off that tree instead of a second inflate.
+    #[tokio::test]
+    async fn staging_after_materializing_still_matches() {
+        let tgz = make_tgz(&[
+            ("pkg/a.rb", b"A\n", false),
+            ("pkg/bin/run", b"#!/bin/sh\n", true),
+        ]);
+        let holder = tempfile::tempdir().unwrap();
+        let bytes = tgz.clone();
+        let fetched = FetchedPackage::pending(
+            holder.path().join("pkg"),
+            "https://example.invalid/x.gem".to_string(),
+            holder,
+            move |dest, skip| extract_tgz_skipping(&bytes, dest, skip),
+        );
+        let materialized = fetched.dir().await.unwrap().to_path_buf();
+        let staged_root = tempfile::tempdir().unwrap();
+        let staged = staged_root.path().join("stage");
+        fetched.stage_into(&staged, None).await.unwrap();
+        assert_eq!(tree_of(&staged), tree_of(&materialized));
+    }
+
+    /// Every file under `root`, relative, with its bytes and unix mode.
+    fn tree_of(root: &Path) -> Vec<(String, Vec<u8>, u32)> {
+        let mut out: Vec<(String, Vec<u8>, u32)> = walkdir::WalkDir::new(root)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .map(|e| {
+                let rel = e
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let bytes = std::fs::read(e.path()).unwrap();
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    e.metadata().unwrap().permissions().mode() & 0o777
+                };
+                #[cfg(not(unix))]
+                let mode = 0;
+                (rel, bytes, mode)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     /// An extraction that cannot be written reports the same failure to
     /// every later caller, and never half-answers.
     #[tokio::test]
@@ -3652,7 +3860,7 @@ mod tests {
             dir.clone(),
             "https://example.invalid/x.tgz".to_string(),
             tmp,
-            Box::new(|_| Err("cannot create /nope: nope".to_string())),
+            |_, _| Err("cannot create /nope: nope".to_string()),
         );
         assert_eq!(
             fetched.dir().await.unwrap_err(),

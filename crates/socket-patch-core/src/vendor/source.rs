@@ -48,6 +48,28 @@ impl<'a> PackageSource<'a> {
             Self::Pending(fetched) => fetched.dir().await,
         }
     }
+
+    /// Stage the source freshly at `dst` — the vendor stage the local build
+    /// patches and then swaps into the copy dir.
+    ///
+    /// An installed tree is copied out of the registry/module cache, as it
+    /// always was. A pending artifact is written STRAIGHT here instead of
+    /// into its tempdir and copied out of it again: the extraction is the
+    /// same walk, so the stage gets the same files with the same bytes and
+    /// the same modes, and `skip_file_name` drops the same entries the copy
+    /// dropped. `dst` is removed and recreated either way.
+    pub async fn stage_into(
+        &self,
+        dst: &Path,
+        skip_file_name: Option<&'static str>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Installed(dir) => crate::patch::copy_tree::fresh_copy(dir, dst, skip_file_name)
+                .await
+                .map_err(|e| e.to_string()),
+            Self::Pending(fetched) => fetched.stage_into(dst, skip_file_name).await,
+        }
+    }
 }
 
 impl<'a> From<&'a Path> for PackageSource<'a> {

@@ -58,7 +58,7 @@ use serde_json::Value;
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
-use crate::patch::copy_tree::{fresh_copy, remove_tree};
+use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::patch::redirect::gem_line_trailing_options;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
@@ -1133,24 +1133,11 @@ async fn materialise_patched_copy(
                 )));
             }
             let stage = stage_dir_for(copy_dir);
-            // The local build is the first branch that reads the installed
-            // gem: a lazily-fetched source is extracted here, and a failure
-            // reads as the copy failure it stands in for.
-            let installed_dir = match installed_dir.materialize().await {
-                Ok(dir) => dir,
-                Err(e) => {
-                    cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-                    return Ok(synthesized_result(
-                        purl,
-                        copy_dir,
-                        Vec::new(),
-                        false,
-                        Some(format!("failed to copy installed gem: {e}")),
-                    ));
-                }
-            };
-            // `fresh_copy` removes + recreates the stage itself.
-            if let Err(e) = fresh_copy(installed_dir, &stage, None).await {
+            // The local build is the first branch that reads the source. An
+            // installed gem is copied out of the gem home; a fetched one is
+            // written straight here from the verified `.gem`. `stage_into`
+            // removes + recreates the stage itself.
+            if let Err(e) = installed_dir.stage_into(&stage, None).await {
                 cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
                 return Ok(synthesized_result(
                     purl,

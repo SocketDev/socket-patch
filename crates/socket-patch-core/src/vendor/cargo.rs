@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
-use crate::patch::copy_tree::{fresh_copy, remove_tree};
+use crate::patch::copy_tree::remove_tree;
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::fs::{is_symlink, read_regular_to_string};
 use crate::utils::purl::{parse_cargo_purl, strip_purl_qualifiers};
@@ -470,24 +470,15 @@ async fn copy_and_patch(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<ApplyResult, ApplyResult> {
     let stage = stage_dir_for(copy_dir);
-    // The local build is the first branch that reads the pristine tree: a
-    // lazily-fetched source is extracted here, and a failure reads as the
-    // copy failure it stands in for.
-    let pristine_src = match pristine_src.materialize().await {
-        Ok(dir) => dir,
-        Err(e) => {
-            cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
-            return Err(synthesized_result(
-                purl,
-                copy_dir,
-                Vec::new(),
-                false,
-                Some(format!("failed to copy pristine source: {e}")),
-            ));
-        }
-    };
-    // `fresh_copy` removes + recreates the stage itself.
-    if let Err(e) = fresh_copy(pristine_src, &stage, Some(".cargo-checksum.json")).await {
+    // The local build is the first branch that reads the pristine tree. An
+    // installed crate is copied out of the registry cache; a fetched one is
+    // written straight here from the verified `.crate`, instead of into a
+    // tempdir and copied out of it again. `stage_into` removes + recreates
+    // the stage itself.
+    if let Err(e) = pristine_src
+        .stage_into(&stage, Some(".cargo-checksum.json"))
+        .await
+    {
         cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
         return Err(synthesized_result(
             purl,

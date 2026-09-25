@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{normalize_file_path, ApplyResult, PatchSources};
-use crate::patch::copy_tree::{fresh_copy, remove_tree};
+use crate::patch::copy_tree::remove_tree;
 use crate::patch::package::read_archive_to_map;
 use crate::patch::path_safety;
 use crate::utils::fs::atomic_write_bytes;
@@ -223,18 +223,11 @@ pub(super) async fn stage_patch_pack(
         }
     };
     let stage = stage_tmp.path().join("stage");
-    // The first read of a lazily-fetched source: extracting it is part of
-    // staging the copy, and a failure reads as one.
-    let installed_dir = match installed_dir.materialize().await {
-        Ok(dir) => dir,
-        Err(e) => {
-            return Err(Box::new(done_failure(
-                purl,
-                format!("cannot stage a copy of the installed package: {e}"),
-            )))
-        }
-    };
-    if let Err(e) = fresh_copy(installed_dir, &stage, None).await {
+    // The first branch that reads the source. An installed package is
+    // copied out of node_modules; a fetched one is written straight here
+    // from the verified tarball, instead of into a tempdir and copied out
+    // of it again.
+    if let Err(e) = installed_dir.stage_into(&stage, None).await {
         return Err(Box::new(done_failure(
             purl,
             format!("cannot stage a copy of the installed package: {e}"),

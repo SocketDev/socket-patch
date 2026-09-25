@@ -26,11 +26,12 @@ fn to_io<E: std::fmt::Display>(e: E) -> std::io::Error {
 pub(crate) async fn fresh_copy(
     src: &Path,
     dst: &Path,
-    skip_file_name: Option<&'static str>,
+    skip_file_name: Option<&str>,
 ) -> std::io::Result<()> {
     let src = src.to_path_buf();
     let dst = dst.to_path_buf();
-    tokio::task::spawn_blocking(move || copy_tree_blocking(&src, &dst, skip_file_name))
+    let skip_file_name = skip_file_name.map(str::to_string);
+    tokio::task::spawn_blocking(move || copy_tree_blocking(&src, &dst, skip_file_name.as_deref()))
         .await
         .map_err(to_io)?
 }
@@ -43,11 +44,7 @@ pub(crate) async fn fresh_copy(
 /// the skip is not pruned, so its contents are still copied and must create
 /// the skipped directory on demand (it then exists in the copy only when it
 /// has contents, as it always has).
-fn copy_tree_blocking(
-    src: &Path,
-    dst: &Path,
-    skip_file_name: Option<&'static str>,
-) -> std::io::Result<()> {
+fn copy_tree_blocking(src: &Path, dst: &Path, skip_file_name: Option<&str>) -> std::io::Result<()> {
     force_remove_dir_all(dst)?;
     std::fs::create_dir_all(dst)?;
     // Depth of the outermost skipped directory the walk is inside.
@@ -91,7 +88,7 @@ fn copy_tree_blocking(
 fn copy_tree_blocking_reference(
     src: &Path,
     dst: &Path,
-    skip_file_name: Option<&'static str>,
+    skip_file_name: Option<&str>,
 ) -> std::io::Result<()> {
     force_remove_dir_all(dst)?;
     std::fs::create_dir_all(dst)?;
