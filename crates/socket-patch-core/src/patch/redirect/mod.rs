@@ -2151,16 +2151,13 @@ fn plan_cargo_toml(
             let sub = parse_cargo_entry_key(dotted);
             if sub.as_ref().is_some_and(|(key, _)| key == "workspace") {
                 pending.push(Pending::NeedsWorkspacePin(key.clone()));
-            } else if key == crate_name {
-                pending.push(Pending::Refuse(
-                    "declared with dotted keys this rewriter does not edit".to_string(),
-                ));
-            } else if sub
-                .filter(|(key, _)| key == "package")
-                .and_then(|(_, rest)| rest.trim_start().strip_prefix('='))
-                .and_then(cargo_toml_string)
-                .as_deref()
-                == Some(crate_name)
+            } else if key == crate_name
+                || sub
+                    .filter(|(key, _)| key == "package")
+                    .and_then(|(_, rest)| rest.trim_start().strip_prefix('='))
+                    .and_then(cargo_toml_string)
+                    .as_deref()
+                    == Some(crate_name)
             {
                 pending.push(Pending::Refuse(
                     "declared with dotted keys this rewriter does not edit".to_string(),
