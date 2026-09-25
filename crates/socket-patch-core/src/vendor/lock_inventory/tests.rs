@@ -2478,3 +2478,73 @@ async fn the_hosted_rewriters_own_output_reinventories() {
         "wet requirements.txt:\n{wet}\nentries: {entries:?}"
     );
 }
+
+/// The VENDORED requirements.txt shape must inventory too.
+///
+/// `already_redirected_requirements_lines_stay_in_the_inventory` covers the
+/// hosted `name @ <url>` half. The vendored writer emits something else
+/// entirely — a BARE path line,
+/// `./<rel wheel>[ ; marker] --hash=sha256:<hex>  # socket-patch vendor:
+/// <name>==<ver>` (`vendor::pypi_requirements::vendor_line`) — with no
+/// `name @` at all, so the direct-reference reader never sees it and the
+/// package drops out of the inventory exactly the way the hosted lines did.
+/// The `socket-patch vendor:` comment tag is the name/version the writer
+/// left for its readers; cross-check it against the path's own coordinates.
+#[tokio::test]
+async fn already_vendored_requirements_lines_stay_in_the_inventory() {
+    const UUID: &str = "33333333-3333-3333-3333-333333333333";
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "requirements.txt",
+        &format!(
+            "./.socket/vendor/pypi/{UUID}/requests-2.28.1-py3-none-any.whl \
+             --hash=sha256:{sha}  # socket-patch vendor: requests==2.28.1\n\
+             ./.socket/vendor/pypi/{UUID}/urllib3-1.26.18-py2.py3-none-any.whl ; \
+             python_version >= \"3.7\" --hash=sha256:{sha}  \
+             # socket-patch vendor: urllib3==1.26.18 (transitive)\n\
+             flask==3.0.0\n\
+             ./wheels/local_thing-1.0-py3-none-any.whl\n",
+            sha = "c".repeat(64),
+        ),
+    )
+    .await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![
+            ("flask".to_string(), "3.0.0".to_string()),
+            ("requests".to_string(), "2.28.1".to_string()),
+            ("urllib3".to_string(), "1.26.18".to_string()),
+        ],
+        "a user's own wheel path stays out; ours come back as the package \
+         they replace: {entries:?}"
+    );
+    for e in &entries {
+        assert_eq!(e.integrity, LockIntegrity::None, "{e:?}");
+        assert_eq!(e.resolved, None, "{e:?}");
+    }
+}
+
+/// The vendored writer's OWN output must re-inventory: build the line with
+/// the writer's formatter and feed it straight back in.
+#[tokio::test]
+async fn the_vendored_requirements_writers_own_output_reinventories() {
+    const UUID: &str = "44444444-4444-4444-4444-444444444444";
+    let tmp = tempfile::tempdir().unwrap();
+    let line = crate::vendor::pypi_requirements::vendor_line(
+        &format!(".socket/vendor/pypi/{UUID}/requests-2.28.1-py3-none-any.whl"),
+        &"c".repeat(64),
+        "requests",
+        "2.28.1",
+        &None,
+        false,
+    );
+    write(tmp.path(), "requirements.txt", &format!("{line}\n")).await;
+    let entries = inventory_pypi_locks(tmp.path()).await.unwrap();
+    assert_eq!(
+        sorted_pairs(&entries),
+        vec![("requests".to_string(), "2.28.1".to_string())],
+        "wet requirements.txt:\n{line}\nentries: {entries:?}"
+    );
+}

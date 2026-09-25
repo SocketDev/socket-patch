@@ -114,13 +114,14 @@ pub(crate) fn exact_pin(code: &str) -> Option<(&str, &str)> {
 }
 
 /// The `(name as spelled, reference)` of a PEP 508 direct reference
-/// (`name[extras] @ <url-or-path>`) — the shape the hosted redirect and the
-/// vendored requirements writer rewrite an exact pin INTO. `None` for
-/// anything else, [`exact_pin`]s included (a pin has no `@` before its
-/// specifier). Like `exact_pin` this reads a logical line's code part and
-/// stops at an optional `; marker`; the name cannot contain an `@`, so the
-/// first one is always the separator and a url's own `user@host` stays
-/// inside the reference.
+/// (`name[extras] @ <url-or-path>`) — the shape the HOSTED redirect
+/// rewrites an exact pin INTO. The VENDORED requirements writer emits a
+/// bare path line tagged with [`vendor_tag`] instead, which this does NOT
+/// match: it has no `name @`. `None` for anything else, [`exact_pin`]s
+/// included (a pin has no `@` before its specifier). Like `exact_pin` this
+/// reads a logical line's code part and stops at an optional `; marker`;
+/// the name cannot contain an `@`, so the first one is always the separator
+/// and a url's own `user@host` stays inside the reference.
 pub(crate) fn direct_reference(code: &str) -> Option<(&str, &str)> {
     let (name, rest) = code.split(';').next()?.split_once('@')?;
     let name = name.split('[').next()?.trim();

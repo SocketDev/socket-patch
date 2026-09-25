@@ -543,14 +543,25 @@ async fn inventory_pdm_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
 /// ([`crate::utils::requirements`]: continuations joined, comments cut, one
 /// leading BOM dropped), the same one the planner and discovery use.
 ///
-/// A line we ourselves rewrote — the hosted `name @ <patch-server url>` and
-/// the vendored `name @ ./.socket/vendor/pypi/…` direct references — is
-/// still the package it replaced, at its version: it stays in the inventory
-/// so a re-scan of an already-wired project counts (and re-confirms) it
-/// instead of reporting the package gone. Same rule, and the same
-/// [`socket_reference_coords`] reader, as Pipfile.lock's own entries; a
-/// uv.lock keeps its `[[package]]` name/version through the rewrite for
-/// free. A user's OWN file/url reference is not ours to resolve and stays
+/// A line we ourselves rewrote is still the package it replaced, at its
+/// version: it stays in the inventory so a re-scan of an already-wired
+/// project counts (and re-confirms) it instead of reporting the package
+/// gone. Same rule, and the same [`socket_reference_coords`] reader, as
+/// Pipfile.lock's own entries; a uv.lock keeps its `[[package]]`
+/// name/version through the rewrite for free. The two writers spell their
+/// line differently, so both shapes are read:
+///
+/// * hosted redirect — the PEP 508 direct reference
+///   `name @ <patch-server url>` (`utils::requirements::direct_reference`);
+/// * vendored requirements — a BARE path line,
+///   `./.socket/vendor/pypi/<uuid>/<wheel> --hash=sha256:…
+///   # socket-patch vendor: <name>==<ver>`
+///   (`vendor::pypi_requirements::vendor_line`), whose requirement name
+///   lives ONLY in that comment tag
+///   (`utils::requirements::vendor_tag`, the reader
+///   `vex::discover::pypi_other` already uses).
+///
+/// A user's OWN file/url/path reference is not ours to resolve and stays
 /// out, exactly as before.
 async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = read_regular_to_string(&project_root.join("requirements.txt"))
@@ -558,7 +569,8 @@ async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileE
         .ok()?;
     let mut out = Vec::new();
     for line in crate::utils::requirements::logical_lines(&text) {
-        let t = crate::utils::requirements::strip_comment(&line.text).trim();
+        let (code, comment) = crate::utils::requirements::split_comment(&line.text);
+        let t = code.trim();
         if t.is_empty() || t.starts_with('-') {
             continue;
         }
@@ -569,6 +581,14 @@ async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileE
             None => {
                 let Some((raw_name, reference)) = crate::utils::requirements::direct_reference(t)
                     .and_then(|(n, r)| Some((n, socket_reference_coords(r)?)))
+                    .or_else(|| {
+                        // The VENDORED writer's shape: a bare path line
+                        // whose requirement name lives only in the
+                        // `socket-patch vendor:` comment tag it appends.
+                        let coords = socket_reference_coords(t.split_whitespace().next()?)?;
+                        let (tag_name, _) = crate::utils::requirements::vendor_tag(comment?)?;
+                        Some((tag_name, coords))
+                    })
                 else {
                     continue;
                 };
