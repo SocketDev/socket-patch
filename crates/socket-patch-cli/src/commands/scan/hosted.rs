@@ -1491,8 +1491,6 @@ pub(crate) async fn run_redirect_selected(
         {
             return refuse_symlinked_file(common, scan_result.take(), linked);
         }
-        let patch_entries =
-            socket_patch_core::vendor::cargo_config::read_patch_entries(&common.cwd).await;
         let mut refused: Vec<String> = Vec::new();
         for (candidate, ledger_entry) in &takeover {
             let purl = &candidate.purl;
@@ -1608,23 +1606,30 @@ pub(crate) async fn run_redirect_selected(
                 // this crate is nevertheless present, the ledger is missing or
                 // corrupt — the originals needed to revert are unrecoverable,
                 // so redirecting on top would wedge the project. Refuse.
-                // (Cargo-only probe: `.cargo/config.toml` `[patch]` entries.
-                // An npm purl in this state falls through to the rewriters'
-                // own per-flavor diagnostics.)
-                let name = purl
+                // (Cargo-only probe: Socket-owned `[patch.crates-io]` entries
+                // for exactly this name@version in the root Cargo.toml or a
+                // legacy `.cargo/config*` — another vendored version of the
+                // crate has its own ledger entry. An npm purl in this state
+                // falls through to the rewriters' own per-flavor
+                // diagnostics.)
+                let coords = purl
                     .starts_with("pkg:cargo/")
-                    .then(|| purl_parts(purl).map(|(_, name, _)| name))
+                    .then(|| purl_parts(purl).map(|(_, name, version)| (name, version)))
                     .flatten();
-                let wired = name
-                    .as_deref()
-                    .is_some_and(|n| patch_entries.get(n).is_some_and(|i| i.socket_owned));
+                let wired = match &coords {
+                    Some((n, v)) => {
+                        socket_patch_core::vendor::cargo::socket_wiring_present(&common.cwd, n, v)
+                            .await
+                    }
+                    None => false,
+                };
                 if wired {
                     refused.push(purl.clone());
                     takeover_pre_warnings.push(serde_json::json!({
                         "code": "redirect_vendored_revert_failed",
                         "detail": format!(
-                            "{purl} has socket-owned vendored wiring in \
-                             .cargo/config.toml but no usable vendored ledger entry \
+                            "{purl} has socket-owned vendored `[patch.crates-io]` \
+                             wiring but no usable vendored ledger entry \
                              (.socket/vendor/state.json is missing or corrupt); NOT \
                              redirected — restore the ledger or remove the vendored \
                              wiring manually, then re-run"
@@ -1701,6 +1706,19 @@ pub(crate) async fn run_redirect_selected(
             }
             if let Ok(content) = read_regular_to_string(&common.cwd.join(name)).await {
                 files.insert((*name).to_string(), content);
+            }
+        }
+
+        // Cargo workspace members (and in-root path dependencies) declare
+        // dependencies of their own: a member's direct `cfg-if = "1"` must
+        // be pinned alongside the root's, or the redirected lock entry is
+        // unsatisfiable. Keyed `<dir>/Cargo.toml` for the cargo rewriter.
+        if files.contains_key("Cargo.toml") && candidates.iter().any(|c| c.dep.ecosystem == "cargo")
+        {
+            for rel in socket_patch_core::utils::cargo_workspace::member_manifests(&common.cwd) {
+                if let Ok(content) = read_regular_to_string(&common.cwd.join(&rel)).await {
+                    files.insert(rel, content);
+                }
             }
         }
 
@@ -2574,6 +2592,13 @@ pub(crate) async fn run_redirect_selected(
                     }
                 }
             }
+            // Dedup against the ledger as this run found it, never within
+            // this run: one run legitimately records identical edits (a
+            // Cargo.toml declaring the crate with the same line in two
+            // sections), and each one reverts one occurrence — collapsing
+            // them made `remove` leave the second pin (and its registry
+            // block) in place while reporting success.
+            let recorded = ledger.edits.len();
             for edit in &rewrite.edits {
                 let is_rebased = REBASE_KINDS.contains(&edit.kind.as_str())
                     && rebased.iter().any(|&t| {
@@ -2583,7 +2608,7 @@ pub(crate) async fn run_redirect_selected(
                             && old.key == edit.key
                             && old.new == edit.new
                     });
-                if !is_rebased && !ledger.edits.contains(edit) {
+                if !is_rebased && !ledger.edits[..recorded].contains(edit) {
                     ledger.edits.push(edit.clone());
                 }
             }

@@ -143,6 +143,7 @@ pub async fn vendor_gem(
     let Some((name, version)) = parse_gem_purl(purl) else {
         return refused("unsafe_coordinates", format!("not a gem purl: {purl}"));
     };
+    let (name, version) = (name.as_ref(), version.as_ref());
     // SECURITY: `uuid`, `name` and `version` come from committed, tamper-able
     // manifest data. They key the copy dir vendor creates and `--revert`
     // deletes, and — stricter than the path guard — they are embedded
@@ -1214,8 +1215,8 @@ pub async fn revert_gem_opts(
     // in — the patch would silently stay applied.
     if entry.wiring.is_empty() {
         let name = parse_gem_purl(&entry.base_purl)
-            .map(|(n, _)| n)
-            .unwrap_or("<unknown>");
+            .map(|(n, _)| n.into_owned())
+            .unwrap_or_else(|| "<unknown>".to_string());
         return RevertOutcome::failed(format!(
             "vendor_wiring_unknown: the ledger records no wiring for `{name}` (a \
              reconstructed entry without recoverable originals); refusing to delete {} and \
@@ -1350,6 +1351,7 @@ pub async fn reconstruct_gem_wiring(
     let Some((name, version)) = parse_gem_purl(&entry.base_purl) else {
         return Err(format!("not a gem purl: {}", entry.base_purl));
     };
+    let (name, version) = (name.as_ref(), version.as_ref());
     // SECURITY: the coordinates come from a re-synthesized entry
     // (manifest/API purl) and are matched against Gemfile/lock line
     // grammar — the same fail-closed token guard as `vendor_gem`.

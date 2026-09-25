@@ -325,7 +325,7 @@ pub async fn remove_go_redirect(
             format!("not a golang purl: {purl}"),
         )
     })?;
-    let (module, version) = (&*module, &*version);
+    let (module, version) = (module.as_ref(), version.as_ref());
 
     // SECURITY: the copy dir is `<base_rel>/<module>@<version>/` and is about
     // to be `remove_tree`d. Unsafe coordinates (`..` segment / separator /
@@ -361,9 +361,9 @@ pub async fn reconcile_go_redirects(
     desired: &HashSet<String>,
     dry_run: bool,
 ) -> Vec<String> {
-    let desired_modules: HashSet<std::borrow::Cow<str>> = desired
+    let desired_modules: HashSet<String> = desired
         .iter()
-        .filter_map(|p| parse_golang_purl(p).map(|(m, _)| m))
+        .filter_map(|p| parse_golang_purl(p).map(|(m, _)| m.into_owned()))
         .collect();
 
     let mut removed: Vec<String> = Vec::new();
@@ -408,7 +408,7 @@ pub async fn reconcile_go_redirects(
             // Path-exact on purpose: a directive already repointed at the
             // desired version's copy is never touched.
             if let Some((module, version)) = parse_golang_purl(&purl) {
-                let (module, version) = (&*module, &*version);
+                let (module, version) = (module.as_ref(), version.as_ref());
                 let target = replace_target_path(GO_PATCHES_DIR, module, version);
                 if entries.iter().any(|e| {
                     e.owner == Some(ReplaceOwner::GoPatches)
@@ -458,16 +458,16 @@ pub async fn verify_go_redirect_state(
     // Required versions from go.mod (None ⇒ no go.mod ⇒ skip the version
     // cross-check). Read once, project-local, offline.
     let required = read_required_versions(project_root).await;
-    let desired_modules: HashSet<std::borrow::Cow<str>> = desired
+    let desired_modules: HashSet<String> = desired
         .iter()
-        .filter_map(|p| parse_golang_purl(p).map(|(m, _)| m))
+        .filter_map(|p| parse_golang_purl(p).map(|(m, _)| m.into_owned()))
         .collect();
 
     for purl in desired {
         let Some((module, version)) = parse_golang_purl(purl) else {
             continue;
         };
-        let (module, version) = (&*module, &*version);
+        let (module, version) = (module.as_ref(), version.as_ref());
         let Some(record) = manifest.patches.get(purl) else {
             continue;
         };

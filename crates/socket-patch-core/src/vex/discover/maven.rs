@@ -384,6 +384,7 @@ async fn extract_vendored(
         let Some((group, artifact, version)) = crate::utils::purl::parse_maven_purl(purl) else {
             continue;
         };
+        let (group, artifact, version) = (group.as_ref(), artifact.as_ref(), version.as_ref());
         let rel = format!(
             "{dir}/{}",
             local_repo_artifact_path(group, artifact, version, "jar")

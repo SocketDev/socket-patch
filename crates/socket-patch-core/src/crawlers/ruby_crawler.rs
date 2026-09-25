@@ -168,6 +168,7 @@ impl RubyCrawler {
 
         for purl in purls {
             if let Some((name, version)) = crate::utils::purl::parse_gem_purl(purl) {
+                let (name, version) = (name.as_ref(), version.as_ref());
                 // SECURITY: name/version come straight from the (untrusted)
                 // manifest PURL and are formatted into a `<name>-<version>`
                 // dir name joined onto `gem_path` below. A real gem

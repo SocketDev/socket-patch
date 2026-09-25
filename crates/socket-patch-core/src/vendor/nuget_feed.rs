@@ -227,6 +227,7 @@ pub async fn vendor_nuget(
     let Some((name, version)) = parse_nuget_purl(purl) else {
         return refused("unsafe_coordinates", format!("not a nuget purl: {purl}"));
     };
+    let (name, version) = (name.as_ref(), version.as_ref());
     // SECURITY: `uuid`, `name`, and `version` come from committed, tamper-able
     // manifest data. They key the uuid dir vendor creates and `--revert`
     // deletes, the vendored filename, and — via `nuget.config` — XML attribute

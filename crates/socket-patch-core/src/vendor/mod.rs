@@ -14,7 +14,7 @@
 //! | eco      | artifact            | wiring                                         |
 //! |----------|---------------------|------------------------------------------------|
 //! | npm      | deterministic tgz   | per lockfile flavor: package-lock `resolved`+`integrity`, yarn classic, yarn berry, pnpm, bun ([`npm_flavor`] routes) |
-//! | cargo    | crate dir           | `.cargo/config.toml` `[patch.crates-io]` + Cargo.lock surgery |
+//! | cargo    | crate dir           | root `Cargo.toml` `[patch.crates-io]` + Cargo.lock surgery ([`cargo_manifest`]) |
 //! | golang   | module dir          | `go.mod` `replace` ([`ReplaceOwner::Vendor`])  |
 //! | composer | package dir         | composer.lock `dist` → `{type: path}`          |
 //! | gem      | gem dir (+gemspec)  | Gemfile `path:` + Gemfile.lock PATH pair       |
@@ -56,6 +56,8 @@ mod bun_workspace;
 pub mod cargo;
 pub mod cargo_config;
 pub mod cargo_lock;
+pub mod cargo_manifest;
+pub mod cargo_tag;
 pub(crate) mod common;
 pub mod composer_lock;
 pub mod gem;

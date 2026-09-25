@@ -552,6 +552,7 @@ pub async fn vendor_pypi_with_pipenv_version(
             format!("{purl} is not a pkg:pypi PURL with a version"),
         );
     };
+    let (raw_name, version) = (raw_name.as_ref(), version.as_ref());
     let canon_name = canonicalize_pypi_name(raw_name);
 
     // SECURITY: the uuid comes from a committed, tamper-able manifest and

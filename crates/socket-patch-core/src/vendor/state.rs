@@ -369,6 +369,13 @@ impl Default for VendorState {
 ///     entry is its only home. A re-vendor over already-detached wiring
 ///     records `lock: None` (there was nothing left to detach), and taking
 ///     the fresh entry verbatim would destroy the first run's originals;
+///   * carries forward a cargo copy's whole-tree file inventory when the
+///     fresh entry names the SAME copy (same uuid + artifact path) and
+///     records none — the cargo backend never inventories, and a re-run
+///     that only (re)tags or migrates the wiring of that copy must not
+///     silently downgrade whole-tree verification to the patched members
+///     (the inventory check compares the copy's `Cargo.toml` with this
+///     uuid's tag dropped, so the tag itself still verifies);
 ///   * preserves the go-patch-takeover flag.
 ///
 /// The wiring UNION is scoped to a re-vendor of the SAME patch generation
@@ -387,6 +394,14 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
     entry.took_over_go_patches = entry.took_over_go_patches || prev.took_over_go_patches;
     if entry.lock.is_none() {
         entry.lock = prev.lock.clone();
+    }
+    if entry.ecosystem == "cargo"
+        && prev.ecosystem == "cargo"
+        && entry.artifact.file_inventory.is_none()
+        && prev.uuid == entry.uuid
+        && prev.artifact.path == entry.artifact.path
+    {
+        entry.artifact.file_inventory = prev.artifact.file_inventory.clone();
     }
 
     for rec in &mut entry.wiring {
@@ -442,6 +457,13 @@ pub fn carry_forward_wiring(prev: &VendorEntry, entry: &mut VendorEntry) {
 /// Binary IDs are offsets into Bun's package array and may change after an
 /// installer re-save. Match the predecessor's semantic resolution instead.
 fn wiring_surface_matches(previous: &WiringRecord, current: &WiringRecord) -> bool {
+    // A cargo entry has ONE `[patch.crates-io]` surface wherever it lives:
+    // the pre-v5 `.cargo/config*` record and the v5 `Cargo.toml` record (or
+    // a manifest record under another key) are the same wiring, so a
+    // migrated entry never carries the retired config record forward.
+    if previous.kind == "cargo_patch_entry" && current.kind == "cargo_patch_entry" {
+        return true;
+    }
     if previous.file != current.file || previous.kind != current.kind {
         return false;
     }
@@ -671,6 +693,118 @@ mod tests {
             pdm: None,
             pipenv: None,
         }
+    }
+
+    /// A cargo entry migrated from the pre-v5 `.cargo/config.toml` wiring to
+    /// `Cargo.toml` must not carry the retired config record forward (one
+    /// `[patch]` surface per entry), while the lock record and originals
+    /// still carry over.
+    #[test]
+    fn carry_forward_drops_the_legacy_cargo_config_record() {
+        let rec = |file: &str, kind: &str, key: &str| WiringRecord {
+            file: file.into(),
+            kind: kind.into(),
+            action: WiringAction::Added,
+            key: Some(key.into()),
+            original: None,
+            new: None,
+        };
+        let uuid = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+        let base = |wiring: Vec<WiringRecord>, lock: Option<CargoLockOriginal>| VendorEntry {
+            ecosystem: "cargo".into(),
+            base_purl: "pkg:cargo/cfg-if@1.0.4".into(),
+            uuid: uuid.into(),
+            artifact: VendorArtifact {
+                path: format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4"),
+                sha256: String::new(),
+                size: None,
+                platform_locked: None,
+                file_inventory: None,
+            },
+            wiring,
+            lock,
+            took_over_go_patches: false,
+            detached: false,
+            record: None,
+            flavor: None,
+            uv: None,
+            pnpm: None,
+            poetry: None,
+            pdm: None,
+            pipenv: None,
+        };
+        let orig = CargoLockOriginal {
+            source: "registry+https://github.com/rust-lang/crates.io-index".into(),
+            checksum: Some("a".repeat(64)),
+        };
+        let prev = base(
+            vec![
+                rec(".cargo/config.toml", "cargo_patch_entry", "cfg-if"),
+                rec("Cargo.lock", "cargo_lock_entry", "cfg-if@1.0.4"),
+            ],
+            Some(orig.clone()),
+        );
+        let mut fresh = base(vec![rec("Cargo.toml", "cargo_patch_entry", "cfg-if")], None);
+        carry_forward_wiring(&prev, &mut fresh);
+        let files: Vec<&str> = fresh.wiring.iter().map(|w| w.file.as_str()).collect();
+        assert_eq!(files, vec!["Cargo.toml", "Cargo.lock"]);
+        assert_eq!(fresh.lock, Some(orig));
+    }
+
+    /// A cargo re-run that only (re)tags or migrates the SAME copy records
+    /// no inventory (the cargo backend never takes one): the previous
+    /// entry's whole-tree inventory carries forward, so verification is not
+    /// silently downgraded to the patched members. A new uuid or copy path
+    /// is a new tree: nothing carries.
+    #[test]
+    fn carry_forward_keeps_a_cargo_inventory_for_the_same_copy() {
+        let uuid2 = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+        let cargo = |uuid: &str, inventory: Option<BTreeMap<String, String>>| {
+            let mut e = sample_entry();
+            e.ecosystem = "cargo".into();
+            e.base_purl = "pkg:cargo/cfg-if@1.0.4".into();
+            e.uuid = uuid.into();
+            e.wiring.clear();
+            e.artifact.path = format!(".socket/vendor/cargo/{uuid}/cfg-if-1.0.4");
+            e.artifact.file_inventory = inventory;
+            e
+        };
+        let inventory: BTreeMap<String, String> = [("Cargo.toml".to_string(), "ab".repeat(32))]
+            .into_iter()
+            .collect();
+        let prev = cargo(UUID, Some(inventory.clone()));
+
+        let mut same = cargo(UUID, None);
+        carry_forward_wiring(&prev, &mut same);
+        assert_eq!(same.artifact.file_inventory, Some(inventory.clone()));
+
+        let mut fresh_inventory: BTreeMap<String, String> = BTreeMap::new();
+        fresh_inventory.insert("src/lib.rs".into(), "cd".repeat(32));
+        let mut own = cargo(UUID, Some(fresh_inventory.clone()));
+        carry_forward_wiring(&prev, &mut own);
+        assert_eq!(
+            own.artifact.file_inventory,
+            Some(fresh_inventory),
+            "never overwritten"
+        );
+
+        let mut bumped = cargo(uuid2, None);
+        carry_forward_wiring(&prev, &mut bumped);
+        assert_eq!(
+            bumped.artifact.file_inventory, None,
+            "another uuid: another tree"
+        );
+
+        let mut moved = cargo(UUID, None);
+        moved.artifact.path = format!(".socket/vendor/cargo/{UUID}/cfg-if-1.0.5");
+        carry_forward_wiring(&prev, &mut moved);
+        assert_eq!(moved.artifact.file_inventory, None, "another copy path");
+
+        let mut npm_prev = sample_entry();
+        npm_prev.artifact.file_inventory = Some(inventory);
+        let mut npm = sample_entry();
+        carry_forward_wiring(&npm_prev, &mut npm);
+        assert_eq!(npm.artifact.file_inventory, None, "cargo only");
     }
 
     /// Every spelling `purl_keys` promises: the (possibly qualified,

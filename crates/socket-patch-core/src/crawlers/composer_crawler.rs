@@ -165,6 +165,8 @@ impl ComposerCrawler {
             if let Some(((namespace, name), version)) =
                 crate::utils::purl::parse_composer_purl(purl)
             {
+                let (namespace, name, version) =
+                    (namespace.as_ref(), name.as_ref(), version.as_ref());
                 let full_name = format!("{namespace}/{name}").to_ascii_lowercase();
 
                 let Some(entry) = installed.get(&full_name) else {

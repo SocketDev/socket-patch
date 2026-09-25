@@ -1106,6 +1106,49 @@ checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     assert_eq!(entry(&entries, "git-dep").integrity, LockIntegrity::None);
 }
 
+/// A sourced entry carrying a Socket tag (hand-edited / foreign: vendoring
+/// writes tagged entries SOURCELESS, which are skipped) is listed under its
+/// purl version with no verifier; the sourceless tagged copy is not listed.
+#[tokio::test]
+async fn cargo_lock_strips_a_socket_tag_and_drops_its_verifier() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "Cargo.lock",
+        r#"version = 4
+
+[[package]]
+name = "cfg-if"
+version = "1.0.4+socket.9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddc6f9cc94d67c0e21aaf7eda3a010fd3af78ebf6e096aa6e2e13c79749cce4f"
+
+[[package]]
+name = "zstd-sys"
+version = "2.0.1+zstd.1.5.2.socket.9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f"
+
+[[package]]
+name = "keep-meta"
+version = "2.0.1+zstd.1.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#,
+    )
+    .await;
+    let entries = inventory_cargo_lock(tmp.path()).await.unwrap();
+    let cfg_if = entry(&entries, "cfg-if");
+    assert_eq!(cfg_if.version, "1.0.4");
+    assert_eq!(cfg_if.purl, "pkg:cargo/cfg-if@1.0.4");
+    assert_eq!(cfg_if.integrity, LockIntegrity::None);
+    assert!(!entries.iter().any(|e| e.name == "zstd-sys"), "{entries:?}");
+    let meta = entry(&entries, "keep-meta");
+    assert_eq!(
+        meta.version, "2.0.1+zstd.1.5.2",
+        "non-Socket build metadata stays"
+    );
+    assert!(matches!(meta.integrity, LockIntegrity::Sha256Hex(_)));
+}
+
 #[tokio::test]
 async fn go_sum_inventories_module_zip_lines() {
     let tmp = tempfile::tempdir().unwrap();
