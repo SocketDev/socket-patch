@@ -3,7 +3,8 @@
 use super::bun_lockb::{BinaryPackage, BunLockb};
 use super::common::{already_patched_result, refused};
 use super::npm_common::{
-    done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
+    done_failure_unstage, gate_packages, guard_coordinates, guard_revert_uuid_dir, refusal_code,
+    stage_patch_pack, tgz_rel_leaf, NpmCoords,
 };
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
@@ -43,61 +44,16 @@ pub(crate) async fn vendor(
         Ok(v) => v,
         Err(o) => return *o,
     };
-    if crate::utils::fs::is_symlink(&root.join(LOCK)).await {
-        return refused(
-            "vendor_bun_lockb_invalid",
-            "bun.lockb is a symbolic link; replace it with a regular file before vendoring",
-        );
-    }
-    let mut lock = match read_regular_to_bytes_sync(&root.join(LOCK))
-        .map_err(|e| e.to_string())
-        .and_then(|b| BunLockb::parse(&b))
-    {
+    let project = match read_project(root).await {
         Ok(v) => v,
-        Err(e) => return refused("vendor_bun_lockb_invalid", e),
-    };
-    if let Err(e) = lock.validate_mutation() {
-        return refused("vendor_bun_lockb_invalid", e);
-    }
-    let packages = match lock.packages() {
-        Ok(v) => v,
-        Err(e) => return refused("vendor_bun_lockb_invalid", e),
+        Err(o) => return *o,
     };
     let leaf = tgz_rel_leaf(&coords.name, &coords.version);
-    let matches: Vec<_> = packages
-        .into_iter()
-        .filter(|p| {
-            (p.name == coords.name && p.version.as_deref() == Some(&coords.version))
-                || is_ours(p, &coords.name, &leaf)
-        })
-        .collect();
-    if matches.is_empty() {
-        return refused(
-            "vendor_lock_entry_not_found",
-            format!(
-                "{LOCK} has no registry entry for {}@{}",
-                coords.name, coords.version
-            ),
-        );
-    }
-    let mirrors = match lock.workspace_paths().and_then(|paths| {
-        paths
-            .into_iter()
-            .map(|workspace| {
-                let rel = format!(
-                    "{}/{}/{}",
-                    workspace.trim_start_matches("./"),
-                    coords.uuid_dir_rel,
-                    leaf
-                );
-                validate_mirror_path(root, &rel)?;
-                Ok((workspace, rel))
-            })
-            .collect::<Result<Vec<_>, String>>()
-    }) {
+    let (matches, mirrors) = match preflight_package(&project, root, &coords, &leaf) {
         Ok(v) => v,
-        Err(e) => return refused("vendor_bun_lockb_invalid", e),
+        Err(o) => return *o,
     };
+    let BinaryProject { mut lock, .. } = project;
     let mut warnings = Vec::new();
     let preexisted = root.join(&coords.uuid_dir_rel).exists();
     let (staged, result) = match stage_patch_pack(
@@ -284,6 +240,110 @@ pub(crate) async fn vendor(
             pipenv: None,
         }),
     }
+}
+
+/// The binary lock, parsed and validated for mutation before any write,
+/// with its package records. [`vendor`] reads it per package; the vendor
+/// loop's download plan reads it once and gates every package against the
+/// same parse ([`preflight_packages`]).
+pub(super) struct BinaryProject {
+    lock: BunLockb,
+    packages: Vec<BinaryPackage>,
+}
+
+/// Read the lock, refusing (before any write) a symlinked, unreadable,
+/// unparseable or non-rewritable one.
+pub(super) async fn read_project(root: &Path) -> Result<BinaryProject, Box<VendorOutcome>> {
+    if crate::utils::fs::is_symlink(&root.join(LOCK)).await {
+        return Err(Box::new(refused(
+            "vendor_bun_lockb_invalid",
+            "bun.lockb is a symbolic link; replace it with a regular file before vendoring",
+        )));
+    }
+    let lock = match read_regular_to_bytes_sync(&root.join(LOCK))
+        .map_err(|e| e.to_string())
+        .and_then(|b| BunLockb::parse(&b))
+    {
+        Ok(v) => v,
+        Err(e) => return Err(Box::new(refused("vendor_bun_lockb_invalid", e))),
+    };
+    if let Err(e) = lock.validate_mutation() {
+        return Err(Box::new(refused("vendor_bun_lockb_invalid", e)));
+    }
+    let packages = match lock.packages() {
+        Ok(v) => v,
+        Err(e) => return Err(Box::new(refused("vendor_bun_lockb_invalid", e))),
+    };
+    Ok(BinaryProject { lock, packages })
+}
+
+/// The per-package pre-flight against an already-read lock: the records
+/// to rewrite (the exact `name@version`, plus our own tuples for it), and
+/// the workspace mirror paths validated. Nothing here reads the package's
+/// source or asks the service, so the download plan evaluates it ahead of
+/// the loop.
+pub(super) fn preflight_package(
+    project: &BinaryProject,
+    root: &Path,
+    coords: &NpmCoords,
+    leaf: &str,
+) -> Result<(Vec<BinaryPackage>, Vec<(String, String)>), Box<VendorOutcome>> {
+    let matches: Vec<_> = project
+        .packages
+        .iter()
+        .filter(|p| {
+            (p.name == coords.name && p.version.as_deref() == Some(&coords.version))
+                || is_ours(p, &coords.name, leaf)
+        })
+        .cloned()
+        .collect();
+    if matches.is_empty() {
+        return Err(Box::new(refused(
+            "vendor_lock_entry_not_found",
+            format!(
+                "{LOCK} has no registry entry for {}@{}",
+                coords.name, coords.version
+            ),
+        )));
+    }
+    let mirrors = match project.lock.workspace_paths().and_then(|paths| {
+        paths
+            .into_iter()
+            .map(|workspace| {
+                let rel = format!(
+                    "{}/{}/{}",
+                    workspace.trim_start_matches("./"),
+                    coords.uuid_dir_rel,
+                    leaf
+                );
+                validate_mirror_path(root, &rel)?;
+                Ok((workspace, rel))
+            })
+            .collect::<Result<Vec<_>, String>>()
+    }) {
+        Ok(v) => v,
+        Err(e) => return Err(Box::new(refused("vendor_bun_lockb_invalid", e))),
+    };
+    Ok((matches, mirrors))
+}
+
+/// Which of `packages` [`vendor`] would refuse before its first service
+/// call, from one read of the lock; see
+/// [`super::npm_flavor::preflight_packages`].
+pub(super) async fn preflight_packages(
+    root: &Path,
+    packages: &[(&str, &PatchRecord)],
+) -> Vec<Result<(), &'static str>> {
+    gate_packages(
+        read_project(root).await.map_err(|o| refusal_code(&o)),
+        packages,
+        |project, coords| {
+            let leaf = tgz_rel_leaf(&coords.name, &coords.version);
+            preflight_package(project, root, coords, &leaf)
+                .map(drop)
+                .map_err(|o| refusal_code(&o))
+        },
+    )
 }
 
 /// Validate and stage every inverse before changing the lock or removing its

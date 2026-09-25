@@ -140,73 +140,16 @@ pub async fn vendor_npm<'a>(
             );
         }
     };
-    let lock_version = lock.get("lockfileVersion").and_then(Value::as_u64);
-    if !matches!(lock_version, Some(2) | Some(3))
-        || !lock.get("packages").is_some_and(Value::is_object)
-    {
-        return refused(
-            "vendor_lockfile_version_unsupported",
-            format!(
-                "{lock_name} has lockfileVersion {:?}; only v2/v3 locks (with a `packages` \
-                 object) are supported — run `npm install` with npm >= 7 to upgrade it",
-                lock_version
-            ),
-        );
-    }
+    let lock_version = match lock_version_gate(&lock, &lock_name) {
+        Ok(lock_version) => lock_version,
+        Err(outcome) => return *outcome,
+    };
 
     // ── 3. Find the rewritable lock instances ───────────────────────────
-    let matches = match scan_lock_matches(&lock, name, version, &mut warnings) {
-        LockScan::Matches(m) => m,
-        LockScan::WorkspaceMember { key } => {
-            // A matching key outside node_modules/ is the user's own
-            // workspace member — its source of truth is the working tree,
-            // not a tarball; vendoring it would shadow their code.
-            return refused(
-                "vendor_workspace_member",
-                format!(
-                    "`{key}` is a workspace member of this project; patch the source directly \
-                     instead of vendoring it"
-                ),
-            );
-        }
+    let matches = match rewritable_matches(&lock, name, version, &lock_name, &mut warnings) {
+        Ok(matches) => matches,
+        Err(outcome) => return *outcome,
     };
-    if matches.is_empty() {
-        // Every instance the scan saw was skipped (bundled inside a parent's
-        // tarball, or a link): the entry IS in the lock, so the generic
-        // "not found / run `npm install`" advice would be wrong twice over.
-        // Refuse with the real reason and carry the stays-UNPATCHED
-        // advisories in the detail — a Refused outcome has no warnings
-        // channel, and silently dropping them would hide a security-critical
-        // fact.
-        let skipped: Vec<&str> = warnings
-            .iter()
-            .filter(|w| {
-                matches!(
-                    w.code,
-                    "vendor_bundled_instance_skipped" | "vendor_link_entry_skipped"
-                )
-            })
-            .map(|w| w.detail.as_str())
-            .collect();
-        if !skipped.is_empty() {
-            return refused(
-                "vendor_lock_entry_not_rewritable",
-                format!(
-                    "every {lock_name} entry for {name}@{version} is bundled inside a \
-                     parent's tarball or a link and cannot be rewritten — those copies \
-                     stay UNPATCHED and `npm install` will not help: {}",
-                    skipped.join("; ")
-                ),
-            );
-        }
-        return refused(
-            "vendor_lock_entry_not_found",
-            format!(
-                "{lock_name} has no rewritable entry for {name}@{version} — make sure the \
-                 package is installed and locked (`npm install`) before vendoring"
-            ),
-        );
-    }
 
     // ── 3b. Sibling lock (npm 12) ───────────────────────────────────────
     // npm 12 removed `npm shrinkwrap`, auto-creates a package-lock.json
@@ -456,6 +399,138 @@ pub async fn vendor_npm<'a>(
         pipenv: None,
     };
     done(result, Some(entry), warnings)
+}
+
+/// The lock version gate of [`vendor_npm`]'s step 2: only v2/v3 locks with
+/// a `packages` object are rewritten. `Ok` is the parsed `lockfileVersion`.
+fn lock_version_gate(lock: &Value, lock_name: &str) -> Result<Option<u64>, Box<VendorOutcome>> {
+    let lock_version = lock.get("lockfileVersion").and_then(Value::as_u64);
+    if !matches!(lock_version, Some(2) | Some(3))
+        || !lock.get("packages").is_some_and(Value::is_object)
+    {
+        return Err(Box::new(refused(
+            "vendor_lockfile_version_unsupported",
+            format!(
+                "{lock_name} has lockfileVersion {:?}; only v2/v3 locks (with a `packages` \
+                 object) are supported — run `npm install` with npm >= 7 to upgrade it",
+                lock_version
+            ),
+        )));
+    }
+    Ok(lock_version)
+}
+
+/// [`vendor_npm`]'s step 3: the rewritable `packages` instances of
+/// `name@version`, refusing a workspace member, an entry whose every
+/// instance is bundled or linked, and an absent entry. Nothing here reads
+/// the package's source or asks the service, so the vendor loop's download
+/// plan evaluates it ahead of the loop ([`preflight_packages`]).
+fn rewritable_matches(
+    lock: &Value,
+    name: &str,
+    version: &str,
+    lock_name: &str,
+    warnings: &mut Vec<VendorWarning>,
+) -> Result<Vec<LockMatch>, Box<VendorOutcome>> {
+    let matches = match scan_lock_matches(lock, name, version, warnings) {
+        LockScan::Matches(m) => m,
+        LockScan::WorkspaceMember { key } => {
+            // A matching key outside node_modules/ is the user's own
+            // workspace member — its source of truth is the working tree,
+            // not a tarball; vendoring it would shadow their code.
+            return Err(Box::new(refused(
+                "vendor_workspace_member",
+                format!(
+                    "`{key}` is a workspace member of this project; patch the source directly \
+                     instead of vendoring it"
+                ),
+            )));
+        }
+    };
+    if matches.is_empty() {
+        // Every instance the scan saw was skipped (bundled inside a parent's
+        // tarball, or a link): the entry IS in the lock, so the generic
+        // "not found / run `npm install`" advice would be wrong twice over.
+        // Refuse with the real reason and carry the stays-UNPATCHED
+        // advisories in the detail — a Refused outcome has no warnings
+        // channel, and silently dropping them would hide a security-critical
+        // fact.
+        let skipped: Vec<&str> = warnings
+            .iter()
+            .filter(|w| {
+                matches!(
+                    w.code,
+                    "vendor_bundled_instance_skipped" | "vendor_link_entry_skipped"
+                )
+            })
+            .map(|w| w.detail.as_str())
+            .collect();
+        if !skipped.is_empty() {
+            return Err(Box::new(refused(
+                "vendor_lock_entry_not_rewritable",
+                format!(
+                    "every {lock_name} entry for {name}@{version} is bundled inside a \
+                     parent's tarball or a link and cannot be rewritten — those copies \
+                     stay UNPATCHED and `npm install` will not help: {}",
+                    skipped.join("; ")
+                ),
+            )));
+        }
+        return Err(Box::new(refused(
+            "vendor_lock_entry_not_found",
+            format!(
+                "{lock_name} has no rewritable entry for {name}@{version} — make sure the \
+                 package is installed and locked (`npm install`) before vendoring"
+            ),
+        )));
+    }
+    Ok(matches)
+}
+
+/// The primary lock as [`vendor_npm`]'s step 2 leaves it: selected, parsed
+/// and version-gated. Read once for the vendor loop's download plan
+/// ([`preflight_packages`]); the loop itself runs the same three steps
+/// inline, per package, and refuses with the codes returned here.
+pub(super) struct NpmLockProject {
+    lock_name: String,
+    lock: Value,
+}
+
+pub(super) async fn read_project(project_root: &Path) -> Result<NpmLockProject, &'static str> {
+    let (lock_name, lock_bytes, _sibling_locks) = match select_lockfile(project_root).await {
+        Ok(Some(found)) => found,
+        Ok(None) | Err(_) => return Err("vendor_lockfile_missing"),
+    };
+    let lock: Value =
+        serde_json::from_slice(&lock_bytes).map_err(|_| "vendor_lockfile_version_unsupported")?;
+    lock_version_gate(&lock, &lock_name).map_err(|o| super::npm_common::refusal_code(&o))?;
+    Ok(NpmLockProject { lock_name, lock })
+}
+
+/// Which of `packages` [`vendor_npm`] would refuse before its first
+/// service call, from one read of the lock; see
+/// [`super::npm_flavor::preflight_packages`]. The skip advisories the scan
+/// raises are the loop's to report, and are dropped here.
+pub(crate) async fn preflight_packages(
+    project_root: &Path,
+    packages: &[(&str, &PatchRecord)],
+) -> Vec<Result<(), &'static str>> {
+    super::npm_common::gate_packages(
+        read_project(project_root).await,
+        packages,
+        |project, coords| {
+            let mut warnings = Vec::new();
+            rewritable_matches(
+                &project.lock,
+                &coords.name,
+                &coords.version,
+                &project.lock_name,
+                &mut warnings,
+            )
+            .map(drop)
+            .map_err(|o| super::npm_common::refusal_code(&o))
+        },
+    )
 }
 
 /// FAIL-CLOSED revert guard for a ledger entry with NO wiring records,
@@ -4512,5 +4587,113 @@ mod tests {
         }
         assert_eq!(tokio::fs::read(fx.lock_path()).await.unwrap(), before);
         assert!(!fx.root().join(fx.expected_rel_tgz()).exists());
+    }
+
+    // ── download-plan pre-flight parity ───────────────────────────────────
+
+    /// `(the plan's verdict, the loop's own outcome)` for the fixture's
+    /// package — the pre-flight first, since a successful vendor rewrites
+    /// the lock it would then read.
+    async fn preflight_then_vendor(
+        fx: &Fixture,
+    ) -> (Result<(), &'static str>, Result<(), &'static str>) {
+        let planned = preflight_packages(fx.root(), &[(&fx.purl(), &fx.record)])
+            .await
+            .remove(0);
+        let looped = match fx.vendor(false).await {
+            VendorOutcome::Refused { code, .. } => Err(code),
+            VendorOutcome::Done { .. } => Ok(()),
+        };
+        (planned, looped)
+    }
+
+    /// The vendor loop's download plan gates each package with this
+    /// backend's own pre-flight (`preflight_packages`): the lock selected,
+    /// parsed and version-gated once, then the rewritable-instance scan per
+    /// package. Same code wherever the loop refuses, admitted wherever it
+    /// vendors.
+    #[tokio::test]
+    async fn preflight_agrees_with_the_loop_on_every_pre_service_refusal() {
+        let (planned, looped) = preflight_then_vendor(&fixture().await).await;
+        assert_eq!(
+            (planned, looped),
+            (Ok(()), Ok(())),
+            "the plain fixture vendors"
+        );
+
+        let workspace_member = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0" },
+                "packages/left-pad": { "name": "left-pad", "version": "1.3.0" }
+            }
+        });
+        let v1 = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 1,
+            "dependencies": {
+                "left-pad": { "version": "1.3.0", "resolved": REG_RESOLVED, "integrity": "sha512-orig==" }
+            }
+        });
+        let mut absent = default_lock();
+        absent["packages"]["node_modules/left-pad"]["version"] = json!("1.2.0");
+        absent["packages"]["node_modules/foo/node_modules/left-pad"]["version"] = json!("1.2.0");
+        let cases = [
+            (
+                "workspace member",
+                workspace_member,
+                "vendor_workspace_member",
+            ),
+            (
+                "lockfileVersion 1",
+                v1,
+                "vendor_lockfile_version_unsupported",
+            ),
+            ("absent entry", absent, "vendor_lock_entry_not_found"),
+        ];
+        for (label, lock, code) in cases {
+            let (planned, looped) =
+                preflight_then_vendor(&fixture_with("left-pad", "1.3.0", lock).await).await;
+            assert_eq!(looped, Err(code), "{label}: the loop's own refusal");
+            assert_eq!(
+                planned, looped,
+                "{label}: the plan must refuse as the loop does"
+            );
+        }
+
+        let fx = fixture().await;
+        tokio::fs::write(fx.lock_path(), b"{ definitely: not json")
+            .await
+            .unwrap();
+        let (planned, looped) = preflight_then_vendor(&fx).await;
+        assert_eq!(looped, Err("vendor_lockfile_version_unsupported"));
+        assert_eq!(planned, looped, "an unparseable lock");
+
+        let fx = fixture().await;
+        tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+        let (planned, looped) = preflight_then_vendor(&fx).await;
+        assert_eq!(looped, Err("vendor_lockfile_missing"));
+        assert_eq!(planned, looped, "a missing lock");
+    }
+
+    /// A gate only the local build reaches — bundled dependencies are
+    /// checked on the STAGED copy, after the service has been asked — is
+    /// not a pre-flight gate: the plan admits the package (the loop would
+    /// ask the service for it) and the loop's own refusal stands.
+    #[tokio::test]
+    async fn preflight_leaves_post_service_gates_to_the_loop() {
+        let fx = fixture().await;
+        tokio::fs::write(
+            fx.installed().join("package.json"),
+            br#"{"name":"left-pad","version":"1.3.0","bundleDependencies":["dep"]}"#,
+        )
+        .await
+        .unwrap();
+        let (planned, looped) = preflight_then_vendor(&fx).await;
+        assert_eq!(planned, Ok(()), "the plan cannot see a staged-copy gate");
+        assert_eq!(looped, Err("vendor_bundled_deps_unsupported"));
     }
 }

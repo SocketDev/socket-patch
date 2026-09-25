@@ -140,13 +140,9 @@ pub async fn vendor_yarn_berry<'a>(
     }
 
     // ── 4. Root workspace name (the lock key/resolution embed it) ────────
-    let Some(workspace) = root_workspace_name(&blocks) else {
-        return refused(
-            "vendor_lockfile_version_unsupported",
-            "yarn.lock has no root `<name>@workspace:.` entry; cannot build the \
-             workspace-bound file: locator"
-                .to_string(),
-        );
+    let workspace = match root_workspace_gate(&blocks) {
+        Ok(workspace) => workspace,
+        Err(outcome) => return *outcome,
     };
 
     // ── 5. package.json + user-override conflict gate ─────────────────────
@@ -181,49 +177,10 @@ pub async fn vendor_yarn_berry<'a>(
             format!("{PACKAGE_JSON} root is not an object"),
         );
     };
-    // A user-authored BARE-name pin to the exact version being vendored is
-    // TAKEN OVER (its value is rewritten to our spec — the pin already
-    // forced this exact version, so semantics are preserved — and recorded
-    // as the wiring `original` so revert restores it). Anything else
-    // same-name still refuses.
-    let mut takeover_original: Option<String> = None;
-    if let Some(res) = pkg_obj.get("resolutions") {
-        let Some(res_obj) = res.as_object() else {
-            return refused(
-                "vendor_override_conflict",
-                format!("{PACKAGE_JSON} `resolutions` is not an object"),
-            );
-        };
-        for (selector, value) in res_obj {
-            let sel_name = split_pattern(selector)
-                .map(|(n, _)| n)
-                .unwrap_or(selector.as_str());
-            if sel_name != name {
-                continue;
-            }
-            // Our own (possibly stale-uuid) entry is fine to overwrite; a
-            // user-authored override is never clobbered silently.
-            let ours = value
-                .as_str()
-                .is_some_and(|v| parse_vendor_path(v).is_some_and(|p| p.eco == "npm"));
-            if ours {
-                continue;
-            }
-            if selector == name && value.as_str() == Some(version) {
-                takeover_original = Some(version.to_string());
-                continue;
-            }
-            return refused(
-                "vendor_override_conflict",
-                format!(
-                    "{PACKAGE_JSON} already has a resolutions entry for `{selector}` \
-                     ({value}); vendor will not overwrite a user-authored override (an \
-                     exact-version pin `\"{name}\": \"{version}\"` is taken over \
-                     automatically)"
-                ),
-            );
-        }
-    }
+    let takeover_original = match resolutions_gate(pkg_obj, name, version) {
+        Ok(takeover_original) => takeover_original,
+        Err(outcome) => return *outcome,
+    };
 
     // ── 6. The single replaceable lock entry ──────────────────────────────
     let scan = match scan_berry_target(&blocks, name, version) {
@@ -244,29 +201,9 @@ pub async fn vendor_yarn_berry<'a>(
             ),
         ));
     }
-    let (target, target_is_ours) = match scan.target {
-        Some((idx, is_ours)) => (&blocks[idx], is_ours),
-        None => {
-            if !scan.alias_keys.is_empty() {
-                return refused(
-                    "vendor_lock_entry_not_found",
-                    format!(
-                        "{YARN_LOCK} resolves {name}@{version} only through npm: alias \
-                         descriptors ({}); berry resolutions are name-keyed and cannot \
-                         reach aliased descriptors, so vendoring cannot rewire this \
-                         project's copy",
-                        scan.alias_keys.join(", ")
-                    ),
-                );
-            }
-            return refused(
-                "vendor_lock_entry_not_found",
-                format!(
-                    "{YARN_LOCK} has no `{name}@npm:` entry resolving {version} — make sure \
-                     the package is installed and locked (`yarn install`) before vendoring"
-                ),
-            );
-        }
+    let (target, target_is_ours) = match target_gate(&scan, name, version) {
+        Ok((idx, is_ours)) => (&blocks[idx], is_ours),
+        Err(outcome) => return *outcome,
     };
     let patches_manifest = record
         .files
@@ -506,6 +443,176 @@ pub async fn vendor_yarn_berry<'a>(
         entry: Some(entry),
         warnings,
     }
+}
+
+/// [`vendor_yarn_berry`]'s step 4: the root workspace's name (the lock
+/// key/resolution embed it).
+fn root_workspace_gate(blocks: &[LockBlock]) -> Result<String, Box<VendorOutcome>> {
+    root_workspace_name(blocks).ok_or_else(|| {
+        Box::new(refused(
+            "vendor_lockfile_version_unsupported",
+            "yarn.lock has no root `<name>@workspace:.` entry; cannot build the \
+             workspace-bound file: locator"
+                .to_string(),
+        ))
+    })
+}
+
+/// [`vendor_yarn_berry`]'s step-5 conflict gate over the project
+/// `package.json`'s `resolutions`. A user-authored BARE-name pin to the
+/// exact version being vendored is TAKEN OVER (its value is rewritten to
+/// our spec — the pin already forced this exact version, so semantics are
+/// preserved — and recorded as the wiring `original` so revert restores
+/// it): `Ok(Some(version))`. Anything else same-name still refuses.
+fn resolutions_gate(
+    pkg_obj: &serde_json::Map<String, Value>,
+    name: &str,
+    version: &str,
+) -> Result<Option<String>, Box<VendorOutcome>> {
+    let mut takeover_original: Option<String> = None;
+    if let Some(res) = pkg_obj.get("resolutions") {
+        let Some(res_obj) = res.as_object() else {
+            return Err(Box::new(refused(
+                "vendor_override_conflict",
+                format!("{PACKAGE_JSON} `resolutions` is not an object"),
+            )));
+        };
+        for (selector, value) in res_obj {
+            let sel_name = split_pattern(selector)
+                .map(|(n, _)| n)
+                .unwrap_or(selector.as_str());
+            if sel_name != name {
+                continue;
+            }
+            // Our own (possibly stale-uuid) entry is fine to overwrite; a
+            // user-authored override is never clobbered silently.
+            let ours = value
+                .as_str()
+                .is_some_and(|v| parse_vendor_path(v).is_some_and(|p| p.eco == "npm"));
+            if ours {
+                continue;
+            }
+            if selector == name && value.as_str() == Some(version) {
+                takeover_original = Some(version.to_string());
+                continue;
+            }
+            return Err(Box::new(refused(
+                "vendor_override_conflict",
+                format!(
+                    "{PACKAGE_JSON} already has a resolutions entry for `{selector}` \
+                     ({value}); vendor will not overwrite a user-authored override (an \
+                     exact-version pin `\"{name}\": \"{version}\"` is taken over \
+                     automatically)"
+                ),
+            )));
+        }
+    }
+    Ok(takeover_original)
+}
+
+/// [`vendor_yarn_berry`]'s step-6 gate over the target scan: the one
+/// replaceable entry, as `(index into blocks, is_ours)`.
+fn target_gate(
+    scan: &BerryTargetScan,
+    name: &str,
+    version: &str,
+) -> Result<(usize, bool), Box<VendorOutcome>> {
+    match scan.target {
+        Some(target) => Ok(target),
+        None => {
+            if !scan.alias_keys.is_empty() {
+                return Err(Box::new(refused(
+                    "vendor_lock_entry_not_found",
+                    format!(
+                        "{YARN_LOCK} resolves {name}@{version} only through npm: alias \
+                         descriptors ({}); berry resolutions are name-keyed and cannot \
+                         reach aliased descriptors, so vendoring cannot rewire this \
+                         project's copy",
+                        scan.alias_keys.join(", ")
+                    ),
+                )));
+            }
+            Err(Box::new(refused(
+                "vendor_lock_entry_not_found",
+                format!(
+                    "{YARN_LOCK} has no `{name}@npm:` entry resolving {version} — make sure \
+                     the package is installed and locked (`yarn install`) before vendoring"
+                ),
+            )))
+        }
+    }
+}
+
+/// The project as [`vendor_yarn_berry`]'s steps 2–5 leave it: the lock
+/// gated on its line endings, scanned into blocks and gated (cacheKey,
+/// `.yarnrc.yml`, root workspace), the project `package.json` gated on its
+/// line endings and parsed. Read once for the vendor
+/// loop's download plan ([`preflight_packages`]); the loop itself runs the
+/// same steps inline, per package, and refuses with the codes returned
+/// here.
+pub(super) struct BerryProject {
+    blocks: Vec<LockBlock>,
+    pkg: Value,
+}
+
+pub(super) async fn read_project(project_root: &Path) -> Result<BerryProject, &'static str> {
+    let code = |o: VendorOutcome| super::npm_common::refusal_code(&o);
+    let lock_text = read_yarn_lock(project_root)
+        .await
+        .map_err(|o| super::npm_common::refusal_code(&o))?;
+    if let Some(outcome) = refuse_mixed_line_endings(YARN_LOCK, &lock_text) {
+        return Err(code(outcome));
+    }
+    let blocks = scan_blocks(&lock_text);
+    if let Some(outcome) = refuse_unsupported_cache(&blocks) {
+        return Err(code(outcome));
+    }
+    if let Some(outcome) = refuse_unsupported_compression(project_root).await {
+        return Err(code(outcome));
+    }
+    root_workspace_gate(&blocks).map_err(|o| super::npm_common::refusal_code(&o))?;
+    let pkg_bytes = read_regular_to_bytes(&project_root.join(PACKAGE_JSON))
+        .await
+        .map_err(|_| "vendor_yarn_berry_manifest_unreadable")?;
+    if let Some(outcome) =
+        refuse_mixed_line_endings(PACKAGE_JSON, &String::from_utf8_lossy(&pkg_bytes))
+    {
+        return Err(code(outcome));
+    }
+    let pkg: Value =
+        parse_json_manifest(&pkg_bytes).map_err(|_| "vendor_yarn_berry_manifest_unreadable")?;
+    if !pkg.is_object() {
+        return Err("vendor_yarn_berry_manifest_unreadable");
+    }
+    Ok(BerryProject { blocks, pkg })
+}
+
+/// Which of `packages` [`vendor_yarn_berry`] would refuse before its first
+/// service call, from one read of the project; see
+/// [`super::npm_flavor::preflight_packages`]. The alias advisories the
+/// scan raises are the loop's to report, and are dropped here.
+pub(crate) async fn preflight_packages(
+    project_root: &Path,
+    packages: &[(&str, &PatchRecord)],
+) -> Vec<Result<(), &'static str>> {
+    super::npm_common::gate_packages(
+        read_project(project_root).await,
+        packages,
+        |project, coords| {
+            let (name, version) = (coords.name.as_str(), coords.version.as_str());
+            let pkg_obj = project
+                .pkg
+                .as_object()
+                .ok_or("vendor_yarn_berry_manifest_unreadable")?;
+            resolutions_gate(pkg_obj, name, version)
+                .map_err(|o| super::npm_common::refusal_code(&o))?;
+            let scan =
+                scan_berry_target(&project.blocks, name, version).map_err(|(code, _)| code)?;
+            target_gate(&scan, name, version)
+                .map(drop)
+                .map_err(|o| super::npm_common::refusal_code(&o))
+        },
+    )
 }
 
 /// Undo one yarn-berry vendored package: restore the recorded lock entry,
@@ -3743,5 +3850,125 @@ __metadata:
         ] {
             assert_eq!(resolution_selector_target(sel), want, "{sel}");
         }
+    }
+
+    // ── download-plan pre-flight parity ───────────────────────────────────
+
+    /// `(the plan's verdict, the loop's own outcome)` for the fixture's
+    /// package — the pre-flight first, since a successful vendor rewrites
+    /// the project it would then read.
+    async fn preflight_then_vendor(
+        fx: &Fixture,
+    ) -> (Result<(), &'static str>, Result<(), &'static str>) {
+        let planned = preflight_packages(fx.root(), &[("pkg:npm/left-pad@1.3.0", &fx.record)])
+            .await
+            .remove(0);
+        let looped = match fx.vendor(false).await {
+            VendorOutcome::Refused { code, .. } => Err(code),
+            VendorOutcome::Done { .. } => Ok(()),
+        };
+        (planned, looped)
+    }
+
+    /// The vendor loop's download plan gates each package with this
+    /// backend's own pre-flight (`preflight_packages`): the lock scanned
+    /// and cache-gated, `.yarnrc.yml` and `package.json` read once, then
+    /// the resolutions and target gates per package. Same code wherever the
+    /// loop refuses, admitted wherever it vendors.
+    #[tokio::test]
+    async fn preflight_agrees_with_the_loop_on_every_pre_service_refusal() {
+        let (planned, looped) =
+            preflight_then_vendor(&fixture_with(B3_BEFORE_PKG, B3_BEFORE_LOCK).await).await;
+        assert_eq!(
+            (planned, looped),
+            (Ok(()), Ok(())),
+            "the plain fixture vendors"
+        );
+
+        let conflicting_pkg = r#"{
+  "name": "vendor-spike",
+  "dependencies": { "left-pad": "1.3.0" },
+  "resolutions": { "left-pad": "^1.0.0" }
+}
+"#;
+        let other_cache_key = B3_BEFORE_LOCK.replace("cacheKey: 10c0", "cacheKey: 10");
+        let other_version = B3_BEFORE_LOCK.replace("1.3.0", "1.2.0");
+        // The lock without its left-pad block at all.
+        let absent = {
+            let start = B3_BEFORE_LOCK.find("\"left-pad@npm:1.3.0\":").unwrap();
+            let end = B3_BEFORE_LOCK
+                .find("\"vendor-spike@workspace:.\":")
+                .unwrap();
+            format!("{}{}", &B3_BEFORE_LOCK[..start], &B3_BEFORE_LOCK[end..])
+        };
+        let no_workspace = B3_BEFORE_LOCK.replace(
+            "\"vendor-spike@workspace:.\":",
+            "\"vendor-spike@workspace:packages/x\":",
+        );
+        let cases: [(&str, &str, &str, &str); 5] = [
+            (
+                "other cacheKey",
+                B3_BEFORE_PKG,
+                &other_cache_key,
+                "vendor_yarn_berry_cache_unsupported",
+            ),
+            (
+                "user resolution",
+                conflicting_pkg,
+                B3_BEFORE_LOCK,
+                "vendor_override_conflict",
+            ),
+            // Another version of the name is refused fail-closed as a
+            // conflict (a bare-name resolution would move it too).
+            (
+                "other version of the name",
+                B3_BEFORE_PKG,
+                &other_version,
+                "vendor_override_conflict",
+            ),
+            (
+                "absent entry",
+                B3_BEFORE_PKG,
+                &absent,
+                "vendor_lock_entry_not_found",
+            ),
+            (
+                "no root workspace entry",
+                B3_BEFORE_PKG,
+                &no_workspace,
+                "vendor_lockfile_version_unsupported",
+            ),
+        ];
+        for (label, pkg, lock, code) in cases {
+            let (planned, looped) = preflight_then_vendor(&fixture_with(pkg, lock).await).await;
+            assert_eq!(looped, Err(code), "{label}: the loop's own refusal");
+            assert_eq!(
+                planned, looped,
+                "{label}: the plan must refuse as the loop does"
+            );
+        }
+
+        let fx = fixture().await;
+        tokio::fs::write(
+            fx.root().join(YARNRC),
+            "nodeLinker: node-modules\ncompressionLevel: mixed\n",
+        )
+        .await
+        .unwrap();
+        let (planned, looped) = preflight_then_vendor(&fx).await;
+        assert_eq!(looped, Err("vendor_yarn_berry_cache_unsupported"));
+        assert_eq!(planned, looped, "a checksum-changing .yarnrc.yml knob");
+
+        let fx = fixture().await;
+        tokio::fs::remove_file(fx.pkg_path()).await.unwrap();
+        let (planned, looped) = preflight_then_vendor(&fx).await;
+        assert_eq!(looped, Err("vendor_yarn_berry_manifest_unreadable"));
+        assert_eq!(planned, looped, "a missing project package.json");
+
+        let fx = fixture().await;
+        tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+        let (planned, looped) = preflight_then_vendor(&fx).await;
+        assert_eq!(looped, Err("vendor_lockfile_missing"));
+        assert_eq!(planned, looped, "a missing lock");
     }
 }

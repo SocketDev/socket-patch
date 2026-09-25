@@ -111,6 +111,40 @@ pub(super) fn guard_revert_uuid_dir(uuid: &str) -> Result<String, RevertOutcome>
     })
 }
 
+/// The code a pre-flight refusal carries. Every pre-flight gate returns
+/// `Refused`; a `Done` cannot come out of one, and reads as a failure so a
+/// plan built from it still leaves the package to the loop.
+pub(super) fn refusal_code(outcome: &VendorOutcome) -> &'static str {
+    match outcome {
+        VendorOutcome::Refused { code, .. } => code,
+        VendorOutcome::Done { .. } => "vendor_preflight_failed",
+    }
+}
+
+/// Gate `packages` (npm purls with their records) against ONE read of the
+/// project, for the vendor loop's download plan: a project the flavor
+/// refuses outright refuses every package with that code; otherwise each
+/// package is guarded ([`guard_coordinates`], the flavors' first gate) and
+/// handed to the flavor's own per-package pre-flight. The verdicts come
+/// back in `packages` order.
+pub(super) fn gate_packages<P>(
+    project: Result<P, &'static str>,
+    packages: &[(&str, &PatchRecord)],
+    gate: impl Fn(&P, &NpmCoords) -> Result<(), &'static str>,
+) -> Vec<Result<(), &'static str>> {
+    let project = match project {
+        Ok(project) => project,
+        Err(code) => return vec![Err(code); packages.len()],
+    };
+    packages
+        .iter()
+        .map(|(purl, record)| {
+            let coords = guard_coordinates(purl, record).map_err(|o| refusal_code(&o))?;
+            gate(&project, &coords)
+        })
+        .collect()
+}
+
 /// The shared pipeline's product: a verified, deterministically packed
 /// tarball plus the facts the flavor wiring needs.
 pub(super) struct NpmStagedPack {

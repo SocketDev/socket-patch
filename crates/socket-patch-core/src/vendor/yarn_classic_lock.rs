@@ -86,16 +86,8 @@ pub async fn vendor_yarn_classic<'a>(
         Ok(t) => t,
         Err(outcome) => return *outcome,
     };
-    // Defensive re-sniff: the flavor router already separates classic from
-    // berry, but rewriting a berry lock with classic grammar would corrupt
-    // it — never proceed past a `__metadata:` key.
-    if text.lines().any(|l| l.starts_with("__metadata:")) {
-        return refused(
-            "vendor_lockfile_version_unsupported",
-            "yarn.lock is a yarn berry (v2+) lockfile (top-level `__metadata:` key); the \
-             yarn-classic backend cannot rewrite it"
-                .to_string(),
-        );
+    if let Err(outcome) = refuse_berry_lock(&text) {
+        return *outcome;
     }
 
     // ── 3. Find the rewritable blocks (pre-flight, BEFORE staging) ────────
@@ -110,32 +102,10 @@ pub async fn vendor_yarn_classic<'a>(
             BlockClass::NoMatch => {}
         }
     }
-    if candidate_keys.is_empty() {
-        return refused(
-            "vendor_lock_entry_not_found",
-            format!(
-                "{YARN_LOCK} has no rewritable block for {name}@{version} — make sure the \
-                 package is installed and locked (`yarn install`) before vendoring"
-            ),
-        );
-    }
-    // A candidate key on more than one block (a mangled merge — yarn itself
-    // parses duplicates last-wins) makes the by-key rewrite below ambiguous:
-    // it would splice the first same-key block, even a version-mismatched
-    // one classification never selected, and leave yarn's winner resolving
-    // to the registry — success reported, package unpatched. Refuse-early.
-    for key in &candidate_keys {
-        if blocks.iter().filter(|b| &b.key == key).count() > 1 {
-            return refused(
-                "vendor_lock_entry_ambiguous",
-                format!(
-                    "{YARN_LOCK} has more than one block with the key `{key}` (most likely a \
-                     mangled merge; yarn keeps only the last) — run `yarn install` to re-lock, \
-                     then re-run the vendor"
-                ),
-            );
-        }
-    }
+    let candidate_keys = match rewritable_candidates(&blocks, candidate_keys, name, version) {
+        Ok(keys) => keys,
+        Err(outcome) => return *outcome,
+    };
     drop(blocks);
 
     // ── 4–7. Stage → patch → pack (shared flavor-agnostic pipeline) ───────
@@ -301,6 +271,111 @@ pub async fn vendor_yarn_classic<'a>(
         entry: Some(entry),
         warnings,
     }
+}
+
+/// [`vendor_yarn_classic`]'s defensive re-sniff: the flavor router already
+/// separates classic from berry, but rewriting a berry lock with classic
+/// grammar would corrupt it — never proceed past a `__metadata:` key.
+fn refuse_berry_lock(text: &str) -> Result<(), Box<VendorOutcome>> {
+    if text.lines().any(|l| l.starts_with("__metadata:")) {
+        return Err(Box::new(refused(
+            "vendor_lockfile_version_unsupported",
+            "yarn.lock is a yarn berry (v2+) lockfile (top-level `__metadata:` key); the \
+             yarn-classic backend cannot rewrite it"
+                .to_string(),
+        )));
+    }
+    Ok(())
+}
+
+/// [`vendor_yarn_classic`]'s step-3 gate over the candidate keys its block
+/// classification collected: at least one rewritable block, and no key on
+/// more than one block. Nothing here reads the package's source or asks
+/// the service, so the vendor loop's download plan evaluates it ahead of
+/// the loop ([`preflight_packages`]).
+fn rewritable_candidates(
+    blocks: &[LockBlock],
+    candidate_keys: Vec<String>,
+    name: &str,
+    version: &str,
+) -> Result<Vec<String>, Box<VendorOutcome>> {
+    if candidate_keys.is_empty() {
+        return Err(Box::new(refused(
+            "vendor_lock_entry_not_found",
+            format!(
+                "{YARN_LOCK} has no rewritable block for {name}@{version} — make sure the \
+                 package is installed and locked (`yarn install`) before vendoring"
+            ),
+        )));
+    }
+    // A candidate key on more than one block (a mangled merge — yarn itself
+    // parses duplicates last-wins) makes the by-key rewrite ambiguous: it
+    // would splice the first same-key block, even a version-mismatched one
+    // classification never selected, and leave yarn's winner resolving to
+    // the registry — success reported, package unpatched. Refuse-early.
+    for key in &candidate_keys {
+        if blocks.iter().filter(|b| &b.key == key).count() > 1 {
+            return Err(Box::new(refused(
+                "vendor_lock_entry_ambiguous",
+                format!(
+                    "{YARN_LOCK} has more than one block with the key `{key}` (most likely a \
+                     mangled merge; yarn keeps only the last) — run `yarn install` to re-lock, \
+                     then re-run the vendor"
+                ),
+            )));
+        }
+    }
+    Ok(candidate_keys)
+}
+
+/// The lock as [`vendor_yarn_classic`]'s step 2 leaves it: read, re-sniffed
+/// and scanned into blocks. Read once for the vendor loop's download plan
+/// ([`preflight_packages`]); the loop itself runs the same steps inline,
+/// per package.
+pub(super) struct ClassicProject {
+    blocks: Vec<LockBlock>,
+}
+
+pub(super) async fn read_project(project_root: &Path) -> Result<ClassicProject, &'static str> {
+    let text = read_yarn_lock(project_root)
+        .await
+        .map_err(|o| super::npm_common::refusal_code(&o))?;
+    refuse_berry_lock(&text).map_err(|o| super::npm_common::refusal_code(&o))?;
+    Ok(ClassicProject {
+        blocks: scan_blocks(&text),
+    })
+}
+
+/// Which of `packages` [`vendor_yarn_classic`] would refuse before its
+/// first service call, from one read of the lock; see
+/// [`super::npm_flavor::preflight_packages`]. The classification fold is
+/// the loop's step 3 over the same blocks; its link-skip advisories are
+/// the loop's to report and are dropped here.
+pub(crate) async fn preflight_packages(
+    project_root: &Path,
+    packages: &[(&str, &PatchRecord)],
+) -> Vec<Result<(), &'static str>> {
+    super::npm_common::gate_packages(
+        read_project(project_root).await,
+        packages,
+        |project, coords| {
+            let (name, version) = (coords.name.as_str(), coords.version.as_str());
+            let candidate_keys: Vec<String> = project
+                .blocks
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        classify_classic_block(block, name, version),
+                        BlockClass::Candidate
+                    )
+                })
+                .map(|block| block.key.clone())
+                .collect();
+            rewritable_candidates(&project.blocks, candidate_keys, name, version)
+                .map(drop)
+                .map_err(|o| super::npm_common::refusal_code(&o))
+        },
+    )
 }
 
 /// Undo one yarn-classic vendored package: restore the recorded lock blocks
@@ -2842,5 +2917,75 @@ left-pad@^1.3.0:
                 "empty wiring replays nothing"
             );
         }
+    }
+
+    // ── download-plan pre-flight parity ───────────────────────────────────
+
+    /// `(the plan's verdict, the loop's own outcome)` for the fixture's
+    /// package — the pre-flight first, since a successful vendor rewrites
+    /// the lock it would then read.
+    async fn preflight_then_vendor(
+        fx: &Fixture,
+    ) -> (Result<(), &'static str>, Result<(), &'static str>) {
+        let planned = preflight_packages(fx.root(), &[("pkg:npm/left-pad@1.3.0", &fx.record)])
+            .await
+            .remove(0);
+        let looped = match fx.vendor(false).await {
+            VendorOutcome::Refused { code, .. } => Err(code),
+            VendorOutcome::Done { .. } => Ok(()),
+        };
+        (planned, looped)
+    }
+
+    /// The vendor loop's download plan gates each package with this
+    /// backend's own pre-flight (`preflight_packages`): the lock read,
+    /// re-sniffed and scanned once, then the candidate gate per package.
+    /// Same code wherever the loop refuses, admitted wherever it vendors.
+    #[tokio::test]
+    async fn preflight_agrees_with_the_loop_on_every_pre_service_refusal() {
+        let (planned, looped) = preflight_then_vendor(&fixture_with_lock(Y2_BEFORE).await).await;
+        assert_eq!(
+            (planned, looped),
+            (Ok(()), Ok(())),
+            "the plain fixture vendors"
+        );
+
+        let absent = Y2_BEFORE.replace("1.3.0", "1.2.0");
+        let duplicate_key = r#"# yarn lockfile v1
+
+left-pad@^1.3.0:
+  version "1.3.0"
+  resolved "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915589e782f8c94d1e"
+  integrity sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==
+
+left-pad@^1.3.0:
+  version "1.3.0"
+  resolved "https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#5b8a3a7765dfe001261dde915589e782f8c94d1e"
+  integrity sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==
+"#;
+        let berry = "__metadata:\n  version: 8\n  cacheKey: 10c0\n";
+        let cases: [(&str, &str, &str); 3] = [
+            ("absent block", &absent, "vendor_lock_entry_not_found"),
+            (
+                "duplicate key",
+                duplicate_key,
+                "vendor_lock_entry_ambiguous",
+            ),
+            ("berry lock", berry, "vendor_lockfile_version_unsupported"),
+        ];
+        for (label, lock, code) in cases {
+            let (planned, looped) = preflight_then_vendor(&fixture_with_lock(lock).await).await;
+            assert_eq!(looped, Err(code), "{label}: the loop's own refusal");
+            assert_eq!(
+                planned, looped,
+                "{label}: the plan must refuse as the loop does"
+            );
+        }
+
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+        let (planned, looped) = preflight_then_vendor(&fx).await;
+        assert_eq!(looped, Err("vendor_lockfile_missing"));
+        assert_eq!(planned, looped);
     }
 }

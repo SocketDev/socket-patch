@@ -376,6 +376,49 @@ pub async fn vendor_npm_any<'a>(
     outcome
 }
 
+/// Which of `packages` — npm purls with their records, in vendor-loop
+/// order — [`vendor_npm_any`] would refuse before it first asks the patch
+/// service for a prebuilt archive. `Ok(())` means the loop reaches the
+/// service for that package; `Err(code)` names the refusing gate. The
+/// vendor loop's download plan consults this so it never asks the service
+/// for a package the loop then refuses: a download grant can start a
+/// server-side build and counts against quota.
+///
+/// Every gate is the loop's own, evaluated against the project as it is
+/// when the plan is built: the flavor probe (a probe refusal refuses every
+/// package), then the flavor's project read (lock present, parseable,
+/// supported version, line endings, cache configuration) and its
+/// per-package pre-flight (coordinates, the entry present and rewritable,
+/// override conflicts, workspace gates). The project is read once for the
+/// whole plan. Gates the loop can only evaluate after the service has
+/// answered, or that only a local build reaches — the bundled-dependencies
+/// refusal, the prebuilt archive's afterHash check — are not pre-flight
+/// gates and stay in the loop; a package the plan admits and the loop then
+/// refuses simply fetches nothing further, its planned download dropped.
+pub async fn preflight_packages(
+    project_root: &Path,
+    packages: &[(&str, &PatchRecord)],
+) -> Vec<Result<(), &'static str>> {
+    let flavor = match detect_npm_lock_flavor(project_root).await {
+        Ok((flavor, _probe_warnings)) => flavor,
+        Err((code, _detail)) => return vec![Err(code); packages.len()],
+    };
+    match flavor {
+        NpmLockFlavor::PackageLock => npm_lock::preflight_packages(project_root, packages).await,
+        NpmLockFlavor::YarnClassic => {
+            yarn_classic_lock::preflight_packages(project_root, packages).await
+        }
+        NpmLockFlavor::YarnBerry => {
+            yarn_berry_lock::preflight_packages(project_root, packages).await
+        }
+        NpmLockFlavor::Pnpm => pnpm_lock::preflight_packages(project_root, packages).await,
+        NpmLockFlavor::PnpmLegacy => {
+            pnpm_lock_legacy::preflight_packages(project_root, packages).await
+        }
+        NpmLockFlavor::Bun => bun_lock::preflight_packages(project_root, packages).await,
+    }
+}
+
 /// Is this npm-vendored entry still consumed by its lockfile's dependency
 /// graph?
 ///
@@ -1356,5 +1399,113 @@ mod tests {
         assert_eq!(npm_use, None);
         assert_eq!(yarn_use, None);
         assert_eq!(bun_use, None);
+    }
+
+    // ── download-plan pre-flight routing ──────────────────────────────────
+
+    const OTHER_UUID: &str = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d";
+
+    fn record(uuid: &str) -> PatchRecord {
+        PatchRecord {
+            uuid: uuid.to_string(),
+            exported_at: String::new(),
+            files: HashMap::new(),
+            vulnerabilities: HashMap::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: String::new(),
+        }
+    }
+
+    /// A v9 pnpm project with two patched packages: `left-pad` the backend
+    /// vendors, `peer-pad` it refuses (a peer-suffixed snapshot key).
+    async fn pnpm_project(root: &Path) {
+        touch(
+            root,
+            "package.json",
+            r#"{ "name": "plan", "dependencies": { "left-pad": "1.3.0", "peer-pad": "1.0.0" } }"#,
+        )
+        .await;
+        touch(
+            root,
+            PNPM_LOCK,
+            "lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    dependencies:
+      left-pad:
+        specifier: 1.3.0
+        version: 1.3.0
+      peer-pad:
+        specifier: 1.0.0
+        version: 1.0.0(react@18.2.0)
+
+packages:
+
+  left-pad@1.3.0:
+    resolution: {integrity: sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA==}
+
+  peer-pad@1.0.0:
+    resolution: {integrity: sha512-peerpadpeerpadpeerpadpeerpadpeerpadpeerpadpeerpadpeerpadpeerpadpeerpadpeerpadpeerpadpee==}
+
+snapshots:
+
+  left-pad@1.3.0: {}
+
+  peer-pad@1.0.0(react@18.2.0): {}
+",
+        )
+        .await;
+    }
+
+    /// The download plan's pre-flight routes by the same probe as the
+    /// vendoring and answers in input order: the package the flavor
+    /// backend vendors is admitted, the one it refuses carries that
+    /// backend's own code, and a project the probe refuses refuses every
+    /// package with the probe's code.
+    #[tokio::test]
+    async fn preflight_routes_by_flavor_and_answers_in_input_order() {
+        let (left, peer) = (record(UUID), record(OTHER_UUID));
+        let packages: [(&str, &PatchRecord); 3] = [
+            ("pkg:npm/peer-pad@1.0.0", &peer),
+            ("pkg:npm/left-pad@1.3.0", &left),
+            ("pkg:npm/absent@0.0.1", &left),
+        ];
+
+        let tmp = tempfile::tempdir().unwrap();
+        pnpm_project(tmp.path()).await;
+        assert_eq!(
+            preflight_packages(tmp.path(), &packages).await,
+            vec![
+                Err("vendor_lock_entry_unsupported"),
+                Ok(()),
+                Err("vendor_lock_entry_not_found"),
+            ]
+        );
+
+        // The probe's own refusals apply to every package.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            preflight_packages(tmp.path(), &packages).await,
+            vec![Err("vendor_lockfile_missing"); 3]
+        );
+        touch(tmp.path(), ".pnp.cjs", "/* pnp */").await;
+        touch(tmp.path(), "package-lock.json", "{}").await;
+        assert_eq!(
+            preflight_packages(tmp.path(), &packages).await,
+            vec![Err("vendor_yarn_berry_unsupported"); 3]
+        );
+
+        // Malformed coordinates refuse before any read, as the backends do.
+        let tmp = tempfile::tempdir().unwrap();
+        pnpm_project(tmp.path()).await;
+        let bad_uuid = record("not-a-uuid");
+        assert_eq!(
+            preflight_packages(tmp.path(), &[("pkg:npm/left-pad@1.3.0", &bad_uuid)]).await,
+            vec![Err("unsafe_coordinates")]
+        );
+        assert_eq!(preflight_packages(tmp.path(), &[]).await, Vec::new());
     }
 }
