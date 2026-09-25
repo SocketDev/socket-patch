@@ -435,7 +435,7 @@ fn walk_zip(
     skip_file_name: Option<&str>,
 ) -> Result<bool, String> {
     let plan = plan_zip(bytes, dest, strip_first, sink, watch, skip_file_name)?;
-    let body_refusal = inflate_planned_entries(bytes, &plan.entries);
+    let body_refusal = inflate_planned_entries(bytes, &plan.entries, plan.declared_total);
     match (body_refusal, plan.header_refusal) {
         // Both passes refused: the walk stopped at whichever entry came
         // first, and within one entry the header checks ran first.
@@ -465,6 +465,9 @@ struct ZipPlan {
     entries: Vec<PlannedEntry>,
     /// The first header-shaped refusal and the entry index it fired at.
     header_refusal: Option<(usize, String)>,
+    /// What the planned entries declare they decompress to — the pool's
+    /// work estimate.
+    declared_total: u64,
     seen_watched: bool,
 }
 
@@ -485,6 +488,7 @@ fn plan_zip(
     let mut plan = ZipPlan {
         entries: Vec::new(),
         header_refusal: None,
+        declared_total: 0,
         seen_watched: false,
     };
     // Where each destination path was last planned, so a repeated name is
@@ -557,6 +561,7 @@ fn plan_zip(
             }
         }
         plan.seen_watched |= watch.is_some_and(|name| lands_at_root(&rel, name));
+        plan.declared_total += declared;
         plan.entries.push(PlannedEntry {
             index: i,
             rel_str,
@@ -574,11 +579,30 @@ fn plan_zip(
 const ZIP_CHUNK: usize = 16;
 const ZIP_THREADS: usize = 8;
 
+/// The pool only pays for itself on an archive with real inflating to do.
+/// Measured on a 60-package composer vendor, where every dist zip is small:
+/// spreading them cost 0.8 s of system time and 4x the involuntary context
+/// switches for an instruction count that moved 3%, because each archive
+/// was spawning and tearing down its own thread stacks. Below these, one
+/// thread does the pass.
+const ZIP_PARALLEL_MIN_ENTRIES: usize = 64;
+const ZIP_PARALLEL_MIN_BYTES: u64 = 8 * 1024 * 1024;
+
 /// Inflate the planned entries, writing each one that has a destination.
 /// Returns the refusal at the LOWEST entry index, which is where the
 /// one-at-a-time walk would have stopped.
-fn inflate_planned_entries(bytes: &[u8], entries: &[PlannedEntry]) -> Option<(usize, String)> {
-    let threads = (entries.len() / ZIP_CHUNK).clamp(1, ZIP_THREADS);
+fn inflate_planned_entries(
+    bytes: &[u8],
+    entries: &[PlannedEntry],
+    declared_total: u64,
+) -> Option<(usize, String)> {
+    let worth_spreading =
+        entries.len() >= ZIP_PARALLEL_MIN_ENTRIES && declared_total >= ZIP_PARALLEL_MIN_BYTES;
+    let threads = if worth_spreading {
+        (entries.len() / ZIP_CHUNK).clamp(1, ZIP_THREADS)
+    } else {
+        1
+    };
     if threads == 1 {
         let mut archive = match zip::ZipArchive::new(std::io::Cursor::new(bytes)) {
             Ok(archive) => archive,
@@ -4014,11 +4038,13 @@ mod tests {
     /// oracle.
     #[test]
     fn parallel_zip_extraction_matches_the_in_order_reader() {
+        // Past both pool thresholds (entries and declared bytes), so this
+        // really does run on the pool.
         let payloads: Vec<(String, Vec<u8>, u32)> = (0..200)
             .map(|i| {
                 (
                     format!("pkg/dir{}/file{i}.txt", i % 7),
-                    format!("contents of {i}\n").repeat(1 + i % 5).into_bytes(),
+                    format!("contents of {i}\n").repeat(4096).into_bytes(),
                     if i % 3 == 0 { 0o755 } else { 0o644 },
                 )
             })
@@ -4041,7 +4067,7 @@ mod tests {
     #[test]
     fn parallel_zip_resolves_repeated_destinations_last_wins() {
         let mut files: Vec<(String, Vec<u8>)> = (0..100)
-            .map(|i| (format!("a/pad{i}.txt"), vec![b'p'; 32]))
+            .map(|i| (format!("a/pad{i}.txt"), vec![b'p'; 128 * 1024]))
             .collect();
         files.push(("a/dup.txt".to_string(), b"first".to_vec()));
         files.push(("b/dup.txt".to_string(), b"second".to_vec()));
@@ -4064,10 +4090,10 @@ mod tests {
     #[test]
     fn parallel_zip_reports_a_late_refusal_verbatim() {
         let mut files: Vec<(String, Vec<u8>)> = (0..80)
-            .map(|i| (format!("pkg/ok{i}.txt"), vec![b'x'; 16]))
+            .map(|i| (format!("pkg/ok{i}.txt"), vec![b'x'; 128 * 1024]))
             .collect();
         files.push(("../evil.txt".to_string(), b"evil".to_vec()));
-        files.extend((0..80).map(|i| (format!("pkg/after{i}.txt"), vec![b'y'; 16])));
+        files.extend((0..80).map(|i| (format!("pkg/after{i}.txt"), vec![b'y'; 128 * 1024])));
         let refs: Vec<(&str, &[u8])> = files
             .iter()
             .map(|(n, b)| (n.as_str(), b.as_slice()))
