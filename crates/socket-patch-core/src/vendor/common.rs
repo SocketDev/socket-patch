@@ -414,13 +414,27 @@ const DOS_DEVICE_NAMES: [&str; 22] = [
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
+/// `NAME_MAX`: the longest single path component APFS, ext4 and NTFS will
+/// create. A member past it cannot be extracted at all — the on-disk path
+/// fails the whole rebuild with `cannot create <path>: File name too long`,
+/// so a name this long has to keep taking that path to keep failing.
+const MAX_COMPONENT_BYTES: usize = 255;
+
+/// And the whole name, so `<stage>/<name>` cannot pass `PATH_MAX` either
+/// (1024 on macOS, the tightest of the three; a `tempfile` stage prefix is
+/// ~60 bytes there, and Rust's Windows `File::create` takes the verbatim
+/// `\\?\` route past `MAX_PATH`). Deliberately far above real archives: the
+/// longest entry name across 78k members of 362 real jars is 149 bytes.
+const MAX_NAME_BYTES: usize = 512;
+
 /// True when `name` is spelled so that a filesystem can only ever store it as
-/// itself: printable ASCII (so no Unicode-normalising filesystem folds it into
-/// a sibling), none of the characters Windows rewrites or rejects, and no
-/// component that a path walk re-spells (`.`, `..`, empty) or that Windows
-/// trims (a trailing `.` or space) or redirects (a DOS device name).
+/// itself — and can store it at all: printable ASCII (so no Unicode-normalising
+/// filesystem folds it into a sibling), none of the characters Windows rewrites
+/// or rejects, no component that a path walk re-spells (`.`, `..`, empty) or
+/// that Windows trims (a trailing `.` or space) or redirects (a DOS device
+/// name), and nothing longer than the filesystem would accept.
 fn is_plain_archive_name(name: &str) -> bool {
-    if name.is_empty() {
+    if name.is_empty() || name.len() > MAX_NAME_BYTES {
         return false;
     }
     if !name.chars().all(|c| {
@@ -431,6 +445,7 @@ fn is_plain_archive_name(name: &str) -> bool {
     }
     name.split('/').all(|part| {
         !part.is_empty()
+            && part.len() <= MAX_COMPONENT_BYTES
             && part != "."
             && part != ".."
             && !part.ends_with('.')
@@ -2285,6 +2300,7 @@ mod tests {
     /// last one wins, in memory a naive map would keep both.
     #[tokio::test]
     async fn ambiguous_names_fall_back_to_the_on_disk_repack() {
+        let over_name_max = format!("lib/{}.class", "A".repeat(MAX_COMPONENT_BYTES));
         let cases: Vec<(&str, Vec<u8>, Vec<&str>)> = vec![
             (
                 "case-colliding names",
@@ -2333,6 +2349,11 @@ mod tests {
                 "a patch key naming a member's directory under another spelling",
                 build_zip(&[entry("Lib/x.dll", b"a")]),
                 vec!["lib"],
+            ),
+            (
+                "a component past NAME_MAX",
+                build_zip(&[entry(&over_name_max, b"a")]),
+                vec![],
             ),
         ];
         for (label, archive, keys) in cases {
@@ -2387,6 +2408,29 @@ mod tests {
         let bytes = assert_repacks_agree(&archive, &["dup.txt"], &[], None, async |_| {}).await;
         assert_eq!(zip_entry_names(&bytes), ["dup.txt"]);
         assert_eq!(zip_member(&bytes, "dup.txt"), b"second");
+    }
+
+    /// A member no filesystem can create: the extraction fails the whole
+    /// rebuild with ENAMETOOLONG, so the gate has to keep such an archive on
+    /// that path. In memory it would rebuild cleanly and turn a package the
+    /// baseline refused into a vendored one.
+    #[tokio::test]
+    async fn a_member_past_name_max_still_fails_the_rebuild() {
+        let long = format!("lib/{}.class", "A".repeat(MAX_COMPONENT_BYTES));
+        let archive = build_zip(&[entry("LICENSE", b"a"), entry(&long, b"b")]);
+        assert!(
+            prepare_memory_repack(&archive, &target_files(&["LICENSE"]), &[])
+                .unwrap()
+                .is_none(),
+            "an unwritable member name must take the on-disk repack"
+        );
+        let stage = tempfile::tempdir().unwrap();
+        let error = super::super::registry_fetch::extract_zip(&archive, stage.path(), false)
+            .expect_err("no filesystem creates a component past NAME_MAX");
+        assert!(
+            error.starts_with("cannot create ") && error.contains(&long["lib/".len()..]),
+            "{error}"
+        );
     }
 
     /// Two spellings of one directory: a case-insensitive stage collapses them,
@@ -2538,6 +2582,21 @@ mod tests {
         assert!(!plain(["a/./b"]), "re-spelled component");
         assert!(!plain(["a//b"]), "empty component");
         assert!(!plain([""]), "empty name");
+        let long_part = "A".repeat(MAX_COMPONENT_BYTES + 1);
+        assert!(
+            !plain([format!("org/apache/{long_part}.class").as_str()]),
+            "a component past NAME_MAX — the extraction would have failed with \
+             ENAMETOOLONG, so the rebuild has to keep failing"
+        );
+        assert!(
+            plain([format!("org/apache/{}.class", "A".repeat(MAX_COMPONENT_BYTES - 6)).as_str()]),
+            "a component exactly at NAME_MAX still extracts"
+        );
+        let deep = vec!["dir"; MAX_NAME_BYTES / 4 + 1].join("/");
+        assert!(
+            !plain([deep.as_str()]),
+            "a whole name long enough to push `<stage>/<name>` past PATH_MAX"
+        );
         assert!(
             names_are_unambiguous(["my lib/x.dll", "a-b_c+d$e.txt", "[Content_Types].xml"], []),
             "ordinary jar/nupkg spellings stay on the fast path"
