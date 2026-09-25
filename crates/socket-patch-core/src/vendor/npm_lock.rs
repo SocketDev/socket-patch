@@ -1369,6 +1369,44 @@ mod tests {
         }
     }
 
+    /// The lock a package wrote is handed back to the next package through
+    /// the run's memo — but only while it is still the lock on DISK. A
+    /// `git checkout package-lock.json` between two vendor calls must be
+    /// seen: the second call re-wires the pristine lock instead of reading
+    /// its predecessor's document and reporting the project already in sync.
+    #[tokio::test]
+    async fn an_external_lock_reset_between_vendor_calls_is_not_memoized() {
+        let fx = fixture().await;
+
+        let (result, _entry, _w) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let wired = fx.read_lock().await;
+        assert_eq!(
+            wired["packages"]["node_modules/left-pad"]["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz())),
+            "the first call wires the lock"
+        );
+
+        // Someone restores the pre-vendor lock from version control.
+        tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
+            .await
+            .unwrap();
+
+        let (result, _entry, _w) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let rewired = fx.read_lock().await;
+        assert_eq!(
+            rewired["packages"]["node_modules/left-pad"]["resolved"],
+            json!(format!("file:{}", fx.expected_rel_tgz())),
+            "the second call must re-wire the lock it found on disk, not \
+             trust the document the first one left in the memo"
+        );
+        assert_eq!(
+            rewired, wired,
+            "re-wiring the restored lock reproduces the first call's bytes"
+        );
+    }
+
     fn expect_done(
         outcome: VendorOutcome,
     ) -> (ApplyResult, Option<VendorEntry>, Vec<VendorWarning>) {
