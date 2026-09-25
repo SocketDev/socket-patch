@@ -1000,10 +1000,13 @@ impl ApiClient {
     /// outcome fetched ahead of it (at most `window` in flight, and at
     /// most `window` requests ahead of the loop) — see
     /// [`super::vendor_prefetch`] for why nothing observable changes, and
-    /// what the speculation can cost. A uuid this method refuses without
-    /// any I/O is dropped from the plan, so the prefetch never sends what
-    /// the loop's own call would not. The plan replaces any plan already
-    /// attached.
+    /// what the plan may cost (it is exact: the CLI gates it with the
+    /// backends' own pre-flights,
+    /// [`crate::vendor::npm_flavor::preflight_packages`], so it names only
+    /// the downloads the loop will ask for). A uuid this method refuses
+    /// without any I/O is dropped from the plan, so the prefetch never
+    /// sends what the loop's own call would not. The plan replaces any plan
+    /// already attached.
     pub fn prefetch_vendor_packages(
         &self,
         uuids: Vec<String>,

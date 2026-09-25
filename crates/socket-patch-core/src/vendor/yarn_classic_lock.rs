@@ -336,6 +336,9 @@ pub(super) struct ClassicProject {
     blocks: Vec<LockBlock>,
 }
 
+/// Read the lock as [`vendor_yarn_classic`]'s step 2 does — read,
+/// re-sniffed against a berry lock, scanned into blocks — once, for the
+/// download plan; refuses with the loop's codes.
 pub(super) async fn read_project(project_root: &Path) -> Result<ClassicProject, &'static str> {
     let text = read_yarn_lock(project_root)
         .await

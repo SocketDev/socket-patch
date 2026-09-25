@@ -496,6 +496,9 @@ pub(super) struct NpmLockProject {
     lock: Value,
 }
 
+/// Read the lock as [`vendor_npm`]'s step 2 does — selected, parsed,
+/// version-gated — once, for the download plan; refuses with the loop's
+/// codes.
 pub(super) async fn read_project(project_root: &Path) -> Result<NpmLockProject, &'static str> {
     let (lock_name, lock_bytes, _sibling_locks) = match select_lockfile(project_root).await {
         Ok(Some(found)) => found,

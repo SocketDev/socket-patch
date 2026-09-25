@@ -555,6 +555,10 @@ pub(super) struct BerryProject {
     pkg: Value,
 }
 
+/// Read the project as [`vendor_yarn_berry`]'s steps 2–5 do — the lock
+/// scanned and gated (cacheKey, `.yarnrc.yml`, root workspace), the
+/// project `package.json` parsed — once, for the download plan; refuses
+/// with the loop's codes.
 pub(super) async fn read_project(project_root: &Path) -> Result<BerryProject, &'static str> {
     let code = |o: VendorOutcome| super::npm_common::refusal_code(&o);
     let lock_text = read_yarn_lock(project_root)
