@@ -1709,13 +1709,16 @@ mod tests {
             let judged = judge_installed_record(dir.path(), &record).await;
             let verified = verify_patch_record(dir.path(), &record).await.is_ok();
             assert_eq!(judged.patched, verified, "seed {seed}: patched");
-            if !verified {
-                assert_eq!(
-                    judged.stale_evidence,
-                    stale_positive_evidence_oracle(dir.path(), &record).await,
-                    "seed {seed}: evidence"
-                );
-            }
+            // On EVERY seed, verified ones included: `stale_evidence` is
+            // the only surviving pin on the CLI probe's old rule (its
+            // caller is now a `#[cfg(test)]` view of this judge), and a
+            // judge that set it alongside `patched` would change the
+            // gem/python warning text with nothing to catch it.
+            assert_eq!(
+                judged.stale_evidence,
+                stale_positive_evidence_oracle(dir.path(), &record).await,
+                "seed {seed}: evidence"
+            );
             seen_patched += usize::from(judged.patched);
             seen_stale += usize::from(judged.stale_evidence);
         }
