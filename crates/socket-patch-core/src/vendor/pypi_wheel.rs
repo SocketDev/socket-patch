@@ -25,7 +25,10 @@ use crate::utils::fs::{
     atomic_write_bytes, list_dir_entries, read_regular_to_bytes, read_regular_to_string,
 };
 
-use super::common::{failed_result, is_executable, write_zip_entries};
+use super::common::{
+    can_repack_in_memory, failed_result, is_executable, patch_target_paths, write_zip_entries,
+    Stage,
+};
 
 /// The located installed distribution for one `name@version`.
 #[derive(Debug, Clone)]
@@ -368,7 +371,7 @@ pub async fn build_patched_wheel(
 
     // Stage the members into a private tree preserving the site-packages-
     // relative layout, so the manifest's sp-relative pypi file keys resolve.
-    let stage = match tempfile::tempdir() {
+    let stage = match Stage::new() {
         Ok(dir) => dir,
         Err(e) => {
             return Ok((
@@ -377,6 +380,16 @@ pub async fn build_patched_wheel(
             ))
         }
     };
+    // The apply pipeline only ever resolves the patch targets, so they are
+    // the only members that have to exist on disk: every other member is read
+    // once and carried straight into the wheel. That holds only while no two
+    // names can fold into one another on the staging filesystem (a
+    // case-insensitive or Unicode-normalising volume) — for anything else the
+    // whole member set is staged and read back from there, as before.
+    let targets: HashSet<&str> = patch_target_paths(&record.files).into_iter().collect();
+    let held_in_memory =
+        can_repack_in_memory(members.iter().map(String::as_str), targets.iter().copied());
+    let mut held: HashMap<String, Vec<u8>> = HashMap::new();
     let mut exec_bits: HashMap<String, bool> = HashMap::new();
     for member in &members {
         let src = site_packages.join(member);
@@ -394,6 +407,10 @@ pub async fn build_patched_wheel(
             }
         };
         exec_bits.insert(member.clone(), is_executable(&metadata));
+        if held_in_memory && !targets.contains(member.as_str()) {
+            held.insert(member.clone(), bytes);
+            continue;
+        }
         let dst = stage.path().join(member);
         if let Some(parent) = dst.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -408,6 +425,25 @@ pub async fn build_patched_wheel(
                 failed_result(purl, site_packages, format!("cannot stage {member}: {e}")),
                 None,
             ));
+        }
+    }
+    // A patch key can name a DIRECTORY of the installed tree; a fully staged
+    // tree carried one wherever a member lived under it, and the verify reads
+    // "cannot hash" there rather than "not found". Recreate exactly those.
+    if held_in_memory {
+        for target in &targets {
+            let prefix = format!("{target}/");
+            if members.iter().any(|m| m == target)
+                || !members.iter().any(|m| m.starts_with(&prefix))
+            {
+                continue;
+            }
+            if let Err(e) = tokio::fs::create_dir_all(stage.path().join(target)).await {
+                return Ok((
+                    failed_result(purl, site_packages, format!("cannot stage {target}: {e}")),
+                    None,
+                ));
+            }
         }
     }
 
@@ -427,6 +463,7 @@ pub async fn build_patched_wheel(
     )
     .await;
     if dry_run || !result.success {
+        stage.dispose().await;
         return Ok((result, None));
     }
 
@@ -450,13 +487,19 @@ pub async fn build_patched_wheel(
     let mut entries: Vec<(String, Vec<u8>, u32)> = Vec::with_capacity(members.len() + 1);
     let mut record_lines = String::new();
     for member in &members {
-        let bytes = match tokio::fs::read(stage.path().join(member)).await {
-            Ok(b) => b,
-            Err(e) => {
-                result.success = false;
-                result.error = Some(format!("staged member {member} vanished: {e}"));
-                return Ok((result, None));
-            }
+        // A member the apply never touched was never written out: it comes
+        // from the one read of the installed tree above. The rest (the patch
+        // targets, and the files the patch created) come back off the stage.
+        let bytes = match held.remove(member.as_str()) {
+            Some(bytes) => bytes,
+            None => match tokio::fs::read(stage.path().join(member)).await {
+                Ok(b) => b,
+                Err(e) => {
+                    result.success = false;
+                    result.error = Some(format!("staged member {member} vanished: {e}"));
+                    return Ok((result, None));
+                }
+            },
         };
         let digest = sha2::Sha256::digest(&bytes);
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
@@ -479,6 +522,7 @@ pub async fn build_patched_wheel(
         record_lines.into_bytes(),
         0o644,
     ));
+    stage.dispose().await;
 
     let zip_bytes = match tokio::task::spawn_blocking(move || write_zip_entries(&entries)).await {
         Ok(Ok(bytes)) => bytes,
@@ -912,6 +956,194 @@ mod tests {
         }
         // Patched bytes actually landed in the wheel.
         assert_eq!(zip_file(&bytes, "six.py"), PATCHED);
+    }
+
+    /// X10 equivalence: keeping the installed tree's members in memory must
+    /// rebuild the EXACT wheel bytes the stage-everything build produced —
+    /// the emitted `--hash` / uv lock pin rides on them. Driven twice over
+    /// one fixture (an exec-bit member, a zero-length member, a nested tree,
+    /// a member large enough to span several read buffers, a patched member
+    /// and a created one), once with the in-memory path forced off.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn in_memory_wheel_build_matches_the_on_disk_build_byte_for_byte() {
+        async fn build(on_disk: bool) -> (Vec<u8>, WheelArtifact) {
+            let _forced = on_disk.then(crate::vendor::common::OnDiskRepackGuard::acquire);
+            let fx = make_fixture(
+                "six/__init__.py,sha256=CC,10\n\
+                 six/empty.py,,0\n\
+                 six/data/table.bin,sha256=DD,8\n\
+                 six-script.sh,sha256=EE,20\n",
+                None,
+            )
+            .await;
+            tokio::fs::create_dir_all(fx.site_packages.join("six/data"))
+                .await
+                .unwrap();
+            tokio::fs::write(fx.site_packages.join("six/__init__.py"), b"# pkg\n")
+                .await
+                .unwrap();
+            tokio::fs::write(fx.site_packages.join("six/empty.py"), b"")
+                .await
+                .unwrap();
+            tokio::fs::write(
+                fx.site_packages.join("six/data/table.bin"),
+                vec![7u8; 2 * 1024 * 1024],
+            )
+            .await
+            .unwrap();
+            let script = fx.site_packages.join("six-script.sh");
+            tokio::fs::write(&script, b"#!/bin/sh\nexit 0\n")
+                .await
+                .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+
+            let dist = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
+                .await
+                .unwrap();
+            let record =
+                patch_record(&[("six.py", ORIG, PATCHED), ("six/created.py", b"", PATCHED)]);
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let (result, artifact) = build_patched_wheel(
+                "pkg:pypi/six@1.16.0",
+                &fx.site_packages,
+                &dist,
+                &record,
+                &sources,
+                &fx.dest,
+                false,
+                false,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap();
+            assert!(result.success, "{:?}", result.error);
+            (
+                tokio::fs::read(&fx.dest).await.unwrap(),
+                artifact.expect("a successful build yields an artifact"),
+            )
+        }
+
+        let (fast, fast_artifact) = build(false).await;
+        let (oracle, oracle_artifact) = build(true).await;
+        assert_eq!(
+            fast, oracle,
+            "the in-memory build must be byte-identical to the staged one"
+        );
+        assert_eq!(fast_artifact, oracle_artifact, "and so must the lock pin");
+        assert_eq!(zip_file(&fast, "six.py"), PATCHED);
+        assert_eq!(zip_file(&fast, "six/created.py"), PATCHED);
+        assert_eq!(zip_file(&fast, "six/empty.py"), b"");
+        assert_eq!(
+            zip_file(&fast, "six/data/table.bin"),
+            vec![7u8; 2 * 1024 * 1024]
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(zip_unix_mode(&fast, "six-script.sh") & 0o777, 0o755);
+            assert_eq!(zip_unix_mode(&fast, "six.py") & 0o777, 0o644);
+        }
+        assert_eq!(
+            zip_names(&fast).last().map(String::as_str),
+            Some("six-1.16.0.dist-info/RECORD"),
+            "RECORD stays last"
+        );
+    }
+
+    /// A patch key that names a DIRECTORY of the installed tree must reach
+    /// the verify as a directory on both staging paths: a fully staged tree
+    /// carried one wherever a member lived under it, so the in-memory staging
+    /// materialises exactly those. Without it `--force` would read
+    /// "File not found" and silently skip the key instead of refusing to hash
+    /// a directory.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn patch_key_naming_a_directory_verifies_the_same_on_both_staging_paths() {
+        async fn verify_message(on_disk: bool) -> String {
+            let _forced = on_disk.then(crate::vendor::common::OnDiskRepackGuard::acquire);
+            let fx = make_fixture("six/__init__.py,sha256=CC,10\n", None).await;
+            tokio::fs::create_dir_all(fx.site_packages.join("six"))
+                .await
+                .unwrap();
+            tokio::fs::write(fx.site_packages.join("six/__init__.py"), b"# pkg\n")
+                .await
+                .unwrap();
+            let dist = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
+                .await
+                .unwrap();
+            let record = patch_record(&[("six", ORIG, PATCHED)]);
+            let sources = PatchSources::blobs_only(&fx.blobs);
+            let (result, _) = build_patched_wheel(
+                "pkg:pypi/six@1.16.0",
+                &fx.site_packages,
+                &dist,
+                &record,
+                &sources,
+                &fx.dest,
+                /*dry_run=*/ true,
+                /*force=*/ true,
+                &mut Vec::new(),
+            )
+            .await
+            .unwrap();
+            result
+                .files_verified
+                .iter()
+                .find(|v| v.file == "six")
+                .and_then(|v| v.message.clone())
+                .unwrap_or_default()
+        }
+
+        for (label, message) in [
+            ("in memory", verify_message(false).await),
+            ("on disk", verify_message(true).await),
+        ] {
+            assert!(
+                message.starts_with("Failed to hash file"),
+                "{label}: a key naming a directory must refuse to hash, got {message:?}"
+            );
+        }
+    }
+
+    /// A member name a filesystem could re-spell (here: non-ASCII, which a
+    /// normalising volume folds) sends the build back to the stage-everything
+    /// path. It must still produce a correct wheel.
+    #[tokio::test]
+    async fn a_respellable_member_name_still_builds_through_the_staged_path() {
+        let fx = make_fixture("six/caf\u{e9}.txt,sha256=FF,6\n", None).await;
+        tokio::fs::create_dir_all(fx.site_packages.join("six"))
+            .await
+            .unwrap();
+        tokio::fs::write(fx.site_packages.join("six/caf\u{e9}.txt"), b"latte\n")
+            .await
+            .unwrap();
+        let dist = locate_installed_dist(&fx.site_packages, "six", "1.16.0")
+            .await
+            .unwrap();
+        let record = patch_record(&[("six.py", ORIG, PATCHED)]);
+        let sources = PatchSources::blobs_only(&fx.blobs);
+        let (result, artifact) = build_patched_wheel(
+            "pkg:pypi/six@1.16.0",
+            &fx.site_packages,
+            &dist,
+            &record,
+            &sources,
+            &fx.dest,
+            false,
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(artifact.is_some());
+        let bytes = tokio::fs::read(&fx.dest).await.unwrap();
+        assert_eq!(zip_file(&bytes, "six.py"), PATCHED);
+        assert_eq!(zip_file(&bytes, "six/caf\u{e9}.txt"), b"latte\n");
     }
 
     #[tokio::test]
