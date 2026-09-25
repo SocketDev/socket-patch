@@ -1295,7 +1295,10 @@ fn crawler_options_for(common: &GlobalArgs) -> CrawlerOptions {
 /// those from memory instead of fetching every view a second time. Only
 /// successful fetches are cached: a variant whose view errored or 404'd is
 /// re-fetched by the loop so the failure surfaces per patch as before.
-/// With `--all-releases` set this is a verbatim pass-through.
+/// With `--all-releases` set no variant is narrowed away and no view is
+/// fetched — the whole selection comes back, in the same purl order
+/// ([`sort_by_purl`]) as the narrowed arm, so both arms of this function
+/// share one output contract.
 async fn filter_to_installed_releases(
     selected: &[PatchSearchResult],
     all_releases: bool,
