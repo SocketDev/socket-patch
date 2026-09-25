@@ -166,6 +166,16 @@ impl LockGuard {
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
+        // R0: sync every artifact still pending a durability barrier while
+        // the lock is held — an artifact rebuilt in place that no later
+        // commit point's barrier covered (see `utils::durability`). Best
+        // effort: a drop cannot fail the command, so a failure is said.
+        if let Err(e) = crate::utils::durability::barrier_blocking() {
+            eprintln!(
+                "Warning: could not sync the vendored artifacts this run wrote ({e}); \
+                 run `socket-patch repair` after an unclean shutdown"
+            );
+        }
         // R1: unlink while still holding the lock — but only the file we
         // hold. The unlink is gated on the path still naming the held
         // inode: after a non-cooperating `rm` + `touch`, the path names a

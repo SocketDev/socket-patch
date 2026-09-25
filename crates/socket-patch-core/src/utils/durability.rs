@@ -41,28 +41,38 @@
 //! or missing after a reboot. That is safe because nothing trusts an
 //! artifact's bytes without re-verifying them, on every run:
 //!
-//! 1. **Before the barrier nothing refers to the artifact.** The commit
-//!    points still hold their pre-run bytes (the barrier runs before the
-//!    first commit-point write; with the group commit the whole run's commit
-//!    points are written after it), so the artifact is an orphan in a uuid
-//!    dir no ledger entry and no lockfile names. The next run re-derives
-//!    everything from the ledger, finds no entry for it, and re-vendors —
-//!    each backend rebuilds a uuid dir it does not own the ledger for —
-//!    and `vendor --revert` / the orphan sweep delete unreferenced uuid dirs.
+//! 1. **Before the barrier nothing new refers to the artifact.** The
+//!    commit points still hold their pre-run bytes (the barrier runs before
+//!    the first commit-point write; with the group commit the whole run's
+//!    commit points are written after it), so a newly built artifact is an
+//!    orphan in a uuid dir no ledger entry and no lockfile names. The next
+//!    run re-derives everything from the ledger, finds no entry for it, and
+//!    re-vendors — each backend rebuilds a uuid dir it does not own the
+//!    ledger for — and `vendor --revert` / the orphan sweep delete
+//!    unreferenced uuid dirs. The one exception is an artifact REBUILT IN
+//!    PLACE (a drifted or missing committed artifact healed at its own
+//!    path), which the committed state already names; a rebuild that
+//!    changes no lockfile and no ledger byte reaches no commit point, so
+//!    the group commit runs the barrier even when it has nothing to write,
+//!    and releasing the apply lock runs it once more for every other
+//!    command ([`barrier_blocking`]): the command never returns with an
+//!    unsynced artifact.
 //! 2. **After the barrier the artifact is as durable as before.** Its data
 //!    and directory entry were fsynced (and the device cache flushed) before
 //!    the commit point that references it was written.
-//! 3. **Every consumer re-verifies.** The vendor hot path accepts a committed
-//!    artifact only when it hashes to what the ledger (and the lockfile's own
-//!    integrity field) records — `sha256` for a file artifact, the per-file
-//!    afterHashes and the full-tree `fileInventory` for a copy dir — and
-//!    otherwise rebuilds it; `repair` rebuilds a missing or drifted one;
-//!    `vex` and `verify` refuse to attest one that does not match. The
-//!    marker is never a trust input at all.
+//! 3. **Consumers re-verify.** `repair` rebuilds a missing or drifted
+//!    artifact; `vex` and `verify` refuse to attest one that does not match
+//!    the ledger (`sha256` for a file artifact, the per-file afterHashes and
+//!    the full-tree `fileInventory` for a copy dir); a lockfile integrity
+//!    field makes the package manager refuse it; the re-run deferral that
+//!    skips the pristine download hashes a file artifact before trusting
+//!    it. (Some backends' in-sync checks look only for the artifact's
+//!    presence — pypi's among them, unchanged by this module — which is
+//!    why point 1 never leaves an artifact the committed state names
+//!    unsynced.) The marker is never a trust input at all.
 //!
-//! So the worst a crash can do to an artifact is make the next run rebuild
-//! it, which is exactly what that run would do for an artifact deleted by
-//! hand.
+//! So a crash can only lose an artifact nothing durable names yet, which
+//! the next run rebuilds exactly as it would one deleted by hand.
 //!
 //! The patched files the apply engine writes into a vendor stage are
 //! artifacts too: [`artifact_writes`] marks the vendor stage's apply calls,
@@ -153,23 +163,59 @@ pub(crate) fn moved(from: &Path, to: &Path) {
 /// unwind) is skipped; any other fsync failure is returned, and the caller
 /// — a durable commit point — must not proceed, since what it would name
 /// may not be on disk. A directory sync stays best-effort, as it always
-/// was for the durable writer.
+/// was for the durable writer. A failed barrier keeps everything it took
+/// pending, so the next barrier (a caller that carries on, or the one the
+/// apply lock's release runs) syncs it again rather than skipping it.
 pub(crate) async fn barrier() -> std::io::Result<()> {
-    let (files, dirs) = {
-        let mut pending = pending();
-        if pending.files.is_empty() && pending.dirs.is_empty() {
-            return Ok(());
-        }
-        (
-            std::mem::take(&mut pending.files),
-            std::mem::take(&mut pending.dirs),
-        )
+    let Some((files, dirs)) = take_pending() else {
+        return Ok(());
     };
     crate::utils::failpoint::hit("durability_barrier");
-    match tokio::task::spawn_blocking(move || sync_all_blocking(&files, &dirs)).await {
-        Ok(result) => result,
+    let synced = tokio::task::spawn_blocking(move || {
+        let result = sync_all_blocking(&files, &dirs);
+        (result, files, dirs)
+    })
+    .await;
+    match synced {
+        Ok((Ok(()), _, _)) => Ok(()),
+        Ok((Err(e), files, dirs)) => {
+            restore_pending(files, dirs);
+            Err(e)
+        }
         Err(_) => Err(std::io::Error::other("background task failed")),
     }
+}
+
+/// [`barrier`], blocking — for the apply lock's release, which runs it
+/// once more so an artifact rewritten in place without any later commit
+/// point (a rebuild that left every lockfile and the ledger unchanged) is
+/// synced before the command returns.
+pub(crate) fn barrier_blocking() -> std::io::Result<()> {
+    let Some((files, dirs)) = take_pending() else {
+        return Ok(());
+    };
+    let result = sync_all_blocking(&files, &dirs);
+    if result.is_err() {
+        restore_pending(files, dirs);
+    }
+    result
+}
+
+fn take_pending() -> Option<(Vec<PathBuf>, BTreeSet<PathBuf>)> {
+    let mut pending = pending();
+    if pending.files.is_empty() && pending.dirs.is_empty() {
+        return None;
+    }
+    Some((
+        std::mem::take(&mut pending.files),
+        std::mem::take(&mut pending.dirs),
+    ))
+}
+
+fn restore_pending(files: Vec<PathBuf>, dirs: BTreeSet<PathBuf>) {
+    let mut pending = pending();
+    pending.files.extend(files);
+    pending.dirs.extend(dirs);
 }
 
 /// Plain-fsync every file and directory, then flush each device's cache

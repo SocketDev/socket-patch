@@ -381,10 +381,13 @@ impl GroupCommit {
         // naming wiring that is not there yet.
         changes.sort_by_key(|c| is_ledger(&c.rel));
         let changed: Vec<String> = changes.iter().map(|c| rel_string(&c.rel)).collect();
+        // Even with nothing to write: an artifact rebuilt in place (a
+        // drifted committed copy healed at its own path) is already named
+        // by the committed state, so it is synced before the run returns.
+        super::durability::barrier().await?;
         if changes.is_empty() {
             return Ok(changed);
         }
-        super::durability::barrier().await?;
         if let [only] = changes.as_slice() {
             apply_durably(&root, only).await?;
             return Ok(changed);
