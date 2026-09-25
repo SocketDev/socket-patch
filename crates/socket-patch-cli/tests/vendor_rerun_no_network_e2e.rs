@@ -974,3 +974,80 @@ async fn cargo_service_never_vendors_a_git_or_custom_registry_crate() {
         "an unverifiable crate is never downloaded"
     );
 }
+
+/// A deferred fetch that does run — a drifted committed copy rebuilt from a
+/// reachable registry — reports its `vendor_fetched_missing` just ahead of
+/// the package's own event, exactly where the eager ladder reported it, and
+/// downloads the pristine crate once.
+#[tokio::test]
+async fn cargo_rerun_over_a_drifted_copy_reports_the_deferred_fetch_first() {
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    const PURL: &str = "pkg:cargo/cfg-if@1.0.4";
+    const UUID: &str = "2b1f6c1e-8d3a-4f6b-9c2d-7e5a9b1c3d0b";
+    const PRISTINE: &[u8] = b"pub fn cfg() {}\n";
+    const PATCHED: &[u8] = b"pub fn cfg() { /* patched */ }\n";
+    const TOML: &[u8] = b"[package]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n";
+    let pristine = make_crate(
+        "cfg-if-1.0.4",
+        &[("Cargo.toml", TOML), ("src/lib.rs", PRISTINE)],
+    );
+    let checksum = hex::encode(Sha256::digest(&pristine));
+    let registry = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(pristine))
+        .mount(&registry)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\ncfg-if = \"1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Cargo.lock"),
+        format!(
+            "version = 4\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+             dependencies = [\n \"cfg-if\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"{checksum}\"\n"
+        ),
+    )
+    .unwrap();
+    write_manifest(&root, PURL, UUID, "package/src/lib.rs", PRISTINE, PATCHED);
+    let empty_home = tmp.path().join("cargo-home");
+    std::fs::create_dir_all(&empty_home).unwrap();
+    let home = empty_home.to_string_lossy().into_owned();
+    let uri = registry.uri();
+    let env = [
+        ("CARGO_HOME", home.as_str()),
+        ("SOCKET_CRATES_REGISTRY", uri.as_str()),
+    ];
+    let dead = dead_endpoint();
+    let gets = || async { registry.received_requests().await.unwrap_or_default().len() };
+
+    let (code, v, stderr) = run_vendor(&root, &dead, &[], &env);
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    let copy_lib = root.join(format!(
+        ".socket/vendor/cargo/{UUID}/cfg-if-1.0.4/src/lib.rs"
+    ));
+    std::fs::write(&copy_lib, b"tampered\n").unwrap();
+    let before = gets().await;
+
+    let (code, v, stderr) = run_vendor(&root, &dead, &[], &env);
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert_eq!(
+        purl_events(&v, PURL),
+        vec![
+            ("skipped", "vendor_fetched_missing"),
+            ("applied", ""),
+            ("skipped", "vendor_artifact_rebuilt"),
+        ],
+        "the fetch is reported first, then the package's own events: {v:#}"
+    );
+    assert_eq!(gets().await, before + 1, "one pristine download");
+    assert_eq!(std::fs::read(&copy_lib).unwrap(), PATCHED, "rebuilt");
+}
