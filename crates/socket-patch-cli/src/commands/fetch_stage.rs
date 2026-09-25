@@ -770,8 +770,8 @@ fn contentless_reason(contentless: &[&str]) -> Option<String> {
     Some(match rest.len() {
         0 => format!("the patch view served no blob content for {first}"),
         n => format!(
-            "the patch view served no blob content for {first} (and {n} other {})",
-            plural(n, "file", "files")
+            "the patch view served no blob content for {first} (and {n} more file{})",
+            if n == 1 { "" } else { "s" }
         ),
     })
 }
@@ -779,6 +779,27 @@ fn contentless_reason(contentless: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-package `no_local_source` detail is the ONE machine-readable
+    /// explanation a `--json` consumer gets (every human channel in the
+    /// stager is gated on `!--json`), so its wording is pinned here —
+    /// including the count, which `plural` already carries.
+    #[test]
+    fn contentless_reason_names_the_file_and_counts_the_rest() {
+        assert_eq!(contentless_reason(&[]), None);
+        assert_eq!(
+            contentless_reason(&["package/index.js"]).as_deref(),
+            Some("the patch view served no blob content for package/index.js")
+        );
+        assert_eq!(
+            contentless_reason(&["a.js", "b.js"]).as_deref(),
+            Some("the patch view served no blob content for a.js (and 1 more file)")
+        );
+        assert_eq!(
+            contentless_reason(&["a.js", "b.js", "c.js"]).as_deref(),
+            Some("the patch view served no blob content for a.js (and 2 more files)")
+        );
+    }
 
     #[test]
     fn progress_lines_name_no_internal_tags() {
