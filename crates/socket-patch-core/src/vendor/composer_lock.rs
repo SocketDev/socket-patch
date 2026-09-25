@@ -48,6 +48,7 @@ use super::common::{
     swap_stage_into_place, synthesized_result,
 };
 use super::lock_inventory::{composer_lock_packages, ComposerLockPackage};
+use super::parse_memo::ParseMemo;
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
 use super::registry_fetch::{extract_on_blocking_pool, extract_zip};
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
@@ -59,6 +60,11 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, Vendo
 
 /// Project-relative lockfile this backend wires.
 const COMPOSER_LOCK: &str = "composer.lock";
+
+/// The run's composer.lock parse. Every entry point below re-reads the lock
+/// (the read is the TOCTOU guarantee) and reuses this parse whenever the
+/// bytes it read are the ones the parse came from; see [`ParseMemo`].
+static LOCK_MEMO: ParseMemo<Value> = ParseMemo::new();
 
 /// Wiring-record discriminator. The record's `key` is
 /// `"<section>:<vendor>/<name>"` where `<section>` is `packages` or
@@ -145,7 +151,9 @@ pub async fn vendor_composer<'a>(
         }
     };
     // An unparseable lock is as unusable as a missing one — same refusal code.
-    let mut lock: Value = match serde_json::from_str(&lock_text) {
+    let lock = match LOCK_MEMO.parse(&lock_path, lock_text.as_bytes(), || {
+        serde_json::from_str::<Value>(&lock_text)
+    }) {
         Ok(v) => v,
         Err(e) => {
             return refused(
@@ -302,6 +310,10 @@ pub async fn vendor_composer<'a>(
         };
 
     // ── lock rewrite ─────────────────────────────────────────────────────
+    // The memo hands the parse out shared; this is the one branch that
+    // mutates it, so it takes its own copy — exactly the allocation the
+    // parse it replaced would have made.
+    let mut lock = (*lock).clone();
     let original_entry = lock[section][idx].clone();
     let Some(original_obj) = original_entry.as_object() else {
         // find_lock_entry only matches objects; defensive.
@@ -325,7 +337,15 @@ pub async fn vendor_composer<'a>(
     let rewritten = rewrite_lock_entry(original_obj, &copy_rel, &record.uuid);
     lock[section][idx] = Value::Object(rewritten.clone());
     let write_result = match composer_json_bytes(&lock) {
-        Ok(bytes) => atomic_write_bytes_preserving_mode(&lock_path, &bytes).await,
+        Ok(bytes) => match atomic_write_bytes_preserving_mode(&lock_path, &bytes).await {
+            // The bytes now on disk and the doc they came from: the next
+            // package in this run reads them back and skips the parse.
+            Ok(()) => {
+                LOCK_MEMO.store(&lock_path, bytes, lock);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
         Err(e) => Err(e),
     };
     if let Err(e) = write_result {
@@ -884,7 +904,9 @@ async fn stranded_wired_packages(
     let Ok(text) = read_regular_to_string(lock_path).await else {
         return Vec::new();
     };
-    let Ok(lock) = serde_json::from_str::<Value>(&text) else {
+    let Ok(lock) = LOCK_MEMO.parse(lock_path, text.as_bytes(), || {
+        serde_json::from_str::<Value>(&text)
+    }) else {
         return Vec::new();
     };
     stranded_in(&lock, uuid, restorable)
@@ -935,19 +957,26 @@ async fn restore_lock_entry(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(format!("unreadable composer.lock: {e}")),
     };
-    let mut lock: Value =
-        serde_json::from_str(&lock_text).map_err(|e| format!("unparseable composer.lock: {e}"))?;
+    let lock = LOCK_MEMO
+        .parse(lock_path, lock_text.as_bytes(), || {
+            serde_json::from_str::<Value>(&lock_text)
+        })
+        .map_err(|e| format!("unparseable composer.lock: {e}"))?;
 
     let Some(idx) = wired_entry_index(&lock, section, pkg, uuid) else {
         return Ok(false);
     };
 
     if !dry_run {
+        let mut lock = (*lock).clone();
         lock[section][idx] = original;
         let bytes = composer_json_bytes(&lock).map_err(|e| e.to_string())?;
         atomic_write_bytes_preserving_mode(lock_path, &bytes)
             .await
             .map_err(|e| format!("failed to write composer.lock: {e}"))?;
+        // Re-seeded the same way the vendor path does, so the next record's
+        // restore reads back its own write for free.
+        LOCK_MEMO.store(lock_path, bytes, lock);
     }
     Ok(true)
 }
@@ -1203,6 +1232,84 @@ mod tests {
         assert_eq!(w.key.as_deref(), Some("packages:psr/log"));
         assert_eq!(w.original.as_ref().unwrap(), &lock["packages"][0]);
         assert_eq!(w.new.as_ref().unwrap(), e);
+    }
+
+    /// Two packages in one run with a hand edit to composer.lock between
+    /// them: the second package must wire against the bytes on DISK, not the
+    /// parse the first one left in the memo. The memo only ever skips the
+    /// parse — the read, and with it the edit, always happens.
+    #[tokio::test]
+    async fn test_external_lock_edit_between_packages_is_not_memoized() {
+        const DEV_UUID: &str = "3c1d5e7f-9a2b-4c6d-8e0f-1a2b3c4d5e6f";
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+
+        // Package one: composer.lock is rewritten, the memo seeded with it.
+        let (result, _entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+
+        // Someone else edits the lock — a `composer update`, a hand edit —
+        // touching a key neither vendor call writes.
+        let mut edited: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        edited["content-hash"] = json!("edited-between-packages");
+        tokio::fs::write(
+            root.join(COMPOSER_LOCK),
+            composer_json_bytes(&edited).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Package two: the packages-dev[] entry, under its own uuid.
+        let dev_installed = root.join("vendor/phpunit/phpunit");
+        tokio::fs::create_dir_all(dev_installed.join("src"))
+            .await
+            .unwrap();
+        tokio::fs::write(dev_installed.join("src/LoggerInterface.php"), PRISTINE)
+            .await
+            .unwrap();
+        let dev_record = PatchRecord {
+            uuid: DEV_UUID.to_string(),
+            ..record.clone()
+        };
+        let (result, _entry, _w) = unwrap_done(
+            run_vendor(
+                root,
+                &blobs,
+                &dev_installed,
+                &dev_record,
+                "pkg:composer/phpunit/phpunit@10.0.0",
+                false,
+            )
+            .await,
+        );
+        assert!(result.success, "{:?}", result.error);
+
+        let after: Value = serde_json::from_str(
+            &tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            after["content-hash"], "edited-between-packages",
+            "the second package must build on the edited bytes, not on the \
+             first package's memoized parse"
+        );
+        assert_eq!(
+            after["packages"][0]["dist"]["type"], "path",
+            "the first package's wiring must survive"
+        );
+        assert_eq!(
+            after["packages-dev"][0]["dist"]["type"], "path",
+            "the second package must still be wired"
+        );
     }
 
     #[tokio::test]
