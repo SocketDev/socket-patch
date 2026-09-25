@@ -49,7 +49,8 @@ pub(crate) async fn vendor(
         Err(o) => return *o,
     };
     let leaf = tgz_rel_leaf(&coords.name, &coords.version);
-    let (matches, mirrors) = match preflight_package(&project, root, &coords, &leaf) {
+    let BinaryTargets { matches, mirrors } = match preflight_package(&project, root, &coords, &leaf)
+    {
         Ok(v) => v,
         Err(o) => return *o,
     };
@@ -277,6 +278,13 @@ pub(super) async fn read_project(root: &Path) -> Result<BinaryProject, Box<Vendo
     Ok(BinaryProject { lock, packages })
 }
 
+/// What the per-package pre-flight hands the vendoring: the records to
+/// rewrite and the validated `(workspace, artifact path)` mirrors.
+pub(super) struct BinaryTargets {
+    matches: Vec<BinaryPackage>,
+    mirrors: Vec<(String, String)>,
+}
+
 /// The per-package pre-flight against an already-read lock: the records
 /// to rewrite (the exact `name@version`, plus our own tuples for it), and
 /// the workspace mirror paths validated. Nothing here reads the package's
@@ -287,7 +295,7 @@ pub(super) fn preflight_package(
     root: &Path,
     coords: &NpmCoords,
     leaf: &str,
-) -> Result<(Vec<BinaryPackage>, Vec<(String, String)>), Box<VendorOutcome>> {
+) -> Result<BinaryTargets, Box<VendorOutcome>> {
     let matches: Vec<_> = project
         .packages
         .iter()
@@ -324,7 +332,7 @@ pub(super) fn preflight_package(
         Ok(v) => v,
         Err(e) => return Err(Box::new(refused("vendor_bun_lockb_invalid", e))),
     };
-    Ok((matches, mirrors))
+    Ok(BinaryTargets { matches, mirrors })
 }
 
 /// Which of `packages` [`vendor`] would refuse before its first service
