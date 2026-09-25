@@ -542,6 +542,16 @@ async fn inventory_pdm_lock(project_root: &Path) -> Option<Vec<LockfileEntry>> {
 /// logical lines with the shared requirements lexer
 /// ([`crate::utils::requirements`]: continuations joined, comments cut, one
 /// leading BOM dropped), the same one the planner and discovery use.
+///
+/// A line we ourselves rewrote — the hosted `name @ <patch-server url>` and
+/// the vendored `name @ ./.socket/vendor/pypi/…` direct references — is
+/// still the package it replaced, at its version: it stays in the inventory
+/// so a re-scan of an already-wired project counts (and re-confirms) it
+/// instead of reporting the package gone. Same rule, and the same
+/// [`socket_reference_coords`] reader, as Pipfile.lock's own entries; a
+/// uv.lock keeps its `[[package]]` name/version through the rewrite for
+/// free. A user's OWN file/url reference is not ours to resolve and stays
+/// out, exactly as before.
 async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileEntry>> {
     let text = read_regular_to_string(&project_root.join("requirements.txt"))
         .await
@@ -554,11 +564,23 @@ async fn inventory_requirements_txt(project_root: &Path) -> Option<Vec<LockfileE
         }
         // `name==version` (extras, env markers, hash options stripped) —
         // the shared exact-pin rule discovery reads requirements with.
-        let Some((raw_name, version)) = crate::utils::requirements::exact_pin(t) else {
-            continue;
+        let (name, version) = match crate::utils::requirements::exact_pin(t) {
+            Some((raw_name, version)) => (canonicalize_pypi_name(raw_name), version.to_string()),
+            None => {
+                let Some((raw_name, reference)) = crate::utils::requirements::direct_reference(t)
+                    .and_then(|(n, r)| Some((n, socket_reference_coords(r)?)))
+                else {
+                    continue;
+                };
+                // The line's own name must agree with the artifact's:
+                // a reference whose coordinates contradict the requirement
+                // it stands on is not one of ours, whoever wrote it.
+                if canonicalize_pypi_name(raw_name) != reference.0 {
+                    continue;
+                }
+                reference
+            }
         };
-        let name = canonicalize_pypi_name(raw_name);
-        let version = version.to_string();
         let Some(purl) = pypi_purl(&name, &version) else {
             continue;
         };
