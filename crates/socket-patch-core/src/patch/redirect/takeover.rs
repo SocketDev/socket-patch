@@ -130,26 +130,14 @@ fn find_record_key(state: &RedirectState, purl: &str) -> Result<(String, String)
 }
 
 /// Refuse a per-purl claim while the ledger holds a `redirect_*` edit this
-/// release cannot classify that mentions `<name>@<version>`: claiming the
-/// rest and dropping the record would strand that edit (half a takeover).
+/// release cannot classify that names `<name>@<version>`: claiming the rest
+/// and dropping the record would strand that edit (half a takeover).
 fn refuse_unclassified_edits(
     state: &RedirectState,
     name: &str,
     version: &str,
 ) -> Result<(), String> {
-    let needle = format!("{name}@{version}");
-    let mentions = |v: &Option<Value>| match v {
-        Some(Value::String(s)) => s.contains(&needle),
-        Some(other) => other.to_string().contains(&needle),
-        None => false,
-    };
-    match state.edits.iter().find(|e| {
-        e.kind.starts_with("redirect_")
-            && super::replay::is_unclassified_kind(&e.kind, &e.action)
-            && (e.key.as_deref().is_some_and(|k| k.contains(&needle))
-                || mentions(&e.original)
-                || mentions(&e.new))
-    }) {
+    match state.unclassified_edit_naming(name, version) {
         Some(e) => Err(format!(
             "the redirect ledger holds a {} edit this socket-patch release does not \
              understand; upgrade socket-patch",
@@ -2541,6 +2529,19 @@ mod tests {
             .expect("revert succeeds");
         assert_eq!(state.edits.len(), 1);
         assert_eq!(state.edits[0].kind, "redirect_vlt_lock_node");
+    }
+
+    #[tokio::test]
+    async fn npm_unclassified_edit_for_a_longer_or_scoped_name_does_not_block_the_claim() {
+        for other in ["long-left-pad", "@scope/left-pad"] {
+            let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &classic_pristine()).await;
+            state.edits.push(vlt_lock_node_edit(other, "1.3.0"));
+            revert_redirect_purl(tmp.path(), &mut state, NPM_PURL, false)
+                .await
+                .unwrap_or_else(|e| panic!("{other}: {e}"));
+            assert_eq!(state.edits.len(), 1, "{other}");
+            assert_eq!(state.edits[0].kind, "redirect_vlt_lock_node", "{other}");
+        }
     }
 
     #[tokio::test]

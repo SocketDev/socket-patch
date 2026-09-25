@@ -542,15 +542,21 @@ pub async fn revert_remaining_redirect_edits(
                     continue 'group;
                 }
                 Inverse::Unsupported => {
-                    refuse(
+                    let reason = if *group == "unknown" {
+                        format!(
+                            "the redirect ledger holds a {} edit this socket-patch release \
+                             does not understand; upgrade socket-patch",
+                            edit.kind
+                        )
+                    } else {
                         format!(
                             "no hosted-redirect revert implementation for {} — re-run \
                              `scan --mode hosted` to normalize, or restore the file from \
                              version control",
                             edit.kind
-                        ),
-                        &mut outcome,
-                    );
+                        )
+                    };
+                    refuse(reason, &mut outcome);
                     refused_groups.insert(group);
                     continue 'group;
                 }
@@ -2067,14 +2073,31 @@ mod tests {
             let out = revert_remaining_redirect_edits(dir.path(), &mut state, dry_run).await;
             assert_eq!(out.refusals.len(), 1, "{out:?}");
             assert_eq!(out.refusals[0].group, "unknown");
+            assert_eq!(
+                out.refusals[0].reason,
+                "the redirect ledger holds a redirect_vlt_lock_node edit this socket-patch \
+                 release does not understand; upgrade socket-patch"
+            );
             assert!(out.dropped_records.is_empty(), "{out:?}");
             assert!(state.records.contains_key("pkg:npm/minimist@1.2.8"));
             assert!(state.records.contains_key("pkg:composer/v/c@1.0.0"));
             assert_eq!(read(dir.path(), "vlt-lock.json").await, VLT_LOCK);
-            assert!(state
-                .edits
-                .iter()
-                .any(|e| e.kind == "redirect_vlt_lock_node"));
+            let kinds: Vec<&str> = state.edits.iter().map(|e| e.kind.as_str()).collect();
+            // The composer group still unwinds on disk; only its record waits
+            // for the unknown group to clear.
+            if dry_run {
+                assert_eq!(
+                    read(dir.path(), "composer.lock").await,
+                    "https://patch.example/c\n"
+                );
+                assert_eq!(kinds, ["redirect_vlt_lock_node", "redirect_composer_dist"]);
+            } else {
+                assert_eq!(
+                    read(dir.path(), "composer.lock").await,
+                    "https://packagist.example/c\n"
+                );
+                assert_eq!(kinds, ["redirect_vlt_lock_node"]);
+            }
         }
     }
 

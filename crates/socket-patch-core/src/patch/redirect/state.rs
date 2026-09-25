@@ -75,6 +75,59 @@ impl RedirectState {
             .cloned()
             .collect()
     }
+
+    /// The first `redirect_*` edit this release cannot classify (a newer
+    /// socket-patch's writer) whose `key`, `original` or `new` names
+    /// `<name>@<version>` at a package-name boundary. Anything that claims
+    /// that package's ledger data must refuse while one exists: dropping the
+    /// record or its known edits would strand the unknown one.
+    pub(crate) fn unclassified_edit_naming(&self, name: &str, version: &str) -> Option<&FileEdit> {
+        let needle = format!("{name}@{version}");
+        let scoped = name.starts_with('@');
+        let names = |v: &Option<serde_json::Value>| match v {
+            Some(serde_json::Value::String(s)) => names_at_boundary(s, &needle, scoped),
+            Some(other) => names_at_boundary(&other.to_string(), &needle, scoped),
+            None => false,
+        };
+        self.edits.iter().find(|e| {
+            is_unclassified_redirect_edit(e)
+                && (e
+                    .key
+                    .as_deref()
+                    .is_some_and(|k| names_at_boundary(k, &needle, scoped))
+                    || names(&e.original)
+                    || names(&e.new))
+        })
+    }
+}
+
+fn is_unclassified_redirect_edit(edit: &FileEdit) -> bool {
+    edit.kind.starts_with("redirect_")
+        && super::replay::is_unclassified_kind(&edit.kind, &edit.action)
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
+}
+
+/// Does `text` contain `needle` starting at a package-name boundary? A
+/// match glued to a longer name (`left-pad@…` for `pad@…`) or to a scope
+/// (`@scope/a@…` for an unscoped `a@…`) names a different package.
+fn names_at_boundary(text: &str, needle: &str, scoped: bool) -> bool {
+    text.match_indices(needle).any(|(at, _)| {
+        let before = &text[..at];
+        match before.chars().next_back() {
+            None => true,
+            Some('/') => {
+                scoped
+                    || !before[..before.len() - 1]
+                        .rsplit(|c: char| !(is_name_char(c) || c == '@'))
+                        .next()
+                        .is_some_and(|segment| segment.starts_with('@'))
+            }
+            Some(c) => !is_name_char(c),
+        }
+    })
 }
 
 impl Default for RedirectState {
@@ -280,6 +333,10 @@ pub async fn save_redirect_state(
 /// keyed `"trustLockfile"`) stay: they belong to the hosted flow's own
 /// config surface and other still-redirected package(s) may ride on them.
 ///
+/// A `redirect_*` edit kind this release cannot classify that names the
+/// purl or would be claimed by the rules above drops nothing and returns
+/// `false`: its lockfile may still resolve the hosted artifact.
+///
 /// Returns whether anything was removed. The caller persists the mutated
 /// ledger via [`persist_redirect_state`] (atomic; an emptied ledger is
 /// deleted).
@@ -292,6 +349,10 @@ pub fn drop_superseded_purl(state: &mut RedirectState, purl: &str) -> bool {
         return false;
     };
     let (name, version) = (name.to_string(), version.to_string());
+
+    if state.unclassified_edit_naming(&name, &version).is_some() {
+        return false;
+    }
 
     let record_keys = state.record_keys_for(purl);
     // THIS purl's patch uuid(s), captured before the records are removed —
@@ -307,16 +368,12 @@ pub fn drop_superseded_purl(state: &mut RedirectState, purl: &str) -> bool {
         // revert data. Fail closed to the version-exact-only path instead.
         .filter(|u| !u.is_empty())
         .collect();
-    for key in &record_keys {
-        state.records.remove(key);
-    }
 
     let name_at_version = format!("{name}@{version}");
-    let edits_before = state.edits.len();
-    state.edits.retain(|e| {
+    let claims = |e: &FileEdit| {
         let Some(key) = e.key.as_deref() else {
             // No key ⇒ not attributable to any package; keep.
-            return true;
+            return false;
         };
         // Version-exact instance keys: `name@version`, pnpm v6 peer-suffixed
         // `name@version(peer…)`, pnpm v5 respelled `name@version_peer…`.
@@ -337,8 +394,21 @@ pub fn drop_superseded_purl(state: &mut RedirectState, purl: &str) -> bool {
                 };
                 uuids.iter().any(|uuid| text.contains(uuid.as_str()))
             });
-        !(version_exact || anchored)
-    });
+        version_exact || anchored
+    };
+    if state
+        .edits
+        .iter()
+        .any(|e| is_unclassified_redirect_edit(e) && claims(e))
+    {
+        return false;
+    }
+
+    for key in &record_keys {
+        state.records.remove(key);
+    }
+    let edits_before = state.edits.len();
+    state.edits.retain(|e| !claims(e));
 
     !record_keys.is_empty() || state.edits.len() != edits_before
 }
@@ -769,6 +839,111 @@ mod tests {
             "without an artifact anchor only version-exact instance keys may \
              be claimed: {keys:?}"
         );
+    }
+
+    fn vlt_node_edit(name: &str, version: &str, url: &str) -> FileEdit {
+        FileEdit {
+            path: "vlt-lock.json".to_string(),
+            kind: "redirect_vlt_lock_node".to_string(),
+            action: "rewritten".to_string(),
+            key: Some(format!("{name}@{version}")),
+            original: Some(serde_json::json!(format!(
+                "\"~npm~{name}@{version}\": [0,\"{name}\",\"sha512-r\"]"
+            ))),
+            new: Some(serde_json::json!(format!(
+                "\"~npm~{name}@{version}\": [0,\"{name}\",\"sha512-p\",\"{url}\"]"
+            ))),
+        }
+    }
+
+    #[test]
+    fn drop_superseded_purl_drops_nothing_beside_an_unclassified_edit_naming_it() {
+        let url = hosted_url("left-pad", "1.3.0", SAMPLE_UUID);
+        let unanchored = hosted_url("left-pad", "1.3.0", "0e0e0e0e-0000-4000-8000-000000000000");
+        for (with_record, vlt_key, vlt_url) in [
+            (true, "left-pad@1.3.0", url.as_str()),
+            (false, "left-pad@1.3.0", url.as_str()),
+            (false, "left-pad@1.3.0~custom", unanchored.as_str()),
+        ] {
+            let mut state = RedirectState::new();
+            if with_record {
+                state
+                    .records
+                    .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
+            }
+            state.edits = vec![
+                edit_resolved(
+                    "yarn.lock",
+                    "redirect_yarn_classic_entry",
+                    "left-pad@1.3.0",
+                    &url,
+                ),
+                FileEdit {
+                    key: Some(vlt_key.to_string()),
+                    ..vlt_node_edit("left-pad", "1.3.0", vlt_url)
+                },
+            ];
+            let before = serde_json::to_value(&state).unwrap();
+            assert!(!drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
+            assert_eq!(
+                serde_json::to_value(&state).unwrap(),
+                before,
+                "{with_record} {vlt_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_superseded_purl_drops_nothing_when_an_unclassified_edit_is_anchored() {
+        let mut state = RedirectState::new();
+        state
+            .records
+            .insert("pkg:npm/left-pad@1.3.0".to_string(), sample_record());
+        state.edits = vec![FileEdit {
+            key: Some("nodes/0".to_string()),
+            ..edit_resolved(
+                "future.lock",
+                "redirect_future_lock_entry",
+                "unused",
+                &hosted_url("left-pad", "1.3.0", SAMPLE_UUID),
+            )
+        }];
+        let before = serde_json::to_value(&state).unwrap();
+        assert!(!drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
+        assert_eq!(serde_json::to_value(&state).unwrap(), before);
+    }
+
+    #[test]
+    fn drop_superseded_purl_ignores_an_unclassified_edit_for_another_package() {
+        let mut state = RedirectState::new();
+        state
+            .records
+            .insert("pkg:npm/pad@1.3.0".to_string(), sample_record());
+        state.edits = vec![
+            edit(
+                "pnpm-lock.yaml",
+                "redirect_pnpm_resolution",
+                Some("pad@1.3.0"),
+            ),
+            vlt_node_edit(
+                "left-pad",
+                "1.3.0",
+                &hosted_url("left-pad", "1.3.0", "0e0e0e0e-0000-4000-8000-000000000000"),
+            ),
+            vlt_node_edit(
+                "@scope/pad",
+                "1.3.0",
+                &hosted_url(
+                    "@scope/pad",
+                    "1.3.0",
+                    "1e1e1e1e-0000-4000-8000-000000000000",
+                ),
+            ),
+        ];
+        assert!(drop_superseded_purl(&mut state, "pkg:npm/pad@1.3.0"));
+        assert!(state.records.is_empty());
+        let kinds: Vec<&str> = state.edits.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, ["redirect_vlt_lock_node", "redirect_vlt_lock_node"]);
     }
 
     /// A version-boundary key (`left-pad@1.3.10`) and a different package

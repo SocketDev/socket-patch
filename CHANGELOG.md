@@ -631,10 +631,15 @@ into the new version's section — see docs/releasing.md.
   A hosted redirect edit kind this release does not understand used to
   let `rollback` drop the npm record beside it, leaving that lockfile
   redirected with nothing tracking it. Such an edit now holds every
-  record in the redirect ledger, and `rollback <purl>`, `remove` and the
-  hosted-to-vendored takeover refuse, with nothing written, when it
-  names the purl ("the redirect ledger holds a {kind} edit this
-  socket-patch release does not understand; upgrade socket-patch").
+  record in the redirect ledger ("the redirect ledger holds a {kind}
+  edit this socket-patch release does not understand; upgrade
+  socket-patch"). When it names a purl, that purl's own revert in
+  `rollback <purl>`, `remove` and the hosted-to-vendored takeover
+  refuses with nothing written, and the takeover's ledger reconcile
+  leaves the purl for the manual cleanup. When the scope still covers
+  every hosted record, the whole-ledger replay goes on to unwind the
+  lockfiles this release understands, but keeps every record and the
+  unknown edit.
   `repair` skips vendored npm entries whose `flavor` it does not know
   (`vendor_wiring_unknown_revert_blocked`) instead of rebuilding them
   with the wrong layout rules. vlt ledgers (`redirect_vlt_lock_node`,
