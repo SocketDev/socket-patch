@@ -10,6 +10,14 @@ use crate::utils::fs::is_dir;
 #[cfg(test)]
 mod oracle;
 
+/// How many `.pom` paths the parallel parse takes at a time. Every phase
+/// stays in walk order whatever the chunk, so this only bounds peak
+/// memory: a real `~/.m2` holds 10-50k artifacts (corporate caches many
+/// times that, and a GAV dir commonly holds more than one `.pom`), and
+/// buffering every path and every parse result before the dedup would put
+/// tens of megabytes on a scan that runs eight other crawlers beside it.
+const POM_PARSE_CHUNK: usize = 1024;
+
 // ---------------------------------------------------------------------------
 // POM XML minimal parser
 // ---------------------------------------------------------------------------
@@ -575,59 +583,82 @@ impl MavenCrawler {
     /// Uses `walkdir` to recursively find `.pom` files, then extracts
     /// coordinates from the POM content or falls back to directory path parsing.
     ///
-    /// Three phases: the (serial) walk collects the `.pom` paths in walk
-    /// order, the reads and parses run through [`par_map`] — in parallel on
-    /// the walk pool's threads, and on the calling thread when no walk
-    /// thread could be spawned (each POM's coordinates depend on that file
-    /// alone) — and the PURL dedup runs serially in walk order, so the
-    /// first-seen version dir wins and packages come out exactly as the
-    /// one-at-a-time scan's did.
+    /// Three phases per chunk of the walk: the (serial) walk collects
+    /// `.pom` paths in walk order, the reads and parses run through
+    /// [`par_map`] — in parallel on the walk pool's threads, and on the
+    /// calling thread when no walk thread could be spawned (each POM's
+    /// coordinates depend on that file alone) — and the PURL dedup runs
+    /// serially in walk order, so the first-seen version dir wins and
+    /// packages come out exactly as the one-at-a-time scan's did.
     fn scan_maven_repo(&self, repo_path: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
+        self.scan_maven_repo_chunked(repo_path, seen, POM_PARSE_CHUNK)
+    }
+
+    /// [`Self::scan_maven_repo`] over an explicit chunk size, so tests can
+    /// cross the chunk boundary on a small fixture.
+    fn scan_maven_repo_chunked(
+        &self,
+        repo_path: &Path,
+        seen: &mut HashSet<String>,
+        chunk: usize,
+    ) -> Vec<CrawledPackage> {
+        let chunk = chunk.max(1);
+        let mut results = Vec::new();
         let mut poms: Vec<PathBuf> = Vec::new();
-        for entry in walkdir::WalkDir::new(repo_path)
+        let mut walk = walkdir::WalkDir::new(repo_path)
             .follow_links(false)
             .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "pom") {
-                continue;
-            }
-            if path.parent().is_none() {
-                continue;
-            }
-            poms.push(entry.into_path());
-        }
+            .filter_map(|e| e.ok());
 
-        let parsed: Vec<Option<(String, String, String)>> = par_map(&poms, |path| {
-            let version_dir = path.parent()?;
-            // Try POM parsing first, fall back to directory path parsing
-            std::fs::read_to_string(path)
-                .ok()
-                .and_then(|content| parse_pom_group_artifact_version(&content))
-                .or_else(|| parse_path_coordinates(version_dir, repo_path))
-        });
-
-        let mut results = Vec::new();
-        for (path, coords) in poms.iter().zip(parsed) {
-            let Some(version_dir) = path.parent() else {
-                continue;
-            };
-            if let Some((group_id, artifact_id, version)) = coords {
-                let purl = crate::utils::purl::build_maven_purl(&group_id, &artifact_id, &version);
-                if seen.insert(purl.clone()) {
-                    results.push(CrawledPackage {
-                        name: artifact_id,
-                        version,
-                        namespace: Some(group_id),
-                        purl,
-                        path: version_dir.to_path_buf(),
-                    });
+        loop {
+            for entry in walk.by_ref() {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                if path.extension().is_none_or(|ext| ext != "pom") {
+                    continue;
+                }
+                if path.parent().is_none() {
+                    continue;
+                }
+                poms.push(entry.into_path());
+                if poms.len() >= chunk {
+                    break;
                 }
             }
+            if poms.is_empty() {
+                break;
+            }
+
+            let parsed: Vec<Option<(String, String, String)>> = par_map(&poms, |path| {
+                let version_dir = path.parent()?;
+                // Try POM parsing first, fall back to directory path parsing
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|content| parse_pom_group_artifact_version(&content))
+                    .or_else(|| parse_path_coordinates(version_dir, repo_path))
+            });
+
+            for (path, coords) in poms.iter().zip(parsed) {
+                let Some(version_dir) = path.parent() else {
+                    continue;
+                };
+                if let Some((group_id, artifact_id, version)) = coords {
+                    let purl =
+                        crate::utils::purl::build_maven_purl(&group_id, &artifact_id, &version);
+                    if seen.insert(purl.clone()) {
+                        results.push(CrawledPackage {
+                            name: artifact_id,
+                            version,
+                            namespace: Some(group_id),
+                            purl,
+                            path: version_dir.to_path_buf(),
+                        });
+                    }
+                }
+            }
+            poms.clear();
         }
 
         results
@@ -1753,6 +1784,37 @@ mod tests {
                     _ => write(&file, &pom(rng, group, artifact, version)),
                 }
             }
+        }
+
+        /// Chunking the parallel parse changes nothing: the walk, the
+        /// parse and the dedup each stay in walk order, so every chunk
+        /// size — one POM at a time included — produces the serial
+        /// oracle's rows, with the first-seen version dir still winning
+        /// across a chunk boundary.
+        #[tokio::test]
+        async fn every_parse_chunk_size_matches_the_serial_oracle() {
+            let mut total = 0;
+            for seed in 0..16u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut perms = PermGuard::default();
+                let mut rng = Rng::new(seed);
+                let root = tmp.path().join("repository");
+                repo(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                perms.apply();
+                let options = CrawlerOptions {
+                    cwd: tmp.path().to_path_buf(),
+                    global: false,
+                    global_prefix: Some(root.clone()),
+                };
+                let old = LegacyMavenCrawler::crawl_all(&options).await;
+                for chunk in [0usize, 1, 2, 3, 7, 4096] {
+                    let mut seen = HashSet::new();
+                    let found = MavenCrawler.scan_maven_repo_chunked(&root, &mut seen, chunk);
+                    assert_eq!(rows(&found), rows(&old), "seed {seed}, chunk {chunk}");
+                }
+                total += old.len();
+            }
+            assert!(total > 50, "vacuous fixtures: {total}");
         }
 
         /// The no-walk-pool fallback (the OS refused even one walk thread,
