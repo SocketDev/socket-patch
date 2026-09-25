@@ -534,15 +534,26 @@ pub(crate) fn names_are_unambiguous<'a>(
     true
 }
 
-/// Test seam: forces every local rebuild down the extract-to-disk staging the
-/// in-memory repack is defined against, so the equivalence tests can drive one
-/// fixture through both and compare the rebuilt artifact byte for byte. Only
-/// [`can_repack_in_memory`] reads it — [`names_are_unambiguous`] keeps
-/// answering for itself, so the gate's own tests are unaffected — and only a
-/// `#[serial]` test may set it.
 #[cfg(test)]
-pub(crate) static FORCE_ON_DISK_REPACK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// Test seam: forces every local rebuild down the extract-to-disk staging
+    /// the in-memory repack is defined against, so the equivalence tests can
+    /// drive one fixture through both and compare the rebuilt artifact byte
+    /// for byte. Only [`can_repack_in_memory`] reads it —
+    /// [`names_are_unambiguous`] keeps answering for itself, so the gate's own
+    /// tests are unaffected.
+    ///
+    /// THREAD-LOCAL, not process-wide: `#[tokio::test]` runs its whole future
+    /// on the test's own thread, and libtest gives every test a thread of its
+    /// own, so a forced run cannot reach the ~40 other local-rebuild tests
+    /// running beside it and silently move them off the in-memory path.
+    static FORCE_ON_DISK_REPACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// How many rebuilds took the in-memory path on THIS thread — the
+    /// equivalence tests read it to prove which staging each of their two runs
+    /// actually used, rather than trusting the seam and the fixture's names.
+    static IN_MEMORY_REPACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Sets [`FORCE_ON_DISK_REPACK`] for as long as it is held.
 #[cfg(test)]
@@ -551,7 +562,7 @@ pub(crate) struct OnDiskRepackGuard;
 #[cfg(test)]
 impl OnDiskRepackGuard {
     pub(crate) fn acquire() -> Self {
-        FORCE_ON_DISK_REPACK.store(true, std::sync::atomic::Ordering::SeqCst);
+        FORCE_ON_DISK_REPACK.set(true);
         Self
     }
 }
@@ -559,8 +570,15 @@ impl OnDiskRepackGuard {
 #[cfg(test)]
 impl Drop for OnDiskRepackGuard {
     fn drop(&mut self) {
-        FORCE_ON_DISK_REPACK.store(false, std::sync::atomic::Ordering::SeqCst);
+        FORCE_ON_DISK_REPACK.set(false);
     }
+}
+
+/// The running count of [`IN_MEMORY_REPACKS`] for this thread; a test brackets
+/// a rebuild with it to assert which staging ran.
+#[cfg(test)]
+pub(crate) fn in_memory_repacks() -> usize {
+    IN_MEMORY_REPACKS.get()
 }
 
 /// Whether a local rebuild may keep the archive (or the installed tree) in
@@ -570,10 +588,15 @@ pub(crate) fn can_repack_in_memory<'a>(
     targets: impl IntoIterator<Item = &'a str>,
 ) -> bool {
     #[cfg(test)]
-    if FORCE_ON_DISK_REPACK.load(std::sync::atomic::Ordering::SeqCst) {
+    if FORCE_ON_DISK_REPACK.get() {
         return false;
     }
-    names_are_unambiguous(members, targets)
+    let in_memory = names_are_unambiguous(members, targets);
+    #[cfg(test)]
+    if in_memory {
+        IN_MEMORY_REPACKS.set(IN_MEMORY_REPACKS.get() + 1);
+    }
+    in_memory
 }
 
 /// A local rebuild carried in memory: the archive's members never touch the
@@ -2148,8 +2171,8 @@ mod tests {
     /// large enough to span several read buffers must all repack to the same
     /// bytes as a full extraction would.
     #[tokio::test]
-    // `FORCE_ON_DISK_REPACK` is process-wide, so every test that asserts the
-    // in-memory path was taken runs under the same `#[serial]` lock.
+    // The fixture must take the in-memory path, and `FORCE_ON_DISK_REPACK` is
+    // thread-local, so `#[serial]` is belt and braces here.
     #[serial_test::serial]
     async fn in_memory_repack_matches_the_extract_and_rezip_oracle() {
         let big = vec![b'z'; 3 * 1024 * 1024];
@@ -2193,8 +2216,8 @@ mod tests {
     /// staged path (NuGet's `.nupkg.metadata` fixup) — must land in the
     /// rebuilt archive exactly as they do over a full extraction.
     #[tokio::test]
-    // `FORCE_ON_DISK_REPACK` is process-wide, so every test that asserts the
-    // in-memory path was taken runs under the same `#[serial]` lock.
+    // The fixture must take the in-memory path, and `FORCE_ON_DISK_REPACK` is
+    // thread-local, so `#[serial]` is belt and braces here.
     #[serial_test::serial]
     async fn in_memory_repack_tracks_rewrites_creations_and_deletions() {
         let archive = build_zip(&[
@@ -2234,8 +2257,8 @@ mod tests {
     /// The `skip_entry` drop (NuGet's `.signature.p7s`) is applied by both
     /// repacks at the same point.
     #[tokio::test]
-    // `FORCE_ON_DISK_REPACK` is process-wide, so every test that asserts the
-    // in-memory path was taken runs under the same `#[serial]` lock.
+    // The fixture must take the in-memory path, and `FORCE_ON_DISK_REPACK` is
+    // thread-local, so `#[serial]` is belt and braces here.
     #[serial_test::serial]
     async fn in_memory_repack_drops_the_skipped_entry() {
         let archive = build_zip(&[
@@ -2258,8 +2281,8 @@ mod tests {
     /// verify reports "File not found" where it used to report a hash
     /// failure, and `--force` would silently skip the key.
     #[tokio::test]
-    // `FORCE_ON_DISK_REPACK` is process-wide, so every test that asserts the
-    // in-memory path was taken runs under the same `#[serial]` lock.
+    // The fixture must take the in-memory path, and `FORCE_ON_DISK_REPACK` is
+    // thread-local, so `#[serial]` is belt and braces here.
     #[serial_test::serial]
     async fn in_memory_repack_materialises_a_directory_a_patch_key_names() {
         let archive = build_zip(&[entry("lib/net6.0/x.dll", b"MZ")]);
@@ -2282,8 +2305,8 @@ mod tests {
     /// Only the patch targets and the explicitly requested extras are written
     /// out — the point of the whole change.
     #[tokio::test]
-    // `FORCE_ON_DISK_REPACK` is process-wide, so every test that asserts the
-    // in-memory path was taken runs under the same `#[serial]` lock.
+    // The fixture must take the in-memory path, and `FORCE_ON_DISK_REPACK` is
+    // thread-local, so `#[serial]` is belt and braces here.
     #[serial_test::serial]
     async fn in_memory_repack_stages_only_what_the_apply_resolves() {
         let archive = build_zip(&[
@@ -2458,8 +2481,8 @@ mod tests {
     /// spelling's bytes are what the rebuild carries. The in-memory reader
     /// collapses the pair the same way, and the two repacks must agree.
     #[tokio::test]
-    // `FORCE_ON_DISK_REPACK` is process-wide, so every test that asserts the
-    // in-memory path was taken runs under the same `#[serial]` lock.
+    // The fixture must take the in-memory path, and `FORCE_ON_DISK_REPACK` is
+    // thread-local, so `#[serial]` is belt and braces here.
     #[serial_test::serial]
     async fn repeated_entry_names_repack_as_last_one_wins() {
         // `ZipWriter` refuses a repeated name, so build two same-length names

@@ -974,6 +974,7 @@ mod tests {
     async fn in_memory_wheel_build_matches_the_on_disk_build_byte_for_byte() {
         async fn build(on_disk: bool) -> (Vec<u8>, WheelArtifact) {
             let _forced = on_disk.then(crate::vendor::common::OnDiskRepackGuard::acquire);
+            let before = crate::vendor::common::in_memory_repacks();
             let fx = make_fixture(
                 "six/__init__.py,sha256=CC,10\n\
                  six/empty.py,,0\n\
@@ -1027,6 +1028,14 @@ mod tests {
             .await
             .unwrap();
             assert!(result.success, "{:?}", result.error);
+            // Without this the comparison is vacuous: a fixture member name
+            // the gate later rejects would stage BOTH runs in full and the
+            // test would keep passing while asserting nothing.
+            assert_eq!(
+                crate::vendor::common::in_memory_repacks() > before,
+                !on_disk,
+                "this run took the wrong staging path (on_disk={on_disk})"
+            );
             (
                 tokio::fs::read(&fx.dest).await.unwrap(),
                 artifact.expect("a successful build yields an artifact"),

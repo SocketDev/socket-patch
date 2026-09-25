@@ -2153,6 +2153,7 @@ mod tests {
     async fn in_memory_nupkg_rebuild_matches_the_on_disk_rebuild_byte_for_byte() {
         async fn rebuild(on_disk: bool) -> (Vec<u8>, ApplyResult) {
             let _forced = on_disk.then(crate::vendor::common::OnDiskRepackGuard::acquire);
+            let before = crate::vendor::common::in_memory_repacks();
             let (dir, blobs, installed, record) = fixture(true, None).await;
             tokio::fs::write(
                 installed.join("newtonsoft.json.13.0.3.nupkg"),
@@ -2164,6 +2165,14 @@ mod tests {
                 unwrap_done(run_vendor(dir.path(), &blobs, &installed, &record, false).await);
             assert!(result.success, "{:?}", result.error);
             assert!(entry.is_some(), "a successful rebuild records an entry");
+            // Without this the comparison is vacuous: a fixture part name the
+            // gate later rejects would send BOTH runs to disk and the test
+            // would keep passing while asserting nothing.
+            assert_eq!(
+                crate::vendor::common::in_memory_repacks() > before,
+                !on_disk,
+                "this run took the wrong staging path (on_disk={on_disk})"
+            );
             let bytes = tokio::fs::read(dir.path().join(copy_rel())).await.unwrap();
             (bytes, result)
         }
