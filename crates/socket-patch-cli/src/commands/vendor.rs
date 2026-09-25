@@ -119,6 +119,7 @@ pub(crate) async fn dispatch_vendor_one(
     // rebuilds locally from the recorded patch.
     service: Option<&VendorServiceConfig>,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
+    installed_sites: &vendor::pypi::InstalledSiteListings,
 ) -> Option<VendorOutcome> {
     let eco = ecosystem_dir_for_purl(purl)?;
 
@@ -204,6 +205,7 @@ pub(crate) async fn dispatch_vendor_one(
                 force,
                 service,
                 pipenv_version,
+                installed_sites,
             )
             .await
         }
@@ -1646,6 +1648,7 @@ pub(crate) async fn vendor_records_reusing(
     let berry_takeover_refusal: tokio::sync::OnceCell<Option<(&'static str, String)>> =
         tokio::sync::OnceCell::new();
     let pipenv_version = tokio::sync::OnceCell::new();
+    let installed_sites = vendor::pypi::InstalledSiteListings::default();
     let mut dry_in_sync: u32 = 0;
     // Sorted, so per-package lines print in the same order every run.
     // Purls are unique keys, so ordering on the purl alone is the order the
@@ -2043,6 +2046,7 @@ pub(crate) async fn vendor_records_reusing(
                 force,
                 service,
                 &pipenv_version,
+                &installed_sites,
             )
             .await;
             status.finish();
@@ -2810,6 +2814,7 @@ mod dispatch_tests {
             false,
             Some(&service),
             &tokio::sync::OnceCell::new(),
+            &Default::default(),
         )
         .await;
         // The backend itself may refuse (nothing is installed in the

@@ -1393,42 +1393,73 @@ impl PythonCrawler {
         site_packages_path: &Path,
         purls: &[String],
     ) -> Result<HashMap<String, CrawledPackage>, std::io::Error> {
-        let mut result = HashMap::new();
-
         // Build lookup: canonicalized-name@version -> purl. The API serves
         // purls percent-encoded (a PEP 440 local/epoch version carries
         // `+`/`!`, arriving as `%2B`/`%21`), and `parse_pypi_purl` decodes
         // the coordinates — undecoded, the installed package never matches.
-        let mut purl_lookup: HashMap<String, &str> = HashMap::new();
-        for purl in purls {
-            if let Some((name, version)) = crate::utils::purl::parse_pypi_purl(purl) {
-                let key = format!("{}@{}", canonicalize_pypi_name(&name), version);
-                purl_lookup.insert(key, purl.as_str());
-            }
-        }
-
+        let purl_lookup = purl_lookup(purls);
+        // A lookup with no parseable PURL never lists the directory.
         if purl_lookup.is_empty() {
-            return Ok(result);
+            return Ok(HashMap::new());
         }
-
-        for (name, version) in list_dist_info_packages(site_packages_path).await {
-            let key = format!("{name}@{version}");
-            if let Some(&matched_purl) = purl_lookup.get(&key) {
-                result.insert(
-                    matched_purl.to_string(),
-                    CrawledPackage {
-                        name,
-                        version,
-                        namespace: None,
-                        purl: matched_purl.to_string(),
-                        path: site_packages_path.to_path_buf(),
-                    },
-                );
-            }
-        }
-
-        Ok(result)
+        let listing = list_dist_info_packages(site_packages_path).await;
+        Ok(match_listing(&purl_lookup, site_packages_path, &listing))
     }
+
+    /// [`Self::find_by_purls`] over an ALREADY-LISTED `site_packages_path`
+    /// — the same matching over the same listing shape, for a caller that
+    /// lists a site once and asks about it for many packages.
+    pub fn find_by_purls_listed(
+        &self,
+        site_packages_path: &Path,
+        listing: &[(String, String)],
+        purls: &[String],
+    ) -> HashMap<String, CrawledPackage> {
+        let purl_lookup = purl_lookup(purls);
+        if purl_lookup.is_empty() {
+            return HashMap::new();
+        }
+        match_listing(&purl_lookup, site_packages_path, listing)
+    }
+}
+
+/// `canonicalized-name@version -> purl` for every parseable PURL in
+/// `purls`; see [`PythonCrawler::find_by_purls`] for the decoding.
+fn purl_lookup(purls: &[String]) -> HashMap<String, &str> {
+    let mut lookup: HashMap<String, &str> = HashMap::new();
+    for purl in purls {
+        if let Some((name, version)) = crate::utils::purl::parse_pypi_purl(purl) {
+            let key = format!("{}@{}", canonicalize_pypi_name(&name), version);
+            lookup.insert(key, purl.as_str());
+        }
+    }
+    lookup
+}
+
+/// The listed packages `purl_lookup` names, in listing order (a later
+/// listing entry overwrites an earlier one under the same key).
+fn match_listing(
+    purl_lookup: &HashMap<String, &str>,
+    site_packages_path: &Path,
+    listing: &[(String, String)],
+) -> HashMap<String, CrawledPackage> {
+    let mut result = HashMap::new();
+    for (name, version) in listing {
+        let key = format!("{name}@{version}");
+        if let Some(&matched_purl) = purl_lookup.get(&key) {
+            result.insert(
+                matched_purl.to_string(),
+                CrawledPackage {
+                    name: name.clone(),
+                    version: version.clone(),
+                    namespace: None,
+                    purl: matched_purl.to_string(),
+                    path: site_packages_path.to_path_buf(),
+                },
+            );
+        }
+    }
+    result
 }
 
 impl PythonCrawler {
@@ -1482,7 +1513,7 @@ impl PythonCrawler {
 /// in listing order. One blocking-pool task for the listing and every
 /// METADATA read (one runtime hop per open, read and stat used to set the
 /// scan's pace).
-async fn list_dist_info_packages(site_packages_path: &Path) -> Vec<(String, String)> {
+pub(crate) async fn list_dist_info_packages(site_packages_path: &Path) -> Vec<(String, String)> {
     let site_packages_path = site_packages_path.to_path_buf();
     run_blocking(move || list_dist_info_packages_sync(&site_packages_path)).await
 }

@@ -7,6 +7,7 @@
 //! byte-untouched and an artifact failure never leaves half-wired lockfiles.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use sha2::{Digest as _, Sha256};
 
@@ -544,8 +545,42 @@ pub async fn vendor_pypi<'a>(
         force,
         service,
         &tokio::sync::OnceCell::new(),
+        &InstalledSiteListings::default(),
     )
     .await
+}
+
+/// The run's listings of the project's virtualenv `site-packages`, keyed by
+/// site.
+///
+/// [`pipenv_stale_install_warning`] judges every patched package against the
+/// same venvs, and each judgement re-listed the whole directory (a
+/// `.dist-info` scan plus a METADATA read per installed package) to answer
+/// one question about one purl. A vendor run never writes into a venv, so
+/// one listing per site answers for every package that asks.
+#[derive(Default)]
+pub struct InstalledSiteListings(tokio::sync::Mutex<SiteListings>);
+
+/// Each listed site's `(canonicalized name, version)` pairs, in listing
+/// order — the shape [`crate::crawlers::python_crawler::PythonCrawler::find_by_purls_listed`]
+/// matches against.
+type SiteListings = std::collections::HashMap<std::path::PathBuf, Arc<Vec<(String, String)>>>;
+
+impl InstalledSiteListings {
+    /// `site`'s installed packages, listed on the first ask of the run.
+    async fn of(&self, site: &Path) -> Arc<Vec<(String, String)>> {
+        if let Some(listed) = self.0.lock().await.get(site) {
+            return Arc::clone(listed);
+        }
+        // Listed outside the lock: two packages racing here simply list
+        // twice and agree, and neither blocks the other's judgement.
+        let listed = Arc::new(crate::crawlers::python_crawler::list_dist_info_packages(site).await);
+        self.0
+            .lock()
+            .await
+            .insert(site.to_path_buf(), Arc::clone(&listed));
+        listed
+    }
 }
 
 /// Pipenv never reinstalls a release that is already present — measured on
@@ -559,6 +594,7 @@ async fn pipenv_stale_install_warning(
     project_root: &Path,
     purl: &str,
     record: &PatchRecord,
+    listings: &InstalledSiteListings,
 ) -> Option<VendorWarning> {
     use crate::crawlers::python_crawler::{find_local_venv_site_packages, PythonCrawler};
     use crate::patch::apply::{verify_file_patch, VerifyStatus};
@@ -572,10 +608,8 @@ async fn pipenv_stale_install_warning(
     let crawler = PythonCrawler::new();
     let mut stale_dirs: Vec<std::path::PathBuf> = Vec::new();
     for site in find_local_venv_site_packages(project_root).await {
-        let found = crawler
-            .find_by_purls(&site, std::slice::from_ref(&base))
-            .await
-            .unwrap_or_default();
+        let listed = listings.of(&site).await;
+        let found = crawler.find_by_purls_listed(&site, &listed, std::slice::from_ref(&base));
         if !found.contains_key(&base) {
             continue;
         }
@@ -628,6 +662,7 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
     force: bool,
     service: Option<&VendorServiceConfig>,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
+    installed_sites: &InstalledSiteListings,
 ) -> VendorOutcome {
     let site_packages = site_packages.into();
     // The purl may carry `?artifact_id=` variant qualifiers; everything here
@@ -810,7 +845,9 @@ pub async fn vendor_pypi_with_pipenv_version<'a>(
             }
             // Both a fresh vendor and a re-run over an already-wired lock
             // keep warning while the venv still holds the upstream release.
-            if let Some(stale) = pipenv_stale_install_warning(project_root, purl, record).await {
+            if let Some(stale) =
+                pipenv_stale_install_warning(project_root, purl, record, installed_sites).await
+            {
                 warnings.push(stale);
             }
             match target {
