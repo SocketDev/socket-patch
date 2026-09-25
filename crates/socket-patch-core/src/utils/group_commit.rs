@@ -55,10 +55,11 @@
 //! disagrees. A single changed file needs no journal: its own atomic
 //! rename is the commit.
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
@@ -73,12 +74,40 @@ const LEDGERS: [&str; 2] = [
     ".socket/vendor/redirect-state.json",
 ];
 
-#[derive(Clone)]
 struct Captured {
     /// The file's bytes, `None` once removed.
-    bytes: Option<Vec<u8>>,
+    bytes: Option<Content>,
     /// Written through the mode-preserving writer.
     preserve_mode: bool,
+}
+
+/// A captured file's content: bytes, or a typed value whose bytes are
+/// rendered only when something reads them (see [`capture_value`]).
+enum Content {
+    Bytes(Vec<u8>),
+    Value {
+        value: Arc<dyn Any + Send + Sync>,
+        render: Render,
+        rendered: OnceLock<std::io::Result<Vec<u8>>>,
+    },
+}
+
+type Render = fn(&(dyn Any + Send + Sync)) -> std::io::Result<Vec<u8>>;
+
+impl Content {
+    fn bytes(&self) -> std::io::Result<Vec<u8>> {
+        match self {
+            Content::Bytes(bytes) => Ok(bytes.clone()),
+            Content::Value {
+                value,
+                render,
+                rendered,
+            } => match rendered.get_or_init(|| render(value.as_ref())) {
+                Ok(bytes) => Ok(bytes.clone()),
+                Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+            },
+        }
+    }
 }
 
 struct Overlay {
@@ -155,9 +184,55 @@ pub(crate) fn read(path: &Path) -> Option<std::io::Result<Vec<u8>>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let captured = files.get(&key)?;
     Some(match &captured.bytes {
-        Some(bytes) => Ok(bytes.clone()),
+        Some(content) => content.bytes(),
         None => Err(not_found(path)),
     })
+}
+
+/// Capture a write of `path` as a typed value — the vendor ledger, which
+/// the loop re-saves after every package: holding the value instead of its
+/// serialization skips rendering (and later re-parsing) the whole ledger
+/// per package. `render` produces the bytes the durable writer would have
+/// written, only when a byte reader or the commit needs them; typed readers
+/// ([`read_value`]) get the value back. `false` when `path` is not captured.
+pub(crate) fn capture_value<T: Any + Send + Sync>(
+    path: &Path,
+    value: Arc<T>,
+    render: Render,
+) -> bool {
+    let Some((overlay, key)) = resolve(path) else {
+        return false;
+    };
+    overlay
+        .files
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            key,
+            Captured {
+                bytes: Some(Content::Value {
+                    value,
+                    render,
+                    rendered: OnceLock::new(),
+                }),
+                preserve_mode: false,
+            },
+        );
+    true
+}
+
+/// The value [`capture_value`] captured for `path`, when it was captured
+/// as a `T`.
+pub(crate) fn read_value<T: Any + Send + Sync>(path: &Path) -> Option<Arc<T>> {
+    let (overlay, key) = resolve(path)?;
+    let files = overlay
+        .files
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match files.get(&key)?.bytes.as_ref()? {
+        Content::Value { value, .. } => Arc::clone(value).downcast::<T>().ok(),
+        Content::Bytes(_) => None,
+    }
 }
 
 /// Whether `path` exists as the run sees it; `None` when not captured.
@@ -183,7 +258,7 @@ pub(crate) fn capture_write(path: &Path, bytes: &[u8], preserve_mode: bool) -> b
         .insert(
             key,
             Captured {
-                bytes: Some(bytes.to_vec()),
+                bytes: Some(Content::Bytes(bytes.to_vec())),
                 preserve_mode,
             },
         );
@@ -287,13 +362,17 @@ impl GroupCommit {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(e) => return Err(e),
             };
-            if before == captured.bytes {
+            let after = match &captured.bytes {
+                Some(content) => Some(content.bytes()?),
+                None => None,
+            };
+            if before == after {
                 continue;
             }
             changes.push(Change {
                 rel,
                 before,
-                after: captured.bytes,
+                after,
                 preserve_mode: captured.preserve_mode,
             });
         }
@@ -358,6 +437,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// A one-file commit: the durable writer's own rename is atomic.
 async fn apply_durably(root: &Path, change: &Change) -> std::io::Result<()> {
     let path = root.join(&change.rel);
+    ensure_parent(&path, change).await?;
     match &change.after {
         Some(bytes) if change.preserve_mode => {
             super::fs::atomic_write_bytes_preserving_mode(&path, bytes).await
@@ -377,6 +457,7 @@ async fn apply_durably(root: &Path, change: &Change) -> std::io::Result<()> {
 /// that follows.
 async fn apply_deferred(root: &Path, change: &Change) -> std::io::Result<()> {
     let path = root.join(&change.rel);
+    ensure_parent(&path, change).await?;
     match &change.after {
         Some(bytes) => {
             super::fs::atomic_write_unsynced(&path, bytes, change.preserve_mode).await?;
@@ -392,6 +473,16 @@ async fn apply_deferred(root: &Path, change: &Change) -> std::io::Result<()> {
                 Ok(())
             }
         },
+    }
+}
+
+/// A captured file's directory may have been created by the run only in
+/// intent (a writer that created it on disk is the norm, but nothing
+/// guarantees it): create it before writing the file.
+async fn ensure_parent(path: &Path, change: &Change) -> std::io::Result<()> {
+    match (change.after.as_ref(), path.parent()) {
+        (Some(_), Some(parent)) => tokio::fs::create_dir_all(parent).await,
+        _ => Ok(()),
     }
 }
 
@@ -529,7 +620,12 @@ pub fn recover(project_root: &Path) -> std::io::Result<Recovery> {
     let mut rewritten = Vec::new();
     for (path, after, preserve_mode) in &pending {
         match after {
-            Some(bytes) => super::fs::atomic_write_sync(path, bytes, *preserve_mode)?,
+            Some(bytes) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                super::fs::atomic_write_sync(path, bytes, *preserve_mode)?
+            }
             None => match std::fs::remove_file(path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
                 _ => sync_dir(path.parent()),
@@ -605,6 +701,41 @@ mod tests {
         assert_eq!(std::fs::read(&lock).unwrap(), b"new");
         assert!(!ws.exists(), "created then removed: never written");
         assert!(!root.join(COMMIT_JOURNAL_REL).exists());
+    }
+
+    fn render_string(value: &(dyn Any + Send + Sync)) -> std::io::Result<Vec<u8>> {
+        Ok(value.downcast_ref::<String>().unwrap().as_bytes().to_vec())
+    }
+
+    /// A value capture answers typed readers with the value itself, byte
+    /// readers with its rendering, and commits the rendering.
+    #[tokio::test]
+    async fn a_captured_value_renders_only_for_bytes_and_the_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
+        let ledger = root.join(".socket/vendor/state.json");
+        let group = GroupCommit::begin(root);
+        assert!(capture_value(
+            &ledger,
+            Arc::new("{\"version\":1}\n".to_string()),
+            render_string
+        ));
+        assert_eq!(
+            read_value::<String>(&ledger).as_deref().map(String::as_str),
+            Some("{\"version\":1}\n")
+        );
+        assert!(read_value::<u32>(&ledger).is_none(), "typed by T");
+        assert_eq!(
+            super::super::fs::read_regular_to_bytes(&ledger)
+                .await
+                .unwrap(),
+            b"{\"version\":1}\n"
+        );
+        assert!(!ledger.exists());
+        group.commit().await.unwrap();
+        assert_eq!(std::fs::read(&ledger).unwrap(), b"{\"version\":1}\n");
+        assert!(read_value::<String>(&ledger).is_none(), "closed");
     }
 
     #[tokio::test]
