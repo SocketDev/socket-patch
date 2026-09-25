@@ -138,14 +138,15 @@ async fn hosted_redirect_residue(project_root: &Path, name: &str, version: &str)
     // run in an open(2) that waits for a writer; an unreadable manifest has
     // no readable residue, matching the read_to_string Err arm this guards.
     if let Ok(toml) = read_regular_to_string(&project_root.join("Cargo.toml")).await {
-        let c = regex::escape(name);
-        let re = regex::Regex::new(&format!(
-            r#"(?m)^\s*{c}\s*=\s*\{{[^}}\n]*registry\s*=\s*"socket-patch-[0-9a-fA-F-]{{36}}""#
-        ))
-        .expect("static regex");
-        if re.is_match(&toml) {
+        // The rewriter's own reader, not a single-line regex: the hosted pin
+        // is just as often a standalone `registry = …` line under a
+        // `[dependencies.<crate>]` header, or sits under a renamed key
+        // (`legacy = { package = "<crate>", … }`) — shapes a
+        // `<name> = { … }` regex reads as "not redirected", which is exactly
+        // the half-reverted state this guard exists for.
+        if let Some(reg) = crate::patch::redirect::cargo_socket_registry_pin(&toml, name) {
             return Some(format!(
-                "Cargo.toml pins `{name}` to a socket-patch hosted registry"
+                "Cargo.toml pins `{name}` to the socket-patch hosted registry `{reg}`"
             ));
         }
     }
@@ -3610,6 +3611,105 @@ mod tests {
             run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
             "hosted_redirect_live",
         );
+    }
+
+    /// FAIL CLOSED in EVERY manifest shape the hosted rewriter writes: a
+    /// standalone `registry = …` line under a `[dependencies.<crate>]`
+    /// header, a renamed declaration (`legacy = { package = "cfg-if", … }`)
+    /// and a quoted key. The lock is the pristine crates.io one — a
+    /// re-resolve or a `git checkout Cargo.lock` puts it back while the
+    /// manifest pin survives — so the manifest probe is the ONLY thing
+    /// standing between `vendor` and a project wired for both modes at once.
+    #[tokio::test]
+    async fn test_refuses_live_hosted_redirect_in_every_manifest_shape() {
+        let index = "sparse+http://127.0.0.1:5555/index/";
+        let shapes = [
+            (
+                "table form",
+                format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                     [dependencies.cfg-if]\nversion = \"1\"\n\
+                     registry = \"socket-patch-{UUID}\"\n"
+                ),
+            ),
+            (
+                "renamed declaration",
+                format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                     [dependencies]\ncfg-if-legacy = {{ package = \"cfg-if\", \
+                     version = \"1\", registry = \"socket-patch-{UUID}\" }}\n"
+                ),
+            ),
+            (
+                "quoted key",
+                format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                     [dependencies]\n\"cfg-if\" = {{ version = \"1\", \
+                     registry = \"socket-patch-{UUID}\" }}\n"
+                ),
+            ),
+            (
+                "dev-dependency table",
+                format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                     [dev-dependencies.cfg-if]\n\
+                     registry = \"socket-patch-{UUID}\"\nversion = \"1\"\n"
+                ),
+            ),
+        ];
+        for (shape, manifest) in shapes {
+            let (dir, blobs, pristine, record) = fixture().await;
+            let root = dir.path();
+            tokio::fs::write(root.join("Cargo.toml"), &manifest)
+                .await
+                .unwrap();
+            tokio::fs::create_dir_all(root.join(".cargo"))
+                .await
+                .unwrap();
+            tokio::fs::write(
+                root.join(".cargo/config.toml"),
+                format!("[registries.socket-patch-{UUID}]\nindex = \"{index}\"\n"),
+            )
+            .await
+            .unwrap();
+            let detail = expect_refused(
+                run_vendor(PURL, root, &blobs, &pristine, &record, false).await,
+                "hosted_redirect_live",
+            );
+            assert!(
+                detail.contains(&format!("socket-patch-{UUID}")),
+                "{shape}: the refusal names the live registry: {detail}"
+            );
+            assert!(
+                !root.join(format!(".socket/vendor/cargo/{UUID}")).exists(),
+                "{shape}: nothing was half-vendored"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("Cargo.toml"))
+                    .await
+                    .unwrap(),
+                manifest,
+                "{shape}: the manifest is untouched"
+            );
+        }
+    }
+
+    /// A dependency pinned to a registry that is NOT ours, and an unpinned
+    /// one, are not hosted residue: vendoring proceeds.
+    #[tokio::test]
+    async fn test_foreign_registry_pin_is_not_hosted_residue() {
+        let (dir, blobs, pristine, record) = fixture().await;
+        let root = dir.path();
+        tokio::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies.cfg-if]\nversion = \"1\"\nregistry = \"corp-mirror\"\n",
+        )
+        .await
+        .unwrap();
+        let (result, _entry, _warnings) =
+            expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+        assert!(result.success, "vendor failed: {:?}", result.error);
     }
 
     // ── service status arms: pending / unavailable / failed ──────────────

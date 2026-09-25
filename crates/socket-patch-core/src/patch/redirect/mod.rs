@@ -985,6 +985,118 @@ fn is_socket_patch_registry_name(value: &str) -> bool {
     socket_patch_name_uuid_exact(value, false).is_some()
 }
 
+/// The `socket-patch-<uuid>` registry name pinning `crate_name` in this
+/// manifest, in EVERY declaration shape [`plan_cargo_toml`] writes: a
+/// `[…dependencies.<key>]` header table (whose pin is a standalone
+/// `registry = …` line), an inline table, a quoted key, and a rename
+/// (`package = "<crate>"` under any key). Readers that probe for a LIVE
+/// hosted redirect use this rather than a single-line regex, which saw only
+/// the inline spelling and read the other three as "not redirected".
+pub(crate) fn cargo_socket_registry_pin(content: &str, crate_name: &str) -> Option<String> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let socket_value = |text: &str| -> Option<String> {
+        CARGO_TOML_REGISTRY_VAL_RE
+            .captures(text)
+            .map(|c| c[1].to_string())
+            .filter(|v| is_socket_patch_registry_name(v))
+    };
+    let mut section = CargoTomlSection::Other;
+    for (idx, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') && !trimmed.starts_with("[[") {
+            section = match CARGO_TOML_HEADER_RE.captures(trimmed) {
+                Some(c) => classify_cargo_section(
+                    c.get(1)
+                        .expect("header_re always captures group 1 (section name)")
+                        .as_str(),
+                ),
+                None => CargoTomlSection::Other,
+            };
+            let CargoTomlSection::DepEntry { key, .. } = section.clone() else {
+                continue;
+            };
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(idx + 1)
+                .find(|(_, l)| l.trim_start().starts_with('['))
+                .map_or(lines.len(), |(j, _)| j);
+            let block: Vec<&str> = (idx + 1..end)
+                .map(|j| lines[j].trim_start())
+                .filter(|t| !t.is_empty() && !t.starts_with('#'))
+                .collect();
+            let value_of = |name: &str| -> Option<String> {
+                block.iter().find_map(|t| {
+                    let (k, rest) = parse_cargo_entry_key(t)?;
+                    if k != name {
+                        return None;
+                    }
+                    let v = rest.trim_start().strip_prefix('=')?.trim();
+                    Some(
+                        v.strip_prefix('"')
+                            .and_then(|s| s.split('"').next())
+                            .unwrap_or(v)
+                            .to_string(),
+                    )
+                })
+            };
+            let is_ours = match value_of("package") {
+                Some(package) => package == crate_name,
+                None => key == crate_name,
+            };
+            if is_ours {
+                if let Some(reg) = value_of("registry").filter(|v| is_socket_patch_registry_name(v))
+                {
+                    return Some(reg);
+                }
+            }
+            continue;
+        }
+        let CargoTomlSection::DepTable { .. } = section else {
+            continue;
+        };
+        let Some((key, rest)) = parse_cargo_entry_key(trimmed) else {
+            continue;
+        };
+        let rest_trim = rest.trim_start();
+        if let Some(dotted) = rest_trim.strip_prefix('.') {
+            // `<crate>.registry = "socket-patch-…"`: a spelling this rewriter
+            // refuses to write, but a hand edit can leave one behind.
+            if key == crate_name
+                && parse_cargo_entry_key(dotted).is_some_and(|(k, _)| k == "registry")
+            {
+                if let Some(reg) = socket_value(trimmed) {
+                    return Some(reg);
+                }
+            }
+            continue;
+        }
+        let Some(value) = rest_trim.strip_prefix('=').map(str::trim_start) else {
+            continue;
+        };
+        if !value.starts_with('{') {
+            continue;
+        }
+        let Some(close) = value.find('}') else {
+            continue;
+        };
+        let inner = &value[1..close];
+        let is_ours = match CARGO_TOML_PACKAGE_RE.captures(inner) {
+            Some(c) => c[1] == *crate_name,
+            None => key == crate_name,
+        };
+        if is_ours {
+            if let Some(reg) = socket_value(inner) {
+                return Some(reg);
+            }
+        }
+    }
+    None
+}
+
 /// Split a TOML table-header path into dot segments, respecting quoted
 /// segments (`target.'cfg(unix)'.dependencies`). `None` on unbalanced quotes.
 fn split_toml_header_segments(inner: &str) -> Option<Vec<String>> {
@@ -7885,6 +7997,79 @@ mod tests {
         assert!(r.files.contains_key(".cargo/config.toml"));
         assert!(!r.files.contains_key(".cargo/config"));
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    /// The residue probe (`vendor`'s fail-closed guard against wiring
+    /// `[patch.crates-io]` on top of a live hosted redirect) reads back
+    /// EVERY declaration shape this rewriter pins — driven through the
+    /// rewriter itself so the two can never drift apart. A single-line
+    /// `<name> = { … }` regex saw only the first of these.
+    #[test]
+    fn cargo_socket_registry_pin_reads_back_every_written_shape() {
+        let head = "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n";
+        let shapes = [
+            ("plain version", "[dependencies]\nserde = \"1.0.190\"\n"),
+            ("quoted key", "[dependencies]\n\"serde\" = \"1.0.190\"\n"),
+            (
+                "inline table",
+                "[dependencies]\nserde = { version = \"1.0.190\" }\n",
+            ),
+            (
+                "renamed inline table",
+                "[dependencies]\nlegacy = { package = \"serde\", version = \"1.0.190\" }\n",
+            ),
+            (
+                "table form",
+                "[dependencies.serde]\nversion = \"1.0.190\"\n",
+            ),
+            (
+                "renamed table form",
+                "[dependencies.legacy]\npackage = \"serde\"\nversion = \"1.0.190\"\n",
+            ),
+            (
+                "dev-dependency table form",
+                "[dev-dependencies.serde]\nversion = \"1.0.190\"\n",
+            ),
+            (
+                "target table",
+                "[target.'cfg(unix)'.dependencies]\nserde = \"1.0.190\"\n",
+            ),
+            (
+                "workspace dependencies table form",
+                "[workspace.dependencies.serde]\nversion = \"1.0.190\"\n",
+            ),
+        ];
+        for (shape, body) in shapes {
+            let pristine = format!("{head}{body}");
+            assert_eq!(
+                cargo_socket_registry_pin(&pristine, "serde"),
+                None,
+                "{shape}: an unpinned manifest is not residue"
+            );
+            let r = rewrite_registry_redirect(&cargo_files(&pristine), &[cargo_sparse_override()]);
+            assert!(r.warnings.is_empty(), "{shape}: {:?}", r.warnings);
+            let written = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
+            assert_eq!(
+                cargo_socket_registry_pin(written, "serde").as_deref(),
+                Some(cargo_reg().as_str()),
+                "{shape}: the probe must read back what the rewriter wrote: {written}"
+            );
+        }
+        // Another crate's pin, and a registry that is not ours, are not this
+        // crate's residue.
+        let other = format!(
+            "{head}[dependencies]\nother = {{ version = \"1\", registry = \"{}\" }}\n\
+             serde = {{ version = \"1.0.190\", registry = \"corp-mirror\" }}\n",
+            cargo_reg()
+        );
+        assert_eq!(cargo_socket_registry_pin(&other, "serde"), None);
+        // A renamed key declaring ANOTHER crate never answers for `serde`.
+        let renamed_other = format!(
+            "{head}[dependencies]\nserde = {{ package = \"serde_json\", version = \"1\", \
+             registry = \"{}\" }}\n",
+            cargo_reg()
+        );
+        assert_eq!(cargo_socket_registry_pin(&renamed_other, "serde"), None);
     }
 
     fn cargo_lock_with(name: &str, version: &str) -> String {
