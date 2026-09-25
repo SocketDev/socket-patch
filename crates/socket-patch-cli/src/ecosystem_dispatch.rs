@@ -490,9 +490,16 @@ pub struct NpmCrawlSnapshot {
 impl NpmCrawlSnapshot {
     /// Whether this snapshot was crawled with exactly `options`.
     fn taken_with(&self, options: &CrawlerOptions) -> bool {
-        self.cwd == options.cwd
-            && self.global == options.global
-            && self.global_prefix == options.global_prefix
+        // Destructured, not field-by-field: a new crawler option that
+        // changes what the crawler walks has to be answered here, and the
+        // compiler is what asks. Everything this snapshot stands in for
+        // was crawled with these options and nothing else.
+        let CrawlerOptions {
+            cwd,
+            global,
+            global_prefix,
+        } = options;
+        self.cwd == *cwd && self.global == *global && self.global_prefix == *global_prefix
     }
 
     /// The crawled npm packages, when crawled with exactly `options`.
