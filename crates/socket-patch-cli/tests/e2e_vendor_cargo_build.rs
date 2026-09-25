@@ -1826,6 +1826,87 @@ fn cargo_legacy_config_wiring_migrates_to_the_manifest() {
     assert!(!proj.join(".socket/vendor").exists());
 }
 
+/// CRLF: a `Cargo.lock` (and `Cargo.toml`) committed with Windows line
+/// endings must come out of vendoring with those endings intact and revert
+/// byte-for-byte. REGRESSION: `toml_edit` renders LF only, so the lock
+/// surgery rewrote every line of a CRLF lock, and `vendor --revert`
+/// "restored" an all-LF file — a whole-file diff on a Windows checkout and
+/// a rollback that was not byte-identical. The manifest already reconciled
+/// endings; the lock did not.
+#[test]
+fn cargo_vendor_keeps_crlf_line_endings_and_reverts_byte_identically() {
+    const SUITE: &str = "e2e_vendor_cargo_build (crlf)";
+    if !cargo_e2e_matrix::cargo_available(SUITE) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let Some((proj, cargo_home, version, crate_dir)) = stage_fixture(tmp.path(), "crlf") else {
+        return;
+    };
+    // Commit both files with CRLF, as a Windows checkout would.
+    let to_crlf = |p: &Path| {
+        let text = std::fs::read_to_string(p).unwrap();
+        std::fs::write(p, text.replace("\r\n", "\n").replace('\n', "\r\n")).unwrap();
+    };
+    to_crlf(&proj.join("Cargo.toml"));
+    to_crlf(&proj.join("Cargo.lock"));
+    let manifest_before = std::fs::read(proj.join("Cargo.toml")).unwrap();
+    let lock_before = std::fs::read(proj.join("Cargo.lock")).unwrap();
+
+    let purl = format!("pkg:cargo/{DEP}@{version}");
+    let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
+    let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    stage_patch(&proj, &purl, "src/lib.rs", &orig, &patched);
+
+    let env = vendor_ok(&proj, &cargo_home, "crlf");
+    assert_eq!(env["summary"]["failed"], 0, "{env}");
+
+    let all_crlf = |p: &Path, what: &str| {
+        let text = std::fs::read_to_string(p).unwrap();
+        assert!(
+            !text.replace("\r\n", "").contains('\n'),
+            "{what} must stay CRLF after vendoring:\n{text:?}"
+        );
+        text
+    };
+    all_crlf(&proj.join("Cargo.toml"), "Cargo.toml");
+    let lock_after = all_crlf(&proj.join("Cargo.lock"), "Cargo.lock");
+    assert!(
+        lock_after.contains(&format!(
+            "name = \"{DEP}\"\r\nversion = \"{}\"\r\n",
+            tagged(&version, UUID)
+        )),
+        "the detached entry is tagged:\n{lock_after}"
+    );
+
+    // Real cargo accepts the CRLF lock under --locked and builds the copy.
+    std::fs::write(proj.join("src/main.rs"), ORACLE_MAIN).unwrap();
+    let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains(&oracle_line(&version, UUID)),
+        "the CRLF-locked project builds the patched copy:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    std::fs::write(
+        proj.join("src/main.rs"),
+        "fn main() { println!(\"baseline\"); }\n",
+    )
+    .unwrap();
+    revert_ok(&proj, &cargo_home, "crlf");
+    assert_eq!(
+        std::fs::read(proj.join("Cargo.lock")).unwrap(),
+        lock_before,
+        "the revert must restore the CRLF lock byte-for-byte"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("Cargo.toml")).unwrap(),
+        manifest_before
+    );
+    assert!(!proj.join(".socket/vendor").exists());
+}
+
 // ── build-metadata versions (the encoded purl the API serves) ─────────
 
 /// A dep-free crates.io crate whose version carries semver BUILD METADATA.

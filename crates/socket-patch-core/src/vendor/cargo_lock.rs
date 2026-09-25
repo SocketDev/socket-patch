@@ -102,9 +102,13 @@ impl std::fmt::Display for LockEditError {
 
 /// Read + parse `<root>/Cargo.lock`, mapping errors to [`LockEditError`]
 /// (the lock inventory reads the lock through it too).
+///
+/// The verbatim `content` comes back with the parse: `toml_edit` renders
+/// LF only, so [`write_lock`] needs the original bytes to put the file's
+/// own line endings back (see [`super::cargo_manifest::reconcile_line_endings`]).
 pub(crate) async fn read_lock(
     project_root: &Path,
-) -> Result<(std::path::PathBuf, DocumentMut), LockEditError> {
+) -> Result<(std::path::PathBuf, DocumentMut, String), LockEditError> {
     let path = project_root.join("Cargo.lock");
     let content = match read_regular_to_string(&path).await {
         Ok(c) => c,
@@ -116,7 +120,7 @@ pub(crate) async fn read_lock(
     let doc = content
         .parse::<DocumentMut>()
         .map_err(|e| LockEditError::Parse(e.to_string()))?;
-    Ok((path, doc))
+    Ok((path, doc, content))
 }
 
 /// How strongly a `[[package]]` at `found` (with a `source` or not) is THE
@@ -473,8 +477,17 @@ fn ensure_consistent(
 /// whole project's resolution, so never truncate-in-place. Mode-preserving:
 /// the lock is a user-owned file we merely edit, so the swapped-in inode must
 /// keep its permission bits rather than reset them to umask defaults.
-async fn write_lock(path: &Path, doc: &DocumentMut) -> Result<(), LockEditError> {
-    atomic_write_bytes_preserving_mode(path, doc.to_string().as_bytes())
+///
+/// `original` is the text [`read_lock`] parsed. `toml_edit` renders LF only
+/// — it drops the `\r` of every CRLF line, even the ones no edit touched —
+/// so the rendering is mapped back onto the original's line endings, the
+/// same way the copy's `Cargo.toml` is written. A CRLF lock therefore stays
+/// CRLF, a mixed-ending lock keeps each line's own ending, and a lock with
+/// no trailing newline keeps that too, so `vendor --revert` restores the
+/// file byte-for-byte.
+async fn write_lock(path: &Path, doc: &DocumentMut, original: &str) -> Result<(), LockEditError> {
+    let rendered = super::cargo_manifest::reconcile_line_endings(original, &doc.to_string());
+    atomic_write_bytes_preserving_mode(path, rendered.as_bytes())
         .await
         .map_err(|e| LockEditError::Io(e.to_string()))
 }
@@ -496,7 +509,7 @@ pub async fn detach_lock_entry(
     uuid: &str,
     dry_run: bool,
 ) -> Result<CargoLockOriginal, LockEditError> {
-    let (path, mut doc) = read_lock(project_root).await?;
+    let (path, mut doc, lock_text) = read_lock(project_root).await?;
     // The registry entry is what gets detached (an entry already at the
     // tagged version beside it then refuses in `ensure_consistent`).
     let registry = doc
@@ -554,7 +567,7 @@ pub async fn detach_lock_entry(
     ensure_consistent(&doc, name, version, &tagged)?;
 
     if !dry_run {
-        write_lock(&path, &doc).await?;
+        write_lock(&path, &doc, &lock_text).await?;
     }
     Ok(CargoLockOriginal { source, checksum })
 }
@@ -588,7 +601,7 @@ pub async fn retag_lock_entry_to(
     target: &str,
     dry_run: bool,
 ) -> Result<Option<String>, LockEditError> {
-    let (path, mut doc) = read_lock(project_root).await?;
+    let (path, mut doc, lock_text) = read_lock(project_root).await?;
     let table = find_entry_mut(&mut doc, name, version, cargo_tag::tag_uuid(target))
         .ok_or(LockEditError::EntryMissing)?;
     if table.get("source").is_some() {
@@ -608,7 +621,7 @@ pub async fn retag_lock_entry_to(
     rewrite_version_refs(&mut doc, name, &current, None, &format!("{name} {target}"));
     ensure_consistent(&doc, name, &current, target)?;
     if !dry_run {
-        write_lock(&path, &doc).await?;
+        write_lock(&path, &doc, &lock_text).await?;
     }
     Ok(Some(current))
 }
@@ -639,7 +652,7 @@ pub async fn restore_lock_entry(
     original: &CargoLockOriginal,
     dry_run: bool,
 ) -> Result<bool, LockEditError> {
-    let (path, mut doc) = read_lock(project_root).await?;
+    let (path, mut doc, lock_text) = read_lock(project_root).await?;
     let v1 = is_v1_lock(&doc);
     let Some(idx) = pick_index(&doc, name, version, Some(uuid)) else {
         return Ok(false);
@@ -727,7 +740,7 @@ pub async fn restore_lock_entry(
     }
 
     if !dry_run {
-        write_lock(&path, &doc).await?;
+        write_lock(&path, &doc, &lock_text).await?;
     }
     Ok(true)
 }
@@ -740,7 +753,7 @@ pub async fn restore_lock_entry(
 /// versions. A Socket-tagged vendored entry counts as its untagged version.
 /// Reads only the project lockfile: no registry, no network.
 pub async fn read_locked_versions(project_root: &Path) -> Option<HashMap<String, HashSet<String>>> {
-    let (_path, doc) = read_lock(project_root).await.ok()?;
+    let (_path, doc, _) = read_lock(project_root).await.ok()?;
     doc.get("package")?.as_array_of_tables()?;
     let mut map: HashMap<String, HashSet<String>> = HashMap::new();
     for pkg in locked_packages(&doc) {
@@ -791,7 +804,7 @@ pub async fn probe_lock_entry_for(
     uuid: Option<&str>,
 ) -> LockEntryProbe {
     let doc = match read_lock(project_root).await {
-        Ok((_path, doc)) => doc,
+        Ok((_path, doc, _)) => doc,
         Err(LockEditError::NoLockfile) => return LockEntryProbe::NoLockfile,
         Err(_) => return LockEntryProbe::Unreadable,
     };
@@ -825,7 +838,7 @@ pub async fn probe_lock_entry_for(
 /// the only lock edits a vendored crate still needs — a retag between tags —
 /// never touch it.
 pub async fn count_lock_entries(project_root: &Path, name: &str, version: &str) -> usize {
-    let Ok((_path, doc)) = read_lock(project_root).await else {
+    let Ok((_path, doc, _)) = read_lock(project_root).await else {
         return 0;
     };
     let hits: Vec<LockedPackage> = locked_packages(&doc)
@@ -870,6 +883,170 @@ mod tests {
              source = \"{SOURCE}\"\n\
              checksum = \"{CHECKSUM}\"\n"
         )
+    }
+
+    /// A minimal registry-shaped lock in format `v` (1..=4): v1 keeps the
+    /// checksum in `[metadata]` and references the crate by full id; v2 is
+    /// the header with no `version` key; v3/v4 add the version marker.
+    fn lock_in_format(v: u8) -> String {
+        let header = "# This file is automatically @generated by Cargo.\n\
+                      # It is not intended for manual editing.\n";
+        match v {
+            1 => format!(
+                "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+                 \"cfg-if 1.0.4 ({SOURCE})\",\n]\n\n\
+                 [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{SOURCE}\"\n\n\
+                 [metadata]\n\"checksum cfg-if 1.0.4 ({SOURCE})\" = \"{CHECKSUM}\"\n"
+            ),
+            2 => format!(
+                "{header}\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\n \"cfg-if\",\n]\n\n\
+                 [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+                 source = \"{SOURCE}\"\nchecksum = \"{CHECKSUM}\"\n"
+            ),
+            3 | 4 => format!(
+                "{header}version = {v}\n\n[[package]]\nname = \"app\"\n\
+                 version = \"0.1.0\"\ndependencies = [\n \"cfg-if\",\n]\n\n\
+                 [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+                 source = \"{SOURCE}\"\nchecksum = \"{CHECKSUM}\"\n"
+            ),
+            _ => unreachable!("lock formats 1..=4"),
+        }
+    }
+
+    /// `(content, ending)` per line of `text` (ending `""` on a final line
+    /// with no newline).
+    fn line_endings(text: &str) -> Vec<(&str, &str)> {
+        text.split_inclusive('\n')
+            .map(|seg| match seg.strip_suffix("\r\n") {
+                Some(c) => (c, "\r\n"),
+                None => match seg.strip_suffix('\n') {
+                    Some(c) => (c, "\n"),
+                    None => (seg, ""),
+                },
+            })
+            .collect()
+    }
+
+    /// REGRESSION: `toml_edit` renders LF only, so writing the edited lock
+    /// back rewrote a CRLF `Cargo.lock` as all-LF — and `vendor --revert`
+    /// then "restored" a file that differed from the original in every line
+    /// ending, so the rollback was not byte-identical (the copy's
+    /// `Cargo.toml` already reconciled endings; the lock did not). Covers
+    /// CRLF, LF and a missing trailing newline, in lock formats v1–v4,
+    /// across detach → retag → restore.
+    #[tokio::test]
+    async fn lock_edits_keep_line_endings_and_revert_byte_identically() {
+        for v in 1u8..=4 {
+            let lf = lock_in_format(v);
+            let crlf = lf.replace('\n', "\r\n");
+            let no_trailing = crlf.trim_end_matches("\r\n").to_string();
+
+            for (kind, before) in [
+                ("lf", &lf),
+                ("crlf", &crlf),
+                ("crlf-no-trailing-newline", &no_trailing),
+            ] {
+                let label = format!("v{v}/{kind}");
+                let dir = tempfile::tempdir().unwrap();
+                let lock = dir.path().join("Cargo.lock");
+                tokio::fs::write(&lock, before).await.unwrap();
+
+                let orig = detach_lock_entry(dir.path(), "cfg-if", "1.0.4", UUID, false)
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: detach failed: {e}"));
+                let detached = tokio::fs::read_to_string(&lock).await.unwrap();
+                if kind == "lf" {
+                    assert!(!detached.contains('\r'), "{label}: an LF lock stays LF");
+                } else {
+                    assert!(
+                        !detached.replace("\r\n", "").contains('\n'),
+                        "{label}: a CRLF lock stays CRLF:\n{detached:?}"
+                    );
+                }
+                assert_eq!(
+                    before.ends_with('\n'),
+                    detached.ends_with('\n'),
+                    "{label}: the trailing newline must be preserved"
+                );
+
+                // A uuid bump goes through `retag_lock_entry`: same contract.
+                retag_lock_entry(dir.path(), "cfg-if", "1.0.4", UUID2, false)
+                    .await
+                    .unwrap_or_else(|e| panic!("{label}: retag failed: {e}"));
+
+                assert!(
+                    restore_lock_entry(dir.path(), "cfg-if", "1.0.4", UUID2, &orig, false)
+                        .await
+                        .unwrap_or_else(|e| panic!("{label}: restore failed: {e}")),
+                    "{label}: the detached entry must restore"
+                );
+                assert_eq!(
+                    tokio::fs::read_to_string(&lock).await.unwrap(),
+                    *before,
+                    "{label}: revert must be byte-identical"
+                );
+            }
+        }
+    }
+
+    /// A lock whose lines do NOT agree on an ending: every line the edit
+    /// leaves alone keeps its own ending, and the trailing newline is
+    /// preserved. A line the edit rewrites, removes or re-inserts takes the
+    /// file's dominant ending — its original one is not recoverable from
+    /// text alone — so a mixed lock is NOT promised a byte-identical
+    /// revert, only an unchanged remainder (the same contract
+    /// `Cargo.toml` has had).
+    #[tokio::test]
+    async fn a_mixed_ending_lock_keeps_every_untouched_line() {
+        for v in 1u8..=4 {
+            let lf = lock_in_format(v);
+            let lines: Vec<&str> = lf.split_inclusive('\n').collect();
+            let half = lines.len() / 2;
+            let mixed: String = lines
+                .iter()
+                .enumerate()
+                .map(|(i, seg)| {
+                    if i < half {
+                        seg.replace('\n', "\r\n")
+                    } else {
+                        (*seg).to_string()
+                    }
+                })
+                .collect();
+            let label = format!("v{v}/mixed");
+            let dir = tempfile::tempdir().unwrap();
+            let lock = dir.path().join("Cargo.lock");
+            tokio::fs::write(&lock, &mixed).await.unwrap();
+
+            detach_lock_entry(dir.path(), "cfg-if", "1.0.4", UUID, false)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: detach failed: {e}"));
+            let detached = tokio::fs::read_to_string(&lock).await.unwrap();
+
+            // Only lines whose content is UNIQUE can be identified in the
+            // output (`[[package]]` appears twice, with different endings).
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            for (content, _) in line_endings(&mixed) {
+                *counts.entry(content).or_default() += 1;
+            }
+            let original: HashMap<&str, &str> = line_endings(&mixed)
+                .into_iter()
+                .filter(|(c, _)| counts[c] == 1)
+                .collect();
+            for (content, ending) in line_endings(&detached) {
+                if let Some(want) = original.get(content) {
+                    assert_eq!(
+                        ending, *want,
+                        "{label}: untouched line {content:?} changed its ending"
+                    );
+                }
+            }
+            assert!(
+                detached.ends_with('\n'),
+                "{label}: the trailing newline must be preserved"
+            );
+        }
     }
 
     async fn fixture() -> tempfile::TempDir {

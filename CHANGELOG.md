@@ -726,6 +726,15 @@ into the new version's section — see docs/releasing.md.
   `setup --remove` could not land byte-identical on the pre-setup file.
   `package.json` is now written in its own layout (BOM, indent, line ending,
   trailing-newline shape), the same helper the vendored backends use.
+- **A CRLF `Cargo.lock` stays CRLF, and reverts byte-for-byte.** Vendoring
+  rewrote every line of a lock committed with Windows line endings as LF
+  (`toml_edit` renders LF only), and `vendor --revert` then "restored" the
+  all-LF file — a whole-file diff on a Windows checkout and a rollback that
+  was not byte-identical. The lock edits (detach, retag, restore) now map
+  the rendering back onto the file's own line endings, the way the copy's
+  `Cargo.toml` already did, in lock formats v1–v4: a CRLF lock stays CRLF,
+  a missing trailing newline stays missing, and every line a mixed-ending
+  lock's edit leaves alone keeps its own ending.
 - **Vendored mode can patch a package whose version carries build
   metadata.** The patches API serves canonical PURLs, so a semver build
   metadata version arrives percent-encoded

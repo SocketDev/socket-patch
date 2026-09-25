@@ -31,7 +31,7 @@ pub(super) async fn inventory_cargo_lock(project_root: &Path) -> Option<Vec<Lock
 /// [`inventory_cargo_lock`] before its collapse: every instance
 /// ([`super::inventory_project_every_lock`]).
 pub(super) async fn inventory_cargo_lock_raw(project_root: &Path) -> Option<Vec<LockfileEntry>> {
-    let (_, doc) = crate::vendor::cargo_lock::read_lock(project_root)
+    let (_, doc, _) = crate::vendor::cargo_lock::read_lock(project_root)
         .await
         .ok()?;
     let mut out = Vec::new();
