@@ -1087,6 +1087,9 @@ async fn vendor_over_hosted_without_ledger_is_refused() {
     let purl = format!("pkg:cargo/{DEP}@{version}");
     let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
     let patched: Vec<u8> = [orig.as_slice(), PATCH_SUFFIX.as_bytes()].concat();
+    // Kept for the second arm: the pristine crates.io lock a checkout
+    // restores over the redirected one.
+    let pristine_lock = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
 
     let server = MockServer::start().await;
     let crate_bytes =
@@ -1141,5 +1144,50 @@ async fn vendor_over_hosted_without_ledger_is_refused() {
     assert_eq!(read(&proj, "Cargo.lock"), lock_before);
     assert!(!read(&proj, ".cargo/config.toml").contains("[patch.crates-io]"));
     assert!(!read(&proj, "Cargo.toml").contains("[patch.crates-io]"));
+    assert!(!vendor_ledger_claims(&proj, &purl));
+
+    // The half-reverted state this guard really exists for: the lock is
+    // back on crates.io (restored from version control, or re-resolved)
+    // while the manifest pin survives — here in the TABLE form the hosted
+    // rewriter writes for a `[dependencies.<crate>]` declaration, which a
+    // `<name> = { … }` probe reads as "not redirected".
+    let registry = toml_before
+        .split("registry = \"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the hosted scan pinned a socket-patch registry")
+        .to_string();
+    assert!(registry.starts_with("socket-patch-"), "{registry}");
+    std::fs::write(proj.join("Cargo.lock"), &pristine_lock).unwrap();
+    std::fs::write(
+        proj.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies.{DEP}]\nversion = \"1.0\"\nregistry = \"{registry}\"\n"
+        ),
+    )
+    .unwrap();
+    let table_toml = read(&proj, "Cargo.toml");
+    let (code, stdout, stderr) = run_socket(
+        &proj,
+        &[
+            "vendor",
+            "--json",
+            "--offline",
+            "--cwd",
+            proj.to_str().unwrap(),
+        ],
+        &cargo_home,
+    );
+    assert_eq!(
+        code, 1,
+        "the table-form pin must fail closed too: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("hosted_redirect_live"),
+        "actionable refusal code missing: {stdout}"
+    );
+    assert_eq!(read(&proj, "Cargo.toml"), table_toml);
+    assert_eq!(read(&proj, "Cargo.lock"), pristine_lock);
     assert!(!vendor_ledger_claims(&proj, &purl));
 }
