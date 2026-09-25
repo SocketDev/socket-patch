@@ -122,25 +122,25 @@ pub(super) fn refusal_code(outcome: &VendorOutcome) -> &'static str {
 }
 
 /// Gate `packages` (npm purls with their records) against ONE read of the
-/// project, for the vendor loop's download plan: a project the flavor
-/// refuses outright refuses every package with that code; otherwise each
-/// package is guarded ([`guard_coordinates`], the flavors' first gate) and
-/// handed to the flavor's own per-package pre-flight. The verdicts come
-/// back in `packages` order.
+/// project, for the vendor loop's download plan, in the order every
+/// flavor's `vendor_*` gates them: each package is guarded first
+/// ([`guard_coordinates`], the flavors' first gate, ahead of any read),
+/// then a project the flavor refuses outright refuses it with that code,
+/// and otherwise it is handed to the flavor's own per-package pre-flight.
+/// The verdicts come back in `packages` order.
 pub(super) fn gate_packages<P>(
     project: Result<P, &'static str>,
     packages: &[(&str, &PatchRecord)],
     gate: impl Fn(&P, &NpmCoords) -> Result<(), &'static str>,
 ) -> Vec<Result<(), &'static str>> {
-    let project = match project {
-        Ok(project) => project,
-        Err(code) => return vec![Err(code); packages.len()],
-    };
     packages
         .iter()
         .map(|(purl, record)| {
             let coords = guard_coordinates(purl, record).map_err(|o| refusal_code(&o))?;
-            gate(&project, &coords)
+            match &project {
+                Ok(project) => gate(project, &coords),
+                Err(code) => Err(*code),
+            }
         })
         .collect()
 }
@@ -859,6 +859,50 @@ mod tests {
             }
             other => panic!("expected Refused {want_code}, got {other:?}"),
         }
+    }
+
+    /// The download plan gates a package in the loop's order: coordinates
+    /// first, ahead of any read — so a malformed record in a project the
+    /// flavor refuses carries `unsafe_coordinates`, as `vendor_*` reports
+    /// it, and only a well-formed one carries the project's code. A
+    /// readable project hands each well-formed package to the flavor's
+    /// gate, in input order.
+    #[test]
+    fn gate_packages_guards_coordinates_before_it_consults_the_project() {
+        let good = record_with_uuid(UUID);
+        let bad_uuid = record_with_uuid("not-a-uuid");
+        let packages: [(&str, &PatchRecord); 3] = [
+            ("pkg:npm/left-pad@1.3.0", &bad_uuid),
+            ("pkg:npm/left-pad@1.3.0", &good),
+            ("pkg:npm/left-pad@1.2.0", &good),
+        ];
+
+        let unread: Result<(), &'static str> = Err("vendor_lockfile_missing");
+        assert_eq!(
+            gate_packages(unread, &packages, |(), _| unreachable!(
+                "no project to gate against"
+            )),
+            vec![
+                Err("unsafe_coordinates"),
+                Err("vendor_lockfile_missing"),
+                Err("vendor_lockfile_missing"),
+            ]
+        );
+
+        let read: Result<(), &'static str> = Ok(());
+        assert_eq!(
+            gate_packages(read, &packages, |(), coords| {
+                (coords.version == "1.3.0")
+                    .then_some(())
+                    .ok_or("vendor_lock_entry_not_found")
+            }),
+            vec![
+                Err("unsafe_coordinates"),
+                Ok(()),
+                Err("vendor_lock_entry_not_found"),
+            ]
+        );
+        assert_eq!(gate_packages(read, &[], |(), _| Ok(())), Vec::new());
     }
 
     #[test]

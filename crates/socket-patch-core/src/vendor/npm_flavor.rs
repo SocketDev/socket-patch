@@ -385,16 +385,20 @@ pub async fn vendor_npm_any<'a>(
 /// server-side build and counts against quota.
 ///
 /// Every gate is the loop's own, evaluated against the project as it is
-/// when the plan is built: the flavor probe (a probe refusal refuses every
-/// package), then the flavor's project read (lock present, parseable,
-/// supported version, line endings, cache configuration) and its
-/// per-package pre-flight (coordinates, the entry present and rewritable,
-/// override conflicts, workspace gates). The project is read once for the
-/// whole plan. Gates the loop can only evaluate after the service has
-/// answered, or that only a local build reaches — the bundled-dependencies
-/// refusal, the prebuilt archive's afterHash check — are not pre-flight
-/// gates and stay in the loop; a package the plan admits and the loop then
-/// refuses simply fetches nothing further, its planned download dropped.
+/// when the plan is built, in the loop's order: the flavor probe (a probe
+/// refusal refuses every package), then per package the coordinates guard
+/// — the flavors' first gate, ahead of any read, so a malformed record in
+/// a project the flavor refuses carries `unsafe_coordinates` as the loop
+/// would report it — then the flavor's project read (lock present,
+/// parseable, supported version, line endings, cache configuration) and
+/// its per-package pre-flight (the entry present and rewritable, override
+/// conflicts, workspace gates). The project is read once for the whole
+/// plan. Gates the loop can only evaluate after the service has answered,
+/// or that only a local build reaches — the bundled-dependencies refusal,
+/// the prebuilt archive's afterHash check — are not pre-flight gates and
+/// stay in the loop: they run after the loop has already taken its planned
+/// download, so the refusal is the loop's own and costs no request the
+/// serial loop would not have made.
 pub async fn preflight_packages(
     project_root: &Path,
     packages: &[(&str, &PatchRecord)],
@@ -1498,13 +1502,30 @@ snapshots:
             vec![Err("vendor_yarn_berry_unsupported"); 3]
         );
 
-        // Malformed coordinates refuse before any read, as the backends do.
+        // Malformed coordinates refuse before any read, as the backends do
+        // — even in a project the backend's own read then refuses (here
+        // the pnpm pair with its `package.json` gone): the loop guards the
+        // coordinates first, so the plan's code is the loop's for both.
         let tmp = tempfile::tempdir().unwrap();
         pnpm_project(tmp.path()).await;
         let bad_uuid = record("not-a-uuid");
         assert_eq!(
             preflight_packages(tmp.path(), &[("pkg:npm/left-pad@1.3.0", &bad_uuid)]).await,
             vec![Err("unsafe_coordinates")]
+        );
+        tokio::fs::remove_file(tmp.path().join("package.json"))
+            .await
+            .unwrap();
+        assert_eq!(
+            preflight_packages(
+                tmp.path(),
+                &[
+                    ("pkg:npm/left-pad@1.3.0", &bad_uuid),
+                    ("pkg:npm/left-pad@1.3.0", &left),
+                ],
+            )
+            .await,
+            vec![Err("unsafe_coordinates"), Err("vendor_lockfile_missing")]
         );
         assert_eq!(preflight_packages(tmp.path(), &[]).await, Vec::new());
     }
