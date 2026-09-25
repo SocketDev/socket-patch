@@ -182,12 +182,14 @@ impl FetchedPackage {
                 .await
                 .map_err(|e| e.to_string());
         }
+        // `fresh_copy`'s own remove/create errors reached the backend's
+        // wrapper bare, so these do too.
         crate::patch::copy_tree::remove_tree(dst)
             .await
-            .map_err(|e| format!("cannot clear {}: {e}", dst.display()))?;
+            .map_err(|e| e.to_string())?;
         tokio::fs::create_dir_all(dst)
             .await
-            .map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
+            .map_err(|e| e.to_string())?;
         self.write_tree(dst.to_path_buf(), skip_file_name.map(str::to_string))
             .await
     }
@@ -4730,6 +4732,35 @@ mod tests {
         let stage = stage_root.path().join("stage");
         fetched.stage_into(&stage, None).await.unwrap();
         assert_eq!(tree_of(&stage), tree_of(fetched.dir().await.unwrap()));
+    }
+
+    /// A stage that cannot be cleared or created reports what the copy out
+    /// of the tempdir reported — the backends wrap it in their own wording.
+    #[tokio::test]
+    async fn a_stage_that_cannot_be_made_reads_as_the_copy_read() {
+        let tgz = make_tgz(&[("pkg/a.txt", b"hello", false)]);
+        let bytes = tgz.clone();
+        let holder = tempfile::tempdir().unwrap();
+        let fetched = FetchedPackage::pending(
+            holder.path().join("pkg"),
+            "https://example.invalid/x.tgz".to_string(),
+            holder,
+            move |dest, skip| extract_tgz_skipping(&bytes, dest, skip),
+        );
+        // A stage whose parent is a FILE: `create_dir_all` fails the same
+        // way for `fresh_copy` and for a direct stage.
+        let root = tempfile::tempdir().unwrap();
+        let blocker = root.path().join("blocked");
+        std::fs::write(&blocker, b"not a dir").unwrap();
+        let stage = blocker.join("stage");
+
+        let installed = tempfile::tempdir().unwrap();
+        let oracle = crate::patch::copy_tree::fresh_copy(installed.path(), &stage, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        let direct = fetched.stage_into(&stage, None).await.unwrap_err();
+        assert_eq!(direct, oracle);
     }
 
     /// Every DIRECTORY under `root`, relative. `tree_of` lists files, so it
