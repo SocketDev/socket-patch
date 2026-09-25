@@ -51,15 +51,6 @@ pub(crate) enum NpmLockFlavor {
 }
 
 impl NpmLockFlavor {
-    const ALL: [NpmLockFlavor; 6] = [
-        NpmLockFlavor::PackageLock,
-        NpmLockFlavor::YarnClassic,
-        NpmLockFlavor::YarnBerry,
-        NpmLockFlavor::Pnpm,
-        NpmLockFlavor::PnpmLegacy,
-        NpmLockFlavor::Bun,
-    ];
-
     /// The stable string recorded as [`VendorEntry::flavor`].
     fn as_str(self) -> &'static str {
         match self {
@@ -69,6 +60,22 @@ impl NpmLockFlavor {
             NpmLockFlavor::Pnpm => "pnpm",
             NpmLockFlavor::PnpmLegacy => pnpm_lock_legacy::FLAVOR,
             NpmLockFlavor::Bun => "bun",
+        }
+    }
+
+    /// The flavor a [`VendorEntry::flavor`] names, `None` for one this build
+    /// has no backend for. A pre-flavor ledger (`None`) is package-lock. The
+    /// revert and in-use dispatch go through this, so every flavor they can
+    /// route is known to [`npm_flavor_is_known`].
+    fn from_recorded(flavor: Option<&str>) -> Option<Self> {
+        match flavor {
+            None | Some("package-lock") => Some(NpmLockFlavor::PackageLock),
+            Some("yarn-classic") => Some(NpmLockFlavor::YarnClassic),
+            Some("yarn-berry") => Some(NpmLockFlavor::YarnBerry),
+            Some("pnpm") => Some(NpmLockFlavor::Pnpm),
+            Some(pnpm_lock_legacy::FLAVOR) => Some(NpmLockFlavor::PnpmLegacy),
+            Some("bun") => Some(NpmLockFlavor::Bun),
+            Some(_) => None,
         }
     }
 }
@@ -397,9 +404,9 @@ pub async fn vendor_npm_any(
 /// fail-safe. Detached entries are wired into the lock exactly like
 /// manifest-tracked ones, so the probe applies to every entry.
 pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    match entry.flavor.as_deref() {
-        Some("pnpm") => pnpm_lock::pnpm_entry_in_use(entry, project_root).await,
-        Some("pnpm-legacy") => {
+    match NpmLockFlavor::from_recorded(entry.flavor.as_deref())? {
+        NpmLockFlavor::Pnpm => pnpm_lock::pnpm_entry_in_use(entry, project_root).await,
+        NpmLockFlavor::PnpmLegacy => {
             pnpm_lock_legacy::pnpm_legacy_entry_in_use(entry, project_root).await
         }
         // The remaining flavors wire resolutions into the lock itself
@@ -408,13 +415,13 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
         // resolution still points at the artifact. Both npm locks are
         // probed: npm <= 11 installs from the shrinkwrap, npm 12 from the
         // package-lock beside it.
-        None | Some("package-lock") => {
+        NpmLockFlavor::PackageLock => {
             lock_text_mentions_uuid(project_root, &NPM_LOCKS, &entry.uuid).await
         }
-        Some("yarn-classic") | Some("yarn-berry") => {
+        NpmLockFlavor::YarnClassic | NpmLockFlavor::YarnBerry => {
             lock_text_mentions_uuid(project_root, &["yarn.lock"], &entry.uuid).await
         }
-        Some("bun") => {
+        NpmLockFlavor::Bun => {
             if super::lock_inventory::bun::bun_text_lock_present(project_root).await {
                 return lock_text_mentions_uuid(project_root, &[BUN_LOCK], &entry.uuid).await;
             }
@@ -431,7 +438,6 @@ pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> 
                     .any(|package| package.resolution.contains(&needle)),
             )
         }
-        Some(_) => None, // unknown flavor: cannot determine
     }
 }
 
@@ -468,7 +474,7 @@ pub(super) async fn lock_text_mentions_uuid(
 /// wired by a newer socket-patch, so health checks and rebuilds must not
 /// judge it by this build's layout rules.
 pub fn npm_flavor_is_known(flavor: Option<&str>) -> bool {
-    flavor.is_none_or(|f| NpmLockFlavor::ALL.iter().any(|known| known.as_str() == f))
+    NpmLockFlavor::from_recorded(flavor).is_some()
 }
 
 /// Revert one recorded npm vendor entry through the flavor that wired it.
@@ -490,23 +496,26 @@ pub async fn revert_npm_any_opts(
     project_root: &Path,
     opts: RevertOpts,
 ) -> RevertOutcome {
-    match entry.flavor.as_deref() {
-        None | Some("package-lock") => npm_lock::revert_npm_opts(entry, project_root, opts).await,
-        Some("yarn-classic") => {
+    let Some(flavor) = NpmLockFlavor::from_recorded(entry.flavor.as_deref()) else {
+        return RevertOutcome::failed(format!(
+            "this socket-patch build cannot revert npm vendor flavor `{}` — upgrade \
+             socket-patch and re-run",
+            entry.flavor.as_deref().unwrap_or_default()
+        ));
+    };
+    match flavor {
+        NpmLockFlavor::PackageLock => npm_lock::revert_npm_opts(entry, project_root, opts).await,
+        NpmLockFlavor::YarnClassic => {
             yarn_classic_lock::revert_yarn_classic_opts(entry, project_root, opts).await
         }
-        Some("yarn-berry") => {
+        NpmLockFlavor::YarnBerry => {
             yarn_berry_lock::revert_yarn_berry_opts(entry, project_root, opts).await
         }
-        Some("pnpm") => pnpm_lock::revert_pnpm_opts(entry, project_root, opts).await,
-        Some("pnpm-legacy") => {
+        NpmLockFlavor::Pnpm => pnpm_lock::revert_pnpm_opts(entry, project_root, opts).await,
+        NpmLockFlavor::PnpmLegacy => {
             pnpm_lock_legacy::revert_pnpm_legacy_opts(entry, project_root, opts).await
         }
-        Some("bun") => bun_lock::revert_bun_opts(entry, project_root, opts).await,
-        Some(other) => RevertOutcome::failed(format!(
-            "this socket-patch build cannot revert npm vendor flavor `{other}` — upgrade \
-             socket-patch and re-run"
-        )),
+        NpmLockFlavor::Bun => bun_lock::revert_bun_opts(entry, project_root, opts).await,
     }
 }
 
@@ -571,17 +580,17 @@ mod tests {
 
     #[test]
     fn flavor_strings_are_stable() {
-        assert_eq!(
-            NpmLockFlavor::ALL.map(NpmLockFlavor::as_str),
-            [
-                "package-lock",
-                "yarn-classic",
-                "yarn-berry",
-                "pnpm",
-                "pnpm-legacy",
-                "bun"
-            ]
-        );
+        use NpmLockFlavor::*;
+        for flavor in [PackageLock, YarnClassic, YarnBerry, Pnpm, PnpmLegacy, Bun] {
+            match flavor {
+                PackageLock | YarnClassic | YarnBerry | Pnpm | PnpmLegacy | Bun => {}
+            }
+            assert_eq!(
+                NpmLockFlavor::from_recorded(Some(flavor.as_str())),
+                Some(flavor)
+            );
+        }
+        assert_eq!(NpmLockFlavor::from_recorded(None), Some(PackageLock));
         assert_eq!(NpmLockFlavor::PackageLock.as_str(), "package-lock");
         assert_eq!(NpmLockFlavor::YarnClassic.as_str(), "yarn-classic");
         assert_eq!(NpmLockFlavor::Pnpm.as_str(), "pnpm");
