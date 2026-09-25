@@ -1290,6 +1290,31 @@ into the new version's section — see docs/releasing.md.
   downloading it: a local build can never vendor a downloaded `.gem` (no
   eval-able stub gemspec), so the download was pure waste.
 
+- **A vendored run commits its lockfile and ledger edits once, not per
+  package.** `vendor`, `scan --mode vendored` and `get --mode vendored` used
+  to rewrite every touched lockfile / `package.json` / `pnpm-workspace.yaml`
+  / config and the whole `.socket/vendor/state.json` after EACH package. The
+  run now captures those edits in memory (every backend still reads its own
+  and its siblings' earlier edits) and writes the final state once, after
+  the loop, through a roll-forward journal
+  (`.socket/vendor/.commit-journal.json`, removed when the commit
+  completes). The packages that succeeded are committed even when others
+  failed, so a completed run leaves exactly the files per-package commits
+  left. Crash semantics move from per-package to per-run: a crash before
+  the commit leaves the project's lockfiles and ledgers as they were before
+  the run (the artifacts it wrote are orphans the next run re-vendors over);
+  a crash during the commit is finished by the next command that takes the
+  apply lock, before it reads any of those files — or, when a file the
+  journal covers was edited since, the journal is set aside
+  (`.commit-journal.set-aside-<uuid>.json`, with a stderr warning naming
+  `repair`) and nothing of it is applied. A re-vendor under a newer patch
+  uuid now removes the replaced uuid's artifact dir after the commit, so its
+  `vendor_stale_artifact_removed` event comes after the run's per-package
+  events instead of right after the package's own. A commit that cannot be
+  written fails the run with the new top-level error `vendor_commit_failed`
+  (exit 1), leaving the pre-run lockfiles and ledger in place. `repair`,
+  `vendor --revert` and `rollback` keep their per-entry saves.
+
 - **Vendored artifacts are no longer fsynced one by one.** The files a
   vendored run produces under `.socket/vendor/<eco>/<uuid>/` — patched copy
   trees, the `.tgz` / `.whl` / `.nupkg` / `.jar` + `.pom` artifacts and their
