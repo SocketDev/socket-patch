@@ -1917,8 +1917,38 @@ fn cargo_vendor_keeps_crlf_line_endings_and_reverts_byte_identically() {
 // ── build-metadata versions (the encoded purl the API serves) ─────────
 
 /// A dep-free crates.io crate whose version carries semver BUILD METADATA.
+/// Its 46 `extern "C"` WASI syscalls (`fd_read`, `proc_exit`, ...) only
+/// resolve on wasm targets, so the consumer below is a LIBRARY and its
+/// oracle is compile-time: linking `wasi` into a native executable fails on
+/// MSVC (`LNK1120: 46 unresolved externals`) while GNU/Apple linkers
+/// dead-strip the never-called wrappers.
 const META_DEP: &str = "wasi";
 const META_VERSION: &str = "0.11.0+wasi-snapshot-preview1";
+
+/// The consumer's baseline `src/lib.rs`.
+const META_BASELINE_LIB: &str = "pub fn baseline() {}\n";
+
+/// The patch suffix: constants, so the oracle needs nothing linked or run.
+const META_PATCH_SUFFIX: &[u8] = b"\n/// Socket-patch build-metadata marker.\npub const SOCKET_PATCHED: u32 = 1;\n\
+    /// The version cargo compiled this copy as.\npub const SOCKET_PKG_VERSION: &str = env!(\"CARGO_PKG_VERSION\");\n";
+
+/// The consumer's oracle `src/lib.rs`: it compiles only when the patched
+/// bytes are what cargo compiled (`SOCKET_PATCHED` exists) AND their
+/// `CARGO_PKG_VERSION` is exactly `expected` — both evaluated by rustc's
+/// const evaluator (`while` in `const fn` needs 1.46, `assert!` in a const
+/// needs 1.57; the matrix floor is 1.82), so `cargo build` of this library
+/// never links anything.
+fn meta_oracle_lib(expected: &str) -> String {
+    const BYTES_EQ: &str = "const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {\n\
+        \x20   if a.len() != b.len() {\n        return false;\n    }\n\
+        \x20   let mut i = 0;\n\
+        \x20   while i < a.len() {\n        if a[i] != b[i] {\n            return false;\n        }\n        i += 1;\n    }\n\
+        \x20   true\n}\n";
+    format!(
+        "{BYTES_EQ}const _: () = assert!({META_DEP}::SOCKET_PATCHED == 1);\n\
+         const _: () = assert!(bytes_eq({META_DEP}::SOCKET_PKG_VERSION.as_bytes(), b\"{expected}\"));\n"
+    )
+}
 
 /// BUILD METADATA: the patches API serves canonical purls, so this crate's
 /// version arrives percent-encoded (`0.11.0%2Bwasi-snapshot-preview1`).
@@ -1929,9 +1959,11 @@ const META_VERSION: &str = "0.11.0+wasi-snapshot-preview1";
 /// ever be vendored. Proves the whole committable shape for one: the copy
 /// dir keeps the DECODED version, its manifest is tagged
 /// `<version>.socket.<uuid>` (the tag appends to existing metadata), the
-/// lock entry is detached at the tagged version, real cargo builds and runs
-/// the patched bytes under `--locked --offline`, and `--revert` restores
-/// both files byte-for-byte.
+/// lock entry is detached at the tagged version, real cargo compiles the
+/// patched bytes as that tagged version under `--locked --offline` (a
+/// compile-time oracle in a library consumer — see `META_DEP` for why no
+/// native binary may link `wasi`), and `--revert` restores both files
+/// byte-for-byte.
 #[test]
 fn cargo_vendor_build_metadata_version_from_encoded_purl() {
     const SUITE: &str = "e2e_vendor_cargo_build (build-metadata)";
@@ -1953,11 +1985,7 @@ fn cargo_vendor_build_metadata_version_from_encoded_purl() {
         ),
     )
     .unwrap();
-    std::fs::write(
-        proj.join("src/main.rs"),
-        "fn main() { println!(\"baseline\"); }\n",
-    )
-    .unwrap();
+    std::fs::write(proj.join("src/lib.rs"), META_BASELINE_LIB).unwrap();
     let build = cargo(&proj, &["build", "-q"], &cargo_home);
     if !build.status.success() {
         let _ = cargo_e2e_matrix::skip(
@@ -1983,9 +2011,7 @@ fn cargo_vendor_build_metadata_version_from_encoded_purl() {
     // EXACTLY what the API serves: the version percent-encoded.
     let purl = format!("pkg:cargo/{META_DEP}@{}", version.replace('+', "%2B"));
     let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
-    let suffix = b"\n/// Socket-patch build-metadata marker.\npub fn socket_patched() -> u32 { 1 }\n\
-                   /// The version cargo compiled this copy as.\npub fn socket_pkg_version() -> &'static str { env!(\"CARGO_PKG_VERSION\") }\n";
-    let patched: Vec<u8> = [orig.as_slice(), suffix.as_slice()].concat();
+    let patched: Vec<u8> = [orig.as_slice(), META_PATCH_SUFFIX].concat();
     stage_patch(&proj, &purl, "src/lib.rs", &orig, &patched);
 
     let manifest_before = std::fs::read(proj.join("Cargo.toml")).unwrap();
@@ -2027,20 +2053,18 @@ fn cargo_vendor_build_metadata_version_from_encoded_purl() {
         "the [patch.crates-io] entry pins the copy:\n{manifest_after}"
     );
 
-    // COMPILE ORACLE: only the patched bytes have `socket_patched`.
-    std::fs::write(
-        proj.join("src/main.rs"),
-        format!(
-            "fn main() {{ println!(\"MARKER:{{}}:{{}}\", {META_DEP}::socket_patched(), {META_DEP}::socket_pkg_version()); }}\n"
-        ),
-    )
-    .unwrap();
-    let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
+    // COMPILE ORACLE: only the patched bytes have `SOCKET_PATCHED`, and the
+    // const assert pins `CARGO_PKG_VERSION` to the tagged version.
+    std::fs::write(proj.join("src/lib.rs"), meta_oracle_lib(&tagged_version)).unwrap();
+    let build = cargo(
+        &proj,
+        &["build", "-q", "--locked", "--offline"],
+        &cargo_home,
+    );
     assert!(
-        String::from_utf8_lossy(&run.stdout).contains(&format!("MARKER:1:{tagged_version}")),
-        "the patched copy builds and runs as the tagged version:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
+        build.status.success(),
+        "the patched copy compiles as the tagged version:\n{}",
+        String::from_utf8_lossy(&build.stderr)
     );
 
     // Fresh checkout: committable, and nothing is fetched.
@@ -2054,11 +2078,7 @@ fn cargo_vendor_build_metadata_version_from_encoded_purl() {
     assert!(!home.join("registry").exists(), "zero crate downloads");
 
     // Revert is byte-identical.
-    std::fs::write(
-        proj.join("src/main.rs"),
-        "fn main() { println!(\"baseline\"); }\n",
-    )
-    .unwrap();
+    std::fs::write(proj.join("src/lib.rs"), META_BASELINE_LIB).unwrap();
     revert_ok(&proj, &cargo_home, "build-metadata");
     assert_eq!(
         std::fs::read(proj.join("Cargo.toml")).unwrap(),
