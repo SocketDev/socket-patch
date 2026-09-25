@@ -1260,6 +1260,36 @@ into the new version's section — see docs/releasing.md.
   instead of every ecosystem's. A GC run (`--prune`/`--sync`) still crawls
   every ecosystem — the prune needs the full installed set — and reports
   exactly what it did before.
+
+- **An already-vendored project re-runs `vendor` without the network.** A
+  vendorable purl with no installed copy (the fresh-clone case) used to have
+  its pristine artifact downloaded and verified before the backend was even
+  asked, although the backend's in-sync check answers from the committed
+  artifact alone. That download is now deferred to the backend branch that
+  actually reads the pristine tree, whenever the vendor ledger already
+  covers the purl (its entry records the record's patch uuid and the
+  committed artifact is on disk; `--force` keeps the eager fetch), and for
+  every lockfile-only cargo crate while the patch service is enabled (the
+  cargo backend reads the pristine source only once `cargo_service_copy`
+  falls back to the local build). Visible effects: an idempotent re-run
+  makes no registry requests and no longer reports `vendor_fetched_missing`
+  for fetches it never needed; with no network (or under `--offline`) the
+  re-run of an already-vendored pypi, cargo, go or lockfile-only gem
+  project now SUCCEEDS (`already_vendored`, exit 0) instead of failing
+  `vendor_fetch_failed` / `package_not_installed`; a cargo crate the service
+  serves is never downloaded from the registry. When a deferred fetch does
+  happen (a drifted committed copy being rebuilt locally, a service miss),
+  its `vendor_fetched_missing` warning is recorded just ahead of that
+  package's own event instead of in the up-front fetch pass, and a failed,
+  unverifiable or `--offline`-refused deferred fetch reports exactly the
+  eager ladder's outcome for the purl (`vendor_fetch_failed` /
+  `vendor_fetch_unverifiable` + `package_not_installed` /
+  `package_not_installed`), in loop order. `vendor --vendor-source build`
+  (or no service config) now refuses a not-installed gem that the lock can
+  verify and no ledger entry covers with `gem_spec_missing` BEFORE
+  downloading it: a local build can never vendor a downloaded `.gem` (no
+  eval-able stub gemspec), so the download was pure waste.
+
 - **Release publishing decomposed into per-registry workflows.** The
   crates.io, npm, PyPI, and RubyGems legs of the `Release` workflow now live
   in their own workflows
