@@ -634,8 +634,34 @@ into the new version's section — see docs/releasing.md.
   time. Unset, empty or non-numeric values keep the defaults. Results,
   warnings and their order never depend on the setting.
 
+  Two request-count consequences an operator may see before they read the
+  code, neither of which changes any output:
+
+  - A vendored run fetches prebuilt archives ahead of the wiring loop, and
+    the plan it fetches is built from the gates the CLI can see. A package
+    a vendor backend then refuses in its own pre-flight was still asked
+    for, so a run issues up to a window's worth of `POST
+    /v0/orgs/<org>/patches/package` download grants for packages it does
+    not end up vendoring (on a fresh depscan run, 74 grants where the
+    one-at-a-time loop made 71). Those grants can start a server-side
+    archive build and count against quota. `SOCKET_API_CONCURRENCY=1`
+    turns the look-ahead off entirely.
+  - A token revoked *mid-run* now costs the authenticated batch endpoint
+    the requests already in flight — up to the in-flight cap instead of
+    one — before the run downgrades to the public proxy. Their answers are
+    discarded and the connections are dropped mid-response, so the
+    endpoint's access log shows them; the downgrade warning, the patches
+    and the exit code are the same as before.
+
 ### Fixed
 
+- **`vex`'s API-fallback note no longer depends on which refusal landed
+  first.** When the patch API refuses several patch records, the
+  `api_auth_fallback` note quoted whichever refusal happened to answer
+  first — a race, so two runs of the same project could report different
+  text (`Unauthorized` or `Forbidden`) and retry the refused records in a
+  different order. Both now follow the order the records are listed in,
+  like every other note.
 - **Hosted Go redirects no longer claim patches that did not land.**
   `scan`/`get --mode hosted` counted a Go module as redirected (recorded
   it in the redirect ledger, so `vex` attested it) whenever any project
