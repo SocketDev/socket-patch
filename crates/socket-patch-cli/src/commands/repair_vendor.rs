@@ -1333,9 +1333,32 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
             _ => None,
         };
         match pristine {
+            // Repair always rebuilds locally, so the pristine tree is read
+            // either way: materialise it right here, where an extraction
+            // failure is still the fetch failure it was before the write
+            // moved off the fetch.
             PristineFetch::Fetched(fetched) => {
-                all_packages.insert(c.purl.clone(), fetched.dir().to_path_buf());
-                holders.push(fetched);
+                match fetched.dir().await.map(std::path::Path::to_path_buf) {
+                    Ok(dir) => {
+                        all_packages.insert(c.purl.clone(), dir);
+                        holders.push(fetched);
+                    }
+                    Err(detail) => {
+                        if c.soft {
+                            soft_restore_without_fingerprint(
+                                env,
+                                common,
+                                &c.purl,
+                                &c.entry.artifact.path,
+                                &format!("the pristine fetch failed ({detail})"),
+                            );
+                            rebuilt += 1;
+                        } else {
+                            fail(env, common.json, &c.purl, "vendor_fetch_failed", detail);
+                        }
+                        unrebuildable.insert(c.purl.clone());
+                    }
+                }
             }
             PristineFetch::NoSource | PristineFetch::Unverifiable(_) => {
                 // Last rung (npm): the REWIRED lockfile still records the
@@ -1353,10 +1376,23 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                                 .await
                             {
                                 Ok(fetched) => {
-                                    all_packages
-                                        .insert(c.purl.clone(), fetched.dir().to_path_buf());
-                                    holders.push(fetched);
-                                    must_verify.insert(c.purl.clone(), wired);
+                                    match fetched.dir().await.map(std::path::Path::to_path_buf) {
+                                        Ok(dir) => {
+                                            all_packages.insert(c.purl.clone(), dir);
+                                            holders.push(fetched);
+                                            must_verify.insert(c.purl.clone(), wired);
+                                        }
+                                        Err(d) => {
+                                            fail(
+                                                env,
+                                                common.json,
+                                                &c.purl,
+                                                "vendor_fetch_failed",
+                                                d,
+                                            );
+                                            unrebuildable.insert(c.purl.clone());
+                                        }
+                                    }
                                     continue;
                                 }
                                 Err(registry_fetch::FetchError::Failed(d))
@@ -1499,7 +1535,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
             };
         let outcome = dispatch_vendor_one(
             &c.purl,
-            &pkg_path,
+            pkg_path.as_path().into(),
             &common.cwd,
             &c.record,
             &sources,

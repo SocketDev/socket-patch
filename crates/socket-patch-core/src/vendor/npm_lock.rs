@@ -29,6 +29,7 @@ use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
 use super::path::parse_vendor_path;
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -77,9 +78,9 @@ const DEP_MANIFEST_FIELDS: [&str; 4] = [
 /// `None` for dry runs and for the in-sync re-run (the existing ledger entry
 /// stays authoritative; we never re-record our own edit as an "original").
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_npm(
+pub async fn vendor_npm<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -88,6 +89,7 @@ pub async fn vendor_npm(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // ── 1. Coordinates (shared guard: fail-closed before any disk access,

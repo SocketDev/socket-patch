@@ -46,21 +46,96 @@ pub(crate) const MAX_TOTAL_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const MAX_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
 pub(crate) const MAX_ENTRIES: usize = 60_000;
 
-/// A fetched, verified, extracted package. The tempdir lives exactly as
-/// long as this value — callers must hold it until the vendor pipeline has
-/// finished staging from [`FetchedPackage::dir`].
-#[derive(Debug)]
+/// A fetched, verified package whose tree is written only when a branch
+/// actually reads it.
+///
+/// The download, the size caps and the SRI / sha / dirhash verification all
+/// stay EAGER, and so does the archive walk: before this value exists the
+/// bytes have been validated against exactly the rules the extractor
+/// enforces ([`Sink::Validate`]), so a truncated, oversized, traversing or
+/// otherwise malformed artifact is still refused at the fetch, at the same
+/// entry and with the same message. What is deferred is the WRITING — the
+/// committed-artifact reuse, the in-sync hot path and the vendoring service
+/// never read the tree, so an idempotent re-run on a lockfile-only checkout
+/// no longer creates and deletes one.
+///
+/// The tempdir lives exactly as long as this value — callers must hold it
+/// until the vendor pipeline has finished staging from [`FetchedPackage::dir`].
 pub struct FetchedPackage {
     dir: PathBuf,
     /// Where the bytes came from (surfaced in the fetch warning event).
     pub url: String,
+    /// The verified bytes and the extractor that turns them into `dir` —
+    /// the same function an eager fetch called. Taken by the first
+    /// [`FetchedPackage::dir`].
+    pending: std::sync::Mutex<Option<PendingExtract>>,
+    /// The first materialisation's outcome, shared by every later caller so
+    /// a failure reads the same both times.
+    extracted: tokio::sync::OnceCell<Result<(), String>>,
     _tmp: tempfile::TempDir,
 }
 
+/// The deferred half of a fetch: bytes plus the extractor that writes them.
+type PendingExtract = Box<dyn FnOnce(&Path) -> Result<(), String> + Send>;
+
+impl std::fmt::Debug for FetchedPackage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FetchedPackage")
+            .field("dir", &self.dir)
+            .field("url", &self.url)
+            .field(
+                "extracted",
+                &self.extracted.get().is_some_and(Result::is_ok),
+            )
+            .finish()
+    }
+}
+
 impl FetchedPackage {
-    /// The extracted package root (`package.json` at the top for npm).
-    pub fn dir(&self) -> &Path {
+    fn pending(dir: PathBuf, url: String, tmp: tempfile::TempDir, extract: PendingExtract) -> Self {
+        Self {
+            dir,
+            url,
+            pending: std::sync::Mutex::new(Some(extract)),
+            extracted: tokio::sync::OnceCell::new(),
+            _tmp: tmp,
+        }
+    }
+
+    /// Where the package root WILL be. Pure — no I/O and no extraction, so
+    /// it answers naming questions (a gem's `<name>-<version>` leaf, whether
+    /// the parent is a gem home's `gems/`) without materialising anything.
+    pub fn dir_path(&self) -> &Path {
         &self.dir
+    }
+
+    /// The package root (`package.json` at the top for npm) with its content
+    /// on disk, extracted on the first call and kept for the rest of the run.
+    pub async fn dir(&self) -> Result<&Path, String> {
+        let done = self
+            .extracted
+            .get_or_init(|| async {
+                let Some(extract) = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                else {
+                    return Ok(());
+                };
+                // Extraction is sync CPU + disk work; keep it off the runtime
+                // thread so the concurrent fetches around it keep moving.
+                let dir = self.dir.clone();
+                match tokio::task::spawn_blocking(move || extract(&dir)).await {
+                    Ok(outcome) => outcome,
+                    Err(e) => Err(format!("extraction task failed: {e}")),
+                }
+            })
+            .await;
+        match done {
+            Ok(()) => Ok(&self.dir),
+            Err(detail) => Err(detail.clone()),
+        }
     }
 }
 
@@ -132,6 +207,110 @@ pub async fn fetch_and_stage(
     }
 }
 
+/// Run one of the extractors on the blocking pool.
+///
+/// A service archive is written out in full — tens of thousands of small
+/// files for a big package — and doing that inline pinned a runtime worker
+/// for the whole write, next to the downloads A6 runs concurrently. The
+/// bytes move into the task, so callers hand over the archive they have
+/// finished verifying.
+pub(crate) async fn extract_on_blocking_pool<F>(
+    bytes: Vec<u8>,
+    dest: &Path,
+    extract: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&[u8], &Path) -> Result<(), String> + Send + 'static,
+{
+    let dest = dest.to_path_buf();
+    match tokio::task::spawn_blocking(move || extract(&bytes, &dest)).await {
+        Ok(outcome) => outcome,
+        Err(e) => Err(format!("extraction task failed: {e}")),
+    }
+}
+
+/// What an archive walk does with each entry's decompressed bytes.
+///
+/// The two modes run the SAME walk in the same order over the same
+/// constants: every archive-shaped refusal (entry count, the declared and
+/// actual size caps, the traversal guard, the declared-vs-actual mismatch)
+/// fires at the same entry with the same message in both. [`Sink::Validate`]
+/// only sends the bytes to `io::sink()` instead of a file and creates
+/// nothing, so a source whose extraction is deferred
+/// ([`FetchedPackage::dir`]) can still be refused where the eager extraction
+/// refused it. Only the environment-shaped `cannot create …` errors are
+/// exclusive to [`Sink::Write`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Sink {
+    Write,
+    Validate,
+}
+
+/// The destination side of an archive walk: opens each entry's file and
+/// creates each parent directory ONCE per walk (archives list a directory's
+/// files consecutively, so the per-entry `create_dir_all` re-walked the same
+/// parents for every member). In [`Sink::Validate`] it opens nothing.
+struct EntrySink<'a> {
+    dest: &'a Path,
+    sink: Sink,
+    made: std::collections::HashSet<PathBuf>,
+}
+
+impl<'a> EntrySink<'a> {
+    fn new(dest: &'a Path, sink: Sink) -> Self {
+        Self {
+            dest,
+            sink,
+            made: std::collections::HashSet::new(),
+        }
+    }
+
+    /// The open destination file for `rel`, or `None` when validating.
+    fn open(&mut self, rel: &Path) -> Result<Option<std::fs::File>, String> {
+        if self.sink == Sink::Validate {
+            return Ok(None);
+        }
+        let target = self.dest.join(rel);
+        if let Some(parent) = target.parent() {
+            if !self.made.contains(parent) {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+                self.made.insert(parent.to_path_buf());
+            }
+        }
+        std::fs::File::create(&target)
+            .map(Some)
+            .map_err(|e| format!("cannot create {}: {e}", target.display()))
+    }
+}
+
+/// Copy one entry's bytes into the opened file, or count them when
+/// validating.
+fn drain_entry<R: std::io::Read>(
+    reader: &mut R,
+    out: Option<&mut std::fs::File>,
+) -> std::io::Result<u64> {
+    match out {
+        Some(file) => std::io::copy(reader, file),
+        None => std::io::copy(reader, &mut std::io::sink()),
+    }
+}
+
+/// Give an extracted entry the exec-aware mode through its OWN open handle
+/// (`fchmod`), so the walk never re-resolves the path it just wrote. The
+/// chmod stays explicit: the mode must be exact regardless of umask.
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn set_entry_mode(file: Option<&std::fs::File>, exec: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(file) = file {
+            let perms = if exec { 0o755 } else { 0o644 };
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(perms));
+        }
+    }
+}
+
 /// Traversal-guarded zip extraction. `strip_first` mirrors the tar
 /// behavior (composer dist zips carry a variable top dir; wheels carry
 /// content at the root).
@@ -139,12 +318,36 @@ pub async fn fetch_and_stage(
 /// `pub(crate)` so the composer service-download path can extract a downloaded
 /// dist zip into the vendor copy dir (`strip_first` = drop the top-level dir).
 pub(crate) fn extract_zip(bytes: &[u8], dest: &Path, strip_first: bool) -> Result<(), String> {
+    walk_zip(bytes, dest, strip_first, Sink::Write, None).map(|_| ())
+}
+
+/// [`extract_zip`]'s write-free twin: every refusal, nothing created.
+/// Reports whether the extraction would put `watch` at the root (see
+/// [`lands_at_root`]) so the fetchers' post-extraction presence probe can
+/// run without a tree.
+pub(crate) fn validate_zip(
+    bytes: &[u8],
+    strip_first: bool,
+    watch: Option<&str>,
+) -> Result<bool, String> {
+    walk_zip(bytes, Path::new(""), strip_first, Sink::Validate, watch)
+}
+
+fn walk_zip(
+    bytes: &[u8],
+    dest: &Path,
+    strip_first: bool,
+    sink: Sink,
+    watch: Option<&str>,
+) -> Result<bool, String> {
     use std::io::Read as _;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("unreadable zip: {e}"))?;
     if archive.len() > MAX_ENTRIES {
         return Err(format!("zip exceeds {MAX_ENTRIES} entries"));
     }
+    let mut out = EntrySink::new(dest, sink);
+    let mut seen_watched = false;
     let mut total: u64 = 0;
     for i in 0..archive.len() {
         let mut file = archive
@@ -181,18 +384,12 @@ pub(crate) fn extract_zip(bytes: &[u8], dest: &Path, strip_first: bool) -> Resul
                 "zip decompresses past the {MAX_TOTAL_DECOMPRESSED_BYTES}-byte cap"
             ));
         }
-        let target = dest.join(&rel);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-        }
-        let mut out = std::fs::File::create(&target)
-            .map_err(|e| format!("cannot create {}: {e}", target.display()))?;
+        let mut target = out.open(&rel)?;
         // The declared size is header data a crafted zip can understate (the
         // zip crate does not bound an entry's read by it), so hold the caps
         // against the ACTUAL decompressed bytes too: read at most declared+1
         // and refuse on any mismatch.
-        let copied = std::io::copy(&mut (&mut file).take(declared + 1), &mut out)
+        let copied = drain_entry(&mut (&mut file).take(declared + 1), target.as_mut())
             .map_err(|e| format!("cannot extract `{rel_str}`: {e}"))?;
         if copied != declared {
             return Err(format!(
@@ -200,15 +397,23 @@ pub(crate) fn extract_zip(bytes: &[u8], dest: &Path, strip_first: bool) -> Resul
                  — refusing the artifact"
             ));
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let exec = file.unix_mode().is_some_and(|m| m & 0o111 != 0);
-            let perms = if exec { 0o755 } else { 0o644 };
-            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(perms));
-        }
+        set_entry_mode(
+            target.as_ref(),
+            file.unix_mode().is_some_and(|m| m & 0o111 != 0),
+        );
+        seen_watched |= watch.is_some_and(|name| lands_at_root(&rel, name));
     }
-    Ok(())
+    Ok(seen_watched)
+}
+
+/// Whether extracting `rel` puts `name` at the root of the destination —
+/// either as the entry itself or as a directory the walk creates for it.
+/// This is exactly what a `metadata(dest.join(name))` probe answered once
+/// the eager extraction had run.
+fn lands_at_root(rel: &Path, name: &str) -> bool {
+    rel.components()
+        .next()
+        .is_some_and(|c| c.as_os_str() == name)
 }
 
 /// Composer dist zips: sha1-verified; a variable zipball top dir is
@@ -233,21 +438,20 @@ async fn fetch_composer(
     // zipball layout) — flat `composer archive`-built dists carry
     // composer.json at the root; see [`zip_has_single_top_dir`].
     let strip_first = zip_has_single_top_dir(&bytes).map_err(FetchError::Failed)?;
-    extract_zip(&bytes, &dir, strip_first).map_err(FetchError::Failed)?;
-    if tokio::fs::metadata(dir.join("composer.json"))
-        .await
-        .is_err()
-    {
+    let has_manifest =
+        validate_zip(&bytes, strip_first, Some("composer.json")).map_err(FetchError::Failed)?;
+    if !has_manifest {
         return Err(FetchError::Failed(format!(
             "fetched dist for {}@{} carries no composer.json",
             entry.name, entry.version
         )));
     }
-    Ok(FetchedPackage {
+    Ok(FetchedPackage::pending(
         dir,
         url,
-        _tmp: tmp,
-    })
+        tmp,
+        Box::new(move |dest| extract_zip(&bytes, dest, strip_first)),
+    ))
 }
 
 /// `.gem` files are plain tar containers holding `data.tar.gz` (the
@@ -281,12 +485,13 @@ async fn fetch_gem(
     let tmp = tempfile::tempdir()
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
     let dir = tmp.path().join(format!("{}-{}", entry.name, entry.version));
-    extract_gem_data(&bytes, &dir).map_err(FetchError::Failed)?;
-    Ok(FetchedPackage {
+    validate_gem_data(&bytes).map_err(FetchError::Failed)?;
+    Ok(FetchedPackage::pending(
         dir,
         url,
-        _tmp: tmp,
-    })
+        tmp,
+        Box::new(move |dest| extract_gem_data(&bytes, dest)),
+    ))
 }
 
 /// Pure-python wheels recorded by uv.lock (URL + sha256): the unzipped
@@ -329,7 +534,10 @@ async fn resolve_pypi_url_by_hash(
         entry.version
     );
     let resp = client.get(&api).send().await.map_err(|e| {
-        FetchError::Failed(format!("PyPI JSON API request for {} failed: {e}", entry.purl))
+        FetchError::Failed(format!(
+            "PyPI JSON API request for {} failed: {e}",
+            entry.purl
+        ))
     })?;
     if !resp.status().is_success() {
         return Err(FetchError::Failed(format!(
@@ -339,7 +547,10 @@ async fn resolve_pypi_url_by_hash(
         )));
     }
     let body: serde_json::Value = resp.json().await.map_err(|e| {
-        FetchError::Failed(format!("PyPI JSON API response for {} is not JSON: {e}", entry.purl))
+        FetchError::Failed(format!(
+            "PyPI JSON API response for {} is not JSON: {e}",
+            entry.purl
+        ))
     })?;
     let digest_matches = |file: &serde_json::Value| {
         file.get("digests")
@@ -419,12 +630,13 @@ async fn fetch_pypi(
     let tmp = tempfile::tempdir()
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
     let dir = tmp.path().join("site-packages");
-    extract_zip(&bytes, &dir, /*strip_first=*/ false).map_err(FetchError::Failed)?;
-    Ok(FetchedPackage {
+    validate_zip(&bytes, /*strip_first=*/ false, None).map_err(FetchError::Failed)?;
+    Ok(FetchedPackage::pending(
         dir,
         url,
-        _tmp: tmp,
-    })
+        tmp,
+        Box::new(move |dest| extract_zip(&bytes, dest, /*strip_first=*/ false)),
+    ))
 }
 
 /// crates.io static download host; override with `SOCKET_CRATES_REGISTRY`.
@@ -460,18 +672,18 @@ async fn fetch_cargo(
     let tmp = tempfile::tempdir()
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
     let dir = tmp.path().join("crate");
-    extract_tgz(&bytes, &dir).map_err(FetchError::Failed)?;
-    if tokio::fs::metadata(dir.join("Cargo.toml")).await.is_err() {
+    if !validate_tgz(&bytes, Some("Cargo.toml")).map_err(FetchError::Failed)? {
         return Err(FetchError::Failed(format!(
             "fetched .crate for {}@{} carries no Cargo.toml — not a crate",
             entry.name, entry.version
         )));
     }
-    Ok(FetchedPackage {
+    Ok(FetchedPackage::pending(
         dir,
         url,
-        _tmp: tmp,
-    })
+        tmp,
+        Box::new(move |dest| extract_tgz(&bytes, dest)),
+    ))
 }
 
 /// go's default module proxy (the first element of go's default
@@ -562,6 +774,35 @@ fn go_glob_match(pattern: &[u8], name: &[u8]) -> bool {
 /// Runs in the ecosystem-agnostic service-download path whenever the
 /// service reports a `dirhashH1`.
 fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
+    Ok(walk_module_zip(bytes, None)?.h1)
+}
+
+/// What one walk over a module zip learned.
+struct ModuleZipWalk {
+    /// The `h1:` dirhash of the entries.
+    h1: String,
+    /// The refusal [`extract_zip_with_prefix`] would have raised over the
+    /// same entries, held back — `None` when it would have extracted
+    /// cleanly, and always `None` when no prefix was given.
+    extract_refusal: Option<String>,
+}
+
+/// The dirhash walk, optionally also answering what the extraction walk
+/// would have said about the same entries.
+///
+/// The golang registry fetch used to inflate every entry twice: once for
+/// the dirhash, once to write the tree. Both walks read the same deflate
+/// streams and both derive everything they check from the entry's name,
+/// its declared size and how many bytes it actually decompresses to — all
+/// of which this walk already has — so the second inflate bought nothing.
+///
+/// The ORDER the two walks produced is preserved exactly. The dirhash pass
+/// ran to completion first, so its refusal still wins outright and returns
+/// here; the extraction refusal is recorded at the lowest entry index,
+/// where the second walk would have stopped, and handed back for the caller
+/// to raise only after the dirhash has been compared — which is where the
+/// second walk used to start.
+fn walk_module_zip(bytes: &[u8], validate_prefix: Option<&str>) -> Result<ModuleZipWalk, String> {
     use std::io::Read as _;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("unreadable module zip: {e}"))?;
@@ -570,6 +811,10 @@ fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
     }
     let mut files: Vec<(String, String)> = Vec::new();
     let mut total: u64 = 0;
+    // The extraction walk's own running total — DECLARED sizes, where the
+    // dirhash walk counts actual ones.
+    let mut declared_total: u64 = 0;
+    let mut extract_refusal: Option<String> = None;
     for i in 0..archive.len() {
         let mut file = archive
             .by_index(i)
@@ -581,10 +826,10 @@ fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
         if name.contains('\n') {
             return Err("module zip entry name contains a newline".to_string());
         }
-        if file.size() > MAX_ENTRY_BYTES {
+        let declared = file.size();
+        if declared > MAX_ENTRY_BYTES {
             return Err(format!(
-                "module zip entry `{name}` is {} bytes (cap {MAX_ENTRY_BYTES})",
-                file.size()
+                "module zip entry `{name}` is {declared} bytes (cap {MAX_ENTRY_BYTES})"
             ));
         }
         // The caps count ACTUAL decompressed bytes — the declared size is
@@ -615,6 +860,13 @@ fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
                 "module zip decompresses past the {MAX_TOTAL_DECOMPRESSED_BYTES}-byte cap"
             ));
         }
+        // What `extract_zip_with_prefix` would have made of this entry, in
+        // its own order. Only up to the first refusal: past that the walk it
+        // stands in for had already stopped, totals included.
+        if let (Some(prefix), None) = (validate_prefix, extract_refusal.as_ref()) {
+            extract_refusal =
+                module_entry_refusal(&name, prefix, declared, entry_bytes, &mut declared_total);
+        }
         files.push((name, hex::encode(hasher.finalize())));
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -622,10 +874,55 @@ fn go_h1_of_zip(bytes: &[u8]) -> Result<String, String> {
     for (name, content_hex) in &files {
         h.update(format!("{content_hex}  {name}\n").as_bytes());
     }
-    Ok(format!(
-        "h1:{}",
-        base64::engine::general_purpose::STANDARD.encode(h.finalize())
-    ))
+    Ok(ModuleZipWalk {
+        h1: format!(
+            "h1:{}",
+            base64::engine::general_purpose::STANDARD.encode(h.finalize())
+        ),
+        extract_refusal,
+    })
+}
+
+/// [`walk_zip_with_prefix`]'s per-entry refusals, checked in its order over
+/// the one inflate [`walk_module_zip`] already did. `actual` is how many
+/// bytes the entry really decompressed to, which is what the extraction's
+/// `take(declared + 1)` copy would have counted (capped there).
+fn module_entry_refusal(
+    name: &str,
+    prefix: &str,
+    declared: u64,
+    actual: u64,
+    declared_total: &mut u64,
+) -> Option<String> {
+    let Some(rel) = name.strip_prefix(prefix) else {
+        return Some(format!(
+            "module zip entry `{name}` lies outside `{prefix}` — refusing the artifact"
+        ));
+    };
+    if !is_safe_relative_subpath(rel) {
+        return Some(format!(
+            "module zip entry `{name}` escapes the extraction dir — refusing the artifact"
+        ));
+    }
+    if declared > MAX_ENTRY_BYTES {
+        return Some(format!(
+            "module zip entry `{name}` is {declared} bytes (cap {MAX_ENTRY_BYTES})"
+        ));
+    }
+    *declared_total += declared;
+    if *declared_total > MAX_TOTAL_DECOMPRESSED_BYTES {
+        return Some(format!(
+            "module zip decompresses past the {MAX_TOTAL_DECOMPRESSED_BYTES}-byte cap"
+        ));
+    }
+    let copied = actual.min(declared + 1);
+    if copied != declared {
+        return Some(format!(
+            "module zip entry `{name}` decompresses to {copied} bytes but declares \
+             {declared} — refusing the artifact"
+        ));
+    }
+    None
 }
 
 /// Verify a golang module zip's `h1:` dirhash against an expected value.
@@ -656,12 +953,25 @@ pub(crate) fn extract_zip_with_prefix(
     dest: &Path,
     prefix: &str,
 ) -> Result<(), String> {
+    walk_zip_with_prefix(bytes, dest, prefix, Sink::Write)
+}
+
+/// [`extract_zip_with_prefix`]'s write-free twin: every refusal, nothing
+/// created. The golang fetch gets the same answer out of its dirhash walk
+/// ([`walk_module_zip`]); this is the oracle that pins the two together.
+#[cfg(test)]
+pub(crate) fn validate_zip_with_prefix(bytes: &[u8], prefix: &str) -> Result<(), String> {
+    walk_zip_with_prefix(bytes, Path::new(""), prefix, Sink::Validate)
+}
+
+fn walk_zip_with_prefix(bytes: &[u8], dest: &Path, prefix: &str, sink: Sink) -> Result<(), String> {
     use std::io::Read as _;
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| format!("unreadable module zip: {e}"))?;
     if archive.len() > MAX_ENTRIES {
         return Err(format!("module zip exceeds {MAX_ENTRIES} entries"));
     }
+    let mut out = EntrySink::new(dest, sink);
     let mut total: u64 = 0;
     for i in 0..archive.len() {
         let mut file = archive
@@ -697,16 +1007,10 @@ pub(crate) fn extract_zip_with_prefix(
                 "module zip decompresses past the {MAX_TOTAL_DECOMPRESSED_BYTES}-byte cap"
             ));
         }
-        let target = dest.join(rel);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-        }
-        let mut out = std::fs::File::create(&target)
-            .map_err(|e| format!("cannot create {}: {e}", target.display()))?;
+        let mut target = out.open(Path::new(rel))?;
         // Hold the caps against the ACTUAL decompressed bytes too — the
         // declared size is header data a crafted zip can understate.
-        let copied = std::io::copy(&mut (&mut file).take(declared + 1), &mut out)
+        let copied = drain_entry(&mut (&mut file).take(declared + 1), target.as_mut())
             .map_err(|e| format!("cannot extract `{rel}`: {e}"))?;
         if copied != declared {
             return Err(format!(
@@ -714,13 +1018,10 @@ pub(crate) fn extract_zip_with_prefix(
                  {declared} — refusing the artifact"
             ));
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let exec = file.unix_mode().is_some_and(|m| m & 0o111 != 0);
-            let perms = if exec { 0o755 } else { 0o644 };
-            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(perms));
-        }
+        set_entry_mode(
+            target.as_ref(),
+            file.unix_mode().is_some_and(|m| m & 0o111 != 0),
+        );
     }
     Ok(())
 }
@@ -744,23 +1045,29 @@ async fn fetch_golang(
         ),
     };
     let bytes = download(client, &url).await.map_err(FetchError::Failed)?;
-    let actual = go_h1_of_zip(&bytes).map_err(FetchError::Failed)?;
-    if &actual != expected {
+    let prefix = format!("{}@{}/", entry.name, entry.version);
+    // One inflate answers both the dirhash and the extraction rules; see
+    // [`walk_module_zip`] for why that keeps the two refusals' order.
+    let walk = walk_module_zip(&bytes, Some(&prefix)).map_err(FetchError::Failed)?;
+    if walk.h1 != *expected {
         return Err(FetchError::Failed(format!(
             "go.sum dirhash mismatch: lockfile records {expected}, the fetched module zip \
-             hashes to {actual}"
+             hashes to {}",
+            walk.h1
         )));
+    }
+    if let Some(detail) = walk.extract_refusal {
+        return Err(FetchError::Failed(detail));
     }
     let tmp = tempfile::tempdir()
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
     let dir = tmp.path().join("module");
-    let prefix = format!("{}@{}/", entry.name, entry.version);
-    extract_zip_with_prefix(&bytes, &dir, &prefix).map_err(FetchError::Failed)?;
-    Ok(FetchedPackage {
+    Ok(FetchedPackage::pending(
         dir,
         url,
-        _tmp: tmp,
-    })
+        tmp,
+        Box::new(move |dest| extract_zip_with_prefix(&bytes, dest, &prefix)),
+    ))
 }
 
 async fn fetch_npm(
@@ -819,18 +1126,18 @@ async fn fetch_npm_inner(
     let tmp = tempfile::tempdir()
         .map_err(|e| FetchError::Failed(format!("cannot create fetch tempdir: {e}")))?;
     let dir = tmp.path().join("package");
-    extract_tgz(&bytes, &dir).map_err(FetchError::Failed)?;
-    if tokio::fs::metadata(dir.join("package.json")).await.is_err() {
+    if !validate_tgz(&bytes, Some("package.json")).map_err(FetchError::Failed)? {
         return Err(FetchError::Failed(format!(
             "fetched tarball for {}@{} carries no package.json — not an npm package",
             entry.name, entry.version
         )));
     }
-    Ok(FetchedPackage {
+    Ok(FetchedPackage::pending(
         dir,
         url,
-        _tmp: tmp,
-    })
+        tmp,
+        Box::new(move |dest| extract_tgz(&bytes, dest)),
+    ))
 }
 
 /// Stage a package from an on-disk vendored tarball (the fresh-clone
@@ -894,12 +1201,13 @@ pub async fn stage_local_artifact(
     let tmp = tempfile::tempdir()
         .map_err(|e| FetchError::Failed(format!("cannot create staging tempdir: {e}")))?;
     let dir = tmp.path().join("package");
-    extract_tgz(&bytes, &dir).map_err(FetchError::Failed)?;
-    Ok(FetchedPackage {
+    validate_tgz(&bytes, None).map_err(FetchError::Failed)?;
+    Ok(FetchedPackage::pending(
         dir,
-        url: format!("file:{}", tgz_path.display()),
-        _tmp: tmp,
-    })
+        format!("file:{}", tgz_path.display()),
+        tmp,
+        Box::new(move |dest| extract_tgz(&bytes, dest)),
+    ))
 }
 
 /// Capped download. http(s) only; the cap is enforced on the declared
@@ -1140,10 +1448,16 @@ pub(crate) fn extract_tgz(bytes: &[u8], dest: &Path) -> Result<(), String> {
     extract_tar_gz(bytes, dest, /*strip_first=*/ true)
 }
 
-/// Like [`extract_tgz`] but keeps entry paths verbatim (gem `data.tar.gz`
-/// archives carry package content at the root, no prefix dir).
-fn extract_tgz_no_strip(bytes: &[u8], dest: &Path) -> Result<(), String> {
-    extract_tar_gz(bytes, dest, /*strip_first=*/ false)
+/// [`extract_tgz`]'s write-free twin: every refusal, nothing created.
+/// Reports whether `watch` would land at the root (see [`lands_at_root`]).
+pub(crate) fn validate_tgz(bytes: &[u8], watch: Option<&str>) -> Result<bool, String> {
+    walk_tar_gz(
+        bytes,
+        Path::new(""),
+        /*strip_first=*/ true,
+        Sink::Validate,
+        watch,
+    )
 }
 
 /// Extract a `.gem`'s package content into `dest`. A `.gem` is a plain
@@ -1157,6 +1471,15 @@ fn extract_tgz_no_strip(bytes: &[u8], dest: &Path) -> Result<(), String> {
 /// integrity-verified `.gem` into the vendor copy dir — the same content the
 /// local `fresh_copy(installed_dir)` produces.
 pub(crate) fn extract_gem_data(gem_bytes: &[u8], dest: &Path) -> Result<(), String> {
+    walk_gem_data(gem_bytes, dest, Sink::Write)
+}
+
+/// [`extract_gem_data`]'s write-free twin: every refusal, nothing created.
+pub(crate) fn validate_gem_data(gem_bytes: &[u8]) -> Result<(), String> {
+    walk_gem_data(gem_bytes, Path::new(""), Sink::Validate)
+}
+
+fn walk_gem_data(gem_bytes: &[u8], dest: &Path, sink: Sink) -> Result<(), String> {
     use std::io::Read as _;
     let mut archive = tar::Archive::new(gem_bytes);
     for e in archive
@@ -1177,15 +1500,27 @@ pub(crate) fn extract_gem_data(gem_bytes: &[u8], dest: &Path) -> Result<(), Stri
         let mut buf = Vec::new();
         e.read_to_end(&mut buf)
             .map_err(|err| format!("cannot read data.tar.gz: {err}"))?;
-        return extract_tgz_no_strip(&buf, dest);
+        return walk_tar_gz(&buf, dest, /*strip_first=*/ false, sink, None).map(|_| ());
     }
     Err("the .gem carries no data.tar.gz".to_string())
 }
 
 fn extract_tar_gz(bytes: &[u8], dest: &Path, strip_first: bool) -> Result<(), String> {
+    walk_tar_gz(bytes, dest, strip_first, Sink::Write, None).map(|_| ())
+}
+
+fn walk_tar_gz(
+    bytes: &[u8],
+    dest: &Path,
+    strip_first: bool,
+    sink: Sink,
+    watch: Option<&str>,
+) -> Result<bool, String> {
     use std::io::Read as _;
     let gz = flate2::read::GzDecoder::new(bytes).take(MAX_TOTAL_DECOMPRESSED_BYTES);
     let mut archive = tar::Archive::new(gz);
+    let mut out = EntrySink::new(dest, sink);
+    let mut seen_watched = false;
     let mut count = 0usize;
     for entry in archive
         .entries()
@@ -1226,24 +1561,14 @@ fn extract_tar_gz(bytes: &[u8], dest: &Path, strip_first: bool) -> Result<(), St
                 "tarball entry `{rel_str}` is {size} bytes (cap {MAX_ENTRY_BYTES})"
             ));
         }
-        let target = dest.join(&rel);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-        }
-        let mut out = std::fs::File::create(&target)
-            .map_err(|e| format!("cannot create {}: {e}", target.display()))?;
-        std::io::copy(&mut entry, &mut out)
+        let mut target = out.open(&rel)?;
+        let mode = entry.header().mode().unwrap_or(0o644);
+        drain_entry(&mut entry, target.as_mut())
             .map_err(|e| format!("cannot extract `{rel_str}`: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = entry.header().mode().unwrap_or(0o644);
-            let perms = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
-            let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(perms));
-        }
+        set_entry_mode(target.as_ref(), mode & 0o111 != 0);
+        seen_watched |= watch.is_some_and(|name| lands_at_root(&rel, name));
     }
-    Ok(())
+    Ok(seen_watched)
 }
 
 #[cfg(test)]
@@ -1362,22 +1687,22 @@ mod tests {
         let fetched = fetch_and_stage(&entry, &build_registry_client())
             .await
             .unwrap();
-        assert!(fetched.dir().join("package.json").is_file());
+        assert!(fetched.dir().await.unwrap().join("package.json").is_file());
         assert_eq!(
-            std::fs::read(fetched.dir().join("index.js")).unwrap(),
+            std::fs::read(fetched.dir().await.unwrap().join("index.js")).unwrap(),
             b"module.exports = 1;\n"
         );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(fetched.dir().join("bin/cli.js"))
+            let mode = std::fs::metadata(fetched.dir().await.unwrap().join("bin/cli.js"))
                 .unwrap()
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o111, 0o111, "exec bit preserved");
         }
         // The tempdir dies with the holder.
-        let dir = fetched.dir().to_path_buf();
+        let dir = fetched.dir().await.unwrap().to_path_buf();
         drop(fetched);
         assert!(!dir.exists());
     }
@@ -1503,7 +1828,7 @@ mod tests {
         let fetched = fetch_and_stage(&entry, &build_registry_client())
             .await
             .unwrap();
-        assert!(fetched.dir().join("package.json").is_file());
+        assert!(fetched.dir().await.unwrap().join("package.json").is_file());
 
         // Tampered checksum → Failed; foreign cacheKey → Unverifiable.
         let entry = npm_entry(
@@ -1533,7 +1858,7 @@ mod tests {
         let sha = hex::encode(Sha256::digest(&tgz));
 
         let staged = stage_local_artifact(&tgz_path, &sha).await.unwrap();
-        assert!(staged.dir().join("package.json").is_file());
+        assert!(staged.dir().await.unwrap().join("package.json").is_file());
 
         match stage_local_artifact(&tgz_path, &"0".repeat(64)).await {
             Err(FetchError::Failed(msg)) => assert!(msg.contains("mismatch"), "{msg}"),
@@ -1576,8 +1901,8 @@ mod tests {
         let fetched = fetch_and_stage(&entry, &build_registry_client())
             .await
             .unwrap();
-        assert!(fetched.dir().join("Cargo.toml").is_file());
-        assert!(fetched.dir().join("src/lib.rs").is_file());
+        assert!(fetched.dir().await.unwrap().join("Cargo.toml").is_file());
+        assert!(fetched.dir().await.unwrap().join("src/lib.rs").is_file());
 
         // Tampered checksum fails closed.
         let entry = LockfileEntry {
@@ -1665,8 +1990,8 @@ mod tests {
         let fetched = fetch_and_stage(&entry, &build_registry_client())
             .await
             .unwrap();
-        assert!(fetched.dir().join("go.mod").is_file());
-        assert!(fetched.dir().join("a/b.go").is_file());
+        assert!(fetched.dir().await.unwrap().join("go.mod").is_file());
+        assert!(fetched.dir().await.unwrap().join("a/b.go").is_file());
 
         // Tampered h1 fails closed.
         let entry = LockfileEntry {
@@ -1744,8 +2069,13 @@ mod tests {
         let fetched = fetch_and_stage(&entry, &build_registry_client())
             .await
             .unwrap();
-        assert!(fetched.dir().join("composer.json").is_file());
-        assert!(fetched.dir().join("src/Logger.php").is_file());
+        assert!(fetched.dir().await.unwrap().join("composer.json").is_file());
+        assert!(fetched
+            .dir()
+            .await
+            .unwrap()
+            .join("src/Logger.php")
+            .is_file());
 
         let entry = LockfileEntry {
             integrity: LockIntegrity::Sha1Hex("0".repeat(40)),
@@ -1790,9 +2120,9 @@ mod tests {
         let fetched = fetch_and_stage(&entry, &build_registry_client())
             .await
             .expect("a flat-layout dist is a genuine, integrity-verified artifact");
-        assert!(fetched.dir().join("composer.json").is_file());
+        assert!(fetched.dir().await.unwrap().join("composer.json").is_file());
         assert!(
-            fetched.dir().join("src/Flat.php").is_file(),
+            fetched.dir().await.unwrap().join("src/Flat.php").is_file(),
             "flat-layout paths must extract verbatim, not lose their first segment"
         );
     }
@@ -1860,16 +2190,22 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            fetched.dir().join("lib/rails.rb").is_file(),
+            fetched.dir().await.unwrap().join("lib/rails.rb").is_file(),
             "data.tar.gz content extracts at the root (no strip)"
         );
-        assert!(fetched.dir().join("README.md").is_file());
+        assert!(fetched.dir().await.unwrap().join("README.md").is_file());
         // The staged leaf must be the canonical `{name}-{version}`:
         // vendor_gem's platform-suffix guard refuses any other leaf
         // (`platform_gem_unsupported`), which killed lockfile auto-fetch
         // when this dir was named `gem`.
         assert_eq!(
-            fetched.dir().file_name().unwrap().to_string_lossy(),
+            fetched
+                .dir()
+                .await
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
             "rails-7.1.0",
             "staged dir leaf must satisfy vendor_gem's `{{name}}-{{version}}` check"
         );
@@ -1932,12 +2268,18 @@ mod tests {
             .unwrap();
         // Wheel content at the root: a site-packages-shaped dir with the
         // dist-info RECORD the pypi vendor backend stages from.
-        assert!(fetched.dir().join("requests/__init__.py").is_file());
         assert!(fetched
             .dir()
+            .await
+            .unwrap()
+            .join("requests/__init__.py")
+            .is_file());
+        assert!(fetched
+            .dir()
+            .await
+            .unwrap()
             .join("requests-2.28.0.dist-info/RECORD")
             .is_file());
-
     }
 
     /// poetry.lock records wheel hashes but no URLs: the fetcher resolves the
@@ -1947,7 +2289,10 @@ mod tests {
     async fn pypi_hash_only_entry_is_resolved_through_the_json_api() {
         let wheel = make_zip(&[
             ("requests/__init__.py", b"__version__ = '2.28.0'\n"),
-            ("requests-2.28.0.dist-info/RECORD", b"requests/__init__.py,sha256=abc,24\n"),
+            (
+                "requests-2.28.0.dist-info/RECORD",
+                b"requests/__init__.py,sha256=abc,24\n",
+            ),
         ]);
         let sha = hex::encode(Sha256::digest(&wheel));
         let mock = MockServer::start().await;
@@ -1996,7 +2341,12 @@ mod tests {
         let bare_result = fetch_and_stage(&bare, &build_registry_client()).await;
         restore();
         let fetched = fetched.unwrap();
-        assert!(fetched.dir().join("requests/__init__.py").is_file());
+        assert!(fetched
+            .dir()
+            .await
+            .unwrap()
+            .join("requests/__init__.py")
+            .is_file());
         assert!(fetched.url.ends_with("requests-2.28.0-py3-none-any.whl"));
         match missing {
             Err(FetchError::Unverifiable(msg)) => assert!(msg.contains("matches"), "{msg}"),
@@ -2017,7 +2367,10 @@ mod tests {
     async fn pypi_digest_set_entry_picks_the_pure_wheel_by_hash() {
         let wheel = make_zip(&[
             ("requests/__init__.py", b"__version__ = '2.28.0'\n"),
-            ("requests-2.28.0.dist-info/RECORD", b"requests/__init__.py,sha256=abc,24\n"),
+            (
+                "requests-2.28.0.dist-info/RECORD",
+                b"requests/__init__.py,sha256=abc,24\n",
+            ),
         ]);
         let wheel_sha = hex::encode(Sha256::digest(&wheel));
         let sdist_sha = "0".repeat(64);
@@ -2081,12 +2434,27 @@ mod tests {
         let unknown_result = fetch_and_stage(&unknown, &build_registry_client()).await;
         restore();
         let fetched = fetched.unwrap();
-        assert!(fetched.dir().join("requests/__init__.py").is_file());
-        assert!(fetched.url.ends_with("requests-2.28.0-py3-none-any.whl"), "{}", fetched.url);
-        for (label, result) in [("no pure wheel", no_pure_result), ("unknown", unknown_result)] {
+        assert!(fetched
+            .dir()
+            .await
+            .unwrap()
+            .join("requests/__init__.py")
+            .is_file());
+        assert!(
+            fetched.url.ends_with("requests-2.28.0-py3-none-any.whl"),
+            "{}",
+            fetched.url
+        );
+        for (label, result) in [
+            ("no pure wheel", no_pure_result),
+            ("unknown", unknown_result),
+        ] {
             match result {
                 Err(FetchError::Unverifiable(msg)) => {
-                    assert!(msg.contains("none-any.whl") && msg.contains("digests"), "{label}: {msg}")
+                    assert!(
+                        msg.contains("none-any.whl") && msg.contains("digests"),
+                        "{label}: {msg}"
+                    )
                 }
                 other => panic!("{label}: expected Unverifiable, got {other:?}"),
             }
@@ -2586,7 +2954,7 @@ mod tests {
             format!("{}/left-pad/left-pad-1.3.0.crate", mock.uri()),
             "conventional URL: {{base}}/{{name}}/{{name}}-{{version}}.crate"
         );
-        assert!(fetched.dir().join("Cargo.toml").is_file());
+        assert!(fetched.dir().await.unwrap().join("Cargo.toml").is_file());
     }
 
     #[tokio::test]
@@ -2636,7 +3004,7 @@ mod tests {
             format!("{}/github.com/!azure/y/@v/v1.0.0-!r!c1.zip", mock.uri()),
             "case escaping must apply to the name AND the version"
         );
-        assert!(fetched.dir().join("go.mod").is_file());
+        assert!(fetched.dir().await.unwrap().join("go.mod").is_file());
     }
 
     /// go never sends a module path to a proxy when GOPROXY starts with
@@ -2794,7 +3162,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         extract_zip(&bytes, tmp.path(), /*strip_first=*/ false).unwrap();
         assert!(tmp.path().join("m@v1/go.mod").is_file());
-        assert!(!tmp.path().join("m@v1/d").exists(), "dir entry must not materialize");
+        assert!(
+            !tmp.path().join("m@v1/d").exists(),
+            "dir entry must not materialize"
+        );
 
         // The dirhash covers FILES only — the dir entry must not add a line.
         assert_eq!(
@@ -3006,6 +3377,294 @@ mod tests {
         assert!(err.contains("size cap"), "{err}");
     }
 
+    /// A gzipped tarball carrying one entry whose RAW header name is
+    /// `evil` — the tar crate refuses to write a `..` path, so a hostile
+    /// tarball's bytes have to be crafted.
+    fn make_traversing_tgz(evil: &str) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let mut header = tar::Header::new_gnu();
+        {
+            let name = &mut header.as_gnu_mut().unwrap().name;
+            name[..evil.len()].copy_from_slice(evil.as_bytes());
+        }
+        header.set_size(4);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, &b"evil"[..]).unwrap();
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// A `.gem` wrapping `data`, as `fetch_gem` receives it.
+    fn wrap_gem(data_tgz: &[u8]) -> Vec<u8> {
+        let mut outer = tar::Builder::new(Vec::new());
+        for (name, bytes) in [
+            ("metadata.gz", b"meta".as_slice()),
+            ("data.tar.gz", data_tgz),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            outer.append_data(&mut header, name, bytes).unwrap();
+        }
+        outer.into_inner().unwrap()
+    }
+
+    /// The archives the extractors refuse, each paired with the walk that
+    /// reads it. Deferring the WRITE is only safe while the fetch still
+    /// decides everything the write decided, so the validation pass has to
+    /// refuse the same bytes at the same entry with the same words.
+    #[test]
+    fn validation_pass_refuses_exactly_what_the_extractor_refuses() {
+        let big_content = vec![0x42u8; 4096];
+
+        // ── tar.gz ──────────────────────────────────────────────────────
+        let mut over_cap = tar::Header::new_gnu();
+        over_cap.set_path("package/huge.bin").unwrap();
+        over_cap.set_size(MAX_ENTRY_BYTES + 1);
+        over_cap.set_mode(0o644);
+        over_cap.set_cksum();
+        let oversized_tgz = {
+            use std::io::Write as _;
+            let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            ));
+            builder
+                .get_mut()
+                .write_all(&over_cap.as_bytes()[..])
+                .unwrap();
+            builder.into_inner().unwrap().finish().unwrap()
+        };
+        let truncated_tgz = {
+            let mut bytes = make_tgz(&[("package/a.txt", b"hello", false)]);
+            bytes.truncate(bytes.len() / 2);
+            bytes
+        };
+        for (label, bytes) in [
+            (
+                "tar traversal",
+                make_traversing_tgz("package/../../evil.js"),
+            ),
+            ("tar oversized header", oversized_tgz),
+            ("tar truncated", truncated_tgz),
+        ] {
+            let stage = tempfile::tempdir().unwrap();
+            let eager = extract_tgz(&bytes, stage.path()).unwrap_err();
+            let lazy = validate_tgz(&bytes, Some("package.json")).unwrap_err();
+            assert_eq!(lazy, eager, "{label}");
+        }
+
+        // ── zip ─────────────────────────────────────────────────────────
+        let mut lying_zip = make_zip(&[("a.bin", &big_content)]);
+        patch_declared_uncompressed_size(&mut lying_zip, 1);
+        let mut over_cap_zip = make_zip(&[("a.bin", &[0u8; 16])]);
+        patch_declared_uncompressed_size(&mut over_cap_zip, (MAX_ENTRY_BYTES + 1) as u32);
+        let truncated_zip = {
+            let mut bytes = make_zip(&[("a.txt", b"hello")]);
+            bytes.truncate(bytes.len() / 2);
+            bytes
+        };
+        for (label, bytes, strip) in [
+            ("zip traversal", make_zip(&[("../evil.txt", b"x")]), false),
+            (
+                "zip traversal after strip",
+                make_zip(&[("pfx/../../up.txt", b"x")]),
+                true,
+            ),
+            ("zip lying declared size", lying_zip, false),
+            ("zip declared over cap", over_cap_zip, false),
+            ("zip truncated", truncated_zip, false),
+        ] {
+            let stage = tempfile::tempdir().unwrap();
+            let eager = extract_zip(&bytes, stage.path(), strip).unwrap_err();
+            let lazy = validate_zip(&bytes, strip, Some("composer.json")).unwrap_err();
+            assert_eq!(lazy, eager, "{label}");
+        }
+
+        // ── module zip (prefix) ─────────────────────────────────────────
+        let prefix = "github.com/x/y@v1.0.0/";
+        let mut module_over_cap = make_module_zip(prefix, &[("big.bin", &[0u8; 16])]);
+        patch_declared_uncompressed_size(&mut module_over_cap, (MAX_ENTRY_BYTES + 1) as u32);
+        let mut module_lying = make_module_zip(prefix, &[("lie.bin", &big_content)]);
+        patch_declared_uncompressed_size(&mut module_lying, 1);
+        for (label, bytes) in [
+            (
+                "module zip outside prefix",
+                make_zip(&[("other@v1/go.mod", b"module m\n")]),
+            ),
+            (
+                "module zip interior traversal",
+                make_module_zip(prefix, &[("../evil", b"x")]),
+            ),
+            ("module zip declared over cap", module_over_cap),
+            ("module zip lying declared size", module_lying),
+        ] {
+            let stage = tempfile::tempdir().unwrap();
+            let eager = extract_zip_with_prefix(&bytes, stage.path(), prefix).unwrap_err();
+            let lazy = validate_zip_with_prefix(&bytes, prefix).unwrap_err();
+            assert_eq!(lazy, eager, "{label}");
+            // And the golang fetch's fused walk, which answers the same
+            // question off the dirhash pass's single inflate.
+            match walk_module_zip(&bytes, Some(prefix)) {
+                // The dirhash pass guards the caps too and refuses first —
+                // exactly where the pair of walks did.
+                Err(dirhash_refusal) => assert!(
+                    dirhash_refusal.contains("cap"),
+                    "{label}: {dirhash_refusal}"
+                ),
+                Ok(walk) => assert_eq!(
+                    walk.extract_refusal.as_deref(),
+                    Some(eager.as_str()),
+                    "{label}: the fused walk must hold the extraction refusal verbatim"
+                ),
+            }
+        }
+
+        // A healthy module zip: the fused walk agrees with both walks.
+        let healthy = make_module_zip(prefix, &[("go.mod", b"module m"), ("a/b.go", b"package b")]);
+        let walk = walk_module_zip(&healthy, Some(prefix)).unwrap();
+        assert_eq!(walk.h1, go_h1_of_zip(&healthy).unwrap());
+        assert_eq!(walk.extract_refusal, None);
+
+        // ── .gem ────────────────────────────────────────────────────────
+        let no_data = {
+            let mut outer = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_gnu();
+            header.set_size(4);
+            header.set_mode(0o644);
+            header.set_cksum();
+            outer
+                .append_data(&mut header, "metadata.gz", &b"meta"[..])
+                .unwrap();
+            outer.into_inner().unwrap()
+        };
+        let traversing = wrap_gem(&make_traversing_tgz("../evil.rb"));
+        for (label, bytes) in [("gem without data", no_data), ("gem traversal", traversing)] {
+            let stage = tempfile::tempdir().unwrap();
+            let eager = extract_gem_data(&bytes, stage.path()).unwrap_err();
+            let lazy = validate_gem_data(&bytes).unwrap_err();
+            assert_eq!(lazy, eager, "{label}");
+        }
+    }
+
+    /// And on a healthy archive: the pass accepts it, writes nothing, and
+    /// answers the root-file probe the fetchers used to run against the
+    /// extracted tree.
+    #[test]
+    fn validation_pass_accepts_and_answers_the_root_probe() {
+        let tgz = make_tgz(&[
+            ("package/package.json", b"{}", false),
+            ("package/bin/cli.js", b"#!/usr/bin/env node\n", true),
+        ]);
+        assert!(validate_tgz(&tgz, Some("package.json")).unwrap());
+        assert!(!validate_tgz(&tgz, Some("Cargo.toml")).unwrap());
+
+        // A nested entry counts, exactly as the directory the extraction
+        // creates for it made `metadata(dir.join(name))` succeed.
+        let nested = make_tgz(&[("package/composer.json/x", b"{}", false)]);
+        assert!(validate_tgz(&nested, Some("composer.json")).unwrap());
+
+        let zip_bytes = make_zip(&[("pfx/composer.json", b"{}"), ("pfx/src/a.php", b"<?php")]);
+        assert!(validate_zip(
+            &zip_bytes,
+            /*strip_first=*/ true,
+            Some("composer.json")
+        )
+        .unwrap());
+        assert!(!validate_zip(
+            &zip_bytes,
+            /*strip_first=*/ false,
+            Some("composer.json")
+        )
+        .unwrap());
+
+        validate_gem_data(&wrap_gem(&make_tgz(&[("lib/a.rb", b"x", false)]))).unwrap();
+        let prefix = "github.com/x/y@v1.0.0/";
+        validate_zip_with_prefix(&make_module_zip(prefix, &[("go.mod", b"module m")]), prefix)
+            .unwrap();
+    }
+
+    /// A deferred source extracts to exactly what the eager fetch wrote —
+    /// same tree, same bytes, same modes — and says so only once.
+    #[tokio::test]
+    async fn deferred_extraction_materializes_the_eager_tree() {
+        let tgz = make_tgz(&[
+            ("package/package.json", br#"{"name":"left-pad"}"#, false),
+            ("package/index.js", b"module.exports=1\n", false),
+            ("package/bin/cli.js", b"#!/usr/bin/env node\n", true),
+        ]);
+        let eager = tempfile::tempdir().unwrap();
+        extract_tgz(&tgz, eager.path()).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("package");
+        let bytes = tgz.clone();
+        let fetched = FetchedPackage::pending(
+            dir.clone(),
+            "https://example.invalid/left-pad.tgz".to_string(),
+            tmp,
+            Box::new(move |dest| extract_tgz(&bytes, dest)),
+        );
+        // The path is known before anything is written, and nothing is.
+        assert_eq!(fetched.dir_path(), dir);
+        assert!(!dir.exists(), "a pending source writes nothing until read");
+
+        assert_eq!(fetched.dir().await.unwrap(), dir);
+        for rel in ["package.json", "index.js", "bin/cli.js"] {
+            assert_eq!(
+                std::fs::read(dir.join(rel)).unwrap(),
+                std::fs::read(eager.path().join(rel)).unwrap(),
+                "{rel}"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    std::fs::metadata(dir.join(rel))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    std::fs::metadata(eager.path().join(rel))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    "{rel} mode"
+                );
+            }
+        }
+        // A second read is the same answer, not a second extraction.
+        assert_eq!(fetched.dir().await.unwrap(), dir);
+    }
+
+    /// An extraction that cannot be written reports the same failure to
+    /// every later caller, and never half-answers.
+    #[tokio::test]
+    async fn deferred_extraction_failure_is_sticky() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("package");
+        let fetched = FetchedPackage::pending(
+            dir.clone(),
+            "https://example.invalid/x.tgz".to_string(),
+            tmp,
+            Box::new(|_| Err("cannot create /nope: nope".to_string())),
+        );
+        assert_eq!(
+            fetched.dir().await.unwrap_err(),
+            "cannot create /nope: nope"
+        );
+        assert_eq!(
+            fetched.dir().await.unwrap_err(),
+            "cannot create /nope: nope",
+            "the outcome is decided once and shared"
+        );
+    }
+
     #[test]
     fn verify_go_h1_accepts_matching_dirhash() {
         // The SUCCESS path is the golang service-download content verifier —
@@ -3014,8 +3673,11 @@ mod tests {
         let zip_bytes = make_module_zip("m@v1/", &[("go.mod", b"module m\n")]);
         let h1 = go_h1_of_zip(&zip_bytes).unwrap();
         verify_go_h1(&zip_bytes, &h1).expect("a matching dirhash must verify");
-        let err = verify_go_h1(&zip_bytes, "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-            .unwrap_err();
+        let err = verify_go_h1(
+            &zip_bytes,
+            "h1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )
+        .unwrap_err();
         assert!(err.contains("mismatch"), "{err}");
     }
 
@@ -3047,9 +3709,8 @@ mod tests {
 
         // GoH1 has a dedicated fetch-path verifier; None is reachable from a
         // repair against an npm-era lock recording no integrity. Both refuse.
-        let err =
-            artifact_matches_integrity(b"x", "pkg", &LockIntegrity::GoH1("h1:x".into()))
-                .unwrap_err();
+        let err = artifact_matches_integrity(b"x", "pkg", &LockIntegrity::GoH1("h1:x".into()))
+            .unwrap_err();
         assert!(err.contains("dedicated ecosystem fetcher"), "{err}");
         let err = artifact_matches_integrity(b"x", "pkg", &LockIntegrity::None).unwrap_err();
         assert!(err.contains("no integrity recorded"), "{err}");

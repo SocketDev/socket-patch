@@ -77,6 +77,7 @@ use super::pnpm_lock::{
     revert_overrides_line, revert_pkg_record, section_bounds, split_lines, value_lines,
     vendor_value_is_for, yaml_key, yaml_key_like, KIND_LOCK_OVERRIDES,
 };
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
     WiringRecord,
@@ -283,9 +284,9 @@ impl Ctx<'_> {
 /// present iff success and not a dry run, in-sync re-runs synthesize
 /// AlreadyPatched.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_pnpm_legacy(
+pub async fn vendor_pnpm_legacy<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -294,6 +295,7 @@ pub async fn vendor_pnpm_legacy(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // ── 1. Coordinates ────────────────────────────────────────────────────

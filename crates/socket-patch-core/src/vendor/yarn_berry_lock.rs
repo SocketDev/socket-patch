@@ -60,6 +60,7 @@ use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
 use super::path::parse_vendor_path;
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -85,9 +86,9 @@ const SUPPORTED_CACHE_KEY: &str = "10c0";
 /// project. Same contract as [`super::npm_lock::vendor_npm`]: refuse-early,
 /// wire-last; `entry` is `None` for dry runs and the in-sync re-run.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_yarn_berry(
+pub async fn vendor_yarn_berry<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -96,6 +97,7 @@ pub async fn vendor_yarn_berry(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // ── 1. Coordinates (shared fail-closed guard, before any disk access) ─

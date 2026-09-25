@@ -36,6 +36,7 @@ use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
 use super::path::parse_vendor_path;
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -54,9 +55,9 @@ const KIND_LOCK_BLOCK: &str = "yarn_lock_block";
 /// the final mutation), `entry` is `None` for dry runs and the in-sync
 /// re-run.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_yarn_classic(
+pub async fn vendor_yarn_classic<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -65,6 +66,7 @@ pub async fn vendor_yarn_classic(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // ── 1. Coordinates (shared fail-closed guard, before any disk access) ─

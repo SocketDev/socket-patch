@@ -31,6 +31,7 @@ use super::npm_pack::{pack_deterministic, PackedTarball};
 use super::path::vendor_uuid_dir_rel;
 use super::reuse;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::source::PackageSource;
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
 /// Validated npm vendoring coordinates (the output of
@@ -158,7 +159,7 @@ pub(super) struct NpmStagedPack {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn stage_patch_pack(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: PackageSource<'_>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -222,6 +223,17 @@ pub(super) async fn stage_patch_pack(
         }
     };
     let stage = stage_tmp.path().join("stage");
+    // The first read of a lazily-fetched source: extracting it is part of
+    // staging the copy, and a failure reads as one.
+    let installed_dir = match installed_dir.materialize().await {
+        Ok(dir) => dir,
+        Err(e) => {
+            return Err(Box::new(done_failure(
+                purl,
+                format!("cannot stage a copy of the installed package: {e}"),
+            )))
+        }
+    };
     if let Err(e) = fresh_copy(installed_dir, &stage, None).await {
         return Err(Box::new(done_failure(
             purl,
@@ -985,7 +997,7 @@ mod tests {
             let mut warnings = Vec::new();
             match stage_patch_pack(
                 "pkg:npm/left-pad@1.3.0",
-                &root.join("node_modules/left-pad"),
+                (&root.join("node_modules/left-pad")).into(),
                 root,
                 record,
                 &sources,
@@ -1136,7 +1148,7 @@ mod tests {
         let mut warnings = Vec::new();
         stage_patch_pack(
             LP_PURL,
-            &root.join("node_modules/left-pad"),
+            (&root.join("node_modules/left-pad")).into(),
             root,
             record,
             &sources,
@@ -1414,7 +1426,7 @@ mod tests {
         let cfg = service_cfg(&server.uri(), VendorSource::Auto);
         let Ok((Some(staged), result)) = stage_patch_pack(
             LP_PURL,
-            &root.join("node_modules/left-pad"),
+            (&root.join("node_modules/left-pad")).into(),
             root,
             &record,
             &sources,

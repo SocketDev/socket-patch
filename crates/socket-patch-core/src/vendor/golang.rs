@@ -35,8 +35,9 @@ use super::common::{
     swap_stage_into_place,
 };
 use super::path::vendor_uuid_dir_rel;
-use super::registry_fetch::extract_zip_with_prefix;
+use super::registry_fetch::{extract_on_blocking_pool, extract_zip_with_prefix};
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -54,9 +55,9 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, Vendo
 /// module+version surfaces as a failed result (the engine's `go.mod` editor
 /// refuses it), not a refusal — the verify report is still useful.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_go_module(
+pub async fn vendor_go_module<'a>(
     purl: &str,
-    pristine_src: &Path,
+    pristine_src: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -65,6 +66,7 @@ pub async fn vendor_go_module(
     force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
+    let pristine_src = pristine_src.into();
     // ── coordinate validation (fail-closed, before any disk access) ──────
     let Some((module, version)) = parse_golang_purl(purl) else {
         return refused("unsafe_coordinates", format!("not a golang purl: {purl}"));
@@ -201,6 +203,23 @@ pub async fn vendor_go_module(
         }
         GoServiceRedirect::HardFail(outcome) => return *outcome,
         GoServiceRedirect::FallBack => {
+            // The local build (and the dry-run verify it previews) is the
+            // only branch that reads the pristine tree: a lazily-fetched
+            // source is extracted here.
+            let pristine_src = match pristine_src.materialize().await {
+                Ok(dir) => dir,
+                Err(e) => {
+                    return done(
+                        failed_result(
+                            purl,
+                            Path::new(""),
+                            format!("failed to copy pristine source: {e}"),
+                        ),
+                        None,
+                        warnings,
+                    )
+                }
+            };
             // Vendor auto-force policy (the engine's copy is staged from the
             // pristine source, never the user's tree — see `force_apply_staged`):
             // missing patch targets still fail closed unless the caller's own
@@ -468,7 +487,7 @@ async fn go_service_redirect(
         }
     };
     match fetch_verified_archive(cfg, &record.uuid).await {
-        ServiceArtifact::Ready(archive) => {
+        ServiceArtifact::Ready(mut archive) => {
             // Extract the module zip (strip its literal `{module}@{version}/`
             // prefix) into a STAGE sibling of the copy dir and swap it into
             // place only once verified — the cargo / composer / gem shape: a
@@ -492,7 +511,13 @@ async fn go_service_redirect(
                 );
             }
             let prefix = format!("{module}@{version}/");
-            if let Err(e) = extract_zip_with_prefix(&archive.bytes, &stage, &prefix) {
+            let zip_bytes = std::mem::take(&mut archive.bytes);
+            let prefix_owned = prefix.clone();
+            if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, move |b, d| {
+                extract_zip_with_prefix(b, d, &prefix_owned)
+            })
+            .await
+            {
                 cleanup_failed_service_stage(
                     &stage,
                     project_root,

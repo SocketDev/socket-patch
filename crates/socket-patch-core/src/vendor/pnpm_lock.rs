@@ -61,6 +61,7 @@ use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
 use super::path::parse_vendor_path;
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, PnpmMeta, VendorArtifact, VendorEntry, VendorMarker, WiringAction,
     WiringRecord,
@@ -102,9 +103,9 @@ const REVERT_ALLOWLIST: [&str; 3] = [PNPM_LOCK, PACKAGE_JSON, PNPM_WORKSPACE];
 /// refuse-early / wire-last, `entry` present iff `result.success` and not a
 /// dry run, and an in-sync re-run synthesizes AlreadyPatched with no entry.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_pnpm(
+pub async fn vendor_pnpm<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -113,6 +114,7 @@ pub async fn vendor_pnpm(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
     let mut warnings: Vec<VendorWarning> = Vec::new();
 
     // ── 1. Coordinates (shared fail-closed guard) ─────────────────────────

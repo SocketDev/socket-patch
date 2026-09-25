@@ -49,8 +49,9 @@ use super::common::{
 };
 use super::lock_inventory::{composer_lock_packages, ComposerLockPackage};
 use super::path::{parse_vendor_path, vendor_uuid_dir_rel};
-use super::registry_fetch::extract_zip;
+use super::registry_fetch::{extract_on_blocking_pool, extract_zip};
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -75,9 +76,9 @@ const WIRING_KIND: &str = "composer_lock_package";
 /// The lock edit runs LAST: any copy/patch failure removes the copy and
 /// leaves the lock untouched.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_composer(
+pub async fn vendor_composer<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -86,6 +87,7 @@ pub async fn vendor_composer(
     force: bool,
     service: Option<&VendorServiceConfig>,
 ) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
     // ── coordinates ──────────────────────────────────────────────────────
     let Some(((vendor, name), version)) = parse_composer_purl(purl) else {
         return refused("unsafe_coordinates", format!("not a composer purl: {purl}"));
@@ -229,6 +231,24 @@ pub async fn vendor_composer(
     // ── dry run: verify-only against the installed dir, no writes ────────
     if dry_run {
         let mut dry_warnings: Vec<VendorWarning> = Vec::new();
+        // The verify reads the installed tree, so a lazily-fetched source
+        // materialises here — the one dry-run branch that touches it.
+        let installed_dir = match installed_dir.materialize().await {
+            Ok(dir) => dir,
+            Err(e) => {
+                return done(
+                    synthesized_result(
+                        purl,
+                        &copy_dir,
+                        Vec::new(),
+                        false,
+                        Some(format!("failed to copy installed package: {e}")),
+                    ),
+                    None,
+                    dry_warnings,
+                )
+            }
+        };
         let mut result = super::force_apply_staged(
             purl,
             installed_dir,
@@ -558,7 +578,7 @@ async fn cleanup_failed_stage(stage: &Path, uuid_dir: &Path, unwind_uuid_dir: bo
 #[allow(clippy::too_many_arguments)]
 async fn copy_and_patch(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: PackageSource<'_>,
     copy_dir: &Path,
     uuid_dir: &Path,
     record: &PatchRecord,
@@ -570,6 +590,22 @@ async fn copy_and_patch(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<ApplyResult, ApplyResult> {
     let stage = stage_dir_for(copy_dir);
+    // The local build is the first branch that reads the installed tree: a
+    // lazily-fetched source is extracted here, and a failure reads as the
+    // copy failure it stands in for.
+    let installed_dir = match installed_dir.materialize().await {
+        Ok(dir) => dir,
+        Err(e) => {
+            cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
+            return Err(synthesized_result(
+                purl,
+                copy_dir,
+                Vec::new(),
+                false,
+                Some(format!("failed to copy installed package: {e}")),
+            ));
+        }
+    };
     // `fresh_copy` removes + recreates the stage itself.
     if let Err(e) = fresh_copy(installed_dir, &stage, None).await {
         cleanup_failed_stage(&stage, uuid_dir, unwind_uuid_dir).await;
@@ -642,7 +678,7 @@ async fn composer_service_copy(
         }
     };
     match fetch_verified_archive(cfg, &record.uuid).await {
-        ServiceArtifact::Ready(archive) => {
+        ServiceArtifact::Ready(mut archive) => {
             // Extract into a STAGE sibling and swap it into the copy dir only
             // once fully verified — a failure then leaves any pre-existing
             // (possibly live-wired) copy and its marker untouched and no husk
@@ -657,7 +693,12 @@ async fn composer_service_copy(
                 );
             }
             // composer dist zips carry a single variable top-level dir.
-            if let Err(e) = extract_zip(&archive.bytes, &stage, /*strip_first=*/ true) {
+            let zip_bytes = std::mem::take(&mut archive.bytes);
+            if let Err(e) = extract_on_blocking_pool(zip_bytes, &stage, |b, d| {
+                extract_zip(b, d, /*strip_first=*/ true)
+            })
+            .await
+            {
                 cleanup_failed_stage(&stage, uuid_dir, false).await;
                 return hard(
                     "vendor_prebuilt_extract_failed",

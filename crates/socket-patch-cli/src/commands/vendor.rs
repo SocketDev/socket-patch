@@ -24,15 +24,15 @@ use socket_patch_core::constants::SOCKET_DIR;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
+use socket_patch_core::patch::apply::{verify_file_patch, PatchSources, VerifyStatus};
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
 use socket_patch_core::utils::concurrent::{ordered_concurrent, registry_concurrency};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::{
     self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, registry_fetch,
-    save_state, RevertOpts, RevertOutcome, VendorEntry, VendorOutcome, VendorServiceConfig,
-    VendorState, VendorWarning,
+    save_state, PackageSource, RevertOpts, RevertOutcome, VendorEntry, VendorOutcome,
+    VendorServiceConfig, VendorState, VendorWarning,
 };
 use socket_patch_core::vex::time::now_rfc3339;
 use std::collections::{HashMap, HashSet};
@@ -100,11 +100,13 @@ fn refusal_is_benign(code: &str) -> bool {
 
 /// Dispatch one purl to its ecosystem backend. `pkg_path` is the crawler's
 /// installed location (site-packages root for pypi, the package dir
-/// otherwise). Returns `None` for purls with no vendor backend in this build.
+/// otherwise), or a fetched artifact the backend materialises only if it
+/// reaches a branch that reads it. Returns `None` for purls with no vendor
+/// backend in this build.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_vendor_one(
     purl: &str,
-    pkg_path: &Path,
+    pkg_path: PackageSource<'_>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -163,6 +165,29 @@ pub(crate) async fn dispatch_vendor_one(
             .await
         };
     }
+    // Maven and NuGet have no registry-fetch rung — `fetch_and_stage` serves
+    // no fetcher for either and `stage_local_artifact` is npm-only — so their
+    // source is always the crawler's own directory.
+    macro_rules! vend_installed {
+        ($backend:path) => {{
+            debug_assert!(
+                matches!(pkg_path, PackageSource::Installed(_)),
+                "{eco} has no fetch rung; a pending source would need materialising"
+            );
+            $backend(
+                purl,
+                pkg_path.path(),
+                project_root,
+                record,
+                sources,
+                vendored_at,
+                dry_run,
+                force,
+                service,
+            )
+            .await
+        }};
+    }
     Some(match eco {
         // The flavor router probes the project's lockfile (package-lock /
         // yarn / pnpm / bun) and dispatches or refuses per flavor.
@@ -186,8 +211,8 @@ pub(crate) async fn dispatch_vendor_one(
         "cargo" => vend!(vendor::cargo::vendor_cargo_crate),
         "golang" => vend!(vendor::golang::vendor_go_module),
         "composer" => vend!(vendor::composer_lock::vendor_composer),
-        "nuget" => vend!(vendor::nuget_feed::vendor_nuget),
-        "maven" => vend!(vendor::maven_repo::vendor_maven),
+        "nuget" => vend_installed!(vendor::nuget_feed::vendor_nuget),
+        "maven" => vend_installed!(vendor::maven_repo::vendor_maven),
         _ => return None,
     })
 }
@@ -1133,6 +1158,28 @@ pub(crate) async fn fetch_pristine_package(
     }
 }
 
+/// One purl's pristine source while the vendor loop is being assembled.
+///
+/// A fetched artifact is held by index into the run's `fetched_holders`
+/// rather than by path: the tree is not on disk yet (see
+/// [`registry_fetch::FetchedPackage`]), and only a backend branch that
+/// actually reads it makes it so.
+enum StagedSource {
+    /// The crawler's installed location.
+    Installed(std::path::PathBuf),
+    /// `fetched_holders[i]`.
+    Fetched(usize),
+}
+
+impl StagedSource {
+    fn as_source<'a>(&'a self, holders: &'a [registry_fetch::FetchedPackage]) -> PackageSource<'a> {
+        match self {
+            Self::Installed(dir) => PackageSource::Installed(dir),
+            Self::Fetched(at) => PackageSource::Pending(&holders[*at]),
+        }
+    }
+}
+
 /// Where a vendorable purl with no installed copy stands after the local
 /// rungs of the pristine-source ladder (see [`missing_local_rung`]).
 enum MissingRung {
@@ -1328,13 +1375,16 @@ pub(crate) async fn vendor_records_reusing(
     // registry download, and (for gem) a HashMap-order platform coin-flip.
     // The rollback variant fans each base path back out to every qualified
     // manifest purl (same invariant as `find_manifest_package_paths`).
-    let mut all_packages = find_packages_for_rollback_reusing(
+    let mut all_packages: HashMap<String, StagedSource> = find_packages_for_rollback_reusing(
         &vendorable_partition,
         &crawler_options,
         common.silent || common.json,
         prior,
     )
-    .await;
+    .await
+    .into_iter()
+    .map(|(purl, dir)| (purl, StagedSource::Installed(dir)))
+    .collect();
 
     // An npm alias is installed under its dependency key, not its actual
     // package name. The targeted resolver probes canonical paths; before
@@ -1351,7 +1401,7 @@ pub(crate) async fn vendor_records_reusing(
         None => npm_paths_by_identity(&crawler_options, &missing_npm).await,
     };
     for (purl, paths) in by_identity {
-        all_packages.insert(purl, paths[0].clone());
+        all_packages.insert(purl, StagedSource::Installed(paths[0].clone()));
     }
 
     // ── Auto-fetch: lockfile-resolved packages with no installed copy ────
@@ -1437,7 +1487,8 @@ pub(crate) async fn vendor_records_reusing(
                 }
                 let fetched = match rung {
                     MissingRung::Staged(staged) => {
-                        all_packages.insert(purl.clone(), staged.dir().to_path_buf());
+                        all_packages
+                            .insert(purl.clone(), StagedSource::Fetched(fetched_holders.len()));
                         fetched_holders.push(staged);
                         continue;
                     }
@@ -1496,7 +1547,8 @@ pub(crate) async fn vendor_records_reusing(
                             ),
                             common,
                         );
-                        all_packages.insert(purl.clone(), fetched.dir().to_path_buf());
+                        all_packages
+                            .insert(purl.clone(), StagedSource::Fetched(fetched_holders.len()));
                         fetched_holders.push(fetched);
                     }
                     PristineFetch::NoSource => {
@@ -1596,8 +1648,10 @@ pub(crate) async fn vendor_records_reusing(
     let pipenv_version = tokio::sync::OnceCell::new();
     let mut dry_in_sync: u32 = 0;
     // Sorted, so per-package lines print in the same order every run.
-    let mut all_packages: Vec<(String, std::path::PathBuf)> = all_packages.into_iter().collect();
-    all_packages.sort();
+    // Purls are unique keys, so ordering on the purl alone is the order the
+    // `(purl, path)` sort produced.
+    let mut all_packages: Vec<(String, StagedSource)> = all_packages.into_iter().collect();
+    all_packages.sort_by(|a, b| a.0.cmp(&b.0));
     // Progress over the per-package engine calls (download, pack, lockfile
     // rewrite): shown only while an engine call runs, so every per-package
     // line prints on a clean line.
@@ -1640,7 +1694,8 @@ pub(crate) async fn vendor_records_reusing(
                 .collect();
             cfg.prefetch_archives(planned)
         });
-    for (index, (purl, pkg_path)) in all_packages.iter().enumerate() {
+    for (index, (purl, staged)) in all_packages.iter().enumerate() {
+        let pkg_source = staged.as_source(&fetched_holders);
         let is_variant_eco =
             Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
         let candidates: Vec<String> = if is_variant_eco {
@@ -1680,7 +1735,14 @@ pub(crate) async fn vendor_records_reusing(
                 // disqualify a variant. Same deterministic pick as apply /
                 // core's `select_installed_variants`.
                 let first = match representative_file(&record.files) {
-                    Some((f, info)) => Some(verify_file_patch(pkg_path, f, info).await.status),
+                    Some((f, info)) => Some(match pkg_source.materialize().await {
+                        Ok(dir) => verify_file_patch(dir, f, info).await.status,
+                        // A source that cannot be materialised reads exactly
+                        // as the missing tree it is: `NotFound`, which
+                        // disqualifies the variant just as a deleted
+                        // installed dir did.
+                        Err(_) => VerifyStatus::NotFound,
+                    }),
                     None => None,
                 };
                 if !variant_matches_installed(first.as_ref()) {
@@ -1947,7 +2009,7 @@ pub(crate) async fn vendor_records_reusing(
             ));
             let outcome = dispatch_vendor_one(
                 candidate,
-                pkg_path,
+                pkg_source,
                 &common.cwd,
                 record,
                 sources,
@@ -2090,6 +2152,13 @@ pub(crate) async fn vendor_records_reusing(
                 }
             }
         }
+    }
+
+    // Every backend has staged what it needed, so the fetch tempdirs can
+    // go. Dropping them removes whatever was extracted into them — a
+    // recursive delete that belongs off the runtime thread.
+    if !fetched_holders.is_empty() {
+        let _ = tokio::task::spawn_blocking(move || drop(fetched_holders)).await;
     }
 
     // Manifest entries that targeted in-scope ecosystems but had no
@@ -2707,7 +2776,7 @@ mod dispatch_tests {
         assert_eq!(service.source, VendorSource::Service);
         let outcome = dispatch_vendor_one(
             "pkg:maven/org.apache.logging.log4j/log4j-core@2.17.0",
-            tmp.path(),
+            tmp.path().into(),
             tmp.path(),
             &record,
             &sources,

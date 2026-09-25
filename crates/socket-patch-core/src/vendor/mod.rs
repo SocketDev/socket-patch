@@ -88,6 +88,7 @@ mod pypi_wheel;
 pub mod registry_fetch;
 pub(crate) mod reuse;
 pub(crate) mod service_fetch;
+pub mod source;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod toml_surgery;
@@ -99,6 +100,7 @@ mod yarn_layering_tests;
 
 pub use path::{ecosystem_dir_for_purl, parse_vendor_path};
 pub(crate) use pypi_lock::restore_document as restore_python_document;
+pub use source::PackageSource;
 // `vex::discover` validates lockfile-recorded npm names with the same rule the
 // npm backends apply to their own coordinates.
 pub(crate) use npm_common::is_safe_npm_name;
@@ -314,14 +316,16 @@ impl VendorServiceConfig {
             return None;
         }
         let client = self.client.as_ref()?;
-        Some(client.prefetch_vendor_packages(
-            uuids,
-            self.use_public_proxy,
-            self.vendor_url.as_deref(),
-            self.patch_server_url.as_deref(),
-            crate::utils::concurrent::api_concurrency(self.use_public_proxy)
-                .min(ARCHIVE_PREFETCH_WINDOW),
-        ))
+        Some(
+            client.prefetch_vendor_packages(
+                uuids,
+                self.use_public_proxy,
+                self.vendor_url.as_deref(),
+                self.patch_server_url.as_deref(),
+                crate::utils::concurrent::api_concurrency(self.use_public_proxy)
+                    .min(ARCHIVE_PREFETCH_WINDOW),
+            ),
+        )
     }
 }
 

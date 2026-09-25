@@ -40,6 +40,7 @@ use super::pypi_wheel::{
 };
 use super::reuse;
 use super::service_fetch::{fetch_verified_archive, ServiceArtifact};
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, PdmMeta, PipenvMeta, PoetryMeta, UvMeta, VendorArtifact, VendorEntry,
     VendorMarker,
@@ -521,9 +522,9 @@ fn pipenv_wired_pin(lock: &serde_json::Value, uuid_dir_rel: &str) -> Option<(Str
 /// the patched wheel at `.socket/vendor/pypi/<uuid>/<wheel>`, write the
 /// marker, then wire the project files (LAST).
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_pypi(
+pub async fn vendor_pypi<'a>(
     purl: &str,
-    site_packages: &Path,
+    site_packages: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -616,9 +617,9 @@ async fn pipenv_stale_install_warning(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_pypi_with_pipenv_version(
+pub async fn vendor_pypi_with_pipenv_version<'a>(
     purl: &str,
-    site_packages: &Path,
+    site_packages: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -628,6 +629,7 @@ pub async fn vendor_pypi_with_pipenv_version(
     service: Option<&VendorServiceConfig>,
     pipenv_version: &tokio::sync::OnceCell<Option<u32>>,
 ) -> VendorOutcome {
+    let site_packages = site_packages.into();
     // The purl may carry `?artifact_id=` variant qualifiers; everything here
     // keys off the qualifier-free base.
     let base = strip_purl_qualifiers(purl);
@@ -1632,7 +1634,7 @@ async fn acquire_patched_wheel(
     base: &str,
     raw_name: &str,
     version: &str,
-    site_packages: &Path,
+    site_packages: PackageSource<'_>,
     uuid_dir_rel: &str,
     project_root: &Path,
     record: &PatchRecord,
@@ -1668,7 +1670,17 @@ async fn acquire_patched_wheel(
         }
     }
 
-    // Local build from the installed dist.
+    // Local build from the installed dist — the first branch that reads the
+    // site-packages tree, so a lazily-fetched wheel is extracted here.
+    let site_packages = match site_packages.materialize().await {
+        Ok(dir) => dir,
+        Err(e) => {
+            return Err(refused(
+                "pypi_dist_not_found",
+                format!("cannot stage a copy of the installed distribution: {e}"),
+            ))
+        }
+    };
     let dist = match locate_installed_dist(site_packages, raw_name, version).await {
         Ok(d) => d,
         Err((code, detail)) => return Err(refused(code, detail)),

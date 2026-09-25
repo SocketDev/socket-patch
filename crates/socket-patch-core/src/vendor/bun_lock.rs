@@ -52,6 +52,7 @@ use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
 use super::path::parse_vendor_path;
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -323,9 +324,9 @@ pub async fn binary_vendor_paths(project_root: &Path) -> Result<Vec<String>, Str
 /// `entry` present iff `result.success` and not a dry run, and an in-sync
 /// re-run synthesizes AlreadyPatched with no entry.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn vendor_bun(
+pub(crate) async fn vendor_bun<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -334,6 +335,7 @@ pub(crate) async fn vendor_bun(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
     if !project_root.join(BUN_LOCK).exists() && project_root.join("bun.lockb").exists() {
         return super::bun_binary::vendor(
             purl,

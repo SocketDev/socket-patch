@@ -26,6 +26,7 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
 
 use super::pnpm_lock_legacy::PnpmLockGrammar;
+use super::source::PackageSource;
 use super::state::VendorEntry;
 use super::{
     bun_lock, npm_lock, pnpm_lock, pnpm_lock_legacy, yarn_berry_lock, yarn_classic_lock,
@@ -316,9 +317,9 @@ async fn sniff_yarn_lock(project_root: &Path) -> Result<NpmLockFlavor, (&'static
 /// surface verbatim; the detected flavor is stamped onto the ledger entry so
 /// `revert_npm_any` routes back to the same backend.
 #[allow(clippy::too_many_arguments)]
-pub async fn vendor_npm_any(
+pub async fn vendor_npm_any<'a>(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: impl Into<PackageSource<'a>>,
     project_root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -327,6 +328,7 @@ pub async fn vendor_npm_any(
     force: bool,
     service: Option<&super::VendorServiceConfig>,
 ) -> VendorOutcome {
+    let installed_dir = installed_dir.into();
     let (flavor, probe_warnings) = match detect_npm_lock_flavor(project_root).await {
         Ok(found) => found,
         Err((code, detail)) => return VendorOutcome::Refused { code, detail },

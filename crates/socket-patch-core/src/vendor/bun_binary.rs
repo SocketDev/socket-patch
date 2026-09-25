@@ -6,6 +6,7 @@ use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
 use super::path::parse_vendor_path;
+use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
@@ -29,7 +30,7 @@ fn is_ours(package: &BinaryPackage, name: &str, leaf: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn vendor(
     purl: &str,
-    installed_dir: &Path,
+    installed_dir: PackageSource<'_>,
     root: &Path,
     record: &PatchRecord,
     sources: &PatchSources<'_>,
@@ -545,7 +546,7 @@ mod symlink_tests {
             assert!(preflight.1.contains("symbolic link"));
             let outcome = vendor(
                 purl,
-                &root.path().join("node_modules/minimist"),
+                (&root.path().join("node_modules/minimist")).into(),
                 root.path(),
                 &record,
                 &PatchSources::blobs_only(root.path()),
@@ -680,7 +681,7 @@ mod rebuild_tests {
         let blobs = fx.root().join(".socket/blobs");
         vendor(
             PURL,
-            &fx.installed(),
+            (&fx.installed()).into(),
             fx.root(),
             &fx.record,
             &PatchSources::blobs_only(&blobs),
