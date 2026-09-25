@@ -894,6 +894,18 @@ fn rewrite_cargo(
                 &root_workspace,
             ) {
                 Ok(plan) => {
+                    if let Err(reason) = validate_cargo_toml_pins(
+                        &plan.content,
+                        &dep.name,
+                        &dep.version,
+                        &other_versions,
+                        &reg,
+                        &plan.workspace,
+                        &root_workspace,
+                    ) {
+                        refused = Some((path.clone(), reason));
+                        break;
+                    }
                     if path == "Cargo.toml" {
                         root_workspace = plan.workspace.clone();
                     }
@@ -1738,6 +1750,96 @@ fn cargo_toml_inline_string(inner: &str, key: &str) -> Option<String> {
         .get(key)?
         .as_str()
         .map(str::to_string)
+}
+
+fn validate_cargo_toml_pins(
+    content: &str,
+    crate_name: &str,
+    version: &str,
+    other_versions: &[String],
+    registry: &str,
+    workspace: &BTreeMap<String, CargoWorkspaceEntry>,
+    inherited: &BTreeMap<String, CargoWorkspaceEntry>,
+) -> Result<(), String> {
+    let document = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| "the planned manifest does not parse as TOML".to_string())?;
+    let unpinned = |dependencies: &dyn toml_edit::TableLike| {
+        dependencies.iter().find_map(|(key, entry)| {
+            let table = entry.as_table_like();
+            let field = |name: &str| table.and_then(|table| table.get(name));
+            if field("workspace").and_then(toml_edit::Item::as_bool) == Some(true) {
+                return match workspace.get(key).or(inherited.get(key)) {
+                    Some(
+                        CargoWorkspaceEntry::Pinned
+                        | CargoWorkspaceEntry::OtherVersion
+                        | CargoWorkspaceEntry::OtherPackage,
+                    ) => None,
+                    None if key != crate_name => None,
+                    None => Some(key.to_string()),
+                };
+            }
+            let name = field("package")
+                .and_then(toml_edit::Item::as_str)
+                .unwrap_or(key);
+            if name != crate_name {
+                return None;
+            }
+            let requirement = entry
+                .as_str()
+                .or_else(|| field("version").and_then(toml_edit::Item::as_str));
+            match cargo_req_selects(requirement, version, other_versions) {
+                CargoReqMatch::NotOurs => return None,
+                CargoReqMatch::Ambiguous => return Some(key.to_string()),
+                CargoReqMatch::Ours => {}
+            }
+            let is_pinned = field("registry").and_then(toml_edit::Item::as_str) == Some(registry)
+                && field("path").is_none()
+                && field("git").is_none()
+                && field("registry-index").is_none();
+            (!is_pinned).then(|| key.to_string())
+        })
+    };
+    let mut scopes: Vec<&dyn toml_edit::TableLike> = vec![document.as_table()];
+    if let Some(targets) = document
+        .get("target")
+        .and_then(toml_edit::Item::as_table_like)
+    {
+        scopes.extend(
+            targets
+                .iter()
+                .filter_map(|(_, target)| target.as_table_like()),
+        );
+    }
+    for scope in scopes {
+        for kind in [
+            "dependencies",
+            "dev-dependencies",
+            "build-dependencies",
+            "dev_dependencies",
+            "build_dependencies",
+        ] {
+            if let Some(key) = scope
+                .get(kind)
+                .and_then(toml_edit::Item::as_table_like)
+                .and_then(&unpinned)
+            {
+                return Err(format!("dependency declaration {key} was not pinned"));
+            }
+        }
+    }
+    if let Some(key) = document
+        .get("workspace")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(unpinned)
+    {
+        return Err(format!(
+            "workspace dependency declaration {key} was not pinned"
+        ));
+    }
+    Ok(())
 }
 
 struct CargoTomlPlan {
@@ -9068,6 +9170,86 @@ mod tests {
         );
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         assert!(r.confirmed_cargo_uuids.contains(CARGO_UUID));
+    }
+
+    #[test]
+    fn cargo_root_dependency_forms_cannot_leave_partial_redirect() {
+        for dependency in [
+            "dependencies.serde = \"1.0.190\"",
+            "dependencies = { serde = \"1.0.190\" }",
+            "dependencies = { serde = { version = \"1.0.190\" } }",
+            "target.'cfg(unix)'.dependencies.serde = \"1.0.190\"",
+            "workspace.dependencies.serde = \"1.0.190\"",
+            "workspace = { dependencies = { serde = \"1.0.190\" } }",
+        ] {
+            let manifest = format!(
+                "{dependency}\n\n[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [dev-dependencies]\nserde = \"1.0.190\"\n"
+            );
+            assert!(manifest.parse::<toml_edit::DocumentMut>().is_ok());
+            let result =
+                rewrite_registry_redirect(&cargo_files(&manifest), &[cargo_sparse_override()]);
+            assert!(result.files.is_empty(), "{manifest}: {:?}", result.files);
+            assert!(result.edits.is_empty(), "{manifest}");
+            assert!(result.confirmed_cargo_uuids.is_empty(), "{manifest}");
+            assert!(result
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "redirect_cargo_toml_dep_unrewritable"));
+        }
+    }
+
+    #[test]
+    fn cargo_semantic_pin_guard_preserves_other_version_declarations() {
+        let manifest = "dependencies.serde = \"0.9\"\n\n\
+                        [package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                        [dev-dependencies]\nserde = \"1.0.190\"\n";
+        let mut files = cargo_files(manifest);
+        files.get_mut("Cargo.lock").unwrap().push_str(&format!(
+            "\n[[package]]\nname = \"serde\"\nversion = \"0.9.15\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+             checksum = \"{}\"\n",
+            "a".repeat(64)
+        ));
+        let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.confirmed_cargo_uuids.contains(CARGO_UUID));
+        let document = result.files["Cargo.toml"]
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert_eq!(document["dependencies"]["serde"].as_str(), Some("0.9"));
+        assert_eq!(
+            document["dev-dependencies"]["serde"]["registry"].as_str(),
+            Some(cargo_reg().as_str())
+        );
+    }
+
+    #[test]
+    fn cargo_semantic_pin_guard_checks_unchanged_members() {
+        let mut files = cargo_files(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [workspace]\nmembers = [\"member\"]\n\n\
+             [dependencies]\nserde = \"1.0.190\"\n",
+        );
+        files.insert(
+            "member/Cargo.toml".to_string(),
+            "dependencies = { serde = \"1.0.190\" }\n\n\
+             [package]\nname = \"member\"\nversion = \"0.1.0\"\n"
+                .to_string(),
+        );
+        files.get_mut("Cargo.lock").unwrap().push_str(
+            "\n[[package]]\nname = \"member\"\nversion = \"0.1.0\"\n\
+             dependencies = [\"serde\"]\n",
+        );
+        let result = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
+        assert!(result.files.is_empty());
+        assert!(result.edits.is_empty());
+        assert!(result.confirmed_cargo_uuids.is_empty());
+        assert!(result.warnings.iter().any(|warning| {
+            warning.code == "redirect_cargo_toml_dep_unrewritable"
+                && warning.detail.contains("member/Cargo.toml")
+                && warning.detail.contains("was not pinned")
+        }));
     }
 
     #[test]
@@ -16535,13 +16717,8 @@ packages:
     // tolerance legs, workspace-inheritance satisfaction, and the remaining
     // diagnosis spellings.
 
-    /// Malformed Cargo.toml section headers (unbalanced quote in a segment,
-    /// an unclosed `[dependencies`) must classify as non-dependency sections
-    /// — their entries stay byte-identical — and garbage lines inside the
-    /// real [dependencies] table are skipped while the real entry still
-    /// gains the pin.
     #[test]
-    fn cargo_malformed_headers_and_table_lines_are_skipped_not_fatal() {
+    fn cargo_malformed_manifest_headers_and_lines_refuse_redirect() {
         let files = cargo_files(
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
              [target.'cfg(unix).dependencies]\nserde = \"9.9.9\"\n\n\
@@ -16549,50 +16726,29 @@ packages:
              [dependencies]\n= \"junk\"\njunk\nserde = \"1.0.190\"\n",
         );
         let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
-        assert!(
-            r.warnings.is_empty(),
-            "garbage headers/lines are skipped, not refused: {:?}",
-            r.warnings
-        );
-        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
-        let pinned = format!(
-            "serde = {{ version = \"1.0.190\", registry = \"{}\" }}",
-            cargo_reg()
-        );
-        assert_eq!(
-            toml.matches(&pinned).count(),
-            1,
-            "only the real [dependencies] entry is pinned: {toml}"
-        );
-        assert!(
-            toml.contains("serde = \"9.9.9\"") && toml.contains("serde = \"8.8.8\""),
-            "entries under malformed headers stay byte-identical: {toml}"
-        );
-        assert!(
-            toml.contains("= \"junk\"\njunk\n"),
-            "garbage table lines survive untouched: {toml}"
-        );
+        assert!(r.files.is_empty());
+        assert!(r.edits.is_empty());
+        assert!(r.confirmed_cargo_uuids.is_empty());
+        assert!(r.warnings.iter().any(|warning| {
+            warning.code == "redirect_cargo_toml_dep_unrewritable"
+                && warning.detail.contains("does not parse as TOML")
+        }));
     }
 
-    /// Unparseable lines INSIDE a `[dependencies.<key>]` table block (a bare
-    /// `= …`, a key token with no `=`) are skipped by the block scanner while
-    /// the block still gains its `registry` pin right after the header.
     #[test]
-    fn cargo_dep_entry_block_garbage_lines_are_skipped() {
+    fn cargo_malformed_dep_entry_block_refuses_redirect() {
         let files = cargo_files(
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
              [dependencies.serde]\n= \"zap\"\npackage \"serde\"\nversion = \"1.0.190\"\n",
         );
         let r = rewrite_registry_redirect(&files, &[cargo_sparse_override()]);
-        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
-        let toml = r.files.get("Cargo.toml").expect("Cargo.toml rewritten");
-        assert!(
-            toml.contains(&format!(
-                "[dependencies.serde]\nregistry = \"{}\"\n= \"zap\"\npackage \"serde\"\nversion = \"1.0.190\"",
-                cargo_reg()
-            )),
-            "registry pin inserted after the header, garbage lines untouched: {toml}"
-        );
+        assert!(r.files.is_empty());
+        assert!(r.edits.is_empty());
+        assert!(r.confirmed_cargo_uuids.is_empty());
+        assert!(r.warnings.iter().any(|warning| {
+            warning.code == "redirect_cargo_toml_dep_unrewritable"
+                && warning.detail.contains("does not parse as TOML")
+        }));
     }
 
     /// A `[workspace.dependencies]` entry ALREADY pinned to the managed
