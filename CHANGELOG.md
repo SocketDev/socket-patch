@@ -97,12 +97,13 @@ into the new version's section — see docs/releasing.md.
   of `.cargo/config.toml` / `.cargo/config`, so Socket scanners can recover
   the patch uuid from the manifest alone and single-version wiring builds
   on cargo older than 1.56 (the floor of config-file `[patch]`; proven on
-  cargo 1.41 with no network); two vendored versions of one crate make older cargo
-  load the crates.io index to tell the two entries apart: `--offline` from
-  an empty `$CARGO_HOME` is enough on cargo 1.56, while older cargo such as
-  1.41 needs the index itself (the crates.io index in `$CARGO_HOME`, or
-  network access), and without `--offline` either one first tries to update
-  the index and fails when it is unreachable. The edit is
+  cargo 1.41 with no network). TWO vendored versions of one crate need
+  cargo 1.45 or newer: from 1.45 `--offline` from an empty `$CARGO_HOME` is
+  enough (without `--offline` it first tries to update the crates.io index
+  and fails when that is unreachable), while cargo before 1.45 resolves
+  every source-less lock entry for a crate through one `[patch]` path and
+  fails closed on the other — see the `cargo_multi_version_old_cargo`
+  entry under Fixed. The edit is
   format-preserving (comments, ordering, CRLF / mixed line endings, a
   UTF-8 BOM and the trailing-newline state survive; a revert restores the
   manifest byte for byte and keeps a user's own `[patch]` /
@@ -726,6 +727,24 @@ into the new version's section — see docs/releasing.md.
   `setup --remove` could not land byte-identical on the pre-setup file.
   `package.json` is now written in its own layout (BOM, indent, line ending,
   trailing-newline shape), the same helper the vendored backends use.
+- **Two vendored versions of one cargo crate are documented — and now
+  warned about — as needing cargo 1.45.** The docs said older cargo (1.41)
+  only needed a populated crates.io index. It needs more than that: cargo
+  before 1.45 resolves every source-less `Cargo.lock` entry for a crate
+  through ONE `[patch.crates-io]` path — the entry whose KEY sorts last —
+  so one of the two versions is pinned to the other's copy and `cargo build
+  --locked` fails closed with ``patch for `<crate>` … did not resolve to
+  any crates``, index or no index. The old-toolchain e2e passed only
+  because its fixture uuids happened to sort the other way; it now uses the
+  adversarial order, and the floor was measured rather than assumed — on
+  one two-version fixture in both key orders, 1.41.1, 1.42, 1.43 and 1.44
+  refuse the adversarial order while 1.45, 1.49, 1.53, 1.56 and current
+  stable resolve either order, each lock entry to its own copy. Vendoring a
+  second version of a crate warns with `cargo_multi_version_old_cargo`
+  unless the project's `rust-version` or `rust-toolchain[.toml]` promises
+  cargo 1.45 or newer (socket-patch never runs `cargo`, so those files are
+  the only signal it has). A SINGLE vendored version still builds on cargo
+  1.41, as before.
 - **A CRLF `Cargo.lock` stays CRLF, and reverts byte-for-byte.** Vendoring
   rewrote every line of a lock committed with Windows line endings as LF
   (`toml_edit` renders LF only), and `vendor --revert` then "restored" the

@@ -36,8 +36,8 @@
 //! tagged lock build the patched copy with no network on cargo 1.41 / 1.56
 //! — the local `rust:1.41-slim` / `rust:1.56-slim` docker images, preferred,
 //! else installed rustup toolchains 1.36..=1.56 (type-check only) —
-//! config-file `[patch]` needs 1.56+; two versions of one crate there need
-//! `--offline`; skipped when neither is available, required by the
+//! config-file `[patch]` needs 1.56+; two versions of one crate need cargo
+//! 1.45+ and `--offline`; skipped when neither is available, required by the
 //! `cargo-old-toolchains` CI leg). Also: a
 //! URL-spelled crates.io `[patch]` table is refused, an ancestor-directory
 //! config entry cannot silently shadow the vendored copy, and the pre-v5
@@ -1190,7 +1190,14 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
 
 // ── v5 manifest wiring: multi-version, legacy migration, old toolchains ─
 
-const UUID_OLD: &str = "3c4d5e6f-7081-4b2c-9d3e-123456789abc";
+/// The second patch uuid of the multi-version fixtures. Deliberately
+/// ADVERSARIAL: its `cfg-if-socket-1a2b3c4d` key sorts BEFORE `UUID`'s, so
+/// the HIGHER version's `[patch.crates-io]` key sorts LAST — the order
+/// cargo before 1.45 cannot resolve (see
+/// `cargo_vendored_two_versions_are_refused_by_cargo_below_1_45`). With the
+/// opposite order 1.41 happens to build, so a favorable pair would let a
+/// regression in the modern-cargo path go unnoticed here.
+const UUID_OLD: &str = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
 const PATCH_SUFFIX_OLD: &str =
     "\n/// Socket-patch marker for the OLD major (added by the vendored patch).\npub fn socket_patched_old() -> u32 { 2 }\n";
 
@@ -2070,6 +2077,12 @@ const OLD_TOOLCHAINS_REQUIRED_ENV: &str = "SOCKET_PATCH_CARGO_OLD_TOOLCHAINS_REQ
 /// locally (the test never pulls; the CI leg does).
 const OLD_CARGO_IMAGES: [(&str, u32); 2] = [("rust:1.41-slim", 41), ("rust:1.56-slim", 56)];
 
+/// The cargo minor from which two vendored versions of one crate resolve in
+/// EITHER `[patch.crates-io]` key order — the floor
+/// `socket_patch_core`'s `MULTI_VERSION_CARGO_MINOR` warns below. Measured
+/// on 1.41.1/1.42/1.43/1.44 (refuse) and 1.45/1.49/1.53/1.56 (build).
+const MULTI_VERSION_FLOOR: u32 = 45;
+
 /// One old cargo under test.
 #[derive(Clone, Debug)]
 enum OldCargo {
@@ -2312,26 +2325,33 @@ fn cargo_vendored_manifest_patch_builds_on_old_toolchains() {
     }
 }
 
-/// OLD TOOLCHAIN, TWO VERSIONS of one crate: older cargo loads the
-/// crates.io index to tell two same-named `[patch]` entries apart. Every
-/// clause of the documented constraint is ASSERTED here, in both
-/// directions, because both arms run with no network (docker `--network
-/// none`, rustup pointed at a dead proxy):
+/// OLD TOOLCHAIN, TWO VERSIONS of one crate: cargo 1.45 is the FLOOR.
 ///
-/// * without `--offline` the build MUST fail, and fail on the unreachable
-///   index — the negative control for "pass `--offline`";
-/// * cargo 1.56 then builds under `--offline` from an EMPTY CARGO_HOME;
-/// * older cargo (1.41) MUST first fail even under `--offline` (no registry
-///   cache to read), and the documented remedy — a populated crates.io
-///   index in `$CARGO_HOME` — must then build (and run) both patched
-///   copies with no network. That step is unconditional below 1.56, so a
-///   cargo that stops needing it fails this test instead of silently
-///   skipping the remedy.
+/// Cargo before 1.45 resolves every source-less `Cargo.lock` entry for a
+/// crate through ONE `[patch.crates-io]` path — the entry whose KEY sorts
+/// last — so with two vendored versions one lock entry is pinned to the
+/// other version's copy. The fixture uuids are chosen so the HIGHER
+/// version's key sorts last (see `UUID_OLD`), the order 1.41 cannot take;
+/// with the opposite order 1.41 happens to build, which is how the
+/// limitation went unnoticed. Asserted in every direction, with no network
+/// (docker `--network none`, rustup pointed at a dead proxy):
 ///
-/// Current stable needs neither — see
+/// * without `--offline` EVERY old cargo fails on the unreachable
+///   crates.io index (it loads the index to tell two same-named `[patch]`
+///   entries apart) — the negative control for "pass `--offline`";
+/// * cargo 1.45 and later then build BOTH copies under `--offline` from an
+///   EMPTY CARGO_HOME (measured on 1.45, 1.49, 1.53 and 1.56);
+/// * below 1.45 `--offline` fails on the patch resolution itself —
+///   ``patch for `cfg-if` … did not resolve to any crates`` — from an empty
+///   CARGO_HOME AND with the index remedy that makes a single vendored
+///   version work there (measured on 1.41.1, 1.42, 1.43 and 1.44). A cargo
+///   below 1.45 that starts building this fails the test instead of
+///   silently widening the supported range.
+///
+/// Current stable needs none of it — see
 /// `cargo_vendor_two_versions_of_one_crate_locked_build`.
 #[test]
-fn cargo_vendored_two_versions_on_old_toolchains_need_offline() {
+fn cargo_vendored_two_versions_are_refused_by_cargo_below_1_45() {
     const SUITE: &str = "e2e_vendor_cargo_build (old-toolchain multi-version)";
     let Some(cargos) = old_cargos_or_skip(SUITE) else {
         return;
@@ -2345,6 +2365,22 @@ fn cargo_vendored_two_versions_on_old_toolchains_need_offline() {
     };
     let env = vendor_ok(&fx.proj, &fx.cargo_home, "old-toolchain multi-version");
     assert_eq!(env["summary"]["failed"], 0, "{env}");
+    // The vendor says the project now needs cargo 1.45 (the fixture
+    // declares no `rust-version` and pins no toolchain).
+    assert!(
+        env["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["errorCode"] == "cargo_multi_version_old_cargo"),
+        "the second version must warn about the cargo floor: {env}"
+    );
+    // The adversarial key order is what this test pins.
+    let manifest = std::fs::read_to_string(fx.proj.join("Cargo.toml")).unwrap();
+    assert!(
+        socket_key(UUID_OLD) < socket_key(UUID),
+        "the HIGHER version's key must sort last: {manifest}"
+    );
     std::fs::write(fx.proj.join("src/main.rs"), TWO_VERSION_MAIN).unwrap();
     let lock = std::fs::read_to_string(fx.proj.join("Cargo.lock")).unwrap();
     if !lock.contains("version = 4\n") {
@@ -2373,43 +2409,66 @@ fn cargo_vendored_two_versions_on_old_toolchains_need_offline() {
              wiring:\n{online_stderr}"
         );
         println!("old-toolchain multi-version {name} without --offline: needs the index");
-        let mut run = old_cargo_run(&old, &fresh, &["--offline"]);
-        if old.minor() < 56 {
-            let stderr = String::from_utf8_lossy(&run.out.stderr).into_owned();
+
+        let run = old_cargo_run(&old, &fresh, &["--offline"]);
+        let stderr = String::from_utf8_lossy(&run.out.stderr).into_owned();
+        if old.minor() >= MULTI_VERSION_FLOOR {
             assert!(
-                !run.out.status.success(),
-                "{name}: below 1.56 an EMPTY CARGO_HOME cannot tell the two [patch] \
-                 entries apart offline — the reason the index remedy is documented:\n\
-                 {stderr}"
+                run.out.status.success(),
+                "{name}: 1.{MULTI_VERSION_FLOOR}+ must build two vendored versions under \
+                 --offline from an empty CARGO_HOME:\n{stderr}"
             );
-            assert!(
-                stderr.contains("unable to fetch registry") && stderr.contains("in offline mode"),
-                "{name}: the only accepted failure below 1.56 is the missing registry \
-                 index:\n{stderr}"
-            );
-            println!("old-toolchain multi-version {name}: needs a registry index (documented)");
-            seed_old_crates_io_index(&fresh.join(".old-cargo-home"), &[&fx.new_v, &fx.old_v]);
-            run = old_cargo_run(&old, &fresh, &["--offline"]);
+            if matches!(old, OldCargo::Docker { .. }) {
+                assert!(
+                    String::from_utf8_lossy(&run.out.stdout).contains("MARKER:1:2"),
+                    "{name}: both patched copies run: {}",
+                    String::from_utf8_lossy(&run.out.stdout)
+                );
+            }
+            let _ = std::fs::remove_dir_all(&fresh);
+            continue;
         }
+
+        // Below 1.45 the patch resolution itself fails, with an empty
+        // CARGO_HOME and with the documented index remedy alike.
         assert!(
-            run.out.status.success(),
-            "{name}: two vendored versions must build under --offline:\n{}",
-            String::from_utf8_lossy(&run.out.stderr)
+            !run.out.status.success(),
+            "{name}: below 1.{MULTI_VERSION_FLOOR} two vendored versions must NOT build \
+             offline:\n{stderr}"
         );
-        if matches!(old, OldCargo::Docker { .. }) {
-            assert!(
-                String::from_utf8_lossy(&run.out.stdout).contains("MARKER:1:2"),
-                "{name}: both patched copies run: {}",
-                String::from_utf8_lossy(&run.out.stdout)
-            );
-        }
+        assert!(
+            stderr.contains("did not resolve to any crates"),
+            "{name}: below 1.{MULTI_VERSION_FLOOR} the failure is the unresolvable second \
+             `[patch]` entry:\n{stderr}"
+        );
+        seed_old_crates_io_index(&fresh.join(".old-cargo-home"), &[&fx.new_v, &fx.old_v]);
+        let seeded = old_cargo_run(&old, &fresh, &["--offline"]);
+        let seeded_stderr = String::from_utf8_lossy(&seeded.out.stderr).into_owned();
+        assert!(
+            !seeded.out.status.success(),
+            "{name}: below 1.{MULTI_VERSION_FLOOR} two vendored versions must NOT build \
+             even with a populated crates.io index — if this cargo now resolves both \
+             `[patch]` entries, the documented floor is wrong:\nstdout:\n{}\nstderr:\n\
+             {seeded_stderr}",
+            String::from_utf8_lossy(&seeded.out.stdout)
+        );
+        assert!(
+            seeded_stderr.contains("did not resolve to any crates"),
+            "{name}: the pinned failure is the unresolvable second `[patch]` entry, not \
+             something else:\n{seeded_stderr}"
+        );
+        println!(
+            "old-toolchain multi-version {name}: refused below 1.{MULTI_VERSION_FLOOR} \
+             (documented)"
+        );
         let _ = std::fs::remove_dir_all(&fresh);
     }
 }
 
-/// The documented remedy for two vendored versions on cargo older than
-/// 1.56: a populated crates.io index in `$CARGO_HOME`. Writes the minimal
-/// one an old cargo reads offline — the git index at the pre-1.85
+/// A populated crates.io index in `$CARGO_HOME` — what an old cargo needs
+/// before it can even look at two same-named `[patch]` entries offline, and
+/// the state in which the sub-1.45 refusal is pinned. Writes the minimal
+/// index an old cargo reads offline — the git index at the pre-1.85
 /// `registry/index/github.com-1ecc6299db9ec823` path (`origin/HEAD` names
 /// the tree cargo loads), listing `versions` of the patched crate. No
 /// `.crate` is cached: every listed version is patched to a path copy, so

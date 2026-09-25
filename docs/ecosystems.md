@@ -216,7 +216,7 @@ entry in the **workspace-root `Cargo.toml`** (the manifest beside the
 ```toml
 [patch.crates-io]
 cfg-if-socket-9f6b2c4e = { package = "cfg-if", path = ".socket/vendor/cargo/<uuid>/cfg-if-1.0.4" }
-# a second vendored version of the same crate:
+# a second vendored version of the same crate (needs cargo 1.45+):
 cfg-if-socket-0a1b2c3d = { package = "cfg-if", path = ".socket/vendor/cargo/<uuid2>/cfg-if-0.1.10" }
 ```
 
@@ -260,14 +260,27 @@ version = "1.0.4+socket.<uuid>"
   the patched copy with no network on the cargo 1.41 and 1.56 docker
   images — the CI `cargo-old-toolchains` leg; without the images a local
   run falls back to type-checking on rustup toolchains).
-  Two vendored versions of ONE crate make older cargo load the crates.io
-  index to tell the two `[patch]` entries apart: on 1.56 `cargo build
-  --offline` from an empty `$CARGO_HOME` is enough, while older cargo
-  (1.41) needs the index itself — a populated crates.io index in
-  `$CARGO_HOME`, or network access. Without `--offline` either one tries to
-  update the index first and fails when it is unreachable. Current stable
-  needs neither. Each clause is asserted by the old-toolchain e2e test, in
-  both directions.
+  **Two vendored versions of ONE crate need cargo 1.45 or newer.** Cargo
+  before 1.45 resolves every source-less `Cargo.lock` entry for a crate
+  through ONE `[patch.crates-io]` path — the entry whose KEY sorts last —
+  so with two vendored versions one of the two lock entries is pinned to
+  the other version's copy and `cargo build --locked` fails closed with
+  ``patch for `<crate>` … did not resolve to any crates``. A populated
+  crates.io index in `$CARGO_HOME` does not help; whether a given pair of
+  patch uuids happens to build there is an accident of how their keys
+  sort. The floor was measured on one two-version fixture in both key
+  orders (`cargo check --locked --offline`, empty `$CARGO_HOME`): 1.41.1,
+  1.42, 1.43 and 1.44 refuse the adversarial order; 1.45, 1.49, 1.53, 1.56
+  and current stable resolve either order, each lock entry to its own copy.
+  Vendoring a second version of a crate therefore warns
+  (`cargo_multi_version_old_cargo`) unless the project's `rust-version` or
+  `rust-toolchain[.toml]` promises cargo 1.45+ — socket-patch never runs
+  `cargo`, so those files are the only signal it has. On an old cargo,
+  `cargo build --offline` from an empty `$CARGO_HOME` is enough; without
+  `--offline` it loads the crates.io index first and fails when that is
+  unreachable. Current stable needs neither. A SINGLE vendored version
+  still builds on 1.41. Each clause is asserted by the old-toolchain e2e
+  test, in both directions, with the adversarial key order.
 - **Keys.** Always the Socket-owned `<name>-socket-<first 8 hex of the
   uuid>` with `package = "<name>"` (the full uuid hex if that key is
   taken), never the bare crate name: cargo lets a config-file `[patch]`
@@ -277,7 +290,10 @@ version = "1.0.4+socket.<uuid>"
   of those config files already use are avoided. Every lookup (re-run,
   revert, VEX discovery) is key-agnostic: an entry belongs to
   `name@version` when its crate (`package`, else the key) is `name` and its
-  path is `.socket/vendor/cargo/<uuid>/<name>-<version>`.
+  path is `.socket/vendor/cargo/<uuid>/<name>-<version>`. The key is a
+  function of the patch uuid, so the order two versions' keys sort in is
+  arbitrary — which is why cargo below 1.45 cannot be relied on for a
+  multi-version project (above).
 - **Your entries.** User-authored `[patch.crates-io]` entries are never
   modified. One — in `Cargo.toml` or any cargo config file cargo merges
   (project, ancestors, `$CARGO_HOME`) — that patches the same crate and is

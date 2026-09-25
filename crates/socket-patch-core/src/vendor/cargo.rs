@@ -52,6 +52,122 @@ use super::state::{
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
 
+/// The cargo release where a project may vendor TWO versions of one crate.
+///
+/// Cargo before 1.45 resolves every source-less `Cargo.lock` entry of a
+/// crate through a single `[patch.crates-io]` path — the entry whose KEY
+/// sorts last — so with two vendored versions one of the two lock entries
+/// is pinned to the other version's copy. It fails closed
+/// (``patch for `<crate>` … did not resolve to any crates`` under
+/// `--locked`, with or without `--offline` and with or without a populated
+/// crates.io index), and which of the two orders happens to work is an
+/// accident of the patch uuids. Measured on one two-version fixture, both
+/// key orders, `cargo check --locked --offline` from an empty CARGO_HOME:
+/// 1.41.1, 1.42, 1.43 and 1.44 refuse the adversarial order; 1.45, 1.49,
+/// 1.53, 1.56 and current stable resolve either order, each lock entry to
+/// its own copy.
+const MULTI_VERSION_CARGO_MINOR: u32 = 45;
+
+/// The lowest cargo minor this project TELLS us it must build on, read
+/// offline from the project itself: the workspace root's `rust-version`
+/// (`[package]`, else `[workspace.package]`), else `rust-toolchain.toml`'s
+/// `[toolchain] channel`, else the legacy plain-text `rust-toolchain` file.
+///
+/// `None` when the project declares nothing, or pins a rolling channel
+/// (`stable`, `nightly`, …) — socket-patch never runs `cargo`, so there is
+/// no other signal, and "no declaration" is NOT evidence of a modern cargo.
+async fn declared_cargo_minor(project_root: &Path) -> Option<u32> {
+    fn minor_of(spec: &str) -> Option<u32> {
+        let spec = spec.trim().trim_matches('"');
+        let rest = spec.strip_prefix("1.")?;
+        rest.split(['.', '-', '+']).next()?.parse().ok()
+    }
+    if let Ok(text) = read_regular_to_string(&project_root.join(cargo_manifest::CARGO_TOML)).await {
+        if let Ok(doc) = text.parse::<toml_edit::DocumentMut>() {
+            let rust_version = doc
+                .get("package")
+                .and_then(|p| p.get("rust-version"))
+                .or_else(|| {
+                    doc.get("workspace")
+                        .and_then(|w| w.get("package"))
+                        .and_then(|p| p.get("rust-version"))
+                })
+                .and_then(|v| v.as_str())
+                .and_then(minor_of);
+            if rust_version.is_some() {
+                return rust_version;
+            }
+        }
+    }
+    if let Ok(text) = read_regular_to_string(&project_root.join("rust-toolchain.toml")).await {
+        if let Ok(doc) = text.parse::<toml_edit::DocumentMut>() {
+            if let Some(channel) = doc
+                .get("toolchain")
+                .and_then(|t| t.get("channel"))
+                .and_then(|v| v.as_str())
+            {
+                return minor_of(channel);
+            }
+        }
+    }
+    // The legacy file is a bare channel name, but rustup also accepts the
+    // TOML form under this name.
+    if let Ok(text) = read_regular_to_string(&project_root.join("rust-toolchain")).await {
+        if let Ok(doc) = text.parse::<toml_edit::DocumentMut>() {
+            if let Some(channel) = doc
+                .get("toolchain")
+                .and_then(|t| t.get("channel"))
+                .and_then(|v| v.as_str())
+            {
+                return minor_of(channel);
+            }
+        }
+        return minor_of(&text);
+    }
+    None
+}
+
+/// A warning when THIS vendor puts a SECOND version of `name` behind
+/// `[patch.crates-io]` in a project that may be built by a cargo older than
+/// [`MULTI_VERSION_CARGO_MINOR`] — `None` when the crate has only this one
+/// vendored version, or the project declares a new enough cargo.
+///
+/// `other` is another vendored version's copy path (for the message).
+async fn multi_version_warning(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+) -> Option<VendorWarning> {
+    let other = socket_patch_paths(project_root, name)
+        .await
+        .into_iter()
+        .find(|p| !cargo_manifest::is_socket_copy_of(p, name, version))?;
+    let declared = declared_cargo_minor(project_root).await;
+    if declared.is_some_and(|m| m >= MULTI_VERSION_CARGO_MINOR) {
+        return None;
+    }
+    let says = match declared {
+        Some(m) => format!("this project pins cargo 1.{m}"),
+        None => "this project declares no `rust-version` or toolchain, so the cargo \
+                 that builds it is unknown"
+            .to_string(),
+    };
+    Some(VendorWarning::new(
+        "cargo_multi_version_old_cargo",
+        format!(
+            "{name} is now vendored at TWO versions ({version} beside {other}), which needs \
+             cargo {MULTI_VERSION_CARGO_MINOR_SPELLED} or newer — {says}. Older cargo resolves \
+             every source-less Cargo.lock entry for a crate through ONE `[patch.crates-io]` \
+             path (the entry whose key sorts last), so one of the two versions is pinned to the \
+             other's copy and `cargo build --locked` fails closed with `patch for `{name}` … \
+             did not resolve to any crates` — a populated crates.io index does not help. Build \
+             with cargo {MULTI_VERSION_CARGO_MINOR_SPELLED}+, or vendor only one version of \
+             {name}.",
+            MULTI_VERSION_CARGO_MINOR_SPELLED = format_args!("1.{MULTI_VERSION_CARGO_MINOR}"),
+        ),
+    ))
+}
+
 /// True if a crate is vendored under `<project_root>/vendor/` (in either the
 /// `<name>-<version>/` or bare `<name>/` layout the cargo crawler probes). A
 /// real `cargo vendor` tree already provides committed, project-owned bytes
@@ -607,6 +723,9 @@ pub async fn vendor_cargo_crate(
         if !legacy_paths.is_empty() {
             dry_warnings.push(migration_warning(project_root, name, version, true).await);
         }
+        if let Some(w) = multi_version_warning(project_root, name, version).await {
+            dry_warnings.push(w);
+        }
         // Preview the wet run's lock edit — unless a live hosted redirect
         // still owns the lock entry: the wet run reverts it from the
         // redirect ledger first, so its lock is not this one.
@@ -932,6 +1051,9 @@ pub async fn vendor_cargo_crate(
     };
     let had_prior_wiring =
         ensured.prior_path.is_some() || !legacy_paths.is_empty() || prior_socket_copy;
+    if let Some(w) = multi_version_warning(project_root, name, version).await {
+        warnings.push(w);
+    }
 
     // ── detach (and tag) the lock entry ───────────────────────────────────
     // `retagged_from`: the version a retag replaced, for the unwind.
@@ -1931,6 +2053,156 @@ mod tests {
 
     fn git_sha(bytes: &[u8]) -> String {
         compute_git_sha256_from_bytes(bytes)
+    }
+
+    /// A project root with `Cargo.toml` and, optionally, a
+    /// `[patch.crates-io]` table and toolchain files.
+    async fn toolchain_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in files {
+            tokio::fs::write(dir.path().join(name), body).await.unwrap();
+        }
+        dir
+    }
+
+    /// The only signals socket-patch can read offline for "which cargo will
+    /// build this project" — it never runs `cargo` itself.
+    #[tokio::test]
+    async fn declared_cargo_minor_reads_rust_version_and_toolchain_files() {
+        /// `(project files, the declared cargo minor)`.
+        type Case = (&'static [(&'static str, &'static str)], Option<u32>);
+        let cases: [Case; 8] = [
+            (
+                &[(
+                    "Cargo.toml",
+                    "[package]\nname = \"a\"\nrust-version = \"1.70\"\n",
+                )],
+                Some(70),
+            ),
+            (
+                &[(
+                    "Cargo.toml",
+                    "[package]\nname = \"a\"\nrust-version = \"1.41.1\"\n",
+                )],
+                Some(41),
+            ),
+            (
+                &[(
+                    "Cargo.toml",
+                    "[workspace]\nmembers = []\n\n[workspace.package]\nrust-version = \"1.56\"\n",
+                )],
+                Some(56),
+            ),
+            (
+                &[
+                    ("Cargo.toml", "[package]\nname = \"a\"\n"),
+                    ("rust-toolchain.toml", "[toolchain]\nchannel = \"1.63.0\"\n"),
+                ],
+                Some(63),
+            ),
+            (
+                &[
+                    ("Cargo.toml", "[package]\nname = \"a\"\n"),
+                    ("rust-toolchain", "1.48.0\n"),
+                ],
+                Some(48),
+            ),
+            // A rolling channel says nothing about the cargo in use.
+            (
+                &[
+                    ("Cargo.toml", "[package]\nname = \"a\"\n"),
+                    ("rust-toolchain.toml", "[toolchain]\nchannel = \"stable\"\n"),
+                ],
+                None,
+            ),
+            (&[("Cargo.toml", "[package]\nname = \"a\"\n")], None),
+            // `rust-version` wins over a toolchain file: it is the floor the
+            // project promises, the toolchain file only what one dev uses.
+            (
+                &[
+                    (
+                        "Cargo.toml",
+                        "[package]\nname = \"a\"\nrust-version = \"1.41\"\n",
+                    ),
+                    ("rust-toolchain.toml", "[toolchain]\nchannel = \"1.80.0\"\n"),
+                ],
+                Some(41),
+            ),
+        ];
+        for (files, want) in cases {
+            let dir = toolchain_fixture(files).await;
+            assert_eq!(
+                declared_cargo_minor(dir.path()).await,
+                want,
+                "files: {files:?}"
+            );
+        }
+    }
+
+    /// The `[patch.crates-io]` table wiring `versions` of cfg-if, each under
+    /// its own Socket-owned key/uuid.
+    fn patch_table(versions: &[(&str, &str)]) -> String {
+        let mut out =
+            String::from("[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[patch.crates-io]\n");
+        for (version, uuid) in versions {
+            out.push_str(&format!(
+                "cfg-if-socket-{} = {{ package = \"cfg-if\", path = \".socket/vendor/cargo/{uuid}/cfg-if-{version}\" }}\n",
+                &uuid.replace('-', "")[..8]
+            ));
+        }
+        out
+    }
+
+    /// REGRESSION: cargo before 1.45 resolves every source-less lock entry
+    /// of a crate through ONE `[patch.crates-io]` path (the entry whose key
+    /// sorts last), so a second vendored version of the same crate cannot
+    /// build there — verified on the `rust:1.41-slim` image and cargo
+    /// 1.42/1.43/1.44, where the adversarial key order fails ``patch for
+    /// `cfg-if` … did not resolve to any crates`` even with a populated
+    /// index, while 1.45 and later build either order. The vendor says so
+    /// when the project does not promise a cargo that can take it.
+    #[tokio::test]
+    async fn a_second_vendored_version_warns_unless_the_project_pins_cargo_1_45() {
+        // One version: nothing to warn about.
+        let dir = toolchain_fixture(&[("Cargo.toml", &patch_table(&[("1.0.4", UUID)]))]).await;
+        assert!(multi_version_warning(dir.path(), "cfg-if", "1.0.4")
+            .await
+            .is_none());
+
+        // Two versions, no declared cargo: warn.
+        let two = patch_table(&[("1.0.4", UUID), ("0.1.10", UUID2)]);
+        let dir = toolchain_fixture(&[("Cargo.toml", &two)]).await;
+        let warning = multi_version_warning(dir.path(), "cfg-if", "1.0.4")
+            .await
+            .expect("a second version warns");
+        assert_eq!(warning.code, "cargo_multi_version_old_cargo");
+        assert!(warning.detail.contains("cfg-if-0.1.10"), "{warning:?}");
+        assert!(warning.detail.contains("1.45"), "{warning:?}");
+        // Either version's vendor says it.
+        assert!(multi_version_warning(dir.path(), "cfg-if", "0.1.10")
+            .await
+            .is_some());
+
+        // The project promises a cargo that can take it: silent.
+        let dir = toolchain_fixture(&[
+            ("Cargo.toml", &two),
+            ("rust-toolchain.toml", "[toolchain]\nchannel = \"1.45.0\"\n"),
+        ])
+        .await;
+        assert!(multi_version_warning(dir.path(), "cfg-if", "1.0.4")
+            .await
+            .is_none());
+
+        // A project that pins an OLDER cargo says so in the warning.
+        let dir = toolchain_fixture(&[
+            ("Cargo.toml", &two),
+            ("rust-toolchain.toml", "[toolchain]\nchannel = \"1.41.0\"\n"),
+        ])
+        .await;
+        let warning = multi_version_warning(dir.path(), "cfg-if", "1.0.4")
+            .await
+            .expect("an old pinned cargo warns");
+        assert!(warning.detail.contains("pins cargo 1.41"), "{warning:?}");
     }
 
     /// The path of the root manifest's Socket-owned `[patch.crates-io]`
