@@ -1661,19 +1661,24 @@ pub(crate) async fn vendor_records_reusing(
     let mut status = StatusLine::stderr(common.json, common.silent);
     let total = all_packages.len();
     // Service downloads, fetched ahead of this serial loop (the wiring and
-    // every write stay here, in order). The plan is the npm records the
-    // loop is expected to download: in loop order, past the Bun refusal
-    // and the takeover gate below, with no committed artifact the ledger
-    // anchors at the record's uuid (those re-runs reuse it and never ask
-    // the service). It is advisory — the breaker and every outcome are
-    // still decided at the loop's own call (see `VendorPrefetch`). Asking
-    // `wants_prefetch` first keeps the walk off the runs that would drop
-    // the plan anyway (`--vendor-source build`, `--offline`, one request
-    // at a time).
-    let _service_prefetch = service
-        .filter(|cfg| !common.dry_run && cfg.wants_prefetch())
-        .and_then(|cfg| {
-            let planned: Vec<String> = all_packages
+    // every write stay here, in order). The plan is EXACT — the npm records
+    // the loop will ask the service for, in loop order: past the Bun
+    // refusal and the takeover gate below, past every refusal the flavor
+    // backend raises before its first service call (evaluated here with
+    // the backend's own gates, `preflight_packages`), and with no committed
+    // artifact the ledger anchors at the record's uuid (those re-runs reuse
+    // it and never ask the service). A download grant can start a
+    // server-side build and counts against quota, so a package the loop
+    // refuses is never granted on its behalf. The plan stays advisory —
+    // the breaker and every outcome are still decided at the loop's own
+    // call (see `VendorPrefetch`). Asking `wants_prefetch` first keeps the
+    // walk off the runs that would drop the plan anyway (`--vendor-source
+    // build`, `--offline`, one request at a time), and a plan of fewer
+    // than two downloads has nothing to overlap, so the backend gates are
+    // only consulted past that.
+    let _service_prefetch = match service.filter(|cfg| !common.dry_run && cfg.wants_prefetch()) {
+        Some(cfg) => {
+            let candidates: Vec<(&str, &PatchRecord)> = all_packages
                 .iter()
                 .filter(|(purl, _)| Ecosystem::from_purl(purl) == Some(Ecosystem::Npm))
                 .filter(|(purl, _)| bun_refusal.as_ref().is_none_or(|r| !r.applies_to(purl)))
@@ -1685,18 +1690,31 @@ pub(crate) async fn vendor_records_reusing(
                                 .any(|k| canonical_purl(k) == canonical_purl(purl))
                         })
                 })
-                .filter_map(|(purl, _)| records.get(purl))
-                .filter(|record| {
+                .filter_map(|(purl, _)| records.get(purl).map(|record| (purl.as_str(), record)))
+                .filter(|(_, record)| {
                     !state.entries.values().any(|e| {
                         e.ecosystem == "npm"
                             && e.uuid == record.uuid
                             && !e.artifact.sha256.is_empty()
                     })
                 })
-                .map(|record| record.uuid.clone())
                 .collect();
-            cfg.prefetch_archives(planned)
-        });
+            if candidates.len() < 2 {
+                None
+            } else {
+                let admitted =
+                    vendor::npm_flavor::preflight_packages(&common.cwd, &candidates).await;
+                let planned: Vec<String> = candidates
+                    .iter()
+                    .zip(admitted)
+                    .filter(|(_, verdict)| verdict.is_ok())
+                    .map(|((_, record), _)| record.uuid.clone())
+                    .collect();
+                cfg.prefetch_archives(planned)
+            }
+        }
+        None => None,
+    };
     // The source of the purl the loop has just left. Its archive is what a
     // fetched source holds to be able to write its tree, and `all_packages`
     // gives each holder to exactly one purl — so once the loop moves on,

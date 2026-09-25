@@ -27,14 +27,19 @@
 //!   when the loop takes its outcome, where the serial request would have
 //!   printed them.
 //!
-//! ## What the speculation can cost
+//! ## What the plan may cost
 //!
-//! The plan is built from the gates the CLI can see, so a package each
-//! backend refuses in its own pre-flight (an unsupported lockfile entry,
-//! an override conflict) can still be planned, and the loop then never
-//! asks for it. That is a real request against the service — on a
-//! depscan vendored run, 74 download grants where the serial loop made
-//! 71 — so the task is bounded in requests, not just in time:
+//! A download grant is a real request against the service — it can start
+//! a server-side build and counts against quota — so the plan is EXACT:
+//! the CLI names only the packages the loop will ask the service for. It
+//! evaluates every refusal a backend raises before its first service call
+//! with the backend's own gates
+//! ([`crate::vendor::npm_flavor::preflight_packages`]) and leaves out the
+//! re-runs whose committed artifact the ledger anchors, so a package the
+//! loop refuses is never granted on its behalf (on a depscan vendored run,
+//! 71 grants — the serial loop's own count). The task is still bounded in
+//! requests, not just in time, as a second line of defence should a plan
+//! ever name a position the loop then passes over:
 //!
 //! * It only ever requests plan positions in `[at, at + reach)`, where
 //!   `at` is the position the loop has reached and `reach` is one until
@@ -806,14 +811,18 @@ mod tests {
         assert!(posts <= window, "{posts} grants for one consumed package");
     }
 
-    /// What a package the loop refuses before the service costs, pinned:
-    /// the loop consults the plan at position 0 and then again at 5, so
-    /// the task may request `[0, 1)`, then `[0, window)` once the service
-    /// has answered, then `[5, 5 + window)` — four grants for a plan of
-    /// seven, and never a retry ladder for a passed-over one. Without a
-    /// bound it would work through the whole plan.
+    /// The plan the CLI builds is exact — a package the loop refuses before
+    /// the service is never planned (its gates are the loop's own; see the
+    /// CLI's `a_package_the_loop_refuses_costs_zero_grants`), so the loop
+    /// never passes over a planned position in practice. Should a plan
+    /// ever fall out of step with the loop, the request bound still holds,
+    /// pinned here: the loop consults the plan at position 0 and then again
+    /// at 5, so the task may request `[0, 1)`, then `[0, window)` once the
+    /// service has answered, then `[5, 5 + window)` — four grants for a
+    /// plan of seven, and never a retry ladder for a passed-over one.
+    /// Without the bound it would work through the whole plan.
     #[tokio::test]
-    async fn a_package_the_loop_refuses_costs_at_most_one_grant() {
+    async fn a_planned_position_the_loop_passes_over_costs_at_most_one_grant() {
         let window = 2;
         let scripts: Vec<Script> = (0..7).map(|_| Script::Granted(0)).collect();
         let server = serve(&scripts).await;
