@@ -28,6 +28,7 @@ use super::common::{already_patched_result, detect_indent, done, refused, serial
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
+use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
 use super::state::{
@@ -46,6 +47,14 @@ use crate::constants::npm_family::NPM_LOCKS;
 /// a silent no-op.
 const SHRINKWRAP: &str = NPM_LOCKS[0];
 const PACKAGE_LOCK: &str = NPM_LOCKS[1];
+
+/// The run's npm-lock parses. Every patched package re-read AND re-parsed
+/// the project's lock — both of them in npm 12's dual-lock state — and a
+/// real `package-lock.json` runs to megabytes of JSON. Two slots: the
+/// primary and its sibling are read in the same pass, so one slot would
+/// have them evict each other. An idempotent re-run writes nothing, so
+/// every package after the first hits; see [`ParseMemo`].
+static LOCK_MEMO: ParseMemo<Value, 2> = ParseMemo::new();
 
 const NODE_MODULES_SEG: &str = "node_modules/";
 
@@ -122,7 +131,7 @@ pub async fn vendor_npm<'a>(
             );
         }
     };
-    let mut lock: Value = match serde_json::from_slice(&lock_bytes) {
+    let lock = match LOCK_MEMO.parse(&lock_bytes, || serde_json::from_slice::<Value>(&lock_bytes)) {
         Ok(v) => v,
         Err(e) => {
             return refused(
@@ -268,6 +277,9 @@ pub async fn vendor_npm<'a>(
     let mut wiring: Vec<WiringRecord> = Vec::new();
     let mut changed = false;
     let mut recomputed_deps = false;
+    // The memo hands the parse out shared; the rewrite takes its own copy —
+    // the allocation the per-package parse it replaced would have made.
+    let mut lock = (*lock).clone();
     let rewire = LockRewire {
         name,
         version,
@@ -370,6 +382,8 @@ pub async fn vendor_npm<'a>(
     // left resolving through an artifact the unstage removes.
     let mut written: Vec<(&str, &[u8])> = Vec::new();
     let mut write_err: Option<String> = None;
+    // Dropped before the first write, so a torn one leaves nothing behind.
+    LOCK_MEMO.invalidate();
     for (sib_name, original, out) in &sibling_writes {
         if let Err(e) = atomic_write_bytes_preserving_mode(&project_root.join(sib_name), out).await
         {
@@ -581,16 +595,17 @@ pub async fn revert_npm_opts(
             }
             Err(e) => return RevertOutcome::failed(format!("cannot read {lock_name}: {e}")),
         };
-        let mut lock: Value = match serde_json::from_slice(&lock_bytes) {
-            Ok(v) => v,
-            // Fail-closed: editing a lock we cannot parse risks destroying
-            // it; the user must repair it before revert can restore.
-            Err(e) => {
-                return RevertOutcome::failed(format!(
-                    "{lock_name} is not parseable JSON ({e}); fix it and re-run revert"
-                ))
-            }
-        };
+        let mut lock =
+            match LOCK_MEMO.parse(&lock_bytes, || serde_json::from_slice::<Value>(&lock_bytes)) {
+                Ok(v) => (*v).clone(),
+                // Fail-closed: editing a lock we cannot parse risks destroying
+                // it; the user must repair it before revert can restore.
+                Err(e) => {
+                    return RevertOutcome::failed(format!(
+                        "{lock_name} is not parseable JSON ({e}); fix it and re-run revert"
+                    ))
+                }
+            };
 
         let mut changed = false;
         // Reverse application order, like every backend's revert.
@@ -612,6 +627,7 @@ pub async fn revert_npm_opts(
                     return RevertOutcome::failed(format!("cannot serialize {lock_name}: {e}"))
                 }
             };
+            LOCK_MEMO.invalidate();
             if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, &out).await {
                 return RevertOutcome::failed(format!("cannot write {lock_name}: {e}"));
             }
@@ -1055,8 +1071,10 @@ fn sibling_lock_target(
     warnings: &mut Vec<VendorWarning>,
 ) -> Result<SiblingLock, String> {
     let bytes = sib_bytes.map_err(|e| format!("it cannot be read: {e}"))?;
-    let lock: Value =
-        serde_json::from_slice(&bytes).map_err(|e| format!("it is not parseable JSON: {e}"))?;
+    let lock = (*LOCK_MEMO
+        .parse(&bytes, || serde_json::from_slice::<Value>(&bytes))
+        .map_err(|e| format!("it is not parseable JSON: {e}"))?)
+    .clone();
     let lock_version = lock.get("lockfileVersion").and_then(Value::as_u64);
     if !matches!(lock_version, Some(2) | Some(3))
         || !lock.get("packages").is_some_and(Value::is_object)

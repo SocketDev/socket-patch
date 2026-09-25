@@ -59,15 +59,22 @@ use super::common::{already_patched_result, parse_json_manifest, refused, JsonLa
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack, tgz_rel_leaf,
 };
+use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
 use super::state::{
     write_marker_or_warn, VendorArtifact, VendorEntry, VendorMarker, WiringAction, WiringRecord,
 };
 use super::yarn_classic_lock::{
-    block_eol, body_field_line, lines_to_json, pattern_real_name, read_yarn_lock, replace_block,
-    revert_recorded_block, scan_blocks, split_berry_key_patterns, split_pattern, LockBlock,
+    block_eol, body_field_line, forget_block_scans, lines_to_json, pattern_real_name,
+    read_yarn_lock, replace_block, revert_recorded_block, scan_blocks, scan_blocks_shared,
+    split_berry_key_patterns, split_pattern, LockBlock,
 };
+
+/// The run's project-`package.json` parse: berry re-read AND re-parsed the
+/// manifest for every patched package to check the `resolutions` gate. See
+/// [`ParseMemo`].
+static PKG_JSON_MEMO: ParseMemo<Value> = ParseMemo::new();
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
 const YARN_LOCK: &str = "yarn.lock";
@@ -122,7 +129,7 @@ pub async fn vendor_yarn_berry<'a>(
     if let Some(outcome) = refuse_mixed_line_endings(YARN_LOCK, &lock_text) {
         return outcome;
     }
-    let blocks = scan_blocks(&lock_text);
+    let blocks = scan_blocks_shared(&lock_text);
     if let Some(outcome) = refuse_unsupported_cache(&blocks) {
         return outcome;
     }
@@ -159,7 +166,7 @@ pub async fn vendor_yarn_berry<'a>(
     if let Some(outcome) = refuse_mixed_line_endings(PACKAGE_JSON, &pkg_text) {
         return outcome;
     }
-    let pkg: Value = match parse_json_manifest(&pkg_bytes) {
+    let pkg = match PKG_JSON_MEMO.parse(&pkg_bytes, || parse_json_manifest(&pkg_bytes)) {
         Ok(v) => v,
         Err(e) => {
             return refused(
@@ -388,7 +395,7 @@ pub async fn vendor_yarn_berry<'a>(
 
     // ── 11. Build both new byte images, then commit pkg-first/lock-second ─
     let existing_entry = existing_res.is_some();
-    let mut new_pkg = pkg.clone();
+    let mut new_pkg = (*pkg).clone();
     {
         let obj = new_pkg.as_object_mut().expect("validated above");
         let res = obj
@@ -601,6 +608,7 @@ pub async fn revert_yarn_berry_opts(
                     );
                 }
                 if changed {
+                    forget_block_scans();
                     if let Err(e) =
                         atomic_write_bytes_preserving_mode(&lock_path, text.as_bytes()).await
                     {
@@ -649,6 +657,7 @@ pub async fn revert_yarn_berry_opts(
                     // bytes (CRLF, BOM and trailing newline included).
                     match JsonLayout::of(&String::from_utf8_lossy(&bytes)).render(&pkg) {
                         Ok(out) => {
+                            PKG_JSON_MEMO.invalidate();
                             if let Err(e) =
                                 atomic_write_bytes_preserving_mode(&pkg_path, &out).await
                             {
@@ -950,6 +959,9 @@ async fn commit_pair(
     new_lock: &[u8],
 ) -> Result<(), String> {
     let pkg_path = project_root.join(PACKAGE_JSON);
+    // Dropped before the first write, so a torn one leaves nothing behind.
+    PKG_JSON_MEMO.invalidate();
+    forget_block_scans();
     atomic_write_bytes_preserving_mode(&pkg_path, new_pkg)
         .await
         .map_err(|e| format!("cannot write {PACKAGE_JSON}: {e}"))?;

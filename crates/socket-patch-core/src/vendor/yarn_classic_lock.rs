@@ -22,6 +22,7 @@
 //! preserved verbatim, so yarn's re-serialization produces no churn.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -35,6 +36,7 @@ use super::common::{already_patched_result, detect_eol, refused};
 use super::npm_common::{
     done_failure_unstage, guard_coordinates, guard_revert_uuid_dir, stage_patch_pack,
 };
+use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
 use super::state::{
@@ -98,8 +100,8 @@ pub async fn vendor_yarn_classic<'a>(
 
     // ── 3. Find the rewritable blocks (pre-flight, BEFORE staging) ────────
     let mut candidate_keys: Vec<String> = Vec::new();
-    let blocks = scan_blocks(&text);
-    for block in &blocks {
+    let blocks = scan_blocks_shared(&text);
+    for block in blocks.iter() {
         match classify_classic_block(block, name, version) {
             BlockClass::Candidate => candidate_keys.push(block.key.clone()),
             BlockClass::LinkSkip(detail) => {
@@ -176,7 +178,7 @@ pub async fn vendor_yarn_classic<'a>(
     let mut wiring: Vec<WiringRecord> = Vec::new();
     for key in &candidate_keys {
         let edit = {
-            let blocks = scan_blocks(&new_text);
+            let blocks = scan_blocks_shared(&new_text);
             let Some(block) = blocks.iter().find(|b| &b.key == key) else {
                 return done_failure_unstage(
                     purl,
@@ -246,6 +248,7 @@ pub async fn vendor_yarn_classic<'a>(
         };
     }
 
+    forget_block_scans();
     if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, new_text.as_bytes()).await {
         return done_failure_unstage(
             purl,
@@ -398,6 +401,7 @@ pub async fn revert_yarn_classic_opts(
             );
         }
         if changed {
+            forget_block_scans();
             if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, text.as_bytes()).await {
                 return RevertOutcome::failed(format!("cannot write {YARN_LOCK}: {e}"));
             }
@@ -729,6 +733,28 @@ pub(crate) struct LockBlock {
     pub key: String,
     /// Verbatim block lines (key line first), without line terminators.
     pub lines: Vec<String>,
+}
+
+/// The run's yarn-lock block scans. `scan_blocks` walks every line of the
+/// lock and copies each one into the block it belongs to, and BOTH yarn
+/// backends re-scanned the whole lock for every patched package — plus once
+/// per candidate key while splicing. Two slots: the splice loop re-scans
+/// the text it is building beside the one it started from. An idempotent
+/// re-run writes nothing, so every scan after the first hits; see
+/// [`ParseMemo`].
+static BLOCK_MEMO: ParseMemo<Vec<LockBlock>, 2> = ParseMemo::new();
+
+/// [`scan_blocks`], shared and memoized on the lock text — for the callers
+/// that only read the blocks.
+pub(crate) fn scan_blocks_shared(text: &str) -> Arc<Vec<LockBlock>> {
+    BLOCK_MEMO.parse_infallible(text.as_bytes(), || scan_blocks(text))
+}
+
+/// Drop the memoized scans, for the writers on both yarn backends. Never
+/// needed for correctness (a scan is keyed on the text it came from) — it
+/// is how a write stops the memo holding a scan nothing will hit again.
+pub(super) fn forget_block_scans() {
+    BLOCK_MEMO.invalidate();
 }
 
 /// Scan a lockfile into blocks, CRLF-aware. Comments, blank lines, and
