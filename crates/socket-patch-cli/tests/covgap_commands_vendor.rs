@@ -1006,7 +1006,7 @@ async fn vendor_state_write_failure_reports_failed_event() {
 /// `redirect_ledger_write_failed` before vendoring it.)
 #[cfg(unix)]
 #[test]
-fn redirect_ledger_write_failure_fails_takeover_purl_closed() {
+fn redirect_ledger_write_failure_commits_nothing() {
     let fx = npm_fixture();
     std::fs::create_dir_all(fx.vendor_dir()).unwrap();
     let before_hash = compute_git_sha256_from_bytes(ORIG_INDEX);
@@ -1042,6 +1042,10 @@ fn redirect_ledger_write_failure_fails_takeover_purl_closed() {
         std::fs::read(fx.redirect_state_path()).unwrap(),
         ledger_bytes,
         "the unpersistable ledger is left exactly as found"
+    );
+    assert!(
+        !fx.vendor_dir().join(".commit-journal.json").exists(),
+        "the failed commit leaves no journal behind"
     );
 }
 
