@@ -63,9 +63,9 @@ use crate::utils::purl::{build_nuget_purl, parse_nuget_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::{
-    already_patched_result, any_live_file_references, done, failed_result,
+    already_patched_result, any_live_file_references, done, failed_result, prepare_memory_repack,
     prune_empty_vendor_levels, read_zip_artifact, rebuild_zip, refused, synthesized_result,
-    zip_bytes_match_after_hashes,
+    write_zip_entries, zip_bytes_match_after_hashes, MemoryRepack, Stage,
 };
 use super::path::vendor_uuid_dir_rel;
 use super::registry_fetch::extract_zip;
@@ -93,6 +93,16 @@ const LOCK_WIRING_KIND: &str = "nuget_lock_entry";
 /// patched (content-changed) package reads as unsigned rather than
 /// invalid-signed.
 const SIGNATURE_PART: &str = ".signature.p7s";
+
+/// The two package-root paths `patch::sidecars::nuget`'s fixup reads while the
+/// apply runs over the stage — it deletes the first and reports an advisory
+/// when a file matching the second sits beside it. A rebuild that keeps the
+/// package's parts in memory still materialises both, so the fixup sees the
+/// same package root a full extraction would have given it. (Neither normally
+/// rides INSIDE a `.nupkg` — they are install-dir bookkeeping — but a crafted
+/// package can carry them, and the decision must not turn on that.)
+const SIDECAR_METADATA_PART: &str = ".nupkg.metadata";
+const SIDECAR_SIGNATURE_MARKER_SUFFIX: &str = ".nupkg.sha512";
 
 /// The implicit default public NuGet source, seeded as the catch-all target
 /// when a from-scratch `<packageSourceMapping>` would otherwise have no
@@ -867,7 +877,7 @@ async fn local_rebuild(
             ));
         }
     };
-    let stage = match tempfile::tempdir() {
+    let stage = match Stage::new() {
         Ok(dir) => dir,
         Err(e) => {
             return Ok((
@@ -876,9 +886,37 @@ async fn local_rebuild(
             ));
         }
     };
-    // The nupkg carries content at the archive root (no strip). extract_zip is
-    // traversal-guarded and refuses an escaping entry fail-closed.
-    if let Err(e) = extract_zip(&bytes, stage.path(), /*strip_first=*/ false) {
+    // The nupkg carries content at the archive root (no strip). Both staging
+    // paths are traversal-guarded and refuse an escaping entry fail-closed
+    // with the same message: `prepare_memory_repack` keeps the parts in
+    // memory and materialises only what the apply pipeline resolves, while a
+    // package whose part names a filesystem could fold together or re-spell
+    // is extracted whole, the shape the in-memory repack is defined against.
+    let mut repack = match prepare_memory_repack(&bytes, &record.files)
+        .map_err(|e| format!("cannot extract {}: {e}", src_nupkg.display()))
+    {
+        Ok(repack) => repack,
+        Err(e) => return Ok((Vec::new(), failed_result(purl, nupkg_path, e))),
+    };
+    let staged = match repack.as_mut() {
+        Some(repack) => {
+            // The sidecar fixup deletes `.nupkg.metadata` and looks beside it
+            // for a `*.nupkg.sha512` marker, so both have to be on disk for
+            // it to see exactly what a full extraction would have shown it.
+            repack.also_stage(SIDECAR_METADATA_PART);
+            let markers: Vec<String> = repack
+                .member_names()
+                .filter(|n| !n.contains('/') && n.ends_with(SIDECAR_SIGNATURE_MARKER_SUFFIX))
+                .map(str::to_string)
+                .collect();
+            for marker in &markers {
+                repack.also_stage(marker);
+            }
+            repack.stage_into(stage.path()).await
+        }
+        None => extract_zip(&bytes, stage.path(), /*strip_first=*/ false),
+    };
+    if let Err(e) = staged {
         return Ok((
             Vec::new(),
             failed_result(
@@ -902,29 +940,15 @@ async fn local_rebuild(
     )
     .await;
     if !result.success {
+        stage.dispose().await;
         return Ok((Vec::new(), result));
     }
 
-    // Deterministic re-zip of the patched stage (RECORD-free — a nupkg is a
-    // plain OPC zip; NuGet reads the central directory, so entry order is free
-    // to be lexicographic for stable bytes across re-runs).
-    let stage_path = stage.path().to_path_buf();
-    let rezip =
-        tokio::task::spawn_blocking(move || rebuild_zip(&stage_path, Some(SIGNATURE_PART))).await;
-    let nupkg_bytes = match rezip {
-        Ok(Ok(b)) => b,
-        Ok(Err(e)) => {
-            return Ok((
-                Vec::new(),
-                failed_result(purl, nupkg_path, format!("nupkg re-zip failed: {e}")),
-            ));
-        }
-        Err(e) => {
-            return Ok((
-                Vec::new(),
-                failed_result(purl, nupkg_path, format!("nupkg re-zip task failed: {e}")),
-            ));
-        }
+    let rebuilt = rebuild_nupkg_bytes(repack, stage.path()).await;
+    stage.dispose().await;
+    let nupkg_bytes = match rebuilt {
+        Ok(bytes) => bytes,
+        Err(e) => return Ok((Vec::new(), failed_result(purl, nupkg_path, e))),
     };
 
     if let Err(e) = write_nupkg(uuid_dir, nupkg_path, &nupkg_bytes).await {
@@ -938,6 +962,36 @@ async fn local_rebuild(
         return Ok((Vec::new(), failed_result(purl, nupkg_path, e)));
     }
     Ok((nupkg_bytes, result))
+}
+
+/// Deterministic re-zip of the patched stage (RECORD-free — a nupkg is a plain
+/// OPC zip; NuGet reads the central directory, so entry order is free to be
+/// lexicographic for stable bytes across re-runs). The in-memory repack
+/// assembles the same entry list from the parts it never wrote out; a package
+/// that had to be extracted is walked as before.
+async fn rebuild_nupkg_bytes(
+    repack: Option<MemoryRepack>,
+    stage: &Path,
+) -> Result<Vec<u8>, String> {
+    let rezip = match repack {
+        Some(repack) => {
+            let entries = repack
+                .into_entries(stage, Some(SIGNATURE_PART))
+                .await
+                .map_err(|e| format!("nupkg re-zip failed: {e}"))?;
+            tokio::task::spawn_blocking(move || write_zip_entries(&entries)).await
+        }
+        None => {
+            let stage_path = stage.to_path_buf();
+            tokio::task::spawn_blocking(move || rebuild_zip(&stage_path, Some(SIGNATURE_PART)))
+                .await
+        }
+    };
+    match rezip {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(e)) => Err(format!("nupkg re-zip failed: {e}")),
+        Err(e) => Err(format!("nupkg re-zip task failed: {e}")),
+    }
 }
 
 /// Write `bytes` to `nupkg_path`, creating the uuid dir. Errors are strings.
@@ -1924,6 +1978,44 @@ mod tests {
         zw.finish().unwrap().into_inner()
     }
 
+    /// A nupkg carrying every spelling the in-memory repack and the
+    /// extract-to-disk rebuild could disagree on: a zero-length part, a
+    /// STORED part, an exec-bit part, a nested tree, a part large enough to
+    /// span several read buffers, the signature part the rebuild drops, and
+    /// the two package-root paths the sidecar fixup reads.
+    fn make_rich_nupkg(license: &[u8]) -> Vec<u8> {
+        use zip::CompressionMethod::{Deflated, Stored};
+        let big = vec![b'z'; 3 * 1024 * 1024];
+        let entries: &[(&str, &[u8], zip::CompressionMethod, u32)] = &[
+            ("[Content_Types].xml", b"<?xml version=\"1.0\"?><Types/>", Deflated, 0o644),
+            ("_rels/.rels", b"<?xml version=\"1.0\"?><Relationships/>", Deflated, 0o644),
+            (
+                "Newtonsoft.Json.nuspec",
+                b"<?xml version=\"1.0\"?><package><metadata><id>Newtonsoft.Json</id><version>13.0.3</version></metadata></package>",
+                Deflated,
+                0o644,
+            ),
+            (".signature.p7s", b"FAKE-SIGNATURE-BYTES", Deflated, 0o644),
+            (".nupkg.metadata", b"{\"contentHash\":\"stale\"}", Deflated, 0o644),
+            ("newtonsoft.json.13.0.3.nupkg.sha512", b"marker", Deflated, 0o644),
+            ("lib/net6.0/Newtonsoft.Json.dll", b"MZ-fake-assembly", Deflated, 0o644),
+            ("lib/net6.0/empty.xml", b"", Deflated, 0o644),
+            ("lib/net6.0/stored.bin", b"stored bytes", Stored, 0o644),
+            ("tools/run.sh", b"#!/bin/sh\nexit 0\n", Deflated, 0o755),
+            ("lib/net6.0/big.bin", &big, Deflated, 0o644),
+            ("LICENSE.md", license, Deflated, 0o644),
+        ];
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, bytes, method, mode) in entries {
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(*method)
+                .unix_permissions(*mode);
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(bytes).unwrap();
+        }
+        zw.finish().unwrap().into_inner()
+    }
+
     async fn fixture(
         with_lock: bool,
         with_config: Option<&str>,
@@ -2044,6 +2136,66 @@ mod tests {
             None,
         )
         .await
+    }
+
+    /// X10 equivalence: keeping the package's parts in memory must rebuild
+    /// the EXACT bytes the extract-to-disk rebuild produced — the lock's
+    /// `contentHash` pin rides on them. Driven twice over one fixture, once
+    /// with the in-memory repack forced off. The fixture also exercises the
+    /// two paths the sidecar fixup reads: `.nupkg.metadata` (deleted, so it
+    /// must drop out of the rebuild) and the `*.nupkg.sha512` marker (which
+    /// must still raise the signed-package advisory).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn in_memory_nupkg_rebuild_matches_the_on_disk_rebuild_byte_for_byte() {
+        async fn rebuild(on_disk: bool) -> (Vec<u8>, ApplyResult) {
+            let _forced = on_disk.then(crate::vendor::common::OnDiskRepackGuard::acquire);
+            let (dir, blobs, installed, record) = fixture(true, None).await;
+            tokio::fs::write(
+                installed.join("newtonsoft.json.13.0.3.nupkg"),
+                make_rich_nupkg(PRISTINE),
+            )
+            .await
+            .unwrap();
+            let (result, entry, _w) =
+                unwrap_done(run_vendor(dir.path(), &blobs, &installed, &record, false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert!(entry.is_some(), "a successful rebuild records an entry");
+            let bytes = tokio::fs::read(dir.path().join(copy_rel())).await.unwrap();
+            (bytes, result)
+        }
+
+        let (fast, fast_result) = rebuild(false).await;
+        let (oracle, oracle_result) = rebuild(true).await;
+        assert_eq!(
+            fast, oracle,
+            "the in-memory rebuild must be byte-identical to the extracted one"
+        );
+        assert_eq!(
+            format!("{:?}", fast_result.sidecar),
+            format!("{:?}", oracle_result.sidecar),
+            "the sidecar fixup must see the same package root either way"
+        );
+        assert_eq!(
+            read_nupkg_entry(&fast, "LICENSE.md").as_deref(),
+            Some(PATCHED)
+        );
+        assert!(
+            read_nupkg_entry(&fast, SIGNATURE_PART).is_none(),
+            "the signature part is dropped"
+        );
+        assert!(
+            read_nupkg_entry(&fast, ".nupkg.metadata").is_none(),
+            "the sidecar fixup deleted it, so it leaves the rebuild"
+        );
+        assert_eq!(
+            read_nupkg_entry(&fast, "lib/net6.0/empty.xml").as_deref(),
+            Some(&[][..])
+        );
+        assert_eq!(
+            read_nupkg_entry(&fast, "lib/net6.0/stored.bin").as_deref(),
+            Some(&b"stored bytes"[..])
+        );
     }
 
     fn read_nupkg_entry(bytes: &[u8], name: &str) -> Option<Vec<u8>> {

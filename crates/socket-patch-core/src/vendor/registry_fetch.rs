@@ -39,9 +39,12 @@ pub const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
 /// because these are full upstream packages, but still bounded so a
 /// poisoned lockfile cannot turn the fetch into a disk/memory bomb.
 const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_TOTAL_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_ENTRIES: usize = 60_000;
+// `pub(crate)`: `common::read_zip_members` is the in-memory twin of
+// [`extract_zip`] and must refuse exactly the same archives, so it reads the
+// one set of caps rather than carrying a copy that can drift.
+pub(crate) const MAX_TOTAL_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_ENTRIES: usize = 60_000;
 
 /// A fetched, verified, extracted package. The tempdir lives exactly as
 /// long as this value — callers must hold it until the vendor pipeline has
