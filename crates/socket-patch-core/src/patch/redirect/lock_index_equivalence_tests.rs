@@ -4,54 +4,8 @@
 //! verbatim and the production rewriters must produce the identical output
 //! bytes, FileEdit list, warnings and refusals on randomized locks.
 
+use super::rewrite_oracle_support::{assert_same, Rng};
 use super::*;
-
-type Snapshot = (
-    BTreeMap<String, String>,
-    Vec<FileEdit>,
-    Vec<(String, String)>,
-);
-
-fn snapshot(r: &RewriteResult) -> Snapshot {
-    (
-        r.files.clone(),
-        r.edits.clone(),
-        r.warnings
-            .iter()
-            .map(|w| (w.code.clone(), w.detail.clone()))
-            .collect(),
-    )
-}
-
-fn assert_same(want: &RewriteResult, got: &RewriteResult, what: &str) {
-    let (want, got) = (snapshot(want), snapshot(got));
-    assert_eq!(got.0, want.0, "{what}: rewritten bytes");
-    assert_eq!(got.1.len(), want.1.len(), "{what}: edit count");
-    for (i, (g, w)) in got.1.iter().zip(&want.1).enumerate() {
-        assert_eq!(g, w, "{what}: edit #{i}");
-    }
-    assert_eq!(got.2, want.2, "{what}: warnings (code, detail) in order");
-}
-
-/// Deterministic xorshift64* — no `rand` dev-dependency.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-    fn chance(&mut self, percent: u64) -> bool {
-        self.next() % 100 < percent
-    }
-}
 
 fn name(i: usize) -> String {
     match i % 4 {

@@ -6,26 +6,8 @@
 //! refusals — on depscan-sized synthetic locks and on randomized mixes of
 //! every lock flavor the grammar handles.
 
+use super::rewrite_oracle_support::{assert_same, Rng};
 use super::*;
-
-type Snapshot = (
-    BTreeMap<String, String>,
-    Vec<FileEdit>,
-    Vec<(String, String)>,
-    std::collections::BTreeSet<String>,
-);
-
-fn snapshot(r: &RewriteResult) -> Snapshot {
-    (
-        r.files.clone(),
-        r.edits.clone(),
-        r.warnings
-            .iter()
-            .map(|w| (w.code.clone(), w.detail.clone()))
-            .collect(),
-        r.refused_pnpm_uuids.clone(),
-    )
-}
 
 /// Run both implementations and assert they agree; returns the result.
 fn assert_equivalent(files: &BTreeMap<String, String>, overrides: &[DepOverride]) -> RewriteResult {
@@ -33,51 +15,8 @@ fn assert_equivalent(files: &BTreeMap<String, String>, overrides: &[DepOverride]
     rewrite_pnpm_lock_oracle(files, overrides, &mut want);
     let mut got = RewriteResult::default();
     rewrite_pnpm_lock(files, overrides, &mut got);
-    let (want_s, got_s) = (snapshot(&want), snapshot(&got));
-    for (path, want_text) in &want_s.0 {
-        let got_text = got_s.0.get(path);
-        assert!(
-            got_text == Some(want_text),
-            "rewritten bytes differ for {path} (first diff at byte {:?})",
-            got_text.map(|g| g
-                .bytes()
-                .zip(want_text.bytes())
-                .position(|(a, b)| a != b)
-                .unwrap_or(g.len().min(want_text.len())))
-        );
-    }
-    assert_eq!(
-        got_s.0.keys().collect::<Vec<_>>(),
-        want_s.0.keys().collect::<Vec<_>>(),
-        "rewritten file set"
-    );
-    assert_eq!(got_s.1.len(), want_s.1.len(), "edit count");
-    for (i, (g, w)) in got_s.1.iter().zip(&want_s.1).enumerate() {
-        assert_eq!(g, w, "edit #{i}");
-    }
-    assert_eq!(got_s.2, want_s.2, "warnings (code, detail) in order");
-    assert_eq!(got_s.3, want_s.3, "refused pnpm uuids");
+    assert_same(&want, &got, "pnpm");
     got
-}
-
-/// Deterministic xorshift64* — no `rand` dev-dependency.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-    fn chance(&mut self, percent: u64) -> bool {
-        self.next() % 100 < percent
-    }
 }
 
 #[derive(Clone, Copy, PartialEq)]

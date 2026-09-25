@@ -43,6 +43,8 @@ mod pnpm_equivalence_tests;
 mod poetry;
 mod replay;
 mod requirements;
+#[cfg(test)]
+mod rewrite_oracle_support;
 mod staged;
 mod state;
 mod takeover;
