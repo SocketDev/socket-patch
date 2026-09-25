@@ -1322,19 +1322,20 @@ async fn missing_local_rung(
 }
 
 /// Whether the ledger already covers `record` for `entry`'s purl: the entry
-/// records this very patch uuid and its committed artifact is on disk.
-/// Read-only (one stat). The backend's in-sync hot path answers such a purl
-/// from the committed artifact without reading the pristine tree, which is
-/// what lets its download be deferred; whether the artifact still VERIFIES
-/// is the backend's own question — a drifted one is rebuilt, and a rebuild
-/// that needs the pristine tree fetches it then.
+/// records this very patch uuid and its committed artifact is on disk — a
+/// FILE artifact (wheel, tarball) hashing to the ledger's `sha256`.
+/// Read-only, no network. The backend's in-sync hot path answers such a
+/// purl from the committed artifact without reading the pristine tree,
+/// which is what lets its download be deferred. Some in-sync checks look
+/// only for the artifact's presence (pypi's), so a file artifact that no
+/// longer hashes to its ledger pin is not covered: it keeps the eager
+/// ladder, and a run that cannot reach the registry says so as it always
+/// did. A copy DIR's integrity stays the backend's own question — a
+/// drifted one is rebuilt, and a rebuild that needs the pristine tree
+/// fetches it then.
 async fn ledger_covers(cwd: &Path, entry: Option<&VendorEntry>, record: &PatchRecord) -> bool {
     match entry {
-        Some(entry) if entry.uuid == record.uuid && !entry.artifact.path.is_empty() => {
-            tokio::fs::metadata(cwd.join(&entry.artifact.path))
-                .await
-                .is_ok()
-        }
+        Some(entry) if entry.uuid == record.uuid => entry.committed_artifact_intact(cwd).await,
         _ => false,
     }
 }

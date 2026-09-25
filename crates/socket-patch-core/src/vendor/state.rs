@@ -277,6 +277,26 @@ pub struct VendorEntry {
 }
 
 impl VendorEntry {
+    /// Whether this entry's committed artifact is on disk under
+    /// `project_root` — for a FILE artifact (wheel, tarball: a recorded
+    /// `sha256`), only when its bytes still hash to that pin; a copy dir
+    /// (no `sha256`) is only stat-ed. Read-only, no network.
+    pub async fn committed_artifact_intact(&self, project_root: &Path) -> bool {
+        use sha2::Digest as _;
+        if self.artifact.path.is_empty() {
+            return false;
+        }
+        let path = project_root.join(&self.artifact.path);
+        if self.artifact.sha256.is_empty() {
+            return tokio::fs::metadata(&path).await.is_ok();
+        }
+        match read_regular_to_bytes(&path).await {
+            Ok(bytes) => hex::encode(sha2::Sha256::digest(&bytes))
+                .eq_ignore_ascii_case(&self.artifact.sha256),
+            Err(_) => false,
+        }
+    }
+
     /// Does this entry, stored under ledger `key`, match a remove/rollback
     /// identifier? By its ledger key or by its base purl (mirroring the
     /// manifest matching of [`patch_matches`]; a golang key is case-encoded

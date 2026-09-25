@@ -226,14 +226,14 @@ fn snapshot_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
 
 // ── pypi ────────────────────────────────────────────────────────────────
 
-#[test]
-fn pypi_rerun_without_network_is_in_sync() {
-    const PURL: &str = "pkg:pypi/six@1.16.0";
-    const UUID: &str = "2b1f6c1e-8d3a-4f6b-9c2d-7e5a9b1c3d01";
+const SIX_PURL: &str = "pkg:pypi/six@1.16.0";
+
+/// A requirements project with `six` installed in `.venv` and a patch for
+/// it in the manifest.
+fn write_six_project(root: &Path, uuid: &str) {
+    const PURL: &str = SIX_PURL;
     const ORIG: &[u8] = b"# six\nVERSION = '1.16.0'\n";
     const PATCHED: &[u8] = b"# six\nVERSION = '1.16.0'\nSAFE = True\n";
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
     // A hash-pinned requirement: the ledger-recovered pre-vendor line is
     // then fetchable, so the old ladder really went to the registry.
     std::fs::write(
@@ -265,14 +265,62 @@ fn pypi_rerun_without_network_is_in_sync() {
          six-1.16.0.dist-info/WHEEL,,\nsix-1.16.0.dist-info/RECORD,,\n",
     )
     .unwrap();
-    write_manifest(root, PURL, UUID, "six.py", ORIG, PATCHED);
+    write_manifest(root, PURL, uuid, "six.py", ORIG, PATCHED);
+}
 
+#[test]
+fn pypi_rerun_without_network_is_in_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_six_project(root, "2b1f6c1e-8d3a-4f6b-9c2d-7e5a9b1c3d01");
     assert_rerun_green_without_network(
         root,
-        PURL,
+        SIX_PURL,
         |root| std::fs::remove_dir_all(root.join(".venv")).unwrap(),
         &[],
     );
+}
+
+/// The deferral trusts a committed FILE artifact only while it hashes to
+/// its ledger pin (the pypi in-sync check looks only for the wheel's
+/// presence). A tampered wheel on a fresh clone keeps the eager ladder, so
+/// with no network the run fails as it always did instead of calling the
+/// garbage in sync.
+#[test]
+fn pypi_rerun_over_a_tampered_wheel_is_not_called_in_sync() {
+    const UUID: &str = "2b1f6c1e-8d3a-4f6b-9c2d-7e5a9b1c3d09";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_six_project(root, UUID);
+    let dead = dead_endpoint();
+    let (code, v, stderr) = run_vendor(root, &dead, &[], &[]);
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    std::fs::remove_dir_all(root.join(".venv")).unwrap();
+    let uuid_dir = root.join(format!(".socket/vendor/pypi/{UUID}"));
+    let wheel = std::fs::read_dir(&uuid_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "whl"))
+        .expect("the committed wheel");
+    std::fs::write(&wheel, b"garbage").unwrap();
+
+    for extra in [&[][..], &["--offline"][..]] {
+        let (code, v, stderr) = run_vendor(root, &dead, extra, &[]);
+        assert_eq!(code, 1, "{extra:?}: {v:#}\n{stderr}");
+        // Exactly what the eager ladder reports for it (the integrated
+        // base binary's events on this fixture).
+        let expected = if extra.is_empty() {
+            vec![
+                ("skipped", "vendor_fetch_unverifiable"),
+                ("skipped", "package_not_installed"),
+            ]
+        } else {
+            vec![("skipped", "package_not_installed")]
+        };
+        assert_eq!(purl_events(&v, SIX_PURL), expected, "{extra:?}: {v:#}");
+    }
+    assert_eq!(std::fs::read(&wheel).unwrap(), b"garbage");
 }
 
 // ── cargo ───────────────────────────────────────────────────────────────
