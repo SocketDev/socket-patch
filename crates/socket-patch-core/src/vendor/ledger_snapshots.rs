@@ -1,59 +1,74 @@
 //! The on-disk form of the ledger's whole-file wiring snapshots.
 //!
 //! Several backends record a WHOLE file as a wiring record's `original` /
-//! `new` (maven's `pom.xml`, nuget's config, the Python locks and PEP 723
-//! scripts): revert restores the verbatim original when the live file is
-//! still exactly what vendoring wrote, and otherwise does a structural or
-//! fragment-level restore that needs both texts. Every package of a project
-//! re-records the same growing file, so a ledger over N packages held 2N
-//! near-identical copies of it — tens of megabytes on a hundred-package
-//! maven or pylock project, re-serialized after every package and re-parsed
-//! by every later command.
+//! `new` (maven's `pom.xml`, nuget's config, `pylock*.toml`, PEP 723
+//! scripts and hatch's project files — [`WHOLE_FILE_KINDS`]): revert
+//! restores the verbatim original when the live file is still exactly what
+//! vendoring wrote, and otherwise does a structural or fragment-level
+//! restore that needs both texts. A record's `new` is its `original` plus
+//! the package's own few-hundred-byte edit, yet was stored in full beside
+//! it, so every package of a project held two near-identical copies of the
+//! (growing) file — tens of megabytes on a hundred-package maven or pylock
+//! project, re-serialized after every package and re-parsed by every later
+//! command.
 //!
 //! **Schema version 2** keeps the in-memory model exactly as it was (every
 //! consumer — revert, repair, `vex`, the carry-forward — still sees full
-//! strings) and changes only the file:
+//! strings) and changes only the file: the `new` text of a whole-file
+//! record of at least [`SNAPSHOT_MIN_BYTES`] is written as an edit of the
+//! SAME record's `original`,
+//! `{"snapshot": "<sha256 hex of the text>", "ops": [[start, len], "inserted text", …]}`
+//! — the text is the ops concatenated in order, a `[start, len]` pair
+//! copying that byte range of the record's `original` and a string
+//! inserting itself (a line-level diff, so an edit that touches two distant
+//! places of a file stays two small inserts). The `original` itself stays
+//! the plain string it always was, and the ledger's `"version"` is `2`. A
+//! ledger with no such record keeps the version-1 file byte for byte, and
+//! every other record (every lockfile splice fragment) is untouched.
 //!
-//! * each string `original` / `new` of at least [`SNAPSHOT_MIN_BYTES`] is
-//!   written as `{"snapshot": "<sha256 hex of the text>"}`;
-//! * a top-level `"snapshots"` object maps each hash to either the full
-//!   text, `{"text": "…"}`, or an edit of another snapshot,
-//!   `{"base": "<sha256>", "ops": [[start, len], "inserted text", …]}` —
-//!   the text is the ops concatenated in order, a `[start, len]` pair
-//!   copying that byte range of the base and a string inserting itself (a
-//!   line-level diff, so an edit that touches two distant places of a file
-//!   stays two small inserts). A record's `new` is encoded as an edit of the same
-//!   record's `original` (the package's own edit, a few hundred bytes), and
-//!   an `original` that is some other record's `new` shares its entry, so a
-//!   file costs one full text plus one small edit per package;
-//! * `"version"` is `2`. A ledger with no snapshot-sized string keeps the
-//!   version-1 file byte for byte.
+//! Each record is self-contained on purpose. An older socket-patch keeps a
+//! record's `original` / `new` as opaque JSON and re-saves them verbatim
+//! but drops anything it does not know (a top-level table, an unknown
+//! field), and it adds, replaces and deletes whole entries; an encoding
+//! that shared text ACROSS records or entries would lose it the moment an
+//! older binary re-saved the ledger. This one survives any such round trip.
 //!
 //! Reading accepts both versions. Version 1 (every ledger written before
-//! this) holds inline strings and is parsed as it always was. Version 2 is
-//! resolved back to full strings, and every resolved text is checked
-//! against its hash — a snapshot that does not reproduce its text, a
-//! missing or cyclic base, or an out-of-range edit makes the ledger
-//! unreadable (`vendor_state_unreadable`) rather than handing revert a
-//! wrong original. An older binary that meets a version-2 record sees an
-//! object where it expects a string and leaves that fragment alone with a
-//! drift warning, the documented forward-compatibility posture.
-
-use std::collections::{BTreeMap, HashMap};
+//! this) holds inline strings and is parsed as it always was. A version-2
+//! edit is rebuilt against its record's `original` and checked against its
+//! hash — an edit that does not reproduce its text, has no string
+//! `original` to apply to, or copies out of range, and any `{"snapshot":
+//! …}` value that is not such an edit, makes the ledger unreadable
+//! (`vendor_state_unreadable`) rather than handing revert a wrong text. An
+//! older binary that meets a version-2 record sees an object where it
+//! expects a string and leaves that fragment alone with a drift warning,
+//! the documented forward-compatibility posture.
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-/// Strings at least this long are stored in the snapshot table. Every
-/// splice fragment the lock backends record is far shorter; whole-file
+/// A `new` text at least this long is stored as an edit. Whole-file
 /// snapshots of real projects are far longer.
 pub(crate) const SNAPSHOT_MIN_BYTES: usize = 1024;
 
-/// The version a ledger carrying a snapshot table is written with.
+/// The wiring kinds whose `original` / `new` hold a whole file. Every other
+/// kind records a lockfile fragment and is never rewritten.
+pub(crate) const WHOLE_FILE_KINDS: &[&str] = &[
+    "maven_pom_repository",
+    "nuget_config_source",
+    "python_lock_document",
+    "python_script_metadata",
+    "hatch_document",
+];
+
+/// The version a ledger carrying an edit is written with.
 pub(crate) const SNAPSHOT_VERSION: u64 = 2;
 
+/// The version every other ledger is written with.
+const PLAIN_VERSION: u64 = 1;
+
 const SNAPSHOT_REF: &str = "snapshot";
-const SNAPSHOTS: &str = "snapshots";
+const OPS: &str = "ops";
 
 fn sha256_hex(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
@@ -72,86 +87,44 @@ fn records_mut(ledger: &mut Value) -> impl Iterator<Item = &mut Map<String, Valu
 }
 
 /// Rewrite a serialized version-1 ledger into its on-disk form (see the
-/// module docs): large snapshot strings move into the table.
+/// module docs): a whole-file record's large `new` becomes an edit of its
+/// `original`.
 pub(crate) fn encode(ledger: &mut Value) {
-    let mut texts: BTreeMap<String, String> = BTreeMap::new();
-    // new-text hash → the hash of the original it was derived from.
-    let mut derived: HashMap<String, String> = HashMap::new();
+    let mut encoded = false;
     for record in records_mut(ledger) {
-        let mut take = |field: &str| -> Option<String> {
-            let slot = record.get_mut(field)?;
-            let text = match slot {
-                Value::String(text) if text.len() >= SNAPSHOT_MIN_BYTES => std::mem::take(text),
-                _ => return None,
-            };
-            let hash = sha256_hex(&text);
-            *slot = serde_json::json!({ SNAPSHOT_REF: hash });
-            texts.entry(hash.clone()).or_insert(text);
-            Some(hash)
+        let whole_file = record
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| WHOLE_FILE_KINDS.contains(&kind));
+        if !whole_file {
+            continue;
+        }
+        let (Some(Value::String(original)), Some(Value::String(new))) =
+            (record.get("original"), record.get("new"))
+        else {
+            continue;
         };
-        let original = take("original");
-        let new = take("new");
-        if let (Some(original), Some(new)) = (original, new) {
-            if original != new {
-                derived.entry(new).or_insert(original);
-            }
+        if new.len() < SNAPSHOT_MIN_BYTES || original == new {
+            continue;
         }
+        let Some(ops) = edit(original, new) else {
+            continue;
+        };
+        let value = serde_json::json!({ SNAPSHOT_REF: sha256_hex(new), OPS: ops });
+        record.insert("new".to_string(), value);
+        encoded = true;
     }
-    if texts.is_empty() {
-        return;
-    }
-
-    // Emit every text as an edit of the one it was derived from once that
-    // one is itself emitted; a text derived from nothing (the pre-vendor
-    // original) — or left on a cycle — is written in full.
-    let mut encoded: BTreeMap<String, Value> = BTreeMap::new();
-    loop {
-        let mut progressed = false;
-        for (hash, text) in &texts {
-            if encoded.contains_key(hash) {
-                continue;
-            }
-            match derived.get(hash).filter(|base| texts.contains_key(*base)) {
-                None => {
-                    encoded.insert(hash.clone(), full(text));
-                    progressed = true;
-                }
-                Some(base) if encoded.contains_key(base) => {
-                    encoded.insert(hash.clone(), edit(base, &texts[base], text));
-                    progressed = true;
-                }
-                Some(_) => {}
-            }
+    if encoded {
+        if let Some(object) = ledger.as_object_mut() {
+            object.insert("version".to_string(), Value::from(SNAPSHOT_VERSION));
         }
-        if encoded.len() == texts.len() {
-            break;
-        }
-        if !progressed {
-            // Only a cycle is left: break it with one full text.
-            if let Some((hash, text)) = texts.iter().find(|(h, _)| !encoded.contains_key(*h)) {
-                encoded.insert(hash.clone(), full(text));
-            }
-        }
-    }
-    if let Some(object) = ledger.as_object_mut() {
-        object.insert("version".to_string(), Value::from(SNAPSHOT_VERSION));
-        object.insert(
-            SNAPSHOTS.to_string(),
-            Value::Object(encoded.into_iter().collect()),
-        );
     }
 }
 
-fn full(text: &str) -> Value {
-    serde_json::json!({ "text": text })
-}
-
-/// `target` as an edit of `base` (see the module docs), or in full when the
-/// edit would not be clearly smaller.
-fn edit(base_hash: &str, base: &str, target: &str) -> Value {
-    let Some(ops) = line_diff(base, target) else {
-        return full(target);
-    };
+/// `target` as copy/insert ops over `base` (see the module docs), or
+/// `None` when the edit would not be clearly smaller than the text.
+fn edit(base: &str, target: &str) -> Option<Vec<Value>> {
+    let ops = line_diff(base, target)?;
     let inserted: usize = ops
         .iter()
         .map(|op| match op {
@@ -160,16 +133,16 @@ fn edit(base_hash: &str, base: &str, target: &str) -> Value {
         })
         .sum();
     if inserted + 128 >= target.len() {
-        return full(target);
+        return None;
     }
-    let ops: Vec<Value> = ops
-        .into_iter()
-        .map(|op| match op {
-            Op::Copy(start, len) => serde_json::json!([start, len]),
-            Op::Insert(text) => Value::String(text.to_string()),
-        })
-        .collect();
-    serde_json::json!({ "base": base_hash, "ops": ops })
+    Some(
+        ops.into_iter()
+            .map(|op| match op {
+                Op::Copy(start, len) => serde_json::json!([start, len]),
+                Op::Insert(text) => Value::String(text.to_string()),
+            })
+            .collect(),
+    )
 }
 
 enum Op<'a> {
@@ -294,135 +267,87 @@ fn line_diff<'a>(base: &str, target: &'a str) -> Option<Vec<Op<'a>>> {
     Some(ops)
 }
 
-/// Whether raw ledger bytes may carry a snapshot table — a cheap scan so
+/// Whether raw ledger bytes may carry a version-2 edit — a cheap scan so
 /// every version-1 ledger keeps the direct parse. A false positive only
 /// costs the slower path.
 pub(crate) fn may_have_snapshots(bytes: &[u8]) -> bool {
-    let needle = b"\"snapshots\"";
+    let needle = b"\"snapshot\"";
     bytes.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Whether a wiring value is in the version-2 snapshot shape: an object
+/// whose `snapshot` is a string and whose other keys are ours. A lockfile
+/// fragment recorded as an object (composer's package) never is.
+fn is_snapshot_value(object: &Map<String, Value>) -> bool {
+    object.get(SNAPSHOT_REF).is_some_and(Value::is_string)
+        && object.keys().all(|k| k == SNAPSHOT_REF || k == OPS)
+}
+
 /// Resolve a version-2 ledger back to the version-1 shape in place (see the
-/// module docs). A ledger without a table is left untouched.
+/// module docs), `version` included, so the loaded model is exactly the
+/// one that was saved. A version-1 ledger is left untouched.
 pub(crate) fn decode(ledger: &mut Value) -> Result<(), String> {
-    let Some(table) = ledger
-        .as_object_mut()
-        .and_then(|object| object.remove(SNAPSHOTS))
-    else {
-        return Ok(());
-    };
-    let Value::Object(table) = table else {
-        return Err("the snapshot table is not an object".to_string());
-    };
-    let mut resolved: HashMap<String, String> = HashMap::new();
-    for hash in table.keys() {
-        resolve(hash, &table, &mut resolved, 0)?;
-    }
     for record in records_mut(ledger) {
-        for field in ["original", "new"] {
-            let Some(slot) = record.get_mut(field) else {
-                continue;
-            };
-            let Some(hash) = slot
-                .as_object()
-                .filter(|o| o.len() == 1)
-                .and_then(|o| o.get(SNAPSHOT_REF))
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-            let text = resolved
-                .get(hash)
-                .ok_or_else(|| format!("wiring names snapshot {hash}, which the table lacks"))?;
-            *slot = Value::String(text.clone());
+        if let Some(Value::Object(original)) = record.get("original") {
+            if is_snapshot_value(original) {
+                return Err(
+                    "a wiring original is stored as a snapshot, which no build writes".to_string(),
+                );
+            }
+        }
+        let Some(Value::Object(new)) = record.get("new") else {
+            continue;
+        };
+        if !is_snapshot_value(new) {
+            continue;
+        }
+        let hash = new[SNAPSHOT_REF]
+            .as_str()
+            .expect("checked by the shape test");
+        let ops = new
+            .get(OPS)
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("wiring names snapshot {hash} with no edit to rebuild it"))?;
+        let base = record
+            .get("original")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("snapshot {hash} has no original to apply its edit to"))?;
+        let text = apply_ops(hash, base, ops)?;
+        record.insert("new".to_string(), Value::String(text));
+    }
+    if let Some(object) = ledger.as_object_mut() {
+        if object.get("version").and_then(Value::as_u64) == Some(SNAPSHOT_VERSION) {
+            object.insert("version".to_string(), Value::from(PLAIN_VERSION));
         }
     }
     Ok(())
 }
 
-/// Longest edit chain followed before a table is declared cyclic.
-const MAX_CHAIN: usize = 100_000;
-
-fn resolve(
-    hash: &str,
-    table: &Map<String, Value>,
-    resolved: &mut HashMap<String, String>,
-    depth: usize,
-) -> Result<(), String> {
-    if resolved.contains_key(hash) {
-        return Ok(());
-    }
-    // Walk the chain down to a full text iteratively (a long run of edits
-    // must not recurse), then rebuild it upwards.
-    let mut chain: Vec<&str> = vec![hash];
-    loop {
-        let top = *chain.last().expect("non-empty");
-        if resolved.contains_key(top) {
-            break;
-        }
-        let entry = table
-            .get(top)
-            .ok_or_else(|| format!("snapshot {top} is missing from the table"))?;
-        if entry.get("text").is_some() {
-            break;
-        }
-        let base = entry
-            .get("base")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("snapshot {top} has neither a text nor a base"))?;
-        if chain.len() + depth > MAX_CHAIN || chain.contains(&base) {
-            return Err(format!("snapshot {top} is on a cyclic edit chain"));
-        }
-        chain.push(base);
-    }
-    for at in (0..chain.len()).rev() {
-        let key = chain[at];
-        if resolved.contains_key(key) {
-            continue;
-        }
-        let entry = &table[key];
-        let text = match entry.get("text") {
-            Some(Value::String(text)) => text.clone(),
-            Some(_) => return Err(format!("snapshot {key} has a non-string text")),
-            None => {
-                let base_hash = entry["base"].as_str().expect("checked on the way down");
-                let base = &resolved[base_hash];
-                let ops = entry
-                    .get("ops")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| format!("snapshot {key} has no `ops`"))?;
-                let mut text = String::new();
-                for op in ops {
-                    match op {
-                        Value::String(insert) => text.push_str(insert),
-                        Value::Array(range) if range.len() == 2 => {
-                            let bound =
-                                |v: &Value| v.as_u64().and_then(|n| usize::try_from(n).ok());
-                            let (Some(start), Some(len)) = (bound(&range[0]), bound(&range[1]))
-                            else {
-                                return Err(format!("snapshot {key} has a malformed copy"));
-                            };
-                            let end = start
-                                .checked_add(len)
-                                .filter(|end| *end <= base.len())
-                                .filter(|end| {
-                                    base.is_char_boundary(start) && base.is_char_boundary(*end)
-                                })
-                                .ok_or_else(|| format!("snapshot {key} edits outside its base"))?;
-                            text.push_str(&base[start..end]);
-                        }
-                        _ => return Err(format!("snapshot {key} has a malformed op")),
-                    }
-                }
-                text
+/// The text `ops` build over `base`, checked against `hash`.
+fn apply_ops(hash: &str, base: &str, ops: &[Value]) -> Result<String, String> {
+    let mut text = String::new();
+    for op in ops {
+        match op {
+            Value::String(insert) => text.push_str(insert),
+            Value::Array(range) if range.len() == 2 => {
+                let bound = |v: &Value| v.as_u64().and_then(|n| usize::try_from(n).ok());
+                let (Some(start), Some(len)) = (bound(&range[0]), bound(&range[1])) else {
+                    return Err(format!("snapshot {hash} has a malformed copy"));
+                };
+                let end = start
+                    .checked_add(len)
+                    .filter(|end| *end <= base.len())
+                    .filter(|end| base.is_char_boundary(start) && base.is_char_boundary(*end))
+                    .ok_or_else(|| format!("snapshot {hash} edits outside its original"))?;
+                text.push_str(&base[start..end]);
             }
-        };
-        if sha256_hex(&text) != key {
-            return Err(format!("snapshot {key} does not reproduce its text"));
+            _ => return Err(format!("snapshot {hash} has a malformed op")),
         }
-        resolved.insert(key.to_string(), text);
     }
-    Ok(())
+    if sha256_hex(&text) != hash {
+        return Err(format!("snapshot {hash} does not reproduce its text"));
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -436,12 +361,12 @@ mod tests {
         )
     }
 
-    fn ledger(records: Vec<(Option<&str>, Option<&str>)>) -> Value {
+    fn ledger_of(kind: &str, records: Vec<(Option<&str>, Option<&str>)>) -> Value {
         let wiring: Vec<Value> = records
             .into_iter()
             .map(|(o, n)| {
                 let mut r =
-                    serde_json::json!({ "file": "pom.xml", "kind": "k", "action": "added" });
+                    serde_json::json!({ "file": "pom.xml", "kind": kind, "action": "added" });
                 if let Some(o) = o {
                     r["original"] = Value::String(o.to_string());
                 }
@@ -454,8 +379,12 @@ mod tests {
         serde_json::json!({ "version": 1, "entries": { "pkg:x/a@1": { "wiring": wiring } } })
     }
 
+    fn ledger(records: Vec<(Option<&str>, Option<&str>)>) -> Value {
+        ledger_of("maven_pom_repository", records)
+    }
+
     #[test]
-    fn a_chain_of_edits_costs_one_full_text_and_round_trips() {
+    fn a_new_text_is_an_edit_of_its_own_original_and_round_trips() {
         let v0 = big("base");
         let v1 = v0.replace("</project>", "  <repo>one</repo>\n</project>");
         let v2 = v1.replace("</project>", "  <repo>two</repo>\n</project>");
@@ -466,21 +395,20 @@ mod tests {
         let mut encoded = original.clone();
         encode(&mut encoded);
         assert_eq!(encoded["version"], 2);
-        let table = encoded["snapshots"].as_object().unwrap();
-        assert_eq!(table.len(), 3);
-        assert_eq!(
-            table.values().filter(|e| e.get("text").is_some()).count(),
-            1,
-            "only the pre-vendor original is stored in full"
-        );
+        assert!(encoded.get("snapshots").is_none(), "no shared table");
+        let wiring = encoded["entries"]["pkg:x/a@1"]["wiring"]
+            .as_array()
+            .unwrap();
+        for record in wiring {
+            assert!(record["original"].is_string(), "originals stay plain text");
+            assert!(record["new"]["ops"].is_array(), "{record}");
+        }
         let wire = serde_json::to_vec(&encoded).unwrap();
         let one_text = serde_json::to_string(&v0).unwrap().len();
-        assert!(wire.len() < one_text + 1024, "{} bytes", wire.len());
+        assert!(wire.len() < 2 * one_text + 1024, "{} bytes", wire.len());
         let mut decoded: Value = serde_json::from_slice(&wire).unwrap();
         decode(&mut decoded).unwrap();
-        let mut expected = original;
-        expected["version"] = Value::from(2);
-        assert_eq!(decoded, expected);
+        assert_eq!(decoded, original, "version included");
     }
 
     #[test]
@@ -489,6 +417,58 @@ mod tests {
         let mut encoded = original.clone();
         encode(&mut encoded);
         assert_eq!(encoded, original);
+    }
+
+    /// A lockfile fragment of any size is never rewritten: only whole-file
+    /// kinds are, and a whole-file `new` with no `original` (a file the
+    /// run created) stays inline too.
+    #[test]
+    fn fragments_and_created_files_keep_version_one() {
+        let v0 = big("base");
+        let v1 = v0.replace("</project>", "  <repo>one</repo>\n</project>");
+        let fragment = ledger_of(
+            "poetry_lock_package",
+            vec![(Some(v0.as_str()), Some(v1.as_str()))],
+        );
+        let mut encoded = fragment.clone();
+        encode(&mut encoded);
+        assert_eq!(encoded, fragment);
+        let created = ledger(vec![(None, Some(v1.as_str()))]);
+        let mut encoded = created.clone();
+        encode(&mut encoded);
+        assert_eq!(encoded, created);
+    }
+
+    /// What an older socket-patch does to a version-2 ledger — re-save it
+    /// through its own model, which keeps a record's `original` / `new`
+    /// verbatim, and add, replace or delete whole entries — never loses a
+    /// text the remaining records need.
+    #[test]
+    fn survives_an_older_binary_dropping_entries_and_unknown_fields() {
+        let v0 = big("base");
+        let v1 = v0.replace("</project>", "  <repo>one</repo>\n</project>");
+        let v2 = v1.replace("</project>", "  <repo>two</repo>\n</project>");
+        let mut state = ledger(vec![(Some(v0.as_str()), Some(v1.as_str()))]);
+        state["entries"]["pkg:x/b@1"] = serde_json::json!({ "wiring": [{
+            "file": "pom.xml", "kind": "maven_pom_repository", "action": "added",
+            "original": v1, "new": v2,
+        }]});
+        let mut encoded = state.clone();
+        encode(&mut encoded);
+        encoded["entries"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pkg:x/a@1");
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), Value::Null);
+        encoded.as_object_mut().unwrap().remove("unknown");
+        decode(&mut encoded).unwrap();
+        assert_eq!(
+            encoded["entries"]["pkg:x/b@1"],
+            state["entries"]["pkg:x/b@1"]
+        );
     }
 
     /// An edit in two distant places stays two small inserts, and any
@@ -501,25 +481,13 @@ mod tests {
             .replace("line 290\n", "")
             .replace("line 250\n", "line 250 changed\n")
             + "appended\n";
-        let value = edit("h", &base, &target);
-        let ops = value["ops"].as_array().expect("an edit, not a full text");
+        let ops = edit(&base, &target).expect("an edit, not a full text");
         let inserted: usize = ops.iter().filter_map(Value::as_str).map(str::len).sum();
-        assert!(inserted < 80, "{inserted} bytes inserted: {value}");
-        let mut text = String::new();
-        for op in ops {
-            match op {
-                Value::String(s) => text.push_str(s),
-                Value::Array(r) => {
-                    let (a, n) = (
-                        r[0].as_u64().unwrap() as usize,
-                        r[1].as_u64().unwrap() as usize,
-                    );
-                    text.push_str(&base[a..a + n]);
-                }
-                _ => unreachable!(),
-            }
-        }
-        assert_eq!(text, target);
+        assert!(inserted < 80, "{inserted} bytes inserted: {ops:?}");
+        assert_eq!(
+            apply_ops(&sha256_hex(&target), &base, &ops).unwrap(),
+            target
+        );
         for (b, t) in [
             ("", "x\n"),
             ("x\n", ""),
@@ -542,51 +510,68 @@ mod tests {
     fn edits_respect_multibyte_boundaries() {
         let v0 = format!("{}é{}", "x".repeat(2000), "y".repeat(2000));
         let v1 = format!("{}è{}", "x".repeat(2000), "y".repeat(2000));
-        let mut encoded = ledger(vec![(Some(v0.as_str()), Some(v1.as_str()))]);
-        encode(&mut encoded);
-        let mut decoded = encoded.clone();
+        let original = ledger(vec![(Some(v0.as_str()), Some(v1.as_str()))]);
+        let mut decoded = original.clone();
+        encode(&mut decoded);
         decode(&mut decoded).unwrap();
-        assert_eq!(decoded["entries"]["pkg:x/a@1"]["wiring"][0]["new"], v1);
+        assert_eq!(decoded, original);
     }
 
     #[test]
-    fn a_tampered_or_broken_table_is_rejected() {
+    fn a_tampered_or_dangling_snapshot_is_rejected() {
         let v0 = big("base");
         let v1 = v0.replace("</project>", "  <repo>one</repo>\n</project>");
         let mut encoded = ledger(vec![(Some(v0.as_str()), Some(v1.as_str()))]);
         encode(&mut encoded);
-        let table = encoded["snapshots"].as_object().unwrap().clone();
-        let (edit_hash, _) = table.iter().find(|(_, e)| e.get("base").is_some()).unwrap();
-        let (full_hash, _) = table.iter().find(|(_, e)| e.get("text").is_some()).unwrap();
+        fn new(v: &mut Value) -> &mut Value {
+            &mut v["entries"]["pkg:x/a@1"]["wiring"][0]
+        }
 
         let mut tampered = encoded.clone();
-        tampered["snapshots"][edit_hash]["ops"]
+        new(&mut tampered)["new"]["ops"]
             .as_array_mut()
             .unwrap()
             .push(Value::from("evil"));
         assert!(decode(&mut tampered).unwrap_err().contains("reproduce"));
 
         let mut out_of_range = encoded.clone();
-        out_of_range["snapshots"][edit_hash]["ops"][0] = serde_json::json!([u64::MAX / 4, 1]);
+        new(&mut out_of_range)["new"]["ops"][0] = serde_json::json!([u64::MAX / 4, 1]);
         assert!(decode(&mut out_of_range).is_err());
 
-        let mut missing = encoded.clone();
-        missing["snapshots"]
+        let mut orphaned = encoded.clone();
+        new(&mut orphaned)
             .as_object_mut()
             .unwrap()
-            .remove(full_hash.as_str());
-        assert!(decode(&mut missing).unwrap_err().contains("missing"));
+            .remove("original");
+        assert!(decode(&mut orphaned).unwrap_err().contains("no original"));
 
-        let mut cyclic = encoded.clone();
-        cyclic["snapshots"][full_hash.as_str()] =
-            serde_json::json!({ "base": edit_hash, "ops": [] });
-        assert!(decode(&mut cyclic).unwrap_err().contains("cyclic"));
+        let mut dangling = encoded.clone();
+        new(&mut dangling)["new"] = serde_json::json!({ "snapshot": sha256_hex(&v1) });
+        assert!(decode(&mut dangling).unwrap_err().contains("no edit"));
+
+        let mut original_ref = encoded.clone();
+        new(&mut original_ref)["original"] = serde_json::json!({ "snapshot": sha256_hex(&v0) });
+        assert!(decode(&mut original_ref).is_err());
+    }
+
+    /// A lockfile fragment recorded as a JSON object is data, whatever its
+    /// keys, unless it is exactly the snapshot shape.
+    #[test]
+    fn object_fragments_are_not_mistaken_for_snapshots() {
+        let mut value = serde_json::json!({ "version": 1, "entries": { "pkg:x/a@1": {
+            "wiring": [{ "file": "composer.lock", "kind": "composer_lock_package",
+                         "action": "added",
+                         "original": { "name": "a", "snapshot": "x" },
+                         "new": { "name": "a", "snapshot": "y" } }] } } });
+        let before = value.clone();
+        decode(&mut value).unwrap();
+        assert_eq!(value, before);
     }
 
     #[test]
-    fn the_snapshot_probe_ignores_escaped_text() {
-        assert!(may_have_snapshots(br#"{"snapshots":{}}"#));
-        assert!(!may_have_snapshots(br#"{"new":"snapshots:\n  a: {}"}"#));
-        assert!(!may_have_snapshots(br#"{"new":"say \"snapshots\""}"#));
+    fn the_snapshot_probe_ignores_escaped_text_and_kind_names() {
+        assert!(may_have_snapshots(br#"{"new":{"snapshot":"ab"}}"#));
+        assert!(!may_have_snapshots(br#"{"kind":"pnpm_lock_snapshot"}"#));
+        assert!(!may_have_snapshots(br#"{"new":"say \"snapshot\""}"#));
     }
 }

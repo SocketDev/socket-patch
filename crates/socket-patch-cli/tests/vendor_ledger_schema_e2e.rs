@@ -1,7 +1,7 @@
-//! The vendor ledger's version-2 snapshot table (see
-//! `socket_patch_core::vendor::ledger_snapshots`): whole-file wiring
-//! snapshots are stored once per file plus one small edit per package, and
-//! every older ledger keeps reverting byte for byte.
+//! The vendor ledger's version-2 snapshot edits (see
+//! `socket_patch_core::vendor::ledger_snapshots`): a whole-file wiring
+//! record's `new` is stored as a small edit of the same record's
+//! `original`, and every older ledger keeps reverting byte for byte.
 //!
 //! * `legacy_ledgers_revert_byte_for_byte` replays ledgers the integrated
 //!   base binary wrote (version 1, inline whole-file snapshots — checked in
@@ -11,8 +11,9 @@
 //!   the base binary's own revert left.
 //! * `new_ledgers_compact_whole_file_snapshots_and_revert` vendors each
 //!   ecosystem with this binary: the ledgers that hold whole-file snapshots
-//!   (maven, nuget, pylock) come out as version 2 and much smaller than the
-//!   inline form, the others stay version 1, and the revert is exact.
+//!   (maven, nuget, pylock) come out as version 2 with every `new` an edit
+//!   far smaller than the inline text, the others stay version 1, and the
+//!   revert is exact.
 
 #[path = "vendor_ecosystem_fixtures/mod.rs"]
 mod fx;
@@ -149,28 +150,44 @@ fn new_ledgers_compact_whole_file_snapshots_and_revert() {
                 .unwrap(),
             )
             .unwrap();
-            // The whole-file snapshot bytes the base binary stored inline…
+            // The whole-file `new` texts the base binary stored inline…
             let inline: usize = legacy["entries"]
                 .as_object()
                 .unwrap()
                 .values()
                 .flat_map(|e| e["wiring"].as_array().unwrap().iter())
-                .flat_map(|r| [&r["original"], &r["new"]])
-                .filter_map(|v| v.as_str())
+                .filter_map(|r| r["new"].as_str())
                 .filter(|t| t.len() >= 1024)
                 .map(str::len)
                 .sum();
-            // …against the table this binary stores them in.
-            let table = serde_json::to_vec(&ledger["snapshots"]).unwrap().len();
+            // …against the edits this binary stores them as. Every record
+            // stays self-contained: its `original` is still plain text and
+            // nothing lives outside the entries (an older binary re-saving
+            // the ledger drops unknown top-level fields).
+            assert!(ledger.get("snapshots").is_none(), "{eco}: {ledger:#}");
+            let records: Vec<&serde_json::Value> = ledger["entries"]
+                .as_object()
+                .unwrap()
+                .values()
+                .flat_map(|e| e["wiring"].as_array().unwrap().iter())
+                .collect();
             assert!(
-                table * 2 < inline,
-                "{eco}: the snapshot table ({table} bytes) is well under the inline \
-                 snapshots ({inline} bytes)"
+                records
+                    .iter()
+                    .all(|r| r["original"].get("snapshot").is_none()),
+                "{eco}: an original is never an edit: {ledger:#}"
             );
-            let table = ledger["snapshots"].as_object().unwrap();
+            let stored: usize = records
+                .iter()
+                .map(|r| &r["new"])
+                .filter(|v| v.get("snapshot").is_some())
+                .map(|v| serde_json::to_vec(v).unwrap().len())
+                .sum();
+            assert!(stored > 0, "{eco}: {ledger:#}");
             assert!(
-                table.values().filter(|e| e.get("text").is_some()).count() <= 2,
-                "{eco}: at most one full text per snapshotted file: {ledger:#}"
+                stored * 4 < inline,
+                "{eco}: the edits ({stored} bytes) are well under the inline \
+                 `new` texts ({inline} bytes)"
             );
         }
 

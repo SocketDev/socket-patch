@@ -587,7 +587,7 @@ fn parse_state(bytes: &[u8], path: &Path) -> std::io::Result<VendorState> {
     })
 }
 
-/// A ledger that may carry the version-2 snapshot table (see
+/// A ledger that may carry version-2 snapshot edits (see
 /// [`super::ledger_snapshots`]): resolved back to full strings, every one
 /// checked against its hash, before the typed parse.
 fn parse_snapshot_state(bytes: &[u8], path: &Path) -> std::io::Result<VendorState> {
@@ -669,9 +669,10 @@ pub async fn save_state(project_root: &Path, state: &VendorState) -> std::io::Re
     Ok(())
 }
 
-/// The ledger's on-disk JSON: whole-file wiring snapshots move into the
-/// version-2 snapshot table (see `super::ledger_snapshots`); a ledger
-/// without any keeps its version-1 form.
+/// The ledger's on-disk JSON: a whole-file wiring record's `new` is
+/// stored as a version-2 edit of its `original` (see
+/// `super::ledger_snapshots`); a ledger without one keeps its version-1
+/// form.
 fn ledger_value(state: &VendorState) -> std::io::Result<serde_json::Value> {
     let mut ledger = serde_json::to_value(state).map_err(std::io::Error::other)?;
     super::ledger_snapshots::encode(&mut ledger);
@@ -1002,8 +1003,9 @@ mod tests {
         entry
     }
 
-    /// Whole-file snapshots are stored once plus one small edit per
-    /// package (version 2) and load back to exactly the in-memory state.
+    /// A whole-file record's `new` is stored as a small edit of its own
+    /// `original` (version 2) and loads back to exactly the in-memory
+    /// state, `version` included.
     #[tokio::test]
     async fn whole_file_snapshots_are_stored_as_edits_and_load_back_exactly() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1034,15 +1036,26 @@ mod tests {
         let bytes = std::fs::read(tmp.path().join(VENDOR_STATE_REL)).unwrap();
         let on_disk: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(on_disk["version"], 2);
-        assert_eq!(on_disk["snapshots"].as_object().unwrap().len(), 3);
         assert!(
-            bytes.len() < pom0.len() + 4096,
-            "one full pom plus two edits, not four poms: {} bytes",
+            bytes.len() < 2 * pom0.len() + 4096,
+            "two full poms plus two edits, not four poms: {} bytes",
             bytes.len()
         );
+        assert_eq!(load_state(tmp.path()).await.unwrap(), state);
+
+        // Losing the last whole-file record (a revert of that package)
+        // re-saves the plain version-1 bytes.
         let mut back = load_state(tmp.path()).await.unwrap();
-        back.version = state.version;
-        assert_eq!(back, state);
+        back.entries.clear();
+        back.entries
+            .insert("pkg:npm/lodash@4.17.21".into(), sample_entry());
+        save_state(tmp.path(), &back).await.unwrap();
+        let mut expected = serde_json::to_vec_pretty(&back).unwrap();
+        expected.push(b'\n');
+        assert_eq!(
+            std::fs::read(tmp.path().join(VENDOR_STATE_REL)).unwrap(),
+            expected
+        );
     }
 
     /// A ledger with no snapshot-sized string keeps its version-1 bytes,
