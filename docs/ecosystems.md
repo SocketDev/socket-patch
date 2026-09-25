@@ -174,11 +174,18 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   other crawl of `~/.m2/repository`) takes a POM's groupId / artifactId / version from
   its directory when the file sits at the canonical
   `<group path>/<artifactId>/<version>/<artifactId>-<version>.pom` — the only place Maven
-  writes one — without opening it. Any other `.pom` (a SNAPSHOT dir's timestamped POM, a
-  hand-placed `extra.pom`, a group directory whose name holds a `.`) is parsed as before,
-  falling back to the directory path when the POM names no usable coordinates. The one
-  visible consequence: a POM placed by hand at a canonical path whose contents disagree
-  with its directory reports the directory's coordinates.
+  writes one — without opening it. The path spells the group relative to the scan root,
+  so each top-level group directory (`org/`, `com/`, ...) is confirmed first: the first
+  canonical POM under it whose contents parse must name the coordinates its path does.
+  A directory that fails that check — all of them when `--global-prefix` /
+  `SOCKET_GLOBAL_PREFIX` / `MAVEN_REPO_LOCAL` names a directory above or inside the
+  repository rather than the repository itself — is read content-first, as before. Any
+  other `.pom` (a SNAPSHOT dir's timestamped POM, a hand-placed `extra.pom`, a group
+  directory whose name holds a `.`) is parsed as before, falling back to the directory
+  path when the POM names no usable coordinates. The one visible consequence: under a
+  confirmed directory, a POM at a canonical path whose contents disagree with its
+  directory (hand-placed, or a legacy upstream POM with mismatched coordinates) reports
+  the directory's coordinates.
 * **Warm `~/.m2` shadowing (vendored Maven only).** Maven consults the *local repository*
   before any configured `<repository>`, so with vendored mode a warm `~/.m2` copy of the
   same GAV silently wins over the committed `file://` repository — the build succeeds

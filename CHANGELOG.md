@@ -1236,13 +1236,20 @@ into the new version's section — see docs/releasing.md.
 - **Maven discovery takes coordinates from the `~/.m2` path.** A POM at its
   canonical `<group path>/<artifactId>/<version>/<artifactId>-<version>.pom`
   location is no longer opened: its groupId / artifactId / version come from
-  the directory names, which is where Maven itself writes every POM, so on a
-  real local repository every purl is unchanged and the crawl skips reading
-  and parsing tens of thousands of files. Other `.pom` files (timestamped
-  SNAPSHOT POMs, hand-placed extras, a dotted group directory) are parsed as
-  before. One semantic change: a hand-placed POM at a canonical path whose
-  contents disagree with its directory now reports the directory's
-  coordinates instead of the ones in the file.
+  the directory names, which is where Maven itself writes every POM, so the
+  crawl skips reading and parsing tens of thousands of files. The path only
+  spells the right group when the scan root is the repository root, so each
+  top-level group directory (`org/`, `com/`, ...) is confirmed first: the
+  first canonical POM under it whose contents parse must agree with its
+  path, and a directory whose first such POM disagrees — every one of them
+  when `--global-prefix` / `SOCKET_GLOBAL_PREFIX` / `MAVEN_REPO_LOCAL` points
+  one level above or inside the repository — is read content-first exactly
+  as before. Other `.pom` files (timestamped SNAPSHOT POMs, hand-placed
+  extras, a dotted group directory) are parsed as before. One semantic
+  change: under a confirmed directory, a POM at a canonical path whose
+  contents disagree with its directory (hand-placed, or a legacy upstream
+  POM with mismatched coordinates) now reports the directory's coordinates
+  instead of the ones in the file.
 - **`scan --ecosystems` crawls only the named ecosystems.** Without
   `--prune`/`--sync`, a `scan -e npm` no longer walks `~/.m2`, the cargo
   registry, the Go module cache and the rest only to filter their packages

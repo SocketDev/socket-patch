@@ -382,10 +382,12 @@ fn parse_path_coordinates(
 ///   layout Maven writes, so its content decides.
 ///
 /// Maven itself writes every POM it resolves at exactly this path, so on a
-/// real `~/.m2` the answer equals what the POM's own coordinates say — the
-/// scan takes it without opening the file. The one case where the two
-/// differ is a POM placed by hand whose contents disagree with its
-/// directory: it reports the directory's coordinates.
+/// real `~/.m2` — scanned from its repository root — the answer equals what
+/// the POM's own coordinates say, and the scan takes it without opening the
+/// file once [`LayoutTrust`] has confirmed the root. The case where the two
+/// differ under a confirmed root is a POM at a canonical path whose contents
+/// disagree with its directory (hand-placed, or a legacy upstream POM with
+/// mismatched coordinates): it reports the directory's coordinates.
 fn canonical_layout_coordinates(pom: &Path, repo_root: &Path) -> Option<(String, String, String)> {
     let rel = pom.strip_prefix(repo_root).ok()?;
     let mut components: Vec<&str> = Vec::new();
@@ -413,6 +415,97 @@ fn canonical_layout_coordinates(pom: &Path, repo_root: &Path) -> Option<(String,
         artifact_id.to_string(),
         version.to_string(),
     ))
+}
+
+/// How many canonical POMs of one top-level group directory
+/// [`LayoutTrust`] reads, at most, looking for one whose content parses.
+/// Past that the directory stays unconfirmed (content-first, as before
+/// MVN-1) rather than reading on, serially, through a tree of unparseable
+/// POMs.
+const LAYOUT_TRUST_ATTEMPTS: u8 = 8;
+
+/// Whether the path of a canonical POM ([`canonical_layout_coordinates`])
+/// may stand in for its content — confirmed per top-level group directory
+/// of one repository root (`org`, `com`, `io`, ...).
+///
+/// The canonical path only spells the right group when the scan root IS
+/// the repository root. A `--global-prefix` / `MAVEN_REPO_LOCAL` one level
+/// too high (`~/.m2`) would prepend `repository.` to every group, and a
+/// subtree root (`~/.m2/repository/org`) would drop `org.` — where the
+/// content-first parse still read the right coordinates. So the first
+/// canonical POM (walk order) of each top-level directory whose content
+/// parses decides it: content equal to the path confirms the directory,
+/// and every later canonical POM under it is taken from its path; content
+/// that disagrees leaves the directory content-first, exactly the pre-MVN-1
+/// scan. A directory whose canonical POMs never parse (within
+/// [`LAYOUT_TRUST_ATTEMPTS`]) stays content-first too — for those the
+/// content-first answer is the directory path anyway.
+#[derive(Default)]
+struct LayoutTrust {
+    dirs: HashMap<String, TrustVerdict>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TrustVerdict {
+    Trusted,
+    Untrusted,
+    /// No sampled POM parsed yet; how many were read.
+    Unsettled(u8),
+}
+
+impl LayoutTrust {
+    /// A trust that starts with `trusted` top-level directories confirmed,
+    /// so a test can pin what a confirmed directory does with a POM that
+    /// walk order might otherwise have sampled first.
+    #[cfg(test)]
+    fn trusting(trusted: &[&str]) -> Self {
+        Self {
+            dirs: trusted
+                .iter()
+                .map(|dir| ((*dir).to_string(), TrustVerdict::Trusted))
+                .collect(),
+        }
+    }
+
+    /// The top-level group directory of canonical coordinates: the group's
+    /// first segment (canonical group segments never hold a `.`).
+    fn dir_of(gav: &(String, String, String)) -> &str {
+        gav.0.split('.').next().unwrap_or_default()
+    }
+
+    /// Whether `gav`, a canonical path's coordinates, may be taken as is.
+    fn trusts(&self, gav: &(String, String, String)) -> bool {
+        self.dirs.get(Self::dir_of(gav)) == Some(&TrustVerdict::Trusted)
+    }
+
+    /// Settle what one chunk's canonical POMs (in walk order, `None` for
+    /// the off-shape ones) can settle, reading at most one POM per
+    /// unsettled directory that parses — serially, so the verdict is the
+    /// same for every chunk size and thread count.
+    fn settle<'a>(
+        &mut self,
+        poms: impl IntoIterator<Item = (&'a Path, Option<&'a (String, String, String)>)>,
+    ) {
+        for (path, gav) in poms {
+            let Some(gav) = gav else {
+                continue;
+            };
+            let attempts = match self.dirs.get(Self::dir_of(gav)) {
+                None => 0,
+                Some(TrustVerdict::Unsettled(n)) if *n < LAYOUT_TRUST_ATTEMPTS => *n,
+                Some(_) => continue,
+            };
+            let verdict = match std::fs::read_to_string(path)
+                .ok()
+                .and_then(|content| parse_pom_group_artifact_version(&content))
+            {
+                Some(content) if content == *gav => TrustVerdict::Trusted,
+                Some(_) => TrustVerdict::Untrusted,
+                None => TrustVerdict::Unsettled(attempts + 1),
+            };
+            self.dirs.insert(Self::dir_of(gav).to_string(), verdict);
+        }
+    }
 }
 
 /// Whether the PURL-derived Maven coordinates are safe to join onto the
@@ -631,15 +724,18 @@ impl MavenCrawler {
     ///
     /// Uses `walkdir` to recursively find `.pom` files, then takes the
     /// coordinates from the canonical `<group>/<a>/<v>/<a>-<v>.pom` path
-    /// ([`canonical_layout_coordinates`]) without reading the file, and only
-    /// otherwise extracts them from the POM content, falling back to
-    /// directory path parsing.
+    /// ([`canonical_layout_coordinates`]) without reading the file once
+    /// [`LayoutTrust`] has confirmed the path spells them under this root,
+    /// and only otherwise extracts them from the POM content, falling back
+    /// to directory path parsing.
     ///
-    /// Three phases per chunk of the walk: the (serial) walk collects
-    /// `.pom` paths in walk order, the reads and parses run through
-    /// [`par_map`] — in parallel on the walk pool's threads, and on the
-    /// calling thread when no walk thread could be spawned (each POM's
-    /// coordinates depend on that file alone) — and the PURL dedup runs
+    /// Four phases per chunk of the walk: the (serial) walk collects
+    /// `.pom` paths in walk order, [`LayoutTrust::settle`] reads (serially,
+    /// in walk order) the few POMs that confirm or refute its top-level
+    /// directories, the reads and parses run through [`par_map`] — in
+    /// parallel on the walk pool's threads, and on the calling thread when
+    /// no walk thread could be spawned (each POM's coordinates depend on
+    /// that file and the settled trust alone) — and the PURL dedup runs
     /// serially in walk order, so the first-seen version dir wins and
     /// packages come out exactly as the one-at-a-time scan's did.
     fn scan_maven_repo(&self, repo_path: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
@@ -653,6 +749,18 @@ impl MavenCrawler {
         repo_path: &Path,
         seen: &mut HashSet<String>,
         chunk: usize,
+    ) -> Vec<CrawledPackage> {
+        self.scan_maven_repo_trusting(repo_path, seen, chunk, LayoutTrust::default())
+    }
+
+    /// [`Self::scan_maven_repo_chunked`] from an explicit starting
+    /// [`LayoutTrust`], so tests can pin what a confirmed directory does.
+    fn scan_maven_repo_trusting(
+        &self,
+        repo_path: &Path,
+        seen: &mut HashSet<String>,
+        chunk: usize,
+        mut trust: LayoutTrust,
     ) -> Vec<CrawledPackage> {
         let chunk = chunk.max(1);
         let mut results = Vec::new();
@@ -683,17 +791,29 @@ impl MavenCrawler {
                 break;
             }
 
-            let parsed: Vec<Option<(String, String, String)>> = par_map(&poms, |path| {
+            let canonical: Vec<Option<(String, String, String)>> = poms
+                .iter()
+                .map(|path| canonical_layout_coordinates(path, repo_path))
+                .collect();
+            trust.settle(
+                poms.iter()
+                    .map(PathBuf::as_path)
+                    .zip(canonical.iter().map(Option::as_ref)),
+            );
+            let work: Vec<_> = poms.iter().zip(canonical).collect();
+            let trust = &trust;
+            let parsed: Vec<Option<(String, String, String)>> = par_map(work, |(path, gav)| {
+                // A canonical path under a confirmed top-level directory
+                // names the coordinates outright; any other POM is parsed,
+                // falling back to the directory path.
+                if let Some(gav) = gav.filter(|gav| trust.trusts(gav)) {
+                    return Some(gav);
+                }
                 let version_dir = path.parent()?;
-                // The canonical layout names the coordinates outright; any
-                // other path parses the POM, then falls back to the
-                // directory path.
-                canonical_layout_coordinates(path, repo_path).or_else(|| {
-                    std::fs::read_to_string(path)
-                        .ok()
-                        .and_then(|content| parse_pom_group_artifact_version(&content))
-                        .or_else(|| parse_path_coordinates(version_dir, repo_path))
-                })
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|content| parse_pom_group_artifact_version(&content))
+                    .or_else(|| parse_path_coordinates(version_dir, repo_path))
             });
 
             for (path, coords) in poms.iter().zip(parsed) {
@@ -1220,18 +1340,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_scan_canonical_path_wins_over_disagreeing_pom() {
-        // MVN-1: a POM at its canonical `<group>/<a>/<v>/<a>-<v>.pom` path
-        // reports the directory's coordinates without being read — even a
-        // hand-placed one whose contents name something else.
-        let dir = tempfile::tempdir().unwrap();
-        let pkg_dir = dir
-            .path()
-            .join("com")
-            .join("example")
-            .join("real")
-            .join("2.0.0");
+    /// A canonical POM at `com/example/real/2.0.0/real-2.0.0.pom` whose
+    /// contents name other coordinates.
+    fn disagreeing_canonical_pom(root: &Path) -> PathBuf {
+        let pkg_dir = root.join("com").join("example").join("real").join("2.0.0");
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(
             pkg_dir.join("real-2.0.0.pom"),
@@ -1242,15 +1354,145 @@ mod tests {
 </project>"#,
         )
         .unwrap();
+        pkg_dir
+    }
+
+    #[test]
+    fn test_scan_canonical_path_wins_over_disagreeing_pom() {
+        // MVN-1: under a top-level directory the scan has confirmed, a POM
+        // at its canonical `<group>/<a>/<v>/<a>-<v>.pom` path reports the
+        // directory's coordinates without being read — even one whose
+        // contents name something else.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = disagreeing_canonical_pom(dir.path());
 
         let mut seen = HashSet::new();
-        let pkgs = MavenCrawler::new().scan_maven_repo(dir.path(), &mut seen);
+        let pkgs = MavenCrawler::new().scan_maven_repo_trusting(
+            dir.path(),
+            &mut seen,
+            POM_PARSE_CHUNK,
+            LayoutTrust::trusting(&["com"]),
+        );
         assert_eq!(pkgs.len(), 1, "{pkgs:?}");
         assert_eq!(pkgs[0].purl, "pkg:maven/com.example/real@2.0.0");
         assert_eq!(pkgs[0].name, "real");
         assert_eq!(pkgs[0].version, "2.0.0");
         assert_eq!(pkgs[0].namespace, Some("com.example".to_string()));
         assert_eq!(pkgs[0].path, pkg_dir);
+    }
+
+    #[test]
+    fn test_scan_disagreeing_first_sample_keeps_its_dir_content_first() {
+        // The same POM as the only one under `com/`: it is the sample that
+        // decides `com/`, and its disagreement leaves the directory
+        // content-first — the scan reports what the file says, as it did
+        // before MVN-1.
+        let dir = tempfile::tempdir().unwrap();
+        let pkg_dir = disagreeing_canonical_pom(dir.path());
+
+        let mut seen = HashSet::new();
+        let pkgs = MavenCrawler::new().scan_maven_repo(dir.path(), &mut seen);
+        assert_eq!(pkgs.len(), 1, "{pkgs:?}");
+        assert_eq!(pkgs[0].purl, "pkg:maven/org.claimed/claimed@9.9.9");
+        assert_eq!(pkgs[0].path, pkg_dir);
+    }
+
+    /// A small real-shaped repository under `root/repository`: two groups
+    /// under `org/`, one under `com/`, each POM agreeing with its path.
+    fn agreeing_repo(root: &Path) -> PathBuf {
+        let repo = root.join("repository");
+        for (group, artifact, version) in [
+            ("org/apache/commons", "commons-lang3", "3.12.0"),
+            ("org/slf4j", "slf4j-api", "2.0.9"),
+            ("com/google/guava", "guava", "32.1.3-jre"),
+        ] {
+            let dir = repo.join(group).join(artifact).join(version);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{artifact}-{version}.pom")),
+                format!(
+                    "<project><groupId>{}</groupId><artifactId>{artifact}</artifactId><version>{version}</version></project>",
+                    group.replace('/', ".")
+                ),
+            )
+            .unwrap();
+        }
+        repo
+    }
+
+    #[test]
+    fn test_scan_misrooted_repository_keeps_content_coordinates() {
+        // The canonical path spells the group relative to the scan root, so
+        // a root one level too high (`~/.m2` for `~/.m2/repository`) or a
+        // subtree of the repository would turn every path-derived group
+        // wrong. The first POM of each top-level directory refutes the
+        // path there, and the scan reads the contents as it always did.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = agreeing_repo(dir.path());
+        const LANG3: &str = "pkg:maven/org.apache.commons/commons-lang3@3.12.0";
+        const SLF4J: &str = "pkg:maven/org.slf4j/slf4j-api@2.0.9";
+        const GUAVA: &str = "pkg:maven/com.google.guava/guava@32.1.3-jre";
+        for (root, want) in [
+            (repo.clone(), vec![LANG3, SLF4J, GUAVA]),
+            (dir.path().to_path_buf(), vec![LANG3, SLF4J, GUAVA]),
+            (repo.join("org"), vec![LANG3, SLF4J]),
+            (repo.join("org").join("apache"), vec![LANG3]),
+        ] {
+            let mut seen = HashSet::new();
+            let purls: HashSet<String> = MavenCrawler::new()
+                .scan_maven_repo(&root, &mut seen)
+                .into_iter()
+                .map(|p| p.purl)
+                .collect();
+            let want: HashSet<String> = want.into_iter().map(str::to_string).collect();
+            assert_eq!(purls, want, "root {}", root.display());
+        }
+    }
+
+    #[test]
+    fn test_layout_trust_reads_a_bounded_number_of_unparseable_samples() {
+        // Unparseable canonical POMs leave their directory unsettled; the
+        // first one that parses settles it, but only within
+        // LAYOUT_TRUST_ATTEMPTS reads — past that the directory stays
+        // content-first instead of reading on.
+        let dir = tempfile::tempdir().unwrap();
+        let pom = |i: usize, content: &str| -> (PathBuf, (String, String, String)) {
+            let version = format!("1.{i}");
+            let path = dir
+                .path()
+                .join("org")
+                .join("x")
+                .join("a")
+                .join(&version)
+                .join(format!("a-{version}.pom"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, content.replace("{v}", &version)).unwrap();
+            let gav = canonical_layout_coordinates(&path, dir.path()).unwrap();
+            (path, gav)
+        };
+        let agreeing = "<project><groupId>org.x</groupId><artifactId>a</artifactId><version>{v}</version></project>";
+        let cap = usize::from(LAYOUT_TRUST_ATTEMPTS);
+        for (unparseable, want) in [
+            (0, TrustVerdict::Trusted),
+            (cap - 1, TrustVerdict::Trusted),
+            (cap, TrustVerdict::Unsettled(LAYOUT_TRUST_ATTEMPTS)),
+        ] {
+            let mut poms: Vec<_> = (0..unparseable).map(|i| pom(i, "not xml")).collect();
+            poms.push(pom(unparseable, agreeing));
+            let mut trust = LayoutTrust::default();
+            trust.settle(poms.iter().map(|(path, gav)| (path.as_path(), Some(gav))));
+            assert_eq!(trust.dirs.get("org"), Some(&want), "{unparseable}");
+        }
+        // A disagreeing first parse refutes the directory for good.
+        let mut trust = LayoutTrust::default();
+        let refuting = pom(99, "<project><groupId>x</groupId><artifactId>a</artifactId><version>{v}</version></project>");
+        let confirming = pom(98, agreeing);
+        trust.settle([
+            (refuting.0.as_path(), Some(&refuting.1)),
+            (confirming.0.as_path(), Some(&confirming.1)),
+        ]);
+        assert_eq!(trust.dirs.get("org"), Some(&TrustVerdict::Untrusted));
+        assert!(!trust.trusts(&confirming.1));
     }
 
     #[test]
@@ -2093,6 +2335,50 @@ mod tests {
                 total += old.len();
             }
             assert!(total > 200, "vacuous fixtures: {total}");
+        }
+
+        /// The path-first step is only as right as the scan root: from a
+        /// root one level above the repository, or from inside it (a
+        /// top-level group dir, or two levels in), every path-derived group
+        /// would be wrong. [`LayoutTrust`] must notice and leave such a
+        /// scan exactly as the content-first scan had it — the parse and
+        /// path-rescue arms included.
+        #[tokio::test]
+        async fn misrooted_repos_match_the_content_first_scan() {
+            let mut total = 0;
+            for seed in 0..64u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut perms = PermGuard::default();
+                let mut rng = Rng::new(seed);
+                let root = tmp.path().join("repository");
+                repo_with(
+                    &mut rng,
+                    &root,
+                    &tmp.path().join("outside"),
+                    &mut perms,
+                    true,
+                );
+                perms.apply();
+                let mut misroots = vec![tmp.path().to_path_buf()];
+                misroots.extend(
+                    ["org", "com", "io", "org/apache", "com/google"]
+                        .iter()
+                        .map(|sub| root.join(sub))
+                        .filter(|dir| dir.is_dir()),
+                );
+                for misroot in misroots {
+                    let options = CrawlerOptions {
+                        cwd: tmp.path().to_path_buf(),
+                        global: false,
+                        global_prefix: Some(misroot.clone()),
+                    };
+                    let new = MavenCrawler::new().crawl_all(&options).await;
+                    let old = super::super::oracle::crawl_all_content_first(&options).await;
+                    assert_eq!(rows(&new), rows(&old), "seed {seed}, {}", misroot.display());
+                    total += old.len();
+                }
+            }
+            assert!(total > 400, "vacuous fixtures: {total}");
         }
 
         #[tokio::test]
