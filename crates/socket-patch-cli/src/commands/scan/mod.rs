@@ -1926,9 +1926,11 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // The batches run concurrently (at most `api_concurrency` in flight)
     // but are CONSUMED in chunk order, one window at a time:
     //
-    // - The first chunk goes alone, so a stale token costs the
-    //   authenticated API one request before the downgrade, as it always
-    //   did.
+    // - On the authenticated client the first chunk goes alone, so a stale
+    //   token costs the authenticated API one request before the
+    //   downgrade, as it always did. Already on the proxy there is no
+    //   downgrade left to cap (the fallback arm below is authenticated-
+    //   only), so a token-less run opens the full window at chunk 0.
     // - Fallback: a 401/403 against the authenticated endpoint can mean a
     //   stale/revoked token. At the first consumed chunk `k` whose error is
     //   a fallback candidate (any index, not just the first), the window is
@@ -1944,7 +1946,11 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     let chunks: Vec<&[String]> = all_purls.chunks(batch_size).collect();
     let mut next = 0usize;
     'windows: while next < total_batches {
-        let end = if next == 0 { 1 } else { total_batches };
+        let end = if next == 0 && !use_public_proxy {
+            1
+        } else {
+            total_batches
+        };
         let mut fallback_error = None;
         {
             let client = &api_client;

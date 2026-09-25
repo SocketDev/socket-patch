@@ -445,6 +445,158 @@ async fn all_batches_failed_reports_the_last_chunks_error() {
     );
 }
 
+/// `scan` against `proxy` with NO API token — the common unauthenticated
+/// path. `extra` env is applied on top of the scrubbed environment. The
+/// authenticated base URL is unroutable, so any request that reached for it
+/// fails the run loudly instead of escaping to the real API.
+fn run_scan_anonymous(
+    cwd: &Path,
+    proxy: &str,
+    args: &[&str],
+    extra: &[(&str, &str)],
+) -> (i32, String, String) {
+    let mut cmd = scrubbed_cli();
+    cmd.arg("scan")
+        .args([
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--api-url",
+            "http://127.0.0.1:1",
+            "--proxy-url",
+            proxy,
+        ])
+        .args(args)
+        .env("SOCKET_NO_API_TOKEN", "1")
+        .env("SOCKET_NO_CONFIG", "1");
+    for (key, value) in extra {
+        cmd.env(key, value);
+    }
+    let out = cmd.output().expect("run socket-patch scan");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Every proxy batch POST takes this long, so the chunks in flight at an
+/// arrival are exactly those that arrived less than this before it.
+const PROXY_CHUNK_DELAY: Duration = Duration::from_millis(400);
+
+/// Records each proxy batch POST's arrival, then answers its chunk's
+/// packages after [`PROXY_CHUNK_DELAY`].
+struct ProxyArrivals(std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>);
+
+impl wiremock::Respond for ProxyArrivals {
+    fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+        self.0.lock().unwrap().push(std::time::Instant::now());
+        let body: serde_json::Value = serde_json::from_slice(&req.body).expect("batch body");
+        let entries: Vec<serde_json::Value> = body["components"]
+            .as_array()
+            .expect("components")
+            .iter()
+            .map(|c| {
+                let p = c["purl"].as_str().unwrap();
+                let idx = NAMES.iter().position(|n| purl(n) == p).unwrap();
+                batch_entry(idx, PROXY)
+            })
+            .collect();
+        ResponseTemplate::new(200)
+            .set_body_json(batch_body(entries))
+            .set_delay(PROXY_CHUNK_DELAY)
+    }
+}
+
+/// A request is "in flight" at an arrival when it arrived less than this
+/// before: its slot frees only once its answer, one delay later, is back.
+fn in_flight_window() -> Duration {
+    PROXY_CHUNK_DELAY.mul_f32(0.8)
+}
+
+/// Most arrivals inside one [`in_flight_window`] — a lower bound on the
+/// chunks that were in flight together.
+fn peak_in_flight(arrivals: &[Duration]) -> usize {
+    (0..arrivals.len())
+        .map(|i| {
+            arrivals[i..]
+                .iter()
+                .take_while(|t| **t - arrivals[i] < in_flight_window())
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// One anonymous `scan --json --batch-size 1` over every package against a
+/// proxy that records arrivals; returns `(stdout, each chunk POST's
+/// arrival as an offset from the first, sorted)`.
+async fn anonymous_batch_run(root: &Path, extra: &[(&str, &str)]) -> (String, Vec<Duration>) {
+    let proxy = MockServer::start().await;
+    let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path(PROXY_BATCH_ROUTE))
+        .respond_with(ProxyArrivals(std::sync::Arc::clone(&arrivals)))
+        .mount(&proxy)
+        .await;
+
+    let (code, stdout, stderr) =
+        run_scan_anonymous(root, &proxy.uri(), &["--json", "--batch-size", "1"], extra);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert_eq!(
+        batch_requests(&proxy, PROXY_BATCH_ROUTE).await.len(),
+        NAMES.len(),
+        "one POST per chunk"
+    );
+    let mut arrivals = arrivals.lock().unwrap().clone();
+    arrivals.sort();
+    let first = arrivals[0];
+    (
+        stdout,
+        arrivals.into_iter().map(|t| t - first).collect::<Vec<_>>(),
+    )
+}
+
+/// A token-less run is already on the proxy, so it has no authenticated
+/// downgrade left to cap: its batch window opens at chunk 0 instead of
+/// waiting out a round trip for a fallback that cannot fire. The second
+/// chunk therefore arrives while the first is still unanswered — and
+/// `SOCKET_API_CONCURRENCY=1`, the escape hatch for an endpoint that caps
+/// in-flight requests, puts the very same run back on one request at a
+/// time, with identical output.
+#[tokio::test]
+async fn proxy_batch_window_opens_at_the_first_chunk_unless_capped() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path(), &NAMES);
+
+    let (concurrent_stdout, concurrent) = anonymous_batch_run(tmp.path(), &[]).await;
+    assert!(
+        concurrent[1] < in_flight_window(),
+        "chunk 0 must not go alone on the proxy: arrivals {concurrent:?}"
+    );
+    assert!(
+        peak_in_flight(&concurrent) > 1,
+        "chunks must overlap: arrivals {concurrent:?}"
+    );
+
+    let (serial_stdout, serial) =
+        anonymous_batch_run(tmp.path(), &[("SOCKET_API_CONCURRENCY", "1")]).await;
+    assert_eq!(
+        peak_in_flight(&serial),
+        1,
+        "a cap of 1 is the old serial loop: arrivals {serial:?}"
+    );
+    assert_eq!(
+        concurrent_stdout, serial_stdout,
+        "the cap changes pacing, never output"
+    );
+    let folded = folded_uuids(&concurrent_stdout);
+    assert_eq!(folded.len(), NAMES.len(), "{concurrent_stdout}");
+    for (p, uuids) in folded {
+        let idx = NAMES.iter().position(|n| purl(n) == p).unwrap();
+        assert_eq!(uuids, vec![uuid(idx, PROXY)], "{p}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-package detail GETs (A1)
 // ---------------------------------------------------------------------------
