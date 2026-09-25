@@ -725,3 +725,137 @@ async fn cargo_service_vendor_never_downloads_the_pristine_crate() {
         PATCHED
     );
 }
+
+/// The deferral behind the service moves only WHEN the pristine crate is
+/// downloaded, never WHICH crates are vendored. A crate the lock resolves
+/// from a git fork or a custom registry (no crates.io checksum) has no
+/// verifiable pristine source, so the eager ladder refuses it
+/// `vendor_fetch_unverifiable` + `package_not_installed` and touches
+/// nothing — the crates.io patch the service serves must not replace it.
+#[tokio::test]
+async fn cargo_service_never_vendors_a_git_or_custom_registry_crate() {
+    use base64::Engine as _;
+    use sha2::Sha512;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    const PURL: &str = "pkg:cargo/cfg-if@1.0.4";
+    const UUID: &str = "2b1f6c1e-8d3a-4f6b-9c2d-7e5a9b1c3d08";
+    const PRISTINE: &[u8] = b"pub fn cfg() {}\n";
+    const PATCHED: &[u8] = b"pub fn cfg() { /* patched */ }\n";
+    const TOML: &[u8] = b"[package]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n";
+
+    let registry = MockServer::start().await;
+    let api = MockServer::start().await;
+    let prebuilt = make_crate(
+        "cfg-if-1.0.4",
+        &[("Cargo.toml", TOML), ("src/lib.rs", PATCHED)],
+    );
+    let sha512 = format!(
+        "sha512-{}",
+        base64::engine::general_purpose::STANDARD.encode(Sha512::digest(&prebuilt))
+    );
+    let serve_path = format!("/patch/cargo/cfg-if/1.0.4/tok/{UUID}/cfg-if-1.0.4.crate");
+    let serve_url = format!("{}{serve_path}", api.uri());
+    Mock::given(method("POST"))
+        .and(path("/v0/orgs/acme/patches/package"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": { UUID: {
+                "status": "granted", "url": serve_url, "purl": PURL,
+                "artifacts": [{ "kind": "tarball", "url": serve_url,
+                                "integrity": { "sha512": sha512 } }]
+            }}
+        })))
+        .mount(&api)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(serve_path))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(prebuilt))
+        .mount(&api)
+        .await;
+
+    for source in [
+        "git+https://example.com/fork/cfg-if#abc123",
+        "registry+https://my-registry.example/index",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\ncfg-if = { git = \"https://example.com/fork/cfg-if\" }\n",
+        )
+        .unwrap();
+        let lock = format!(
+            "version = 4\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\
+             dependencies = [\n \"cfg-if\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+             source = \"{source}\"\n"
+        );
+        std::fs::write(root.join("Cargo.lock"), &lock).unwrap();
+        write_manifest(&root, PURL, UUID, "package/src/lib.rs", PRISTINE, PATCHED);
+        let empty_home = tmp.path().join("cargo-home");
+        std::fs::create_dir_all(&empty_home).unwrap();
+
+        let mut cmd = Command::new(binary());
+        cmd.args([
+            "vendor",
+            "--json",
+            "--vendor-source",
+            "auto",
+            "--api-url",
+            &api.uri(),
+            "--api-token",
+            "sktsec_placeholder_value_for_tests_api",
+            "--org",
+            "acme",
+        ])
+        .current_dir(&root);
+        for (key, _) in std::env::vars() {
+            if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
+                cmd.env_remove(key);
+            }
+        }
+        let out = cmd
+            .env("SOCKET_TELEMETRY_DISABLED", "1")
+            .env("SOCKET_CRATES_REGISTRY", registry.uri())
+            .env("CARGO_HOME", &empty_home)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .unwrap_or_else(|e| panic!("{e}: {stdout}\n{}", String::from_utf8_lossy(&out.stderr)));
+
+        assert_eq!(out.status.code(), Some(1), "{source}: {v:#}");
+        assert_eq!(
+            purl_events(&v, PURL),
+            vec![
+                ("skipped", "vendor_fetch_unverifiable"),
+                ("skipped", "package_not_installed"),
+            ],
+            "{source}: {v:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("Cargo.lock")).unwrap(),
+            lock,
+            "{source}: the lock keeps its provenance"
+        );
+        assert!(
+            !root.join(".cargo").exists(),
+            "{source}: no [patch] written"
+        );
+        assert!(
+            !root.join(".socket/vendor").exists(),
+            "{source}: nothing vendored"
+        );
+    }
+    assert!(
+        registry
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "an unverifiable crate is never downloaded"
+    );
+}

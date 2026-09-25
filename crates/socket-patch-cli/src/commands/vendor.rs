@@ -1198,6 +1198,33 @@ pub(crate) async fn fetch_pristine_package(
     }
 }
 
+/// Whether [`fetch_pristine_package`] would pick a VERIFIABLE registry
+/// resolution for this purl — the same entry choice, made without the
+/// download: the lock's own entry when it carries an integrity, else the
+/// pre-vendor resolution the ledger recovers. A cargo crate from a git,
+/// path or custom-registry source has neither, so its fetch refuses
+/// `vendor_fetch_unverifiable` and the purl is not vendored; deferring that
+/// fetch behind the patch service would instead vendor the crates.io patch
+/// over it.
+async fn cargo_fetch_is_verifiable(
+    project_root: &Path,
+    inventory: &[lock_inventory::LockfileEntry],
+    purl: &str,
+    ledger_entry: Option<&VendorEntry>,
+) -> bool {
+    let verifiable =
+        |e: &lock_inventory::LockfileEntry| e.integrity != lock_inventory::LockIntegrity::None;
+    if lock_inventory::lookup(inventory, purl).is_some_and(verifiable) {
+        return true;
+    }
+    match ledger_entry {
+        Some(le) => lock_inventory::recover_lock_entry(project_root, le)
+            .await
+            .is_ok_and(|e| verifiable(&e)),
+        None => false,
+    }
+}
+
 /// One purl's pristine source while the vendor loop is being assembled.
 ///
 /// A fetched artifact is held by index into the run's `fetched_holders`
@@ -1646,7 +1673,12 @@ pub(crate) async fn vendor_records_reusing(
             //    rebuild anyway, so it keeps the eager fetch.
             //  * a cargo crate the patch service can serve: the backend reads
             //    the pristine tree only once `cargo_service_copy` falls back
-            //    to the local build.
+            //    to the local build. Only a crate the registry ladder COULD
+            //    fetch (see `cargo_fetch_is_verifiable`) — a git, path or
+            //    custom-registry crate keeps the eager rung, whose
+            //    `vendor_fetch_unverifiable` refusal is what keeps a
+            //    crates.io patch off a crate that does not come from
+            //    crates.io.
             //
             // A backend that does reach its pristine tree fetches it then,
             // through the same ladder, and the loop reports the fetch as the
@@ -1666,7 +1698,16 @@ pub(crate) async fn vendor_records_reusing(
                     };
                 let cargo_via_service = service_enabled
                     && matches!(rung, MissingRung::Fetch)
-                    && Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo);
+                    && Ecosystem::from_purl(purl) == Some(Ecosystem::Cargo)
+                    && cargo_fetch_is_verifiable(
+                        &common.cwd,
+                        inventory
+                            .get_or_init(|| lock_inventory::inventory_project(&common.cwd))
+                            .await,
+                        purl,
+                        lookup_entry(&state.entries, purl),
+                    )
+                    .await;
                 if covered || cargo_via_service {
                     *rung = MissingRung::Deferred;
                 }
