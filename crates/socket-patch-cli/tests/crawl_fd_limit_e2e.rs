@@ -12,6 +12,10 @@
 //! thread (the sequential walk scans it fully at 14; with one walk thread
 //! per CPU it lost most of it at 16); the multi-ecosystem tree pins the
 //! crawlers running one at a time.
+//!
+//! Descriptors are the only resource with a budget here. Peak memory also
+//! scales with the walk thread count now (one package.json read per
+//! thread, uncapped); nothing pins that — see the `walk_pool` module docs.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -185,6 +189,23 @@ fn scan(root: &Path, nofile: Option<u32>) -> Output {
     cmd.output().unwrap()
 }
 
+/// A dropped package is a blown descriptor budget, not a JSON diff: say
+/// so before the byte-for-byte comparison does, while the limit that
+/// produced it is still in hand. Silent when the tight run printed no
+/// JSON at all — the stdout comparison then reports it, with stderr.
+fn assert_scanned_the_same(tight: &Output, ample_json: &Value, limit: u32) {
+    let Ok(tight_json) = serde_json::from_slice::<Value>(&tight.stdout) else {
+        return;
+    };
+    assert_eq!(
+        tight_json["scannedPackages"],
+        ample_json["scannedPackages"],
+        "ulimit -n {limit} dropped packages — the crawl's descriptor budget regressed; \
+         stderr:\n{}",
+        String::from_utf8_lossy(&tight.stderr)
+    );
+}
+
 #[test]
 fn tight_descriptor_limit_scans_the_same_packages() {
     let tmp = tempfile::tempdir().unwrap();
@@ -206,6 +227,7 @@ fn tight_descriptor_limit_scans_the_same_packages() {
         Some(expected as u64),
         "{ample_json}"
     );
+    assert_scanned_the_same(&tight, &ample_json, 16);
     assert_eq!(
         String::from_utf8_lossy(&tight.stdout),
         String::from_utf8_lossy(&ample.stdout),
@@ -222,6 +244,13 @@ fn tight_descriptor_limit_scans_the_same_packages() {
 /// macOS, where it was measured: the sequential dispatch scans this tree
 /// fully down to 11, while running the crawlers concurrently loses 40-80
 /// of its packages at 12) it is what pins the one-at-a-time dispatch.
+///
+/// 12 therefore leaves the serial dispatch exactly ONE descriptor of
+/// slack: the measured cliff is 11 (complete) / 10 (445 of 485 packages).
+/// Anything that holds one more descriptor open across the crawl — a
+/// config read, a cert store, a log file — fails this test, so the
+/// package-count assertion below runs first and names the budget instead
+/// of leaving a 40-package JSON diff.
 #[test]
 fn tight_descriptor_limit_scans_every_ecosystem_the_same() {
     let tmp = tempfile::tempdir().unwrap();
@@ -254,6 +283,7 @@ fn tight_descriptor_limit_scans_every_ecosystem_the_same() {
             Some(99),
             "ulimit -n {limit} was refused"
         );
+        assert_scanned_the_same(&tight, &ample_json, limit);
         assert_eq!(
             String::from_utf8_lossy(&tight.stdout),
             String::from_utf8_lossy(&ample.stdout),
