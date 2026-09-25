@@ -10,7 +10,7 @@ use std::path::Path;
 
 use sha2::{Digest as _, Sha256};
 
-use crate::api::client::ApiClient;
+use crate::api::client::{ApiClient, DeferredAttempt};
 use crate::constants::SOCKET_DIR;
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::manifest::schema::PatchRecord;
@@ -136,31 +136,34 @@ pub async fn fetch_hosted_wheel_metadata(
     decode_hosted_wheel_metadata(&bytes, sha256)
 }
 
-/// One speculative [`fetch_hosted_wheel_metadata`], for running several
-/// concurrently while keeping the one-at-a-time loop's outcomes.
-pub enum HostedWheelMetadataAttempt {
-    /// Settled on the first attempt: [`Self::into_result`] gives exactly
-    /// what `fetch_hosted_wheel_metadata` would have returned.
-    Settled {
-        result: Result<Option<String>, String>,
-        debug: Vec<String>,
-    },
+/// [`fetch_hosted_wheel_metadata`]'s FIRST attempt, for running several
+/// wheels' first attempts concurrently while keeping the one-at-a-time
+/// loop's per-wheel request sequence. Opaque; hand it back to
+/// [`finish_hosted_wheel_metadata`], which either reports what it settled or
+/// spends the rest of its retry budget.
+pub struct HostedWheelMetadataAttempt {
+    outcome: WheelAttemptOutcome,
+    /// The attempt's `debug_log` lines, held back so they print where the
+    /// one-at-a-time loop's would have — its GET really happened, so they
+    /// are printed, never dropped.
+    debug: Vec<String>,
+}
+
+enum WheelAttemptOutcome {
+    /// Settled on the first attempt: exactly what
+    /// `fetch_hosted_wheel_metadata` would have returned.
+    Settled(Result<Option<String>, String>),
     /// The first attempt failed in a way `fetch_hosted_wheel_metadata`
-    /// retries; the caller must run that instead (with a fresh budget).
-    Retry,
+    /// retries, with the rest of its budget still unspent.
+    Retry(DeferredAttempt),
 }
 
 impl HostedWheelMetadataAttempt {
-    /// The settled result, printing the attempt's held-back debug lines —
-    /// call it where the one-at-a-time loop would have fetched this wheel.
-    pub fn into_result(self) -> Option<Result<Option<String>, String>> {
-        match self {
-            Self::Settled { result, debug } => {
-                crate::api::client::flush_deferred_debug(debug);
-                Some(result)
-            }
-            Self::Retry => None,
-        }
+    /// Did the first attempt fail in a way the retry budget covers? Such an
+    /// attempt is finished one at a time, so a caller fanning out stops
+    /// widening at the first one: the host is struggling.
+    pub fn needs_retry(&self) -> bool {
+        matches!(self.outcome, WheelAttemptOutcome::Retry(_))
     }
 }
 
@@ -172,21 +175,49 @@ pub async fn try_fetch_hosted_wheel_metadata_once(
     sha256: &str,
 ) -> HostedWheelMetadataAttempt {
     if let Err(error) = validate_hosted_wheel_sha256(sha256) {
-        return HostedWheelMetadataAttempt::Settled {
-            result: Err(error),
+        return HostedWheelMetadataAttempt {
+            outcome: WheelAttemptOutcome::Settled(Err(error)),
             debug: Vec::new(),
         };
     }
     let (attempt, debug) =
         crate::api::client::with_deferred_debug(client.download_artifact_first_attempt(url)).await;
-    match attempt {
-        None => HostedWheelMetadataAttempt::Retry,
-        Some(downloaded) => HostedWheelMetadataAttempt::Settled {
-            result: downloaded
-                .map_err(|error| format!("cannot fetch hosted wheel metadata: {error}"))
-                .and_then(|bytes| decode_hosted_wheel_metadata(&bytes, sha256)),
-            debug,
+    HostedWheelMetadataAttempt {
+        outcome: match attempt {
+            Err(deferred) => WheelAttemptOutcome::Retry(deferred),
+            Ok(downloaded) => WheelAttemptOutcome::Settled(
+                downloaded
+                    .map_err(|error| format!("cannot fetch hosted wheel metadata: {error}"))
+                    .and_then(|bytes| decode_hosted_wheel_metadata(&bytes, sha256)),
+            ),
         },
+        debug,
+    }
+}
+
+/// Finish a wheel's metadata fetch where the one-at-a-time loop would have
+/// run it: the first attempt's held-back debug lines print here, and an
+/// attempt that earned a retry spends the REST of its budget here, pausing
+/// as its `Retry-After` asked. `None` (no attempt was ever started) runs the
+/// whole of [`fetch_hosted_wheel_metadata`]. Either way this wheel costs the
+/// host the one-at-a-time loop's requests, at most `attempts` of them.
+pub async fn finish_hosted_wheel_metadata(
+    client: &ApiClient,
+    url: &str,
+    sha256: &str,
+    attempt: Option<HostedWheelMetadataAttempt>,
+) -> Result<Option<String>, String> {
+    let Some(attempt) = attempt else {
+        return fetch_hosted_wheel_metadata(client, url, sha256).await;
+    };
+    crate::api::client::flush_deferred_debug(attempt.debug);
+    match attempt.outcome {
+        WheelAttemptOutcome::Settled(result) => result,
+        WheelAttemptOutcome::Retry(deferred) => client
+            .download_artifact_resuming(url, deferred)
+            .await
+            .map_err(|error| format!("cannot fetch hosted wheel metadata: {error}"))
+            .and_then(|bytes| decode_hosted_wheel_metadata(&bytes, sha256)),
     }
 }
 

@@ -178,6 +178,33 @@ impl Respond for OneAtATime {
     }
 }
 
+/// A serve host that 503s a wheel's first `fail_first` requests and serves
+/// it from then on — the shape that catches a retry budget being spent
+/// twice: one `attempts`-deep budget never reaches request `fail_first + 1`.
+struct Flapping {
+    name: &'static str,
+    body: Vec<u8>,
+    fail_first: usize,
+    log: Arc<Mutex<Vec<(&'static str, u16)>>>,
+}
+
+impl Respond for Flapping {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let mut log = self.log.lock().unwrap();
+        let seen = log.iter().filter(|(n, _)| *n == self.name).count();
+        let (status, template) = if seen < self.fail_first {
+            (503, ResponseTemplate::new(503))
+        } else {
+            (
+                200,
+                ResponseTemplate::new(200).set_body_bytes(self.body.clone()),
+            )
+        };
+        log.push((self.name, status));
+        template
+    }
+}
+
 /// Which wheel host [`mock_api`] mounts.
 enum WheelHost {
     /// `aaa` and `ccc` serve valid bytes (reversed delays), `bbb` is a SLOW
@@ -185,7 +212,14 @@ enum WheelHost {
     Mixed(Arrivals),
     /// Every wheel is valid, behind a [`OneAtATime`] host.
     OneAtATime(Arc<Mutex<Vec<(&'static str, u16)>>>),
+    /// Every wheel is valid, but `bbb` is behind a [`Flapping`] host that
+    /// 503s its first `VENDOR_ATTEMPTS` requests.
+    Flapping(Arc<Mutex<Vec<(&'static str, u16)>>>),
 }
+
+/// `VendorRetryPolicy::default().attempts` — the requests one wheel
+/// download may cost the host, however the fan-out splits it up.
+const VENDOR_ATTEMPTS: usize = 3;
 
 /// Discovery, per-package search and the reference grants for all of PKGS,
 /// with the wheels served per [`WheelHost::Mixed`]. Returns the
@@ -264,6 +298,21 @@ async fn mock_api_with(server: &MockServer, host: WheelHost) {
                         name,
                         body: bytes,
                         busy_until: busy_until.clone(),
+                        log: log.clone(),
+                    })
+                    .mount(server)
+                    .await;
+            }
+            WheelHost::Flapping(log) => {
+                wheel
+                    .respond_with(Flapping {
+                        name,
+                        body: bytes,
+                        fail_first: if name == "bbb-pkg" {
+                            VENDOR_ATTEMPTS
+                        } else {
+                            0
+                        },
                         log: log.clone(),
                     })
                     .mount(server)
@@ -379,14 +428,36 @@ async fn wheel_metadata_failures_fold_in_dep_order() {
     );
 }
 
+/// The debug stream's wheel GET lines, as `(dep name, whole line)`.
+fn wheel_debug_gets(stderr: &str, api: &str) -> Vec<(String, String)> {
+    stderr
+        .lines()
+        .filter(|line| line.starts_with("[socket-patch debug]") && line.contains("/wheels/"))
+        .map(|line| {
+            let dep = PKGS
+                .iter()
+                .find(|(name, version, _)| line.ends_with(&wheel_file(name, version)))
+                .unwrap_or_else(|| panic!("unknown wheel in {line}"));
+            assert!(line.contains(api), "the wheel host is {api}: {line}");
+            (dep.0.to_string(), line.to_string())
+        })
+        .collect()
+}
+
 /// A host that serves one download at a time and 429s the rest must end up
 /// with the one-at-a-time loop's outcome: every wheel's metadata fetched,
 /// nothing skipped. Concurrent attempts that share a `Retry-After` wake up
 /// together and collide again, so letting each one retry on its own drains
 /// the budgets and drops a redirect the serial loop makes; a retryable
-/// failure must hand the rest of the fan-out back to the serial loop. The
-/// opt-in debug stream must also match the serial loop's: one wheel GET per
-/// dep, in dep order, and no failed attempt (the serial loop never collides).
+/// failure must hand the rest of the fan-out back to the serial loop.
+///
+/// The collisions themselves are the fan-out's own doing, so this asserts on
+/// the HOST's log, not only on stdout: no wheel may cost more requests than
+/// the one-at-a-time loop's budget (a deferred attempt is resumed, never
+/// replayed on a fresh one), and every wheel must end on a 200. The opt-in
+/// debug stream must account for every one of those requests — a speculative
+/// GET the host really served is reported, not censored — and must still
+/// fold in dep order.
 #[tokio::test]
 async fn rate_limited_wheel_host_matches_the_serial_outcome() {
     let server = MockServer::start().await;
@@ -440,26 +511,128 @@ async fn rate_limited_wheel_host_matches_the_serial_outcome() {
         "no wheel may be skipped: {metadata_skips:?}\nwheel requests: {log:?}"
     );
 
-    let wheel_debug: Vec<&str> = stderr
+    // No wheel may cost more than one retry budget, and each must end on a
+    // 200 — a deferred first attempt is resumed, not replayed on a fresh
+    // budget, which would let a wheel outlive the serial loop's failures.
+    for (name, _, _) in PKGS {
+        let statuses: Vec<u16> = log
+            .iter()
+            .filter(|(n, _)| *n == name)
+            .map(|(_, status)| *status)
+            .collect();
+        assert!(
+            !statuses.is_empty() && statuses.len() <= VENDOR_ATTEMPTS,
+            "{name} may cost at most {VENDOR_ATTEMPTS} requests, got {statuses:?}: {log:?}"
+        );
+        assert_eq!(
+            statuses.last(),
+            Some(&200),
+            "{name} must end on the metadata the serial loop got: {log:?}"
+        );
+    }
+
+    // Every request the host really served is in the debug stream, and the
+    // stream still folds in dep order (each dep's lines in one run).
+    let wheel_debug = wheel_debug_gets(&stderr, &server.uri());
+    assert_eq!(
+        wheel_debug.len(),
+        log.len(),
+        "the debug stream must account for every wheel request the host \
+         served ({log:?}):\n{stderr}"
+    );
+    let mut folded: Vec<&str> = wheel_debug.iter().map(|(dep, _)| dep.as_str()).collect();
+    folded.dedup();
+    assert_eq!(
+        folded,
+        PKGS.iter().map(|(name, _, _)| *name).collect::<Vec<_>>(),
+        "each dep's GETs must fold together, in dep order:\n{stderr}"
+    );
+    // Each reported retry is a real 429, and each real 429 is reported.
+    let failed = stderr
         .lines()
-        .filter(|line| line.starts_with("[socket-patch debug]") && line.contains("/wheels/"))
-        .collect();
-    let expected: Vec<String> = PKGS
+        .filter(|line| line.contains("vendor package download attempt"))
+        .count();
+    assert_eq!(
+        failed,
+        log.iter().filter(|(_, status)| *status == 429).count(),
+        "every collision the host answered must be reported once:\n{stderr}"
+    );
+    assert_eq!(
+        failed,
+        stderr
+            .lines()
+            .filter(|line| line.contains("vendor service retry"))
+            .count(),
+        "every reported failure must also report its Retry-After pause:\n{stderr}"
+    );
+}
+
+/// The fan-out may not hand a wheel a second retry budget. A host that 503s
+/// a wheel's first `VENDOR_ATTEMPTS` requests exhausts the one-at-a-time
+/// loop's budget, so that wheel is skipped and the other three redirect.
+/// Spending the speculative attempt and then starting a FULL retry budget
+/// would reach the host's first 200 instead — a different stdout, and in a
+/// wet run a lockfile the serial loop never writes.
+#[tokio::test]
+async fn a_deferred_wheel_attempt_does_not_buy_a_second_retry_budget() {
+    let server = MockServer::start().await;
+    let log: Arc<Mutex<Vec<(&'static str, u16)>>> = Arc::default();
+    mock_api_with(&server, WheelHost::Flapping(log.clone())).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    write_uv_project(&root);
+
+    let cwd = root.to_str().unwrap().to_string();
+    let api = server.uri();
+    let (code, stdout, stderr) = common::run_with_env(
+        &root,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--dry-run",
+            "--json",
+            "--cwd",
+            &cwd,
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+        ],
+        &[],
+    );
+    let doc: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("JSON envelope ({e}):\n{stdout}\n{stderr}"));
+    assert_eq!(code, 0, "{doc:#}\n{stderr}");
+    let log = log.lock().unwrap().clone();
+    let bbb: Vec<u16> = log
         .iter()
-        .map(|(name, version, _)| {
-            format!(
-                "[socket-patch debug] GET vendor package {}/wheels/{}",
-                server.uri(),
-                wheel_file(name, version)
-            )
-        })
+        .filter(|(n, _)| *n == "bbb-pkg")
+        .map(|(_, status)| *status)
         .collect();
     assert_eq!(
-        wheel_debug, expected,
-        "debug lines must follow the serial loop's order:\n{stderr}"
+        bbb,
+        vec![503; VENDOR_ATTEMPTS],
+        "the flapping wheel gets exactly the serial loop's budget, all of \
+         it spent before the host's first 200: {log:?}"
     );
-    assert!(
-        !stderr.contains("vendor package download attempt"),
-        "the serial loop never collides, so no attempt fails:\n{stderr}"
+    let skipped: Vec<String> = doc["redirect"]["skipped"]
+        .as_array()
+        .unwrap_or_else(|| panic!("redirect.skipped: {doc:#}"))
+        .iter()
+        .filter(|s| s["reason"] == "python_metadata_unavailable")
+        .map(|s| s["purl"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        skipped,
+        vec![purl("bbb-pkg", "2.0.0")],
+        "the exhausted wheel is skipped, as in the serial loop: {doc:#}"
+    );
+    assert_eq!(
+        doc["redirect"]["redirected"],
+        PKGS.len() - 1,
+        "the other three still redirect: {doc:#}"
     );
 }

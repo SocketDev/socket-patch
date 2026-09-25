@@ -1835,26 +1835,32 @@ pub(crate) async fn run_redirect_selected(
         // failure) is never settled concurrently. At the first one no
         // further attempt is started, the ones already in flight are awaited
         // (so the host is idle again, as the serial loop would find it), and
-        // that dep plus every later one without a settled attempt are
-        // fetched one at a time with the full retry budget and `Retry-After`
-        // pacing, exactly as the serial loop fetched them. A rate-limited or
-        // struggling host therefore sees the serial loop's behavior from
-        // there on, and no outcome can be worse than the serial loop's.
+        // that dep plus every later one are finished one at a time. A
+        // deferred attempt is RESUMED, not restarted: `Retry-After` is
+        // waited out and only the budget it left is spent, so each wheel
+        // costs the host exactly the requests the serial loop's would have.
+        // What stays different is only their overlap: a host that answers a
+        // burst differently than it answers the same requests one at a time
+        // (a sliding-window limiter, a bot challenge) can still hand back a
+        // status the serial loop would not have seen. The first such answer
+        // is what closes the window.
         //
         // Kept small on purpose: each in-flight download buffers a whole
-        // wheel (up to MAX_VENDOR_PACKAGE_BYTES) under its own body timeout.
-        // Under a tight descriptor limit it is 1, like the API loops (see
+        // wheel, so the peak is `wheel_metadata_concurrency` ×
+        // MAX_VENDOR_PACKAGE_BYTES (4 × 256 MiB), each under its own body
+        // timeout. Raising it raises that ceiling in step. Under a tight
+        // descriptor limit it is 1, like the API loops (see
         // `api_concurrency`): the serial loop held one socket at a time.
+        const WHEEL_METADATA_CONCURRENCY: usize = 4;
         let wheel_metadata_concurrency =
             if socket_patch_core::crawlers::walk_pool::fd_limit_is_tight() {
                 1
             } else {
-                4
+                WHEEL_METADATA_CONCURRENCY
             };
         use futures_util::StreamExt as _;
         use socket_patch_core::vendor::pypi::{
-            fetch_hosted_wheel_metadata, try_fetch_hosted_wheel_metadata_once,
-            HostedWheelMetadataAttempt,
+            finish_hosted_wheel_metadata, try_fetch_hosted_wheel_metadata_once,
         };
         // Lazily built: a dep's attempt starts only once it is pulled here.
         let mut unstarted = wheel_deps.iter().map(|&(dep, sha256)| {
@@ -1872,28 +1878,27 @@ pub(crate) async fn run_redirect_selected(
                 "Fetching hosted wheel metadata for {}...",
                 dep.name
             ));
-            let settled = match drained.as_mut() {
+            let attempt = match drained.as_mut() {
                 Some(drained) => drained.pop_front(),
                 None => match in_flight.next().await {
-                    Some(HostedWheelMetadataAttempt::Retry) | None => {
+                    Some(attempt) if !attempt.needs_retry() => {
+                        in_flight.extend(unstarted.next());
+                        Some(attempt)
+                    }
+                    // A retryable failure (or nothing left in flight): let
+                    // the host go idle, then finish one at a time from here.
+                    struggling => {
                         let mut rest = std::collections::VecDeque::new();
                         while let Some(later) = in_flight.next().await {
                             rest.push_back(later);
                         }
                         drained = Some(rest);
-                        None
-                    }
-                    Some(settled) => {
-                        in_flight.extend(unstarted.next());
-                        Some(settled)
+                        struggling
                     }
                 },
             };
-            let fetched = match settled.and_then(|settled| settled.into_result()) {
-                Some(fetched) => fetched,
-                None => fetch_hosted_wheel_metadata(api_client, &dep.artifact_url, sha256).await,
-            };
-            match fetched {
+            match finish_hosted_wheel_metadata(api_client, &dep.artifact_url, sha256, attempt).await
+            {
                 Ok(Some(metadata)) => {
                     python_metadata.insert(dep.artifact_url.clone(), metadata);
                 }

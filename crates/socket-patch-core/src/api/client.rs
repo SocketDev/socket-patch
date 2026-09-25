@@ -1289,20 +1289,42 @@ impl ApiClient {
     /// [`VendorRetryPolicy`]; the flag says whether a final `Failed` was a
     /// retryable (availability) failure.
     async fn download_vendor_archive_retrying(&self, url: &str) -> (ServeDownload, bool) {
+        self.download_vendor_archive_from(url, 1).await
+    }
+
+    /// [`Self::download_vendor_archive_retrying`] starting at attempt
+    /// `attempt` — 2 when attempt 1 was made elsewhere and deferred (see
+    /// [`Self::download_artifact_resuming`]), so a split download still
+    /// costs the policy's `attempts` requests, not one budget per split.
+    async fn download_vendor_archive_from(
+        &self,
+        url: &str,
+        mut attempt: u32,
+    ) -> (ServeDownload, bool) {
         let attempts = self.vendor_retry.attempts.max(1);
-        let mut attempt = 1;
         loop {
             match self.download_vendor_archive_once(url).await {
                 (ServeDownload::Failed(e), Some(retry_after)) if attempt < attempts => {
-                    debug_log(&format!(
-                        "vendor package download attempt {attempt} failed: {e}"
-                    ));
-                    self.vendor_backoff(attempt, retry_after).await;
+                    self.vendor_download_retry(attempt, &e, retry_after).await;
                     attempt += 1;
                 }
                 (outcome, hint) => return (outcome, hint.is_some()),
             }
         }
+    }
+
+    /// Report attempt `attempt`'s retryable failure and pause before the
+    /// next one.
+    async fn vendor_download_retry(
+        &self,
+        attempt: u32,
+        e: &ApiError,
+        retry_after: Option<Duration>,
+    ) {
+        debug_log(&format!(
+            "vendor package download attempt {attempt} failed: {e}"
+        ));
+        self.vendor_backoff(attempt, retry_after).await;
     }
 
     /// [`Self::download_vendor_archive_retrying`] without the flag.
@@ -1416,20 +1438,52 @@ impl ApiClient {
         artifact_download_result(self.download_vendor_archive(url).await, url)
     }
 
-    /// The first attempt of [`Self::download_artifact`] alone: `Some` with
+    /// The first attempt of [`Self::download_artifact`] alone: `Ok` with
     /// exactly the result `download_artifact` would return when that attempt
-    /// settles it (success, or a failure it would not retry), `None` when it
-    /// would retry. A caller that gets `None` runs `download_artifact` from
-    /// scratch, so it keeps the full retry budget and `Retry-After` pacing.
+    /// settles it (success, or a failure it would not retry), `Err` with the
+    /// budget the attempt left unspent when it would retry. That `Err` goes
+    /// to [`Self::download_artifact_resuming`], which spends the REST of the
+    /// budget — so however a caller splits the two, the host sees the single
+    /// request sequence `download_artifact` would have made.
     pub(crate) async fn download_artifact_first_attempt(
         &self,
         url: &str,
-    ) -> Option<Result<Vec<u8>, ApiError>> {
+    ) -> Result<Result<Vec<u8>, ApiError>, DeferredAttempt> {
         match self.download_vendor_archive_once(url).await {
-            (ServeDownload::Failed(_), Some(_)) if self.vendor_retry.attempts.max(1) > 1 => None,
-            (outcome, _) => Some(artifact_download_result(outcome, url)),
+            (ServeDownload::Failed(error), Some(retry_after))
+                if self.vendor_retry.attempts.max(1) > 1 =>
+            {
+                Err(DeferredAttempt { error, retry_after })
+            }
+            (outcome, _) => Ok(artifact_download_result(outcome, url)),
         }
     }
+
+    /// [`Self::download_artifact`] resumed from the attempt
+    /// [`Self::download_artifact_first_attempt`] deferred: that attempt's
+    /// failure is reported and its `Retry-After` waited out exactly where
+    /// the retry loop would have, then the remaining attempts run.
+    pub(crate) async fn download_artifact_resuming(
+        &self,
+        url: &str,
+        deferred: DeferredAttempt,
+    ) -> Result<Vec<u8>, ApiError> {
+        self.vendor_download_retry(1, &deferred.error, deferred.retry_after)
+            .await;
+        artifact_download_result(self.download_vendor_archive_from(url, 2).await.0, url)
+    }
+}
+
+/// The unspent remainder of a retry budget: a first attempt that failed
+/// retryably and was set aside, carrying the failure its retry still owes a
+/// debug line and the `Retry-After` it still owes a pause. Only
+/// [`ApiClient::download_artifact_first_attempt`] makes one (and only when
+/// the policy has an attempt left to give), and only
+/// [`ApiClient::download_artifact_resuming`] spends it.
+#[derive(Debug)]
+pub(crate) struct DeferredAttempt {
+    error: ApiError,
+    retry_after: Option<Duration>,
 }
 
 // ── Free functions ────────────────────────────────────────────────────
@@ -4257,9 +4311,9 @@ mod vendor_retry_tests {
     }
 
     /// `download_artifact_first_attempt` settles exactly what
-    /// `download_artifact` would return on its first attempt, and declines
-    /// (`None`, one request, no backoff) wherever `download_artifact` would
-    /// retry — unless the policy has no retry to give, where it settles.
+    /// `download_artifact` would return on its first attempt, and defers
+    /// (one request, no backoff) wherever `download_artifact` would retry —
+    /// unless the policy has no retry to give, where it settles.
     #[tokio::test]
     async fn first_attempt_settles_or_defers_like_download_artifact() {
         let server = MockServer::start().await;
@@ -4290,7 +4344,7 @@ mod vendor_retry_tests {
                 retrying
                     .download_artifact_first_attempt(&url(route))
                     .await
-                    .is_none(),
+                    .is_err(),
                 "{route} is retried by download_artifact, so it defers"
             );
         }
@@ -4320,6 +4374,51 @@ mod vendor_retry_tests {
             .await
             .expect_err("503 is an error");
         assert_eq!(settled.to_string(), full.to_string());
+    }
+
+    /// A deferral RESUMES the budget: a first attempt plus
+    /// `download_artifact_resuming` costs the host exactly the requests one
+    /// `download_artifact` costs — never the deferred attempt plus a fresh
+    /// budget, which would give a flapping host one extra try and turn the
+    /// serial loop's failure into a success.
+    #[tokio::test]
+    async fn resuming_a_deferral_spends_one_budget_not_two() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/down"))
+            .respond_with(ResponseTemplate::new(503).set_body_bytes(BYTES.to_vec()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/down", server.uri());
+        let gets = || async {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r.url.path() == "/down")
+                .count()
+        };
+        let client = client(&server.uri(), fast());
+
+        let whole = client.download_artifact(&url).await.expect_err("503");
+        let serial = gets().await;
+        assert_eq!(serial, fast().attempts as usize, "the policy's attempts");
+
+        let deferred = client
+            .download_artifact_first_attempt(&url)
+            .await
+            .expect_err("503 defers");
+        let resumed = client
+            .download_artifact_resuming(&url, deferred)
+            .await
+            .expect_err("503");
+        assert_eq!(resumed.to_string(), whole.to_string(), "same final error");
+        assert_eq!(
+            gets().await - serial,
+            serial,
+            "the split download costs the same budget as the whole one"
+        );
     }
 
     fn granted(server: &MockServer, uuid: &str) -> ResponseTemplate {
