@@ -306,6 +306,16 @@ async fn contentless_patch_view_fails_only_its_own_package() {
         bad["errorCode"], "no_local_source",
         "the per-package failure keeps the staging code: {env:#}"
     );
+    // The per-package slot is the ONE machine-readable explanation a
+    // `--json` consumer gets (every human channel in the stager is gated
+    // on `!--json`), so it must carry the REAL reason. This run is neither
+    // offline nor a download failure: the view was served, 200, with a
+    // file it had no content for.
+    assert_eq!(
+        bad["error"].as_str(),
+        Some("the patch view served no blob content for package/index.js"),
+        "the failure names the file that was served without content: {env:#}"
+    );
 
     let good = event_for(&env, GOOD_PURL);
     assert_eq!(

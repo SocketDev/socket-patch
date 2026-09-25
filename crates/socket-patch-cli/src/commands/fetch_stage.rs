@@ -441,12 +441,13 @@ pub(crate) struct MemStagedSources {
     diffs: PathBuf,
     packages: PathBuf,
     mem: HashMap<String, Vec<u8>>,
-    /// The purls this staging could NOT obtain patch content for, while at
-    /// least one other patch staged fine. Each is an unsatisfiable package
-    /// the caller reports per-package (and leaves out of the engine run) —
-    /// see [`stage_vendor_sources_in_memory`]. Sorted, so the per-package
-    /// reports come out in the same order every run.
-    unavailable: Vec<String>,
+    /// The purls this staging could NOT obtain patch content for, each with
+    /// the reason, while at least one other patch staged fine. Each is an
+    /// unsatisfiable package the caller reports per-package (and leaves out
+    /// of the engine run) — see [`stage_vendor_sources_in_memory`]. Sorted
+    /// by purl, so the per-package reports come out in the same order every
+    /// run.
+    unavailable: Vec<(String, String)>,
 }
 
 impl MemStagedSources {
@@ -462,7 +463,7 @@ impl MemStagedSources {
     }
 
     /// See [`MemStagedSources::unavailable`].
-    pub(crate) fn unavailable(&self) -> &[String] {
+    pub(crate) fn unavailable(&self) -> &[(String, String)] {
         &self.unavailable
     }
 }
@@ -533,7 +534,7 @@ pub(crate) async fn stage_vendor_sources_in_memory(
     let missing_blobs = get_missing_blobs(manifest, &blobs).await;
     let missing_package_archives = get_missing_archives(manifest, &packages).await;
     let mut mem = seed;
-    let mut unavailable: Vec<String> = Vec::new();
+    let mut unavailable: Vec<(String, String)> = Vec::new();
 
     // A diff archive alone is NOT a sufficient source here, unlike the disk
     // stager: vendoring runs the auto-force policy, where a beforeHash
@@ -610,7 +611,12 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                 &built
             }
         };
-        let mut failed: Vec<&str> = Vec::new();
+        // Each dropped purl with WHY it was dropped. The reason is the only
+        // machine-readable explanation the caller can put in that package's
+        // `failed` event, and the human `[error]` lines below are printed
+        // exclusively under `!--json` — so without it a `--json` consumer
+        // learned nothing about which file was contentless.
+        let mut failed: Vec<(&str, String)> = Vec::new();
         for (i, (purl, uuid)) in to_fetch.iter().enumerate() {
             if to_fetch.len() > 1 {
                 status.set(format!(
@@ -625,11 +631,11 @@ pub(crate) async fn stage_vendor_sources_in_memory(
             let record = manifest.patches.get(*purl);
             match client.fetch_patch(uuid).await {
                 Ok(Some(patch)) => {
-                    let mut complete = true;
                     // Named so the per-file report is the same on every run:
                     // `patch.files` is a `HashMap`, so "the first file with
                     // no content" is otherwise bucket order.
                     let mut contentless: Vec<&str> = Vec::new();
+                    let mut malformed: Option<String> = None;
                     for (file, info) in &patch.files {
                         let Some(b64) = &info.blob_content else {
                             // A zero-delta file is served without content
@@ -645,17 +651,19 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                                 continue;
                             }
                             contentless.push(file);
-                            complete = false;
                             continue;
                         };
                         let Some(hash) = &info.after_hash else {
-                            complete = false;
+                            malformed =
+                                Some(format!("the patch view served no afterHash for {file}"));
                             break;
                         };
                         // Same key guard as the disk writer: the hash names the
                         // lookup key the apply pipeline gates writes on.
                         if !is_valid_blob_hash(hash) {
-                            complete = false;
+                            malformed = Some(format!(
+                                "the patch view served an invalid afterHash for {file}"
+                            ));
                             break;
                         }
                         match base64_decode(b64) {
@@ -663,7 +671,9 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                                 mem.insert(hash.clone(), bytes);
                             }
                             Err(_) => {
-                                complete = false;
+                                malformed = Some(format!(
+                                    "the patch view served undecodable blob content for {file}"
+                                ));
                                 break;
                             }
                         }
@@ -678,11 +688,12 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                             ));
                         }
                     }
-                    if !complete {
-                        failed.push(purl);
+                    if let Some(reason) = malformed.or_else(|| contentless_reason(&contentless)) {
+                        failed.push((purl, reason));
                     }
                 }
-                _ => failed.push(purl),
+                Ok(None) => failed.push((purl, format!("no patch view is served for {uuid}"))),
+                Err(e) => failed.push((purl, format!("the patch view could not be fetched: {e}"))),
             }
         }
         status.finish();
@@ -695,11 +706,12 @@ pub(crate) async fn stage_vendor_sources_in_memory(
             // channel for these purls in both arms below: the per-package
             // arm only records events.
             if !common.json {
+                let purls: Vec<&str> = failed.iter().map(|(purl, _)| *purl).collect();
                 eprintln!(
                     "Error: Could not fetch patch content for {}:",
                     plural(failed.len(), "patch", "patches")
                 );
-                for line in format_purl_list(&failed, 5) {
+                for line in format_purl_list(&purls, 5) {
                     eprintln!("{line}");
                 }
             }
@@ -710,7 +722,10 @@ pub(crate) async fn stage_vendor_sources_in_memory(
             if failed.len() == manifest.patches.len() {
                 return MemStageOutcome::Unavailable;
             }
-            unavailable = failed.into_iter().map(str::to_string).collect();
+            unavailable = failed
+                .into_iter()
+                .map(|(purl, reason)| (purl.to_string(), reason))
+                .collect();
             unavailable.sort();
         }
     }
@@ -732,22 +747,33 @@ pub(crate) async fn stage_vendor_sources_in_memory(
 pub(crate) fn drop_unstageable<'a>(
     env: &mut Envelope,
     records: &'a HashMap<String, PatchRecord>,
-    unavailable: &[String],
+    unavailable: &[(String, String)],
 ) -> (Cow<'a, HashMap<String, PatchRecord>>, bool) {
     if unavailable.is_empty() {
         return (Cow::Borrowed(records), false);
     }
-    for purl in unavailable {
+    for (purl, reason) in unavailable {
         env.record(
-            PatchEvent::new(PatchAction::Failed, purl.clone()).with_error(
-                "no_local_source",
-                "patch artifacts unavailable (offline or download failure)",
-            ),
+            PatchEvent::new(PatchAction::Failed, purl.clone())
+                .with_error("no_local_source", reason.clone()),
         );
     }
     let mut kept = records.clone();
-    kept.retain(|purl, _| !unavailable.contains(purl));
+    kept.retain(|purl, _| !unavailable.iter().any(|(dropped, _)| dropped == purl));
     (Cow::Owned(kept), true)
+}
+
+/// The reason string for a view that came back missing the blob content of
+/// `contentless` (already sorted). `None` when nothing was missing.
+fn contentless_reason(contentless: &[&str]) -> Option<String> {
+    let (first, rest) = contentless.split_first()?;
+    Some(match rest.len() {
+        0 => format!("the patch view served no blob content for {first}"),
+        n => format!(
+            "the patch view served no blob content for {first} (and {n} other {})",
+            plural(n, "file", "files")
+        ),
+    })
 }
 
 #[cfg(test)]

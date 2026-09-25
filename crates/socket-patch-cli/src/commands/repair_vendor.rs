@@ -1216,7 +1216,7 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
     if !staged.unavailable().is_empty() {
         let (stuck, rest): (Vec<Candidate>, Vec<Candidate>) = candidates
             .into_iter()
-            .partition(|c| staged.unavailable().contains(&c.purl));
+            .partition(|c| staged.unavailable().iter().any(|(purl, _)| purl == &c.purl));
         report_no_local_source(env, common, &stuck, &unrebuildable, &mut rebuilt);
         candidates = rest;
         if candidates.is_empty() {
