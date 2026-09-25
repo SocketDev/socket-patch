@@ -892,7 +892,10 @@ async fn local_rebuild(
     // memory and materialises only what the apply pipeline resolves, while a
     // package whose part names a filesystem could fold together or re-spell
     // is extracted whole, the shape the in-memory repack is defined against.
-    let mut repack = match prepare_memory_repack(&bytes, &record.files)
+    // The sidecar fixup deletes `.nupkg.metadata` and looks beside it for a
+    // `*.nupkg.sha512` marker, so both have to be on disk for it to see
+    // exactly what a full extraction would have shown it.
+    let mut repack = match prepare_memory_repack(&bytes, &record.files, &[SIDECAR_METADATA_PART])
         .map_err(|e| format!("cannot extract {}: {e}", src_nupkg.display()))
     {
         Ok(repack) => repack,
@@ -900,10 +903,6 @@ async fn local_rebuild(
     };
     let staged = match repack.as_mut() {
         Some(repack) => {
-            // The sidecar fixup deletes `.nupkg.metadata` and looks beside it
-            // for a `*.nupkg.sha512` marker, so both have to be on disk for
-            // it to see exactly what a full extraction would have shown it.
-            repack.also_stage(SIDECAR_METADATA_PART);
             let markers: Vec<String> = repack
                 .member_names()
                 .filter(|n| !n.contains('/') && n.ends_with(SIDECAR_SIGNATURE_MARKER_SUFFIX))
@@ -926,6 +925,9 @@ async fn local_rebuild(
             ),
         ));
     }
+    // The compressed package has been read out; the in-memory repack holds
+    // the parts it needs, so don't carry a second copy through the apply.
+    drop(bytes);
 
     let result = super::force_apply_staged(
         purl,

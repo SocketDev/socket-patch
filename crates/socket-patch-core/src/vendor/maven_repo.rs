@@ -893,7 +893,7 @@ async fn stage_local_jar(
         .map_err(|e| format!("cannot read {}: {e}", src_jar.display()))?;
     let stage = Stage::new().map_err(|e| format!("cannot create stage dir: {e}"))?;
     let unreadable = |e| format!("cannot extract {}: {e}", src_jar.display());
-    let repack = prepare_memory_repack(&bytes, files).map_err(unreadable)?;
+    let repack = prepare_memory_repack(&bytes, files, &[]).map_err(unreadable)?;
     match &repack {
         Some(repack) => repack.stage_into(stage.path()).await.map_err(unreadable)?,
         None => extract_zip(&bytes, stage.path(), /*strip_first=*/ false).map_err(unreadable)?,

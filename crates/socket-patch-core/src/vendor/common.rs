@@ -308,8 +308,9 @@ pub(crate) struct ArchiveMember {
     /// Archive-relative, `/`-separated name — the name the rebuilt zip uses.
     name: String,
     bytes: Vec<u8>,
-    /// The entry's unix exec bit, i.e. the mode [`super::registry_fetch::extract_zip`] would have
-    /// put on the extracted file (0o755 vs 0o644).
+    /// The entry's unix exec bit, i.e. the mode
+    /// [`super::registry_fetch::extract_zip`] would have put on the
+    /// extracted file (0o755 vs 0o644).
     exec: bool,
     /// Set when the staged twin is gone after the apply (NuGet's sidecar
     /// fixup deletes `.nupkg.metadata`): the member then drops out of the
@@ -317,7 +318,8 @@ pub(crate) struct ArchiveMember {
     dropped: bool,
 }
 
-/// The in-memory twin of [`super::registry_fetch::extract_zip`]`(bytes, stage, /*strip_first=*/ false)`:
+/// The in-memory twin of an [`super::registry_fetch::extract_zip`] with
+/// `strip_first = false`:
 /// every member decompressed into memory, in archive order, with the LAST
 /// spelling of a repeated name winning — what an extraction to disk leaves
 /// behind. Every guard (entry count, the per-entry and total decompressed
@@ -557,15 +559,24 @@ pub(crate) struct MemoryRepack {
 }
 
 /// Read `archive` into memory for an in-place rebuild, or `Ok(None)` when its
-/// names (together with `files`' patch targets) are not unambiguous on every
-/// filesystem — the caller must then extract to disk instead, which is what
-/// this path is defined against. Errors are [`super::registry_fetch::extract_zip`]'s, verbatim.
+/// names (together with `files`' patch targets and `extra`) are not unambiguous
+/// on every filesystem — the caller must then extract to disk instead, which is
+/// what this path is defined against. Errors are
+/// [`super::registry_fetch::extract_zip`]'s, verbatim.
+///
+/// `extra` names the fixed paths the ecosystem's sidecar fixup resolves beside
+/// the patch targets (NuGet's `.nupkg.metadata`). They are materialised like a
+/// target and, like one, must not fold onto a member under a different
+/// spelling — the fixup would delete that member on a case-insensitive volume
+/// and leave it in place on a case-sensitive one.
 pub(crate) fn prepare_memory_repack(
     archive: &[u8],
     files: &HashMap<String, PatchFileInfo>,
+    extra: &[&str],
 ) -> Result<Option<MemoryRepack>, String> {
     let members = read_zip_members(archive)?;
-    let targets: Vec<&str> = patch_target_paths(files);
+    let mut targets: Vec<&str> = patch_target_paths(files);
+    targets.extend_from_slice(extra);
     if !can_repack_in_memory(
         members.iter().map(|m| m.name.as_str()),
         targets.iter().copied(),
@@ -2055,7 +2066,7 @@ mod tests {
         skip_entry: Option<&str>,
         apply: impl AsyncFn(&Path),
     ) -> Result<Option<Vec<u8>>, String> {
-        let Some(mut repack) = prepare_memory_repack(archive, files)? else {
+        let Some(mut repack) = prepare_memory_repack(archive, files, extra)? else {
             return Ok(None);
         };
         for name in extra {
@@ -2211,7 +2222,9 @@ mod tests {
     async fn in_memory_repack_materialises_a_directory_a_patch_key_names() {
         let archive = build_zip(&[entry("lib/net6.0/x.dll", b"MZ")]);
         let files = target_files(&["lib/net6.0"]);
-        let repack = prepare_memory_repack(&archive, &files).unwrap().unwrap();
+        let repack = prepare_memory_repack(&archive, &files, &[])
+            .unwrap()
+            .unwrap();
         let stage = tempfile::tempdir().unwrap();
         repack.stage_into(stage.path()).await.unwrap();
         assert!(
@@ -2238,7 +2251,9 @@ mod tests {
             entry(".nupkg.metadata", b"{}"),
         ]);
         let files = target_files(&["LICENSE"]);
-        let mut repack = prepare_memory_repack(&archive, &files).unwrap().unwrap();
+        let mut repack = prepare_memory_repack(&archive, &files, &[])
+            .unwrap()
+            .unwrap();
         repack.also_stage(".nupkg.metadata");
         let stage = tempfile::tempdir().unwrap();
         repack.stage_into(stage.path()).await.unwrap();
@@ -2298,10 +2313,35 @@ mod tests {
         for (label, archive, keys) in cases {
             let files = target_files(&keys);
             assert!(
-                prepare_memory_repack(&archive, &files).unwrap().is_none(),
+                prepare_memory_repack(&archive, &files, &[])
+                    .unwrap()
+                    .is_none(),
                 "{label} must fall back to the on-disk repack"
             );
         }
+    }
+
+    /// A member folding onto one of the sidecar fixup's fixed paths must fall
+    /// back too: the fixup would delete that member on a case-insensitive
+    /// volume and leave it in place on a case-sensitive one, so the rebuilt
+    /// package is only reproducible through the on-disk path.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_member_folding_onto_a_sidecar_path_falls_back() {
+        let archive = build_zip(&[entry(".NUPKG.METADATA", b"{}"), entry("LICENSE", b"x")]);
+        let files = target_files(&["LICENSE"]);
+        assert!(
+            prepare_memory_repack(&archive, &files, &[".nupkg.metadata"])
+                .unwrap()
+                .is_none(),
+            "a member folding onto `.nupkg.metadata` must take the on-disk path"
+        );
+        assert!(
+            prepare_memory_repack(&archive, &files, &[])
+                .unwrap()
+                .is_some(),
+            "and only because the fixup path was declared"
+        );
     }
 
     /// A repeated entry name: the extraction overwrites in place, so the LAST
