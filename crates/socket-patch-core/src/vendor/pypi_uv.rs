@@ -70,7 +70,9 @@ enum UvDepClass {
 /// the lock rewrite is text surgery, so there is no mutated document to
 /// hand back, and the pyproject's emitted text may have had its CRLF line
 /// endings restored — the document those bytes parse to is not the one in
-/// hand. A write simply costs the next package one parse, as before.
+/// hand. A write simply costs the next package one parse, as before, and
+/// every write path here drops the slot it just made unreachable rather
+/// than leaving a megabyte of document for the next read to evict.
 static PYPROJECT_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
 static LOCK_MEMO: ParseMemo<DocumentMut> = ParseMemo::new();
 
@@ -718,9 +720,12 @@ pub(super) async fn wire_uv(
             )
         })?;
     PYPROJECT_MEMO.invalidate();
-    if let Err(e) =
-        atomic_write_bytes_preserving_mode(&root.join("uv.lock"), new_lock.as_bytes()).await
-    {
+    let write =
+        atomic_write_bytes_preserving_mode(&root.join("uv.lock"), new_lock.as_bytes()).await;
+    // Dropped whether or not the write landed: a torn one leaves bytes
+    // nobody holds behind too (same posture as `revert_uv`).
+    LOCK_MEMO.invalidate();
+    if let Err(e) = write {
         // Unwind so a sources-bearing pyproject is never paired with the old
         // registry lock (that combo makes `uv lock --check` fail and plain
         // `uv sync` rewrite the lock under the user).
