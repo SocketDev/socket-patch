@@ -1290,6 +1290,22 @@ into the new version's section — see docs/releasing.md.
   downloading it: a local build can never vendor a downloaded `.gem` (no
   eval-able stub gemspec), so the download was pure waste.
 
+- **Vendored artifacts are no longer fsynced one by one.** The files a
+  vendored run produces under `.socket/vendor/<eco>/<uuid>/` — patched copy
+  trees, the `.tgz` / `.whl` / `.nupkg` / `.jar` + `.pom` artifacts and their
+  `.sha1` sidecars, and the marker — are still written atomically (stage +
+  rename) but without their own `fsync`/`F_FULLFSYNC`. One durability
+  barrier syncs every such file and, once per directory, their directories
+  (with a single `F_FULLFSYNC` per device on macOS) before the next durable
+  commit point — a lockfile, `go.mod`/`go.sum`, `pom.xml`, `nuget.config`,
+  `package.json`, `pnpm-workspace.yaml`, the vendor ledger or the redirect
+  ledger — is written, so nothing durable ever names an artifact that could
+  still be lost. A crash can at worst leave an artifact the next run
+  re-verifies against the ledger and rebuilds (see
+  `socket_patch_core::utils::durability` for the full argument). The
+  in-place `apply` of an installed tree keeps its per-file durable writes.
+  Commit granularity is unchanged.
+
 - **Release publishing decomposed into per-registry workflows.** The
   crates.io, npm, PyPI, and RubyGems legs of the `Release` workflow now live
   in their own workflows
