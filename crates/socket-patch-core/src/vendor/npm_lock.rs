@@ -408,6 +408,16 @@ pub async fn vendor_npm<'a>(
         return done_failure_unstage(purl, e, project_root, &uuid_dir_rel, uuid_dir_preexisted)
             .await;
     }
+    // The bytes now on disk and the documents they were serialized from: the
+    // next package in this run reads them back and skips the parse.
+    for sib in siblings {
+        if let Some((_, _, written)) = sibling_writes.iter().find(|(name, ..)| *name == sib.name) {
+            LOCK_MEMO.store(written.clone(), sib.lock);
+        }
+    }
+    if primary_changed {
+        LOCK_MEMO.store(out, lock);
+    }
 
     // ── 9. Marker + ledger entry ─────────────────────────────────────────
     let marker = VendorMarker::new("npm", &base_purl, record, vendored_at);
