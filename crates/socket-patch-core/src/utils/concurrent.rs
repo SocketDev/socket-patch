@@ -38,6 +38,26 @@ pub const API_CONCURRENCY_ENV: &str = "SOCKET_API_CONCURRENCY";
 /// requests the patch API was measured to answer without a 429.
 const MAX_API_CONCURRENCY: usize = 32;
 
+/// In-flight cap for pristine downloads from the PUBLIC package registries
+/// (npmjs.org, PyPI, crates.io, RubyGems, the Go proxy, Maven Central).
+/// Deliberately its own number, not [`API_CONCURRENCY`]: those hosts are
+/// not the patch API, they have their own rate limits, the fetcher has no
+/// 429/`Retry-After` handling, and [`API_CONCURRENCY_ENV`] is the escape
+/// hatch for an operator's *patch API* — turning it up must not turn a
+/// public registry up with it. 4 keeps the lockfile-only ladder latency-
+/// flat without bursting at anyone.
+pub const REGISTRY_CONCURRENCY: usize = 4;
+
+/// The in-flight cap for pristine registry downloads; see
+/// [`REGISTRY_CONCURRENCY`]. No env override — a tight `RLIMIT_NOFILE`
+/// still forces one at a time, for the reason [`api_concurrency`] gives.
+pub fn registry_concurrency() -> usize {
+    if crate::crawlers::walk_pool::fd_limit_is_tight() {
+        return 1;
+    }
+    REGISTRY_CONCURRENCY
+}
+
 /// The in-flight cap for a client on the public proxy (`true`) or the
 /// authenticated API (`false`).
 ///

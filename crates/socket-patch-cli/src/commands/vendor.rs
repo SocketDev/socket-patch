@@ -26,7 +26,7 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
-use socket_patch_core::utils::concurrent::{api_concurrency, ordered_concurrent};
+use socket_patch_core::utils::concurrent::{ordered_concurrent, registry_concurrency};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
 use socket_patch_core::vendor::{
@@ -1146,6 +1146,15 @@ enum MissingRung {
     Fetch,
 }
 
+impl MissingRung {
+    /// Whether this purl still needs [`fetch_pristine_package`] — the one
+    /// predicate behind both the fetch plan and the lazy lock inventory,
+    /// so they cannot name different purls.
+    fn needs_registry(&self) -> bool {
+        matches!(self, MissingRung::Fetch)
+    }
+}
+
 /// The local rungs for one missing purl, deciding without emitting
 /// anything: an already-vendored npm purl with no installed copy (fresh
 /// clone) stages from its own committed artifact, sha256-verified against
@@ -1379,7 +1388,7 @@ pub(crate) async fn vendor_records_reusing(
             // committed-artifact staging and the offline stop: local and
             // read-only, so deciding them early changes nothing) without
             // emitting anything; the purls left for the registry are then
-            // fetched at most `api_concurrency` at a time, in order, and
+            // fetched at most `registry_concurrency` at a time, in order, and
             // pass 2 emits every purl's outcome in turn.
             let rungs: Vec<(Option<String>, MissingRung)> = {
                 let mut rungs = Vec::with_capacity(missing.len());
@@ -1391,7 +1400,7 @@ pub(crate) async fn vendor_records_reusing(
             };
             // Parsed only when some purl reaches the registry rung (the
             // serial loop's lazy first use).
-            if inventory.is_none() && rungs.iter().any(|(_, r)| matches!(r, MissingRung::Fetch)) {
+            if inventory.is_none() && rungs.iter().any(|(_, r)| r.needs_registry()) {
                 inventory = Some(lock_inventory::inventory_project(&common.cwd).await);
             }
             let inv = inventory.as_deref().unwrap_or_default();
@@ -1399,12 +1408,12 @@ pub(crate) async fn vendor_records_reusing(
             let to_fetch: Vec<&String> = missing
                 .iter()
                 .zip(&rungs)
-                .filter(|(_, (_, rung))| matches!(rung, MissingRung::Fetch))
+                .filter(|(_, (_, rung))| rung.needs_registry())
                 .map(|(purl, _)| purl)
                 .collect();
             let mut pristine = std::pin::pin!(ordered_concurrent(
                 to_fetch,
-                api_concurrency(false),
+                registry_concurrency(),
                 |purl| fetch_pristine_package(cwd, inv, client, purl, lookup_entry(ledger, purl)),
             ));
             for (purl, (artifact_missing, rung)) in missing.iter().zip(rungs) {
@@ -1453,8 +1462,12 @@ pub(crate) async fn vendor_records_reusing(
                     MissingRung::Offline => continue,
                     MissingRung::Fetch => match pristine.next().await {
                         Some(fetched) => fetched,
-                        // Unreachable: one fetch per Fetch rung.
+                        // Unreachable: `to_fetch` holds one fetch per
+                        // `needs_registry` rung, and this is the only arm
+                        // that consumes one. A live fetch keeps the outcome
+                        // right if the two ever fall out of step.
                         None => {
+                            debug_assert!(false, "pristine prefetch plan out of step at {purl}");
                             fetch_pristine_package(
                                 cwd,
                                 inv,
