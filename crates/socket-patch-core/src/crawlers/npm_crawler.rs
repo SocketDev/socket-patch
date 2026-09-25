@@ -633,6 +633,17 @@ impl NpmCrawler {
     /// them single-threaded so the order-dependent `seen` dedup (and the
     /// store entries' `identity_seen` decisions) see exactly the state the
     /// sequential walk would have — same packages, same paths, same order.
+    ///
+    /// Buffering costs memory the sequential walk did not pay: every root's
+    /// events are resident before the merge starts, so peak memory scales
+    /// with dirs VISITED (duplicates included) rather than with the unique
+    /// packages that survive the dedup — about +18% on a depscan-sized
+    /// tree. Merging each root as its gather finishes would barely help,
+    /// because the tree is one root: 5,080 of depscan's 5,520 packages
+    /// live in the root's virtual store, so the largest root's events —
+    /// which no per-root scheme shrinks — are the peak. The resolver's
+    /// per-level buffering is the one that grew without bound, and that is
+    /// [`Self::visit_resolver_dir`]'s to keep sparse.
     pub async fn crawl_all(&self, options: &CrawlerOptions) -> Vec<CrawledPackage> {
         self.crawl_all_with_roots(options).await.0
     }
@@ -1326,6 +1337,14 @@ impl NpmCrawler {
     /// skips its package.json, because bundled dependencies are real dirs
     /// nested inside the package itself (pnpm cannot link them out),
     /// physically present only there.
+    ///
+    /// The identity is read even for the child the merge will skip, which
+    /// the sequential walk avoided (it knew `identity_seen` as it went).
+    /// The gather cannot: the skip depends on the dedup state at merge
+    /// time. Deferring that one read to the merge thread would move the
+    /// store's transitive-only reads — the ones that are NEVER skipped,
+    /// and the bulk of a virtual store — onto the serial path, to save one
+    /// open per root-linked direct dep. So the read stays here.
     fn gather_package(path: PathBuf, entry_key: Option<String>, recurse: bool) -> Vec<ScanEvent> {
         let identity = read_package_json_sync(&path.join("package.json"));
         let nested = recurse.then(|| path.join("node_modules"));
@@ -1394,8 +1413,10 @@ impl NpmCrawler {
     /// inventoried (every root-linked direct dep — the importer pass wins
     /// the `seen` dedup) gets `identity_seen` = that name, decided HERE,
     /// against the dedup state at this point of the replay: its matching
-    /// direct child is skipped (the sequential walk did not even read its
-    /// package.json), while everything below it is still replayed.
+    /// direct child is skipped — its gathered identity discarded unread,
+    /// the one read the parallel gather cannot avoid (see
+    /// [`Self::gather_package`]); the sequential walk did not even open
+    /// that package.json. Everything below the entry is still replayed.
     fn merge_scan_events(
         events: Vec<ScanEvent>,
         identity_seen: Option<&str>,
