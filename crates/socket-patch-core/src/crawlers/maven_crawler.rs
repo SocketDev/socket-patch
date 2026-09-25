@@ -2,10 +2,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rayon::prelude::*;
-
 use super::types::{CrawledPackage, CrawlerOptions};
-use super::walk_pool::run_walk;
+use super::walk_pool::{par_map, run_walk};
 use crate::patch::path_safety;
 use crate::utils::fs::is_dir;
 
@@ -578,10 +576,12 @@ impl MavenCrawler {
     /// coordinates from the POM content or falls back to directory path parsing.
     ///
     /// Three phases: the (serial) walk collects the `.pom` paths in walk
-    /// order, the reads and parses run in parallel on the walk pool (each
-    /// POM's coordinates depend on that file alone), and the PURL dedup
-    /// runs serially in walk order — so the first-seen version dir wins
-    /// and packages come out exactly as the one-at-a-time scan's did.
+    /// order, the reads and parses run through [`par_map`] — in parallel on
+    /// the walk pool's threads, and on the calling thread when no walk
+    /// thread could be spawned (each POM's coordinates depend on that file
+    /// alone) — and the PURL dedup runs serially in walk order, so the
+    /// first-seen version dir wins and packages come out exactly as the
+    /// one-at-a-time scan's did.
     fn scan_maven_repo(&self, repo_path: &Path, seen: &mut HashSet<String>) -> Vec<CrawledPackage> {
         let mut poms: Vec<PathBuf> = Vec::new();
         for entry in walkdir::WalkDir::new(repo_path)
@@ -602,17 +602,14 @@ impl MavenCrawler {
             poms.push(entry.into_path());
         }
 
-        let parsed: Vec<Option<(String, String, String)>> = poms
-            .par_iter()
-            .map(|path| {
-                let version_dir = path.parent()?;
-                // Try POM parsing first, fall back to directory path parsing
-                std::fs::read_to_string(path)
-                    .ok()
-                    .and_then(|content| parse_pom_group_artifact_version(&content))
-                    .or_else(|| parse_path_coordinates(version_dir, repo_path))
-            })
-            .collect();
+        let parsed: Vec<Option<(String, String, String)>> = par_map(&poms, |path| {
+            let version_dir = path.parent()?;
+            // Try POM parsing first, fall back to directory path parsing
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|content| parse_pom_group_artifact_version(&content))
+                .or_else(|| parse_path_coordinates(version_dir, repo_path))
+        });
 
         let mut results = Vec::new();
         for (path, coords) in poms.iter().zip(parsed) {
@@ -1756,6 +1753,36 @@ mod tests {
                     _ => write(&file, &pom(rng, group, artifact, version)),
                 }
             }
+        }
+
+        /// The no-walk-pool fallback (the OS refused even one walk thread,
+        /// so `run_walk` runs the walk on the calling blocking-pool thread)
+        /// scans exactly as the serial oracle does. A bare rayon iterator
+        /// here would instead build rayon's GLOBAL pool from that thread —
+        /// which needs the threads the OS just refused, and panics when it
+        /// cannot get them — where the serial scan simply finished.
+        #[tokio::test]
+        async fn no_pool_repos_match_the_serial_oracle() {
+            let _off = crate::crawlers::walk_pool::test_hooks::DisablePool::new();
+            let mut total = 0;
+            for seed in 0..16u64 {
+                let tmp = tempfile::tempdir().unwrap();
+                let mut perms = PermGuard::default();
+                let mut rng = Rng::new(seed);
+                let root = tmp.path().join("repository");
+                repo(&mut rng, &root, &tmp.path().join("outside"), &mut perms);
+                perms.apply();
+                let options = CrawlerOptions {
+                    cwd: tmp.path().to_path_buf(),
+                    global: false,
+                    global_prefix: Some(root.clone()),
+                };
+                let new = MavenCrawler::new().crawl_all(&options).await;
+                let old = LegacyMavenCrawler::crawl_all(&options).await;
+                assert_eq!(rows(&new), rows(&old), "no pool, seed {seed}");
+                total += old.len();
+            }
+            assert!(total > 50, "vacuous fixtures: {total}");
         }
 
         #[tokio::test]

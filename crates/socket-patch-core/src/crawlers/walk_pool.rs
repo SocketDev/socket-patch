@@ -353,6 +353,41 @@ mod tests {
         assert_eq!(out, (1..=1000).collect::<Vec<_>>());
     }
 
+    /// [`par_map`] is the crate's ONLY rayon parallel iterator. A bare one
+    /// anywhere else runs on rayon's global pool whenever its caller is
+    /// off-pool — the no-walk-pool fallback, where building that pool needs
+    /// the very threads the OS just refused and panics when it cannot get
+    /// them. Checked against the sources, because the escape is invisible
+    /// on a machine that can still spawn threads (a crawler's equivalence
+    /// oracle passes either way). A future parallel map belongs in
+    /// `par_map` too, even one written inside a `pool.install`.
+    #[test]
+    fn par_map_is_the_crates_only_rayon_iterator() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let (mut offenders, mut scanned) = (Vec::new(), 0);
+        for entry in walkdir::WalkDir::new(&src)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "rs") || path.ends_with("walk_pool.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(path).expect("crate source is readable");
+            scanned += 1;
+            for (line_no, line) in text.lines().enumerate() {
+                if line.contains("par_iter()") || line.contains("par_bridge()") {
+                    offenders.push(format!("{}:{}", path.display(), line_no + 1));
+                }
+            }
+        }
+        assert!(scanned > 50, "the crate sources were not found: {scanned}");
+        assert!(
+            offenders.is_empty(),
+            "bare rayon iterators (use walk_pool::par_map): {offenders:?}"
+        );
+    }
+
     /// With no walk pool the walk runs off-pool (so `par_map` stays
     /// sequential); otherwise on a walk-pool thread.
     #[tokio::test]
