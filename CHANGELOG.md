@@ -627,6 +627,20 @@ into the new version's section — see docs/releasing.md.
 
 ### Fixed
 
+- **Ledgers written by a newer socket-patch are never half-reverted.**
+  A hosted redirect edit kind this release does not understand used to
+  let `rollback` drop the npm record beside it, leaving that lockfile
+  redirected with nothing tracking it. Such an edit now holds every
+  record in the redirect ledger, and `rollback <purl>`, `remove` and the
+  hosted-to-vendored takeover refuse, with nothing written, when it
+  names the purl ("the redirect ledger holds a {kind} edit this
+  socket-patch release does not understand; upgrade socket-patch").
+  `repair` skips vendored npm entries whose `flavor` it does not know
+  (`vendor_wiring_unknown_revert_blocked`) instead of rebuilding them
+  with the wrong layout rules. vlt ledgers (`redirect_vlt_lock_node`,
+  `flavor: "vlt"`) require the socket-patch release that adds vlt
+  support.
+
 - **Hosted Go redirects no longer claim patches that did not land.**
   `scan`/`get --mode hosted` counted a Go module as redirected (recorded
   it in the redirect ledger, so `vex` attested it) whenever any project

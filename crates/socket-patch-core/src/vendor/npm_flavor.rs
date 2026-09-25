@@ -51,6 +51,15 @@ pub(crate) enum NpmLockFlavor {
 }
 
 impl NpmLockFlavor {
+    const ALL: [NpmLockFlavor; 6] = [
+        NpmLockFlavor::PackageLock,
+        NpmLockFlavor::YarnClassic,
+        NpmLockFlavor::YarnBerry,
+        NpmLockFlavor::Pnpm,
+        NpmLockFlavor::PnpmLegacy,
+        NpmLockFlavor::Bun,
+    ];
+
     /// The stable string recorded as [`VendorEntry::flavor`].
     fn as_str(self) -> &'static str {
         match self {
@@ -454,6 +463,14 @@ pub(super) async fn lock_text_mentions_uuid(
     any_readable.then_some(false)
 }
 
+/// Does this build have a backend for an npm entry's recorded flavor?
+/// `None` is a pre-flavor (package-lock) ledger. An unknown flavor was
+/// wired by a newer socket-patch, so health checks and rebuilds must not
+/// judge it by this build's layout rules.
+pub fn npm_flavor_is_known(flavor: Option<&str>) -> bool {
+    flavor.is_none_or(|f| NpmLockFlavor::ALL.iter().any(|known| known.as_str() == f))
+}
+
 /// Revert one recorded npm vendor entry through the flavor that wired it.
 /// Entries from before the flavor field existed (`None`) are package-lock
 /// wirings; an unknown flavor fails CLOSED (an older binary must not guess
@@ -554,6 +571,17 @@ mod tests {
 
     #[test]
     fn flavor_strings_are_stable() {
+        assert_eq!(
+            NpmLockFlavor::ALL.map(NpmLockFlavor::as_str),
+            [
+                "package-lock",
+                "yarn-classic",
+                "yarn-berry",
+                "pnpm",
+                "pnpm-legacy",
+                "bun"
+            ]
+        );
         assert_eq!(NpmLockFlavor::PackageLock.as_str(), "package-lock");
         assert_eq!(NpmLockFlavor::YarnClassic.as_str(), "yarn-classic");
         assert_eq!(NpmLockFlavor::Pnpm.as_str(), "pnpm");
@@ -1046,6 +1074,9 @@ mod tests {
         assert!(!outcome.success);
         assert!(outcome.error.as_deref().unwrap().contains("future-pm"));
 
+        assert!(!npm_flavor_is_known(Some("future-pm")));
+        assert!(!npm_flavor_is_known(Some("vlt")));
+
         // Every known flavor routes to its backend; with no wiring records and
         // nothing on disk each reverts trivially (None = a pre-flavor ledger).
         for flavor in [
@@ -1057,6 +1088,7 @@ mod tests {
             Some("pnpm-legacy".to_string()),
             Some("bun".to_string()),
         ] {
+            assert!(npm_flavor_is_known(flavor.as_deref()), "{flavor:?}");
             entry.flavor = flavor.clone();
             let outcome = revert_npm_any(&entry, tmp.path(), false).await;
             assert!(outcome.success, "flavor {flavor:?}: {:?}", outcome.error);

@@ -129,6 +129,36 @@ fn find_record_key(state: &RedirectState, purl: &str) -> Result<(String, String)
     Ok((record_key, strip_purl_qualifiers(purl).to_string()))
 }
 
+/// Refuse a per-purl claim while the ledger holds a `redirect_*` edit this
+/// release cannot classify that mentions `<name>@<version>`: claiming the
+/// rest and dropping the record would strand that edit (half a takeover).
+fn refuse_unclassified_edits(
+    state: &RedirectState,
+    name: &str,
+    version: &str,
+) -> Result<(), String> {
+    let needle = format!("{name}@{version}");
+    let mentions = |v: &Option<Value>| match v {
+        Some(Value::String(s)) => s.contains(&needle),
+        Some(other) => other.to_string().contains(&needle),
+        None => false,
+    };
+    match state.edits.iter().find(|e| {
+        e.kind.starts_with("redirect_")
+            && super::replay::is_unclassified_kind(&e.kind, &e.action)
+            && (e.key.as_deref().is_some_and(|k| k.contains(&needle))
+                || mentions(&e.original)
+                || mentions(&e.new))
+    }) {
+        Some(e) => Err(format!(
+            "the redirect ledger holds a {} edit this socket-patch release does not \
+             understand; upgrade socket-patch",
+            e.kind
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Drop the claimed edits (by ledger index) and the purl's record from the
 /// ledger — only after every inverse applied cleanly. The caller persists.
 fn drop_claimed(state: &mut RedirectState, claimed: Vec<usize>, record_key: &str) {
@@ -224,6 +254,7 @@ pub async fn revert_cargo_redirect_purl(
         return Err(format!("not a cargo purl: {purl}"));
     };
     let (name, version) = (name.into_owned(), version.into_owned());
+    refuse_unclassified_edits(state, &name, &version)?;
     let lock_key = format!("{name}@{version}");
 
     // Manifest edits are keyed by crate NAME (the shared golden ledger
@@ -481,6 +512,7 @@ pub async fn revert_golang_redirect_purl(
         return Err(format!("not a golang purl: {purl}"));
     };
     let (module, version) = (module.into_owned(), version.into_owned());
+    refuse_unclassified_edits(state, &module, &version)?;
     let lhs = format!("{module} {version} =>");
     let is_replace_edit = |e: &FileEdit| {
         matches!(
@@ -761,6 +793,7 @@ pub async fn revert_npm_redirect_purl(
         return Err(format!("not an npm purl: {purl}"));
     };
     let (name, version) = (name.into_owned(), version.into_owned());
+    refuse_unclassified_edits(state, &name, &version)?;
     let lock_key = format!("{name}@{version}");
 
     // The package-lock/shrinkwrap files any `redirect_npm_lock_entry` edits
@@ -2449,6 +2482,95 @@ mod tests {
         );
         assert!(state.records.is_empty(), "record dropped");
         assert!(state.edits.is_empty(), "edits dropped");
+    }
+
+    fn vlt_lock_node_edit(name: &str, version: &str) -> FileEdit {
+        FileEdit {
+            path: "vlt-lock.json".into(),
+            kind: "redirect_vlt_lock_node".into(),
+            action: "rewritten".into(),
+            key: Some(format!("{name}@{version}")),
+            original: Some(Value::String(format!(
+                "\"~npm~{name}@{version}\": [0,\"{name}\",\"sha512-r\"]"
+            ))),
+            new: Some(Value::String(format!(
+                "\"~npm~{name}@{version}\": [0,\"{name}\",\"sha512-p\",\"{NPM_URL}\"]"
+            ))),
+        }
+    }
+
+    #[tokio::test]
+    async fn npm_unclassified_edit_naming_the_purl_refuses_the_claim_untouched() {
+        for dry_run in [true, false] {
+            let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &classic_pristine()).await;
+            let root = tmp.path();
+            state.edits.push(vlt_lock_node_edit("left-pad", "1.3.0"));
+            let wired = tokio::fs::read_to_string(root.join("yarn.lock"))
+                .await
+                .unwrap();
+            let before = state.clone();
+            let err = revert_redirect_purl(root, &mut state, NPM_PURL, dry_run)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err,
+                "the redirect ledger holds a redirect_vlt_lock_node edit this socket-patch \
+                 release does not understand; upgrade socket-patch"
+            );
+            assert_eq!(
+                serde_json::to_value(&state).unwrap(),
+                serde_json::to_value(&before).unwrap(),
+                "nothing claimed"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("yarn.lock"))
+                    .await
+                    .unwrap(),
+                wired
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn npm_unclassified_edit_for_another_package_does_not_block_the_claim() {
+        let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &classic_pristine()).await;
+        let root = tmp.path();
+        state.edits.push(vlt_lock_node_edit("left-pad", "1.3.1"));
+        revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("revert succeeds");
+        assert_eq!(state.edits.len(), 1);
+        assert_eq!(state.edits[0].kind, "redirect_vlt_lock_node");
+    }
+
+    #[tokio::test]
+    async fn cargo_and_golang_claims_refuse_an_unclassified_edit_naming_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (purl, name, version) in [
+            ("pkg:cargo/serde@1.0.0", "serde", "1.0.0"),
+            ("pkg:golang/example.com/m@v1.2.3", "example.com/m", "v1.2.3"),
+        ] {
+            let mut state = RedirectState::new();
+            state.records.insert(purl.into(), record());
+            state.edits.push(FileEdit {
+                path: "future.lock".into(),
+                kind: "redirect_future_lock_entry".into(),
+                action: "rewritten".into(),
+                key: None,
+                original: Some(serde_json::json!({ "id": format!("{name}@{version}") })),
+                new: Some(Value::String("x".into())),
+            });
+            let before = state.clone();
+            let err = revert_redirect_purl(tmp.path(), &mut state, purl, false)
+                .await
+                .unwrap_err();
+            assert!(err.contains("redirect_future_lock_entry edit"), "{err}");
+            assert_eq!(
+                serde_json::to_value(&state).unwrap(),
+                serde_json::to_value(&before).unwrap(),
+                "{purl}"
+            );
+        }
     }
 
     #[tokio::test]

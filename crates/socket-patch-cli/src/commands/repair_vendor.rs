@@ -876,6 +876,22 @@ pub(crate) async fn repair_vendored_artifacts_with_references(
                     format!("the ledger entry cannot be verified ({reason}); fix state.json"),
                 );
             }
+            ArtifactHealth::UnknownFlavor { flavor } => {
+                record_warning(
+                    env,
+                    purl,
+                    &VendorWarning::new(
+                        "vendor_wiring_unknown_revert_blocked",
+                        format!(
+                            "{} was vendored for the npm flavor `{flavor}`, which this \
+                             socket-patch release does not understand; left untouched — \
+                             upgrade socket-patch",
+                            normalize_purl(purl)
+                        ),
+                    ),
+                    common,
+                );
+            }
             health @ (ArtifactHealth::Missing | ArtifactHealth::Corrupt { .. }) => {
                 let reason = if matches!(health, ArtifactHealth::Missing) {
                     "vendor_artifact_missing"

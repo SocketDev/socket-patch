@@ -853,6 +853,123 @@ async fn scoped_unsupported_ecosystem_fails_closed() {
     );
 }
 
+/// A ledger written by a newer socket-patch carries a hosted edit kind this
+/// release has no revert for (`redirect_vlt_lock_node`). A scoped rollback
+/// of the purl it names must refuse with nothing written, and an unscoped
+/// one must keep the record while that edit survives.
+async fn write_vlt_ledger_fixture(root: &Path) -> String {
+    let vlt_new = format!(
+        "\"~npm~left-pad@1.2.3\": [0,\"left-pad\",\"sha512-PATCHEDpatched==\",\"{LP_HOSTED_URL}\"]"
+    );
+    let vlt_lock = format!(
+        "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    {vlt_new}\n  }},\n  \"edges\": {{\n    \"file~_d left-pad\": \"prod 1.2.3 ~npm~left-pad@1.2.3\"\n  }}\n}}\n"
+    );
+    std::fs::write(root.join("vlt-lock.json"), &vlt_lock).unwrap();
+    std::fs::write(
+        root.join("yarn.lock"),
+        yarn_lock_content(&yarn_redirected_block()),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("Gemfile.lock"),
+        gemfile_lock_content(GEM_PATCH_REMOTE),
+    )
+    .unwrap();
+    write_hosted_ledger(
+        root,
+        vec![
+            (LP_PURL, patch_record(LP_UUID, "GHSA-lpad-aaaa-bbbb")),
+            (GEM_PURL, patch_record(GEM_UUID, "GHSA-gems-cccc-dddd")),
+        ],
+        vec![
+            yarn_classic_edit(),
+            gem_source_edit(),
+            FileEdit {
+                path: "vlt-lock.json".to_string(),
+                kind: "redirect_vlt_lock_node".to_string(),
+                action: "rewritten".to_string(),
+                key: Some("left-pad@1.2.3".to_string()),
+                original: Some(Value::String(
+                    "\"~npm~left-pad@1.2.3\": [0,\"left-pad\",\"sha512-UPSTREAMupstream==\"]"
+                        .to_string(),
+                )),
+                new: Some(Value::String(vlt_new)),
+            },
+        ],
+    )
+    .await;
+    vlt_lock
+}
+
+#[tokio::test]
+#[serial]
+async fn scoped_rollback_refuses_a_purl_named_by_an_unknown_edit_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vlt_lock = write_vlt_ledger_fixture(tmp.path()).await;
+    let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
+    let yarn_before = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
+
+    let (code, envelope) = run_rollback_subprocess(tmp.path(), &[LP_PURL]);
+    assert_eq!(code, 1, "{envelope}");
+    assert_eq!(envelope["status"], "partial_failure", "{envelope}");
+    assert_eq!(
+        envelope["hosted"]["reverted"],
+        serde_json::json!([]),
+        "{envelope}"
+    );
+    let failed = envelope["hosted"]["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1, "{envelope}");
+    assert_eq!(failed[0]["purl"], LP_PURL);
+    assert!(
+        failed[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("redirect_vlt_lock_node edit this socket-patch release does not understand"),
+        "{envelope}"
+    );
+    assert_eq!(
+        std::fs::read(ledger_path(tmp.path())).unwrap(),
+        ledger_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
+        yarn_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("vlt-lock.json")).unwrap(),
+        vlt_lock
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn unscoped_rollback_holds_the_record_beside_an_unknown_edit_kind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vlt_lock = write_vlt_ledger_fixture(tmp.path()).await;
+
+    let code = rollback_in_process(tmp.path(), Vec::new(), false).await;
+    assert_eq!(
+        code, 1,
+        "an unknown edit kind must fail the rollback closed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("vlt-lock.json")).unwrap(),
+        vlt_lock
+    );
+    let ledger: Value =
+        serde_json::from_slice(&std::fs::read(ledger_path(tmp.path())).unwrap()).unwrap();
+    assert!(ledger["records"].get(LP_PURL).is_some(), "{ledger}");
+    assert!(ledger["records"].get(GEM_PURL).is_some(), "{ledger}");
+    assert!(
+        ledger["edits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "redirect_vlt_lock_node"),
+        "{ledger}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 4. unscoped rollback replays the unsupported ecosystems
 // ---------------------------------------------------------------------------

@@ -178,29 +178,36 @@ fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
     }
 }
 
+/// Is `kind` a hosted-redirect edit this release has no replay arm for
+/// (a newer socket-patch's writer)?
+pub(super) fn is_unclassified_kind(kind: &str, action: &str) -> bool {
+    classify(kind, action).0 == "unknown"
+}
+
 /// The replay groups a record's ecosystem can have written edits into —
 /// the drop rule holds a record while ANY of its groups refused. npm
-/// purls fan across every npm-family lock flavor.
+/// purls fan across every npm-family lock flavor. Every ecosystem also
+/// lists the reserved "unknown" group: an edit kind this release cannot
+/// classify may belong to any record (a newer release's writer for a new
+/// lock flavor), so dropping a record beside one would strand that edit.
 fn groups_for_record_purl(purl: &str) -> &'static [&'static str] {
     if purl.starts_with("pkg:npm/") {
-        &["npm", "yarn", "pnpm", "bun"]
+        &["npm", "yarn", "pnpm", "bun", "unknown"]
     } else if purl.starts_with("pkg:cargo/") {
-        &["cargo"]
+        &["cargo", "unknown"]
     } else if purl.starts_with("pkg:gem/") {
-        &["gem"]
+        &["gem", "unknown"]
     } else if purl.starts_with("pkg:pypi/") {
-        &["pypi"]
+        &["pypi", "unknown"]
     } else if purl.starts_with("pkg:composer/") {
-        &["composer"]
+        &["composer", "unknown"]
     } else if purl.starts_with("pkg:golang/") {
-        &["golang"]
+        &["golang", "unknown"]
     } else if purl.starts_with("pkg:maven/") {
-        &["maven"]
+        &["maven", "unknown"]
     } else if purl.starts_with("pkg:nuget/") {
-        &["nuget"]
+        &["nuget", "unknown"]
     } else {
-        // Unknown ecosystems fail closed: tie them to the reserved
-        // "unknown" group, which refuses whenever it holds edits.
         &["unknown"]
     }
 }
@@ -2018,6 +2025,79 @@ mod tests {
         assert_eq!(out.refusals.len(), 1);
         assert_eq!(out.refusals[0].group, "unknown");
         assert_eq!(state.edits.len(), 1);
+    }
+
+    const VLT_LOCK: &str = "{\n  \"lockfileVersion\": 0,\n  \"nodes\": {\n    \"~npm~minimist@1.2.8\": [0,\"minimist\",\"sha512-p\",\"https://patch.socket.dev/npm/minimist/1.2.8/t/u/minimist-1.2.8.tgz\"]\n  },\n  \"edges\": {}\n}\n";
+
+    fn vlt_lock_node_edit() -> FileEdit {
+        FileEdit {
+            key: Some("minimist@1.2.8".into()),
+            ..edit(
+                "vlt-lock.json",
+                "redirect_vlt_lock_node",
+                "rewritten",
+                Some("\"~npm~minimist@1.2.8\": [0,\"minimist\",\"sha512-r\"]"),
+                Some(
+                    "\"~npm~minimist@1.2.8\": [0,\"minimist\",\"sha512-p\",\
+                     \"https://patch.socket.dev/npm/minimist/1.2.8/t/u/minimist-1.2.8.tgz\"]",
+                ),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn unclassified_kind_holds_the_npm_record_and_every_other_record() {
+        for dry_run in [true, false] {
+            let dir = TempDir::new().unwrap();
+            write(dir.path(), "vlt-lock.json", VLT_LOCK).await;
+            write(dir.path(), "composer.lock", "https://patch.example/c\n").await;
+            let mut state = state_with(
+                vec![
+                    vlt_lock_node_edit(),
+                    edit(
+                        "composer.lock",
+                        "redirect_composer_dist",
+                        "rewritten",
+                        Some("https://packagist.example/c"),
+                        Some("https://patch.example/c"),
+                    ),
+                ],
+                &["pkg:npm/minimist@1.2.8", "pkg:composer/v/c@1.0.0"],
+            );
+            let out = revert_remaining_redirect_edits(dir.path(), &mut state, dry_run).await;
+            assert_eq!(out.refusals.len(), 1, "{out:?}");
+            assert_eq!(out.refusals[0].group, "unknown");
+            assert!(out.dropped_records.is_empty(), "{out:?}");
+            assert!(state.records.contains_key("pkg:npm/minimist@1.2.8"));
+            assert!(state.records.contains_key("pkg:composer/v/c@1.0.0"));
+            assert_eq!(read(dir.path(), "vlt-lock.json").await, VLT_LOCK);
+            assert!(state
+                .edits
+                .iter()
+                .any(|e| e.kind == "redirect_vlt_lock_node"));
+        }
+    }
+
+    #[test]
+    fn every_ecosystem_group_list_includes_the_unknown_group() {
+        for purl in [
+            "pkg:npm/a@1",
+            "pkg:cargo/a@1",
+            "pkg:gem/a@1",
+            "pkg:pypi/a@1",
+            "pkg:composer/v/a@1",
+            "pkg:golang/example.com/a@v1.0.0",
+            "pkg:maven/g/a@1",
+            "pkg:nuget/A@1",
+            "pkg:hex/a@1",
+        ] {
+            assert!(groups_for_record_purl(purl).contains(&"unknown"), "{purl}");
+        }
+        assert!(is_unclassified_kind("redirect_vlt_lock_node", "rewritten"));
+        assert!(!is_unclassified_kind(
+            "redirect_bun_lock_package",
+            "rewritten"
+        ));
     }
 
     #[tokio::test]

@@ -438,6 +438,9 @@ pub enum ArtifactHealth {
     /// The entry can't be judged (poisoned path, empty record): fail
     /// closed, never rebuild from it.
     Unverifiable { reason: String },
+    /// An npm entry wired by a flavor this build has no backend for (a
+    /// newer socket-patch): its layout is not ours to judge or rebuild.
+    UnknownFlavor { flavor: String },
 }
 
 /// Health-check one vendored artifact against its patch record: the
@@ -453,6 +456,12 @@ pub async fn check_vendored_artifact(
     entry: &VendorEntry,
     record: &PatchRecord,
 ) -> ArtifactHealth {
+    if entry.ecosystem == "npm" && !super::npm_flavor::npm_flavor_is_known(entry.flavor.as_deref())
+    {
+        return ArtifactHealth::UnknownFlavor {
+            flavor: entry.flavor.clone().unwrap_or_default(),
+        };
+    }
     match verify_vendored_patch_record(project_root, entry, record).await {
         Err(tag) => {
             // A broken member copy must not hide a simultaneously corrupt
@@ -1430,6 +1439,33 @@ mod tests {
                 reason: "vendor_path_unsafe".to_string()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_npm_flavor_is_never_judged_by_this_builds_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
+        tokio::fs::create_dir_all(root.join(&rel).join("node_modules"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join(&rel).join("index.js"), b"tampered")
+            .await
+            .unwrap();
+        let rec = record(UUID, "package/index.js");
+        let mut ent = entry("npm", UUID, &rel);
+        ent.flavor = Some("vlt".into());
+        assert_eq!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::UnknownFlavor {
+                flavor: "vlt".into()
+            }
+        );
+        ent.flavor = Some("bun".into());
+        assert!(matches!(
+            check_vendored_artifact(root, &ent, &rec).await,
+            ArtifactHealth::Corrupt { .. }
+        ));
     }
 
     /// SECURITY: the zip entry-count cap fails a tampered wheel closed —
