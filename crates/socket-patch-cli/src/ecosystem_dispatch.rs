@@ -1615,41 +1615,91 @@ mod tests {
         );
     }
 
+    /// Stage one installed package for EVERY ecosystem under `root`, the
+    /// dir handed to all nine crawlers verbatim as `--global-prefix`. Each
+    /// layout is the one that crawler's own global-prefix tests use, and
+    /// they do not collide: a cargo crate dir has no `lib/` (so it is no
+    /// gem), a gem dir has no `Cargo.toml`, a NuGet id dir carries its
+    /// version as a child rather than a `-` suffix, and the jsr scope dir
+    /// holds no package.json.
+    fn stage_every_ecosystem(root: &std::path::Path) {
+        let dir = |path: PathBuf| std::fs::create_dir_all(path).unwrap();
+        let file = |path: PathBuf, body: String| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+
+        // npm: <root>/<name>/package.json
+        for (name, version) in [("zeta", "1.0.0"), ("alpha", "2.0.0"), ("mid", "3.0.0")] {
+            file(
+                root.join(name).join("package.json"),
+                format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+            );
+        }
+        // pypi: <root>/<name>-<version>.dist-info/METADATA
+        for (name, version) in [("requests", "2.31.0"), ("attrs", "23.1.0")] {
+            file(
+                root.join(format!("{name}-{version}.dist-info"))
+                    .join("METADATA"),
+                format!("Name: {name}\nVersion: {version}\n"),
+            );
+        }
+        // cargo: <root>/<name>-<version>/Cargo.toml
+        for (name, version) in [("serde", "1.0.0"), ("anyhow", "1.0.75")] {
+            file(
+                root.join(format!("{name}-{version}")).join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
+            );
+        }
+        // gem: <root>/<name>-<version>/ verified by a .gemspec (a `lib/`
+        // would also make NuGet's legacy `<Name>.<Version>` reading of the
+        // same dir stick).
+        file(
+            root.join("rgem-2.0.0").join("rgem.gemspec"),
+            "Gem::Specification.new\n".to_string(),
+        );
+        // golang: <root>/<host>/<path>@<version>/
+        dir(root.join("example.com").join("gomod@v1.2.3"));
+        // maven: <root>/<group path>/<artifact>/<version>/<artifact>-<version>.pom
+        file(
+            root.join("org")
+                .join("example")
+                .join("mlib")
+                .join("4.0.0")
+                .join("mlib-4.0.0.pom"),
+            "<project><groupId>org.example</groupId>\
+             <artifactId>mlib</artifactId><version>4.0.0</version></project>"
+                .to_string(),
+        );
+        // composer: the prefix IS the vendor dir — its metadata plus the
+        // install dir, which crawl_all requires to exist.
+        dir(root.join("acme").join("phplib"));
+        file(
+            root.join("composer").join("installed.json"),
+            serde_json::json!({"packages": [{"name": "acme/phplib", "version": "3.0.0"}]})
+                .to_string(),
+        );
+        // nuget: <root>/<id>/<version>/ verified by a lib/
+        dir(root.join("nugetlib").join("5.0.0").join("lib"));
+        // deno (jsr): <root>/@<scope>/<name>/<version>/
+        dir(root.join("@denoscope").join("jsrlib").join("6.0.0"));
+    }
+
     /// The concurrent crawl must yield exactly the serial run's packages,
     /// in the fixed ecosystem order, with the same counts. A
     /// `--global-prefix` root is handed to every crawler verbatim, so one
-    /// polyglot dir exercises several ecosystems at once.
+    /// polyglot dir exercises every ecosystem at once — and it has to:
+    /// an ecosystem that finds nothing contributes nothing to the
+    /// concatenation, so its POSITION in the consumption array is
+    /// unobservable and a reordering would ship silently. That order is
+    /// shipped behavior: `scan` chunks the crawl-ordered purls into
+    /// batches, so it decides batch composition, the `batch N/M failed`
+    /// warning text and order, and `last_batch_error`.
     #[tokio::test(flavor = "multi_thread")]
     async fn crawl_all_ecosystems_matches_serial_order() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        for (name, version) in [("zeta", "1.0.0"), ("alpha", "2.0.0"), ("mid", "3.0.0")] {
-            let pkg_dir = root.join(name);
-            std::fs::create_dir_all(&pkg_dir).unwrap();
-            std::fs::write(
-                pkg_dir.join("package.json"),
-                format!(r#"{{"name":"{name}","version":"{version}"}}"#),
-            )
-            .unwrap();
-        }
-        for (name, version) in [("requests", "2.31.0"), ("attrs", "23.1.0")] {
-            let dist = root.join(format!("{name}-{version}.dist-info"));
-            std::fs::create_dir_all(&dist).unwrap();
-            std::fs::write(
-                dist.join("METADATA"),
-                format!("Name: {name}\nVersion: {version}\n"),
-            )
-            .unwrap();
-        }
-        for (name, version) in [("serde", "1.0.0"), ("anyhow", "1.0.75")] {
-            let krate = root.join(format!("{name}-{version}"));
-            std::fs::create_dir_all(&krate).unwrap();
-            std::fs::write(
-                krate.join("Cargo.toml"),
-                format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\n"),
-            )
-            .unwrap();
-        }
+        stage_every_ecosystem(root);
         let options = CrawlerOptions {
             cwd: root.to_path_buf(),
             global: false,
@@ -1686,7 +1736,24 @@ mod tests {
             serial.iter().map(key).collect::<Vec<_>>()
         );
         assert_eq!(counts, serial_counts);
-        // Non-vacuous: several ecosystems contributed.
+        // Non-vacuous for EVERY ecosystem, or the ones that found nothing
+        // are pinned only by this test's own copy of the order.
+        for eco in [
+            Ecosystem::Npm,
+            Ecosystem::Pypi,
+            Ecosystem::Cargo,
+            Ecosystem::Gem,
+            Ecosystem::Golang,
+            Ecosystem::Maven,
+            Ecosystem::Composer,
+            Ecosystem::Nuget,
+            Ecosystem::Deno,
+        ] {
+            assert!(
+                counts.get(&eco).is_some_and(|&n| n >= 1),
+                "{eco:?} found nothing — its position is unobservable: {counts:?}"
+            );
+        }
         assert!(counts[&Ecosystem::Npm] >= 3, "{counts:?}");
         assert!(counts[&Ecosystem::Pypi] >= 2, "{counts:?}");
     }
