@@ -133,10 +133,6 @@ pub struct HeldBack<T> {
 }
 
 impl<T> HeldBack<T> {
-    pub(crate) fn new(value: T, debug: Vec<String>) -> Self {
-        Self { value, debug }
-    }
-
     /// The output, without releasing the debug lines.
     pub(crate) fn peek(&self) -> &T {
         &self.value
@@ -999,9 +995,13 @@ impl ApiClient {
     /// expected to download from the service, in loop order, with these
     /// request parameters. Until the guard drops, the loop's
     /// [`Self::fetch_vendor_package`] call for a planned uuid takes an
-    /// outcome fetched ahead of it (at most `window` in flight) — see
-    /// [`super::vendor_prefetch`] for why nothing observable changes. The
-    /// plan replaces any plan already attached.
+    /// outcome fetched ahead of it (at most `window` in flight, and at
+    /// most `window` requests ahead of the loop) — see
+    /// [`super::vendor_prefetch`] for why nothing observable changes, and
+    /// what the speculation can cost. A uuid this method refuses without
+    /// any I/O is dropped from the plan, so the prefetch never sends what
+    /// the loop's own call would not. The plan replaces any plan already
+    /// attached.
     pub fn prefetch_vendor_packages(
         &self,
         uuids: Vec<String>,
@@ -1010,12 +1010,20 @@ impl ApiClient {
         patch_server_url: Option<&str>,
         window: usize,
     ) -> VendorPrefetchGuard {
-        let plan = VendorPrefetch::new(uuids, free_only, vendor_url, patch_server_url, window);
+        let planned: Vec<String> = uuids.into_iter().filter(|u| is_valid_uuid(u)).collect();
+        let plan = Arc::new(VendorPrefetch::new(
+            planned,
+            free_only,
+            vendor_url,
+            patch_server_url,
+            window,
+        ));
         if let Ok(mut slot) = self.vendor_prefetch.lock() {
-            *slot = Some(Arc::new(plan));
+            *slot = Some(Arc::clone(&plan));
         }
         VendorPrefetchGuard {
             slot: Arc::clone(&self.vendor_prefetch),
+            plan,
         }
     }
 

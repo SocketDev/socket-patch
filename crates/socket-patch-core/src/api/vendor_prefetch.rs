@@ -7,8 +7,8 @@
 //! prebuilt archives paid those round trips back to back. A
 //! [`VendorPrefetch`] plan names the uuids the loop is expected to
 //! download, in loop order; a background task fetches them ahead of the
-//! loop, at most `window` in flight, and the loop's own call for a planned
-//! uuid takes the fetched outcome instead of making the requests.
+//! loop and the loop's own call for a planned uuid takes the fetched
+//! outcome instead of making the requests.
 //!
 //! Nothing observable may change, so the plan is advisory and every
 //! decision stays at consumption time, in loop order:
@@ -27,20 +27,44 @@
 //!   when the loop takes its outcome, where the serial request would have
 //!   printed them.
 //!
-//! The task only starts at the loop's first planned call (a run whose
-//! packages all refuse before the service makes no speculative request),
-//! and it stops speculating after [`super::client::VENDOR_BREAKER_THRESHOLD`]
-//! consecutive availability failures of its own. Dropping the
-//! [`VendorPrefetchGuard`] detaches the plan and aborts the task.
+//! ## What the speculation can cost
+//!
+//! The plan is built from the gates the CLI can see, so a package each
+//! backend refuses in its own pre-flight (an unsupported lockfile entry,
+//! an override conflict) can still be planned, and the loop then never
+//! asks for it. That is a real request against the service, so the task
+//! is bounded in requests, not just in time:
+//!
+//! * It only ever requests plan positions in `[at, at + reach)`, where
+//!   `at` is the position the loop has reached and `reach` is one until
+//!   the service has answered once and `window` after. So it never runs
+//!   more than `window` requests ahead of the loop, a run that stops
+//!   consulting the plan (every remaining package refused, or the loop
+//!   finishing) leaves at most `window` requests outstanding, and a plan
+//!   the loop never consults makes no request at all.
+//! * It never requests a position the loop has already passed, and stops
+//!   entirely once it has seen
+//!   [`super::client::VENDOR_BREAKER_THRESHOLD`] consecutive availability
+//!   failures of its own — so a service that is down from the first
+//!   package costs exactly the retry ladders the serial loop paid before
+//!   its own breaker opened, not a window of them.
+//!
+//! Outcomes are delivered as they finish, not in plan order: a passed-over
+//! download must never hold up the package the loop is actually waiting
+//! for (that would make the loop slower than serial, on a request serial
+//! never made). `take` puts an early outcome aside until its own call.
+//! Dropping the [`VendorPrefetchGuard`] detaches the plan and aborts the
+//! task.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures_util::StreamExt;
 
 use super::client::{
-    with_deferred_debug, ApiClient, HeldBack, VendorServiceOutcome, VENDOR_BREAKER_THRESHOLD,
+    hold_back_debug, ApiClient, HeldBack, VendorServiceOutcome, VENDOR_BREAKER_THRESHOLD,
 };
-use crate::utils::concurrent::ordered_concurrent;
 
 /// One fetched outcome: `(outcome, retryable failure)` as
 /// `fetch_vendor_package_once` returned it, debug lines held back.
@@ -55,19 +79,94 @@ pub(crate) struct VendorPrefetch {
     patch_server_url: Option<String>,
     /// Planned uuids, in the order the vendor loop consumes them.
     planned: Vec<String>,
-    /// Most downloads in flight (and queued unconsumed) at once.
+    /// Most downloads in flight at once, and the most the task may run
+    /// ahead of the loop.
     window: usize,
+    /// What the task is allowed to request, shared with it.
+    look: Arc<Lookahead>,
     state: tokio::sync::Mutex<PrefetchState>,
+}
+
+/// The window of plan positions the task may request: `[at, at + reach)`.
+/// Both ends move — `at` as the loop consumes, `reach` once the service has
+/// answered — so the speculation is bounded in REQUESTS by what the loop
+/// has actually reached (see the module docs). Gating on the position
+/// rather than on a count of permits keeps the order deterministic: the
+/// futures are polled in whatever order the unordered pool likes, so a
+/// counter would hand the opening request to an arbitrary position.
+#[derive(Debug)]
+struct Lookahead {
+    /// The plan position the loop is at; everything below it was passed
+    /// over and must never be requested.
+    at: AtomicUsize,
+    /// How far past `at` the task may run: one until the service has
+    /// answered once, then the whole window.
+    reach: AtomicUsize,
+    /// Consecutive retryable failures the TASK has seen, in the order its
+    /// own requests answered. Purely a stop signal for the speculation —
+    /// the observable breaker is the client's, folded at consumption time.
+    failures: AtomicU32,
+    /// Woken whenever `at` or `reach` moves.
+    moved: tokio::sync::Notify,
+}
+
+impl Lookahead {
+    fn new() -> Self {
+        Self {
+            at: AtomicUsize::new(0),
+            // Opens at one request: a service that is down from the first
+            // package then costs what the serial loop cost.
+            reach: AtomicUsize::new(1),
+            failures: AtomicU32::new(0),
+            moved: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// The loop has reached plan position `position`.
+    fn arrive(&self, position: usize) {
+        self.at.store(position, Ordering::Relaxed);
+        self.moved.notify_waiters();
+    }
+
+    /// The service answered: the task may now run the full window ahead.
+    fn widen(&self, window: usize) {
+        self.reach.store(window, Ordering::Relaxed);
+        self.moved.notify_waiters();
+    }
+
+    /// Wait until plan position `index` may be requested; `false` when it
+    /// never may be (the loop passed it, or the task's breaker opened).
+    async fn admits(&self, index: usize) -> bool {
+        loop {
+            let notified = self.moved.notified();
+            tokio::pin!(notified);
+            // Armed before the check, so a move between the two is not lost.
+            notified.as_mut().enable();
+            if index < self.at.load(Ordering::Relaxed)
+                || self.failures.load(Ordering::Relaxed) >= VENDOR_BREAKER_THRESHOLD
+            {
+                return false;
+            }
+            if index < self.at.load(Ordering::Relaxed) + self.reach.load(Ordering::Relaxed) {
+                return true;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct PrefetchState {
-    /// First plan position not yet consumed or passed over.
-    cursor: usize,
-    /// Outcomes from the task, tagged with their plan position, in order.
-    /// `None` until the loop's first planned call starts the task.
+    /// First plan position not yet consumed or passed over — where the
+    /// next lookup starts, so a repeated call never waits on an outcome
+    /// already taken.
+    next: usize,
+    /// Outcomes from the task, tagged with their plan position, as they
+    /// finish. `None` until the loop's first planned call starts the task.
     rx: Option<tokio::sync::mpsc::Receiver<(usize, Fetched)>>,
     task: Option<tokio::task::JoinHandle<()>>,
+    /// Outcomes that answered before the loop asked for them, by position.
+    ready: HashMap<usize, Fetched>,
 }
 
 impl Drop for PrefetchState {
@@ -92,6 +191,7 @@ impl VendorPrefetch {
             patch_server_url: patch_server_url.map(str::to_string),
             planned,
             window: window.max(1),
+            look: Arc::new(Lookahead::new()),
             state: tokio::sync::Mutex::new(PrefetchState::default()),
         }
     }
@@ -114,31 +214,50 @@ impl VendorPrefetch {
             return None;
         }
         let mut state = self.state.lock().await;
-        let position = state.cursor
-            + self.planned[state.cursor..]
+        let from = state.next;
+        let position = from
+            + self.planned[from..]
                 .iter()
                 .position(|planned| planned == uuid)?;
-        state.cursor = position + 1;
-        if state.rx.is_none() {
+        // Pass over every position before this one: the task must not
+        // request them, anything they already answered is dropped
+        // (unreleased, with its debug lines), and the loop's arrival here
+        // is what lets the task run one position further.
+        state.next = position + 1;
+        // Everything BELOW this position was passed over; this position's
+        // own outcome, if it already answered, is the one being taken.
+        state.ready.retain(|index, _| *index >= position);
+        self.look.arrive(position);
+        if state.task.is_none() {
             self.start(&mut state, client, position);
         }
-        let rx = state.rx.as_mut()?;
+        let PrefetchState { rx, ready, .. } = &mut *state;
+        if let Some(fetched) = ready.remove(&position) {
+            return Some(fetched);
+        }
+        let rx = rx.as_mut()?;
         loop {
             match rx.recv().await {
                 Some((index, fetched)) if index == position => return Some(fetched),
-                Some((index, _)) if index < position => continue,
-                // Past the position (never sent out of order) or the task
-                // stopped: fetch live from here on.
-                _ => {
-                    state.rx = None;
-                    state.cursor = self.planned.len();
-                    return None;
+                // A later position answered first: keep it for its own
+                // call. An earlier one was passed over — drop it here.
+                Some((index, fetched)) => {
+                    if index > position {
+                        ready.insert(index, fetched);
+                    }
                 }
+                // The task stopped (its breaker, or the plan ran out) and
+                // this position never came: fetch live from here on.
+                _ => break,
             }
         }
+        state.rx = None;
+        state.next = self.planned.len();
+        self.look.arrive(self.planned.len());
+        None
     }
 
-    /// Spawn the task fetching `planned[from..]` in order.
+    /// Spawn the task fetching `planned[from..]`, at most `window` at once.
     fn start(&self, state: &mut PrefetchState, client: &ApiClient, from: usize) {
         let (tx, rx) = tokio::sync::mpsc::channel(self.window);
         let client = client.clone();
@@ -146,37 +265,52 @@ impl VendorPrefetch {
         let (free_only, window) = (self.free_only, self.window);
         let vendor_url = self.vendor_url.clone();
         let patch_server_url = self.patch_server_url.clone();
+        let look = Arc::clone(&self.look);
         state.task = Some(tokio::spawn(async move {
             let (client, vendor_url, patch_server_url) =
                 (&client, vendor_url.as_deref(), patch_server_url.as_deref());
-            let mut fetched = std::pin::pin!(ordered_concurrent(
-                planned.into_iter().enumerate(),
-                window,
-                move |(offset, uuid): (usize, String)| async move {
-                    let (outcome, debug) = with_deferred_debug(client.fetch_vendor_package_once(
-                        &uuid,
-                        free_only,
-                        vendor_url,
-                        patch_server_url,
-                    ))
-                    .await;
-                    (from + offset, HeldBack::new(outcome, debug))
-                },
-            ));
-            let mut consecutive_failures = 0;
-            while let Some((index, held)) = fetched.next().await {
-                match held.peek() {
-                    (VendorServiceOutcome::Failed(_), true) => consecutive_failures += 1,
-                    (VendorServiceOutcome::Failed(_), false) => {}
-                    _ => consecutive_failures = 0,
+            let look = &look;
+            // UNORDERED on purpose, unlike every folding loop in the CLI:
+            // nothing observable is folded here, and a passed-over
+            // download must not delay the one the loop is waiting for.
+            // `take` puts each outcome back on its own call.
+            let mut fetched =
+                std::pin::pin!(futures_util::stream::iter(planned.into_iter().enumerate())
+                    .map(move |(offset, uuid): (usize, String)| async move {
+                        let index = from + offset;
+                        if !look.admits(index).await {
+                            return None;
+                        }
+                        let held = hold_back_debug(client.fetch_vendor_package_once(
+                            &uuid,
+                            free_only,
+                            vendor_url,
+                            patch_server_url,
+                        ))
+                        .await;
+                        Some((index, held))
+                    })
+                    .buffer_unordered(window));
+            while let Some(item) = fetched.next().await {
+                let Some((index, held)) = item else { continue };
+                let availability_failure =
+                    matches!(held.peek(), (VendorServiceOutcome::Failed(_), true));
+                if availability_failure {
+                    look.failures.fetch_add(1, Ordering::Relaxed);
+                } else if !matches!(held.peek(), (VendorServiceOutcome::Failed(_), false)) {
+                    // Anything but a failure proves the service is up. A
+                    // NON-retryable failure (auth, parse) says nothing
+                    // about availability either way, so it neither counts
+                    // nor resets — exactly the client breaker's rule.
+                    look.failures.store(0, Ordering::Relaxed);
+                }
+                if !availability_failure {
+                    look.widen(window);
                 }
                 if tx.send((index, held)).await.is_err() {
                     return;
                 }
-                // The breaker would skip the service from here on unless a
-                // package in between succeeds; stop speculating (later
-                // calls fetch live, through the breaker).
-                if consecutive_failures >= VENDOR_BREAKER_THRESHOLD {
+                if look.failures.load(Ordering::Relaxed) >= VENDOR_BREAKER_THRESHOLD {
                     return;
                 }
             }
@@ -191,12 +325,21 @@ impl VendorPrefetch {
 #[derive(Debug)]
 pub struct VendorPrefetchGuard {
     pub(crate) slot: Arc<std::sync::Mutex<Option<Arc<VendorPrefetch>>>>,
+    /// The plan this guard attached. Only that one is detached on drop, so
+    /// a guard outliving a plan attached after it cannot take the newer
+    /// plan down with it.
+    pub(crate) plan: Arc<VendorPrefetch>,
 }
 
 impl Drop for VendorPrefetchGuard {
     fn drop(&mut self) {
         if let Ok(mut slot) = self.slot.lock() {
-            slot.take();
+            if slot
+                .as_ref()
+                .is_some_and(|attached| Arc::ptr_eq(attached, &self.plan))
+            {
+                slot.take();
+            }
         }
     }
 }
@@ -311,6 +454,17 @@ mod tests {
         }
     }
 
+    /// Requests the mock server saw, as `"METHOD /path"`.
+    async fn request_log(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect()
+    }
+
     /// Run `calls` (indices into the scripted uuids) one at a time, with
     /// `plan` attached when given; the per-call outcomes and final count.
     async fn run(
@@ -381,6 +535,28 @@ mod tests {
         assert_eq!(run(&server, Some(&all), &all).await, (serial, count));
     }
 
+    /// A service that is down from the first package costs the plan
+    /// exactly what it costs the serial loop: the speculation opens at one
+    /// request and stops itself at the breaker's threshold, so it never
+    /// aims a window of retry ladders at a service answering none.
+    #[tokio::test]
+    async fn a_service_that_is_down_costs_no_more_than_the_serial_loop() {
+        let scripts: Vec<Script> = (0..8).map(|_| Script::Down).collect();
+        let all: Vec<usize> = (0..scripts.len()).collect();
+
+        let serial_server = serve(&scripts).await;
+        let serial = run(&serial_server, None, &all).await;
+        let serial_posts = request_log(&serial_server).await.len();
+
+        let planned_server = serve(&scripts).await;
+        assert_eq!(run(&planned_server, Some(&all), &all).await, serial);
+        let planned_posts = request_log(&planned_server).await.len();
+        assert_eq!(
+            planned_posts, serial_posts,
+            "an outage must not be amplified by the plan"
+        );
+    }
+
     /// Isolated failures, non-retryable failures (which neither count nor
     /// reset) and answers that prove the service is up (which reset), in
     /// one sequence.
@@ -416,28 +592,58 @@ mod tests {
         assert_matches_serial(&scripts, &plan, &calls).await;
     }
 
-    /// The plan actually runs ahead: the second package's POST goes out
-    /// before the first package's (slow) grant has even been answered,
-    /// where the serial loop sends it only after the first archive GET.
+    /// A planned package the loop never asks for must not hold up the one
+    /// it does: the passed-over download is still in flight (30 s of
+    /// grant) when the next consumed package answers, and the call
+    /// returns anyway.
+    #[tokio::test]
+    async fn a_passed_over_download_never_blocks_the_next_call() {
+        let scripts = [
+            Script::Granted(0),
+            Script::Granted(30_000),
+            Script::Granted(0),
+        ];
+        let server = serve(&scripts).await;
+        let c = client(&server.uri());
+        let _guard = c.prefetch_vendor_packages((0..3).map(uuid).collect(), false, None, None, 4);
+        // Position 0 widens the window, so position 1 (the stalled one) is
+        // in flight before the loop passes it over for position 2.
+        assert!(
+            summary(&c.fetch_vendor_package(&uuid(0), false, None, None).await)
+                .starts_with("ready")
+        );
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            c.fetch_vendor_package(&uuid(2), false, None, None),
+        )
+        .await
+        .expect("a skipped package's download must not gate the next one");
+    }
+
+    /// The plan actually runs ahead: while the second package's grant is
+    /// still unanswered, the third and fourth have already downloaded
+    /// their archives — where the serial loop reaches those GETs only
+    /// after the second package's. (The first package opens the window on
+    /// its own, so the overlap starts at the second.)
     #[tokio::test]
     async fn planned_downloads_overlap_the_loop() {
-        let scripts = [Script::Granted(300), Script::Granted(0), Script::Granted(0)];
+        let scripts = [
+            Script::Granted(0),
+            Script::Granted(300),
+            Script::Granted(0),
+            Script::Granted(0),
+        ];
         let server = serve(&scripts).await;
-        let all = [0, 1, 2];
+        let all = [0, 1, 2, 3];
         run(&server, Some(&all), &all).await;
-        let log: Vec<String> = server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| format!("{} {}", r.method, r.url.path()))
-            .collect();
-        let first_get = log.iter().position(|r| r.starts_with("GET")).unwrap();
-        let posts_before = log[..first_get]
-            .iter()
-            .filter(|r| r.starts_with("POST"))
-            .count();
-        assert!(posts_before >= 2, "{log:?}");
+        let log = request_log(&server).await;
+        let get_at = |i: usize| {
+            log.iter()
+                .position(|r| *r == format!("GET /serve/{}.tgz", uuid(i)))
+                .unwrap_or_else(|| panic!("no archive GET for {i}: {log:?}"))
+        };
+        let slow = get_at(1);
+        assert!(get_at(2) < slow && get_at(3) < slow, "{log:?}");
     }
 
     /// The task starts at the loop's first planned call: a plan the loop
@@ -451,6 +657,35 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         drop(guard);
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// The speculation is bounded in REQUESTS, not just in time: once the
+    /// loop stops consulting the plan (here after one package, the rest
+    /// refused before the service), at most `window` more downloads are
+    /// ever issued — not the whole remaining plan.
+    #[tokio::test]
+    async fn the_task_runs_at_most_a_window_past_the_loop() {
+        let window = 4;
+        let scripts: Vec<Script> = (0..40).map(|_| Script::Granted(0)).collect();
+        let server = serve(&scripts).await;
+        let c = client(&server.uri());
+        let guard = c.prefetch_vendor_packages(
+            (0..scripts.len()).map(uuid).collect(),
+            false,
+            None,
+            None,
+            window,
+        );
+        c.fetch_vendor_package(&uuid(0), false, None, None).await;
+        // Whatever the task does from here, the loop never asks again.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        drop(guard);
+        let posts = request_log(&server)
+            .await
+            .iter()
+            .filter(|r| r.starts_with("POST"))
+            .count();
+        assert!(posts <= window, "{posts} grants for one consumed package");
     }
 
     /// A call with other request parameters than the plan's never takes a
@@ -481,5 +716,52 @@ mod tests {
             .filter(|r| r.method == wiremock::http::Method::POST)
             .count();
         assert_eq!(posts, 4);
+    }
+
+    /// A uuid the live path refuses without any I/O is never speculated on
+    /// either: the plan drops malformed ones as it is attached.
+    #[tokio::test]
+    async fn a_malformed_uuid_is_never_planned() {
+        let scripts = [Script::Granted(0)];
+        let server = serve(&scripts).await;
+        let c = client(&server.uri());
+        let _guard = c.prefetch_vendor_packages(
+            vec!["not-a-uuid".to_string(), uuid(0)],
+            false,
+            None,
+            None,
+            4,
+        );
+        let refused = summary(
+            &c.fetch_vendor_package("not-a-uuid", false, None, None)
+                .await,
+        );
+        assert!(refused.contains("Invalid patch UUID"), "{refused}");
+        assert!(
+            !request_log(&server)
+                .await
+                .iter()
+                .any(|r| r.starts_with("POST")),
+            "a malformed uuid must cost no request"
+        );
+    }
+
+    /// Dropping a guard detaches only the plan it attached: a plan
+    /// attached later keeps serving its own calls.
+    #[tokio::test]
+    async fn a_guard_detaches_only_its_own_plan() {
+        let scripts: Vec<Script> = (0..2).map(|_| Script::Granted(0)).collect();
+        let server = serve(&scripts).await;
+        let c = client(&server.uri());
+        let outer = c.prefetch_vendor_packages(vec![uuid(0)], false, None, None, 4);
+        let _inner = c.prefetch_vendor_packages(vec![uuid(1)], false, None, None, 4);
+        drop(outer);
+        assert!(
+            summary(&c.fetch_vendor_package(&uuid(1), false, None, None).await)
+                .starts_with("ready")
+        );
+        // One grant + one archive: the inner plan served the call, so the
+        // live path never repeated them.
+        assert_eq!(request_log(&server).await.len(), 2);
     }
 }
