@@ -51,7 +51,9 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::utils::purl::{canonical_purl, parse_cargo_purl, parse_golang_purl, parse_name_version};
+use crate::utils::purl::{
+    parse_cargo_purl, parse_golang_purl, parse_name_version, strip_purl_qualifiers,
+};
 use crate::vendor::go_mod_edit::{
     is_hosted_module_path, parse_replace_entries, HOSTED_GO_MODULE_PREFIX,
 };
@@ -119,7 +121,11 @@ fn find_record_key(state: &RedirectState, purl: &str) -> Result<(String, String)
             "the redirect ledger records no hosted redirect for {purl}"
         ));
     };
-    Ok((record_key, canonical_purl(purl)))
+    // The target keeps the purl's ORIGINAL (percent-encoded) spelling minus
+    // its qualifiers: `parse_cargo_purl` / `parse_name_version` decode the
+    // components themselves, and `canonical_purl` here would decode a second
+    // time (a literal `%2B` in a name would become `+`).
+    Ok((record_key, strip_purl_qualifiers(purl).to_string()))
 }
 
 /// Drop the claimed edits (by ledger index) and the purl's record from the
@@ -163,7 +169,7 @@ pub async fn revert_cargo_redirect_purl(
     let Some((name, version)) = parse_cargo_purl(&target) else {
         return Err(format!("not a cargo purl: {purl}"));
     };
-    let (name, version) = (name.to_string(), version.to_string());
+    let (name, version) = (name.into_owned(), version.into_owned());
     let lock_key = format!("{name}@{version}");
 
     let is_wiring_edit = |e: &FileEdit| {
@@ -589,11 +595,11 @@ pub async fn revert_npm_redirect_purl(
     dry_run: bool,
 ) -> Result<RedirectRevert, String> {
     let (record_key, target) = find_record_key(state, purl)?;
-    // `target` is canonical (percent-decoded); the name keeps its `@scope/`.
+    // The parse percent-decodes both components; the name keeps its `@scope/`.
     let Some((name, version)) = parse_name_version(&target, "pkg:npm/") else {
         return Err(format!("not an npm purl: {purl}"));
     };
-    let (name, version) = (name.to_string(), version.to_string());
+    let (name, version) = (name.into_owned(), version.into_owned());
     let lock_key = format!("{name}@{version}");
 
     // The package-lock/shrinkwrap files any `redirect_npm_lock_entry` edits

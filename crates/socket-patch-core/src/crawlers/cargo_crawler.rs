@@ -211,6 +211,7 @@ impl CargoCrawler {
 
         for purl in purls {
             if let Some((name, version)) = crate::utils::purl::parse_cargo_purl(purl) {
+                let (name, version) = (name.as_ref(), version.as_ref());
                 // Both coordinates are joined onto the scanned source root
                 // below and the resolved crate dir is patched IN PLACE, so a
                 // tampered PURL must not be able to traverse out of the

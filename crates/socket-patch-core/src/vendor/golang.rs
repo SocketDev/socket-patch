@@ -69,7 +69,7 @@ pub async fn vendor_go_module(
     let Some((module, version)) = parse_golang_purl(purl) else {
         return refused("unsafe_coordinates", format!("not a golang purl: {purl}"));
     };
-    let (module, version) = (&*module, &*version);
+    let (module, version) = (module.as_ref(), version.as_ref());
     // SECURITY: `module`+`version` key the on-disk copy dir
     // (`.socket/vendor/golang/<uuid>/<module>@<version>/`) and the `replace`
     // target path. A `..` segment / absolute path / backslash from a tampered
@@ -706,7 +706,7 @@ pub async fn revert_go_vendor_opts(
     let Some((module, version)) = parse_golang_purl(&entry.base_purl) else {
         return RevertOutcome::failed(format!("not a golang purl: {}", entry.base_purl));
     };
-    let (module, version) = (&*module, &*version);
+    let (module, version) = (module.as_ref(), version.as_ref());
     if !are_safe_redirect_coords(module, version) {
         return RevertOutcome::failed(format!(
             "refusing to revert unsafe golang coordinates `{module}`/`{version}`"

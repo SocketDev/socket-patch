@@ -421,6 +421,8 @@ impl MavenCrawler {
             if let Some((group_id, artifact_id, version)) =
                 crate::utils::purl::parse_maven_purl(purl)
             {
+                let (group_id, artifact_id, version) =
+                    (group_id.as_ref(), artifact_id.as_ref(), version.as_ref());
                 // SECURITY: the coordinates are untrusted manifest input joined
                 // onto the repo root and then patched IN PLACE. Reject anything
                 // that could traverse out of the repository before touching the

@@ -165,6 +165,8 @@ pub async fn vendor_maven(
     let Some((group_id, artifact_id, version)) = parse_maven_purl(purl) else {
         return refused("unsafe_coordinates", format!("not a maven purl: {purl}"));
     };
+    let (group_id, artifact_id, version) =
+        (group_id.as_ref(), artifact_id.as_ref(), version.as_ref());
     // SECURITY: `uuid`, `group_id`, `artifact_id`, and `version` come from
     // committed, tamper-able manifest data. They key the uuid dir vendor
     // creates and `--revert` deletes, the nested maven2 path, the vendored

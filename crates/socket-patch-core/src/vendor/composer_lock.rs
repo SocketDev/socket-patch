@@ -90,6 +90,7 @@ pub async fn vendor_composer(
     let Some(((vendor, name), version)) = parse_composer_purl(purl) else {
         return refused("unsafe_coordinates", format!("not a composer purl: {purl}"));
     };
+    let version = version.as_ref();
     // Canonical (packagist) lowercase form keys the on-disk copy dir and the
     // dist URL; the lock's own pretty casing is preserved untouched.
     let vendor = vendor.to_lowercase();

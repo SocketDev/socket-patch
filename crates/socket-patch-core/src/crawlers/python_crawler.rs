@@ -1365,13 +1365,11 @@ impl PythonCrawler {
 
         // Build lookup: canonicalized-name@version -> purl. The API serves
         // purls percent-encoded (a PEP 440 local/epoch version carries
-        // `+`/`!`, arriving as `%2B`/`%21`), so decode the coordinates
-        // before keying or the installed package never matches.
+        // `+`/`!`, arriving as `%2B`/`%21`), and `parse_pypi_purl` decodes
+        // the coordinates — undecoded, the installed package never matches.
         let mut purl_lookup: HashMap<String, &str> = HashMap::new();
         for purl in purls {
             if let Some((name, version)) = crate::utils::purl::parse_pypi_purl(purl) {
-                let name = crate::utils::purl::percent_decode_purl_component(name);
-                let version = crate::utils::purl::percent_decode_purl_component(version);
                 let key = format!("{}@{}", canonicalize_pypi_name(&name), version);
                 purl_lookup.insert(key, purl.as_str());
             }

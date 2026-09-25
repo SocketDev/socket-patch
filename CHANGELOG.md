@@ -726,6 +726,19 @@ into the new version's section — see docs/releasing.md.
   `setup --remove` could not land byte-identical on the pre-setup file.
   `package.json` is now written in its own layout (BOM, indent, line ending,
   trailing-newline shape), the same helper the vendored backends use.
+- **Vendored mode can patch a package whose version carries build
+  metadata.** The patches API serves canonical PURLs, so a semver build
+  metadata version arrives percent-encoded
+  (`pkg:cargo/wasi@0.11.0%2Bwasi-snapshot-preview1`). The PURL parsers
+  compared that raw spelling against the lockfile / install directory's
+  `0.11.0+wasi-snapshot-preview1`, never matched, and refused the package
+  (`vendor_fetched_missing`, then `locked_version_mismatch`) — so no cargo
+  crate with build metadata (`wasi` is in most Rust dependency graphs)
+  could be vendored at all. Every ecosystem's PURL parse now
+  percent-decodes the namespace, name and version once, after the
+  `/`-and-`@` split and before the path-safety guards, so an escaped
+  separator still cannot introduce a path segment. Hosted mode was already
+  correct.
 - **A vendoring-service outage no longer re-vendors packages.** An npm
   re-run (every lock flavor, `bun.lockb` included) re-acquired its tarball
   from whichever source answered — the service's prebuilt, or a local pack

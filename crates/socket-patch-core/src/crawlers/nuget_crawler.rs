@@ -114,6 +114,7 @@ impl NuGetCrawler {
             let Some((name, version)) = crate::utils::purl::parse_nuget_purl(purl) else {
                 continue;
             };
+            let (name, version) = (name.as_ref(), version.as_ref());
             // SECURITY: the coordinates are untrusted manifest input
             // joined onto the package root and then patched IN PLACE
             // (NuGet has no redirect backend). Reject anything that
@@ -748,7 +749,9 @@ mod tests {
     async fn test_scan_package_dir_dedups_same_package_across_two_scans() {
         let dir = tempfile::tempdir().unwrap();
         let pkg_dir = dir.path().join("newtonsoft.json").join("13.0.3");
-        tokio::fs::create_dir_all(pkg_dir.join("lib")).await.unwrap();
+        tokio::fs::create_dir_all(pkg_dir.join("lib"))
+            .await
+            .unwrap();
 
         let crawler = NuGetCrawler::new();
         let mut seen = HashSet::new();

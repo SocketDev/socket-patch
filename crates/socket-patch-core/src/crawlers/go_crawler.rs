@@ -181,7 +181,7 @@ impl GoCrawler {
 
         for purl in purls {
             if let Some((module_path, version)) = crate::utils::purl::parse_golang_purl(purl) {
-                let (module_path, version) = (&*module_path, &*version);
+                let (module_path, version) = (module_path.as_ref(), version.as_ref());
                 // SECURITY: `module_path`/`version` come straight from the
                 // (untrusted) manifest PURL and are joined onto the cache root
                 // below. In global mode the resolved directory is patched IN
@@ -1222,8 +1222,7 @@ mod tests {
         // FIRST GOPATH entry is skipped in favor of the next non-empty one
         // (GOPATH is an OS-separator-delimited list; Go uses the first
         // usable entry for the module cache).
-        let gopath_list =
-            std::env::join_paths(["".as_ref(), gopath_a.path().as_os_str()]).unwrap();
+        let gopath_list = std::env::join_paths(["".as_ref(), gopath_a.path().as_os_str()]).unwrap();
         let _gomodcache = EnvGuard::set("GOMODCACHE", "");
         let _gopath = EnvGuard::set("GOPATH", gopath_list.to_str().unwrap());
         let _home = EnvGuard::set("HOME", "/nonexistent-home-unused");

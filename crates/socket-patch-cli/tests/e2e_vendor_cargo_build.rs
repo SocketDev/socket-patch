@@ -1826,6 +1826,160 @@ fn cargo_legacy_config_wiring_migrates_to_the_manifest() {
     assert!(!proj.join(".socket/vendor").exists());
 }
 
+// ── build-metadata versions (the encoded purl the API serves) ─────────
+
+/// A dep-free crates.io crate whose version carries semver BUILD METADATA.
+const META_DEP: &str = "wasi";
+const META_VERSION: &str = "0.11.0+wasi-snapshot-preview1";
+
+/// BUILD METADATA: the patches API serves canonical purls, so this crate's
+/// version arrives percent-encoded (`0.11.0%2Bwasi-snapshot-preview1`).
+/// REGRESSION: the vendored backend compared that raw spelling against
+/// Cargo.lock's `0.11.0+wasi-snapshot-preview1` and refused
+/// (`vendor_fetched_missing` then `locked_version_mismatch`), so no crate
+/// with build metadata — `wasi` is in most Rust dependency graphs — could
+/// ever be vendored. Proves the whole committable shape for one: the copy
+/// dir keeps the DECODED version, its manifest is tagged
+/// `<version>.socket.<uuid>` (the tag appends to existing metadata), the
+/// lock entry is detached at the tagged version, real cargo builds and runs
+/// the patched bytes under `--locked --offline`, and `--revert` restores
+/// both files byte-for-byte.
+#[test]
+fn cargo_vendor_build_metadata_version_from_encoded_purl() {
+    const SUITE: &str = "e2e_vendor_cargo_build (build-metadata)";
+    if !cargo_e2e_matrix::cargo_available(SUITE) {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    // A consumer whose ONLY dependency is the build-metadata crate, so the
+    // fresh-checkout build below has no unvendored registry dep to fetch.
+    let proj = tmp.path().join("proj");
+    let cargo_home = tmp.path().join("cargo-home");
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    std::fs::create_dir_all(&cargo_home).unwrap();
+    std::fs::write(
+        proj.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\n{META_DEP} = \"={META_VERSION}\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        proj.join("src/main.rs"),
+        "fn main() { println!(\"baseline\"); }\n",
+    )
+    .unwrap();
+    let build = cargo(&proj, &["build", "-q"], &cargo_home);
+    if !build.status.success() {
+        let _ = cargo_e2e_matrix::skip(
+            SUITE,
+            &format!(
+                "baseline `cargo build` failed (crates.io unreachable?):\n{}",
+                String::from_utf8_lossy(&build.stderr)
+            ),
+        );
+        return;
+    }
+    cargo_e2e_matrix::apply_lock_version(&proj);
+    let lock_text = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
+    let version = locked_version(&lock_text, META_DEP)
+        .unwrap_or_else(|| panic!("Cargo.lock must lock {META_DEP}:\n{lock_text}"));
+    assert_eq!(
+        version, META_VERSION,
+        "the fixture pins the build-metadata version"
+    );
+    let crate_dir = find_registry_crate(&cargo_home, &format!("{META_DEP}-{version}"))
+        .unwrap_or_else(|| panic!("{META_DEP}-{version} must be extracted under registry/src"));
+
+    // EXACTLY what the API serves: the version percent-encoded.
+    let purl = format!("pkg:cargo/{META_DEP}@{}", version.replace('+', "%2B"));
+    let orig = std::fs::read(crate_dir.join("src/lib.rs")).unwrap();
+    let suffix = b"\n/// Socket-patch build-metadata marker.\npub fn socket_patched() -> u32 { 1 }\n\
+                   /// The version cargo compiled this copy as.\npub fn socket_pkg_version() -> &'static str { env!(\"CARGO_PKG_VERSION\") }\n";
+    let patched: Vec<u8> = [orig.as_slice(), suffix.as_slice()].concat();
+    stage_patch(&proj, &purl, "src/lib.rs", &orig, &patched);
+
+    let manifest_before = std::fs::read(proj.join("Cargo.toml")).unwrap();
+    let lock_before = std::fs::read(proj.join("Cargo.lock")).unwrap();
+
+    let env = vendor_ok(&proj, &cargo_home, "build-metadata");
+    assert_eq!(
+        env["summary"]["failed"], 0,
+        "no refusal for a build-metadata version: {env}"
+    );
+
+    // The copy dir and the ledger key off the DECODED version.
+    let copy_rel = format!(".socket/vendor/cargo/{UUID}/{META_DEP}-{version}");
+    let copy_manifest = std::fs::read_to_string(proj.join(&copy_rel).join("Cargo.toml")).unwrap();
+    assert_eq!(
+        socket_patch_core::vendor::cargo_tag::manifest_tag_uuid(&copy_manifest).as_deref(),
+        Some(UUID),
+        "the copy's version is tagged:\n{copy_manifest}"
+    );
+    let tagged_version = socket_patch_core::vendor::cargo_tag::tag_version(&version, UUID);
+    assert_eq!(
+        tagged_version,
+        format!("{version}.socket.{UUID}"),
+        "the tag appends to the existing build metadata"
+    );
+    let lock_after = std::fs::read_to_string(proj.join("Cargo.lock")).unwrap();
+    assert!(
+        lock_after.contains(&format!(
+            "name = \"{META_DEP}\"\nversion = \"{tagged_version}\"\n"
+        )),
+        "the lock entry carries the tagged version:\n{lock_after}"
+    );
+    let manifest_after = std::fs::read_to_string(proj.join("Cargo.toml")).unwrap();
+    assert!(
+        manifest_after.contains(&format!(
+            "{META_DEP}-socket-{} = {{ package = \"{META_DEP}\", path = \"{copy_rel}\" }}",
+            &UUID.replace('-', "")[..8]
+        )),
+        "the [patch.crates-io] entry pins the copy:\n{manifest_after}"
+    );
+
+    // COMPILE ORACLE: only the patched bytes have `socket_patched`.
+    std::fs::write(
+        proj.join("src/main.rs"),
+        format!(
+            "fn main() {{ println!(\"MARKER:{{}}:{{}}\", {META_DEP}::socket_patched(), {META_DEP}::socket_pkg_version()); }}\n"
+        ),
+    )
+    .unwrap();
+    let run = cargo(&proj, &["run", "-q", "--locked", "--offline"], &cargo_home);
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains(&format!("MARKER:1:{tagged_version}")),
+        "the patched copy builds and runs as the tagged version:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // Fresh checkout: committable, and nothing is fetched.
+    let (fresh, home) = fresh_checkout(&proj, tmp.path(), "build-metadata");
+    let build = cargo(&fresh, &["build", "-q", "--locked", "--offline"], &home);
+    assert!(
+        build.status.success(),
+        "the fresh checkout must build:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert!(!home.join("registry").exists(), "zero crate downloads");
+
+    // Revert is byte-identical.
+    std::fs::write(
+        proj.join("src/main.rs"),
+        "fn main() { println!(\"baseline\"); }\n",
+    )
+    .unwrap();
+    revert_ok(&proj, &cargo_home, "build-metadata");
+    assert_eq!(
+        std::fs::read(proj.join("Cargo.toml")).unwrap(),
+        manifest_before
+    );
+    assert_eq!(std::fs::read(proj.join("Cargo.lock")).unwrap(), lock_before);
+    assert!(!proj.join(".socket/vendor").exists());
+}
+
 /// Set to `1` by the CI leg that provides old cargos: then finding none
 /// is a failure, not a skip (the regular matrix legs set
 /// `SOCKET_PATCH_CARGO_E2E_REQUIRED` but provide no old cargo).

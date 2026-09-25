@@ -96,6 +96,7 @@ async fn is_vendored(project_root: &Path, name: &str, version: &str) -> bool {
 /// * no readable lock → `None` (cannot determine — callers keep, fail-safe).
 pub async fn vendored_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
     let (name, version) = parse_cargo_purl(&entry.base_purl)?;
+    let (name, version) = (name.as_ref(), version.as_ref());
     match cargo_lock::probe_lock_entry_for(project_root, name, version, Some(&entry.uuid)).await {
         cargo_lock::LockEntryProbe::NoLockfile | cargo_lock::LockEntryProbe::Unreadable => None,
         cargo_lock::LockEntryProbe::EntryMissing => Some(false),
@@ -408,6 +409,7 @@ pub async fn vendor_cargo_crate(
     let Some((name, version)) = parse_cargo_purl(purl) else {
         return refused("unsafe_coordinates", format!("not a cargo purl: {purl}"));
     };
+    let (name, version) = (name.as_ref(), version.as_ref());
     // SECURITY: `name`/`version` key the on-disk copy dir
     // (`.socket/vendor/cargo/<uuid>/<name>-<version>/`) and the `[patch]`
     // path. A `..`/separator from a tampered manifest PURL would let the copy
@@ -1063,6 +1065,7 @@ fn cargo_entry(
     let base_purl = strip_purl_qualifiers(purl).to_string();
     let mut wiring = vec![manifest_wiring_record(ensured, copy_rel)];
     if let (Some(orig), Some((name, version))) = (&lock_original, parse_cargo_purl(&base_purl)) {
+        let (name, version) = (name.as_ref(), version.as_ref());
         wiring.push(WiringRecord {
             file: "Cargo.lock".to_string(),
             kind: "cargo_lock_entry".to_string(),
@@ -1586,6 +1589,7 @@ pub async fn migrate_legacy_wiring(
     let Some((name, version)) = parse_cargo_purl(&entry.base_purl) else {
         return Ok(None);
     };
+    let (name, version) = (name.as_ref(), version.as_ref());
     if !is_safe_single_segment(name) || !is_safe_single_segment(version) {
         return Ok(None);
     }
@@ -1765,6 +1769,7 @@ pub async fn revert_cargo_vendor_opts(
     let Some((name, version)) = parse_cargo_purl(&entry.base_purl) else {
         return RevertOutcome::failed(format!("not a cargo purl: {}", entry.base_purl));
     };
+    let (name, version) = (name.as_ref(), version.as_ref());
     if !is_safe_single_segment(name) || !is_safe_single_segment(version) {
         return RevertOutcome::failed(format!(
             "refusing to revert unsafe cargo coordinates `{name}`/`{version}`"
