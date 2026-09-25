@@ -381,8 +381,10 @@ async fn edit_config(
                     if let Some(parent) = path.parent() {
                         // Best-effort: `remove_dir` only succeeds when the dir
                         // is empty, so a `.cargo/` holding other files (e.g.
-                        // credentials) is left intact.
-                        let _ = fs::remove_dir(parent).await;
+                        // credentials) is left intact. Inside a vendored
+                        // run's group commit the file's removal is captured,
+                        // so the directory goes once the commit is on disk.
+                        crate::utils::group_commit::remove_dir_after_commit(parent).await;
                     }
                 } else {
                     if let Some(parent) = path.parent() {

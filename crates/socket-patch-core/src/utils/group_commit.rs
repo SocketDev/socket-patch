@@ -39,21 +39,36 @@
 //! 1. the artifact barrier ([`super::durability::barrier`]) makes every
 //!    artifact the new state names durable;
 //! 2. `.socket/vendor/.commit-journal.json` is written durably, holding
-//!    every changed file's new bytes (or its deletion) and a sha256 of the
-//!    bytes it replaces — THIS is the commit point;
+//!    every changed file's new bytes (or its deletion) and the bytes it
+//!    replaces with their sha256 — THIS is the commit point;
 //! 3. the files are replaced (stage + rename each, ledgers last), one
 //!    barrier syncs them all, and the journal is deleted.
 //!
 //! A crash between 2 and the journal's deletion leaves a journal that the
 //! next command taking the apply lock replays ([`recover`], run by
 //! [`crate::patch::apply_lock::acquire`]): each file already at its new
-//! bytes is left alone, each still at its recorded old bytes is replaced,
-//! and a file matching neither (edited by hand since the crash) makes the
-//! whole journal stand down — it is renamed aside, never half-applied. So
-//! the lockfiles and the ledger are only ever observed all-old or all-new
-//! by the next locked command; never a half-wired lock with a ledger that
-//! disagrees. A single changed file needs no journal: its own atomic
+//! bytes is left alone and each still at its recorded old bytes is
+//! replaced, so the lockfiles and the ledger are observed all-new by the
+//! next locked command; never a half-wired lock with a ledger that
+//! disagrees. A replay that fails on I/O keeps the journal and fails the
+//! acquire, so no command works over the torn state.
+//!
+//! A file matching neither side (edited by hand since the crash) is never
+//! written over, and the journal is renamed aside once the replay has made
+//! the other files agree with that edit where the edit says which side of
+//! the commit it was made on: when every such file still carries the
+//! commit's own lines (it was replaced, then edited) the rest of the commit
+//! is finished around it, so the ledger records the wiring on disk; when
+//! none carries any of them (it was edited before the crash reached it)
+//! the files already replaced are put back from the journal's recorded
+//! bytes; otherwise nothing is written. A journal naming a path outside the
+//! captured set, or one that would write through a symbolic link, is set
+//! aside unapplied. A single changed file needs no journal: its own atomic
 //! rename is the commit.
+//!
+//! A failed replacement during the commit itself puts the files already
+//! replaced back and removes the journal; when putting them back fails as
+//! well, the journal is kept for the next locked command ([`is_pending`]).
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -114,6 +129,12 @@ struct Overlay {
     root: PathBuf,
     canonical_root: Option<PathBuf>,
     files: Mutex<BTreeMap<PathBuf, Captured>>,
+    /// Trees to delete once the commit is on disk: `(tree, prune bound)`
+    /// (see [`remove_after_commit`]).
+    after_commit: Mutex<Vec<(PathBuf, PathBuf)>>,
+    /// Directories to remove once the commit is on disk, if empty then
+    /// (see [`remove_dir_after_commit`]).
+    dirs_after_commit: Mutex<Vec<PathBuf>>,
 }
 
 static ACTIVE: Mutex<Vec<Arc<Overlay>>> = Mutex::new(Vec::new());
@@ -297,6 +318,108 @@ fn not_found(path: &Path) -> std::io::Error {
     )
 }
 
+/// Delete `tree` — something the COMMITTED wiring may still name, such as
+/// the `.socket/go-patches/` copy a takeover repoints `go.mod` away from —
+/// only once the run's commit is on disk, then prune its now-empty parents
+/// up to and including `prune_bound`. Deleting it when the run captured the
+/// repoint would leave the on-disk `go.mod` naming a deleted directory
+/// until the commit, and for good after a crash or a failed commit. With
+/// no group open for `tree` it is deleted now (the caller's edit was
+/// already written durably).
+pub(crate) async fn remove_after_commit(tree: &Path, prune_bound: &Path) {
+    if ACTIVE_COUNT.load(Ordering::Acquire) != 0 {
+        let overlay = active()
+            .iter()
+            .find(|o| {
+                tree.starts_with(&o.root)
+                    || o.canonical_root
+                        .as_deref()
+                        .is_some_and(|r| tree.starts_with(r))
+            })
+            .cloned();
+        if let Some(overlay) = overlay {
+            overlay
+                .after_commit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((tree.to_path_buf(), prune_bound.to_path_buf()));
+            return;
+        }
+    }
+    remove_tree_pruned(tree, prune_bound).await;
+}
+
+/// Remove the directory `dir` if it is empty — the `.cargo/` a deleted
+/// socket-created `.cargo/config.toml` leaves — once the run's commit is on
+/// disk. A captured removal of the file inside it only reaches the disk at
+/// the commit, so removing the directory now would find it still holding
+/// that file. `remove_dir` is non-recursive: a directory holding anything
+/// else (a user's credentials, a file the run wrote back) is kept. With no
+/// group open for `dir` it is removed now.
+pub(crate) async fn remove_dir_after_commit(dir: &Path) {
+    if ACTIVE_COUNT.load(Ordering::Acquire) != 0 {
+        let overlay = active()
+            .iter()
+            .find(|o| {
+                dir.starts_with(&o.root)
+                    || o.canonical_root
+                        .as_deref()
+                        .is_some_and(|r| dir.starts_with(r))
+            })
+            .cloned();
+        if let Some(overlay) = overlay {
+            overlay
+                .dirs_after_commit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(dir.to_path_buf());
+            return;
+        }
+    }
+    let _ = tokio::fs::remove_dir(dir).await;
+}
+
+/// Delete `tree` (NotFound is fine) and prune its empty parents up to and
+/// including `bound`. `remove_dir` is non-recursive: a parent still holding
+/// something else fails and stops the prune; a level already gone is
+/// skipped.
+async fn remove_tree_pruned(tree: &Path, bound: &Path) {
+    let _ = crate::patch::copy_tree::remove_tree(tree).await;
+    let mut parent = tree.parent().map(Path::to_path_buf);
+    while let Some(dir) = parent {
+        if !dir.starts_with(bound) {
+            break;
+        }
+        match tokio::fs::remove_dir(&dir).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => break,
+        }
+        parent = dir.parent().map(Path::to_path_buf);
+    }
+}
+
+/// The error a commit returns when a file replacement failed AND putting
+/// the already-replaced files back failed too: the journal is kept, so the
+/// next command taking the apply lock rolls the commit forward (every file
+/// is at its recorded old bytes or its new ones). See [`is_pending`].
+#[derive(Debug)]
+struct CommitPending(std::io::Error);
+
+impl std::fmt::Display for CommitPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for CommitPending {}
+
+/// Whether a failed [`GroupCommit::commit`] left its journal for the next
+/// locked command to finish, rather than leaving the files as they were.
+pub fn is_pending(error: &std::io::Error) -> bool {
+    error.get_ref().is_some_and(|e| e.is::<CommitPending>())
+}
+
 /// An open group commit (see the module docs). Dropping it without
 /// [`Self::commit`] discards every captured write — the crash semantics.
 pub struct GroupCommit {
@@ -319,6 +442,8 @@ impl GroupCommit {
             root: root.to_path_buf(),
             canonical_root: std::fs::canonicalize(root).ok(),
             files: Mutex::new(BTreeMap::new()),
+            after_commit: Mutex::new(Vec::new()),
+            dirs_after_commit: Mutex::new(Vec::new()),
         });
         let mut active = active();
         active.push(Arc::clone(&overlay));
@@ -341,11 +466,40 @@ impl GroupCommit {
 
     /// Write the captured state to disk (see the module docs). Returns the
     /// project-relative paths it changed. On failure nothing the commit
-    /// wrote is left half-done: the journal is replayed by the next locked
-    /// command, or — when replacing a file failed outright — the files
-    /// already replaced are put back and the journal removed.
+    /// wrote is left half-done: when replacing a file failed outright the
+    /// files already replaced are put back and the journal removed, and
+    /// when putting them back failed too the journal is kept for the next
+    /// locked command to roll forward ([`is_pending`]). The trees queued by
+    /// [`remove_after_commit`] (and the empty directories queued by
+    /// [`remove_dir_after_commit`]) are deleted only after a commit
+    /// succeeded.
     pub async fn commit(mut self) -> std::io::Result<Vec<String>> {
         self.close();
+        let changed = self.write().await?;
+        let removals = std::mem::take(
+            &mut *self
+                .overlay
+                .after_commit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (tree, bound) in removals {
+            remove_tree_pruned(&tree, &bound).await;
+        }
+        let dirs = std::mem::take(
+            &mut *self
+                .overlay
+                .dirs_after_commit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for dir in dirs {
+            let _ = tokio::fs::remove_dir(&dir).await;
+        }
+        Ok(changed)
+    }
+
+    async fn write(&mut self) -> std::io::Result<Vec<String>> {
         let root = self.overlay.root.clone();
         let captured = std::mem::take(
             &mut *self
@@ -400,9 +554,18 @@ impl GroupCommit {
         crate::utils::failpoint::hit("group_commit_journal");
         for (at, change) in changes.iter().enumerate() {
             if let Err(e) = apply_deferred(&root, change).await {
-                let _ = restore(&root, &changes[..at]).await;
-                let _ = tokio::fs::remove_file(&journal).await;
-                return Err(e);
+                // Put the replaced files back, and only then drop the
+                // journal. When the restore fails as well (the same full
+                // disk, say), the journal is the only thing that can make
+                // the files agree again: keep it, so the next locked
+                // command rolls the commit forward.
+                return match restore(&root, &changes[..at]).await {
+                    Ok(()) => {
+                        let _ = tokio::fs::remove_file(&journal).await;
+                        Err(e)
+                    }
+                    Err(_) => Err(std::io::Error::new(e.kind(), CommitPending(e))),
+                };
             }
             crate::utils::failpoint::hit("group_commit_file");
         }
@@ -489,8 +652,18 @@ async fn ensure_parent(path: &Path, change: &Change) -> std::io::Result<()> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Unit tests: make [`restore`] fail, as a full disk would.
+    static FAIL_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Put `applied` back to their pre-commit bytes (a failed commit).
 async fn restore(root: &Path, applied: &[Change]) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_RESTORE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("injected restore failure"));
+    }
     for change in applied.iter().rev() {
         let back = Change {
             rel: change.rel.clone(),
@@ -528,6 +701,11 @@ struct JournalFile {
     path: String,
     /// sha256 of the bytes being replaced; `None` when the file is new.
     before: Option<String>,
+    /// base64 of the bytes being replaced (hashing to `before`): what a
+    /// replay that must stand down puts back, and what a set-aside journal
+    /// keeps for a manual restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original: Option<String>,
     /// base64 of the new bytes; `None` when the file is removed.
     after: Option<String>,
     #[serde(default)]
@@ -544,6 +722,10 @@ fn journal_bytes(changes: &[Change]) -> std::io::Result<Vec<u8>> {
             .map(|c| JournalFile {
                 path: rel_string(&c.rel),
                 before: c.before.as_deref().map(sha256_hex),
+                original: c
+                    .before
+                    .as_deref()
+                    .map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
                 after: c
                     .after
                     .as_deref()
@@ -562,15 +744,127 @@ pub enum Recovery {
     Clean,
     /// An interrupted commit was rolled forward; the paths it rewrote.
     RolledForward(Vec<String>),
-    /// The journal could not be replayed as a whole (unreadable, or a file
-    /// changed since the crash to bytes it records neither side of); it was
-    /// renamed to the path given and nothing was applied.
-    SetAside(PathBuf),
+    /// The journal could not be replayed as a whole (unreadable, unsafe, or
+    /// a file changed since the crash to bytes it records neither side of);
+    /// it was renamed to `journal`, and `outcome` says what was done to the
+    /// files it covers.
+    SetAside {
+        journal: PathBuf,
+        outcome: SetAsideOutcome,
+    },
+}
+
+/// What a set-aside replay did to the files the journal covers.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetAsideOutcome {
+    /// Nothing was written.
+    LeftAsIs,
+    /// Every file changed since the crash still carries the commit's own
+    /// edit, so the rest of the commit was finished around them (the ledger
+    /// then records the wiring those files carry).
+    FinishedAround(Vec<String>),
+    /// No file changed since the crash carries the commit's edit, so the
+    /// files the crash had already replaced were put back to their
+    /// pre-commit bytes (the pre-run state, bar the hand edits).
+    RolledBack(Vec<String>),
+}
+
+/// One journaled file as the replay finds it.
+struct Replay {
+    path: PathBuf,
+    after: Option<Vec<u8>>,
+    original: Option<Vec<u8>>,
+    before_hash: Option<String>,
+    preserve_mode: bool,
+    current: Option<Vec<u8>>,
+}
+
+impl Replay {
+    fn at_new(&self) -> bool {
+        self.current == self.after
+    }
+
+    fn at_old(&self) -> bool {
+        self.current.as_deref().map(sha256_hex) == self.before_hash
+    }
+}
+
+/// Whether a file that matches neither side of the journal still carries
+/// the commit's edit (`Some(true)`: it was replaced, then edited), carries
+/// none of it (`Some(false)`: it was edited before the crash reached it),
+/// or cannot be told (`None`). Line-level: the lines the commit added are
+/// all present / all absent, and the lines it removed all absent / all
+/// present.
+fn carries_commit(item: &Replay) -> Option<bool> {
+    match (&item.original, &item.after, &item.current) {
+        // The commit created the file: whatever is there now is an edit
+        // of ours. It deleted the file: the file still being there means
+        // the deletion never ran.
+        (None, Some(_), Some(_)) if item.before_hash.is_none() => Some(true),
+        (_, None, Some(_)) => Some(false),
+        (Some(before), Some(after), Some(current)) => {
+            let lines = |b: &[u8]| -> std::collections::HashSet<Vec<u8>> {
+                b.split(|c| *c == b'\n').map(<[u8]>::to_vec).collect()
+            };
+            let (before, after, current) = (lines(before), lines(after), lines(current));
+            let added: Vec<_> = after.difference(&before).collect();
+            let removed: Vec<_> = before.difference(&after).collect();
+            if added.is_empty() && removed.is_empty() {
+                return None;
+            }
+            let has = |l: &&Vec<u8>| current.contains(*l);
+            let new_side = added.iter().all(has) && !removed.iter().any(has);
+            let old_side = !added.iter().any(has) && removed.iter().all(has);
+            match (new_side, old_side) {
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether any existing level of `rel` below `root` — the file itself
+/// included — is a symbolic link: a journal must never write through one
+/// (out of the project, or onto a file it does not name).
+fn crosses_symlink(root: &Path, rel: &Path) -> std::io::Result<bool> {
+    let mut at = root.to_path_buf();
+    for component in rel.components() {
+        at.push(component);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(false)
+}
+
+fn write_sync(path: &Path, bytes: Option<&[u8]>, preserve_mode: bool) -> std::io::Result<()> {
+    match bytes {
+        Some(bytes) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            super::fs::atomic_write_sync(path, bytes, preserve_mode)
+        }
+        None => match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => {
+                sync_dir(path.parent());
+                Ok(())
+            }
+        },
+    }
 }
 
 /// Finish (or set aside) a group commit a crash interrupted — see the
 /// module docs. Synchronous: it runs inside the apply-lock acquire, before
-/// the locked command reads any file the journal covers.
+/// the locked command reads any file the journal covers. An `Err` (a file
+/// it cannot read or write) leaves the journal in place; the caller must
+/// not proceed over the files it covers.
 pub fn recover(project_root: &Path) -> std::io::Result<Recovery> {
     let journal_path = project_root.join(COMMIT_JOURNAL_REL);
     let raw = match super::fs::read_regular_to_bytes_sync(&journal_path) {
@@ -578,67 +872,111 @@ pub fn recover(project_root: &Path) -> std::io::Result<Recovery> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Recovery::Clean),
         Err(e) => return Err(e),
     };
-    let set_aside = || -> std::io::Result<Recovery> {
+    let set_aside = |outcome: SetAsideOutcome| -> std::io::Result<Recovery> {
         let aside = journal_path.with_file_name(format!(
             ".commit-journal.set-aside-{}.json",
             uuid::Uuid::new_v4()
         ));
         std::fs::rename(&journal_path, &aside)?;
-        Ok(Recovery::SetAside(aside))
+        sync_dir(journal_path.parent());
+        Ok(Recovery::SetAside {
+            journal: aside,
+            outcome,
+        })
     };
     let Ok(journal) = serde_json::from_slice::<Journal>(&raw) else {
-        return set_aside();
+        return set_aside(SetAsideOutcome::LeftAsIs);
     };
     if journal.version != JOURNAL_VERSION {
-        return set_aside();
+        return set_aside(SetAsideOutcome::LeftAsIs);
     }
-    let mut pending: Vec<(PathBuf, Option<Vec<u8>>, bool)> = Vec::new();
+    let decode = |b64: &Option<String>| -> Result<Option<Vec<u8>>, ()> {
+        match b64 {
+            Some(b64) => base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map(Some)
+                .map_err(|_| ()),
+            None => Ok(None),
+        }
+    };
+    let mut items: Vec<Replay> = Vec::with_capacity(journal.files.len());
     for file in &journal.files {
         let rel = Path::new(&file.path);
-        if relative_to(Path::new(""), rel).is_none() || !is_captured(rel) {
-            return set_aside();
+        if relative_to(Path::new(""), rel).is_none()
+            || !is_captured(rel)
+            || crosses_symlink(project_root, rel)?
+        {
+            return set_aside(SetAsideOutcome::LeftAsIs);
         }
-        let after = match &file.after {
-            Some(b64) => match base64::engine::general_purpose::STANDARD.decode(b64) {
-                Ok(bytes) => Some(bytes),
-                Err(_) => return set_aside(),
-            },
-            None => None,
+        let (Ok(after), Ok(original)) = (decode(&file.after), decode(&file.original)) else {
+            return set_aside(SetAsideOutcome::LeftAsIs);
         };
+        // A recorded original must be the bytes the hash names.
+        if original
+            .as_deref()
+            .map(sha256_hex)
+            .is_some_and(|h| Some(h) != file.before)
+        {
+            return set_aside(SetAsideOutcome::LeftAsIs);
+        }
         let path = project_root.join(rel);
         let current = match super::fs::read_regular_to_bytes_sync(&path) {
             Ok(bytes) => Some(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
-        if current == after {
-            continue;
-        }
-        let current_hash = current.as_deref().map(sha256_hex);
-        if current_hash != file.before {
-            return set_aside();
-        }
-        pending.push((path, after, file.preserve_mode));
+        items.push(Replay {
+            path,
+            after,
+            original,
+            before_hash: file.before.clone(),
+            preserve_mode: file.preserve_mode,
+            current,
+        });
     }
-    let mut rewritten = Vec::new();
-    for (path, after, preserve_mode) in &pending {
-        match after {
-            Some(bytes) => {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                super::fs::atomic_write_sync(path, bytes, *preserve_mode)?
-            }
-            None => match std::fs::remove_file(path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-                _ => sync_dir(path.parent()),
-            },
+    let rel_of =
+        |item: &Replay| rel_string(item.path.strip_prefix(project_root).unwrap_or(&item.path));
+    let conflicts: Vec<&Replay> = items
+        .iter()
+        .filter(|i| !i.at_new() && !i.at_old())
+        .collect();
+    if conflicts.is_empty() {
+        let mut rewritten = Vec::new();
+        for item in items.iter().filter(|i| !i.at_new()) {
+            write_sync(&item.path, item.after.as_deref(), item.preserve_mode)?;
+            rewritten.push(rel_of(item));
         }
-        rewritten.push(rel_string(path.strip_prefix(project_root).unwrap_or(path)));
+        std::fs::remove_file(&journal_path)?;
+        sync_dir(journal_path.parent());
+        return Ok(Recovery::RolledForward(rewritten));
     }
-    std::fs::remove_file(&journal_path)?;
-    sync_dir(journal_path.parent());
-    Ok(Recovery::RolledForward(rewritten))
+    // Some file was edited after the crash. Never write over that edit;
+    // make every other file agree with it instead, when the edit says
+    // which side of the commit it was made on.
+    let verdicts: Vec<Option<bool>> = conflicts.iter().map(|i| carries_commit(i)).collect();
+    let outcome = if verdicts.iter().all(|v| *v == Some(true)) {
+        let mut rewritten = Vec::new();
+        for item in items.iter().filter(|i| i.at_old() && !i.at_new()) {
+            write_sync(&item.path, item.after.as_deref(), item.preserve_mode)?;
+            rewritten.push(rel_of(item));
+        }
+        SetAsideOutcome::FinishedAround(rewritten)
+    } else if verdicts.iter().all(|v| *v == Some(false))
+        && items
+            .iter()
+            .filter(|i| i.at_new() && !i.at_old())
+            .all(|i| i.original.is_some() || i.before_hash.is_none())
+    {
+        let mut rewritten = Vec::new();
+        for item in items.iter().filter(|i| i.at_new() && !i.at_old()) {
+            write_sync(&item.path, item.original.as_deref(), item.preserve_mode)?;
+            rewritten.push(rel_of(item));
+        }
+        SetAsideOutcome::RolledBack(rewritten)
+    } else {
+        SetAsideOutcome::LeftAsIs
+    };
+    set_aside(outcome)
 }
 
 #[cfg(test)]
@@ -838,8 +1176,9 @@ mod tests {
         assert_eq!(recover(root).unwrap(), Recovery::Clean);
     }
 
-    /// A file edited since the crash matches neither side: the journal is
-    /// set aside whole and nothing is applied.
+    /// A file edited since the crash matches neither side, and the edit
+    /// does not say which side it was made on: the journal is set aside
+    /// whole and nothing is applied.
     #[test]
     fn recovery_sets_a_conflicting_journal_aside_without_applying_it() {
         let tmp = tempfile::tempdir().unwrap();
@@ -867,7 +1206,10 @@ mod tests {
         )
         .unwrap();
         match recover(root).unwrap() {
-            Recovery::SetAside(path) => assert!(path.is_file()),
+            Recovery::SetAside {
+                journal,
+                outcome: SetAsideOutcome::LeftAsIs,
+            } => assert!(journal.is_file()),
             other => panic!("expected the journal set aside, got {other:?}"),
         }
         assert_eq!(std::fs::read(root.join("a.lock")).unwrap(), b"a-old");
@@ -895,10 +1237,281 @@ mod tests {
                 serde_json::to_vec(&journal).unwrap(),
             )
             .unwrap();
-            assert!(
-                matches!(recover(root).unwrap(), Recovery::SetAside(_)),
+            assert_eq!(
+                set_aside_outcome(recover(root).unwrap()),
+                SetAsideOutcome::LeftAsIs,
                 "{bad}"
             );
         }
+    }
+
+    fn set_aside_outcome(recovery: Recovery) -> SetAsideOutcome {
+        match recovery {
+            Recovery::SetAside { journal, outcome } => {
+                assert!(journal.is_file(), "the set-aside journal is kept");
+                outcome
+            }
+            other => panic!("expected the journal set aside, got {other:?}"),
+        }
+    }
+
+    fn write_journal(root: &Path, changes: &[Change]) {
+        std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
+        std::fs::write(
+            root.join(COMMIT_JOURNAL_REL),
+            journal_bytes(changes).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn change(rel: &str, before: &[u8], after: &[u8]) -> Change {
+        Change {
+            rel: rel.into(),
+            before: Some(before.to_vec()),
+            after: Some(after.to_vec()),
+            preserve_mode: false,
+        }
+    }
+
+    /// The crash replaced the lock, the ledger was still old, and the lock
+    /// was then edited by hand (it still carries the commit's lines): the
+    /// rest of the commit is finished around the edit, so the ledger
+    /// records the wiring on disk instead of losing it.
+    #[test]
+    fn recovery_finishes_the_commit_around_an_edit_of_the_new_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let changes = vec![
+            change("pylock.toml", b"a\nb\n", b"a\nWIRED\nb\n"),
+            change(".socket/vendor/state.json", b"{}\n", b"{\"entries\":1}\n"),
+        ];
+        write_journal(root, &changes);
+        std::fs::write(root.join("pylock.toml"), b"a\nWIRED\nb\nuser\n").unwrap();
+        std::fs::write(root.join(".socket/vendor/state.json"), b"{}\n").unwrap();
+        assert_eq!(
+            set_aside_outcome(recover(root).unwrap()),
+            SetAsideOutcome::FinishedAround(vec![".socket/vendor/state.json".into()])
+        );
+        assert_eq!(
+            std::fs::read(root.join("pylock.toml")).unwrap(),
+            b"a\nWIRED\nb\nuser\n",
+            "the hand edit is never written over"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
+            b"{\"entries\":1}\n"
+        );
+        assert!(!root.join(COMMIT_JOURNAL_REL).exists());
+    }
+
+    /// The crash replaced one file, and a file it had not reached yet was
+    /// edited by hand (none of the commit's lines): the replaced file is
+    /// put back from the journal's recorded original, so the project is
+    /// the pre-run one plus the hand edit.
+    #[test]
+    fn recovery_rolls_back_around_an_edit_of_the_old_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let changes = vec![
+            change("a.lock", b"a-old\n", b"a-new\n"),
+            change("package.json", b"x\ny\n", b"x\nWIRED\ny\n"),
+        ];
+        write_journal(root, &changes);
+        std::fs::write(root.join("a.lock"), b"a-new\n").unwrap();
+        std::fs::write(root.join("package.json"), b"x\ny\nuser\n").unwrap();
+        assert_eq!(
+            set_aside_outcome(recover(root).unwrap()),
+            SetAsideOutcome::RolledBack(vec!["a.lock".into()])
+        );
+        assert_eq!(std::fs::read(root.join("a.lock")).unwrap(), b"a-old\n");
+        assert_eq!(
+            std::fs::read(root.join("package.json")).unwrap(),
+            b"x\ny\nuser\n"
+        );
+    }
+
+    /// A journal never writes through a symlinked directory (out of the
+    /// project) or onto a symlink: it is set aside and nothing is written.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_refuses_a_journal_that_crosses_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        std::fs::write(outside.join("target.json"), b"old").unwrap();
+        std::os::unix::fs::symlink(outside.join("target.json"), root.join("package.json")).unwrap();
+        for rel in ["link/pwned.txt", "package.json"] {
+            let changes = vec![
+                Change {
+                    rel: rel.into(),
+                    before: None,
+                    after: Some(b"pwned".to_vec()),
+                    preserve_mode: false,
+                },
+                change("b.lock", b"b", b"b2"),
+            ];
+            write_journal(&root, &changes);
+            assert_eq!(
+                set_aside_outcome(recover(&root).unwrap()),
+                SetAsideOutcome::LeftAsIs,
+                "{rel}"
+            );
+            assert!(!outside.join("pwned.txt").exists(), "{rel}");
+            assert_eq!(std::fs::read(outside.join("target.json")).unwrap(), b"old");
+            assert!(!root.join("b.lock").exists(), "{rel}: nothing applied");
+        }
+    }
+
+    /// A project whose second journaled file cannot be written: `d/` is
+    /// read-only, so creating `d/sub/` fails after `a.lock` was replaced.
+    #[cfg(unix)]
+    async fn commit_that_fails_on_its_second_file(root: &Path) -> std::io::Result<Vec<String>> {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(root.join("a.lock"), b"a-old").unwrap();
+        std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
+        std::fs::create_dir_all(root.join("d")).unwrap();
+        std::fs::set_permissions(root.join("d"), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let group = GroupCommit::begin(root);
+        super::super::fs::atomic_write_bytes(&root.join("a.lock"), b"a-new")
+            .await
+            .unwrap();
+        super::super::fs::atomic_write_bytes(&root.join("d/sub/x.lock"), b"x")
+            .await
+            .unwrap();
+        let result = group.commit().await;
+        std::fs::set_permissions(root.join("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        result
+    }
+
+    /// A root process ignores the read-only mode the tests rely on.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|o| o.stdout.starts_with(b"0\n"))
+    }
+
+    /// A replacement that fails part-way puts the files already replaced
+    /// back to their pre-commit bytes and removes the journal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_commit_puts_the_replaced_files_back() {
+        if running_as_root() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let err = commit_that_fails_on_its_second_file(root)
+            .await
+            .unwrap_err();
+        assert!(!is_pending(&err), "{err}");
+        assert_eq!(std::fs::read(root.join("a.lock")).unwrap(), b"a-old");
+        assert!(!root.join("d/sub").exists());
+        assert!(!root.join(COMMIT_JOURNAL_REL).exists());
+    }
+
+    /// When putting the replaced files back fails too, the journal is the
+    /// only thing that can make the files agree again: it is kept, the
+    /// error says so, and the next recovery finishes the commit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_commit_whose_restore_fails_keeps_the_journal() {
+        if running_as_root() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        FAIL_RESTORE.with(|f| f.set(true));
+        let result = commit_that_fails_on_its_second_file(root).await;
+        FAIL_RESTORE.with(|f| f.set(false));
+        let err = result.unwrap_err();
+        assert!(is_pending(&err), "{err}");
+        assert!(
+            root.join(COMMIT_JOURNAL_REL).exists(),
+            "the journal is kept"
+        );
+        assert_eq!(std::fs::read(root.join("a.lock")).unwrap(), b"a-new");
+        assert_eq!(
+            recover(root).unwrap(),
+            Recovery::RolledForward(vec!["d/sub/x.lock".into()])
+        );
+        assert_eq!(std::fs::read(root.join("d/sub/x.lock")).unwrap(), b"x");
+    }
+
+    /// A tree queued for removal after the commit survives a commit that
+    /// never ran (a crash, a failure) and goes once one succeeds, with its
+    /// emptied parents pruned up to the bound.
+    #[tokio::test]
+    async fn trees_queued_for_after_the_commit_go_only_once_it_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bound = root.join(".socket/go-patches");
+        let tree = bound.join("example.com/m@v1.0.0");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("go.mod"), b"module m\n").unwrap();
+
+        let dropped = GroupCommit::begin(root);
+        remove_after_commit(&tree, &bound).await;
+        assert!(tree.exists(), "queued, not removed");
+        drop(dropped);
+        assert!(tree.exists(), "an abandoned commit removes nothing");
+
+        let group = GroupCommit::begin(root);
+        remove_after_commit(&tree, &bound).await;
+        assert!(tree.exists());
+        group.commit().await.unwrap();
+        assert!(!bound.exists(), "removed and pruned up to the bound");
+        assert!(root.join(".socket").exists(), "never above the bound");
+    }
+
+    /// A captured removal of the only file in a directory reaches the disk
+    /// at the commit, so the directory queued behind it is removed then —
+    /// not before (it still holds the file), not by an abandoned commit,
+    /// and never while it holds anything else.
+    #[tokio::test]
+    async fn a_directory_emptied_by_the_commit_goes_after_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join(".cargo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), b"[patch]\n").unwrap();
+
+        let dropped = GroupCommit::begin(root);
+        super::super::fs::remove_file(&dir.join("config.toml"))
+            .await
+            .unwrap();
+        remove_dir_after_commit(&dir).await;
+        drop(dropped);
+        assert!(dir.join("config.toml").exists(), "an abandoned commit removes nothing");
+
+        let group = GroupCommit::begin(root);
+        super::super::fs::remove_file(&dir.join("config.toml"))
+            .await
+            .unwrap();
+        remove_dir_after_commit(&dir).await;
+        assert!(dir.join("config.toml").exists(), "captured, still on disk");
+        group.commit().await.unwrap();
+        assert!(!dir.exists(), "the emptied directory is removed after the commit");
+
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), b"[patch]\n").unwrap();
+        std::fs::write(dir.join("credentials.toml"), b"token\n").unwrap();
+        let group = GroupCommit::begin(root);
+        super::super::fs::remove_file(&dir.join("config.toml"))
+            .await
+            .unwrap();
+        remove_dir_after_commit(&dir).await;
+        group.commit().await.unwrap();
+        assert!(!dir.join("config.toml").exists());
+        assert!(dir.join("credentials.toml").exists(), "a non-empty directory is kept");
+
+        remove_dir_after_commit(&root.join("gone")).await;
+        std::fs::remove_file(dir.join("credentials.toml")).unwrap();
+        remove_dir_after_commit(&dir).await;
+        assert!(!dir.exists(), "with no group open it is removed now");
     }
 }

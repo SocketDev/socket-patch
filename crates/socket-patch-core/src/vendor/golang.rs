@@ -325,30 +325,18 @@ pub async fn vendor_go_module<'a>(
     }
 
     if takeover {
-        // The `replace` line was already atomically repointed by the upsert;
-        // the apply backend's copy is now unreachable — delete it (built from
-        // OUR validated coordinates, never from the go.mod string). NotFound
-        // is fine (the user may have cleaned it already).
+        // The upsert repointed the `replace` line; the apply backend's copy
+        // is then unreachable — delete it (built from OUR validated
+        // coordinates, never from the go.mod string; NotFound is fine, the
+        // user may have cleaned it already) and prune the now-empty parent
+        // husks (`<go-patches>/example.com/`) up to and including the
+        // go-patches root. Inside a group commit the repoint is only
+        // captured, so the on-disk go.mod still names this copy until the
+        // commit: the deletion waits for it (and never happens if the run
+        // crashes or its commit fails).
         let stale = copy_dir_for(project_root, GO_PATCHES_DIR, module, version);
-        let _ = remove_tree(&stale).await;
-        // Prune now-empty parent husks (`<go-patches>/example.com/`) up to
-        // and including the go-patches root (`starts_with` holds for the
-        // root itself and bounds the climb). `remove_dir` is non-recursive:
-        // a parent still holding another module's copy fails and stops the
-        // prune; a level the user already removed is skipped.
-        let go_patches_root = project_root.join(GO_PATCHES_DIR);
-        let mut parent = stale.parent().map(|p| p.to_path_buf());
-        while let Some(dir) = parent {
-            if !dir.starts_with(&go_patches_root) {
-                break;
-            }
-            match tokio::fs::remove_dir(&dir).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => break, // non-empty — stop pruning
-            }
-            parent = dir.parent().map(|p| p.to_path_buf());
-        }
+        crate::utils::group_commit::remove_after_commit(&stale, &project_root.join(GO_PATCHES_DIR))
+            .await;
         warnings.push(VendorWarning::new(
             "vendor_takeover",
             format!(
@@ -1057,6 +1045,53 @@ mod tests {
             )),
             "the old replace target is recorded verbatim"
         );
+    }
+
+    /// Inside a group commit the takeover's repoint of `go.mod` is only
+    /// captured, so the `.socket/go-patches/` copy the on-disk `go.mod`
+    /// still names survives until the commit: an abandoned commit (a crash,
+    /// a failed commit) leaves a `go.mod` whose replace target exists, and
+    /// a completed one removes the copy.
+    #[tokio::test]
+    async fn test_takeover_in_a_group_commit_removes_the_copy_only_after_it() {
+        use crate::utils::group_commit::GroupCommit;
+        for commit in [false, true] {
+            let (dir, blobs, pristine, record) = fixture().await;
+            let root = dir.path();
+            let sources = PatchSources::blobs_only(&blobs);
+            let pre = apply_go_redirect(
+                PURL,
+                MODULE,
+                VERSION,
+                &pristine,
+                root,
+                GO_PATCHES_DIR,
+                &record.files,
+                &sources,
+                Some(UUID),
+                false,
+                MismatchPolicy::Warn,
+            )
+            .await;
+            assert!(pre.success, "fixture redirect failed: {:?}", pre.error);
+            let stale = root.join(".socket/go-patches/github.com/foo/bar@v1.4.2");
+            let go_mod_before = std::fs::read(root.join("go.mod")).unwrap();
+
+            let group = GroupCommit::begin(root);
+            let (result, ..) =
+                expect_done(run_vendor(PURL, root, &blobs, &pristine, &record, false).await);
+            assert!(result.success, "{:?}", result.error);
+            assert!(stale.exists(), "the on-disk go.mod still names it");
+            if commit {
+                group.commit().await.unwrap();
+                assert!(!stale.exists(), "removed once the repoint is on disk");
+                assert_ne!(std::fs::read(root.join("go.mod")).unwrap(), go_mod_before);
+            } else {
+                drop(group);
+                assert!(stale.exists(), "an abandoned commit removes nothing");
+                assert_eq!(std::fs::read(root.join("go.mod")).unwrap(), go_mod_before);
+            }
+        }
     }
 
     /// Wired go.mod with a deleted committed copy: the module copy is

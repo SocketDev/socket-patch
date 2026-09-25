@@ -2629,10 +2629,22 @@ pub(crate) async fn vendor_records_reusing(
             }
             Err(e) => {
                 has_errors = true;
-                let detail = format!(
-                    "could not commit the vendored lockfile, manifest and ledger edits: {e}; \
-                     the project's lockfiles and .socket/vendor/state.json are unchanged"
-                );
+                let detail = if socket_patch_core::utils::group_commit::is_pending(&e) {
+                    // Some files were replaced and could not be put back:
+                    // the journal left behind makes the next locked command
+                    // finish the commit.
+                    format!(
+                        "could not commit the vendored lockfile, manifest and ledger edits: \
+                         {e}; the commit is journaled and the next socket-patch command in \
+                         this project finishes it"
+                    )
+                } else {
+                    format!(
+                        "could not commit the vendored lockfile, manifest and ledger edits: \
+                         {e}; the project's lockfiles and .socket/vendor/state.json are \
+                         unchanged"
+                    )
+                };
                 if !common.json {
                     eprintln!("Error: {detail}");
                 }

@@ -124,8 +124,10 @@ pub enum LockError {
     /// We could not create `socket_dir`, or could not open or lock the
     /// lock file (a file squatting on `.socket/`, a directory squatting
     /// on `apply.lock`, a permissions problem, a filesystem without
-    /// advisory locks, …). `path` is the directory for a `create_dir`
-    /// failure and the lock file otherwise.
+    /// advisory locks, …), or could not finish an interrupted vendored
+    /// run's group commit once the lock was ours. `path` is the directory
+    /// for a `create_dir` failure, the commit journal for a recovery
+    /// failure, and the lock file otherwise.
     #[error("failed to open lock file at {path:?}: {source}")]
     Io {
         path: PathBuf,
@@ -222,22 +224,56 @@ fn prune_empty_socket_dir(socket_dir: &Path) {
 /// [`crate::utils::group_commit`]), now that no other command can be
 /// writing the files it covers. Every locked command runs it before reading
 /// any of them, so the lockfiles and ledgers are never observed half-new.
-/// A replay that cannot run (a file edited by hand since the crash) sets
-/// the journal aside and says so; an I/O failure leaves it for the next
-/// locked command.
-fn recover_group_commit(socket_dir: &Path) {
+/// A replay that cannot run as a whole (a file edited by hand since the
+/// crash) sets the journal aside and says what it did. A replay that fails
+/// on I/O leaves the journal for the next locked command and fails this
+/// acquire: the command must not read or write over a torn commit.
+fn recover_group_commit(socket_dir: &Path) -> Result<(), LockError> {
+    use crate::utils::group_commit::{recover, Recovery, SetAsideOutcome};
     let Some(project_root) = socket_dir.parent() else {
-        return;
+        return Ok(());
     };
-    if let Ok(crate::utils::group_commit::Recovery::SetAside(path)) =
-        crate::utils::group_commit::recover(project_root)
-    {
-        eprintln!(
-            "Warning: an interrupted vendored run's commit could not be finished (a file it \
-             covers changed since); it was set aside at {} — run `socket-patch repair` to \
-             check the vendored wiring",
-            path.display()
-        );
+    match recover(project_root) {
+        Ok(Recovery::SetAside { journal, outcome }) => {
+            let done = match outcome {
+                SetAsideOutcome::LeftAsIs => {
+                    "nothing of it was applied (a file it covers changed since)".to_string()
+                }
+                SetAsideOutcome::FinishedAround(files) => format!(
+                    "it was finished around the files edited since{}",
+                    named(&files)
+                ),
+                SetAsideOutcome::RolledBack(files) => {
+                    format!("the files it had replaced were put back{}", named(&files))
+                }
+            };
+            eprintln!(
+                "Warning: an interrupted vendored run's commit could not be finished as \
+                 written: {done}; the journal was set aside at {} — run `socket-patch \
+                 repair` to check the vendored wiring",
+                journal.display()
+            );
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(source) => Err(LockError::Io {
+            path: project_root.join(crate::utils::group_commit::COMMIT_JOURNAL_REL),
+            source: std::io::Error::new(
+                source.kind(),
+                format!(
+                    "could not finish an interrupted vendored run's commit: {source}; the \
+                     journal is kept for the next command"
+                ),
+            ),
+        }),
+    }
+}
+
+fn named(files: &[String]) -> String {
+    if files.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", files.join(", "))
     }
 }
 
@@ -279,7 +315,8 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
         // delete-pending window for everyone.
         match attempt(&path, socket_dir) {
             Attempt::Acquired(guard) => {
-                recover_group_commit(socket_dir);
+                // On failure the guard drops here, releasing the lock.
+                recover_group_commit(socket_dir)?;
                 return Ok(guard);
             }
             Attempt::Contended => {

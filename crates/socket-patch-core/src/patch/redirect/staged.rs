@@ -90,8 +90,10 @@ pub(super) async fn flush_staged(
                 if in_subdir {
                     if let Some(parent) = path.parent() {
                         // `remove_dir` refuses a non-empty directory, so this
-                        // only ever removes the husk the revert emptied.
-                        let _ = tokio::fs::remove_dir(parent).await;
+                        // only ever removes the husk the revert emptied —
+                        // after a vendored run's group commit when the
+                        // removal above was captured.
+                        crate::utils::group_commit::remove_dir_after_commit(parent).await;
                     }
                 }
             }
