@@ -1785,7 +1785,8 @@ async fn try_pypi_service_wheel(
                 );
             }
             let rel_wheel = format!("{uuid_dir_rel}/{wheel_name}");
-            let sha256_hex = hex::encode(Sha256::digest(&archive.bytes));
+            // Digested on the fetch task, beside the sha512 verification.
+            let sha256_hex = archive.sha256_hex.clone();
             // In-sync rebuild: the lockfile still pins the first vendor's
             // wheel path + sha256, and a prebuilt wheel that differs would
             // break every subsequent hash-checked install the moment vendor
