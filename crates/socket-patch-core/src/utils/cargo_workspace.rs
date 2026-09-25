@@ -98,9 +98,15 @@ fn enqueue(
     dirs: &mut BTreeSet<String>,
     queue: &mut Vec<(String, DocumentMut)>,
 ) {
+    // `target` is cargo's build directory at every level: the glob walk
+    // already skips it, and a literal `members = ["target/gen"]` or a path
+    // dependency into it names a manifest the next `cargo clean` deletes —
+    // pinning it would record a hosted edit whose file can vanish, blocking
+    // the rollback of every other cargo edit.
     if dir.is_empty()
         || dirs.len() >= MAX_MANIFESTS
         || dirs.contains(&dir)
+        || dir.split('/').any(|seg| seg == "target")
         || !is_real_dir_path(root, &dir)
     {
         return;
@@ -160,7 +166,7 @@ fn path_dependencies(doc: &DocumentMut) -> Vec<String> {
 
 /// `base/rel` lexically normalized to a repo-relative slash path; `None`
 /// when it is absolute or climbs out of the root.
-fn normalize_rel(base: &str, rel: &str) -> Option<String> {
+pub(crate) fn normalize_rel(base: &str, rel: &str) -> Option<String> {
     let rel = rel.replace('\\', "/");
     if rel.starts_with('/') || Path::new(&rel).is_absolute() {
         return None;
@@ -387,6 +393,32 @@ mod tests {
             ),
         );
         assert!(member_manifests(&root).is_empty());
+    }
+
+    /// Cargo's build directory is never a member, whichever way it is
+    /// named: the glob walk skips it, and so do a literal `members` entry
+    /// and a path dependency pointing into it. `cargo clean` deletes those
+    /// manifests, and a recorded hosted edit for a file that no longer
+    /// exists blocks the rollback of every other cargo edit.
+    #[test]
+    fn build_directory_manifests_are_never_members() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "Cargo.toml",
+            &format!(
+                "[workspace]\nmembers = [\"crates/*\", \"target/generated\"]\n\n\
+                 {}[dependencies]\ngen2 = {{ path = \"target/gen2\" }}\n\
+                 nested = {{ path = \"crates/a/target/gen3\" }}\n",
+                pkg("root")
+            ),
+        );
+        write(root, "crates/a/Cargo.toml", &pkg("a"));
+        write(root, "crates/a/target/gen3/Cargo.toml", &pkg("gen3"));
+        write(root, "target/generated/Cargo.toml", &pkg("generated"));
+        write(root, "target/gen2/Cargo.toml", &pkg("gen2"));
+        assert_eq!(member_manifests(root), vec!["crates/a/Cargo.toml"]);
     }
 
     #[test]

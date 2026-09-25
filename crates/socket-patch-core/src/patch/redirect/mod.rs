@@ -1094,9 +1094,9 @@ fn is_cargo_member_manifest_key(key: &str) -> bool {
         && !key.starts_with('/')
         && !key.contains('\\')
         && !key.contains(':')
-        && dir
-            .split('/')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && seg != ".socket")
+        && dir.split('/').all(|seg| {
+            !seg.is_empty() && seg != "." && seg != ".." && seg != ".socket" && seg != "target"
+        })
 }
 
 /// The not-declared warning for a crate no manifest names at the patched
@@ -9502,6 +9502,8 @@ mod tests {
             "a/../b/Cargo.toml",
             "./a/Cargo.toml",
             ".socket/vendor/cargo/x/Cargo.toml",
+            "target/generated/Cargo.toml",
+            "crates/a/target/gen/Cargo.toml",
             "a//Cargo.toml",
             "a/Cargo.toml.orig",
         ] {
