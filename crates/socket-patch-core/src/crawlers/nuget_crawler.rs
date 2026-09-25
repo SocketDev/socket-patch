@@ -165,7 +165,8 @@ impl Default for NuGetCrawler {
 fn find_by_purls_sync(pkg_path: &Path, purls: &[String]) -> HashMap<String, CrawledPackage> {
     let mut result: HashMap<String, CrawledPackage> = HashMap::new();
     // The package root's entry names (lossy, in readdir order), listed on
-    // the first PURL that needs the case-insensitive fallback.
+    // the first PURL that needs the case-insensitive fallback — and only
+    // kept when the listing is the whole directory (`names_memoized`).
     let mut root_names: Option<Vec<String>> = None;
 
     for purl in purls {
@@ -200,13 +201,8 @@ fn find_by_purls_sync(pkg_path: &Path, purls: &[String]) -> HashMap<String, Craw
         } else if verify_nuget_package(&legacy_dir) {
             Some(legacy_dir)
         } else {
-            let root_names = root_names.get_or_insert_with(|| {
-                list_dir_sync(pkg_path)
-                    .into_iter()
-                    .map(|entry| entry.name.to_string_lossy().into_owned())
-                    .collect()
-            });
-            find_legacy_dir_case_insensitive(pkg_path, root_names, name, version)
+            let names = super::listing::names_memoized(pkg_path, &mut root_names);
+            find_legacy_dir_case_insensitive(pkg_path, &names, name, version)
         };
 
         if let Some(path) = found {

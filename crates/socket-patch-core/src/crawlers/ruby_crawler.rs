@@ -722,7 +722,8 @@ impl RubyCrawler {
         let purls = purls.to_vec();
         crate::utils::fs::run_blocking(move || {
             // `gem_path`'s entry names (lossy, readdir order), listed on
-            // the first PURL that needs the prefix scan.
+            // the first PURL that needs the prefix scan — and only kept
+            // when the listing is the whole directory (`names_memoized`).
             let mut names: Option<Vec<String>> = None;
             purls
                 .iter()
@@ -760,12 +761,7 @@ fn locate_gem_dir_sync(
         return Some(exact);
     }
     let prefix = format!("{name}-{version}-");
-    let names = names.get_or_insert_with(|| {
-        super::listing::list_dir_sync(gem_path)
-            .into_iter()
-            .map(|entry| entry.name.to_string_lossy().into_owned())
-            .collect()
-    });
+    let names = super::listing::names_memoized(gem_path, names);
     for dir_name in names.iter() {
         if dir_name.starts_with(&prefix) {
             let dir = gem_path.join(dir_name);
