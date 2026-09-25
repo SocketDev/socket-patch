@@ -414,3 +414,172 @@ async fn a_view_whose_only_contentless_files_are_zero_delta_vendors() {
         "the zero-delta file is vendored from the pristine copy: {members:?}"
     );
 }
+
+// ── the other caller of the per-package drop ────────────────────────────
+//
+// `drop_unstageable` is wired into `vendor` (above), `scan --mode vendored`
+// / `get --mode vendored` (`scan::vendor_flow`) and `repair`. The vendored
+// SCAN fold — `Ok(staging_errors || engine_errors)` — has its own error
+// path, and every existing suite that touches it mounts a single-patch
+// manifest, so it only ever exercised the preserved whole-run bail.
+
+const GOOD_ENCODED: &str = "pkg%3Anpm%2Fleft-pad%401.3.0";
+const BAD_ENCODED: &str = "pkg%3Anpm%2Ftar-fs%402.1.1";
+
+/// Discovery for both packages: the batch endpoint plus the per-package
+/// search each purl falls back to.
+async fn mount_discovery(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(wm_path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "packages": [
+                { "purl": GOOD_PURL, "patches": [{
+                    "uuid": GOOD_UUID, "purl": GOOD_PURL, "tier": "free",
+                    "cveIds": ["CVE-2026-0001"], "ghsaIds": [], "severity": "high",
+                    "title": "good" }] },
+                { "purl": BAD_PURL, "patches": [{
+                    "uuid": BAD_UUID, "purl": BAD_PURL, "tier": "free",
+                    "cveIds": ["CVE-2026-0002"], "ghsaIds": [], "severity": "high",
+                    "title": "bad" }] },
+            ],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    for (encoded, uuid, purl) in [
+        (GOOD_ENCODED, GOOD_UUID, GOOD_PURL),
+        (BAD_ENCODED, BAD_UUID, BAD_PURL),
+    ] {
+        Mock::given(method("GET"))
+            .and(wm_path(format!(
+                "/v0/orgs/{ORG}/patches/by-package/{encoded}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "patches": [{
+                    "uuid": uuid,
+                    "purl": purl,
+                    "publishedAt": "2026-01-01T00:00:00Z",
+                    "description": "d",
+                    "license": "MIT",
+                    "tier": "free",
+                    "vulnerabilities": {},
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(server)
+            .await;
+    }
+}
+
+/// The good package's view, served complete.
+async fn mount_good_view(server: &MockServer) {
+    use base64::Engine;
+    Mock::given(method("GET"))
+        .and(wm_path(format!("/v0/orgs/{ORG}/patches/view/{GOOD_UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "uuid": GOOD_UUID,
+            "purl": GOOD_PURL,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": { "package/index.js": {
+                "beforeHash": git_hash(GOOD_ORIG),
+                "afterHash": git_hash(GOOD_PATCHED),
+                "blobContent": base64::engine::general_purpose::STANDARD.encode(GOOD_PATCHED),
+            }},
+            "vulnerabilities": {},
+            "description": "d",
+            "license": "MIT",
+            "tier": "free",
+        })))
+        .mount(server)
+        .await;
+}
+
+/// The project WITHOUT `.socket/`: vendored mode is manifest-free, so the
+/// records come from discovery and the blobs from the download phase.
+fn scan_fixture(root: &Path) {
+    fixture(root);
+    std::fs::remove_dir_all(root.join(".socket")).unwrap();
+}
+
+fn scan_vendored_cli(root: &Path, api_url: &str) -> (i32, Value, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socket-patch"));
+    cmd.args([
+        "scan",
+        "--json",
+        "--mode",
+        "vendored",
+        "--yes",
+        "--vendor-source",
+        "build",
+        "--api-url",
+        api_url,
+        "--api-token",
+        "fake-token",
+        "--org",
+        ORG,
+    ])
+    .current_dir(root);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("SOCKET_") && key != "SOCKET_NO_CONFIG" {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "1");
+    let out = cmd.output().expect("spawn socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let env: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("scan --json must emit an envelope: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+    });
+    (out.status.code().unwrap_or(-1), env, stderr)
+}
+
+/// `scan --mode vendored` over a mixed selection: one package the view
+/// cannot supply and one it can. The unsatisfiable package is reported
+/// once, per package, and the other still vendors — the vendored scan's
+/// own fold, not `vendor`'s.
+#[tokio::test]
+async fn scan_vendored_reports_an_unstageable_package_and_vendors_the_rest() {
+    let server = MockServer::start().await;
+    mount_discovery(&server).await;
+    mount_good_view(&server).await;
+    mount_contentless_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    scan_fixture(root);
+
+    let (code, env, stderr) = scan_vendored_cli(root, &server.uri());
+
+    assert_eq!(code, 1, "{env:#}\nstderr:\n{stderr}");
+    let vendor = &env["vendor"];
+    assert_eq!(
+        vendor["status"], "partialFailure",
+        "one bad package is a partial failure, not a step abort: {env:#}"
+    );
+    let bad = event_for(vendor, BAD_PURL);
+    assert_eq!(bad["action"], "failed", "{env:#}");
+    assert_eq!(bad["errorCode"], "no_local_source", "{env:#}");
+    assert_eq!(
+        bad["error"].as_str(),
+        Some("the patch view served no blob content for package/index.js"),
+        "{env:#}"
+    );
+    assert_eq!(
+        events(vendor)
+            .iter()
+            .filter(|e| e["purl"] == BAD_PURL)
+            .count(),
+        1,
+        "the stuck package is reported exactly once: {env:#}"
+    );
+    assert_eq!(event_for(vendor, GOOD_PURL)["action"], "applied", "{env:#}");
+    assert!(
+        root.join(format!(".socket/vendor/npm/{GOOD_UUID}/left-pad-1.3.0.tgz"))
+            .is_file(),
+        "the satisfiable package must still be vendored: {env:#}"
+    );
+    assert!(
+        !root.join(format!(".socket/vendor/npm/{BAD_UUID}")).exists(),
+        "nothing is written for the unstageable package: {env:#}"
+    );
+}
