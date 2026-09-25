@@ -36,16 +36,25 @@ pub(crate) struct VerifiedArchive {
     /// lockfiles that key on sha512 embed verbatim.
     pub integrity_sri: String,
     /// Hex sha256 of the same bytes — the pin a pypi lock records for the
-    /// vendored wheel. Taken alongside the sha512 verification below, on the
-    /// prefetch task, so the serial vendor loop does not walk the archive a
-    /// second time for it.
-    pub sha256_hex: String,
+    /// vendored wheel. Taken on FIRST READ: pypi is the only backend that
+    /// asks for it, and the other seven download through this same path, so
+    /// digesting every archive here would charge them all for a walk none of
+    /// them makes.
+    sha256_hex: std::sync::OnceLock<String>,
     /// The (possibly host-rewritten) URL the bytes came from — for logging.
     pub source_url: String,
     /// The OTHER served artifacts (e.g. gem's path-source stub gemspec), still
     /// unverified — a backend that needs one calls [`fetch_verified_secondary`]
     /// to download + integrity-verify it on demand.
     pub secondary: Vec<SecondaryArtifact>,
+}
+
+impl VerifiedArchive {
+    /// Hex sha256 of [`Self::bytes`], digested once on first ask.
+    pub(crate) fn sha256_hex(&self) -> &str {
+        self.sha256_hex
+            .get_or_init(|| hex::encode(sha2::Sha256::digest(&self.bytes)))
+    }
 }
 
 /// Result of attempting a service download for one patch UUID.
@@ -114,12 +123,10 @@ pub(crate) async fn fetch_verified_archive(
         }
     }
 
-    let sha256_hex = hex::encode(sha2::Sha256::digest(&pkg.tarball));
-
     ServiceArtifact::Ready(VerifiedArchive {
         bytes: pkg.tarball,
         integrity_sri: pkg.integrity_sri,
-        sha256_hex,
+        sha256_hex: std::sync::OnceLock::new(),
         source_url: pkg.source_url,
         secondary: pkg.secondary_artifacts,
     })
@@ -763,7 +770,7 @@ mod tests {
         let archive = VerifiedArchive {
             bytes: Vec::new(),
             integrity_sri: String::new(),
-            sha256_hex: String::new(),
+            sha256_hex: std::sync::OnceLock::new(),
             source_url: String::new(),
             secondary: vec![SecondaryArtifact {
                 kind: "gem-stub-gemspec".into(),
