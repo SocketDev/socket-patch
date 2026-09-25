@@ -637,15 +637,17 @@ into the new version's section — see docs/releasing.md.
   Two request-count consequences an operator may see before they read the
   code, neither of which changes any output:
 
-  - A vendored run fetches prebuilt archives ahead of the wiring loop, and
-    the plan it fetches is built from the gates the CLI can see. A package
-    a vendor backend then refuses in its own pre-flight was still asked
-    for, so a run issues up to a window's worth of `POST
-    /v0/orgs/<org>/patches/package` download grants for packages it does
-    not end up vendoring (on a fresh depscan run, 74 grants where the
-    one-at-a-time loop made 71). Those grants can start a server-side
-    archive build and count against quota. `SOCKET_API_CONCURRENCY=1`
-    turns the look-ahead off entirely.
+  - A vendored run fetches prebuilt archives ahead of the wiring loop.
+    The plan it fetches is exact — it is gated by the same pre-flight each
+    vendor backend runs before it would ask the service (an unsupported or
+    absent lockfile entry, an override conflict, a workspace gate), so a
+    package the run does not end up vendoring is never asked for: the
+    `POST /v0/orgs/<org>/patches/package` download grants, which can start
+    a server-side archive build and count against quota, are exactly the
+    one-at-a-time loop's (71 on a fresh depscan run, where an earlier
+    draft of the look-ahead issued 74). What changes is only their timing:
+    up to four are in flight at once. `SOCKET_API_CONCURRENCY=1` turns the
+    look-ahead off entirely.
   - A token revoked *mid-run* now costs the authenticated batch endpoint
     the requests already in flight — up to the in-flight cap instead of
     one — before the run downgrades to the public proxy. Their answers are
