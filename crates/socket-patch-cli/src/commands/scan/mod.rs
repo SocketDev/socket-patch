@@ -188,11 +188,7 @@ pub fn resolve_mode_flags(args: &mut ScanArgs) -> Result<(), String> {
         return Err(format!(
             "{} cannot be used with --mode hosted: global installs have no project \
              lockfile to redirect",
-            if args.common.global {
-                "--global"
-            } else {
-                "--global-prefix"
-            },
+            if args.common.global { "--global" } else { "--global-prefix" },
         ));
     }
     if args.detached && args.mode != Some(ScanMode::Vendored) {
@@ -405,10 +401,7 @@ async fn embed_vex_human(
     // Dry-run twin of the JSON guard above: no generation, no file write.
     if common.dry_run {
         if !common.silent {
-            println!(
-                "{}",
-                crate::commands::vex::format_vex_dry_run_skip("applied")
-            );
+            println!("{}", crate::commands::vex::format_vex_dry_run_skip("applied"));
         }
         return base_code;
     }
@@ -1742,11 +1735,7 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
                     } else {
                         format!("{excluded_supplements} lockfile-only/vendor-ledger packages have")
                     },
-                    if excluded_supplements == 1 {
-                        "was"
-                    } else {
-                        "were"
-                    },
+                    if excluded_supplements == 1 { "was" } else { "were" },
                 ),
             ));
         }
@@ -2617,7 +2606,9 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
 
         // The rule is as wide as the table, but never wraps a terminal.
         let header = render::table_header(purl_w);
-        let cap = std::io::stdout().is_terminal().then(ui::stdout_width);
+        let cap = std::io::stdout()
+            .is_terminal()
+            .then(ui::stdout_width);
         let rule = render::ruler(
             std::iter::once(header.as_str()).chain(rows.iter().map(String::as_str)),
             cap,
@@ -2859,10 +2850,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
             println!("\nPatches to apply:\n");
         }
         for patch in &selected {
-            let severity = ui::severity(
-                render::highest_severity(patch).unwrap_or("unknown"),
-                use_color,
-            );
+            let severity =
+                ui::severity(render::highest_severity(patch).unwrap_or("unknown"), use_color);
             // The manifest already records a different patch for this
             // package: say so, and warn when the new one fixes less. Agent
             // mode only: vendored mode never writes the manifest.
@@ -2998,7 +2987,10 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     // Download, then apply in place — or vendor (vendored mode, where the
     // download only saves and the vendor step below does the rest).
     let params = download_params(
-        &args, /*save_only=*/ vendor, /*json=*/ false, silent,
+        &args,
+        /*save_only=*/ vendor,
+        /*json=*/ false,
+        silent,
     );
 
     let code = if vendor {

@@ -2050,11 +2050,7 @@ mod tests {
                 "pkg:npm/lockonly@1.0.0",
                 std::path::PathBuf::from("/nonexistent"),
             ),
-            crawled_pkg(
-                "alpha",
-                "pkg:npm/alpha@1.0.0",
-                installed("alpha", "alpha.js"),
-            ),
+            crawled_pkg("alpha", "pkg:npm/alpha@1.0.0", installed("alpha", "alpha.js")),
             crawled_pkg(
                 "embedded",
                 "pkg:npm/embedded@1.0.0",
