@@ -551,7 +551,7 @@ fn target_gate(
 /// same steps inline, per package, and refuses with the codes returned
 /// here.
 pub(super) struct BerryProject {
-    blocks: Vec<LockBlock>,
+    blocks: std::sync::Arc<Vec<LockBlock>>,
     pkg: Value,
 }
 
@@ -567,7 +567,7 @@ pub(super) async fn read_project(project_root: &Path) -> Result<BerryProject, &'
     if let Some(outcome) = refuse_mixed_line_endings(YARN_LOCK, &lock_text) {
         return Err(code(outcome));
     }
-    let blocks = scan_blocks(&lock_text);
+    let blocks = scan_blocks_shared(&lock_text);
     if let Some(outcome) = refuse_unsupported_cache(&blocks) {
         return Err(code(outcome));
     }

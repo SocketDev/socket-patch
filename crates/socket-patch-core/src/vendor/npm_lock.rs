@@ -493,19 +493,21 @@ fn rewritable_matches(
 /// inline, per package, and refuses with the codes returned here.
 pub(super) struct NpmLockProject {
     lock_name: String,
-    lock: Value,
+    lock: std::sync::Arc<Value>,
 }
 
 /// Read the lock as [`vendor_npm`]'s step 2 does — selected, parsed,
 /// version-gated — once, for the download plan; refuses with the loop's
-/// codes.
+/// codes. The parse goes through the loop's memo, so the loop's first
+/// package reuses it.
 pub(super) async fn read_project(project_root: &Path) -> Result<NpmLockProject, &'static str> {
     let (lock_name, lock_bytes, _sibling_locks) = match select_lockfile(project_root).await {
         Ok(Some(found)) => found,
         Ok(None) | Err(_) => return Err("vendor_lockfile_missing"),
     };
-    let lock: Value =
-        serde_json::from_slice(&lock_bytes).map_err(|_| "vendor_lockfile_version_unsupported")?;
+    let lock = LOCK_MEMO
+        .parse(&lock_bytes, || serde_json::from_slice::<Value>(&lock_bytes))
+        .map_err(|_| "vendor_lockfile_version_unsupported")?;
     lock_version_gate(&lock, &lock_name).map_err(|o| super::npm_common::refusal_code(&o))?;
     Ok(NpmLockProject { lock_name, lock })
 }

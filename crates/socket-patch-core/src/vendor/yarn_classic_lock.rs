@@ -333,7 +333,7 @@ fn rewritable_candidates(
 /// ([`preflight_packages`]); the loop itself runs the same steps inline,
 /// per package.
 pub(super) struct ClassicProject {
-    blocks: Vec<LockBlock>,
+    blocks: Arc<Vec<LockBlock>>,
 }
 
 /// Read the lock as [`vendor_yarn_classic`]'s step 2 does — read,
@@ -345,7 +345,7 @@ pub(super) async fn read_project(project_root: &Path) -> Result<ClassicProject, 
         .map_err(|o| super::npm_common::refusal_code(&o))?;
     refuse_berry_lock(&text).map_err(|o| super::npm_common::refusal_code(&o))?;
     Ok(ClassicProject {
-        blocks: scan_blocks(&text),
+        blocks: scan_blocks_shared(&text),
     })
 }
 
