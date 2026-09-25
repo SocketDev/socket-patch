@@ -24,7 +24,7 @@ use socket_patch_core::constants::SOCKET_DIR;
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::patch::apply::{verify_file_patch, PatchSources, VerifyStatus};
+use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
 use socket_patch_core::utils::concurrent::{ordered_concurrent, registry_concurrency};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
@@ -1735,14 +1735,30 @@ pub(crate) async fn vendor_records_reusing(
                 // disqualify a variant. Same deterministic pick as apply /
                 // core's `select_installed_variants`.
                 let first = match representative_file(&record.files) {
-                    Some((f, info)) => Some(match pkg_source.materialize().await {
-                        Ok(dir) => verify_file_patch(dir, f, info).await.status,
-                        // A source that cannot be materialised reads exactly
-                        // as the missing tree it is: `NotFound`, which
-                        // disqualifies the variant just as a deleted
-                        // installed dir did.
-                        Err(_) => VerifyStatus::NotFound,
-                    }),
+                    Some((f, info)) => match pkg_source.materialize().await {
+                        Ok(dir) => Some(verify_file_patch(dir, f, info).await.status),
+                        // Not a variant verdict: the tree could not be
+                        // WRITTEN at all — a full or unwritable `$TMPDIR`,
+                        // no file descriptors. The eager fetch hit that
+                        // while fetching and reported it; reading it as a
+                        // variant that does not match would file the purl
+                        // under `package_not_installed` ("no installed
+                        // package found on disk") and lose the cause.
+                        Err(detail) => {
+                            has_errors = true;
+                            fetch_failed.insert(candidate.clone());
+                            env.record(
+                                PatchEvent::new(PatchAction::Failed, candidate.clone())
+                                    .with_error("vendor_fetch_failed", detail.clone()),
+                            );
+                            report_vendor_failure(
+                                common,
+                                candidate,
+                                &format!("fetch failed: {detail}"),
+                            );
+                            continue;
+                        }
+                    },
                     None => None,
                 };
                 if !variant_matches_installed(first.as_ref()) {
