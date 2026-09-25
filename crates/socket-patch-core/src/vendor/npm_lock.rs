@@ -2326,6 +2326,48 @@ mod tests {
         assert!(!fx.root().join(".socket/vendor/npm").join(UUID).exists());
     }
 
+    /// npm 12 auto-creates a package-lock.json from the registry beside an
+    /// already-wired shrinkwrap, so the second run finds the PRIMARY in sync
+    /// and only the sibling to rewrite — the one state where the primary
+    /// lock is read but never written. It must be left byte-identical while
+    /// the sibling is brought up to the primary's wiring.
+    #[tokio::test]
+    async fn a_sibling_lock_added_after_wiring_is_rewired_without_touching_the_primary() {
+        let fx = fixture().await;
+        // Run one: the shrinkwrap is the only lock, and it is wired.
+        tokio::fs::write(fx.root().join(SHRINKWRAP), &fx.lock_bytes)
+            .await
+            .unwrap();
+        tokio::fs::remove_file(fx.lock_path()).await.unwrap();
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+        let wired_shrink = tokio::fs::read(fx.root().join(SHRINKWRAP)).await.unwrap();
+
+        // npm 12 reifies a fresh, unpatched package-lock.json beside it.
+        tokio::fs::write(fx.lock_path(), &fx.lock_bytes)
+            .await
+            .unwrap();
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.expect("the sibling rewrite is a wiring change");
+        assert!(
+            entry.wiring.iter().all(|r| r.file == PACKAGE_LOCK),
+            "only the sibling is rewritten: {:?}",
+            entry.wiring
+        );
+        assert_eq!(
+            tokio::fs::read(fx.root().join(SHRINKWRAP)).await.unwrap(),
+            wired_shrink,
+            "the in-sync primary must not be rewritten"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            wired_shrink,
+            "the sibling gets the identical rewrite"
+        );
+    }
+
     /// Only the shrinkwrap (primary) is rewired when a stale sibling
     /// package-lock.json lacks the package: vendor still succeeds, but LOUDLY
     /// names the lock npm 12 would install from unpatched.
