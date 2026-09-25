@@ -463,6 +463,12 @@ fn is_plain_archive_name(name: &str) -> bool {
 /// that names a DIRECTORY of the archive is ordinary (the staging materialises
 /// one), whereas a name living under a member — which is a FILE — is the case
 /// where the two paths diverge.
+///
+/// Every `/`-separated PREFIX is checked, not only the whole name: a directory
+/// is a filesystem entry too, so `Lib/a.class` + `lib/b.class` collapse into
+/// one directory on a case-insensitive volume and the walk back out re-spells
+/// the second member under the first's casing — a different rebuilt archive,
+/// silently.
 pub(crate) fn names_are_unambiguous<'a>(
     members: impl IntoIterator<Item = &'a str>,
     targets: impl IntoIterator<Item = &'a str>,
@@ -477,19 +483,28 @@ pub(crate) fn names_are_unambiguous<'a>(
         if !is_plain_archive_name(name) {
             return false;
         }
-        let lower = name.to_ascii_lowercase();
-        // The same path can legitimately arrive twice — a patch target IS
-        // usually a member. Only a DIFFERENT spelling folding onto one
-        // already seen is ambiguous.
-        match folded.get(lower.as_str()) {
-            Some(seen) if *seen != name => return false,
-            Some(_) => {}
-            None => {
-                folded.insert(lower.clone(), name);
+        for end in name
+            .match_indices('/')
+            .map(|(at, _)| at)
+            .chain(std::iter::once(name.len()))
+        {
+            let part = &name[..end];
+            let lower = part.to_ascii_lowercase();
+            // The same path can legitimately arrive twice — a patch target IS
+            // usually a member, and siblings share their directories. Only a
+            // DIFFERENT spelling folding onto one already seen is ambiguous.
+            match folded.get(lower.as_str()) {
+                Some(seen) if *seen != part => return false,
+                Some(_) => {}
+                None => {
+                    folded.insert(lower.clone(), part);
+                }
             }
-        }
-        if is_member {
-            member_folded.insert(lower);
+            // Only the whole name is a member FILE; its prefixes are the
+            // directories it lives in, which the ancestor rule below is about.
+            if is_member && end == name.len() {
+                member_folded.insert(lower);
+            }
         }
     }
     for name in folded.keys() {
@@ -2309,6 +2324,16 @@ mod tests {
                 build_zip(&[entry("LICENSE", b"a")]),
                 vec!["license"],
             ),
+            (
+                "two spellings of one directory",
+                build_zip(&[entry("Lib/a.class", b"a"), entry("lib/b.class", b"b")]),
+                vec![],
+            ),
+            (
+                "a patch key naming a member's directory under another spelling",
+                build_zip(&[entry("Lib/x.dll", b"a")]),
+                vec!["lib"],
+            ),
         ];
         for (label, archive, keys) in cases {
             let files = target_files(&keys);
@@ -2362,6 +2387,38 @@ mod tests {
         let bytes = assert_repacks_agree(&archive, &["dup.txt"], &[], None, async |_| {}).await;
         assert_eq!(zip_entry_names(&bytes), ["dup.txt"]);
         assert_eq!(zip_member(&bytes, "dup.txt"), b"second");
+    }
+
+    /// Two spellings of one directory: a case-insensitive stage collapses them,
+    /// and the walk back out re-spells the second member under the first's
+    /// casing — a different rebuilt artifact, and so a different `.sha1`
+    /// sidecar and NuGet `contentHash`. The in-memory repack cannot reproduce
+    /// that, so the gate must send the archive to disk.
+    #[tokio::test]
+    async fn case_variant_directory_spellings_take_the_on_disk_repack() {
+        let archive = build_zip(&[
+            entry("LICENSE", b"pristine\n"),
+            entry("Lib/a.class", b"a"),
+            entry("lib/b.class", b"b"),
+        ]);
+        assert!(
+            prepare_memory_repack(&archive, &target_files(&["LICENSE"]), &[])
+                .unwrap()
+                .is_none(),
+            "a folded directory spelling must take the on-disk repack"
+        );
+        // And on a volume that really does fold, pin what the extraction
+        // leaves behind — so the gate stays necessary rather than cosmetic.
+        let probe = tempfile::tempdir().unwrap();
+        std::fs::create_dir(probe.path().join("Lib")).unwrap();
+        if std::fs::create_dir(probe.path().join("lib")).is_err() {
+            let oracle = on_disk_repack(&archive, None, async |_| {}).await.unwrap();
+            assert_eq!(
+                zip_entry_names(&oracle),
+                ["LICENSE", "Lib/a.class", "Lib/b.class"],
+                "the second member is republished under the first's casing"
+            );
+        }
     }
 
     /// Rewrite every occurrence of an entry name in a zip's bytes. `from` and
@@ -2440,6 +2497,23 @@ mod tests {
             "a target folding onto a member"
         );
         assert!(!names_are_unambiguous(["A.txt", "a.txt"], []), "case fold");
+        assert!(
+            !names_are_unambiguous(["Lib/a.class", "lib/b.class"], []),
+            "two spellings of one DIRECTORY fold into one entry too — the walk \
+             back out would re-spell the second member under the first's casing"
+        );
+        assert!(
+            !names_are_unambiguous(["META-INF/services/a", "meta-inf/services/b"], []),
+            "a folded directory anywhere along the path"
+        );
+        assert!(
+            !names_are_unambiguous(["Lib/x.dll"], ["lib"]),
+            "a target naming a member's directory under a different spelling"
+        );
+        assert!(
+            names_are_unambiguous(["lib/a.dll", "lib/b.dll", "lib/net6.0/c.dll"], []),
+            "siblings sharing a directory spelling stay on the fast path"
+        );
         assert!(
             !names_are_unambiguous(["a", "a/b"], []),
             "file vs directory"
