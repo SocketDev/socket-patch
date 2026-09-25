@@ -178,7 +178,16 @@ pub async fn vendor_yarn_classic<'a>(
     let mut wiring: Vec<WiringRecord> = Vec::new();
     for key in &candidate_keys {
         let edit = {
-            let blocks = scan_blocks_shared(&new_text);
+            // While nothing has been spliced yet, `new_text` is still the
+            // text scanned above and every candidate hits that scan — the
+            // whole idempotent re-run takes this arm. Once a splice has
+            // rewritten it, each key sees text no later read can ask for
+            // again, so scan it without paying the memo's copy of it.
+            let blocks = if wiring.is_empty() {
+                scan_blocks_shared(&new_text)
+            } else {
+                Arc::new(scan_blocks(&new_text))
+            };
             let Some(block) = blocks.iter().find(|b| &b.key == key) else {
                 return done_failure_unstage(
                     purl,
@@ -738,11 +747,11 @@ pub(crate) struct LockBlock {
 /// The run's yarn-lock block scans. `scan_blocks` walks every line of the
 /// lock and copies each one into the block it belongs to, and BOTH yarn
 /// backends re-scanned the whole lock for every patched package — plus once
-/// per candidate key while splicing. Two slots: the splice loop re-scans
-/// the text it is building beside the one it started from. An idempotent
-/// re-run writes nothing, so every scan after the first hits; see
-/// [`ParseMemo`].
-static BLOCK_MEMO: ParseMemo<Vec<LockBlock>, 2> = ParseMemo::new();
+/// per candidate key while splicing. One slot: a project has one yarn.lock,
+/// and the splice loop leaves the memo alone once it has rewritten the text
+/// (nothing can ask for a half-spliced lock again). An idempotent re-run
+/// writes nothing, so every scan after the first hits; see [`ParseMemo`].
+static BLOCK_MEMO: ParseMemo<Vec<LockBlock>> = ParseMemo::new();
 
 /// [`scan_blocks`], shared and memoized on the lock text — for the callers
 /// that only read the blocks.
