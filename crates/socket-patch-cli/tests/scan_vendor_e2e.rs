@@ -2354,6 +2354,18 @@ snapshots:
     /// is still the loop's, reported as it always was.
     #[tokio::test]
     async fn a_package_the_loop_refuses_costs_zero_grants() {
+        // The plan is only built when the run may keep more than one
+        // request in flight, and a tight descriptor limit pins the API
+        // concurrency at one whatever the environment says (the helper
+        // already scrubs `SOCKET_API_CONCURRENCY`). The strictly serial
+        // loop then trivially grants nothing for the refused package, and
+        // this test would pass without the pre-flight it pins ever
+        // running — so fail loudly rather than vacuously.
+        assert!(
+            !socket_patch_core::crawlers::walk_pool::fd_limit_is_tight(),
+            "the descriptor limit is too tight for the download plan to be built, so this \
+             test cannot exercise the pre-flight it pins; raise `ulimit -n` and re-run"
+        );
         let mock = MockServer::start().await;
         mount_three_patch_api(&mock).await;
         let tmp = tempfile::tempdir().unwrap();
