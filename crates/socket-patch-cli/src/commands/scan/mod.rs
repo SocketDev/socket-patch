@@ -662,6 +662,21 @@ fn partition_agent_selection(
 /// shape (`json`/`silent`) and `save_only` differ per flow; vendored mode
 /// never persists blobs (its records stay in memory and the vendor step
 /// consumes the staged sources).
+/// The ecosystems a scan crawls (`None`: every one). `--ecosystems`
+/// narrows everything the run counts, queries and shows to the named
+/// ecosystems, so without a GC the other crawlers' output would only be
+/// filtered away: they are not run at all. A GC run (`--prune` / `--sync`)
+/// still crawls everything — the GC judges every manifest entry against the
+/// FULL installed set (see `scanned_purls` in `run_scan`), and a skipped
+/// ecosystem would read as uninstalled.
+fn crawl_scope(prune: bool, ecosystems: Option<&[String]>) -> Option<&[String]> {
+    if prune {
+        None
+    } else {
+        ecosystems
+    }
+}
+
 fn download_params(args: &ScanArgs, save_only: bool, json: bool, silent: bool) -> DownloadParams {
     DownloadParams {
         cwd: args.common.cwd.clone(),
@@ -1584,17 +1599,8 @@ async fn run_scan(mut args: ScanArgs, telemetry: &mut PendingTelemetry) -> i32 {
     let mut status = StatusLine::stderr(args.common.json, args.common.silent);
     status.set(format!("Scanning {scan_target}..."));
 
-    // Which ecosystems to crawl. `--ecosystems` narrows everything this
-    // run counts, queries and shows to the named ecosystems, so without a
-    // GC the other crawlers' output would only be filtered away below: they
-    // are not run at all. `--prune` / `--sync` still crawl everything — the
-    // GC judges every manifest entry against the FULL installed set (see
-    // `scanned_purls`), and a skipped ecosystem would read as uninstalled.
-    let crawl_scope = if prune {
-        None
-    } else {
-        args.common.ecosystems.as_deref()
-    };
+    // Which ecosystems to crawl (see `crawl_scope`).
+    let crawl_scope = crawl_scope(prune, args.common.ecosystems.as_deref());
 
     // Crawl packages. Vendored mode keeps the npm half: its engine
     // resolves the same untouched tree and reuses this crawl instead of
@@ -3096,6 +3102,18 @@ mod tests {
             );
         }
         m
+    }
+
+    /// MVN-4: only a non-GC `--ecosystems` run narrows the crawl. A GC run
+    /// crawls every ecosystem whatever `--ecosystems` says (its prune reads
+    /// the full installed set), and no `--ecosystems` crawls every one.
+    #[test]
+    fn crawl_scope_narrows_only_a_non_gc_filtered_run() {
+        let npm = vec!["npm".to_string()];
+        assert_eq!(crawl_scope(false, Some(&npm)), Some(&npm[..]));
+        assert_eq!(crawl_scope(true, Some(&npm)), None);
+        assert_eq!(crawl_scope(false, None), None);
+        assert_eq!(crawl_scope(true, None), None);
     }
 
     // ---- cross-mode ledger takeover (hosted ⇄ vendored) --------------------
