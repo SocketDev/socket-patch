@@ -759,7 +759,7 @@ fn check_rewritable_refs(lines: &[String], ctx: &Ctx<'_>) -> Result<(), String> 
                 }
             } else {
                 k += 1;
-                rest
+                rest.to_string()
             };
             if value == reg_key || value.starts_with(&key_peer_prefix) {
                 return refuse("an aliased root dependency", &value);
@@ -781,10 +781,10 @@ fn check_rewritable_refs(lines: &[String], ctx: &Ctx<'_>) -> Result<(), String> 
                     continue;
                 };
                 if rest == reg_key || rest.starts_with(&key_peer_prefix) {
-                    return refuse("an aliased dependency reference", &rest);
+                    return refuse("an aliased dependency reference", rest);
                 }
                 if dep == ctx.name && rest.starts_with(&val_peer_prefix) {
-                    return refuse("a peer-suffixed dependency reference", &rest);
+                    return refuse("a peer-suffixed dependency reference", rest);
                 }
             }
             i = block.end;
@@ -810,9 +810,9 @@ fn dep_field_lines(
         let Some((field, _repr, fval)) = parse_key_line(&lines[f], indent) else {
             break;
         };
-        match field.as_str() {
-            "specifier" => spec = Some((f, fval)),
-            "version" => ver = Some((f, fval)),
+        match field {
+            "specifier" => spec = Some((f, fval.to_string())),
+            "version" => ver = Some((f, fval.to_string())),
             _ => {}
         }
         f += 1;
@@ -838,7 +838,8 @@ fn edit_overrides(
             if let Some((key, repr, rest)) = parse_key_line(line, 2) {
                 last_entry = i;
                 if key == our_key {
-                    ours = Some((i, repr, rest));
+                    // Owned: the rewrite below splices `lines[i]`.
+                    ours = Some((i, repr.to_string(), rest.to_string()));
                     break;
                 }
             }
@@ -918,22 +919,25 @@ fn edit_root_deps_v54(
                 hit = true; // in sync
                 continue;
             }
-            let target = rest == ctx.version || ctx.is_ours(&rest);
+            let target = rest == ctx.version || ctx.is_ours(rest);
             if !target {
                 continue;
             }
             hit = true;
-            let was_ours = ctx.is_ours(&rest);
-            let original = (!was_ours).then(|| Value::String(rest.clone()));
-            *line = format!("  {}: {}", yaml_key_like(&dep, &repr), ctx.spec);
-            wiring.push(WiringRecord {
+            let was_ours = ctx.is_ours(rest);
+            let original = (!was_ours).then(|| Value::String(rest.to_string()));
+            // Built before the splice below: `dep`/`repr` borrow `*line`.
+            let record = WiringRecord {
                 file: PNPM_LOCK.to_string(),
                 kind: KIND_LOCK_ROOT_DEP.to_string(),
                 action: WiringAction::Rewritten,
                 key: Some(format!("{section}|{dep}")),
                 original,
                 new: Some(Value::String(ctx.spec.to_string())),
-            });
+            };
+            let rewritten = format!("  {}: {}", yaml_key_like(dep, repr), ctx.spec);
+            *line = rewritten;
+            wiring.push(record);
             changed = true;
         }
     }
@@ -963,16 +967,19 @@ fn edit_specifier_v54(
         }
         // Ours at a stale root/uuid (a moved checkout being re-vendored) has
         // no original; anything else is the user's range, recorded.
-        let original = (!ctx.is_ours(&rest)).then(|| Value::String(rest.clone()));
-        *line = format!("  {}: {}", yaml_key_like(&key, &repr), ctx.abs_spec);
-        wiring.push(WiringRecord {
+        let original = (!ctx.is_ours(rest)).then(|| Value::String(rest.to_string()));
+        // Built before the splice below: `key`/`repr` borrow `*line`.
+        let record = WiringRecord {
             file: PNPM_LOCK.to_string(),
             kind: KIND_LOCK_SPECIFIER.to_string(),
             action: WiringAction::Rewritten,
-            key: Some(key),
+            key: Some(key.to_string()),
             original,
             new: Some(Value::String(ctx.abs_spec.to_string())),
-        });
+        };
+        let rewritten = format!("  {}: {}", yaml_key_like(key, repr), ctx.abs_spec);
+        *line = rewritten;
+        wiring.push(record);
         return Ok(true);
     }
     Ok(false)
@@ -1012,9 +1019,8 @@ fn edit_root_deps_v60(
                         continue; // in sync
                     }
                     let was_ours = ctx.is_ours(&old_ver);
-                    lines[si] = format!("    specifier: {}", ctx.abs_spec);
-                    lines[vi] = format!("    version: {}", ctx.spec);
-                    wiring.push(WiringRecord {
+                    // Built before the splices below: `dep` borrows `lines[k]`.
+                    let record = WiringRecord {
                         file: PNPM_LOCK.to_string(),
                         kind: KIND_LOCK_ROOT_DEP_PAIR.to_string(),
                         action: WiringAction::Rewritten,
@@ -1031,7 +1037,10 @@ fn edit_root_deps_v60(
                             "specifier": ctx.abs_spec,
                             "version": ctx.spec,
                         })),
-                    });
+                    };
+                    lines[si] = format!("    specifier: {}", ctx.abs_spec);
+                    lines[vi] = format!("    version: {}", ctx.spec);
+                    wiring.push(record);
                     changed = true;
                 }
             }
@@ -1095,7 +1104,7 @@ fn edit_packages(
         let mut replaced_resolution = false;
         for line in &original_lines[1..] {
             if let Some((field, _repr, _rest)) = parse_key_line(line, 4) {
-                match field.as_str() {
+                match field {
                     "resolution" => {
                         new_lines.push(expected_resolution.clone());
                         new_lines.push(format!("    name: {}", ctx.name));
@@ -1163,8 +1172,8 @@ fn edit_pkg_dep_refs(
         let mut in_dep_map = false;
         for line in lines[block.header + 1..block.end].iter_mut() {
             if let Some((field, _repr, rest)) = parse_key_line(line, 4) {
-                in_dep_map = rest.is_empty()
-                    && matches!(field.as_str(), "dependencies" | "optionalDependencies");
+                in_dep_map =
+                    rest.is_empty() && matches!(field, "dependencies" | "optionalDependencies");
                 continue;
             }
             if !in_dep_map {
@@ -1176,13 +1185,13 @@ fn edit_pkg_dep_refs(
             if dep != ctx.name {
                 continue;
             }
-            let target = rest == ctx.version || (rest != ctx.spec && ctx.is_ours(&rest));
+            let target = rest == ctx.version || (rest != ctx.spec && ctx.is_ours(rest));
             if !target {
                 continue;
             }
-            let was_ours = ctx.is_ours(&rest);
-            *line = format!("      {}: {}", yaml_key(&dep), ctx.spec);
-            wiring.push(WiringRecord {
+            let was_ours = ctx.is_ours(rest);
+            // Built before the splice below: `dep`/`rest` borrow `*line`.
+            let record = WiringRecord {
                 file: PNPM_LOCK.to_string(),
                 kind: KIND_LOCK_PKG_DEP_REF.to_string(),
                 action: WiringAction::Rewritten,
@@ -1190,10 +1199,13 @@ fn edit_pkg_dep_refs(
                 original: if was_ours {
                     None
                 } else {
-                    Some(Value::String(rest.clone()))
+                    Some(Value::String(rest.to_string()))
                 },
                 new: Some(Value::String(ctx.spec.to_string())),
-            });
+            };
+            let rewritten = format!("      {}: {}", yaml_key(dep), ctx.spec);
+            *line = rewritten;
+            wiring.push(record);
             changed = true;
         }
         i = block.end;
@@ -1527,11 +1539,11 @@ fn revert_value_line(
         // pre-vendor original — an earlier partial revert (or the user, by
         // hand) already restored it. Not drift: stay silent so the
         // drift-skip keep gate can converge.
-        if rec.original.as_ref().and_then(Value::as_str) == Some(rest.as_str()) {
+        if rec.original.as_ref().and_then(Value::as_str) == Some(rest) {
             return;
         }
-        let ours = Some(rest.as_str()) == rec.new.as_ref().and_then(Value::as_str)
-            || parse_vendor_path(&rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
+        let ours = Some(rest) == rec.new.as_ref().and_then(Value::as_str)
+            || parse_vendor_path(rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if !ours {
             warnings.push(drifted(format!(
                 "{section} entry `{dep}` was changed since vendoring ({rest}); left alone"
@@ -1545,7 +1557,7 @@ fn revert_value_line(
             )));
             return;
         };
-        *line = format!("  {}: {orig}", yaml_key_like(dep, &repr));
+        *line = format!("  {}: {orig}", yaml_key_like(dep, repr));
         *dirty = true;
         return;
     }
@@ -1676,7 +1688,7 @@ fn revert_package_block(
         }
         let live: Vec<String> = lines[block.header..block.end].to_vec();
         let key_is_ours =
-            parse_vendor_path(&new_key).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
+            parse_vendor_path(new_key).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if live != new_lines && !key_is_ours {
             warnings.push(drifted(format!(
                 "packages entry `{new_key}` was changed since vendoring; left alone"
@@ -1696,7 +1708,7 @@ fn revert_package_block(
             )));
             return;
         };
-        if swap_block_sorted(lines, "packages", &new_key, &orig_key, &original).is_err() {
+        if swap_block_sorted(lines, "packages", new_key, orig_key, &original).is_err() {
             warnings.push(drifted(format!(
                 "packages entry `{new_key}` vanished mid-restore; left alone"
             )));
@@ -1753,8 +1765,8 @@ fn revert_pkg_dep_ref(
         let mut in_dep_map = false;
         for line in lines[block.header + 1..block.end].iter_mut() {
             if let Some((field, _repr, rest)) = parse_key_line(line, 4) {
-                in_dep_map = rest.is_empty()
-                    && matches!(field.as_str(), "dependencies" | "optionalDependencies");
+                in_dep_map =
+                    rest.is_empty() && matches!(field, "dependencies" | "optionalDependencies");
                 continue;
             }
             if !in_dep_map {
@@ -1769,11 +1781,11 @@ fn revert_pkg_dep_ref(
             // ALREADY CONVERGED: the live ref already equals the recorded
             // pre-vendor original — an earlier partial revert (or the
             // user, by hand) already restored it. Not drift.
-            if rec.original.as_ref().and_then(Value::as_str) == Some(rest.as_str()) {
+            if rec.original.as_ref().and_then(Value::as_str) == Some(rest) {
                 return;
             }
-            let ours = Some(rest.as_str()) == rec.new.as_ref().and_then(Value::as_str)
-                || parse_vendor_path(&rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
+            let ours = Some(rest) == rec.new.as_ref().and_then(Value::as_str)
+                || parse_vendor_path(rest).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
             if !ours {
                 warnings.push(drifted(format!(
                     "dep ref `{key}` was re-resolved since vendoring ({rest}); left alone"
