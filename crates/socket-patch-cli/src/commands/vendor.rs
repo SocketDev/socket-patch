@@ -1363,6 +1363,46 @@ pub(crate) async fn vendor_records(
                     inventory = Some(lock_inventory::inventory_project(&common.cwd).await);
                 }
                 let inv = inventory.as_deref().expect("filled just above");
+                // A NOT-INSTALLED gem can only be vendored through the patch
+                // service. The bundler path source the gem backend wires
+                // needs the eval-able stub gemspec rubygems writes into
+                // `<gem home>/specifications/` at INSTALL time; a fetched
+                // `.gem` carries its gemspec only as YAML in `metadata.gz`,
+                // which is exactly why the service serves a converted
+                // `gem-stub-gemspec` second artifact. With the service off
+                // (`--vendor-source build`, or no config at all) the fetched
+                // copy is unusable, so the backend refused `gem_spec_missing`
+                // — AFTER paying for the download, on every run. Refuse here
+                // instead, with the same code and a detail that names the
+                // real remedy. The backend keeps its own refusal as the
+                // backstop for every other route into it.
+                //
+                // Scoped to the purls a fetch would actually be attempted
+                // for (what `fetch_pristine_package` resolves from the
+                // lockfile or the ledger): a gem that resolves from nowhere
+                // has nothing to say about gemspecs and keeps the calm
+                // `package_not_installed` skip below.
+                if purl.starts_with("pkg:gem/")
+                    && !service.is_some_and(VendorServiceConfig::service_enabled)
+                    && (lock_inventory::lookup(inv, purl).is_some() || ledger_entry.is_some())
+                {
+                    fetch_failed.insert(purl.clone());
+                    let detail = format!(
+                        "{} is not installed, and a local build cannot vendor a fetched \
+                         gem: the bundler path source needs the stub gemspec rubygems \
+                         writes into specifications/ when the gem is installed, which a \
+                         downloaded .gem does not carry. Install the gem (e.g. \
+                         `bundle install`) and re-run, or use --vendor-source=auto to \
+                         vendor it from the patch service.",
+                        normalize_purl(purl)
+                    );
+                    env.record(
+                        PatchEvent::new(PatchAction::Failed, purl.clone())
+                            .with_error("gem_spec_missing", detail.clone()),
+                    );
+                    report_vendor_failure(common, purl, &detail);
+                    continue;
+                }
                 match fetch_pristine_package(&common.cwd, inv, &client, purl, ledger_entry).await {
                     PristineFetch::Fetched(fetched) => {
                         record_warning(
