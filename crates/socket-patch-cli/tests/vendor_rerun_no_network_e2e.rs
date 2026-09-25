@@ -452,6 +452,11 @@ const GEM_PATCHED: &[u8] = b"module SocketFixtureGem; VERSION = '1.0.0'; SAFE = 
 /// Gemfile + a bundler >= 2.6 Gemfile.lock (CHECKSUMS pin, so the gem is
 /// fetchable from `remote`) + the manifest.
 fn write_gem_project(root: &Path, remote: &str, uuid: &str) {
+    write_gem_project_with(root, remote, uuid, &"b".repeat(64));
+}
+
+/// [`write_gem_project`] with the lock's `CHECKSUMS` sha256 given.
+fn write_gem_project_with(root: &Path, remote: &str, uuid: &str, checksum: &str) {
     std::fs::write(
         root.join("Gemfile"),
         format!("source \"{remote}\"\ngem \"{GEM_NAME}\"\n"),
@@ -465,7 +470,7 @@ fn write_gem_project(root: &Path, remote: &str, uuid: &str) {
              DEPENDENCIES\n  {GEM_NAME}\n\n\
              CHECKSUMS\n  {GEM_NAME} ({GEM_VERSION}) sha256={}\n\n\
              BUNDLED WITH\n   2.6.2\n",
-            "b".repeat(64)
+            checksum
         ),
     )
     .unwrap();
@@ -546,6 +551,68 @@ async fn gem_build_mode_refuses_a_lockfile_only_gem_before_downloading_it() {
         "{v:#}"
     );
     assert!(!root.join(".socket/vendor").exists(), "nothing is written");
+}
+
+/// A `.gem`: an uncompressed outer tar holding `metadata.gz` and a
+/// `data.tar.gz` of `data_files` at its root.
+fn make_gem(data_files: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write as _;
+    let gz = |bytes: &[u8]| {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    };
+    let tar = |files: &[(&str, &[u8])]| {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (rel, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, rel, *content).unwrap();
+        }
+        builder.into_inner().unwrap()
+    };
+    let data = gz(&tar(data_files));
+    let metadata =
+        gz(format!("--- !ruby/object:Gem::Specification\nname: {GEM_NAME}\n").as_bytes());
+    tar(&[("metadata.gz", &metadata), ("data.tar.gz", &data)])
+}
+
+/// The build-mode refusal happens before the download only on a wet run: a
+/// `--dry-run` never refused, and still fetches the gem and previews it
+/// (`vendor_fetched_missing` + `verified`, exit 0) as it always did.
+#[tokio::test]
+async fn gem_build_mode_dry_run_still_fetches_and_previews() {
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    let gem = make_gem(&[(GEM_LIB, GEM_PRISTINE)]);
+    let checksum = hex::encode(Sha256::digest(&gem));
+    let registry = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(gem))
+        .mount(&registry)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_gem_project_with(
+        root,
+        &registry.uri(),
+        "2b1f6c1e-8d3a-4f6b-9c2d-7e5a9b1c3d0a",
+        &checksum,
+    );
+
+    let (code, v, stderr) = run_vendor(root, &dead_endpoint(), &["--dry-run"], &[]);
+
+    assert_eq!(code, 0, "{v:#}\n{stderr}");
+    assert_eq!(
+        purl_events(&v, GEM_PURL),
+        vec![("skipped", "vendor_fetched_missing"), ("verified", "")],
+        "{v:#}"
+    );
+    assert!(
+        !root.join(".socket/vendor").exists(),
+        "a dry run writes nothing"
+    );
 }
 
 /// The deferral only moves the download; it never hides one the backend

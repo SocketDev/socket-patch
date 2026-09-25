@@ -1734,8 +1734,14 @@ pub(crate) async fn vendor_records_reusing(
             // the calm `package_not_installed` skip; a gem the ledger already
             // holds is the already-vendored fresh-clone case the backend's
             // hot path confirms without a stub gemspec; a gem that resolves
-            // from nowhere keeps the calm skip.
+            // from nowhere keeps the calm skip. Refusing first also means a
+            // refusal the backend would have reached earlier on the fetched
+            // copy (an uneditable Gemfile declaration, say) now reports as
+            // `gem_spec_missing` instead; either way the package fails.
+            // A dry run never refused: the backend's verify-only preview
+            // runs on the fetched copy, so it keeps the eager fetch.
             if !service_enabled
+                && !common.dry_run
                 && missing
                     .iter()
                     .zip(&rungs)
@@ -1839,14 +1845,11 @@ pub(crate) async fn vendor_records_reusing(
                     }
                     MissingRung::GemBuildRefused => {
                         fetch_failed.insert(purl.clone());
+                        // The backend's own refusal text, word for word.
                         let detail = format!(
-                            "{} is not installed, and a local build cannot vendor a fetched \
-                             gem: the bundler path source needs the stub gemspec rubygems \
-                             writes into specifications/ when the gem is installed, which a \
-                             downloaded .gem does not carry. Install the gem (e.g. \
-                             `bundle install`) and re-run, or use --vendor-source=auto to \
-                             vendor it from the patch service.",
-                            normalize_purl(purl)
+                            "no local stub gemspec for {} (a path source cannot be wired \
+                             without one); install the gem or use --vendor-source=service",
+                            strip_purl_qualifiers(purl).trim_start_matches("pkg:gem/")
                         );
                         env.record(
                             PatchEvent::new(PatchAction::Failed, purl.clone())
