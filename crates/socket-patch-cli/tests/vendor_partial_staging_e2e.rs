@@ -1,20 +1,26 @@
-//! One unstageable patch must not abort a whole vendored run.
+//! Two rules about a patch view that does not serve every file's bytes.
 //!
-//! The patch view serves `blobContent` only for files the patch actually
-//! CHANGES: a file whose `beforeHash` equals its `afterHash` comes back with
-//! hashes and no content (live example: `pkg:npm/tar-fs@2.1.1`, patch
+//! The view serves `blobContent` only for files the patch actually CHANGES:
+//! a file whose `beforeHash` equals its `afterHash` comes back with hashes
+//! and no content (live example: `pkg:npm/tar-fs@2.1.1`, patch
 //! `8ff3e0c7-6855-4224-924b-3e1151744ed4`, seven zero-delta fixture files
-//! plus one changed `package/index.js`). The in-memory vendor stager treats
-//! any such view as a failed fetch, and a single failed fetch made the WHOLE
-//! run bail `no_local_source` — exit 1, `status: error`, zero events, and
-//! every OTHER package in the manifest left unvendored without a word.
+//! plus one changed `package/index.js`).
+//!
+//! 1. A zero-delta file needs NO content — the pristine copy already holds
+//!    the patched bytes — so such a view stages and the package vendors
+//!    (`a_view_whose_only_contentless_files_are_zero_delta_vendors`).
+//! 2. A file the patch CHANGES that is served without content is genuinely
+//!    unsatisfiable. That is a broken PACKAGE, not a broken run: it gets
+//!    its own `failed` event and the rest of the run carries on. A single
+//!    such patch used to make the WHOLE run bail `no_local_source` — exit
+//!    1, `status: error`, zero events, and every OTHER package in the
+//!    manifest left unvendored without a word.
 //!
 //! A package whose patch content cannot be obtained is an unsatisfiable
 //! package like any other (`vendor_fetch_failed`, `redirect_revert_failed`,
-//! the Bun refusals …): it gets its own `failed` event and the run carries
-//! on. The pre-event `no_local_source` bail stays for the case it was
-//! written for — NOTHING in the manifest can be staged, so there are no
-//! events to report.
+//! the Bun refusals …). The pre-event `no_local_source` bail stays for the
+//! case it was written for — NOTHING in the manifest can be staged, so
+//! there are no events to report.
 //!
 //! Hermetic: the API is a `wiremock` mock, `--vendor-source build` keeps the
 //! vendoring service out of the run, and every package is installed on disk
@@ -37,8 +43,9 @@ const GOOD_UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
 const GOOD_ORIG: &[u8] = b"module.exports = () => 'orig';\n";
 const GOOD_PATCHED: &[u8] = b"module.exports = () => 'patched';\n";
 
-/// The JS-7 package: one changed file plus one zero-delta file the view
-/// serves with no `blobContent`.
+/// The JS-7 package shape: one changed file plus one zero-delta file the
+/// view always serves with no `blobContent`. Whether the CHANGED file is
+/// served with content is what each test varies.
 const BAD_PURL: &str = "pkg:npm/tar-fs@2.1.1";
 const BAD_UUID: &str = "8ff3e0c7-6855-4224-924b-3e1151744ed4";
 const BAD_ORIG: &[u8] = b"module.exports = require('./lib');\n";
@@ -160,11 +167,20 @@ fn fixture(root: &Path) {
     .unwrap();
 }
 
-/// The JS-7 view: the changed file carries `blobContent`, the zero-delta
-/// file carries hashes only.
-async fn mount_contentless_view(server: &MockServer) {
+/// Mount the bad package's view. `changed_content` is the `blobContent`
+/// the CHANGED file is served with; `None` makes the view genuinely
+/// unsatisfiable (the patch needs those bytes and nothing can supply
+/// them). The zero-delta file always comes back with hashes and no
+/// content — that is how the API serves a file a patch does not change.
+async fn mount_view(server: &MockServer, changed_content: Option<&[u8]>) {
     use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(BAD_PATCHED);
+    let mut changed = json!({
+        "beforeHash": git_hash(BAD_ORIG),
+        "afterHash": git_hash(BAD_PATCHED),
+    });
+    if let Some(bytes) = changed_content {
+        changed["blobContent"] = json!(base64::engine::general_purpose::STANDARD.encode(bytes));
+    }
     Mock::given(method("GET"))
         .and(wm_path(format!("/v0/orgs/{ORG}/patches/view/{BAD_UUID}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -172,11 +188,7 @@ async fn mount_contentless_view(server: &MockServer) {
             "purl": BAD_PURL,
             "publishedAt": "2026-01-01T00:00:00Z",
             "files": {
-                "package/index.js": {
-                    "beforeHash": git_hash(BAD_ORIG),
-                    "afterHash": git_hash(BAD_PATCHED),
-                    "blobContent": b64,
-                },
+                "package/index.js": changed,
                 "package/test/fixtures/d/file1": {
                     "beforeHash": git_hash(BAD_FIXTURE),
                     "afterHash": git_hash(BAD_FIXTURE),
@@ -189,6 +201,37 @@ async fn mount_contentless_view(server: &MockServer) {
         })))
         .mount(server)
         .await;
+}
+
+/// A view the run genuinely cannot satisfy: the file the patch CHANGES is
+/// served with no `blobContent`, so the patched bytes exist nowhere.
+async fn mount_contentless_view(server: &MockServer) {
+    mount_view(server, None).await;
+}
+
+/// The live JS-7 view: the changed file carries `blobContent`, and only
+/// the zero-delta file comes back contentless — which needs no content.
+async fn mount_zero_delta_view(server: &MockServer) {
+    mount_view(server, Some(BAD_PATCHED)).await;
+}
+
+/// The `path -> bytes` map of a gzipped tarball's regular members.
+fn tgz_members(tgz: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let file = std::fs::File::open(tgz).unwrap_or_else(|e| panic!("open {}: {e}", tgz.display()));
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let mut out = std::collections::BTreeMap::new();
+    for entry in archive.entries().expect("tar entries") {
+        let mut entry = entry.expect("tar entry");
+        let path = entry
+            .path()
+            .expect("tar path")
+            .to_string_lossy()
+            .into_owned();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).expect("tar member bytes");
+        out.insert(path, bytes);
+    }
+    out
 }
 
 /// `vendor --json --vendor-source build` against the mock API, with every
@@ -314,5 +357,50 @@ async fn every_patch_unstageable_keeps_the_run_level_error() {
     assert!(
         !root.join(".socket/vendor").exists(),
         "an aborted run vendors nothing: {env:#}"
+    );
+}
+
+/// The JS-7 package itself must VENDOR, not merely fail politely.
+///
+/// `pkg:npm/tar-fs@2.1.1` patch `8ff3e0c7-…` changes one file and carries
+/// seven zero-delta fixture files (`beforeHash == afterHash`). The view
+/// serves `blobContent` only for the file it CHANGES, so those seven come
+/// back contentless — and a zero-delta file needs no content: the pristine
+/// copy already holds the patched bytes, which is exactly what
+/// `verify_file_patch` answers `AlreadyPatched` for. Requiring the
+/// after-blob for every file made this patch permanently unvendorable.
+#[tokio::test]
+async fn a_view_whose_only_contentless_files_are_zero_delta_vendors() {
+    let server = MockServer::start().await;
+    mount_zero_delta_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fixture(root);
+
+    let (code, env, stderr) = vendor_cli(root, &server.uri());
+
+    assert_eq!(
+        code, 0,
+        "nothing in this patch needs the unserved bytes: {env:#}\nstderr:\n{stderr}"
+    );
+    assert_eq!(env["status"], "success", "{env:#}");
+    assert_eq!(event_for(&env, BAD_PURL)["action"], "applied", "{env:#}");
+    assert_eq!(event_for(&env, GOOD_PURL)["action"], "applied", "{env:#}");
+
+    // The vendored tarball carries BOTH files — the changed one at its
+    // patched bytes, the zero-delta one at the bytes it always had.
+    let tgz = root.join(format!(".socket/vendor/npm/{BAD_UUID}/tar-fs-2.1.1.tgz"));
+    let members = tgz_members(&tgz);
+    assert_eq!(
+        members.get("package/index.js").map(Vec::as_slice),
+        Some(BAD_PATCHED),
+        "the changed file is the patched content: {members:?}"
+    );
+    assert_eq!(
+        members
+            .get("package/test/fixtures/d/file1")
+            .map(Vec::as_slice),
+        Some(BAD_FIXTURE),
+        "the zero-delta file is vendored from the pristine copy: {members:?}"
     );
 }

@@ -16,7 +16,7 @@ use socket_patch_core::api::blob_fetcher::{
     DownloadMode, FetchMissingBlobsResult,
 };
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
-use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::manifest::schema::{PatchFileInfo, PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{is_valid_blob_hash, PatchSources};
 use tempfile::TempDir;
 
@@ -473,6 +473,18 @@ pub(crate) enum MemStageOutcome {
     Unavailable,
 }
 
+/// Does vendoring this file need the patch's after-BLOB?
+///
+/// No, when the patch does not change it (`beforeHash == afterHash`): the
+/// pristine copy already carries the patched bytes, and the apply pipeline
+/// answers `AlreadyPatched` for it without writing anything. The patch view
+/// says the same thing by serving such a file with hashes and no
+/// `blobContent`, so treating it as a failed fetch made any patch with a
+/// zero-delta file permanently unvendorable.
+fn needs_blob(file: &PatchFileInfo) -> bool {
+    file.before_hash != file.after_hash
+}
+
 /// Stage patch sources for a VENDOR run without writing anything:
 /// a record is locally satisfied when all its after-blobs are on disk or
 /// a package archive is (a diff archive is NOT sufficient — vendor's
@@ -530,12 +542,22 @@ pub(crate) async fn stage_vendor_sources_in_memory(
     // produce. On-disk diffs still serve Strategy 2 for clean files; the
     // after-blob content must additionally exist (disk, seed/harvest, or
     // fetch).
+    //
+    // …for the files the patch CHANGES. A ZERO-DELTA file
+    // (`beforeHash == afterHash`) is already at its patched content in the
+    // pristine copy — `verify_file_patch` answers `AlreadyPatched` as soon
+    // as the on-disk hash equals `afterHash` — so it needs no blob, which
+    // is exactly why the view serves it with hashes and no `blobContent`.
+    // Demanding it made such a patch permanently unvendorable (JS-7:
+    // `pkg:npm/tar-fs@2.1.1`, seven zero-delta fixture files). This
+    // predicate is the AUTHORITY the fetch loop below agrees with, so the
+    // two can never disagree about which files a fetch must bring back.
     let covered = |record: &PatchRecord, mem: &HashMap<String, Vec<u8>>| {
-        record
-            .files
-            .values()
-            .all(|f| !missing_blobs.contains(&f.after_hash) || mem.contains_key(&f.after_hash))
-            || !missing_package_archives.contains(&record.uuid)
+        record.files.values().all(|f| {
+            !needs_blob(f)
+                || !missing_blobs.contains(&f.after_hash)
+                || mem.contains_key(&f.after_hash)
+        }) || !missing_package_archives.contains(&record.uuid)
     };
     let mut to_fetch: Vec<(&str, &str)> = manifest
         .patches
@@ -598,19 +620,35 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                     to_fetch.len()
                 ));
             }
+            // The record is what `covered` above judged, so it is also what
+            // decides which of this view's files actually need bytes.
+            let record = manifest.patches.get(*purl);
             match client.fetch_patch(uuid).await {
                 Ok(Some(patch)) => {
                     let mut complete = true;
+                    // Named so the per-file report is the same on every run:
+                    // `patch.files` is a `HashMap`, so "the first file with
+                    // no content" is otherwise bucket order.
+                    let mut contentless: Vec<&str> = Vec::new();
                     for (file, info) in &patch.files {
-                        let (Some(b64), Some(hash)) = (&info.blob_content, &info.after_hash) else {
-                            // An error, not progress chatter: prints even
-                            // under --silent (same rule as
-                            // report_offline_missing above).
-                            if !common.json {
-                                status.println(format!(
-                                    "  [error] {purl}: no blob content served for {file}"
-                                ));
+                        let Some(b64) = &info.blob_content else {
+                            // A zero-delta file is served without content
+                            // because it needs none (see `covered` above).
+                            // Anything else the patch changes is genuinely
+                            // unsatisfiable — collect them all rather than
+                            // abandoning the view's remaining files in
+                            // `HashMap` order.
+                            if record
+                                .and_then(|r| r.files.get(file))
+                                .is_some_and(|f| !needs_blob(f))
+                            {
+                                continue;
                             }
+                            contentless.push(file);
+                            complete = false;
+                            continue;
+                        };
+                        let Some(hash) = &info.after_hash else {
                             complete = false;
                             break;
                         };
@@ -628,6 +666,16 @@ pub(crate) async fn stage_vendor_sources_in_memory(
                                 complete = false;
                                 break;
                             }
+                        }
+                    }
+                    contentless.sort_unstable();
+                    // An error, not progress chatter: prints even under
+                    // --silent (same rule as report_offline_missing above).
+                    if !common.json {
+                        for file in &contentless {
+                            status.println(format!(
+                                "  [error] {purl}: no blob content served for {file}"
+                            ));
                         }
                     }
                     if !complete {
