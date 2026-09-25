@@ -357,6 +357,41 @@ mod tests {
         );
     }
 
+    /// The blocking twin refuses the same size/stream disagreements as
+    /// [`compute_git_sha256_from_reader`], with the same error kind and the
+    /// same message. Its one caller passes the open handle's fstat size, so
+    /// these fire when a file is truncated or grows between the stat and the
+    /// read — the race the guards exist for — and the digest they refuse to
+    /// return would belong to no real Git object. Asserted against the async
+    /// twin so the two cannot drift.
+    #[tokio::test]
+    async fn test_std_reader_refuses_a_size_that_disagrees_with_the_stream() {
+        let body = b"exactly-this-many-bytes";
+        let len = body.len() as u64;
+        for size in [len + 100, 4, len - 1, 0] {
+            let sync = compute_git_sha256_from_std_reader(size, &body[..])
+                .expect_err("declared size must match the stream");
+            let asynchronous =
+                compute_git_sha256_from_reader(size, tokio::io::BufReader::new(&body[..]))
+                    .await
+                    .expect_err("declared size must match the stream");
+            assert_eq!(sync.kind(), io::ErrorKind::InvalidData, "size {size}");
+            assert_eq!(sync.kind(), asynchronous.kind(), "size {size}");
+            assert_eq!(sync.to_string(), asynchronous.to_string(), "size {size}");
+        }
+
+        // An agreeing size still hashes, across the buffer boundary too.
+        assert_eq!(
+            compute_git_sha256_from_std_reader(len, &body[..]).unwrap(),
+            compute_git_sha256_from_bytes(body)
+        );
+        let long: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+        assert_eq!(
+            compute_git_sha256_from_std_reader(long.len() as u64, &long[..]).unwrap(),
+            compute_git_sha256_from_bytes(&long)
+        );
+    }
+
     /// The error path must trigger on the *first* over-size byte: a stream that
     /// yields exactly `size` bytes and then one more must be rejected, not
     /// accepted on a boundary. Guards the strict `>` (vs `>=`) comparison and
