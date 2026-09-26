@@ -63,6 +63,10 @@ docker-e2e = []
 setup-e2e = []
 
 [dev-dependencies]
+# vendor_crash_safety_e2e / vendor_group_commit_e2e crash the binary through
+# its failpoints; with this, `cargo test --release` (the test-release job)
+# builds them in too. Dev-only: resolver 2 keeps it out of normal builds.
+socket-patch-core = { workspace = true, features = ["failpoints"] }
 sha2 = { workspace = true }
 # docker_e2e_vendor_maven's host oracle recomputes the maven2 .jar.sha1 sidecar.
 sha1 = { workspace = true }

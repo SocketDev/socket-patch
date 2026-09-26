@@ -1,5 +1,5 @@
 //! Crash injection for the crash-safety tests, compiled into debug builds
-//! only.
+//! (and test builds with the `failpoints` feature) only.
 //!
 //! `SOCKET_PATCH_FAILPOINT=<name>[@<n>][,…]` makes the process exit
 //! (status 86, no destructors, no further writes) at the `n`-th time
@@ -7,11 +7,14 @@
 //! effect of a crash at that point: whatever was written before is on disk,
 //! nothing after it is. Release builds compile [`hit`] to nothing, so no
 //! environment variable can make a shipped binary stop half-way; the same
-//! goes for [`switched_off`].
+//! goes for [`switched_off`]. The `failpoints` feature compiles them into an
+//! optimized build as well; only the CLI's dev-dependencies enable it, so
+//! it reaches the optimized test binaries (`cargo test --release`) and
+//! never a `cargo build`/`cargo install` one.
 
 /// A named crash point (see the module docs).
 pub fn hit(name: &str) {
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "failpoints"))]
     {
         use std::collections::HashMap;
         use std::sync::Mutex;
@@ -39,7 +42,7 @@ pub fn hit(name: &str) {
             }
         }
     }
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(any(debug_assertions, feature = "failpoints")))]
     let _ = name;
 }
 
@@ -48,12 +51,12 @@ pub fn hit(name: &str) {
 /// the pre-change code path as their oracle. Always `false` in release
 /// builds.
 pub fn switched_off(name: &str) -> bool {
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "failpoints"))]
     {
         std::env::var("SOCKET_PATCH_SWITCH_OFF")
             .is_ok_and(|spec| spec.split(',').any(|p| p.trim() == name))
     }
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(any(debug_assertions, feature = "failpoints")))]
     {
         let _ = name;
         false

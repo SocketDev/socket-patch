@@ -7,6 +7,15 @@ license.workspace = true
 repository.workspace = true
 readme = "README.md"
 
+[features]
+# Compiles the crash-injection failpoints (`utils::failpoint`) into builds
+# without debug assertions too. Debug builds always have them; this exists
+# so the crash-safety e2e suites also run against the optimized binary the
+# `test-release` CI job builds — the CLI enables it from its
+# [dev-dependencies] only, so a `cargo build --release` / `cargo install`
+# binary never carries it.
+failpoints = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
