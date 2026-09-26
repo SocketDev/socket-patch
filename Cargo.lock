@@ -1701,6 +1701,7 @@ dependencies = [
 name = "socket-patch-core"
 version = "4.0.0"
 dependencies = [
+ "aho-corasick",
  "base64",
  "flate2",
  "fs2",
