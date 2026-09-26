@@ -21,15 +21,6 @@ use super::StaleInstallOutcome;
 pub(super) const REINSTALL_REQUIRED: &str = "redirect_vlt_reinstall_required";
 const ARTIFACT_UNVERIFIABLE: &str = "redirect_vlt_artifact_unverifiable";
 
-/// The lock-level warnings that say vlt may discard the redirect (§3.9 (c);
-/// `redirect_vlt_sibling_lockfiles` says nothing about vlt's reading of the
-/// lock).
-const DISCARDING_LOCK_WARNINGS: [&str; 3] = [
-    "redirect_vlt_lockfile_version_missing",
-    "redirect_vlt_old_lockfile_ignored",
-    "redirect_vlt_scalar_registry_ignored",
-];
-
 /// Whether vlt's install state exists: the hidden lock as a regular file,
 /// or the store as a real directory. Stat only; the hidden lock can be
 /// megabytes and is never read into the rewriter's input.
@@ -477,7 +468,7 @@ pub(super) async fn heal_after_rewrite(
     let lock_discards = inputs
         .rewrite_warning_codes
         .iter()
-        .any(|code| DISCARDING_LOCK_WARNINGS.contains(code));
+        .any(|code| vlt::DISCARDING_LOCK_CODES.contains(code));
     for (purl, uuid) in inputs.confirmed {
         if !inputs.confirmed_vlt.contains(uuid) {
             continue;

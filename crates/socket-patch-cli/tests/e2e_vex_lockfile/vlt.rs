@@ -19,7 +19,9 @@
 //!     `(redirected)` from the patch API's record;
 //!   - a tampered or pristine store copy is omitted (`hash_mismatch` /
 //!     `not_applied`) even though the importer copy is patched;
-//!   - not installed attests from the lock's sha512 pin;
+//!   - not installed attests from the lock's sha512 pin, except in the
+//!     version-less lock vlt ≥ rc.15 re-resolves (`package_not_found`,
+//!     `patched_ref_unattributable`);
 //!   - a record naming another package, or another patch, is omitted
 //!     (`record_mismatch`);
 //!   - `--offline` is omitted (`record_unavailable`) with zero requests;
@@ -172,8 +174,22 @@ fn hosted_every_vlt_era_manifestless_evidence_cells() {
 
         std::fs::remove_dir_all(root.join("node_modules")).unwrap();
         let out = run_vex(&bin, root, &online(&api));
-        assert_eq!(out.code, Some(0), "[{tag}] not installed: {out}");
-        assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
+        if *era == Era::A0 {
+            // vlt ≥ rc.15 re-resolves a version-less lock, so its pin is no
+            // evidence of what installs (as in-run `--vex` withholds it).
+            assert_eq!(out.code, Some(1), "[{tag}] not installed: {out}");
+            assert_not_attested(&out.envelope, PURL, "package_not_found");
+            assert_absent(out.doc.as_ref(), PURL);
+            assert!(
+                out.envelope
+                    .to_string()
+                    .contains("patched_ref_unattributable"),
+                "[{tag}] the withheld pin is diagnosed: {out}"
+            );
+        } else {
+            assert_eq!(out.code, Some(0), "[{tag}] not installed: {out}");
+            assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
+        }
         install(root, id, PATCHED);
 
         for (what, uuid, purl) in [

@@ -27,9 +27,11 @@ pub(crate) struct VltLockNode {
     pub(crate) location: Option<String>,
 }
 
-/// A readable `vlt-lock.json`: its `options` and every node whose id splits.
+/// A readable `vlt-lock.json`: its `lockfileVersion` (`None` when absent),
+/// its `options` and every node whose id splits.
 #[derive(Debug, Clone)]
 pub(crate) struct VltLock {
+    pub(crate) version: Option<u64>,
     pub(crate) options: Option<Map<String, Value>>,
     pub(crate) nodes: Vec<VltLockNode>,
 }
@@ -80,6 +82,7 @@ pub(crate) fn vlt_lock_model(text: &str) -> Result<VltLock, String> {
         })
         .unwrap_or_default();
     Ok(VltLock {
+        version: lock.version,
         options: lock.options().cloned(),
         nodes,
     })

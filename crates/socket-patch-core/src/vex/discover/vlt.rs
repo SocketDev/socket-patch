@@ -51,6 +51,18 @@
 //! Every other registry instance is evidence against another lock's wiring
 //! of the same package ([`Discovery::resolved_elsewhere`]).
 //!
+//! ## Locks a vlt release discards
+//!
+//! A lock with no `lockfileVersion`, a pre-v1 lock with `··` or
+//! scalar-registry URL ids and no vlt.json `modifiers`, or a lock with a
+//! scalar `registry` (outside a v1 lock that also has `registries.npm`) is
+//! re-resolved by some vlt releases, which then install the registry bytes
+//! (the hosted rewriter's [`DISCARDING_LOCK_CODES`], which in-run VEX
+//! withholds too). Its hosted refs keep no lock pin, so only an installed
+//! tree attests them, and one [`DIAG_REF_UNATTRIBUTABLE`] names them.
+//!
+//! [`DISCARDING_LOCK_CODES`]: crate::patch::redirect::vlt::DISCARDING_LOCK_CODES
+//!
 //! ## Parsing
 //!
 //! A BOM-prefixed (never stripped), unparseable, non-object or
@@ -61,7 +73,7 @@
 //!
 //! Non-goals: nested `*/vlt-lock.json` (a separate project, DESIGN D3), the
 //! hidden `node_modules/.vlt-lock.json` (install state, not wiring) and
-//! `vlt.json` (registry definitions only).
+//! `vlt.json` as wiring (it is read only for its `modifiers`, above).
 
 use std::collections::BTreeSet;
 
@@ -69,8 +81,9 @@ use super::{
     npm_purl, vendor_ref, DiscoverCtx, Discovery, PatchedRef, DIAG_LOCKFILE_UNPARSEABLE,
     DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
-use crate::constants::npm_family::VLT_LOCK;
+use crate::constants::npm_family::{VLT_CONFIG, VLT_LOCK};
 use crate::patch::redirect::hosted_url_names;
+use crate::patch::redirect::vlt::{discarding_lock_codes, discarding_lock_detail};
 use crate::utils::digest::is_sri_pin;
 use crate::utils::purl::percent_decode_purl_component;
 use crate::vendor::lock_inventory::vlt::{vlt_lock_model, VltLockNode};
@@ -92,6 +105,15 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             return;
         }
     };
+    // `vlt.json` is never wiring; read only for its `modifiers`.
+    let vlt_config = ctx.read_text(VLT_CONFIG, out).await;
+    let discards = discarding_lock_codes(
+        lock.version,
+        lock.options.as_ref(),
+        lock.nodes.iter().map(|n| &n.dep_id),
+        vlt_config.as_deref(),
+    );
+    let mut discarded_pins: BTreeSet<&str> = BTreeSet::new();
     let classified: Vec<Classified> = lock.nodes.iter().map(|n| classify(ctx, n)).collect();
     let unattested: BTreeSet<&str> = classified
         .iter()
@@ -130,8 +152,13 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 url,
                 integrity,
             } => {
-                let pin = (!unattested.contains(purl.as_str()) && outside_source.is_none())
-                    .then(|| LockIntegrity::Sri(integrity.clone()));
+                if !discards.is_empty() {
+                    discarded_pins.insert(purl.as_str());
+                }
+                let pin = (discards.is_empty()
+                    && !unattested.contains(purl.as_str())
+                    && outside_source.is_none())
+                .then(|| LockIntegrity::Sri(integrity.clone()));
                 out.push(PatchedRef::hosted(
                     purl.clone(),
                     uuid.clone(),
@@ -180,6 +207,24 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             }
             Classified::Other => {}
         }
+    }
+    if !discarded_pins.is_empty() {
+        let why: Vec<&str> = discards
+            .iter()
+            .copied()
+            .map(discarding_lock_detail)
+            .collect();
+        out.diag(
+            DIAG_REF_UNATTRIBUTABLE,
+            VLT_LOCK,
+            format!(
+                "{VLT_LOCK}: a vlt release may discard its hosted pins of {} ({}), so they are \
+                 not attested from the lock alone, only from an installed tree whose every copy \
+                 verifies",
+                discarded_pins.into_iter().collect::<Vec<_>>().join(", "),
+                why.join("; ")
+            ),
+        );
     }
 }
 
@@ -401,7 +446,6 @@ mod tests {
             (Some(1), "~npm~left-pad@1.3.0"),
             (Some(1), "~npm~left-pad@1.3.0~peer.0df72515a50372ba"),
             (Some(0), "·npm·left-pad@1.3.0"),
-            (None, "··left-pad@1.3.0"),
             (Some(1), "~acme~left-pad@1.3.0"),
         ] {
             let out = discover(&lock(
@@ -419,6 +463,116 @@ mod tests {
             assert!(r.integrity_required && r.lockfile_basis_ok(), "{id}");
             assert_eq!(r.url.as_deref(), Some(hosted.as_str()));
             assert!(out.diagnostics.is_empty(), "{id}: {:?}", out.diagnostics);
+        }
+    }
+
+    fn lock_with_options(version: &str, options: &str, nodes: &[String]) -> String {
+        format!(
+            "{{\n{version}  \"options\": {options},\n  \"nodes\": {{\n    {}\n  }},\n  \
+             \"edges\": {{}}\n}}\n",
+            nodes.join(",\n    ")
+        )
+    }
+
+    /// A lock some vlt release discards (the hosted rewriter's
+    /// `redirect_vlt_lockfile_version_missing`, `_old_lockfile_ignored` and
+    /// `_scalar_registry_ignored`) keeps its hosted refs without the lock
+    /// pin, as in-run VEX withholds them, and says why once.
+    #[tokio::test]
+    async fn hosted_pins_of_a_lock_vlt_may_discard_are_withheld() {
+        let hosted = url(UUID_A, "left-pad-1.3.0.tgz");
+        let pinned = |id: &str| node(id, "left-pad", Some(SRI), Some(&hosted));
+        let scalar = r#"{"registry":"https://registry.npmjs.org/"}"#;
+        for (text, vlt_json, why) in [
+            (
+                lock(None, &[pinned("··left-pad@1.3.0")]),
+                None,
+                "no lockfileVersion",
+            ),
+            (
+                lock(Some(0), &[pinned("··left-pad@1.3.0")]),
+                None,
+                "0.0.0-16 … 0.0.0-24",
+            ),
+            (
+                lock(Some(0), &[pinned("··left-pad@1.3.0")]),
+                Some("{}"),
+                "0.0.0-16 … 0.0.0-24",
+            ),
+            (
+                lock_with_options(
+                    "  \"lockfileVersion\": 1,\n",
+                    scalar,
+                    &[pinned("~https_c++registry.npmjs.org+~left-pad@1.3.0")],
+                ),
+                None,
+                "rc.7 … rc.29",
+            ),
+            (
+                lock_with_options(
+                    "  \"lockfileVersion\": 0,\n",
+                    r#"{"registry":"https://registry.npmjs.org/","registries":{"npm":"https://registry.npmjs.org/"}}"#,
+                    &[pinned("·npm·left-pad@1.3.0")],
+                ),
+                None,
+                "rc.7 … rc.29",
+            ),
+        ] {
+            let p = Project::new();
+            p.write("vlt-lock.json", &text);
+            if let Some(config) = vlt_json {
+                p.write("vlt.json", config);
+            }
+            let out = p.run(|c, o| Box::pin(super::extract(c, o))).await;
+            assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+            let r = &out.refs[0];
+            assert_eq!(r.locked_integrity, None, "{text}");
+            assert!(r.integrity_required && !r.lockfile_basis_ok(), "{text}");
+            assert_eq!(out.diagnostics.len(), 1, "{text}: {:?}", out.diagnostics);
+            let d = &out.diagnostics[0];
+            assert_eq!(d.code, DIAG_REF_UNATTRIBUTABLE, "{text}");
+            assert!(
+                d.detail.contains(PURL) && d.detail.contains(why),
+                "{text}: {}",
+                d.detail
+            );
+        }
+    }
+
+    /// The same locks with what makes vlt read them keep the pin: a v0
+    /// `··` lock whose vlt.json declares `modifiers`, and a v1 lock whose
+    /// scalar `registry` sits beside `registries.npm`.
+    #[tokio::test]
+    async fn hosted_pins_of_a_lock_vlt_reads_are_kept() {
+        let hosted = url(UUID_A, "left-pad-1.3.0.tgz");
+        let pinned = |id: &str| node(id, "left-pad", Some(SRI), Some(&hosted));
+        for (text, vlt_json) in [
+            (
+                lock(Some(0), &[pinned("··left-pad@1.3.0")]),
+                Some(r#"{"modifiers":{}}"#),
+            ),
+            (
+                lock_with_options(
+                    "  \"lockfileVersion\": 1,\n",
+                    r#"{"registry":"https://registry.npmjs.org/","registries":{"npm":"https://registry.npmjs.org/"}}"#,
+                    &[pinned("~npm~left-pad@1.3.0")],
+                ),
+                None,
+            ),
+        ] {
+            let p = Project::new();
+            p.write("vlt-lock.json", &text);
+            if let Some(config) = vlt_json {
+                p.write("vlt.json", config);
+            }
+            let out = p.run(|c, o| Box::pin(super::extract(c, o))).await;
+            assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+            assert_eq!(
+                out.refs[0].locked_integrity,
+                Some(LockIntegrity::Sri(SRI.into())),
+                "{text}"
+            );
+            assert!(out.diagnostics.is_empty(), "{text}: {:?}", out.diagnostics);
         }
     }
 

@@ -19,7 +19,7 @@ use crate::constants::npm_family::{
 use crate::vendor::vlt_lock_text::{
     entry_text, installs_outside_registry, is_default_registry, is_registry_url_segment,
     nodes_block, parse_node_entry_text, parse_node_line, parse_vendored_path, render_entry_line,
-    render_tuple_with_slots, sniff_lock, split_dep_id, split_lines, DepIdKind, LockSniff,
+    render_tuple_with_slots, sniff_lock, split_dep_id, split_lines, DepId, DepIdKind, LockSniff,
     NodeEntry, ParsedLock, SectionSpan,
 };
 
@@ -163,20 +163,33 @@ pub(super) fn has_vendored_instance(lock: &HostedLock, dep: &DepOverride) -> boo
         .is_some_and(|nodes| has_vendored_node(nodes, &full_name(dep), &dep.version))
 }
 
-fn is_old_lockfile_ignored(lock: &HostedLock, files: &BTreeMap<String, String>) -> bool {
-    if lock.parsed.version == Some(1) {
+/// The lock-level warnings that say vlt may discard the lock's pins
+/// (§3.9 (c)): neither in-run nor standalone VEX attests a hosted pin of such
+/// a lock from the lock alone.
+pub const DISCARDING_LOCK_CODES: [&str; 3] = [
+    VERSION_MISSING,
+    OLD_LOCKFILE_IGNORED,
+    SCALAR_REGISTRY_IGNORED,
+];
+
+const VERSION_MISSING: &str = "redirect_vlt_lockfile_version_missing";
+const OLD_LOCKFILE_IGNORED: &str = "redirect_vlt_old_lockfile_ignored";
+const SCALAR_REGISTRY_IGNORED: &str = "redirect_vlt_scalar_registry_ignored";
+
+fn is_old_lockfile_ignored<'a>(
+    version: Option<u64>,
+    options: Option<&Map<String, Value>>,
+    mut ids: impl Iterator<Item = &'a DepId>,
+    vlt_config: Option<&str>,
+) -> bool {
+    if version == Some(1) {
         return false;
     }
-    let options = lock.parsed.options();
-    let has_legacy_default = lock.parsed.nodes().is_some_and(|nodes| {
-        nodes.keys().any(|id| {
-            split_dep_id(id).is_some_and(|dep_id| {
-                dep_id.kind == DepIdKind::Registry
-                    && (dep_id.first.is_empty() || is_registry_url_segment(&dep_id.first, options))
-            })
-        })
+    let has_legacy_default = ids.any(|dep_id| {
+        dep_id.kind == DepIdKind::Registry
+            && (dep_id.first.is_empty() || is_registry_url_segment(&dep_id.first, options))
     });
-    let declares_modifiers = files.get(VLT_CONFIG).is_some_and(|text| {
+    let declares_modifiers = vlt_config.is_some_and(|text| {
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         serde_json::from_str::<Value>(text)
             .ok()
@@ -186,8 +199,7 @@ fn is_old_lockfile_ignored(lock: &HostedLock, files: &BTreeMap<String, String>) 
     has_legacy_default && !declares_modifiers
 }
 
-fn is_scalar_registry_ignored(lock: &HostedLock) -> bool {
-    let options = lock.parsed.options();
+fn is_scalar_registry_ignored(version: Option<u64>, options: Option<&Map<String, Value>>) -> bool {
     let scalar = options
         .and_then(|o| o.get("registry"))
         .is_some_and(Value::is_string);
@@ -195,7 +207,47 @@ fn is_scalar_registry_ignored(lock: &HostedLock) -> bool {
         .and_then(|o| o.get("registries"))
         .and_then(|r| r.get("npm"))
         .is_some_and(Value::is_string);
-    scalar && (lock.parsed.version != Some(1) || !registries_npm)
+    scalar && (version != Some(1) || !registries_npm)
+}
+
+/// Which of [`DISCARDING_LOCK_CODES`] hold, in that order, for a lock of
+/// `version` and `options` whose node ids are `ids`, given `vlt.json`'s
+/// text.
+pub(crate) fn discarding_lock_codes<'a>(
+    version: Option<u64>,
+    options: Option<&Map<String, Value>>,
+    ids: impl Iterator<Item = &'a DepId>,
+    vlt_config: Option<&str>,
+) -> Vec<&'static str> {
+    let mut codes = Vec::new();
+    if version.is_none() {
+        codes.push(VERSION_MISSING);
+    }
+    if is_old_lockfile_ignored(version, options, ids, vlt_config) {
+        codes.push(OLD_LOCKFILE_IGNORED);
+    }
+    if is_scalar_registry_ignored(version, options) {
+        codes.push(SCALAR_REGISTRY_IGNORED);
+    }
+    codes
+}
+
+/// Why vlt may discard the lock, for one of [`DISCARDING_LOCK_CODES`].
+pub(crate) fn discarding_lock_detail(code: &str) -> &'static str {
+    match code {
+        VERSION_MISSING => {
+            "vlt-lock.json has no lockfileVersion; vlt ≥ 1.0.0-rc.15 silently re-resolves it on \
+             `vlt install` (and `vlt ci` fails); re-lock with a current vlt"
+        }
+        OLD_LOCKFILE_IGNORED => {
+            "vlt 0.0.0-16 … 0.0.0-24 ignore vlt-lock.json unless vlt.json declares \
+             \"modifiers\": {}; upgrade vlt or add \"modifiers\": {} to vlt.json"
+        }
+        _ => {
+            "vlt 1.0.0-rc.7 … rc.29 ignore vlt-lock.json when a scalar `registry` is configured; \
+             upgrade vlt to ≥ 1.0.0-rc.30"
+        }
+    }
 }
 
 fn lock_level_warnings(
@@ -203,32 +255,23 @@ fn lock_level_warnings(
     files: &BTreeMap<String, String>,
     bun_lockb_present: bool,
 ) -> Vec<RewriteWarning> {
-    let mut warnings = Vec::new();
-    if lock.parsed.version.is_none() {
-        warnings.push(RewriteWarning {
-            code: "redirect_vlt_lockfile_version_missing".into(),
-            detail: "vlt-lock.json has no lockfileVersion; vlt ≥ 1.0.0-rc.15 silently \
-                     re-resolves it on `vlt install` (and `vlt ci` fails); re-lock with a \
-                     current vlt"
-                .into(),
-        });
-    }
-    if is_old_lockfile_ignored(lock, files) {
-        warnings.push(RewriteWarning {
-            code: "redirect_vlt_old_lockfile_ignored".into(),
-            detail: "vlt 0.0.0-16 … 0.0.0-24 ignore vlt-lock.json unless vlt.json declares \
-                     \"modifiers\": {}; upgrade vlt or add \"modifiers\": {} to vlt.json"
-                .into(),
-        });
-    }
-    if is_scalar_registry_ignored(lock) {
-        warnings.push(RewriteWarning {
-            code: "redirect_vlt_scalar_registry_ignored".into(),
-            detail: "vlt 1.0.0-rc.7 … rc.29 ignore vlt-lock.json when a scalar `registry` is \
-                     configured; upgrade vlt to ≥ 1.0.0-rc.30"
-                .into(),
-        });
-    }
+    let ids: Vec<DepId> = lock
+        .parsed
+        .nodes()
+        .map(|nodes| nodes.keys().filter_map(|id| split_dep_id(id)).collect())
+        .unwrap_or_default();
+    let mut warnings: Vec<RewriteWarning> = discarding_lock_codes(
+        lock.parsed.version,
+        lock.parsed.options(),
+        ids.iter(),
+        files.get(VLT_CONFIG).map(String::as_str),
+    )
+    .into_iter()
+    .map(|code| RewriteWarning {
+        code: code.into(),
+        detail: discarding_lock_detail(code).into(),
+    })
+    .collect();
     if !vlt_drives(files, bun_lockb_present) {
         let others = sibling_locks(files, bun_lockb_present);
         warnings.push(RewriteWarning {

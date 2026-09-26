@@ -391,11 +391,14 @@ into the new version's section — see docs/releasing.md.
   of its installed copies (pnpm and vlt peer, modifier and registry-alias
   instances), and a same-version instance on another registry (or a
   Socket-shaped one that does not verify) keeps a vlt hosted pin from
-  attesting before install. A vendored vlt directory verified without its
-  vendor ledger checks a devDependencies-stripped `package.json` against
-  the patched blob in `.socket/blobs`, and is omitted as
-  `vendor_manifest_unverifiable` when that blob is absent. `setup.manual`
-  accepts `vlt`.
+  attesting before install, as does a lock some vlt release discards (no
+  `lockfileVersion`, a pre-v1 legacy-id lock without vlt.json `modifiers`,
+  or a scalar `registry` outside a v1 lock with `registries.npm`), which
+  also warns `patched_ref_unattributable`. A vendored vlt directory
+  verified without its vendor ledger checks a devDependencies-stripped
+  `package.json` against the patched blob in `.socket/blobs`, and is
+  omitted as `vendor_manifest_unverifiable` when that blob is absent.
+  `setup.manual` accepts `vlt`.
 - **`setup` wires vlt projects.** A `vlt-lock.json`, `vlt.json`,
   `node_modules/.vlt-lock.json` or `node_modules/.vlt/` directory in the
   project root makes `setup` treat it as vlt, ahead of any pnpm marker. The
