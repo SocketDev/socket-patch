@@ -153,7 +153,7 @@ mod tests {
             seed
         };
         let alphabet = ['a', 'b', '/', '\\', '%'];
-        let mut word = |max: u64, next: &mut dyn FnMut() -> u64| -> String {
+        let word = |max: u64, next: &mut dyn FnMut() -> u64| -> String {
             let len = next() % (max + 1);
             (0..len)
                 .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
