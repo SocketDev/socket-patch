@@ -8,7 +8,11 @@
 # <version>/cases/<case>/ holds case.json and, unless refused, expected/.
 # A lock ci rewrites is recorded in case.json `ciChurn` (pairs of the line
 # surgery wrote and the line vlt wrote); the expected lock is then taken
-# after a second `ci`, which must leave it unchanged.
+# after a second `ci`, which must leave it unchanged. Every expected lock
+# must also survive `vlt install --frozen-lockfile` byte for byte (warm,
+# then from a clean node_modules), and `vlt install escape-html@1.0.3`
+# must keep every entry of it unchanged, except the values of the vendored
+# node's own edges (rc.14 rewrites their peer specs on every reify).
 #
 # usage: VLT_BIN_DIR=<dir holding <version>/node_modules/vlt/vlt.js> ./regenerate.sh
 set -euo pipefail
@@ -19,7 +23,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 UUID=11111111-2222-4333-8444-555555555555
-VERSIONS=${VERSIONS:-"1.2.0 1.0.10 1.0.0-rc.14"}
+VERSIONS=${VERSIONS:-"1.2.0 1.0.10 1.0.4 1.0.0-rc.32 1.0.0-rc.14"}
 
 vlt() {
   local version=$1 xdg=$2
@@ -44,6 +48,12 @@ write_project() {
       json '{"name":"root","version":"1.0.0","dependencies":{"left-pad":"1.3.0","ms":"2.1.3","supports-color":"7.2.0","@isaacs/string-locale-compare":"1.1.0","semver":"7.6.0","react":"18.2.0","use-sync-external-store":"1.2.0"},"devDependencies":{"is-number":"7.0.0"},"optionalDependencies":{"escape-string-regexp":"4.0.0"}}' >"$dir/package.json"
       json '{"name":"a","version":"1.0.0","dependencies":{"left-pad":"1.3.0","debug":"4.3.4"}}' >"$dir/packages/a/package.json"
       ;;
+    peer-member)
+      mkdir -p "$dir/packages/a"
+      json "{${cfg:+$cfg,}\"workspaces\":\"packages/*\"}" >"$dir/vlt.json"
+      json '{"name":"root","version":"1.0.0"}' >"$dir/package.json"
+      json '{"name":"a","version":"1.0.0","dependencies":{"use-sync-external-store":"1.2.0","react":"18.2.0"}}' >"$dir/packages/a/package.json"
+      ;;
     alias)
       json "{${cfg}}" >"$dir/vlt.json"
       json '{"name":"root","version":"1.0.0","dependencies":{"lp":"npm:left-pad@1.3.0","react":"18.2.0","usx":"npm:use-sync-external-store@1.2.0"}}' >"$dir/package.json"
@@ -60,6 +70,7 @@ dev-edge:workspace:is-number@7.0.0
 optional-edge:workspace:escape-string-regexp@4.0.0
 member-only:workspace:debug@4.3.4
 peer:workspace:use-sync-external-store@1.2.0
+peer-member:peer-member:use-sync-external-store@1.2.0
 transitive:workspace:has-flag@4.0.0
 alias:alias:left-pad@1.3.0
 alias-selfref-peer:alias:use-sync-external-store@1.2.0"
@@ -72,7 +83,7 @@ copy_inputs() {
 }
 
 for version in $VERSIONS; do
-  for project in workspace alias; do
+  for project in workspace peer-member alias; do
     base=$WORK/$version/$project
     write_project "$project" "$version" "$base"
     (cd "$base" && vlt "$version" "$WORK/xdg-$version" install >"$WORK/$version-$project-install.log" 2>&1)
@@ -137,5 +148,25 @@ for version in $VERSIONS; do
     json "{\"project\":\"$project\",\"purl\":\"pkg:npm/$target\",\"uuid\":\"$UUID\",\"refusal\":null,\"ciChurn\":$churn}" >"$out/case.json"
     copy_inputs "$run" "$out/expected"
     rm -f "$out/expected/vlt.json"
+    cp "$run/vlt-lock.json" "$WORK/expected.json"
+    (cd "$run" && vlt "$version" "$WORK/xdg-$version" install --frozen-lockfile >"$WORK/$version-$case-frozen.log" 2>&1)
+    cmp -s "$WORK/expected.json" "$run/vlt-lock.json" || { echo "$version $case: install --frozen-lockfile changed the lock" >&2; exit 1; }
+    (cd "$run" && rm -rf node_modules packages/a/node_modules && vlt "$version" "$WORK/xdg-$version" install --frozen-lockfile >"$WORK/$version-$case-frozen-cold.log" 2>&1)
+    cmp -s "$WORK/expected.json" "$run/vlt-lock.json" || { echo "$version $case: a cold install --frozen-lockfile changed the lock" >&2; exit 1; }
+    (cd "$run" && vlt "$version" "$WORK/xdg-$version" install escape-html@1.0.3 >"$WORK/$version-$case-new.log" 2>&1)
+    node -e '
+      const fs = require("fs");
+      const entries = f => new Map(fs.readFileSync(f, "utf8").split("\n")
+        .filter(l => l.startsWith("    \"")).map(l => l.replace(/,?\r?$/, ""))
+        .map(l => [JSON.parse(l.slice(4, l.indexOf("\": ") + 1)), l]));
+      const after = entries(process.argv[2]);
+      const own = process.argv[3] + " ";
+      const lost = [...entries(process.argv[1])].filter(([k, l]) =>
+        after.get(k) !== l && !(k.startsWith(own) && after.has(k)));
+      if (lost.length || !fs.readFileSync(process.argv[2], "utf8").includes("escape-html")) {
+        console.error(JSON.stringify(lost)); process.exit(1);
+      }
+    ' "$WORK/expected.json" "$run/vlt-lock.json" "$(node -e 'process.stdout.write(JSON.parse(process.argv[1]).fileId)' "$verdict")" || { echo "$version $case: vlt install <new> dropped the wiring" >&2; exit 1; }
+    echo "$version $case: frozen-lockfile byte-stable, install <new> keeps the wiring"
   done
 done

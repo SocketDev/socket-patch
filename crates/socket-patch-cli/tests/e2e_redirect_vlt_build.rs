@@ -1452,8 +1452,8 @@ async fn vlt_pinned_matrix_hosted_then_vendored_optional_takeover() {
         assert_eq!(
             detail,
             format!(
-                "vendored 1 hosted-pinned packages, but node_modules still holds 1 copies of \
-                 the hosted artifacts of optional dependencies; {OPTIONAL_KEPT}"
+                "vendored 1 hosted-pinned packages, but node_modules still holds 1 installed \
+                 copies of the vendored optional dependencies; {OPTIONAL_KEPT}"
             ),
             "{kind}"
         );

@@ -376,11 +376,11 @@ fn rollback_detail(tally: &HealTally, restored: usize) -> Option<String> {
 }
 
 fn takeover_detail(tally: &HealTally, vendored: usize) -> Option<String> {
-    let held = "copies of the hosted artifacts of optional dependencies";
+    let held = "installed copies of the vendored optional dependencies";
     let detail = if tally.stale_left > 0 {
         format!(
-            "vendored {vendored} hosted-pinned packages, but node_modules still holds {} copies \
-             of the hosted artifacts; run `vlt install` (or re-run without \
+            "vendored {vendored} hosted-pinned packages, but node_modules still holds {} \
+             installed copies of the vendored packages; run `vlt install` (or re-run without \
              --no-vlt-install-cleanup)",
             tally.stale_left
         )
@@ -614,7 +614,7 @@ mod tests {
         let also = |held: &str| format!("node_modules also still holds 2 {held}; {OPTIONAL_KEPT}");
         let unpatched = also("unpatched copies of optional dependencies");
         let patched = also("patched copies of optional dependencies");
-        let hosted = also("copies of the hosted artifacts of optional dependencies");
+        let hosted = also("installed copies of the vendored optional dependencies");
 
         assert_eq!(
             reinstall_detail(&optional(0, 0, 0)),
@@ -672,8 +672,8 @@ mod tests {
         assert_eq!(
             takeover_detail(&optional(0, 0, 0), 1).unwrap(),
             format!(
-                "vendored 1 hosted-pinned packages, but node_modules still holds 2 copies of the \
-                 hosted artifacts of optional dependencies; {OPTIONAL_KEPT}"
+                "vendored 1 hosted-pinned packages, but node_modules still holds 2 installed \
+                 copies of the vendored optional dependencies; {OPTIONAL_KEPT}"
             )
         );
         assert_eq!(
@@ -686,8 +686,8 @@ mod tests {
         assert_eq!(
             takeover_detail(&optional(0, 1, 0), 2).unwrap(),
             format!(
-                "vendored 2 hosted-pinned packages, but node_modules still holds 1 copies of the \
-                 hosted artifacts; run `vlt install` (or re-run without \
+                "vendored 2 hosted-pinned packages, but node_modules still holds 1 installed \
+                 copies of the vendored packages; run `vlt install` (or re-run without \
                  --no-vlt-install-cleanup). {hosted}"
             )
         );

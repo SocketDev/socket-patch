@@ -323,11 +323,17 @@ into the new version's section — see docs/releasing.md.
   own ignores while `.gitattributes` keeps EOL conversion off it. The
   lock's node becomes a `file` node, its importer edges and the importers'
   `package.json` specs move to the `file:` path, and every moved entry is
-  placed where vlt's own serializer puts it, so `vlt ci` keeps the lock
-  byte-identical (checked against vlt 1.2.0, 1.0.10 and 1.0.0-rc.14).
-  Transitive targets (`vendor_vlt_transitive_unsupported`), peer or
-  modifier variants, foreign registries, peer edges and dependencies
-  declared in several fields refuse before any write, as do locks vlt
+  placed where vlt's own serializer puts it, so `vlt ci`, warm and cold
+  `vlt install --frozen-lockfile` keep the lock byte-identical and `vlt
+  install <new>` keeps the wiring (checked against vlt 1.2.0, 1.0.10,
+  1.0.4, 1.0.0-rc.32 and 1.0.0-rc.14). A node whose only extra is one
+  peer context (a root dependency with resolved peers from vlt 1.0.8, a
+  workspace member's from rc.15) is vendored without the extra, as vlt
+  writes `file:` dependencies. Transitive targets
+  (`vendor_vlt_transitive_unsupported`), several instances of one
+  `name@version`, modifier variants, foreign registries, peer edges and
+  dependencies declared in several fields refuse before any write, as do
+  locks vlt
   cannot read and specs that no longer match the lock
   (`vendor_vlt_lock_out_of_sync`); a payload git would ignore refuses with
   `vendor_artifact_gitignored`, and a package already vendored through
@@ -335,7 +341,13 @@ into the new version's section — see docs/releasing.md.
   restores the registry node, edges and specs (keeping flags, trailing
   slots and outgoing edge values vlt rewrote since) or keeps everything on
   drift. Lock inventory reads `vlt-lock.json` too, Socket-hosted pins
-  included.
+  included. Era-A locks (`··` ids, or URL-segment ids equal to a scalar
+  `registry`) warn `vendor_vlt_legacy_lockfile`. A vendored optional
+  dependency gets the new `vendor_vlt_reinstall_required` advisory: from
+  vlt 0.0.0-30 a plain `vlt install` keeps its installed upstream copy,
+  so it says to run `vlt ci` (or delete `node_modules` and run `vlt
+  install`); it also names any dependency whose `node_modules` link still
+  resolves to vlt's store.
 - **Vendored vlt through every command.** `vendor`, `scan --mode vendored`
   and `get --mode vendored` run the complete vlt vendored preflight (lock
   version and layout, transitive, peer or foreign-registry targets,
@@ -348,7 +360,9 @@ into the new version's section — see docs/releasing.md.
   artifact is staged inventory-verified when nothing is installed (a fresh
   clone), and vlt's own link to it is never taken as a pristine source.
   After a hosted → vendored takeover the store copies vlt installed from
-  the hosted pin are removed (`redirect_vlt_reinstall_required`). `repair`
+  the hosted pin are removed (`redirect_vlt_reinstall_required`), except
+  optional ones, which the advisory reports as installed copies of the
+  vendored optional dependencies. `repair`
   finds vlt references in `vlt-lock.json` and workspace `package.json`
   files, rebuilds vlt directories against the inventory that leaves out
   vlt's `node_modules/` links, restores a missing `<uuid>/.gitignore` or

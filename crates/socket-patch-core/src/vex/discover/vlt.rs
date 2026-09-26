@@ -435,7 +435,7 @@ mod tests {
     async fn every_vendored_capture_wires_its_case_purl() {
         let root = fixture_path("vendor/npm/vlt");
         let mut checked = 0;
-        for version in ["1.2.0", "1.0.10", "1.0.0-rc.14"] {
+        for version in ["1.2.0", "1.0.10", "1.0.4", "1.0.0-rc.32", "1.0.0-rc.14"] {
             let cases = root.join(version).join("cases");
             for case in std::fs::read_dir(&cases).unwrap() {
                 let dir = case.unwrap().path();

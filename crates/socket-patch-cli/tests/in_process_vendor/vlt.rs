@@ -179,10 +179,161 @@ fn vendor_vlt_refuses_transitive() {
     run_capture_case("1.2.0", "transitive");
 }
 
+/// A node whose only extra is one peer context (the root from vlt 1.0.8, a
+/// workspace member from rc.15) is vendored without the extra, exactly as
+/// real vlt keeps it through `vlt ci`, and reverts to the extra-bearing
+/// DepID.
 #[test]
-fn vendor_vlt_refuses_peer_variants() {
-    run_capture_case("1.2.0", "peer");
-    run_capture_case("1.0.10", "alias-selfref-peer");
+fn vendor_vlt_single_peer_context_drops_extra() {
+    for (vlt, case) in [
+        ("1.2.0", "peer"),
+        ("1.2.0", "peer-member"),
+        ("1.0.10", "alias-selfref-peer"),
+        ("1.0.4", "peer-member"),
+        ("1.0.0-rc.32", "peer-member"),
+    ] {
+        let lock = std::fs::read_to_string(
+            fixtures()
+                .join(vlt)
+                .join("projects")
+                .join(
+                    &cases(vlt)
+                        .into_iter()
+                        .find(|c| c.name == case)
+                        .unwrap()
+                        .project,
+                )
+                .join(VLT_LOCK),
+        )
+        .unwrap();
+        assert!(
+            lock.contains("use-sync-external-store@1.2.0~peer."),
+            "{vlt}/{case}: the capture carries a peer extra"
+        );
+        run_capture_case(vlt, case);
+    }
+}
+
+/// Several instances of one name@version, or a modifier extra, stay
+/// refused before any write.
+#[test]
+fn vendor_vlt_refuses_peer_and_modifier_variants() {
+    let two = Lock::v1(
+        &[
+            &reg_node("~npm~left-pad@1.3.0~peer.1"),
+            &reg_node("~npm~left-pad@1.3.0~peer.2"),
+        ],
+        &[
+            "\"file~_d left-pad\": \"prod 1.3.0 ~npm~left-pad@1.3.0~peer.1\"",
+            "\"workspace~packages+a left-pad\": \"prod 1.3.0 ~npm~left-pad@1.3.0~peer.2\"",
+        ],
+    );
+    let detail = refused_with(&two.render(), ROOT_PKG, "vendor_lock_entry_unsupported");
+    assert!(
+        detail.contains("2 instances") && detail.contains("peer/modifier variants"),
+        "{detail}"
+    );
+    let modifier = "~npm~left-pad@1.3.0~_croot_s_g_s#left-pad";
+    let lock = Lock::v1(
+        &[&reg_node(modifier)],
+        &[&format!("\"file~_d left-pad\": \"prod 1.3.0 {modifier}\"")],
+    );
+    let detail = refused_with(&lock.render(), ROOT_PKG, "vendor_lock_entry_unsupported");
+    assert!(
+        detail.contains(&format!("a modifier variant instance ({modifier})")),
+        "{detail}"
+    );
+}
+
+/// `vendor_vlt_reinstall_required`: a rewired optional dependency always
+/// gets the `vlt ci` advisory; an in-sync rerun gets it again only while
+/// node_modules still links the installed upstream copy.
+#[test]
+fn vendor_vlt_optional_edge_asks_for_vlt_ci() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let lock = Lock::v1(
+        &[&reg_node("~npm~left-pad@1.3.0")],
+        &["\"file~_d left-pad\": \"optional 1.3.0 ~npm~left-pad@1.3.0\""],
+    );
+    let pkg = ROOT_PKG.replace("\"dependencies\"", "\"optionalDependencies\"");
+    project(root, &lock, &pkg, "~npm~left-pad@1.3.0");
+    let store = store_dir(root, "~npm~left-pad@1.3.0", NAME);
+    link_dir(&store, &root.join("node_modules").join(NAME));
+    let advisory = |env: &Value| -> Vec<String> {
+        events(env)
+            .iter()
+            .filter(|e| e["errorCode"] == "vendor_vlt_reinstall_required")
+            .map(|e| e.to_string())
+            .collect()
+    };
+    let (code, env, stderr) = vendor(root, &[]);
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    let got = advisory(&env);
+    assert_eq!(got.len(), 1, "{env:#}");
+    assert!(
+        got[0].contains("left-pad@1.3.0 is an optional dependency")
+            && got[0].contains("run `vlt ci` (or delete node_modules and run `vlt install`)")
+            && got[0].contains("before 1.0.5"),
+        "{}",
+        got[0]
+    );
+    let (code, env, _) = vendor(root, &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        codes(&env).contains(&"already_vendored".to_string()),
+        "{env:#}"
+    );
+    assert_eq!(
+        advisory(&env).len(),
+        1,
+        "the upstream copy is still linked: {env:#}"
+    );
+    unlink_dir(&root.join("node_modules").join(NAME));
+    link_dir(
+        &root.join(rel_dir(UUID, NAME, VERSION)),
+        &root.join("node_modules").join(NAME),
+    );
+    let (code, env, _) = vendor(root, &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        advisory(&env).is_empty(),
+        "linked to the vendored copy: {env:#}"
+    );
+}
+
+/// A prod dependency whose link still resolves into vlt's store gets the
+/// reinstall advisory; one without a stale link gets none.
+#[test]
+fn vendor_vlt_stale_prod_link_asks_for_a_reinstall() {
+    let tmp = tempfile::tempdir().unwrap();
+    direct_project(tmp.path());
+    let (code, env, _) = vendor(tmp.path(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert!(
+        !codes(&env).contains(&"vendor_vlt_reinstall_required".to_string()),
+        "{env:#}"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    direct_project(root);
+    let store = store_dir(root, "~npm~left-pad@1.3.0", NAME);
+    link_dir(&store, &root.join("node_modules").join(NAME));
+    let (code, env, stderr) = vendor(root, &[]);
+    assert_eq!(code, 0, "{env:#}\n{stderr}");
+    let detail = events(&env)
+        .into_iter()
+        .find(|e| e["errorCode"] == "vendor_vlt_reinstall_required")
+        .unwrap_or_else(|| panic!("{env:#}"))
+        .to_string();
+    assert!(
+        detail.contains(
+            "node_modules/left-pad still links left-pad@1.3.0 to its installed upstream copy; \
+             run `vlt install` (or `vlt ci`) to link the vendored copy"
+        ),
+        "{detail}"
+    );
 }
 
 // ── synthetic shapes ─────────────────────────────────────────────────────
@@ -723,6 +874,20 @@ fn vendor_vlt_revendor_new_uuid() {
 
 /// vlt's post-install layout: `node_modules/<name>` links the committed
 /// dir of `uuid`, and the store copy is gone.
+fn link_dir(target: &Path, link: &Path) {
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(target, link).unwrap();
+}
+
+fn unlink_dir(link: &Path) {
+    std::fs::remove_file(link)
+        .or_else(|_| std::fs::remove_dir(link))
+        .unwrap();
+}
+
 fn link_vendored_dir(root: &Path, uuid: &str) {
     std::fs::remove_dir_all(root.join("node_modules")).unwrap();
     std::fs::create_dir_all(root.join("node_modules")).unwrap();

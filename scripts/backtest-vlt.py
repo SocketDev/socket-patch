@@ -492,7 +492,10 @@ def to_crlf(data):
 
 def skipped_dir(parts):
     """node_modules is never committed, except the vendored payload's own
-    `<leaf>/node_modules/<name>` dir under .socket/vendor/."""
+    `<leaf>/node_modules/<name>` dir under .socket/vendor/; neither is a
+    `.VLT.DELETE.<n>.<name>` dir vlt rc.14 deletes in the background."""
+    if any(part.startswith('.VLT.DELETE.') for part in parts):
+        return True
     if 'node_modules' not in parts:
         return False
     if parts[:2] != ('.socket', 'vendor'):

@@ -398,7 +398,7 @@ struct Case {
 
 fn cases() -> Vec<Case> {
     let mut out = Vec::new();
-    for version in ["1.2.0", "1.0.10", "1.0.0-rc.14"] {
+    for version in ["1.2.0", "1.0.10", "1.0.4", "1.0.0-rc.32", "1.0.0-rc.14"] {
         let root = vendor_root().join(version);
         let mut names: Vec<String> = fs::read_dir(root.join("cases"))
             .unwrap()
@@ -612,7 +612,7 @@ fn expect_done(outcome: VendorOutcome, label: &str) -> VendorEntry {
 #[test]
 fn every_vendored_case_is_a_regenerated_fixture() {
     let all = cases();
-    assert_eq!(all.len(), 33, "11 cases on each of 3 vlt versions");
+    assert_eq!(all.len(), 60, "12 cases on each of 5 vlt versions");
     for case in &all {
         assert_eq!(
             case.refusal.is_none(),

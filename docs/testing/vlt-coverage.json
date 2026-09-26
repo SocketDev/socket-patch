@@ -88,7 +88,14 @@
     "vendor_vlt_legacy_lockfile": [
       "vendor_vlt_legacy_lockfile_warning",
       "the_legacy_era_warns_and_wires_with_its_own_grammar",
-      "vlt_pinned_matrix_vendored_legacy_lockfile_warning"
+      "vlt_pinned_matrix_vendored_legacy_lockfile_warning",
+      "a_scalar_registry_era_a_lock_warns_like_an_empty_segment_one"
+    ],
+    "vendor_vlt_reinstall_required": [
+      "an_optional_or_stale_linked_edge_asks_for_vlt_ci",
+      "vendor_vlt_optional_edge_asks_for_vlt_ci",
+      "vendor_vlt_stale_prod_link_asks_for_a_reinstall",
+      "vlt_pinned_matrix_vendored_optional_warm_reinstall"
     ],
     "vendor_flavor_changed": [
       "vendor_vlt_refuses_flavor_changed",
@@ -144,6 +151,15 @@
       "vlt_hosted_then_vendored_takeover_keeps_an_optional_hosted_copy",
       "vlt_failed_vendor_after_the_takeover_revert_still_heals_the_store",
       "vlt_pinned_matrix_hosted_then_vendored_optional_takeover"
+    ],
+    "vendor_vlt_reinstall_required: optional dependency rewired or still linked upstream": [
+      "an_optional_or_stale_linked_edge_asks_for_vlt_ci",
+      "vendor_vlt_optional_edge_asks_for_vlt_ci",
+      "vlt_pinned_matrix_vendored_optional_warm_reinstall"
+    ],
+    "vendor_vlt_reinstall_required: a non-optional dependency still linked upstream": [
+      "an_optional_or_stale_linked_edge_asks_for_vlt_ci",
+      "vendor_vlt_stale_prod_link_asks_for_a_reinstall"
     ],
     "redirect_vlt_artifact_unverifiable: content-encoding": [
       "scan_redirect_vlt_artifact_content_encoding_refused"

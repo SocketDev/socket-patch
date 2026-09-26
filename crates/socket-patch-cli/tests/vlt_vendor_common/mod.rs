@@ -38,7 +38,7 @@ pub const REG_URL: &str = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.
 pub const VLT_LOCK: &str = "vlt-lock.json";
 
 /// The real-vlt versions whose captures are committed.
-pub const CAPTURED: &[&str] = &["1.2.0", "1.0.10", "1.0.0-rc.14"];
+pub const CAPTURED: &[&str] = &["1.2.0", "1.0.10", "1.0.4", "1.0.0-rc.32", "1.0.0-rc.14"];
 
 pub fn git_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();

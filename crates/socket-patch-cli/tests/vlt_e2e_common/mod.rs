@@ -179,6 +179,10 @@ pub const LOCKFILE_VERSION_CHECKED_FROM: VltVersion = VltVersion::rc(15);
 /// `vlt ci` installs optional dependencies from the lock of an
 /// optional-only project.
 pub const OPTIONAL_ONLY_CI_FROM: VltVersion = VltVersion::release(1, 0, 5);
+/// A plain `vlt install` keeps the installed upstream copy of an optional
+/// dependency whose spec moved to a vendored `file:` dir (only `vlt ci`
+/// links the vendored copy).
+pub const VENDORED_OPTIONAL_INSTALL_KEPT_FROM: VltVersion = VltVersion::zero(30);
 /// `vlt install --force` exists.
 pub const INSTALL_FORCE_FROM: VltVersion = VltVersion::rc(28);
 /// `registries.npm` is required by install commands.
@@ -782,9 +786,9 @@ pub fn write_shims(bin: &Path, js: &Path, log: &Path) {
     write_shims_for(bin, js, log, &socket_bin());
 }
 
-/// [`write_shims`] with the `npx` shim running `socket`. cmd.exe's `%*`
-/// ignores `shift`, so the `.cmd` shim rebuilds the argument list after
-/// the package token itself.
+/// [`write_shims`] with the `npx` shim running `socket`. The `.cmd` shim
+/// forwards the raw `%*` text after the package token (and its `@version`):
+/// `%1` … split on `,`, `;` and `=`, and `%*` ignores `shift`.
 pub fn write_shims_for(bin: &Path, js: &Path, log: &Path, socket: &Path) {
     std::fs::create_dir_all(bin).unwrap();
     let sh_npx = format!(
@@ -797,7 +801,7 @@ pub fn write_shims_for(bin: &Path, js: &Path, log: &Path, socket: &Path) {
         js.display()
     );
     let cmd_npx = format!(
-        "@echo off\r\nsetlocal\r\nset SP_ARGS=\r\n:loop\r\nif \"%~1\"==\"\" goto run\r\nset SP_PKG=%~1\r\nshift\r\nif \"%SP_PKG:~0,28%\"==\"@socketsecurity/socket-patch\" goto collect\r\ngoto loop\r\n:collect\r\nif \"%~1\"==\"\" goto run\r\nset SP_ARGS=%SP_ARGS% %1\r\nshift\r\ngoto collect\r\n:run\r\n>>\"{log}\" echo npx%SP_ARGS%\r\n\"{socket}\"%SP_ARGS%\r\n",
+        "@echo off\r\nsetlocal\r\nset \"SP_ALL=%*\"\r\nset SP_ARGS=\r\nif not defined SP_ALL goto run\r\nset \"SP_REST=%SP_ALL:*@socketsecurity/socket-patch=%\"\r\nif \"%SP_REST%\"==\"%SP_ALL%\" goto run\r\nset \"SP_ARGS=%SP_REST%\"\r\nif not defined SP_ARGS goto run\r\nif not \"%SP_ARGS:~0,1%\"==\"@\" goto run\r\nset SP_ARGS=\r\nfor /f \"tokens=1,*\" %%a in (\"%SP_REST%\") do if not \"%%b\"==\"\" set \"SP_ARGS= %%b\"\r\n:run\r\n>>\"{log}\" echo npx%SP_ARGS%\r\n\"{socket}\"%SP_ARGS%\r\n",
         log = log.display(),
         socket = socket.display()
     );
@@ -1253,8 +1257,13 @@ pub fn git_sha256(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+/// A dir vlt (rc.14) renames an old tree to and deletes in the background.
+pub fn is_vlt_delete_staging(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().starts_with(".VLT.DELETE.")
+}
+
 /// Every regular file under `dir` (relative, forward-slashed), skipping
-/// `node_modules` and following no links.
+/// `node_modules`, vlt's `.VLT.DELETE.*` staging dirs and links.
 pub fn package_files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
         let mut entries: Vec<_> = std::fs::read_dir(dir)
@@ -1266,7 +1275,7 @@ pub fn package_files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
             let ty = e.file_type().unwrap();
             let p = e.path();
             if ty.is_dir() {
-                if e.file_name() == "node_modules" {
+                if e.file_name() == "node_modules" || is_vlt_delete_staging(&e.file_name()) {
                     continue;
                 }
                 walk(base, &p, out);
@@ -2098,7 +2107,7 @@ pub fn fresh_checkout(proj: &Path, dest: &Path) -> PathBuf {
         };
         for e in rd.flatten() {
             let name = e.file_name();
-            if name.to_string_lossy().starts_with(".VLT.DELETE") {
+            if is_vlt_delete_staging(&name) {
                 continue;
             }
             let Ok(ty) = e.file_type() else {
@@ -2178,7 +2187,10 @@ fn snap_walk(label: &str, base: &Path, dir: &Path, out: &mut BTreeMap<String, St
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut entries: Vec<_> = rd.map(|e| e.unwrap()).collect();
+    let mut entries: Vec<_> = rd
+        .map(|e| e.unwrap())
+        .filter(|e| !is_vlt_delete_staging(&e.file_name()))
+        .collect();
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let p = e.path();
@@ -2224,7 +2236,7 @@ impl Snapshot {
             for e in rd {
                 let e = e.unwrap();
                 let name = e.file_name().to_string_lossy().into_owned();
-                if exclude.contains(&name) || name.starts_with(".VLT.DELETE") {
+                if exclude.contains(&name) || name.starts_with(".VLT.DELETE.") {
                     continue;
                 }
                 let mut one = BTreeMap::new();

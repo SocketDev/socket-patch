@@ -1,0 +1,17 @@
+{
+  "lockfileVersion": 1,
+  "options": {},
+  "nodes": {
+    "~npm~js-tokens@4.0.0": [0,"js-tokens","sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ=="],
+    "~npm~loose-envify@1.4.0": [0,"loose-envify","sha512-lyuxPGr/Wfhrlem2CL/UcnUc1zcqKAImBDzukY7Y5F/yQiNdko6+fRLevlw1HgMySw7f611UIY408EtxRSoK3Q==",null,null,null,null,null,{  "loose-envify": "cli.js"}],
+    "~npm~react@18.2.0": [0,"react","sha512-/3IjMdb2L9QbBdWiW5e3P2/npwMBaU9mHCSCUzNln0ZCYbcfTsGbTJrU/kGemdH2IWmB2ioZ+zkxtmq6g09fGQ=="],
+    "~npm~use-sync-external-store@1.2.0~peer.1": [0,"use-sync-external-store","sha512-eEgnFxGQ1Ife9bzYs6VLi8/4X6CObHMw9Qr9tPY43iKwsPw8xE8+EFsf/2cFZ5S3esXgpWgtSCtLNS41F+sKPA=="]
+  },
+  "edges": {
+    "workspace~packages+a react": "prod 18.2.0 ~npm~react@18.2.0",
+    "workspace~packages+a use-sync-external-store": "prod 1.2.0 ~npm~use-sync-external-store@1.2.0~peer.1",
+    "~npm~loose-envify@1.4.0 js-tokens": "prod ^3.0.0 || ^4.0.0 ~npm~js-tokens@4.0.0",
+    "~npm~react@18.2.0 loose-envify": "prod ^1.1.0 ~npm~loose-envify@1.4.0",
+    "~npm~use-sync-external-store@1.2.0~peer.1 react": "peer ^16.8.0 || ^17.0.0 || ^18.0.0 ~npm~react@18.2.0"
+  }
+}

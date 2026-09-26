@@ -12,7 +12,8 @@ MAP = ROOT / "docs" / "testing" / "vlt-coverage.json"
 CONTRACT = ROOT / "crates" / "socket-patch-cli" / "CLI_CONTRACT.md"
 GOLDENS = ROOT / "crates" / "socket-patch-core" / "tests" / "fixtures" / "redirect"
 
-# DESIGN §2.3, the complete list of codes vlt support adds.
+# DESIGN §2.3, the complete list of codes vlt support adds (plus
+# vendor_vlt_reinstall_required, added after the design).
 CODES = [
     "redirect_vlt_lock_unsupported", "redirect_vlt_missing_sha512", "redirect_vlt_entry_not_found",
     "redirect_vlt_entry_vendored", "redirect_vlt_unsupported_lock_key",
@@ -20,8 +21,8 @@ CODES = [
     "redirect_vlt_scalar_registry_ignored", "redirect_vlt_lockfile_version_missing",
     "redirect_vlt_sibling_lockfiles", "redirect_vlt_no_lockfile", "redirect_vlt_artifact_unverifiable",
     "redirect_vlt_reinstall_required", "vendor_vlt_transitive_unsupported",
-    "vendor_vlt_lock_out_of_sync", "vendor_vlt_legacy_lockfile", "vendor_flavor_changed",
-    "vendor_artifact_gitignored", "vlt_root_scripts_not_run",
+    "vendor_vlt_lock_out_of_sync", "vendor_vlt_legacy_lockfile", "vendor_vlt_reinstall_required",
+    "vendor_flavor_changed", "vendor_artifact_gitignored", "vlt_root_scripts_not_run",
 ]
 MODE_COMMANDS = [
     "hosted/scan", "hosted/get", "hosted/rollback", "hosted/remove", "hosted/vex",

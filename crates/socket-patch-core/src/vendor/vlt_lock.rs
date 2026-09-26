@@ -2,7 +2,9 @@
 //! for a direct dependency (DESIGN §4.5).
 //!
 //! The target's default-registry node becomes a `file` node naming the
-//! directory artifact ([`super::npm_dir`]); its importer edges and the
+//! directory artifact ([`super::npm_dir`]), without the peer-context extra
+//! a single-context node may carry (vlt never gives a `file` node one, and
+//! keeps its peer edges); its importer edges and the
 //! importers' package.json specs move to `file:<path relative to the
 //! importer>`, and its own outgoing edges are re-keyed to the new DepID.
 //! Every other line of the lock stays byte-identical, and the moved entries
@@ -19,7 +21,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::constants::npm_family::VLT_LOCK;
+use crate::constants::npm_family::{VLT_LOCK, VLT_STORE_DIR};
 use crate::constants::SOCKET_DIR;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
@@ -35,11 +37,11 @@ use super::state::{
     WiringRecord,
 };
 use super::vlt_lock_text::{
-    edges_block, entry_text, file_dep_id, is_default_registry, is_importer_dep_id, nodes_block,
-    parse_edge_entry_text, parse_edge_line, parse_node_entry_text, parse_node_line,
-    parse_vendored_dir_path, render_entry_line, render_tuple_with_slots, sniff_lock, split_dep_id,
-    split_lines, vendored_dir_rel, vlt_collate, vlt_edge_cmp, DepIdEra, DepIdKind, LockSniff,
-    ParsedLock, SectionSpan,
+    edges_block, entry_text, file_dep_id, is_default_registry, is_importer_dep_id,
+    is_registry_url_segment, nodes_block, parse_edge_entry_text, parse_edge_line,
+    parse_node_entry_text, parse_node_line, parse_vendored_dir_path, render_entry_line,
+    render_tuple_with_slots, sniff_lock, split_dep_id, split_lines, vendored_dir_rel, vlt_collate,
+    vlt_edge_cmp, DepIdEra, DepIdKind, LockSniff, ParsedLock, SectionSpan,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -263,8 +265,31 @@ impl LockDoc {
         self.parsed.options()
     }
 
-    fn legacy_default_keys(&self) -> bool {
-        self.nodes.entries.iter().any(|e| e.key.starts_with("··"))
+    /// An era-A lock (0.0.0-19 … 1.0.0-rc.8): a `··` id, or default-registry
+    /// ids that are URL segments equal to a scalar `options.registry` with
+    /// no `·npm·` id beside them (era B spells the default registry `npm`
+    /// whatever the scalar).
+    fn is_era_a(&self) -> bool {
+        if self.era != DepIdEra::Legacy {
+            return false;
+        }
+        let mut url_segment = false;
+        for e in &self.nodes.entries {
+            if e.key.starts_with("··") {
+                return true;
+            }
+            let Some(dep_id) = split_dep_id(&e.key) else {
+                continue;
+            };
+            if dep_id.kind != DepIdKind::Registry || dep_id.era != DepIdEra::Legacy {
+                continue;
+            }
+            if dep_id.first == "npm" {
+                return false;
+            }
+            url_segment |= is_registry_url_segment(&dep_id.first, self.options());
+        }
+        url_segment
     }
 }
 
@@ -373,6 +398,8 @@ fn importer_dir(from: &str) -> Option<String> {
         .then_some(dep_id.first)
 }
 
+/// The one default-registry instance of `name@version` (plain or with only
+/// a peer-context extra) or our own vendored node, with its importer edges.
 fn find_target(doc: &LockDoc, name: &str, version: &str) -> Result<Target, Refusal> {
     let options = doc.options();
     let mut defaults = Vec::new();
@@ -385,7 +412,8 @@ fn find_target(doc: &LockDoc, name: &str, version: &str) -> Result<Target, Refus
         match dep_id.kind {
             DepIdKind::Registry if dep_id.registry_identity() == Some((name, version)) => {
                 if is_default_registry(&dep_id.first, options) {
-                    defaults.push((i, dep_id.extra.is_some()));
+                    let variant = dep_id.extra.is_some() && !dep_id.has_peer_extra_only();
+                    defaults.push((i, variant));
                 } else {
                     foreign.push(i);
                 }
@@ -437,7 +465,7 @@ fn find_target(doc: &LockDoc, name: &str, version: &str) -> Result<Target, Refus
                 format!(
                     "vlt-lock.json holds {} ({}): peer/modifier variants; use --mode hosted",
                     if ids.len() == 1 {
-                        "a variant instance".to_string()
+                        "a modifier variant instance".to_string()
                     } else {
                         format!("{} instances", ids.len())
                     },
@@ -994,6 +1022,81 @@ async fn prior_vlt_entry(project_root: &Path, purl: &str) -> Option<VendorEntry>
     })
 }
 
+const REINSTALL_REQUIRED: &str = "vendor_vlt_reinstall_required";
+
+/// The importer edges whose `node_modules/<dep>` still resolves into vlt's
+/// store, i.e. to an installed registry copy rather than the vendored dir.
+async fn stale_links<'t>(project_root: &Path, target: &'t Target) -> Vec<&'t ImporterEdge> {
+    let Ok(store) = tokio::fs::canonicalize(project_root.join(VLT_STORE_DIR)).await else {
+        return Vec::new();
+    };
+    let mut stale = Vec::new();
+    for edge in &target.importers {
+        let link = project_root
+            .join(&edge.dir)
+            .join("node_modules")
+            .join(&edge.dep);
+        if tokio::fs::canonicalize(&link)
+            .await
+            .is_ok_and(|real| real.starts_with(&store))
+        {
+            stale.push(edge);
+        }
+    }
+    stale
+}
+
+/// `vendor_vlt_reinstall_required`: from 0.0.0-30 a plain `vlt install`
+/// keeps an installed optional dependency whose spec moved to a `file:`
+/// dir, so every rewired or still-stale optional edge needs `vlt ci`; a
+/// stale link of any other edge needs a reinstall.
+async fn reinstall_advisory(
+    project_root: &Path,
+    name: &str,
+    version: &str,
+    target: &Target,
+    rewired: bool,
+) -> Option<VendorWarning> {
+    let stale = stale_links(project_root, target).await;
+    let optional = target.importers.iter().any(|e| {
+        e.edge_type == "optional" && (rewired || stale.iter().any(|s| s.index == e.index))
+    });
+    if optional {
+        return Some(VendorWarning::new(
+            REINSTALL_REQUIRED,
+            format!(
+                "{name}@{version} is an optional dependency: `vlt install` (vlt 0.0.0-30 and \
+                 later) keeps an installed upstream copy of an optional dependency whose spec \
+                 moved to a vendored `file:` directory, so run `vlt ci` (or delete node_modules \
+                 and run `vlt install`) to link the vendored copy. vlt releases before 1.0.5 \
+                 install no optional dependency from the lock of a project that declares only \
+                 optional dependencies: upgrade vlt to 1.0.5 or later first."
+            ),
+        ));
+    }
+    if stale.is_empty() {
+        return None;
+    }
+    let links: Vec<String> = stale
+        .iter()
+        .map(|e| {
+            if e.dir.is_empty() {
+                format!("node_modules/{}", e.dep)
+            } else {
+                format!("{}/node_modules/{}", e.dir, e.dep)
+            }
+        })
+        .collect();
+    Some(VendorWarning::new(
+        REINSTALL_REQUIRED,
+        format!(
+            "{} still links {name}@{version} to its installed upstream copy; run `vlt install` \
+             (or `vlt ci`) to link the vendored copy",
+            links.join(", ")
+        ),
+    ))
+}
+
 /// Vendor one installed npm package into a vlt project (see the module
 /// doc). Same contract as the other npm backends: refuse-early / wire-last,
 /// `entry` present iff `result.success` and not a dry run, and an in-sync
@@ -1020,11 +1123,12 @@ pub(crate) async fn vendor_vlt(
         Err((code, detail)) => return refused(code, detail),
     };
     let mut warnings = Vec::new();
-    if analysis.doc.legacy_default_keys() {
+    if analysis.doc.is_era_a() {
         warnings.push(VendorWarning::new(
             "vendor_vlt_legacy_lockfile",
-            "vlt-lock.json was written by vlt 0.0.0-19 … 1.0.0-rc.8 (`··` ids); those releases \
-             install the vendored lock but fail if it is deleted and re-created — upgrade vlt",
+            "vlt-lock.json was written by vlt 0.0.0-19 … 1.0.0-rc.8 (`··` or scalar-registry URL \
+             ids); those releases install the vendored lock but fail if it is deleted and \
+             re-created — upgrade vlt",
         ));
     }
     let prior = prior_vlt_entry(project_root, purl).await;
@@ -1032,6 +1136,15 @@ pub(crate) async fn vendor_vlt(
         Ok(wiring) => wiring,
         Err((code, detail)) => return refused(code, detail),
     };
+
+    let reinstall = reinstall_advisory(
+        project_root,
+        name,
+        version,
+        &analysis.target,
+        wiring.is_some(),
+    )
+    .await;
 
     let (staged, result) = match stage_patch_dir(
         purl,
@@ -1049,6 +1162,7 @@ pub(crate) async fn vendor_vlt(
         Ok(pair) => pair,
         Err(outcome) => return *outcome,
     };
+    warnings.extend(reinstall);
     let Some(staged) = staged else {
         return done(result, None, warnings);
     };
@@ -1946,6 +2060,8 @@ mod tests {
     #[tokio::test]
     async fn target_analysis_refusals() {
         let url_node = r#""~npm~left-pad@1.3.0~peer.1": [0,"left-pad","sha512-P=="]"#;
+        let modifier_node =
+            r#""~npm~left-pad@1.3.0~_croot_s_g_s#left-pad": [0,"left-pad","sha512-M=="]"#;
         let cases: Vec<(String, &str, &str, &str)> = vec![
             (
                 render(1, &[r#""~acme~left-pad@1.3.0": [0,"left-pad","sha512-A=="]"#], &[r#""file~_d left-pad": "prod 1.3.0 ~acme~left-pad@1.3.0""#]),
@@ -1960,10 +2076,16 @@ mod tests {
                 "peer/modifier variants; use --mode hosted",
             ),
             (
-                render(1, &[url_node], &[r#""file~_d left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0~peer.1""#]),
+                render(1, &[modifier_node], &[r#""file~_d left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0~_croot_s_g_s#left-pad""#]),
                 ROOT_PKG,
                 UNSUPPORTED,
-                "peer/modifier variants",
+                "a modifier variant instance (~npm~left-pad@1.3.0~_croot_s_g_s#left-pad): peer/modifier variants",
+            ),
+            (
+                render(1, &[REG_NODE.replace("~npm~left-pad@1.3.0", "~npm~left-pad@1.3.0~peer.2").as_str(), url_node], &[r#""file~_d left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0~peer.1""#, r#""workspace~packages+a left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0~peer.2""#]),
+                ROOT_PKG,
+                UNSUPPORTED,
+                "2 instances",
             ),
             (
                 render(1, &[r#""~npm~a@1.0.0": [0,"a"]"#], &[]),
@@ -2022,6 +2144,222 @@ mod tests {
             assert_eq!(read(&fx, VLT_LOCK).await, lock);
             assert!(!fx.root.join(".socket").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn a_single_peer_context_is_vendored_without_its_extra() {
+        let member_pkg =
+            "{\n  \"name\": \"a\",\n  \"dependencies\": {\n    \"left-pad\": \"1.3.0\"\n  }\n}\n";
+        let rows = [
+            (
+                1,
+                "~npm~left-pad@1.3.0~peer.0df72515a50372ba",
+                "file~_d",
+                "~npm~z@1.0.0",
+                "",
+            ),
+            (
+                1,
+                "~npm~left-pad@1.3.0~peer.1",
+                "workspace~packages+a",
+                "~npm~z@1.0.0",
+                "packages/a",
+            ),
+            (
+                0,
+                "·npm·left-pad@1.3.0·%E1%B9%97%3A3",
+                "file·.",
+                "·npm·z@1.0.0",
+                "",
+            ),
+        ];
+        for (version, reg, importer, z, dir) in rows {
+            let lock = render(
+                version,
+                &[
+                    &format!(
+                        r#""{reg}": [0,"left-pad","sha512-REG==","https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"]"#
+                    ),
+                    &format!(r#""{z}": [0,"z","sha512-Z=="]"#),
+                ],
+                &[
+                    &format!(r#""{importer} left-pad": "prod 1.3.0 {reg}""#),
+                    &format!(r#""{reg} z": "peer ^1.0.0 {z}""#),
+                ],
+            );
+            let pkg_rel = if dir.is_empty() {
+                PACKAGE_JSON.to_string()
+            } else {
+                format!("{dir}/{PACKAGE_JSON}")
+            };
+            let pkg = if dir.is_empty() { ROOT_PKG } else { member_pkg };
+            let fx = fx(&lock, &[(pkg_rel.as_str(), pkg)]).await;
+            let (entry, _) = entry_of(run(&fx, UUID, false).await);
+            let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
+            let era = if version == 1 {
+                DepIdEra::Tilde
+            } else {
+                DepIdEra::Legacy
+            };
+            let file_id = file_dep_id(&rel, era);
+            let spec = importer_spec(dir, &rel);
+            assert_eq!(
+                read(&fx, VLT_LOCK).await,
+                render(
+                    version,
+                    &[
+                        &format!(r#""{z}": [0,"z","sha512-Z=="]"#),
+                        &format!(r#""{file_id}": [0,"left-pad",null,"{rel}"]"#),
+                    ],
+                    &[
+                        &format!(r#""{importer} left-pad": "prod {spec} {file_id}""#),
+                        &format!(r#""{file_id} z": "peer ^1.0.0 {z}""#),
+                    ],
+                ),
+                "{reg}"
+            );
+            assert!(read(&fx, &pkg_rel)
+                .await
+                .contains(&format!("\"left-pad\": \"{spec}\"")));
+            assert_eq!(entry.wiring[1].key.as_deref(), Some(reg), "{reg}");
+            let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
+            assert!(out.success && out.warnings.is_empty(), "{reg}: {out:?}");
+            assert_eq!(
+                read(&fx, VLT_LOCK).await,
+                lock,
+                "{reg}: revert restores the extra"
+            );
+            assert_eq!(read(&fx, &pkg_rel).await, pkg, "{reg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scalar_registry_era_a_lock_warns_like_an_empty_segment_one() {
+        let url_id = "·https%3A§§registry.yarnpkg.com§·left-pad@1.3.0";
+        let lock = |registry: &str, extra_node: Option<&str>| {
+            let mut nodes = vec![format!(r#""{url_id}": [0,"left-pad","sha512-REG=="]"#)];
+            nodes.extend(extra_node.map(str::to_string));
+            let nodes: Vec<&str> = nodes.iter().map(String::as_str).collect();
+            render(
+                0,
+                &nodes,
+                &[&format!(r#""file·. left-pad": "prod 1.3.0 {url_id}""#)],
+            )
+            .replace(
+                "\"options\": {}",
+                &format!("\"options\": {{\"registry\": \"{registry}\"}}"),
+            )
+        };
+        let cases = [
+            (lock("https://registry.yarnpkg.com", None), true),
+            (lock("https://registry.yarnpkg.com/", None), true),
+            (lock("https://registry.npmjs.org/", None), false),
+            (
+                lock(
+                    "https://registry.yarnpkg.com/",
+                    Some(r#""·npm·a@1.0.0": [0,"a","sha512-A=="]"#),
+                ),
+                false,
+            ),
+        ];
+        for (lock, warns) in cases {
+            let fx = fx(&lock, &[(PACKAGE_JSON, ROOT_PKG)]).await;
+            let outcome = run(&fx, UUID, false).await;
+            if lock.contains("registry.npmjs.org") {
+                let (code, _) = refusal(outcome);
+                assert_eq!(code, UNSUPPORTED, "{lock}");
+                continue;
+            }
+            let (_, warnings) = entry_of(outcome);
+            assert_eq!(
+                codes(&warnings).contains(&"vendor_vlt_legacy_lockfile"),
+                warns,
+                "{lock}: {warnings:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_optional_or_stale_linked_edge_asks_for_vlt_ci() {
+        let optional_lock = basic_lock().replace(
+            "\"file~_d left-pad\": \"prod 1.3.0",
+            "\"file~_d left-pad\": \"optional 1.3.0",
+        );
+        let optional_pkg = "{\n  \"name\": \"root\",\n  \"dependencies\": {\n    \"a\": \"1.0.0\"\n  },\n  \"optionalDependencies\": {\n    \"left-pad\": \"1.3.0\"\n  }\n}\n";
+        let fx = fx(&optional_lock, &[(PACKAGE_JSON, optional_pkg)]).await;
+        let (entry, warnings) = entry_of(run(&fx, UUID, false).await);
+        let advisory: Vec<&VendorWarning> = warnings
+            .iter()
+            .filter(|w| w.code == REINSTALL_REQUIRED)
+            .collect();
+        assert_eq!(advisory.len(), 1, "{warnings:?}");
+        assert!(
+            advisory[0].detail.starts_with(
+                "left-pad@1.3.0 is an optional dependency: `vlt install` (vlt 0.0.0-30 and later) \
+                 keeps an installed upstream copy"
+            ),
+            "{}",
+            advisory[0].detail
+        );
+        assert!(advisory[0].detail.contains("run `vlt ci`"));
+        persist(&fx, &entry).await;
+        let rerun = run(&fx, UUID, false).await;
+        let VendorOutcome::Done { warnings, .. } = rerun else {
+            panic!("{rerun:?}");
+        };
+        assert!(
+            !codes(&warnings).contains(&REINSTALL_REQUIRED),
+            "{warnings:?}"
+        );
+
+        let store = fx
+            .root
+            .join(VLT_STORE_DIR)
+            .join(REG)
+            .join("node_modules/left-pad");
+        std::fs::create_dir_all(&store).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&store, fx.root.join("node_modules/left-pad")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&store, fx.root.join("node_modules/left-pad")).unwrap();
+        let VendorOutcome::Done { warnings, .. } = run(&fx, UUID, false).await else {
+            panic!("rerun");
+        };
+        assert!(
+            warnings.iter().any(|w| w.code == REINSTALL_REQUIRED
+                && w.detail
+                    .starts_with("left-pad@1.3.0 is an optional dependency")),
+            "an in-sync rerun with the upstream copy still linked: {warnings:?}"
+        );
+
+        let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (_, warnings) = entry_of(run(&fx, UUID, false).await);
+        assert!(
+            !codes(&warnings).contains(&REINSTALL_REQUIRED),
+            "{warnings:?}"
+        );
+        let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let store = fx
+            .root
+            .join(VLT_STORE_DIR)
+            .join(REG)
+            .join("node_modules/left-pad");
+        std::fs::create_dir_all(&store).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&store, fx.root.join("node_modules/left-pad")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&store, fx.root.join("node_modules/left-pad")).unwrap();
+        let (_, warnings) = entry_of(run(&fx, UUID, false).await);
+        let advisory: Vec<&VendorWarning> = warnings
+            .iter()
+            .filter(|w| w.code == REINSTALL_REQUIRED)
+            .collect();
+        assert_eq!(advisory.len(), 1, "{warnings:?}");
+        assert_eq!(
+            advisory[0].detail,
+            "node_modules/left-pad still links left-pad@1.3.0 to its installed upstream copy; run \
+             `vlt install` (or `vlt ci`) to link the vendored copy"
+        );
     }
 
     #[tokio::test]

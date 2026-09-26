@@ -299,7 +299,9 @@ shared store. Hosted mode repoints the patched nodes' integrity and URL, first c
 that each artifact is served the way vlt can verify, and removes stale installed copies
 so the next `vlt install` fetches the patched packages. Vendored mode commits a patched
 package directory for each direct dependency of the root or a workspace member
-(transitive dependencies need hosted mode). vlt is detected ahead of every other
+(transitive dependencies need hosted mode), including one vlt gave a single peer
+context; after vendoring an optional dependency run `vlt ci`, because a plain `vlt
+install` keeps its installed upstream copy. vlt is detected ahead of every other
 npm-family package manager. vlt ledgers require the socket-patch release that adds vlt support.
 See [vlt notes](docs/ecosystems.md#npm-vlt-notes) for the caveats (`vlt update`, optional
 dependencies, registry configuration) and [vlt compatibility](docs/testing/vlt-compatibility.md)

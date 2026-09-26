@@ -1,0 +1,8 @@
+{
+  "config": {
+    "registries": {
+      "npm": "https://registry.npmjs.org/"
+    }
+  },
+  "workspaces": "packages/*"
+}

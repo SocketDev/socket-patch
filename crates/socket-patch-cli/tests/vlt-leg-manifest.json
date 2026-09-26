@@ -52,6 +52,8 @@
         "alias_selfref",
         "peer_root_selfref",
         "peer_member_selfref",
+        "single_peer_context",
+        "optional_warm_reinstall",
         "dep_with_deps",
         "hostile_gitignore",
         "autocrlf_checkout",
@@ -189,6 +191,8 @@
       "alias_selfref",
       "peer_root_selfref",
       "peer_member_selfref",
+      "single_peer_context",
+      "optional_warm_reinstall",
       "dep_with_deps",
       "hostile_gitignore",
       "autocrlf_checkout",
@@ -567,7 +571,7 @@
       "reason": "npm-alias-non-hermetic"
     },
     {
-      "boundary": "era A (`\u00b7\u00b7` ids): `vendor_vlt_legacy_lockfile`",
+      "boundary": "era A (`\u00b7\u00b7` ids, or scalar-registry URL-segment ids with no `\u00b7npm\u00b7` id): `vendor_vlt_legacy_lockfile`",
       "suite": "vendored",
       "legs": [
         "legacy_lockfile_warning"

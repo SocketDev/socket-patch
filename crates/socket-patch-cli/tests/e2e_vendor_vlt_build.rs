@@ -406,18 +406,7 @@ async fn vlt_pinned_matrix_vendored_alias_selfref() {
 const USX: (&str, &str) = ("use-sync-external-store", "1.2.0");
 const REACT: (&str, &str) = ("react", "18.2.0");
 
-/// `use-sync-external-store` beside react 18, a direct dependency of the
-/// root or of workspace member `packages/a`. Where vlt gives the node a
-/// peer extra (members from rc.15, the root from 1.0.8) vendored mode
-/// refuses it today (`vendor_lock_entry_unsupported`, nothing written);
-/// elsewhere it is vendored and `with-selector`'s self-reference
-/// (`require('use-sync-external-store/shim')`) loads the patched copy after
-/// a fresh `vlt ci`.
-async fn peer_selfref(name: &'static str, member: bool) {
-    let Some(leg) = vendored_leg(name) else {
-        return;
-    };
-    let importer = if member { "packages/a" } else { "" };
+fn peer_shape(member: bool) -> Shape {
     let mut shape = Shape {
         deps: vec![USX, REACT],
         pins: vec![
@@ -425,6 +414,7 @@ async fn peer_selfref(name: &'static str, member: bool) {
             REACT,
             ("loose-envify", "1.4.0"),
             ("js-tokens", "4.0.0"),
+            MS,
         ],
         targets: vec![(USX.0, USX.1, UUID_USX, "shim/index.js")],
         warm: true,
@@ -438,47 +428,38 @@ async fn peer_selfref(name: &'static str, member: bool) {
             package_json("a", &[USX, REACT]),
         )];
     }
-    let fx = Fixture::build(leg, shape).await;
-    let t = fx.t().clone();
-    let ids = fx.store_ids(&t);
+    shape
+}
+
+/// The one use-sync-external-store node, with the peer extra vlt gives it
+/// exactly where the measured boundary says (members from rc.15, the root
+/// from 1.0.8).
+fn assert_peer_boundary(fx: &Fixture, member: bool) -> String {
+    let ids = fx.store_ids(fx.t());
     assert_eq!(ids.len(), 1, "{ids:?}");
-    let id = &ids[0];
+    let id = ids[0].clone();
     let sep = if fx.leg.era().tilde() { '~' } else { '·' };
-    let extra = id.split(sep).count() > 3;
     assert_eq!(
-        extra,
+        id.split(sep).count() > 3,
         direct_peer_extra(fx.leg.version(), member),
         "the measured peer-extra boundary: {id}"
     );
-    if extra {
-        let manifest = fx.proj.join(importer).join("package.json");
-        let pkg = std::fs::read(&manifest).unwrap();
-        let lock = lock_bytes(&fx.proj);
-        let out = socket_api(
-            &fx.proj,
-            &fx.svc,
-            &["scan", "--mode", "vendored"],
-            &["--vendor-source", "build"],
-        );
-        assert_eq!(out.code, 1, "{out}");
-        let refusal = coded(&out.json())
-            .into_iter()
-            .find(|e| e["errorCode"] == "vendor_lock_entry_unsupported")
-            .map(Value::to_string)
-            .unwrap_or_else(|| panic!("a vendor_lock_entry_unsupported refusal: {out}"));
-        assert!(
-            refusal.contains(&format!("a variant instance ({id})")),
-            "{refusal}"
-        );
-        assert_eq!(lock_bytes(&fx.proj), lock, "the lock is untouched");
-        assert_eq!(
-            std::fs::read(&manifest).unwrap(),
-            pkg,
-            "{importer}/package.json"
-        );
-        assert!(!fx.proj.join(".socket/vendor/npm").exists(), "no artifact");
-        return fx.leg.ran();
-    }
+    id
+}
+
+/// `use-sync-external-store` beside react 18, a direct dependency of the
+/// root or of workspace member `packages/a`, is vendored whether or not vlt
+/// gave its node a peer extra, and `with-selector`'s self-reference
+/// (`require('use-sync-external-store/shim')`) loads the patched copy after
+/// a fresh `vlt ci`.
+async fn peer_selfref(name: &'static str, member: bool) {
+    let Some(leg) = vendored_leg(name) else {
+        return;
+    };
+    let importer = if member { "packages/a" } else { "" };
+    let fx = Fixture::build(leg, peer_shape(member)).await;
+    let t = fx.t().clone();
+    assert_peer_boundary(&fx, member);
     vendor_scan(&fx);
     assert_vendored(&fx, &t, importer);
     let co = fx.checkout(&format!("fresh-{name}"));
@@ -515,6 +496,202 @@ async fn vlt_pinned_matrix_vendored_peer_root_selfref() {
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_vendored_peer_member_selfref() {
     peer_selfref("peer_member_selfref", true).await;
+}
+
+/// Every lock entry of `expected` except the values of `file_id`'s own
+/// edges (rc.14 rewrites their peer specs on each reify) is in `got`.
+fn assert_entries_kept(expected: &[u8], got: &[u8], file_id: &str, what: &str) {
+    let entries = |bytes: &[u8]| -> std::collections::BTreeMap<String, String> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter(|l| l.starts_with("    \""))
+            .map(|l| {
+                let l = l.trim_end_matches('\r').trim_end_matches(',');
+                let key = l[4..].split_once("\": ").unwrap().0.to_string();
+                (key, l.to_string())
+            })
+            .collect()
+    };
+    let after = entries(got);
+    let own = format!("\"{file_id} ");
+    for (key, line) in entries(expected) {
+        let kept =
+            after.get(&key) == Some(&line) || (key.starts_with(&own) && after.contains_key(&key));
+        assert!(
+            kept,
+            "{what}: lost `{line}`:\n{}",
+            String::from_utf8_lossy(got)
+        );
+    }
+}
+
+/// A single peer context (the root from 1.0.8, a workspace member from
+/// rc.15): the node is vendored without its extra, as vlt writes `file:`
+/// dependencies, its peer edge moves to the file node, and the wiring is
+/// byte-stable through a warm and a cold `vlt install --frozen-lockfile`,
+/// a fresh `vlt ci`, and kept by `vlt install <new>`; the revert restores
+/// the extra-bearing lock byte for byte.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
+async fn vlt_pinned_matrix_vendored_single_peer_context() {
+    let Some(leg) = vendored_leg("single_peer_context") else {
+        return;
+    };
+    let mut leg = leg;
+    for member in [false, true] {
+        let which = if member { "member" } else { "root" };
+        let importer = if member { "packages/a" } else { "" };
+        let fx = Fixture::build(leg, peer_shape(member)).await;
+        let t = fx.t().clone();
+        let reg_id = assert_peer_boundary(&fx, member);
+        let lock_before = lock_bytes(&fx.proj);
+        let manifest = fx.proj.join(importer).join("package.json");
+        let pkg_before = std::fs::read(&manifest).unwrap();
+        vendor_scan(&fx);
+        assert_vendored(&fx, &t, importer);
+        let lock = read_lock(&fx.proj);
+        assert!(
+            node_ids(&lock, USX.0, USX.1).is_empty(),
+            "{which}: {lock:#}"
+        );
+        let r = rel(&t);
+        let file_id = lock["nodes"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, tuple)| tuple[3] == r)
+            .map(|(id, _)| id.clone())
+            .unwrap();
+        let sep = if fx.leg.era().tilde() { '~' } else { '·' };
+        assert_eq!(
+            file_id.split(sep).count(),
+            2,
+            "{which}: no extra on {file_id}"
+        );
+        let edges = lock["edges"].as_object().unwrap();
+        let peer = edges[&format!("{file_id} react")].as_str().unwrap();
+        assert!(peer.starts_with("peer "), "{which}: {peer}");
+        assert!(
+            !edges.keys().any(|k| k.starts_with(&format!("{reg_id} "))),
+            "{which}: every edge of {reg_id} moved: {lock:#}"
+        );
+        let wired = lock_bytes(&fx.proj);
+        fx.vlt_ok(&fx.proj, &fx.leg.frozen_args());
+        assert_eq!(lock_bytes(&fx.proj), wired, "{which}: warm frozen install");
+        assert_eq!(
+            state_at(&importer_dir(&fx.proj, importer, &t.name), &t),
+            State::Patched,
+            "{which}: warm frozen install links the vendored copy"
+        );
+        let co = fx.checkout(&format!("fresh-{which}"));
+        assert_ci_byte_stable(&fx.leg, &co, &VltRun::profile(which), false);
+        let frozen = format!("fresh-{which}-frozen");
+        std::fs::remove_dir_all(co.join("node_modules")).unwrap();
+        let _ = std::fs::remove_dir_all(co.join(importer).join("node_modules"));
+        fx.vlt_ok_profile(&co, &fx.leg.frozen_args(), &frozen);
+        assert_eq!(lock_bytes(&co), wired, "{which}: cold frozen install");
+        assert_eq!(
+            state_at(&importer_dir(&co, importer, &t.name), &t),
+            State::Patched,
+            "{which}: cold frozen install"
+        );
+        fx.vlt_ok_profile(&co, &["install", &format!("{}@{}", MS.0, MS.1)], &frozen);
+        assert_entries_kept(&wired, &lock_bytes(&co), &file_id, which);
+        assert_eq!(
+            state_at(&importer_dir(&co, importer, &t.name), &t),
+            State::Patched,
+            "{which}: vlt install <new> keeps the vendored copy"
+        );
+        let out = vendor_revert(&fx.proj);
+        assert_eq!(out.code, 0, "{which}: {out}");
+        assert_eq!(
+            String::from_utf8_lossy(&lock_bytes(&fx.proj)),
+            String::from_utf8_lossy(&lock_before),
+            "{which}: the revert restores {reg_id}"
+        );
+        assert_eq!(std::fs::read(&manifest).unwrap(), pkg_before, "{which}");
+        leg = fx.leg;
+    }
+    leg.ran();
+}
+
+const REINSTALL_REQUIRED: &str = "vendor_vlt_reinstall_required";
+
+fn reinstall_advisories(doc: &Value) -> Vec<String> {
+    coded(doc)
+        .into_iter()
+        .filter(|e| e["errorCode"] == REINSTALL_REQUIRED)
+        .map(Value::to_string)
+        .collect()
+}
+
+/// An optional dependency moved to its vendored dir on a warm tree gets
+/// `vendor_vlt_reinstall_required`: from 0.0.0-30 a plain `vlt install`
+/// keeps the installed upstream copy linked (and an in-sync rerun repeats
+/// the advisory), and `vlt ci` links the vendored copy, after which the
+/// advisory is gone.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
+async fn vlt_pinned_matrix_vendored_optional_warm_reinstall() {
+    let Some(leg) = vendored_leg("optional_warm_reinstall") else {
+        return;
+    };
+    let shape = Shape {
+        deps: vec![LP],
+        optional: vec![MS],
+        pins: vec![LP, MS],
+        targets: vec![(MS.0, MS.1, UUID_MS, "index.js")],
+        warm: true,
+        ..Shape::left_pad()
+    };
+    let fx = Fixture::build(leg, shape).await;
+    let t = fx.t().clone();
+    assert_eq!(state(&fx.proj, &t), State::Pristine, "the warm tree");
+    let doc = vendor_scan(&fx);
+    let got = reinstall_advisories(&doc);
+    assert_eq!(got.len(), 1, "{doc:#}");
+    assert!(
+        got[0].contains("ms@2.1.3 is an optional dependency")
+            && got[0].contains("run `vlt ci` (or delete node_modules and run `vlt install`)"),
+        "{}",
+        got[0]
+    );
+    assert_vendored(&fx, &t, "");
+
+    fx.vlt_ok(&fx.proj, &["install"]);
+    let kept = fx.leg.at_least(VENDORED_OPTIONAL_INSTALL_KEPT_FROM);
+    assert_eq!(
+        state(&fx.proj, &t),
+        if kept {
+            State::Pristine
+        } else {
+            State::Patched
+        },
+        "a plain `vlt install` on {}",
+        fx.leg.tc.raw
+    );
+    let doc = vendor_scan(&fx);
+    assert_eq!(
+        reinstall_advisories(&doc).len(),
+        usize::from(kept),
+        "the in-sync rerun: {doc:#}"
+    );
+
+    fx.vlt_ok(&fx.proj, &fx.leg.locked_install_args());
+    assert_eq!(
+        state(&fx.proj, &t),
+        State::Patched,
+        "`vlt ci` links the vendored copy"
+    );
+    let link = std::fs::canonicalize(importer_dir(&fx.proj, "", &t.name)).unwrap();
+    assert!(
+        link.to_string_lossy().replace('\\', "/").contains(&rel(&t)),
+        "{}",
+        link.display()
+    );
+    let doc = vendor_scan(&fx);
+    assert!(reinstall_advisories(&doc).is_empty(), "{doc:#}");
+    fx.leg.ran();
 }
 
 /// A dependency with dependencies: vlt creates the link dir inside the
@@ -1054,8 +1231,10 @@ async fn vlt_pinned_matrix_vendored_transitive_refused() {
     fx.leg.ran();
 }
 
-/// An era-A lock (0.0.0-19 … rc.8) with `··` ids (the default registry,
-/// public npm) vendors with `vendor_vlt_legacy_lockfile`.
+/// An era-A lock (0.0.0-19 … rc.8) vendors with
+/// `vendor_vlt_legacy_lockfile`, whether its default-registry ids are `··`
+/// (public npm) or URL segments equal to a scalar `registry` (the local
+/// registry the harness configures).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_vendored_legacy_lockfile_warning() {
@@ -1065,21 +1244,41 @@ async fn vlt_pinned_matrix_vendored_legacy_lockfile_warning() {
     if leg.era() != VltEra::A {
         return leg.skip("not-legacy-lockfile");
     }
-    let mut shape = Shape::with_bystander().warm();
-    shape.vlt_json.no_registry = true;
-    let fx = Fixture::build(leg, shape).await;
-    let lock = read_lock(&fx.proj);
-    assert!(
-        node_id(&lock, LP.0, LP.1).starts_with("··"),
-        "the default registry writes `··` ids: {lock:#}"
-    );
-    let doc = vendor_scan(&fx);
-    assert!(
-        doc.to_string().contains("vendor_vlt_legacy_lockfile"),
-        "{doc:#}"
-    );
-    assert_fresh_vendored(&fx, fx.t(), "fresh-legacy");
-    fx.leg.ran();
+    let mut leg = leg;
+    for scalar in [false, true] {
+        let mut shape = Shape::with_bystander().warm();
+        shape.vlt_json.no_registry = !scalar;
+        let fx = Fixture::build(leg, shape).await;
+        let lock = read_lock(&fx.proj);
+        let id = node_id(&lock, LP.0, LP.1);
+        if scalar {
+            assert!(
+                id.starts_with("·http") && lock["options"]["registry"].is_string(),
+                "a scalar registry writes URL-segment ids: {lock:#}"
+            );
+        } else {
+            assert!(
+                id.starts_with("··"),
+                "the default registry writes `··` ids: {lock:#}"
+            );
+        }
+        let doc = vendor_scan(&fx);
+        assert!(
+            doc.to_string().contains("vendor_vlt_legacy_lockfile"),
+            "{doc:#}"
+        );
+        assert_fresh_vendored(
+            &fx,
+            fx.t(),
+            if scalar {
+                "fresh-legacy-scalar"
+            } else {
+                "fresh-legacy"
+            },
+        );
+        leg = fx.leg;
+    }
+    leg.ran();
 }
 
 /// An A0 lock (no `lockfileVersion`, ≤ 0.0.0-18) is refused

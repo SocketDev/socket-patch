@@ -1,0 +1,8 @@
+{
+  "name": "a",
+  "version": "1.0.0",
+  "dependencies": {
+    "use-sync-external-store": "file:../../.socket/vendor/npm/11111111-2222-4333-8444-555555555555/use-sync-external-store-1.2.0/node_modules/use-sync-external-store",
+    "react": "18.2.0"
+  }
+}

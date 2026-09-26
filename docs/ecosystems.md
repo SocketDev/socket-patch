@@ -194,7 +194,11 @@ outside the project, no link target and no copy socket-patch cannot judge is eve
 removed. A stale copy of an optional dependency is kept, because `vlt install` does not
 put back a removed optional dependency; the advisory says to run `vlt ci` instead, and to
 upgrade to vlt 1.0.5 first when every dependency is optional (earlier releases install no
-optional dependency from the lock of such a project). `--no-vlt-install-cleanup` (or
+optional dependency from the lock of such a project; mixed projects install it on every
+release). The advisory names the kept copies by what they are: unpatched copies after
+`scan`/`get`, patched copies after `rollback`/`remove`, and, after a hosted → vendored
+takeover, the installed copies of the now-vendored optional dependencies (whatever bytes
+the hosted pin left installed). `--no-vlt-install-cleanup` (or
 `SOCKET_NO_VLT_INSTALL_CLEANUP`) keeps the tree. `redirect_vlt_reinstall_required` says
 what happened and what to run; a stale or unchecked copy is never attested by the run's
 `--vex`.
@@ -236,15 +240,20 @@ stays byte-exact. The lock's node becomes a `file` node, the importer edges and 
 importers' `package.json` specs move to the `file:` path, and every moved entry is placed
 where vlt's own serializer puts it, so `vlt ci` keeps the lock byte-identical. Transitive
 targets are refused (`vendor_vlt_transitive_unsupported`: vlt silently reverts
-transitive lock surgery), as are peer or modifier variants, importer peer edges, foreign
-registries and a dependency declared in several fields (`vendor_lock_entry_unsupported`);
-use hosted mode for those. From vlt 1.0.8 a root dependency with resolved peers carries a
-`~peer.<hex>` extra even with one peer context (a workspace member's from rc.15), and
-vendored mode refuses such a variant instance today. Before rc.6 vlt cannot reinstall a
-vendored `file:` dependency without the lock (`vendor_vlt_legacy_lockfile` on era-A
-locks), and A0 locks are refused. From 0.0.0-30 a plain `vlt install` keeps an optional
-dependency's installed upstream copy after vendoring; run `vlt ci` to link the vendored
-directory.
+transitive lock surgery), as are several instances of one `name@version`, modifier
+variants, importer peer edges, foreign registries and a dependency declared in several
+fields (`vendor_lock_entry_unsupported`); use hosted mode for those. From vlt 1.0.8 a root
+dependency with resolved peers carries a `~peer.<hex>` extra even with one peer context (a
+workspace member's a `~peer.N` one from rc.15): vendored mode writes its `file` node
+without the extra, exactly as vlt writes a `file:` dependency, keeps its peer edges, and
+`vendor --revert` restores the extra. Before rc.6 vlt cannot reinstall a vendored `file:`
+dependency without the lock (`vendor_vlt_legacy_lockfile` on era-A locks: `··` ids, or
+URL-segment ids equal to a scalar `registry`), and A0 locks are refused. From 0.0.0-30 a
+plain `vlt install` keeps an optional dependency's installed upstream copy after
+vendoring; `vendor_vlt_reinstall_required` says to run `vlt ci` (or delete `node_modules`
+and run `vlt install`) to link the vendored directory, and to upgrade to vlt 1.0.5 first
+when every dependency is optional. The same advisory names any dependency whose
+`node_modules` link still resolves to vlt's store.
 
 **Agent mode.** `apply` and `rollback` patch every store copy of a `name@version`
 (legacy and tilde DepIDs, peer and modifier variants, transitive-only packages) and

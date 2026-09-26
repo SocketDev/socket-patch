@@ -564,6 +564,17 @@ class VltLockHelperTests(unittest.TestCase):
                 'package.json', 'vlt-lock.json', 'vlt.json', 'packages/a/package.json',
                 f'{payload}/package.json', '.socket/vendor/state.json']))
 
+    def test_snapshot_skips_vlt_background_delete_dirs(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            payload = f'.socket/vendor/npm/{vlt.UUID}/minimist-1.2.2/node_modules/minimist'
+            for rel in ['package.json', '.VLT.DELETE.3.node_modules/.vlt/x/package.json',
+                        f'{payload}/index.js', f'{payload}/.VLT.DELETE.1.node_modules/d/index.js',
+                        'packages/a/.VLT.DELETE.7.node_modules/m/package.json']:
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(rel)
+            self.assertEqual(sorted(vlt.snapshot(root)), sorted(['package.json', f'{payload}/index.js']))
+
     def test_remove_node_modules_keeps_the_vendored_payload(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

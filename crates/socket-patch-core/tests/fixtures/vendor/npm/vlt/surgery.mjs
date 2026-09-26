@@ -1,7 +1,9 @@
 // Independent JS reading of DESIGN §4.5 (vendored vlt wiring of a direct
 // target), used only to build the byte-stability fixtures: its output is
 // handed to real `vlt ci`, and the lock vlt writes back is the expected
-// lock. Orders with Node's own `localeCompare(…, 'en')`, like vlt.
+// lock. Orders with Node's own `localeCompare(…, 'en')`, like vlt. A node
+// whose only extra is a peer context becomes a `file` node without it, as
+// vlt writes `file:` dependencies.
 //
 // usage: node surgery.mjs <project> <name@version> <uuid>
 // prints {"refusal": code, "detail": …} or {"rel": …, "fileId": …}
@@ -107,7 +109,9 @@ const instances = nodes
 if (instances.some(({ r }) => !isDefault(r.segment))) {
   refuse('vendor_lock_entry_unsupported', "not from vlt's default registry")
 }
-if (instances.length > 1 || instances.some(({ r }) => r.extra !== undefined)) {
+const PEER_CONTEXT = /^(?:peer\.(?:\d+|[0-9a-f]{16})|ṗ:\d+)$/
+if (instances.length > 1 ||
+    instances.some(({ r }) => r.extra !== undefined && !PEER_CONTEXT.test(dec(r.extra)))) {
   refuse('vendor_lock_entry_unsupported', 'peer/modifier variants; use --mode hosted')
 }
 if (instances.length === 0) refuse('vendor_lock_entry_not_found', `${target}`)

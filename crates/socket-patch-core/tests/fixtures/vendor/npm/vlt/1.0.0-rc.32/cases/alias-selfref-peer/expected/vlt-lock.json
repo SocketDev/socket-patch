@@ -1,0 +1,19 @@
+{
+  "lockfileVersion": 1,
+  "options": {},
+  "nodes": {
+    "~npm~js-tokens@4.0.0": [0,"js-tokens","sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ=="],
+    "~npm~left-pad@1.3.0": [0,"left-pad","sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="],
+    "~npm~loose-envify@1.4.0": [0,"loose-envify","sha512-lyuxPGr/Wfhrlem2CL/UcnUc1zcqKAImBDzukY7Y5F/yQiNdko6+fRLevlw1HgMySw7f611UIY408EtxRSoK3Q==",null,null,null,null,null,{  "loose-envify": "cli.js"}],
+    "~npm~react@18.2.0": [0,"react","sha512-/3IjMdb2L9QbBdWiW5e3P2/npwMBaU9mHCSCUzNln0ZCYbcfTsGbTJrU/kGemdH2IWmB2ioZ+zkxtmq6g09fGQ=="],
+    "file~.socket+vendor+npm+11111111-2222-4333-8444-555555555555+use-sync-external-store-1.2.0+node__modules+use-sync-external-store": [0,"use-sync-external-store",null,".socket/vendor/npm/11111111-2222-4333-8444-555555555555/use-sync-external-store-1.2.0/node_modules/use-sync-external-store"]
+  },
+  "edges": {
+    "file~_d lp": "prod npm:left-pad@1.3.0 ~npm~left-pad@1.3.0",
+    "file~_d react": "prod 18.2.0 ~npm~react@18.2.0",
+    "file~_d usx": "prod file:./.socket/vendor/npm/11111111-2222-4333-8444-555555555555/use-sync-external-store-1.2.0/node_modules/use-sync-external-store file~.socket+vendor+npm+11111111-2222-4333-8444-555555555555+use-sync-external-store-1.2.0+node__modules+use-sync-external-store",
+    "~npm~loose-envify@1.4.0 js-tokens": "prod ^3.0.0 || ^4.0.0 ~npm~js-tokens@4.0.0",
+    "~npm~react@18.2.0 loose-envify": "prod ^1.1.0 ~npm~loose-envify@1.4.0",
+    "file~.socket+vendor+npm+11111111-2222-4333-8444-555555555555+use-sync-external-store-1.2.0+node__modules+use-sync-external-store react": "peer ^16.8.0 || ^17.0.0 || ^18.0.0 ~npm~react@18.2.0"
+  }
+}

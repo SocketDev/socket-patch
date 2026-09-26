@@ -555,8 +555,8 @@ async fn vlt_hosted_then_vendored_takeover_keeps_an_optional_hosted_copy() {
     assert_eq!(
         detail_of(&env, "redirect_vlt_reinstall_required"),
         format!(
-            "vendored 1 hosted-pinned packages, but node_modules still holds 1 copies of the \
-             hosted artifacts of optional dependencies; {}",
+            "vendored 1 hosted-pinned packages, but node_modules still holds 1 installed copies \
+             of the vendored optional dependencies; {}",
             hosted::OPTIONAL_KEPT
         )
     );

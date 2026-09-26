@@ -80,6 +80,28 @@ impl DepId {
             _ => None,
         }
     }
+
+    /// Whether the extra names only a peer context: `ṗ:<n>` (rc.6 …
+    /// rc.14), `peer.<n>` (rc.15 … 1.0.7) or `peer.<16 hex>` (1.0.8 on).
+    /// Modifier queries, and an id without an extra, are not.
+    pub(crate) fn has_peer_extra_only(&self) -> bool {
+        let Some(extra) = self
+            .extra
+            .as_deref()
+            .and_then(|e| decode_segment(e, self.era))
+        else {
+            return false;
+        };
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        if let Some(context) = extra.strip_prefix("peer.") {
+            return digits(context)
+                || (context.len() == 16
+                    && context
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        }
+        extra.strip_prefix("ṗ:").is_some_and(digits)
+    }
 }
 
 pub(crate) fn dep_id_era(id: &str) -> Option<DepIdEra> {
@@ -1486,6 +1508,30 @@ mod tests {
         );
         assert_eq!(file_dep_id(".", Tilde), "file~_d");
         assert_eq!(file_dep_id(".", Legacy), "file·.");
+    }
+
+    #[test]
+    fn a_peer_context_is_the_only_extra_vendoring_drops() {
+        let rows = [
+            ("~npm~x@1.0.0~peer.2", true),
+            ("~npm~x@1.0.0~peer.0df72515a50372ba", true),
+            ("·npm·x@1.0.0·%E1%B9%97%3A3", true),
+            ("··x@1.0.0·%E1%B9%97%3A12", true),
+            ("~npm~x@1.0.0~ṗ_c3", true),
+            ("~npm~x@1.0.0", false),
+            ("~npm~x@1.0.0~peer.", false),
+            ("~npm~x@1.0.0~peer.0DF72515A50372BA", false),
+            ("~npm~x@1.0.0~peer.0df72515a50372b", false),
+            ("~npm~x@1.0.0~peer.2x", false),
+            ("~npm~x@1.0.0~_croot_s_g_s#x", false),
+            ("··x@1.0.0·%3Aroot%20%3E%20%23x", false),
+            ("·npm·x@1.0.0·%E1%B9%97%3A", false),
+            ("·npm·x@1.0.0·%E1%B9%97%3A3%20", false),
+        ];
+        for (id, peer_only) in rows {
+            let dep_id = split_dep_id(id).unwrap_or_else(|| panic!("{id}"));
+            assert_eq!(dep_id.has_peer_extra_only(), peer_only, "{id}");
+        }
     }
 
     #[test]
