@@ -106,9 +106,20 @@ pub fn normalize_purl(purl: &str) -> Cow<'_, str> {
 }
 
 /// Purl equality up to percent-encoding of the base components
-/// (`pkg:npm/%40scope/x@1` ≡ `pkg:npm/@scope/x@1`).
+/// (`pkg:npm/%40scope/x@1` ≡ `pkg:npm/@scope/x@1`) and, for composer, up to
+/// the version spelling of one release (`@3.0.2` ≡ `@v3.0.2` ≡ `@3.0.2.0`,
+/// name case-insensitive; see [`crate::utils::composer_version`]).
+/// Qualifiers and subpath must still match exactly.
 pub fn purl_eq(a: &str, b: &str) -> bool {
-    normalize_purl(a) == normalize_purl(b)
+    let (a, b) = (normalize_purl(a), normalize_purl(b));
+    if a == b {
+        return true;
+    }
+    let split = |p: &str| p.find(['?', '#']).unwrap_or(p.len());
+    let (base_a, suffix_a) = a.split_at(split(&a));
+    let (base_b, suffix_b) = b.split_at(split(&b));
+    suffix_a == suffix_b
+        && crate::utils::composer_version::composer_bases_equivalent(base_a, base_b)
 }
 
 /// Extract the value of a single PURL qualifier (`?key=value&…`), if present.
@@ -1256,6 +1267,31 @@ mod tests {
             "pkg:npm/%40scope/x@1.0.0",
             "pkg:npm/@scope/x@2.0.0"
         ));
+        // Composer compares release identity: padding, a `v` tag, name case.
+        for spelling in [
+            "pkg:composer/psr/log@3.0.2.0",
+            "pkg:composer/psr/log@v3.0.2",
+            "pkg:composer/Psr/Log@3.0.2",
+        ] {
+            assert!(
+                purl_eq("pkg:composer/psr/log@3.0.2", spelling),
+                "{spelling}"
+            );
+            assert!(
+                purl_eq(spelling, "pkg:composer/psr/log@3.0.2"),
+                "{spelling}"
+            );
+        }
+        assert!(!purl_eq(
+            "pkg:composer/psr/log@3.0.2",
+            "pkg:composer/psr/log@3.0.20"
+        ));
+        assert!(!purl_eq(
+            "pkg:composer/psr/log@3.0.2?a=1",
+            "pkg:composer/psr/log@3.0.2.0?a=2"
+        ));
+        // Only composer: other ecosystems stay spelling-exact.
+        assert!(!purl_eq("pkg:npm/x@1.0", "pkg:npm/x@1.0.0.0"));
         // Qualifiers/subpath are preserved verbatim (not decoded).
         assert_eq!(
             normalize_purl("pkg:npm/%40s/x@1?artifact_id=a%2Fb"),

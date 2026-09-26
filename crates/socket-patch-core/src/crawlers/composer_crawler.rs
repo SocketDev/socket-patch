@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
+use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::fs::{is_dir, is_file, normalize_lexically};
 use crate::utils::process::{CommandRunner, SystemCommandRunner};
 
@@ -173,11 +174,10 @@ impl ComposerCrawler {
                     continue;
                 };
 
-                // Verify version matches installed.json. Compare on the
-                // normalized version so a `v`-prefixed installed.json
-                // version (`v6.4.1`) matches a bare PURL version (`6.4.1`)
-                // and vice versa.
-                if normalize_version(&entry.version) != normalize_version(version) {
+                // Verify version matches installed.json by composer release
+                // identity: installed.json's pretty `v6.4.1` / `3.0.2`
+                // matches a purl's `6.4.1` / padded `3.0.2.0`.
+                if !composer_versions_equivalent(&entry.version, version) {
                     continue;
                 }
 
@@ -832,6 +832,77 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result.contains_key("pkg:composer/symfony/console@6.4.1"));
         assert!(result.contains_key("pkg:composer/symfony/console@v6.4.1"));
+    }
+
+    /// A patch purl may carry composer's padded `version_normalized`
+    /// spelling (`3.0.2.0`) while installed.json records the pretty
+    /// `3.0.2` / `v3.0.2` / `1.0` / `8.1.0-RC1`: the same release, found.
+    /// A different release is still not found.
+    #[tokio::test]
+    async fn test_find_by_purls_matches_equivalent_composer_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("vendor");
+        let composer_dir = vendor_dir.join("composer");
+        tokio::fs::create_dir_all(&composer_dir).await.unwrap();
+        tokio::fs::write(
+            composer_dir.join("installed.json"),
+            r#"{"packages": [
+                {"name": "psr/log", "version": "3.0.2"},
+                {"name": "psr/cache", "version": "v3.0.2"},
+                {"name": "psr/container", "version": "1.0"},
+                {"name": "symfony/http-kernel", "version": "v8.1.0-RC1"}
+            ]}"#,
+        )
+        .await
+        .unwrap();
+        for pkg in [
+            "psr/log",
+            "psr/cache",
+            "psr/container",
+            "symfony/http-kernel",
+        ] {
+            tokio::fs::create_dir_all(vendor_dir.join(pkg))
+                .await
+                .unwrap();
+        }
+
+        let found = [
+            "pkg:composer/psr/log@3.0.2.0",
+            "pkg:composer/psr/log@v3.0.2",
+            "pkg:composer/psr/cache@3.0.2.0",
+            "pkg:composer/psr/cache@3.0.2",
+            "pkg:composer/psr/container@1.0.0.0",
+            "pkg:composer/psr/container@1.0.0",
+            "pkg:composer/symfony/http-kernel@8.1.0.0-RC1",
+            "pkg:composer/symfony/http-kernel@8.1.0-rc.1",
+        ];
+        let missing = [
+            "pkg:composer/psr/log@3.0.20",
+            "pkg:composer/psr/log@3.0.2.1",
+            "pkg:composer/symfony/http-kernel@8.1.0",
+            "pkg:composer/symfony/http-kernel@8.1.0-RC2",
+        ];
+        let purls: Vec<String> = found
+            .iter()
+            .chain(&missing)
+            .map(|p| p.to_string())
+            .collect();
+        let result = ComposerCrawler::new()
+            .find_by_purls(&vendor_dir, &purls)
+            .await
+            .unwrap();
+
+        for purl in found {
+            let pkg = result
+                .get(purl)
+                .unwrap_or_else(|| panic!("{purl} not found"));
+            assert_eq!(pkg.purl, purl, "the result keeps the requested spelling");
+        }
+        assert_eq!(result.len(), found.len(), "{:?}", result.keys());
+        assert_eq!(
+            result["pkg:composer/psr/log@3.0.2.0"].path,
+            vendor_dir.join("psr/log")
+        );
     }
 
     #[tokio::test]

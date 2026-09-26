@@ -7,7 +7,8 @@ use socket_patch_core::api::types::{
     BatchPackagePatches, BatchPatchInfo, PatchResponse, PatchSearchResult,
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::composer_version::purl_identity_key;
+use socket_patch_core::utils::purl::{normalize_purl, purl_eq, strip_purl_qualifiers};
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
 use socket_patch_core::vendor::VendorState;
 use std::borrow::Cow;
@@ -121,8 +122,12 @@ pub(super) async fn lockfile_supplement(
 /// the comparison bridges the two via `normalize_purl`. The ONE predicate
 /// behind the `notInstalled` flag, the `[NOT INSTALLED]` marker, the
 /// `package_not_installed` skip partition and the vendor baseline pre-check.
+/// A composer purl also matches its lock spelling of the same release (the
+/// API may serve the padded `@3.0.2.0` for a lock's `3.0.2`).
 pub(super) fn lockfile_only_contains(purls: &HashSet<String>, api_purl: &str) -> bool {
-    purls.contains(normalize_purl(strip_purl_qualifiers(api_purl)).as_ref())
+    let base = strip_purl_qualifiers(api_purl);
+    purls.contains(normalize_purl(base).as_ref())
+        || (base.starts_with("pkg:composer/") && purls.iter().any(|p| purl_eq(p, base)))
 }
 
 /// A displayable crawl entry fabricated from a purl (decoded form). The
@@ -278,7 +283,6 @@ pub(super) async fn preverify_vendor_baselines<W: std::io::Write>(
 ) -> (HashSet<String>, HashMap<String, PatchResponse>) {
     use socket_patch_core::manifest::schema::PatchFileInfo;
     use socket_patch_core::patch::apply::{verify_file_patch, VerifyStatus};
-    use socket_patch_core::utils::purl::purl_eq;
     use socket_patch_core::vendor::lookup_entry;
 
     let mut mismatched: HashSet<String> = HashSet::new();
@@ -436,7 +440,8 @@ pub(super) fn detect_updates(
         // artifact-pinned ecosystems, qualified (`?artifact_id=...`); the
         // batch *package* purl is the crawler's literal spelling. Bridge
         // both divergences like the lockfile-only partition does: exact hit
-        // first, then a normalized qualifier-stripped comparison.
+        // first, then a normalized qualifier-stripped comparison (composer
+        // by release identity: a `@3.0.2.0` key is the crawler's `@3.0.2`).
         //
         // Qualifier TWINS (one package recorded under two artifact-pinned
         // keys, e.g. a pypi wheel + sdist pair) both match the stripped
@@ -447,12 +452,12 @@ pub(super) fn detect_updates(
         // from the candidate, and fall back to the first twin when all
         // agree.
         let existing = manifest.patches.get(&pkg.purl).or_else(|| {
-            let want = normalize_purl(strip_purl_qualifiers(&pkg.purl));
+            let want = purl_identity_key(&pkg.purl);
             let mut twins: Vec<(&String, &socket_patch_core::manifest::schema::PatchRecord)> =
                 manifest
                     .patches
                     .iter()
-                    .filter(|(k, _)| normalize_purl(strip_purl_qualifiers(k)) == want)
+                    .filter(|(k, _)| purl_identity_key(k) == want)
                     .collect();
             twins.sort_by(|a, b| a.0.cmp(b.0));
             twins

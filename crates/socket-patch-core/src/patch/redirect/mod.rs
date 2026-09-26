@@ -22,7 +22,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::crawlers::composer_crawler::normalize_version;
+use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::digest::is_hex64_lower;
 use crate::utils::line_endings::{to_lf, LineEndings};
 use crate::vendor::yarn_berry_lock::yarnrc_compression_level;
@@ -4197,9 +4197,9 @@ enum ComposerEntry {
 /// Names match CASE-INSENSITIVELY, the way the composer crawler and the vendor
 /// backend already match them: packagist canonicalizes to lowercase, but
 /// hand-written mixed-case locks install fine and would otherwise silently miss
-/// the redirect. The locked version must match the patched one through
-/// composer's leading-`v` normalization (locks carry the pretty `v6.4.1`, PURLs
-/// the bare `6.4.1`); matching on name alone repointed whatever version the
+/// the redirect. The locked version must match the patched one by composer
+/// release identity (locks carry the pretty `v6.4.1`, PURLs the bare `6.4.1`
+/// or padded `6.4.1.0`); matching on name alone repointed whatever version the
 /// lock happened to hold at a patch built for a different one.
 fn find_composer_entry(content: &str, pkg: &str, version: &str) -> ComposerEntry {
     let mut mismatched: Option<String> = None;
@@ -4216,7 +4216,7 @@ fn find_composer_entry(content: &str, pkg: &str, version: &str) -> ComposerEntry
         let Some(locked) = json_string_field(entry, "version") else {
             continue;
         };
-        if normalize_version(locked) == normalize_version(version) {
+        if composer_versions_equivalent(locked, version) {
             return ComposerEntry::Found(name_idx, end);
         }
         mismatched = Some(locked.to_string());

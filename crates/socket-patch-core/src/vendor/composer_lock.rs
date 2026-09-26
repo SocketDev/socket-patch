@@ -19,9 +19,10 @@
 //! Lock names are matched CASE-INSENSITIVELY (locks are normally lowercase,
 //! but hand-written mixed-case locks exist and install fine) while the dist
 //! URL we write always uses the lowercase canonical `<vendor>/<name>` — the
-//! casing of the directory this backend creates. Versions are matched through
-//! the leading-`v` normalization (locks carry the pretty `v6.4.1`, PURLs the
-//! bare `6.4.1`) but the lock's own `version` string is never rewritten.
+//! casing of the directory this backend creates. Versions are matched by
+//! composer release identity (locks carry the pretty `v6.4.1` / `3.0.2`, a
+//! patch purl the bare `6.4.1` or padded `3.0.2.0`) but the lock's own
+//! `version` string is never rewritten.
 //!
 //! Serialization mirrors composer's own writer: 4-space indent
 //! (`JSON_PRETTY_PRINT`) + trailing newline; serde_json does not escape `/`
@@ -33,11 +34,11 @@ use std::path::Path;
 use serde_json::{json, Map, Value};
 
 use crate::constants::SOCKET_DIR;
-use crate::crawlers::composer_crawler::normalize_version;
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::patch::copy_tree::{fresh_copy, remove_tree};
 use crate::patch::path_safety::{is_safe_multi_segment, is_safe_single_segment};
+use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::purl::{build_composer_purl, parse_composer_purl};
 use crate::utils::socket_dir::remove_tree_and_prune;
@@ -738,15 +739,15 @@ async fn composer_service_copy(
 }
 
 /// Locate the package's entry: `packages[]` first, then `packages-dev[]`.
-/// Names are compared case-insensitively, versions through the `v`-prefix
-/// normalization (see module doc).
+/// Names are compared case-insensitively, versions by composer release
+/// identity (see module doc).
 fn find_lock_entry(lock: &Value, pkg_lc: &str, version: &str) -> Option<(&'static str, usize)> {
     composer_lock_packages(lock)
         .into_iter()
         .find(|p| {
             p.name.is_some_and(|n| n.eq_ignore_ascii_case(pkg_lc))
                 && p.version
-                    .is_some_and(|v| normalize_version(v) == normalize_version(version))
+                    .is_some_and(|v| composer_versions_equivalent(v, version))
         })
         .map(|p| (p.section, p.index))
 }
@@ -2744,6 +2745,47 @@ mod tests {
             find_lock_entry(&json!({ "packages": "oops" }), "psr/log", "3.0.2"),
             None
         );
+    }
+
+    /// The patch purl's version may be composer's padded spelling of the
+    /// release the lock records prettily (`3.0.2.0` for `3.0.2` / `v3.0.2`,
+    /// `1.0.0.0` for `1.0`, `8.1.0.0-RC1` for `v8.1.0-rc.1`); other releases
+    /// never match.
+    #[test]
+    fn test_find_lock_entry_matches_equivalent_composer_versions() {
+        let lock = json!({
+            "packages": [
+                { "name": "psr/log", "version": "3.0.20" },
+                { "name": "psr/log", "version": "3.0.2" },
+                { "name": "psr/cache", "version": "v3.0.2" },
+                { "name": "psr/container", "version": "1.0" }
+            ],
+            "packages-dev": [
+                { "name": "symfony/http-kernel", "version": "v8.1.0-rc.1" }
+            ]
+        });
+        for (pkg, version, want) in [
+            ("psr/log", "3.0.2.0", Some(("packages", 1))),
+            ("psr/log", "v3.0.2", Some(("packages", 1))),
+            ("psr/log", "3.0.2", Some(("packages", 1))),
+            ("psr/log", "3.0.20.0", Some(("packages", 0))),
+            ("psr/cache", "3.0.2.0", Some(("packages", 2))),
+            ("psr/container", "1.0.0.0", Some(("packages", 3))),
+            (
+                "symfony/http-kernel",
+                "8.1.0.0-RC1",
+                Some(("packages-dev", 0)),
+            ),
+            ("psr/log", "3.0.2.1", None),
+            ("psr/container", "1.0.1", None),
+            ("symfony/http-kernel", "8.1.0", None),
+        ] {
+            assert_eq!(
+                find_lock_entry(&lock, pkg, version),
+                want,
+                "{pkg}@{version}"
+            );
+        }
     }
 
     /// A source-only entry (no `dist`) gets `dist` + `transport-options`

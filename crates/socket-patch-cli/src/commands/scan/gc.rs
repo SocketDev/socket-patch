@@ -5,7 +5,8 @@
 use socket_patch_core::manifest::cleanup_blobs::CleanupResult;
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::utils::purl::{canonical_purl, strip_purl_qualifiers};
+use socket_patch_core::utils::composer_version::purl_identity_key;
+use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::VENDOR_STATE_REL;
 use std::collections::HashSet;
 use std::path::Path;
@@ -497,12 +498,13 @@ fn detect_prunable(
     scanned_purls: &HashSet<String>,
     vendored: &HashSet<String>,
 ) -> Vec<String> {
-    let scanned_bases: HashSet<String> = scanned_purls.iter().map(|p| canonical_purl(p)).collect();
+    let scanned_bases: HashSet<String> =
+        scanned_purls.iter().map(|p| purl_identity_key(p)).collect();
     manifest
         .patches
         .keys()
         .filter(|p| {
-            !scanned_bases.contains(&canonical_purl(p))
+            !scanned_bases.contains(&purl_identity_key(p))
                 && !vendored.contains(p.as_str())
                 && !vendored.contains(strip_purl_qualifiers(p))
                 && crate::ecosystem_dispatch::crawl_covers_purl(p.as_str())
@@ -635,6 +637,29 @@ mod tests {
         assert_eq!(
             out,
             vec!["pkg:npm/bar@2.0".to_string(), "pkg:npm/foo@1.0".to_string()],
+        );
+    }
+
+    /// A composer manifest key in the API's padded spelling (`@3.0.2.0`) or a
+    /// `v` tag is the SAME release the crawler reports as `@3.0.2`: prune must
+    /// keep it. A composer release that really is gone is still pruned.
+    #[test]
+    fn detect_prunable_keeps_equivalent_composer_spellings() {
+        let m = manifest_with(&[
+            ("pkg:composer/psr/log@3.0.2.0", "uuid-a"),
+            ("pkg:composer/psr/cache@v3.0.2", "uuid-b"),
+            ("pkg:composer/psr/container@1.0.0.0", "uuid-c"),
+            ("pkg:composer/symfony/console@6.4.1.0", "uuid-d"),
+        ]);
+        let s = scanned(&[
+            "pkg:composer/psr/log@3.0.2",
+            "pkg:composer/psr/cache@3.0.2",
+            "pkg:composer/psr/container@1.0",
+            "pkg:composer/symfony/console@6.4.10",
+        ]);
+        assert_eq!(
+            detect_prunable(&m, &s, &no_vendored()),
+            vec!["pkg:composer/symfony/console@6.4.1.0".to_string()]
         );
     }
 
