@@ -93,7 +93,7 @@ fn entry_span(text: &str, section: &str, index: usize) -> Option<(usize, usize)>
 /// 4), else the lock's first indent.
 fn indent_unit(text: &str, base: &str) -> String {
     let half = base.len() / 2;
-    if half > 0 && base.len() % 2 == 0 && base[..half] == base[half..] {
+    if half > 0 && base.len().is_multiple_of(2) && base[..half] == base[half..] {
         base[..half].to_string()
     } else {
         detect_indent(text)
