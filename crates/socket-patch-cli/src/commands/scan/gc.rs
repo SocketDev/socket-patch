@@ -7,7 +7,7 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::utils::composer_version::purl_identity_key;
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
-use socket_patch_core::vendor::VENDOR_STATE_REL;
+use socket_patch_core::vendor::{purl_keys_cover, VENDOR_STATE_REL};
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
@@ -505,8 +505,7 @@ fn detect_prunable(
         .keys()
         .filter(|p| {
             !scanned_bases.contains(&purl_identity_key(p))
-                && !vendored.contains(p.as_str())
-                && !vendored.contains(strip_purl_qualifiers(p))
+                && !purl_keys_cover(vendored, p)
                 && crate::ecosystem_dispatch::crawl_covers_purl(p.as_str())
         })
         .cloned()

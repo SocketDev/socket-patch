@@ -9,7 +9,7 @@ use socket_patch_core::api::types::{
     BatchPackagePatches, BatchPatchInfo, PatchResponse, PatchSearchResult,
 };
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
-use socket_patch_core::utils::composer_version::purl_identity_key;
+use socket_patch_core::utils::composer_version::{composer_purl_identity, purl_identity_key};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{normalize_purl, purl_eq, strip_purl_qualifiers};
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
@@ -201,14 +201,14 @@ pub(super) async fn vendored_ledger_supplement(
         // contract-documented recovery convention — see `vendor::path`).
         Err(_) => vendored_purls_from_artifacts(common).await,
     };
-    let crawled_norm: HashSet<String> = crawled
-        .iter()
-        .map(|p| normalize_purl(&p.purl).into_owned())
-        .collect();
+    // Composer by release identity: a ledger `@3.0.2.0` is the crawled
+    // `@3.0.2`, not a second package to supplement.
+    let key = |p: &str| composer_purl_identity(p).unwrap_or_else(|| normalize_purl(p).into_owned());
+    let crawled_norm: HashSet<String> = crawled.iter().map(|p| key(&p.purl)).collect();
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
     for base in &base_purls {
-        let norm = normalize_purl(base).into_owned();
+        let norm = key(base);
         if crawled_norm.contains(&norm) || !seen.insert(norm) {
             continue;
         }
@@ -1214,6 +1214,43 @@ mod tests {
         };
         let state = socket_patch_core::vendor::load_state(root).await;
         vendored_ledger_supplement(&args, crawled, &state).await
+    }
+
+    /// A ledger entry vendored as `@3.0.2.0` is the crawled composer
+    /// `@3.0.2`, not a second package to add to the scan.
+    #[tokio::test]
+    async fn ledger_supplement_matches_composer_by_release_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = VendorState::new();
+        let entry: socket_patch_core::vendor::VendorEntry =
+            serde_json::from_value(serde_json::json!({
+                "ecosystem": "composer",
+                "basePurl": "pkg:composer/psr/log@3.0.2.0",
+                "uuid": VENDORED_UUID,
+                "artifact": {"path": format!(".socket/vendor/composer/{VENDORED_UUID}/psr/log@3.0.2.0"), "sha256": ""},
+                "wiring": [],
+            }))
+            .unwrap();
+        state
+            .entries
+            .insert("pkg:composer/psr/log@3.0.2.0".to_string(), entry);
+        let crawled = crawled_from_purl("pkg:composer/psr/log@3.0.2", tmp.path()).unwrap();
+        let args = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            ..GlobalArgs::default()
+        };
+        let out = vendored_ledger_supplement(&args, &[crawled], &Ok(state.clone())).await;
+        assert!(
+            out.is_empty(),
+            "{:?}",
+            out.iter().map(|p| &p.purl).collect::<Vec<_>>()
+        );
+
+        let out = vendored_ledger_supplement(&args, &[], &Ok(state)).await;
+        assert_eq!(
+            out.iter().map(|p| p.purl.as_str()).collect::<Vec<_>>(),
+            vec!["pkg:composer/psr/log@3.0.2.0"]
+        );
     }
 
     #[tokio::test]

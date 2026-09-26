@@ -511,7 +511,7 @@ impl Discovery {
         let key = canonical_base_purl(purl);
         self.refs
             .iter()
-            .any(|r| r.uuid == uuid && r.mode == mode && r.purl == key)
+            .any(|r| r.uuid == uuid && r.mode == mode && same_package(&r.purl, &key))
     }
 
     /// Whether some file discovery read mentions patch `uuid` as a `mode`
@@ -648,7 +648,7 @@ impl Discovery {
             self.refs.iter().any(|r| {
                 r.uuid == uuid
                     && r.mode == WiringMode::Vendored
-                    && r.purl == key
+                    && same_package(&r.purl, &key)
                     && r.artifact_rel.as_deref() == Some(artifact)
             })
         })
@@ -1417,6 +1417,14 @@ pub fn canonical_base_purl(purl: &str) -> String {
     }
 }
 
+/// Whether a ref's [`canonical_base_purl`] and `key` (another canonical
+/// base) name the same package release: equal, or for composer the same
+/// release in another version spelling (a ledger's `@3.0.2.0` is the lock's
+/// `@3.0.2`).
+fn same_package(ref_purl: &str, key: &str) -> bool {
+    ref_purl == key || crate::utils::composer_version::composer_purls_equivalent(ref_purl, key)
+}
+
 /// [`canonical_base_purl`] for a ref about to be pushed, plus shape checks:
 /// a known ecosystem type and a non-empty name and version (the version
 /// after the LAST `@`, containing no `/`).
@@ -1445,7 +1453,9 @@ impl Discovery {
     /// `mode`, whichever patch it names.
     pub fn wires_package(&self, purl: &str, mode: WiringMode) -> bool {
         let key = canonical_base_purl(purl);
-        self.refs.iter().any(|r| r.mode == mode && r.purl == key)
+        self.refs
+            .iter()
+            .any(|r| r.mode == mode && same_package(&r.purl, &key))
     }
 
     /// Liveness of a VENDOR-ledger entry — the ONE rule every reader of the

@@ -26,6 +26,7 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::apply::{verify_file_patch, PatchSources};
 use socket_patch_core::telemetry::{track_patch_vendor_failed, track_patch_vendored};
+use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::concurrent::{ordered_concurrent, registry_concurrency};
 use socket_patch_core::utils::group_commit::GroupCommit;
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_qualifiers};
@@ -2872,6 +2873,8 @@ pub(crate) async fn vendor_records_reusing(
                     if let Some(entry) = entry {
                         if let Some(flavor) = entry.flavor.as_deref() {
                             wired_flavors.insert(flavor.to_string());
+                        } else if entry.ecosystem == "composer" {
+                            wired_flavors.insert("composer".to_string());
                         }
                         let (save_failed, stale) = record_vendor_entry(
                             common, env, &mut state, candidate, entry, detached, record,
@@ -3035,7 +3038,16 @@ pub(crate) async fn vendor_records_reusing(
                      until reinstalled."
                 );
             }
-            if let Ok(lock) = std::fs::read_to_string(common.cwd.join("composer.lock")) {
+            let composer_lock = wired_flavors
+                .contains("composer")
+                .then(|| {
+                    socket_patch_core::utils::fs::read_regular_to_string_sync(
+                        &common.cwd.join("composer.lock"),
+                    )
+                    .ok()
+                })
+                .flatten();
+            if let Some(lock) = composer_lock {
                 let packages = super::composer_hints::vendored_composer_packages(&lock);
                 super::composer_hints::vendored_reinstall_hints(&packages)
                     .iter()
@@ -3471,7 +3483,11 @@ pub(crate) async fn run_vendor_gc(
             let dropped: Vec<String> = m
                 .patches
                 .keys()
-                .filter(|k| *k == &purl || strip_purl_qualifiers(k) == base)
+                .filter(|k| {
+                    *k == &purl
+                        || strip_purl_qualifiers(k) == base
+                        || composer_purls_equivalent(k, &base)
+                })
                 .cloned()
                 .collect();
             for k in dropped {

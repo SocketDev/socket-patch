@@ -22,6 +22,7 @@ use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSea
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry};
+use socket_patch_core::utils::composer_version::composer_purls_equivalent;
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
@@ -403,7 +404,12 @@ async fn migrate_legacy_manifest_records(
         let keys: Vec<String> = manifest
             .patches
             .keys()
-            .filter(|k| *k == &key || *k == purl || strip_purl_qualifiers(k) == base)
+            .filter(|k| {
+                *k == &key
+                    || *k == purl
+                    || strip_purl_qualifiers(k) == base
+                    || composer_purls_equivalent(k, base)
+            })
             .cloned()
             .collect();
         for k in keys {
