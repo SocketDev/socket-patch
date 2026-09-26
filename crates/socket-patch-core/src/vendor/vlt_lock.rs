@@ -1302,8 +1302,9 @@ pub(crate) async fn vendor_vlt(
             "vendor_dep_manifest_stale",
             format!(
                 "the patch rewrites {name}@{version}'s package.json; vlt-lock.json keeps the \
-                 node's recorded dependency edges — if the patch changed dependency ranges, run \
-                 `vlt install` to re-resolve them"
+                 node's recorded dependency edges, and `vlt install` and `vlt ci` install from \
+                 them — if the patch changed dependency ranges, run `vlt update` to re-resolve \
+                 them (it resolves every dependency of the project from scratch)"
             ),
         ));
     }
@@ -1890,6 +1891,9 @@ pub async fn revert_vlt_opts(
             outcome.keep_artifact(&uuid_dir_rel);
             return outcome;
         }
+        if let Some(staged) = staged.as_mut() {
+            drop_unrecorded_file_edges(staged, entry);
+        }
         let new_lock = match (doc.as_ref(), staged) {
             (Some(doc), Some(staged)) => Some(render_restored(doc, staged)),
             _ => None,
@@ -1932,6 +1936,50 @@ pub async fn revert_vlt_opts(
     }
     outcome.warnings.extend(reinstall);
     outcome
+}
+
+/// Edges vlt added from the vendored `file` node after vendoring (a `vlt
+/// update` resolving a dependency the patch added) have no wiring record
+/// and would dangle from the node the revert removes: drop them, and every
+/// node that only they kept in the lock.
+fn drop_unrecorded_file_edges(staged: &mut Staged, entry: &VendorEntry) {
+    let live = |staged: &Staged, id: &str| {
+        staged
+            .nodes
+            .iter()
+            .enumerate()
+            .any(|(i, e)| e.key == id && !staged.merged_nodes.contains(&i))
+    };
+    let mut gone: Vec<String> = entry
+        .wiring
+        .iter()
+        .filter(|r| r.kind == KIND_LOCK_NODE)
+        .filter_map(|r| fragment(&r.new).and_then(parse_node_entry_text))
+        .map(|n| n.key.to_string())
+        .filter(|id| !live(staged, id))
+        .collect();
+    let target_of = |e: &Entry| parse_edge_entry_text(&e.text()).map(|x| x.target().to_string());
+    while let Some(id) = gone.pop() {
+        let mut targets = Vec::new();
+        for (i, e) in staged.edges.iter().enumerate() {
+            if e.edge_from() == id && staged.merged_edges.insert(i) {
+                targets.extend(target_of(e));
+            }
+        }
+        for target in targets {
+            let referenced = staged.edges.iter().enumerate().any(|(i, e)| {
+                !staged.merged_edges.contains(&i) && target_of(e).as_deref() == Some(&target)
+            });
+            if referenced {
+                continue;
+            }
+            if let Some(i) = staged.nodes.iter().position(|e| e.key == target) {
+                if staged.merged_nodes.insert(i) {
+                    gone.push(target);
+                }
+            }
+        }
+    }
 }
 
 /// A block without its merged entries, the restored ones re-placed
@@ -2895,6 +2943,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revert_drops_the_edges_vlt_added_from_the_vendored_node() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (entry, _) = entry_of(run(&fx, UUID, false).await);
+        persist(&fx, &entry).await;
+        let lock = read(&fx, VLT_LOCK).await;
+        let file_id = lock
+            .lines()
+            .find_map(|l| {
+                l.trim_start()
+                    .strip_prefix('"')
+                    .and_then(|l| l.split_once("\": ["))
+                    .map(|(id, _)| id.to_string())
+                    .filter(|id| id.starts_with("file~.socket"))
+            })
+            .expect("the vendored file node");
+        let insert_before = |text: &str, before: &str, line: String| {
+            let at = text.find(before).expect(before);
+            let at = text[..at].rfind('\n').unwrap() + 1;
+            format!("{}    {line},\n{}", &text[..at], &text[at..])
+        };
+        let updated = insert_before(
+            &lock,
+            "\"~npm~z@1.0.0\": [",
+            r#""~npm~escape-html@1.0.3": [0,"escape-html","sha512-E=="]"#.to_string(),
+        );
+        let updated = insert_before(
+            &updated,
+            &format!("\"{file_id} z\": "),
+            format!(r#""{file_id} escape-html": "prod 1.0.3 ~npm~escape-html@1.0.3""#),
+        );
+        let updated = insert_before(
+            &updated,
+            &format!("\"{file_id} escape-html\": "),
+            format!(r#""{file_id} a": "prod 1.0.0 ~npm~a@1.0.0""#),
+        );
+        tokio::fs::write(fx.root.join(VLT_LOCK), &updated)
+            .await
+            .unwrap();
+        let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
+        assert!(out.success && out.warnings.is_empty(), "{out:?}");
+        assert_eq!(read(&fx, VLT_LOCK).await, basic_lock());
+    }
+
+    #[tokio::test]
     async fn a_new_uuid_warns_about_links_into_the_replaced_dir() {
         let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
         let (first, _) = entry_of(run(&fx, UUID, false).await);
@@ -3000,7 +3092,8 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|w| w.code == "vendor_dep_manifest_stale"),
+                .any(|w| w.code == "vendor_dep_manifest_stale"
+                    && w.detail.contains("run `vlt update` to re-resolve them")),
             "{warnings:?}"
         );
         let committed = read(&fx, &format!("{}/package.json", entry.artifact.path)).await;
