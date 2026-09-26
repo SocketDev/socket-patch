@@ -1622,6 +1622,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage_local_dir_artifact_verifies_the_inventory_and_drops_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("left-pad");
+        std::fs::create_dir_all(dir.join("node_modules/.bin")).unwrap();
+        std::fs::write(dir.join("package.json"), b"{}").unwrap();
+        std::fs::write(dir.join("index.js"), b"x").unwrap();
+        std::fs::write(dir.join("node_modules/.bin/tool"), b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../../elsewhere", dir.join("node_modules/dep")).unwrap();
+        let inventory = super::super::verify::compute_package_dir_inventory(&dir)
+            .await
+            .unwrap();
+        assert_eq!(inventory.len(), 2, "{inventory:?}");
+
+        let staged = stage_local_dir_artifact(&dir, Some(&inventory))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(staged.dir().join("index.js")).unwrap(), b"x");
+        assert!(!staged.dir().join("node_modules").exists());
+        assert_eq!(staged.url, format!("file:{}", dir.display()));
+
+        std::fs::write(dir.join("planted.js"), b"y").unwrap();
+        match stage_local_dir_artifact(&dir, Some(&inventory)).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("file inventory"), "{msg}"),
+            other => panic!("a planted file must fail, got {other:?}"),
+        }
+        std::fs::remove_file(dir.join("planted.js")).unwrap();
+        std::fs::write(dir.join("index.js"), b"modified").unwrap();
+        match stage_local_dir_artifact(&dir, Some(&inventory)).await {
+            Err(FetchError::Failed(msg)) => assert!(msg.contains("file inventory"), "{msg}"),
+            other => panic!("a modified file must fail, got {other:?}"),
+        }
+        match stage_local_dir_artifact(&dir, None).await {
+            Err(FetchError::Unverifiable(_)) => {}
+            other => panic!("no inventory is unverifiable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn cargo_crate_fetch_verifies_sha256_and_extracts() {
         // .crate = tar.gz with a {name}-{version}/ top dir.
         let crate_bytes = make_tgz(&[

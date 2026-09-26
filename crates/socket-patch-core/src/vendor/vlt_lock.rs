@@ -706,19 +706,13 @@ struct Wiring {
     lock: Option<String>,
 }
 
-fn wiring_record(
-    file: &str,
-    kind: &str,
-    key: &str,
-    original: Option<String>,
-    new: String,
-) -> WiringRecord {
+fn wiring_record(file: &str, kind: &str, key: &str, original: String, new: String) -> WiringRecord {
     WiringRecord {
         file: file.to_string(),
         kind: kind.to_string(),
         action: WiringAction::Rewritten,
         key: Some(key.to_string()),
-        original: original.map(Value::String),
+        original: Some(Value::String(original)),
         new: Some(Value::String(new)),
     }
 }
@@ -741,6 +735,28 @@ fn original_text(rec: Option<&WiringRecord>) -> Option<String> {
     rec.and_then(|r| r.original.as_ref())
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// A re-vendor over our own dir carries the prior record's key and
+/// original forward; without them the new records could never be reverted.
+fn carried(
+    target: &Target,
+    rec: Option<&WiringRecord>,
+    what: &str,
+) -> Result<(String, String), Refusal> {
+    match (rec.and_then(|r| r.key.clone()), original_text(rec)) {
+        (Some(key), Some(original)) => Ok((key, original)),
+        _ => Err((
+            "vendor_wiring_unknown",
+            format!(
+                "vlt-lock.json already resolves this package through {}, but the vendor ledger \
+                 records no pre-vendor {what} to carry forward (it was likely reconstructed by \
+                 `socket-patch repair`); restore the registry spec in package.json, run `vlt \
+                 install`, then vendor again",
+                target.key
+            ),
+        )),
+    }
 }
 
 /// DESIGN §4.5.2–§4.5.4: the records and the new surfaces, or `None` when
@@ -795,9 +811,10 @@ fn plan_wiring(
         }
         let key = format!("{}/{}", edge.field, edge.dep);
         let original = if target.ours {
-            original_text(prior_original(prior, &pkg_rel, KIND_PKG_DEP, |k| k == key))
+            let rec = prior_original(prior, &pkg_rel, KIND_PKG_DEP, |k| k == key);
+            carried(target, rec, &format!("{pkg_rel} {key} spec"))?.1
         } else {
-            Some(current)
+            current
         };
         let edited = replace_dependency_token(&text, edge.field, &edge.dep, &new)
             .map_err(|_| (OUT_OF_SYNC, format!("cannot edit {pkg_rel}")))?;
@@ -808,15 +825,10 @@ fn plan_wiring(
     let mut node_touch = Vec::new();
     if *node != new_node {
         let (key, original) = if target.ours {
-            let prior_rec = prior_original(prior, VLT_LOCK, KIND_LOCK_NODE, |_| true);
-            (
-                prior_rec
-                    .and_then(|r| r.key.clone())
-                    .unwrap_or_else(|| node.key.clone()),
-                original_text(prior_rec),
-            )
+            let rec = prior_original(prior, VLT_LOCK, KIND_LOCK_NODE, |_| true);
+            carried(target, rec, "registry node")?
         } else {
-            (node.key.clone(), Some(node.text()))
+            (node.key.clone(), node.text())
         };
         records.push(wiring_record(
             VLT_LOCK,
@@ -848,11 +860,10 @@ fn plan_wiring(
             continue;
         }
         let original = if target.ours {
-            original_text(prior_original(prior, VLT_LOCK, KIND_LOCK_EDGE, |k| {
-                k == current.key
-            }))
+            let rec = prior_original(prior, VLT_LOCK, KIND_LOCK_EDGE, |k| k == current.key);
+            carried(target, rec, &format!("edge `{}`", current.key))?.1
         } else {
-            Some(current.text())
+            current.text()
         };
         records.push(wiring_record(
             VLT_LOCK,
@@ -874,18 +885,13 @@ fn plan_wiring(
         };
         let (key, original) = if target.ours {
             let dep = current.edge_dep().to_string();
-            let prior_rec = prior_original(prior, VLT_LOCK, KIND_LOCK_EDGE, |k| {
+            let rec = prior_original(prior, VLT_LOCK, KIND_LOCK_EDGE, |k| {
                 k.split_once(' ')
                     .is_some_and(|(from, d)| d == dep && !is_importer_dep_id(from))
             });
-            (
-                prior_rec
-                    .and_then(|r| r.key.clone())
-                    .unwrap_or_else(|| current.key.clone()),
-                original_text(prior_rec),
-            )
+            carried(target, rec, &format!("edge `{}`", current.key))?
         } else {
-            (current.key.clone(), Some(current.text()))
+            (current.key.clone(), current.text())
         };
         records.push(wiring_record(
             VLT_LOCK,
@@ -1078,11 +1084,17 @@ pub(crate) async fn vendor_vlt(
                 warnings,
             );
         }
+        let relink = if staged.links_dropped {
+            "; its node_modules/ held more than vlt's dependency links and was discarded, so \
+             run `vlt install` to re-link its dependencies"
+        } else {
+            ""
+        };
         warnings.push(VendorWarning::new(
             "vendor_artifact_rebuilt",
             format!(
                 "the committed vendored dir for {name}@{version} was missing or stale; rebuilt \
-                 at {} (vlt-lock.json and package.json untouched)",
+                 at {} (vlt-lock.json and package.json untouched){relink}",
                 staged.rel_dir
             ),
         ));
@@ -1234,6 +1246,9 @@ struct Staged {
     edges: Vec<Entry>,
     touched_nodes: Vec<usize>,
     touched_edges: Vec<usize>,
+    /// Vendored entries dropped in favor of a live registry twin.
+    merged_nodes: BTreeSet<usize>,
+    merged_edges: BTreeSet<usize>,
 }
 
 enum Step {
@@ -1245,6 +1260,11 @@ enum Step {
 fn slot_value(raw: Option<&str>) -> Option<Value> {
     raw.filter(|s| *s != "null")
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
+}
+
+fn registry_slots(entry: &Entry) -> Option<(Option<Value>, Option<Value>)> {
+    let text = entry.text();
+    parse_node_entry_text(&text).map(|n| (slot_value(n.slot(2)), slot_value(n.slot(3))))
 }
 
 fn revert_node(staged: &mut Staged, rec: &WiringRecord) -> Step {
@@ -1264,6 +1284,17 @@ fn revert_node(staged: &mut Staged, rec: &WiringRecord) -> Step {
         if live.slot(2) != Some("null") || slot_value(live.slot(3)) != slot_value(new.slot(3)) {
             return Step::Drift(format!("{} drifted from the vendored wiring", new.key));
         }
+        let wanted = (slot_value(original.slot(2)), slot_value(original.slot(3)));
+        if let Some(twin) = staged.nodes.iter().find(|e| e.key == original.key) {
+            if registry_slots(twin) != Some(wanted) {
+                return Step::Drift(format!(
+                    "vlt-lock.json holds both {} and a different {}",
+                    new.key, original.key
+                ));
+            }
+            staged.merged_nodes.insert(i);
+            return Step::Applied;
+        }
         let tuple = render_tuple_with_slots(
             &live.elems,
             original.slot(2).filter(|s| *s != "null"),
@@ -1281,11 +1312,7 @@ fn revert_node(staged: &mut Staged, rec: &WiringRecord) -> Step {
         .nodes
         .iter()
         .find(|e| e.key == original.key)
-        .and_then(|e| {
-            let text = e.text();
-            parse_node_entry_text(&text)
-                .map(|live| (slot_value(live.slot(2)), slot_value(live.slot(3))))
-        });
+        .and_then(registry_slots);
     if restored == Some((slot_value(original.slot(2)), slot_value(original.slot(3)))) {
         Step::AlreadyReverted
     } else {
@@ -1324,7 +1351,15 @@ fn revert_edge(staged: &mut Staged, rec: &WiringRecord) -> Step {
         };
     }
     match (find(&new.key), find(&original.key)) {
-        (Some(i), _) => {
+        (Some(i), Some(j)) if staged.edges[i].value == staged.edges[j].value => {
+            staged.merged_edges.insert(i);
+            Step::Applied
+        }
+        (Some(_), Some(_)) => Step::Drift(format!(
+            "vlt-lock.json holds both `{}` and a different `{}`",
+            new.key, original.key
+        )),
+        (Some(i), None) => {
             staged.edges[i].key = original.key.clone();
             staged.touched_edges.push(i);
             Step::Applied
@@ -1489,6 +1524,8 @@ pub async fn revert_vlt_opts(
             edges: d.edges.entries.clone(),
             touched_nodes: Vec::new(),
             touched_edges: Vec::new(),
+            merged_nodes: BTreeSet::new(),
+            merged_edges: BTreeSet::new(),
         });
         let mut new_pkgs = pkgs.clone();
         let mut drift: Option<String> = None;
@@ -1549,24 +1586,39 @@ pub async fn revert_vlt_opts(
     outcome
 }
 
-/// The lock with the restored entries re-placed (§4.5.4), in the forward
-/// record order.
+/// A block without its merged entries, the restored ones re-placed
+/// (§4.5.4) in the forward record order.
+fn restored_block(
+    entries: &[Entry],
+    touched: &[usize],
+    merged: &BTreeSet<usize>,
+    cmp: fn(&Entry, &Entry) -> Option<Ordering>,
+) -> Vec<Entry> {
+    let kept: Vec<Entry> = entries
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !merged.contains(i))
+        .map(|(_, e)| e.clone())
+        .collect();
+    let touched: Vec<(usize, Entry)> = touched
+        .iter()
+        .rev()
+        .map(|&i| (i - merged.range(..i).count(), entries[i].clone()))
+        .collect();
+    place(&kept, &touched, cmp)
+}
+
 fn render_restored(doc: &LockDoc, staged: Staged) -> String {
-    let touched = |entries: &[Entry], order: &[usize]| -> Vec<(usize, Entry)> {
-        order
-            .iter()
-            .rev()
-            .map(|&i| (i, entries[i].clone()))
-            .collect()
-    };
-    let nodes = place(
+    let nodes = restored_block(
         &staged.nodes,
-        &touched(&staged.nodes, &staged.touched_nodes),
+        &staged.touched_nodes,
+        &staged.merged_nodes,
         node_cmp,
     );
-    let edges = place(
+    let edges = restored_block(
         &staged.edges,
-        &touched(&staged.edges, &staged.touched_edges),
+        &staged.touched_edges,
+        &staged.merged_edges,
         edge_cmp,
     );
     LockDoc {
@@ -2394,6 +2446,553 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        assert!(!fx.root.join(".socket/vendor").exists());
+    }
+
+    fn file_id() -> String {
+        format!("file~.socket+vendor+npm+{UUID}+left-pad-1.3.0+node__modules+left-pad")
+    }
+
+    fn uuid_dir(fx: &Fx, uuid: &str) -> std::path::PathBuf {
+        fx.root.join(format!(".socket/vendor/npm/{uuid}"))
+    }
+
+    type DoneParts = (
+        (bool, Option<String>),
+        Option<VendorEntry>,
+        Vec<VendorWarning>,
+    );
+
+    fn done_parts(outcome: VendorOutcome) -> DoneParts {
+        match outcome {
+            VendorOutcome::Done {
+                result,
+                entry,
+                warnings,
+            } => ((result.success, result.error), entry, warnings),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    fn codes(warnings: &[VendorWarning]) -> Vec<&str> {
+        warnings.iter().map(|w| w.code).collect()
+    }
+
+    #[tokio::test]
+    async fn revert_beside_a_registry_twin_merges_into_it_or_drifts() {
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
+        let file_id = file_id();
+        let file_node = format!(r#""{file_id}": [0,"left-pad",null,"{rel}"]"#);
+        let file_edge = format!(r#""file~_d left-pad": "prod file:./{rel} {file_id}""#);
+        let file_out = format!(r#""{file_id} z": "prod ^1.0.0 ~npm~z@1.0.0""#);
+        let ws_edge = r#""workspace~packages+a left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0""#;
+        let a_node = r#""~npm~a@1.0.0": [0,"a","sha512-A=="]"#;
+        let z_node = r#""~npm~z@1.0.0": [0,"z","sha512-Z=="]"#;
+        let a_edge = r#""file~_d a": "prod 1.0.0 ~npm~a@1.0.0""#;
+        let reg_out = r#""~npm~left-pad@1.3.0 z": "prod ^1.0.0 ~npm~z@1.0.0""#;
+        let cases = [
+            (REG_NODE.to_string(), reg_out.to_string(), true),
+            (
+                REG_NODE.replace("sha512-REG==", "sha512-OTHER=="),
+                reg_out.to_string(),
+                false,
+            ),
+            (
+                REG_NODE.to_string(),
+                reg_out.replace("~npm~z@1.0.0", "~npm~z@1.0.1"),
+                false,
+            ),
+        ];
+        for (twin_node, twin_out, merges) in cases {
+            let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+            let (entry, _) = entry_of(run(&fx, UUID, false).await);
+            let twin = render(
+                1,
+                &[a_node, &twin_node, z_node, &file_node],
+                &[a_edge, &file_edge, ws_edge, &file_out, &twin_out],
+            );
+            tokio::fs::write(fx.root.join(VLT_LOCK), &twin)
+                .await
+                .unwrap();
+            let pkg = read(&fx, PACKAGE_JSON).await;
+            let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
+            if merges {
+                assert!(out.success && out.warnings.is_empty(), "{out:?}");
+                assert_eq!(
+                    read(&fx, VLT_LOCK).await,
+                    render(
+                        1,
+                        &[a_node, REG_NODE, z_node],
+                        &[
+                            a_edge,
+                            r#""file~_d left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0""#,
+                            ws_edge,
+                            reg_out,
+                        ],
+                    )
+                );
+                assert_eq!(read(&fx, PACKAGE_JSON).await, ROOT_PKG);
+                assert!(!uuid_dir(&fx, UUID).exists());
+                assert!(parse_doc(&read(&fx, VLT_LOCK).await).is_ok());
+            } else {
+                assert!(
+                    out.success && out.drift_skipped() && out.kept_artifact,
+                    "{out:?}"
+                );
+                assert!(
+                    out.warnings[0].detail.contains("holds both"),
+                    "{:?}",
+                    out.warnings
+                );
+                assert_eq!(read(&fx, VLT_LOCK).await, twin, "a drift writes nothing");
+                assert_eq!(read(&fx, PACKAGE_JSON).await, pkg);
+                assert!(fx.root.join(&entry.artifact.path).exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn revert_finishes_a_partial_revert_record_by_record() {
+        let file_id = file_id();
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0/node_modules/left-pad");
+        let wired_pkg = ROOT_PKG.replace(
+            "\"left-pad\": \"1.3.0\"",
+            &format!("\"left-pad\": \"file:./{rel}\""),
+        );
+        type Undo = fn(&str, &str) -> (Option<String>, bool);
+        let undos: [(&str, Undo); 3] = [
+            ("the lock was already restored", |_, _| {
+                (Some(basic_lock()), false)
+            }),
+            (
+                "only the outgoing edge was re-keyed back",
+                |wired, file_id| {
+                    (
+                        Some(
+                            wired.replace(&format!("\"{file_id} z\""), "\"~npm~left-pad@1.3.0 z\""),
+                        ),
+                        false,
+                    )
+                },
+            ),
+            ("package.json was already restored", |_, _| (None, true)),
+        ];
+        for (label, undo) in undos {
+            let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+            let (entry, _) = entry_of(run(&fx, UUID, false).await);
+            assert_eq!(read(&fx, PACKAGE_JSON).await, wired_pkg);
+            let wired = read(&fx, VLT_LOCK).await;
+            let (lock, pkg_restored) = undo(&wired, &file_id);
+            if let Some(lock) = lock {
+                tokio::fs::write(fx.root.join(VLT_LOCK), lock)
+                    .await
+                    .unwrap();
+            }
+            if pkg_restored {
+                tokio::fs::write(fx.root.join(PACKAGE_JSON), ROOT_PKG)
+                    .await
+                    .unwrap();
+            }
+            let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
+            assert!(out.success && out.warnings.is_empty(), "{label}: {out:?}");
+            assert_eq!(read(&fx, VLT_LOCK).await, basic_lock(), "{label}");
+            assert_eq!(read(&fx, PACKAGE_JSON).await, ROOT_PKG, "{label}");
+            assert!(!uuid_dir(&fx, UUID).exists(), "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn revert_never_follows_a_record_outside_the_importer_allowlist() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (mut entry, _) = entry_of(run(&fx, UUID, false).await);
+        let pkg_rec = entry.wiring[0].clone();
+        let new = fragment(&pkg_rec.new).unwrap().to_string();
+        let planted = format!("{{\"dependencies\":{{\"left-pad\":{new}}}}}");
+        let outside = ["vendor/x/package.json", "../escape/package.json"];
+        for rel in outside {
+            let path = fx.root.join(rel);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, &planted).await.unwrap();
+            entry.wiring.insert(
+                0,
+                WiringRecord {
+                    file: rel.to_string(),
+                    ..pkg_rec.clone()
+                },
+            );
+        }
+        let lock = read(&fx, VLT_LOCK).await;
+        let pkg = read(&fx, PACKAGE_JSON).await;
+        let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
+        assert!(out.drift_skipped() && out.kept_artifact, "{out:?}");
+        for rel in outside {
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_lock_entry_drifted"
+                        && w.detail.contains("non-allowlisted")
+                        && w.detail.contains(rel)),
+                "{rel}: {:?}",
+                out.warnings
+            );
+            assert_eq!(read(&fx, rel).await, planted, "{rel} is never written");
+        }
+        assert_eq!(read(&fx, VLT_LOCK).await, lock);
+        assert_eq!(read(&fx, PACKAGE_JSON).await, pkg);
+        assert!(fx.root.join(&entry.artifact.path).exists());
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_revert_writes_nothing() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (entry, _) = entry_of(run(&fx, UUID, false).await);
+        let lock = read(&fx, VLT_LOCK).await;
+        let pkg = read(&fx, PACKAGE_JSON).await;
+        let inventory = crate::vendor::verify::compute_package_dir_inventory(
+            &fx.root.join(&entry.artifact.path),
+        )
+        .await
+        .unwrap();
+        let out = revert_vlt_opts(
+            &entry,
+            &fx.root,
+            RevertOpts {
+                dry_run: true,
+                keep_artifact: false,
+            },
+        )
+        .await;
+        assert!(out.success && out.warnings.is_empty(), "{out:?}");
+        assert_eq!(read(&fx, VLT_LOCK).await, lock);
+        assert_eq!(read(&fx, PACKAGE_JSON).await, pkg);
+        assert_eq!(
+            crate::vendor::verify::compute_package_dir_inventory(
+                &fx.root.join(&entry.artifact.path)
+            )
+            .await
+            .unwrap(),
+            inventory
+        );
+        assert!(uuid_dir(&fx, UUID).join(".gitignore").is_file());
+    }
+
+    #[tokio::test]
+    async fn a_new_uuid_over_an_unwired_prior_refuses_before_any_write() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (mut first, _) = entry_of(run(&fx, UUID, false).await);
+        first.wiring.clear();
+        persist(&fx, &first).await;
+        let lock = read(&fx, VLT_LOCK).await;
+        let pkg = read(&fx, PACKAGE_JSON).await;
+        let (code, detail) = refusal(run(&fx, UUID2, false).await);
+        assert_eq!(code, "vendor_wiring_unknown", "{detail}");
+        assert!(
+            detail.contains("run `vlt install`") && detail.contains(&file_id()),
+            "{detail}"
+        );
+        assert_eq!(read(&fx, VLT_LOCK).await, lock);
+        assert_eq!(read(&fx, PACKAGE_JSON).await, pkg);
+        assert!(!uuid_dir(&fx, UUID2).exists());
+
+        let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (mut partial, _) = entry_of(run(&fx, UUID, false).await);
+        partial.wiring[1].original = None;
+        persist(&fx, &partial).await;
+        let (code, _) = refusal(run(&fx, UUID2, false).await);
+        assert_eq!(code, "vendor_wiring_unknown");
+        assert!(!uuid_dir(&fx, UUID2).exists());
+    }
+
+    #[tokio::test]
+    async fn a_stale_committed_dir_is_rebuilt_under_in_sync_wiring() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (first, _) = entry_of(run(&fx, UUID, false).await);
+        persist(&fx, &first).await;
+        let lock = read(&fx, VLT_LOCK).await;
+        let pkg = read(&fx, PACKAGE_JSON).await;
+        let index = fx.root.join(&first.artifact.path).join("index.js");
+        tokio::fs::remove_file(&index).await.unwrap();
+
+        let (result, entry, warnings) = done_parts(run(&fx, UUID, false).await);
+        assert!(result.0, "{result:?}");
+        let mut entry = entry.expect("a rebuild returns its entry");
+        assert_eq!(codes(&warnings), ["vendor_artifact_rebuilt"]);
+        assert!(!warnings[0].detail.contains("vlt install"), "{warnings:?}");
+        assert_eq!(tokio::fs::read(&index).await.unwrap(), PATCHED);
+        assert_eq!(read(&fx, VLT_LOCK).await, lock);
+        assert_eq!(read(&fx, PACKAGE_JSON).await, pkg);
+        assert_eq!(entry.artifact.path, first.artifact.path);
+        assert_eq!(entry.artifact.file_inventory, first.artifact.file_inventory);
+        assert!(entry.wiring.is_empty());
+        crate::vendor::state::carry_forward_wiring(&first, &mut entry);
+        assert_eq!(entry.wiring, first.wiring);
+    }
+
+    #[tokio::test]
+    async fn a_rebuild_clears_strays_beside_the_package_dir_and_ends_healthy() {
+        use crate::vendor::verify::{check_vendored_artifact, ArtifactHealth};
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (first, _) = entry_of(run(&fx, UUID, false).await);
+        persist(&fx, &first).await;
+        let rec = record(UUID);
+        let leaf = uuid_dir(&fx, UUID).join("left-pad-1.3.0");
+        tokio::fs::write(leaf.join("node_modules/.DS_Store"), b"x")
+            .await
+            .unwrap();
+        tokio::fs::write(leaf.join("stray.txt"), b"x")
+            .await
+            .unwrap();
+        assert_eq!(
+            check_vendored_artifact(&fx.root, &first, &rec).await,
+            ArtifactHealth::Corrupt {
+                reason: "vendor_inventory_mismatch".into()
+            }
+        );
+        let (result, entry, warnings) = done_parts(run(&fx, UUID, false).await);
+        assert!(result.0, "{result:?}");
+        assert_eq!(codes(&warnings), ["vendor_artifact_rebuilt"]);
+        let mut entry = entry.unwrap();
+        crate::vendor::state::carry_forward_wiring(&first, &mut entry);
+        persist(&fx, &entry).await;
+        assert_eq!(
+            check_vendored_artifact(&fx.root, &entry, &rec).await,
+            ArtifactHealth::Healthy
+        );
+        assert!(!leaf.join("node_modules/.DS_Store").exists());
+        assert!(!leaf.join("stray.txt").exists());
+        let (result, entry, warnings) = done_parts(run(&fx, UUID, false).await);
+        assert!(
+            result.0 && entry.is_none() && warnings.is_empty(),
+            "{warnings:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rebuild_keeps_vlt_links_and_says_to_reinstall_when_it_cannot() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (first, _) = entry_of(run(&fx, UUID, false).await);
+        persist(&fx, &first).await;
+        let rel_abs = fx.root.join(&first.artifact.path);
+        let links = rel_abs.join("node_modules");
+        tokio::fs::create_dir_all(links.join(".bin")).await.unwrap();
+        std::os::unix::fs::symlink(
+            "../../../../../../../../node_modules/.vlt/z",
+            links.join("z"),
+        )
+        .unwrap();
+        tokio::fs::write(links.join(".bin/tool"), b"#!/bin/sh\n")
+            .await
+            .unwrap();
+        tokio::fs::remove_file(rel_abs.join("index.js"))
+            .await
+            .unwrap();
+
+        let (_, entry, warnings) = done_parts(run(&fx, UUID, false).await);
+        assert!(entry.is_some());
+        assert_eq!(codes(&warnings), ["vendor_artifact_rebuilt"]);
+        assert!(!warnings[0].detail.contains("vlt install"), "{warnings:?}");
+        assert_eq!(
+            std::fs::read_link(links.join("z")).unwrap(),
+            std::path::Path::new("../../../../../../../../node_modules/.vlt/z")
+        );
+        assert!(links.join(".bin/tool").is_file());
+        assert_eq!(
+            tokio::fs::read(rel_abs.join("index.js")).await.unwrap(),
+            PATCHED
+        );
+
+        tokio::fs::write(links.join("planted.js"), b"x")
+            .await
+            .unwrap();
+        let (_, entry, warnings) = done_parts(run(&fx, UUID, false).await);
+        assert!(entry.is_some());
+        assert_eq!(codes(&warnings), ["vendor_artifact_rebuilt"]);
+        assert!(
+            warnings[0].detail.contains("run `vlt install`"),
+            "{warnings:?}"
+        );
+        assert!(!links.exists());
+    }
+
+    #[tokio::test]
+    async fn an_in_sync_rerun_restores_the_uuid_metadata() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (first, _) = entry_of(run(&fx, UUID, false).await);
+        persist(&fx, &first).await;
+        let dir = uuid_dir(&fx, UUID);
+        tokio::fs::write(dir.join(".gitignore"), b"*\n")
+            .await
+            .unwrap();
+        tokio::fs::remove_file(dir.join(".gitattributes"))
+            .await
+            .unwrap();
+        let (result, entry, warnings) = done_parts(run(&fx, UUID, false).await);
+        assert!(
+            result.0 && entry.is_none() && warnings.is_empty(),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(dir.join(".gitignore"))
+                .await
+                .unwrap(),
+            super::super::npm_dir::UUID_GITIGNORE
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(dir.join(".gitattributes"))
+                .await
+                .unwrap(),
+            super::super::npm_dir::UUID_GITATTRIBUTES
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_gitignored_payload_refuses_and_unwinds() {
+        let Some(git) = crate::utils::process::resolve_tool("git") else {
+            return;
+        };
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let status = std::process::Command::new(&git)
+            .args(["init", "-q"])
+            .current_dir(&fx.root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        tokio::fs::write(fx.root.join(".gitignore"), ".socket/\n")
+            .await
+            .unwrap();
+        let (code, detail) = refusal(run(&fx, UUID, false).await);
+        assert_eq!(code, "vendor_artifact_gitignored", "{detail}");
+        assert!(detail.contains(".gitignore:1:.socket/"), "{detail}");
+        assert!(!uuid_dir(&fx, UUID).exists());
+        assert_eq!(read(&fx, VLT_LOCK).await, basic_lock());
+        assert_eq!(read(&fx, PACKAGE_JSON).await, ROOT_PKG);
+    }
+
+    #[tokio::test]
+    async fn a_bundling_package_refuses_on_the_local_build() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        tokio::fs::write(
+            fx.installed.join(PACKAGE_JSON),
+            "{\"name\":\"left-pad\",\"version\":\"1.3.0\",\"bundleDependencies\":[\"x\"]}",
+        )
+        .await
+        .unwrap();
+        let (code, _) = refusal(run(&fx, UUID, false).await);
+        assert_eq!(code, "vendor_bundled_deps_unsupported");
+        assert!(!fx.root.join(".socket").exists());
+        assert_eq!(read(&fx, VLT_LOCK).await, basic_lock());
+    }
+
+    #[tokio::test]
+    async fn the_service_tree_is_pruned_and_a_bundling_one_refuses() {
+        use crate::vendor::test_support::{mount_granted, service_cfg};
+        use crate::vendor::verify::{check_vendored_artifact, ArtifactHealth};
+        use crate::vendor::VendorSource;
+        let server = wiremock::MockServer::start().await;
+        let tgz = service_tgz(&[
+            (
+                "package/package.json",
+                tar::EntryType::Regular,
+                b"{\"name\":\"left-pad\",\"version\":\"1.3.0\"}",
+            ),
+            ("package/index.js", tar::EntryType::Regular, PATCHED),
+            (
+                "package/node_modules/x/index.js",
+                tar::EntryType::Regular,
+                b"bundled",
+            ),
+        ]);
+        mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &tgz).await;
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let cfg = service_cfg(&server.uri(), VendorSource::Auto, false);
+        let (entry, warnings) = entry_of(run_with(&fx, &cfg).await);
+        assert!(
+            codes(&warnings).contains(&"vendor_prebuilt_downloaded"),
+            "{warnings:?}"
+        );
+        assert!(!fx
+            .root
+            .join(&entry.artifact.path)
+            .join("node_modules")
+            .exists());
+        assert_eq!(
+            check_vendored_artifact(&fx.root, &entry, &record(UUID)).await,
+            ArtifactHealth::Healthy
+        );
+
+        let server = wiremock::MockServer::start().await;
+        let tgz = service_tgz(&[
+            (
+                "package/package.json",
+                tar::EntryType::Regular,
+                b"{\"name\":\"left-pad\",\"version\":\"1.3.0\",\"bundleDependencies\":[\"x\"]}",
+            ),
+            ("package/index.js", tar::EntryType::Regular, PATCHED),
+            (
+                "package/node_modules/x/index.js",
+                tar::EntryType::Regular,
+                b"bundled",
+            ),
+        ]);
+        mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &tgz).await;
+        let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let cfg = service_cfg(&server.uri(), VendorSource::Auto, false);
+        let (code, _) = refusal(run_with(&fx, &cfg).await);
+        assert_eq!(code, "vendor_bundled_deps_unsupported");
+        assert!(!fx.root.join(".socket/vendor").exists());
+        assert_eq!(read(&fx, VLT_LOCK).await, basic_lock());
+    }
+
+    #[tokio::test]
+    async fn a_service_tree_without_the_patched_files_falls_back_or_fails_closed() {
+        use crate::vendor::test_support::{mount_granted, service_cfg};
+        use crate::vendor::VendorSource;
+        let server = wiremock::MockServer::start().await;
+        let tgz = service_tgz(&[
+            (
+                "package/package.json",
+                tar::EntryType::Regular,
+                b"{\"name\":\"left-pad\",\"version\":\"1.3.0\"}",
+            ),
+            (
+                "package/index.js",
+                tar::EntryType::Regular,
+                b"not the patch",
+            ),
+        ]);
+        mount_granted(&server, UUID, "left-pad-1.3.0.tgz", &tgz).await;
+
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let cfg = service_cfg(&server.uri(), VendorSource::Auto, false);
+        let (entry, warnings) = entry_of(run_with(&fx, &cfg).await);
+        assert!(
+            codes(&warnings).contains(&"vendor_prebuilt_layout_mismatch"),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            tokio::fs::read(fx.root.join(&entry.artifact.path).join("index.js"))
+                .await
+                .unwrap(),
+            PATCHED,
+            "the local build replaced the service tree"
+        );
+
+        let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let cfg = service_cfg(&server.uri(), VendorSource::Service, false);
+        let (result, entry, _) = done_parts(run_with(&fx, &cfg).await);
+        assert!(!result.0 && entry.is_none(), "{result:?}");
+        assert!(
+            result
+                .1
+                .unwrap()
+                .contains("does not carry the patched files"),
+            "fails closed"
+        );
+        assert_eq!(read(&fx, VLT_LOCK).await, basic_lock());
         assert!(!fx.root.join(".socket/vendor").exists());
     }
 }

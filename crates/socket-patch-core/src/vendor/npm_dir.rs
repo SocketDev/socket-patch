@@ -61,6 +61,9 @@ pub(super) struct NpmStagedDir {
     pub staged_pkg_json: Option<Value>,
     /// The committed dir passed the reuse check; nothing was written.
     pub reused: bool,
+    /// A rebuild discarded the old dir's `node_modules/` (it held more
+    /// than vlt's links), so the package needs `vlt install` to re-link.
+    pub links_dropped: bool,
 }
 
 // ── package.json spans ───────────────────────────────────────────────────
@@ -431,24 +434,17 @@ pub(crate) async fn gitignored(project_root: &Path, paths: &[String]) -> Option<
     if inside.trim() != "true" {
         return None;
     }
-    let input: String = paths.iter().map(|p| format!("{p}\n")).collect();
+    let input: String = paths.iter().map(|p| format!("{p}\0")).collect();
     let (code, out) = git_output(
         &git,
         project_root,
-        &["check-ignore", "-v", "--no-index", "--stdin"],
+        &["check-ignore", "-v", "-z", "--no-index", "--stdin"],
         Some(input),
     )
     .await?;
-    let lines: Vec<&str> = out
-        .lines()
-        .filter(|line| {
-            let rule = line.split('\t').next().unwrap_or_default();
-            let pattern = rule.splitn(3, ':').nth(2).unwrap_or_default();
-            !pattern.is_empty() && !pattern.starts_with('!')
-        })
-        .collect();
+    let lines = ignoring_rules(&out);
     (code == 0 && !lines.is_empty()).then(|| {
-        let shown: Vec<&str> = lines.iter().take(3).copied().collect();
+        let shown: Vec<&str> = lines.iter().take(3).map(String::as_str).collect();
         let more = lines.len().saturating_sub(shown.len());
         let mut detail = shown.join("; ");
         if more > 0 {
@@ -456,6 +452,19 @@ pub(crate) async fn gitignored(project_root: &Path, paths: &[String]) -> Option<
         }
         detail
     })
+}
+
+/// The non-negated matches of `git check-ignore -v -z` output
+/// (`<source> NUL <linenum> NUL <pattern> NUL <pathname> NUL` per path), as
+/// `<source>:<linenum>:<pattern>\t<pathname>`. A source may hold a colon
+/// (a Windows drive letter), so the fields are split on NUL only.
+fn ignoring_rules(out: &str) -> Vec<String> {
+    let fields: Vec<&str> = out.split('\0').collect();
+    fields
+        .chunks_exact(4)
+        .filter(|f| !f[2].is_empty() && !f[2].starts_with('!'))
+        .map(|f| format!("{}:{}:{}\t{}", f[0], f[1], f[2], f[3]))
+        .collect()
 }
 
 fn gitignored_refusal(rel_dir: &str, rules: &str) -> VendorOutcome {
@@ -519,6 +528,7 @@ pub(super) async fn stage_patch_dir(
                         uuid_dir_preexisted: true,
                         staged_pkg_json,
                         reused: true,
+                        links_dropped: false,
                     }),
                     result,
                 ));
@@ -561,6 +571,7 @@ pub(super) async fn stage_patch_dir(
     }
     let result = match result {
         Some(result) => {
+            prune_staged_node_modules(purl, &stage, &coords.name, &coords.version).await?;
             apply_transforms(&stage, &coords.name, &coords.version).await?;
             result
         }
@@ -571,24 +582,7 @@ pub(super) async fn stage_patch_dir(
                     format!("cannot stage a copy of the installed package: {e}"),
                 )));
             }
-            if let Err(e) = remove_tree(&stage.join(NODE_MODULES)).await {
-                return Err(Box::new(done_failure(
-                    purl,
-                    format!("cannot prune staged node_modules: {e}"),
-                )));
-            }
-            if let Ok(pkg) = read_manifest(&stage).await {
-                if declares_bundled_deps(&pkg) {
-                    return Err(Box::new(refused(
-                        "vendor_bundled_deps_unsupported",
-                        format!(
-                            "{}@{} declares bundleDependencies; vendoring would drop its \
-                             bundled node_modules and break installs",
-                            coords.name, coords.version
-                        ),
-                    )));
-                }
-            }
+            prune_staged_node_modules(purl, &stage, &coords.name, &coords.version).await?;
             let result = super::force_apply_staged(
                 purl,
                 &stage,
@@ -622,11 +616,14 @@ pub(super) async fn stage_patch_dir(
             uuid_dir_preexisted,
         )
     };
-    if let Err(e) = write_into_place(&stage, &uuid_dir, &rel_abs).await {
-        return Err(Box::new(
-            unstage(format!("cannot write {rel_dir}: {e}")).await,
-        ));
-    }
+    let links_dropped = match write_into_place(&stage, &uuid_dir, &rel_abs, &coords.name).await {
+        Ok(dropped) => dropped,
+        Err(e) => {
+            return Err(Box::new(
+                unstage(format!("cannot write {rel_dir}: {e}")).await,
+            ))
+        }
+    };
     if let Err(e) = restore_uuid_metadata(&uuid_dir).await {
         return Err(Box::new(
             unstage(format!(
@@ -667,9 +664,38 @@ pub(super) async fn stage_patch_dir(
             uuid_dir_preexisted,
             staged_pkg_json,
             reused: false,
+            links_dropped,
         }),
         result,
     ))
+}
+
+/// DESIGN §4.3 step 5 on any staged tree: prune its `node_modules/` and
+/// refuse a package that bundles dependencies.
+async fn prune_staged_node_modules(
+    purl: &str,
+    stage: &Path,
+    name: &str,
+    version: &str,
+) -> Result<(), Box<VendorOutcome>> {
+    if let Err(e) = remove_tree(&stage.join(NODE_MODULES)).await {
+        return Err(Box::new(done_failure(
+            purl,
+            format!("cannot prune staged node_modules: {e}"),
+        )));
+    }
+    if let Ok(pkg) = read_manifest(stage).await {
+        if declares_bundled_deps(&pkg) {
+            return Err(Box::new(refused(
+                "vendor_bundled_deps_unsupported",
+                format!(
+                    "{name}@{version} declares bundleDependencies; vendoring would drop its \
+                     bundled node_modules and break installs"
+                ),
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn read_manifest(dir: &Path) -> Result<Value, String> {
@@ -680,30 +706,56 @@ async fn read_manifest(dir: &Path) -> Result<Value, String> {
         .map_err(|e| format!("package.json is not parseable JSON: {e}"))
 }
 
-/// Copy the stage to `<uuid>/.tmp-*`, then rename it over `rel_abs`.
-async fn write_into_place(stage: &Path, uuid_dir: &Path, rel_abs: &Path) -> std::io::Result<()> {
-    tokio::fs::create_dir_all(uuid_dir).await?;
-    let parent: PathBuf = rel_abs
+/// Build the whole `<leaf>` level in `<uuid>/.tmp-*` and rename it over
+/// the old one, so nothing but the package dir survives beside it. The old
+/// dir's `node_modules/` moves along when it holds only vlt's links;
+/// `Ok(true)` when it held anything else and was discarded.
+async fn write_into_place(
+    stage: &Path,
+    uuid_dir: &Path,
+    rel_abs: &Path,
+    name: &str,
+) -> std::io::Result<bool> {
+    let mut leaf_abs = rel_abs.to_path_buf();
+    for _ in name.split('/') {
+        leaf_abs.pop();
+    }
+    leaf_abs.pop();
+    let parent: PathBuf = leaf_abs
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| std::io::Error::other("artifact path has no parent"))?;
+    tokio::fs::create_dir_all(uuid_dir).await?;
     tokio::fs::create_dir_all(&parent).await?;
     let tmp = tempfile::Builder::new()
         .prefix(".tmp-")
         .tempdir_in(uuid_dir)?
         .keep();
-    if let Err(e) = fresh_copy(stage, &tmp, None).await {
+    let tmp_pkg = tmp.join(NODE_MODULES).join(name);
+    if let Err(e) = fresh_copy(stage, &tmp_pkg, None).await {
         let _ = remove_tree(&tmp).await;
         return Err(e);
     }
-    if tokio::fs::symlink_metadata(rel_abs).await.is_ok() {
-        remove_tree(rel_abs).await?;
+    let old_links = rel_abs.join(NODE_MODULES);
+    let mut dropped = false;
+    if tokio::fs::symlink_metadata(&old_links).await.is_ok() {
+        if node_modules_holds_only_links(rel_abs).await {
+            if let Err(e) = tokio::fs::rename(&old_links, tmp_pkg.join(NODE_MODULES)).await {
+                let _ = remove_tree(&tmp).await;
+                return Err(e);
+            }
+        } else {
+            dropped = true;
+        }
     }
-    if let Err(e) = tokio::fs::rename(&tmp, rel_abs).await {
+    if tokio::fs::symlink_metadata(&leaf_abs).await.is_ok() {
+        remove_tree(&leaf_abs).await?;
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, &leaf_abs).await {
         let _ = remove_tree(&tmp).await;
         return Err(e);
     }
-    Ok(())
+    Ok(dropped)
 }
 
 /// Every record file of the extracted tree hashes to its afterHash (the
@@ -987,6 +1039,22 @@ mod tests {
                     .unwrap_err();
             assert!(err.contains("not a regular file"), "{kind:?}: {err}");
         }
+    }
+
+    #[test]
+    fn check_ignore_records_split_on_nul_so_a_drive_letter_source_parses() {
+        let out = "C:/Users/u/.gitignore_global\x003\x00!dist/\x00.socket/p/dist/i.js\x00\
+                   C:/Users/u/.gitignore_global\x004\x00*.map\x00.socket/p/i.js.map\x00\
+                   .gitignore\x001\x00.socket/\x00.socket/p/a.js\x00";
+        assert_eq!(
+            ignoring_rules(out),
+            [
+                "C:/Users/u/.gitignore_global:4:*.map\t.socket/p/i.js.map",
+                ".gitignore:1:.socket/\t.socket/p/a.js",
+            ]
+        );
+        assert!(ignoring_rules("").is_empty());
+        assert!(ignoring_rules("C:/g\x002\x00!x\x00x\x00").is_empty());
     }
 
     #[cfg(unix)]

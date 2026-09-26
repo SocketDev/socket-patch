@@ -1849,6 +1849,7 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
         "yarn.lock",
         "bun.lock",
         "shrinkwrap.yaml",
+        "vlt-lock.json",
     ];
     for name in names {
         mkfifo(&root.join(name));
@@ -1870,6 +1871,7 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
             inventory_yarn_classic(&root).await,
             inventory_yarn_berry(&root).await,
             inventory_bun(&root).await,
+            inventory_vlt(&root).await,
             inventory_pnpm_lock_at(&root.join("shrinkwrap.yaml")).await,
             gem_remotes(&root).await,
             wired_vendor_integrity(&root, ".socket/vendor/npm/x/x.tgz").await,
@@ -1885,8 +1887,22 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
         }
         panic!("lockfile inventories must fail fast on FIFO lockfiles");
     };
-    let (cargo, go, composer, gem, pypi, npm, pnpm, yarn_c, yarn_b, bun, legacy, remotes, wired) =
-        results;
+    let (
+        cargo,
+        go,
+        composer,
+        gem,
+        pypi,
+        npm,
+        pnpm,
+        yarn_c,
+        yarn_b,
+        bun,
+        vlt,
+        legacy,
+        remotes,
+        wired,
+    ) = results;
     for (label, opt) in [
         ("cargo", cargo),
         ("go", go),
@@ -1898,6 +1914,7 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
         ("yarn classic", yarn_c),
         ("yarn berry", yarn_b),
         ("bun", bun),
+        ("vlt", vlt),
         ("pnpm legacy", legacy),
     ] {
         assert!(
