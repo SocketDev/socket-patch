@@ -6,14 +6,17 @@
 //! The lock is parsed as JSON, so the `\/`-escaped slashes older composer
 //! versions write (fixture `escaped-slash-lock`; the hosted rewriter's
 //! [`crate::patch::redirect::artifact_url_present`] accepts both spellings)
-//! arrive unescaped. Each entry's identity is its own `name` (lowercased by
+//! arrive unescaped. Each entry's purl is its own `name` (lowercased by
 //! [`composer_purl`], the way packagist canonicalizes and both backends
 //! match — fixture `mixed-case-v-prefix`) and its `version` through
 //! composer's leading-`v` normalization
 //! ([`crate::crawlers::composer_crawler::normalize_version`]: locks carry the
-//! pretty `v6.4.1`, purls the bare `6.4.1`). Only `dist` is read: it is what
-//! composer's default `--prefer-dist` install consumes and the only block
-//! either backend rewrites.
+//! pretty `v6.4.1`, purls the bare `6.4.1`). A vendored leaf matches it by
+//! release identity ([`composer_purls_equivalent`]: a leaf keyed by the
+//! patch's padded `3.0.2.0` is the lock's `3.0.2`). The rewritten `dist` is
+//! what composer's default install consumes and the only block either
+//! backend rewrites, so it is what a ref is read from — unless composer
+//! installs the entry from its `source` instead (below).
 //!
 //! * **Hosted** (`patch::redirect::rewrite_composer_lock`): `dist.url` on
 //!   the patch server → [`DiscoverCtx::hosted_uuid`] (last canonical-uuid
@@ -28,11 +31,12 @@
 //!   upstream commit and is not checked. A `path`-type dist never downloads
 //!   its url, so a Socket url there wires nothing and is diagnosed. The
 //!   rewriter also drops the entry's git `source` (fixture
-//!   `source-and-dist`): composer 1 and 2.2 LTS fall back to it when the
-//!   hosted dist fails, installing the pristine upstream commit. A `source`
-//!   is NOT a reason to reject the ref (locks redirected before that fix
-//!   still carry one); an installed tree that came from the fallback is
-//!   pristine and fails hash verification (`not_applied`).
+//!   `source-and-dist`): Composer 1 and Composer 2 before 2.10 fall back to
+//!   it when the hosted dist fails, installing the pristine upstream commit.
+//!   A leftover `source` (locks redirected before that fix still carry one)
+//!   rejects the ref only when composer installs from it outright (below);
+//!   an installed tree that came from the fallback is pristine and fails
+//!   hash verification (`not_applied`).
 //! * **Vendored** (`vendor::composer_lock::rewrite_lock_entry`): `dist:
 //!   {"type": "path", "url": ".socket/vendor/composer/<uuid>/<vendor>/<name>@<version>",
 //!   "reference": "<uuid>"}` with `source` removed and
@@ -44,11 +48,22 @@
 //!   (the backend keys the dir `<vendor>/<name>@<purl version>`, lowercase),
 //!   and `reference` equal to the path's uuid (the backend has written the
 //!   uuid there since vendoring shipped; composer carries it verbatim into
-//!   `vendor/composer/installed.json`). `transport-options` and a leftover
-//!   `source` are NOT required — composer still consumes the vendored bytes
-//!   without them (symlinked instead of mirrored; `--prefer-source` aside).
-//!   A path dist pins no content hash, so `locked_integrity` is `None`; the
-//!   committed artifact is hashed instead.
+//!   `vendor/composer/installed.json`). `transport-options` is NOT required —
+//!   composer still consumes the vendored bytes without it (symlinked
+//!   instead of mirrored). A path dist pins no content hash, so
+//!   `locked_integrity` is `None`; the committed artifact is hashed instead.
+//!
+//! **Source installs.** Composer tries an entry's `source` before its `dist`
+//! when the root `composer.json`'s `config.preferred-install` resolves to
+//! `source` for the package (a string, or the first matching pattern of a
+//! per-package map), or when it is `auto` — the default through Composer
+//! 2.0, read from the lock's `plugin-api-version` — and the version is a dev
+//! version. A Socket-wired entry that still has a `source` (a lock
+//! hand-edited after vendoring, or redirected before the rewriter dropped
+//! it) then installs the pristine upstream commit, so it is diagnosed and
+//! yields no ref: the same veto depscan's SBOM applies
+//! (`composerInstallsFromSource`). `--prefer-source` / `--prefer-dist` and
+//! global config are install-time choices the project cannot record.
 //!
 //! Out of scope: `vendor/composer/installed.json` (an install artifact, not a
 //! root lock — the installed tree is verified by the crawler instead) and
@@ -61,11 +76,111 @@ use super::{
     DiscoverCtx, Discovery, LocateOpts, PatchedRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
 };
 use crate::crawlers::composer_crawler::normalize_version;
-use crate::utils::composer_version::composer_purls_equivalent;
+use crate::utils::composer_version::{composer_purls_equivalent, composer_version_normalize};
 use crate::vendor::lock_inventory::{composer_lock_packages, ComposerLockPackage};
 
 /// The lock both backends rewrite (root-relative).
 const COMPOSER_LOCK: &str = "composer.lock";
+
+/// The manifest beside it, read for `config.preferred-install`.
+const COMPOSER_JSON: &str = "composer.json";
+
+/// What decides whether `composer install` takes an entry from its `source`
+/// (see the module doc): the root composer.json's
+/// `config.preferred-install` and the lock's `plugin-api-version`.
+struct InstallPreference {
+    preferred_install: Option<Value>,
+    plugin_api_version: Option<String>,
+}
+
+impl InstallPreference {
+    /// Read quietly: composer.json is not a lock, and a missing or
+    /// unparseable one leaves composer's default.
+    async fn load(ctx: &DiscoverCtx<'_>, lock: &Value) -> Self {
+        let preferred_install =
+            crate::utils::fs::read_regular_to_string(&ctx.root.join(COMPOSER_JSON))
+                .await
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|manifest| manifest.get("config")?.get("preferred-install").cloned());
+        Self {
+            preferred_install,
+            plugin_api_version: lock
+                .get("plugin-api-version")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }
+    }
+
+    /// Composer's `preferred-install` default: `auto` through 2.0, `dist`
+    /// from 2.1. A lock without `plugin-api-version` was written by 1.x.
+    fn default_preference(&self) -> &'static str {
+        match self.plugin_api_version.as_deref() {
+            None => "auto",
+            Some(v) if v.starts_with("1.") || v.starts_with("2.0.") => "auto",
+            Some(_) => "dist",
+        }
+    }
+
+    /// Whether composer installs `entry` from its `source` before trying
+    /// its `dist` (`DownloadManager::getAvailableSources`).
+    fn installs_from_source(&self, entry: &ComposerLockPackage<'_>) -> bool {
+        if !has_source(entry.source) {
+            return false;
+        }
+        let is_dev = entry.version.is_some_and(is_dev_version);
+        let fallback = Value::from(self.default_preference());
+        match self.preferred_install.as_ref().unwrap_or(&fallback) {
+            Value::Object(patterns) => {
+                // Composer's Config::merge folds the string default in as a
+                // trailing `*`, which every name matches.
+                let name = entry.name.unwrap_or("");
+                let value = patterns
+                    .iter()
+                    .filter(|(pattern, _)| pattern.as_str() != "*")
+                    .find(|(pattern, _)| preference_pattern_matches(pattern, name))
+                    .map(|(_, value)| value)
+                    .or_else(|| patterns.get("*"))
+                    .unwrap_or(&fallback);
+                !(value == "dist" || (!is_dev && value == "auto"))
+            }
+            Value::String(preference) if preference == "source" => true,
+            // PHP's loose `switch` sends `true` to the 'dist' case.
+            Value::String(preference) if preference == "dist" => false,
+            Value::Bool(true) => false,
+            _ => is_dev,
+        }
+    }
+}
+
+/// An entry `source` composer can install from: an object whose `type` is
+/// set (PHP truthiness: `''` and `'0'` name none).
+fn has_source(source: Option<&Value>) -> bool {
+    match source
+        .and_then(Value::as_object)
+        .and_then(|s| s.get("type"))
+    {
+        None => false,
+        Some(Value::String(kind)) => !kind.is_empty() && kind != "0",
+        Some(_) => true,
+    }
+}
+
+/// A `dev-*` branch or `*-dev` version (a `#<commit>` suffix ignored).
+fn is_dev_version(version: &str) -> bool {
+    let mut normalized = composer_version_normalize(version).unwrap_or_else(|| version.to_string());
+    if let Some(hash) = normalized.find('#').filter(|&i| i + 1 < normalized.len()) {
+        normalized.truncate(hash);
+    }
+    normalized.starts_with("dev-") || normalized.ends_with("-dev")
+}
+
+/// Composer's `preferred-install` pattern match: `*` is any run, the rest is
+/// literal, the whole name must match, case-insensitively.
+fn preference_pattern_matches(pattern: &str, name: &str) -> bool {
+    let source = regex::escape(pattern).replace(r"\*", ".*");
+    regex::Regex::new(&format!("(?i)^{source}$")).is_ok_and(|re| re.is_match(name))
+}
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let file = COMPOSER_LOCK;
@@ -87,11 +202,12 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         );
         return;
     }
+    let preference = InstallPreference::load(ctx, &doc).await;
     // The inventory's own walk: `packages` then `packages-dev` (a missing
     // or non-array section — composer writes `"packages-dev": []`, older /
     // hand-trimmed locks may omit it — is simply empty).
     for entry in composer_lock_packages(&doc) {
-        entry_ref(ctx, file, &entry, out);
+        entry_ref(ctx, file, &entry, &preference, out);
     }
 }
 
@@ -102,6 +218,7 @@ fn entry_ref(
     ctx: &DiscoverCtx<'_>,
     file: &str,
     entry: &ComposerLockPackage<'_>,
+    preference: &InstallPreference,
     out: &mut Discovery,
 ) {
     let section = entry.section;
@@ -154,6 +271,18 @@ fn entry_ref(
         );
         return;
     };
+    if preference.installs_from_source(entry) {
+        out.diag(
+            DIAG_REF_INVALID,
+            file,
+            format!(
+                "{file}: {purl} is Socket-wired in its dist, but its lock entry keeps a `source` \
+                 that composer installs from instead (preferred-install), so the installed \
+                 bytes are the unpatched upstream"
+            ),
+        );
+        return;
+    }
 
     if let Some(vref) = vendored {
         // The leaf carries the patch purl's spelling (`@3.0.2.0`), the lock
@@ -866,19 +995,166 @@ mod tests {
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
-    /// A vendored entry that still carries its upstream `source` (a lock
-    /// hand-edited after vendoring) is still the committed copy: composer's
-    /// default `--prefer-dist` installs the path dist.
-    #[tokio::test]
-    async fn vendored_entry_with_a_leftover_source_is_a_ref() {
-        let mut entry = vendored_entry("psr/log", "3.0.2", UUID_B);
+    fn with_source(mut entry: Value) -> Value {
         entry["source"] = json!({
             "type": "git",
             "url": "https://github.com/php-fig/log.git",
             "reference": "f16e1d5"
         });
+        entry
+    }
+
+    fn composer_json(preferred_install: Value) -> String {
+        serde_json::to_string_pretty(&json!({
+            "require": {"psr/log": "^3.0"},
+            "config": {"preferred-install": preferred_install}
+        }))
+        .unwrap()
+    }
+
+    fn assert_source_veto(out: &Discovery) {
+        assert!(out.refs.is_empty(), "{:?}", out.refs);
+        assert_eq!(out.diagnostics.len(), 1, "{:?}", out.diagnostics);
+        assert_eq!(out.diagnostics[0].code, DIAG_REF_INVALID);
+        assert!(
+            out.diagnostics[0].detail.contains("installs from instead"),
+            "{:?}",
+            out.diagnostics[0]
+        );
+    }
+
+    /// A vendored entry that still carries its upstream `source` (a lock
+    /// hand-edited after vendoring) is still the committed copy under
+    /// composer's default install, which takes the path dist.
+    #[tokio::test]
+    async fn vendored_entry_with_a_leftover_source_is_a_ref() {
+        let entry = with_source(vendored_entry("psr/log", "3.0.2", UUID_B));
+        for manifest in [
+            None,
+            Some(composer_json(json!("dist"))),
+            Some(composer_json(json!("auto"))),
+        ] {
+            let p = Project::new();
+            p.write("composer.lock", lock(json!([entry.clone()]), json!([])));
+            if let Some(manifest) = &manifest {
+                p.write("composer.json", manifest);
+            }
+            let out = run(&p).await;
+            assert_refs(
+                &out,
+                &[("pkg:composer/psr/log@3.0.2", UUID_B, WiringMode::Vendored)],
+            );
+            assert!(
+                out.diagnostics.is_empty(),
+                "{manifest:?}: {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    /// `preferred-install: source` makes composer git-clone the pristine
+    /// upstream commit from a leftover `source`: neither a vendored nor a
+    /// hosted entry is a ref then, and the run says why.
+    #[tokio::test]
+    async fn a_leftover_source_composer_installs_from_is_not_a_ref() {
+        let hosted = with_source(hosted_entry(
+            "psr/log",
+            "3.0.2",
+            &format!("https://patch.socket.dev/patch/composer/psr/log/3.0.2/{TOKEN}/{UUID_B}/log-3.0.2.zip"),
+            Some(SHA1),
+        ));
+        let vendored = with_source(vendored_entry("psr/log", "3.0.2", UUID_B));
+        for entry in [vendored, hosted] {
+            for preference in [
+                json!("source"),
+                json!({"psr/*": "source", "*": "dist"}),
+                json!({"*": "source"}),
+            ] {
+                let p = Project::new();
+                p.write("composer.lock", lock(json!([entry.clone()]), json!([])));
+                p.write("composer.json", composer_json(preference));
+                assert_source_veto(&run(&p).await);
+            }
+        }
+    }
+
+    /// Composer's per-package map: the first matching non-`*` pattern
+    /// decides, case-insensitively; the `*` entry (or composer's default)
+    /// covers the rest.
+    #[tokio::test]
+    async fn preferred_install_patterns_pick_the_first_match() {
+        let entry = with_source(vendored_entry("psr/log", "3.0.2", UUID_B));
+        for (preference, vetoed) in [
+            (json!({"PSR/*": "source"}), true),
+            (json!({"psr/log": "dist", "psr/*": "source"}), false),
+            (json!({"monolog/*": "source"}), false),
+            (json!({"monolog/*": "source", "*": "source"}), true),
+        ] {
+            let p = Project::new();
+            p.write("composer.lock", lock(json!([entry.clone()]), json!([])));
+            p.write("composer.json", composer_json(preference.clone()));
+            let out = run(&p).await;
+            assert_eq!(out.refs.is_empty(), vetoed, "{preference}: {:?}", out.refs);
+        }
+    }
+
+    /// `auto` installs a dev version from source. It is the default on a
+    /// Composer 1 lock (no `plugin-api-version`) and on 2.0; from 2.1 the
+    /// default is `dist`.
+    #[tokio::test]
+    async fn auto_installs_dev_versions_from_source() {
+        let dev = with_source(vendored_entry("psr/log", "dev-main", UUID_B));
+        let stable = with_source(vendored_entry("psr/log", "3.0.2", UUID_B));
+        let lock_with_api = |entry: &Value, api: Option<&str>| {
+            let mut doc: Value =
+                serde_json::from_str(&lock(json!([entry.clone()]), json!([]))).unwrap();
+            match api {
+                Some(api) => doc["plugin-api-version"] = json!(api),
+                None => {
+                    doc.as_object_mut().unwrap().remove("plugin-api-version");
+                }
+            }
+            serde_json::to_string_pretty(&doc).unwrap()
+        };
+        for (entry, api, manifest, vetoed) in [
+            (&dev, None, None, true),
+            (&dev, Some("2.0.0"), None, true),
+            (&dev, Some("2.6.0"), None, false),
+            (&dev, Some("2.6.0"), Some(json!("auto")), true),
+            (&stable, None, None, false),
+            (&stable, Some("2.6.0"), Some(json!("auto")), false),
+        ] {
+            let p = Project::new();
+            p.write("composer.lock", lock_with_api(entry, api));
+            if let Some(preference) = &manifest {
+                p.write("composer.json", composer_json(preference.clone()));
+            }
+            let out = run(&p).await;
+            assert_eq!(
+                out.refs.is_empty(),
+                vetoed,
+                "{api:?} {manifest:?}: {:?}",
+                out.refs
+            );
+            if vetoed {
+                assert_source_veto(&out);
+            }
+        }
+    }
+
+    /// No `source` left, nothing to install from: `preferred-install:
+    /// source` falls back to the dist, which is the patch.
+    #[tokio::test]
+    async fn source_preference_without_a_source_keeps_the_ref() {
         let p = Project::new();
-        p.write("composer.lock", lock(json!([entry]), json!([])));
+        p.write(
+            "composer.lock",
+            lock(
+                json!([vendored_entry("psr/log", "3.0.2", UUID_B)]),
+                json!([]),
+            ),
+        );
+        p.write("composer.json", composer_json(json!("source")));
         let out = run(&p).await;
         assert_refs(
             &out,
