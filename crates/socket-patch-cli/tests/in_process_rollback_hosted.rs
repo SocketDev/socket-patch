@@ -854,17 +854,13 @@ async fn scoped_unsupported_ecosystem_fails_closed() {
 }
 
 /// A ledger written by a newer socket-patch carries a hosted edit kind this
-/// release has no revert for (`redirect_vlt_lock_node`). A scoped rollback
-/// of the purl it names must refuse with nothing written, and an unscoped
-/// one must keep the record while that edit survives.
-async fn write_vlt_ledger_fixture(root: &Path, with_gem: bool) -> String {
-    let vlt_new = format!(
-        "\"~npm~left-pad@1.2.3\": [0,\"left-pad\",\"sha512-PATCHEDpatched==\",\"{LP_HOSTED_URL}\"]"
-    );
-    let vlt_lock = format!(
-        "{{\n  \"lockfileVersion\": 1,\n  \"options\": {{}},\n  \"nodes\": {{\n    {vlt_new}\n  }},\n  \"edges\": {{\n    \"file~_d left-pad\": \"prod 1.2.3 ~npm~left-pad@1.2.3\"\n  }}\n}}\n"
-    );
-    std::fs::write(root.join("vlt-lock.json"), &vlt_lock).unwrap();
+/// release has no revert for (`redirect_future_lock_entry`). A scoped
+/// rollback of the purl it names must refuse with nothing written, and an
+/// unscoped one must keep the record while that edit survives.
+async fn write_unknown_kind_ledger_fixture(root: &Path, with_gem: bool) -> String {
+    let future_new = format!("left-pad@1.2.3 {LP_HOSTED_URL}");
+    let future_lock = format!("{future_new}\n");
+    std::fs::write(root.join("future.lock"), &future_lock).unwrap();
     std::fs::write(
         root.join("yarn.lock"),
         yarn_lock_content(&yarn_redirected_block()),
@@ -882,17 +878,17 @@ async fn write_vlt_ledger_fixture(root: &Path, with_gem: bool) -> String {
         edits.push(gem_source_edit());
     }
     edits.push(FileEdit {
-        path: "vlt-lock.json".to_string(),
-        kind: "redirect_vlt_lock_node".to_string(),
+        path: "future.lock".to_string(),
+        kind: "redirect_future_lock_entry".to_string(),
         action: "rewritten".to_string(),
         key: Some("left-pad@1.2.3".to_string()),
         original: Some(Value::String(
-            "\"~npm~left-pad@1.2.3\": [0,\"left-pad\",\"sha512-UPSTREAMupstream==\"]".to_string(),
+            "left-pad@1.2.3 sha512-UPSTREAMupstream==".to_string(),
         )),
-        new: Some(Value::String(vlt_new)),
+        new: Some(Value::String(future_new)),
     });
     write_hosted_ledger(root, records, edits).await;
-    vlt_lock
+    future_lock
 }
 
 fn ledger_edit_kinds(root: &Path) -> Vec<String> {
@@ -909,7 +905,7 @@ fn ledger_edit_kinds(root: &Path) -> Vec<String> {
 #[serial]
 async fn scoped_rollback_refuses_a_purl_named_by_an_unknown_edit_kind() {
     let tmp = tempfile::tempdir().unwrap();
-    let vlt_lock = write_vlt_ledger_fixture(tmp.path(), true).await;
+    let future_lock = write_unknown_kind_ledger_fixture(tmp.path(), true).await;
     let ledger_before = std::fs::read(ledger_path(tmp.path())).unwrap();
     let yarn_before = std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap();
 
@@ -925,10 +921,9 @@ async fn scoped_rollback_refuses_a_purl_named_by_an_unknown_edit_kind() {
     assert_eq!(failed.len(), 1, "{envelope}");
     assert_eq!(failed[0]["purl"], LP_PURL);
     assert!(
-        failed[0]["error"]
-            .as_str()
-            .unwrap()
-            .contains("redirect_vlt_lock_node edit this socket-patch release does not understand"),
+        failed[0]["error"].as_str().unwrap().contains(
+            "redirect_future_lock_entry edit this socket-patch release does not understand"
+        ),
         "{envelope}"
     );
     assert_eq!(
@@ -940,8 +935,8 @@ async fn scoped_rollback_refuses_a_purl_named_by_an_unknown_edit_kind() {
         yarn_before
     );
     assert_eq!(
-        std::fs::read_to_string(tmp.path().join("vlt-lock.json")).unwrap(),
-        vlt_lock
+        std::fs::read_to_string(tmp.path().join("future.lock")).unwrap(),
+        future_lock
     );
 }
 
@@ -949,7 +944,7 @@ async fn scoped_rollback_refuses_a_purl_named_by_an_unknown_edit_kind() {
 #[serial]
 async fn unscoped_rollback_holds_the_record_beside_an_unknown_edit_kind() {
     let tmp = tempfile::tempdir().unwrap();
-    let vlt_lock = write_vlt_ledger_fixture(tmp.path(), true).await;
+    let future_lock = write_unknown_kind_ledger_fixture(tmp.path(), true).await;
 
     let code = rollback_in_process(tmp.path(), Vec::new(), false).await;
     assert_eq!(
@@ -957,8 +952,8 @@ async fn unscoped_rollback_holds_the_record_beside_an_unknown_edit_kind() {
         "an unknown edit kind must fail the rollback closed"
     );
     assert_eq!(
-        std::fs::read_to_string(tmp.path().join("vlt-lock.json")).unwrap(),
-        vlt_lock
+        std::fs::read_to_string(tmp.path().join("future.lock")).unwrap(),
+        future_lock
     );
     let ledger: Value =
         serde_json::from_slice(&std::fs::read(ledger_path(tmp.path())).unwrap()).unwrap();
@@ -966,7 +961,10 @@ async fn unscoped_rollback_holds_the_record_beside_an_unknown_edit_kind() {
     assert!(ledger["records"].get(GEM_PURL).is_some(), "{ledger}");
     // The groups this release understands still unwind on disk; their
     // records wait for the unknown group to clear.
-    assert_eq!(ledger_edit_kinds(tmp.path()), ["redirect_vlt_lock_node"]);
+    assert_eq!(
+        ledger_edit_kinds(tmp.path()),
+        ["redirect_future_lock_entry"]
+    );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
         yarn_lock_content(&yarn_original_block())
@@ -984,7 +982,7 @@ async fn unscoped_rollback_holds_the_record_beside_an_unknown_edit_kind() {
 #[serial]
 async fn scoped_rollback_of_the_only_record_holds_it_beside_an_unknown_edit_kind() {
     let tmp = tempfile::tempdir().unwrap();
-    let vlt_lock = write_vlt_ledger_fixture(tmp.path(), false).await;
+    let future_lock = write_unknown_kind_ledger_fixture(tmp.path(), false).await;
 
     let (code, envelope) = run_rollback_subprocess(tmp.path(), &[LP_PURL]);
     assert_eq!(code, 1, "{envelope}");
@@ -1001,8 +999,8 @@ async fn scoped_rollback_of_the_only_record_holds_it_beside_an_unknown_edit_kind
         .collect();
     assert_eq!(failed, [LP_PURL, "group:unknown"], "{envelope}");
     assert_eq!(
-        std::fs::read_to_string(tmp.path().join("vlt-lock.json")).unwrap(),
-        vlt_lock
+        std::fs::read_to_string(tmp.path().join("future.lock")).unwrap(),
+        future_lock
     );
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("yarn.lock")).unwrap(),
@@ -1011,7 +1009,10 @@ async fn scoped_rollback_of_the_only_record_holds_it_beside_an_unknown_edit_kind
     let ledger: Value =
         serde_json::from_slice(&std::fs::read(ledger_path(tmp.path())).unwrap()).unwrap();
     assert!(ledger["records"].get(LP_PURL).is_some(), "{ledger}");
-    assert_eq!(ledger_edit_kinds(tmp.path()), ["redirect_vlt_lock_node"]);
+    assert_eq!(
+        ledger_edit_kinds(tmp.path()),
+        ["redirect_future_lock_entry"]
+    );
 }
 
 // ---------------------------------------------------------------------------

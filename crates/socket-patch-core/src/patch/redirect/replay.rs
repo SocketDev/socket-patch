@@ -91,6 +91,9 @@ enum Inverse {
     /// surviving (refused) package-lock edit keeps the setting it needs.
     NpmrcAllowRemote,
     BunBinaryPackage,
+    /// A hosted vlt node splice: `original`'s slots [2] and [3] go back on
+    /// the line keyed by the recorded DepID ([`super::vlt::revert_vlt_slots`]).
+    VltSlots,
     /// Owned by a per-purl revert (npm JSON kinds). Present here only
     /// when that revert failed — refuse the group rather than guess.
     PerPurlOnly,
@@ -131,6 +134,7 @@ fn classify(kind: &str, action: &str) -> (&'static str, Inverse) {
         }
         "redirect_bun_lockb_package" => ("bun", Inverse::BunBinaryPackage),
         "redirect_bun_lock_package" => ("bun", Inverse::ReplaceFragment),
+        super::vlt::KIND => ("vlt", Inverse::VltSlots),
         "redirect_gemfile_lock_dependency_pin"
         | "redirect_gemfile_lock_checksum"
         | "redirect_gemfile_source_block" => (
@@ -192,7 +196,7 @@ pub(super) fn is_unclassified_kind(kind: &str, action: &str) -> bool {
 /// lock flavor), so dropping a record beside one would strand that edit.
 fn groups_for_record_purl(purl: &str) -> &'static [&'static str] {
     if purl.starts_with("pkg:npm/") {
-        &["npm", "yarn", "pnpm", "bun", "unknown"]
+        &["npm", "yarn", "pnpm", "bun", "vlt", "unknown"]
     } else if purl.starts_with("pkg:cargo/") {
         &["cargo", "unknown"]
     } else if purl.starts_with("pkg:gem/") {
@@ -519,6 +523,35 @@ pub async fn revert_remaining_redirect_edits(
                     match restored {
                         Ok(bytes) => {
                             staged_bytes.insert(edit.path.clone(), bytes);
+                            group_drops.insert(idx);
+                        }
+                        Err(reason) => {
+                            refuse(reason, &mut outcome);
+                            refused_groups.insert(group);
+                            continue 'group;
+                        }
+                    }
+                }
+                Inverse::VltSlots => {
+                    let content = match staged_read(&staged, project_root, &edit.path).await {
+                        Ok(Some(content)) => content,
+                        Ok(None) => {
+                            refuse(format!("{} no longer exists", edit.path), &mut outcome);
+                            refused_groups.insert(group);
+                            continue 'group;
+                        }
+                        Err(error) => {
+                            refuse(error, &mut outcome);
+                            refused_groups.insert(group);
+                            continue 'group;
+                        }
+                    };
+                    match super::vlt::revert_vlt_slots(&content, edit) {
+                        Ok(Some(restored)) => {
+                            staged.insert(edit.path.clone(), Some(restored));
+                            group_drops.insert(idx);
+                        }
+                        Ok(None) => {
                             group_drops.insert(idx);
                         }
                         Err(reason) => {
@@ -2033,20 +2066,18 @@ mod tests {
         assert_eq!(state.edits.len(), 1);
     }
 
-    const VLT_LOCK: &str = "{\n  \"lockfileVersion\": 0,\n  \"nodes\": {\n    \"~npm~minimist@1.2.8\": [0,\"minimist\",\"sha512-p\",\"https://patch.socket.dev/npm/minimist/1.2.8/t/u/minimist-1.2.8.tgz\"]\n  },\n  \"edges\": {}\n}\n";
+    const FUTURE_LOCK: &str =
+        "minimist@1.2.8 https://patch.socket.dev/npm/minimist/1.2.8/t/u/minimist-1.2.8.tgz\n";
 
-    fn vlt_lock_node_edit() -> FileEdit {
+    fn future_lock_edit() -> FileEdit {
         FileEdit {
             key: Some("minimist@1.2.8".into()),
             ..edit(
-                "vlt-lock.json",
-                "redirect_vlt_lock_node",
+                "future.lock",
+                "redirect_future_lock_entry",
                 "rewritten",
-                Some("\"~npm~minimist@1.2.8\": [0,\"minimist\",\"sha512-r\"]"),
-                Some(
-                    "\"~npm~minimist@1.2.8\": [0,\"minimist\",\"sha512-p\",\
-                     \"https://patch.socket.dev/npm/minimist/1.2.8/t/u/minimist-1.2.8.tgz\"]",
-                ),
+                Some("minimist@1.2.8 sha512-r"),
+                Some("minimist@1.2.8 https://patch.socket.dev/npm/minimist/1.2.8/t/u/minimist-1.2.8.tgz"),
             )
         }
     }
@@ -2055,11 +2086,11 @@ mod tests {
     async fn unclassified_kind_holds_the_npm_record_and_every_other_record() {
         for dry_run in [true, false] {
             let dir = TempDir::new().unwrap();
-            write(dir.path(), "vlt-lock.json", VLT_LOCK).await;
+            write(dir.path(), "future.lock", FUTURE_LOCK).await;
             write(dir.path(), "composer.lock", "https://patch.example/c\n").await;
             let mut state = state_with(
                 vec![
-                    vlt_lock_node_edit(),
+                    future_lock_edit(),
                     edit(
                         "composer.lock",
                         "redirect_composer_dist",
@@ -2075,13 +2106,13 @@ mod tests {
             assert_eq!(out.refusals[0].group, "unknown");
             assert_eq!(
                 out.refusals[0].reason,
-                "the redirect ledger holds a redirect_vlt_lock_node edit this socket-patch \
+                "the redirect ledger holds a redirect_future_lock_entry edit this socket-patch \
                  release does not understand; upgrade socket-patch"
             );
             assert!(out.dropped_records.is_empty(), "{out:?}");
             assert!(state.records.contains_key("pkg:npm/minimist@1.2.8"));
             assert!(state.records.contains_key("pkg:composer/v/c@1.0.0"));
-            assert_eq!(read(dir.path(), "vlt-lock.json").await, VLT_LOCK);
+            assert_eq!(read(dir.path(), "future.lock").await, FUTURE_LOCK);
             let kinds: Vec<&str> = state.edits.iter().map(|e| e.kind.as_str()).collect();
             // The composer group still unwinds on disk; only its record waits
             // for the unknown group to clear.
@@ -2090,15 +2121,80 @@ mod tests {
                     read(dir.path(), "composer.lock").await,
                     "https://patch.example/c\n"
                 );
-                assert_eq!(kinds, ["redirect_vlt_lock_node", "redirect_composer_dist"]);
+                assert_eq!(
+                    kinds,
+                    ["redirect_future_lock_entry", "redirect_composer_dist"]
+                );
             } else {
                 assert_eq!(
                     read(dir.path(), "composer.lock").await,
                     "https://packagist.example/c\n"
                 );
-                assert_eq!(kinds, ["redirect_vlt_lock_node"]);
+                assert_eq!(kinds, ["redirect_future_lock_entry"]);
             }
         }
+    }
+
+    const VLT_REGISTRY_ENTRY: &str =
+        "\"~npm~minimist@1.2.8~peer.1\": [2,\"minimist\",\"sha512-r\"]";
+    const VLT_HOSTED_ENTRY: &str = "\"~npm~minimist@1.2.8~peer.1\": [2,\"minimist\",\"sha512-p\",\"https://patch.socket.dev/npm/minimist/1.2.8/t/u/minimist-1.2.8.tgz\"]";
+
+    fn vlt_lock(entry: &str) -> String {
+        format!(
+            "{{\r\n  \"lockfileVersion\": 1,\r\n  \"nodes\": {{\r\n    {entry},\r\n    \"~npm~zz@1.0.0\": [0,\"zz\",\"sha512-z\"]\r\n  }}\r\n}}\r\n"
+        )
+    }
+
+    fn vlt_edit() -> FileEdit {
+        FileEdit {
+            key: Some("minimist@1.2.8~peer.1".into()),
+            ..edit(
+                "vlt-lock.json",
+                super::super::vlt::KIND,
+                "rewritten",
+                Some(VLT_REGISTRY_ENTRY),
+                Some(VLT_HOSTED_ENTRY),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn vlt_node_edits_replay_by_slots_and_drop_the_npm_record() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "vlt-lock.json", &vlt_lock(VLT_HOSTED_ENTRY)).await;
+        let mut state = state_with(vec![vlt_edit()], &["pkg:npm/minimist@1.2.8"]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert!(out.fully_reverted(), "{out:?}");
+        assert_eq!(
+            read(dir.path(), "vlt-lock.json").await,
+            vlt_lock(VLT_REGISTRY_ENTRY)
+        );
+        assert!(state.edits.is_empty() && state.records.is_empty());
+        assert_eq!(out.dropped_records, ["pkg:npm/minimist@1.2.8"]);
+    }
+
+    #[tokio::test]
+    async fn a_drifted_vlt_edit_holds_the_npm_record() {
+        let dir = TempDir::new().unwrap();
+        let drifted = VLT_HOSTED_ENTRY.replace("sha512-p", "sha512-x");
+        write(dir.path(), "vlt-lock.json", &vlt_lock(&drifted)).await;
+        let mut state = state_with(vec![vlt_edit()], &["pkg:npm/minimist@1.2.8"]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals.len(), 1, "{out:?}");
+        assert_eq!(out.refusals[0].group, "vlt");
+        assert!(out.refusals[0].reason.contains("drifted"), "{out:?}");
+        assert_eq!(read(dir.path(), "vlt-lock.json").await, vlt_lock(&drifted));
+        assert_eq!(state.edits.len(), 1);
+        assert!(state.records.contains_key("pkg:npm/minimist@1.2.8"));
+    }
+
+    #[tokio::test]
+    async fn a_vlt_edit_whose_lock_is_gone_refuses() {
+        let dir = TempDir::new().unwrap();
+        let mut state = state_with(vec![vlt_edit()], &["pkg:npm/minimist@1.2.8"]);
+        let out = revert_remaining_redirect_edits(dir.path(), &mut state, false).await;
+        assert_eq!(out.refusals[0].reason, "vlt-lock.json no longer exists");
+        assert!(state.records.contains_key("pkg:npm/minimist@1.2.8"));
     }
 
     #[test]
@@ -2116,7 +2212,11 @@ mod tests {
         ] {
             assert!(groups_for_record_purl(purl).contains(&"unknown"), "{purl}");
         }
-        assert!(is_unclassified_kind("redirect_vlt_lock_node", "rewritten"));
+        assert!(is_unclassified_kind(
+            "redirect_future_lock_entry",
+            "rewritten"
+        ));
+        assert!(!is_unclassified_kind("redirect_vlt_lock_node", "rewritten"));
         assert!(!is_unclassified_kind(
             "redirect_bun_lock_package",
             "rewritten"
@@ -2580,6 +2680,7 @@ mod tests {
             ("redirect_yarn_berry_entry", "rewritten"),
             ("redirect_bun_lock_package", "rewritten"),
             ("redirect_bun_lockb_package", "rewritten"),
+            ("redirect_vlt_lock_node", "rewritten"),
             ("redirect_gemfile_lock_dependency_pin", "rewritten"),
             ("redirect_gemfile_lock_dependency_pin", "added"),
             ("redirect_gemfile_lock_checksum", "rewritten"),

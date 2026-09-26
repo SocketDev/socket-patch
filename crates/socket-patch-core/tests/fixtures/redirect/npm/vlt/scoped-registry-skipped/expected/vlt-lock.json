@@ -1,0 +1,19 @@
+{
+  "lockfileVersion": 1,
+  "options": {
+    "scope-registries": {
+      "@a": "https://scoped.example.com/"
+    },
+    "registries": {
+      "npm": "https://registry.npmjs.org/"
+    }
+  },
+  "nodes": {
+    "~https_c++scoped.example.com+~@a+b@1.0.0": [0,"@a/b","sha512-ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss==","https://scoped.example.com/@a/b/-/b-1.0.0.tgz"],
+    "~npm~@a+b@1.0.0": [0,"@a/b","sha512-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB==","https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/b-1.0.0.tgz"]
+  },
+  "edges": {
+    "file~_d @a/b": "prod 1.0.0 ~https_c++scoped.example.com+~@a+b@1.0.0",
+    "workspace~packages+a @a/b": "prod 1.0.0 ~npm~@a+b@1.0.0"
+  }
+}

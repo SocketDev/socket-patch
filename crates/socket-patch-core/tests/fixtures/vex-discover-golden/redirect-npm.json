@@ -925,6 +925,1047 @@
     "elsewhere": [],
     "live_claims": []
   },
+  "redirect/npm/vlt/alias-edge/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/alias-edge/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/alias-url-equals-registry/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/alias-url-equals-registry/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/basic/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/basic/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/bins-and-platform-slots/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/bins-and-platform-slots/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/bom-refusal/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-0.0.0-1/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-0.0.0-1/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-0.0.0-16/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-0.0.0-16/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-0.0.0-19/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-0.0.0-19/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-0.0.0-32/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-0.0.0-32/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.0.0-rc.14/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.0.0-rc.14/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.0.0-rc.15/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.0.0-rc.15/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.0.0-rc.32/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.0.0-rc.32/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.0.0-rc.33/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.0.0-rc.33/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.0.0-rc.8/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.0.0-rc.8/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.0.10/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.0.10/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.1.1/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.1.1/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.2.0/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/capture-1.2.0/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/crlf/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/crlf/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/custom-registry-skipped/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/default-registry-alias/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/default-registry-alias/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/hidden-lock-sentinel/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/invalid-json/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/jsr-skipped/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/jsr-skipped/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/legacy-mixed-default-segments/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/legacy-mixed-default-segments/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-absent-version/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-absent-version/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-absent-version-warning/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-absent-version-warning/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v0-empty-segment/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v0-empty-segment/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v0-empty-segment-old-lockfile-warning/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v0-empty-segment-old-lockfile-warning/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v0-npm-segment/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v0-npm-segment/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v0-url-segment-old-lockfile-warning/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v0-url-segment-old-lockfile-warning/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v1-3tuple/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v1-3tuple/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v1-both-registry-keys/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v1-both-registry-keys/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v1-scalar-registry-3tuple/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-v1-scalar-registry-3tuple/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-version-exponent/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-version-float/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-version-string/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lock-version-unsupported/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/lone-surrogate-string/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/mirror-registries-npm/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/mirror-registries-npm/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/missing-sha512/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/mixed-eol/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/mixed-eol/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/modifier-extra/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/modifier-extra/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/multiple-versions/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/multiple-versions/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/no-lockfile-vlt-json/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/non-canonical-layout-refusal/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/not-json-object/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/peer-extras/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/peer-extras/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/re-redirect-stale-url/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/re-redirect-stale-url/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/remote-file-git-untouched/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/remote-file-git-untouched/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/rerun-noop/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/residual-gate-duplicate-nodes/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/scalar-registry-v0-with-registries-npm/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/scalar-registry-v0-with-registries-npm/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/scalar-registry-warning/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/scalar-registry-warning/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/scoped-package/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/scoped-package/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/scoped-registry-skipped/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/scoped-registry-skipped/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/sibling-package-lock/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "mode": "hosted",
+        "source_file": "package-lock.json",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-11111111111111111111111111111111111111111111111111111111111111111111111111111111111111==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/11111111-1111-4111-8111-111111111111/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "package-lock.json"
+      },
+      {
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "mode": "hosted",
+        "file": "package-lock.json"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/ms@2.1.3",
+        "file": "package-lock.json"
+      }
+    ],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/vlt/sibling-package-lock/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "package-lock.json"
+      },
+      {
+        "purl": "pkg:npm/ms@2.1.3",
+        "file": "package-lock.json"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/sibling-package-lock-vlt-installed/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "mode": "hosted",
+        "source_file": "package-lock.json",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-11111111111111111111111111111111111111111111111111111111111111111111111111111111111111==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/11111111-1111-4111-8111-111111111111/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      },
+      {
+        "purl": "pkg:npm/ms@2.1.3",
+        "uuid": "22222222-2222-4222-8222-222222222222",
+        "mode": "hosted",
+        "source_file": "package-lock.json",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-22222222222222222222222222222222222222222222222222222222222222222222222222222222222222==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/22222222-2222-4222-8222-222222222222/ms-2.1.3.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "package-lock.json"
+      },
+      {
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "mode": "hosted",
+        "file": "package-lock.json"
+      },
+      {
+        "uuid": "22222222-2222-4222-8222-222222222222",
+        "mode": "hosted",
+        "file": "package-lock.json"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      },
+      {
+        "mode": "hosted",
+        "uuid": "22222222-2222-4222-8222-222222222222",
+        "purl": "pkg:npm/ms@2.1.3"
+      }
+    ]
+  },
+  "redirect/npm/vlt/sibling-package-lock-vlt-installed/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "package-lock.json"
+      },
+      {
+        "purl": "pkg:npm/ms@2.1.3",
+        "file": "package-lock.json"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/sibling-refused-in-vlt/expected": {
+    "refs": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "mode": "hosted",
+        "source_file": "package-lock.json",
+        "artifact_rel": null,
+        "locked_integrity": "Sri(\"sha512-11111111111111111111111111111111111111111111111111111111111111111111111111111111111111==\")",
+        "integrity_required": true,
+        "url": "https://patch.socket.dev/patch/npm/11111111-1111-1111-1111-111111111111/11111111-1111-4111-8111-111111111111/left-pad-1.3.0.tgz",
+        "lockfile_basis_ok": true
+      }
+    ],
+    "diagnostics": [],
+    "recognized": [
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "mode": "hosted",
+        "file": "package-lock.json"
+      },
+      {
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "mode": "hosted",
+        "file": "package-lock.json"
+      }
+    ],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/ms@2.1.3",
+        "file": "package-lock.json"
+      }
+    ],
+    "live_claims": [
+      {
+        "mode": "hosted",
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "purl": "pkg:npm/left-pad@1.3.0"
+      }
+    ]
+  },
+  "redirect/npm/vlt/sibling-refused-in-vlt/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:npm/left-pad@1.3.0",
+        "file": "package-lock.json"
+      },
+      {
+        "purl": "pkg:npm/ms@2.1.3",
+        "file": "package-lock.json"
+      }
+    ],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/unsupported-lock-key/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/url-segment-default/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/url-segment-default/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/url-segment-trailing-slash/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/url-segment-trailing-slash/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/vendored-entry/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/vendored-entry-tgz/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/vlt-json-bom/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/vlt-json-bom/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/workspace/expected": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
+  "redirect/npm/vlt/workspace/input": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [],
+    "live_claims": []
+  },
   "redirect/npm/yarn-berry/basic/expected": {
     "refs": [
       {

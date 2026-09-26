@@ -621,10 +621,11 @@ fn cargo_declared_req(fragment: Option<&Value>) -> Option<String> {
 /// The npm-family text-fragment edit kinds CLAIMED BY KEY: `original`/`new`
 /// hold the whole lock fragment as a string, the edit's `key` embeds
 /// `<name>@<version>`, and the revert is a `replacen(new, original)`.
-const NPM_TEXT_KINDS: [&str; 3] = [
+const NPM_TEXT_KINDS: [&str; 4] = [
     "redirect_yarn_classic_entry",
     "redirect_yarn_berry_entry",
     "redirect_pnpm_resolution",
+    super::vlt::KIND,
 ];
 
 /// The bun hosted rewriter's edit kind (`rewrite_bun_lock`): `original`/`new`
@@ -636,8 +637,9 @@ const NPM_TEXT_KINDS: [&str; 3] = [
 /// (`elems[0]`), the field the rewriter itself matched on.
 const BUN_TEXT_KIND: &str = "redirect_bun_lock_package";
 
-/// Does this edit kind replay as a whole text fragment
-/// (`content.replacen(new, original, 1)`, fail-closed on drift)?
+/// Does this edit kind replay as a text fragment, fail-closed on drift?
+/// Most replace the whole fragment (`content.replacen(new, original, 1)`);
+/// vlt node edits revert slot by slot ([`super::vlt::revert_vlt_slots`]).
 fn replays_as_text_fragment(kind: &str) -> bool {
     NPM_TEXT_KINDS.contains(&kind) || kind == BUN_TEXT_KIND
 }
@@ -829,6 +831,7 @@ pub async fn revert_npm_redirect_purl(
     for (i, e) in state.edits.iter().enumerate() {
         let key = e.key.as_deref().unwrap_or_default();
         let claimed = match e.kind.as_str() {
+            super::vlt::KIND => super::vlt::claims_key(key, &name, &version),
             k if NPM_TEXT_KINDS.contains(&k) => {
                 key == lock_key
                     || (k == "redirect_pnpm_resolution"
@@ -971,6 +974,13 @@ pub async fn revert_npm_redirect_purl(
                     edit.path
                 ));
             };
+            if edit.kind == super::vlt::KIND {
+                if let Some(restored) = super::vlt::revert_vlt_slots(&content, edit)? {
+                    staged.insert(edit.path.clone(), Some(restored));
+                    out.reverted_files.push(edit.path.clone());
+                }
+                continue;
+            }
             // A yarn block recorded on a CRLF checkout, replayed on an LF
             // one (or the reverse — `core.autocrlf` re-spells the lock on
             // every OS switch, never the committed ledger): when neither
@@ -2472,19 +2482,118 @@ mod tests {
         assert!(state.edits.is_empty(), "edits dropped");
     }
 
-    fn vlt_lock_node_edit(name: &str, version: &str) -> FileEdit {
+    fn future_lock_edit(name: &str, version: &str) -> FileEdit {
         FileEdit {
-            path: "vlt-lock.json".into(),
-            kind: "redirect_vlt_lock_node".into(),
+            path: "future.lock".into(),
+            kind: "redirect_future_lock_entry".into(),
             action: "rewritten".into(),
             key: Some(format!("{name}@{version}")),
-            original: Some(Value::String(format!(
-                "\"~npm~{name}@{version}\": [0,\"{name}\",\"sha512-r\"]"
-            ))),
-            new: Some(Value::String(format!(
-                "\"~npm~{name}@{version}\": [0,\"{name}\",\"sha512-p\",\"{NPM_URL}\"]"
+            original: Some(Value::String(format!("{name}@{version} sha512-r"))),
+            new: Some(Value::String(format!("{name}@{version} {NPM_URL}"))),
+        }
+    }
+
+    fn vlt_lock(entries: &[String]) -> String {
+        let body: Vec<String> = entries.iter().map(|e| format!("    {e}")).collect();
+        format!(
+            "{{\n  \"lockfileVersion\": 1,\n  \"nodes\": {{\n{}\n  }},\n  \"edges\": {{}}\n}}\n",
+            body.join(",\n")
+        )
+    }
+
+    fn vlt_entry(id: &str, slots: &str) -> String {
+        format!("\"{id}\": [0,\"left-pad\",{slots}]")
+    }
+
+    fn vlt_node_edit(key: &str, id: &str) -> FileEdit {
+        FileEdit {
+            path: "vlt-lock.json".into(),
+            kind: super::super::vlt::KIND.into(),
+            action: "rewritten".into(),
+            key: Some(key.into()),
+            original: Some(Value::String(vlt_entry(id, "\"sha512-r\""))),
+            new: Some(Value::String(vlt_entry(
+                id,
+                &format!("\"sha512-p\",\"{NPM_URL}\""),
             ))),
         }
+    }
+
+    #[tokio::test]
+    async fn npm_vlt_takeover_claims_every_variant_by_key_and_leaves_other_versions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let hosted = format!("\"sha512-p\",\"{NPM_URL}\"");
+        let wired = vlt_lock(&[
+            vlt_entry("·npm·left-pad@1.3.0·%E1%B9%97%3A3", &hosted),
+            vlt_entry("~npm~left-pad@1.3.0", &hosted),
+            vlt_entry("~npm~left-pad@1.3.0-rc.1", &hosted),
+            vlt_entry("~npm~left-pad@1.3.0~peer.2", &hosted),
+        ]);
+        tokio::fs::write(root.join("vlt-lock.json"), &wired)
+            .await
+            .unwrap();
+        let mut state = RedirectState::new();
+        state.records.insert(NPM_PURL.into(), record());
+        state.edits = vec![
+            vlt_node_edit(
+                "left-pad@1.3.0~%E1%B9%97%3A3",
+                "·npm·left-pad@1.3.0·%E1%B9%97%3A3",
+            ),
+            vlt_node_edit("left-pad@1.3.0", "~npm~left-pad@1.3.0"),
+            vlt_node_edit("left-pad@1.3.0-rc.1", "~npm~left-pad@1.3.0-rc.1"),
+            vlt_node_edit("left-pad@1.3.0~peer.2", "~npm~left-pad@1.3.0~peer.2"),
+        ];
+        revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .expect("revert succeeds");
+        let registry = "\"sha512-r\"";
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("vlt-lock.json"))
+                .await
+                .unwrap(),
+            vlt_lock(&[
+                vlt_entry("·npm·left-pad@1.3.0·%E1%B9%97%3A3", registry),
+                vlt_entry("~npm~left-pad@1.3.0", registry),
+                vlt_entry("~npm~left-pad@1.3.0-rc.1", &hosted),
+                vlt_entry("~npm~left-pad@1.3.0~peer.2", registry),
+            ])
+        );
+        let keys: Vec<&str> = state
+            .edits
+            .iter()
+            .filter_map(|e| e.key.as_deref())
+            .collect();
+        assert_eq!(keys, ["left-pad@1.3.0-rc.1"]);
+        assert!(state.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn npm_vlt_takeover_refuses_a_drifted_line_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wired = vlt_lock(&[vlt_entry("~npm~left-pad@1.3.0", "\"sha512-other\"")]);
+        tokio::fs::write(root.join("vlt-lock.json"), &wired)
+            .await
+            .unwrap();
+        let mut state = RedirectState::new();
+        state.records.insert(NPM_PURL.into(), record());
+        state.edits = vec![vlt_node_edit("left-pad@1.3.0", "~npm~left-pad@1.3.0")];
+        let before = state.clone();
+        let err = revert_redirect_purl(root, &mut state, NPM_PURL, false)
+            .await
+            .unwrap_err();
+        assert!(err.contains("drifted from the recorded redirect"), "{err}");
+        assert_eq!(
+            serde_json::to_value(&state).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("vlt-lock.json"))
+                .await
+                .unwrap(),
+            wired
+        );
     }
 
     #[tokio::test]
@@ -2492,7 +2601,7 @@ mod tests {
         for dry_run in [true, false] {
             let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &classic_pristine()).await;
             let root = tmp.path();
-            state.edits.push(vlt_lock_node_edit("left-pad", "1.3.0"));
+            state.edits.push(future_lock_edit("left-pad", "1.3.0"));
             let wired = tokio::fs::read_to_string(root.join("yarn.lock"))
                 .await
                 .unwrap();
@@ -2502,7 +2611,7 @@ mod tests {
                 .unwrap_err();
             assert_eq!(
                 err,
-                "the redirect ledger holds a redirect_vlt_lock_node edit this socket-patch \
+                "the redirect ledger holds a redirect_future_lock_entry edit this socket-patch \
                  release does not understand; upgrade socket-patch"
             );
             assert_eq!(
@@ -2523,24 +2632,24 @@ mod tests {
     async fn npm_unclassified_edit_for_another_package_does_not_block_the_claim() {
         let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &classic_pristine()).await;
         let root = tmp.path();
-        state.edits.push(vlt_lock_node_edit("left-pad", "1.3.1"));
+        state.edits.push(future_lock_edit("left-pad", "1.3.1"));
         revert_redirect_purl(root, &mut state, NPM_PURL, false)
             .await
             .expect("revert succeeds");
         assert_eq!(state.edits.len(), 1);
-        assert_eq!(state.edits[0].kind, "redirect_vlt_lock_node");
+        assert_eq!(state.edits[0].kind, "redirect_future_lock_entry");
     }
 
     #[tokio::test]
     async fn npm_unclassified_edit_for_a_longer_or_scoped_name_does_not_block_the_claim() {
         for other in ["long-left-pad", "@scope/left-pad"] {
             let (tmp, mut state) = npm_redirected_fixture("yarn.lock", &classic_pristine()).await;
-            state.edits.push(vlt_lock_node_edit(other, "1.3.0"));
+            state.edits.push(future_lock_edit(other, "1.3.0"));
             revert_redirect_purl(tmp.path(), &mut state, NPM_PURL, false)
                 .await
                 .unwrap_or_else(|e| panic!("{other}: {e}"));
             assert_eq!(state.edits.len(), 1, "{other}");
-            assert_eq!(state.edits[0].kind, "redirect_vlt_lock_node", "{other}");
+            assert_eq!(state.edits[0].kind, "redirect_future_lock_entry", "{other}");
         }
     }
 

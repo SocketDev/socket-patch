@@ -279,6 +279,14 @@ into the new version's section — see docs/releasing.md.
   `failed to roll back` for pnpm and vlt alike. `--update` in a vlt
   project suggests `vlt install @socketsecurity/socket-patch@latest`, and
   in vlx's cache `vlx -y -- @socketsecurity/socket-patch@latest …`.
+- **`rollback`, `remove` and the vendored takeover revert hosted vlt
+  redirects.** A `redirect_vlt_lock_node` ledger edit (written by the
+  depscan PR flow, or by `scan --mode hosted` once it rewrites
+  `vlt-lock.json`) puts the registry integrity and URL back on the node,
+  keeping whatever vlt re-laid since (a moved comma, a new flag or bins
+  slot, CRLF re-saved as LF). A node vlt has since re-locked away is
+  already reverted; any other change refuses with the `vlt-lock.json`
+  remedy. Peer and modifier variants are claimed per `name@version`.
 - **`redirect_yarn_berry_mixed_line_endings` and
   `vendor_yarn_berry_mixed_line_endings`.** A `yarn.lock` (or, vendored, a
   root `package.json`) that mixes CRLF and LF line endings — or holds a bare

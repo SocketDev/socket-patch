@@ -376,11 +376,12 @@ pub fn drop_superseded_purl(state: &mut RedirectState, purl: &str) -> bool {
             return false;
         };
         // Version-exact instance keys: `name@version`, pnpm v6 peer-suffixed
-        // `name@version(peer…)`, pnpm v5 respelled `name@version_peer…`.
+        // `name@version(peer…)`, pnpm v5 respelled `name@version_peer…`, vlt
+        // peer/modifier variants `name@version~extra`.
         let version_exact = key == name_at_version
             || key
                 .strip_prefix(name_at_version.as_str())
-                .is_some_and(|rest| rest.starts_with('(') || rest.starts_with('_'));
+                .is_some_and(|rest| rest.starts_with(['(', '_', '~']));
         // Artifact anchor: the edit's rewritten (`new`) content references
         // this purl's hosted artifact (its patch uuid — spelling-invariant
         // across raw / `\/`-escaped / percent-encoded URL forms).
@@ -841,18 +842,14 @@ mod tests {
         );
     }
 
-    fn vlt_node_edit(name: &str, version: &str, url: &str) -> FileEdit {
+    fn future_lock_edit(name: &str, version: &str, url: &str) -> FileEdit {
         FileEdit {
-            path: "vlt-lock.json".to_string(),
-            kind: "redirect_vlt_lock_node".to_string(),
+            path: "future.lock".to_string(),
+            kind: "redirect_future_lock_entry".to_string(),
             action: "rewritten".to_string(),
             key: Some(format!("{name}@{version}")),
-            original: Some(serde_json::json!(format!(
-                "\"~npm~{name}@{version}\": [0,\"{name}\",\"sha512-r\"]"
-            ))),
-            new: Some(serde_json::json!(format!(
-                "\"~npm~{name}@{version}\": [0,\"{name}\",\"sha512-p\",\"{url}\"]"
-            ))),
+            original: Some(serde_json::json!(format!("{name}@{version} sha512-r"))),
+            new: Some(serde_json::json!(format!("{name}@{version} {url}"))),
         }
     }
 
@@ -860,7 +857,7 @@ mod tests {
     fn drop_superseded_purl_drops_nothing_beside_an_unclassified_edit_naming_it() {
         let url = hosted_url("left-pad", "1.3.0", SAMPLE_UUID);
         let unanchored = hosted_url("left-pad", "1.3.0", "0e0e0e0e-0000-4000-8000-000000000000");
-        for (with_record, vlt_key, vlt_url) in [
+        for (with_record, future_key, future_url) in [
             (true, "left-pad@1.3.0", url.as_str()),
             (false, "left-pad@1.3.0", url.as_str()),
             (false, "left-pad@1.3.0~custom", unanchored.as_str()),
@@ -879,8 +876,8 @@ mod tests {
                     &url,
                 ),
                 FileEdit {
-                    key: Some(vlt_key.to_string()),
-                    ..vlt_node_edit("left-pad", "1.3.0", vlt_url)
+                    key: Some(future_key.to_string()),
+                    ..future_lock_edit("left-pad", "1.3.0", future_url)
                 },
             ];
             let before = serde_json::to_value(&state).unwrap();
@@ -888,7 +885,7 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(&state).unwrap(),
                 before,
-                "{with_record} {vlt_key}"
+                "{with_record} {future_key}"
             );
         }
     }
@@ -925,12 +922,12 @@ mod tests {
                 "redirect_pnpm_resolution",
                 Some("pad@1.3.0"),
             ),
-            vlt_node_edit(
+            future_lock_edit(
                 "left-pad",
                 "1.3.0",
                 &hosted_url("left-pad", "1.3.0", "0e0e0e0e-0000-4000-8000-000000000000"),
             ),
-            vlt_node_edit(
+            future_lock_edit(
                 "@scope/pad",
                 "1.3.0",
                 &hosted_url(
@@ -943,7 +940,39 @@ mod tests {
         assert!(drop_superseded_purl(&mut state, "pkg:npm/pad@1.3.0"));
         assert!(state.records.is_empty());
         let kinds: Vec<&str> = state.edits.iter().map(|e| e.kind.as_str()).collect();
-        assert_eq!(kinds, ["redirect_vlt_lock_node", "redirect_vlt_lock_node"]);
+        assert_eq!(
+            kinds,
+            ["redirect_future_lock_entry", "redirect_future_lock_entry"]
+        );
+    }
+
+    #[test]
+    fn drop_superseded_purl_claims_vlt_variant_keys() {
+        let mut state = RedirectState::new();
+        state.edits = vec![
+            edit(
+                "vlt-lock.json",
+                "redirect_vlt_lock_node",
+                Some("left-pad@1.3.0"),
+            ),
+            edit(
+                "vlt-lock.json",
+                "redirect_vlt_lock_node",
+                Some("left-pad@1.3.0~peer.0df72515a50372ba"),
+            ),
+            edit(
+                "vlt-lock.json",
+                "redirect_vlt_lock_node",
+                Some("left-pad@1.3.0-rc.1~peer.1"),
+            ),
+        ];
+        assert!(drop_superseded_purl(&mut state, "pkg:npm/left-pad@1.3.0"));
+        let keys: Vec<&str> = state
+            .edits
+            .iter()
+            .filter_map(|e| e.key.as_deref())
+            .collect();
+        assert_eq!(keys, ["left-pad@1.3.0-rc.1~peer.1"]);
     }
 
     /// A version-boundary key (`left-pad@1.3.10`) and a different package
