@@ -636,6 +636,70 @@ mod tests {
         assert!(!all.contains_key(&purls[0]), "{all:?}");
     }
 
+    /// H3: the identity fallback answered from the crawl snapshot finds the
+    /// same copies as crawling again — here an alias installed through a
+    /// symlink (yarn's pnpm linker, `npm link`), which neither the targeted
+    /// lookup nor the alias walk (it skips symlinks) finds, among other
+    /// crawled packages so it is not the snapshot's first entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn npm_identity_fallback_from_the_snapshot_matches_the_crawl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_pkg(root, "node_modules/aaa", "aaa", "1.0.0");
+        write_pkg(root, "node_modules/left-pad", "left-pad", "1.2.0");
+        write_pkg(root, "node_modules/zzz", "zzz", "1.0.0");
+        // Two such packages, so an answer drawn from only part of the
+        // snapshot (whatever its directory order) cannot match.
+        for (store, link, name) in [
+            ("store/a", "node_modules/lp", "left-pad"),
+            ("store/b", "node_modules/odd", "is-odd"),
+        ] {
+            write_pkg(root, store, name, "1.3.0");
+            std::os::unix::fs::symlink(root.join(store), root.join(link)).unwrap();
+        }
+        let options = local(root);
+        let purls = vec![
+            "pkg:npm/left-pad@1.3.0".to_string(),
+            "pkg:npm/is-odd@1.3.0".to_string(),
+            "pkg:npm/absent@2.0.0".to_string(),
+        ];
+        let aliases = npm_alias_copies(&options, &purls).await;
+        assert!(
+            aliases.is_empty(),
+            "the alias walk skips symlinks: {aliases:?}"
+        );
+
+        let (_, _, _, snapshot) =
+            crate::ecosystem_dispatch::crawl_ecosystems_with_npm(&options, None).await;
+        let snapshot = snapshot.expect("npm crawled");
+        assert!(
+            snapshot.packages_for(&options).is_some_and(|p| p.len() > 1),
+            "several crawled packages"
+        );
+
+        let mut walked: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        npm_identity_fallback(Some(&purls), &options, &mut walked, &aliases).await;
+        let mut reused: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        npm_identity_fallback_reusing(
+            Some(&purls),
+            &options,
+            &mut reused,
+            &aliases,
+            Some(&snapshot),
+        )
+        .await;
+        assert_eq!(reused, walked);
+        for purl in &purls[..2] {
+            assert_eq!(
+                reused.get(purl).map(Vec::len),
+                Some(1),
+                "{purl}: {reused:?}"
+            );
+        }
+        assert!(!reused.contains_key("pkg:npm/absent@2.0.0"), "{reused:?}");
+    }
+
     /// Only dirs whose install key differs from the package name are
     /// aliases; scoped keys, nested trees and scoped targets are walked;
     /// hidden dirs, other versions and symlinks are not copies.
